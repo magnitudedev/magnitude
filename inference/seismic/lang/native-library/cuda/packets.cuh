@@ -200,6 +200,7 @@ template <int HIGH_BITS> struct KQuant45 {
     static constexpr int GROUPS = 2;
     static constexpr bool BIAS = true;
     static constexpr bool DENSE = false;
+    static constexpr bool SCALED_GEMM = false;
     struct Raw {
         uint4 low;
         u32 high;
@@ -373,6 +374,7 @@ struct KQuant6 {
     static constexpr int GROUPS = 4;
     static constexpr bool BIAS = false;
     static constexpr bool DENSE = false;
+    static constexpr bool SCALED_GEMM = false;
     struct Raw {
         uint4 low;
         uint2 high;
@@ -517,6 +519,7 @@ struct Q8 {
     static constexpr int GROUPS = 2;
     static constexpr bool BIAS = false;
     static constexpr bool DENSE = false;
+    static constexpr bool SCALED_GEMM = false;
     struct Raw {
         uint4 first;
         uint4 second;
@@ -616,40 +619,199 @@ struct Q8 {
     }
 };
 
-// The iq4g32 table (the registry's code interpretation, GGUF kvalues_iq4nl)
-// as little-endian s8 bytes: word w holds the values of codes 4w..4w+3.
-constexpr u32 IQ4_TABLE_0 = 0xBFAD9881u; // -127 -104 -83 -65
-constexpr u32 IQ4_TABLE_1 = 0xF6EADDCFu; //  -49  -35 -22 -10
-constexpr u32 IQ4_TABLE_2 = 0x26190D01u; //    1   13  25  38
-constexpr u32 IQ4_TABLE_3 = 0x71594535u; //   53   69  89 113
+// ---------------------------------------------------------------------------
+// 4-bit coded weights (the registry's c4 family: iq4g32, q4g32s, mxfp4g32,
+// nvfp4g16): a nibble code names one of sixteen exact integer values of a
+// codebook (all within s8), and every group of 32 or 16 codes has one scale:
+// value = scale * table[code]. The code plane is q4k's low-nibble plane. A
+// table codebook's step word becomes s8 table values by `values`, after
+// which every path is q8's: exact 16-bit operands (`O::bytes`), s8
+// fragments, and value = scale * value (one F32 rounding); a linear codebook
+// decodes its nibbles directly, as q4k does. E2M1 tables hold the values
+// doubled, and their scales carry the exact factor 1/2.
 
-// The s8 table values of the four 4-bit codes in bits 0..15 of `codes`, as
-// bytes 0..3. Two byte permutes look each code's low three bits up in both
-// table halves; a third keeps the half its high bit names (selector +4).
-// Raw `prmt` reads bit 3 of a selector nibble as sign replication, so the
-// lookup selectors carry only the low three bits.
-__device__ __forceinline__ u32 iq4_values(u32 codes) {
-    const u32 low = prmt(IQ4_TABLE_0, IQ4_TABLE_1, codes & 0x7777u);
-    const u32 high = prmt(IQ4_TABLE_2, IQ4_TABLE_3, codes & 0x7777u);
-    return prmt(low, high, 0x3210u | ((codes & 0x8888u) >> 1));
-}
+// A codebook as little-endian s8 bytes: word w holds the values of codes
+// 4w..4w+3.
+//
+// A codebook decodes one mma16 step word (the eight 4-bit slots of a lane):
+// `decode<O>` into the four A registers, `s8` into the s8 fragments of rows g
+// and g+8, and `code` one slot as an s8 byte.
+template <u32 W0, u32 W1, u32 W2, u32 W3> struct Codebook {
+    // The s8 table values of the four 4-bit codes in bits 0..15 of `codes`,
+    // as bytes 0..3. Two byte permutes look each code's low three bits up in
+    // both table halves; a third keeps the half its high bit names (selector
+    // +4). Raw `prmt` reads bit 3 of a selector nibble as sign replication,
+    // so the lookup selectors carry only the low three bits.
+    __device__ static __forceinline__ u32 values(u32 codes) {
+        const u32 low = prmt(W0, W1, codes & 0x7777u);
+        const u32 high = prmt(W2, W3, codes & 0x7777u);
+        return prmt(low, high, 0x3210u | ((codes & 0x8888u) >> 1));
+    }
+    template <class O> __device__ static __forceinline__ void decode(u32 word, u32 (&a)[4]) {
+        const u32 low = values(word & 0xFFFFu), high = values(word >> 16);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            a[i] = O::bytes(low, high, i);
+    }
+    __device__ static __forceinline__ S8Pair s8(u32 word) {
+        const u32 low = values(word & 0xFFFFu), high = values(word >> 16);
+        return S8Pair{prmt(low, high, 0x6240u), prmt(low, high, 0x7351u)};
+    }
+    __device__ static __forceinline__ u32 code(u32 word, u32 slot) {
+        return (values((word >> (16 * (slot / 4))) & 0xFFFFu) >> (8 * (slot % 4))) & 0xFFu;
+    }
+};
+// GGUF kvalues_iq4nl (iq4g32).
+typedef Codebook<0xBFAD9881u,  // -127 -104 -83 -65
+                 0xF6EADDCFu,  //  -49  -35 -22 -10
+                 0x26190D01u,  //    1   13  25  38
+                 0x71594535u>  //   53   69  89 113
+    Iq4Codes;
+// Codes offset by OFFSET (q4g32s: 8): decoded directly, as q4k's nibbles are,
+// with the offset subtracted exactly (`O::codes<OFFSET>`, a bytewise s8
+// subtraction) instead of a table lookup.
+template <u32 OFFSET> struct LinearCodebook {
+    template <class O> __device__ static __forceinline__ void decode(u32 word, u32 (&a)[4]) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            a[i] = O::template codes<OFFSET>((word >> (4 * i)) & 0x000F000Fu);
+    }
+    __device__ static __forceinline__ S8Pair s8(u32 word) {
+        const S8Pair pair = s8_nibbles(word);
+        return S8Pair{__vsub4(pair.row_g, OFFSET * 0x01010101u), __vsub4(pair.row_g8, OFFSET * 0x01010101u)};
+    }
+    __device__ static __forceinline__ u32 code(u32 word, u32 slot) {
+        return (((word >> (4 * slot)) & 15u) - OFFSET) & 0xFFu;
+    }
+};
+typedef LinearCodebook<8> LinearCodes;
+// E2M1 doubled, GGUF kvalues_mxfp4 (mxfp4g32, nvfp4g16).
+typedef Codebook<0x03020100u,  //  0  1  2   3
+                 0x0C080604u,  //  4  6  8  12
+                 0xFDFEFF00u,  //  0 -1 -2  -3
+                 0xF4F8FAFCu>  // -4 -6 -8 -12
+    E2M1Codes;
 
-// iq4g32 (GGUF IQ4_XS / IQ4_NL): 4-bit codes naming the registry's sixteen
-// integer table values (all within s8), one f32 scale per 32: value =
-// scale * table[code]. The code plane is q4k's low-nibble plane; a step word's
-// codes become s8 table values by `iq4_values`, after which every path is
-// q8's: exact 16-bit operands (`O::bytes`), s8 fragments, and value =
-// scale * value (one F32 rounding).
-struct IQ4 {
+// Scale fields in the supers plane. `GROUP` codes share one scale; a
+// superblock (256 codes) of one row holds `BLOCK_BYTES` bytes of fields. The
+// supers plane ends 16 B-aligned inside the row, so a row's last (possibly
+// partial) superblock is readable whole.
+struct F32Scale {
+    static constexpr int GROUP = 32;
+    static constexpr int BLOCK_BYTES = 32;
+    struct Block {
+        uint4 packed[2][2];
+    };
+    __device__ static __forceinline__ void load(const u8 *fields, Block &block, int r) {
+        block.packed[r][0] = seismic_ld_nc_v4(fields);
+        block.packed[r][1] = seismic_ld_nc_v4(fields + 16);
+    }
+    // Scale `group` (of 8 per superblock) of row half `r`.
+    __device__ static __forceinline__ float at(const Block &block, int r, int group) {
+        const uint4 &half = block.packed[r][group / 4];
+        return __uint_as_float(word_of(half, group % 4));
+    }
+    __device__ static __forceinline__ float read(const u8 *supers, u64 group) {
+        return *reinterpret_cast<const float *>(supers + group * 4);
+    }
+    // GEMM staging: the k-block's two scales.
+    static constexpr int COEF_WORDS = 2;
+    __device__ static __forceinline__ u64 coef_offset(u64 kblock, int word) { return kblock * 8 + 4 * word; }
+    __device__ static __forceinline__ float staged(const u32 *words, u64, int group) {
+        return __uint_as_float(words[group]);
+    }
+};
+struct F16Scale {
+    static constexpr int GROUP = 32;
+    static constexpr int BLOCK_BYTES = 16;
+    struct Block {
+        uint4 packed[2];
+    };
+    __device__ static __forceinline__ void load(const u8 *fields, Block &block, int r) {
+        block.packed[r] = seismic_ld_nc_v4(fields);
+    }
+    __device__ static __forceinline__ float at(const Block &block, int r, int group) {
+        return seismic_f16_to_f32((u16)(word_of(block.packed[r], group / 2) >> (16 * (group % 2))));
+    }
+    __device__ static __forceinline__ float read(const u8 *supers, u64 group) { return f16_at(supers + group * 2); }
+    static constexpr int COEF_WORDS = 1;
+    __device__ static __forceinline__ u64 coef_offset(u64 kblock, int) { return kblock * 4; }
+    __device__ static __forceinline__ float staged(const u32 *words, u64, int group) {
+        return seismic_f16_to_f32((u16)(words[0] >> (16 * group)));
+    }
+};
+// E8M0 2^(e - 127), halved for the doubled codebook: 2^(e - 128) (e < 2 are
+// F32 subnormals); 0xff is NaN.
+struct E8M0Scale {
+    static constexpr int GROUP = 32;
+    static constexpr int BLOCK_BYTES = 8;
+    struct Block {
+        uint2 packed[2];
+    };
+    __device__ static __forceinline__ float decode(u32 e) {
+        return __uint_as_float(e < 2u ? 0x00200000u << e : e == 255u ? 0x7FC00000u : (e - 1u) << 23);
+    }
+    __device__ static __forceinline__ void load(const u8 *fields, Block &block, int r) {
+        block.packed[r] = seismic_ld_nc_v2(fields);
+    }
+    __device__ static __forceinline__ float at(const Block &block, int r, int group) {
+        const u32 word = group < 4 ? block.packed[r].x : block.packed[r].y;
+        return decode((word >> (8 * (group % 4))) & 0xFFu);
+    }
+    __device__ static __forceinline__ float read(const u8 *supers, u64 group) { return decode(supers[group]); }
+    // GEMM staging: the aligned word holding the k-block's two fields.
+    static constexpr int COEF_WORDS = 1;
+    __device__ static __forceinline__ u64 coef_offset(u64 kblock, int) { return (kblock * 2) & ~3ull; }
+    __device__ static __forceinline__ float staged(const u32 *words, u64 kblock, int group) {
+        return decode((words[0] >> (16 * (kblock % 2) + 8 * group)) & 0xFFu);
+    }
+};
+// UE4M3 (sign bit ignored; 0x7f is NaN), halved for the doubled codebook:
+// (1 + m/8) 2^(e - 8), or m 2^-10 when e = 0. One per 16 codes.
+struct UE4M3Scale {
+    static constexpr int GROUP = 16;
+    static constexpr int BLOCK_BYTES = 16;
+    struct Block {
+        uint4 packed[2];
+    };
+    __device__ static __forceinline__ float decode(u32 raw) {
+        raw &= 0x7Fu;
+        const u32 e = raw >> 3, m = raw & 7u;
+        const float normal = __uint_as_float(((e + 119u) << 23) | (m << 20));
+        return raw == 0x7Fu ? __uint_as_float(0x7FC00000u) : e == 0u ? (float)m * 0.0009765625f : normal;
+    }
+    __device__ static __forceinline__ void load(const u8 *fields, Block &block, int r) {
+        block.packed[r] = seismic_ld_nc_v4(fields);
+    }
+    __device__ static __forceinline__ float at(const Block &block, int r, int group) {
+        return decode((word_of(block.packed[r], group / 4) >> (8 * (group % 4))) & 0xFFu);
+    }
+    __device__ static __forceinline__ float read(const u8 *supers, u64 group) { return decode(supers[group]); }
+    static constexpr int COEF_WORDS = 1;
+    __device__ static __forceinline__ u64 coef_offset(u64 kblock, int) { return kblock * 4; }
+    __device__ static __forceinline__ float staged(const u32 *words, u64, int group) {
+        return decode((words[0] >> (8 * group)) & 0xFFu);
+    }
+};
+
+// A coded representation of codebook C and scale fields S. `WHOLE` states
+// that rows hold whole 256-code storage groups (iq4g32), so a superblock's
+// four k-blocks always exist; otherwise a row's last superblock may be
+// partial and its missing k-blocks are not fetched. `SCALED` selects the
+// scaled GEMM (projection.cuh `gemm_tile_half`): the table values are exact
+// operands and group scales multiply F32 partial products. iq4g32 keeps the
+// dequantized GEMM its Qwen results were qualified with.
+template <class C, class S, bool WHOLE, bool SCALED> struct Coded4 {
     const u8 *base;
     u64 stride;
     CodePlane low;
     u64 supers;
 
-    static constexpr int GROUP = 32;
-    static constexpr int GROUPS = 2;
+    static constexpr int GROUP = S::GROUP;
+    static constexpr int GROUPS = 64 / GROUP;
     static constexpr bool BIAS = false;
     static constexpr bool DENSE = false;
+    static constexpr bool SCALED_GEMM = SCALED;
     struct Raw {
         uint4 low;
     };
@@ -660,74 +822,53 @@ struct IQ4 {
     struct Super {
         uint4 low[4];
     };
-    // Rows hold whole 256-code storage groups, so all four k-blocks exist.
-    __device__ __forceinline__ Super fetch_superblock(u64 tile, u64 superblock, u64, u32 lane) const {
+    __device__ __forceinline__ Super fetch_superblock(u64 tile, u64 superblock, u64 kblocks, u32 lane) const {
         Super super;
 #pragma unroll
         for (int q = 0; q < 4; ++q)
-            super.low[q] = seismic_ld_nc_na_v4(low.chunk(base, stride, tile, (4 * superblock + q) * 512 + lane * 16));
+            if (WHOLE || 4 * superblock + q < kblocks)
+                super.low[q] =
+                    seismic_ld_nc_na_v4(low.chunk(base, stride, tile, (4 * superblock + q) * 512 + lane * 16));
         return super;
     }
     __device__ __forceinline__ Raw raw(const Super &super, int q, u32) const { return Raw{super.low[q]}; }
-    // The s8 values of slots 0..3 (low) and 4..7 (high) of step `step`.
-    __device__ static __forceinline__ void slots(const Raw &raw, int step, u32 &low, u32 &high) {
-        const u32 word = word_of(raw.low, step);
-        low = iq4_values(word & 0xFFFFu);
-        high = iq4_values(word >> 16);
-    }
     template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
-        u32 low, high;
-        slots(raw, step, low, high);
-#pragma unroll
-        for (int i = 0; i < 4; ++i)
-            a[i] = O::bytes(low, high, i);
+        C::template decode<O>(word_of(raw.low, step), a);
     }
-    __device__ __forceinline__ S8Pair s8(const Raw &raw, int step) const {
-        u32 low, high;
-        slots(raw, step, low, high);
-        return S8Pair{prmt(low, high, 0x6240u), prmt(low, high, 0x7351u)};
-    }
+    __device__ __forceinline__ S8Pair s8(const Raw &raw, int step) const { return C::s8(word_of(raw.low, step)); }
     __device__ __forceinline__ void coefficient(u64 row, u64 kblock, int group, float &scale, float &bias) const {
-        scale = *reinterpret_cast<const float *>(base + row * stride + supers + (kblock * 2 + group) * 4);
+        scale = S::read(base + row * stride + supers, kblock * GROUPS + group);
         bias = 0.0f;
     }
-    // The 8 f32 group scales of one superblock (256 codes) of rows g, g+8.
-    struct Block {
-        uint4 packed[2][2];
-    };
+    // The scale fields of one superblock (256 codes) of rows g, g+8.
+    typedef typename S::Block Block;
     __device__ __forceinline__ Block block(u64 tile, u64 superblock, u32 lane) const {
         Block block;
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            const u8 *scales = base + (tile * 16 + lane / 4 + 8 * r) * stride + supers + superblock * 32;
-            block.packed[r][0] = seismic_ld_nc_v4(scales);
-            block.packed[r][1] = seismic_ld_nc_v4(scales + 16);
-        }
+        for (int r = 0; r < 2; ++r)
+            S::load(base + (tile * 16 + lane / 4 + 8 * r) * stride + supers + superblock * S::BLOCK_BYTES, block, r);
         return block;
     }
-    // GEMM staging: the k-block's two f32 group scales.
-    static constexpr int COEF_WORDS = 2;
+    // GEMM staging: the words holding the k-block's scale fields.
+    static constexpr int COEF_WORDS = S::COEF_WORDS;
     __device__ __forceinline__ const u8 *coef_word(u64 row, u64 kblock, int word) const {
-        return base + row * stride + supers + kblock * 8 + 4 * word;
+        return base + row * stride + supers + S::coef_offset(kblock, word);
     }
-    __device__ __forceinline__ void staged_coefficient(const u32 *words, u64, int group, float &scale,
+    __device__ __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
                                                        float &bias) const {
-        scale = __uint_as_float(words[group]);
+        scale = S::staged(words, kblock, group);
         bias = 0.0f;
     }
-    __device__ __forceinline__ void coefficients(const Block &block, int q, Coefficients<2> &c) const {
+    __device__ __forceinline__ void coefficients(const Block &block, int q, Coefficients<GROUPS> &c) const {
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            const uint4 &half = block.packed[r][q / 2];
-            c.scale[r][0] = __uint_as_float(q % 2 == 0 ? half.x : half.z);
-            c.scale[r][1] = __uint_as_float(q % 2 == 0 ? half.y : half.w);
-        }
+        for (int r = 0; r < 2; ++r)
+#pragma unroll
+            for (int group = 0; group < GROUPS; ++group)
+                c.scale[r][group] = S::at(block, r, q * GROUPS + group);
     }
-    // The s8 table value of fragment slot `slot` in step `step`.
+    // The s8 value of fragment slot `slot` in step `step`.
     __device__ __forceinline__ u32 code(const Raw &raw, int step, u32 slot) const {
-        u32 low, high;
-        slots(raw, step, low, high);
-        return ((slot < 4 ? low : high) >> (8 * (slot % 4))) & 0xFFu;
+        return C::code(word_of(raw.low, step), slot);
     }
     __device__ static __forceinline__ float apply(u32 code, float scale, float) {
         return (float)(int)(signed char)code * scale;
@@ -738,6 +879,155 @@ struct IQ4 {
     }
     __device__ __forceinline__ Raw from_shared(const u8 *staged, u32 lane) const {
         return Raw{*reinterpret_cast<const uint4 *>(staged + lane * 16)};
+    }
+};
+
+typedef Coded4<Iq4Codes, F32Scale, true, false> IQ4;
+typedef Coded4<LinearCodes, F16Scale, false, true> Q4G32S;
+typedef Coded4<E2M1Codes, E8M0Scale, false, true> MXFP4;
+typedef Coded4<E2M1Codes, UE4M3Scale, false, true> NVFP4;
+
+// q5g32s (GGUF Q5_0: value = d * (code - 16)) and q5g32 (GGUF Q5_1: value =
+// d * code + m, the bias -m): q5k's code planes, one f16 d (and m) per 32.
+// Rows need not hold whole superblocks: the high bits are fetched per k-block
+// and a missing k-block is not fetched.
+template <bool MINIMUM> struct Q5G32 {
+    const u8 *base;
+    u64 stride;
+    CodePlane low;
+    CodePlane high;
+    u64 supers;
+    u64 supers_bytes; // payload bytes of a row's supers plane
+
+    static constexpr int GROUP = 32;
+    static constexpr int GROUPS = 2;
+    static constexpr bool BIAS = MINIMUM;
+    static constexpr bool DENSE = false;
+    // Codes (Q5_0: less 16) are exact operands; Q5_1's minimum is folded by
+    // the scaled GEMM as m * sum(x) per group.
+    static constexpr bool SCALED_GEMM = true;
+    static constexpr u32 OFFSET = MINIMUM ? 0u : 16u;
+    static constexpr u64 FIELD = MINIMUM ? 4 : 2; // supers bytes per group
+    struct Raw {
+        uint4 low;
+        u32 high;
+    };
+
+    __device__ __forceinline__ Raw fetch(u64 tile, u64 kblock, u32 lane) const {
+        Raw raw;
+        raw.low = seismic_ld_nc_na_v4(low.chunk(base, stride, tile, kblock * 512 + lane * 16));
+        raw.high = seismic_ld_nc_u32(high.chunk(base, stride, tile, kblock * 128 + lane * 4));
+        return raw;
+    }
+    struct Super {
+        Raw raw[4];
+    };
+    __device__ __forceinline__ Super fetch_superblock(u64 tile, u64 superblock, u64 kblocks, u32 lane) const {
+        Super super;
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            if (4 * superblock + q < kblocks)
+                super.raw[q] = fetch(tile, 4 * superblock + q, lane);
+        return super;
+    }
+    __device__ __forceinline__ Raw raw(const Super &super, int q, u32) const { return super.raw[q]; }
+    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
+        const u32 word = word_of(raw.low, step);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            u32 pair = (word >> (4 * i)) & 0x000F000Fu;
+            const u32 bits = raw.high >> (8 * step + i);
+            pair |= ((bits << 4) & 0x10u) | ((bits << 16) & 0x100000u);
+            a[i] = O::template codes<OFFSET>(pair);
+        }
+    }
+    __device__ __forceinline__ S8Pair s8(const Raw &raw, int step) const {
+        S8Pair pair = s8_nibbles(word_of(raw.low, step));
+        const u32 bits = raw.high >> (8 * step);
+        pair.row_g |= ((bits & 1u) << 4) | (((bits >> 4) & 1u) << 12) | (((bits >> 2) & 1u) << 20) |
+                      (((bits >> 6) & 1u) << 28);
+        pair.row_g8 |= (((bits >> 1) & 1u) << 4) | (((bits >> 5) & 1u) << 12) | (((bits >> 3) & 1u) << 20) |
+                       (((bits >> 7) & 1u) << 28);
+        if constexpr (!MINIMUM) {
+            // Codes 0..31 less 16, per byte: -16..15 as s8.
+            pair.row_g = __vsub4(pair.row_g, 0x10101010u);
+            pair.row_g8 = __vsub4(pair.row_g8, 0x10101010u);
+        }
+        return pair;
+    }
+    __device__ __forceinline__ void coefficient(u64 row, u64 kblock, int group, float &scale, float &bias) const {
+        const u8 *fields = base + row * stride + supers + (kblock * 2 + (u64)group) * FIELD;
+        scale = f16_at(fields);
+        bias = MINIMUM ? -f16_at(fields + 2) : 0.0f;
+    }
+    // The fields of one superblock (8 groups) of rows g, g+8. A row's last
+    // superblock may end inside its supers plane's final 16 B: the second
+    // half of the (d, m) fields is loaded only where it exists.
+    struct Block {
+        uint4 packed[2][MINIMUM ? 2 : 1];
+    };
+    __device__ __forceinline__ Block block(u64 tile, u64 superblock, u32 lane) const {
+        Block block;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const u8 *fields = base + (tile * 16 + lane / 4 + 8 * r) * stride + supers + superblock * 8 * FIELD;
+            block.packed[r][0] = seismic_ld_nc_v4(fields);
+            if constexpr (MINIMUM)
+                block.packed[r][1] =
+                    superblock * 32 + 16 < supers_bytes ? seismic_ld_nc_v4(fields + 16) : make_uint4(0, 0, 0, 0);
+        }
+        return block;
+    }
+    __device__ __forceinline__ void coefficients(const Block &block, int q, Coefficients<2> &c) const {
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+#pragma unroll
+            for (int group = 0; group < 2; ++group) {
+                const int index = 2 * q + group;
+                if constexpr (MINIMUM) {
+                    const u32 word = word_of(block.packed[r][index / 4], index % 4);
+                    c.scale[r][group] = seismic_f16_to_f32((u16)(word & 0xFFFFu));
+                    c.bias[r][group] = -seismic_f16_to_f32((u16)(word >> 16));
+                } else {
+                    c.scale[r][group] = seismic_f16_to_f32((u16)(word_of(block.packed[r][0], q) >> (16 * group)));
+                }
+            }
+    }
+    // GEMM staging: the k-block's two groups' fields.
+    static constexpr int COEF_WORDS = MINIMUM ? 2 : 1;
+    __device__ __forceinline__ const u8 *coef_word(u64 row, u64 kblock, int word) const {
+        return base + row * stride + supers + kblock * 2 * FIELD + 4 * word;
+    }
+    __device__ __forceinline__ void staged_coefficient(const u32 *words, u64, int group, float &scale,
+                                                       float &bias) const {
+        if constexpr (MINIMUM) {
+            scale = seismic_f16_to_f32((u16)(words[group] & 0xFFFFu));
+            bias = -seismic_f16_to_f32((u16)(words[group] >> 16));
+        } else {
+            scale = seismic_f16_to_f32((u16)(words[0] >> (16 * group)));
+            bias = 0.0f;
+        }
+    }
+    __device__ __forceinline__ u32 code(const Raw &raw, int step, u32 slot) const {
+        return ((word_of(raw.low, step) >> (4 * slot)) & 15u) | (((raw.high >> (8 * step + slot)) & 1u) << 4);
+    }
+    __device__ static __forceinline__ float apply(u32 code, float scale, float bias) {
+        if constexpr (MINIMUM)
+            return seismic_fma_rn(scale, (float)code, -bias);
+        else
+            return scale * (float)((int)code - 16);
+    }
+    static constexpr int CHUNKS = 32 + 8;
+    __device__ __forceinline__ const u8 *chunk_source(u64 tile, u64 kblock, u32 chunk) const {
+        if (chunk < 32)
+            return low.chunk(base, stride, tile, kblock * 512 + chunk * 16);
+        return high.chunk(base, stride, tile, kblock * 128 + (chunk - 32) * 16);
+    }
+    __device__ __forceinline__ Raw from_shared(const u8 *staged, u32 lane) const {
+        Raw raw;
+        raw.low = *reinterpret_cast<const uint4 *>(staged + lane * 16);
+        raw.high = *reinterpret_cast<const u32 *>(staged + 512 + lane * 4);
+        return raw;
     }
 };
 
@@ -761,6 +1051,7 @@ template <class E> struct Dense {
     static constexpr int GROUPS = 2;
     static constexpr bool BIAS = false;
     static constexpr bool DENSE = true;
+    static constexpr bool SCALED_GEMM = false;
     static constexpr int WORDS = E::bytes / 2; // 32-bit words per fragment register
     // Matrix `index` of a stacked tensor whose matrices are `matrix_stride`
     // elements apart.
@@ -910,10 +1201,16 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
         (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES), PACKETS_PLANE(P, CODES),                \
             ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET)                                                     \
     }
-#define PACKETS_MAKE_IQ4(P, pointer)                                                                     \
-    packets::IQ4 {                                                                                       \
+#define PACKETS_MAKE_C4(TYPE, P, pointer)                                                                \
+    packets::TYPE {                                                                                      \
         (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES), PACKETS_PLANE(P, CODES_LO),             \
             ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET)                                                     \
+    }
+#define PACKETS_MAKE_Q5(MINIMUM, P, pointer)                                                             \
+    packets::Q5G32<MINIMUM> {                                                                            \
+        (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES), PACKETS_PLANE(P, CODES_LO),             \
+            PACKETS_PLANE(P, CODES_HI), ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET),                        \
+            ELEMENT_CAT(P, _PLANE_SUPERS_BYTES_PER_ROW)                                                  \
     }
 
 // Dense weights: the tensor's rows (extent 0) at its row stride (stride 0,
@@ -963,7 +1260,22 @@ namespace packets { typedef Q8 W0; }
 #define KERNEL_W0_AT(pointer) PACKETS_MAKE_Q8(KERNEL_W0, pointer)
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_IQ4G32)
 namespace packets { typedef IQ4 W0; }
-#define KERNEL_W0_AT(pointer) PACKETS_MAKE_IQ4(KERNEL_W0, pointer)
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_C4(IQ4, KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q4G32S)
+namespace packets { typedef Q4G32S W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_C4(Q4G32S, KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_MXFP4G32)
+namespace packets { typedef MXFP4 W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_NVFP4G16)
+namespace packets { typedef NVFP4 W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_C4(NVFP4, KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q5G32S)
+namespace packets { typedef Q5G32<false> W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_Q5(false, KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q5G32)
+namespace packets { typedef Q5G32<true> W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_Q5(true, KERNEL_W0, pointer)
 #else
 #error "KERNEL_W0: unsupported weight representation"
 #endif
@@ -994,7 +1306,22 @@ namespace packets { typedef Q8 W1; }
 #define KERNEL_W1_AT(pointer) PACKETS_MAKE_Q8(KERNEL_W1, pointer)
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_IQ4G32)
 namespace packets { typedef IQ4 W1; }
-#define KERNEL_W1_AT(pointer) PACKETS_MAKE_IQ4(KERNEL_W1, pointer)
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_C4(IQ4, KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q4G32S)
+namespace packets { typedef Q4G32S W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_C4(Q4G32S, KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_MXFP4G32)
+namespace packets { typedef MXFP4 W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_NVFP4G16)
+namespace packets { typedef NVFP4 W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_C4(NVFP4, KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q5G32S)
+namespace packets { typedef Q5G32<false> W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_Q5(false, KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q5G32)
+namespace packets { typedef Q5G32<true> W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_Q5(true, KERNEL_W1, pointer)
 #else
 #error "KERNEL_W1: unsupported weight representation"
 #endif
@@ -1025,7 +1352,22 @@ namespace packets { typedef Q8 W2; }
 #define KERNEL_W2_AT(pointer) PACKETS_MAKE_Q8(KERNEL_W2, pointer)
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_IQ4G32)
 namespace packets { typedef IQ4 W2; }
-#define KERNEL_W2_AT(pointer) PACKETS_MAKE_IQ4(KERNEL_W2, pointer)
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_C4(IQ4, KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q4G32S)
+namespace packets { typedef Q4G32S W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_C4(Q4G32S, KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_MXFP4G32)
+namespace packets { typedef MXFP4 W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_NVFP4G16)
+namespace packets { typedef NVFP4 W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_C4(NVFP4, KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q5G32S)
+namespace packets { typedef Q5G32<false> W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_Q5(false, KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q5G32)
+namespace packets { typedef Q5G32<true> W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_Q5(true, KERNEL_W2, pointer)
 #else
 #error "KERNEL_W2: unsupported weight representation"
 #endif
@@ -1056,7 +1398,22 @@ namespace packets { typedef Q8 W3; }
 #define KERNEL_W3_AT(pointer) PACKETS_MAKE_Q8(KERNEL_W3, pointer)
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_IQ4G32)
 namespace packets { typedef IQ4 W3; }
-#define KERNEL_W3_AT(pointer) PACKETS_MAKE_IQ4(KERNEL_W3, pointer)
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_C4(IQ4, KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q4G32S)
+namespace packets { typedef Q4G32S W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_C4(Q4G32S, KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_MXFP4G32)
+namespace packets { typedef MXFP4 W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_NVFP4G16)
+namespace packets { typedef NVFP4 W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_C4(NVFP4, KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q5G32S)
+namespace packets { typedef Q5G32<false> W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_Q5(false, KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q5G32)
+namespace packets { typedef Q5G32<true> W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_Q5(true, KERNEL_W3, pointer)
 #else
 #error "KERNEL_W3: unsupported weight representation"
 #endif

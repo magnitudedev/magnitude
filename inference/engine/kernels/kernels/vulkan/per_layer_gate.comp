@@ -1,0 +1,101 @@
+// per_layer_gate: `stage` rounds the F32 hidden rows to A in scratch; the
+// projection launches project them through the gate rows with the
+// activated-product epilogue A(A(act(A(gate))) * inputs[m, layer, p]). The
+// Vulkan form of `metal/per_layer_gate.metal`.
+#include "lib/core/activation.glsl"
+#if SEISMIC_DIM_GS != 0
+#define PROJECTION_SCALED
+#endif
+#include "lib/projection/projection.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define GATE_ACT ELEMENT_ACT
+#else
+#error "per_layer_gate requires a bf16 or f16 activation"
+#endif
+
+#if defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q4K)
+#define GATE_KIND PACKETS_Q4K
+#define GATE_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q5K)
+#define GATE_KIND PACKETS_Q5K
+#define GATE_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q6K)
+#define GATE_KIND PACKETS_Q6K
+#define GATE_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q8G32S)
+#define GATE_KIND PACKETS_Q8
+#define GATE_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_IQ4G32)
+#define GATE_KIND PACKETS_IQ4
+#define GATE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q4G32S)
+#define GATE_KIND PACKETS_Q4G32S
+#define GATE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_MXFP4G32)
+#define GATE_KIND PACKETS_MXFP4
+#define GATE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_NVFP4G16)
+#define GATE_KIND PACKETS_NVFP4
+#define GATE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q5G32S)
+#define GATE_KIND PACKETS_Q5G32S
+#define GATE_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q5G32)
+#define GATE_KIND PACKETS_Q5G32
+#define GATE_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_BF16)
+#define GATE_KIND PACKETS_BF16
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 2)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_F16)
+#define GATE_KIND PACKETS_F16
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 2)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_F32)
+#define GATE_KIND PACKETS_F32
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 4)
+#else
+#error "unsupported per_layer_gate gate_weight representation"
+#endif
+#if defined(SEISMIC_GATE_WEIGHT_KIND_PACKED) && !defined(SEISMIC_GATE_WEIGHT_LAYOUT_ROWS16)
+#error "per_layer_gate requires the rows16 layout for gate_weight"
+#endif
+
+#define GATE_D uint(SEISMIC_DIM_D)
+#define GATE_ROUNDED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ROUNDED)
+
+projection_prologue per_layer_gate_input() {
+    return projection_plain(GATE_ACT, GATE_ROUNDED, SEISMIC_DIM_D, 1ul, GATE_D, 0ul);
+}
+
+projection_epilogue per_layer_gate_output() {
+    const uint64_t inputs = SEISMIC_PTR(SEISMIC_BUFFER_INPUTS)
+        + uint64_t(int(SEISMIC_PARAM_LAYER)) * SEISMIC_INPUTS_STRIDE_1 * 4ul;
+    return projection_scaled(projection_activated_mul(GATE_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1, inputs, SEISMIC_INPUTS_STRIDE_0, SEISMIC_INPUTS_STRIDE_2,
+        int(SEISMIC_PARAM_ACTIVATION)),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, 0ul, 0ul), 1.0);
+}
+
+projection_weights per_layer_gate_weight() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY, GATE_D, 0ul);
+}
+
+void per_layer_gate_stage() {
+    const uint64_t m = gl_WorkGroupID.x;
+    for (uint i = gl_LocalInvocationID.x; i < GATE_D; i += 256u)
+        element_put(GATE_ACT, GATE_ROUNDED, m * SEISMIC_DIM_D + i, element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)
+            + (m * SEISMIC_HIDDEN_STRIDE_0 + uint64_t(i) * SEISMIC_HIDDEN_STRIDE_1) * 4ul));
+}
+
+void per_layer_gate_gemv() {
+    const projection_weights w = per_layer_gate_weight();
+    projection_gemv(GATE_KIND, GATE_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_NONE,
+        per_layer_gate_input(), per_layer_gate_output(), w, w, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_P), GATE_D,
+        gl_WorkGroupID.x);
+}
+
+void per_layer_gate_gemm() {
+    projection_gemm(GATE_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
+        per_layer_gate_input(), per_layer_gate_output(), per_layer_gate_weight(), uint(SEISMIC_DIM_M),
+        uint(SEISMIC_DIM_P), GATE_D, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
+}

@@ -18,9 +18,15 @@
 // plain operand: no GEMM tile repeats the prologue.
 //
 // Epilogues receive the F32 dot product:
-//   Store<E>   y = round_E(acc)                  (logits: Store<element::F32>)
+//   Store<E>   y = round_E(acc)
 //   Residual   y = residual[row(m), n] + round_A(acc)                  (F32)
 //   SiluMul    y = round_A(round_A(silu(round_A(gate))) * round_A(up))
+//   Glu        y = round_A(round_A(act(round_A(gate))) * round_A(up))  (act by code)
+//   Activated  y = round_A(act(round_A(acc)))                    (up-only, ReLU²)
+//   Mul        y = gate * up                                   (F32, unrounded)
+//   ActivatedMul y = round_A(round_A(act(round_A(acc))) * external[m, n])
+//   Logits     y = acc, or cap * tanh(acc / cap) when cap > 0          (F32)
+// (`functions::` in `../core/functions.h` holds the activation codes.)
 //
 // A segmented projection is one launch over several weight tensors (each
 // with its own packet type and destination). Every threadgroup belongs to
@@ -43,6 +49,7 @@
 // This file is independent of any entry ABI.
 
 #include "../core/activation.h"
+#include "../core/functions.h"
 #include <seismic/packets.h>
 
 namespace projection {
@@ -134,6 +141,127 @@ struct SiluMul {
             [ulong(m) * stride0 + ulong(n) * stride1] = A::store(activated * up);
     }
 };
+
+// Activation-generic GLU (paired):
+//   y = round_A(round_A(act(round_A(gate))) * round_A(up))
+// with `function` a `functions::` code (SiLU gives SiluMul's bits).
+template <typename A>
+struct Glu {
+    device uchar *y;
+    ulong stride0, stride1;
+    int function;
+    void store_pair(uint m, uint n, float gate_sum, float up_sum) const {
+        float gate = A::round(gate_sum);
+        float up = A::round(up_sum);
+        float activated = A::round(functions::activate(function, gate));
+        reinterpret_cast<device typename A::storage *>(y)
+            [ulong(m) * stride0 + ulong(n) * stride1] = A::store(activated * up);
+    }
+};
+
+// A plain activated projection (up-only feed-forward, ReLU²):
+//   y = round_A(act(round_A(acc)))
+template <typename A>
+struct Activated {
+    device uchar *y;
+    ulong stride0, stride1;
+    int function;
+    void store(uint m, uint n, float value) const {
+        reinterpret_cast<device typename A::storage *>(y)[ulong(m) * stride0 + ulong(n) * stride1] =
+            A::store(functions::activate(function, A::round(value)));
+    }
+    void store2(uint m, uint n, float first, float second) const {
+        store(m, n, first);
+        store(m, n + 1u, second);
+    }
+};
+
+// The F32 product of two projections of one input (paired), unrounded:
+//   y = gate * up
+struct Mul {
+    device float *y;
+    ulong stride0, stride1;
+    void store_pair(uint m, uint n, float gate_sum, float up_sum) const {
+        y[ulong(m) * stride0 + ulong(n) * stride1] = gate_sum * up_sum;
+    }
+};
+
+// An activated projection times an external F32 multiplier:
+//   y = round_A(round_A(act(round_A(acc))) * external[m, n])
+template <typename A>
+struct ActivatedMul {
+    device uchar *y;
+    ulong stride0, stride1;
+    device const float *external;
+    ulong external0, external1;
+    int function;
+    void store(uint m, uint n, float value) const {
+        float activated = A::round(functions::activate(function, A::round(value)));
+        reinterpret_cast<device typename A::storage *>(y)[ulong(m) * stride0 + ulong(n) * stride1] =
+            A::store(activated * external[ulong(m) * external0 + ulong(n) * external1]);
+    }
+    void store2(uint m, uint n, float first, float second) const {
+        store(m, n, first);
+        store(m, n + 1u, second);
+    }
+};
+
+// F32 logits, softcapped in F32 from the accumulator when `cap` > 0:
+//   y = cap > 0 ? cap * tanh(acc / cap) : acc
+struct Logits {
+    device uchar *y;
+    ulong stride0, stride1;
+    float cap;
+    void store(uint m, uint n, float value) const {
+        reinterpret_cast<device float *>(y)[ulong(m) * stride0 + ulong(n) * stride1] =
+            cap > 0.0f ? functions::softcap(cap, value) : value;
+    }
+    void store2(uint m, uint n, float first, float second) const {
+        store(m, n, first);
+        store(m, n + 1u, second);
+    }
+};
+
+// A weight's second-level scale (NVFP4 `.scale`, per tensor or per expert)
+// on the F32 accumulator, before the wrapped epilogue: `first` scales the
+// projection (a paired epilogue's gate stream), `second` a paired
+// epilogue's up stream. Entries wrap their epilogue only when a scale port
+// is present (its static extent is 1), so an unscaled entry compiles as
+// before.
+template <typename Out>
+struct Scaled {
+    Out out;
+    float first, second;
+    void store(uint m, uint n, float value) const { out.store(m, n, value * first); }
+    void store2(uint m, uint n, float a, float b) const { out.store2(m, n, a * first, b * first); }
+    void store_pair(uint m, uint n, float gate, float up) const { out.store_pair(m, n, gate * first, up * second); }
+};
+
+// The epilogue of a projection with scale ports of static extents: the
+// epilogue itself when every extent is 0 (no scale, no load), else wrapped.
+template <bool SCALED>
+struct scaling;
+template <>
+struct scaling<false> {
+    template <typename Out>
+    using type = Out;
+    template <typename Out>
+    static Out wrap(thread const Out &out, float, float) { return out; }
+};
+template <>
+struct scaling<true> {
+    template <typename Out>
+    using type = Scaled<Out>;
+    template <typename Out>
+    static Scaled<Out> wrap(thread const Out &out, float first, float second) { return Scaled<Out>{out, first, second}; }
+};
+
+// A scale port's value at `index` along its expert axis (0 for a
+// per-tensor port; `stride` that axis' stride), or 1 for an absent port
+// (static `extent` 0: the port is never read).
+inline float scale_factor(device const float *scale, ulong extent, ulong stride, ulong index) {
+    return extent == 0 ? 1.0f : scale[index * stride];
+}
 
 // ---------------------------------------------------------------------------
 // The normalizing pre-pass.

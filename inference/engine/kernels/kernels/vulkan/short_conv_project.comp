@@ -1,0 +1,230 @@
+// short_conv_project: RMS prologue over every residual row, then one
+// segmented projection: the u segment pairs the B and X streams into
+// u = B * X (F32, columns 0..CH), the C segment stores C (F32, columns
+// CH..2CH). The Vulkan form of `metal/short_conv_project.metal`.
+#include "lib/core/activation.glsl"
+#if SEISMIC_DIM_BS != 0 || SEISMIC_DIM_CS != 0 || SEISMIC_DIM_XS != 0
+#define PROJECTION_SCALED
+#endif
+#include "lib/projection/projection.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define CONV_ACT ELEMENT_ACT
+#else
+#error "short_conv_project requires a bf16 or f16 activation"
+#endif
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define CONV_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define CONV_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define CONV_NORM ELEMENT_BF16
+#else
+#error "short_conv_project requires a dense norm"
+#endif
+
+#if defined(SEISMIC_B_WEIGHT_REPRESENTATION_Q4K)
+#define B_KIND PACKETS_Q4K
+#define B_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_B_WEIGHT)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_Q5K)
+#define B_KIND PACKETS_Q5K
+#define B_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_B_WEIGHT)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_Q6K)
+#define B_KIND PACKETS_Q6K
+#define B_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_B_WEIGHT)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_Q8G32S)
+#define B_KIND PACKETS_Q8
+#define B_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_B_WEIGHT)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_IQ4G32)
+#define B_KIND PACKETS_IQ4
+#define B_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_B_WEIGHT)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_Q4G32S)
+#define B_KIND PACKETS_Q4G32S
+#define B_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_B_WEIGHT)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_MXFP4G32)
+#define B_KIND PACKETS_MXFP4
+#define B_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_B_WEIGHT)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_NVFP4G16)
+#define B_KIND PACKETS_NVFP4
+#define B_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_B_WEIGHT)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_Q5G32S)
+#define B_KIND PACKETS_Q5G32S
+#define B_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_B_WEIGHT)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_Q5G32)
+#define B_KIND PACKETS_Q5G32
+#define B_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_B_WEIGHT)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_BF16)
+#define B_KIND PACKETS_BF16
+#define B_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_B_WEIGHT, 2)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_F16)
+#define B_KIND PACKETS_F16
+#define B_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_B_WEIGHT, 2)
+#elif defined(SEISMIC_B_WEIGHT_REPRESENTATION_F32)
+#define B_KIND PACKETS_F32
+#define B_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_B_WEIGHT, 4)
+#else
+#error "unsupported short_conv_project b_weight representation"
+#endif
+#if defined(SEISMIC_B_WEIGHT_KIND_PACKED) && !defined(SEISMIC_B_WEIGHT_LAYOUT_ROWS16)
+#error "short_conv_project requires the rows16 layout for b_weight"
+#endif
+
+#if defined(SEISMIC_C_WEIGHT_REPRESENTATION_Q4K)
+#define C_KIND PACKETS_Q4K
+#define C_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_C_WEIGHT)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_Q5K)
+#define C_KIND PACKETS_Q5K
+#define C_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_C_WEIGHT)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_Q6K)
+#define C_KIND PACKETS_Q6K
+#define C_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_C_WEIGHT)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_Q8G32S)
+#define C_KIND PACKETS_Q8
+#define C_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_C_WEIGHT)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_IQ4G32)
+#define C_KIND PACKETS_IQ4
+#define C_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_C_WEIGHT)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_Q4G32S)
+#define C_KIND PACKETS_Q4G32S
+#define C_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_C_WEIGHT)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_MXFP4G32)
+#define C_KIND PACKETS_MXFP4
+#define C_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_C_WEIGHT)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_NVFP4G16)
+#define C_KIND PACKETS_NVFP4
+#define C_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_C_WEIGHT)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_Q5G32S)
+#define C_KIND PACKETS_Q5G32S
+#define C_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_C_WEIGHT)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_Q5G32)
+#define C_KIND PACKETS_Q5G32
+#define C_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_C_WEIGHT)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_BF16)
+#define C_KIND PACKETS_BF16
+#define C_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_C_WEIGHT, 2)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_F16)
+#define C_KIND PACKETS_F16
+#define C_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_C_WEIGHT, 2)
+#elif defined(SEISMIC_C_WEIGHT_REPRESENTATION_F32)
+#define C_KIND PACKETS_F32
+#define C_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_C_WEIGHT, 4)
+#else
+#error "unsupported short_conv_project c_weight representation"
+#endif
+#if defined(SEISMIC_C_WEIGHT_KIND_PACKED) && !defined(SEISMIC_C_WEIGHT_LAYOUT_ROWS16)
+#error "short_conv_project requires the rows16 layout for c_weight"
+#endif
+
+#if defined(SEISMIC_X_WEIGHT_REPRESENTATION_Q4K)
+#define X_KIND PACKETS_Q4K
+#define X_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_X_WEIGHT)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_Q5K)
+#define X_KIND PACKETS_Q5K
+#define X_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_X_WEIGHT)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_Q6K)
+#define X_KIND PACKETS_Q6K
+#define X_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_X_WEIGHT)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_Q8G32S)
+#define X_KIND PACKETS_Q8
+#define X_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_X_WEIGHT)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_IQ4G32)
+#define X_KIND PACKETS_IQ4
+#define X_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_X_WEIGHT)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_Q4G32S)
+#define X_KIND PACKETS_Q4G32S
+#define X_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_X_WEIGHT)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_MXFP4G32)
+#define X_KIND PACKETS_MXFP4
+#define X_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_X_WEIGHT)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_NVFP4G16)
+#define X_KIND PACKETS_NVFP4
+#define X_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_X_WEIGHT)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_Q5G32S)
+#define X_KIND PACKETS_Q5G32S
+#define X_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_X_WEIGHT)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_Q5G32)
+#define X_KIND PACKETS_Q5G32
+#define X_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_X_WEIGHT)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_BF16)
+#define X_KIND PACKETS_BF16
+#define X_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_X_WEIGHT, 2)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_F16)
+#define X_KIND PACKETS_F16
+#define X_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_X_WEIGHT, 2)
+#elif defined(SEISMIC_X_WEIGHT_REPRESENTATION_F32)
+#define X_KIND PACKETS_F32
+#define X_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_X_WEIGHT, 4)
+#else
+#error "unsupported short_conv_project x_weight representation"
+#endif
+#if defined(SEISMIC_X_WEIGHT_KIND_PACKED) && !defined(SEISMIC_X_WEIGHT_LAYOUT_ROWS16)
+#error "short_conv_project requires the rows16 layout for x_weight"
+#endif
+
+#define CONV_H uint(SEISMIC_DIM_H)
+#define CONV_CH uint(SEISMIC_DIM_CH)
+
+projection_prologue short_conv_project_input() {
+    return projection_rms(CONV_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL), SEISMIC_RESIDUAL_STRIDE_0,
+        SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0, CONV_NORM,
+        element_word_f32(SEISMIC_PARAM_EPS), CONV_H, 0ul);
+}
+
+projection_epilogue short_conv_project_u() {
+    return projection_scaled(projection_mul(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_B_SCALE), SEISMIC_DIM_BS, 0ul, 0ul),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_X_SCALE), SEISMIC_DIM_XS, 0ul, 0ul));
+}
+
+projection_epilogue short_conv_project_c() {
+    return projection_scaled(projection_store(ELEMENT_F32, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_DIM_CH),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_C_SCALE), SEISMIC_DIM_CS, 0ul, 0ul), 1.0);
+}
+
+projection_weights short_conv_project_b() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_B_WEIGHT), B_GEOMETRY, CONV_H, 0ul);
+}
+projection_weights short_conv_project_x() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_X_WEIGHT), X_GEOMETRY, CONV_H, 0ul);
+}
+projection_weights short_conv_project_cw() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_C_WEIGHT), C_GEOMETRY, CONV_H, 0ul);
+}
+
+void short_conv_project_gemv() {
+    const uint per = projection_gemv_rows(SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES);
+    const uint rows = uint(SEISMIC_DIM_M), tile = gl_WorkGroupID.x, segment = (CONV_CH + per - 1u) / per;
+    const projection_prologue x = short_conv_project_input();
+    if (tile < segment) {
+        projection_gemv(B_KIND, X_KIND, true, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED, x,
+            short_conv_project_u(), short_conv_project_b(), short_conv_project_x(), rows, CONV_CH, CONV_H, tile);
+    } else {
+        const projection_weights w = short_conv_project_cw();
+        projection_gemv(C_KIND, C_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED, x,
+            short_conv_project_c(), w, w, rows, CONV_CH, CONV_H, tile - segment);
+    }
+}
+
+void short_conv_project_stage() {
+    projection_stage(short_conv_project_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        CONV_H);
+}
+
+// Workgroup column n < S (the u segment's TILE_N / 2-feature tiles) runs the
+// paired GEMM, the rest the C segment's TILE_N-feature tiles.
+void short_conv_project_gemm() {
+    const projection_prologue x = projection_plain(CONV_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        SEISMIC_DIM_H, 1ul, CONV_H, 0ul);
+    const uint half_tile = SEISMIC_TUNE_TILE_N / 2u, segment = (CONV_CH + half_tile - 1u) / half_tile;
+    const uint m = uint(SEISMIC_DIM_M), n = gl_WorkGroupID.x;
+    if (n < segment)
+        projection_gemm_paired(B_KIND, X_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M,
+            SEISMIC_TUNE_SUB_N, x, short_conv_project_u(), short_conv_project_b(), short_conv_project_x(), m,
+            CONV_CH, CONV_H, gl_WorkGroupID.y, n, 0xffffffffu);
+    else
+        projection_gemm(C_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x,
+            short_conv_project_c(), short_conv_project_cw(), m, CONV_CH, CONV_H, gl_WorkGroupID.y, n - segment,
+            0xffffffffu);
+}

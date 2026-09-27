@@ -309,6 +309,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // one row and one bank.
         let lookahead = self.execution.policy().limits().lookahead;
         let mut target_banks = 0usize;
+        let mut head_banks = 0usize;
         for operation in operations {
             let rows = operation.row_count();
             match operation {
@@ -317,24 +318,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         let ahead = usize::from(
                             lookahead && lookahead::continuation_of(operation).is_some(),
                         );
-                        target.push(state.demand(rows + ahead));
+                        target.extend(state.demands(rows + ahead));
                         target_banks += 1 + ahead;
                     }
                 }
                 Operation::Head { request, .. } => {
                     if let Some(state) = self.head.get(request) {
-                        head.push(state.demand(rows));
+                        head.extend(state.demands(rows));
+                        head_banks += 1;
                     }
                 }
                 _ => {}
             }
         }
-        if !target.is_empty() {
+        // Stores without history domains still grow banks.
+        if target_banks != 0 {
             self.grant_state_growth(self.target_store.clone(), &target, target_banks)?;
         }
-        if !head.is_empty() {
+        if head_banks != 0 {
             if let Some(store) = self.head_store.clone() {
-                self.grant_state_growth(store, &head, head.len())?;
+                self.grant_state_growth(store, &head, head_banks)?;
             }
         }
         // The import itself runs under a claim at reservation; admit its peak
@@ -484,32 +487,36 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(self.memory.borrow_mut().check(required, staged)?)
     }
 
-    /// Repack the target history of a request at the visible segment limit
-    /// into one contiguous run with the bit-exact state copy program, so its
-    /// next launch cannot exceed the limit. Rare by construction (placement
-    /// keeps histories in few runs), so the copy completes before the state
-    /// publishes the new run and the launch proceeds.
+    /// Repack the target history of a request at a domain's visible segment
+    /// limit into one contiguous run with the bit-exact state copy program,
+    /// so its next launch cannot exceed the limit. Rare by construction
+    /// (placement keeps histories in few runs), so the copy completes before
+    /// the state publishes the new run and the launch proceeds. Each domain
+    /// at its limit is repacked by its own copy.
     pub(super) fn compact_target(&mut self, request: RequestId) -> Result<(), DomainError> {
         let Some(state) = self.target.get(&request) else {
             return Ok(());
         };
-        if !state.compaction_needed() || !self.family.state_is_bound() {
+        if state.compaction_needed().is_none() || !self.family.state_is_bound() {
             return Ok(());
         }
-        let rows = state
-            .history_ranges()
-            .iter()
-            .map(|(_, count)| count)
-            .sum::<usize>();
-        self.grant_state_growth(
-            self.target_store.clone(),
-            &[magnitude_state::RowDemand { after: None, rows }],
-            0,
-        )?;
+        let demands = state.compaction_demands();
+        self.grant_state_growth(self.target_store.clone(), &demands, 0)?;
+        for demand in demands {
+            self.compact_target_domain(request, demand.domain)?;
+        }
+        Ok(())
+    }
+
+    fn compact_target_domain(
+        &mut self,
+        request: RequestId,
+        domain: magnitude_state::HistoryDomainId,
+    ) -> Result<(), DomainError> {
         let state = self.target.remove(&request).expect("state checked above");
         // One copy launch of at most the largest prepared copy class.
         let max_rows = self.execution.policy().limits().max_launch_rows;
-        let compaction = match OwnedCompaction::prepare(state, max_rows) {
+        let compaction = match OwnedCompaction::prepare(state, domain, max_rows) {
             Ok(OwnedCompactionPreparation::Ready(compaction)) => compaction,
             Ok(
                 OwnedCompactionPreparation::NotNeeded(state)
@@ -536,7 +543,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let batch = match crate::batching::ValidatedStateBatch::copy(
             compaction.copies().to_vec(),
-            self.target_store.history_capacity(),
+            self.target_store.history_capacity(compaction.domain()),
             class_rows,
         ) {
             Ok(batch) => batch,

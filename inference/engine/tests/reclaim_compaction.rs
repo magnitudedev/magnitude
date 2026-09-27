@@ -33,6 +33,7 @@ fn domain() -> (ExecutorDomain, usize, usize, usize) {
         package: PackageOptions {
             target: model,
             projector: ProjectorSelection::Disabled,
+            draft: None,
         },
         model: ModelPolicy {
             method: ModelMethod::Plain,
@@ -58,13 +59,14 @@ fn domain() -> (ExecutorDomain, usize, usize, usize) {
     }
     .resolve()
     .unwrap();
-    let vocabulary = resolved.manifest.definition.geometry.vocabulary as usize;
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let package = resolved.host.shared_package();
     let (domain, plan) = build_native_domain(&resolved.manifest, package).unwrap();
     (
         domain,
         vocabulary,
-        plan.target_state().history_slab_rows().unwrap() as usize,
+        // Qwen's target store has one Token history domain.
+        plan.target_state().sole_history().unwrap().slab_rows as usize,
         plan.target_state().bank_slab_banks().unwrap() as usize,
     )
 }

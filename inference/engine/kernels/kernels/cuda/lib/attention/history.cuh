@@ -14,6 +14,12 @@ struct DenseHistory {
     u64 key_row, key_head, value_row, value_head;
     u64 slab_rows;
 
+    // The end of the run of rows [token, hi) within history row `token`'s
+    // slab.
+    __device__ __forceinline__ int slab_end(int token, int hi) const {
+        return static_cast<int>(min(static_cast<u64>(hi), (static_cast<u64>(token) / slab_rows + 1) * slab_rows));
+    }
+
     // Byte addresses of a (history row, kv head) vector.
     __device__ __forceinline__ u8 *key_vector(int token, int kv_head) const {
         return slab::row(key, token, slab_rows, key_row * Act::bytes)
@@ -37,7 +43,7 @@ struct DenseHistory {
 };
 
 // Affine K8/V4 history (the `affine_k8_uniform_v4` codec,
-// `gated_attention_*_k8v4`). A (history row, kv head) vector is a code row of
+// `attention_*_k8v4`). A (history row, kv head) vector is a code row of
 // W * B / 32 u32 words (code i at bits B * (i % (32 / B)) of word
 // i / (32 / B)) plus one F16 (scale, zero) pair per group of GROUP
 // consecutive dimensions, pairs in group order; decoded value =
@@ -153,6 +159,12 @@ struct AffineHistory {
     u64 key_codes_row, key_codes_head, key_pairs_row, key_pairs_head;
     u64 value_codes_row, value_codes_head, value_pairs_row, value_pairs_head;
     u64 slab_rows;
+
+    // The end of the run of rows [token, hi) within history row `token`'s
+    // slab.
+    __device__ __forceinline__ int slab_end(int token, int hi) const {
+        return static_cast<int>(min(static_cast<u64>(hi), (static_cast<u64>(token) / slab_rows + 1) * slab_rows));
+    }
 
     // A vector's code row and (scale, zero) pairs (one u32 each).
     __device__ __forceinline__ u32 *key_row(int token, int kv_head) const {

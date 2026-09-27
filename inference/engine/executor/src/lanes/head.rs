@@ -4,7 +4,7 @@ use crate::{
     FeatureRows, InvariantError, NativeGraphOutputLease, NativeGraphWorkspaceLease, PoolClass,
     ResourceDomainId,
 };
-use magnitude_batching::ValidatedHeadBatch;
+use magnitude_batching::{HeadPasses, ValidatedHeadBatch};
 use magnitude_state::{OwnedStateAdvance, StateStore};
 use std::rc::Rc;
 
@@ -86,7 +86,57 @@ impl HeadLaunchInputs {
             .zip(&self.conditioning)
             .enumerate()
         {
-            let chain = self.batch.chain_destinations(index);
+            let binding = advance.bindings();
+            if i32::try_from(binding.previous_bank).ok() != Some(slot.bank())
+                || i32::try_from(binding.following_bank).ok() != Some(slot.following_bank())
+            {
+                return Err(invalid(format!("slot {index} uses another state bank")));
+            }
+            if rows.rows() != slot.rows() || rows.row_bytes() != row_bytes {
+                return Err(invalid(format!(
+                    "slot {index} conditioning has {} rows of {} bytes for {} entry rows",
+                    rows.rows(),
+                    rows.row_bytes(),
+                    slot.rows()
+                )));
+            }
+            if self.batch.passes() == HeadPasses::Block {
+                // A separate draft's entry rows each inject into every
+                // history domain of its store at their own destination,
+                // attending nothing else; its block rows append nowhere.
+                if !advance.belongs_to(store) || slot.rows() != advance.rows() {
+                    return Err(invalid(format!(
+                        "slot {index} differs from its state advance"
+                    )));
+                }
+                for domain in store.history_domains() {
+                    let history = slot
+                        .history(domain.0)
+                        .ok_or_else(|| invalid(format!("slot {index} lacks a history domain")))?;
+                    let expected = binding.destinations[domain.0]
+                        .iter()
+                        .map(|destination| i32::try_from(*destination).ok())
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| invalid(format!("slot {index} destination exceeds i32")))?;
+                    if history.destinations != expected.as_slice() {
+                        return Err(invalid(format!("slot {index} destinations differ")));
+                    }
+                    if history.visible.iter().flatten().any(|span| *span != [0, 0]) {
+                        return Err(invalid(format!(
+                            "slot {index} injection rows attend history"
+                        )));
+                    }
+                }
+                continue;
+            }
+            // The draft head's store has one Token domain.
+            let domain = store
+                .sole_history_domain()
+                .map_err(|error| invalid(error.to_string()))?;
+            let history = slot
+                .history(domain.0)
+                .ok_or_else(|| invalid(format!("slot {index} lacks its history domain")))?;
+            let chain = self.batch.chain_destinations(index, domain.0);
             let written = chain
                 .iter()
                 .filter(|destination| **destination >= 0)
@@ -96,22 +146,15 @@ impl HeadLaunchInputs {
                     "slot {index} differs from its state advance"
                 )));
             }
-            let binding = advance.bindings();
-            if i32::try_from(binding.previous_bank).ok() != Some(slot.bank())
-                || i32::try_from(binding.following_bank).ok() != Some(slot.following_bank())
-            {
-                return Err(invalid(format!("slot {index} uses another state bank")));
-            }
             // Entry rows append first, then each chained row in step order;
             // a chained row past the request's own proposals appends nowhere.
-            let expected = binding
-                .destinations
+            let expected = binding.destinations[domain.0]
                 .iter()
                 .map(|destination| i32::try_from(*destination).ok())
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| invalid(format!("slot {index} destination exceeds i32")))?;
-            let packed = slot
-                .destinations()
+            let packed = history
+                .destinations
                 .iter()
                 .copied()
                 .chain(
@@ -125,7 +168,7 @@ impl HeadLaunchInputs {
                 return Err(invalid(format!("slot {index} destinations differ")));
             }
             let visible = advance
-                .history_ranges()
+                .history_ranges(domain)
                 .into_iter()
                 .map(|(start, count)| {
                     let end = start.checked_add(count)?;
@@ -137,7 +180,7 @@ impl HeadLaunchInputs {
                         "slot {index} history range exceeds packed coordinates"
                     ))
                 })?;
-            if slot.visible().iter().any(|row| {
+            if history.visible.iter().any(|row| {
                 row.len() < visible.len()
                     || &row[..visible.len()] != visible.as_slice()
                     || row[visible.len()..]
@@ -146,14 +189,6 @@ impl HeadLaunchInputs {
             }) {
                 return Err(invalid(format!(
                     "slot {index} visibility differs from accepted state"
-                )));
-            }
-            if rows.rows() != slot.rows() || rows.row_bytes() != row_bytes {
-                return Err(invalid(format!(
-                    "slot {index} conditioning has {} rows of {} bytes for {} entry rows",
-                    rows.rows(),
-                    rows.row_bytes(),
-                    slot.rows()
                 )));
             }
         }

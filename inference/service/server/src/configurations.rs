@@ -141,6 +141,8 @@ impl ResolvedConfigurations {
                     Some(projector) => ProjectorSelection::Explicit(projector),
                     None => ProjectorSelection::Disabled,
                 },
+                // Drafts are served once DFlash is validated (dflash lane).
+                draft: None,
             },
             model: serving_policy(),
             context_tokens: None,

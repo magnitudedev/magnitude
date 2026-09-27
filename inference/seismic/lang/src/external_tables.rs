@@ -71,6 +71,11 @@ pub(crate) const IQ3S_GRID: [u32; 512] = [
     0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
 ];
 
+/// The resident E2M1 code of a GGUF MXFP4 / NVFP4 code: ggml's
+/// `kvalues_mxfp4` decodes code 8 (E2M1 -0) as +0, so it becomes code 0; every
+/// other code keeps its value.
+pub(crate) static E2M1_POSITIVE_ZERO: [i32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 0, 9, 10, 11, 12, 13, 14, 15];
+
 /// The signed IQ3_S magnitude at index `((sign << 9 | point) << 2) | j`:
 /// byte `j` of grid point `point`, negated when `sign` is set.
 pub(crate) static IQ3S_SIGNED_MAGNITUDES: [i32; 4096] = {

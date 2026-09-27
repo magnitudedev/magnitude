@@ -5,7 +5,7 @@
 //! 8, 16, 64, 128}, across weight representations and mapping parameters.
 
 use magnitude_kernels::{
-    attention_output, dense_expand, dense_output, embedding_rows, gated_attention_project,
+    attention_output, attention_project, dense_expand, dense_output, embedding_rows,
     gated_delta_output, gated_delta_project, head_logits_rows, readout_features_rows,
     readout_head_rows, readout_selected_rows,
 };
@@ -137,7 +137,17 @@ enum Repr {
     Q8,
     Iq4,
     Bf16,
+    // Built from GGUF blocks through the registry's conversion
+    // (`gguf_weight`).
+    Q4g32s,
+    Q5g32s,
+    Q5g32,
+    Mxfp4,
+    Nvfp4,
 }
+
+/// The formats with a representation of their own, imported from GGUF.
+const GGUF_REPRS: [Repr; 5] = [Repr::Q4g32s, Repr::Q5g32s, Repr::Q5g32, Repr::Mxfp4, Repr::Nvfp4];
 
 /// The iq4g32 code table (the registry's `iq4g32` interpretation).
 const IQ4_TABLE: [i8; 16] = [
@@ -153,6 +163,23 @@ impl Repr {
             Repr::Q8 => "q8g32s",
             Repr::Iq4 => "iq4g32",
             Repr::Bf16 => "bf16",
+            Repr::Q4g32s => "q4g32s",
+            Repr::Q5g32s => "q5g32s",
+            Repr::Q5g32 => "q5g32",
+            Repr::Mxfp4 => "mxfp4g32",
+            Repr::Nvfp4 => "nvfp4g16",
+        }
+    }
+    /// The GGUF source of a representation built from GGUF blocks, with its
+    /// block bytes and values.
+    fn gguf_source(self) -> Option<(&'static str, usize, usize)> {
+        match self {
+            Repr::Q4g32s => Some(("gguf_q4_0", 18, 32)),
+            Repr::Q5g32s => Some(("gguf_q5_0", 22, 32)),
+            Repr::Q5g32 => Some(("gguf_q5_1", 24, 32)),
+            Repr::Mxfp4 => Some(("gguf_mxfp4", 17, 32)),
+            Repr::Nvfp4 => Some(("gguf_nvfp4", 36, 64)),
+            _ => None,
         }
     }
     fn storage(self) -> RepresentationId {
@@ -215,6 +242,9 @@ fn planes(repr: Repr, k: usize) -> Planes {
             planes.supers = place(4 * (k / 32));
         }
         Repr::Bf16 => at = 2 * k,
+        Repr::Q4g32s | Repr::Q5g32s | Repr::Q5g32 | Repr::Mxfp4 | Repr::Nvfp4 => {
+            unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)")
+        }
     }
     planes.stride = at;
     planes
@@ -298,6 +328,9 @@ fn put_bits(bytes: &mut [u8], bit: usize, width: usize, value: u32) {
 fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
     let scale = scale * 2.0 / (k as f32).sqrt();
     let mut rng = Rng::new(seed);
+    if repr.gguf_source().is_some() {
+        return gguf_weight(repr, rows, k, &mut rng, scale);
+    }
     let p = planes(repr, k);
     let mut bytes = vec![0u8; p.stride * rows];
     let mut values = vec![0f32; rows * k];
@@ -389,8 +422,62 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
                     out[column] = value;
                 }
             }
+            Repr::Q4g32s | Repr::Q5g32s | Repr::Q5g32 | Repr::Mxfp4 | Repr::Nvfp4 => {
+                unreachable!("built by `gguf_weight`")
+            }
         }
     }
+    Weight {
+        repr,
+        rows,
+        k,
+        bytes,
+        values,
+    }
+}
+
+/// A random weight of a representation imported from GGUF: random blocks of
+/// its source format (with scale fields of magnitude about `scale / 8`)
+/// through the registry's conversion, so the rows16 bytes are the ones the
+/// device repack produces.
+fn gguf_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> Weight {
+    let (source, block_bytes, block_values) = repr.gguf_source().unwrap();
+    assert_eq!(k % block_values, 0, "{repr:?} rows of whole GGUF blocks");
+    let mut external = Vec::with_capacity(rows * k / block_values * block_bytes);
+    for _ in 0..rows * k / block_values {
+        let mut block = (0..block_bytes).map(|_| rng.next() as u8).collect::<Vec<_>>();
+        let factor = scale * (0.5 + rng.uniform());
+        match repr {
+            Repr::Q4g32s => block[..2].copy_from_slice(&f16_bits(factor / 8.0).to_le_bytes()),
+            Repr::Q5g32s => block[..2].copy_from_slice(&f16_bits(factor / 16.0).to_le_bytes()),
+            Repr::Q5g32 => {
+                block[..2].copy_from_slice(&f16_bits(factor / 16.0).to_le_bytes());
+                block[2..4].copy_from_slice(&f16_bits(-factor).to_le_bytes());
+            }
+            // E8M0: the power of two nearest factor / 6 (the E2M1 range).
+            Repr::Mxfp4 => block[0] = (127.0 + (factor / 6.0).log2().round()) as u8,
+            // UE4M3 exponent of factor / 6 (normal), random mantissas.
+            Repr::Nvfp4 => {
+                for field in &mut block[..4] {
+                    let exponent = ((factor / 6.0).log2().floor() as i32 + 7).clamp(1, 14) as u8;
+                    *field = (exponent << 3) | rng.below(8) as u8;
+                }
+            }
+            _ => unreachable!("{repr:?} is not imported from GGUF"),
+        }
+        external.extend(block);
+    }
+    let shape = [rows as u64, k as u64];
+    let element = repr.element();
+    let bytes = element
+        .repack_host(Element::named(source).unwrap(), &shape, &external)
+        .unwrap();
+    let values = element
+        .decode_host(&shape, &bytes)
+        .unwrap()
+        .into_iter()
+        .map(|value| value as f32)
+        .collect();
     Weight {
         repr,
         rows,
@@ -759,7 +846,7 @@ fn dense_output_specialization_on(
             gemm: 4,
         },
         true,
-    )
+    ).with_static("DS", 0)
 }
 
 fn gated_delta_output_specialization_on(
@@ -813,7 +900,7 @@ fn dense_expand_specialization_on(
             gemm: 4,
         },
         false,
-    )
+    ).with_static("GS", 0).with_static("US", 0)
 }
 
 fn readout_projection_specialization_on(
@@ -892,6 +979,10 @@ fn module() -> CheckedModule {
             "attention.seismic",
             include_str!("../kernels/attention.seismic"),
         ),
+        (
+            "functions.seismic",
+            include_str!("../kernels/functions.seismic"),
+        ),
     ] {
         sources.push(SourceFile {
             path: path.into(),
@@ -904,6 +995,7 @@ fn module() -> CheckedModule {
 enum Input {
     Data(TensorData),
     F32(f32),
+    I32(i32),
 }
 
 fn floats(shape: &[usize], values: &[f32]) -> Input {
@@ -950,6 +1042,7 @@ fn interpret(
         .map(|input| match input {
             Input::Data(data) => Arg::Tensor(interpreter.add_tensor(data)),
             Input::F32(value) => Arg::Scalar(ReferenceScalar::F32(value.to_bits())),
+            Input::I32(value) => Arg::Scalar(ReferenceScalar::I32(value)),
         })
         .collect::<Vec<_>>();
     let outcome = interpreter
@@ -978,6 +1071,12 @@ fn norm_values(n: usize, seed: u64) -> Vec<f32> {
 
 fn bf16_norm(device: &Device, values: &[f32]) -> Tensor {
     act_tensor(device, Act::Bf16, &[values.len()], values)
+}
+
+/// `attention_project`'s statics in Qwen's form: the query segment holds the
+/// interleaved query and gate rows, no separate gate segment.
+fn attention_project_statics(d: usize, kv: usize, g: usize, w: usize) -> [(&'static str, usize); 5] {
+    [("D", d), ("Q", kv * g * 2 * w), ("GR", 0), ("K", kv * w), ("V", kv * w)]
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1147,9 @@ fn dense_expand_native(
             up_weight: &up.tensor(device),
             out_rows: &i32_tensor(device, &[out_rows.len()], out_rows),
             eps,
+            activation: 0,
+            gate_scale: &f32_tensor(device, &[0], &[]),
+            up_scale: &f32_tensor(device, &[0], &[]),
         })
         .unwrap()
         .value;
@@ -1138,6 +1240,7 @@ fn dense_expand_matches_its_portable_body_on(device: &Device, pairs: &[(Repr, Re
                     Input::Data(up.oracle()),
                     ints(&[out_rows.len()], &out_rows),
                     Input::F32(1e-6),
+                    Input::I32(0),
                 ],
             );
             let oracle = result(&outcome, 0);
@@ -1292,6 +1395,7 @@ fn dense_output_native_arithmetic(
                 down.tensor(device)
             },
             out_rows: &i32_tensor(device, &[out_rows.len()], out_rows),
+            down_scale: &f32_tensor(device, &[0], &[]),
         })
         .unwrap()
         .value;
@@ -1386,6 +1490,106 @@ fn dense_output_matches_its_portable_body_and_the_host_reference() {
 fn dense_output_iq4_matches_its_portable_body_and_the_host_reference() {
     for device in devices() {
         dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &[Repr::Iq4]);
+    }
+}
+
+/// Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4 weights, imported into representations
+/// of their own.
+#[test]
+fn dense_output_gguf_formats_match_their_portable_body_and_the_host_reference() {
+    for device in devices() {
+        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &GGUF_REPRS);
+    }
+}
+
+#[test]
+fn dense_expand_gguf_formats_match_their_portable_body() {
+    for device in devices() {
+        dense_expand_matches_its_portable_body_on(
+            &device,
+            &[
+                (Repr::Q4g32s, Repr::Q4g32s),
+                (Repr::Mxfp4, Repr::Nvfp4),
+                (Repr::Q5g32s, Repr::Q5g32),
+            ],
+        );
+    }
+}
+
+/// Rows whose K is not a multiple of 256 (a partial last 256-value block):
+/// Gemma's 704 (expert down) and 2112 (dense down) and Nemotron's 2688, on
+/// the portable body at K = 704 and on the host reference over the row
+/// classes.
+#[test]
+fn dense_output_gguf_formats_at_32_granular_k() {
+    for device in devices() {
+        dense_output_gguf_formats_at_32_granular_k_on(&device);
+    }
+}
+
+fn dense_output_gguf_formats_at_32_granular_k_on(device: &Device) {
+    let module = module();
+    let act = Act::Bf16;
+    for repr in GGUF_REPRS {
+        let (h, f) = (16, 704);
+        let down = weight(repr, h, f, 41, 1.0);
+        let (rows, out_rows) = (3usize, vec![2, 0]);
+        let mut rng = Rng::new(43);
+        let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+        let product = (0..out_rows.len() * f)
+            .map(|_| act.round(rng.symmetric()))
+            .collect::<Vec<_>>();
+        let outcome = interpret(
+            &module,
+            "dense_output",
+            &[("A", registry::dense(DType::BF16)), ("DW", repr.storage())],
+            vec![
+                floats(&[rows, h], &residual),
+                activations(act, &[out_rows.len(), f], &product),
+                Input::Data(down.oracle()),
+                ints(&[out_rows.len()], &out_rows),
+            ],
+        );
+        let oracle = result(&outcome, 0);
+        let (_, bound) = dense_output_reference(act, &down, &residual, &product, &out_rows);
+        for mapping in MAPPINGS {
+            let native =
+                dense_output_native(&device, act, &down, &residual, rows, &product, &out_rows, mapping);
+            assert_within(
+                &format!("dense_output portable {repr:?} K {f} {mapping:?}"),
+                &native,
+                &oracle,
+                &bound,
+            );
+        }
+        for f in [704usize, 2112, 2688] {
+            let h = 72;
+            let down = weight(repr, h, f, 42 + f as u64, 1.0);
+            for rows in ROW_CLASSES {
+                let mut rng = Rng::new(rows as u64 + f as u64);
+                let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+                let out_rows = (0..rows)
+                    .map(|i| ((i * 5 + 1) % rows) as i32)
+                    .collect::<Vec<_>>();
+                let product = (0..rows * f)
+                    .map(|_| act.round(rng.symmetric()))
+                    .collect::<Vec<_>>();
+                let (expected, bound) = under(out_rows.len(), || {
+                    dense_output_reference(act, &down, &residual, &product, &out_rows)
+                });
+                for mapping in MAPPINGS {
+                    let native = dense_output_native(
+                        &device, act, &down, &residual, rows, &product, &out_rows, mapping,
+                    );
+                    assert_within(
+                        &format!("dense_output {repr:?} K {f} M {rows} {mapping:?}"),
+                        &native,
+                        &expected,
+                        &bound,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -2014,20 +2218,20 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             .map(|i| weight(reprs[i], rows_of[i], d, 60 + i as u64, 1.0))
             .collect::<Vec<_>>();
         let norm = norm_values(d, 7);
-        let query_norm = vec![1.0f32; w];
         let project = |hidden: &[f32], rows: usize, mapping: Mapping| {
-            let kernel = gated_attention_project::native_for_device_with(
+            let kernel = attention_project::native_for_device_with(
                 &device,
-                gated_attention_project::Elements {
+                attention_project::Elements {
                     NW: Element::bf16(),
                     QW: reprs[0].element(),
+                    GW: Element::bf16(),
                     KW: reprs[1].element(),
                     VW: reprs[2].element(),
                     A: act.element(),
                 },
                 &scoped_projection_specialization_on(
                     device,
-                    &[("D", d), ("KV", kv), ("G", g), ("W", w)],
+                    &attention_project_statics(d, kv, g, w),
                     mapping,
                     ProjectionLaunches {
                         gemv: 1,
@@ -2039,11 +2243,11 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             )
             .unwrap();
             let out = kernel
-                .call(gated_attention_project::Args {
+                .call(attention_project::Args {
                     hidden: &f32_tensor(&device, &[rows, d], hidden),
                     input_norm: &bf16_norm(&device, &norm),
-                    query_norm: &f32_tensor(&device, &[w], &query_norm),
-                    query_gate_weight: &weights[0].tensor(&device),
+                    query_weight: &weights[0].tensor(&device),
+                    gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
                     key_weight: &weights[1].tensor(&device),
                     value_weight: &weights[2].tensor(&device),
                     epsilon: 1e-6,
@@ -2051,8 +2255,8 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 .unwrap();
             [
                 read_act(act, &out.r0),
-                read_act(act, &out.r1),
                 read_act(act, &out.r2),
+                read_act(act, &out.r3),
             ]
         };
         let reference = |hidden: &[f32], rows: usize| {
@@ -2083,10 +2287,11 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 .collect::<Vec<_>>();
             let outcome = interpret(
                 &module,
-                "gated_attention_project",
+                "attention_project",
                 &[
                     ("NW", registry::dense(DType::BF16)),
                     ("QW", reprs[0].storage()),
+                    ("GW", registry::dense(DType::BF16)),
                     ("KW", reprs[1].storage()),
                     ("VW", reprs[2].storage()),
                     ("A", registry::dense(DType::BF16)),
@@ -2094,8 +2299,8 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 vec![
                     floats(&[rows, d], &hidden),
                     activations(Act::Bf16, &[d], &norm),
-                    floats(&[w], &query_norm),
                     Input::Data(weights[0].oracle()),
+                    activations(Act::Bf16, &[0, d], &[]),
                     Input::Data(weights[1].oracle()),
                     Input::Data(weights[2].oracle()),
                     Input::F32(1e-6),
@@ -2108,7 +2313,8 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     assert_within(
                         &format!("attention_project[{i}] portable rows {rows} {mapping:?}"),
                         &native[i],
-                        &result(&outcome, i),
+                        // The results after the empty gate segment.
+                        &result(&outcome, [0, 2, 3][i]),
                         &expected[i].1,
                     );
                 }
@@ -2220,10 +2426,51 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
     }
 }
 
+/// One readout check: vocabulary V and width D, head representations, output
+/// row classes, mappings, the softcap (0 = none), and whether the portable
+/// bodies are interpreted at 2 output rows (Q6K).
+struct ReadoutCheck {
+    v: usize,
+    d: usize,
+    reprs: &'static [Repr],
+    output_classes: &'static [usize],
+    mappings: &'static [Mapping],
+    softcap: f32,
+    portable: bool,
+}
+
 #[test]
 fn readout_entries_match_their_portable_bodies_and_the_host_reference() {
+    let check = ReadoutCheck {
+        v: 1000,
+        d: 512,
+        reprs: &[Repr::Q6k, Repr::Q4k, Repr::Q8],
+        output_classes: &ROW_CLASSES,
+        mappings: &MAPPINGS,
+        softcap: 0.0,
+        portable: true,
+    };
     for device in devices() {
-        readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device, false);
+        readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device, &check);
+    }
+}
+
+/// Gemma's softcap 30: 2 rows (GEMV) and 12 (Metal's batched GEMV, Vulkan's
+/// GEMM); every class publishes through the same logits epilogue.
+#[test]
+fn readout_softcap_matches_the_portable_bodies_and_the_host_reference() {
+    const MAPPING: [Mapping; 1] = [MAPPINGS[0]];
+    let check = ReadoutCheck {
+        v: 256,
+        d: 256,
+        reprs: &[Repr::Q6k],
+        output_classes: &[2, 12],
+        mappings: &MAPPING,
+        softcap: 30.0,
+        portable: true,
+    };
+    for device in devices() {
+        readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device, &check);
     }
 }
 
@@ -2235,7 +2482,17 @@ fn metal_readout_scoped_launches_match_the_host() {
     else {
         return;
     };
-    readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device, true);
+    const SCOPED: [Mapping; 2] = [MAPPINGS[0], MAPPINGS[2]];
+    let check = ReadoutCheck {
+        v: 256,
+        d: 256,
+        reprs: &[Repr::Q6k],
+        output_classes: &[1, 8, 32, 128],
+        mappings: &SCOPED,
+        softcap: 0.0,
+        portable: false,
+    };
+    readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device, &check);
 }
 
 #[test]
@@ -2298,37 +2555,18 @@ fn head_logits_scoped_launches_match_the_host(device: &Device) {
 
 fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
     device: &Device,
-    scoped: bool,
+    check: &ReadoutCheck,
 ) {
     let module = module();
     let act = Act::Bf16;
-    let (v, d) = if scoped {
-        (256usize, 256usize)
-    } else {
-        (1000usize, 512usize)
-    };
-    let reprs: &[Repr] = if scoped {
-        &[Repr::Q6k]
-    } else {
-        &[Repr::Q6k, Repr::Q4k, Repr::Q8]
-    };
-    let output_classes: &[usize] = if scoped {
-        &[1, 8, 32, 128]
-    } else {
-        &ROW_CLASSES
-    };
-    let mappings: &[Mapping] = if scoped {
-        &[MAPPINGS[0], MAPPINGS[2]]
-    } else {
-        &MAPPINGS
-    };
-    for &repr in reprs {
+    let (v, d, cap) = (check.v, check.d, check.softcap);
+    for &repr in check.reprs {
         let head = weight(repr, v, d, 80, 1.0);
         let norm = norm_values(d, 8);
         let selected = (0..37)
             .map(|i| ((i * 37 + 11) % v) as i32)
             .collect::<Vec<_>>();
-        for &outputs in output_classes {
+        for &outputs in check.output_classes {
             let rows = outputs.max(2) + 1;
             let mut rng = Rng::new(outputs as u64 + 13);
             let hidden = (0..rows * d)
@@ -2384,13 +2622,21 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                 &features,
                 &feature_bound,
             );
+            // The softcap c * tanh(z / c) has slope at most 1, so a logit's
+            // bound carries over; its exp form adds a few ulp of c.
             let bounds = |terms: &[(f32, f32)]| {
                 terms
                     .iter()
-                    .map(|(magnitude, rest)| reassociation(outputs) * magnitude + rest)
+                    .map(|(magnitude, rest)| reassociation(outputs) * magnitude + rest + 1e-6 * cap)
                     .collect::<Vec<_>>()
             };
-            for &mapping in mappings {
+            let capped = |values: &[f32]| {
+                values
+                    .iter()
+                    .map(|z| if cap > 0.0 { (f64::from(cap) * (f64::from(*z) / f64::from(cap)).tanh()) as f32 } else { *z })
+                    .collect::<Vec<_>>()
+            };
+            for &mapping in check.mappings {
                 let head_native = readout_head_rows::native_for_device_with(
                     &device,
                     readout_head_rows::Elements {
@@ -2407,13 +2653,14 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     weight: &head.tensor(&device),
                     out_rows: &rows_tensor,
                     epsilon: 1e-6,
+                    softcap: cap,
                 })
                 .unwrap()
                 .value;
                 assert_within(
-                    &format!("head_rows {repr:?} O {outputs} {mapping:?}"),
+                    &format!("head_rows {repr:?} O {outputs} {mapping:?} softcap {cap}"),
                     &read_f32(&head_native),
-                    &logits,
+                    &capped(&logits),
                     &bounds(&logit_bound),
                 );
                 let selected_native = readout_selected_rows::native_for_device_with(
@@ -2433,17 +2680,18 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     out_rows: &rows_tensor,
                     selected: &i32_tensor(&device, &[selected.len()], &selected),
                     epsilon: 1e-6,
+                    softcap: cap,
                 })
                 .unwrap()
                 .value;
                 assert_within(
-                    &format!("selected_rows {repr:?} O {outputs} {mapping:?}"),
+                    &format!("selected_rows {repr:?} O {outputs} {mapping:?} softcap {cap}"),
                     &read_f32(&selected_native),
-                    &chosen,
+                    &capped(&chosen),
                     &bounds(&chosen_bound),
                 );
             }
-            if !scoped && outputs == 2 && repr == Repr::Q6k {
+            if check.portable && outputs == 2 && repr == Repr::Q6k {
                 let bindings = [
                     ("NW", registry::dense(DType::BF16)),
                     ("OW", repr.storage()),
@@ -2459,27 +2707,23 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                 };
                 let mut head_inputs = inputs();
                 head_inputs.push(Input::F32(1e-6));
-                let oracle = result(
-                    &interpret(&module, "readout_head_rows", &bindings, head_inputs),
-                    0,
-                );
+                head_inputs.push(Input::F32(cap));
+                let oracle = result(&interpret(&module, "readout_head_rows", &bindings, head_inputs), 0);
                 assert_within(
-                    "head_rows portable",
+                    &format!("head_rows portable softcap {cap}"),
                     &oracle,
-                    &logits,
+                    &capped(&logits),
                     &bounds(&logit_bound),
                 );
                 let mut selected_inputs = inputs();
                 selected_inputs.push(ints(&[selected.len()], &selected));
                 selected_inputs.push(Input::F32(1e-6));
-                let oracle = result(
-                    &interpret(&module, "readout_selected_rows", &bindings, selected_inputs),
-                    0,
-                );
+                selected_inputs.push(Input::F32(cap));
+                let oracle = result(&interpret(&module, "readout_selected_rows", &bindings, selected_inputs), 0);
                 assert_within(
-                    "selected_rows portable",
+                    &format!("selected_rows portable softcap {cap}"),
                     &oracle,
-                    &chosen,
+                    &capped(&chosen),
                     &bounds(&chosen_bound),
                 );
                 let oracle = result(
@@ -2687,6 +2931,7 @@ fn timing_on(device: &Device) {
             .map(|i| noise_weight(&device, repr, h, f, i as u64 + 1))
             .collect::<Vec<_>>();
         let residual = f32_tensor(&device, &[max_m, h], &uniform_values(max_m * h, 1, 1.0));
+        let absent_scale = f32_tensor(&device, &[0], &[]);
         for &m in &rows_list {
             let product = act_tensor(&device, act, &[m, f], &uniform_values(m * f, 2, 1.0));
             let out_rows = i32_tensor(&device, &[m], &(0..m as i32).collect::<Vec<_>>());
@@ -2707,6 +2952,7 @@ fn timing_on(device: &Device) {
                         product: &product,
                         down_weight: weight,
                         out_rows: &out_rows,
+                        down_scale: &absent_scale,
                     })
                     .collect();
                 let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
@@ -2735,6 +2981,7 @@ fn timing_on(device: &Device) {
             })
             .collect::<Vec<_>>();
         let residual = f32_tensor(&device, &[max_m, h], &uniform_values(max_m * h, 3, 1.0));
+        let absent_scale = f32_tensor(&device, &[0], &[]);
         let norm = bf16_norm(&device, &norm_values(h, 3));
         for &m in &rows_list {
             let out_rows = i32_tensor(&device, &[m], &(0..m as i32).collect::<Vec<_>>());
@@ -2759,6 +3006,9 @@ fn timing_on(device: &Device) {
                         up_weight: up,
                         out_rows: &out_rows,
                         eps: 1e-6,
+                        activation: 0,
+                        gate_scale: &absent_scale,
+                        up_scale: &absent_scale,
                     })
                     .collect();
                 let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
@@ -2960,23 +3210,24 @@ fn timing_on(device: &Device) {
             })
             .collect::<Vec<_>>();
         let norm = bf16_norm(&device, &norm_values(d, 6));
-        let query_norm = f32_tensor(&device, &[w], &vec![1.0; w]);
+        let no_gate = act_tensor(&device, Act::Bf16, &[0, d], &[]);
         let total = rows_of.iter().sum::<usize>();
         for &m in &rows_list {
             let hidden = f32_tensor(&device, &[m, d], &uniform_values(m * d, 8, 1.0));
             for mapping in timing_mappings(m) {
-                let kernel = gated_attention_project::native_for_device_with(
+                let kernel = attention_project::native_for_device_with(
                     &device,
-                    gated_attention_project::Elements {
+                    attention_project::Elements {
                         NW: Element::bf16(),
                         QW: reprs[0].element(),
+                        GW: Element::bf16(),
                         KW: reprs[1].element(),
                         VW: reprs[2].element(),
                         A: a,
                     },
                     &scoped_projection_specialization_on(
                         device,
-                        &[("D", d), ("KV", kv), ("G", g), ("W", w)],
+                        &attention_project_statics(d, kv, g, w),
                         mapping,
                         ProjectionLaunches {
                             gemv: 1,
@@ -2989,11 +3240,11 @@ fn timing_on(device: &Device) {
                 .unwrap();
                 let rotation = weights
                     .iter()
-                    .map(|set| gated_attention_project::Args {
+                    .map(|set| attention_project::Args {
                         hidden: &hidden,
                         input_norm: &norm,
-                        query_norm: &query_norm,
-                        query_gate_weight: &set[0],
+                        query_weight: &set[0],
+                        gate_weight: &no_gate,
                         key_weight: &set[1],
                         value_weight: &set[2],
                         epsilon: 1e-6,
@@ -3120,6 +3371,7 @@ fn timing_on(device: &Device) {
                     weight: &weight,
                     out_rows: &out_rows,
                     epsilon: 1e-6,
+                    softcap: 0.0,
                 }];
                 let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
                 report(label, m, mapping, measured.median, bytes, m * v * d);
@@ -3162,12 +3414,57 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
             .call(embedding_rows::Args {
                 table: &table.tensor(&device),
                 tokens: &i32_tensor(&device, &[rows, 2], &pairs),
+                scale: 1.0,
+                normalize: 0,
+                epsilon: 0.0,
             })
             .unwrap();
             let expected = tokens
                 .iter()
                 .flat_map(|t| table.row(*t as usize).iter().map(|value| act.round(*value)))
                 .collect::<Vec<_>>();
+            // The scaled (Gemma, √D) and normalized (Muse, weightless RMS)
+            // forms: the square sum reassociates, so within an A rounding.
+            for (scale, normalize) in [(39.191835f32, 0), (1.0, 1)] {
+                let transformed = embedding_rows::native_for_device_with(
+                    &device,
+                    embedding_rows::Elements {
+                        EW: repr.element(),
+                        A: act.element(),
+                    },
+                    &statics_on(device, &[("D", d)]),
+                )
+                .unwrap()
+                .call(embedding_rows::Args {
+                    table: &table.tensor(&device),
+                    tokens: &i32_tensor(&device, &[rows, 2], &pairs),
+                    scale,
+                    normalize,
+                    epsilon: 1e-5,
+                })
+                .unwrap();
+                let (values, bound): (Vec<f32>, Vec<f32>) = tokens
+                    .iter()
+                    .flat_map(|t| {
+                        let row = table.row(*t as usize).iter().map(|v| v * scale).collect::<Vec<_>>();
+                        let inverse = if normalize != 0 {
+                            let squares = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>();
+                            (1.0 / (squares / d as f64 + 1e-5).sqrt()) as f32
+                        } else {
+                            1.0
+                        };
+                        row.into_iter()
+                            .map(move |v| (act.round(v * inverse), (v * inverse).abs() / 128.0))
+                            .collect::<Vec<_>>()
+                    })
+                    .unzip();
+                assert_within(
+                    &format!("embedding {repr:?} rows {rows} scale {scale} normalize {normalize}"),
+                    &read_act(act, &transformed.r0),
+                    &values,
+                    &bound,
+                );
+            }
             let exact = vec![0.0; expected.len()];
             assert_within(
                 &format!("embedding {repr:?} rows {rows} (A)"),
@@ -3186,7 +3483,13 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
                     &module,
                     "embedding_rows",
                     &[("EW", repr.storage()), ("A", registry::dense(DType::BF16))],
-                    vec![Input::Data(table.oracle()), ints(&[rows, 2], &pairs)],
+                    vec![
+                        Input::Data(table.oracle()),
+                        ints(&[rows, 2], &pairs),
+                        Input::F32(1.0),
+                        Input::I32(0),
+                        Input::F32(0.0),
+                    ],
                 );
                 assert_within(
                     &format!("embedding {repr:?} portable"),

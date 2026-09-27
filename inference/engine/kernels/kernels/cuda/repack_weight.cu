@@ -32,6 +32,39 @@
 #elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ4_XS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ4G32)
 #define REPACK_IQ4 1
 #define REPACK_CODE_BITS 4u
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q4_0) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q4G32S)
+// block_q4_0: d (f16) | qs[16].
+#define REPACK_BLOCK32 1
+#define REPACK_SCALE_BYTES 2u
+#define REPACK_QS 2u
+#define REPACK_CODE_BITS 4u
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_MXFP4) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_MXFP4G32)
+// block_mxfp4: e (E8M0) | qs[16].
+#define REPACK_BLOCK32 1
+#define REPACK_E2M1 1
+#define REPACK_SCALE_BYTES 1u
+#define REPACK_QS 1u
+#define REPACK_CODE_BITS 4u
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q5_0) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q5G32S)
+// block_q5_0: d (f16) | qh[4] | qs[16].
+#define REPACK_BLOCK32 1
+#define REPACK_SCALE_BYTES 2u
+#define REPACK_HIGH_BIT 1
+#define REPACK_QS 6u
+#define REPACK_CODE_BITS 5u
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q5_1) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q5G32)
+// block_q5_1: d | m (f16) | qh[4] | qs[16].
+#define REPACK_BLOCK32 1
+#define REPACK_SCALE_BYTES 4u
+#define REPACK_HIGH_BIT 1
+#define REPACK_QS 8u
+#define REPACK_CODE_BITS 5u
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_NVFP4) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_NVFP4G16)
+// block_nvfp4: d[4] (UE4M3) | qs[32].
+#define REPACK_NVFP4 1
+#define REPACK_E2M1 1
+#define REPACK_SCALE_BYTES 4u
+#define REPACK_CODE_BITS 4u
 #else
 #error "repack_weight binding is not a registered GGUF-to-resident conversion"
 #endif
@@ -143,6 +176,23 @@ __device__ __forceinline__ u32 source_code(const u8 *in, u32 p) {
     return (u32)in[2 + p];
 #elif defined(REPACK_IQ4NL)
     return (in[(p / 32) * 18 + 2 + p % 16] >> ((p % 32 / 16) * 4)) & 15u;
+#elif defined(REPACK_BLOCK32) || defined(REPACK_NVFP4)
+#if defined(REPACK_BLOCK32)
+    // The low (p < 16) or high nibble of qs[p % 16], with bit p of qh.
+    u32 code = (in[REPACK_QS + p % 16] >> ((p / 16) * 4)) & 15u;
+#else
+    // Sixteen-value sub-block s = p / 16: the low (p % 16 < 8) or high
+    // nibble of qs[8 s + p % 8].
+    u32 code = (in[4 + 8 * (p / 16) + p % 8] >> ((p % 16 / 8) * 4)) & 15u;
+#endif
+#if defined(REPACK_HIGH_BIT)
+    code |= (((u32)in[REPACK_SCALE_BYTES + p / 8] >> (p % 8)) & 1u) << 4;
+#endif
+#if defined(REPACK_E2M1)
+    // E2M1 -0 (code 8) becomes ggml's +0 (code 0).
+    code = code == 8u ? 0u : code;
+#endif
+    return code;
 #else
     return (in[8 + (p / 32) * 16 + p % 16] >> ((p % 32 / 16) * 4)) & 15u;
 #endif
@@ -213,6 +263,9 @@ __device__ __forceinline__ void write_supers(const u8 *in, u8 *out) {
     for (u32 j = 0; j < 8; ++j)
         reinterpret_cast<float *>(out)[j] =
             seismic_f16_to_f32((unsigned short)(in[18 * j] | (in[18 * j + 1] << 8)));
+#elif defined(REPACK_SCALE_BYTES)
+    // The block's leading scale fields (d, d | m, e or d[4]), bit for bit.
+    for (u32 i = 0; i < REPACK_SCALE_BYTES; ++i) out[i] = in[i];
 #else
     for (u32 j = 0; j < 8; ++j) reinterpret_cast<float *>(out)[j] = iq4_scale(in, j);
 #endif
@@ -290,7 +343,13 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
             value |= shift >= 0 ? raw << shift : raw >> (-shift);
         }
         u8 *out = destination_packet(destination, seismic_words_value, b, n, packet);
+#if SEISMIC_ELEMENT_U_PACKET_SIZE % 4 == 0
         reinterpret_cast<u32 *>(out + SEISMIC_ELEMENT_U_PLANE_0_OFFSET)[word] = value;
+#else
+        // Byte-aligned packets (the E8M0 and UE4M3 scale planes): bytewise.
+        for (u32 byte = 0; byte < 4; ++byte)
+            out[SEISMIC_ELEMENT_U_PLANE_0_OFFSET + 4 * word + byte] = (u8)(value >> (8 * byte));
+#endif
     }
     if (within != 0 || lane >= TILE_ROWS || row0 + lane >= SEISMIC_DIM_N) return;
     const u64 n = row0 + lane;
@@ -458,8 +517,20 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
         else zero_bytes(supers, SEISMIC_ELEMENT_U_PLANE_SUPERS_BYTES_PER_GROUP);
     }
 
+    // Alignment tails at the row's last stored tile. Low code planes are whole
+    // multiples of 16 bytes; a high-bit plane of 32-value groups may not be.
     if (column0 + TILE_COLUMNS == stored_columns && lane < rows) {
         u8 *row = row_base(destination, seismic_words_value, b, row0 + lane);
+#if defined(SEISMIC_ELEMENT_U_PLANE_CODES_HI)
+#if defined(SEISMIC_ELEMENT_U_PLANE_SCALES)
+        const u64 after_high = SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET;
+#else
+        const u64 after_high = SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET;
+#endif
+        zero_bytes(row + SEISMIC_RESULT_0_PLANE_CODES_HI_ROW_OFFSET + SEISMIC_RESULT_0_PLANE_CODES_HI_BYTES_PER_ROW,
+                   after_high - SEISMIC_RESULT_0_PLANE_CODES_HI_ROW_OFFSET -
+                       SEISMIC_RESULT_0_PLANE_CODES_HI_BYTES_PER_ROW);
+#endif
 #if defined(SEISMIC_ELEMENT_U_PLANE_SCALES)
         zero_bytes(row + SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET + SEISMIC_RESULT_0_PLANE_SCALES_BYTES_PER_ROW,
                    SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET - SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET -

@@ -6,16 +6,20 @@ mod device_resources;
 mod domain;
 mod error;
 mod execution_path;
+mod host_tables;
+mod import_transforms;
 mod kernel_cache;
 mod lanes;
 pub mod memory;
 mod native;
 mod operation;
+mod operators;
 mod planning;
 pub mod programs;
 pub use programs::{
     CommitSpan, CompletedHeadWork, CompletedImportWork, CompletedStateWork, CompletedTargetWork,
-    CompletedVisionWork, HeadProgram, ImportProgram, PreparedHeadGraphs, PreparedStateCopyGraphs,
+    CompletedVisionWork, HeadProgram, ImportProgram, PreparedDraftGraphs, PreparedDrafterGraphs,
+    PreparedHeadGraphs, PreparedStateCopyGraphs,
     PreparedTargetGraphs, PreparedTargetReadoutGraphs, PreparedVisionGraphs, SealReport,
     StateProgram, TargetOutput, TargetProgram, VisionProgram,
 };
@@ -62,7 +66,8 @@ pub use native::{
     ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
 };
 pub use operation::{
-    CommittedClass, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, GroupKey, Operation,
+    CommittedClass, DraftForm, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, GroupKey,
+    Operation,
     OperationError, Outcome, ProgramIdentity, RequestId, ResourceDomainId, RowResult, Sampling,
     SelectSpec, Selected, Shaping, TokenId, WorkKind,
 };
@@ -72,25 +77,32 @@ pub use planning::{
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding,
     AttentionShape, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
     EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
-    FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, ImportProgramSlot,
-    MixerProgramSlot, ModelLoadPlan, NativeGraphCharge, PlannedDevice, PlannedMethod, ProgramPlan,
+    FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HostTablePlan,
+    ImportProgramSlot, MixerProgramSlot, ModelLoadPlan, NativeGraphCharge, DenseBranchBinding,
+    ParallelBinding, PerLayerBinding,
+    PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
     ReadoutBinding, RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity,
     ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding, StartupSlots, StateCapacityPlan,
-    StateProgramPlan, StateResourcePlan, StateStorePlan, StreamingCost, TargetBlockProgramSlot,
-    TargetProgramPlan, VisionBlockBinding, VisionMergerBinding, VisionPatchBinding,
-    VisionProgramPlan, WeightPlan, WeightStorageIdentity, MAX_DRAFT_PROPOSALS,
+    StateProgramPlan, StateResourcePlan, StateStorePlan, StreamingCost, SublayerTail,
+    TargetBlockProgramSlot, DraftBlockBinding, DraftProgramPlan, MarkovBinding, TapProgramPlan,
+    TargetProgramPlan, VisionProgramPlan, WeightPlan, WeightStorageIdentity,
+    MAX_DRAFT_PROPOSALS,
 };
+pub use operators::routed::{Expansion, GeneralRoutedBinding, GeneralRoutedShape};
+pub use operators::short_conv::{ShortConvBinding, ShortConvShape};
+pub use operators::state_space::{StateSpaceBinding, StateSpaceShape};
+pub use operators::vision::{VisionEntry, VisionKernel};
+
+/// Whether this executor runs `definition` with its draft head selected.
+pub fn head_admitted(definition: &magnitude_family_contracts::ModelDefinition) -> bool {
+    definition.head.is_some() && operators::admit(definition, true).is_ok()
+}
 pub use residency::{
     ComponentLoader, ImportArtifactTensor, ResidentWeight, Stored, StoredTensor, WeightImportError,
 };
 pub use residency::{MappedImportReport, ResidencyStore};
 pub use resident_weights::{
-    ResidencyError, ResidentAttentionWeights, ResidentBlockWeights,
-    ResidentDenseFeedForwardWeights, ResidentFeedForwardWeights, ResidentFusedQkvWeights,
-    ResidentHead, ResidentHeadBlock, ResidentLayerNormWeights, ResidentMixerWeights,
-    ResidentRecurrentWeights, ResidentRoutedFeedForwardWeights, ResidentTarget, ResidentVision,
-    ResidentVisionAttentionWeights, ResidentVisionBlockWeights, ResidentVisionFeedForwardWeights,
-    ResidentVisionMergerWeights,
+    ResidencyError, ResidentHead, ResidentRoles, ResidentTarget, ResidentVision,
 };
 pub use resources::{
     AllocatedResources, AllocationError, GraphOutputOwner, GraphOutputTensor, ImportWorkspaceLease,

@@ -40,13 +40,20 @@ impl TokenPlan {
 }
 
 /// Patch order and spatial controls supplied by the model family, not derived
-/// by an encoder stage. Indices address the model's position table.
+/// by an encoder stage, one entry per tower row. Tower row `r` holds the
+/// processor's patch row `patch_order[r]` (the identity unless the tower
+/// attends within windows); its rotary coordinates are
+/// `attention_coordinates[r]`; its position-table value is the blend of the
+/// four table rows `interpolation_indices[·][r]` with the matching
+/// coefficients; a windowed layer lets it attend to the tower rows
+/// `window_ranges[r]` (`[start, end)`, empty without windows).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VisionSpatialControls {
     patch_order: Vec<usize>,
     attention_coordinates: Vec<[i32; 2]>,
     interpolation_indices: [Vec<i32>; 4],
     interpolation_coefficients: [Vec<f32>; 4],
+    window_ranges: Vec<[i32; 2]>,
 }
 
 impl VisionSpatialControls {
@@ -55,6 +62,7 @@ impl VisionSpatialControls {
         attention_coordinates: Vec<[i32; 2]>,
         interpolation_indices: [Vec<i32>; 4],
         interpolation_coefficients: [Vec<f32>; 4],
+        window_ranges: Vec<[i32; 2]>,
     ) -> Result<Self, InputPreparationError> {
         let rows = patch_order.len();
         let mut seen = vec![false; rows];
@@ -81,23 +89,22 @@ impl VisionSpatialControls {
                         .iter()
                         .any(|coefficient| !coefficient.is_finite() || *coefficient < 0.0)
             })
+            || (!window_ranges.is_empty() && window_ranges.len() != rows)
+            || window_ranges.iter().enumerate().any(|(row, &[start, end])| {
+                start < 0
+                    || start as usize > row
+                    || end as usize <= row
+                    || end as usize > rows
+            })
         {
             return Err(InputPreparationError::VisionGeometry);
-        }
-        for row in 0..rows {
-            let sum = interpolation_coefficients
-                .iter()
-                .map(|coefficients| coefficients[row])
-                .sum::<f32>();
-            if (sum - 1.0).abs() > 1e-5 {
-                return Err(InputPreparationError::VisionGeometry);
-            }
         }
         Ok(Self {
             patch_order,
             attention_coordinates,
             interpolation_indices,
             interpolation_coefficients,
+            window_ranges,
         })
     }
 
@@ -115,6 +122,10 @@ impl VisionSpatialControls {
 
     pub fn interpolation_coefficients(&self) -> &[Vec<f32>; 4] {
         &self.interpolation_coefficients
+    }
+
+    pub fn window_ranges(&self) -> &[[i32; 2]] {
+        &self.window_ranges
     }
 
     pub fn rows(&self) -> usize {
@@ -138,27 +149,17 @@ impl PreparedVisionInput {
         pixels: PreparedTensor,
         spatial: VisionSpatialControls,
     ) -> Result<Self, InputPreparationError> {
-        let geometry = &definition
+        let vision = definition
             .vision
             .as_ref()
-            .ok_or(InputPreparationError::UnsupportedMedia)?
-            .geometry;
-        let patch_width = [
-            geometry.channels,
-            geometry.temporal_patch,
-            geometry.patch,
-            geometry.patch,
-        ]
-        .into_iter()
-        .try_fold(1u64, |product, extent| product.checked_mul(extent))
-        .and_then(|width| usize::try_from(width).ok())
-        .ok_or(InputPreparationError::VisionGeometry)?;
-        let table_rows = geometry
-            .table_side
-            .checked_mul(geometry.table_side)
-            .filter(|rows| *rows <= i32::MAX as u64)
+            .ok_or(InputPreparationError::UnsupportedMedia)?;
+        let patch_width = vision
+            .patch_row_width()
+            .ok()
+            .and_then(|width| usize::try_from(width).ok())
             .ok_or(InputPreparationError::VisionGeometry)?;
-        let merge = usize::try_from(geometry.merge)
+        let table_rows = vision.stem.positions().rows();
+        let merge = usize::try_from(vision.preprocessing.merge)
             .ok()
             .filter(|merge| *merge > 0)
             .ok_or(InputPreparationError::VisionGeometry)?;
@@ -166,6 +167,7 @@ impl PreparedVisionInput {
             .into_iter()
             .try_fold(1usize, |product, extent| product.checked_mul(extent))
             .ok_or(InputPreparationError::VisionGeometry)?;
+        let windowed = vision.window.is_some();
         if identity.is_empty()
             || grid.contains(&0)
             || pixels.dtype() != DType::F32
@@ -175,9 +177,13 @@ impl PreparedVisionInput {
             || spatial.rows() != rows
             || grid[1] % merge != 0
             || grid[2] % merge != 0
-            || spatial.attention_coordinates().iter().any(|coordinate| {
-                coordinate[0] as usize >= grid[1] || coordinate[1] as usize >= grid[2]
-            })
+            || windowed == spatial.window_ranges().is_empty()
+            || (!windowed
+                && spatial
+                    .patch_order()
+                    .iter()
+                    .enumerate()
+                    .any(|(row, source)| row != *source))
             || spatial
                 .interpolation_indices()
                 .iter()
@@ -270,13 +276,10 @@ impl PreparedModelInput {
         {
             return Err(InputPreparationError::InputAlignment);
         }
-        if let Some(vision_geometry) = definition.vision.as_ref().map(|v| &v.geometry) {
-            let merge = usize::try_from(vision_geometry.merge)
+        if let Some(description) = &definition.vision {
+            let merge_area = usize::try_from(description.cell_rows())
                 .ok()
-                .filter(|merge| *merge > 0)
-                .ok_or(InputPreparationError::VisionGeometry)?;
-            let merge_area = merge
-                .checked_mul(merge)
+                .filter(|area| *area > 0)
                 .ok_or(InputPreparationError::VisionGeometry)?;
             if layout.spans().iter().zip(&vision).any(|(span, image)| {
                 let [t, h, w] = image.grid();
@@ -331,6 +334,7 @@ impl PreparedModelInput {
                     attention_coordinates,
                     interpolation_indices,
                     interpolation_coefficients,
+                    window_ranges,
                 } = image.spatial;
                 PreparedVisionInput::new(
                     definition,
@@ -342,6 +346,7 @@ impl PreparedModelInput {
                         attention_coordinates,
                         interpolation_indices,
                         interpolation_coefficients,
+                        window_ranges,
                     )?,
                 )
             })

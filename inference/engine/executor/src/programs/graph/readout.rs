@@ -6,14 +6,20 @@
 //! orders the projected rows with the selected ones first, so shaping and
 //! sampling read the leading `selected` logits rows; no identity copy or
 //! gather node precedes any readout entry.
+//!
+//! When a separate draft drafts, the features are its conditioning instead:
+//! the fusion of the target taps (`project_rows` over the draft input rows
+//! the tapped blocks wrote) gathered through `out_rows` (`feature_rows`).
 
 use crate::{
     native::AttestedTarget, programs::graph::draft::GraphDraft, DeviceError, InvariantError,
     ModelLoadPlan, ResidentTarget, ResourceLimits, SubmitError,
 };
 use magnitude_batching::TargetBatchUpload;
-use magnitude_family_contracts::{DecoderGeometry, WeightKind, WeightRole, WeightScope};
-use magnitude_kernels::{readout_features_rows, readout_head_rows, sample_rows, shape_rows};
+use magnitude_family_contracts::{Decoder, ExitNorm, WeightKind, WeightRole, WeightScope};
+use magnitude_kernels::{
+    feature_rows, project_rows, readout_features_rows, readout_head_rows, sample_rows, shape_rows,
+};
 use seismic::{
     BackendName, BoundNativeGraphPlan, Device, Element, Entry, NativeGraphClassSlice,
     NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan,
@@ -60,11 +66,53 @@ pub(crate) struct ReadoutClass {
     pub kind: ReadoutKind,
 }
 
+/// Where a readout's features come from.
+#[derive(Clone, Copy)]
+enum FeatureSource<'p> {
+    /// The final norm of the hidden rows.
+    Output,
+    /// A separate draft's fused taps: `fusion` projects the draft input rows.
+    Taps { fusion: &'p crate::WeightPlan },
+}
+
+impl<'p> FeatureSource<'p> {
+    /// The draft's taps when its fusion is planned with the target.
+    fn of(load: &'p ModelLoadPlan) -> Self {
+        let role = WeightRole {
+            scope: WeightScope::Draft,
+            kind: WeightKind::DraftFusion,
+        };
+        match load.target().iter().find(|weight| weight.role == role) {
+            Some(fusion) => Self::Taps { fusion },
+            None => Self::Output,
+        }
+    }
+}
+
+/// The feature entries of a readout graph, by its feature source.
+enum FeatureEntries<'a, G: GraphDraft + 'a> {
+    Output(G::Binding<'a, readout_features_rows::Entry>),
+    Taps {
+        fusion: G::Binding<'a, project_rows::Entry>,
+        features: G::Binding<'a, feature_rows::Entry>,
+    },
+}
+
+/// The draft input rows (bound per run) and the fusion weight of a readout
+/// graph that publishes a separate draft's conditioning.
+#[derive(Clone)]
+pub(crate) struct ReadoutTapPorts {
+    pub taps: NativePort,
+    pub fusion: NativePort,
+    pub absent_scale: NativePort,
+}
+
 #[derive(Clone)]
 pub(crate) struct PreparedTargetReadoutGraph {
     pub plan: NativeGraphPlan,
-    pub hidden: NativePort,
-    pub norm: NativePort,
+    /// Absent for a tapped readout's feature-only classes.
+    pub final_rows: Option<FinalRowPorts>,
+    pub taps: Option<ReadoutTapPorts>,
     pub weight: Option<NativePort>,
     /// Hidden rows of the feature outputs.
     pub out_rows: NativePort,
@@ -144,7 +192,7 @@ impl PreparedTargetReadoutGraphs {
         device: &Device,
         target: &AttestedTarget,
         load: &ModelLoadPlan,
-        geometry: &DecoderGeometry,
+        geometry: &Decoder,
         limits: ResourceLimits,
     ) -> Result<Self, String> {
         let role = |kind| WeightRole {
@@ -159,8 +207,9 @@ impl PreparedTargetReadoutGraphs {
             .weights()
             .find(|weight| weight.role == role(WeightKind::Output))
             .ok_or("readout output projection weight is absent")?;
+        let source = FeatureSource::of(load);
         let regimes =
-            certify_readout_regimes(device.backend(), geometry, norm, projection, limits)?;
+            certify_readout_regimes(device.backend(), geometry, norm, projection, source, limits)?;
         let mut classes = BTreeMap::new();
         let mut plans = Vec::new();
         let mut add = |class: ReadoutClass| -> Result<(), String> {
@@ -168,7 +217,7 @@ impl PreparedTargetReadoutGraphs {
                 .get(&readout_regime(class))
                 .ok_or("readout class has no resource regime")?;
             let variant = PreparedTargetReadoutGraph::prepare(
-                device, target, geometry, norm, projection, class, layout,
+                device, target, geometry, norm, projection, source, class, layout,
             )?;
             plans.push(variant.plan.clone());
             classes.insert(class, variant);
@@ -208,9 +257,23 @@ impl PreparedTargetReadoutGraphs {
     ) -> Result<BoundTargetReadoutGraphs, String> {
         let mut bound = BTreeMap::new();
         for (class, graph) in &self.classes {
-            let mut fixed = vec![(&graph.norm, resident.output_norm.tensor())];
+            let mut fixed = Vec::new();
+            let absent_scale = seismic::Tensor::from_host(
+                &resident.output.tensor().device(), Element::f32(), &[0], &[],
+            ).map_err(|error| error.to_string())?;
+            if let Some(rows) = &graph.final_rows {
+                fixed.push((&rows.norm, resident.output_norm.tensor()));
+            }
             if let Some(weight) = &graph.weight {
                 fixed.push((weight, resident.output.tensor()));
+            }
+            if let Some(taps) = &graph.taps {
+                let fusion = resident
+                    .fusion
+                    .as_ref()
+                    .ok_or("a tapped readout has no resident draft fusion")?;
+                fixed.push((&taps.fusion, fusion.projection.tensor()));
+                fixed.push((&taps.absent_scale, &absent_scale));
             }
             bound.insert(
                 *class,
@@ -265,20 +328,33 @@ pub(crate) struct ShapingPorts {
 }
 
 impl PreparedTargetReadoutGraph {
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         device: &Device,
         target: &AttestedTarget,
-        geometry: &DecoderGeometry,
+        geometry: &Decoder,
         norm_plan: &crate::WeightPlan,
         weight_plan: &crate::WeightPlan,
+        source: FeatureSource<'_>,
         class: ReadoutClass,
         layout: &NativeGraphLayout,
     ) -> Result<Self, String> {
-        let (mut graph, hidden, norm, out_rows, features) = feature_topology(
+        let entries = match (source, &target.taps) {
+            (FeatureSource::Output, _) => FeatureEntries::Output(&target.readout.features),
+            (FeatureSource::Taps { .. }, Some(taps)) => FeatureEntries::Taps {
+                fusion: &taps.fusion,
+                features: &taps.features,
+            },
+            (FeatureSource::Taps { .. }, None) => {
+                return Err("a tapped readout has no tap entries".into())
+            }
+        };
+        let (mut graph, final_rows, out_rows, features, taps) = feature_topology(
             device.native_graph_with_layout(layout),
-            &target.readout.features,
+            entries,
             geometry,
             norm_plan,
+            source,
             class,
         )?;
         let mut weight = None;
@@ -287,14 +363,17 @@ impl PreparedTargetReadoutGraph {
         let mut selection = None;
         let mut selected = None;
         if class.kind != ReadoutKind::Features {
+            let rows = final_rows
+                .as_ref()
+                .ok_or("a projecting readout has no final rows")?;
             let (projected_graph, projection, rows, projected) = projected_topology(
                 graph,
                 &target.readout.head,
                 geometry,
                 weight_plan,
                 class,
-                &hidden,
-                &norm,
+                &rows.hidden,
+                &rows.norm,
             )?;
             graph = projected_graph;
             if let ReadoutKind::Selection { .. } = class.kind {
@@ -317,8 +396,8 @@ impl PreparedTargetReadoutGraph {
         let plan = graph.seal().map_err(error)?;
         Ok(Self {
             plan,
-            hidden,
-            norm,
+            final_rows,
+            taps,
             weight,
             out_rows,
             logit_rows,
@@ -330,44 +409,133 @@ impl PreparedTargetReadoutGraph {
     }
 }
 
+/// The ports and exported features of a readout's feature prefix. The final
+/// hidden rows and norm are absent when the class reads neither (tapped
+/// features without a projection).
+type FeaturePrefix<G> = (
+    G,
+    Option<FinalRowPorts>,
+    NativePort,
+    WorkflowTensor,
+    Option<ReadoutTapPorts>,
+);
+
+/// The decoder's final hidden rows (bound per run) and final norm.
+#[derive(Clone)]
+pub(crate) struct FinalRowPorts {
+    pub hidden: NativePort,
+    pub norm: NativePort,
+}
+
+fn final_row_ports<G: GraphDraft>(
+    graph: &mut G,
+    geometry: &Decoder,
+    norm_plan: &crate::WeightPlan,
+    class: ReadoutClass,
+) -> Result<FinalRowPorts, String> {
+    Ok(FinalRowPorts {
+        hidden: graph.port_with_class_extent(
+            Element::f32(),
+            &[class.rows, geometry.hidden],
+            0,
+            "M",
+        )?,
+        norm: graph.port(norm_plan.resident, &norm_plan.shape)?,
+    })
+}
+
 /// The same feature prefix is used by feature-only and projected readout
 /// graphs. The checked route seals this prefix only for the feature class.
 fn feature_topology<'a, G: GraphDraft + 'a>(
     mut graph: G,
-    entry: G::Binding<'a, readout_features_rows::Entry>,
-    geometry: &DecoderGeometry,
+    entries: FeatureEntries<'a, G>,
+    geometry: &Decoder,
     norm_plan: &crate::WeightPlan,
+    source: FeatureSource<'_>,
     class: ReadoutClass,
-) -> Result<(G, NativePort, NativePort, NativePort, WorkflowTensor), String> {
-    let hidden =
-        graph.port_with_class_extent(Element::f32(), &[class.rows, geometry.hidden], 0, "M")?;
-    let norm = graph.port(norm_plan.resident, &norm_plan.shape)?;
+) -> Result<FeaturePrefix<G>, String> {
     let dimensions = [
         ("M", class.rows),
         ("O", class.outputs),
         ("D", geometry.hidden),
     ];
-    let out_rows = graph.input_for(entry, "out_rows", &dimensions)?;
-    let features = graph
-        .enqueue::<readout_features_rows::Entry>(
-            entry,
-            &dimensions,
-            readout_features_rows::WorkflowArgs {
-                hidden: hidden.tensor().into(),
-                norm: norm.tensor().into(),
-                out_rows: out_rows.tensor().into(),
-                epsilon: geometry.epsilon as f32,
-            },
-        )?
-        .value;
+    let (final_rows, out_rows, features, taps) = match (entries, source) {
+        (FeatureEntries::Output(entry), FeatureSource::Output) => {
+            let final_rows = final_row_ports(&mut graph, geometry, norm_plan, class)?;
+            let (hidden, norm) = (&final_rows.hidden, &final_rows.norm);
+            let out_rows = graph.input_for(entry, "out_rows", &dimensions)?;
+            let features = graph
+                .enqueue::<readout_features_rows::Entry>(
+                    entry,
+                    &dimensions,
+                    readout_features_rows::WorkflowArgs {
+                        hidden: hidden.tensor().into(),
+                        norm: norm.tensor().into(),
+                        out_rows: out_rows.tensor().into(),
+                        epsilon: readout_epsilon(geometry)?,
+                    },
+                )?
+                .value;
+            (Some(final_rows), out_rows, features, None)
+        }
+        (FeatureEntries::Taps { fusion, features }, FeatureSource::Taps { fusion: plan }) => {
+            let [_, width] = plan.shape[..] else {
+                return Err("the draft fusion is not a matrix".into());
+            };
+            let activation = match geometry.activation_dtype {
+                magnitude_family_contracts::ActivationDType::F16 => Element::f16(),
+                magnitude_family_contracts::ActivationDType::BF16 => Element::bf16(),
+            };
+            let taps = graph.port_with_class_extent(activation, &[class.rows, width], 0, "M")?;
+            let weight = graph.port(plan.resident, &plan.shape)?;
+            let absent_scale = graph.port(Element::f32(), &[0])?;
+            let fused = graph
+                .enqueue::<project_rows::Entry>(
+                    fusion,
+                    &[("M", class.rows), ("K", width), ("N", geometry.hidden), ("WS", 0)],
+                    project_rows::WorkflowArgs {
+                        source: taps.tensor().into(),
+                        weight: weight.tensor().into(),
+                        weight_scale: absent_scale.tensor().into(),
+                    },
+                )?
+                .value;
+            let out_rows = graph.input_for(features, "out_rows", &dimensions)?;
+            let conditioning = graph
+                .enqueue::<feature_rows::Entry>(
+                    features,
+                    &dimensions,
+                    feature_rows::WorkflowArgs {
+                        fused: (&fused).into(),
+                        out_rows: out_rows.tensor().into(),
+                    },
+                )?
+                .value;
+            // A projecting class reads the final rows after the features.
+            let final_rows = (class.kind != ReadoutKind::Features)
+                .then(|| final_row_ports(&mut graph, geometry, norm_plan, class))
+                .transpose()?;
+            (
+                final_rows,
+                out_rows,
+                conditioning,
+                Some(ReadoutTapPorts {
+                    taps,
+                    fusion: weight,
+                    absent_scale,
+                }),
+            )
+        }
+        _ => return Err("readout feature entries disagree with their source".into()),
+    };
     graph.export(&features)?;
-    Ok((graph, hidden, norm, out_rows, features))
+    Ok((graph, final_rows, out_rows, features, taps))
 }
 
 fn projected_topology<'a, G: GraphDraft + 'a>(
     mut graph: G,
     entry: G::Binding<'a, readout_head_rows::Entry>,
-    geometry: &DecoderGeometry,
+    geometry: &Decoder,
     weight_plan: &crate::WeightPlan,
     class: ReadoutClass,
     hidden: &NativePort,
@@ -390,7 +558,8 @@ fn projected_topology<'a, G: GraphDraft + 'a>(
                 norm: norm.tensor().into(),
                 weight: weight.tensor().into(),
                 out_rows: rows.tensor().into(),
-                epsilon: geometry.epsilon as f32,
+                epsilon: readout_epsilon(geometry)?,
+                softcap: readout_softcap(geometry),
             },
         )?
         .value;
@@ -398,11 +567,26 @@ fn projected_topology<'a, G: GraphDraft + 'a>(
     Ok((graph, weight, rows, logits))
 }
 
+/// The epsilon of the decoder's final normalization, which the readout
+/// entries fuse (`operators::admit` admits only an RMS exit norm).
+pub(crate) fn readout_epsilon(geometry: &Decoder) -> Result<f32, String> {
+    match &geometry.exit.norm {
+        ExitNorm::Rms(norm) => Ok(norm.epsilon as f32),
+        _ => Err("readout requires an RMS final normalization".into()),
+    }
+}
+
+/// The head entries' `softcap` scalar: the exit softcap, 0 for none (the
+/// entries' contract).
+pub(crate) fn readout_softcap(geometry: &Decoder) -> f32 {
+    geometry.exit.softcap.map_or(0.0, |cap| cap as f32)
+}
+
 fn selected_topology<'a, G: GraphDraft + 'a>(
     mut graph: G,
     shape: G::Binding<'a, shape_rows::Entry>,
     sampler: G::Binding<'a, sample_rows::Entry>,
-    geometry: &DecoderGeometry,
+    geometry: &Decoder,
     class: ReadoutClass,
     logits: &WorkflowTensor,
 ) -> Result<(G, SelectionPorts, WorkflowTensor), String> {
@@ -432,7 +616,7 @@ fn selected_topology<'a, G: GraphDraft + 'a>(
 #[cfg(test)]
 fn checked_readout_class_storage(
     backend: BackendName,
-    geometry: &DecoderGeometry,
+    geometry: &Decoder,
     norm_plan: &crate::WeightPlan,
     weight_plan: Option<&crate::WeightPlan>,
     class: ReadoutClass,
@@ -442,6 +626,7 @@ fn checked_readout_class_storage(
         geometry,
         norm_plan,
         weight_plan,
+        FeatureSource::Output,
         class,
     )?
     .seal()
@@ -450,9 +635,10 @@ fn checked_readout_class_storage(
 
 fn checked_readout_class_draft(
     graph: NativeGraphMetadata,
-    geometry: &DecoderGeometry,
+    geometry: &Decoder,
     norm_plan: &crate::WeightPlan,
     weight_plan: Option<&crate::WeightPlan>,
+    source: FeatureSource<'_>,
     class: ReadoutClass,
 ) -> Result<NativeGraphMetadata, String> {
     let activation = match geometry.activation_dtype {
@@ -460,11 +646,29 @@ fn checked_readout_class_draft(
         magnitude_family_contracts::ActivationDType::BF16 => Element::bf16(),
     };
     let feature_elements = [("NW", norm_plan.resident), ("A", activation)];
-    let (graph, hidden, norm, _, _) =
-        feature_topology(graph, &feature_elements, geometry, norm_plan, class)?;
+    let fusion_elements = match source {
+        FeatureSource::Output => Vec::new(),
+        FeatureSource::Taps { fusion } => vec![
+            ("A", activation),
+            ("W", fusion.resident),
+            ("Y", Element::f32()),
+        ],
+    };
+    let tap_feature_elements = [("A", activation)];
+    let entries = match source {
+        FeatureSource::Output => FeatureEntries::Output(&feature_elements[..]),
+        FeatureSource::Taps { .. } => FeatureEntries::Taps {
+            fusion: &fusion_elements[..],
+            features: &tap_feature_elements[..],
+        },
+    };
+    let (graph, final_rows, _, _, _) =
+        feature_topology(graph, entries, geometry, norm_plan, source, class)?;
     let graph = if class.kind == ReadoutKind::Features {
         graph
     } else {
+        let FinalRowPorts { hidden, norm } =
+            final_rows.ok_or("a projecting readout has no final rows")?;
         let weight_plan = weight_plan.ok_or("projected readout weight is absent")?;
         let head_elements = [
             ("NW", norm_plan.resident),
@@ -501,7 +705,7 @@ fn checked_readout_class_draft(
 #[cfg(test)]
 pub(crate) fn checked_projected_graph_storage(
     backend: BackendName,
-    geometry: &DecoderGeometry,
+    geometry: &Decoder,
     norm_plan: &crate::WeightPlan,
     weight_plan: &crate::WeightPlan,
     rows: u64,
@@ -527,7 +731,7 @@ pub(crate) fn checked_projected_graph_storage(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn checked_selection_graph_storage(
     backend: BackendName,
-    geometry: &DecoderGeometry,
+    geometry: &Decoder,
     norm_plan: &crate::WeightPlan,
     weight_plan: &crate::WeightPlan,
     rows: u64,
@@ -554,7 +758,7 @@ pub(crate) fn checked_selection_graph_storage(
 pub(crate) fn checked_readout_family_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
-    geometry: &DecoderGeometry,
+    geometry: &Decoder,
     limits: ResourceLimits,
 ) -> Result<NativeGraphStorageBytes, String> {
     let weight = |kind| {
@@ -570,7 +774,14 @@ pub(crate) fn checked_readout_family_storage(
     };
     let norm = weight(WeightKind::OutputNorm)?;
     let projection = weight(WeightKind::Output)?;
-    let regimes = certify_readout_regimes(backend, geometry, norm, projection, limits)?;
+    let regimes = certify_readout_regimes(
+        backend,
+        geometry,
+        norm,
+        projection,
+        FeatureSource::of(load),
+        limits,
+    )?;
     regimes
         .values()
         .map(NativeGraphLayout::storage_bytes)
@@ -595,11 +806,17 @@ fn readout_regime(class: ReadoutClass) -> ReadoutRegime {
 
 fn certify_readout_regimes(
     backend: BackendName,
-    geometry: &DecoderGeometry,
+    geometry: &Decoder,
     norm: &crate::WeightPlan,
     projection: &crate::WeightPlan,
+    source: FeatureSource<'_>,
     limits: ResourceLimits,
 ) -> Result<BTreeMap<ReadoutRegime, NativeGraphLayout>, String> {
+    // The entry whose `O` is the class's feature outputs.
+    let features_entry = match source {
+        FeatureSource::Output => readout_features_rows::Entry::NAME,
+        FeatureSource::Taps { .. } => feature_rows::Entry::NAME,
+    };
     let mut regimes: BTreeMap<ReadoutRegime, Vec<ReadoutClass>> = BTreeMap::new();
     for class in readout_classes(limits)? {
         regimes
@@ -629,7 +846,7 @@ fn certify_readout_regimes(
                 .map(|class| {
                     let slice = NativeGraphClassSlice::new()
                         .dimension("M", [class.rows])
-                        .scoped(readout_features_rows::Entry::NAME, "O", [class.outputs]);
+                        .scoped(features_entry, "O", [class.outputs]);
                     match class.kind {
                         ReadoutKind::Features => slice,
                         ReadoutKind::Logits => {
@@ -646,6 +863,7 @@ fn certify_readout_regimes(
                 geometry,
                 norm,
                 Some(projection),
+                source,
                 template,
             )?
             .seal_template()
@@ -659,7 +877,7 @@ fn certify_readout_regimes(
 #[cfg(test)]
 pub(crate) fn checked_features_graph_storage(
     backend: BackendName,
-    geometry: &DecoderGeometry,
+    geometry: &Decoder,
     norm_plan: &crate::WeightPlan,
     rows: u64,
     outputs: u64,
@@ -766,6 +984,22 @@ pub(crate) fn write_selection(
     selected_class: usize,
     row_words: usize,
 ) -> Result<(), SubmitError> {
+    let actual_selected = batch.select_rows.len();
+    let sources = (0..selected_class)
+        .map(|index| if index < actual_selected { index } else { 0 })
+        .collect::<Vec<_>>();
+    write_selection_rows(batch, active, ports, &sources, row_words)
+}
+
+/// Selection controls whose graph row `j` takes the pass's packed selection
+/// `sources[j]`.
+pub(crate) fn write_selection_rows(
+    batch: &TargetBatchUpload<'_>,
+    active: &mut seismic::NativeGraphFamilyActive<'_>,
+    ports: &SelectionPorts,
+    sources: &[usize],
+    row_words: usize,
+) -> Result<(), SubmitError> {
     fn device(error: impl std::fmt::Display) -> SubmitError {
         SubmitError::Device(DeviceError::Execution(error.to_string()))
     }
@@ -775,31 +1009,34 @@ pub(crate) fn write_selection(
             detail: detail.into(),
         })
     }
-    let actual_selected = batch.select_rows.len();
-    let source = |index: usize| if index < actual_selected { index } else { 0 };
+    let selected_class = sources.len();
     if let Some(shaping) = &ports.shaping {
-        let parameters = (0..selected_class)
-            .flat_map(|index| batch.shaping[source(index)])
+        let parameters = sources
+            .iter()
+            .flat_map(|&source| batch.shaping[source])
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
         active
             .write_input(&shaping.parameters, &parameters)
             .map_err(device)?;
-        let history = (0..selected_class)
-            .flat_map(|index| batch.history[source(index)])
+        let history = sources
+            .iter()
+            .flat_map(|&source| batch.history[source])
             .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>();
         active
             .write_input(&shaping.history, &history)
             .map_err(device)?;
     }
-    let draws = (0..selected_class)
-        .flat_map(|index| batch.draws[source(index)])
+    let draws = sources
+        .iter()
+        .flat_map(|&source| batch.draws[source])
         .flat_map(u32::to_le_bytes)
         .collect::<Vec<_>>();
     active.write_input(&ports.draws, &draws).map_err(device)?;
-    let mask_rows = (0..selected_class)
-        .map(|index| batch.mask_rows[source(index)])
+    let mask_rows = sources
+        .iter()
+        .map(|&source| batch.mask_rows[source])
         .collect::<Vec<_>>();
     let constrained = mask_rows
         .iter()
@@ -882,9 +1119,10 @@ mod resource_regime_tests {
         ] {
             let regimes = certify_readout_regimes(
                 backend,
-                &definition.geometry,
+                &definition.decoder,
                 weight(WeightKind::OutputNorm),
                 weight(WeightKind::Output),
+                FeatureSource::Output,
                 limits,
             )
             .unwrap();
@@ -892,9 +1130,10 @@ mod resource_regime_tests {
                 let layout = &regimes[&readout_regime(class)];
                 let bytes = checked_readout_class_draft(
                     NativeGraphMetadata::new(backend),
-                    &definition.geometry,
+                    &definition.decoder,
                     weight(WeightKind::OutputNorm),
                     Some(weight(WeightKind::Output)),
+                    FeatureSource::Output,
                     class,
                 )
                 .unwrap()

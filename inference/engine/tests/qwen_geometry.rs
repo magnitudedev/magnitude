@@ -2,9 +2,7 @@ use magnitude_artifacts::{
     gguf::{ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
     ArtifactIdentity, PackageIdentity,
 };
-use magnitude_family_contracts::{
-    FeedForwardGeometry, FeedForwardWeights, MixerGeometry, MixerWeights, RecurrentHeadMapping,
-};
+use magnitude_family_contracts::{Operator, RecurrentHeadMapping};
 use magnitude_family_qwen35::inspect_components;
 fn inspect(
     directory: &Directory,
@@ -151,23 +149,16 @@ fn dense_and_routed_roles_preserve_geometry_and_tied_output() {
     for routed in [false, true] {
         let d = directory(routed);
         let model = inspect(&d, ArtifactIdentity([0; 32])).unwrap();
-        let MixerGeometry::Recurrent(recurrent) = &model.geometry.blocks[0].mixer else {
+        let blocks = &model.decoder.blocks;
+        let Operator::GatedDelta(recurrent) = &blocks[0].sublayers[0].op else {
             panic!("first block must be recurrent")
         };
         assert_eq!(recurrent.channels().unwrap(), 16);
         assert_eq!(recurrent.head_mapping, RecurrentHeadMapping::Tiled);
-        assert_eq!(model.output, model.embedding);
-        assert!(matches!(&model.blocks[0].mixer, MixerWeights::Recurrent(_)));
-        assert!(matches!(&model.blocks[1].mixer, MixerWeights::Attention(_)));
+        assert_eq!(model.decoder.exit.output, model.decoder.entry.embedding);
+        assert!(matches!(&blocks[1].sublayers[0].op, Operator::Attention(_)));
         assert_eq!(
-            matches!(&model.blocks[0].feedforward, FeedForwardWeights::Routed(_)),
-            routed
-        );
-        assert_eq!(
-            matches!(
-                &model.geometry.blocks[0].feedforward,
-                FeedForwardGeometry::Routed(_)
-            ),
+            matches!(&blocks[0].sublayers[1].op, Operator::RoutedFfn(_)),
             routed
         );
     }
@@ -217,7 +208,11 @@ fn explicit_mixer_flags_bind_the_named_layer_order() {
         Value::Array(vec![Scalar::Bool(true), Scalar::Bool(false)]),
     );
     assert_eq!(
-        inspect(&d, ArtifactIdentity([0; 32])).unwrap().blocks.len(),
+        inspect(&d, ArtifactIdentity([0; 32]))
+            .unwrap()
+            .decoder
+            .blocks
+            .len(),
         2
     );
     set(
@@ -245,6 +240,7 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
         HostArtifacts::open(&PackageOptions {
             target: target.to_path_buf(),
             projector: ProjectorSelection::Discover,
+            draft: None,
         })
     };
     fn string(out: &mut Vec<u8>, value: &str) {
@@ -380,8 +376,9 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
         "{directory_error}"
     );
     let model = open(&temp.0).unwrap();
-    assert_eq!(model.definition().geometry.vocabulary, 257);
-    assert_eq!(model.definition().output, model.definition().embedding);
+    assert_eq!(model.definition().decoder.vocabulary, 257);
+    let decoder = &model.definition().decoder;
+    assert_eq!(decoder.exit.output, decoder.entry.embedding);
     let identity = model.definition().artifact_identity.to_string();
     // GGUF interpretation is retained; later pathname replacement cannot alter
     // its tokenizer/template metadata or the open weight source.

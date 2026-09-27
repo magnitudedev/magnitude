@@ -110,7 +110,9 @@ fn expand_kernel(
         &mapping.dense_expand_params(
             NativeSpecialization::new()
                 .with_static("H", case.h as u64)
-                .with_static("F", case.f as u64),
+                .with_static("F", case.f as u64)
+                .with_static("GS", 0)
+                .with_static("US", 0),
         ),
     )
     .unwrap()
@@ -132,7 +134,8 @@ fn output_kernel(
         &mapping.dense_output_params(
             NativeSpecialization::new()
                 .with_static("H", h as u64)
-                .with_static("F", f as u64),
+                .with_static("F", f as u64)
+                .with_static("DS", 0),
         ),
     )
     .unwrap()
@@ -150,6 +153,16 @@ fn cuda_dense_expand_matches_host_model() {
 #[test]
 fn cuda_dense_expand_iq4_matches_host_model() {
     dense_expand_cases(&[Format::Iq4], 9);
+}
+
+/// Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4 gate/up weights (the scaled GEMM for
+/// all but Q5_1).
+#[test]
+fn cuda_dense_expand_coded_matches_host_model() {
+    dense_expand_cases(
+        &[Format::Q4_0, Format::Q5_0, Format::Q5_1, Format::Mxfp4, Format::Nvfp4],
+        17,
+    );
 }
 
 fn dense_expand_cases(formats: &[Format], seed: u64) {
@@ -175,6 +188,9 @@ fn dense_expand_cases(formats: &[Format], seed: u64) {
                         up_weight: &up.tensor,
                         out_rows: &out_rows,
                         eps: EPSILON,
+                        activation: 0,
+                        gate_scale: &f32_tensor(&device, &[0], &[]),
+                        up_scale: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -193,9 +209,32 @@ fn dense_expand_cases(formats: &[Format], seed: u64) {
 fn cuda_dense_output_matches_host_model() {
     let Some(device) = cuda() else { return };
     let mut rng = Rng(11);
-    let (h, f) = (272, 512);
-    for format in Format::ALL {
-        let down = weight(&device, format, h, f, &mut rng);
+    dense_output_cases(&device, &Format::ALL, 272, 512, &mut rng);
+}
+
+/// Rows whose K is not a multiple of 256 (a partial last superblock):
+/// Gemma's 704 and 2112, Nemotron's 2688.
+#[test]
+fn cuda_dense_output_32_granular_k_matches_host_model() {
+    let Some(device) = cuda() else { return };
+    let mut rng = Rng(13);
+    let formats = [
+        Format::Q8,
+        Format::Q4_0,
+        Format::Q5_0,
+        Format::Q5_1,
+        Format::Mxfp4,
+        Format::Nvfp4,
+    ];
+    for f in [704, 2112, 2688] {
+        dense_output_cases(&device, &formats, 48, f, &mut rng);
+    }
+}
+
+fn dense_output_cases(device: &Device, formats: &[Format], h: usize, f: usize, rng: &mut Rng) {
+    let device = device.clone();
+    for &format in formats {
+        let down = weight(&device, format, h, f, rng);
         for o in ROWS {
             let m = o + 2;
             let out_rows_values: Vec<i32> = (0..o).map(|i| ((i * 5 + 3) % m) as i32).collect();
@@ -218,7 +257,13 @@ fn cuda_dense_output_matches_host_model() {
                     .collect();
                 // One A rounding of the projection, F32 accumulation and the
                 // GEMM's weight dequantization.
-                let dequant = dequant_bound(&x, &down.values, o, h, f, mapping);
+                // A scaled-GEMM format's weights enter exactly: no
+                // dequantization slack.
+                let dequant = if format.scaled_gemm() {
+                    vec![0.0; o * h]
+                } else {
+                    dequant_bound(&x, &down.values, o, h, f, mapping)
+                };
                 let tolerance: Vec<f64> = (0..o * h)
                     .map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + dequant[i] + 1e-6)
                     .collect();
@@ -228,6 +273,7 @@ fn cuda_dense_output_matches_host_model() {
                         product: &product,
                         down_weight: &down.tensor,
                         out_rows: &out_rows,
+                        down_scale: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -246,6 +292,7 @@ fn cuda_dense_output_matches_host_model() {
 #[ignore]
 fn cuda_dense_expand_scoped_tuning_is_factored() {
     let Some(device) = cuda() else { return };
+    let absent_scale = f32_tensor(&device, &[0], &[]);
     let mut rng = Rng(731);
     let (h, f) = (512usize, 272usize);
     let gate = weight(&device, Format::Q4K, f, h, &mut rng);
@@ -277,6 +324,9 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
                 up_weight: &up.tensor,
                 out_rows,
                 eps: EPSILON,
+                activation: 0,
+                gate_scale: &absent_scale,
+                up_scale: &absent_scale,
             }],
             initialize: None,
         })
@@ -298,7 +348,9 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
     });
     let statics = NativeSpecialization::new()
         .with_static("H", h as u64)
-        .with_static("F", f as u64);
+        .with_static("F", f as u64)
+        .with_static("GS", 0)
+        .with_static("US", 0);
     let result = dense_expand::native_tune_with(
         &device,
         dense_expand::Elements {
@@ -331,6 +383,7 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
 #[ignore]
 fn cuda_dense_output_scoped_tuning_is_factored() {
     let Some(device) = cuda() else { return };
+    let absent_scale = f32_tensor(&device, &[0], &[]);
     let mut rng = Rng(741);
     let (h, f) = (272usize, 512usize);
     let down = weight(&device, Format::Q5K, h, f, &mut rng);
@@ -364,6 +417,7 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
                     product,
                     down_weight: &down.tensor,
                     out_rows,
+                    down_scale: &absent_scale,
                 }],
                 initialize: None,
             },
@@ -386,7 +440,8 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
     });
     let statics = NativeSpecialization::new()
         .with_static("H", h as u64)
-        .with_static("F", f as u64);
+        .with_static("F", f as u64)
+        .with_static("DS", 0);
     let result = dense_output::native_tune_with(
         &device,
         dense_output::Elements {
@@ -444,7 +499,7 @@ fn cuda_dense_weights_match_host_model() {
                     UW: bf16,
                     A: bf16,
                 },
-                &mapping.dense_expand_params(statics.clone()),
+                &mapping.dense_expand_params(statics.clone().with_static("GS", 0).with_static("US", 0)),
             )
             .unwrap()
             .call(dense_expand::Args {
@@ -454,6 +509,9 @@ fn cuda_dense_weights_match_host_model() {
                 up_weight: &up.tensor,
                 out_rows: &out_rows,
                 eps: EPSILON,
+                activation: 0,
+                gate_scale: &f32_tensor(&device, &[0], &[]),
+                up_scale: &f32_tensor(&device, &[0], &[]),
             })
             .unwrap()
             .value;
@@ -481,7 +539,7 @@ fn cuda_dense_weights_match_host_model() {
             let result = dense_output::native_for_device_with(
                 &device,
                 dense_output::Elements { DW: bf16, A: bf16 },
-                &mapping.dense_output_params(statics),
+                &mapping.dense_output_params(statics.with_static("DS", 0)),
             )
             .unwrap()
             .call(dense_output::Args {
@@ -489,6 +547,7 @@ fn cuda_dense_weights_match_host_model() {
                 product: &product,
                 down_weight: &down.tensor,
                 out_rows: &out_rows,
+                down_scale: &f32_tensor(&device, &[0], &[]),
             })
             .unwrap()
             .value;
@@ -536,7 +595,9 @@ fn cuda_gemv_rows_match_single_row_bits() {
                 &mapping.dense_expand_params(
                     NativeSpecialization::new()
                         .with_static("H", h as u64)
-                        .with_static("F", f as u64),
+                        .with_static("F", f as u64)
+                        .with_static("GS", 0)
+                        .with_static("US", 0),
                 ),
             )
             .unwrap();
@@ -561,6 +622,9 @@ fn cuda_gemv_rows_match_single_row_bits() {
                         up_weight: &up.tensor,
                         out_rows: &out_rows,
                         eps: EPSILON,
+                        activation: 0,
+                        gate_scale: &f32_tensor(&device, &[0], &[]),
+                        up_scale: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -571,6 +635,7 @@ fn cuda_gemv_rows_match_single_row_bits() {
                         product: &product,
                         down_weight: &down.tensor,
                         out_rows: &out_rows,
+                        down_scale: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -659,6 +724,7 @@ fn cuda_head_rows_match_host_model() {
                     weight: &head.tensor,
                     out_rows: &out_rows,
                     epsilon: EPSILON,
+                    softcap: 0.0,
                 })
                 .unwrap()
                 .value;
@@ -786,6 +852,7 @@ fn cuda_features_and_selected_rows_match_host_model() {
                 out_rows: &out_rows,
                 selected: &selected,
                 epsilon: EPSILON,
+                softcap: 0.0,
             })
             .unwrap()
             .value;
@@ -825,6 +892,10 @@ fn dense_expand_host_model_matches_portable_body() {
     sources.push(SourceFile {
         path: "dense_rows.seismic".into(),
         text: include_str!("../kernels/dense_rows.seismic").into(),
+    });
+    sources.push(SourceFile {
+        path: "functions.seismic".into(),
+        text: include_str!("../kernels/functions.seismic").into(),
     });
     let module = check_source(sources).unwrap();
     for format in Format::ALL {
@@ -870,6 +941,7 @@ fn dense_expand_host_model_matches_portable_body() {
                 )),
                 Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::I32, vec![o], rows))),
                 Arg::Scalar(ReferenceScalar::F32(EPSILON.to_bits())),
+                Arg::Scalar(ReferenceScalar::I32(0)),
             ];
         let outcome = interpreter.run(&args).unwrap();
         if let SourceTermination::Failed(failure) = outcome.termination() {
@@ -917,6 +989,9 @@ fn cuda_embedding_rows_decode_table_rows() {
         .call(embedding_rows::Args {
             table: &table.tensor,
             tokens: &tokens,
+            scale: 1.0,
+            normalize: 0,
+            epsilon: 0.0,
         })
         .unwrap();
         let rounded = read_bf16(&result.r0);
@@ -1224,6 +1299,7 @@ fn cuda_shape_rows_match_portable_semantics() {
 #[ignore = "timing; run explicitly on the measurement host"]
 fn cuda_projection_timings() {
     let Some(device) = cuda() else { return };
+    let absent_scale = f32_tensor(&device, &[0], &[]);
     let mut rng = Rng(29);
     let options = seismic::MeasureOptions {
         samples: 15,
@@ -1261,6 +1337,9 @@ fn cuda_projection_timings() {
                         up_weight: &ups[r],
                         out_rows: &out_rows,
                         eps: EPSILON,
+                        activation: 0,
+                        gate_scale: &absent_scale,
+                        up_scale: &absent_scale,
                     })
                     .collect();
                 let measured = expand.measure(args, &options).unwrap();
@@ -1277,6 +1356,7 @@ fn cuda_projection_timings() {
                         product: &product,
                         down_weight: &downs[r],
                         out_rows: &out_rows,
+                        down_scale: &absent_scale,
                     })
                     .collect();
                 let measured = output.measure(args, &options).unwrap();
@@ -1335,6 +1415,7 @@ fn cuda_head_timings() {
                     weight: head,
                     out_rows: &out_rows,
                     epsilon: EPSILON,
+                    softcap: 0.0,
                 })
                 .collect();
             let measured = kernel.measure(args, &options).unwrap();

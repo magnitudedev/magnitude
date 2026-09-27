@@ -2,8 +2,8 @@
 //! single lexemes, and every compiled form accepts exactly the grammar's
 //! language, including when greedy lexing cannot be proven safe.
 use magnitude_chat::{
-    BpeConfig, ByteBpeTokenizer, CacheLimits, ConstraintPlan, PieceKind, SpecialTokens, TokenId,
-    Vocabulary,
+    BpeConfig, ByteBpeTokenizer, CacheLimits, ConstraintPlan, Normalization, PieceEncoding,
+    PieceKind, SpecialTokens, Split, SplitBehavior, TokenId, Vocabulary,
 };
 use magnitude_generation::grammar::{to_lark, CONVERTER_IDENTITY};
 use std::{collections::BTreeSet, sync::Arc};
@@ -32,9 +32,16 @@ fn tokenizer() -> Arc<ByteBpeTokenizer> {
             pieces,
             kinds,
             merges: vec![],
-            pattern: r".+|\s".into(),
-            normalize_nfc: false,
+            normalization: Normalization::None,
+            splits: vec![Split {
+                pattern: r".+|\s".into(),
+                behavior: SplitBehavior::Isolated,
+            }],
+            encoding: PieceEncoding::ByteLevel,
+            ignore_merges: false,
+            implicit_bos: None,
             stop_tokens: BTreeSet::from([TokenId(256)]),
+            suppressed_tokens: BTreeSet::new(),
         })
         .unwrap(),
     )

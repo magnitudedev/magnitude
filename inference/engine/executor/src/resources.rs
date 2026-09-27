@@ -8,7 +8,7 @@ pub use graph::{
 
 use crate::Stored;
 use crate::{
-    ExecutionPlan, InvariantError, PreparedHeadGraphs, PreparedStateCopyGraphs,
+    ExecutionPlan, InvariantError, PreparedDrafterGraphs, PreparedStateCopyGraphs,
     PreparedTargetGraphs, PreparedTargetReadoutGraphs, PreparedVisionGraphs, ResourceDomainId,
     WeightPlan,
 };
@@ -302,11 +302,15 @@ impl ResourceAllocator {
         let staged = || {
             // SAFETY: NativeImportProgram fills this exact tensor with
             // write_from_host before binding it as a kernel source.
-            unsafe { Tensor::uninitialized(device, weight.source, &[count]) }
+            unsafe { Tensor::uninitialized(device, weight.upload, &[count]) }
                 .map(ImportSource::Staged)
                 .map_err(|error| AllocationError::Device(error.to_string()))
         };
-        let source = if let Some(window) = window {
+        // A transformed or dequantized weight uploads the host's prepared
+        // bytes; only an unprepared one can read its stored range in place.
+        let source = if weight.host_prepared() {
+            staged()?
+        } else if let Some(window) = window {
             ImportSource::Mapped(window.tensor(stored, weight, count)?)
         } else if device.backend() == BackendName::Metal {
             #[cfg(unix)]
@@ -329,7 +333,7 @@ impl ResourceAllocator {
             ImportSource::Mapped(tensor) | ImportSource::Staged(tensor) => tensor,
         };
         if !tensor.belongs_to(device)
-            || tensor.element() != weight.source
+            || tensor.element() != weight.upload
             || tensor.extents() != [count]
             || tensor.byte_len() != weight.source_bytes
             || matches!(&source, ImportSource::Staged(_))
@@ -355,7 +359,7 @@ impl ResourceAllocator {
         domain: ResourceDomainId,
         target_graphs: &PreparedTargetGraphs,
         target_readout_graphs: &PreparedTargetReadoutGraphs,
-        head_graphs: Option<&PreparedHeadGraphs>,
+        head_graphs: Option<&PreparedDrafterGraphs>,
         vision_graphs: Option<&PreparedVisionGraphs>,
         state_graphs: &PreparedStateCopyGraphs,
     ) -> Result<AllocatedResources, AllocationError> {

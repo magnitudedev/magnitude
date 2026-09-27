@@ -9,7 +9,7 @@
 // -- --ignored --nocapture` (indicative on a shared development GPU; evidence
 // runs hold the GPU lock on a measurement host).
 
-use magnitude_kernels::gated_attention_decode;
+use magnitude_kernels::attention_decode;
 use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
 
 include!("attention_common/fixtures.rs");
@@ -36,22 +36,21 @@ fn decode_time_by_segment_count_on(device: &Device) {
     // The tuned 4B decode configuration: on the GPU (SPAN, PARTS, SIMDS)
     // with the statics; on CPU its default PARTS, no statics.
     let specialization = if is_cpu(device) {
-        NativeSpecialization::new().with_param("PARTS", 8)
+        qwen_form(
+            NativeSpecialization::new().with_static("P", QWEN.p as u64).with_static("S", QWEN.s as u64),
+            QWEN,
+        )
+        .with_param("PARTS", 8)
     } else {
-        let specialization = statics(QWEN)
+        qwen_form(statics(QWEN), QWEN)
             .with_param("SPAN", 32)
             .with_param("PARTS", 16)
-            .with_param("SIMDS", 4);
-        if device.backend() == BackendName::Vulkan {
-            let slices = vulkan_slices(QWEN, 4).next().expect("one slicing is admissible");
-            specialization.with_param("SLICES", slices)
-        } else {
-            specialization
-        }
+            .with_param("SIMDS", 4)
+            .with_param("SLICES", 1)
     };
-    let kernel = gated_attention_decode::native_for_device_with(
+    let kernel = attention_decode::native_for_device_with(
         device,
-        gated_attention_decode::Elements { A: Element::bf16() },
+        attention_decode::Elements { A: Element::bf16() },
         &specialization,
     )
     .unwrap();
@@ -84,13 +83,16 @@ fn decode_time_by_segment_count_on(device: &Device) {
                 let case = Case::new(QWEN, arena, segments, &rows, 3);
                 let Geometry { kv, g, p, .. } = case.geometry;
                 let (m, w, t) = (case.rows, case.geometry.w(), case.history_rows);
-                let query_gate = bf16_tensor(device, &[m, kv * g * 2 * w], &case.query_gate);
-                let key = bf16_tensor(device, &[m, kv * w], &case.key);
-                let value = bf16_tensor(device, &[m, kv * w], &case.value);
-                let query_norm = f32_tensor(device, &[w], &case.query_norm);
-                let key_norm = f32_tensor(device, &[w], &case.key_norm);
+                let query = bf16_tensor(device, &[m, kv * g, 2 * w], &case.query_gate);
+                let gate = bf16_tensor(device, &[m, kv * g, 0], &[]);
+                let key = bf16_tensor(device, &[1, m, kv * w], &case.key);
+                let value = bf16_tensor(device, &[1, m, kv * w], &case.value);
+                let query_norm = f32_tensor(device, &[1, w], &case.query_norm);
+                let key_norm = f32_tensor(device, &[1, w], &case.key_norm);
+                let value_norm = f32_tensor(device, &[0, w], &[]);
                 let components = i32_tensor(device, &[p], &case.components);
                 let frequencies = f32_tensor(device, &[p], &case.frequencies);
+                let amplitudes = f32_tensor(device, &[p], &vec![1.0; p]);
                 let coordinates = i32_tensor(device, &[m, 4], &case.coordinates);
                 let visible_spans = i32_tensor(device, &[m, case.spans, 2], &case.visible);
                 let fresh = i32_tensor(device, &[m, 2], &case.fresh);
@@ -99,14 +101,17 @@ fn decode_time_by_segment_count_on(device: &Device) {
                 let (_value_slabs, mut history_value) = history_slabs(device, t, kv, w, &case.history_value);
                 let measurement = kernel
                     .measure(
-                        vec![gated_attention_decode::Args {
-                            query_gate: &query_gate,
+                        vec![attention_decode::Args {
+                            query: &query,
+                            gate: &gate,
                             key: &key,
                             value: &value,
                             query_norm: &query_norm,
                             key_norm: &key_norm,
+                            value_norm: &value_norm,
                             rotary_components: &components,
                             rotary_frequencies: &frequencies,
+                            rotary_amplitudes: &amplitudes,
                             coordinates: &coordinates,
                             visible: &visible_spans,
                             fresh: &fresh,
@@ -115,6 +120,7 @@ fn decode_time_by_segment_count_on(device: &Device) {
                             history_value: &mut history_value,
                             epsilon: case.epsilon,
                             scale: case.scale,
+                            gate_function: 0,
                             slab_rows: t as u32,
                         }],
                         &TIMING,

@@ -53,7 +53,7 @@ async def measure(
 ) -> Observation:
     started = time.perf_counter()
     headers = ttft = completed = None
-    output = ""
+    output = reasoned = ""
     calls = {}
     finish = evidence = None
     outcome: Outcome = "protocol-error"
@@ -149,10 +149,16 @@ async def measure(
                     if not isinstance(delta, dict):
                         raise ValueError("missing delta")
                     content = delta.get("content") or ""
-                    if not isinstance(content, str):
+                    # A template that always opens a reasoning block (LFM2.5
+                    # 2.6B) streams its first output as reasoning text, which
+                    # both engines separate; for prose it is generated text
+                    # all the same.
+                    reasoning = delta.get("reasoning_content") or ""
+                    if not isinstance(content, str) or not isinstance(reasoning, str):
                         raise ValueError("content delta is not text")
                     output += content
-                    semantic = bool(content)
+                    reasoned += reasoning
+                    semantic = bool(content) or (request.workload == "prose" and bool(reasoning))
                     for call in delta.get("tool_calls") or []:
                         index = call.get("index")
                         if type(index) is not int or index < 0:
@@ -178,7 +184,8 @@ async def measure(
                 if evidence["usage"]["completion_tokens"] > request.output_limit:
                     raise ValueError("engine exceeded the shared output allowance")
                 if request.workload == "prose":
-                    if calls or not output.strip() or evidence["usage"]["completion_tokens"] < 1:
+                    text = output.strip() or reasoned.strip()
+                    if calls or not text or evidence["usage"]["completion_tokens"] < 1:
                         raise ValueError("prose response must contain text and no tool calls")
                     if finish == "length":
                         if evidence["usage"]["completion_tokens"] != request.output_limit:

@@ -2,8 +2,9 @@ use magnitude_chat::{
     generation::{generation_options, MethodPolicy, ModelLimits},
     request::{PromptCache, SamplingControls},
     BpeConfig, ByteBpeTokenizer, ChatError, ChatRequest, EndOfGeneration, Event, FinishReason,
-    GenerationControls, OutputToken, PieceKind, PreparedChat, SpecialTokens, TemplateBundle,
-    TemplateSelection, TemplateVariant, TerminalCause, TokenChatStream, TokenId,
+    GenerationControls, Normalization, OutputToken, PieceEncoding, PieceKind, PreparedChat,
+    SpecialTokens, Split, SplitBehavior, TemplateBundle, TemplateSelection, TemplateVariant,
+    TerminalCause, TokenChatStream, TokenId,
 };
 use std::collections::BTreeSet;
 
@@ -22,7 +23,8 @@ fn method_policy_is_qualified_against_the_prepared_method() {
     assert!(mtp.validate_method("plain").is_err());
 }
 
-fn tokenizer() -> ByteBpeTokenizer {
+/// Byte pieces 0..=255, `<eos>` 256 and `<bos>` 257.
+fn config() -> BpeConfig {
     let mut bytes: Vec<u8> = (33..=126).chain(161..=172).chain(174..=255).collect();
     let mut alphabet: Vec<u32> = bytes.iter().map(|&byte| u32::from(byte)).collect();
     let mut next = 256;
@@ -37,19 +39,29 @@ fn tokenizer() -> ByteBpeTokenizer {
     for (byte, code) in bytes.into_iter().zip(alphabet) {
         pieces[byte as usize] = char::from_u32(code).unwrap().to_string();
     }
-    pieces.push("<eos>".into());
+    pieces.extend(["<eos>".into(), "<bos>".into()]);
     let mut kinds = vec![PieceKind::Normal; 256];
-    kinds.push(PieceKind::Control);
-    ByteBpeTokenizer::new(BpeConfig {
+    kinds.extend([PieceKind::Control, PieceKind::Control]);
+    BpeConfig {
         artifact_identity: "fixture".into(),
         pieces,
         kinds,
         merges: vec![],
-        pattern: r".+|\s".into(),
-        normalize_nfc: true,
+        normalization: Normalization::Nfc,
+        splits: vec![Split {
+            pattern: r".+|\s".into(),
+            behavior: SplitBehavior::Isolated,
+        }],
+        encoding: PieceEncoding::ByteLevel,
+        ignore_merges: false,
+        implicit_bos: None,
         stop_tokens: BTreeSet::from([TokenId(256)]),
-    })
-    .unwrap()
+        suppressed_tokens: BTreeSet::new(),
+    }
+}
+
+fn tokenizer() -> ByteBpeTokenizer {
+    ByteBpeTokenizer::new(config()).unwrap()
 }
 
 fn bundle(suffix: &str) -> TemplateBundle {
@@ -270,6 +282,56 @@ fn preparation_counts_the_exact_rendered_prompt() {
     assert_eq!(prepared.input().tokenizer_identity, tokenizer.identity());
 }
 
+/// LFM, Gemma and Muse templates render the BOS text while their
+/// tokenizers also begin every sequence with the BOS; the prompt holds it once.
+#[test]
+fn implicit_bos_begins_every_prompt_exactly_once() {
+    let bos_first = ByteBpeTokenizer::new(BpeConfig {
+        implicit_bos: Some(TokenId(257)),
+        ..config()
+    })
+    .unwrap();
+    let request = ChatRequest::new(vec![serde_json::json!({"role":"user", "content":"é"})], 0);
+    let prepare = |source: &str| {
+        let bundle = TemplateBundle::new(
+            vec![TemplateVariant {
+                name: "default".into(),
+                source: source.into(),
+                provenance: "fixture".into(),
+            }],
+            "default".into(),
+            [("bos_token".to_string(), "<bos>".to_string())].into(),
+        )
+        .unwrap();
+        PreparedChat::prepare(&bundle, &bos_first, &request, &TemplateSelection::default())
+            .unwrap()
+            .input()
+            .tokens
+            .clone()
+    };
+    let expected = vec![TokenId(257), TokenId(195), TokenId(169)];
+    assert_eq!(
+        prepare("{{ bos_token }}{{ messages[0].content }}"),
+        expected
+    );
+    assert_eq!(prepare("<bos>{{ messages[0].content }}"), expected);
+    assert_eq!(prepare("{{ messages[0].content }}"), expected);
+    // Without an implicit BOS, the rendered text alone decides.
+    let plain = PreparedChat::prepare(
+        &bundle(""),
+        &tokenizer(),
+        &request,
+        &TemplateSelection::default(),
+    )
+    .unwrap();
+    assert_eq!(plain.input().tokens, vec![TokenId(195), TokenId(169)]);
+    // Fragments never receive the sequence start.
+    assert_eq!(
+        bos_first.encode("é", SpecialTokens::Recognize).unwrap(),
+        vec![TokenId(195), TokenId(169)]
+    );
+}
+
 #[test]
 fn token_stream_is_chunk_invariant_and_stops_before_semantic_parsing() {
     let tokenizer = tokenizer();
@@ -350,6 +412,7 @@ fn json_constrained_generation_starts_with_and_without_forced_runs() {
             context_limit: 256,
             vocabulary: tokenizer.vocabulary(),
             stop_tokens: tokenizer.stop_tokens().clone(),
+            suppressed_tokens: tokenizer.suppressed_tokens().clone(),
             sampling: Sampling::Greedy,
             shaping: Shaping {
                 temperature: 0.0,

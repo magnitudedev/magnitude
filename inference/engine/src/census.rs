@@ -57,11 +57,13 @@ impl AllocationCensus {
     /// Classify the device allocation domain's current Seismic charge from
     /// the heap's standing and holdings. Compute bytes are the plan's graph
     /// pools, which are fixed at startup; the model class is the remainder
-    /// of the charge, so every charged byte is reported exactly once.
+    /// of the charge, so every charged byte is reported exactly once. The
+    /// model's host-resident tables are model bytes of host RAM.
     pub(crate) fn classify(
         standing: &MemoryStanding,
         holdings: impl IntoIterator<Item = Holding>,
         compute_bytes: u64,
+        host_table_bytes: u64,
         domain: MemoryDomain,
     ) -> Result<Self, String> {
         let mut context_bytes = 0u64;
@@ -86,14 +88,32 @@ impl AllocationCensus {
             .and_then(|bytes| bytes.checked_sub(auxiliary_bytes))
             .and_then(|bytes| bytes.checked_sub(compute_bytes))
             .ok_or("classified memory exceeds the domain's charge")?;
-        Ok(Self {
-            domains: vec![DomainAllocation {
-                domain,
-                model_bytes,
-                context_bytes,
-                compute_bytes,
-                auxiliary_bytes,
+        let allocation = DomainAllocation {
+            domain,
+            model_bytes,
+            context_bytes,
+            compute_bytes,
+            auxiliary_bytes,
+        };
+        let domains = match (domain, host_table_bytes) {
+            (_, 0) => vec![allocation],
+            (MemoryDomain::HostRam, tables) => vec![DomainAllocation {
+                model_bytes: model_bytes
+                    .checked_add(tables)
+                    .ok_or("census byte count overflow")?,
+                ..allocation
             }],
-        })
+            (MemoryDomain::DeviceLocal { .. }, tables) => vec![
+                allocation,
+                DomainAllocation {
+                    domain: MemoryDomain::HostRam,
+                    model_bytes: tables,
+                    context_bytes: 0,
+                    compute_bytes: 0,
+                    auxiliary_bytes: 0,
+                },
+            ],
+        };
+        Ok(Self { domains })
     }
 }

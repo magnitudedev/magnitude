@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use magnitude_service_models::{
-    InventoryConfig, ManagedModelStore, ResolvingRecommendableCatalog, advance_model_catalog_lock,
+    CatalogLockAdvance, InventoryConfig, ManagedModelStore, ResolvingRecommendableCatalog, advance_model_catalog_lock,
     load_release_catalog,
 };
 
@@ -21,9 +21,14 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Advance the curated model source lock to current upstream commits.
+    ///
+    /// Without `--model`, every model that is not deprecated advances. With it, only the named
+    /// models advance and every other entry keeps its locked revisions.
     UpdateLock {
         #[arg(long)]
         output: PathBuf,
+        #[arg(long = "model")]
+        models: Vec<String>,
         #[arg(long)]
         model_store: PathBuf,
         #[arg(long)]
@@ -46,13 +51,14 @@ enum Command {
 
 async fn update_lock(
     output: PathBuf,
+    advance: CatalogLockAdvance,
     model_store: PathBuf,
     cache_root: PathBuf,
     hf_caches: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     let models = open_catalog_models(model_store, cache_root, hf_caches).await?;
     eprintln!("Resolving current catalog revisions...");
-    let lock = advance_model_catalog_lock(Arc::clone(&models)).await?;
+    let lock = advance_model_catalog_lock(Arc::clone(&models), advance).await?;
     eprintln!("Validating candidate catalog lock...");
     let generated = ResolvingRecommendableCatalog::new(models)
         .resolve_release_catalog_with_lock(lock.clone(), report_progress)
@@ -155,10 +161,18 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::UpdateLock {
             output,
+            models,
             model_store,
             cache_root,
             hf_caches,
-        } => update_lock(output, model_store, cache_root, hf_caches).await,
+        } => {
+            let advance = if models.is_empty() {
+                CatalogLockAdvance::All
+            } else {
+                CatalogLockAdvance::Models(models.into_iter().collect())
+            };
+            update_lock(output, advance, model_store, cache_root, hf_caches).await
+        }
         Command::BuildBundle {
             output,
             model_store,

@@ -208,16 +208,19 @@ fn served_points_keep_an_entry_whose_rows_exceed_the_bound() {
 
 #[test]
 fn rotations_take_distinct_layers_spread_over_depth() {
-    let scopes = (0..32).map(WeightScope::TargetBlock).collect::<Vec<_>>();
+    let block = |block| {
+        WeightScope::TargetSublayer(magnitude_family_contracts::SublayerIndex {
+            block,
+            sublayer: 0,
+        })
+    };
+    let scopes = (0..32).map(block).collect::<Vec<_>>();
     let rows = |rows| served_row_points(512, move |served| served == rows).remove(0);
     assert_eq!(
         TuningInputs::rotation_scopes(&scopes, &rows(4)),
-        [0, 8, 16, 24].map(WeightScope::TargetBlock)
+        [0, 8, 16, 24].map(block)
     );
-    assert_eq!(
-        TuningInputs::rotation_scopes(&scopes, &rows(32)),
-        [WeightScope::TargetBlock(0)]
-    );
+    assert_eq!(TuningInputs::rotation_scopes(&scopes, &rows(32)), [block(0)]);
     let few = [WeightScope::HeadBlock(0)];
     assert_eq!(TuningInputs::rotation_scopes(&few, &rows(1)), few);
 }
@@ -331,6 +334,7 @@ struct FakeArgs {
     product: Tensor,
     down: Tensor,
     out_rows: Tensor,
+    absent_scale: Tensor,
 }
 
 impl EntryTuning for FakeCase {
@@ -341,7 +345,7 @@ impl EntryTuning for FakeCase {
         "fake".into()
     }
     fn statics(&self, _inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
-        Ok(vec![("H", 8), ("F", 16)])
+        Ok(vec![("H", 8), ("F", 16), ("DS", 0)])
     }
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
@@ -358,6 +362,7 @@ impl EntryTuning for FakeCase {
                     product: inputs.scratch(Element::bf16(), &[point.rows, 16])?,
                     down: inputs.scratch(Element::bf16(), &[8, 16])?,
                     out_rows: inputs.every_row(point.rows)?,
+                    absent_scale: inputs.activation(Element::f32(), &[0], 0)?,
                 })
             })
             .collect()
@@ -368,6 +373,7 @@ impl EntryTuning for FakeCase {
             product: &case.product,
             down_weight: &case.down,
             out_rows: &case.out_rows,
+            down_scale: &case.absent_scale,
         }
     }
 
@@ -481,7 +487,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
-            spec.with_static(name.clone(), if name == "H" { 8 } else { 16 })
+            spec.with_static(name.clone(), if name == "DS" { 0 } else if name == "H" { 8 } else { 16 })
         });
     let case = FakeCase::new(&implementation, &statics, "fake");
     let configurations = implementation.admissible(&statics).unwrap().len();
@@ -580,7 +586,7 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
-            spec.with_static(name.clone(), if name == "H" { 8 } else { 16 })
+            spec.with_static(name.clone(), if name == "DS" { 0 } else if name == "H" { 8 } else { 16 })
         });
     let limits = TuningLimits {
         max_rows: 64,
@@ -688,12 +694,18 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
-            spec.with_static(name.clone(), 8)
+            spec.with_static(name.clone(), if name == "DS" { 0 } else { 8 })
         });
     let case = DenseOutputTuning {
         down: Element::bf16(),
         activation: Element::bf16(),
-        scopes: vec![WeightScope::TargetBlock(0)],
+        down_kind: WeightKind::DenseDown,
+        scopes: vec![WeightScope::TargetSublayer(
+            magnitude_family_contracts::SublayerIndex {
+                block: 0,
+                sublayer: 1,
+            },
+        )],
     };
     let key = ("dense_output", case.bindings(), statics.statics().clone());
     let mut tuner = Tuner::new(
@@ -743,9 +755,10 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     assert_eq!(batch.actual_rows, 6);
     assert_eq!(batch.actual_slots, 2);
     assert_eq!(batch.class.rows(), 8);
-    assert_eq!(&batch.destinations[..6], [512, 513, 514, 515, 516, 517]);
-    assert_eq!(batch.visible[0][0], [0, 256]);
-    assert_eq!(batch.visible[3][0], [256, 512]);
+    let history = &batch.histories[0];
+    assert_eq!(&history.destinations[..6], [512, 513, 514, 515, 516, 517]);
+    assert_eq!(history.visible[0][0], [0, 256]);
+    assert_eq!(history.visible[3][0], [256, 512]);
     assert_eq!(batch.coordinates[3][0], 256);
     assert_eq!(&batch.bank[..2], [1, 2]);
     assert_eq!(&batch.following_bank[..2], [3, 4]);

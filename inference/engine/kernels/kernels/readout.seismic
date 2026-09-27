@@ -47,10 +47,13 @@ native readout_features_rows for cpu from "cpu/readout_features_rows.rs":
 
 
 # The head (K1 projection): final RMS prologue over the `out_rows` rows, then
-# the vocabulary projection into F32 logits.
+# the vocabulary projection into F32 logits. With `softcap` > 0 each logit is
+# capped in F32 from the projection, softcap * tanh(z / softcap), written
+# through the sigmoid identity tanh(y) = 2 / (1 + exp(-2y)) - 1 (no tanh
+# primitive); 0 publishes the projection unchanged.
 fn readout_head_rows[M, O, V, D](hidden: &tensor[M, D] f32,
     norm: &tensor[D] NW, weight: &tensor[V, D] OW,
-    out_rows: &tensor[O] i32, epsilon: f32) -> tensor[O, V] f32:
+    out_rows: &tensor[O] i32, epsilon: f32, softcap: f32) -> tensor[O, V] f32:
     let mut selected = tensor[O, D] f32
     let mut features = tensor[O, D] A
     let mut logits = tensor[O, V] f32
@@ -59,6 +62,11 @@ fn readout_head_rows[M, O, V, D](hidden: &tensor[M, D] f32,
             selected[row, col] = hidden[out_rows[row], col]
     rms_norm(selected, norm, features, epsilon)
     linear(features, weight, logits)
+    if softcap > 0.0:
+        parallel for row in 0..O:
+            parallel for col in 0..V:
+                let z = logits[row, col]
+                logits[row, col] = softcap * (2.0 / (1.0 + exp(-2.0 * z / softcap)) - 1.0)
     return logits
 
 # Metal: rows below BATCH_FROM run the GEMV, BATCH_FROM..8 the batched GEMV,
@@ -160,11 +168,12 @@ native readout_head_rows for cpu from "cpu/readout_head_rows.rs":
         threads_per_threadgroup (1, 1, 1)
 
 
-# The head projection restricted to the `selected` vocabulary rows.
+# The head projection restricted to the `selected` vocabulary rows, with the
+# head's softcap (`readout_head_rows`).
 fn readout_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
     norm: &tensor[D] NW, weight: &tensor[V, D] OW,
     out_rows: &tensor[O] i32, selected: &tensor[Sv] i32,
-    epsilon: f32) -> tensor[O, Sv] f32:
+    epsilon: f32, softcap: f32) -> tensor[O, Sv] f32:
     let mut demanded = tensor[O, D] f32
     let mut features = tensor[O, D] A
     let mut logits = tensor[O, Sv] f32
@@ -180,6 +189,11 @@ fn readout_selected_rows[M, O, V, D, Sv](hidden: &tensor[M, D] f32,
                 zeros_like(logits[row : row + 1, col : col + 1], dtype=f32),
             )
             logits[row, col] = acc[0, 0]
+    if softcap > 0.0:
+        parallel for row in 0..O:
+            parallel for col in 0..Sv:
+                let z = logits[row, col]
+                logits[row, col] = softcap * (2.0 / (1.0 + exp(-2.0 * z / softcap)) - 1.0)
     return logits
 
 # Metal: the K1 projection with a weight row gather (the head's row classes).

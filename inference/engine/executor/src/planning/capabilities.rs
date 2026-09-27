@@ -15,6 +15,9 @@ pub enum PlannedMethod {
         greedy_proposals: u8,
         sampled_proposals: u8,
     },
+    /// A separate DFlash/DSpark draft drafting `proposals` tokens per block
+    /// pass, greedy and sampled alike: the block's width is fixed per load.
+    DFlash { proposals: u8 },
 }
 
 impl PlannedMethod {
@@ -27,7 +30,13 @@ impl PlannedMethod {
                 greedy_proposals,
                 sampled_proposals,
             } => usize::from(greedy_proposals.max(sampled_proposals)),
+            Self::DFlash { proposals } => usize::from(proposals),
         }
+    }
+
+    /// Whether the method drafts with the definition's drafter.
+    pub fn drafts(self) -> bool {
+        !matches!(self, Self::Plain)
     }
 }
 

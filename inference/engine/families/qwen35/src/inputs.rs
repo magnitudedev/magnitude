@@ -6,8 +6,8 @@ use magnitude_artifacts::{
     BoundaryRule, ImageProcessor, InputLayout, InputSpan, TokenId,
 };
 use magnitude_family_contracts::{
-    InputPreparationError, ModelDefinition, ModelInputAdapter, PreparedModelInput,
-    PreparedVisionInput, TokenPlan, VisionSpatialControls,
+    InputPreparationError, ModelDefinition, ModelInputAdapter, PositionSampling,
+    PreparedModelInput, PreparedVisionInput, TokenPlan, VisionSpatialControls,
 };
 use sha2::{Digest, Sha256};
 
@@ -98,21 +98,19 @@ impl ModelInputAdapter for QwenInputAdapter {
         if prepared.processor() != processor.identity() || prepared.tensors().len() != 2 {
             return Err(InputPreparationError::UnsupportedMedia);
         }
-        let width = [
-            vision.geometry.channels,
-            vision.geometry.temporal_patch,
-            vision.geometry.patch,
-            vision.geometry.patch,
-        ]
-        .into_iter()
-        .try_fold(1u64, |value, extent| value.checked_mul(extent))
-        .and_then(|value| usize::try_from(value).ok())
-        .ok_or(InputPreparationError::VisionGeometry)?;
-        let merge = usize::try_from(vision.geometry.merge)
+        let width = vision
+            .patch_row_width()
+            .ok()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(InputPreparationError::VisionGeometry)?;
+        let merge = usize::try_from(vision.preprocessing.merge)
             .ok()
             .filter(|value| *value > 0)
             .ok_or(InputPreparationError::VisionGeometry)?;
-        let table_side = usize::try_from(vision.geometry.table_side)
+        let PositionSampling::AlignedCorners { side } = vision.stem.positions().sampling else {
+            return Err(InputPreparationError::VisionGeometry);
+        };
+        let table_side = usize::try_from(side)
             .ok()
             .filter(|value| *value > 0)
             .ok_or(InputPreparationError::VisionGeometry)?;
@@ -381,5 +379,11 @@ pub fn spatial_controls(
             }
         }
     }
-    VisionSpatialControls::new((0..rows).collect(), coordinates, indices, coefficients)
+    VisionSpatialControls::new(
+        (0..rows).collect(),
+        coordinates,
+        indices,
+        coefficients,
+        Vec::new(),
+    )
 }

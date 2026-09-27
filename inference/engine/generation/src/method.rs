@@ -7,6 +7,18 @@ use magnitude_executor::{
 pub enum MethodChoice {
     Plain,
     Mtp { proposals: u8 },
+    /// A separate DFlash or DSpark draft model.
+    DFlash { proposals: u8 },
+}
+
+impl MethodChoice {
+    /// The most tokens one round drafts.
+    pub fn proposals(self) -> usize {
+        match self {
+            Self::Plain => 0,
+            Self::Mtp { proposals } | Self::DFlash { proposals } => usize::from(proposals),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,7 +31,8 @@ pub struct MethodRequirements {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MethodCheckpoint {
     Plain,
-    Mtp(MtpCheckpoint),
+    Mtp(DraftCheckpoint),
+    DFlash(DraftCheckpoint),
 }
 
 impl MethodCheckpoint {
@@ -27,15 +40,15 @@ impl MethodCheckpoint {
     pub fn retained_bytes(&self) -> u64 {
         match self {
             Self::Plain => 0,
-            Self::Mtp(checkpoint) => checkpoint.retained_bytes(),
+            Self::Mtp(checkpoint) | Self::DFlash(checkpoint) => checkpoint.retained_bytes(),
         }
     }
 }
 
-/// The draft head's reconciled state at a numerical boundary: the head
-/// position and the target-conditioned rows it has not yet entered.
+/// A target-conditioned drafter's reconciled state at a numerical boundary:
+/// its position and the target-conditioned rows it has not yet entered.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MtpCheckpoint {
+pub struct DraftCheckpoint {
     pub(crate) position: usize,
     pub(crate) pending: Option<PendingRows>,
     pub(crate) open: Option<FeatureRows>,
@@ -49,7 +62,7 @@ pub(crate) struct PendingRows {
     pub(crate) features: FeatureRows,
 }
 
-impl MtpCheckpoint {
+impl DraftCheckpoint {
     pub const fn position(&self) -> usize {
         self.position
     }

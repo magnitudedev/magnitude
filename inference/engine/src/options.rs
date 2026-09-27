@@ -6,8 +6,8 @@
 
 use magnitude_artifacts::{Package, PackageIdentity, PackageManifest};
 use magnitude_chat::generation::MethodPolicy;
-use magnitude_generation::{Method, Mtp, Plain};
-use magnitude_family_contracts::{FeedForwardGeometry, ModelDefinition, ModelFamily};
+use magnitude_generation::{DFlash, Method, Mtp, Plain};
+use magnitude_family_contracts::{ModelDefinition, ModelFamily, Operator};
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     ExecutionPath, ResourcePlan, MAX_DRAFT_PROPOSALS,
@@ -43,33 +43,43 @@ pub enum ProjectorSelection {
 pub struct PackageOptions {
     pub target: PathBuf,
     pub projector: ProjectorSelection,
+    /// A separate draft model (DFlash, DSpark) for the target.
+    pub draft: Option<PathBuf>,
 }
 
 impl PackageOptions {
     pub fn open(&self) -> Result<Package, magnitude_artifacts::Error> {
-        match &self.projector {
+        let package = match &self.projector {
             ProjectorSelection::Discover => Package::open(&self.target),
             ProjectorSelection::Disabled => Package::open_without_projector(&self.target),
             ProjectorSelection::Explicit(projector) => {
                 Package::open_with_projector(&self.target, projector)
             }
+        }?;
+        match &self.draft {
+            Some(draft) => package.with_draft(draft),
+            None => Ok(package),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ModelMethod {
+    /// A package's separate draft when it has one, else its draft head,
+    /// else plain generation.
     #[default]
     Auto,
     Plain,
     Mtp,
+    DFlash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelPolicy {
     pub method: ModelMethod,
-    /// Explicit proposal width for both greedy and sampled requests. When
-    /// absent, the measured fixed-width policy is resolved from model shape.
+    /// Explicit proposal width of the drafter (MTP or DFlash) for both greedy
+    /// and sampled requests. When absent, the measured fixed-width policy is
+    /// resolved from model shape.
     pub mtp_proposals: Option<u8>,
     pub kv_codec: KvCodec,
     /// Queue each plain decode step's successor on the device before the
@@ -95,6 +105,8 @@ pub enum ResolvedMethod {
         greedy_proposals: u8,
         sampled_proposals: u8,
     },
+    /// A separate draft drafting `proposals` tokens per block.
+    DFlash { proposals: u8 },
 }
 
 impl ResolvedMethod {
@@ -107,6 +119,7 @@ impl ResolvedMethod {
                 greedy_proposals,
                 sampled_proposals,
             } => usize::from(greedy_proposals.max(sampled_proposals)),
+            Self::DFlash { proposals } => usize::from(proposals),
         }
     }
 
@@ -121,6 +134,7 @@ impl ResolvedMethod {
                 greedy_proposals,
                 sampled_proposals,
             },
+            Self::DFlash { proposals } => MethodPolicy::DFlash { proposals },
         }
     }
 
@@ -128,6 +142,23 @@ impl ResolvedMethod {
         match self {
             Self::Plain => Ok(Arc::new(Plain)),
             Self::Mtp { .. } => Ok(Arc::new(Mtp::new(artifact_identity, self.proposals())?)),
+            Self::DFlash { .. } => Ok(Arc::new(DFlash::new(artifact_identity, self.proposals())?)),
+        }
+    }
+
+    /// The definition a load of this method executes: it carries at most
+    /// the drafter the method runs (a plain load keeps its draft head, which
+    /// it never selects).
+    pub fn executed(self, definition: ModelDefinition) -> ModelDefinition {
+        match self {
+            Self::DFlash { .. } => ModelDefinition {
+                head: None,
+                ..definition
+            },
+            Self::Plain | Self::Mtp { .. } => ModelDefinition {
+                draft: None,
+                ..definition
+            },
         }
     }
 }
@@ -147,7 +178,9 @@ impl ModelPolicy {
         Ok(ResolvedModelPolicy {
             method,
             kv_codec: self.kv_codec,
-            lookahead: self.lookahead,
+            // A per-layer entry gathers host-table rows by host tokens, so
+            // its steps cannot chain on device-selected tokens.
+            lookahead: self.lookahead && definition.decoder.entry.per_layer.is_none(),
         })
     }
 }
@@ -283,6 +316,7 @@ impl ExecutionManifest {
         kernel_cache: Option<PathBuf>,
         reserves: MemoryReserves,
     ) -> Result<Self, String> {
+        let definition = model.method.executed(definition);
         definition.validate().map_err(|error| error.to_string())?;
         service.validate()?;
         if package.identity != definition.artifact_identity {
@@ -307,9 +341,32 @@ fn resolve_method(
     definition: &ModelDefinition,
 ) -> Result<ResolvedMethod, String> {
     let head = definition.head.as_ref();
+    let use_dflash = match requested {
+        ModelMethod::Auto => definition.draft.is_some(),
+        ModelMethod::DFlash => true,
+        ModelMethod::Plain | ModelMethod::Mtp => false,
+    };
+    if use_dflash {
+        let draft = definition
+            .draft
+            .as_ref()
+            .ok_or("DFlash was requested but the package has no draft")?;
+        let bound = u8::try_from(draft.max_proposals())
+            .map_err(|_| "the draft's block exceeds the proposal width range")?;
+        let proposals = match override_width {
+            Some(0) => return Err("mtp_proposals must be positive".into()),
+            Some(width) if width > bound => {
+                return Err(format!("the draft proposes at most {bound} tokens per block"))
+            }
+            Some(width) => width,
+            None => DEFAULT_PROPOSALS.min(bound),
+        };
+        return Ok(ResolvedMethod::DFlash { proposals });
+    }
     let use_mtp = match requested {
-        ModelMethod::Auto => head.is_some(),
-        ModelMethod::Plain => false,
+        // A head this executor does not run leaves the model plain.
+        ModelMethod::Auto => magnitude_executor::head_admitted(definition),
+        ModelMethod::Plain | ModelMethod::DFlash => false,
         ModelMethod::Mtp => true,
     };
     if !use_mtp {
@@ -320,10 +377,9 @@ fn resolve_method(
     }
     head.ok_or("MTP was requested but the artifact has no draft head")?;
     let routed = definition
-        .geometry
-        .blocks
-        .iter()
-        .any(|block| matches!(&block.feedforward, FeedForwardGeometry::Routed(_)));
+        .decoder
+        .sublayers()
+        .any(|(_, sublayer)| matches!(sublayer.op, Operator::RoutedFfn(_)));
     let (greedy_proposals, sampled_proposals) = match override_width {
         Some(0) => return Err("mtp_proposals must be positive".into()),
         Some(width) if width > MAX_DRAFT_PROPOSALS => {
@@ -345,65 +401,86 @@ mod tests {
     use super::*;
     use magnitude_artifacts::PackageIdentity;
     use magnitude_family_contracts::{
-        ActivationDType, AttentionGeometry, AttentionWeights, BlockGeometry, BlockWeights,
-        DecoderGeometry, DenseFeedForwardWeights, FeedForwardWeights, HeadBlock, HeadWeights,
-        MixerGeometry, MixerWeights, RotarySemantics, WeightDescriptor,
+        ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
+        EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, Head,
+        HeadBlock, HeadNorm, HistoryDomain, HistoryReads, InputNorm, KeyValue, MediaRowAttention,
+        OutputForm, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource,
+        WeightDescriptor,
     };
 
     fn weight(name: &str, shape: &[u64]) -> WeightDescriptor {
-        WeightDescriptor {
-            name: name.into(),
-            shape: shape.to_vec(),
+        WeightDescriptor::stored(name, shape)
+    }
+
+    fn rms(name: &str) -> RmsNorm {
+        RmsNorm {
+            weight: weight(name, &[2]),
+            epsilon: 1e-6,
         }
     }
 
-    fn definition(with_head: bool) -> ModelDefinition {
-        let attention_geometry = AttentionGeometry {
+    /// One attention and one dense sublayer, their weights named with `p`.
+    fn block(p: &str) -> Block {
+        let attention = Attention {
             heads: 1,
             kv_heads: 1,
             width: 2,
-            rotary: RotarySemantics::Interleaved {
+            query: weight(&format!("{p}qg"), &[4, 2]),
+            gate: AttentionGate::Interleaved {
+                function: GateFunction::Sigmoid,
+            },
+            query_norm: HeadNorm::Rms(rms(&format!("{p}qn"))),
+            key_value: KeyValue::Owned {
+                key: weight(&format!("{p}k"), &[2, 2]),
+                value: ValueSource::Projected(weight(&format!("{p}v"), &[2, 2])),
+                key_norm: HeadNorm::Rms(rms(&format!("{p}kn"))),
+                value_norm: ValueNorm::None,
+                domain: HistoryDomain::Token,
+            },
+            rotary: Rotary::Interleaved {
                 width: 2,
                 base: 10_000.0,
                 sections: vec![1],
                 axis_pattern: vec![0],
             },
+            scale: 1.0 / 2f64.sqrt(),
+            reads: HistoryReads::Visible,
+            media_rows: MediaRowAttention::Causal,
+            output: weight(&format!("{p}o"), &[2, 2]),
         };
-        let attention = || AttentionWeights {
-            query_gate: weight("qg", &[4, 2]),
-            key: weight("k", &[2, 2]),
-            value: weight("v", &[2, 2]),
-            query_norm: weight("qn", &[2]),
-            key_norm: weight("kn", &[2]),
-            output: weight("o", &[2, 2]),
+        let dense = DenseFfn {
+            intermediate: 4,
+            up: FeedForwardUp::Gated {
+                activation: ActivationFunction::Silu,
+                gate: weight(&format!("{p}g"), &[4, 2]),
+                up: weight(&format!("{p}u"), &[4, 2]),
+            },
+            down: weight(&format!("{p}d"), &[2, 4]),
         };
-        let dense = || DenseFeedForwardWeights {
-            gate: weight("g", &[4, 2]),
-            up: weight("u", &[4, 2]),
-            down: weight("d", &[2, 4]),
-        };
-        let geometry = DecoderGeometry {
-            activation_dtype: ActivationDType::BF16,
-            hidden: 2,
-            vocabulary: 8,
-            context_limit: 128,
-            epsilon: 1e-6,
-            blocks: vec![BlockGeometry {
-                mixer: MixerGeometry::Attention(attention_geometry),
-                feedforward: FeedForwardGeometry::Dense { intermediate: 4 },
-            }],
-        };
-        let head = with_head.then(|| HeadWeights {
+        Block {
+            sublayers: vec![
+                Sublayer {
+                    input: InputNorm::Rms(rms(&format!("{p}in"))),
+                    op: Operator::Attention(Box::new(attention)),
+                    output: OutputForm::Residual,
+                },
+                Sublayer {
+                    input: InputNorm::Rms(rms(&format!("{p}fn"))),
+                    op: Operator::DenseFfn(Box::new(dense)),
+                    output: OutputForm::Residual,
+                },
+            ],
+        }
+    }
+
+    fn definition(with_head: bool) -> ModelDefinition {
+        let head = with_head.then(|| Head {
             blocks: vec![HeadBlock {
-                embedding_norm: weight("en", &[2]),
-                hidden_norm: weight("hn", &[2]),
+                embedding_norm: rms("en"),
+                hidden_norm: rms("hn"),
                 combine: weight("combine", &[2, 4]),
-                input_norm: weight("hin", &[2]),
-                attention: attention(),
-                feedforward_norm: weight("hfn", &[2]),
-                feedforward_geometry: FeedForwardGeometry::Dense { intermediate: 4 },
-                feedforward: FeedForwardWeights::Dense(Box::new(dense())),
-                output_norm: weight("hon", &[2]),
+                block: block("h"),
+                output_norm: ExitNorm::Rms(rms("hon")),
             }],
         });
         ModelDefinition {
@@ -412,23 +489,34 @@ mod tests {
                 target: magnitude_artifacts::ArtifactIdentity([1; 32]),
                 projector: None,
             },
-            geometry,
             inputs: magnitude_family_contracts::InputSemantics {
                 coordinate_axes: 1,
                 text_coordinates:
                     magnitude_family_contracts::TextCoordinateSemantics::ReplicatedPosition,
             },
-            embedding: weight("embedding", &[8, 2]),
-            blocks: vec![BlockWeights {
-                input_norm: weight("in", &[2]),
-                mixer: MixerWeights::Attention(Box::new(attention())),
-                feedforward_norm: weight("fn", &[2]),
-                feedforward: FeedForwardWeights::Dense(Box::new(dense())),
-            }],
-            output_norm: weight("on", &[2]),
-            output: weight("out", &[8, 2]),
+            decoder: Decoder {
+                activation_dtype: ActivationDType::BF16,
+                hidden: 2,
+                vocabulary: 8,
+                context_limit: 128,
+                residual: ResidualForm::Single,
+                entry: EntryForm {
+                    embedding: weight("embedding", &[8, 2]),
+                    scale: EmbeddingScale::Unit,
+                    norm: None,
+                    per_layer: None,
+                    hash_routing: None,
+                },
+                blocks: vec![block("")],
+                exit: ExitForm {
+                    norm: ExitNorm::Rms(rms("on")),
+                    output: weight("out", &[8, 2]),
+                    softcap: None,
+                },
+            },
             head,
             vision: None,
+            draft: None,
         }
     }
 
@@ -495,6 +583,7 @@ mod tests {
                 }],
             },
             projector: None,
+            draft: None,
         };
         let model = ModelPolicy::default().resolve(&definition).unwrap();
         let manifest = ExecutionManifest::new(

@@ -6,7 +6,7 @@
 // `cuda/lib/recurrent/recurrent.cuh`, whose arithmetic it follows.
 // Activation tensors are canonical in their last axis.
 #include "../core/activation.glsl"
-#include <seismic/slab.glsl>
+#include "versions.glsl"
 
 #define RECURRENT_NK uint(SEISMIC_DIM_NK)
 #define RECURRENT_NV uint(SEISMIC_DIM_NV)
@@ -75,7 +75,7 @@ int recurrent_tape_rows(recurrent_slot slot) {
 
 // Byte address of tape row `entry` of `bank`.
 uint64_t recurrent_tape_row(recurrent_inputs in_, int bank, int entry) {
-    return slab_row(in_.tape, uint64_t(bank), SEISMIC_PARAM_SLAB_BANKS, SEISMIC_TAPE_STRIDE_0 * 4ul)
+    return versions_bank(in_.tape, bank, SEISMIC_TAPE_STRIDE_0 * 4ul)
         + uint64_t(entry) * SEISMIC_TAPE_STRIDE_1 * 4ul;
 }
 
@@ -98,15 +98,14 @@ float recurrent_projection(recurrent_inputs in_, uint64_t row, uint64_t column) 
 
 uint64_t recurrent_window_at(recurrent_inputs in_, int bank, int tap, uint64_t channel) {
     const uint64_t element_bytes = ELEMENT_BYTES(ELEMENT_ACT);
-    return slab_row(in_.window, uint64_t(bank), SEISMIC_PARAM_SLAB_BANKS,
-            SEISMIC_WINDOW_STRIDE_0 * element_bytes)
+    return versions_bank(in_.window, bank, SEISMIC_WINDOW_STRIDE_0 * element_bytes)
         + (uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1 + channel) * element_bytes;
 }
 
 // Byte address of state row `state_row` of value head `head` in `bank`: W
 // contiguous floats.
 uint64_t recurrent_state_row(recurrent_inputs in_, int bank, uint head, uint state_row) {
-    return slab_row(in_.delta, uint64_t(bank), SEISMIC_PARAM_SLAB_BANKS, SEISMIC_DELTA_STRIDE_0 * 4ul)
+    return versions_bank(in_.delta, bank, SEISMIC_DELTA_STRIDE_0 * 4ul)
         + (uint64_t(head) * SEISMIC_DELTA_STRIDE_1 + uint64_t(state_row) * SEISMIC_DELTA_STRIDE_2) * 4ul;
 }
 

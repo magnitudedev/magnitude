@@ -7,8 +7,8 @@ use magnitude_artifacts::{
     ImageProcessor, InputLayout, TokenId,
 };
 use magnitude_family_contracts::{
-    FeedForwardGeometry, FeedForwardWeights, MixerGeometry, MixerWeights, ModelInputAdapter,
-    RecurrentHeadMapping, TokenPlan,
+    AttentionGate, GateFunction, ImportTransform, InputNorm, ModelInputAdapter, Operator,
+    OutputForm, PositionSampling, RecurrentHeadMapping, RowRange, TokenPlan, VisionResize,
 };
 use magnitude_family_qwen35::inputs::{QwenImageTokens, QwenInputAdapter};
 use magnitude_family_qwen35::{describe_projector, inspect_components, recognize, Architecture};
@@ -236,17 +236,12 @@ fn routed_mtp_head_uses_expert_roles_without_dense_intermediate_metadata() {
         },
     )
     .unwrap();
-    assert_eq!(model.geometry.blocks.len(), 2);
+    assert_eq!(model.decoder.blocks.len(), 2);
     let head = model.head.unwrap();
     assert_eq!(head.depth(), 1);
-    assert!(matches!(
-        head.blocks[0].feedforward,
-        FeedForwardWeights::Routed(_)
-    ));
-    assert!(matches!(
-        head.blocks[0].feedforward_geometry,
-        FeedForwardGeometry::Routed(_)
-    ));
+    let sublayers = &head.blocks[0].block.sublayers;
+    assert!(matches!(sublayers[0].op, Operator::Attention(_)));
+    assert!(matches!(sublayers[1].op, Operator::RoutedFfn(_)));
 }
 
 fn projector() -> Directory {
@@ -269,7 +264,8 @@ fn projector() -> Directory {
         scalar("clip.vision.block_count", Scalar::Unsigned(1)),
         scalar("clip.vision.embedding_length", Scalar::Unsigned(4)),
         scalar("clip.vision.feed_forward_length", Scalar::Unsigned(8)),
-        scalar("clip.vision.attention.head_count", Scalar::Unsigned(2)),
+        // One head of width 4: the smallest 2-D rotary head.
+        scalar("clip.vision.attention.head_count", Scalar::Unsigned(1)),
         scalar("clip.vision.patch_size", Scalar::Unsigned(2)),
         scalar("clip.vision.spatial_merge_size", Scalar::Unsigned(2)),
         scalar("clip.vision.image_size", Scalar::Unsigned(4)),
@@ -360,25 +356,35 @@ fn binds_dense_and_routed_geometry_to_semantic_roles() {
             },
         )
         .unwrap();
-        let MixerGeometry::Recurrent(recurrent) = &model.geometry.blocks[0].mixer else {
+        let decoder = &model.decoder;
+        let Operator::GatedDelta(recurrent) = &decoder.blocks[0].sublayers[0].op else {
             panic!("first block must be recurrent")
         };
         assert_eq!(recurrent.channels().unwrap(), 16);
         assert_eq!(recurrent.head_mapping, RecurrentHeadMapping::Tiled);
-        assert_eq!(model.output, model.embedding);
-        assert!(matches!(&model.blocks[0].mixer, MixerWeights::Recurrent(_)));
-        assert!(matches!(&model.blocks[1].mixer, MixerWeights::Attention(_)));
-        assert_eq!(
-            matches!(&model.blocks[0].feedforward, FeedForwardWeights::Routed(_)),
-            routed
-        );
-        assert_eq!(
-            matches!(
-                &model.geometry.blocks[0].feedforward,
-                FeedForwardGeometry::Routed(_)
-            ),
-            routed
-        );
+        assert_eq!(decoder.exit.output, decoder.entry.embedding);
+        let Operator::Attention(attention) = &decoder.blocks[1].sublayers[0].op else {
+            panic!("second block must be attention")
+        };
+        assert!(matches!(
+            attention.gate,
+            AttentionGate::Interleaved {
+                function: GateFunction::Sigmoid
+            }
+        ));
+        assert_eq!(attention.scale, 1.0 / (attention.width as f64).sqrt());
+        for block in &decoder.blocks {
+            assert_eq!(block.sublayers.len(), 2);
+            assert_eq!(
+                matches!(block.sublayers[1].op, Operator::RoutedFfn(_)),
+                routed
+            );
+            assert!(block
+                .sublayers
+                .iter()
+                .all(|sublayer| sublayer.output == OutputForm::Residual
+                    && matches!(sublayer.input, InputNorm::Rms(_))));
+        }
     }
 }
 
@@ -422,7 +428,7 @@ fn binds_every_mtp_role_outside_the_target_geometry() {
         },
     )
     .unwrap();
-    assert_eq!(model.geometry.blocks.len(), 2);
+    assert_eq!(model.decoder.blocks.len(), 2);
     let head = model.head.unwrap();
     assert_eq!(head.depth(), 1);
     assert_eq!(head.blocks[0].combine.shape, [8, 16]);
@@ -466,18 +472,35 @@ fn binds_every_mtp_role_outside_the_target_geometry() {
 fn projector_description_validates_roles_and_fused_qkv_ranges() {
     let projector = projector();
     let vision = describe_projector(&projector).unwrap();
-    assert_eq!(vision.geometry.table_side, 2);
-    assert_eq!(vision.geometry.temporal_patch, 2);
-    assert_eq!(vision.preprocessing.processor, "qwen3vl_merger");
-    assert_eq!(vision.preprocessing.min_pixels, 65_536);
-    assert_eq!(vision.preprocessing.max_pixels, 16_777_216);
+    assert_eq!(
+        vision.stem.positions().sampling,
+        PositionSampling::AlignedCorners { side: 2 }
+    );
+    assert_eq!(vision.stem.frames(), 2);
+    assert_eq!(
+        vision.preprocessing.resize,
+        VisionResize::PixelBounds {
+            min_pixels: 65_536,
+            max_pixels: 16_777_216
+        }
+    );
     let processor = vision.image_processor_config().unwrap();
     assert_eq!(processor.patch, 2);
     assert_eq!(processor.merge, 2);
-    assert_eq!(processor.temporal_patch, 2);
-    assert_eq!(vision.blocks[0].attention.qkv.query.start, 0);
-    assert_eq!(vision.blocks[0].attention.qkv.key.start, 4);
-    assert_eq!(vision.blocks[0].attention.qkv.value.start, 8);
+    assert_eq!(processor.frames, 2);
+    // The fused QKV projection and its bias are imported as three row ranges.
+    let attention = &vision.blocks[0].attention;
+    for (part, linear) in [&attention.query, &attention.key, &attention.value]
+        .into_iter()
+        .enumerate()
+    {
+        let expected = ImportTransform::Rows(RowRange {
+            start: part as u64 * 4,
+            rows: 4,
+        });
+        assert_eq!(linear.weight.transforms, [expected.clone()]);
+        assert_eq!(linear.bias.as_ref().unwrap().transforms, [expected]);
+    }
 
     let mut target = directory(false);
     target.metadata.push(Metadata {
@@ -548,8 +571,13 @@ fn projector_pixel_bounds_override_processor_defaults() {
         },
     ]);
     let vision = describe_projector(&projector).unwrap();
-    assert_eq!(vision.preprocessing.min_pixels, 1_024);
-    assert_eq!(vision.preprocessing.max_pixels, 4_096);
+    assert_eq!(
+        vision.preprocessing.resize,
+        VisionResize::PixelBounds {
+            min_pixels: 1_024,
+            max_pixels: 4_096
+        }
+    );
 }
 
 #[test]

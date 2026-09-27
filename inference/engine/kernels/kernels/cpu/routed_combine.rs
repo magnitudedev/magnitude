@@ -8,7 +8,7 @@
 // their scores in slot order, and publishes
 //     residual + selected + A(shared) * coefficient.
 
-use lib::core::activation;
+use lib::core::{activation, functions};
 use lib::projection::projection;
 use lib::routed::routed;
 
@@ -70,6 +70,7 @@ fn routed_combine_shared<L: Isa, E: Elements>(
             rows.start,
             &staged[row * h..(row + 1) * h],
             q8,
+            functions::SILU,
             out,
         );
     }

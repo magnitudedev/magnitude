@@ -1,8 +1,8 @@
 //! Analytical decode-speed estimation: a model's header-derived decode demand
 //! evaluated against the measurement basis at each requested context depth.
 
-use super::basis::{ClassMeasurement, MeasurementBasis, SecondsBand};
-use super::demand::DecodeDemand;
+use super::basis::{CostModel, MeasurementBasis, MeasurementKey, SecondsBand};
+use super::demand::{DecodeDemand, DemandTerm, TermShape};
 use super::AssessmentError;
 
 /// How reliable an estimate is, from the relative width of its measured
@@ -56,6 +56,79 @@ impl PerformanceConfidence {
     }
 }
 
+/// Every term's share of the plain decode step at `depth`, at the class's
+/// median, slowest and fastest measured behavior, in demand order.
+pub fn term_seconds<'a>(
+    demand: &'a DecodeDemand,
+    basis: &MeasurementBasis,
+    depth: u32,
+) -> Result<Vec<(&'a DemandTerm, SecondsBand)>, AssessmentError> {
+    demand
+        .terms
+        .iter()
+        .map(|term| Ok((term, one_term_seconds(term, basis, depth)?)))
+        .collect()
+}
+
+fn one_term_seconds(
+    term: &DemandTerm,
+    basis: &MeasurementBasis,
+    depth: u32,
+) -> Result<SecondsBand, AssessmentError> {
+    let unmeasured = |key: &MeasurementKey| {
+        AssessmentError::Estimate(format!("{key} is not measured in the basis"))
+    };
+    let cost_key = term.key.cost();
+    let cost = basis.cost(&cost_key).ok_or_else(|| unmeasured(&cost_key))?;
+    let mismatch = || {
+        AssessmentError::Estimate(format!(
+            "{} demand does not match its measured cost model",
+            term.key
+        ))
+    };
+    let tokens = term
+        .context_window
+        .map_or(u64::from(depth), |window| window.min(u64::from(depth)));
+    let bytes = term
+        .bytes_per_context_token
+        .checked_mul(tokens)
+        .and_then(|history| history.checked_add(term.bytes))
+        .ok_or_else(|| {
+            AssessmentError::Estimate(format!(
+                "{} bytes at depth {depth} overflow",
+                term.key.class.name()
+            ))
+        })?;
+    let median = match (term.shape, &cost.model) {
+        (TermShape::Plain, _) => {
+            return cost.plain_seconds(term.launches, bytes).ok_or_else(mismatch);
+        }
+        (TermShape::Projection { weight, launch_rows }, CostModel::Projection(projection)) => {
+            let per_byte = |weight| {
+                let key = MeasurementKey::weight_format(weight, cost_key.bindings[0]);
+                match basis.cost(&key).map(|cost| &cost.model) {
+                    Some(CostModel::PerByte { seconds_per_byte }) => Ok(*seconds_per_byte),
+                    _ => Err(unmeasured(&key)),
+                }
+            };
+            let reference = per_byte(projection.weight)?;
+            let format = if reference > 0.0 {
+                per_byte(weight)? / reference
+            } else {
+                1.0
+            };
+            projection.launch_seconds * term.launches as f64
+                + projection.seconds_per_byte(launch_rows) * format * bytes as f64
+        }
+        (TermShape::Attention(heads), CostModel::History(history)) => {
+            history.launch_seconds * term.launches as f64
+                + history.seconds_per_byte(heads) * bytes as f64
+        }
+        _ => return Err(mismatch()),
+    };
+    Ok(cost.band(median))
+}
+
 /// One estimate per depth: the plain decode step's time is the sum of every
 /// term's measured class cost at its launches and its bytes at that depth,
 /// at the class's median, slowest and fastest measured behavior. Every class
@@ -67,40 +140,12 @@ pub fn estimate_performance(
     basis: &MeasurementBasis,
     depths: &[u32],
 ) -> Result<Vec<PerformanceEstimate>, AssessmentError> {
-    let costs = demand
-        .terms
-        .iter()
-        .map(|term| match basis.get(&term.key) {
-            Some(ClassMeasurement::Measured { cost, .. }) => Ok((term, cost)),
-            _ => Err(AssessmentError::Estimate(format!(
-                "{} {:?} is not measured in the basis",
-                term.key.class.name(),
-                term.key
-            ))),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     depths
         .iter()
         .map(|&depth| {
-            let step = costs
-                .iter()
-                .try_fold(SecondsBand::ZERO, |step, (term, cost)| {
-                    let bytes = term
-                        .bytes_per_context_token
-                        .checked_mul(u64::from(depth))
-                        .and_then(|history| history.checked_add(term.bytes))
-                        .ok_or_else(|| {
-                            AssessmentError::Estimate(format!(
-                                "{} bytes at depth {depth} overflow",
-                                term.key.class.name()
-                            ))
-                        })?;
-                    Ok::<_, AssessmentError>(step.plus(cost.seconds(
-                        term.launches,
-                        bytes,
-                        term.launch_bytes,
-                    )))
-                })?;
+            let step = term_seconds(demand, basis, depth)?
+                .into_iter()
+                .fold(SecondsBand::ZERO, |step, (_, seconds)| step.plus(seconds));
             if ![step.fast, step.median, step.slow]
                 .iter()
                 .all(|seconds| seconds.is_finite() && *seconds > 0.0)
@@ -127,7 +172,8 @@ pub fn estimate_performance(
 mod tests {
     use super::*;
     use crate::assessment::basis::{
-        BasisIdentity, ClassCost, CostModel, MeasurementKey, MEASUREMENT_PROTOCOL_VERSION,
+        BasisIdentity, ClassCost, ClassMeasurement, CostModel, MeasurementKey, ProjectionCost,
+        MEASUREMENT_PROTOCOL_VERSION,
     };
     use crate::assessment::demand::DemandTerm;
     use crate::StreamingCost;
@@ -153,10 +199,16 @@ mod tests {
         }
     }
 
-    /// A weight term of 10 launches over 1 GB at 1 µs + 1 ps/byte and a
-    /// history term at 1 ns per context byte, 1 KB per token.
+    fn q4() -> Element {
+        Element::named("q4k").unwrap()
+    }
+
+    /// A bf16 weight term of 10 launches over 1 GB at 1 µs + 1 ps/byte, the
+    /// class timed at q4k where bf16 streams at the same rate per byte, and
+    /// a context term at 1 ps per context byte, 1 KB per token.
     fn synthetic(slow: f64, fast: f64) -> (DecodeDemand, MeasurementBasis) {
-        let weights = MeasurementKey::dense_output(Element::bf16(), Element::bf16());
+        let bf16 = Element::bf16();
+        let weights = MeasurementKey::dense_output(bf16, bf16);
         let history = MeasurementKey::sample_rows();
         let demand = DecodeDemand {
             terms: vec![
@@ -165,31 +217,40 @@ mod tests {
                     launches: 10,
                     bytes: 1_000_000_000,
                     bytes_per_context_token: 0,
-                    launch_bytes: 100_000_000,
+                    context_window: None,
+                    shape: TermShape::Projection {
+                        weight: bf16,
+                        launch_rows: 4096,
+                    },
                 },
                 DemandTerm {
                     key: history.clone(),
                     launches: 1,
                     bytes: 0,
                     bytes_per_context_token: 1_000,
-                    launch_bytes: 0,
+                    context_window: None,
+                    shape: TermShape::Plain,
                 },
             ],
         };
+        let format = |seconds_per_byte| measured(CostModel::PerByte { seconds_per_byte }, 1.0, 1.0);
         let basis = MeasurementBasis {
             identity: identity(),
             classes: vec![
                 (
-                    weights,
+                    weights.cost(),
                     measured(
-                        CostModel::Linear(StreamingCost {
+                        CostModel::Projection(ProjectionCost {
                             launch_seconds: 1.0e-6,
-                            seconds_per_byte: 1.0e-12,
+                            weight: q4(),
+                            seconds_per_byte: vec![(1024, 2.0e-12), (4096, 1.0e-12)],
                         }),
                         slow,
                         fast,
                     ),
                 ),
+                (MeasurementKey::weight_format(q4(), bf16), format(1.0e-12)),
+                (MeasurementKey::weight_format(bf16, bf16), format(1.0e-12)),
                 (
                     history,
                     measured(
@@ -204,6 +265,32 @@ mod tests {
             ],
         };
         (demand, basis)
+    }
+
+    #[test]
+    fn a_representation_scales_the_streaming_time_by_its_format_rate() {
+        let (mut demand, mut basis) = synthetic(1.0, 1.0);
+        // bf16 streams at half q4k's rate per byte: its 1 GB costs 2 ms.
+        basis.classes[2].1 = ClassMeasurement::Measured {
+            points: Vec::new(),
+            cost: ClassCost {
+                model: CostModel::PerByte {
+                    seconds_per_byte: 2.0e-12,
+                },
+                slow_factor: 1.0,
+                fast_factor: 1.0,
+            },
+        };
+        demand.terms.truncate(1);
+        let seconds = term_seconds(&demand, &basis, 1).unwrap()[0].1.median;
+        assert!((seconds - (10.0e-6 + 2.0e-3)).abs() < 1e-12);
+        // At fewer launch rows the class streams slower per byte.
+        demand.terms[0].shape = TermShape::Projection {
+            weight: q4(),
+            launch_rows: 1024,
+        };
+        let seconds = term_seconds(&demand, &basis, 1).unwrap()[0].1.median;
+        assert!((seconds - (10.0e-6 + 2.0e-3)).abs() < 1e-12);
     }
 
     #[test]
@@ -222,6 +309,19 @@ mod tests {
             assert_eq!(estimate.confidence, PerformanceConfidence::High);
         }
         assert_eq!(estimates[1].context_tokens, 1_000_000);
+    }
+
+    #[test]
+    fn a_window_domain_reads_at_most_its_window() {
+        let (mut demand, basis) = synthetic(1.0, 1.0);
+        demand.terms[1].context_window = Some(500_000);
+        let estimates = estimate_performance(&demand, &basis, &[250_000, 1_000_000]).unwrap();
+        // 10 µs + 1 ms of weights, then 0.25 ms of history at 250k tokens
+        // and 0.5 ms (the window) at 1M.
+        let near = 1.0 / (10.0e-6 + 1.25e-3);
+        let far = 1.0 / (10.0e-6 + 1.5e-3);
+        assert!((estimates[0].estimated_tokens_per_second - near).abs() < 1e-6);
+        assert!((estimates[1].estimated_tokens_per_second - far).abs() < 1e-6);
     }
 
     #[test]
@@ -265,7 +365,8 @@ mod tests {
                 launches: 0,
                 bytes: 0,
                 bytes_per_context_token: 0,
-                launch_bytes: 0,
+                context_window: None,
+                shape: TermShape::Plain,
             }],
         };
         let (_, basis) = synthetic(1.0, 1.0);

@@ -155,7 +155,7 @@ pub fn model_properties(host: &HostArtifacts) -> Result<ModelProperties, ChatErr
         model_size_bytes: target.sources().map(|source| source.size()).sum(),
         name: text("general.name"),
         architecture: text("general.architecture"),
-        context_tokens: host.definition().geometry.context_limit,
+        context_tokens: host.definition().decoder.context_limit,
         training_context_tokens: host.declared_context_limit(),
         vision: host.media_placeholder().is_some(),
         chat_template: host.templates().default_source().to_owned(),

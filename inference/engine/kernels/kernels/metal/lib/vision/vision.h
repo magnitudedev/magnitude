@@ -1,8 +1,8 @@
-// Shared pieces of the Qwen3-VL vision entries (`qwen_vision_stem`,
-// `qwen_vision_block`, `qwen_vision_merger`). The projections run on the
-// projection library's GEMM (`projection::gemm` over dense weight rows) with
-// the vision epilogues below; the layer norm, the 2D rotary embedding and the
-// full (non-causal) attention are the vision-specific launches.
+// Shared pieces of the vision tower entries (`vision_*` in vision.seismic).
+// The projections run on the projection library's GEMM (`projection::gemm`
+// over dense weight rows) with the vision epilogues below; the row norm, the
+// 2D rotary embedding and the full (non-causal) attention are the
+// vision-specific launches.
 //
 // Numerics (`vision.seismic`): the residual stream is F32; the published
 // intermediates (normalized rows, projections feeding a GEMM or the
@@ -59,52 +59,48 @@ inline float gelu_erf(float value) {
     return 0.5f * value * (1.0f + erf(value * 0.7071067811865476f));
 }
 
+inline float gelu_quick(float value) {
+    return value / (1.0f + metal::precise::exp(-1.702f * value));
+}
+
+// The activation of `vision_linear`: 1 tanh GELU, 2 erf GELU, 3 quick GELU.
+inline float activate(int code, float value) {
+    return code == 1 ? gelu_tanh(value) : code == 2 ? gelu_erf(value) : gelu_quick(value);
+}
+
 // ---------------------------------------------------------------------------
-// GEMM epilogues. `store(m, n, acc)` receives the F32 product of output
-// (m, n); the projection is acc + bias[n].
-
-// round_A(projection).
-template <typename A, typename B>
-struct output_bias {
+// The `vision_linear` epilogue. `store(m, n, acc)` receives the F32 product
+// of output (m, n); the projection is acc, plus bias[n] when BIAS, clamped to
+// [minimum, maximum] when CLAMP. With `activation` nonzero
+// y = Y(act(round_A(projection))); with GATE y = Y(round_A(projection) ·
+// gate[m, n]); otherwise y = Y(projection), plus the F32 residual row when
+// RESIDUAL.
+template <typename A, typename B, typename Y, bool BIAS, bool RESIDUAL, bool GATE, bool CLAMP>
+struct output_linear {
     device uchar *y;
-    ulong stride;
-    device const uchar *bias;
-    void store(uint m, uint n, float value) const {
-        element::put<A>(y, ulong(m) * stride + n, value + element::at<B>(bias, n));
-    }
-    void store2(uint m, uint n, float first, float second) const {
-        store(m, n, first);
-        store(m, n + 1u, second);
-    }
-};
-
-// round_A(gelu(round_A(projection))), tanh or erf form.
-template <typename A, typename B, bool ERF>
-struct output_bias_gelu {
-    device uchar *y;
-    ulong stride;
-    device const uchar *bias;
-    void store(uint m, uint n, float value) const {
-        const float projected = A::round(value + element::at<B>(bias, n));
-        element::put<A>(y, ulong(m) * stride + n, ERF ? gelu_erf(projected) : gelu_tanh(projected));
-    }
-    void store2(uint m, uint n, float first, float second) const {
-        store(m, n, first);
-        store(m, n + 1u, second);
-    }
-};
-
-// The F32 projection, plus an F32 residual row when `residual` is bound.
-template <typename B>
-struct output_bias_f32 {
-    device float *y;
     ulong stride;
     device const uchar *bias;
     device const float *residual;
     ulong residual_stride;
+    device const uchar *gate;
+    ulong gate_stride;
+    float minimum;
+    float maximum;
+    int activation;
     void store(uint m, uint n, float value) const {
-        const float projected = value + element::at<B>(bias, n);
-        y[ulong(m) * stride + n] = residual ? residual[ulong(m) * residual_stride + n] + projected : projected;
+        float projected = value;
+        if (BIAS)
+            projected = value + element::at<B>(bias, n);
+        if (CLAMP)
+            projected = metal::min(metal::max(projected, minimum), maximum);
+        float published = projected;
+        if (activation != 0)
+            published = activate(activation, A::round(projected));
+        else if (GATE)
+            published = A::round(projected) * element::at<A>(gate, ulong(m) * gate_stride + n);
+        else if (RESIDUAL)
+            published = residual[ulong(m) * residual_stride + n] + projected;
+        element::put<Y>(y, ulong(m) * stride + n, published);
     }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
@@ -113,64 +109,101 @@ struct output_bias_f32 {
 };
 
 // ---------------------------------------------------------------------------
-// Layer norm of one F32 row of `width` values (THREADS threads): two-pass
-// centered F32 statistics, out = round_A(centered * inverse * weight + bias).
+// Norm of one F32 row of `width` values (THREADS threads): two-pass F32
+// statistics, centered (a layer norm) or not (the mean taken as 0, a
+// root-mean-square norm), out = Y(centered * inverse [* weight] [+ bias]).
 // `partials` holds THREADS / 32 floats.
-template <uint THREADS, typename A, typename WN, typename BN>
-inline void layer_norm(device const float *row, device uchar *out, device const uchar *weight,
-    device const uchar *bias, uint width, float epsilon, threadgroup float *partials, uint thread_index,
-    uint sg, uint lane) {
-    float sum = 0.0f;
-    for (uint i = thread_index; i < width; i += THREADS)
-        sum += row[i];
-    const float mean = reduce::group_sum<THREADS / 32>(sum, partials, sg, lane) / float(width);
+template <uint THREADS, typename Y, typename WN, typename BN, bool WEIGHT, bool BIAS>
+inline void norm(device const float *row, device uchar *out, ulong stride, device const uchar *weight,
+    device const uchar *bias, uint width, bool centered, float epsilon, threadgroup float *partials,
+    uint thread_index, uint sg, uint lane) {
+    float mean = 0.0f;
+    if (centered) {
+        float sum = 0.0f;
+        for (uint i = thread_index; i < width; i += THREADS)
+            sum += row[i];
+        mean = reduce::group_sum<THREADS / 32>(sum, partials, sg, lane) / float(width);
+    }
     float squares = 0.0f;
     for (uint i = thread_index; i < width; i += THREADS) {
-        const float centered = row[i] - mean;
-        squares = metal::fma(centered, centered, squares);
+        const float value = row[i] - mean;
+        squares = metal::fma(value, value, squares);
     }
     const float inverse =
         metal::rsqrt(reduce::group_sum<THREADS / 32>(squares, partials, sg, lane) / float(width) + epsilon);
-    for (uint i = thread_index; i < width; i += THREADS)
-        element::put<A>(out, i, (row[i] - mean) * inverse * element::at<WN>(weight, i) + element::at<BN>(bias, i));
-}
-
-// ---------------------------------------------------------------------------
-// 2D rotary embedding, in place, of one head row of width W = 4P held by one
-// simdgroup (lane l owns columns [l * E, l * E + E), E = W / 32): column
-// i < 2P pairs with i + 2P (16 lanes away); pair p = i % 2P turns by
-// coordinates[p / P] * 10000^(-(p % P) / P).
-template <typename A, uint W>
-inline void rotate(device typename A::storage *head_row, device const int *coordinates, uint lane) {
-    static_assert(W % 64 == 0, "a rotated head row is two 16-lane halves");
-    constexpr uint E = W / 32;
-    constexpr uint P = W / 4;
-    float x[E];
-    for (uint i = 0; i < E; ++i)
-        x[i] = A::load(head_row[lane * E + i]);
-    float partner[E];
-    for (uint i = 0; i < E; ++i)
-        partner[i] = simd_shuffle_xor(x[i], ushort(16));
-    for (uint i = 0; i < E; ++i) {
-        const uint column = lane * E + i;
-        const uint pair = column % (2 * P);
-        const float frequency = metal::precise::exp(-9.210340371976184f * float(pair % P) / float(P));
-        const float angle = float(coordinates[pair / P]) * frequency;
-        const float c = metal::precise::cos(angle), s = metal::precise::sin(angle);
-        const float rotated = column < 2 * P ? x[i] * c - partner[i] * s : x[i] * c + partner[i] * s;
-        head_row[lane * E + i] = A::store(rotated);
+    // One expression per form: the compiler contracts a product and a sum
+    // only within an expression.
+    for (uint i = thread_index; i < width; i += THREADS) {
+        float value;
+        if (WEIGHT && BIAS)
+            value = (row[i] - mean) * inverse * element::at<WN>(weight, i) + element::at<BN>(bias, i);
+        else if (WEIGHT)
+            value = (row[i] - mean) * inverse * element::at<WN>(weight, i);
+        else if (BIAS)
+            value = (row[i] - mean) * inverse + element::at<BN>(bias, i);
+        else
+            value = (row[i] - mean) * inverse;
+        element::put<Y>(out, ulong(i) * stride, value);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Full attention. A threadgroup owns ATTEND_ROWS query rows of one head
-// (simdgroup s: rows 8s .. 8s + 7 of the tile) and walks every key in tiles
-// of ATTEND_KEYS: K and V staged in threadgroup memory, scores = Q K^T on the
-// matrix units (Q's fragments held in registers), scaled into the exp2
-// domain in F32, the online softmax, and the F32 output accumulated from
-// probabilities rounded to half. `qkv` is the [rows, 3, H, W] projection with
-// its queries and keys rotated; rows past `rows` of the last query tile are
-// read (the buffer holds whole tiles) but never stored.
+// One attention operand head row of width W = 4P, prepared by one simdgroup
+// (lane l owns columns l, l + 32, ...): RMS-normalized with `norm` (`head_norm`:
+// x · rsqrt(Σx² / W + epsilon) · norm[i]) when `normed` (`norm` null: unit
+// weights), then, when `rotated`, the 2D rotary embedding: column i < 2P
+// pairs with i + 2P; pair p = i % 2P turns by coordinates[p / P] ·
+// base^(-(p % P) / P), `log_base` = ln(base). Written rounded to A at
+// `target`, zero from column W to WP.
+template <typename A, uint W, uint WP>
+inline void prepare_head(device const typename A::storage *source, device typename A::storage *target,
+    bool normed, device const float *norm, float epsilon, bool rotated, device const int *coordinates,
+    float log_base, uint lane) {
+    constexpr uint P = W / 4;
+    float inverse = 1.0f;
+    if (normed) {
+        float squares = 0.0f;
+        for (uint i = lane; i < W; i += 32) {
+            const float x = A::load(source[i]);
+            squares += x * x;
+        }
+        for (ushort offset = 16; offset > 0; offset /= 2)
+            squares += simd_shuffle_xor(squares, offset);
+        inverse = metal::rsqrt(squares / float(W) + epsilon);
+    }
+    auto value = [&](uint i) {
+        const float x = A::load(source[i]);
+        return normed ? (norm ? x * inverse * norm[i] : x * inverse) : x;
+    };
+    for (uint i = lane; i < W; i += 32) {
+        const float x = value(i);
+        float published = x;
+        if (rotated) {
+            const uint pair = i % (2 * P);
+            const float frequency = metal::precise::exp(-log_base * float(pair % P) / float(P));
+            const float angle = float(coordinates[pair / P]) * frequency;
+            const float c = metal::precise::cos(angle), s = metal::precise::sin(angle);
+            const float partner = value(i < 2 * P ? i + 2 * P : i - 2 * P);
+            published = i < 2 * P ? x * c - partner * s : x * c + partner * s;
+        }
+        target[i] = A::store(published);
+    }
+    for (uint i = W + lane; i < WP; i += 32)
+        target[i] = A::store(0.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Non-causal attention. A threadgroup owns ATTEND_ROWS query rows of one head
+// (simdgroup s: rows 8s .. 8s + 7 of the tile) and walks the keys of its rows'
+// spans in tiles of ATTEND_KEYS: K and V staged in threadgroup memory, scores =
+// Q K^T on the matrix units (Q's fragments held in registers), scaled into the
+// exp2 domain in F32, the online softmax, and the F32 output accumulated from
+// probabilities rounded to half. `qkv` is the [rows, 3, H, WP] operand rows
+// (queries and keys prepared, zero past the head width W); rows past `rows` of
+// the last query tile are read (the buffer holds whole tiles) but never
+// stored. Without `spans` every row attends to every row; with them row r
+// attends to rows [spans[2r], spans[2r + 1]), the tile walking the union of
+// its rows' spans (`bounds`, two words of threadgroup memory).
 constant constexpr uint ATTEND_ROWS = 64;
 constant constexpr uint ATTEND_KEYS = 32;
 
@@ -194,15 +227,15 @@ inline void attend_stage(threadgroup S *staged, device const S *qkv, ulong row_s
     }
 }
 
-template <typename S, uint W>
+template <typename S, uint W, uint WP>
 inline void attend(device const S *qkv, device S *out, uint rows, uint heads, float scale,
-    threadgroup S *keys, threadgroup S *values, uint tile, uint head, uint thread_index, uint simd,
-    uint lane) {
+    device const int *spans, threadgroup S *keys, threadgroup S *values, threadgroup uint *bounds, uint tile,
+    uint head, uint thread_index, uint simd, uint lane) {
     constexpr uint THREADS = ATTEND_ROWS * 4;
-    constexpr uint PITCH = attend_pitch<W>();
-    constexpr uint DB = W / 8;
+    constexpr uint PITCH = attend_pitch<WP>();
+    constexpr uint DB = WP / 8;
     constexpr uint KB = ATTEND_KEYS / 8;
-    const ulong width = ulong(heads) * W;
+    const ulong width = ulong(heads) * WP;
     const ulong row_stride = 3 * width;
     const float scale2 = scale * 1.4426950408889634f;
 
@@ -212,19 +245,39 @@ inline void attend(device const S *qkv, device S *out, uint rows, uint heads, fl
     const uint fn = (quad & 2) * 2 + (lane % 2) * 2;
     const uint first_row = tile * ATTEND_ROWS + simd * 8;
 
+    // This lane's row's keys, and the keys the tile walks.
+    uint row_first = 0, row_end = rows, walk_first = 0, walk_end = rows;
+    if (spans) {
+        const uint span_row = metal::min(first_row + fm, rows - 1);
+        row_first = uint(spans[span_row * 2]);
+        row_end = uint(spans[span_row * 2 + 1]);
+        if (thread_index == 0) {
+            uint low = rows, high = 0;
+            for (uint r = tile * ATTEND_ROWS; r < metal::min(tile * ATTEND_ROWS + ATTEND_ROWS, rows); ++r) {
+                low = metal::min(low, uint(spans[r * 2]));
+                high = metal::max(high, uint(spans[r * 2 + 1]));
+            }
+            bounds[0] = low;
+            bounds[1] = high;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        walk_first = bounds[0];
+        walk_end = bounds[1];
+    }
+
     simdgroup_matrix<S, 8, 8> q[DB];
     for (uint d = 0; d < DB; ++d)
-        simdgroup_load(q[d], qkv + ulong(first_row) * row_stride + ulong(head) * W + d * 8, row_stride);
+        simdgroup_load(q[d], qkv + ulong(first_row) * row_stride + ulong(head) * WP + d * 8, row_stride);
     simdgroup_matrix<float, 8, 8> output[DB];
     for (uint d = 0; d < DB; ++d)
         output[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     float maximum = -INFINITY;
     float denominator = 0.0f;
 
-    for (uint first = 0; first < rows; first += ATTEND_KEYS) {
+    for (uint first = walk_first; first < walk_end; first += ATTEND_KEYS) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        attend_stage<S, W, THREADS>(keys, qkv, row_stride, width + ulong(head) * W, first, rows, thread_index);
-        attend_stage<S, W, THREADS>(values, qkv, row_stride, 2 * width + ulong(head) * W, first, rows,
+        attend_stage<S, WP, THREADS>(keys, qkv, row_stride, width + ulong(head) * WP, first, rows, thread_index);
+        attend_stage<S, WP, THREADS>(values, qkv, row_stride, 2 * width + ulong(head) * WP, first, rows,
             thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -242,8 +295,9 @@ inline void attend(device const S *qkv, device S *out, uint rows, uint heads, fl
         float tile_maximum = -INFINITY;
         for (uint j = 0; j < KB; ++j) {
             for (uint e = 0; e < 2; ++e) {
+                const uint key = first + j * 8 + fn + e;
                 float s = scores[j].thread_elements()[e] * scale2;
-                if (!whole && first + j * 8 + fn + e >= rows)
+                if ((!whole && key >= rows) || key < row_first || key >= row_end)
                     s = -INFINITY;
                 scores[j].thread_elements()[e] = s;
                 tile_maximum = metal::max(tile_maximum, s);
@@ -252,12 +306,14 @@ inline void attend(device const S *qkv, device S *out, uint rows, uint heads, fl
         tile_maximum = metal::max(tile_maximum, simd_shuffle_xor(tile_maximum, ushort(1)));
         tile_maximum = metal::max(tile_maximum, simd_shuffle_xor(tile_maximum, ushort(8)));
         const float next = metal::max(maximum, tile_maximum);
-        const float carry = metal::fast::exp2(maximum - next);
+        // A row that has seen no key of its span yet keeps its (empty) state.
+        const bool seen = next > -INFINITY;
+        const float carry = seen ? metal::fast::exp2(maximum - next) : 1.0f;
         simdgroup_matrix<half, 8, 8> probabilities[KB];
         float tile_sum = 0.0f;
         for (uint j = 0; j < KB; ++j) {
             for (uint e = 0; e < 2; ++e) {
-                const float p = metal::fast::exp2(scores[j].thread_elements()[e] - next);
+                const float p = seen ? metal::fast::exp2(scores[j].thread_elements()[e] - next) : 0.0f;
                 probabilities[j].thread_elements()[e] = half(p);
                 tile_sum += p;
             }
@@ -285,8 +341,9 @@ inline void attend(device const S *qkv, device S *out, uint rows, uint heads, fl
     const float inverse = 1.0f / denominator;
     for (uint d = 0; d < DB; ++d)
         for (uint e = 0; e < 2; ++e)
-            out[ulong(row) * width + ulong(head) * W + d * 8 + fn + e] =
-                S(output[d].thread_elements()[e] * inverse);
+            if (d * 8 + fn + e < W)
+                out[ulong(row) * heads * W + ulong(head) * W + d * 8 + fn + e] =
+                    S(output[d].thread_elements()[e] * inverse);
 }
 
 } // namespace vision

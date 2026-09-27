@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 magnitude-artifacts = { path = "../../artifacts" }
 serde.workspace = true
+sha2 = "=0.11.0"

@@ -1,11 +1,13 @@
 use super::{source_import_peak_bytes, weight_bytes_by_component, ModelLoadPlan, PlannedMethod};
 use crate::{
-    PreparedHeadGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs, PreparedTargetReadoutGraphs,
-    PreparedVisionGraphs,
+    PreparedDrafterGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs,
+    PreparedTargetReadoutGraphs, PreparedVisionGraphs,
 };
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_state::{
-    BankCapacity, ComponentDescriptor, ComponentSpec, KvCodec, ModelStateLayout, StateStore,
+    BankCapacity, ComponentDescriptor, ComponentSpec, HistoryDomainId, HistoryDomainKind,
+    HistoryDomainLayout, HistoryDomainPlan, HistoryDomainTrace, KvCodec, LayerRef,
+    ModelStateLayout, StateStore,
 };
 use seismic::{DType, Device, Element, SlabLayout, SlabRegion};
 use std::rc::Rc;
@@ -216,46 +218,59 @@ impl NativeGraphCharge {
 
 /// Exact projection used to construct one numerical state arena. The planner
 /// owns every capacity and byte fact; construction only materializes it.
+/// `history` is the store's history domains as `StateStore::new` takes them;
+/// `domains` projects each stored domain, indexed by `HistoryDomainId`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateStorePlan {
     pub context_rows: usize,
-    pub history_rows: usize,
-    pub history_components: Vec<ComponentDescriptor>,
+    /// The largest advance (slot rows): Window domains' row limit.
+    pub max_advance: usize,
+    pub history: Vec<HistoryDomainPlan>,
+    pub domains: Vec<HistoryStorePlan>,
     pub recurrent_components: Vec<ComponentSpec>,
     pub bank_capacity: BankCapacity,
-    pub history_row_bytes: u64,
-    pub history_bytes: u64,
     pub recurrent_bank_bytes: u64,
     pub zero_seed_bytes: u64,
     pub recurrent_pool_bytes: u64,
 }
 
-impl StateStorePlan {
-    pub fn max_visible_spans(&self) -> Result<usize, String> {
-        if self.history_components.is_empty() {
-            return Ok(1);
+/// One stored history domain of a store plan: exactly what the store derives
+/// for it (see `StateStore::allocation_trace`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryStorePlan {
+    pub kind: HistoryDomainKind,
+    pub components: Vec<ComponentDescriptor>,
+    /// Reserved row addresses, sealed into graphs.
+    pub rows: usize,
+    pub row_bytes: u64,
+    pub slab_rows: u32,
+    pub span_bound: usize,
+}
+
+/// The history an attention layer binds: its stored domain, and the
+/// component whose regions it reads (its own, or a Shared domain's source).
+#[derive(Clone, Copy, Debug)]
+pub struct LayerHistory<'a> {
+    pub domain: HistoryDomainId,
+    pub store: &'a HistoryStorePlan,
+    pub component: &'a ComponentDescriptor,
+}
+
+impl HistoryStorePlan {
+    fn trace(&self) -> HistoryDomainTrace {
+        HistoryDomainTrace {
+            kind: self.kind,
+            capacity: self.rows,
+            row_bytes: self.row_bytes,
+            bytes: self.row_bytes * self.rows as u64,
+            slab_rows: self.slab_rows as usize,
+            span_bound: self.span_bound,
         }
-        magnitude_state::max_visible_spans(self.context_rows, self.history_slab_rows()? as usize)
     }
 
-    pub fn history_slab_rows(&self) -> Result<u32, String> {
-        u32::try_from(magnitude_state::history_rows_per_slab(
-            self.history_row_bytes,
-        )?)
-        .map_err(|_| "history slab rows exceed u32".into())
-    }
-
-    pub fn bank_slab_banks(&self) -> Result<u32, String> {
-        u32::try_from(magnitude_state::banks_per_slab(self.recurrent_bank_bytes)?)
-            .map_err(|_| "bank slab count exceeds u32".into())
-    }
-
-    pub fn history_slab_layout(&self) -> Result<Option<SlabLayout>, String> {
-        if self.history_components.is_empty() {
-            return Ok(None);
-        }
+    pub fn slab_layout(&self) -> Result<SlabLayout, String> {
         let regions = self
-            .history_components
+            .components
             .iter()
             .flat_map(ComponentDescriptor::planes)
             .map(|plane| SlabRegion {
@@ -263,13 +278,85 @@ impl StateStorePlan {
                 row_shape: plane.row_extents.iter().map(|&size| size as u64).collect(),
             })
             .collect::<Vec<_>>();
-        SlabLayout::for_regions(
-            u64::from(self.history_slab_rows()?),
-            self.history_rows as u64,
-            &regions,
-        )
-        .map(Some)
-        .map_err(|error| error.to_string())
+        SlabLayout::for_regions(u64::from(self.slab_rows), self.rows as u64, &regions)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl StateStorePlan {
+    /// The largest span bound of the store's domains: the batching and
+    /// kernel span limit (1 without history).
+    pub fn max_visible_spans(&self) -> Result<usize, String> {
+        // A Shared layer reads its source domain's accepted rows and, as
+        // history, the rows its source appends in the advance: at most one
+        // range per slab they touch.
+        let shared = self
+            .history
+            .iter()
+            .filter_map(|plan| match &plan.layout {
+                HistoryDomainLayout::Shared { source, .. } => Some(*source),
+                _ => None,
+            })
+            .map(|source| {
+                let store = self
+                    .layer_history(source)
+                    .ok_or_else(|| format!("shared history source {source:?} has no domain"))?
+                    .store;
+                let slab_rows = usize::try_from(store.slab_rows)
+                    .map_err(|_| "slab rows exceed the host")?;
+                Ok(store.span_bound + self.max_advance.div_ceil(slab_rows) + 1)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(self
+            .domains
+            .iter()
+            .map(|domain| domain.span_bound)
+            .chain(shared)
+            .max()
+            .unwrap_or(1))
+    }
+
+    /// The history `layer` binds, resolving a Shared layer to its source.
+    /// `None` for a layer without history in this store.
+    pub fn layer_history(&self, layer: LayerRef) -> Option<LayerHistory<'_>> {
+        let owner = self
+            .history
+            .iter()
+            .find_map(|plan| match &plan.layout {
+                HistoryDomainLayout::Shared { source, layers } if layers.contains(&layer) => {
+                    Some(*source)
+                }
+                _ => None,
+            })
+            .unwrap_or(layer);
+        self.domains.iter().enumerate().find_map(|(index, store)| {
+            store
+                .components
+                .iter()
+                .find(|component| component.layer == owner)
+                .map(|component| LayerHistory {
+                    domain: HistoryDomainId(index),
+                    store,
+                    component,
+                })
+        })
+    }
+
+    /// The store's one history domain, for a store whose history the
+    /// caller addresses as one domain (the draft head's).
+    pub fn sole_history(&self) -> Result<&HistoryStorePlan, String> {
+        match self.domains.as_slice() {
+            [domain] => Ok(domain),
+            domains => Err(format!(
+                "store has {} history domains where one is required",
+                domains.len()
+            )),
+        }
+    }
+
+    pub fn bank_slab_banks(&self) -> Result<u32, String> {
+        u32::try_from(magnitude_state::banks_per_slab(self.recurrent_bank_bytes)?)
+            .map_err(|_| "bank slab count exceeds u32".into())
     }
 
     pub fn bank_slab_layout(&self) -> Result<Option<SlabLayout>, String> {
@@ -297,11 +384,14 @@ impl StateStorePlan {
         .map_err(|error| error.to_string())
     }
 
+    /// Every stored domain's address table and first slab.
     pub fn startup_history_bytes(&self) -> Result<u64, String> {
-        self.history_slab_layout()?.map_or(Ok(0), |layout| {
+        self.domains.iter().try_fold(0u64, |total, domain| {
+            let layout = domain.slab_layout()?;
             layout
                 .address_table_bytes
                 .checked_add(layout.slab_bytes)
+                .and_then(|bytes| total.checked_add(bytes))
                 .ok_or_else(|| "initial history slab charge overflows".into())
         })
     }
@@ -315,16 +405,31 @@ impl StateStorePlan {
         })
     }
 
+    /// One request's history at `depth` tokens: a Token domain holds `depth`
+    /// rows, a Window domain its steady footprint of `n` plus one advance,
+    /// independent of the depth; each rounded to whole slabs of its domain.
     pub fn history_bytes_at_depth(&self, depth: u64) -> Result<u64, String> {
-        let Some(layout) = self.history_slab_layout()? else {
-            return Ok(0);
-        };
-        let slabs = depth.max(1).div_ceil(u64::from(self.history_slab_rows()?));
-        layout
-            .slab_bytes
-            .checked_mul(slabs)
-            .and_then(|bytes| bytes.checked_add(layout.address_table_bytes))
-            .ok_or_else(|| "history slab fit charge overflows".into())
+        self.domains.iter().try_fold(0u64, |total, domain| {
+            let layout = domain.slab_layout()?;
+            let rows = match domain.kind {
+                HistoryDomainKind::Token => depth,
+                kind => u64::try_from(
+                    kind.row_limit(
+                        usize::try_from(depth).map_err(|_| "fit depth exceeds host range")?,
+                        self.max_advance,
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+                .map_err(|_| "window rows exceed u64")?,
+            };
+            let slabs = rows.max(1).div_ceil(u64::from(domain.slab_rows));
+            layout
+                .slab_bytes
+                .checked_mul(slabs)
+                .and_then(|bytes| bytes.checked_add(layout.address_table_bytes))
+                .and_then(|bytes| total.checked_add(bytes))
+                .ok_or_else(|| "history slab fit charge overflows".into())
+        })
     }
 
     pub fn bank_bytes_at_count(&self, banks: u64) -> Result<u64, String> {
@@ -351,8 +456,8 @@ impl StateStorePlan {
         let store = StateStore::new(
             device,
             self.context_rows,
-            self.history_rows,
-            self.history_components.clone(),
+            self.max_advance,
+            self.history.clone(),
             self.recurrent_components.clone(),
             self.bank_capacity,
         )
@@ -361,9 +466,12 @@ impl StateStorePlan {
             .allocation_trace()
             .map_err(|error| error.to_string())?;
         if trace.context_capacity != self.context_rows
-            || trace.history_capacity != self.history_rows
-            || trace.history_row_bytes != self.history_row_bytes
-            || trace.history_bytes != self.history_bytes
+            || trace.history
+                != self
+                    .domains
+                    .iter()
+                    .map(HistoryStorePlan::trace)
+                    .collect::<Vec<_>>()
             || trace.bank_capacity != self.bank_capacity
             || trace.recurrent_bank_bytes != self.recurrent_bank_bytes
             || trace.zero_seed_bytes != self.zero_seed_bytes
@@ -583,23 +691,36 @@ impl ResourcePlanner {
         if capacity_bytes.domain_bytes == 0 {
             return Err("device domain has zero capacity".into());
         }
-        let layout = ModelStateLayout::derive(
-            &definition.geometry,
-            load.head
-                .as_ref()
-                .and_then(|_| definition.head.as_ref())
-                .map_or(0, |head| head.depth()),
-            codec,
-            method.draft_rows(),
-        )?;
-        let target_history_row_bytes = history_row_bytes(&layout.target_history)?;
-        let head_history_row_bytes = history_row_bytes(&layout.head_history)?;
-        let checkpoint_history_row_bytes = target_history_row_bytes
-            .checked_add(head_history_row_bytes)
+        let drafter = if load.head.is_some() {
+            crate::operators::draft::drafter_blocks(definition)
+        } else {
+            Vec::new()
+        };
+        let layout =
+            ModelStateLayout::derive(&definition.decoder, &drafter, codec, method.draft_rows())?;
+        let history_domains = || layout.target_history.iter().chain(&layout.head_history);
+        let checkpoint_history_row_bytes = history_row_bytes(&layout.target_history)?
+            .checked_add(history_row_bytes(&layout.head_history)?)
             .ok_or("history row byte count overflow")?;
         let recurrent_bank_bytes = recurrent_bank_bytes(&layout.target_recurrent)?;
-        let context = usize::try_from(definition.geometry.context_limit)
+        let context = usize::try_from(definition.decoder.context_limit)
             .map_err(|_| "context limit exceeds host domain")?;
+        let max_advance = limits.max_launch_rows;
+        // A checkpoint's window rows: `n` per Window(n) domain.
+        let checkpoint_window_bytes = history_domains()
+            .filter(|domain| matches!(domain.kind(), HistoryDomainKind::Window { .. }))
+            .try_fold(0u64, |total, domain| {
+                let rows = domain
+                    .kind()
+                    .checkpoint_rows(context)
+                    .map_err(|error| error.to_string())?;
+                domain
+                    .row_bytes()
+                    .map_err(|error| error.to_string())?
+                    .checked_mul(rows as u64)
+                    .and_then(|bytes| total.checked_add(bytes))
+                    .ok_or_else(|| String::from("window checkpoint byte count overflow"))
+            })?;
         // Generation methods keep their carried feature rows on the host, so
         // a retained entry charges only numerical state. Entries on one path
         // share their history rows, so an entry's marginal state is its recurrent
@@ -608,9 +729,16 @@ impl ResourcePlanner {
             recurrent_bank_bytes
         } else {
             checkpoint_history_row_bytes
-                .checked_mul(definition.geometry.context_limit)
+                .checked_mul(definition.decoder.context_limit)
+                .and_then(|bytes| bytes.checked_add(checkpoint_window_bytes))
                 .ok_or("checkpoint state byte count overflow")?
         };
+        // One row in every stored domain.
+        let request_row_bytes = history_domains().try_fold(0u64, |total, domain| {
+            total
+                .checked_add(domain.row_bytes().map_err(|error| error.to_string())?)
+                .ok_or_else(|| String::from("history row byte count overflow"))
+        })?;
         // Reservations are index bounds sealed into graphs, not memory: every
         // bank and history row is committed on demand under a heap claim. A
         // live request holds its accepted bank and, in flight, a successor
@@ -631,7 +759,7 @@ impl ResourcePlanner {
         // A request needs at least one history row and one recurrent bank.
         // This is an address-space ceiling from physical bytes, never an
         // admission policy; each actual row and bank is claimed on demand.
-        let minimum_request_bytes = checkpoint_history_row_bytes
+        let minimum_request_bytes = request_row_bytes
             .checked_add(recurrent_bank_bytes)
             .ok_or("minimum request byte count overflow")?
             .max(1);
@@ -663,23 +791,20 @@ impl ResourcePlanner {
         let recurrent_pool_bytes = recurrent_bank_bytes
             .checked_mul(u64::try_from(bank_count).map_err(|_| "bank capacity exceeds u64")?)
             .ok_or("recurrent bank allocation byte count overflow")?;
-        let target_state = state_store_plan(
+        let rows = HistoryRows {
             context,
-            capacity.history_rows,
+            max_advance,
+            token: capacity.history_rows,
+            domain_bytes: capacity_bytes.domain_bytes,
+        };
+        let target_state = state_store_plan(
+            rows,
             layout.target_history,
             layout.target_recurrent,
             bank_capacity,
         )?;
         let head_state = (!layout.head_history.is_empty())
-            .then(|| {
-                state_store_plan(
-                    context,
-                    capacity.history_rows,
-                    layout.head_history,
-                    Vec::new(),
-                    bank_capacity,
-                )
-            })
+            .then(|| state_store_plan(rows, layout.head_history, Vec::new(), bank_capacity))
             .transpose()?;
         let planned_recurrent = target_state
             .recurrent_pool_bytes
@@ -733,7 +858,7 @@ impl ResourcePlanner {
         state: StateResourcePlan,
         target_graphs: &PreparedTargetGraphs,
         target_readout_graphs: &PreparedTargetReadoutGraphs,
-        head_graphs: Option<&PreparedHeadGraphs>,
+        head_graphs: Option<&PreparedDrafterGraphs>,
         vision_graphs: Option<&PreparedVisionGraphs>,
         state_graphs: &PreparedStateCopyGraphs,
     ) -> Result<ResourcePlan, String> {
@@ -852,17 +977,75 @@ impl ResourcePlanner {
     }
 }
 
+/// The row reservations of a store's history domains.
+#[derive(Clone, Copy)]
+struct HistoryRows {
+    context: usize,
+    max_advance: usize,
+    /// Every Token domain's reservation.
+    token: usize,
+    /// A Window domain reserves what the device domain could back, and at
+    /// least its row limit.
+    domain_bytes: u64,
+}
+
+impl HistoryRows {
+    fn rows(self, layout: &HistoryDomainLayout) -> Result<usize, String> {
+        let kind = layout.kind();
+        Ok(match kind {
+            HistoryDomainKind::Token => self.token,
+            HistoryDomainKind::Window { .. } => {
+                let row_bytes = layout.row_bytes().map_err(|error| error.to_string())?;
+                usize::try_from(self.domain_bytes / row_bytes.max(1))
+                    .unwrap_or(usize::MAX)
+                    .max(
+                        kind.row_limit(self.context, self.max_advance)
+                            .map_err(|error| error.to_string())?,
+                    )
+            }
+            HistoryDomainKind::Shared { .. } => 0,
+            HistoryDomainKind::Block { .. } => {
+                return Err(format!("history domain {kind:?} is not supported"))
+            }
+        })
+    }
+}
+
 fn state_store_plan(
-    context_rows: usize,
-    history_rows: usize,
-    history_components: Vec<ComponentDescriptor>,
+    rows: HistoryRows,
+    history: Vec<HistoryDomainLayout>,
     recurrent_components: Vec<ComponentSpec>,
     bank_capacity: BankCapacity,
 ) -> Result<StateStorePlan, String> {
-    let history_row_bytes = history_row_bytes(&history_components)?;
-    let history_bytes = history_row_bytes
-        .checked_mul(u64::try_from(history_rows).map_err(|_| "history rows exceed u64")?)
-        .ok_or("history allocation byte count overflow")?;
+    let history = history
+        .into_iter()
+        .map(|layout| {
+            Ok(HistoryDomainPlan {
+                logical_rows: rows.rows(&layout)?,
+                layout,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let domains = history
+        .iter()
+        .filter(|plan| !matches!(plan.layout, HistoryDomainLayout::Shared { .. }))
+        .map(|plan| {
+            let kind = plan.layout.kind();
+            let row_bytes = plan.layout.row_bytes().map_err(|error| error.to_string())?;
+            let slab_rows = magnitude_state::history_rows_per_slab(row_bytes)?;
+            let row_limit = kind
+                .row_limit(rows.context, rows.max_advance)
+                .map_err(|error| error.to_string())?;
+            Ok(HistoryStorePlan {
+                kind,
+                components: plan.layout.components().to_vec(),
+                rows: plan.logical_rows,
+                row_bytes,
+                slab_rows: u32::try_from(slab_rows).map_err(|_| "history slab rows exceed u32")?,
+                span_bound: magnitude_state::max_visible_spans(row_limit, slab_rows)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let recurrent_bank_bytes = recurrent_bank_bytes(&recurrent_components)?;
     let recurrent_pool_bytes = recurrent_bank_bytes
         .checked_mul(
@@ -875,13 +1058,12 @@ fn state_store_plan(
         )
         .ok_or("recurrent pool byte count overflow")?;
     Ok(StateStorePlan {
-        context_rows,
-        history_rows,
-        history_components,
+        context_rows: rows.context,
+        max_advance: rows.max_advance,
+        history,
+        domains,
         recurrent_components,
         bank_capacity,
-        history_row_bytes,
-        history_bytes,
         recurrent_bank_bytes,
         zero_seed_bytes: recurrent_bank_bytes,
         recurrent_pool_bytes,
@@ -914,9 +1096,15 @@ mod slab_plan_tests {
         )
         .unwrap();
         let plan = state_store_plan(
-            600_000,
-            1_200_000,
-            vec![history],
+            HistoryRows {
+                context: 600_000,
+                max_advance: 512,
+                token: 1_200_000,
+                domain_bytes: 1 << 30,
+            },
+            vec![HistoryDomainLayout::Token {
+                components: vec![history],
+            }],
             vec![ComponentSpec {
                 shape: vec![4 * 1024 * 1024],
                 dtype: DType::F32,
@@ -928,7 +1116,7 @@ mod slab_plan_tests {
             },
         )
         .unwrap();
-        let history = plan.history_slab_layout().unwrap().unwrap();
+        let history = plan.domains[0].slab_layout().unwrap();
         let banks = plan.bank_slab_layout().unwrap().unwrap();
         assert_eq!(plan.bank_slab_banks().unwrap(), 4);
         assert_eq!(
@@ -950,7 +1138,7 @@ mod slab_plan_tests {
             plan.initial_committed_bytes().unwrap()
         );
 
-        let history_depth = u64::from(plan.history_slab_rows().unwrap()) + 1;
+        let history_depth = u64::from(plan.domains[0].slab_rows) + 1;
         assert_eq!(
             plan.history_bytes_at_depth(0).unwrap(),
             history.address_table_bytes + history.slab_bytes
@@ -966,17 +1154,16 @@ mod slab_plan_tests {
     }
 }
 
-pub(super) fn history_row_bytes(
-    components: &[magnitude_state::ComponentDescriptor],
-) -> Result<u64, String> {
-    components
+/// History bytes per token of context: the rows of every Token domain.
+/// Window domains hold a bounded number of rows whatever the context (see
+/// `HistoryDomainLayout::steady_footprint`).
+pub(super) fn history_row_bytes(domains: &[HistoryDomainLayout]) -> Result<u64, String> {
+    domains
         .iter()
-        .flat_map(|component| component.planes())
-        .try_fold(0u64, |total, plane| {
+        .filter(|domain| domain.kind() == HistoryDomainKind::Token)
+        .try_fold(0u64, |total, domain| {
             total
-                .checked_add(
-                    u64::try_from(plane.row_bytes).map_err(|_| "history row bytes exceed u64")?,
-                )
+                .checked_add(domain.row_bytes().map_err(|error| error.to_string())?)
                 .ok_or_else(|| "history row byte count overflow".into())
         })
 }

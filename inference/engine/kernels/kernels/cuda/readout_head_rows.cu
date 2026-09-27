@@ -1,5 +1,6 @@
 // readout_head_rows: final RMS prologue over the `out_rows` rows, then the
-// vocabulary projection into F32 logits (a K1 projection). GEMV for O <= 16
+// vocabulary projection into F32 logits (a K1 projection), softcapped from the
+// accumulator when `softcap` > 0. GEMV for O <= 16
 // (`gemv` to 8 rows, `gemv16` beyond; at O = 1 the block forms the A row in
 // shared memory, else `stage` forms the A rows first), GEMM otherwise over
 // the A rows (`gemm_small` to 64 rows, `gemm` beyond; the 16-bit path: head
@@ -9,7 +10,7 @@
 
 using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
 using Source = projection::GemvSource<Pro>;
-using Epi = projection::Store<element::F32>;
+using Epi = projection::Logits;
 
 #define PROLOGUE                                                                                              \
     Pro {                                                                                                     \
@@ -19,7 +20,8 @@ using Epi = projection::Store<element::F32>;
     }
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
 #define HEAD KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT))
-#define EPILOGUE Epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, 0}
+#define EPILOGUE                                                                                              \
+    Epi { SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP) }
 
 // The GEMV over NB column blocks of 8 rows.
 template <int NB, int KSPLIT>

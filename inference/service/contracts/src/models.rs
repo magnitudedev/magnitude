@@ -1082,6 +1082,38 @@ pub struct CatalogIntelligence {
     pub provenance: IntelligenceProvenance,
 }
 
+/// What the release promises for a catalog model. It is independent of assessment, which says
+/// what one device can do with it.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "level", rename_all = "camelCase", deny_unknown_fields)]
+pub enum CatalogSupport {
+    /// Intended to be available as a supported catalog model.
+    Supported,
+    /// Temporarily unavailable or not yet supported. Never installed or loaded.
+    Disabled { reason: String },
+    /// Never offered for new installs and never loaded. An installed copy stays identifiable and
+    /// removable, and points at its replacement.
+    #[serde(rename_all = "camelCase")]
+    Deprecated {
+        since: String,
+        replacement: ModelId,
+        reason: String,
+    },
+}
+
+impl CatalogSupport {
+    #[must_use]
+    pub fn is_deprecated(&self) -> bool {
+        matches!(self, Self::Deprecated { .. })
+    }
+
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1096,6 +1128,7 @@ pub struct RecommendableModel {
     pub license: String,
     pub parameterization: ModelParameterization,
     pub intelligence: CatalogIntelligence,
+    pub support: CatalogSupport,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,
 }
@@ -1147,6 +1180,7 @@ pub struct CatalogModel {
     pub source_urls: Vec<String>,
     pub parameterization: ModelParameterization,
     pub intelligence: CatalogIntelligence,
+    pub support: CatalogSupport,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,
     pub local_state: CatalogModelState,

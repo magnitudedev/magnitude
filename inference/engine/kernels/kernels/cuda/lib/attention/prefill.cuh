@@ -1,5 +1,5 @@
-// The prefill attention entries' bodies (`gated_attention_prefill`,
-// `gated_attention_prefill_k8v4`, M >= 16): flash attention on tensor cores
+// The prefill attention entries' bodies (`attention_prefill`,
+// `attention_prefill_k8v4`, M >= 16): flash attention on tensor cores
 // over a history policy (`attention::DenseHistory`,
 // `attention::AffineHistory`) that appends a row's key and value.
 //
@@ -16,7 +16,8 @@
 // stages. S = Q K^T and O += P V run as m16n8k16 MMAs with F32 accumulation;
 // P stays in registers (FA2). Per-row interval masks apply only to K/V tiles
 // outside the rows' common interval, and tiles past every row's interval (the
-// causal tail) are never loaded. The sigmoid gate is fused into the store.
+// causal tail) are never loaded. The output gate is fused into the store. A
+// head wider than 256 makes one such scan per 256-column output window.
 //
 // Dense history and fresh tiles are copied with `cp.async`, the next tile's
 // copy overlapping the current tile's products. Affine history is
@@ -34,10 +35,26 @@ namespace prefill {
 
 constexpr int WARPS = SEISMIC_TUNE_WARPS;
 constexpr int ROWS = WARPS * 16;
+// Tokens of a block: its matrix rows hold QT whole tokens of G query heads;
+// the last ROWS - QT * G rows (none when G divides ROWS) are padding.
 constexpr int QT = ROWS / G;
-constexpr int KEYS = 32;
+// Keys per K/V tile, and output columns per pass over the keys: a head wider
+// than 256 takes 16-key tiles and one pass per 256-column output window, each
+// recomputing the scores (so every pass's softmax statistics are identical)
+// and staging only its window's V columns, which keeps the F32 outputs in
+// registers and the stages within shared memory. Its key tiles also stage in
+// 256-column pieces, one per operand stage, the scores accumulating over the
+// pieces (the query tile is the only whole-head operand in shared memory).
+constexpr int KEYS = W > 256 ? 16 : 32;
+constexpr int WINDOW = W > 256 ? 256 : W;
+constexpr int WINDOWS = W / WINDOW;
+constexpr int PIECE = WINDOW;
+constexpr int PIECES = W / PIECE;
 constexpr int CHUNKS = W / 8;  // 16-byte chunks per 16-bit row
-static_assert(16 % G == 0, "a warp's 16 matrix rows hold whole tokens");
+constexpr int WINDOW_CHUNKS = WINDOW / 8;
+constexpr int PIECE_CHUNKS = PIECE / 8;
+static_assert(QT >= 1, "a block holds at least one token's query heads");
+static_assert(W % WINDOW == 0, "output windows tile the head");
 
 // MMA operand elements (16-bit floats): the element, a packed pair, and the
 // m16n8k16 product with F32 accumulation.
@@ -73,28 +90,30 @@ template <> struct Operands<DenseHistory> : F16Operands {};
 #endif
 template <> struct Operands<AffineHistory> : F16Operands {};
 
-// Swizzled shared layout of a 16-bit [rows][W] tile: 16-byte chunk c of row r
-// sits at chunk c ^ (r % SWIZZLE), so ldmatrix row sets are bank-conflict
-// free (at W = 32 two rows share a bank set).
-constexpr int SWIZZLE = CHUNKS < 8 ? CHUNKS : 8;
+// Swizzled shared layout of a 16-bit [rows][ROW_CHUNKS * 8] tile (the head,
+// or an output window of it): 16-byte chunk c of row r sits at chunk c ^ (r %
+// swizzle), so ldmatrix row sets are bank-conflict free (at 32 columns two
+// rows share a bank set).
+template <int ROW_CHUNKS = CHUNKS>
 __device__ __forceinline__ u32 swizzled(int row, int chunk) {
-    return static_cast<u32>(row * CHUNKS + (chunk ^ (row & (SWIZZLE - 1)))) * 16;
+    constexpr int SWIZZLE = ROW_CHUNKS < 8 ? ROW_CHUNKS : 8;
+    return static_cast<u32>(row * ROW_CHUNKS + (chunk ^ (row & (SWIZZLE - 1)))) * 16;
 }
 
-// Stage `rows` rows of a [.., W] source into a swizzled 16-bit tile, by
-// `threads` threads of which this is `thread`. `source(r)` is the element
-// offset of row r, or -1 for a zero row. An f32 source (dense history of f32
-// activations) converts to the dense operand element; a 16-bit source
-// (activation or operand) is copied with `cp.async`.
-template <bool F32_SOURCE, class Source>
+// Stage `rows` rows of ROW_CHUNKS 16-byte chunks into a swizzled 16-bit tile,
+// by `threads` threads of which this is `thread`. `source(r)` is the element
+// offset of row r's first column, or -1 for a zero row. An f32 source (dense
+// history of f32 activations) converts to the dense operand element; a 16-bit
+// source (activation or operand) is copied with `cp.async`.
+template <bool F32_SOURCE, int ROW_CHUNKS, class Source>
 __device__ __forceinline__ void stage(u8 *tile, const u8 *base, int rows, Source source,
                                       int thread, int threads) {
     typedef Operands<DenseHistory> Ops;
-    for (int index = thread; index < rows * CHUNKS; index += threads) {
-        const int row = index / CHUNKS;
-        const int chunk = index % CHUNKS;
+    for (int index = thread; index < rows * ROW_CHUNKS; index += threads) {
+        const int row = index / ROW_CHUNKS;
+        const int chunk = index % ROW_CHUNKS;
         const long long at = source(row);
-        u8 *destination = tile + swizzled(row, chunk);
+        u8 *destination = tile + swizzled<ROW_CHUNKS>(row, chunk);
         if constexpr (F32_SOURCE) {
             uint4 packed = make_uint4(0, 0, 0, 0);
             if (at >= 0) {
@@ -113,16 +132,16 @@ __device__ __forceinline__ void stage(u8 *tile, const u8 *base, int rows, Source
     }
 }
 
-// Slab history supplies a row pointer for each tile row; rows can cross a
-// slab boundary within one key tile.
-template <bool F32_SOURCE, class Source>
+// Slab history supplies a row pointer (at the row's first staged column) for
+// each tile row; rows can cross a slab boundary within one key tile.
+template <bool F32_SOURCE, int ROW_CHUNKS, class Source>
 __device__ __forceinline__ void stage_slab(u8 *tile, int rows, Source source, int thread, int threads) {
     typedef Operands<DenseHistory> Ops;
-    for (int index = thread; index < rows * CHUNKS; index += threads) {
-        const int row = index / CHUNKS;
-        const int chunk = index % CHUNKS;
+    for (int index = thread; index < rows * ROW_CHUNKS; index += threads) {
+        const int row = index / ROW_CHUNKS;
+        const int chunk = index % ROW_CHUNKS;
         const u8 *base = source(row);
-        u8 *destination = tile + swizzled(row, chunk);
+        u8 *destination = tile + swizzled<ROW_CHUNKS>(row, chunk);
         if constexpr (F32_SOURCE) {
             uint4 packed = make_uint4(0, 0, 0, 0);
             if (base != nullptr) {
@@ -142,17 +161,21 @@ __device__ __forceinline__ void stage_slab(u8 *tile, int rows, Source source, in
 
 constexpr bool F32_ACTIVATION = Act::bytes == 4;
 
-// Dense history K/V tiles of tokens [first, first + KEYS) (zero at or past
-// `limit`), copied by the block's WARPS warps.
+// Dense history K piece tile (columns [piece * PIECE, (piece + 1) * PIECE)) of
+// tokens [first, first + KEYS) (zero at or past `limit`), and with the last
+// piece the V window tile (columns [column0, column0 + WINDOW)), copied by the
+// block's WARPS warps.
 __device__ __forceinline__ void stage_history(const DenseHistory &history, u8 *k_tile,
-                                              u8 *v_tile, int first, int limit, int kv) {
-    stage_slab<F32_ACTIVATION>(k_tile, KEYS, [&](int r) -> const u8 * {
+                                              u8 *v_tile, int first, int limit, int kv, int piece,
+                                              int column0) {
+    stage_slab<F32_ACTIVATION, PIECE_CHUNKS>(k_tile, KEYS, [&](int r) -> const u8 * {
         const int token = first + r;
-        return token < limit ? history.key_vector(token, kv) : nullptr;
+        return token < limit ? history.key_vector(token, kv) + piece * PIECE * Act::bytes : nullptr;
     }, threadIdx.x, WARPS * 32);
-    stage_slab<F32_ACTIVATION>(v_tile, KEYS, [&](int r) -> const u8 * {
+    if (piece + 1 < PIECES) return;
+    stage_slab<F32_ACTIVATION, WINDOW_CHUNKS>(v_tile, KEYS, [&](int r) -> const u8 * {
         const int token = first + r;
-        return token < limit ? history.value_vector(token, kv) : nullptr;
+        return token < limit ? history.value_vector(token, kv) + column0 * Act::bytes : nullptr;
     }, threadIdx.x, WARPS * 32);
 }
 
@@ -162,8 +185,10 @@ __device__ __forceinline__ void stage_history(const DenseHistory &history, u8 *k
 // Producer threads, the 16-byte code pieces of a key and a value row, and the
 // codes of one piece (all in one group).
 constexpr int PRODUCERS = WARPS * 32;
-constexpr int KEY_PIECES = W * KEY_BITS / 128;
-constexpr int VALUE_PIECES = W * VALUE_BITS / 128;
+// Key code pieces of one staged key piece.
+constexpr int KEY_PIECES = PIECE * KEY_BITS / 128;
+// Value pieces of one output window.
+constexpr int VALUE_PIECES = WINDOW * VALUE_BITS / 128;
 constexpr int KEY_ITEMS = (KEYS * KEY_PIECES + PRODUCERS - 1) / PRODUCERS;
 constexpr int VALUE_ITEMS = (KEYS * VALUE_PIECES + PRODUCERS - 1) / PRODUCERS;
 constexpr int KEY_PIECE_CODES = 128 / KEY_BITS;
@@ -202,12 +227,17 @@ __device__ __forceinline__ uint4 value_chunk(u32 word, float2 pair) {
 }
 
 // The affine tile of tokens [first, first + KEYS) decoded into the swizzled K
-// and V operand tiles by producer thread `thread`, each piece with its group's
-// (scale, zero) pair. Rows at or past `limit` get zero codes and zero pairs,
-// so they decode to exact zeros. Every load is issued before any conversion,
-// so they are in flight together.
+// operand tile (key piece `piece`) and, with the last piece, the V operand
+// tile (the output window's columns from column0) by producer thread
+// `thread`, each code piece with its group's (scale, zero) pair. Rows at or
+// past `limit` get zero codes and zero pairs, so they decode to exact zeros.
+// Every load is issued before any conversion, so they are in flight together.
 __device__ __forceinline__ void produce(const AffineHistory &history, u8 *k_tile, u8 *v_tile,
-                                        int first, int limit, int kv, int thread) {
+                                        int first, int limit, int kv, int piece, int column0,
+                                        int thread) {
+    const int key_piece0 = piece * KEY_PIECES;
+    const int value_piece0 = column0 * VALUE_BITS / 128;
+    const bool values = piece + 1 == PIECES;
     uint4 key_bits[KEY_ITEMS];
     u32 key_pairs[KEY_ITEMS];
     uint4 value_bits[VALUE_ITEMS];
@@ -216,24 +246,24 @@ __device__ __forceinline__ void produce(const AffineHistory &history, u8 *k_tile
     for (int k = 0; k < KEY_ITEMS; ++k) {
         const int index = thread + k * PRODUCERS;
         const int token = first + index / KEY_PIECES;
-        const int piece = index % KEY_PIECES;
+        const int code = key_piece0 + index % KEY_PIECES;
         const bool live = index < KEYS * KEY_PIECES && token < limit;
-        key_bits[k] = live ? seismic_ld_nc_v4(history.key_row(token, kv) + piece * 4)
+        key_bits[k] = live ? seismic_ld_nc_v4(history.key_row(token, kv) + code * 4)
                            : make_uint4(0, 0, 0, 0);
         key_pairs[k] = live ? seismic_ld_nc_u32(history.key_pair(token, kv) +
-                                                piece * KEY_PIECE_CODES / GROUP)
+                                                code * KEY_PIECE_CODES / GROUP)
                             : 0u;
     }
 #pragma unroll
     for (int k = 0; k < VALUE_ITEMS; ++k) {
         const int index = thread + k * PRODUCERS;
         const int token = first + index / VALUE_PIECES;
-        const int piece = index % VALUE_PIECES;
-        const bool live = index < KEYS * VALUE_PIECES && token < limit;
-        value_bits[k] = live ? seismic_ld_nc_v4(history.value_row(token, kv) + piece * 4)
+        const int code = value_piece0 + index % VALUE_PIECES;
+        const bool live = values && index < KEYS * VALUE_PIECES && token < limit;
+        value_bits[k] = live ? seismic_ld_nc_v4(history.value_row(token, kv) + code * 4)
                              : make_uint4(0, 0, 0, 0);
         value_pairs[k] = live ? seismic_ld_nc_u32(history.value_pair(token, kv) +
-                                                  piece * VALUE_PIECE_CODES / GROUP)
+                                                  code * VALUE_PIECE_CODES / GROUP)
                               : 0u;
     }
 #pragma unroll
@@ -244,26 +274,27 @@ __device__ __forceinline__ void produce(const AffineHistory &history, u8 *k_tile
             const int r = index / KEY_PIECES;
             const int chunk = (index % KEY_PIECES) * 2;
             const float2 pair = seismic_unpack_f16x2(key_pairs[k]);
-            *reinterpret_cast<uint4 *>(k_tile + swizzled(r, chunk)) =
+            *reinterpret_cast<uint4 *>(k_tile + swizzled<PIECE_CHUNKS>(r, chunk)) =
                 key_chunk(key_bits[k].x, key_bits[k].y, pair);
-            *reinterpret_cast<uint4 *>(k_tile + swizzled(r, chunk + 1)) =
+            *reinterpret_cast<uint4 *>(k_tile + swizzled<PIECE_CHUNKS>(r, chunk + 1)) =
                 key_chunk(key_bits[k].z, key_bits[k].w, pair);
         }
     }
 #pragma unroll
     for (int k = 0; k < VALUE_ITEMS; ++k) {
         const int index = thread + k * PRODUCERS;
-        if (index < KEYS * VALUE_PIECES) {
+        if (values && index < KEYS * VALUE_PIECES) {
             // A 16-byte value piece: 32 codes, four operand chunks.
             const int r = index / VALUE_PIECES;
             const int chunk = (index % VALUE_PIECES) * 4;
             const float2 pair = seismic_unpack_f16x2(value_pairs[k]);
-            *reinterpret_cast<uint4 *>(v_tile + swizzled(r, chunk)) = value_chunk(value_bits[k].x, pair);
-            *reinterpret_cast<uint4 *>(v_tile + swizzled(r, chunk + 1)) =
+            *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, chunk)) =
+                value_chunk(value_bits[k].x, pair);
+            *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, chunk + 1)) =
                 value_chunk(value_bits[k].y, pair);
-            *reinterpret_cast<uint4 *>(v_tile + swizzled(r, chunk + 2)) =
+            *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, chunk + 2)) =
                 value_chunk(value_bits[k].z, pair);
-            *reinterpret_cast<uint4 *>(v_tile + swizzled(r, chunk + 3)) =
+            *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, chunk + 3)) =
                 value_chunk(value_bits[k].w, pair);
         }
     }
@@ -287,6 +318,20 @@ struct Tile {
     int first;
 };
 
+// Key partitions of a query tile: its key tiles (each span's union interval
+// in KEYS steps, spans then fresh) split into runs of at least MIN_TILES over
+// the grid's z extent. A tile served by one partition stores its gated output
+// directly; otherwise each partition stores (partial output, maximum,
+// denominator) per (row, query head) and `merge` combines them. `counts`
+// holds each query tile's partition count. Entries without key partitions
+// (a grid z extent of 1) pass null scratch.
+constexpr int MIN_TILES = 16;
+struct Split {
+    float *partials;    // [parts][M][KV * G][W]
+    float *statistics;  // [parts][M][KV * G][2]
+    u32 *counts;        // [query tiles]
+};
+
 // L1 over `M` rows: 8 warps per block (launch with 256 threads). Queries,
 // keys and values go to scratch as the history policy's operands ([M, KV * G,
 // W], [M, KV, W] and [M, KV, W]).
@@ -305,13 +350,13 @@ __device__ __forceinline__ void prepare(const Inputs &in, const History &history
     const int head = static_cast<int>(item % heads);
     if (head < KV * G) {
         float x[DPL];
-        element::span<Act, DPL, true>(in.query_gate, ATTENTION_QUERY_AT(row, head) + lane * DPL, x);
-        norm_rotary(x, in.query_norm, SEISMIC_QUERY_NORM_STRIDE_0, in, row, exchange[warp], lane);
+        prepared_query(in, row, head, x, exchange[warp], lane);
         u16 *to = queries + (row * KV * G + head) * W + lane * DPL;
 #pragma unroll
-        for (int d = 0; d < DPL; ++d) to[d] = Ops::operand(Act::round(x[d]));
+        for (int d = 0; d < DPL; ++d) to[d] = Ops::operand(x[d]);
         return;
     }
+    if (!FRESH) return;
     const int kv = head - KV * G;
     float k[DPL];
     float v[DPL];
@@ -327,14 +372,16 @@ __device__ __forceinline__ void prepare(const Inputs &in, const History &history
     if (destination >= 0) history.append(destination, kv, k, v, lane);
 }
 
-// L2: block (row tile, kv head): WARPS MMA warps, plus WARPS producer warps
-// for affine history (launch with WARPS * 32 threads for dense history,
-// WARPS * 64 for affine). Shared memory: the query tile [ROWS][W], two
-// operand stages each K [KEYS][W] then V [KEYS][W] 16-bit, then the span
-// table [R + 1][4].
+// L2: block (row tile, kv head, key partition): WARPS MMA warps, plus WARPS
+// producer warps for affine history (launch with WARPS * 32 threads for dense
+// history, WARPS * 64 for affine). Shared memory: the query tile [ROWS][W],
+// two operand stages each K [KEYS][PIECE] then V [KEYS][WINDOW] 16-bit, then
+// the span table [R + 1][4]. The MMA warps make one pass over the partition's
+// key tiles per output window; a key tile is PIECES staged units, the last
+// carrying the window's values.
 template <class History>
 __device__ __forceinline__ void attend(const Inputs &in, const History &history, const u8 *queries,
-                                       const u8 *keys, const u8 *values, u8 *gated) {
+                                       const u8 *keys, const u8 *values, u8 *gated, const Split &split) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     typedef Operands<History> Ops;
     constexpr bool CODED = History::CODED;
@@ -352,16 +399,17 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     extern __shared__ __align__(16) u8 shared[];
     u8 *q_tile = shared;
     u8 *kv_tiles = q_tile + ROWS * W * 2;
-    auto k_tile = [&](int b) { return kv_tiles + b * 2 * KEYS * W * 2; };
-    auto v_tile = [&](int b) { return kv_tiles + b * 2 * KEYS * W * 2 + KEYS * W * 2; };
-    int *table = reinterpret_cast<int *>(kv_tiles + 4 * KEYS * W * 2);  // [R + 1][4]
+    constexpr int STAGE_BYTES = KEYS * (PIECE + WINDOW) * 2;
+    auto k_tile = [&](int b) { return kv_tiles + b * STAGE_BYTES; };
+    auto v_tile = [&](int b) { return kv_tiles + b * STAGE_BYTES + KEYS * PIECE * 2; };
+    int *table = reinterpret_cast<int *>(kv_tiles + 2 * STAGE_BYTES);  // [R + 1][4]
 
     // Query tile (MMA warps): matrix row i is token first_token + i / G, head
-    // kv * G + i % G.
+    // kv * G + i % G; padding rows are zero.
     if (warp < WARPS) {
-        stage<false>(q_tile, queries, ROWS, [&](int i) -> long long {
+        stage<false, CHUNKS>(q_tile, queries, ROWS, [&](int i) -> long long {
             const long long token = first_token + i / G;
-            if (token >= rows_total) return -1;
+            if (i >= QT * G || token >= rows_total) return -1;
             return (token * KV * G + kv * G + i % G) * W;
         }, threadIdx.x, WARPS * 32);
         seismic_cp_async_commit();
@@ -395,38 +443,92 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
         }
         return tile;
     };
-    // Fresh tiles (the batch's prepared keys and values, operands in scratch)
-    // into operand stage b, by `threads` threads of which this is `thread`.
-    auto stage_fresh = [&](Tile tile, int buffer, int thread, int threads) {
+
+    // This block's key partition: tiles [tiles_lo, tiles_lo + count) of the
+    // query tile's sequence.
+    auto span_tiles = [&](int index) {
+        const int lo = table[index * 4 + 0], hi = table[index * 4 + 1];
+        return hi > lo ? (hi - lo + KEYS - 1) / KEYS : 0;
+    };
+    int total_tiles = 0;
+    for (int index = 0; index <= spans; ++index) total_tiles += span_tiles(index);
+    const int parts = static_cast<int>(gridDim.z);
+    const int per = max(MIN_TILES, (total_tiles + parts - 1) / parts);
+    const int active = max(1, (total_tiles + per - 1) / per);
+    const int partition = static_cast<int>(blockIdx.z);
+    if (partition >= active) {
+        seismic_cp_async_wait<0>();
+        return;
+    }
+    if (parts > 1 && partition == 0 && kv == 0 && threadIdx.x == 0) split.counts[blockIdx.x] = active;
+    const int tiles_lo = partition * per;
+    const int count = max(0, min(per, total_tiles - tiles_lo));
+    // Tile `index` of the query tile's sequence.
+    auto nth = [&](int index) {
+        for (int span = 0; span <= spans; ++span) {
+            const int n = span_tiles(span);
+            if (index < n) return Tile{span, table[span * 4 + 0] + index * KEYS};
+            index -= n;
+        }
+        return Tile{spans + 1, 0};
+    };
+    // Fresh tiles (the batch's prepared keys and values, operands in scratch:
+    // the keys' piece, and with the last piece the values' window from
+    // column0) into operand stage b, by `threads` threads of which this is
+    // `thread`.
+    auto stage_fresh = [&](Tile tile, int buffer, int piece, int column0, int thread, int threads) {
         const int limit = table[tile.span * 4 + 1];
         auto row = [&](int r) -> long long {
             const int token = tile.first + r;
             return token < limit ? (static_cast<long long>(token) * KV + kv) * W : -1;
         };
-        stage<false>(k_tile(buffer), keys, KEYS, row, thread, threads);
-        stage<false>(v_tile(buffer), values, KEYS, row, thread, threads);
+        stage<false, PIECE_CHUNKS>(k_tile(buffer), keys, KEYS, [&](int r) -> long long {
+            const long long at = row(r);
+            return at >= 0 ? at + piece * PIECE : -1;
+        }, thread, threads);
+        if (piece + 1 < PIECES) return;
+        stage<false, WINDOW_CHUNKS>(v_tile(buffer), values, KEYS, [&](int r) -> long long {
+            const long long at = row(r);
+            return at >= 0 ? at + column0 : -1;
+        }, thread, threads);
     };
+    // The unit after (tile, piece): the tile's next key piece, else the next
+    // tile's first.
+    auto advance = [&](Tile &tile, int &piece) {
+        if (++piece == PIECES) {
+            piece = 0;
+            tile = settle(Tile{tile.span, tile.first + KEYS});
+        }
+    };
+    // Staged units per output window.
+    const int units = count * PIECES;
 
     if constexpr (CODED) {
         if (warp >= WARPS) {
-            // Producer warps: every tile in order into stage i % 2, once its
-            // previous occupant (tile i - 2) is consumed.
+            // Producer warps: per output window, the partition's units in
+            // order; staged unit i (counted over every window) goes into stage
+            // i % 2 once its previous occupant (unit i - 2) is consumed.
             const int thread = threadIdx.x - WARPS * 32;
-            Tile tile = settle(Tile{0, table[0]});
-            for (int i = 0; tile.span <= spans; ++i) {
-                const int b = i % 2;
-                if (i >= 2) named_sync(EMPTY + b, THREADS);
-                if (tile.span < spans) {
-                    produce(history, k_tile(b), v_tile(b), tile.first, table[tile.span * 4 + 1],
-                            kv, thread);
-                } else {
-                    stage_fresh(tile, b, thread, PRODUCERS);
-                    seismic_cp_async_commit();
-                    seismic_cp_async_wait<0>();
+            for (int window = 0; window < WINDOWS; ++window) {
+                const int column0 = window * WINDOW;
+                Tile tile = nth(tiles_lo);
+                int piece = 0;
+                for (int j = 0; j < units; ++j) {
+                    const int i = window * units + j;
+                    const int b = i % 2;
+                    if (i >= 2) named_sync(EMPTY + b, THREADS);
+                    if (tile.span < spans) {
+                        produce(history, k_tile(b), v_tile(b), tile.first, table[tile.span * 4 + 1],
+                                kv, piece, column0, thread);
+                    } else {
+                        stage_fresh(tile, b, piece, column0, thread, PRODUCERS);
+                        seismic_cp_async_commit();
+                        seismic_cp_async_wait<0>();
+                    }
+                    __threadfence_block();
+                    named_arrive(FULL + b, THREADS);
+                    advance(tile, piece);
                 }
-                __threadfence_block();
-                named_arrive(FULL + b, THREADS);
-                tile = settle(Tile{tile.span, tile.first + KEYS});
             }
             return;
         }
@@ -435,8 +537,8 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     // MMA warps. This lane's two matrix rows (g and g + 8 of the warp's 16).
     const long long token_a = first_token + (warp * 16 + g) / G;
     const long long token_b = first_token + (warp * 16 + g + 8) / G;
-    const bool valid_a = token_a < rows_total;
-    const bool valid_b = token_b < rows_total;
+    const bool valid_a = warp * 16 + g < QT * G && token_a < rows_total;
+    const bool valid_b = warp * 16 + g + 8 < QT * G && token_b < rows_total;
 
     // Affine: the producers stage every K/V tile, so the MMA warps complete
     // their query tile copy here.
@@ -446,34 +548,29 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     }
 
     const float NEG_INF = -__int_as_float(0x7f800000);
-    float o[W / 8][4];
-#pragma unroll
-    for (int n = 0; n < W / 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
-    float maximum[2] = {NEG_INF, NEG_INF};
-    float denominator[2] = {0.0f, 0.0f};
+    // The output window's accumulators and both rows' softmax states, reset
+    // per pass.
+    float o[WINDOW / 8][4];
+    float maximum[2];
+    float denominator[2];
     int cached_span = -1;
     Span interval_a{0, 0}, interval_b{0, 0};
+    // A key tile's scores, accumulated over its pieces.
+    float s[KEYS / 8][4];
 
-    // The products of one staged tile.
-    auto absorb_tile = [&](Tile current, const u8 *k_base, const u8 *v_base) {
-        if (current.span != cached_span) {
-            cached_span = current.span;
-            interval_a = valid_a ? span(in, token_a, current.span, spans) : Span{0, 0};
-            interval_b = valid_b ? span(in, token_b, current.span, spans) : Span{0, 0};
+    // The products of one staged unit: S = Q K^T over the key piece's
+    // columns; after the tile's last piece, the softmax and O += P V.
+    auto absorb_unit = [&](Tile current, int piece, const u8 *k_base, const u8 *v_base) {
+        if (piece == 0) {
+#pragma unroll
+            for (int n = 0; n < KEYS / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
         }
-        const bool full = current.first >= table[current.span * 4 + 2] &&
-                          current.first + KEYS <= table[current.span * 4 + 3];
-
-        // S = Q K^T over W.
-        float s[KEYS / 8][4];
 #pragma unroll
-        for (int n = 0; n < KEYS / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
-#pragma unroll
-        for (int step = 0; step < W / 16; ++step) {
+        for (int step = 0; step < PIECE / 16; ++step) {
             u32 a[4];
             {
                 const int row = warp * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
-                const int chunk = 2 * step + lane / 16;
+                const int chunk = piece * PIECE_CHUNKS + 2 * step + lane / 16;
                 seismic_ldmatrix_x4(a, q_tile + swizzled(row, chunk));
             }
 #pragma unroll
@@ -481,13 +578,22 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                 u32 b4[4];
                 const int row = 8 * (n + lane / 16) + (lane % 8);
                 const int chunk = 2 * step + (lane / 8) % 2;
-                seismic_ldmatrix_x4(b4, k_base + swizzled(row, chunk));
+                seismic_ldmatrix_x4(b4, k_base + swizzled<PIECE_CHUNKS>(row, chunk));
                 const u32 b0[2] = {b4[0], b4[1]};
                 const u32 b1[2] = {b4[2], b4[3]};
                 Ops::mma(s[n], a, b0);
                 Ops::mma(s[n + 1], a, b1);
             }
         }
+        if (piece + 1 < PIECES) return;
+
+        if (current.span != cached_span) {
+            cached_span = current.span;
+            interval_a = valid_a ? span(in, token_a, current.span, spans) : Span{0, 0};
+            interval_b = valid_b ? span(in, token_b, current.span, spans) : Span{0, 0};
+        }
+        const bool full = current.first >= table[current.span * 4 + 2] &&
+                          current.first + KEYS <= table[current.span * 4 + 3];
 
         // Scale into the exp2 domain, mask, then the online softmax of both rows.
 #pragma unroll
@@ -527,14 +633,14 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
             denominator[half] = __fmaf_rn(denominator[half], carry[half], sum);
         }
 #pragma unroll
-        for (int n = 0; n < W / 8; ++n) {
+        for (int n = 0; n < WINDOW / 8; ++n) {
             o[n][0] *= carry[0];
             o[n][1] *= carry[0];
             o[n][2] *= carry[1];
             o[n][3] *= carry[1];
         }
 
-        // O += P V, P from the S registers.
+        // O += P V over the window, P from the S registers.
 #pragma unroll
         for (int step = 0; step < KEYS / 16; ++step) {
             const u32 p[4] = {Ops::pair(s[2 * step][0], s[2 * step][1]),
@@ -542,11 +648,11 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                               Ops::pair(s[2 * step + 1][0], s[2 * step + 1][1]),
                               Ops::pair(s[2 * step + 1][2], s[2 * step + 1][3])};
 #pragma unroll
-            for (int n = 0; n < W / 8; n += 2) {
+            for (int n = 0; n < WINDOW / 8; n += 2) {
                 u32 b4[4];
                 const int row = 16 * step + (lane % 8) + 8 * ((lane / 8) % 2);
                 const int chunk = n + lane / 16;
-                seismic_ldmatrix_x4_trans(b4, v_base + swizzled(row, chunk));
+                seismic_ldmatrix_x4_trans(b4, v_base + swizzled<WINDOW_CHUNKS>(row, chunk));
                 const u32 b0[2] = {b4[0], b4[1]};
                 const u32 b1[2] = {b4[2], b4[3]};
                 Ops::mma(o[n], p, b0);
@@ -555,73 +661,128 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
         }
     };
 
-    Tile current = settle(Tile{0, table[0]});
-    if constexpr (CODED) {
-        // Tile i waits for stage i % 2 to be full; once its products are
-        // issued, the stage is released for tile i + 2 when that tile exists.
-        for (int i = 0; current.span <= spans; ++i) {
-            const int b = i % 2;
-            named_sync(FULL + b, THREADS);
-            absorb_tile(current, k_tile(b), v_tile(b));
-            const Tile next = settle(Tile{current.span, current.first + KEYS});
-            if (next.span <= spans && settle(Tile{next.span, next.first + KEYS}).span <= spans)
-                named_arrive(EMPTY + b, THREADS);
-            current = next;
-        }
-    } else {
-        auto issue = [&](Tile tile, int buffer) {
-            if (tile.span < spans) {
-                stage_history(history, k_tile(buffer), v_tile(buffer), tile.first,
-                              table[tile.span * 4 + 1], kv);
-            } else {
-                stage_fresh(tile, buffer, threadIdx.x, WARPS * 32);
-            }
-            seismic_cp_async_commit();
-        };
-        int buffer = 0;
-        if (current.span <= spans) issue(current, 0);
-        while (current.span <= spans) {
-            const Tile next = settle(Tile{current.span, current.first + KEYS});
-            if (next.span <= spans) {
-                issue(next, buffer ^ 1);
-                seismic_cp_async_wait<1>();
-            } else {
-                seismic_cp_async_wait<0>();
-            }
-            __syncthreads();
-            absorb_tile(current, k_tile(buffer), v_tile(buffer));
-            __syncthreads();
-            current = next;
-            buffer ^= 1;
-        }
-    }
+    for (int column0 = 0; column0 < W; column0 += WINDOW) {
+#pragma unroll
+        for (int n = 0; n < WINDOW / 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+        maximum[0] = maximum[1] = NEG_INF;
+        denominator[0] = denominator[1] = 0.0f;
 
-    // Normalize, gate and store.
-#pragma unroll
-    for (int half = 0; half < 2; ++half) {
-        float l = denominator[half];
-        l += seismic_shfl_xor_f32(l, 1);
-        l += seismic_shfl_xor_f32(l, 2);
-        denominator[half] = fmaxf(l, 1e-30f);
-    }
-#pragma unroll
-    for (int half = 0; half < 2; ++half) {
-        const long long token = half == 0 ? token_a : token_b;
-        if (token >= rows_total) continue;
-        const int query_head = kv * G + (warp * 16 + g + 8 * half) % G;
-        const u64 gate_at = ATTENTION_GATE_AT(token, query_head);
-        const u64 out_at = static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
-                           static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1;
-#pragma unroll
-        for (int n = 0; n < W / 8; ++n) {
-#pragma unroll
-            for (int e = 0; e < 2; ++e) {
-                const int column = 8 * n + 2 * t + e;
-                const float gate = element::at<Act>(in.query_gate, gate_at + column);
-                element::put<Act>(gated, out_at + column * SEISMIC_RESULT_0_STRIDE_2,
-                                  o[n][2 * half + e] / denominator[half] / (1.0f + expf(-gate)));
+        Tile current = nth(tiles_lo);
+        int piece = 0;
+        if constexpr (CODED) {
+            // Staged unit i (counted over every window) waits for stage i % 2
+            // to be full; once its products are issued, the stage is released
+            // for unit i + 2 when that unit exists.
+            const int staged = WINDOWS * units;
+            for (int j = 0; j < units; ++j) {
+                const int i = (column0 / WINDOW) * units + j;
+                const int b = i % 2;
+                named_sync(FULL + b, THREADS);
+                absorb_unit(current, piece, k_tile(b), v_tile(b));
+                if (i + 2 < staged) named_arrive(EMPTY + b, THREADS);
+                advance(current, piece);
+            }
+        } else {
+            auto issue = [&](Tile tile, int tile_piece, int buffer) {
+                if (tile.span < spans) {
+                    stage_history(history, k_tile(buffer), v_tile(buffer), tile.first,
+                                  table[tile.span * 4 + 1], kv, tile_piece, column0);
+                } else {
+                    stage_fresh(tile, buffer, tile_piece, column0, threadIdx.x, WARPS * 32);
+                }
+                seismic_cp_async_commit();
+            };
+            int buffer = 0;
+            if (units > 0) issue(current, 0, 0);
+            for (int i = 0; i < units; ++i) {
+                Tile next = current;
+                int next_piece = piece;
+                advance(next, next_piece);
+                if (i + 1 < units) {
+                    issue(next, next_piece, buffer ^ 1);
+                    seismic_cp_async_wait<1>();
+                } else {
+                    seismic_cp_async_wait<0>();
+                }
+                __syncthreads();
+                absorb_unit(current, piece, k_tile(buffer), v_tile(buffer));
+                __syncthreads();
+                current = next;
+                piece = next_piece;
+                buffer ^= 1;
             }
         }
+
+        // Both rows' whole denominators (their four lanes' shares).
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            float l = denominator[half];
+            l += seismic_shfl_xor_f32(l, 1);
+            l += seismic_shfl_xor_f32(l, 2);
+            denominator[half] = l;
+        }
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const long long token = half == 0 ? token_a : token_b;
+            if (!(half == 0 ? valid_a : valid_b)) continue;
+            const int query_head = kv * G + (warp * 16 + g + 8 * half) % G;
+            if (active > 1) {
+                // A partition's partial: the output relative to its row
+                // maximum, and (maximum, denominator).
+                const u64 slot = (static_cast<u64>(partition) * rows_total + token) * (KV * G) + query_head;
+#pragma unroll
+                for (int n = 0; n < WINDOW / 8; ++n) {
+#pragma unroll
+                    for (int e = 0; e < 2; ++e)
+                        split.partials[slot * W + column0 + 8 * n + 2 * t + e] = o[n][2 * half + e];
+                }
+                if (column0 == 0 && t == 0) {
+                    split.statistics[slot * 2 + 0] = maximum[half];
+                    split.statistics[slot * 2 + 1] = denominator[half];
+                }
+                continue;
+            }
+            const float whole = fmaxf(denominator[half], 1e-30f);
+            const u64 out_at = static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
+                               static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1;
+#pragma unroll
+            for (int n = 0; n < WINDOW / 8; ++n) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int column = column0 + 8 * n + 2 * t + e;
+                    element::put<Act>(gated, out_at + column * SEISMIC_RESULT_0_STRIDE_2,
+                                      attention::gated(in, token, query_head, column,
+                                                       o[n][2 * half + e] / whole));
+                }
+            }
+        }
+    }
+}
+
+// L3: block (query tile, query head), one thread per column. A tile whose
+// keys took several partitions merges each of its rows' partitions in
+// partition order and applies the gate; other tiles were stored by L2.
+__device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &split, u8 *gated) {
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+    const int tile = static_cast<int>(blockIdx.x);
+    const int query_head = static_cast<int>(blockIdx.y);
+    const int column = static_cast<int>(threadIdx.x);
+    const int count = static_cast<int>(split.counts[tile]);
+    if (count <= 1) return;
+    const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
+    const u64 heads = KV * G;
+    for (long long token = static_cast<long long>(tile) * QT;
+         token < min(static_cast<long long>(tile + 1) * QT, rows_total); ++token) {
+        const u64 slot = static_cast<u64>(token) * heads + query_head;
+        float denominator, accumulated;
+        merge(split.statistics + slot * 2, static_cast<u64>(rows_total) * heads * 2,
+              split.partials + slot * W + column, static_cast<u64>(rows_total) * heads * W, count,
+              denominator, accumulated);
+        element::put<Act>(gated,
+                          static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
+                              static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1 +
+                              static_cast<u64>(column) * SEISMIC_RESULT_0_STRIDE_2,
+                          attention::gated(in, token, query_head, column, accumulated / fmaxf(denominator, 1e-30f)));
     }
 }
 

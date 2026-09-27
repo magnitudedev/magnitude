@@ -565,6 +565,8 @@ export const ProviderModelDisabledReasonSchema = Schema.Literal(
   "installation_unavailable",
   "incompatible_runtime",
   "invalid_configuration",
+  "catalog_disabled",
+  "deprecated",
 )
 export type ProviderModelDisabledReason = typeof ProviderModelDisabledReasonSchema.Type
 
@@ -592,10 +594,30 @@ export const ProviderModelCatalogEntrySchema = Schema.Struct({
   { message: () => "supported model slots must be unique" }))
 export type ProviderModelCatalogEntry = typeof ProviderModelCatalogEntrySchema.Type
 
+const CatalogDeprecationDateSchema = Schema.String.pipe(
+  Schema.filter(isRealIsoCalendarDate, {
+    message: () => "catalog deprecation date must be a real YYYY-MM-DD calendar date",
+  }),
+  Schema.brand("CatalogDeprecationDate"),
+)
+
+/** What the release promises for a catalog model, independent of this device's assessment. */
+export const CatalogSupportSchema = Schema.Union(
+  Schema.TaggedStruct("Supported", {}),
+  Schema.TaggedStruct("Disabled", { reason: NonEmptyString }),
+  Schema.TaggedStruct("Deprecated", {
+    since: CatalogDeprecationDateSchema,
+    replacement: CatalogFormModelIdSchema,
+    reason: NonEmptyString,
+  }),
+)
+export type CatalogSupport = typeof CatalogSupportSchema.Type
+
 export const LocalModelCatalogDataSchema = Schema.Struct({
   releaseDate: ModelReleaseDateSchema,
   parameterization: ModelParameterizationSchema,
   intelligence: CatalogIntelligenceSchema,
+  support: CatalogSupportSchema,
   fidelityRank: NonNegativeSafeInteger,
   quantizationAware: Schema.Boolean,
 })

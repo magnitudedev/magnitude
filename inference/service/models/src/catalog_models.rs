@@ -7,7 +7,8 @@ use futures_util::stream::BoxStream;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     CatalogInstallationAdmission, CatalogInstallationRemoval, CatalogModel, CatalogModelState,
-    CatalogModelUpdate, CatalogModels, CatalogModelsResponse, CatalogPackageRole, EffectiveModel,
+    CatalogModelUpdate, CatalogModels, CatalogModelsResponse, CatalogPackageRole, CatalogSupport,
+    EffectiveModel,
     InstalledCatalogAttribution, InstalledModelPackage, ModelAssessmentSubject,
     ModelDomainInvalidation, ModelFailure, ModelId, ModelInstallation, ModelInstallationOwnership,
     ModelPackageId, ModelPackageInstallationOrigin, ModelServingConfiguration, ParsedModelId,
@@ -51,13 +52,36 @@ fn removal_plan(
     }
 }
 
+/// Unavailable catalog models cannot be installed or loaded; their files remain removable.
+pub(crate) fn reject_unavailable(
+    model_id: &ModelId,
+    definition: &RecommendableModel,
+) -> Result<(), InventoryError> {
+    match &definition.support {
+        CatalogSupport::Supported => Ok(()),
+        CatalogSupport::Disabled { reason } => Err(InventoryError::ModelOperation {
+            code: "catalog_model_disabled".to_owned(),
+            message: format!("catalog model {model_id} is disabled ({reason})"),
+            retryable: false,
+        }),
+        CatalogSupport::Deprecated { replacement, reason, .. } => Err(InventoryError::ModelOperation {
+            code: "catalog_model_deprecated".to_owned(),
+            message: format!("catalog model {model_id} is deprecated ({reason}); use {replacement}"),
+            retryable: false,
+        }),
+    }
+}
+
 impl ModelDomainResolver {
     pub fn serving_configuration(
         &self,
         model_id: &ModelId,
     ) -> Result<ModelServingConfiguration, InventoryError> {
         match model_id.parsed() {
-            ParsedModelId::Catalog { .. } => self.effective_catalog_configuration(model_id),
+            ParsedModelId::Catalog { .. } => {
+                reject_unavailable(model_id, self.catalog_definition(model_id)?)?;
+                self.effective_catalog_configuration(model_id)
+            }
             ParsedModelId::HuggingFace { .. } => {
                 let installed = self.inventory.installed_packages.read().map_err(|_| {
                     InventoryError::Internal("installed package lock poisoned".to_owned())
@@ -471,6 +495,7 @@ fn catalog_model(
             .collect(),
         parameterization: definition.parameterization.clone(),
         intelligence: definition.intelligence.clone(),
+        support: definition.support.clone(),
         fidelity_rank: definition.fidelity_rank,
         quantization_aware: definition.quantization_aware,
         local_state: match resolution.state {
@@ -708,8 +733,8 @@ mod tests {
     use std::path::PathBuf;
 
     use magnitude_service_contracts::models::{
-        CatalogBaseId, CatalogIntelligence, CatalogPackageAffiliation, CatalogVariantId,
-        IntelligenceProvenance, ModelFile, ModelFileId, ModelFileRole, ModelPackage,
+        CatalogBaseId, CatalogIntelligence, CatalogPackageAffiliation, CatalogSupport,
+        CatalogVariantId, IntelligenceProvenance, ModelFile, ModelFileId, ModelFileRole, ModelPackage,
         ModelPackageProperties, ModelPackageSource, ModelParameterization, ModelReleaseDate,
         PackageValidation, ResolvedModelInstallation, ServingProfile, SpeculativeDraftSource,
         SpeculativeMethod,
@@ -784,6 +809,7 @@ mod tests {
                     url: "https://example.com/model".to_owned(),
                 },
             },
+            support: CatalogSupport::Supported,
             fidelity_rank: 1,
             quantization_aware: false,
         }
@@ -868,6 +894,39 @@ mod tests {
         );
         assert_eq!(ready.metadata.storage_bytes, 25);
         assert_eq!(ready.speculative_method, Some(SpeculativeMethod::DFlash));
+    }
+
+    #[test]
+    fn unavailable_catalog_models_are_rejected_with_their_reason_or_replacement() {
+        let mut model = definition(ServableModelBundle::Standalone {
+            package: package("target", 1),
+        });
+        let id = catalog_id(&model);
+        assert!(reject_unavailable(&id, &model).is_ok());
+        model.support = CatalogSupport::Disabled {
+            reason: "not yet qualified".to_owned(),
+        };
+        let Err(InventoryError::ModelOperation { code, message, .. }) = reject_unavailable(&id, &model) else {
+            panic!("a disabled model must be rejected");
+        };
+        assert_eq!(code, "catalog_model_disabled");
+        assert!(message.contains("not yet qualified"));
+        model.support = CatalogSupport::Deprecated {
+            since: "2026-09-27".to_owned(),
+            replacement: "replacement:gguf:q4".parse().expect("model ID"),
+            reason: "unsupported architecture".to_owned(),
+        };
+        let Err(InventoryError::ModelOperation {
+            code,
+            message,
+            retryable,
+        }) = reject_unavailable(&id, &model)
+        else {
+            panic!("a deprecated model must be rejected");
+        };
+        assert_eq!(code, "catalog_model_deprecated");
+        assert!(message.contains("replacement:gguf:q4"));
+        assert!(!retryable);
     }
 
     #[test]

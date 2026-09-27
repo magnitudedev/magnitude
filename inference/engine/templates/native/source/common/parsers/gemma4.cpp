@@ -148,6 +148,194 @@ void convert_tool_responses_gemma4(json & messages) {
 
 }
 
+namespace {
+
+// Tool arguments constrained by the function's JSON schema, in the dictionary
+// syntax the template renders them in (`format_argument`): unquoted keys in
+// `dictsort` order, strings between <|"|> delimiters. Every rule is named
+// `<kind>--<path>` after the node kind common_chat_peg_gemma4_mapper converts
+// to JSON, so parsing and the generation grammar come from the same rules.
+class gemma4_argument_rules {
+  public:
+    gemma4_argument_rules(common_chat_peg_builder & p, std::string prefix) : p(p), prefix(std::move(prefix)) {}
+
+    common_peg_parser visit(const common_chat_schema & schema) {
+        switch (schema.kind()) {
+            case common_chat_schema::KIND_ANY:
+                return p.ref("gemma4-value");
+            case common_chat_schema::KIND_NULL:
+                return p.ref("gemma4-null");
+            case common_chat_schema::KIND_BOOLEAN:
+                return p.ref("gemma4-bool");
+            case common_chat_schema::KIND_NUMBER:
+                return p.ref("gemma4-number");
+            case common_chat_schema::KIND_INTEGER: {
+                const auto & integer = static_cast<const common_chat_schema_integer &>(schema);
+                if (integer.minimum != INT64_MIN || integer.maximum != INT64_MAX) {
+                    unsupported("integer bounds");
+                }
+                return p.rule("gemma4-number--" + path(), p.sequence({
+                    p.optional(p.literal("-")),
+                    p.choice({p.literal("0"), p.chars("[1-9]", 1, 1) + p.chars("[0-9]", 0, -1)}),
+                    p.negate(p.chars("[0-9.eE+-]", 1, 1)),
+                }));
+            }
+            case common_chat_schema::KIND_STRING: {
+                const auto & string = static_cast<const common_chat_schema_string &>(schema);
+                if (!string.pattern.empty() || string.format != common_chat_schema::FORMAT_NONE ||
+                    string.min_length != 0 || string.max_length != -1) {
+                    unsupported("string patterns, formats or lengths");
+                }
+                return p.ref("gemma4-string");
+            }
+            case common_chat_schema::KIND_CONST:
+                return constant(static_cast<const common_chat_schema_const &>(schema).value);
+            case common_chat_schema::KIND_ENUM: {
+                std::vector<common_peg_parser> values;
+                for (const auto & value : static_cast<const common_chat_schema_enum &>(schema).values) {
+                    values.push_back(constant(value));
+                }
+                return alternatives(values);
+            }
+            case common_chat_schema::KIND_ANY_OF: {
+                std::vector<common_peg_parser> values;
+                for (const auto & child : static_cast<const common_chat_schema_any_of &>(schema).children) {
+                    values.push_back(visit(*child));
+                }
+                return alternatives(values);
+            }
+            case common_chat_schema::KIND_REF: {
+                const auto * target = static_cast<const common_chat_schema_ref &>(schema).target;
+                if (!target) {
+                    unsupported("unresolved references");
+                }
+                // The placeholder rule lets a recursive schema refer to itself.
+                auto index = references.emplace(target, references.size()).first->second;
+                return p.rule("gemma4-value--" + prefix + "-ref-" + std::to_string(index),
+                              [&]() { return visit(*target); });
+            }
+            case common_chat_schema::KIND_ARRAY:
+                return array(static_cast<const common_chat_schema_array &>(schema));
+            case common_chat_schema::KIND_OBJECT:
+                return object(static_cast<const common_chat_schema_object &>(schema));
+            case common_chat_schema::KIND_ALL_OF:
+                unsupported("allOf");
+            case common_chat_schema::KIND_TUPLE:
+                unsupported("tuples");
+        }
+        unsupported("this schema");
+    }
+
+  private:
+    common_chat_peg_builder &                     p;
+    std::string                                   prefix;
+    size_t                                        next = 0;
+    std::map<const common_chat_schema *, size_t>  references;
+
+    [[noreturn]] static void unsupported(const std::string & what) {
+        throw std::invalid_argument("Unsupported JSON schema: Gemma tool arguments cannot enforce " + what);
+    }
+
+    std::string path() { return prefix + "-" + std::to_string(next++); }
+
+    // A value rendered literally.
+    common_peg_parser constant(const json & value) {
+        auto at = path();
+        if (value.is_string()) {
+            const auto text = value.get<std::string>();
+            if (text.find("<|\"|>") != std::string::npos) {
+                unsupported("strings containing the <|\"|> delimiter");
+            }
+            return p.rule("gemma4-string--" + at,
+                          p.literal("<|\"|>") + p.rule("gemma4-string-content--" + at, p.literal(text)) + p.literal("<|\"|>"));
+        }
+        if (value.is_boolean()) {
+            return p.rule("gemma4-bool--" + at, p.literal(value.get<bool>() ? "true" : "false"));
+        }
+        if (value.is_null()) {
+            return p.rule("gemma4-null--" + at, p.literal("null"));
+        }
+        if (value.is_number()) {
+            return p.rule("gemma4-number--" + at, p.literal(value.dump()));
+        }
+        unsupported("object or array constants");
+    }
+
+    // One of several values. A PEG choice commits to the first alternative
+    // that matches, so each must reach the end of the value.
+    common_peg_parser alternatives(const std::vector<common_peg_parser> & values) {
+        auto end = p.peek(p.choice({p.literal(","), p.literal("}"), p.literal("]"), p.literal(" "), p.literal("\n"), p.literal("\t")}));
+        auto choice = p.choice();
+        for (const auto & value : values) {
+            choice |= value + end;
+        }
+        return p.rule("gemma4-value--" + path(), choice);
+    }
+
+    common_peg_parser array(const common_chat_schema_array & array) {
+        if (array.items->kind() == common_chat_schema::KIND_ANY && array.min_items == 0 && array.max_items < 0) {
+            return p.ref("gemma4-array");
+        }
+        auto item     = visit(*array.items);
+        auto elements = p.eps();
+        if (array.max_items != 0) {
+            auto rest = p.repeat(p.literal(",") + p.space() + item, std::max(array.min_items - 1, 0),
+                                 array.max_items < 0 ? -1 : array.max_items - 1);
+            elements = array.min_items > 0 ? item + rest : p.optional(item + rest);
+        }
+        return p.rule("gemma4-array--" + path(), p.literal("[") + p.space() + elements + p.space() + p.literal("]"));
+    }
+
+    common_peg_parser object(const common_chat_schema_object & object) {
+        if (object.properties.empty() && object.additional_properties &&
+            object.additional_properties->kind() == common_chat_schema::KIND_ANY) {
+            return p.ref("gemma4-dict");
+        }
+        if (object.additional_properties) {
+            unsupported("undeclared properties");
+        }
+        std::vector<const common_chat_schema_property *> properties;
+        for (const auto & property : object.properties) {
+            if (property.name.empty() || property.name.find_first_of(":}") != std::string::npos) {
+                unsupported("property names that are not bare dictionary keys");
+            }
+            properties.push_back(&property);
+        }
+        // `dictsort` orders keys case-insensitively.
+        auto folded = [](const std::string & text) {
+            std::string result = text;
+            std::transform(result.begin(), result.end(), result.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return result;
+        };
+        std::stable_sort(properties.begin(), properties.end(), [&](const auto * a, const auto * b) {
+            return folded(a->name) < folded(b->name);
+        });
+        // Built from the last key: `first` holds the members from here on when
+        // none precedes them, `later` the members after one that did.
+        auto first = p.eps();
+        auto later = p.eps();
+        for (auto it = properties.rbegin(); it != properties.rend(); ++it) {
+            const auto & property = **it;
+            auto at     = path();
+            auto key    = p.rule("gemma4-dict-key--" + at,
+                                 p.rule("gemma4-dict-key-name--" + at, p.literal(property.name)) + p.literal(":"));
+            auto member = p.rule("gemma4-dict-kv--" + at, key + p.space() + visit(*property.schema));
+            auto after  = p.literal(",") + p.space() + member;
+            if (property.required) {
+                first = member + later;
+                later = after + later;
+            } else {
+                first = p.choice({member + later, first});
+                later = p.optional(after) + later;
+            }
+        }
+        return p.rule("gemma4-dict--" + path(), p.literal("{") + p.space() + first + p.space() + p.literal("}"));
+    }
+};
+
+}
+
 common_chat_params common_chat_params_init_gemma4(const common_chat_template &    tmpl,
                                                          const autoparser::generation_params & inputs) {
     common_chat_params data;
@@ -254,15 +442,16 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
 
             auto tool_choice = p.choice();
 
+            size_t index = 0;
             foreach_function(inputs.tools, [&](const json & tool) {
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
-                // TODO @aldehir : need to extend json-schema-to-grammar to produce more than JSON rules
-                // const auto & params   = function.at("parameters");
+                const auto   schema   = common_chat_schema_from_json(common_chat_tool_parameters(function));
+                gemma4_argument_rules arguments(p, "tool-" + std::to_string(index++));
 
                 tool_choice |= p.rule("tool-" + name, p.tool(p.sequence({
                     p.tool_open(p.tool_name(p.literal(name)) + p.peek(p.literal("{"))),
-                    p.tool_args(p.ref("gemma4-dict")),
+                    p.tool_args(arguments.visit(*schema.root)),
                 })));
             });
 

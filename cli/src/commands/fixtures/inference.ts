@@ -163,6 +163,7 @@ const makeCatalogOnlyModel = (
             url: "https://example.com/model",
           },
         }),
+        support: { _tag: "Supported" },
         fidelityRank: 75,
         quantizationAware: false,
     },

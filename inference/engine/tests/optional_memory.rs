@@ -42,6 +42,7 @@ fn plain_owner(
         package: PackageOptions {
             target: model,
             projector: ProjectorSelection::Disabled,
+            draft: None,
         },
         model: ModelPolicy {
             method: ModelMethod::Plain,
@@ -58,7 +59,7 @@ fn plain_owner(
     }
     .resolve()
     .unwrap();
-    let vocabulary = resolved.manifest.definition.geometry.vocabulary as usize;
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let key = RetentionKey::new(
         resolved.manifest.package.identity.clone(),
         TokenizerIdentity::new("optional-memory").unwrap(),
@@ -109,6 +110,7 @@ fn greedy(prompt: &[TokenId], vocabulary: usize, max_tokens: usize) -> Generatio
             context_limit: 1024,
             vocabulary,
             stop_tokens: BTreeSet::new(),
+            suppressed_tokens: BTreeSet::new(),
             sampling: Sampling::Greedy,
             shaping: Shaping {
                 temperature: 0.0,
@@ -371,6 +373,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         package: PackageOptions {
             target: model,
             projector: ProjectorSelection::Disabled,
+            draft: None,
         },
         model: ModelPolicy {
             method: ModelMethod::Mtp,
@@ -392,7 +395,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
     }
     .resolve()
     .unwrap();
-    let row_bytes = usize::try_from(resolved.manifest.definition.geometry.hidden).unwrap() * 2;
+    let row_bytes = usize::try_from(resolved.manifest.definition.decoder.hidden).unwrap() * 2;
     let package = resolved.host.shared_package();
     let (mut domain, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let charge = |domain: &magnitude_executor::ExecutorDomain| {
@@ -409,6 +412,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
             conditioning: FeatureRows::new(vec![0; row_bytes].into(), 1).unwrap(),
             position: 0,
             proposals: Vec::new(),
+            form: magnitude_executor::DraftForm::Chained,
         };
         let groups = service_domain::group(&domain, vec![head]);
         let [group] = groups.as_slice() else {
@@ -481,6 +485,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
         package: PackageOptions {
             target: model,
             projector: ProjectorSelection::Disabled,
+            draft: None,
         },
         model: ModelPolicy {
             method: ModelMethod::Mtp,
@@ -497,7 +502,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
     }
     .resolve()
     .unwrap();
-    let vocabulary = resolved.manifest.definition.geometry.vocabulary as usize;
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let tokenizer = resolved.host.shared_tokenizer();
     let package = resolved.host.shared_package();
     let (domain, _) = build_native_domain(&resolved.manifest, package).unwrap();
@@ -518,6 +523,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
                     context_limit: 1024,
                     vocabulary,
                     stop_tokens: BTreeSet::new(),
+                    suppressed_tokens: BTreeSet::new(),
                     sampling: Sampling::Greedy,
                     shaping: Shaping {
                         temperature: 0.0,
@@ -571,6 +577,7 @@ fn admission_reclaims_under_a_real_process_limit() {
         package: PackageOptions {
             target: model,
             projector: ProjectorSelection::Disabled,
+            draft: None,
         },
         model: ModelPolicy {
             method: ModelMethod::Plain,
@@ -587,7 +594,7 @@ fn admission_reclaims_under_a_real_process_limit() {
     }
     .resolve()
     .unwrap();
-    let vocabulary = resolved.manifest.definition.geometry.vocabulary as usize;
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let package = resolved.host.shared_package();
     let (domain, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let catalog = DeviceCatalog::discover().unwrap();
@@ -613,6 +620,7 @@ fn admission_reclaims_under_a_real_process_limit() {
                 context_limit: 1024,
                 vocabulary,
                 stop_tokens: BTreeSet::new(),
+                suppressed_tokens: BTreeSet::new(),
                 sampling: Sampling::Greedy,
                 shaping: Shaping {
                     temperature: 0.0,
@@ -807,6 +815,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
         package: PackageOptions {
             target: model,
             projector: ProjectorSelection::Disabled,
+            draft: None,
         },
         model: ModelPolicy {
             method: ModelMethod::Plain,
@@ -823,7 +832,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
     }
     .resolve()
     .unwrap();
-    let vocabulary = resolved.manifest.definition.geometry.vocabulary as usize;
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let package = resolved.host.shared_package();
     let (domain, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let catalog = DeviceCatalog::discover().unwrap();
@@ -843,6 +852,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
                 context_limit: 1024,
                 vocabulary,
                 stop_tokens: BTreeSet::new(),
+                suppressed_tokens: BTreeSet::new(),
                 sampling: Sampling::Greedy,
                 shaping: Shaping {
                     temperature: 0.0,

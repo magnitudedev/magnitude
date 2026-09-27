@@ -1,14 +1,16 @@
 //! The fixed device measurement behind a basis.
 //!
-//! Every key of the backend's declared plan is formed with its shipped
-//! default specialization and timed over synthetic device-resident tensors.
-//! Nothing inspects a model artifact, tunes a parameter or loads a model. A
-//! class the backend cannot form is recorded unsupported; any other failure,
-//! including a nonphysical fit, is a measurement error.
+//! Every entry of the backend's plan ([`super::plan`]) is formed with its
+//! shipped default specialization; timed entries are timed over synthetic
+//! device-resident tensors at the plan's generic sizes. Nothing inspects a
+//! model artifact, tunes a parameter or loads a model. An entry the backend
+//! cannot form is recorded unsupported. Measured times are taken as they
+//! are.
 //!
 //! The measurement is built for a cold run of a few seconds:
 //!
-//! - Every planned native form is formed first, in parallel.
+//! - Every planned native form is formed first, in parallel, then every
+//!   timed entry is timed (see [`complete_basis`]).
 //! - Synthetic weights are views into one zero-filled pool per element and
 //!   row width, allocated once for the whole basis and reused by every
 //!   class. A point's rotation of views spans the backend's rotation bytes.
@@ -22,25 +24,27 @@
 //! than the planning reserve.
 
 use super::basis::{
-    median, BasisIdentity, ClassCost, ClassMeasurement, MeasuredPoint, MeasurementBasis,
-    MeasurementKey, OperationClass,
+    median, BasisIdentity, ClassCost, ClassMeasurement, CostModel, HeadGeometry, MeasuredPoint,
+    MeasurementBasis, MeasurementKey, OperationClass, PointShape,
 };
-use super::plan::measurement_plan;
+use super::plan::{activation, measurement_plan, reference_weight, PlannedKey};
+
+mod general_routed;
+mod post_norm;
+mod row_ops;
+mod short_conv;
+mod state_space;
 use crate::platform::{refresh_device_ceiling, MemoryPolicyError, MemoryReserves};
-use magnitude_family_contracts::{
-    ActivationDType, BlockGeometry, DecoderGeometry, FeedForwardGeometry, MixerGeometry,
-    RecurrentGeometry, RecurrentHeadMapping,
-};
 use magnitude_kernels::{
-    attention_output, dense_expand, dense_output, embedding_rows, gated_attention_decode,
-    gated_attention_decode_k8v4, gated_attention_project, gated_delta_output, gated_delta_project,
+    attention_decode, attention_decode_k8v4, attention_output, attention_project, dense_expand,
+    dense_output, embedding_rows, gated_delta_output, gated_delta_project,
     gated_delta_step, readout_features_rows, readout_head_rows, routed_expand, routed_output,
     routed_route, sample_rows,
 };
-use magnitude_state::{ComponentDescriptor, KvCodec, LayerRef, ModelStateLayout};
+use magnitude_state::{BankComponent, ComponentDescriptor, KvCodec, LayerRef};
 use seismic::{
     generated, BackendName, Device, DeviceCatalog, Element, Entry, LoadError, NativeGraph,
-    NativeKernel, NativePort, NativeSpecialization, SlabLayout, SlabRegion, SlabTensor,
+    NativeGraphPlan, NativeGraphSlot, NativeKernel, NativePort, NativeSpecialization, SlabLayout, SlabRegion, SlabTensor,
     SubmissionTrace, Tensor, TraceDetail, WorkflowTensor,
 };
 use std::any::Any;
@@ -50,10 +54,73 @@ use std::fmt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Streamed bytes of the two sizes a linear weight-streaming class is timed
-/// at: a launch-dominated size and a bandwidth-dominated size.
-const SMALL_BYTES: u64 = 2 * 1024 * 1024;
-const LARGE_BYTES: u64 = 64 * 1024 * 1024;
+/// The output rows a weight-streaming class is timed at, at [`REDUCTION`]:
+/// from a head-sized launch to a vocabulary-sized one. Its per-byte time
+/// between them interpolates in log rows.
+const LADDER_ROWS: [u64; 3] = [768, 6144, 49_152];
+/// The reduction of the ladder.
+const REDUCTION: u64 = 4096;
+/// The ladder row count also timed at [`FLOOR_REDUCTION`]: the two sizes
+/// give the class's launch floor.
+const FLOOR_ROWS: u64 = 6144;
+const FLOOR_REDUCTION: u64 = 1024;
+/// The launch every weight representation is timed at through
+/// `project_rows`: large enough to be bandwidth-bound, small enough that a
+/// dense representation fits one rotation.
+const FORMAT_ROWS: u64 = 16_384;
+
+/// One weight-streaming launch of the plan: its nominal output rows and its
+/// reduction. An entry realizes the rows in whole units of its own geometry
+/// (heads, experts, segments) and records the rows it ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Launch {
+    rows: u64,
+    reduction: u64,
+}
+
+/// The launches a weight-streaming class is timed at: the ladder, then the
+/// floor launch.
+fn projection_launches() -> Vec<Launch> {
+    LADDER_ROWS
+        .iter()
+        .map(|&rows| Launch {
+            rows,
+            reduction: REDUCTION,
+        })
+        .chain([Launch {
+            rows: FLOOR_ROWS,
+            reduction: FLOOR_REDUCTION,
+        }])
+        .collect()
+}
+
+/// The launch an exact representation binding is formed at.
+const FORM_LAUNCH: Launch = Launch {
+    rows: FLOOR_ROWS,
+    reduction: REDUCTION,
+};
+
+/// The point of a weight-streaming launch that ran `rows` output rows.
+fn launch_point(at: Launch, rows: u64, weight: Element, bytes: u64, samples: Vec<f64>) -> MeasuredPoint {
+    MeasuredPoint {
+        shape: PointShape::Launch {
+            rows,
+            reduction: at.reduction,
+            weight,
+        },
+        bytes,
+        samples,
+    }
+}
+
+/// The point of a class whose cost follows bytes.
+fn size_point(bytes: u64, samples: Vec<f64>) -> MeasuredPoint {
+    MeasuredPoint {
+        shape: PointShape::Size,
+        bytes,
+        samples,
+    }
+}
 
 /// Distinct bytes one point's rotation of views spans, so that its launches
 /// read from memory as a model's resident weights are read. Evidence
@@ -65,6 +132,11 @@ const LARGE_BYTES: u64 = 64 * 1024 * 1024;
 ///   from 512 MB to 8 GB.
 ///
 /// Vulkan and CPU have no evidence yet and take the larger span.
+///
+/// History and state rotate over the same span, and need it: over 64 MB
+/// instead of 128 MB, M4 Pro dense attention at 4k history read 7–21% faster
+/// and the largest state advances 7–8% faster (2026-09-27), so the GEMV's
+/// flat 64 MB does not carry over.
 fn rotation_bytes(backend: BackendName) -> u64 {
     match backend {
         BackendName::Metal => 128 << 20,
@@ -83,7 +155,13 @@ fn rotation_bytes(backend: BackendName) -> u64 {
 /// - `PARTS`: the history split of fused decode attention. With few KV
 ///   heads it is the attention's parallelism; GB10 tuning selects 24 where
 ///   the default is 12 (35B-A3B, two KV heads: +13% at 16k from defaults).
-const VARIED_PARAMETERS: [&str; 2] = ["INT8", "PARTS"];
+/// - `SLICES`: the query-group split of fused decode attention. Large query
+///   groups (16 heads per KV head and more) are compute-bound on one slice;
+///   tuning selects 2–4 on CUDA and Metal (M4 Pro K8/V4: 212 µs at the
+///   default, 122 µs tuned).
+///
+/// Every variant is screened by one sample; only the fastest is timed.
+const VARIED_PARAMETERS: [&str; 3] = ["INT8", "PARTS", "SLICES"];
 
 /// The most launches one timed graph holds.
 const MAX_LAUNCHES: u64 = 256;
@@ -97,32 +175,98 @@ const WARM_SECONDS: f64 = 0.2;
 const SAMPLE_SECONDS: f64 = 0.003;
 /// The most runs one sample queues.
 const MAX_PASSES: usize = 256;
-/// Every synthetic extent a size search chooses is a multiple of this: it is
-/// a multiple of every packed representation's group and of every native
-/// row and reduction alignment.
+/// Every synthetic extent is a multiple of this: it is a multiple of every
+/// packed representation's group and of every native row and reduction
+/// alignment.
 const UNIT: u64 = 256;
 /// Pool views start at multiples of this many rows (a packed layout's row
 /// group).
 const ROW_ALIGNMENT: u64 = 16;
-/// Context depths the attention history classes are timed at.
-const HISTORY_DEPTHS: [u64; 2] = [4096, 32_768];
 /// Vocabulary widths sampling is timed at.
 const SAMPLE_VOCABULARIES: [u64; 2] = [32_768, 1_048_576];
 
-/// The row width of every synthetic weight-streaming matrix: each class
-/// varies the other dimension, so all its views share one pool per
-/// representation.
+/// Decode attention's reference head geometry, timed at two context depths
+/// (its floor and rate), and the depth every other geometry is timed at.
+const HISTORY_REFERENCE: HeadGeometry = HeadGeometry {
+    kv_heads: 2,
+    group: 8,
+    width: 256,
+};
+const HISTORY_DEPTHS: [u64; 2] = [4096, 32_768];
+const HISTORY_DEPTH: u64 = 32_768;
+/// The geometries decode attention is timed at beside the reference, each
+/// differing from it in one axis: the key/value heads (the attention's
+/// parallelism), the query heads per key/value head and the head width.
+const HISTORY_KV_HEADS: [u64; 4] = [1, 4, 8, 16];
+const HISTORY_GROUPS: [u64; 4] = [2, 4, 16, 32];
+const HISTORY_WIDTHS: [u64; 3] = [64, 128, 512];
+/// Rotated pairs of a timed head: the rotation is per query row, beside a
+/// history the entry streams.
+const HISTORY_ROTARY_PAIRS: u64 = 32;
+
+/// Every decode attention point: the reference at both depths, then each
+/// axis's other values at one depth.
+fn history_points() -> Vec<(HeadGeometry, u64)> {
+    let reference = HISTORY_REFERENCE;
+    HISTORY_DEPTHS
+        .iter()
+        .map(|&depth| (reference, depth))
+        .chain(HISTORY_KV_HEADS.iter().map(|&kv_heads| {
+            (
+                HeadGeometry {
+                    kv_heads,
+                    ..reference
+                },
+                HISTORY_DEPTH,
+            )
+        }))
+        .chain(HISTORY_GROUPS.iter().map(|&group| {
+            (
+                HeadGeometry {
+                    group,
+                    ..reference
+                },
+                HISTORY_DEPTH,
+            )
+        }))
+        .chain(HISTORY_WIDTHS.iter().map(|&width| {
+            (
+                HeadGeometry {
+                    width,
+                    ..reference
+                },
+                HISTORY_DEPTH,
+            )
+        }))
+        .collect()
+}
+
+/// The two sizes of each class whose cost follows the bytes it touches, from
+/// a small model's geometry to a large one's:
+///
+/// - gated delta steps of 16 key heads, by value heads (width 128);
+const DELTA_STEP_HEADS: [u64; 2] = [16, 64];
+/// - routing of 8 selected experts, by (hidden width, experts);
+const ROUTING_SIZES: [(u64, u64); 2] = [(2048, 128), (8192, 512)];
+/// - Mamba-2 steps and gates of 8 groups, heads 64 wide and 128 state
+///   columns, by heads;
+const STATE_SPACE_HEADS: [u64; 2] = [64, 256];
+/// - short convolutions of 3 taps, by channels;
+const SHORT_CONV_CHANNELS: [u64; 2] = [1024, 8192];
+/// - per-layer inputs 256 wide, by layers;
+const PER_LAYER_LAYERS: [u64; 2] = [8, 64];
+/// - row conversions and copies, by elements.
+const CONVERTED_ELEMENTS: [u64; 2] = [4096, 65_536];
+
+/// The hidden width of every one-row launch.
 const HIDDEN: u64 = 4096;
-const ATTENTION_QUERY_HEADS: u64 = 16;
+/// The head width of synthetic attention output projections.
 const ATTENTION_WIDTH: u64 = 256;
-/// The projection is sized by its query heads per kv head, over one kv head
+/// The key and value rows of a synthetic attention projection: one kv head
 /// of width 128.
 const PROJECT_WIDTH: u64 = 128;
-const RECURRENT_KEY_HEADS: u64 = 16;
-const RECURRENT_VALUE_HEADS: u64 = 32;
 const RECURRENT_WIDTH: u64 = 128;
 const ROUTED_SELECTED: u64 = 8;
-const ROUTED_FEATURES: u64 = 512;
 /// Recurrent banks of the step measurement: the pristine bank it reads and
 /// the successor it publishes.
 const STEP_BANKS: u64 = 2;
@@ -141,13 +285,20 @@ const CHAIN_SAMPLES: usize = 7;
 pub enum MeasurementError {
     /// The device's memory ceiling could not be established.
     Ceiling(MemoryPolicyError),
-    /// Allocation, formation infrastructure or a timed launch failed.
+    /// Allocation, formation infrastructure or graph sealing failed.
     Device {
         key: MeasurementKey,
         message: String,
     },
-    /// The class's samples do not establish a physical cost.
-    Cost {
+    /// A timed submission of the class failed on the device (for example an
+    /// illegal memory access). The class is recorded unsupported; the
+    /// device's context may be unusable, so measurement stops.
+    Fault {
+        key: MeasurementKey,
+        message: String,
+    },
+    /// The class's measured points are not its plan's points.
+    Fit {
         key: MeasurementKey,
         message: String,
     },
@@ -159,24 +310,36 @@ impl fmt::Display for MeasurementError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ceiling(error) => write!(formatter, "measurement memory ceiling: {error}"),
-            Self::Device { key, message } => {
-                write!(
-                    formatter,
-                    "measuring {} {key:?}: {message}",
-                    key.class.name()
-                )
+            Self::Device { key, message } => write!(formatter, "measuring {key}: {message}"),
+            Self::Fault { key, message } => {
+                write!(formatter, "device fault while timing {key}: {message}")
             }
-            Self::Cost { key, message } => write!(
-                formatter,
-                "measured {} {key:?} has no physical cost: {message}",
-                key.class.name()
-            ),
+            Self::Fit { key, message } => {
+                write!(formatter, "measured {key} does not fit its cost model: {message}")
+            }
             Self::Trace(message) => write!(formatter, "measurement trace: {message}"),
         }
     }
 }
 
 impl std::error::Error for MeasurementError {}
+
+/// A measurement that stopped early: the classes measured before the error,
+/// valid and worth keeping (a fault's class is among them, recorded
+/// unsupported), and the error.
+#[derive(Debug)]
+pub struct MeasurementFailure {
+    pub basis: MeasurementBasis,
+    pub error: MeasurementError,
+}
+
+impl fmt::Display for MeasurementFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for MeasurementFailure {}
 
 /// Where one class's measurement time went.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -200,50 +363,105 @@ pub struct ClassProfile {
     pub total: Duration,
 }
 
-/// Measure every key of `device`'s declared plan.
+/// Measure the device's whole plan.
 pub fn measure_basis(
     catalog: &DeviceCatalog,
     device: &Device,
     reserves: MemoryReserves,
     identity: BasisIdentity,
 ) -> Result<MeasurementBasis, MeasurementError> {
-    measure_basis_observed(catalog, device, reserves, identity, |_, _, _| {})
+    complete_basis(
+        catalog,
+        device,
+        reserves,
+        MeasurementBasis {
+            identity,
+            classes: Vec::new(),
+        },
+        |_, _, _| {},
+    )
+    .map_err(|failure| failure.error)
 }
 
-/// [`measure_basis`], reporting each class with its time profile as it
-/// completes. The parallel formation pass is reported as the first class's
-/// formation.
-pub fn measure_basis_observed(
+/// Measure every entry of the device's plan that `basis` lacks and add it,
+/// reporting each entry with its time profile as it completes. Entries
+/// already in the basis (from a measurement that stopped early) are kept as
+/// measured. The parallel formation pass is reported as the first measured
+/// entry's formation. The result holds its entries in plan order.
+///
+/// Every form is formed before any class is timed: forming compiles kernels
+/// on every host core, and host work during the timed samples biases device
+/// times (M4 Pro: shader compilation during timing made one-row launches
+/// 2-12x slower). Work by other processes is not observable and is timed as
+/// it falls.
+///
+/// A measurement that stops early returns the entries measured before the
+/// error with it, so the caller can keep them. A device fault records its
+/// entry unsupported (a kernel that faults is not executable on the device)
+/// and stops, since the device's context may be unusable.
+pub fn complete_basis(
     catalog: &DeviceCatalog,
     device: &Device,
     reserves: MemoryReserves,
-    identity: BasisIdentity,
+    basis: MeasurementBasis,
     mut observe: impl FnMut(&MeasurementKey, &ClassMeasurement, &ClassProfile),
-) -> Result<MeasurementBasis, MeasurementError> {
+) -> Result<MeasurementBasis, MeasurementFailure> {
+    let MeasurementBasis {
+        identity,
+        mut classes,
+    } = basis;
     let plan = measurement_plan(device.backend());
-    let session = Session::open(device)?;
-    let formation = session.form_all(&plan);
-    let mut classes = Vec::with_capacity(plan.len());
-    for (index, key) in plan.into_iter().enumerate() {
-        let (measurement, mut profile) = session.measure(catalog, &reserves, &key)?;
-        if index == 0 {
-            profile.formation += formation;
-            profile.total += formation;
+    let missing = plan
+        .iter()
+        .filter(|planned| !classes.iter().any(|(measured, _)| measured == planned.key()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let measured = (|| {
+        if missing.is_empty() {
+            return Ok(());
         }
-        observe(&key, &measurement, &profile);
-        classes.push((key, measurement));
+        let session = Session::open(device)?;
+        let formation = session.form_all(&missing);
+        for (index, planned) in missing.into_iter().enumerate() {
+            let (measurement, mut profile) = match session.measure(catalog, &reserves, &planned) {
+                Ok(measured) => measured,
+                Err(MeasurementError::Fault { key, message }) => {
+                    classes.push((
+                        key.clone(),
+                        ClassMeasurement::Unsupported {
+                            reason: format!("device fault: {message}"),
+                        },
+                    ));
+                    return Err(MeasurementError::Fault { key, message });
+                }
+                Err(error) => return Err(error),
+            };
+            if index == 0 {
+                profile.formation += formation;
+                profile.total += formation;
+            }
+            let key = planned.key().clone();
+            observe(&key, &measurement, &profile);
+            classes.push((key, measurement));
+        }
+        Ok(())
+    })();
+    classes.sort_by_key(|(key, _)| plan.iter().position(|planned| planned.key() == key));
+    let basis = MeasurementBasis { identity, classes };
+    match measured {
+        Ok(()) => Ok(basis),
+        Err(error) => Err(MeasurementFailure { basis, error }),
     }
-    Ok(MeasurementBasis { identity, classes })
 }
 
-/// Measure one class on its own.
-pub fn measure_class(
+/// Measure one planned entry on its own.
+pub fn measure_entry(
     catalog: &DeviceCatalog,
     device: &Device,
     reserves: &MemoryReserves,
-    key: &MeasurementKey,
+    planned: &PlannedKey,
 ) -> Result<(ClassMeasurement, ClassProfile), MeasurementError> {
-    Session::open(device)?.measure(catalog, reserves, key)
+    Session::open(device)?.measure(catalog, reserves, planned)
 }
 
 /// Why a class produced no points.
@@ -252,14 +470,22 @@ enum Stop {
     /// admissible at the class's statics, or the native form fails to form.
     Unsupported(String),
     Failed(String),
+    /// A timed submission failed on the device.
+    Fault(String),
     /// The formation pass queued this point's forms and stopped.
     Queued,
+    /// The compatibility pass formed this point's entry and stopped.
+    Formed,
 }
 
 type Step<T> = Result<T, Stop>;
 
 fn failed(error: impl fmt::Display) -> Stop {
     Stop::Failed(error.to_string())
+}
+
+fn fault(error: impl fmt::Display) -> Stop {
+    Stop::Fault(error.to_string())
 }
 
 fn bytes(element: Element, extents: &[u64]) -> Step<u64> {
@@ -275,24 +501,9 @@ fn sum(parts: &[u64]) -> Step<u64> {
         .ok_or_else(|| failed("synthetic byte count overflows"))
 }
 
-/// The smallest multiple of `unit` whose streamed bytes reach `target`.
-fn size_for(target: u64, unit: u64, streamed: impl Fn(u64) -> Step<u64>) -> Step<u64> {
-    let mut upper = 1u64;
-    while streamed(upper * unit)? < target {
-        upper = upper
-            .checked_mul(2)
-            .ok_or_else(|| failed("synthetic size search overflows"))?;
-    }
-    let mut lower = 0u64;
-    while upper - lower > 1 {
-        let middle = lower + (upper - lower) / 2;
-        if streamed(middle * unit)? < target {
-            lower = middle;
-        } else {
-            upper = middle;
-        }
-    }
-    Ok(upper * unit)
+/// `value` rounded down to a multiple of `unit`, at least one unit.
+fn multiple(value: u64, unit: u64) -> u64 {
+    (value / unit).max(1) * unit
 }
 
 fn i32_bytes(values: &[i32]) -> Vec<u8> {
@@ -300,24 +511,6 @@ fn i32_bytes(values: &[i32]) -> Vec<u8> {
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect()
-}
-
-fn geometry(key: &MeasurementKey, name: &str) -> Step<u64> {
-    key.geometry_value(name)
-        .ok_or_else(|| failed(format!("{} key has no {name}", key.class.name())))
-}
-
-fn activation_dtype(activation: Element) -> Step<ActivationDType> {
-    if activation == Element::bf16() {
-        Ok(ActivationDType::BF16)
-    } else if activation == Element::f16() {
-        Ok(ActivationDType::F16)
-    } else {
-        Err(failed(format!(
-            "{} is not a decoder activation",
-            activation.name()
-        )))
-    }
 }
 
 /// The history planes of one attention layer, as the state layout encodes
@@ -389,6 +582,10 @@ impl Pool {
 type Formed = Mutex<HashMap<String, Box<dyn Any + Send>>>;
 type FormJob<'a> = Box<dyn FnOnce() + Send + 'a>;
 
+/// Points measured in this session, by key: the dependency reference
+/// reuses the classes the plan already timed.
+type Measured = RefCell<HashMap<MeasurementKey, Vec<MeasuredPoint>>>;
+
 /// What one measurement run shares across its classes.
 struct Session<'a> {
     device: &'a Device,
@@ -397,6 +594,7 @@ struct Session<'a> {
     pools: RefCell<Vec<Pool>>,
     warmed: Cell<bool>,
     formed: Formed,
+    measured: Measured,
     /// The reference chain's samples, shared by the dependency and the
     /// submission class.
     chained: RefCell<Option<Chained>>,
@@ -413,26 +611,21 @@ impl<'a> Session<'a> {
             pools: RefCell::new(Vec::new()),
             warmed: Cell::new(false),
             formed: Mutex::new(HashMap::new()),
+            measured: RefCell::new(HashMap::new()),
             chained: RefCell::new(None),
         })
     }
 
     /// Form every native kernel of `plan` in parallel: a formation pass over
     /// the plan queues each point's forms, then worker threads form them.
-    fn form_all(&self, plan: &[MeasurementKey]) -> Duration {
+    fn form_all(&self, plan: &[PlannedKey]) -> Duration {
         let began = Instant::now();
         let jobs: Mutex<Vec<FormJob<'_>>> = Mutex::new(Vec::new());
-        {
-            let runner = Runner {
-                session: self,
-                queue: Some(&jobs),
-                profile: Cell::new(ClassProfile::default()),
-            };
-            for key in plan {
-                // Every outcome of the pass is a queued form or a class that
-                // needs none; the timing pass reports failures.
-                let _ = runner.points(key);
-            }
+        for planned in plan {
+            let runner = Runner::new(self, Pass::Queue(&jobs), planned);
+            // Every outcome of the pass is a queued form or a class that
+            // needs none; the timing pass reports failures.
+            let _ = runner.points(planned.key());
         }
         let jobs = jobs
             .into_inner()
@@ -463,39 +656,50 @@ impl<'a> Session<'a> {
         &self,
         catalog: &DeviceCatalog,
         reserves: &MemoryReserves,
-        key: &MeasurementKey,
+        planned: &PlannedKey,
     ) -> Result<(ClassMeasurement, ClassProfile), MeasurementError> {
         let began = Instant::now();
+        let key = planned.key();
         self.pools.borrow_mut().retain(|pool| !pool.transient);
         refresh_device_ceiling(catalog, self.device, reserves)
             .map_err(MeasurementError::Ceiling)?;
-        let runner = Runner {
-            session: self,
-            queue: None,
-            profile: Cell::new(ClassProfile::default()),
+        let pass = match planned {
+            PlannedKey::Timed(_) => Pass::Time,
+            PlannedKey::Formed(_) => Pass::Form,
         };
-        let points = runner.points(key);
+        let runner = Runner::new(self, pass, planned);
+        let measurement = match runner.points(key) {
+            Ok(points) => ClassCost::from_points(key.class, &points)
+                .map(|cost| ClassMeasurement::Measured { points, cost })
+                .map_err(|message| MeasurementError::Fit {
+                    key: key.clone(),
+                    message,
+                })?,
+            Err(Stop::Formed) => ClassMeasurement::Formed,
+            Err(Stop::Unsupported(reason)) => ClassMeasurement::Unsupported { reason },
+            Err(Stop::Failed(message)) => {
+                return Err(MeasurementError::Device {
+                    key: key.clone(),
+                    message,
+                })
+            }
+            Err(Stop::Fault(message)) => {
+                return Err(MeasurementError::Fault {
+                    key: key.clone(),
+                    message,
+                })
+            }
+            Err(Stop::Queued) => {
+                return Err(MeasurementError::Device {
+                    key: key.clone(),
+                    message: "the timing pass queued a formation".into(),
+                })
+            }
+        };
         let profile = ClassProfile {
             total: began.elapsed(),
             ..runner.profile.get()
         };
-        let measurement = match points {
-            Ok(points) => ClassCost::from_points(key.class, &points)
-                .map(|cost| ClassMeasurement::Measured { points, cost })
-                .map_err(|message| MeasurementError::Cost {
-                    key: key.clone(),
-                    message,
-                }),
-            Err(Stop::Unsupported(reason)) => Ok(ClassMeasurement::Unsupported { reason }),
-            Err(Stop::Failed(message)) => Err(MeasurementError::Device {
-                key: key.clone(),
-                message,
-            }),
-            Err(Stop::Queued) => Err(MeasurementError::Device {
-                key: key.clone(),
-                message: "the timing pass queued a formation".into(),
-            }),
-        }?;
         Ok((measurement, profile))
     }
 }
@@ -522,6 +726,19 @@ impl<E: Entry> Clone for Formation<E> {
 struct Timed {
     graph: NativeGraph,
     bindings: Vec<(NativePort, Tensor)>,
+}
+
+/// A sealed point graph with its bindings, sized to its samples.
+struct Sealed {
+    plan: NativeGraphPlan,
+    slot: NativeGraphSlot,
+    bindings: Vec<(NativePort, Tensor)>,
+    /// Runs one sample queues.
+    passes: usize,
+    /// Launches one run holds.
+    launches: u64,
+    /// Device seconds of the one run that sized the samples.
+    probe: f64,
 }
 
 /// Distinct slab-backed state for one launch in a measurement rotation.
@@ -553,17 +770,42 @@ impl Timed {
     }
 }
 
+/// What one run over a plan entry's points does.
+#[derive(Clone, Copy)]
+enum Pass<'q, 's> {
+    /// Queue every form the points need and stop each point.
+    Queue(&'q Mutex<Vec<FormJob<'s>>>),
+    /// Form the first point's entry and stop: a compatibility binding.
+    Form,
+    /// Time every point.
+    Time,
+}
+
 struct Runner<'q, 's, 'a> {
     session: &'s Session<'a>,
-    /// Present during the formation pass: forms are queued here and the
-    /// point stops.
-    queue: Option<&'q Mutex<Vec<FormJob<'s>>>>,
+    pass: Pass<'q, 's>,
+    /// Whether forms include the varied parameters' variants: only a timed
+    /// entry picks its fastest variant.
+    variants: bool,
     profile: Cell<ClassProfile>,
 }
 
 impl<'q, 's, 'a> Runner<'q, 's, 'a> {
+    fn new(session: &'s Session<'a>, pass: Pass<'q, 's>, planned: &PlannedKey) -> Self {
+        Self {
+            session,
+            pass,
+            variants: matches!(planned, PlannedKey::Timed(_)),
+            profile: Cell::new(ClassProfile::default()),
+        }
+    }
+
     fn device(&self) -> &'a Device {
         self.session.device
+    }
+
+    fn queuing(&self) -> bool {
+        matches!(self.pass, Pass::Queue(_))
     }
 
     fn charge(&self, part: impl FnOnce(&mut ClassProfile) -> &mut Duration, began: Instant) {
@@ -621,7 +863,10 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             })?;
         let mut specializations = vec![defaults.clone()];
         for parameter in &implementation.params {
-            if VARIED_PARAMETERS.contains(&parameter.name.as_str()) && parameter.arithmetic {
+            if self.variants
+                && VARIED_PARAMETERS.contains(&parameter.name.as_str())
+                && parameter.arithmetic
+            {
                 for value in &parameter.values[1..] {
                     let variant = defaults.clone().with_param(parameter.name.clone(), *value);
                     if implementation.validate(&variant).is_ok() {
@@ -656,7 +901,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             }
             Formation::Formed(kernels)
         };
-        if let Some(queue) = self.queue {
+        if let Pass::Queue(queue) = self.pass {
             let mut cache = formed
                 .lock()
                 .expect("formation cache lock is never poisoned");
@@ -794,7 +1039,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         count: u64,
         transient: bool,
     ) -> Step<Vec<Tensor>> {
-        if self.queue.is_some() {
+        if self.queuing() {
             return Err(Stop::Queued);
         }
         let began = Instant::now();
@@ -863,15 +1108,20 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         })
     }
 
-    /// Start a point: its views begin at every pool's start.
-    fn begin(&self) {
+    /// Start a point once its entry is formed: its views begin at every
+    /// pool's start. The compatibility pass stops here.
+    fn begin(&self) -> Step<()> {
+        if let Pass::Form = self.pass {
+            return Err(Stop::Formed);
+        }
         for pool in self.session.pools.borrow_mut().iter_mut() {
             pool.cursor = 0;
         }
+        Ok(())
     }
 
     fn zeros(&self, element: Element, extents: &[u64]) -> Step<Tensor> {
-        if self.queue.is_some() {
+        if self.queuing() {
             return Err(Stop::Queued);
         }
         let began = Instant::now();
@@ -894,102 +1144,148 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             .clamp(1, MAX_LAUNCHES)
     }
 
-    /// Seal `timed` and time it. One run sizes a sample: `passes` runs
-    /// queued as one submission, at least [`SAMPLE_SECONDS`] of device work.
-    /// A leading sample (and, before the session's first point, samples
-    /// until the device has been busy [`WARM_SECONDS`]) brings the device to
-    /// its sustained clock; then [`RUNS`] samples follow back to back. Each
-    /// sample's device interval, per launch.
-    fn run(&self, timed: Timed, launches: u64) -> Step<Vec<f64>> {
+    /// Seal `timed` (a graph of `launches` launches) and size its samples:
+    /// one run sizes a sample to `passes` runs queued as one submission, at
+    /// least [`SAMPLE_SECONDS`] of device work. Before the session's first
+    /// point, samples follow until the device has been busy
+    /// [`WARM_SECONDS`], bringing it to its sustained clock.
+    fn seal(&self, timed: Timed, launches: u64) -> Step<Sealed> {
         let began = Instant::now();
         let plan = timed.graph.seal().map_err(failed)?;
-        let mut slot = plan.new_slot().map_err(failed)?;
+        let slot = plan.new_slot().map_err(failed)?;
         self.charge(|profile| &mut profile.sealing, began);
-        let mut submit = |samples: usize, passes: usize| -> Step<Vec<f64>> {
-            // Work outside these samples (pool fills) is not a sample.
-            let trace_began = Instant::now();
-            self.session.trace.collect().map_err(failed)?;
-            self.charge(|profile| &mut profile.tracing, trace_began);
-            let mut completions = Vec::with_capacity(samples);
-            for _ in 0..samples {
-                let submission_began = Instant::now();
-                let mut sequence = self.device().native_sequence();
-                for _ in 0..passes {
-                    let mut bindings = plan.bindings();
-                    for (port, tensor) in &timed.bindings {
-                        bindings.set(port, tensor).map_err(failed)?;
-                    }
-                    let outputs = plan.new_outputs().map_err(failed)?;
-                    slot.attach(bindings, outputs)
-                        .map_err(failed)?
-                        .queue(&mut sequence)
-                        .map_err(failed)?;
-                }
-                self.charge(|profile| &mut profile.encoding, submission_began);
-                let dispatch_began = Instant::now();
-                completions.push(sequence.submit().map_err(failed)?);
-                self.charge(|profile| &mut profile.dispatch, dispatch_began);
-                self.charge(|profile| &mut profile.submission, submission_began);
-            }
-            let waiting_began = Instant::now();
-            for completion in completions {
-                completion.wait().map_err(failed)?;
-            }
-            self.charge(|profile| &mut profile.waiting, waiting_began);
-            let trace_began = Instant::now();
-            let traced = self.session.trace.collect().map_err(failed)?;
-            self.charge(|profile| &mut profile.tracing, trace_began);
-            if traced.len() != samples {
-                return Err(failed(format!(
-                    "{samples} timed samples recorded {} submissions",
-                    traced.len()
-                )));
-            }
-            let device_seconds: f64 = traced
-                .iter()
-                .map(|submission| submission.device.1 - submission.device.0)
-                .sum();
-            let mut profile = self.profile.get();
-            profile.device += Duration::from_secs_f64(device_seconds);
-            self.profile.set(profile);
-            Ok(traced
-                .iter()
-                .map(|submission| (submission.device.1 - submission.device.0) / passes as f64)
-                .collect())
+        self.charge(|profile| &mut profile.timing, began);
+        let mut sealed = Sealed {
+            plan,
+            slot,
+            bindings: timed.bindings,
+            passes: 1,
+            launches,
+            probe: 0.0,
         };
-        let run = submit(1, 1)?[0];
-        let passes = ((SAMPLE_SECONDS / run.max(1e-7)).ceil() as usize).clamp(1, MAX_PASSES);
+        sealed.probe = self.submit(&mut sealed, 1)?[0];
+        sealed.passes =
+            ((SAMPLE_SECONDS / sealed.probe.max(1e-7)).ceil() as usize).clamp(1, MAX_PASSES);
         if !self.session.warmed.get() {
             let mut busy = 0.0;
             while busy < WARM_SECONDS {
-                busy += submit(RUNS, passes)?.iter().sum::<f64>() * passes as f64;
+                busy += self.submit(&mut sealed, RUNS)?.iter().sum::<f64>();
             }
             self.session.warmed.set(true);
         }
-        let seconds = submit(1 + RUNS, passes)?;
-        self.charge(|profile| &mut profile.timing, began);
-        Ok(seconds[1..]
+        Ok(sealed)
+    }
+
+    /// `samples` samples of `sealed` back to back, each its device interval
+    /// (the sum of its passes).
+    fn submit(&self, sealed: &mut Sealed, samples: usize) -> Step<Vec<f64>> {
+        let began = Instant::now();
+        // Work outside these samples (pool fills) is not a sample.
+        let trace_began = Instant::now();
+        self.session.trace.collect().map_err(failed)?;
+        self.charge(|profile| &mut profile.tracing, trace_began);
+        let mut completions = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let submission_began = Instant::now();
+            let mut sequence = self.device().native_sequence();
+            for _ in 0..sealed.passes {
+                let mut bindings = sealed.plan.bindings();
+                for (port, tensor) in &sealed.bindings {
+                    bindings.set(port, tensor).map_err(failed)?;
+                }
+                let outputs = sealed.plan.new_outputs().map_err(failed)?;
+                sealed
+                    .slot
+                    .attach(bindings, outputs)
+                    .map_err(failed)?
+                    .queue(&mut sequence)
+                    .map_err(failed)?;
+            }
+            self.charge(|profile| &mut profile.encoding, submission_began);
+            let dispatch_began = Instant::now();
+            completions.push(sequence.submit().map_err(fault)?);
+            self.charge(|profile| &mut profile.dispatch, dispatch_began);
+            self.charge(|profile| &mut profile.submission, submission_began);
+        }
+        let waiting_began = Instant::now();
+        for completion in completions {
+            completion.wait().map_err(fault)?;
+        }
+        self.charge(|profile| &mut profile.waiting, waiting_began);
+        let trace_began = Instant::now();
+        let traced = self.session.trace.collect().map_err(failed)?;
+        self.charge(|profile| &mut profile.tracing, trace_began);
+        if traced.len() != samples {
+            return Err(failed(format!(
+                "{samples} timed samples recorded {} submissions",
+                traced.len()
+            )));
+        }
+        let intervals = traced
             .iter()
-            .map(|run| run / launches as f64)
+            .map(|submission| submission.device.1 - submission.device.0)
+            .collect::<Vec<_>>();
+        let mut profile = self.profile.get();
+        profile.device += Duration::from_secs_f64(intervals.iter().sum());
+        self.profile.set(profile);
+        self.charge(|profile| &mut profile.timing, began);
+        Ok(intervals)
+    }
+
+    /// Per-launch seconds of `samples` samples of `sealed`.
+    fn per_launch(&self, sealed: &mut Sealed, samples: usize) -> Step<Vec<f64>> {
+        let runs = (sealed.passes as u64 * sealed.launches) as f64;
+        Ok(self
+            .submit(sealed, samples)?
+            .into_iter()
+            .map(|sample| sample / runs)
             .collect())
     }
 
-    /// The samples of the variant with the smallest median.
+    /// The samples of the fastest of `graphs` (each a graph and its launch
+    /// count) and its position. Several variants are screened by one sample
+    /// each (the run that sized it, when one run fills a sample); the fastest is then timed as a single variant is: a leading
+    /// sample brings it to its sustained behavior and [`RUNS`] samples
+    /// follow back to back.
+    fn fastest_graph(
+        &self,
+        graphs: impl IntoIterator<Item = Step<(Timed, u64)>>,
+    ) -> Step<(usize, Vec<f64>)> {
+        let mut sealed = graphs
+            .into_iter()
+            .map(|graph| graph.and_then(|(timed, launches)| self.seal(timed, launches)))
+            .collect::<Step<Vec<_>>>()?;
+        let chosen = match sealed.len() {
+            0 => return Err(failed("no formed variant was timed")),
+            1 => 0,
+            _ => {
+                let mut best: Option<(usize, f64)> = None;
+                for (index, variant) in sealed.iter_mut().enumerate() {
+                    // A run as long as a sample already is one.
+                    let sample = if variant.passes == 1 {
+                        variant.probe / variant.launches as f64
+                    } else {
+                        self.per_launch(variant, 1)?[0]
+                    };
+                    if best.is_none_or(|(_, fastest)| sample < fastest) {
+                        best = Some((index, sample));
+                    }
+                }
+                best.expect("several variants were screened").0
+            }
+        };
+        let samples = self.per_launch(&mut sealed[chosen], 1 + RUNS)?[1..].to_vec();
+        Ok((chosen, samples))
+    }
+
+    /// The samples of the fastest variant among `kernels`, each timed on the
+    /// graph `graph` builds for it.
     fn fastest<E: Entry>(
         &self,
         kernels: &[NativeKernel<E>],
-        time: impl Fn(&NativeKernel<E>) -> Step<Vec<f64>>,
+        graph: impl Fn(&NativeKernel<E>) -> Step<(Timed, u64)>,
     ) -> Step<Vec<f64>> {
-        let mut best: Option<(f64, Vec<f64>)> = None;
-        for kernel in kernels {
-            let samples = time(kernel)?;
-            let seconds = median(&samples).ok_or_else(|| failed("timed runs have no median"))?;
-            if best.as_ref().is_none_or(|(fastest, _)| seconds < *fastest) {
-                best = Some((seconds, samples));
-            }
-        }
-        best.map(|(_, samples)| samples)
-            .ok_or_else(|| failed("no formed variant was timed"))
+        Ok(self.fastest_graph(kernels.iter().map(graph))?.1)
     }
 
     /// Every point of `targets`; the formation pass visits all of them.
@@ -1014,59 +1310,170 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         }
     }
 
+    /// The points of `key`, timed once per session: a class the plan already
+    /// timed is reused by the dependency reference.
     fn points(&self, key: &MeasurementKey) -> Step<Vec<MeasuredPoint>> {
+        let timing = matches!(self.pass, Pass::Time);
+        if timing {
+            if let Some(points) = self.session.measured.borrow().get(key) {
+                return Ok(points.clone());
+            }
+        }
+        let points = self.class_points(key)?;
+        if timing {
+            self.session
+                .measured
+                .borrow_mut()
+                .insert(key.clone(), points.clone());
+        }
+        Ok(points)
+    }
+
+    fn class_points(&self, key: &MeasurementKey) -> Step<Vec<MeasuredPoint>> {
         use OperationClass as C;
-        let sized = [SMALL_BYTES, LARGE_BYTES];
+        let reference = reference_weight(self.device().backend());
+        let unexpected = || failed(format!("{key} has an unexpected binding list"));
+        // A weight-streaming entry's bindings: its exact ones, or for its cost
+        // key the reference representation with the activation as the norm.
+        let weighted = || -> Step<(Element, Element, Element)> {
+            match key.bindings.as_slice() {
+                &[activation] => Ok((activation, reference, activation)),
+                &[weight, activation] => Ok((activation, weight, activation)),
+                &[norm, weight, activation] => Ok((norm, weight, activation)),
+                _ => Err(unexpected()),
+            }
+        };
+        // A timed class runs its ladder; a formed binding its one launch.
+        let launches = if self.variants {
+            projection_launches()
+        } else {
+            vec![FORM_LAUNCH]
+        };
+        let project = |point: &dyn Fn(Element, Element, Element, Launch) -> Step<MeasuredPoint>| {
+            let (norm, weight, activation) = weighted()?;
+            self.each(&launches, |at| point(norm, weight, activation, at))
+        };
+        let a = activation();
         match (key.class, key.bindings.as_slice()) {
+            (C::EmbeddingRows, &[activation]) => {
+                self.each(&[()], |()| self.embedding_rows(reference, activation))
+            }
             (C::EmbeddingRows, &[table, activation]) => {
                 self.each(&[()], |()| self.embedding_rows(table, activation))
             }
-            (C::AttentionProject, &[norm, weight, activation]) => self.each(&sized, |target| {
-                self.attention_project(norm, weight, activation, target)
-            }),
-            (C::AttentionDecode | C::AttentionDecodeK8V4, &[activation]) => self
-                .each(&HISTORY_DEPTHS, |depth| {
-                    self.attention_decode(key, activation, depth)
-                }),
-            (C::AttentionOutput, &[weight, activation]) => self.each(&sized, |target| {
-                self.attention_output(weight, activation, target)
-            }),
-            (C::DeltaProject, &[norm, weight, activation]) => self.each(&sized, |target| {
-                self.delta_project(norm, weight, activation, target)
-            }),
+            (C::AttentionDecode | C::AttentionDecodeK8V4, &[activation]) => {
+                let affine = key.class == C::AttentionDecodeK8V4;
+                self.each(&history_points(), |(heads, depth)| {
+                    self.attention_decode(affine, activation, heads, depth)
+                })
+            }
             (C::DeltaStep, &[activation]) => {
-                self.each(&[()], |()| self.delta_step(key, activation))
+                self.each(&DELTA_STEP_HEADS, |heads| self.delta_step(activation, heads))
             }
-            (C::DeltaOutput, &[norm, weight, activation]) => self.each(&sized, |target| {
-                self.delta_output(norm, weight, activation, target)
-            }),
-            (C::DenseExpand, &[norm, weight, activation]) => self.each(&sized, |target| {
-                self.dense_expand(norm, weight, activation, target)
-            }),
-            (C::DenseOutput, &[weight, activation]) => self.each(&sized, |target| {
-                self.dense_output(weight, activation, target)
-            }),
-            (C::RoutedRoute, &[norm, router, activation]) => {
-                self.each(&[()], |()| self.routed_route(key, norm, router, activation))
+            (C::RoutedSelect | C::RoutedRoute, bindings) => {
+                let (norm, router, activation) = match bindings {
+                    &[activation] => (activation, activation, activation),
+                    &[norm, router, activation] => (norm, router, activation),
+                    _ => return Err(unexpected()),
+                };
+                let sizes = if self.variants {
+                    &ROUTING_SIZES[..]
+                } else {
+                    &ROUTING_SIZES[..1]
+                };
+                self.each(sizes, |(hidden, experts)| {
+                    if key.class == C::RoutedSelect {
+                        self.routed_select(norm, router, activation, hidden, experts)
+                    } else {
+                        self.routed_route(norm, router, activation, hidden, experts)
+                    }
+                })
             }
-            (C::RoutedExpand, &[weight, activation]) => self.each(&sized, |target| {
-                self.routed_expand(weight, activation, target)
+            (C::StateSpaceStep, &[activation]) => self.each(&STATE_SPACE_HEADS, |heads| {
+                self.state_space_step(activation, heads)
             }),
-            (C::RoutedOutput, &[weight, activation]) => self.each(&sized, |target| {
-                self.routed_output(weight, activation, target)
+            (C::StateSpaceGate, &[activation]) => self.each(&STATE_SPACE_HEADS, |heads| {
+                self.state_space_gate(activation, heads)
             }),
+            (C::ShortConvRows, &[activation]) => self.each(&SHORT_CONV_CHANNELS, |channels| {
+                self.short_conv_rows(activation, channels)
+            }),
+            (C::AttentionProject, _) => project(&|n, w, a, at| self.attention_project(n, w, a, at)),
+            (C::AttentionOutput, _) => project(&|_, w, a, at| self.attention_output(w, a, at)),
+            (C::DeltaProject, _) => project(&|n, w, a, at| self.delta_project(n, w, a, at)),
+            (C::DeltaOutput, _) => project(&|n, w, a, at| self.delta_output(n, w, a, at)),
+            (C::ShortConvProject, _) => {
+                project(&|n, w, a, at| self.short_conv_project(n, w, a, at))
+            }
+            (C::DenseExpand, _) => project(&|n, w, a, at| self.dense_expand(n, w, a, at)),
+            (C::DenseUp, _) => project(&|n, w, a, at| self.dense_up(n, w, a, at)),
+            (C::DenseOutput, _) => project(&|_, w, a, at| self.dense_output(w, a, at)),
+            (C::RoutedGateUp, _) => project(&|_, w, a, at| self.routed_gate_up(w, a, at)),
+            (C::RoutedUp, _) => project(&|_, w, a, at| self.routed_up(w, a, at)),
+            (C::RoutedDown, _) => project(&|_, w, a, at| self.routed_down(w, a, at)),
+            (C::RoutedExpand, _) => project(&|_, w, a, at| self.routed_expand(w, a, at)),
+            (C::RoutedOutput, _) => project(&|_, w, a, at| self.routed_output(w, a, at)),
+            (C::ProjectRows, _) => project(&|_, w, a, at| self.project_rows(w, a, at)),
+            (C::PerLayerGate, _) => project(&|_, w, a, at| self.per_layer_gate(w, a, at)),
+            (C::ReadoutHead, _) => project(&|n, w, a, at| self.readout_head(n, w, a, at)),
+            (C::WeightFormat, &[weight, activation]) => self.each(
+                &[Launch {
+                    rows: FORMAT_ROWS,
+                    reduction: REDUCTION,
+                }],
+                |at| self.project_rows(weight, activation, at),
+            ),
+            (C::PostNormResidual, &[norm]) => {
+                self.each(&[()], |()| self.post_norm_residual(norm))
+            }
+            (C::MoeTail, &[norm]) => self.each(&[()], |()| self.moe_tail(norm)),
+            (C::PerLayerInputs, bindings) => {
+                let (table, norm) = match bindings {
+                    &[norm] => (reference, norm),
+                    &[table, norm] => (table, norm),
+                    _ => return Err(unexpected()),
+                };
+                self.each(&PER_LAYER_LAYERS, |layers| {
+                    self.per_layer_inputs(table, norm, layers)
+                })
+            }
+            (C::ImportRows, bindings) => {
+                let (source, destination) = match bindings {
+                    &[] => (Element::f32(), a),
+                    &[source, destination] => (source, destination),
+                    _ => return Err(unexpected()),
+                };
+                self.each(&CONVERTED_ELEMENTS, |elements| {
+                    self.convert_rows(false, source, destination, elements)
+                })
+            }
+            (C::RepackRows, bindings) => {
+                let (source, destination) = match bindings {
+                    &[] => (
+                        crate::source_element(magnitude_artifacts::gguf::Encoding::Q4K)
+                            .ok_or_else(|| failed("q4_k has a source element"))?,
+                        reference,
+                    ),
+                    &[source, destination] => (source, destination),
+                    _ => return Err(unexpected()),
+                };
+                self.each(&CONVERTED_ELEMENTS, |elements| {
+                    self.convert_rows(true, source, destination, elements)
+                })
+            }
+            (C::CopyRows, &[]) => {
+                self.each(&CONVERTED_ELEMENTS, |elements| self.copy_rows(elements))
+            }
+            (C::TableUpload, &[]) => self.table_uploads(),
             (C::ReadoutFeatures, &[norm, activation]) => {
                 self.each(&[()], |()| self.readout_features(norm, activation))
             }
-            (C::ReadoutHead, &[norm, weight, activation]) => self.each(&sized, |target| {
-                self.readout_head(norm, weight, activation, target)
-            }),
             (C::SampleRows, &[]) => self.each(&SAMPLE_VOCABULARIES, |vocabulary| {
                 self.sample_rows(vocabulary)
             }),
             (C::LaunchDependency, &[]) => Ok(vec![self.chain_samples()?.dependency]),
             (C::StepSubmission, &[]) => Ok(vec![self.chain_samples()?.submission]),
-            _ => Err(failed(format!("{key:?} has an unexpected binding list"))),
+            _ => Err(unexpected()),
         }
     }
 
@@ -1088,7 +1495,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
+        self.begin()?;
         let table_bytes = bytes(table, &[vocabulary, hidden])?;
         let launches = self.copies(table_bytes);
         let tables = self.views(table, hidden, vocabulary, launches)?;
@@ -1105,53 +1512,53 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                         embedding_rows::WorkflowArgs {
                             table: table.tensor().into(),
                             tokens: tokens.tensor().into(),
+                            scale: 1.0,
+                            normalize: 0,
+                            epsilon: 0.0,
                         },
                     )
                     .map_err(failed)?;
                 timed.export(&result.r1)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: table_bytes / vocabulary,
-            samples,
-        })
+        Ok(size_point(table_bytes / vocabulary, samples))
     }
 
-    /// Q/K/V projection over one kv head of width 128 from a 4096-wide
-    /// residual, the query heads per kv head sized to the target.
+    /// Query (with interleaved gate) / key / value projection over one kv
+    /// head of width 128: the query rows fill the launch's rows beside the
+    /// key and value rows, in whole heads with their gates.
     fn attention_project(
         &self,
         norm: Element,
         weight: Element,
         activation: Element,
-        target: u64,
+        at: Launch,
     ) -> Step<MeasuredPoint> {
-        let key_rows = PROJECT_WIDTH;
-        let query_rows = |group: u64| group * 2 * PROJECT_WIDTH;
-        let streamed = |group| {
-            sum(&[
-                bytes(weight, &[query_rows(group), HIDDEN])?,
-                2 * bytes(weight, &[key_rows, HIDDEN])?,
-            ])
-        };
-        let group = size_for(target, 1, streamed)?;
+        let (key_rows, hidden) = (PROJECT_WIDTH, at.reduction);
+        let query = multiple(at.rows.saturating_sub(2 * key_rows), 2 * PROJECT_WIDTH);
+        let point_bytes = sum(&[
+            bytes(weight, &[query, hidden])?,
+            2 * bytes(weight, &[key_rows, hidden])?,
+        ])?;
         let device = self.device();
-        let kernels = self.form::<gated_attention_project::Entry>(
+        let kernels = self.form::<attention_project::Entry>(
             &[norm, weight, activation],
             &[
                 ("M", 1),
-                ("D", HIDDEN),
-                ("KV", 1),
-                ("G", group),
-                ("W", PROJECT_WIDTH),
+                ("D", hidden),
+                ("Q", query),
+                ("GR", 0),
+                ("K", key_rows),
+                ("V", key_rows),
             ],
             move |specialization| {
-                gated_attention_project::native_for_device_with(
+                attention_project::native_for_device_with(
                     device,
-                    gated_attention_project::Elements {
+                    attention_project::Elements {
                         NW: norm,
                         QW: weight,
+                        GW: weight,
                         KW: weight,
                         VW: weight,
                         A: activation,
@@ -1160,33 +1567,32 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
-        let point_bytes = streamed(group)?;
+        self.begin()?;
         let launches = self.copies(point_bytes);
-        let queries = self.views(weight, HIDDEN, query_rows(group), launches)?;
-        let keys = self.views(weight, HIDDEN, key_rows, launches)?;
-        let values = self.views(weight, HIDDEN, key_rows, launches)?;
-        let input = self.zeros(Element::f32(), &[1, HIDDEN])?;
-        let input_norm = self.zeros(norm, &[HIDDEN])?;
-        let query_norm = self.zeros(Element::f32(), &[PROJECT_WIDTH])?;
+        let queries = self.views(weight, hidden, query, launches)?;
+        let keys = self.views(weight, hidden, key_rows, launches)?;
+        let values = self.views(weight, hidden, key_rows, launches)?;
+        let input = self.zeros(Element::f32(), &[1, hidden])?;
+        let input_norm = self.zeros(norm, &[hidden])?;
         let samples = self.fastest(&kernels, |kernel| {
             let mut timed = Timed::new(device);
             let input = timed.bound(&input)?;
             let input_norm = timed.bound(&input_norm)?;
-            let query_norm = timed.bound(&query_norm)?;
             for ((query, key), value) in queries.iter().zip(&keys).zip(&values) {
                 let query = timed.bound(query)?;
                 let key = timed.bound(key)?;
                 let value = timed.bound(value)?;
+                // No separate gate: zero rows of the query weight.
+                let gate = query.tensor().slice_leading(0, 0);
                 let result = timed
                     .graph
                     .enqueue(
                         kernel,
-                        gated_attention_project::WorkflowArgs {
+                        attention_project::WorkflowArgs {
                             hidden: input.tensor().into(),
                             input_norm: input_norm.tensor().into(),
-                            query_norm: query_norm.tensor().into(),
-                            query_gate_weight: query.tensor().into(),
+                            query_weight: query.tensor().into(),
+                            gate_weight: (&gate).into(),
                             key_weight: key.tensor().into(),
                             value_weight: value.tensor().into(),
                             epsilon: 1e-6,
@@ -1194,30 +1600,31 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                     )
                     .map_err(failed)?;
                 timed.export(&result.r0)?;
-                timed.export(&result.r1)?;
                 timed.export(&result.r2)?;
+                timed.export(&result.r3)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: point_bytes,
-            samples,
-        })
+        Ok(launch_point(at, query + 2 * key_rows, weight, point_bytes, samples))
     }
 
-    /// Fused attention of one decode row over `depth` history rows at the
-    /// key's head geometry. The streamed bytes are the history it reads.
+    /// Fused attention of one decode row over `depth` history rows at
+    /// `heads`. The streamed bytes are the history it reads. The measured
+    /// form has an interleaved gate and head norms, whose per-row work is
+    /// small beside the history the entry streams.
     fn attention_decode(
         &self,
-        key: &MeasurementKey,
+        affine: bool,
         activation: Element,
+        heads: HeadGeometry,
         depth: u64,
     ) -> Step<MeasuredPoint> {
-        let affine = key.class == OperationClass::AttentionDecodeK8V4;
-        let kv_heads = geometry(key, "kv_heads")?;
-        let group = geometry(key, "group")?;
-        let pairs = geometry(key, "rotary_pairs")?;
-        let width = geometry(key, "width")?;
+        let HeadGeometry {
+            kv_heads,
+            group,
+            width,
+        } = heads;
+        let pairs = HISTORY_ROTARY_PAIRS.min(width / 2);
         let rows = depth + 1;
         let dimensions = [
             ("M", 1),
@@ -1226,37 +1633,42 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             ("G", group),
             ("P", pairs),
             ("S", width - 2 * pairs),
+            ("I", width),
+            ("U", 0),
+            ("F", 1),
+            ("N", 1),
+            ("NV", 0),
             ("R", 1),
         ];
         let device = self.device();
         let (dense, k8v4) = if affine {
-            let kernels = self.form::<gated_attention_decode_k8v4::Entry>(
+            let kernels = self.form::<attention_decode_k8v4::Entry>(
                 &[activation],
                 &dimensions,
                 move |specialization| {
-                    gated_attention_decode_k8v4::native_for_device_with(
+                    attention_decode_k8v4::native_for_device_with(
                         device,
-                        gated_attention_decode_k8v4::Elements { A: activation },
+                        attention_decode_k8v4::Elements { A: activation },
                         specialization,
                     )
                 },
             )?;
             (Vec::new(), kernels)
         } else {
-            let kernels = self.form::<gated_attention_decode::Entry>(
+            let kernels = self.form::<attention_decode::Entry>(
                 &[activation],
                 &dimensions,
                 move |specialization| {
-                    gated_attention_decode::native_for_device_with(
+                    attention_decode::native_for_device_with(
                         device,
-                        gated_attention_decode::Elements { A: activation },
+                        attention_decode::Elements { A: activation },
                         specialization,
                     )
                 },
             )?;
             (kernels, Vec::new())
         };
-        self.begin();
+        self.begin()?;
         let planes = history_planes(affine, activation, kv_heads, width).map_err(failed)?;
         let row_bytes = sum(&planes
             .iter()
@@ -1274,28 +1686,34 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let launches = self.slab_copies(slab_rows, rows, &regions)?;
         let histories = self.slabbed(slab_rows, rows, regions, launches)?;
         let depth = i32::try_from(depth).map_err(failed)?;
-        let query_gate = self.zeros(activation, &[1, kv_heads * group * 2 * width])?;
-        let fresh_key = self.zeros(activation, &[1, kv_heads * width])?;
-        let fresh_value = self.zeros(activation, &[1, kv_heads * width])?;
-        let query_norm = self.zeros(Element::f32(), &[width])?;
-        let key_norm = self.zeros(Element::f32(), &[width])?;
+        let query = self.zeros(activation, &[1, kv_heads * group, 2 * width])?;
+        let gate = self.zeros(activation, &[1, kv_heads * group, 0])?;
+        let fresh_key = self.zeros(activation, &[1, 1, kv_heads * width])?;
+        let fresh_value = self.zeros(activation, &[1, 1, kv_heads * width])?;
+        let query_norm = self.zeros(Element::f32(), &[1, width])?;
+        let key_norm = self.zeros(Element::f32(), &[1, width])?;
+        let value_norm = self.zeros(Element::f32(), &[0, width])?;
         let rotary_components = self.zeros(Element::i32(), &[pairs])?;
         let rotary_frequencies = self.zeros(Element::f32(), &[pairs])?;
+        let rotary_amplitudes = self.zeros(Element::f32(), &[pairs])?;
         let coordinates = self.zeros(Element::i32(), &[1, 4])?;
         let visible = self.i32s(&[1, 1, 2], &[0, depth])?;
         let fresh = self.i32s(&[1, 2], &[0, 1])?;
         let destinations = self.i32s(&[1], &[depth])?;
         let scale = 1.0 / (width as f32).sqrt();
         // The inputs every launch shares, bound once per graph.
-        let shared = |timed: &mut Timed| -> Step<[NativePort; 11]> {
+        let shared = |timed: &mut Timed| -> Step<[NativePort; 14]> {
             Ok([
-                timed.bound(&query_gate)?,
+                timed.bound(&query)?,
+                timed.bound(&gate)?,
                 timed.bound(&fresh_key)?,
                 timed.bound(&fresh_value)?,
                 timed.bound(&query_norm)?,
                 timed.bound(&key_norm)?,
+                timed.bound(&value_norm)?,
                 timed.bound(&rotary_components)?,
                 timed.bound(&rotary_frequencies)?,
+                timed.bound(&rotary_amplitudes)?,
                 timed.bound(&coordinates)?,
                 timed.bound(&visible)?,
                 timed.bound(&fresh)?,
@@ -1305,7 +1723,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let samples = if affine {
             self.fastest(&k8v4, |kernel| {
                 let mut timed = Timed::new(device);
-                let [qg, k, v, qn, kn, rc, rf, co, vi, fr, de] = shared(&mut timed)?;
+                let [q, g, k, v, qn, kn, vn, rc, rf, ra, co, vi, fr, de] = shared(&mut timed)?;
                 for index in 0..launches as usize {
                     let mut planes = histories[index]
                         .regions
@@ -1321,14 +1739,17 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                         .graph
                         .enqueue(
                             kernel,
-                            gated_attention_decode_k8v4::WorkflowArgs {
-                                query_gate: qg.tensor().into(),
+                            attention_decode_k8v4::WorkflowArgs {
+                                query: q.tensor().into(),
+                                gate: g.tensor().into(),
                                 key: k.tensor().into(),
                                 value: v.tensor().into(),
                                 query_norm: qn.tensor().into(),
                                 key_norm: kn.tensor().into(),
+                                value_norm: vn.tensor().into(),
                                 rotary_components: rc.tensor().into(),
                                 rotary_frequencies: rf.tensor().into(),
+                                rotary_amplitudes: ra.tensor().into(),
                                 coordinates: co.tensor().into(),
                                 visible: vi.tensor().into(),
                                 fresh: fr.tensor().into(),
@@ -1339,6 +1760,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                                 history_value_coefficients: value_coefficients.tensor_mut().into(),
                                 epsilon: 1e-6,
                                 scale,
+                                gate_function: 0,
                                 slab_rows: u32::try_from(slab_rows)
                                     .map_err(|_| failed("history slab rows exceed u32"))?,
                             },
@@ -1346,12 +1768,12 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                         .map_err(failed)?;
                     timed.export(&result.value)?;
                 }
-                self.run(timed, launches)
+                Ok((timed, launches))
             })?
         } else {
             self.fastest(&dense, |kernel| {
                 let mut timed = Timed::new(device);
-                let [qg, k, v, qn, kn, rc, rf, co, vi, fr, de] = shared(&mut timed)?;
+                let [q, g, k, v, qn, kn, vn, rc, rf, ra, co, vi, fr, de] = shared(&mut timed)?;
                 for index in 0..launches as usize {
                     let mut planes = histories[index]
                         .regions
@@ -1365,14 +1787,17 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                         .graph
                         .enqueue(
                             kernel,
-                            gated_attention_decode::WorkflowArgs {
-                                query_gate: qg.tensor().into(),
+                            attention_decode::WorkflowArgs {
+                                query: q.tensor().into(),
+                                gate: g.tensor().into(),
                                 key: k.tensor().into(),
                                 value: v.tensor().into(),
                                 query_norm: qn.tensor().into(),
                                 key_norm: kn.tensor().into(),
+                                value_norm: vn.tensor().into(),
                                 rotary_components: rc.tensor().into(),
                                 rotary_frequencies: rf.tensor().into(),
+                                rotary_amplitudes: ra.tensor().into(),
                                 coordinates: co.tensor().into(),
                                 visible: vi.tensor().into(),
                                 fresh: fr.tensor().into(),
@@ -1381,6 +1806,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                                 history_value: history_value.tensor_mut().into(),
                                 epsilon: 1e-6,
                                 scale,
+                                gate_function: 0,
                                 slab_rows: u32::try_from(slab_rows)
                                     .map_err(|_| failed("history slab rows exceed u32"))?,
                             },
@@ -1388,32 +1814,35 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                         .map_err(failed)?;
                     timed.export(&result.value)?;
                 }
-                self.run(timed, launches)
+                Ok((timed, launches))
             })?
         };
         Ok(MeasuredPoint {
+            shape: PointShape::Heads(heads),
             bytes: history_bytes,
             samples,
         })
     }
 
-    /// Output projection of 16 heads of width 256, the output width sized.
+    /// Output projection of heads of width 256 (the launch's reduction in
+    /// whole heads) into the launch's rows.
     fn attention_output(
         &self,
         weight: Element,
         activation: Element,
-        target: u64,
+        at: Launch,
     ) -> Step<MeasuredPoint> {
-        let reduction = ATTENTION_QUERY_HEADS * ATTENTION_WIDTH;
-        let streamed = |hidden| bytes(weight, &[hidden, reduction]);
-        let hidden = size_for(target, UNIT, streamed)?;
+        let heads = (at.reduction / ATTENTION_WIDTH).max(1);
+        let reduction = heads * ATTENTION_WIDTH;
+        let hidden = at.rows;
+        let point_bytes = bytes(weight, &[hidden, reduction])?;
         let device = self.device();
         let kernels = self.form::<attention_output::Entry>(
             &[weight, activation],
             &[
                 ("M", 1),
                 ("D", hidden),
-                ("Q", ATTENTION_QUERY_HEADS),
+                ("Q", heads),
                 ("W", ATTENTION_WIDTH),
             ],
             move |specialization| {
@@ -1427,12 +1856,11 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
-        let point_bytes = streamed(hidden)?;
+        self.begin()?;
         let launches = self.copies(point_bytes);
         let weights = self.views(weight, reduction, hidden, launches)?;
         let input = self.zeros(Element::f32(), &[1, hidden])?;
-        let gated = self.zeros(activation, &[1, ATTENTION_QUERY_HEADS, ATTENTION_WIDTH])?;
+        let gated = self.zeros(activation, &[1, heads, ATTENTION_WIDTH])?;
         let samples = self.fastest(&kernels, |kernel| {
             let mut timed = Timed::new(device);
             let input = timed.bound(&input)?;
@@ -1452,49 +1880,39 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                     .map_err(failed)?;
                 timed.export(&result.value)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: point_bytes,
-            samples,
-        })
+        Ok(launch_point(at, hidden, weight, point_bytes, samples))
     }
 
-    /// Recurrent projection from a 4096-wide residual at width 128, twice
-    /// as many value heads as key heads, the key heads sized. The small
+    /// Recurrent projection at width 128, twice as many value heads as key
+    /// heads, in whole key heads filling the launch's rows. The small
     /// decay-rate matrices are shared by every launch.
     fn delta_project(
         &self,
         norm: Element,
         weight: Element,
         activation: Element,
-        target: u64,
+        at: Launch,
     ) -> Step<MeasuredPoint> {
-        let width = RECURRENT_WIDTH;
-        let rows = |key_heads: u64| {
-            let value_heads = 2 * key_heads;
-            (
-                (2 * key_heads + value_heads) * width,
-                value_heads * width,
-                value_heads,
-            )
-        };
-        let streamed = |key_heads| {
-            let (channels, inner, value_heads) = rows(key_heads);
-            sum(&[
-                bytes(weight, &[channels, HIDDEN])?,
-                bytes(weight, &[inner, HIDDEN])?,
-                2 * bytes(weight, &[value_heads, HIDDEN])?,
-            ])
-        };
-        let key_heads = size_for(target, 1, streamed)?;
-        let (channels, inner, value_heads) = rows(key_heads);
+        let (width, hidden) = (RECURRENT_WIDTH, at.reduction);
+        // A key head adds 2 key, 2 value and 2 gate rows of the width, and
+        // two decay rows.
+        let key_heads = (at.rows / (6 * width + 4)).max(1);
+        let value_heads = 2 * key_heads;
+        let (channels, inner) = ((2 * key_heads + value_heads) * width, value_heads * width);
+        let rows = channels + inner + 2 * value_heads;
+        let point_bytes = sum(&[
+            bytes(weight, &[channels, hidden])?,
+            bytes(weight, &[inner, hidden])?,
+            2 * bytes(weight, &[value_heads, hidden])?,
+        ])?;
         let device = self.device();
         let kernels = self.form::<gated_delta_project::Entry>(
             &[norm, weight, activation],
             &[
                 ("M", 1),
-                ("H", HIDDEN),
+                ("H", hidden),
                 ("NK", key_heads),
                 ("NV", value_heads),
                 ("W", width),
@@ -1514,15 +1932,14 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
-        let point_bytes = streamed(key_heads)?;
+        self.begin()?;
         let launches = self.copies(point_bytes);
-        let projections = self.views(weight, HIDDEN, channels, launches)?;
-        let gates = self.views(weight, HIDDEN, inner, launches)?;
-        let alpha = self.zeros(weight, &[value_heads, HIDDEN])?;
-        let beta = self.zeros(weight, &[value_heads, HIDDEN])?;
-        let input = self.zeros(Element::f32(), &[1, HIDDEN])?;
-        let input_norm = self.zeros(norm, &[HIDDEN])?;
+        let projections = self.views(weight, hidden, channels, launches)?;
+        let gates = self.views(weight, hidden, inner, launches)?;
+        let alpha = self.zeros(weight, &[value_heads, hidden])?;
+        let beta = self.zeros(weight, &[value_heads, hidden])?;
+        let input = self.zeros(Element::f32(), &[1, hidden])?;
+        let input_norm = self.zeros(norm, &[hidden])?;
         let samples = self.fastest(&kernels, |kernel| {
             let mut timed = Timed::new(device);
             let input = timed.bound(&input)?;
@@ -1549,48 +1966,43 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                     .map_err(failed)?;
                 timed.export(&result.value)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: point_bytes,
-            samples,
-        })
+        Ok(launch_point(at, rows, weight, point_bytes, samples))
     }
 
-    /// One row's recurrent state advance at the key's head geometry, over
-    /// the state layout's bank components (a one-row tape, as plain decoding
-    /// plans it).
-    fn delta_step(&self, key: &MeasurementKey, activation: Element) -> Step<MeasuredPoint> {
-        let key_heads = geometry(key, "key_heads")?;
-        let value_heads = geometry(key, "value_heads")?;
-        let width = geometry(key, "width")?;
-        let convolution_width = geometry(key, "convolution_width")?;
-        let layout = ModelStateLayout::derive(
-            &DecoderGeometry {
-                activation_dtype: activation_dtype(activation)?,
-                hidden: 1,
-                vocabulary: 1,
-                context_limit: 1,
-                epsilon: 1e-6,
-                blocks: vec![BlockGeometry {
-                    mixer: MixerGeometry::Recurrent(RecurrentGeometry {
-                        convolution_width,
-                        key_heads,
-                        value_heads,
-                        width,
-                        head_mapping: RecurrentHeadMapping::Tiled,
-                    }),
-                    feedforward: FeedForwardGeometry::Dense { intermediate: 1 },
-                }],
-            },
-            0,
-            KvCodec::Dense,
-            0,
-        )
-        .map_err(failed)?;
-        let [window, delta, tape] = layout.target_recurrent.as_slice() else {
-            return Err(failed("a recurrent layer has three state components"));
+    /// One row's recurrent state advance of 16 key heads and `value_heads`
+    /// value heads of width 128 with 4 taps, over the state layout's bank
+    /// components (a one-row tape, as plain decoding plans it). Its bytes are
+    /// the bank's.
+    fn delta_step(&self, activation: Element, value_heads: u64) -> Step<MeasuredPoint> {
+        let (key_heads, width, convolution_width) = (16, RECURRENT_WIDTH, 4);
+        let host = |value: u64| {
+            usize::try_from(value).map_err(|_| failed("recurrent geometry exceeds host domain"))
         };
+        // The gated delta bank as the state layout forms it, with the one-row
+        // tape plain decoding plans. The window keeps raw projection rows in
+        // activation precision.
+        let [window, delta, tape] = [
+            BankComponent::ConvWindow {
+                width: host(convolution_width)?,
+                channels: host((2 * key_heads + value_heads) * width)?,
+                dtype: activation
+                    .dtype()
+                    .ok_or_else(|| failed("a decoder activation is dense"))?,
+            },
+            BankComponent::DeltaState {
+                heads: host(value_heads)?,
+                width: host(width)?,
+            },
+            BankComponent::DeltaTape {
+                value_heads: host(value_heads)?,
+                key_heads: host(key_heads)?,
+                width: host(width)?,
+            },
+        ]
+        .map(|component| component.spec(0).map_err(failed));
+        let (window, delta, tape) = (&window?, &delta?, &tape?);
         let tape_rows = *tape
             .shape
             .first()
@@ -1625,7 +2037,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
+        self.begin()?;
         let slab_banks = magnitude_state::banks_per_slab(bank_bytes).map_err(failed)? as u64;
         let regions = [window, delta, tape]
             .iter()
@@ -1698,37 +2110,36 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                     .map_err(failed)?;
                 timed.export(&result.value)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: bank_bytes,
-            samples,
-        })
+        Ok(size_point(bank_bytes, samples))
     }
 
-    /// Gated recurrent output of 32 value heads of width 128, the output
-    /// width sized.
+    /// Gated recurrent output of value heads of width 128 (the launch's
+    /// reduction in whole heads, half as many key heads) into the launch's
+    /// rows.
     fn delta_output(
         &self,
         norm: Element,
         weight: Element,
         activation: Element,
-        target: u64,
+        at: Launch,
     ) -> Step<MeasuredPoint> {
-        let inner = RECURRENT_VALUE_HEADS * RECURRENT_WIDTH;
-        let projection_width = (2 * RECURRENT_KEY_HEADS + RECURRENT_VALUE_HEADS) * RECURRENT_WIDTH
-            + inner
-            + 2 * RECURRENT_VALUE_HEADS;
-        let streamed = |hidden| bytes(weight, &[hidden, inner]);
-        let hidden = size_for(target, UNIT, streamed)?;
+        let value_heads = multiple(at.reduction / RECURRENT_WIDTH, 2);
+        let key_heads = value_heads / 2;
+        let inner = value_heads * RECURRENT_WIDTH;
+        let projection_width =
+            (2 * key_heads + value_heads) * RECURRENT_WIDTH + inner + 2 * value_heads;
+        let hidden = at.rows;
+        let point_bytes = bytes(weight, &[hidden, inner])?;
         let device = self.device();
         let kernels = self.form::<gated_delta_output::Entry>(
             &[norm, weight, activation],
             &[
                 ("M", 1),
                 ("H", hidden),
-                ("NK", RECURRENT_KEY_HEADS),
-                ("NV", RECURRENT_VALUE_HEADS),
+                ("NK", key_heads),
+                ("NV", value_heads),
                 ("W", RECURRENT_WIDTH),
             ],
             move |specialization| {
@@ -1743,12 +2154,11 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
-        let point_bytes = streamed(hidden)?;
+        self.begin()?;
         let launches = self.copies(point_bytes);
         let weights = self.views(weight, inner, hidden, launches)?;
         let input = self.zeros(Element::f32(), &[1, hidden])?;
-        let mixed = self.zeros(activation, &[1, RECURRENT_VALUE_HEADS, RECURRENT_WIDTH])?;
+        let mixed = self.zeros(activation, &[1, value_heads, RECURRENT_WIDTH])?;
         let projection = self.zeros(activation, &[1, projection_width])?;
         let recurrent_norm = self.zeros(norm, &[RECURRENT_WIDTH])?;
         let samples = self.fastest(&kernels, |kernel| {
@@ -1775,29 +2185,25 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                     .map_err(failed)?;
                 timed.export(&result.value)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: point_bytes,
-            samples,
-        })
+        Ok(launch_point(at, hidden, weight, point_bytes, samples))
     }
 
-    /// Paired gate/up projection from a 4096-wide residual, the feature
-    /// width sized; both matrices are streamed.
+    /// Paired gate/up projection: half the launch's rows each.
     fn dense_expand(
         &self,
         norm: Element,
         weight: Element,
         activation: Element,
-        target: u64,
+        at: Launch,
     ) -> Step<MeasuredPoint> {
-        let streamed = |features| Ok(bytes(weight, &[features, HIDDEN])? * 2);
-        let features = size_for(target, UNIT, streamed)?;
+        let (features, hidden) = (multiple(at.rows / 2, ROW_ALIGNMENT), at.reduction);
+        let point_bytes = bytes(weight, &[features, hidden])? * 2;
         let device = self.device();
         let kernels = self.form::<dense_expand::Entry>(
             &[norm, weight, activation],
-            &[("M", 1), ("O", 1), ("H", HIDDEN), ("F", features)],
+            &[("M", 1), ("O", 1), ("H", hidden), ("F", features), ("GS", 0), ("US", 0)],
             move |specialization| {
                 dense_expand::native_for_device_with(
                     device,
@@ -1811,19 +2217,20 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
-        let point_bytes = streamed(features)?;
+        self.begin()?;
         let launches = self.copies(point_bytes);
-        let gates = self.views(weight, HIDDEN, features, launches)?;
-        let ups = self.views(weight, HIDDEN, features, launches)?;
-        let residual = self.zeros(Element::f32(), &[1, HIDDEN])?;
-        let norm = self.zeros(norm, &[HIDDEN])?;
+        let gates = self.views(weight, hidden, features, launches)?;
+        let ups = self.views(weight, hidden, features, launches)?;
+        let residual = self.zeros(Element::f32(), &[1, hidden])?;
+        let norm = self.zeros(norm, &[hidden])?;
         let out_rows = self.zeros(Element::i32(), &[1])?;
+        let scale = self.zeros(Element::f32(), &[0])?;
         let samples = self.fastest(&kernels, |kernel| {
             let mut timed = Timed::new(device);
             let residual = timed.bound(&residual)?;
             let norm = timed.bound(&norm)?;
             let out_rows = timed.bound(&out_rows)?;
+            let scale = timed.bound(&scale)?;
             for (gate, up) in gates.iter().zip(&ups) {
                 let gate = timed.bound(gate)?;
                 let up = timed.bound(up)?;
@@ -1838,33 +2245,32 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                             up_weight: up.tensor().into(),
                             out_rows: out_rows.tensor().into(),
                             eps: 1e-5,
+                            activation: 0,
+                            gate_scale: scale.tensor().into(),
+                            up_scale: scale.tensor().into(),
                         },
                     )
                     .map_err(failed)?;
                 timed.export(&result.value)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: point_bytes,
-            samples,
-        })
+        Ok(launch_point(at, 2 * features, weight, point_bytes, samples))
     }
 
-    /// Down projection from a 4096-wide product, the residual width sized.
+    /// Down projection plus residual into the launch's rows.
     fn dense_output(
         &self,
         weight: Element,
         activation: Element,
-        target: u64,
+        at: Launch,
     ) -> Step<MeasuredPoint> {
-        let features = HIDDEN;
-        let streamed = |hidden| bytes(weight, &[hidden, features]);
-        let hidden = size_for(target, UNIT, streamed)?;
+        let (hidden, features) = (at.rows, at.reduction);
+        let point_bytes = bytes(weight, &[hidden, features])?;
         let device = self.device();
         let kernels = self.form::<dense_output::Entry>(
             &[weight, activation],
-            &[("M", 1), ("O", 1), ("H", hidden), ("F", features)],
+            &[("M", 1), ("O", 1), ("H", hidden), ("F", features), ("DS", 0)],
             move |specialization| {
                 dense_output::native_for_device_with(
                     device,
@@ -1876,18 +2282,19 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
-        let point_bytes = streamed(hidden)?;
+        self.begin()?;
         let launches = self.copies(point_bytes);
         let weights = self.views(weight, features, hidden, launches)?;
         let residual = self.zeros(Element::f32(), &[1, hidden])?;
         let product = self.zeros(activation, &[1, features])?;
         let out_rows = self.zeros(Element::i32(), &[1])?;
+        let scale = self.zeros(Element::f32(), &[0])?;
         let samples = self.fastest(&kernels, |kernel| {
             let mut timed = Timed::new(device);
             let residual = timed.bound(&residual)?;
             let product = timed.bound(&product)?;
             let out_rows = timed.bound(&out_rows)?;
+            let scale = timed.bound(&scale)?;
             for weight in &weights {
                 let weight = timed.bound(weight)?;
                 let result = timed
@@ -1899,31 +2306,28 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                             product: product.tensor().into(),
                             down_weight: weight.tensor().into(),
                             out_rows: out_rows.tensor().into(),
+                            down_scale: scale.tensor().into(),
                         },
                     )
                     .map_err(failed)?;
                 timed.export(&result.value)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: point_bytes,
-            samples,
-        })
+        Ok(launch_point(at, hidden, weight, point_bytes, samples))
     }
 
-    /// Router logits and top-k selection at the key's routing geometry.
+    /// Router logits and top-k selection of 8 of `experts` over a
+    /// `hidden`-wide row. Its bytes are the router's.
     fn routed_route(
         &self,
-        key: &MeasurementKey,
         norm: Element,
         router: Element,
         activation: Element,
+        hidden: u64,
+        experts: u64,
     ) -> Step<MeasuredPoint> {
-        let hidden = geometry(key, "hidden")?;
-        let experts = geometry(key, "experts")?;
-        let selected = geometry(key, "selected")?;
-        let dimensions = [("M", 1), ("H", hidden), ("E", experts), ("K", selected)];
+        let dimensions = [("M", 1), ("H", hidden), ("E", experts), ("K", ROUTED_SELECTED)];
         let device = self.device();
         let kernels = self.form::<routed_route::Entry>(
             &[norm, router, activation],
@@ -1940,7 +2344,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
+        self.begin()?;
         let router_bytes = bytes(router, &[experts, hidden])?;
         let launches = self.copies(router_bytes);
         let routers = self.views(router, hidden, experts, launches)?;
@@ -1981,32 +2385,28 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 timed.export(&result.r0)?;
                 timed.export(scores.tensor())?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: router_bytes,
-            samples,
-        })
+        Ok(size_point(router_bytes, samples))
     }
 
-    /// Decode expansion of 8 selected experts and a shared expert, 512
-    /// features each (the catalog's routed widths), the hidden width sized.
-    /// Only the selected experts are allocated: routes name each once, as a
+    /// Decode expansion of 8 selected experts and a shared expert of equal
+    /// features, gate and up each: the launch's rows in 18 equal parts. Only
+    /// the selected experts are allocated: routes name each once, as a
     /// decode row's choices do.
     fn routed_expand(
         &self,
         weight: Element,
         activation: Element,
-        target: u64,
+        at: Launch,
     ) -> Step<MeasuredPoint> {
-        let (experts, features) = (ROUTED_SELECTED, ROUTED_FEATURES);
-        let streamed = |hidden| {
-            Ok(sum(&[
-                bytes(weight, &[experts, features, hidden])?,
-                bytes(weight, &[features, hidden])?,
-            ])? * 2)
-        };
-        let hidden = size_for(target, UNIT, streamed)?;
+        let experts = ROUTED_SELECTED;
+        let features = multiple(at.rows / (2 * (experts + 1)), ROW_ALIGNMENT);
+        let hidden = at.reduction;
+        let point_bytes = sum(&[
+            bytes(weight, &[experts, features, hidden])?,
+            bytes(weight, &[features, hidden])?,
+        ])? * 2;
         let device = self.device();
         let kernels = self.form::<routed_expand::Entry>(
             &[weight, activation],
@@ -2032,8 +2432,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
-        let point_bytes = streamed(hidden)?;
+        self.begin()?;
         let launches = self.copies(point_bytes);
         let expert_gates = self.shaped(weight, &[experts, features, hidden], launches)?;
         let expert_ups = self.shaped(weight, &[experts, features, hidden], launches)?;
@@ -2074,30 +2473,26 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 timed.export(&result.r0)?;
                 timed.export(&result.r1)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: point_bytes,
-            samples,
-        })
+        Ok(launch_point(at, 2 * (experts + 1) * features, weight, point_bytes, samples))
     }
 
-    /// Decode down projection of 8 selected experts and a shared expert,
-    /// 512 features each, the hidden width sized.
+    /// Decode down projection of 8 selected experts and a shared expert over
+    /// the launch's reduction: its rows in 9 equal parts.
     fn routed_output(
         &self,
         weight: Element,
         activation: Element,
-        target: u64,
+        at: Launch,
     ) -> Step<MeasuredPoint> {
-        let (experts, features) = (ROUTED_SELECTED, ROUTED_FEATURES);
-        let streamed = |hidden| {
-            sum(&[
-                bytes(weight, &[experts, hidden, features])?,
-                bytes(weight, &[hidden, features])?,
-            ])
-        };
-        let hidden = size_for(target, UNIT, streamed)?;
+        let experts = ROUTED_SELECTED;
+        let hidden = multiple(at.rows / (experts + 1), ROW_ALIGNMENT);
+        let features = at.reduction;
+        let point_bytes = sum(&[
+            bytes(weight, &[experts, hidden, features])?,
+            bytes(weight, &[hidden, features])?,
+        ])?;
         let device = self.device();
         let kernels = self.form::<routed_output::Entry>(
             &[weight, activation],
@@ -2121,8 +2516,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
-        let point_bytes = streamed(hidden)?;
+        self.begin()?;
         let launches = self.copies(point_bytes);
         let expert_downs = self.shaped(weight, &[experts, hidden, features], launches)?;
         let shared_downs = self.views(weight, features, hidden, launches)?;
@@ -2164,12 +2558,9 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                     .map_err(failed)?;
                 timed.export(&result.value)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: point_bytes,
-            samples,
-        })
+        Ok(launch_point(at, (experts + 1) * hidden, weight, point_bytes, samples))
     }
 
     /// The final norm of one 4096-wide output row: a launch-dominated class.
@@ -2189,7 +2580,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
+        self.begin()?;
         let launches = MAX_LAUNCHES;
         let hidden = self.zeros(Element::f32(), &[1, HIDDEN])?;
         let norms = self.views(norm, HIDDEN, 1, launches)?;
@@ -2214,28 +2605,26 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                     .map_err(failed)?;
                 timed.export(&result.value)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: bytes(norm, &[HIDDEN])?,
-            samples,
-        })
+        Ok(size_point(bytes(norm, &[HIDDEN])?, samples))
     }
 
-    /// Vocabulary projection of one 4096-wide row, the vocabulary sized.
+    /// Vocabulary projection of one row: the vocabulary is the launch's
+    /// rows.
     fn readout_head(
         &self,
         norm: Element,
         weight: Element,
         activation: Element,
-        target: u64,
+        at: Launch,
     ) -> Step<MeasuredPoint> {
-        let streamed = |vocabulary| bytes(weight, &[vocabulary, HIDDEN]);
-        let vocabulary = size_for(target, UNIT, streamed)?;
+        let (vocabulary, hidden) = (at.rows, at.reduction);
+        let point_bytes = bytes(weight, &[vocabulary, hidden])?;
         let device = self.device();
         let kernels = self.form::<readout_head_rows::Entry>(
             &[norm, weight, activation],
-            &[("M", 1), ("O", 1), ("V", vocabulary), ("D", HIDDEN)],
+            &[("M", 1), ("O", 1), ("V", vocabulary), ("D", hidden)],
             move |specialization| {
                 readout_head_rows::native_for_device_with(
                     device,
@@ -2248,16 +2637,15 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 )
             },
         )?;
-        self.begin();
-        let point_bytes = streamed(vocabulary)?;
+        self.begin()?;
         let launches = self.copies(point_bytes);
-        let weights = self.views(weight, HIDDEN, vocabulary, launches)?;
-        let hidden = self.zeros(Element::f32(), &[1, HIDDEN])?;
-        let norm = self.zeros(norm, &[HIDDEN])?;
+        let weights = self.views(weight, hidden, vocabulary, launches)?;
+        let input = self.zeros(Element::f32(), &[1, hidden])?;
+        let norm = self.zeros(norm, &[hidden])?;
         let out_rows = self.zeros(Element::i32(), &[1])?;
         let samples = self.fastest(&kernels, |kernel| {
             let mut timed = Timed::new(device);
-            let hidden = timed.bound(&hidden)?;
+            let hidden = timed.bound(&input)?;
             let norm = timed.bound(&norm)?;
             let out_rows = timed.bound(&out_rows)?;
             for weight in &weights {
@@ -2272,17 +2660,15 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                             weight: weight.tensor().into(),
                             out_rows: out_rows.tensor().into(),
                             epsilon: 1e-6,
+                            softcap: 0.0,
                         },
                     )
                     .map_err(failed)?;
                 timed.export(&result.value)?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: point_bytes,
-            samples,
-        })
+        Ok(launch_point(at, vocabulary, weight, point_bytes, samples))
     }
 
     /// Unconstrained selection over one F32 logits row of `vocabulary`.
@@ -2292,7 +2678,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let kernels = self.form::<sample_rows::Entry>(&[], &dimensions, move |specialization| {
             sample_rows::native_for_device(device, specialization)
         })?;
-        self.begin();
+        self.begin()?;
         let point_bytes = bytes(Element::f32(), &[1, vocabulary])?;
         let launches = self.copies(point_bytes);
         let logits = self.views(Element::f32(), vocabulary, 1, launches)?;
@@ -2325,12 +2711,9 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                     .map_err(failed)?;
                 timed.export(result.tensor())?;
             }
-            self.run(timed, launches)
+            Ok((timed, launches))
         })?;
-        Ok(MeasuredPoint {
-            bytes: point_bytes,
-            samples,
-        })
+        Ok(size_point(point_bytes, samples))
     }
 
     /// The reference chain's samples, measured once per session.
@@ -2360,8 +2743,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         )
         .ok_or_else(|| failed("q4k has no resident form on this backend"))?;
         let (hidden, features) = (HIDDEN, CHAIN_FEATURES);
-        let (key_heads, value_heads, width) =
-            (RECURRENT_KEY_HEADS, RECURRENT_VALUE_HEADS, RECURRENT_WIDTH);
+        let (key_heads, value_heads, width) = (16, 32, RECURRENT_WIDTH);
         let channels = (2 * key_heads + value_heads) * width;
         let inner = value_heads * width;
         let recurrent = [
@@ -2371,7 +2753,6 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             ("NV", value_heads),
             ("W", width),
         ];
-        let dense = [("M", 1), ("O", 1), ("H", hidden), ("F", features)];
         let device = self.device();
         // Every form is attempted before any stop, so the formation pass
         // queues all four.
@@ -2410,7 +2791,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         );
         let expand = self.form::<dense_expand::Entry>(
             &[activation, weight, activation],
-            &dense,
+            &[("M", 1), ("O", 1), ("H", hidden), ("F", features), ("GS", 0), ("US", 0)],
             move |specialization| {
                 dense_expand::native_for_device_with(
                     device,
@@ -2426,7 +2807,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         );
         let down = self.form::<dense_output::Entry>(
             &[weight, activation],
-            &dense,
+            &[("M", 1), ("O", 1), ("H", hidden), ("F", features), ("DS", 0)],
             move |specialization| {
                 dense_output::native_for_device_with(
                     device,
@@ -2449,7 +2830,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         fn variant<K>(kernels: &[K], choice: usize) -> &K {
             &kernels[choice.min(kernels.len() - 1)]
         }
-        self.begin();
+        self.begin()?;
         let cycles = CHAIN_CYCLES as u64;
         let qkv = self.views(weight, hidden, channels, cycles)?;
         let gates = self.views(weight, hidden, inner, cycles)?;
@@ -2478,6 +2859,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             let alpha = timed.bound(&alpha)?;
             let beta = timed.bound(&beta)?;
             let rows = timed.bound(&self.zeros(Element::i32(), &[1])?)?;
+            let scale = timed.bound(&self.zeros(Element::f32(), &[0])?)?;
             let mut current: Option<WorkflowTensor> = None;
             for cycle in 0..CHAIN_CYCLES {
                 let qkv = timed.bound(&qkv[cycle])?;
@@ -2533,6 +2915,9 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                             up_weight: expand_up.tensor().into(),
                             out_rows: rows.tensor().into(),
                             eps: 1e-5,
+                            activation: 0,
+                            gate_scale: scale.tensor().into(),
+                            up_scale: scale.tensor().into(),
                         },
                     )
                     .map_err(failed)?
@@ -2546,6 +2931,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                             product: (&expanded).into(),
                             down_weight: down_weight.tensor().into(),
                             out_rows: rows.tensor().into(),
+                            down_scale: scale.tensor().into(),
                         },
                     )
                     .map_err(failed)?
@@ -2561,10 +2947,16 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         // What the basis's own classes predict for one cycle's four calls at
         // the bytes they stream: the dependency cost is the chained time
         // those standalone costs do not account for.
-        let class_seconds = |key: MeasurementKey, streamed: u64| -> Step<f64> {
+        // The chain streams the reference representation, so no weight
+        // format enters.
+        let class_seconds = |class: OperationClass, rows: u64, streamed: u64| -> Step<f64> {
+            let key = MeasurementKey::new(class, &[activation]);
             let points = self.points(&key)?;
-            let cost = ClassCost::from_points(key.class, &points).map_err(failed)?;
-            Ok(cost.seconds(1, streamed, streamed).median)
+            match ClassCost::from_points(class, &points).map_err(failed)?.model {
+                CostModel::Projection(projection) => Ok(projection.launch_seconds
+                    + projection.seconds_per_byte(rows) * streamed as f64),
+                _ => Err(failed(format!("{} is not a projection", class.name()))),
+            }
         };
         let project_bytes = sum(&[
             bytes(weight, &[channels, hidden])?,
@@ -2577,44 +2969,36 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             bytes(weight, &[features, hidden])?,
         ])?;
         let standalone_per_call = (class_seconds(
-            MeasurementKey::delta_project(activation, weight, activation),
+            OperationClass::DeltaProject,
+            channels + inner + 2 * value_heads,
             project_bytes,
         )? + class_seconds(
-            MeasurementKey::delta_output(activation, weight, activation),
+            OperationClass::DeltaOutput,
+            hidden,
             bytes(weight, &[hidden, inner])?,
-        )? + class_seconds(
-            MeasurementKey::dense_expand(activation, weight, activation),
-            expand_bytes,
-        )? + class_seconds(
-            MeasurementKey::dense_output(weight, activation),
-            bytes(weight, &[hidden, features])?,
-        )?) / CHAIN_CALLS_PER_CYCLE as f64;
-        let mut fastest: Option<(usize, f64, Vec<f64>)> = None;
-        for choice in 0..variants {
-            let samples = self.run(chain(choice)?, calls)?;
-            let call = median(&samples).ok_or_else(|| failed("no chained median"))?;
-            if fastest.as_ref().is_none_or(|(_, best, _)| call < *best) {
-                fastest = Some((choice, call, samples));
-            }
-        }
-        let (choice, chained_call, chained) =
-            fastest.ok_or_else(|| failed("no chained variant was timed"))?;
+        )? + class_seconds(OperationClass::DenseExpand, 2 * features, expand_bytes)?
+            + class_seconds(
+                OperationClass::DenseOutput,
+                hidden,
+                bytes(weight, &[hidden, features])?,
+            )?)
+            / CHAIN_CALLS_PER_CYCLE as f64;
+        let (choice, chained) =
+            self.fastest_graph((0..variants).map(|choice| Ok((chain(choice)?, calls))))?;
+        let chained_call = median(&chained).ok_or_else(|| failed("no chained median"))?;
         let submission =
             self.submissions(chain(choice)?, chained_call * calls as f64, CHAIN_SAMPLES)?;
         Ok(Chained {
-            dependency: MeasuredPoint {
-                bytes: 0,
-                // A dependent call cannot cost less than its standalone
-                // launch: a difference at or below zero measures none.
-                samples: chained
+            // A dependent call cannot cost less than its standalone launch: a
+            // difference at or below zero measures none.
+            dependency: size_point(
+                0,
+                chained
                     .iter()
                     .map(|call| (call - standalone_per_call).max(0.0))
                     .collect(),
-            },
-            submission: MeasuredPoint {
-                bytes: 0,
-                samples: submission,
-            },
+            ),
+            submission: size_point(0, submission),
         })
     }
 
@@ -2637,8 +3021,8 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                     .attach(bindings, outputs)
                     .map_err(failed)?
                     .submit()
-                    .map_err(failed)?;
-                completion.wait().map_err(failed)?;
+                    .map_err(fault)?;
+                completion.wait().map_err(fault)?;
                 let wall = began.elapsed().as_secs_f64();
                 self.session.trace.collect().map_err(failed)?;
                 Ok((wall - device_seconds).max(0.0))
@@ -2657,29 +3041,40 @@ struct Chained {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic::Layout;
 
     #[test]
-    fn size_search_finds_the_smallest_unit_multiple_reaching_the_target() {
-        let weight = Element::stored("q4k", Layout::Rows16).unwrap();
-        for target in [SMALL_BYTES, LARGE_BYTES] {
-            let streamed = |rows| bytes(weight, &[rows, HIDDEN]);
-            let Ok(rows) = size_for(target, UNIT, streamed) else {
-                panic!("size search failed");
-            };
-            assert_eq!(rows % UNIT, 0);
-            assert!(streamed(rows).ok().unwrap() >= target);
-            assert!(rows == UNIT || streamed(rows - UNIT).ok().unwrap() < target);
+    fn history_points_differ_from_the_reference_in_one_axis() {
+        let points = history_points();
+        assert_eq!(&points[..2], &[(HISTORY_REFERENCE, 4096), (HISTORY_REFERENCE, 32_768)]);
+        for (heads, depth) in &points[2..] {
+            assert_eq!(*depth, HISTORY_DEPTH);
+            let differing = [
+                heads.kv_heads != HISTORY_REFERENCE.kv_heads,
+                heads.group != HISTORY_REFERENCE.group,
+                heads.width != HISTORY_REFERENCE.width,
+            ];
+            assert_eq!(differing.iter().filter(|differs| **differs).count(), 1);
         }
     }
 
     #[test]
+    fn the_floor_launch_shares_a_ladder_row_count() {
+        let launches = projection_launches();
+        assert!(LADDER_ROWS.contains(&FLOOR_ROWS));
+        assert!(FLOOR_REDUCTION < REDUCTION);
+        assert_eq!(launches.len(), LADDER_ROWS.len() + 1);
+        assert_eq!(FORM_LAUNCH.reduction, REDUCTION);
+    }
+
+    #[test]
     fn measured_history_planes_are_the_state_layout_rows() {
-        let configuration = super::super::plan::QWEN35_CONFIGURATIONS[3];
+        let configuration = super::super::plan::tests::QWEN35_CONFIGURATIONS[3];
         let (definition, _) = super::super::plan::tests::declared_model(&configuration);
         for (codec, affine) in [(KvCodec::Dense, false), (KvCodec::AffineK8V4, true)] {
-            let layout = ModelStateLayout::derive(&definition.geometry, 0, codec, 0).unwrap();
-            let layout_row = layout.target_history[0]
+            let layout =
+                magnitude_state::ModelStateLayout::derive(&definition.decoder, &[], codec, 0)
+                    .unwrap();
+            let layout_row = layout.target_history[0].components()[0]
                 .planes()
                 .iter()
                 .map(|plane| plane.row_bytes as u64)

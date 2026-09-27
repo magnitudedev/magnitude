@@ -39,15 +39,26 @@ pub enum Format {
     Q8,
     /// GGUF IQ4_XS, resident as iq4g32.
     Iq4,
+    /// GGUF Q4_0, Q5_0, Q5_1, MXFP4, NVFP4 (representations of their own).
+    Q4_0,
+    Q5_0,
+    Q5_1,
+    Mxfp4,
+    Nvfp4,
 }
 
 impl Format {
-    pub const ALL: [Format; 5] = [
+    pub const ALL: [Format; 10] = [
         Format::Q4K,
         Format::Q5K,
         Format::Q6K,
         Format::Q8,
         Format::Iq4,
+        Format::Q4_0,
+        Format::Q5_0,
+        Format::Q5_1,
+        Format::Mxfp4,
+        Format::Nvfp4,
     ];
     pub fn external(self) -> &'static str {
         match self {
@@ -56,6 +67,11 @@ impl Format {
             Format::Q6K => "gguf_q6_k",
             Format::Q8 => "gguf_q8_0",
             Format::Iq4 => "gguf_iq4_xs",
+            Format::Q4_0 => "gguf_q4_0",
+            Format::Q5_0 => "gguf_q5_0",
+            Format::Q5_1 => "gguf_q5_1",
+            Format::Mxfp4 => "gguf_mxfp4",
+            Format::Nvfp4 => "gguf_nvfp4",
         }
     }
     pub fn representation(self) -> &'static str {
@@ -65,7 +81,21 @@ impl Format {
             Format::Q6K => "q6k",
             Format::Q8 => "q8g32s",
             Format::Iq4 => "iq4g32",
+            Format::Q4_0 => "q4g32s",
+            Format::Q5_0 => "q5g32s",
+            Format::Q5_1 => "q5g32",
+            Format::Mxfp4 => "mxfp4g32",
+            Format::Nvfp4 => "nvfp4g16",
         }
+    }
+    /// Whether the CUDA GEMM keeps this format's codes exact and scales its
+    /// F32 partial products (`SCALED_GEMM`): its weights are never rounded
+    /// to the activation type.
+    pub fn scaled_gemm(self) -> bool {
+        matches!(
+            self,
+            Format::Q4_0 | Format::Q5_0 | Format::Q5_1 | Format::Mxfp4 | Format::Nvfp4
+        )
     }
     pub fn resident(self) -> Element {
         Element::stored(self.representation(), Layout::Mma16).unwrap()
@@ -100,12 +130,36 @@ impl Format {
                 block.extend(f16(rng.uniform(0.00005, 0.0003)));
                 block.extend((0..2 + 4 + 128).map(|_| rng.byte()));
             }
+            Format::Q4_0 => {
+                block.extend(f16(rng.uniform(0.0005, 0.003)));
+                block.extend((0..16).map(|_| rng.byte()));
+            }
+            Format::Q5_0 => {
+                block.extend(f16(rng.uniform(0.0002, 0.0015)));
+                block.extend((0..4 + 16).map(|_| rng.byte()));
+            }
+            Format::Q5_1 => {
+                block.extend(f16(rng.uniform(0.0002, 0.0015)));
+                block.extend(f16(-rng.uniform(0.005, 0.02)));
+                block.extend((0..4 + 16).map(|_| rng.byte()));
+            }
+            Format::Mxfp4 => {
+                // E8M0 2^-10 .. 2^-8 (values up to 6 of them).
+                block.push(117 + (rng.next() % 3) as u8);
+                block.extend((0..16).map(|_| rng.byte()));
+            }
+            Format::Nvfp4 => {
+                // UE4M3 subnormal and smallest-normal scales (<= 2^-5).
+                block.extend((0..4).map(|_| (rng.next() % 16) as u8));
+                block.extend((0..32).map(|_| rng.byte()));
+            }
         }
         block
     }
     pub fn block_values(self) -> usize {
         match self {
-            Format::Q8 => 32,
+            Format::Q8 | Format::Q4_0 | Format::Q5_0 | Format::Q5_1 | Format::Mxfp4 => 32,
+            Format::Nvfp4 => 64,
             _ => 256,
         }
     }
@@ -299,7 +353,7 @@ impl Mapping {
             .with_launch_param(2, "KSPLIT", self.ksplit)
     }
     /// Attention projection owns KSPLIT on its two GEMV launches.
-    pub fn gated_attention_project_params(
+    pub fn attention_project_params(
         self,
         spec: seismic::NativeSpecialization,
     ) -> seismic::NativeSpecialization {
@@ -312,7 +366,7 @@ impl Mapping {
         self,
         spec: seismic::NativeSpecialization,
     ) -> seismic::NativeSpecialization {
-        self.gated_attention_project_params(spec)
+        self.attention_project_params(spec)
     }
     /// Readout head GEMVs own KSPLIT on launches 1 and 2.
     pub fn head_params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
@@ -369,7 +423,7 @@ pub fn timing_formats() -> Vec<Format> {
                 *Format::ALL
                     .iter()
                     .find(|format| format.representation() == name.trim())
-                    .expect("CUDA_TIMING_FORMATS: q4k, q5k, q6k, q8g32s or iq4g32")
+                    .expect("CUDA_TIMING_FORMATS: a resident representation name, e.g. q4k or mxfp4g32")
             })
             .collect(),
         Err(_) => Format::ALL.to_vec(),

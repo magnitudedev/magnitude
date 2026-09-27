@@ -105,11 +105,37 @@ pub struct Select {
 pub struct Row {
     pub token: i32,
     pub coordinates: [i32; 4],
-    /// Accepted-history arena ranges. Each range stays within one slab.
-    pub visible: Vec<[i32; 2]>,
-    pub destination: i32,
+    /// One entry per history domain of the slot's store, in domain order.
+    /// Every row of a batch has the same number.
+    pub histories: Vec<RowHistory>,
     pub demand: Demand,
     pub select: Option<Select>,
+}
+
+/// A row's history in one history domain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowHistory {
+    /// Accepted-history ranges of the domain this row reads. Each range stays
+    /// within one slab.
+    pub visible: Vec<[i32; 2]>,
+    /// The first row of its slot, by offset in the slot, whose fresh history
+    /// this row reads: 0 unless the domain's window starts inside the slot.
+    pub fresh_start: i32,
+    /// For a media row attending its whole span bidirectionally, the offset
+    /// in its slot after the span's last row: it reads the fresh rows up to
+    /// there. A causal row reads the fresh rows through itself.
+    pub bidirectional_end: Option<i32>,
+    /// The domain row this row's history is written to, or -1.
+    pub destination: i32,
+}
+
+/// One history domain's row tables: per row its visible ranges, its fresh
+/// batch rows `[start, end)` and its destination.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryTables {
+    pub visible: Vec<Vec<[i32; 2]>>,
+    pub fresh: Vec<[i32; 2]>,
+    pub destinations: Vec<i32>,
 }
 
 /// A request-local run of rows. Slots are packed in scheduler order.
@@ -139,9 +165,8 @@ pub struct PackedRowTables {
     pub mask_count: usize,
     pub tokens: Vec<i32>,
     pub coordinates: Vec<[i32; 4]>,
-    pub visible: Vec<Vec<[i32; 2]>>,
-    pub fresh: Vec<[i32; 2]>,
-    pub destinations: Vec<i32>,
+    /// One table set per history domain, in domain order.
+    pub histories: Vec<HistoryTables>,
     pub row_slots: Vec<i32>,
     pub demand: Vec<u32>,
     pub segments: Vec<[i32; 2]>,
@@ -193,6 +218,17 @@ pub enum PackError {
     InvalidDestination {
         row: usize,
         destination: i32,
+    },
+    /// A row whose history domain count differs from the batch's first row.
+    HistoryDomains {
+        row: usize,
+        expected: usize,
+        actual: usize,
+    },
+    /// A fresh span that does not hold the row itself within its slot.
+    InvalidFreshSpan {
+        row: usize,
+        fresh: [i32; 2],
     },
     InvalidVisibleRange {
         row: usize,
@@ -262,6 +298,17 @@ impl fmt::Display for PackError {
             Self::InvalidDestination { row, destination } => {
                 write!(f, "row {row} has invalid destination {destination}")
             }
+            Self::HistoryDomains {
+                row,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "row {row} has {actual} history domains; the batch has {expected}"
+            ),
+            Self::InvalidFreshSpan { row, fresh } => {
+                write!(f, "row {row} has invalid fresh span [{}, {})", fresh[0], fresh[1])
+            }
             Self::InvalidVisibleRange { row, range } => write!(
                 f,
                 "row {row} has invalid visible range [{}, {})",
@@ -316,6 +363,18 @@ impl PackedRowTables {
         vocabulary_size: usize,
         row_limit: usize,
     ) -> Result<Self, PackError> {
+        Self::pack_covering(slots, vocabulary_size, row_limit, 1)
+    }
+
+    /// Pack into a launch class covering at least `segments` history ranges
+    /// per row: the class a reservation sized from a bound on its rows'
+    /// ranges.
+    pub fn pack_covering(
+        slots: &[Slot],
+        vocabulary_size: usize,
+        row_limit: usize,
+        segments: usize,
+    ) -> Result<Self, PackError> {
         if vocabulary_size == 0 {
             return Err(PackError::EmptyVocabulary);
         }
@@ -333,8 +392,12 @@ impl PackedRowTables {
             .checked_next_power_of_two()
             .ok_or(PackError::IntegerOverflow("slot count"))?;
 
-        let mut normalized = Vec::with_capacity(actual_rows);
-        let mut max_segments = 1;
+        let domains = slots
+            .first()
+            .and_then(|slot| slot.rows.first())
+            .map_or(0, |row| row.histories.len());
+        let mut index = 0usize;
+        let mut max_segments = segments.max(1);
         let mut union = Demand::NONE;
         for (slot_index, slot) in slots.iter().enumerate() {
             if slot.rows.is_empty() {
@@ -368,8 +431,7 @@ impl PackedRowTables {
                     stop: slot.stop,
                 });
             }
-            for row in &slot.rows {
-                let index = normalized.len();
+            for (offset, row) in slot.rows.iter().enumerate() {
                 if row.token < 0 {
                     return Err(PackError::InvalidToken {
                         row: index,
@@ -382,20 +444,41 @@ impl PackedRowTables {
                         coordinates: row.coordinates,
                     });
                 }
-                if row.destination < -1 {
-                    return Err(PackError::InvalidDestination {
+                if row.histories.len() != domains {
+                    return Err(PackError::HistoryDomains {
                         row: index,
-                        destination: row.destination,
+                        expected: domains,
+                        actual: row.histories.len(),
                     });
+                }
+                for history in &row.histories {
+                    if history.destination < -1 {
+                        return Err(PackError::InvalidDestination {
+                            row: index,
+                            destination: history.destination,
+                        });
+                    }
+                    let fresh_end = fresh_end(history, offset)?;
+                    let start = usize::try_from(history.fresh_start);
+                    let end = usize::try_from(fresh_end);
+                    if !matches!(
+                        (start, end),
+                        (Ok(start), Ok(end)) if start <= offset && offset < end && end <= slot.rows.len()
+                    ) {
+                        return Err(PackError::InvalidFreshSpan {
+                            row: index,
+                            fresh: [history.fresh_start, fresh_end],
+                        });
+                    }
+                    validate_visible(index, &history.visible)?;
+                    max_segments = max_segments.max(history.visible.len());
                 }
                 let has_select = row.select.is_some();
                 if has_select != row.demand.contains(Demand::SELECT) {
                     return Err(PackError::SelectMismatch { row: index });
                 }
-                let visible = validate_visible(index, &row.visible)?;
-                max_segments = max_segments.max(visible.len());
                 union |= row.demand;
-                normalized.push(visible);
+                index += 1;
             }
         }
         let class = LaunchClass::covering(actual_rows, max_segments, union, row_limit)?;
@@ -414,9 +497,14 @@ impl PackedRowTables {
             mask_count: 0,
             tokens: vec![0; m],
             coordinates: vec![[0; 4]; m],
-            visible: vec![vec![[0; 2]; r]; m],
-            fresh: vec![[0; 2]; m],
-            destinations: vec![-1; m],
+            histories: vec![
+                HistoryTables {
+                    visible: vec![vec![[0; 2]; r]; m],
+                    fresh: vec![[0; 2]; m],
+                    destinations: vec![-1; m],
+                };
+                domains
+            ],
             row_slots: vec![b_i32; m],
             demand: vec![0; m],
             segments: vec![[m_i32, m_i32]; padded_slots + 1],
@@ -444,16 +532,19 @@ impl PackedRowTables {
             packed.previous_tape[slot_index] = slot.previous_tape;
             packed.following_bank[slot_index] = slot.following_bank;
             packed.stop[slot_index] = slot.stop;
-            for row in &slot.rows {
+            for (offset, row) in slot.rows.iter().enumerate() {
                 packed.tokens[row_index] = row.token;
                 packed.coordinates[row_index] = row.coordinates;
-                packed.visible[row_index][..normalized[row_index].len()]
-                    .copy_from_slice(&normalized[row_index]);
-                packed.fresh[row_index] = [
-                    as_i32(lo, "fresh start")?,
-                    as_i32(row_index + 1, "fresh end")?,
-                ];
-                packed.destinations[row_index] = row.destination;
+                for (tables, history) in packed.histories.iter_mut().zip(&row.histories) {
+                    tables.visible[row_index][..history.visible.len()]
+                        .copy_from_slice(&history.visible);
+                    // Validated nonnegative and within the slot above.
+                    tables.fresh[row_index] = [
+                        as_i32(lo + history.fresh_start as usize, "fresh start")?,
+                        as_i32(lo + fresh_end(history, offset)? as usize, "fresh end")?,
+                    ];
+                    tables.destinations[row_index] = history.destination;
+                }
                 packed.row_slots[row_index] = as_i32(slot_index, "row slot")?;
                 packed.demand[row_index] = row.demand.bits();
 
@@ -476,10 +567,19 @@ impl PackedRowTables {
     }
 }
 
-/// Preserve the producer's slab boundaries in logical history order and
+/// Accept the producer's slab boundaries in logical history order and
 /// reject ranges that share a row. Arena placement does not follow logical
 /// order, so a later range may lie at a lower address than an earlier one.
-fn validate_visible(row: usize, ranges: &[[i32; 2]]) -> Result<Vec<[i32; 2]>, PackError> {
+/// The offset in its slot after the last fresh row the row at `offset`
+/// reads (`RowHistory::bidirectional_end`).
+fn fresh_end(history: &RowHistory, offset: usize) -> Result<i32, PackError> {
+    match history.bidirectional_end {
+        Some(end) => Ok(end),
+        None => as_i32(offset + 1, "fresh end"),
+    }
+}
+
+fn validate_visible(row: usize, ranges: &[[i32; 2]]) -> Result<(), PackError> {
     for &range in ranges {
         if range[0] < 0 || range[0] >= range[1] {
             return Err(PackError::InvalidVisibleRange { row, range });
@@ -490,7 +590,7 @@ fn validate_visible(row: usize, ranges: &[[i32; 2]]) -> Result<Vec<[i32; 2]>, Pa
     if ordered.windows(2).any(|pair| pair[1][0] < pair[0][1]) {
         return Err(PackError::OverlappingVisibleRanges { row });
     }
-    Ok(ranges.to_vec())
+    Ok(())
 }
 
 fn append_select(
@@ -559,8 +659,12 @@ mod tests {
         Row {
             token,
             coordinates: [token, token, token, 0],
-            visible: vec![[10, 12], [12, 15], [20, 21]],
-            destination: token + 100,
+            histories: vec![RowHistory {
+                visible: vec![[10, 12], [12, 15], [20, 21]],
+                fresh_start: 0,
+                bidirectional_end: None,
+                destination: token + 100,
+            }],
             demand,
             select: None,
         }
@@ -623,22 +727,84 @@ mod tests {
         assert_eq!(packed.stop, vec![1, 1, 2, 0, 0]);
         assert_eq!(&packed.row_slots[..6], &[0, 0, 0, 1, 2, 2]);
         assert_eq!(&packed.row_slots[6..], &[4, 4]);
+        let history = &packed.histories[0];
         assert_eq!(
-            &packed.fresh[..6],
+            &history.fresh[..6],
             &[[0, 1], [0, 2], [0, 3], [3, 4], [4, 5], [4, 6]]
         );
         assert_eq!(&packed.tokens[6..], &[0, 0]);
-        assert_eq!(&packed.destinations[6..], &[-1, -1]);
-        assert_eq!(&packed.fresh[6..], &[[0, 0], [0, 0]]);
-        assert!(packed.visible[6..]
+        assert_eq!(&history.destinations[6..], &[-1, -1]);
+        assert_eq!(&history.fresh[6..], &[[0, 0], [0, 0]]);
+        assert!(history.visible[6..]
             .iter()
             .flatten()
             .all(|range| *range == [0, 0]));
         assert_eq!(packed.class.segments(), 4);
         assert_eq!(
-            packed.visible[0],
+            history.visible[0],
             vec![[10, 12], [12, 15], [20, 21], [0, 0]]
         );
+    }
+
+    /// Each history domain has its own tables; a window domain's rows may
+    /// read the slot's fresh rows from a later start.
+    #[test]
+    fn packs_one_table_set_per_history_domain() {
+        let windowed = |token: i32, offset: i32| Row {
+            histories: vec![
+                RowHistory {
+                    visible: vec![[0, 8]],
+                    fresh_start: 0,
+                    bidirectional_end: None,
+                    destination: 8 + offset,
+                },
+                RowHistory {
+                    visible: if offset == 0 { vec![[40, 42]] } else { vec![] },
+                    fresh_start: (offset - 1).max(0),
+                    bidirectional_end: None,
+                    destination: 42 + offset,
+                },
+            ],
+            ..row(token, Demand::NONE)
+        };
+        let slots = [Slot {
+            rows: vec![windowed(1, 0), windowed(2, 1), windowed(3, 2)],
+            bank: 0,
+            previous_tape: 0,
+            following_bank: 1,
+            stop: 3,
+        }];
+        let packed = PackedRowTables::pack(&slots, 33, 512).unwrap();
+        assert_eq!(packed.histories.len(), 2);
+        assert_eq!(&packed.histories[0].fresh[..3], &[[0, 1], [0, 2], [0, 3]]);
+        assert_eq!(&packed.histories[1].fresh[..3], &[[0, 1], [0, 2], [1, 3]]);
+        assert_eq!(&packed.histories[1].destinations[..3], &[42, 43, 44]);
+        assert_eq!(packed.histories[1].visible[1], vec![[0, 0]]);
+        let mut mismatched = slots.clone();
+        mismatched[0].rows[1].histories.pop();
+        assert!(matches!(
+            PackedRowTables::pack(&mismatched, 33, 512),
+            Err(PackError::HistoryDomains { row: 1, .. })
+        ));
+        let mut early = slots.clone();
+        early[0].rows[1].histories[1].fresh_start = 2;
+        assert!(matches!(
+            PackedRowTables::pack(&early, 33, 512),
+            Err(PackError::InvalidFreshSpan { row: 1, .. })
+        ));
+        // A media span's rows read every fresh row of the span; a span end
+        // beyond the slot is rejected.
+        let mut media = slots.clone();
+        for row in &mut media[0].rows {
+            row.histories[0].bidirectional_end = Some(3);
+        }
+        let packed = PackedRowTables::pack(&media, 33, 512).unwrap();
+        assert_eq!(&packed.histories[0].fresh[..3], &[[0, 3], [0, 3], [0, 3]]);
+        media[0].rows[0].histories[0].bidirectional_end = Some(4);
+        assert!(matches!(
+            PackedRowTables::pack(&media, 33, 512),
+            Err(PackError::InvalidFreshSpan { row: 0, .. })
+        ));
     }
 
     #[test]
@@ -730,7 +896,7 @@ mod tests {
 
         for visible in [vec![[5, 8], [7, 9]], vec![[20, 30], [5, 8], [7, 9]]] {
             let mut bad_range = row(1, Demand::NONE);
-            bad_range.visible = visible;
+            bad_range.histories[0].visible = visible;
             assert!(matches!(
                 PackedRowTables::pack(
                     &[Slot {
@@ -751,7 +917,7 @@ mod tests {
     #[test]
     fn visible_ranges_keep_logical_order_and_adjacent_slab_boundaries() {
         let mut moved = row(1, Demand::NONE);
-        moved.visible = vec![[40, 44], [44, 46], [8, 12], [60, 61]];
+        moved.histories[0].visible = vec![[40, 44], [44, 46], [8, 12], [60, 61]];
         let packed = PackedRowTables::pack(
             &[Slot {
                 rows: vec![moved],
@@ -766,7 +932,7 @@ mod tests {
         .unwrap();
         assert_eq!(packed.class.segments(), 4);
         assert_eq!(
-            packed.visible[0],
+            packed.histories[0].visible[0],
             vec![[40, 44], [44, 46], [8, 12], [60, 61]]
         );
     }

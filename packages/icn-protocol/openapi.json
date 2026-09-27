@@ -2082,6 +2082,7 @@
           "sourceUrls",
           "parameterization",
           "intelligence",
+          "support",
           "fidelityRank",
           "quantizationAware",
           "localState"
@@ -2119,6 +2120,9 @@
           },
           "intelligence": {
             "$ref": "#/components/schemas/CatalogIntelligence"
+          },
+          "support": {
+            "$ref": "#/components/schemas/CatalogSupport"
           },
           "fidelityRank": {
             "type": "integer",
@@ -2247,6 +2251,72 @@
           }
         },
         "additionalProperties": false
+      },
+      "CatalogSupport": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Qualified end to end on at least one host per backend it claims.",
+            "required": [
+              "level"
+            ],
+            "properties": {
+              "level": {
+                "type": "string",
+                "enum": [
+                  "supported"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Temporarily unavailable or not yet supported. Never installed or loaded.",
+            "required": [
+              "reason",
+              "level"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "level": {
+                "type": "string",
+                "enum": [
+                  "disabled"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Never offered for new installs and never loaded. An installed copy stays identifiable and\nremovable, and points at its replacement.",
+            "required": [
+              "since",
+              "replacement",
+              "reason",
+              "level"
+            ],
+            "properties": {
+              "since": {
+                "type": "string"
+              },
+              "replacement": {
+                "$ref": "#/components/schemas/ModelId"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "level": {
+                "type": "string",
+                "enum": [
+                  "deprecated"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What the release promises for a catalog model. It is independent of assessment, which says\nwhat one device can do with it."
       },
       "ChatCompletionChoice": {
         "type": "object",

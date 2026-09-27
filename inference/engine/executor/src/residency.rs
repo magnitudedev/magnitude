@@ -164,6 +164,14 @@ impl Stored {
         }
     }
 
+    /// The artifact encoding of a packed tensor.
+    pub(crate) fn packed_encoding(&self) -> Option<Encoding> {
+        match self {
+            Self::Dense(_) => None,
+            Self::GgmlBlocks { encoding, .. } => Some(*encoding),
+        }
+    }
+
     pub fn source_element(&self) -> Option<Element> {
         match self {
             Self::Dense(tensor) => Some(Element::dense(tensor.dtype)),
@@ -228,6 +236,7 @@ impl ResidentWeight {
 struct ResidencyKey {
     artifact: magnitude_artifacts::ArtifactIdentity,
     name: String,
+    transforms: Vec<magnitude_family_contracts::ImportTransform>,
     resident: Element,
 }
 
@@ -364,8 +373,7 @@ impl ResidencyStore {
             .execution
             .weights()
             .find(|weight| {
-                weight.component.identity == artifact.identity()
-                    && weight.descriptor.name == descriptor.name
+                weight.component.identity == artifact.identity() && weight.descriptor == *descriptor
             })
             .and_then(|weight| weight.resident.dtype())
             .ok_or_else(|| {
@@ -417,8 +425,7 @@ impl ResidencyStore {
             .execution
             .weights()
             .find(|weight| {
-                weight.component.identity == artifact.identity()
-                    && weight.descriptor.name == descriptor.name
+                weight.component.identity == artifact.identity() && weight.descriptor == *descriptor
             })
             .cloned()
             .ok_or_else(|| {
@@ -427,11 +434,10 @@ impl ResidencyStore {
                     descriptor.name
                 ))
             })?;
-        if planned.descriptor != *descriptor
-            || planned
-                .resident
-                .dtype()
-                .is_some_and(|dtype| dtype != target)
+        if planned
+            .resident
+            .dtype()
+            .is_some_and(|dtype| dtype != target)
         {
             return Err(invalid(format!(
                 "weight {:?} import differs from the admitted WeightPlan",
@@ -448,14 +454,27 @@ impl ResidencyStore {
             self.execution.policy().path(),
             self.execution.device().backend(),
         );
-        let actual_resident = match stored {
-            Stored::Dense(_) => Element::dense(target),
-            Stored::GgmlBlocks { encoding, .. } => resident_element(*encoding, target, layout)
-                .ok_or_else(|| invalid("unsupported packed resident representation"))?,
+        // The plan dequantizes a packed weight on the host when its kernels
+        // read dense weights only: it uploads F32 and becomes dense.
+        let dequantized = planned.upload != planned.source;
+        let (upload, actual_resident) = match stored {
+            Stored::Dense(_) => (actual_source, Element::dense(target)),
+            Stored::GgmlBlocks { .. } if dequantized => (Element::f32(), Element::dense(target)),
+            Stored::GgmlBlocks { encoding, .. } => (
+                actual_source,
+                resident_element(*encoding, target, layout)
+                    .ok_or_else(|| invalid("unsupported packed resident representation"))?,
+            ),
         };
+        // The importer uploads the transformed source: its logical shape in
+        // the upload representation.
+        let uploaded = upload
+            .canonical_byte_len(&descriptor.shape)
+            .map_err(|error| invalid(error.to_string()))?;
         if planned.source != actual_source
+            || planned.upload != upload
             || planned.resident != actual_resident
-            || planned.source_bytes != stored.source_bytes()
+            || planned.source_bytes != uploaded
         {
             return Err(invalid(format!(
                 "weight {:?} representation differs from the admitted WeightPlan",
@@ -465,6 +484,7 @@ impl ResidencyStore {
         let key = ResidencyKey {
             artifact: artifact.identity(),
             name: descriptor.name.clone(),
+            transforms: descriptor.transforms.clone(),
             resident: actual_resident,
         };
         if let Some(weight) = self.resident.get(&key) {
@@ -692,7 +712,7 @@ impl ResidencyStore {
             .preload_component(
                 package.target(),
                 &weights,
-                crate::resident_weights::activation_dtype(definition.geometry.activation_dtype),
+                crate::resident_weights::activation_dtype(definition.decoder.activation_dtype),
             )
             .map_err(crate::ResidencyError::from)
             .and_then(|()| crate::resident_weights::import_target(definition, package, self));
@@ -713,10 +733,18 @@ impl ResidencyStore {
     ) -> Result<Option<crate::ResidentHead>, crate::ResidencyError> {
         crate::resident_weights::validate_definition_package(definition, package)?;
         if let Some(weights) = self.execution.load().head().map(|weights| weights.to_vec()) {
+            // A draft head's weights are the target's; a separate draft's
+            // are its own component's.
+            let artifact = match &definition.draft {
+                Some(_) => package
+                    .draft()
+                    .expect("validated: a bound draft has its component"),
+                None => package.target(),
+            };
             self.preload_component(
-                package.target(),
+                artifact,
                 &weights,
-                crate::resident_weights::activation_dtype(definition.geometry.activation_dtype),
+                crate::resident_weights::activation_dtype(definition.decoder.activation_dtype),
             )?;
         }
         crate::resident_weights::import_optional_head(definition, package, self)
@@ -863,6 +891,7 @@ impl ComponentLoader<crate::ResidentHead> {
             .map(|weight| ResidencyKey {
                 artifact: weight.component.identity,
                 name: weight.descriptor.name.clone(),
+                transforms: weight.descriptor.transforms.clone(),
                 resident: weight.resident,
             })
             .collect::<HashSet<_>>();
@@ -873,7 +902,7 @@ impl ComponentLoader<crate::ResidentHead> {
         self.store
             .borrow()
             .programs
-            .head_graphs()
+            .drafter_graphs()
             .ok_or("head graph family was not prepared")?
             .binding_constant_bytes()
     }
@@ -883,9 +912,9 @@ impl ComponentLoader<crate::ResidentHead> {
         definition: Rc<magnitude_family_contracts::ModelDefinition>,
         package: std::sync::Arc<magnitude_artifacts::Package>,
     ) -> Result<Self, WeightImportError> {
-        if definition.head.is_none() {
+        if definition.head.is_none() && definition.draft.is_none() {
             return Err(invalid(
-                "head component is not enabled by the model definition",
+                "the model definition enables no drafter",
             ));
         }
         Ok(Self::new(
@@ -933,10 +962,20 @@ fn validate_request(
     if !matches!(target, DType::F32 | DType::F16 | DType::BF16) {
         return Err(invalid("weight target must be F32, F16, or BF16"));
     }
-    let count = element_count(&descriptor.shape)?;
+    if descriptor
+        .transformed_shape(stored.shape())
+        .map_err(|error| invalid(error.to_string()))?
+        != descriptor.shape
+    {
+        return Err(invalid(
+            "stored weight does not transform to its logical descriptor",
+        ));
+    }
+    // The stored tensor's own byte layout, before any transform.
+    let count = element_count(stored.shape())?;
     match stored {
         Stored::Dense(stored) => {
-            if stored.shape != descriptor.shape || validate_dense(stored)? != count {
+            if validate_dense(stored)? != count {
                 return Err(invalid(
                     "stored dense weight does not match its logical descriptor",
                 ));
@@ -951,11 +990,6 @@ fn validate_request(
             encoding,
             ..
         } => {
-            if shape != &descriptor.shape || element_count(shape)? != count {
-                return Err(invalid(
-                    "stored packed weight does not match its logical descriptor",
-                ));
-            }
             if shape
                 .last()
                 .is_none_or(|extent| !extent.is_multiple_of(encoding.block_elements()))
@@ -1025,21 +1059,18 @@ mod tests {
             Encoding::Iq3S,
             Encoding::Iq4Nl,
             Encoding::Iq4Xs,
+            Encoding::Q4_0,
+            Encoding::Q5_0,
+            Encoding::Q5_1,
+            Encoding::Mxfp4,
+            Encoding::Nvfp4,
         ] {
             assert!(source_element(encoding).is_some());
             for layout in seismic::Layout::ALL {
                 assert!(resident_element(encoding, DType::BF16, layout).is_some());
             }
         }
-        for encoding in [
-            Encoding::Q4_0,
-            Encoding::Q5_0,
-            Encoding::Q5_1,
-            Encoding::Mxfp4,
-            Encoding::Nvfp4,
-            Encoding::Q1_0,
-            Encoding::I32,
-        ] {
+        for encoding in [Encoding::Q1_0, Encoding::I32] {
             assert!(source_element(encoding).is_none());
             assert!(resident_element(encoding, DType::BF16, seismic::Layout::Rows16).is_none());
         }
@@ -1058,13 +1089,23 @@ mod tests {
         let target = ResidencyKey {
             artifact: magnitude_artifacts::ArtifactIdentity([1; 32]),
             name: "shared.weight".into(),
+            transforms: Vec::new(),
             resident: Element::bf16(),
         };
         let projector = ResidencyKey {
             artifact: magnitude_artifacts::ArtifactIdentity([2; 32]),
             name: "shared.weight".into(),
+            transforms: Vec::new(),
             resident: Element::bf16(),
         };
         assert_ne!(target, projector);
+        // Two row ranges of one stored tensor are distinct resident weights.
+        let first_rows = ResidencyKey {
+            transforms: vec![magnitude_family_contracts::ImportTransform::Rows(
+                magnitude_family_contracts::RowRange { start: 0, rows: 2 },
+            )],
+            ..target.clone()
+        };
+        assert_ne!(target, first_rows);
     }
 }

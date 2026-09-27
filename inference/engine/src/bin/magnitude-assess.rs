@@ -1,12 +1,17 @@
 //! Metadata-only model assessment on this machine's selected device.
 //!
-//! Loads (or measures once and stores) the device's measurement basis, then
-//! assesses every model from its headers alone and prints one JSON object per
-//! model, shaped like the service's per-profile assessment result, with the
-//! model's capabilities and template fingerprint alongside.
+//! Loads the device's stored measurement basis and completes it (measuring
+//! and storing what it lacks, printing each entry as it completes) while
+//! every model is prepared from its headers; then assesses every model and
+//! prints one JSON object per model, shaped like the service's per-profile
+//! assessment result, with the model's capabilities and template fingerprint
+//! alongside.
 
 use magnitude_engine::{
-    assessment::{AssessmentEnvironment, ModelAssessment, ModelPackagePaths, assess_model},
+    assessment::{
+        AssessmentEnvironment, AssessmentSetup, ModelAssessment, ModelPackagePaths,
+        PreparedModelAssessment, finish_model_assessment, prepare_model_assessment,
+    },
     error::UnsupportedModel,
     options::{ModelPolicy, standard_service_limits},
     worker::protocol::EngineBuild,
@@ -14,8 +19,9 @@ use magnitude_engine::{
 use magnitude_executor::{
     DEFAULT_KERNEL_CACHE_BYTES, ExecutionPath, KernelCache,
     assessment::{
-        BasisIdentity, DomainFit, ExecutionAssessment, IncompatibleReason, MeasurementBasis,
-        PerformanceConfidence, load_basis, measure_basis, store_basis,
+        BasisIdentity, ClassMeasurement, DomainFit, ExecutionAssessment, IncompatibleReason,
+        MeasurementBasis, PerformanceConfidence, complete_basis, load_basis, store_basis,
+        term_seconds,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformConfig},
 };
@@ -31,11 +37,13 @@ struct Options {
     device: DeviceRequest,
     cache_dir: PathBuf,
     depths: Vec<u32>,
+    /// Print every demand term's share of the step at each depth.
+    breakdown: bool,
     models: Vec<ModelPackagePaths>,
 }
 
 const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu --cache-dir DIR \
-     [--depths 25000,50000,75000] TARGET.gguf[,PROJECTOR.gguf]...";
+     [--depths 25000,50000,75000] [--breakdown] TARGET.gguf[,PROJECTOR.gguf]...";
 
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
     args.next()
@@ -46,6 +54,7 @@ fn parse() -> Result<Options, String> {
     let mut device = None;
     let mut cache_dir = None;
     let mut depths = STANDARD_DEPTHS.to_vec();
+    let mut breakdown = false;
     let mut models = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -68,6 +77,7 @@ fn parse() -> Result<Options, String> {
                     })
                     .collect::<Result<_, _>>()?
             }
+            "--breakdown" => breakdown = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -91,6 +101,7 @@ fn parse() -> Result<Options, String> {
         device: device.ok_or("--device is required")?,
         cache_dir: cache_dir.ok_or("--cache-dir is required")?,
         depths,
+        breakdown,
         models,
     })
 }
@@ -106,46 +117,77 @@ fn main() {
     }
 }
 
-/// The basis cached for this device and build, or a fresh measurement that is
-/// stored for the next run.
+/// The basis stored for this device and build, completed with what it lacks
+/// (measured now and stored for the next run).
 fn basis(
     catalog: &DeviceCatalog,
-    device: DeviceRequest,
-    reserves: MemoryReserves,
+    setup: &AssessmentSetup,
     cache_dir: &Path,
 ) -> Result<MeasurementBasis, String> {
-    let selected = platform::select_device(catalog, ExecutionPath::Native, device, &reserves)
-        .map_err(|error| error.to_string())?;
     let kernels = KernelCache::open(cache_dir.join("kernels"), DEFAULT_KERNEL_CACHE_BYTES)
         .map_err(|error| error.to_string())?;
     let opened = platform::open_selected(
         catalog,
-        selected.info.selector,
+        setup.selected.info.selector,
         PlatformConfig {
             path: ExecutionPath::Native,
             artifacts: Some(Arc::new(kernels) as Arc<dyn seismic::ArtifactStore>),
-            reserves,
+            reserves: setup.reserves,
         },
     )
     .map_err(|error| error.to_string())?;
     let identity = BasisIdentity::for_device(opened.device(), &EngineBuild::current().0);
     let directory = cache_dir.join("assessment-basis");
-    if let Some(basis) = load_basis(&directory, &identity) {
-        eprintln!(
-            "magnitude-assess: using the stored basis for {}",
-            identity.device
-        );
-        return Ok(basis);
-    }
+    let stored = load_basis(&directory, &identity).unwrap_or(MeasurementBasis {
+        identity,
+        classes: Vec::new(),
+    });
+    let known = stored.classes.len();
     let started = Instant::now();
-    let basis = measure_basis(catalog, opened.device(), reserves, identity)
-        .map_err(|error| error.to_string())?;
-    eprintln!(
-        "magnitude-assess: measured the basis ({} classes) in {:.2} s",
-        basis.classes.len(),
-        started.elapsed().as_secs_f64()
+    let basis = complete_basis(
+        catalog,
+        opened.device(),
+        setup.reserves,
+        stored,
+        |key, measurement, profile| {
+            let outcome = match measurement {
+                ClassMeasurement::Measured { .. } => "measured".to_owned(),
+                ClassMeasurement::Formed => "formed".to_owned(),
+                ClassMeasurement::Unsupported { reason } => format!("unsupported: {reason}"),
+            };
+            eprintln!(
+                "magnitude-assess: {:>7.3} s (formation {:.3}, allocation {:.3}, device {:.3}) \
+                 {key} {outcome}",
+                profile.total.as_secs_f64(),
+                profile.formation.as_secs_f64(),
+                profile.allocation.as_secs_f64(),
+                profile.device.as_secs_f64(),
+            );
+        },
     );
-    store_basis(&directory, &basis).map_err(|error| error.to_string())?;
+    let basis = match basis {
+        Ok(basis) => basis,
+        // The classes measured before the failure are kept for the next run.
+        Err(failure) => {
+            if failure.basis.classes.len() > known {
+                store_basis(&directory, &failure.basis).map_err(|error| error.to_string())?;
+            }
+            return Err(failure.error.to_string());
+        }
+    };
+    if basis.classes.len() == known {
+        eprintln!(
+            "magnitude-assess: the stored basis for {} is complete",
+            basis.identity.device
+        );
+    } else {
+        eprintln!(
+            "magnitude-assess: measured {} entries in {:.2} s",
+            basis.classes.len() - known,
+            started.elapsed().as_secs_f64()
+        );
+        store_basis(&directory, &basis).map_err(|error| error.to_string())?;
+    }
     Ok(basis)
 }
 
@@ -153,36 +195,105 @@ fn basis(
 fn run() -> Result<bool, String> {
     let options = parse()?;
     let catalog = DeviceCatalog::discover().map_err(|error| error.to_string())?;
-    let reserves = MemoryReserves::standard();
-    let basis = basis(&catalog, options.device, reserves, &options.cache_dir)?;
     // The standalone engine's defaults: one conversation per batch.
-    let service = standard_service_limits();
-    let environment = AssessmentEnvironment::discover(
-        &catalog,
-        options.device,
-        reserves,
-        basis,
-        ModelPolicy::default(),
-        service,
-    )
-    .map_err(|error| error.to_string())?;
+    let setup = Arc::new(
+        AssessmentSetup::discover(
+            &catalog,
+            options.device,
+            MemoryReserves::standard(),
+            ModelPolicy::default(),
+            standard_service_limits(),
+        )
+        .map_err(|error| error.to_string())?,
+    );
     let mut complete = true;
-    for model in &options.models {
+    let mut report = |model: &ModelPackagePaths, error: &dyn std::fmt::Display| {
+        complete = false;
+        eprintln!("magnitude-assess: {}: {error}", model.target.display());
+    };
+    // The basis is model-free: it is completed while the models are
+    // prepared.
+    let (basis, prepared) = std::thread::scope(|scope| {
+        let basis = scope.spawn(|| basis(&catalog, &setup, &options.cache_dir));
+        let prepared = options
+            .models
+            .iter()
+            .map(|model| {
+                let started = Instant::now();
+                (model, prepare_model_assessment(model, &setup), started.elapsed())
+            })
+            .collect::<Vec<_>>();
+        (basis.join().expect("measurement thread panicked"), prepared)
+    });
+    let basis = basis?;
+    let prepared = prepared
+        .into_iter()
+        .filter_map(|(model, prepared, preparation)| match prepared {
+            Ok(prepared) => Some((model, prepared, preparation)),
+            Err(error) => {
+                report(model, &error);
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let environment = Arc::clone(&setup)
+        .with_basis(basis)
+        .map_err(|error| error.to_string())?;
+    // Assessment time is the model's own preparation and finish, without the
+    // shared measurement.
+    for (model, prepared, preparation) in &prepared {
+        if options.breakdown {
+            print_breakdown(model, prepared, &environment, &options.depths);
+        }
         let started = Instant::now();
-        match assess_model(model, &environment, &options.depths) {
+        match finish_model_assessment(prepared, &environment, &options.depths) {
             Ok(assessment) => {
                 let mut object = render(&environment, &assessment);
                 object["model"] = json!(model.target.display().to_string());
-                object["assessmentSeconds"] = json!(started.elapsed().as_secs_f64());
+                object["assessmentSeconds"] =
+                    json!((*preparation + started.elapsed()).as_secs_f64());
                 println!("{object}");
             }
-            Err(error) => {
-                complete = false;
-                eprintln!("magnitude-assess: {}: {error}", model.target.display());
-            }
+            Err(error) => report(model, &error),
         }
     }
     Ok(complete)
+}
+
+/// Every demand term's median microseconds per step at each depth, largest
+/// first, on stderr: the estimate's composition, to compare with a real
+/// decode's per-entry attribution.
+fn print_breakdown(
+    model: &ModelPackagePaths,
+    prepared: &PreparedModelAssessment,
+    environment: &AssessmentEnvironment,
+    depths: &[u32],
+) {
+    let PreparedModelAssessment::Planned { execution, .. } = prepared else {
+        return;
+    };
+    for &depth in depths {
+        match term_seconds(execution.demand(), &environment.basis, depth) {
+            Ok(mut terms) => {
+                terms.sort_by(|left, right| right.1.median.total_cmp(&left.1.median));
+                let step = terms.iter().map(|(_, seconds)| seconds.median).sum::<f64>();
+                eprintln!(
+                    "magnitude-assess: {} at {depth}: {:.1} µs per step",
+                    model.target.display(),
+                    step * 1e6
+                );
+                for (term, seconds) in terms {
+                    eprintln!(
+                        "magnitude-assess:   {:>9.1} µs  {:>4} launches  {}",
+                        seconds.median * 1e6,
+                        term.launches,
+                        term.key
+                    );
+                }
+            }
+            Err(error) => eprintln!("magnitude-assess: breakdown at {depth}: {error}"),
+        }
+    }
 }
 
 fn render(environment: &AssessmentEnvironment, assessment: &ModelAssessment) -> Value {
@@ -250,25 +361,9 @@ fn render(environment: &AssessmentEnvironment, assessment: &ModelAssessment) -> 
                 "the device's measurement basis does not cover {}",
                 classes
                     .iter()
-                    .map(|(key, reason)| {
-                        let bindings = key
-                            .bindings
-                            .iter()
-                            .map(|element| element.name())
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let geometry = key
-                            .geometry
-                            .iter()
-                            .map(|(name, value)| format!("{name}={value}"))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        match reason {
-                            Some(reason) => {
-                                format!("{:?}[{bindings}]({geometry}): {reason}", key.class)
-                            }
-                            None => format!("{:?}[{bindings}]({geometry})", key.class),
-                        }
+                    .map(|(key, reason)| match reason {
+                        Some(reason) => format!("{key}: {reason}"),
+                        None => key.to_string(),
                     })
                     .collect::<Vec<_>>()
                     .join("; ")

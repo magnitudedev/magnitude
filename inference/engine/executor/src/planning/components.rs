@@ -4,6 +4,8 @@ use magnitude_artifacts::ArtifactIdentity;
 pub enum ArtifactComponentKind {
     Target,
     Projector,
+    /// A separate draft model.
+    Draft,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -33,6 +35,8 @@ impl ComponentPlan {
     }
 }
 
+/// `head` enables the definition's drafter: its embedded head or its separate
+/// draft, whichever it has (an executed definition carries at most one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComponentSelection {
     pub head: bool,

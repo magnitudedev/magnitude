@@ -1,9 +1,9 @@
-// Shared pieces of the gated attention entries on CPU
-// (`gated_attention_decode`, `gated_attention_prefill` and their affine K8/V4
-// history forms `gated_attention_{decode,prefill}_k8v4`): the per-row
-// preparation (RMS norm and partial M-RoPE of every query and key head), a
+// Shared pieces of the attention family entries on CPU (`attention_decode`,
+// `attention_prefill` and their affine K8/V4 history forms
+// `attention_{decode,prefill}_k8v4`): the per-row preparation (optional RMS
+// norm and amplitude-scaled partial M-RoPE of every query and key head), a
 // row's key walk, decode partition bounds, the online-softmax absorb, the
-// fixed-order merge of partial states, the sigmoid gate, and the affine codec
+// fixed-order merge of partial states, the output gate, and the affine codec
 // (encode on append, decode on read). The counterpart of
 // `metal/lib/attention/attention.h`, `cuda/lib/attention/*.cuh` and
 // `vulkan/lib/attention/*.glsl`; each entry keeps its own launch structure and
@@ -18,7 +18,7 @@
 // backend is qualified under.
 
 use super::super::core::{activation, reduce};
-use seismic::cpu::{math, Dense, Tensor, F16};
+use seismic::cpu::{math, Dense, F16};
 use std::ops::Range;
 
 /// Keys scored together before their values are absorbed.
@@ -71,12 +71,63 @@ pub fn angles(coordinates: &[i32], components: &[i32], frequencies: &[f32], cosi
     }
 }
 
-/// The portable `norm_rotary_table` of one head row `x`, published to `A`:
-/// RMS-normalized in F32 with `norm`, its first 2P columns rotated by the
-/// row's `cosines` and `sines`.
-pub fn norm_rotary<A: Dense>(
+/// The structure of an `attention_*` entry (see `attention.seismic`): its
+/// heads, I output gates interleaved after each query head's W columns (0 or
+/// W), U separate gates per query head (0, 1 or W), whether the layer has
+/// fresh keys and values of its own (F = 1), and whether queries and keys
+/// (N = 1) and values (NV = 1) are RMS-normalized. The declarations' `where`
+/// admits only these forms.
+#[derive(Clone, Copy, Debug)]
+pub struct Form {
+    pub heads: Heads,
+    pub interleaved: usize,
+    pub separate: usize,
+    pub fresh: bool,
+    pub norm: bool,
+    pub value_norm: bool,
+}
+
+impl Form {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(kv: u64, g: u64, p: u64, s: u64, i: u64, u: u64, f: u64, n: u64, nv: u64) -> Self {
+        Self {
+            heads: Heads::new(kv, g, p, s),
+            interleaved: i as usize,
+            separate: u as usize,
+            fresh: f == 1,
+            norm: n == 1,
+            value_norm: nv == 1,
+        }
+    }
+
+    /// The form over affine K8/V4 history ([`Heads::affine`]).
+    pub fn affine(self) -> Self {
+        Self { heads: self.heads.affine(), ..self }
+    }
+}
+
+/// [`angles`] with each pair's cosine and sine scaled by its amplitude.
+pub fn scaled_angles(
+    coordinates: &[i32],
+    components: &[i32],
+    frequencies: &[f32],
+    amplitudes: &[f32],
+    cosines: &mut [f32],
+    sines: &mut [f32],
+) {
+    angles(coordinates, components, frequencies, cosines, sines);
+    for ((cosine, sine), amplitude) in cosines.iter_mut().zip(sines.iter_mut()).zip(amplitudes) {
+        *cosine *= amplitude;
+        *sine *= amplitude;
+    }
+}
+
+/// The portable `head_rotary` of one head row `x`, published to `A`:
+/// RMS-normalized in F32 with `norm` when present, its first 2P columns
+/// rotated by the row's (amplitude-scaled) `cosines` and `sines`.
+pub fn prepare_head<A: Dense>(
     x: &[A::Storage],
-    norm: &[f32],
+    norm: Option<&[f32]>,
     cosines: &[f32],
     sines: &[f32],
     epsilon: f32,
@@ -85,9 +136,11 @@ pub fn norm_rotary<A: Dense>(
     let (w, p) = (x.len(), cosines.len());
     let out = &mut out[..w];
     activation::widen::<A>(x, out);
-    let inverse = reduce::rms_inverse(out, epsilon);
-    for (value, weight) in out.iter_mut().zip(&norm[..w]) {
-        *value = *value * inverse * weight;
+    if let Some(norm) = norm {
+        let inverse = reduce::rms_inverse(out, epsilon);
+        for (value, weight) in out.iter_mut().zip(&norm[..w]) {
+            *value = *value * inverse * weight;
+        }
     }
     for pair in 0..p {
         let (low, high) = (out[pair], out[pair + p]);
@@ -100,29 +153,65 @@ pub fn norm_rotary<A: Dense>(
     }
 }
 
-/// Prepares one row: its KV * G queries (the first W columns of each query
-/// head's query|gate pair) into `queries` and its KV keys into `keys`, F32
-/// values of the activation element.
+/// Prepares one row of an `attention_*` entry: its KV * G queries (the first
+/// W columns of each `query(head)`) into `queries`, and when the layer has
+/// fresh rows its KV keys into `keys` and its KV values (`head_norm`ed with
+/// `value_norm` when present) into `values`, all F32 values of the activation
+/// element.
 #[allow(clippy::too_many_arguments)]
-pub fn prepare_row<A: Dense>(
-    heads: Heads,
-    query_gate: &[A::Storage],
+pub fn prepare_form_row<'q, A: Dense>(
+    form: Form,
+    query: impl Fn(usize) -> &'q [A::Storage],
     key: &[A::Storage],
-    query_norm: &[f32],
-    key_norm: &[f32],
+    value: &[A::Storage],
+    norms: (Option<&[f32]>, Option<&[f32]>, Option<&[f32]>),
     cosines: &[f32],
     sines: &[f32],
     epsilon: f32,
     queries: &mut [f32],
     keys: &mut [f32],
-) {
-    let w = heads.w;
-    for head in 0..heads.queries() {
-        let raw = &query_gate[head * 2 * w..][..w];
-        norm_rotary::<A>(raw, query_norm, cosines, sines, epsilon, &mut queries[head * w..][..w]);
+    values: &mut [f32],
+) where
+    A::Storage: 'q,
+{
+    let w = form.heads.w;
+    let (query_norm, key_norm, value_norm) = norms;
+    for head in 0..form.heads.queries() {
+        prepare_head::<A>(&query(head)[..w], query_norm, cosines, sines, epsilon, &mut queries[head * w..][..w]);
     }
-    for head in 0..heads.kv {
-        norm_rotary::<A>(&key[head * w..][..w], key_norm, cosines, sines, epsilon, &mut keys[head * w..][..w]);
+    if !form.fresh {
+        return;
+    }
+    for head in 0..form.heads.kv {
+        prepare_head::<A>(&key[head * w..][..w], key_norm, cosines, sines, epsilon, &mut keys[head * w..][..w]);
+        prepare_head::<A>(&value[head * w..][..w], value_norm, &[], &[], epsilon, &mut values[head * w..][..w]);
+    }
+}
+
+/// One query head's output stored to `A`: `accumulator / max(denominator,
+/// 1e-30)`, column c times its gate c % U (sigmoid, or softplus when
+/// `softplus`); no gates pass the row through.
+pub fn gate_row<A: Dense>(
+    accumulator: &[f32],
+    denominator: f32,
+    gates: &[A::Storage],
+    softplus: bool,
+    out: &mut [A::Storage],
+) {
+    let denominator = denominator.max(1e-30);
+    let u = gates.len();
+    for (column, (target, value)) in out.iter_mut().zip(accumulator).enumerate() {
+        let attended = value / denominator;
+        *target = A::narrow(if u == 0 {
+            attended
+        } else {
+            let gate = A::widen(gates[column % u]);
+            if softplus {
+                attended * math::softplus(gate)
+            } else {
+                attended / (1.0 + math::exp(-gate))
+            }
+        });
     }
 }
 
@@ -479,24 +568,15 @@ mod affine_neon {
     }
 }
 
-/// The fresh rows of a batch as keys and values: prepared keys [M][KV][W]
-/// (F32 values of the activation element) and the projected values
-/// [M, KV * W].
-pub struct Fresh<'a, A: Dense> {
-    pub keys: &'a [f32],
-    pub values: Tensor<'a, A, 2>,
-}
-
 /// Absorbs the part `range` of a row's key sequence (its admitted history
-/// `spans`, then its `fresh` span) for kv head `kv_head` into `state`:
-/// history rows through `history_key(token, out)` / `history_value(token,
-/// out)`, fresh rows from `rows`. `scores` holds G * BLOCK values, `row` W.
+/// `spans`, then its `fresh` span) into `state`: history rows through
+/// `history_key(token, out)` / `history_value(token, out)`, fresh rows through
+/// `fresh_key(token, out)` / `fresh_value(token, out)`. `scores` holds G *
+/// BLOCK values, `row` W.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub fn attend<A: Dense>(
+pub fn attend_rows(
     state: &mut Online<'_>,
-    heads: Heads,
-    kv_head: usize,
     queries: &[f32],
     scale: f32,
     scores: &mut [f32],
@@ -504,11 +584,11 @@ pub fn attend<A: Dense>(
     spans: impl Iterator<Item = (i32, i32)>,
     fresh: (i32, i32),
     range: Range<usize>,
-    rows: &Fresh<'_, A>,
     mut history_key: impl FnMut(usize, &mut [f32]),
     mut history_value: impl FnMut(usize, &mut [f32]),
+    mut fresh_key: impl FnMut(usize, &mut [f32]),
+    mut fresh_value: impl FnMut(usize, &mut [f32]),
 ) {
-    let (kv, w) = (heads.kv, heads.w);
     walk(spans, fresh, range, |keys, first, count| match keys {
         Keys::History => state.absorb(
             queries,
@@ -525,20 +605,18 @@ pub fn attend<A: Dense>(
             count,
             scores,
             row,
-            |j, out| out.copy_from_slice(&rows.keys[((first + j) * kv + kv_head) * w..][..w]),
-            |j, out| activation::widen::<A>(rows.values.span([first + j, kv_head * w], w), out),
+            |j, out| fresh_key(first + j, out),
+            |j, out| fresh_value(first + j, out),
         ),
     });
 }
 
-/// [`attend`] with affine K8/V4 history rows `history_key(token)` and
+/// [`attend_rows`] with affine K8/V4 history rows `history_key(token)` and
 /// `history_value(token)`, absorbed by [`Online::absorb_affine`].
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub fn attend_affine<'h, A: Dense>(
+pub fn attend_affine_rows<'h>(
     state: &mut Online<'_>,
-    heads: Heads,
-    kv_head: usize,
     queries: &[f32],
     scale: f32,
     scores: &mut [f32],
@@ -546,11 +624,11 @@ pub fn attend_affine<'h, A: Dense>(
     spans: impl Iterator<Item = (i32, i32)>,
     fresh: (i32, i32),
     range: Range<usize>,
-    rows: &Fresh<'_, A>,
     history_key: impl Fn(usize) -> AffineRow<'h>,
     history_value: impl Fn(usize) -> AffineRow<'h>,
+    mut fresh_key: impl FnMut(usize, &mut [f32]),
+    mut fresh_value: impl FnMut(usize, &mut [f32]),
 ) {
-    let (kv, w) = (heads.kv, heads.w);
     walk(spans, fresh, range, |keys, first, count| match keys {
         Keys::History => state.absorb_affine(
             queries,
@@ -567,8 +645,8 @@ pub fn attend_affine<'h, A: Dense>(
             count,
             scores,
             row,
-            |j, out| out.copy_from_slice(&rows.keys[((first + j) * kv + kv_head) * w..][..w]),
-            |j, out| activation::widen::<A>(rows.values.span([first + j, kv_head * w], w), out),
+            |j, out| fresh_key(first + j, out),
+            |j, out| fresh_value(first + j, out),
         ),
     });
 }
@@ -600,16 +678,6 @@ pub fn merge<'p>(
         }
     }
     total
-}
-
-/// The gated output of one query head, stored to `A`:
-/// `(accumulator / max(denominator, 1e-30)) / (1 + exp(-gate))`.
-pub fn gate<A: Dense>(accumulator: &[f32], denominator: f32, gate: &[A::Storage], out: &mut [A::Storage]) {
-    let denominator = denominator.max(1e-30);
-    for ((target, value), gate) in out.iter_mut().zip(accumulator).zip(gate) {
-        let attended = value / denominator;
-        *target = A::narrow(attended / (1.0 + math::exp(-A::widen(*gate))));
-    }
 }
 
 pub use super::history::{affine_encode, affine_decode};

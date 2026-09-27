@@ -239,6 +239,19 @@ export const discoveredModelServingState = (
   return { _tag: "Assessed", ...assessed, assessment: assessment.assessment }
 }
 
+const catalogSupport = (support: CatalogModel["support"]) => {
+  switch (support.level) {
+    case "supported": return { _tag: "Supported" as const }
+    case "disabled": return { _tag: "Disabled" as const, reason: support.reason }
+    case "deprecated": return {
+      _tag: "Deprecated" as const,
+      since: support.since,
+      replacement: support.replacement,
+      reason: support.reason,
+    }
+  }
+}
+
 export const catalogRemovalAcquisition = (
   acquisition: LocalModelAcquisitionState,
   removal: LocalModelRemovalState | undefined,
@@ -296,6 +309,7 @@ const catalogModel = (
       releaseDate: Schema.decodeUnknownSync(ModelReleaseDateSchema)(source.releaseDate),
       parameterization: source.parameterization,
       intelligence: source.intelligence,
+      support: catalogSupport(source.support),
       fidelityRank: source.fidelityRank,
       quantizationAware: source.quantizationAware,
     },

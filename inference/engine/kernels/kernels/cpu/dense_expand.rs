@@ -3,9 +3,9 @@
 // output row (rounded to A) as F32 into scratch, one work item per row.
 // `dense_expand_rows` gives each work item ROWS gate and up weight rows, which
 // it projects against every normalized row and combines as the portable body
-// publishes: A(A(silu(A(gate))) * A(up)).
+// publishes: A(A(act(A(gate))) * A(up)), `act` by the `activation` code.
 
-use lib::core::activation;
+use lib::core::{activation, functions};
 use lib::projection::projection;
 
 fn dense_expand_normalize<L: Isa, E: Elements>(
@@ -55,6 +55,9 @@ fn dense_expand_rows<L: Isa, E: Elements>(
     let rows = projection::item_rows(group[0], cx.param_rows(), f);
     let (gate_weight, up_weight, result) =
         (cx.arg_gate_weight(), cx.arg_up_weight(), cx.result_0());
+    let function = cx.arg_activation();
+    let gate_scale = if cx.dim_gs() == 0 { 1.0 } else { cx.arg_gate_scale().get([0]) };
+    let up_scale = if cx.dim_us() == 0 { 1.0 } else { cx.arg_up_scale().get([0]) };
     // SAFETY: the normalize launch wrote every row before this launch.
     let normalized = unsafe { cx.scratch_normalized().slice::<f32>(0, o * h) };
     let blocks = seismic::cpu::quant::blocks(h);
@@ -72,9 +75,9 @@ fn dense_expand_rows<L: Isa, E: Elements>(
             // SAFETY: each work item writes its own columns of every row.
             let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
             for ((target, gate), up) in out.iter_mut().zip(gate.iter()).zip(up.iter()) {
-                let gate = activation::publish::<E::A>(*gate);
-                let activated = activation::publish::<E::A>(activation::silu(gate));
-                *target = E::A::narrow(activated * activation::publish::<E::A>(*up));
+                let gate = activation::publish::<E::A>(gate_scale * *gate);
+                let activated = activation::publish::<E::A>(functions::activate(function, gate));
+                *target = E::A::narrow(activated * activation::publish::<E::A>(up_scale * *up));
             }
         },
     );

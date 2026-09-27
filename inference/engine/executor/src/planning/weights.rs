@@ -3,15 +3,14 @@ use super::{
     ProgramPlan,
 };
 use crate::error::PlanError;
-use crate::ExecutionPath;
+use crate::{operators, ExecutionPath};
 use magnitude_artifacts::{
     gguf::{Encoding, TensorDescriptor},
     ArtifactIdentity, PackageHeaders, PackageIdentity, PackageManifest,
 };
 use magnitude_family_contracts::{
-    ActivationDType, AttentionWeights, BlockWeights, DenseFeedForwardWeights, FeedForwardWeights,
-    LayerNormWeights, MixerWeights, ModelDefinition, RecurrentWeights, RoutedFeedForwardWeights,
-    VisionDescription, WeightDescriptor, WeightKind, WeightRole, WeightScope,
+    ActivationDType, ImportTransform, ModelDefinition, VisionDescription, WeightDescriptor,
+    WeightKind, WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
 use seismic::{BackendName, DType, Element, Layout};
@@ -21,21 +20,36 @@ use std::collections::{HashMap, HashSet};
 pub struct WeightPlan {
     pub role: WeightRole,
     pub component: ArtifactComponent,
+    /// The stored representation of the artifact tensor.
     pub source: Element,
+    /// The representation the importer uploads: `source`, or F32 for a
+    /// packed weight the host dequantizes exactly (`import_transforms::
+    /// dequantize`) because its kernels read dense weights only.
+    pub upload: Element,
     pub resident: Element,
     pub shape: Vec<u64>,
     pub descriptor: WeightDescriptor,
-    /// Startup upload charge for the admitted artifact encoding.
+    /// Startup upload charge: the logical shape in `upload`.
     pub source_bytes: u64,
     pub resident_bytes: u64,
 }
 
+impl WeightPlan {
+    /// Whether the importer uploads host-prepared bytes (transformed or
+    /// dequantized) rather than the stored range as is.
+    pub fn host_prepared(&self) -> bool {
+        !self.descriptor.transforms.is_empty() || self.upload != self.source
+    }
+}
+
 /// Physical resident storage identity. Multiple semantic roles may name one
-/// tensor, while distinct resident representations require distinct storage.
+/// tensor, while distinct resident representations, and distinct import
+/// transforms of one stored tensor, require distinct storage.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WeightStorageIdentity {
     pub component: ArtifactComponent,
     pub tensor_name: String,
+    pub transforms: Vec<ImportTransform>,
     pub resident: Element,
 }
 
@@ -44,6 +58,7 @@ impl WeightPlan {
         WeightStorageIdentity {
             component: self.component,
             tensor_name: self.descriptor.name.clone(),
+            transforms: self.descriptor.transforms.clone(),
             resident: self.resident,
         }
     }
@@ -55,28 +70,149 @@ pub struct EmbeddingBinding {
     pub activation: Element,
 }
 
-/// The dimensions attention kernels are specialized to: the hidden width,
-/// kv heads, query heads per kv head, rotated pairs and head width.
+/// The static axes the attention entries are specialized to. Optional
+/// parts of the operator are axes of extent 0 or 1 (`attention.seismic`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionShape {
+    /// `D`: the hidden width.
     pub hidden: u64,
+    /// `KV`: key/value heads.
     pub kv_heads: u64,
+    /// `G`: query heads per key/value head.
     pub group: u64,
+    /// `P`: rotated pairs of a head.
     pub rotary_pairs: u64,
+    /// `W = 2P + S`: the head width.
     pub width: u64,
+    /// `I` ∈ {0, W}: gate columns after each query head's W columns.
+    pub interleaved_gate: u64,
+    /// `U` ∈ {0, 1, W}: separate gate values per query head.
+    pub separate_gate: u64,
+    /// `F` ∈ {0, 1}: whether the layer projects and appends its own keys and
+    /// values.
+    pub fresh: u64,
+    /// `N` ∈ {0, 1}: whether queries and keys are RMS-normalized per head.
+    pub head_norm: u64,
+    /// `NV` ∈ {0, 1}: whether values are RMS-normalized per head.
+    pub value_norm: u64,
+    /// Whether values have their own projection (else they are the raw key).
+    pub projected_value: bool,
 }
 
+impl AttentionShape {
+    pub fn heads(&self) -> u64 {
+        self.kv_heads * self.group
+    }
+
+    /// `Q`: query (and interleaved gate) projection rows.
+    pub fn query_rows(&self) -> u64 {
+        self.heads() * (self.width + self.interleaved_gate)
+    }
+
+    /// `GR`: separate gate projection rows.
+    pub fn gate_rows(&self) -> u64 {
+        self.heads() * self.separate_gate
+    }
+
+    /// `K`: key projection rows.
+    pub fn key_rows(&self) -> u64 {
+        self.fresh * self.kv_heads * self.width
+    }
+
+    /// `V`: value projection rows.
+    pub fn value_rows(&self) -> u64 {
+        if self.projected_value {
+            self.key_rows()
+        } else {
+            0
+        }
+    }
+
+    /// Unrotated columns of a head.
+    pub fn static_width(&self) -> u64 {
+        self.width - 2 * self.rotary_pairs
+    }
+
+    /// The projection entry's dimensions at `rows` rows.
+    pub fn project_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+        [
+            ("M", rows),
+            ("D", self.hidden),
+            ("Q", self.query_rows()),
+            ("GR", self.gate_rows()),
+            ("K", self.key_rows()),
+            ("V", self.value_rows()),
+        ]
+    }
+
+    /// The static axes of the fused attention entries.
+    pub fn mix_statics(&self) -> [(&'static str, u64); 9] {
+        [
+            ("KV", self.kv_heads),
+            ("G", self.group),
+            ("P", self.rotary_pairs),
+            ("S", self.static_width()),
+            ("I", self.interleaved_gate),
+            ("U", self.separate_gate),
+            ("F", self.fresh),
+            ("N", self.head_norm),
+            ("NV", self.value_norm),
+        ]
+    }
+
+    /// The fused entries' dimensions for `rows` rows over `history_rows`
+    /// history rows read in `segments` visible spans.
+    pub fn mix_dimensions(
+        &self,
+        rows: u64,
+        history_rows: u64,
+        segments: u64,
+    ) -> [(&'static str, u64); 12] {
+        let [kv, g, p, s, i, u, f, n, nv] = self.mix_statics();
+        [
+            ("M", rows),
+            ("T", history_rows),
+            kv,
+            g,
+            p,
+            s,
+            i,
+            u,
+            f,
+            n,
+            nv,
+            ("R", segments),
+        ]
+    }
+}
+
+/// An attention operator's kernel binding. Weights a form lacks (a separate
+/// gate, own keys or values) are empty segments of the projection; they
+/// bind a zero-row view of the query weight and carry its element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionBinding {
     pub shape: AttentionShape,
     pub norm: Element,
-    pub query_gate: Element,
+    pub query: Element,
+    pub gate: Element,
     pub key: Element,
     pub value: Element,
     pub output: Element,
     pub activation: Element,
     /// How the block's history planes encode keys and values.
     pub history: KvCodec,
+    pub tail: SublayerTail,
+}
+
+/// How a sublayer's output projection joins the residual stream (the
+/// contract's `OutputForm`): added by the operator's own output entry, or
+/// projected to F32 and added through a row op that normalizes it first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SublayerTail {
+    Residual,
+    /// `(residual + RMS(projection)·norm)·scale`, the norm weight's element;
+    /// `scaled` when the scale is the layer's output scale (else 1).
+    PostNorm { norm: Element, scaled: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -97,6 +233,37 @@ pub struct RecurrentBinding {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DenseBinding {
+    /// The expansion width (`F`), a static of the specializations: layers
+    /// of different widths (Gemma's double-wide layers) need their own.
+    pub features: u64,
+    pub norm: Element,
+    pub gate: Element,
+    pub up: Element,
+    pub down: Element,
+    pub activation: Element,
+    pub tail: SublayerTail,
+}
+
+/// A dense branch beside a general routed branch
+/// (`operators::DenseBesideRouted`): the dense branch's expansion and its
+/// down projection into F32, the routed branch summed onto zeros, and
+/// `moe_tail`, which normalizes each branch, their sum, and adds it through
+/// the sublayer's post-norm tail (scaled or not). `norm` is the element of
+/// all three tail norms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ParallelBinding {
+    pub hidden: u64,
+    pub dense: DenseBranchBinding,
+    pub routed: crate::operators::routed::GeneralRoutedBinding,
+    pub norm: Element,
+    pub scaled: bool,
+}
+
+/// The dense branch of a [`ParallelBinding`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DenseBranchBinding {
+    /// The expansion width (`F`).
+    pub features: u64,
     pub norm: Element,
     pub gate: Element,
     pub up: Element,
@@ -138,55 +305,14 @@ pub struct FeaturesBinding {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HeadBinding {
-    pub attention_shape: AttentionShape,
     pub embedding_table: Element,
     pub embedding_norm: Element,
     pub hidden_norm: Element,
     pub combine: Element,
-    pub input_norm: Element,
-    pub query_gate: Element,
-    pub key: Element,
-    pub value: Element,
-    pub attention_output: Element,
+    pub attention: AttentionBinding,
     pub feed_forward: FeedForwardProgramSlot,
     pub output_norm: Element,
     pub projection: Element,
-    pub activation: Element,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct VisionPatchBinding {
-    pub temporal_weight_0: Element,
-    pub temporal_weight_1: Element,
-    pub bias: Element,
-    pub position: Element,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct VisionBlockBinding {
-    pub input_norm_weight: Element,
-    pub input_norm_bias: Element,
-    pub qkv_weight: Element,
-    pub qkv_bias: Element,
-    pub attention_output: Element,
-    pub attention_output_bias: Element,
-    pub feedforward_norm_weight: Element,
-    pub feedforward_norm_bias: Element,
-    pub up: Element,
-    pub up_bias: Element,
-    pub down: Element,
-    pub down_bias: Element,
-    pub activation: Element,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct VisionMergerBinding {
-    pub output_norm_weight: Element,
-    pub output_norm_bias: Element,
-    pub hidden: Element,
-    pub hidden_bias: Element,
-    pub output: Element,
-    pub output_bias: Element,
     pub activation: Element,
 }
 
@@ -195,9 +321,24 @@ pub struct ModelLoadPlan {
     pub(super) target: Vec<WeightPlan>,
     pub(super) head: Option<Vec<WeightPlan>>,
     pub(super) vision: Option<Vec<WeightPlan>>,
+    /// The target's host-resident gathered tables.
+    pub(super) host_tables: Vec<HostTablePlan>,
 }
 
 impl ModelLoadPlan {
+    pub fn host_tables(&self) -> &[HostTablePlan] {
+        &self.host_tables
+    }
+
+    /// The host tables' claim in the system-RAM domain.
+    pub fn host_table_bytes(&self) -> Result<u64, String> {
+        self.host_tables.iter().try_fold(0u64, |total, table| {
+            total
+                .checked_add(table.bytes)
+                .ok_or_else(|| "host table bytes overflow".to_owned())
+        })
+    }
+
     /// Peak upload backing while the target component is imported.
     pub fn target_upload_peak_bytes(&self) -> Result<u64, String> {
         let source = self
@@ -271,7 +412,7 @@ pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3]
             match seen.entry(weight.storage_identity()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert((
-                        weight.source,
+                        weight.upload,
                         weight.shape.clone(),
                         weight.source_bytes,
                         weight.resident_bytes,
@@ -283,7 +424,7 @@ pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3]
                 std::collections::hash_map::Entry::Occupied(entry)
                     if entry.get()
                         != &(
-                            weight.source,
+                            weight.upload,
                             weight.shape.clone(),
                             weight.source_bytes,
                             weight.resident_bytes,
@@ -323,6 +464,7 @@ impl ModelLoadPlan {
             &self.target,
             self.head.as_deref(),
             self.vision.as_deref(),
+            &self.host_tables,
             history,
         )
     }
@@ -343,6 +485,10 @@ impl ModelLoadPlan {
                 .projector
                 .as_ref()
                 .map(|projector| (projector.identity, projector.tensors.as_slice())),
+            manifest
+                .draft
+                .as_ref()
+                .map(|draft| (draft.identity, draft.tensors.as_slice())),
             definition,
             selection,
             layout,
@@ -368,10 +514,15 @@ impl ModelLoadPlan {
                     .ok_or_else(|| "projector header has no component identity".to_owned())
             })
             .transpose()?;
+        let manifest = headers.manifest();
         Self::derive_components(
             identity,
             &headers.target().tensors,
             projector,
+            manifest
+                .draft
+                .as_ref()
+                .map(|draft| (draft.identity, draft.tensors.as_slice())),
             definition,
             selection,
             layout,
@@ -382,6 +533,7 @@ impl ModelLoadPlan {
         identity: PackageIdentity,
         target_tensors: &[TensorDescriptor],
         projector: Option<(ArtifactIdentity, &[TensorDescriptor])>,
+        draft: Option<(ArtifactIdentity, &[TensorDescriptor])>,
         definition: &ModelDefinition,
         selection: ComponentSelection,
         layout: Layout,
@@ -394,133 +546,133 @@ impl ModelLoadPlan {
             kind: ArtifactComponentKind::Target,
             identity: identity.target,
         };
+        let decoder = &definition.decoder;
         let target_form = ResidentForm {
-            activation: activation_dtype(definition.geometry.activation_dtype),
+            activation: activation_dtype(decoder.activation_dtype),
             layout,
         };
+        let target_role = |kind| WeightRole {
+            scope: WeightScope::Target,
+            kind,
+        };
         let mut target = Vec::new();
-        push_weight(
-            &mut target,
-            target_tensors,
-            target_component,
-            WeightScope::Target,
-            WeightKind::Embedding,
-            &definition.embedding,
-            target_form,
-        )?;
-        for (index, block) in definition.blocks.iter().enumerate() {
-            let index = u32::try_from(index).map_err(|_| "target block index exceeds u32")?;
-            append_block(
+        // A per-layer entry projects the embedding on the device; its table
+        // is a host table.
+        let per_layer_weights = decoder.entry.per_layer.iter().flat_map(|entry| {
+            [
+                (
+                    target_role(WeightKind::PerLayerModelProjection),
+                    &entry.projection,
+                ),
+                (
+                    target_role(WeightKind::PerLayerProjectionNorm),
+                    &entry.projection_norm.weight,
+                ),
+            ]
+        });
+        let host_tables = decoder
+            .entry
+            .per_layer
+            .iter()
+            .map(|entry| {
+                host_table(
+                    target_tensors,
+                    target_component,
+                    target_role(WeightKind::PerLayerTable),
+                    &entry.table,
+                    target_form,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for (role, descriptor) in std::iter::once((
+            target_role(WeightKind::Embedding),
+            &decoder.entry.embedding,
+        ))
+        .chain(per_layer_weights)
+        .chain(operators::decoder_weights(decoder))
+        .chain([
+            (target_role(WeightKind::OutputNorm), decoder.exit.norm.weight()),
+            (target_role(WeightKind::Output), &decoder.exit.output),
+        ]) {
+            push_weight(
                 &mut target,
                 target_tensors,
                 target_component,
-                WeightScope::TargetBlock(index),
-                block,
+                role.scope,
+                role.kind,
+                descriptor,
                 target_form,
             )?;
         }
-        push_weight(
-            &mut target,
-            target_tensors,
-            target_component,
-            WeightScope::Target,
-            WeightKind::OutputNorm,
-            &definition.output_norm,
-            target_form,
-        )?;
-        push_weight(
-            &mut target,
-            target_tensors,
-            target_component,
-            WeightScope::Target,
-            WeightKind::Output,
-            &definition.output,
-            target_form,
-        )?;
 
-        if selection.head && definition.head.is_none() {
-            return Err("head execution was selected without a head definition".into());
+        // The executed definition carries at most one drafter.
+        if selection.head && definition.head.is_some() == definition.draft.is_some() {
+            return Err(
+                "head execution was selected without exactly one drafter definition".into(),
+            );
         }
         if projector.is_some() != definition.vision.is_some() {
             return Err("projector component and vision definition disagree".into());
         }
+        if draft.is_some() != definition.draft.is_some() {
+            return Err("draft component and draft definition disagree".into());
+        }
         if selection.vision && definition.vision.is_none() {
             return Err("vision execution was selected without a vision definition".into());
         }
-        let head = selection
-            .head
-            .then_some(definition.head.as_ref())
-            .flatten()
-            .map(|head| {
+        let push_all = |plans: &mut Vec<WeightPlan>,
+                        tensors: &[TensorDescriptor],
+                        component: ArtifactComponent,
+                        weights: Vec<(WeightRole, &WeightDescriptor)>| {
+            for (role, descriptor) in weights {
+                push_weight(
+                    plans,
+                    tensors,
+                    component,
+                    role.scope,
+                    role.kind,
+                    descriptor,
+                    target_form,
+                )?;
+            }
+            Ok::<_, String>(())
+        };
+        let head = match (selection.head, &definition.head, &definition.draft, draft) {
+            (false, ..) => None,
+            (true, Some(head), None, _) => {
                 let mut plans = Vec::new();
-                for (index, block) in head.blocks.iter().enumerate() {
-                    let scope = WeightScope::HeadBlock(
-                        u32::try_from(index).map_err(|_| "head block index exceeds u32")?,
-                    );
-                    for (kind, descriptor) in [
-                        (WeightKind::HeadEmbeddingNorm, &block.embedding_norm),
-                        (WeightKind::HeadHiddenNorm, &block.hidden_norm),
-                        (WeightKind::HeadCombine, &block.combine),
-                        (WeightKind::InputNorm, &block.input_norm),
-                    ] {
-                        push_weight(
-                            &mut plans,
-                            target_tensors,
-                            target_component,
-                            scope,
-                            kind,
-                            descriptor,
-                            target_form,
-                        )?;
-                    }
-                    append_attention(
-                        &mut plans,
-                        target_tensors,
-                        target_component,
-                        scope,
-                        &block.attention,
-                        target_form,
-                    )?;
-                    push_weight(
-                        &mut plans,
-                        target_tensors,
-                        target_component,
-                        scope,
-                        WeightKind::FeedForwardNorm,
-                        &block.feedforward_norm,
-                        target_form,
-                    )?;
-                    match &block.feedforward {
-                        FeedForwardWeights::Dense(weights) => append_dense(
-                            &mut plans,
-                            target_tensors,
-                            target_component,
-                            scope,
-                            weights,
-                            target_form,
-                        )?,
-                        FeedForwardWeights::Routed(weights) => append_routed(
-                            &mut plans,
-                            target_tensors,
-                            target_component,
-                            scope,
-                            weights,
-                            target_form,
-                        )?,
-                    }
-                    push_weight(
-                        &mut plans,
-                        target_tensors,
-                        target_component,
-                        scope,
-                        WeightKind::OutputNorm,
-                        &block.output_norm,
-                        target_form,
-                    )?;
-                }
-                Ok::<_, String>(plans)
-            })
-            .transpose()?;
+                push_all(
+                    &mut plans,
+                    target_tensors,
+                    target_component,
+                    operators::head_weights(head).map_err(|error| error.to_string())?,
+                )?;
+                Some(plans)
+            }
+            (true, None, Some(separate), Some((identity, tensors))) => {
+                let component = ArtifactComponent {
+                    kind: ArtifactComponentKind::Draft,
+                    identity,
+                };
+                // The fusion is read by every target step, so it is resident
+                // with the target; the drafter's own weights load with it.
+                push_all(
+                    &mut target,
+                    tensors,
+                    component,
+                    operators::draft::fusion_weights(separate).to_vec(),
+                )?;
+                let mut plans = Vec::new();
+                push_all(
+                    &mut plans,
+                    tensors,
+                    component,
+                    operators::draft::draft_weights(separate).map_err(|error| error.to_string())?,
+                )?;
+                Some(plans)
+            }
+            _ => return Err("the selected drafter has no component".into()),
+        };
 
         let vision = selection
             .vision
@@ -547,6 +699,7 @@ impl ModelLoadPlan {
             target,
             head,
             vision,
+            host_tables,
         })
     }
 
@@ -573,11 +726,115 @@ pub(super) fn validate_unique_roles<'a>(
     Ok(())
 }
 
-pub(super) fn activation_dtype(dtype: ActivationDType) -> DType {
+/// The dense element dtype of a decoder's activations.
+pub(crate) fn activation_dtype(dtype: ActivationDType) -> DType {
     match dtype {
         ActivationDType::F16 => DType::F16,
         ActivationDType::BF16 => DType::BF16,
     }
+}
+
+/// The per-layer entry (Gemma PLE, `EntryForm.per_layer`): the batch rows'
+/// host-table rows (uploaded as `table_source`, converted to `table`) and
+/// the embedding's projection to `layers · width` channels, combined by
+/// `per_layer_inputs` into every block's per-layer input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PerLayerEntryBinding {
+    pub hidden: u64,
+    pub layers: u64,
+    pub width: u64,
+    pub table_source: Element,
+    pub table: Element,
+    pub projection: Element,
+    pub norm: Element,
+    pub activation: Element,
+}
+
+/// A block's per-layer input sublayer: `per_layer_gate` over its layer's
+/// slice, `project_rows` back to the hidden width, and its post-norm tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PerLayerBinding {
+    pub hidden: u64,
+    pub layers: u64,
+    pub width: u64,
+    pub gate: Element,
+    pub projection: Element,
+    pub activation: Element,
+    /// Always a post-norm tail.
+    pub tail: SublayerTail,
+}
+
+/// A host-resident gathered table (model-family plan §3.7): read by row
+/// gather from its artifact and never a device weight. Each step uploads the
+/// batch rows' `source` rows, which the graph converts to `resident` rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostTablePlan {
+    pub role: WeightRole,
+    pub component: ArtifactComponent,
+    pub descriptor: WeightDescriptor,
+    /// `[rows, columns]`.
+    pub shape: Vec<u64>,
+    pub source: Element,
+    pub resident: Element,
+    /// The table's bytes: its claim in the system-RAM domain.
+    pub bytes: u64,
+}
+
+impl HostTablePlan {
+    pub fn columns(&self) -> u64 {
+        self.shape[1]
+    }
+}
+
+/// Plan the host table `descriptor` names: a stored `[rows, columns]`
+/// matrix without import transforms, in a source encoding whose rows the
+/// backend layout can convert on the device.
+fn host_table(
+    inventory: &[TensorDescriptor],
+    component: ArtifactComponent,
+    role: WeightRole,
+    descriptor: &WeightDescriptor,
+    form: ResidentForm,
+) -> Result<HostTablePlan, String> {
+    let stored = inventory
+        .iter()
+        .find(|tensor| tensor.name == descriptor.name)
+        .ok_or_else(|| format!("host table {:?} is absent from its component", descriptor.name))?;
+    if !descriptor.transforms.is_empty() || stored.shape != descriptor.shape {
+        return Err(format!(
+            "host table {:?} must be the stored matrix itself",
+            descriptor.name
+        ));
+    }
+    let [_, _] = stored.shape[..] else {
+        return Err(format!("host table {:?} is not a matrix", descriptor.name));
+    };
+    let source = source_element(stored.encoding)
+        .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
+    let resident = resident_element(stored.encoding, form.activation, form.layout)
+        .ok_or_else(|| {
+            format!(
+                "{:?} has no resident form in the `{}` layout",
+                stored.encoding,
+                form.layout.as_str()
+            )
+        })?;
+    let bytes = representation_bytes(source, &stored.shape)?;
+    if bytes != stored.nbytes {
+        return Err(format!(
+            "host table {:?} stores {} bytes, but its {:?} shape {:?} is {bytes}",
+            descriptor.name, stored.nbytes, stored.encoding, stored.shape
+        ));
+    }
+    Ok(HostTablePlan {
+        role,
+        component,
+        descriptor: descriptor.clone(),
+        shape: stored.shape.clone(),
+        source,
+        resident,
+        bytes,
+    })
 }
 
 fn push_weight(
@@ -598,25 +855,19 @@ fn push_weight(
                 descriptor.name
             )
         })?;
-    if stored.shape != descriptor.shape {
-        return Err(format!(
-            "planned weight {:?} changed shape",
-            descriptor.name
-        ));
-    }
+    // The logical shape the importer's exact transforms make of the stored
+    // tensor (the stored shape when there are none).
+    let logical = crate::import_transforms::admit(descriptor, &stored.shape, stored.encoding)?;
     let role = WeightRole { scope, kind };
     // Projector weights keep their stored dense element: the vision kernels
     // read f32, f16 and bf16 matrices and vectors directly, and converting
     // f16 matrices or f32 biases to the activation dtype only loses bits.
     let stored_dense = source_element(stored.encoding).and_then(Element::dtype);
-    let dense_resident = match (role.scope, stored_dense) {
-        (
-            WeightScope::Vision | WeightScope::VisionPatch(_) | WeightScope::VisionBlock(_),
-            Some(dtype),
-        ) => dtype,
+    let dense_resident = match (role.kind, stored_dense) {
+        (WeightKind::Vision(_), Some(dtype)) => dtype,
         _ => resident_dtype(role, form.activation),
     };
-    if is_fixed_dense_role(kind)
+    if operators::is_fixed_dense_role(kind)
         && !matches!(
             stored.encoding,
             Encoding::F32 | Encoding::F16 | Encoding::BF16
@@ -629,14 +880,24 @@ fn push_weight(
     }
     let source = source_element(stored.encoding)
         .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
-    let resident =
-        resident_element(stored.encoding, dense_resident, form.layout).ok_or_else(|| {
-            format!(
-                "{:?} has no resident form in the `{}` layout",
-                stored.encoding,
-                form.layout.as_str()
-            )
-        })?;
+    // Packed projector weights become dense in the activation dtype: the GPU
+    // vision kernels read dense weights only. The host dequantizes them
+    // exactly to F32 and the device rounds once to the activation dtype.
+    let (upload, resident) = match (role.kind, stored_dense) {
+        (WeightKind::Vision(_), None) => {
+            (Element::f32(), Element::dense(form.activation))
+        }
+        _ => (
+            source,
+            resident_element(stored.encoding, dense_resident, form.layout).ok_or_else(|| {
+                format!(
+                    "{:?} has no resident form in the `{}` layout",
+                    stored.encoding,
+                    form.layout.as_str()
+                )
+            })?,
+        ),
+    };
     let source_bytes = representation_bytes(source, &stored.shape)?;
     if source_bytes != stored.nbytes {
         return Err(format!(
@@ -644,196 +905,26 @@ fn push_weight(
             descriptor.name, stored.nbytes, stored.encoding, stored.shape
         ));
     }
-    let resident_bytes = representation_bytes(resident, &stored.shape)?;
+    let resident_bytes = representation_bytes(resident, &logical)?;
     out.push(WeightPlan {
         role,
         component,
         source,
+        upload,
         resident,
-        shape: descriptor.shape.clone(),
+        shape: logical.clone(),
         descriptor: descriptor.clone(),
-        source_bytes: stored.nbytes,
+        // The bytes the importer uploads: the transformed source, in the
+        // upload representation.
+        source_bytes: representation_bytes(upload, &logical)?,
         resident_bytes,
     });
     Ok(())
 }
 
-/// The resident representation is part of the semantic kernel ABI, not a
-/// blanket model-wide preference. These roles are consumed by fixed-f32
-/// kernel arguments; every other weight remains representation-generic and
-/// follows the component activation dtype (or its admitted packed format).
+/// The resident dense element of a role (`operators::resident_dtype`).
 pub(super) fn resident_dtype(role: WeightRole, activation: DType) -> DType {
-    if is_fixed_dense_role(role.kind) {
-        DType::F32
-    } else {
-        activation
-    }
-}
-
-fn is_fixed_dense_role(kind: WeightKind) -> bool {
-    matches!(
-        kind,
-        WeightKind::QueryNorm
-            | WeightKind::KeyNorm
-            | WeightKind::RecurrentConvolution
-            | WeightKind::RecurrentDecay
-            | WeightKind::RecurrentTimeBias
-            | WeightKind::SharedRouter
-    )
-}
-
-fn append_block(
-    out: &mut Vec<WeightPlan>,
-    inventory: &[TensorDescriptor],
-    component: ArtifactComponent,
-    scope: WeightScope,
-    block: &BlockWeights,
-    form: ResidentForm,
-) -> Result<(), String> {
-    push_weight(
-        out,
-        inventory,
-        component,
-        scope,
-        WeightKind::InputNorm,
-        &block.input_norm,
-        form,
-    )?;
-    match &block.mixer {
-        MixerWeights::Attention(weights) => {
-            append_attention(out, inventory, component, scope, weights, form)?
-        }
-        MixerWeights::Recurrent(weights) => {
-            append_recurrent(out, inventory, component, scope, weights, form)?
-        }
-    }
-    push_weight(
-        out,
-        inventory,
-        component,
-        scope,
-        WeightKind::FeedForwardNorm,
-        &block.feedforward_norm,
-        form,
-    )?;
-    match &block.feedforward {
-        FeedForwardWeights::Dense(weights) => {
-            append_dense(out, inventory, component, scope, weights, form)
-        }
-        FeedForwardWeights::Routed(weights) => {
-            append_routed(out, inventory, component, scope, weights, form)
-        }
-    }
-}
-
-fn append_attention(
-    out: &mut Vec<WeightPlan>,
-    inventory: &[TensorDescriptor],
-    component: ArtifactComponent,
-    scope: WeightScope,
-    weights: &AttentionWeights,
-    form: ResidentForm,
-) -> Result<(), String> {
-    for (kind, descriptor) in [
-        (WeightKind::QueryGate, &weights.query_gate),
-        (WeightKind::Key, &weights.key),
-        (WeightKind::Value, &weights.value),
-        (WeightKind::QueryNorm, &weights.query_norm),
-        (WeightKind::KeyNorm, &weights.key_norm),
-        (WeightKind::AttentionOutput, &weights.output),
-    ] {
-        push_weight(out, inventory, component, scope, kind, descriptor, form)?;
-    }
-    Ok(())
-}
-
-fn append_recurrent(
-    out: &mut Vec<WeightPlan>,
-    inventory: &[TensorDescriptor],
-    component: ArtifactComponent,
-    scope: WeightScope,
-    weights: &RecurrentWeights,
-    form: ResidentForm,
-) -> Result<(), String> {
-    for (kind, descriptor) in [
-        (WeightKind::RecurrentQueryKeyValue, &weights.query_key_value),
-        (WeightKind::RecurrentGate, &weights.gate),
-        (WeightKind::RecurrentAlpha, &weights.alpha),
-        (WeightKind::RecurrentBeta, &weights.beta),
-        (WeightKind::RecurrentConvolution, &weights.convolution),
-        (WeightKind::RecurrentDecay, &weights.decay),
-        (WeightKind::RecurrentTimeBias, &weights.time_bias),
-        (WeightKind::RecurrentNorm, &weights.norm),
-        (WeightKind::RecurrentOutput, &weights.output),
-    ] {
-        push_weight(out, inventory, component, scope, kind, descriptor, form)?;
-    }
-    Ok(())
-}
-
-fn append_dense(
-    out: &mut Vec<WeightPlan>,
-    inventory: &[TensorDescriptor],
-    component: ArtifactComponent,
-    scope: WeightScope,
-    weights: &DenseFeedForwardWeights,
-    form: ResidentForm,
-) -> Result<(), String> {
-    for (kind, descriptor) in [
-        (WeightKind::DenseGate, &weights.gate),
-        (WeightKind::DenseUp, &weights.up),
-        (WeightKind::DenseDown, &weights.down),
-    ] {
-        push_weight(out, inventory, component, scope, kind, descriptor, form)?;
-    }
-    Ok(())
-}
-
-fn append_routed(
-    out: &mut Vec<WeightPlan>,
-    inventory: &[TensorDescriptor],
-    component: ArtifactComponent,
-    scope: WeightScope,
-    weights: &RoutedFeedForwardWeights,
-    form: ResidentForm,
-) -> Result<(), String> {
-    for (kind, descriptor) in [
-        (WeightKind::Router, &weights.router),
-        (WeightKind::SharedRouter, &weights.shared_router),
-        (WeightKind::ExpertGate, &weights.expert_gate),
-        (WeightKind::ExpertUp, &weights.expert_up),
-        (WeightKind::ExpertDown, &weights.expert_down),
-        (WeightKind::SharedGate, &weights.shared_gate),
-        (WeightKind::SharedUp, &weights.shared_up),
-        (WeightKind::SharedDown, &weights.shared_down),
-    ] {
-        push_weight(out, inventory, component, scope, kind, descriptor, form)?;
-    }
-    Ok(())
-}
-
-fn push_norm(
-    out: &mut Vec<WeightPlan>,
-    inventory: &[TensorDescriptor],
-    component: ArtifactComponent,
-    scope: WeightScope,
-    weight_kind: WeightKind,
-    bias_kind: WeightKind,
-    norm: &LayerNormWeights,
-    form: ResidentForm,
-) -> Result<(), String> {
-    push_weight(
-        out,
-        inventory,
-        component,
-        scope,
-        weight_kind,
-        &norm.weight,
-        form,
-    )?;
-    push_weight(
-        out, inventory, component, scope, bias_kind, &norm.bias, form,
-    )
+    operators::resident_dtype(role.kind, activation)
 }
 
 fn plan_vision(
@@ -843,140 +934,13 @@ fn plan_vision(
     layout: Layout,
 ) -> Result<Vec<WeightPlan>, String> {
     let form = ResidentForm {
-        activation: activation_dtype(vision.geometry.activation_dtype),
+        activation: activation_dtype(vision.activation_dtype),
         layout,
     };
     let mut out = Vec::new();
-    for (index, descriptor) in vision.patch_embeddings.iter().enumerate() {
-        let scope = WeightScope::VisionPatch(
-            u32::try_from(index).map_err(|_| "vision patch index exceeds u32")?,
-        );
+    for (role, descriptor) in vision.weights() {
         push_weight(
-            &mut out,
-            inventory,
-            component,
-            scope,
-            WeightKind::PatchEmbedding,
-            descriptor,
-            form,
-        )?;
-    }
-    push_weight(
-        &mut out,
-        inventory,
-        component,
-        WeightScope::Vision,
-        WeightKind::PatchBias,
-        &vision.patch_bias,
-        form,
-    )?;
-    push_weight(
-        &mut out,
-        inventory,
-        component,
-        WeightScope::Vision,
-        WeightKind::PositionEmbedding,
-        &vision.position_embedding,
-        form,
-    )?;
-    for (index, block) in vision.blocks.iter().enumerate() {
-        let scope = WeightScope::VisionBlock(
-            u32::try_from(index).map_err(|_| "vision block index exceeds u32")?,
-        );
-        push_norm(
-            &mut out,
-            inventory,
-            component,
-            scope,
-            WeightKind::InputNormWeight,
-            WeightKind::InputNormBias,
-            &block.input_norm,
-            form,
-        )?;
-        push_weight(
-            &mut out,
-            inventory,
-            component,
-            scope,
-            WeightKind::FusedQkvWeight,
-            &block.attention.qkv.weight,
-            form,
-        )?;
-        push_weight(
-            &mut out,
-            inventory,
-            component,
-            scope,
-            WeightKind::FusedQkvBias,
-            &block.attention.qkv.bias,
-            form,
-        )?;
-        push_weight(
-            &mut out,
-            inventory,
-            component,
-            scope,
-            WeightKind::AttentionOutput,
-            &block.attention.output,
-            form,
-        )?;
-        push_weight(
-            &mut out,
-            inventory,
-            component,
-            scope,
-            WeightKind::AttentionOutputBias,
-            &block.attention.output_bias,
-            form,
-        )?;
-        push_norm(
-            &mut out,
-            inventory,
-            component,
-            scope,
-            WeightKind::FeedForwardNormWeight,
-            WeightKind::FeedForwardNormBias,
-            &block.feedforward_norm,
-            form,
-        )?;
-        for (kind, descriptor) in [
-            (WeightKind::DenseUp, &block.feedforward.up),
-            (WeightKind::FeedForwardUpBias, &block.feedforward.up_bias),
-            (WeightKind::DenseDown, &block.feedforward.down),
-            (
-                WeightKind::FeedForwardDownBias,
-                &block.feedforward.down_bias,
-            ),
-        ] {
-            push_weight(
-                &mut out, inventory, component, scope, kind, descriptor, form,
-            )?;
-        }
-    }
-    push_norm(
-        &mut out,
-        inventory,
-        component,
-        WeightScope::Vision,
-        WeightKind::NormWeight,
-        WeightKind::NormBias,
-        &vision.output_norm,
-        form,
-    )?;
-    for (kind, descriptor) in [
-        (WeightKind::MergerHidden, &vision.merger.hidden),
-        (WeightKind::MergerHiddenBias, &vision.merger.hidden_bias),
-        (WeightKind::MergerOutput, &vision.merger.output),
-        (WeightKind::MergerOutputBias, &vision.merger.output_bias),
-    ] {
-        push_weight(
-            &mut out,
-            inventory,
-            component,
-            WeightScope::Vision,
-            kind,
-            descriptor,
-            form,
+            &mut out, inventory, component, role.scope, role.kind, descriptor, form,
         )?;
     }
     Ok(out)
@@ -1029,6 +993,11 @@ pub fn source_element(encoding: Encoding) -> Option<Element> {
         Encoding::Iq3S => Element::named("gguf_iq3_s"),
         Encoding::Iq4Nl => Element::named("gguf_iq4_nl"),
         Encoding::Iq4Xs => Element::named("gguf_iq4_xs"),
+        Encoding::Q4_0 => Element::named("gguf_q4_0"),
+        Encoding::Q5_0 => Element::named("gguf_q5_0"),
+        Encoding::Q5_1 => Element::named("gguf_q5_1"),
+        Encoding::Mxfp4 => Element::named("gguf_mxfp4"),
+        Encoding::Nvfp4 => Element::named("gguf_nvfp4"),
         _ => None,
     }
 }
@@ -1039,7 +1008,8 @@ pub fn source_element(encoding: Encoding) -> Option<Element> {
 /// format without its own representation imports exactly into one that
 /// holds every value it encodes: Q3_K and IQ3_S into q6k (an f16
 /// super-scale times an int8 sixteen-value sub-block scale times a code in
-/// [-32, 31]), IQ4_NL into iq4g32 (same table).
+/// [-32, 31]), IQ4_NL into iq4g32 (same table). NVFP4's per-tensor F32
+/// `.scale` is a separate tensor; its representation holds the block values.
 pub fn resident_element(encoding: Encoding, dense: DType, layout: Layout) -> Option<Element> {
     let representation = match encoding {
         Encoding::F32 | Encoding::F16 | Encoding::BF16 => return Some(Element::dense(dense)),
@@ -1048,6 +1018,11 @@ pub fn resident_element(encoding: Encoding, dense: DType, layout: Layout) -> Opt
         Encoding::Q4K => "q4k",
         Encoding::Q5K => "q5k",
         Encoding::Iq4Nl | Encoding::Iq4Xs => "iq4g32",
+        Encoding::Q4_0 => "q4g32s",
+        Encoding::Q5_0 => "q5g32s",
+        Encoding::Q5_1 => "q5g32",
+        Encoding::Mxfp4 => "mxfp4g32",
+        Encoding::Nvfp4 => "nvfp4g16",
         _ => return None,
     };
     Element::stored(representation, layout)
@@ -1112,6 +1087,11 @@ mod representation_byte_tests {
             (Encoding::Iq3S, "q6k"),
             (Encoding::Iq4Nl, "iq4g32"),
             (Encoding::Iq4Xs, "iq4g32"),
+            (Encoding::Q4_0, "q4g32s"),
+            (Encoding::Q5_0, "q5g32s"),
+            (Encoding::Q5_1, "q5g32"),
+            (Encoding::Mxfp4, "mxfp4g32"),
+            (Encoding::Nvfp4, "nvfp4g16"),
         ] {
             for layout in Layout::ALL {
                 let element = resident_element(encoding, DType::BF16, layout).unwrap();
@@ -1125,9 +1105,11 @@ mod representation_byte_tests {
             resident_element(Encoding::F16, DType::BF16, Layout::Rows16),
             Some(Element::bf16())
         );
-        assert_eq!(
-            resident_element(Encoding::Mxfp4, DType::BF16, Layout::Rows16),
-            None
-        );
+        for encoding in [Encoding::Q1_0, Encoding::I32] {
+            assert_eq!(
+                resident_element(encoding, DType::BF16, Layout::Rows16),
+                None
+            );
+        }
     }
 }

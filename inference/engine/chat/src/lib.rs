@@ -28,7 +28,10 @@ pub use templates::{
     ChatRequest, TemplateBundle, TemplateInspection, TemplateSelection, TemplateVariant,
     ToolChoice, TEMPLATE_FINGERPRINT_VERSION,
 };
-pub use tokenizer::{BpeConfig, ByteBpeTokenizer, PieceKind, SpecialTokens, TokenDecoder};
+pub use tokenizer::{
+    BpeConfig, ByteBpeTokenizer, Normalization, PieceEncoding, PieceKind, SpecialTokens, Split,
+    SplitBehavior, TokenDecoder, TokenizerError,
+};
 
 /// Measured physical execution time attributed to a request. Durations are
 /// accumulated at completed program boundaries, in nanoseconds.

@@ -1,6 +1,6 @@
-// The body of the prefill attention entries (`gated_attention_prefill` over
-// dense history, `gated_attention_prefill_k8v4` over affine K8/V4 history).
-// The Vulkan form of `metal/gated_attention_prefill.metal`: the same three
+// The body of the prefill attention entries (`attention_prefill` over dense
+// history, `attention_prefill_k8v4` over affine K8/V4 history). The Vulkan
+// form of `metal/attention_prefill.metal`: the same three
 // launches and partition contract; an entry passes its history buffers as an
 // `attention_history` (lib/attention/history.glsl), which is all that differs.
 //
@@ -24,7 +24,11 @@
 //
 // L3 (merge): workgroup (QT-row tile, query head), one invocation per column.
 //
-// Shared bytes: the K/V tile (32 x (W + 8) f16), then 2 KiB per subgroup.
+// A head wider than FLASH_MAX_W stages its K tile in column chunks of
+// FLASH_MAX_W, scored in turn, and its V tile per output window.
+//
+// Shared bytes: the K/V tile (32 x (min(W, FLASH_MAX_W) + 8) f16), then 2 KiB
+// per subgroup.
 #include "history.glsl"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
@@ -34,9 +38,9 @@
 #define PREFILL_KEYS FLASH_KEYS
 #define PREFILL_MIN_TILES 16u
 #define PREFILL_QT (uint(SEISMIC_TUNE_ROWS) / ATTENTION_G)
-// Output columns per pass over the keys: the whole head, so every key tile's
-// scores and history decode happen once, where the device compiles wide
-// accumulator arrays (`flash.glsl`).
+// Output columns per pass over the keys: the whole head up to FLASH_MAX_W, so
+// every key tile's scores and history decode happen once, where the device
+// compiles wide accumulator arrays (`flash.glsl`).
 #define PREFILL_WINDOW FLASH_WINDOW
 
 // ---------------------------------------------------------------------------
@@ -58,10 +62,10 @@ void prefill_prepare(attention_history h) {
         const uint64_t at = ((uint64_t(kv_head) * padded + row) * G + g) * W + lane * E;
         float x[ATTENTION_E];
         if (row < rows) {
-            attention_prepare(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_GATE) + ((row * KV * G + head) * 2ul * W) * 2ul,
+            attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + head) * ATTENTION_QUERY_STRIDE) * 2ul,
                 SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul,
                 SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
-                element_word_f32(SEISMIC_PARAM_EPSILON), lane, x);
+                ATTENTION_AMPLITUDE_BUFFER, element_word_f32(SEISMIC_PARAM_EPSILON), lane, x);
         } else {
             [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                 x[i] = 0.0;
@@ -70,15 +74,17 @@ void prefill_prepare(attention_history h) {
             element_put(ELEMENT_F16, queries, at + i, element_round(ELEMENT_ACT, x[i]));
         return;
     }
-    if (row >= rows)
+    if (row >= rows || !ATTENTION_FRESH)
         return;
     const uint kv_head = head - KV * G;
     const uint64_t source = (row * KV + kv_head) * W;
     float k[ATTENTION_E], v[ATTENTION_E];
     attention_prepare(SEISMIC_PTR(SEISMIC_BUFFER_KEY) + source * 2ul, SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM),
         SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul, SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS),
-        SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES), element_word_f32(SEISMIC_PARAM_EPSILON), lane, k);
-    attention_load_row(SEISMIC_PTR(SEISMIC_BUFFER_VALUE), source + lane * E, v);
+        SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES), ATTENTION_AMPLITUDE_BUFFER,
+        element_word_f32(SEISMIC_PARAM_EPSILON), lane, k);
+    attention_value(SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + source * 2ul, ATTENTION_VALUE_NORM_BUFFER,
+        element_word_f32(SEISMIC_PARAM_EPSILON), lane, v);
     const uint64_t keys = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS);
     const uint64_t values = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES);
     [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
@@ -96,15 +102,18 @@ void prefill_prepare(attention_history h) {
 // ---------------------------------------------------------------------------
 // L2.
 
-// Stages rows [first, first + 32) of one kv head as the f16 tile at shared
-// half 0: history (dense or decoded) or the batch's fresh f16 scratch rows.
-void prefill_stage(attention_history h, const bool is_key, bool historical, int first, int end, uint kv_head) {
+// Stages columns [column, column + w) of rows [first, first + 32) of one kv
+// head as the f16 tile at shared half 0 (row pitch w + 8): history (dense or
+// decoded) or the batch's fresh f16 scratch rows.
+void prefill_stage(attention_history h, const bool is_key, bool historical, int first, int end, uint kv_head,
+    uint column, const uint w) {
     if (historical) {
-        history_stage(h, is_key, first, end, kv_head, 0u);
+        history_stage(h, is_key, first, end, kv_head, column, w, 0u);
     } else {
         const uint64_t plane =
             is_key ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS) : SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES);
-        flash_stage(ELEMENT_F16, plane, uint64_t(ATTENTION_KV * ATTENTION_W), uint64_t(kv_head * ATTENTION_W), first, end, ATTENTION_W, 0u);
+        flash_stage(ELEMENT_F16, plane, uint64_t(ATTENTION_KV * ATTENTION_W), uint64_t(kv_head * ATTENTION_W + column),
+            first, end, w, 0u);
     }
 }
 
@@ -163,7 +172,11 @@ void prefill_attend(attention_history h) {
     const uint kv_head = gl_WorkGroupID.y;
     const uint part = gl_WorkGroupID.z;
     const uint64_t tile_first = uint64_t(tile) * PREFILL_QT;
-    const uint scratch = (FLASH_KEYS * flash_pitch(W)) / 2u + SEISMIC_SUBGROUP * FLASH_SCRATCH_FLOATS;
+    // K stages in chunks of at most FLASH_MAX_W columns, scored in turn; V
+    // stages the pass's output window.
+    const uint chunk = min(W, FLASH_MAX_W);
+    const uint width = flash_window(W, PREFILL_WINDOW);
+    const uint scratch = (FLASH_KEYS * flash_pitch(chunk)) / 2u + SEISMIC_SUBGROUP * FLASH_SCRATCH_FLOATS;
 
     uint total_tiles = 0u;
     for (uint64_t index = 0ul; index <= spans; ++index)
@@ -180,16 +193,18 @@ void prefill_attend(attention_history h) {
     const uint tiles_hi = min(tiles_lo + per, total_tiles);
 
     // The subgroup's block: matrix rows 16 sg .. of the tile's QT x G rows;
-    // the lane's softmax row is lane % 16.
+    // the lane's softmax row is lane % 16. When G does not divide ROWS, the
+    // rows past QT x G are padding: they score whatever query scratch follows
+    // (the declaration adds ROWS rows of slack) and store nothing.
     const uint block_row = 16u * SEISMIC_SUBGROUP;
     const uint lane_row = block_row + lane % 16u;
     const uint64_t token = tile_first + lane_row / G;
-    const bool valid = token < rows;
+    const bool valid = lane_row < PREFILL_QT * G && token < rows;
     const uint64_t block_queries = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES)
         + ((uint64_t(kv_head) * padded + tile_first) * G + block_row) * W * 2ul;
 
     const uint64_t heads = uint64_t(KV * G);
-    const uint64_t query_gate = SEISMIC_PTR(SEISMIC_BUFFER_QUERY_GATE);
+    const uint64_t query = ATTENTION_QUERY_BUFFER;
     const uint64_t gated = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
     const uint64_t partials = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS);
     const uint64_t statistics = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS);
@@ -217,10 +232,15 @@ void prefill_attend(attention_history h) {
                 attention_span(visible, fresh, token, spans, index, row_lo, row_hi);
             for (uint own = own_lo; own < own_hi; ++own) {
                 const int first = interval.x + int(own * PREFILL_KEYS);
-                barrier();
-                prefill_stage(h, true, historical, first, interval.y, kv_head);
-                barrier();
-                flash_scores(block_queries, uint64_t(W), W, 0u, scratch);
+                flash_scores_state scores;
+                flash_scores_clear(scores);
+                for (uint column = 0u; column < W; column += chunk) {
+                    barrier();
+                    prefill_stage(h, true, historical, first, interval.y, kv_head, column, chunk);
+                    barrier();
+                    flash_scores_add(block_queries + uint64_t(column) * 2ul, uint64_t(W), chunk, 0u, scores);
+                }
+                flash_scores_publish(scores, scratch);
                 const bool inside = first >= interval.z && first + int(PREFILL_KEYS) <= interval.w;
                 float s[16];
                 prefill_lane_scores(scratch, scale, first, inside, row_lo, row_hi, s);
@@ -228,9 +248,9 @@ void prefill_attend(attention_history h) {
                 const uint p_half = flash_publish_probabilities(scratch, s);
                 flash_rescale(scratch, alpha, W, PREFILL_WINDOW, o);
                 barrier();
-                prefill_stage(h, false, historical, first, interval.y, kv_head);
+                prefill_stage(h, false, historical, first, interval.y, kv_head, column0, width);
                 barrier();
-                flash_accumulate(p_half, 0u, W, PREFILL_WINDOW, column0, o);
+                flash_accumulate(p_half, 0u, width, width, 0u, o);
             }
         }
         const float maximum = softmax.maximum;
@@ -250,7 +270,7 @@ void prefill_attend(attention_history h) {
             // The row's softmax state lives on lanes r % 16 and r % 16 + 16.
             const float row_maximum = seismic_shuffle(maximum, r % 16u);
             const float row_denominator = seismic_shuffle(denominator, r % 16u);
-            if (out_token < rows) {
+            if (r < PREFILL_QT * G && out_token < rows) {
                 if (used > 1u) {
                     const uint64_t slot = (uint64_t(part) * rows + out_token) * heads + out_head;
                     element_f32_put(partials + (slot * W + column) * 4ul, value);
@@ -259,7 +279,7 @@ void prefill_attend(attention_history h) {
                         element_f32_put(statistics + slot * 8ul + 4ul, row_denominator);
                     }
                 } else {
-                    attention_store_gated(query_gate, gated, out_token, out_head, column,
+                    attention_store_gated(query, ATTENTION_GATE_BUFFER, gated, out_token, out_head, column,
                         seismic_div_rn(value, max(row_denominator, 1e-30)));
                 }
             }
@@ -283,7 +303,7 @@ void prefill_merge() {
     for (uint64_t row = uint64_t(tile) * PREFILL_QT; row < min(uint64_t(tile + 1u) * PREFILL_QT, rows); ++row) {
         const float attended = attention_merge(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
             SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), row * heads + head, rows * heads, count, column);
-        attention_store_gated(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_GATE), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row, head,
-            column, attended);
+        attention_store_gated(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row,
+            head, column, attended);
     }
 }

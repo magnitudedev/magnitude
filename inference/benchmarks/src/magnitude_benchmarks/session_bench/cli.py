@@ -93,8 +93,11 @@ def parser() -> argparse.ArgumentParser:
     )
     native.add_argument("--native-device", default="auto", help="auto, metal, cuda, vulkan, cpu")
     native.add_argument("--native-cache-dir", type=Path, help="persistent kernel and tuning cache")
-    native.add_argument("--native-method", choices=("auto", "plain", "mtp"), default="auto")
-    native.add_argument("--native-mtp-proposals", type=int, help="MTP proposal width")
+    native.add_argument(
+        "--native-method", choices=("auto", "plain", "mtp", "dflash"), default="auto"
+    )
+    native.add_argument("--native-mtp-proposals", type=int, help="MTP or DFlash proposal width")
+    native.add_argument("--native-draft", type=Path, help="separate draft model (DFlash, DSpark)")
     watchdog = execute.add_argument_group("watchdog")
     watchdog.add_argument(
         "--stall-seconds",
@@ -247,6 +250,9 @@ def main(argv=None) -> int:
                     ),
                     method=args.native_method,
                     mtp_proposals=args.native_mtp_proposals,
+                    draft=(
+                        args.native_draft.expanduser().absolute() if args.native_draft else None
+                    ),
                 ),
                 watchdog=Watchdog(
                     stall_seconds=args.stall_seconds, request_seconds=args.request_seconds

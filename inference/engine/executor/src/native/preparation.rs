@@ -4,7 +4,13 @@ use super::tuning::{
         AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
         AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning,
     },
-    cases::{DenseExpandTuning, DenseOutputTuning},
+    cases::{DenseExpandTuning, DenseOutputTuning, DenseUpTuning},
+    general_routed::{
+        routing_shape, RoutedDownTuning, RoutedExpandDecodeTuning, RoutedExpertTilesTuning,
+        RoutedGateUpTuning, RoutedGatedTilesTuning, RoutedScatterTuning, RoutedSelectTuning,
+        RoutedUpTilesTuning, RoutedUpTuning,
+    },
+    post_norm::ProjectRowsTuning,
     readout::{
         DraftRowsTuning, HeadLogitsTuning, HeadRowsTuning, SampleRowsTuning, SelectedRowsTuning,
         ShapeRowsTuning,
@@ -17,11 +23,23 @@ use super::tuning::{
         RoutedCombineTuning, RoutedExpandTuning, RoutedExpertsTuning, RoutedGroupTuning,
         RoutedOutputTuning, RoutedRouteTuning, RoutedShape,
     },
+    short_conv::{ShortConvOutputTuning, ShortConvProjectTuning},
+    state_space::{
+        StateSpaceChunkTuning, StateSpaceOutputTuning, StateSpaceProjectTuning, StateSpaceState,
+        StateSpaceStepTuning,
+    },
     TunedEntry, Tuner, TuningContext, TuningLimits, TuningWeights,
 };
 use super::*;
-use crate::ModelLoadPlan;
-use magnitude_family_contracts::WeightScope;
+use crate::{
+    DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ShortConvBinding, StateSpaceBinding,
+    SublayerTail,
+};
+use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightScope};
+use magnitude_kernels::{
+    conditioning_overlay, draft_confidence, feature_rows, import_dense, moe_tail,
+    per_layer_inputs, post_norm_residual, repack_weight, tap_rows,
+};
 use magnitude_state::KvCodec;
 
 /// The phase-one catalog. Every handle is prepared before qualification and
@@ -33,6 +51,7 @@ pub(super) struct NativePreparationCache {
     pub(super) glue: GlueKernels,
     pub(super) target: TargetKernels,
     pub(super) head: Option<HeadKernels>,
+    pub(super) draft: Option<DraftKernels>,
     pub(super) vision: Option<VisionKernels>,
     pub(super) tuned: Vec<TunedEntry>,
 }
@@ -84,12 +103,24 @@ impl<K: Copy + Eq + std::hash::Hash> BindingLayers<K> {
     }
 }
 
-fn block_scope(index: usize) -> WeightScope {
-    WeightScope::TargetBlock(u32::try_from(index).expect("block count fits u32"))
+/// The scope of sublayer `sublayer` (0 the mixer, 1 the feed-forward) of
+/// target block `index`.
+fn sublayer_scope(index: usize, sublayer: u32) -> WeightScope {
+    WeightScope::TargetSublayer(SublayerIndex {
+        block: u32::try_from(index).expect("block count fits u32"),
+        sublayer,
+    })
 }
 
 fn head_scope(index: usize) -> WeightScope {
     WeightScope::HeadBlock(u32::try_from(index).expect("head block count fits u32"))
+}
+
+fn head_sublayer_scope(index: usize, sublayer: u32) -> WeightScope {
+    WeightScope::HeadSublayer(SublayerIndex {
+        block: u32::try_from(index).expect("head block count fits u32"),
+        sublayer,
+    })
 }
 
 impl NativePreparationCache {
@@ -153,12 +184,21 @@ impl NativePreparationCache {
                 outcome: error.to_string(),
             }
         })?;
+        // Every admitted definition normalizes with one epsilon, which the
+        // readout's final norm states.
+        let epsilon = crate::programs::graph::readout::readout_epsilon(&tuning.definition.decoder)
+            .map_err(|outcome| CatalogFailure::Preparation {
+                entry: "normalization",
+                bindings: "decoder epsilon".into(),
+                outcome,
+            })?;
         // A census walk counts the program's tuning units, so the model's
         // budget can be shared before anything is tuned.
         let mut census = Preparation::new(
             device,
             plan,
             tuning,
+            epsilon,
             Specializer::census(device),
             Tuner::census(
                 device,
@@ -174,6 +214,7 @@ impl NativePreparationCache {
             device,
             plan,
             tuning,
+            epsilon,
             spec,
             Tuner::new(device, tuning, limits, weights, budgets),
         );
@@ -182,6 +223,7 @@ impl NativePreparationCache {
             tuner,
             target,
             head,
+            draft,
             vision,
             ..
         } = preparation;
@@ -192,6 +234,7 @@ impl NativePreparationCache {
             glue,
             target,
             head,
+            draft,
             vision,
             tuned,
         })
@@ -207,9 +250,9 @@ struct Preparation<'a> {
     hidden: u64,
     /// The target's vocabulary: the static dimension of token selection.
     vocabulary: u64,
-    vision_statics: Option<super::vision::VisionStatics>,
     target: TargetKernels,
     head: Option<HeadKernels>,
+    draft: Option<DraftKernels>,
     vision: Option<VisionKernels>,
 }
 
@@ -218,6 +261,7 @@ impl<'a> Preparation<'a> {
         device: &'a Device,
         plan: &ProgramPlan,
         tuning: TuningContext<'a>,
+        epsilon: f32,
         spec: Specializer<'a>,
         tuner: Tuner<'a>,
     ) -> Self {
@@ -225,16 +269,12 @@ impl<'a> Preparation<'a> {
             device,
             spec,
             tuner,
-            epsilon: tuning.definition.geometry.epsilon as f32,
-            hidden: tuning.definition.geometry.hidden,
-            vocabulary: tuning.definition.geometry.vocabulary,
-            vision_statics: tuning
-                .definition
-                .vision
-                .as_ref()
-                .map(|vision| super::vision::VisionStatics::of(&vision.geometry)),
+            epsilon,
+            hidden: tuning.definition.decoder.hidden,
+            vocabulary: tuning.definition.decoder.vocabulary,
             target: TargetKernels::default(),
             head: plan.head().map(|_| HeadKernels::default()),
+            draft: plan.draft().map(|_| DraftKernels::default()),
             vision: plan.vision().map(|_| VisionKernels::default()),
         }
     }
@@ -244,6 +284,7 @@ impl<'a> Preparation<'a> {
         let glue = self.glue(plan)?;
         self.target(plan)?;
         self.head(plan)?;
+        self.draft(plan)?;
         self.vision(plan)?;
         Ok(glue)
     }
@@ -308,42 +349,72 @@ impl<'a> Preparation<'a> {
         }
         let attention_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
             |(index, block)| match block.mixer() {
-                MixerProgramSlot::Attention(binding) => Some((binding, block_scope(index))),
-                MixerProgramSlot::Recurrent(_) => None,
+                MixerProgramSlot::Attention(binding) => Some((binding, sublayer_scope(index, 0))),
+                _ => None,
             },
         ));
         let recurrent_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
             |(index, block)| match block.mixer() {
-                MixerProgramSlot::Recurrent(binding) => Some((binding, block_scope(index))),
-                MixerProgramSlot::Attention(_) => None,
+                MixerProgramSlot::Recurrent(binding) => Some((binding, sublayer_scope(index, 0))),
+                _ => None,
+            },
+        ));
+        let state_space_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.mixer() {
+                MixerProgramSlot::StateSpace(binding) => Some((binding, sublayer_scope(index, 0))),
+                _ => None,
+            },
+        ));
+        let short_conv_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.mixer() {
+                MixerProgramSlot::ShortConv(binding) => Some((binding, sublayer_scope(index, 0))),
+                _ => None,
             },
         ));
         let dense_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
-            |(index, block)| match block.feed_forward() {
-                FeedForwardProgramSlot::Dense(binding) => Some((binding, block_scope(index))),
-                FeedForwardProgramSlot::Routed(_) => None,
+            |(index, block)| match block.feed_forward()? {
+                FeedForwardProgramSlot::Dense(binding) => Some((binding, sublayer_scope(index, 1))),
+                FeedForwardProgramSlot::Routed(_)
+                | FeedForwardProgramSlot::GeneralRouted(_)
+                | FeedForwardProgramSlot::Parallel(_) => None,
             },
         ));
         let routed_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
-            |(index, block)| match block.feed_forward() {
-                FeedForwardProgramSlot::Routed(binding) => Some((binding, block_scope(index))),
-                FeedForwardProgramSlot::Dense(_) => None,
+            |(index, block)| match block.feed_forward()? {
+                FeedForwardProgramSlot::Routed(binding) => {
+                    Some((binding, sublayer_scope(index, 1)))
+                }
+                FeedForwardProgramSlot::Dense(_)
+                | FeedForwardProgramSlot::GeneralRouted(_)
+                | FeedForwardProgramSlot::Parallel(_) => None,
             },
         ));
+        let general_routed_layers =
+            BindingLayers::of(target.blocks().iter().enumerate().filter_map(|(index, block)| {
+                match block.feed_forward()? {
+                    FeedForwardProgramSlot::GeneralRouted(binding) => {
+                        Some((binding, sublayer_scope(index, 1)))
+                    }
+                    FeedForwardProgramSlot::Dense(_)
+                    | FeedForwardProgramSlot::Routed(_)
+                    | FeedForwardProgramSlot::Parallel(_) => None,
+                }
+            }));
+        let parallel_layers =
+            BindingLayers::of(target.blocks().iter().enumerate().filter_map(|(index, block)| {
+                match block.feed_forward()? {
+                    FeedForwardProgramSlot::Parallel(binding) => {
+                        Some((binding, sublayer_scope(index, 1)))
+                    }
+                    FeedForwardProgramSlot::Dense(_)
+                    | FeedForwardProgramSlot::Routed(_)
+                    | FeedForwardProgramSlot::GeneralRouted(_) => None,
+                }
+            }));
         for block in target.blocks() {
             match block.mixer() {
                 MixerProgramSlot::Attention(b) if !self.target.attention.contains_key(&b) => {
-                    if let Some(kernels) = self.attention(
-                        b.shape,
-                        b.norm,
-                        b.query_gate,
-                        b.key,
-                        b.value,
-                        b.output,
-                        b.activation,
-                        b.history,
-                        attention_layers.scopes(b),
-                    )? {
+                    if let Some(kernels) = self.attention(b, attention_layers.scopes(b))? {
                         self.target.attention.insert(b, kernels);
                     }
                 }
@@ -352,27 +423,74 @@ impl<'a> Preparation<'a> {
                         self.target.recurrent.insert(b, kernels);
                     }
                 }
-                MixerProgramSlot::Attention(_) | MixerProgramSlot::Recurrent(_) => {}
+                MixerProgramSlot::StateSpace(b) if !self.target.state_space.contains_key(&b) => {
+                    if let Some(kernels) = self.state_space(b, state_space_layers.scopes(b))? {
+                        self.target.state_space.insert(b, kernels);
+                    }
+                }
+                MixerProgramSlot::ShortConv(b) if !self.target.short_conv.contains_key(&b) => {
+                    if let Some(kernels) = self.short_conv(b, short_conv_layers.scopes(b))? {
+                        self.target.short_conv.insert(b, kernels);
+                    }
+                }
+                MixerProgramSlot::Attention(_)
+                | MixerProgramSlot::Recurrent(_)
+                | MixerProgramSlot::StateSpace(_)
+                | MixerProgramSlot::ShortConv(_) => {}
             }
             match block.feed_forward() {
-                FeedForwardProgramSlot::Dense(b) if !self.target.dense.contains_key(&b) => {
-                    if let Some(kernels) = self.dense(
-                        b.norm,
-                        b.gate,
-                        b.up,
-                        b.down,
-                        b.activation,
-                        dense_layers.scopes(b),
-                    )? {
+                Some(FeedForwardProgramSlot::Dense(b)) if !self.target.dense.contains_key(&b) => {
+                    if let Some(kernels) = self.dense(b, dense_layers.scopes(b))? {
                         self.target.dense.insert(b, kernels);
                     }
                 }
-                FeedForwardProgramSlot::Routed(b) if !self.target.routed.contains_key(&b) => {
+                Some(FeedForwardProgramSlot::Routed(b)) if !self.target.routed.contains_key(&b) => {
                     if let Some(kernels) = self.routed(b, routed_layers.scopes(b))? {
                         self.target.routed.insert(b, kernels);
                     }
                 }
-                FeedForwardProgramSlot::Dense(_) | FeedForwardProgramSlot::Routed(_) => {}
+                Some(FeedForwardProgramSlot::GeneralRouted(b))
+                    if !self.target.general_routed.contains_key(&b) =>
+                {
+                    if let Some(kernels) =
+                        self.general_routed(b, general_routed_layers.scopes(b))?
+                    {
+                        self.target.general_routed.insert(b, kernels);
+                    }
+                }
+                Some(FeedForwardProgramSlot::Parallel(b))
+                    if !self.target.parallel.contains_key(&b) =>
+                {
+                    if let Some(kernels) = self.parallel(b, parallel_layers.scopes(b))? {
+                        self.target.parallel.insert(b, kernels);
+                    }
+                }
+                Some(
+                    FeedForwardProgramSlot::Dense(_)
+                    | FeedForwardProgramSlot::Routed(_)
+                    | FeedForwardProgramSlot::GeneralRouted(_)
+                    | FeedForwardProgramSlot::Parallel(_),
+                )
+                | None => {}
+            }
+        }
+        let per_layer_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, block)| Some((block.per_layer()?, sublayer_scope(index, 2)))),
+        );
+        for b in target.blocks().iter().filter_map(|block| block.per_layer()) {
+            if !self.target.per_layer.contains_key(&b) {
+                if let Some(kernels) = self.per_layer(b, per_layer_layers.scopes(b))? {
+                    self.target.per_layer.insert(b, kernels);
+                }
+            }
+        }
+        if let Some(b) = target.per_layer() {
+            if let Some(kernels) = self.per_layer_entry(b)? {
+                self.target.per_layer_entry.insert(b, kernels);
             }
         }
         let b = target.readout();
@@ -409,6 +527,49 @@ impl<'a> Preparation<'a> {
                 self.target.features.insert(b, kernel);
             }
         }
+        if let Some(taps) = target.taps() {
+            self.taps(taps)?;
+        }
+        Ok(())
+    }
+
+    /// A separate draft's target taps: the tap, the fusion projection of the
+    /// taps (`project_rows` into F32) and the conditioning feature rows.
+    fn taps(&mut self, taps: &crate::TapProgramPlan) -> Result<(), CatalogFailure> {
+        let device = self.device;
+        let activation = taps.activation;
+        let bindings = format!("A={}", activation.name());
+        let tap = fixed!(
+            self.spec,
+            device,
+            tap_rows,
+            bindings,
+            tap_rows::Elements { A: activation }
+        );
+        let fusion = self.spec.tuned(
+            &mut self.tuner,
+            &ProjectRowsTuning {
+                weight: taps.fusion,
+                activation,
+                kind: WeightKind::DraftFusion,
+                output: Element::f32(),
+                scopes: vec![WeightScope::Draft],
+            },
+        )?;
+        let features = fixed!(
+            self.spec,
+            device,
+            feature_rows,
+            bindings,
+            feature_rows::Elements { A: activation }
+        );
+        if let (Some(tap), Some(fusion), Some(features)) = (tap, fusion, features) {
+            self.target.taps = Some(TapKernels {
+                tap,
+                fusion,
+                features,
+            });
+        }
         Ok(())
     }
 
@@ -436,28 +597,21 @@ impl<'a> Preparation<'a> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn attention(
         &mut self,
-        shape: AttentionShape,
-        norm: Element,
-        query_gate: Element,
-        key: Element,
-        value: Element,
-        output: Element,
-        activation: Element,
-        history: KvCodec,
+        binding: AttentionBinding,
         scopes: Vec<WeightScope>,
     ) -> Result<Option<AttentionKernels>, CatalogFailure> {
+        let AttentionBinding {
+            shape,
+            activation,
+            output,
+            ..
+        } = binding;
         let project = self.spec.tuned(
             &mut self.tuner,
             &AttentionProjectTuning {
-                norm,
-                query_gate,
-                key,
-                value,
-                activation,
-                shape,
+                binding,
                 scopes: scopes.clone(),
                 epsilon: self.epsilon,
             },
@@ -469,7 +623,7 @@ impl<'a> Preparation<'a> {
             epsilon: self.epsilon,
         };
         let history =
-            match history {
+            match binding.history {
                 KvCodec::Dense => {
                     let decode = self
                         .spec
@@ -494,25 +648,130 @@ impl<'a> Preparation<'a> {
                 }
                 KvCodec::RotatedK4V4 => {
                     return Err(CatalogFailure::Preparation {
-                        entry: "gated_attention_decode",
+                        entry: "attention_decode",
                         bindings: format!("{shape:?}"),
                         outcome: "the native path has no rotated K4/V4 history entries".into(),
                     })
                 }
             };
-        let output = self.spec.tuned(
-            &mut self.tuner,
-            &AttentionOutputTuning {
-                output,
-                activation,
-                shape,
-                scopes,
-            },
-        )?;
+        let output = match binding.tail {
+            SublayerTail::Residual => self
+                .spec
+                .tuned(
+                    &mut self.tuner,
+                    &AttentionOutputTuning {
+                        output,
+                        activation,
+                        shape,
+                        scopes,
+                    },
+                )?
+                .map(SublayerOutput::Residual),
+            SublayerTail::PostNorm { norm, .. } => self
+                .post_norm(WeightKind::AttentionOutput, output, activation, norm, scopes)?
+                .map(SublayerOutput::PostNorm),
+        };
         Ok(match (project, history, output) {
             (Some(project), Some(history), Some(output)) => Some(AttentionKernels {
                 project,
                 history,
+                output,
+            }),
+            _ => None,
+        })
+    }
+
+    /// The state-space entries (`operators::state_space`): the projection and
+    /// output reuse the attention projection entries at this geometry.
+    fn state_space(
+        &mut self,
+        binding: StateSpaceBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<StateSpaceKernels>, CatalogFailure> {
+        let device = self.device;
+        let project = self.spec.tuned(
+            &mut self.tuner,
+            &StateSpaceProjectTuning {
+                binding,
+                scopes: scopes.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let state = || StateSpaceState {
+            activation: binding.activation,
+            shape: binding.shape,
+            scopes: scopes.clone(),
+        };
+        let step = self
+            .spec
+            .tuned(&mut self.tuner, &StateSpaceStepTuning(state()))?;
+        let chunk = self
+            .spec
+            .tuned(&mut self.tuner, &StateSpaceChunkTuning(state()))?;
+        let shape = binding.shape;
+        let gate = fixed!(
+            self.spec,
+            device,
+            state_space_gate,
+            format!("{binding:?}"),
+            state_space_gate::Elements {
+                A: binding.activation
+            },
+            statics &[("G", shape.norm_groups()), ("U", shape.norm_heads), ("P", shape.head_width)]
+        );
+        let output = self.spec.tuned(
+            &mut self.tuner,
+            &StateSpaceOutputTuning {
+                binding,
+                scopes,
+            },
+        )?;
+        Ok(match (project, step, chunk, gate, output) {
+            (Some(project), Some(step), Some(chunk), Some(gate), Some(output)) => {
+                Some(StateSpaceKernels {
+                    project,
+                    step,
+                    chunk,
+                    gate,
+                    output,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// The short-convolution entries (`operators::short_conv`): the output
+    /// reuses the attention output entry at one head of `channels`.
+    fn short_conv(
+        &mut self,
+        binding: ShortConvBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<ShortConvKernels>, CatalogFailure> {
+        let device = self.device;
+        let project = self.spec.tuned(
+            &mut self.tuner,
+            &ShortConvProjectTuning {
+                binding,
+                scopes: scopes.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let rows = fixed!(
+            self.spec,
+            device,
+            short_conv_rows,
+            format!("{binding:?}"),
+            short_conv_rows::Elements {
+                A: binding.activation
+            }
+        );
+        let output = self
+            .spec
+            .tuned(&mut self.tuner, &ShortConvOutputTuning { binding, scopes })?;
+        Ok(match (project, rows, output) {
+            (Some(project), Some(rows), Some(output)) => Some(ShortConvKernels {
+                project,
+                rows,
                 output,
             }),
             _ => None,
@@ -578,13 +837,18 @@ impl<'a> Preparation<'a> {
 
     fn dense(
         &mut self,
-        norm: Element,
-        gate: Element,
-        up: Element,
-        down: Element,
-        activation: Element,
+        binding: DenseBinding,
         scopes: Vec<WeightScope>,
     ) -> Result<Option<DenseKernels>, CatalogFailure> {
+        let DenseBinding {
+            features: _,
+            norm,
+            gate,
+            up,
+            down,
+            activation,
+            tail,
+        } = binding;
         let expand = self.spec.tuned(
             &mut self.tuner,
             &DenseExpandTuning {
@@ -592,20 +856,426 @@ impl<'a> Preparation<'a> {
                 gate,
                 up,
                 activation,
+                gate_kind: WeightKind::DenseGate,
+                up_kind: WeightKind::DenseUp,
+                // SiLU: the admitted dense form.
+                function: 0,
                 scopes: scopes.clone(),
                 epsilon: self.epsilon,
             },
         )?;
-        let output = self.spec.tuned(
+        let output = match tail {
+            SublayerTail::Residual => self
+                .spec
+                .tuned(
+                    &mut self.tuner,
+                    &DenseOutputTuning {
+                        down,
+                        activation,
+                        down_kind: WeightKind::DenseDown,
+                        scopes,
+                    },
+                )?
+                .map(SublayerOutput::Residual),
+            SublayerTail::PostNorm { norm, .. } => self
+                .post_norm(WeightKind::DenseDown, down, activation, norm, scopes)?
+                .map(SublayerOutput::PostNorm),
+        };
+        Ok(match (expand, output) {
+            (Some(expand), Some(output)) => Some(DenseKernels { expand, output }),
+            _ => None,
+        })
+    }
+
+    /// A per-layer input sublayer: its gate, then the post-norm tail of its
+    /// projection back to the hidden width.
+    fn per_layer(
+        &mut self,
+        binding: crate::PerLayerBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<PerLayerKernels>, CatalogFailure> {
+        let SublayerTail::PostNorm { norm, .. } = binding.tail else {
+            return Err(CatalogFailure::Preparation {
+                entry: "per_layer_gate",
+                bindings: format!("{binding:?}"),
+                outcome: "a per-layer input sublayer ends in a post-norm tail".into(),
+            });
+        };
+        let gate = self.spec.tuned(
             &mut self.tuner,
-            &DenseOutputTuning {
+            &super::tuning::per_layer::PerLayerGateTuning {
+                binding,
+                scopes: scopes.clone(),
+            },
+        )?;
+        let output = self.post_norm(
+            WeightKind::PerLayerProjection,
+            binding.projection,
+            binding.activation,
+            norm,
+            scopes,
+        )?;
+        Ok(gate
+            .zip(output)
+            .map(|(gate, output)| PerLayerKernels { gate, output }))
+    }
+
+    /// The per-layer entry: the embedding's projection into F32 per-layer
+    /// channels and their combination with the host-table rows.
+    fn per_layer_entry(
+        &mut self,
+        binding: crate::PerLayerEntryBinding,
+    ) -> Result<Option<PerLayerEntryKernels>, CatalogFailure> {
+        let project = self.spec.tuned(
+            &mut self.tuner,
+            &ProjectRowsTuning {
+                weight: binding.projection,
+                activation: binding.activation,
+                kind: WeightKind::PerLayerModelProjection,
+                output: Element::f32(),
+                scopes: vec![WeightScope::Target],
+            },
+        )?;
+        let device = self.device;
+        let spec = &mut self.spec;
+        let activation = binding
+            .activation
+            .dtype()
+            .ok_or_else(|| CatalogFailure::Preparation {
+                entry: "import_dense",
+                bindings: format!("{binding:?}"),
+                outcome: "the activation element is not dense".into(),
+            })?;
+        let round = fixed!(
+            spec,
+            device,
+            import_dense,
+            dense_binding_name(seismic::DType::F32, activation),
+            import_dense::Elements {
+                E: Element::f32(),
+                U: binding.activation,
+            }
+        );
+        let table = match (binding.table_source.dtype(), binding.table.dtype()) {
+            (Some(source), Some(resident)) => fixed!(
+                spec,
+                device,
+                import_dense,
+                dense_binding_name(source, resident),
+                import_dense::Elements {
+                    E: binding.table_source,
+                    U: binding.table,
+                }
+            )
+            .map(TableConversion::Dense),
+            _ => fixed!(
+                spec,
+                device,
+                repack_weight,
+                element_binding_name(binding.table_source, binding.table),
+                repack_weight::Elements {
+                    E: binding.table_source,
+                    U: binding.table,
+                }
+            )
+            .map(TableConversion::Repack),
+        };
+        let copy = fixed!(spec, device, conditioning_overlay, "fixed");
+        let inputs = self.spec.fixed::<per_layer_inputs::Entry>(
+            &format!("TW={},NW={}", binding.table.name(), binding.norm.name()),
+            &[("L", binding.layers), ("P", binding.width)],
+            |specialization| {
+                per_layer_inputs::native_for_device_with(
+                    device,
+                    per_layer_inputs::Elements {
+                        TW: binding.table,
+                        NW: binding.norm,
+                    },
+                    specialization,
+                )
+            },
+        )?;
+        Ok(match (round, project, table, inputs, copy) {
+            (Some(round), Some(project), Some(table), Some(inputs), Some(copy)) => {
+                Some(PerLayerEntryKernels {
+                    round,
+                    project,
+                    table,
+                    inputs,
+                    copy,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// A dense branch beside a routed branch; `scopes` are the parallel
+    /// sublayers' scopes, whose branches hold the weights.
+    fn parallel(
+        &mut self,
+        binding: crate::ParallelBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<ParallelKernels>, CatalogFailure> {
+        let branch_scopes = |branch: usize| {
+            scopes
+                .iter()
+                .map(|scope| match *scope {
+                    WeightScope::TargetSublayer(sublayer) => {
+                        Ok(crate::operators::parallel::DenseBesideRouted::scopes(sublayer)[branch])
+                    }
+                    other => Err(CatalogFailure::Preparation {
+                        entry: "moe_tail",
+                        bindings: format!("{binding:?}"),
+                        outcome: format!("parallel branches in {other:?}"),
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let (dense_scopes, routed_scopes) = (branch_scopes(0)?, branch_scopes(1)?);
+        let dense = binding.dense;
+        let expand = self.spec.tuned(
+            &mut self.tuner,
+            &DenseExpandTuning {
+                norm: dense.norm,
+                gate: dense.gate,
+                up: dense.up,
+                activation: dense.activation,
+                gate_kind: WeightKind::DenseGate,
+                up_kind: WeightKind::DenseUp,
+                function: 0,
+                scopes: dense_scopes.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let down = self.spec.tuned(
+            &mut self.tuner,
+            &ProjectRowsTuning {
+                weight: dense.down,
+                activation: dense.activation,
+                kind: WeightKind::DenseDown,
+                output: Element::f32(),
+                scopes: dense_scopes,
+            },
+        )?;
+        let routed = self.general_routed(binding.routed, routed_scopes)?;
+        let device = self.device;
+        let tail = fixed!(
+            self.spec,
+            device,
+            moe_tail,
+            format!("NW={}", binding.norm.name()),
+            moe_tail::Elements { NW: binding.norm }
+        );
+        Ok(match (expand, down, routed, tail) {
+            (Some(expand), Some(down), Some(routed), Some(tail)) => Some(ParallelKernels {
+                expand,
                 down,
+                routed,
+                tail,
+            }),
+            _ => None,
+        })
+    }
+
+    /// A post-norm tail: the output projection `kind` into F32 rows, then the
+    /// row op that normalizes them into the residual.
+    fn post_norm(
+        &mut self,
+        kind: WeightKind,
+        weight: Element,
+        activation: Element,
+        norm: Element,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<PostNormKernels>, CatalogFailure> {
+        let project = self.spec.tuned(
+            &mut self.tuner,
+            &ProjectRowsTuning {
+                weight,
                 activation,
+                kind,
+                output: Element::f32(),
                 scopes,
             },
         )?;
-        Ok(match (expand, output) {
-            (Some(expand), Some(output)) => Some(DenseKernels { expand, output }),
+        let device = self.device;
+        let residual = fixed!(
+            self.spec,
+            device,
+            post_norm_residual,
+            format!("NW={}", norm.name()),
+            post_norm_residual::Elements { NW: norm }
+        );
+        Ok(project
+            .zip(residual)
+            .map(|(project, residual)| PostNormKernels { project, residual }))
+    }
+
+    /// The general routed entries (`operators::routed`), with the shared
+    /// expert and latent projections as dense entries over their own weight
+    /// kinds.
+    fn general_routed(
+        &mut self,
+        binding: GeneralRoutedBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<GeneralRoutedKernels>, CatalogFailure> {
+        let shape = binding.shape;
+        let activation = binding.activation;
+        let epsilon = self.epsilon;
+        let select = self.spec.tuned(
+            &mut self.tuner,
+            &RoutedSelectTuning {
+                binding,
+                scopes: scopes.clone(),
+                epsilon,
+            },
+        )?;
+        let decode = || RoutedExpandDecodeTuning {
+            binding,
+            scopes: scopes.clone(),
+        };
+        let tiles = || RoutedExpertTilesTuning {
+            binding,
+            scopes: scopes.clone(),
+        };
+        let experts = if shape.experts_expansion.gated {
+            let decode = self
+                .spec
+                .tuned(&mut self.tuner, &RoutedGateUpTuning(decode()))?;
+            let grouped = self
+                .spec
+                .tuned(&mut self.tuner, &RoutedGatedTilesTuning(tiles()))?;
+            decode
+                .zip(grouped)
+                .map(|(decode, grouped)| ExpertKernels::Gated { decode, grouped })
+        } else {
+            let decode = self.spec.tuned(&mut self.tuner, &RoutedUpTuning(decode()))?;
+            let grouped = self
+                .spec
+                .tuned(&mut self.tuner, &RoutedUpTilesTuning(tiles()))?;
+            decode
+                .zip(grouped)
+                .map(|(decode, grouped)| ExpertKernels::Plain { decode, grouped })
+        };
+        let down = self.spec.tuned(
+            &mut self.tuner,
+            &RoutedDownTuning {
+                binding,
+                scopes: scopes.clone(),
+            },
+        )?;
+        let group = self.spec.tuned(
+            &mut self.tuner,
+            &RoutedGroupTuning {
+                shape: routing_shape(&binding),
+            },
+        )?;
+        let scatter = self
+            .spec
+            .tuned(&mut self.tuner, &RoutedScatterTuning { binding })?;
+        let shared = match (shape.shared, binding.shared) {
+            (Some((_, expansion)), Some((gate, up, down))) => {
+                let expansion = match gate {
+                    Some(gate) => self
+                        .spec
+                        .tuned(
+                            &mut self.tuner,
+                            &DenseExpandTuning {
+                                norm: binding.norm,
+                                gate,
+                                up,
+                                activation,
+                                gate_kind: WeightKind::SharedGate,
+                                up_kind: WeightKind::SharedUp,
+                                function: expansion.activation,
+                                scopes: scopes.clone(),
+                                epsilon,
+                            },
+                        )?
+                        .map(DenseExpansionKernel::Gated),
+                    None => self
+                        .spec
+                        .tuned(
+                            &mut self.tuner,
+                            &DenseUpTuning {
+                                norm: binding.norm,
+                                up,
+                                activation,
+                                up_kind: WeightKind::SharedUp,
+                                function: expansion.activation,
+                                scopes: scopes.clone(),
+                                epsilon,
+                            },
+                        )?
+                        .map(DenseExpansionKernel::Plain),
+                };
+                let output = self.spec.tuned(
+                    &mut self.tuner,
+                    &DenseOutputTuning {
+                        down,
+                        activation,
+                        down_kind: WeightKind::SharedDown,
+                        scopes: scopes.clone(),
+                    },
+                )?;
+                Some(expansion.zip(output))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(CatalogFailure::Preparation {
+                    entry: "dense_output",
+                    bindings: format!("{binding:?}"),
+                    outcome: "the shared expert's shape and binding disagree".into(),
+                })
+            }
+        };
+        let latent = match binding.latent {
+            Some((down, up)) => {
+                let project = self.spec.tuned(
+                    &mut self.tuner,
+                    &ProjectRowsTuning {
+                        weight: down,
+                        activation,
+                        kind: WeightKind::LatentDown,
+                        output: activation,
+                        scopes: scopes.clone(),
+                    },
+                )?;
+                let output = self.spec.tuned(
+                    &mut self.tuner,
+                    &DenseOutputTuning {
+                        down: up,
+                        activation,
+                        down_kind: WeightKind::LatentUp,
+                        scopes,
+                    },
+                )?;
+                Some(project.zip(output))
+            }
+            None => None,
+        };
+        // `None` anywhere is a tuning census or a missing implementation.
+        Ok(match (select, experts, down, group, scatter) {
+            (Some(select), Some(experts), Some(down), Some(group), Some(scatter)) => {
+                let shared = match shared {
+                    Some(Some(shared)) => Some(shared),
+                    Some(None) => return Ok(None),
+                    None => None,
+                };
+                let latent = match latent {
+                    Some(Some(latent)) => Some(latent),
+                    Some(None) => return Ok(None),
+                    None => None,
+                };
+                Some(GeneralRoutedKernels {
+                    select,
+                    experts,
+                    down,
+                    group,
+                    scatter,
+                    shared,
+                    latent,
+                })
+            }
             _ => None,
         })
     }
@@ -704,13 +1374,18 @@ impl<'a> Preparation<'a> {
         let Some(head_plan) = plan.head() else {
             return Ok(());
         };
-        let layers = BindingLayers::of(
-            head_plan
-                .blocks()
-                .iter()
-                .enumerate()
-                .map(|(index, binding)| (*binding, head_scope(index))),
-        );
+        let scoped = |scope: fn(usize) -> WeightScope| {
+            BindingLayers::of(
+                head_plan
+                    .blocks()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, binding)| (*binding, scope(index))),
+            )
+        };
+        let layers = scoped(head_scope);
+        let attention_layers = scoped(|index| head_sublayer_scope(index, 0));
+        let feed_forward_layers = scoped(|index| head_sublayer_scope(index, 1));
         for &b in head_plan.blocks() {
             if self
                 .head
@@ -732,32 +1407,23 @@ impl<'a> Preparation<'a> {
                     epsilon: self.epsilon,
                 },
             )?;
-            let attention = self.attention(
-                b.attention_shape,
-                b.input_norm,
-                b.query_gate,
-                b.key,
-                b.value,
-                b.attention_output,
-                b.activation,
-                // The draft head's history is always dense.
-                KvCodec::Dense,
-                layers.scopes(b),
-            )?;
+            // The draft head's history is always dense (its binding says so).
+            let attention = self.attention(b.attention, attention_layers.scopes(b))?;
             let feed_forward = match b.feed_forward {
                 FeedForwardProgramSlot::Dense(binding) => self
-                    .dense(
-                        binding.norm,
-                        binding.gate,
-                        binding.up,
-                        binding.down,
-                        binding.activation,
-                        layers.scopes(b),
-                    )?
+                    .dense(binding, feed_forward_layers.scopes(b))?
                     .map(AttestedFeedForward::Dense),
                 FeedForwardProgramSlot::Routed(binding) => self
-                    .routed(binding, layers.scopes(b))?
+                    .routed(binding, feed_forward_layers.scopes(b))?
                     .map(AttestedFeedForward::Routed),
+                // `operators::admit` keeps draft heads on the fused form.
+                FeedForwardProgramSlot::GeneralRouted(_) | FeedForwardProgramSlot::Parallel(_) => {
+                    return Err(CatalogFailure::Preparation {
+                        entry: "routed_select",
+                        bindings: format!("{b:?}"),
+                        outcome: "draft heads run the fused routed form only".into(),
+                    })
+                }
             };
             let features = self.features(&bindings, b.output_norm, b.activation)?;
             let logits = self.spec.tuned(
@@ -788,6 +1454,13 @@ impl<'a> Preparation<'a> {
                     AttestedFeedForward::Routed(routed) => {
                         head.routed.insert(b, routed);
                     }
+                    AttestedFeedForward::GeneralRouted(_) | AttestedFeedForward::Parallel(_) => {
+                        return Err(CatalogFailure::Preparation {
+                            entry: "routed_select",
+                            bindings: format!("{b:?}"),
+                            outcome: "draft heads run the fused routed form only".into(),
+                        })
+                    }
                 }
                 head.features.insert(b, features);
                 head.logits.insert(b, logits);
@@ -810,81 +1483,232 @@ impl<'a> Preparation<'a> {
         Ok(())
     }
 
+    /// A separate draft: per distinct binding, its layers' attention (block
+    /// and injection) and dense entries; the block embedding; the output
+    /// norm and projection of the proposing rows; DSpark's chain entries.
+    fn draft(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        let Some(draft_plan) = plan.draft() else {
+            return Ok(());
+        };
+        let device = self.device;
+        let draft_scope = |index: usize, sublayer: u32| {
+            WeightScope::DraftSublayer(SublayerIndex {
+                block: u32::try_from(index).expect("draft block count fits u32"),
+                sublayer,
+            })
+        };
+        let attention_layers = BindingLayers::of(
+            draft_plan
+                .blocks()
+                .iter()
+                .enumerate()
+                .flat_map(|(index, b)| {
+                    [(b.attention, draft_scope(index, 0)), (b.injection, draft_scope(index, 0))]
+                }),
+        );
+        let dense_layers = BindingLayers::of(
+            draft_plan
+                .blocks()
+                .iter()
+                .enumerate()
+                .map(|(index, b)| (b.feed_forward, draft_scope(index, 1))),
+        );
+        for b in draft_plan.blocks() {
+            for attention in [b.attention, b.injection] {
+                if self.draft_kernels().attention.contains_key(&attention) {
+                    continue;
+                }
+                if let Some(kernels) = self.attention(attention, attention_layers.scopes(attention))? {
+                    self.draft_kernels().attention.insert(attention, kernels);
+                }
+            }
+            if !self.draft_kernels().dense.contains_key(&b.feed_forward) {
+                if let Some(kernels) =
+                    self.dense(b.feed_forward, dense_layers.scopes(b.feed_forward))?
+                {
+                    self.draft_kernels().dense.insert(b.feed_forward, kernels);
+                }
+            }
+        }
+        let b = draft_plan.embedding();
+        let embedding = self.spec.fixed::<embedding_rows::Entry>(
+            &format!("{b:?}"),
+            &[("D", self.hidden)],
+            |specialization| {
+                embedding_rows::native_for_device_with(
+                    device,
+                    embedding_rows::Elements {
+                        EW: b.table,
+                        A: b.activation,
+                    },
+                    specialization,
+                )
+            },
+        )?;
+        let head = self.spec.tuned(
+            &mut self.tuner,
+            &HeadRowsTuning {
+                norm: draft_plan.output_norm(),
+                weight: draft_plan.projection(),
+                activation: draft_plan.activation(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let markov = match draft_plan.markov() {
+            None => None,
+            Some(markov) => {
+                let activation = draft_plan.activation();
+                let bindings = format!("{markov:?}");
+                let rank = markov.rank;
+                let embedding = self.spec.fixed::<embedding_rows::Entry>(
+                    &bindings,
+                    &[("D", rank)],
+                    |specialization| {
+                        embedding_rows::native_for_device_with(
+                            device,
+                            embedding_rows::Elements {
+                                EW: markov.embedding,
+                                A: activation,
+                            },
+                            specialization,
+                        )
+                    },
+                )?;
+                let projection = self.spec.tuned(
+                    &mut self.tuner,
+                    &DenseOutputTuning {
+                        down: markov.projection,
+                        activation,
+                        down_kind: WeightKind::MarkovProjection,
+                        scopes: vec![WeightScope::Draft],
+                    },
+                )?;
+                let features =
+                    self.features(&bindings, draft_plan.output_norm(), activation)?;
+                let confidence = fixed!(
+                    self.spec,
+                    device,
+                    draft_confidence,
+                    bindings,
+                    draft_confidence::Elements { A: activation },
+                    statics &[("D", self.hidden), ("R", rank)]
+                );
+                match (embedding, projection, features, confidence) {
+                    (Some(embedding), Some(projection), Some(features), Some(confidence)) => {
+                        Some(MarkovKernels {
+                            embedding,
+                            projection,
+                            features,
+                            confidence,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+        };
+        let draft = self.draft_kernels();
+        draft.embedding = embedding;
+        draft.head = head;
+        draft.markov = markov;
+        Ok(())
+    }
+
+    fn draft_kernels(&mut self) -> &mut DraftKernels {
+        self.draft.as_mut().expect("a draft plan creates the draft group")
+    }
+
     fn vision(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
         let Some(vision_plan) = plan.vision() else {
             return Ok(());
         };
         let (device, spec) = (self.device, &mut self.spec);
-        let statics = self
-            .vision_statics
-            .expect("a vision plan has a vision definition");
         let vision = self
             .vision
             .as_mut()
             .expect("a vision plan creates the vision group");
-        let b = vision_plan.patch();
-        if let Some(kernel) = fixed!(
-            spec,
-            device,
-            qwen_vision_stem,
-            format!("{b:?}"),
-            qwen_vision_stem::Elements {
-                W0: b.temporal_weight_0,
-                W1: b.temporal_weight_1,
-                B: b.bias,
-                PE: b.position,
-            },
-            statics & statics.stem
-        ) {
-            vision.stem.insert(b, kernel);
-        }
-        for &b in vision_plan.blocks() {
-            if vision.blocks.contains_key(&b) {
-                continue;
+        for kernel in vision_plan.kernels() {
+            let label = format!("{kernel:?}");
+            let statics = kernel.statics.as_slice();
+            macro_rules! element {
+                ($module:ident, $name:literal) => {
+                    super::vision::element(<$module::Entry as seismic::Entry>::NAME, kernel, $name)?
+                };
             }
-            if let Some(kernel) = fixed!(
-                spec,
-                device,
-                qwen_vision_block,
-                format!("{b:?}"),
-                qwen_vision_block::Elements {
-                    A: b.activation,
-                    N1W: b.input_norm_weight,
-                    N1B: b.input_norm_bias,
-                    QW: b.qkv_weight,
-                    QB: b.qkv_bias,
-                    PW: b.attention_output,
-                    PB: b.attention_output_bias,
-                    N2W: b.feedforward_norm_weight,
-                    N2B: b.feedforward_norm_bias,
-                    UW: b.up,
-                    UB: b.up_bias,
-                    DW: b.down,
-                    DB: b.down_bias,
-                },
-                statics & statics.block
-            ) {
-                vision.blocks.insert(b, kernel);
+            macro_rules! prepare {
+                ($module:ident, $map:ident, $elements:expr) => {{
+                    let elements = $elements;
+                    if let Some(native) = fixed!(spec, device, $module, label, elements, statics & statics) {
+                        vision.$map.insert(kernel.clone(), native);
+                    }
+                }};
             }
-        }
-        let b = vision_plan.merger();
-        if let Some(kernel) = fixed!(
-            spec,
-            device,
-            qwen_vision_merger,
-            format!("{b:?}"),
-            qwen_vision_merger::Elements {
-                A: b.activation,
-                NW: b.output_norm_weight,
-                NB: b.output_norm_bias,
-                UW: b.hidden,
-                UB: b.hidden_bias,
-                DW: b.output,
-                DB: b.output_bias,
-            },
-            statics & statics.merger
-        ) {
-            vision.merger.insert(b, kernel);
+            match kernel.entry {
+                VisionEntry::PatchStem => prepare!(
+                    vision_patch_stem,
+                    patch_stem,
+                    vision_patch_stem::Elements {
+                        W0: element!(vision_patch_stem, "W0"),
+                        W1: element!(vision_patch_stem, "W1"),
+                        B: element!(vision_patch_stem, "B"),
+                        PE: element!(vision_patch_stem, "PE"),
+                    }
+                ),
+                VisionEntry::Norm => prepare!(
+                    vision_norm,
+                    norm,
+                    vision_norm::Elements {
+                        NWE: element!(vision_norm, "NWE"),
+                        NBE: element!(vision_norm, "NBE"),
+                        Y: element!(vision_norm, "Y"),
+                    }
+                ),
+                VisionEntry::Linear => prepare!(
+                    vision_linear,
+                    linear,
+                    vision_linear::Elements {
+                        A: element!(vision_linear, "A"),
+                        W: element!(vision_linear, "W"),
+                        B: element!(vision_linear, "B"),
+                        Y: element!(vision_linear, "Y"),
+                    }
+                ),
+                VisionEntry::Clamp => prepare!(
+                    vision_clamp,
+                    clamp,
+                    vision_clamp::Elements {
+                        A: element!(vision_clamp, "A"),
+                    }
+                ),
+                VisionEntry::Attention => prepare!(
+                    vision_attention,
+                    attention,
+                    vision_attention::Elements {
+                        A: element!(vision_attention, "A"),
+                    }
+                ),
+                VisionEntry::Pool => prepare!(
+                    vision_pool,
+                    pool,
+                    vision_pool::Elements {
+                        SB: element!(vision_pool, "SB"),
+                        SS: element!(vision_pool, "SS"),
+                    }
+                ),
+                VisionEntry::Position => prepare!(
+                    vision_position,
+                    position,
+                    vision_position::Elements {
+                        PE: element!(vision_position, "PE"),
+                    }
+                ),
+                VisionEntry::PostNormResidual => prepare!(
+                    post_norm_residual,
+                    post_norm,
+                    post_norm_residual::Elements {
+                        NW: element!(post_norm_residual, "NW"),
+                    }
+                ),
+            }
         }
         Ok(())
     }

@@ -12,15 +12,18 @@ use super::{DeviceSubmission, HeadProgram};
 use crate::{
     completion::CompletionWaiter,
     native::{draft_vocabulary, AttestedFeedForward, AttestedHead, AttestedHeadBlock},
+    operators::attention::graph::{
+        self as attention_graph, attention_weights, AttentionBlock, AttentionGraphEntries,
+        CheckedAttentionEntries,
+    },
+    operators::dense_ffn::graph::{
+        dimensions as dense_dimensions, CheckedDenseEntries, DenseGraphEntries,
+    },
+    operators::output::TailEntries,
+    operators::routed::fused_graph::{self as routed, CheckedRoutedEntries, RoutedGraphEntries},
     programs::{
-        graph::attention::{
-            self as attention_graph, AttentionBlock, AttentionGraphEntries, AttentionWeights,
-            CheckedAttentionEntries,
-        },
-        graph::dense::{dimensions as dense_dimensions, CheckedDenseEntries, DenseGraphEntries},
         graph::draft::GraphDraft,
         graph::readout::{self, shapes, SelectionPorts},
-        graph::routed::{self, CheckedRoutedEntries, RoutedGraphEntries},
         graph::RowForm,
         native_constants::{
             distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
@@ -32,9 +35,9 @@ use crate::{
     ResidentWeight, ResourceLimits, SubmitError, ValidatedHeadLaunch,
 };
 use magnitude_batching::{row_class, TargetBatchUpload};
+use crate::operators::{self, paired_block, Mixer};
 use magnitude_family_contracts::{
-    ActivationDType, AttentionGeometry, DecoderGeometry, ExpertGeometry, WeightKind, WeightRole,
-    WeightScope,
+    ActivationDType, Decoder, HeadBlock, SublayerIndex, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::{
     dense_expand, dense_output, draft_rows, head_logits_rows, readout_features_rows, sample_rows,
@@ -186,8 +189,8 @@ enum HeadFeedForwardEntries<'a, G: GraphDraft + 'a> {
 }
 
 impl<'a> HeadGraphEntries<'a, NativeGraph> {
-    fn prepared(block: &'a AttestedHeadBlock, head: &'a AttestedHead) -> Self {
-        Self {
+    fn prepared(block: &'a AttestedHeadBlock, head: &'a AttestedHead) -> Result<Self, String> {
+        Ok(Self {
             input: &block.input,
             attention: (&block.attention).into(),
             feed_forward: match &block.feed_forward {
@@ -197,12 +200,16 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
                 AttestedFeedForward::Routed(handles) => {
                     HeadFeedForwardEntries::Routed(handles.into())
                 }
+                // `operators::admit` keeps draft heads on the fused form.
+                AttestedFeedForward::GeneralRouted(_) | AttestedFeedForward::Parallel(_) => {
+                    return Err("draft head routed feed-forward form".into())
+                }
             },
             features: &block.features,
             logits: &block.logits,
             shape: &head.shape,
             sample: &head.sample,
-        }
+        })
     }
 }
 
@@ -221,8 +228,8 @@ enum CheckedHeadFeedForwardEntries {
 }
 
 impl CheckedHeadEntries {
-    fn new(binding: HeadBinding) -> Self {
-        Self {
+    fn new(binding: HeadBinding) -> Result<Self, String> {
+        Ok(Self {
             input: [
                 ("EW", binding.embedding_table),
                 ("A", binding.activation),
@@ -230,16 +237,7 @@ impl CheckedHeadEntries {
                 ("HN", binding.hidden_norm),
                 ("CW", binding.combine),
             ],
-            attention: CheckedAttentionEntries::new(crate::AttentionBinding {
-                shape: binding.attention_shape,
-                norm: binding.input_norm,
-                query_gate: binding.query_gate,
-                key: binding.key,
-                value: binding.value,
-                output: binding.attention_output,
-                activation: binding.activation,
-                history: magnitude_state::KvCodec::Dense,
-            }),
+            attention: CheckedAttentionEntries::new(binding.attention),
             feed_forward: match binding.feed_forward {
                 FeedForwardProgramSlot::Dense(binding) => {
                     CheckedHeadFeedForwardEntries::Dense(CheckedDenseEntries::new(binding))
@@ -247,11 +245,15 @@ impl CheckedHeadEntries {
                 FeedForwardProgramSlot::Routed(binding) => {
                     CheckedHeadFeedForwardEntries::Routed(CheckedRoutedEntries::new(binding))
                 }
+                // `operators::admit` keeps draft heads on the fused form.
+                FeedForwardProgramSlot::GeneralRouted(_) | FeedForwardProgramSlot::Parallel(_) => {
+                    return Err("draft head routed feed-forward form".into())
+                }
             },
             features: [("NW", binding.output_norm), ("A", binding.activation)],
             logits: [("OW", binding.projection), ("A", binding.activation)],
             selection: [],
-        }
+        })
     }
 
     fn entries(&self) -> Result<HeadGraphEntries<'_, NativeGraphMetadata>, String> {
@@ -341,8 +343,8 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
     graph: G,
     entries: HeadGraphEntries<'a, G>,
     load: &ModelLoadPlan,
-    geometry: &DecoderGeometry,
-    attention: &AttentionGeometry,
+    geometry: &Decoder,
+    head: &HeadBlock,
     feed_forward: FeedForwardProgramSlot,
     class: HeadGraphClass,
 ) -> Result<HeadGraphParts<G::Plan>, String> {
@@ -351,7 +353,7 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
         entries,
         load,
         geometry,
-        attention,
+        head,
         feed_forward,
         class,
     )?
@@ -362,8 +364,8 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     mut graph: G,
     entries: HeadGraphEntries<'a, G>,
     load: &ModelLoadPlan,
-    geometry: &DecoderGeometry,
-    attention: &AttentionGeometry,
+    geometry: &Decoder,
+    head: &HeadBlock,
     feed_forward: FeedForwardProgramSlot,
     class: HeadGraphClass,
 ) -> Result<HeadGraphParts<G>, String> {
@@ -377,7 +379,11 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     }
     let hidden = geometry.hidden;
     let vocabulary = geometry.vocabulary;
-    let epsilon = geometry.epsilon as f32;
+    let paired = paired_block(&head.block).map_err(|error| error.to_string())?;
+    let Mixer::Attention(attention) = paired.mixer else {
+        return Err("draft head block must attend".into());
+    };
+    let epsilon = paired.epsilon() as f32;
     let mut weights = Vec::new();
     macro_rules! weight {
         ($scope:expr, $kind:expr) => {
@@ -392,20 +398,31 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             )?
         };
     }
+    // The one supported head block: its own weights, then its attention and
+    // feed-forward sublayers.
     let head = WeightScope::HeadBlock(0);
+    let [attention_scope, feed_forward_scope] =
+        [0, 1].map(|sublayer| WeightScope::HeadSublayer(SublayerIndex { block: 0, sublayer }));
     let table = weight!(WeightScope::Target, WeightKind::Embedding);
     let embedding_norm = weight!(head, WeightKind::HeadEmbeddingNorm);
     let hidden_norm = weight!(head, WeightKind::HeadHiddenNorm);
     let combine = weight!(head, WeightKind::HeadCombine);
-    let attention_weights = AttentionWeights {
-        input_norm: weight!(head, WeightKind::InputNorm),
-        query_norm: weight!(head, WeightKind::QueryNorm),
-        key_norm: weight!(head, WeightKind::KeyNorm),
-        query_gate: weight!(head, WeightKind::QueryGate),
-        key: weight!(head, WeightKind::Key),
-        value: weight!(head, WeightKind::Value),
-        output: weight!(head, WeightKind::AttentionOutput),
-    };
+    let attention_shape =
+        operators::attention::shape(hidden, attention).map_err(|error| error.to_string())?;
+    let head_epsilon = operators::attention::head_norm_epsilon(attention, paired.epsilon())
+        .map_err(|error| error.to_string())? as f32;
+    // Draft head sublayers add their outputs to the residual (admission).
+    let attention_weights = attention_weights(&attention_shape, attention, false, |kind| {
+        planned_weight(
+            &mut graph,
+            load,
+            WeightRole {
+                scope: attention_scope,
+                kind,
+            },
+            &mut weights,
+        )
+    })?;
     let output_norm = weight!(head, WeightKind::OutputNorm);
     let draft_vocabulary = draft_vocabulary(vocabulary);
     let projection = (class.steps > 0)
@@ -444,6 +461,9 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         })
         .transpose()?;
     let mut constants = Vec::new();
+    let absent_scale = matches!(feed_forward, FeedForwardProgramSlot::Dense(_))
+        .then(|| GraphConstant::absent_scale(&mut graph, &mut constants))
+        .transpose()?;
     let mut passes = Vec::new();
     let mut entry_features = None;
     let mut previous: Option<WorkflowTensor> = None;
@@ -503,35 +523,40 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             &input,
             AttentionBlock {
                 rows,
-                hidden,
                 segments: class.segments,
                 history_rows: class.history_rows,
                 slab_rows: class.slab_rows,
-                heads: attention.heads,
-                kv_heads: attention.kv_heads,
-                width: attention.width,
-                rotary: &attention.rotary,
+                shape: attention_shape,
+                operator: attention,
                 epsilon,
+                head_epsilon,
+                post_norm_epsilon: 0.0,
+                post_norm_scale: 1.0,
                 activation: activation(geometry.activation_dtype),
             },
         )?;
         let advanced = match (&entries.feed_forward, feed_forward) {
             (HeadFeedForwardEntries::Dense(entries), FeedForwardProgramSlot::Dense(_)) => {
                 graph.set_class_scope((pass == 0).then_some("head-entry-dense"));
-                let feedforward_norm = weight!(head, WeightKind::FeedForwardNorm);
-                let gate_weight = weight!(head, WeightKind::DenseGate);
-                let up_weight = weight!(head, WeightKind::DenseUp);
-                let down_weight = weight!(head, WeightKind::DenseDown);
+                let feedforward_norm = weight!(feed_forward_scope, WeightKind::InputNorm);
+                let gate_weight = weight!(feed_forward_scope, WeightKind::DenseGate);
+                let up_weight = weight!(feed_forward_scope, WeightKind::DenseUp);
+                let down_weight = weight!(feed_forward_scope, WeightKind::DenseDown);
                 let dense_rows = GraphConstant::identity_for_class(
                     &mut graph,
                     rows,
                     (pass == 0).then_some("head_entry_rows"),
                 )?;
-                let dense_dims = dense_dimensions(load, head, rows)?;
+                let dense_dims = dense_dimensions(load, feed_forward_scope, rows)?;
+                let Some(crate::operators::FeedForward::Dense(dense_operator)) =
+                    paired.feed_forward.map(|sublayer| sublayer.op)
+                else {
+                    return Err("draft head dense entries without a dense feed-forward".into());
+                };
                 let product = graph
                     .enqueue(
                         entries.expand,
-                        &dense_dims,
+                        &[dense_dims.as_slice(), &[("GS", 0), ("US", 0)]].concat(),
                         dense_expand::WorkflowArgs {
                             residual: (&attended).into(),
                             norm: (&feedforward_norm).into(),
@@ -539,18 +564,27 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                             up_weight: (&up_weight).into(),
                             out_rows: dense_rows.port().tensor().into(),
                             eps: epsilon,
+                            activation: operators::dense_ffn::activation_code(
+                                dense_operator.up.activation(),
+                            ),
+                            gate_scale: absent_scale.as_ref().ok_or("dense scale is absent")?.into(),
+                            up_scale: absent_scale.as_ref().ok_or("dense scale is absent")?.into(),
                         },
                     )?
                     .value;
+                let TailEntries::Residual(dense_output) = entries.output else {
+                    return Err("draft head feed-forward has a post-norm tail".into());
+                };
                 let output = graph
                     .enqueue(
-                        entries.output,
-                        &dense_dims,
+                        dense_output,
+                        &[dense_dims.as_slice(), &[("DS", 0)]].concat(),
                         dense_output::WorkflowArgs {
                             residual: (&attended).into(),
                             product: (&product).into(),
                             down_weight: (&down_weight).into(),
                             out_rows: dense_rows.port().tensor().into(),
+                            down_scale: absent_scale.as_ref().ok_or("dense scale is absent")?.into(),
                         },
                     )?
                     .value;
@@ -559,13 +593,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 output
             }
             (HeadFeedForwardEntries::Routed(entries), FeedForwardProgramSlot::Routed(binding)) => {
-                let shape = ExpertGeometry {
-                    count: binding.experts,
-                    selected: binding.selected,
-                    intermediate: binding.features,
-                    shared_intermediate: binding.shared,
-                    normalize_selected: binding.normalize_selected,
-                };
+                let shape = routed::ExpertShape::of_binding(&binding);
                 routed::routed(
                     &mut graph,
                     RoutedGraphEntries {
@@ -577,7 +605,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         combine: entries.combine,
                     },
                     load,
-                    head,
+                    feed_forward_scope,
                     &mut weights,
                     &attended,
                     rows,
@@ -672,21 +700,21 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
 pub(crate) fn checked_head_family_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
-    geometry: &DecoderGeometry,
-    attention: &AttentionGeometry,
+    geometry: &Decoder,
+    head: &HeadBlock,
     binding: HeadBinding,
     classes: impl IntoIterator<Item = HeadGraphClass>,
 ) -> Result<CheckedGraphResources, String> {
     let classes = classes.into_iter().collect::<Vec<_>>();
-    certify_head_family(backend, load, geometry, attention, binding, &classes)
+    certify_head_family(backend, load, geometry, head, binding, &classes)
         .map(|(resources, _)| resources)
 }
 
 fn certify_head_family(
     backend: BackendName,
     load: &ModelLoadPlan,
-    geometry: &DecoderGeometry,
-    attention: &AttentionGeometry,
+    geometry: &Decoder,
+    head: &HeadBlock,
     binding: HeadBinding,
     classes: &[HeadGraphClass],
 ) -> Result<
@@ -696,7 +724,7 @@ fn certify_head_family(
     ),
     String,
 > {
-    let checked = CheckedHeadEntries::new(binding);
+    let checked = CheckedHeadEntries::new(binding)?;
     let mut family = CheckedGraphFamilyResources::new();
     let mut layouts = BTreeMap::new();
     // Every field but the entry row count fixes the graph's structure; the
@@ -727,7 +755,7 @@ fn certify_head_family(
             checked.entries()?,
             load,
             geometry,
-            attention,
+            head,
             binding.feed_forward,
             largest,
         )?;
@@ -754,6 +782,10 @@ fn certify_head_family(
                     FeedForwardProgramSlot::Dense(_) => slice
                         .scoped("head-entry-dense", "M", rows)
                         .scoped("head-entry-dense", "O", rows),
+                    FeedForwardProgramSlot::GeneralRouted(_)
+                    | FeedForwardProgramSlot::Parallel(_) => {
+                        return Err("draft head routed feed-forward form".into())
+                    }
                     FeedForwardProgramSlot::Routed(_) if routed::decodes(class.entry_rows) => slice,
                     FeedForwardProgramSlot::Routed(shape) => slice.scoped(
                         "head-entry",
@@ -792,20 +824,20 @@ fn certify_head_family(
 pub(crate) fn verify_head_family_certificates(
     backend: BackendName,
     load: &ModelLoadPlan,
-    geometry: &DecoderGeometry,
-    attention: &AttentionGeometry,
+    geometry: &Decoder,
+    head: &HeadBlock,
     binding: HeadBinding,
     classes: &[HeadGraphClass],
 ) -> Result<(), String> {
-    let (_, layouts) = certify_head_family(backend, load, geometry, attention, binding, classes)?;
-    let checked = CheckedHeadEntries::new(binding);
+    let (_, layouts) = certify_head_family(backend, load, geometry, head, binding, classes)?;
+    let checked = CheckedHeadEntries::new(binding)?;
     for &class in classes {
         let exact = head_graph_draft(
             NativeGraphMetadata::new(backend),
             checked.entries()?,
             load,
             geometry,
-            attention,
+            head,
             binding.feed_forward,
             class,
         )?;
@@ -833,8 +865,8 @@ impl PreparedHeadGraphs {
         target_device: &Device,
         kernels: &AttestedHead,
         load: &ModelLoadPlan,
-        geometry: &DecoderGeometry,
-        attention: &AttentionGeometry,
+        geometry: &Decoder,
+        head: &HeadBlock,
         classes: impl IntoIterator<Item = HeadGraphClass>,
     ) -> Result<Self, SubmitError> {
         let classes = classes.into_iter().collect::<Vec<_>>();
@@ -847,7 +879,7 @@ impl PreparedHeadGraphs {
             target_device.backend(),
             load,
             geometry,
-            attention,
+            head,
             binding,
             &classes,
         )
@@ -862,7 +894,7 @@ impl PreparedHeadGraphs {
                 kernels,
                 load,
                 geometry,
-                attention,
+                head,
                 class,
                 &layouts[&class],
             )?;
@@ -886,8 +918,8 @@ impl PreparedHeadGraphs {
         target_device: &Device,
         kernels: &AttestedHead,
         load: &ModelLoadPlan,
-        geometry: &DecoderGeometry,
-        attention: &AttentionGeometry,
+        geometry: &Decoder,
+        head: &HeadBlock,
         class: HeadGraphClass,
         layout: &NativeGraphLayout,
     ) -> Result<PreparedHeadGraph, SubmitError> {
@@ -897,10 +929,10 @@ impl PreparedHeadGraphs {
             .ok_or_else(|| invalid("attested head block is absent"))?;
         head_graph_topology(
             target_device.native_graph_with_layout(layout),
-            HeadGraphEntries::prepared(block, kernels),
+            HeadGraphEntries::prepared(block, kernels).map_err(invalid)?,
             load,
             geometry,
-            attention,
+            head,
             block.binding.feed_forward,
             class,
         )
@@ -991,48 +1023,11 @@ fn resident_head_weight(
     resident: &ResidentHead,
     role: WeightRole,
 ) -> Result<&ResidentWeight, SubmitError> {
-    let weight = match (role.scope, role.kind) {
-        (WeightScope::Target, WeightKind::Embedding) => &resident.embedding,
-        (WeightScope::Target, WeightKind::Output) => &resident.output,
-        (WeightScope::HeadBlock(0), kind) => {
-            let block = resident
-                .blocks
-                .first()
-                .ok_or_else(|| invalid("resident head block is absent"))?;
-            match kind {
-                WeightKind::HeadEmbeddingNorm => &block.embedding_norm,
-                WeightKind::HeadHiddenNorm => &block.hidden_norm,
-                WeightKind::HeadCombine => &block.combine,
-                WeightKind::InputNorm => &block.input_norm,
-                WeightKind::QueryNorm => &block.attention.query_norm,
-                WeightKind::KeyNorm => &block.attention.key_norm,
-                WeightKind::QueryGate => &block.attention.query_gate,
-                WeightKind::Key => &block.attention.key,
-                WeightKind::Value => &block.attention.value,
-                WeightKind::AttentionOutput => &block.attention.output,
-                WeightKind::FeedForwardNorm => &block.feedforward_norm,
-                kind @ (WeightKind::DenseGate
-                | WeightKind::DenseUp
-                | WeightKind::DenseDown
-                | WeightKind::Router
-                | WeightKind::SharedRouter
-                | WeightKind::ExpertGate
-                | WeightKind::ExpertUp
-                | WeightKind::ExpertDown
-                | WeightKind::SharedGate
-                | WeightKind::SharedUp
-                | WeightKind::SharedDown) => block.feedforward.weight(kind).ok_or_else(|| {
-                    invalid(format!(
-                        "head feed-forward role {kind:?} disagrees with its variant"
-                    ))
-                })?,
-                WeightKind::OutputNorm => &block.output_norm,
-                _ => return Err(invalid(format!("head weight role {role:?} is invalid"))),
-            }
-        }
-        _ => return Err(invalid(format!("head weight role {role:?} is invalid"))),
-    };
-    Ok(weight)
+    match (role.scope, role.kind) {
+        (WeightScope::Target, WeightKind::Embedding) => Ok(&resident.embedding),
+        (WeightScope::Target, WeightKind::Output) => Ok(&resident.output),
+        _ => resident.weights.get(role).map_err(invalid),
+    }
 }
 
 /// One pass's attention controls padded to `rows` rows of the graph's span class
@@ -1054,8 +1049,12 @@ impl PassControls {
         if actual > rows {
             return Err(invalid("head pass has more rows than its graph class"));
         }
+        // The draft head's store has one Token history domain.
+        let [history] = pass.histories else {
+            return Err(invalid("head pass must carry exactly one history domain"));
+        };
         let mut visible = vec![0_i32; rows * segments * 2];
-        for (row, ranges) in pass.visible[..actual].iter().enumerate() {
+        for (row, ranges) in history.visible[..actual].iter().enumerate() {
             let used = ranges
                 .iter()
                 .rposition(|range| range[1] > range[0])
@@ -1089,10 +1088,10 @@ impl PassControls {
                     .unwrap_or([0; 4])
             })),
             visible: i32_bytes(visible),
-            fresh: padded(pass.fresh, [0, 0]),
+            fresh: padded(&history.fresh, [0, 0]),
             destinations: i32_bytes((0..rows).map(|row| {
                 if row < actual {
-                    pass.destinations[row]
+                    history.destinations[row]
                 } else {
                     -1
                 }
@@ -1102,7 +1101,7 @@ impl PassControls {
 }
 
 pub struct NativeHeadProgram {
-    geometry: DecoderGeometry,
+    geometry: Decoder,
     graphs: BoundHeadGraphs,
     waiter: CompletionWaiter,
 }
@@ -1113,7 +1112,7 @@ impl NativeHeadProgram {
     }
 
     pub(crate) fn new(
-        geometry: DecoderGeometry,
+        geometry: Decoder,
         graphs: BoundHeadGraphs,
     ) -> Result<Self, SubmitError> {
         let waiter = CompletionWaiter::spawn().map_err(device)?;

@@ -117,6 +117,11 @@ impl Gguf {
             14 => Format::Q6K,
             8 => Format::Q8,
             23 => Format::Iq4,
+            2 => Format::Q4_0,
+            6 => Format::Q5_0,
+            7 => Format::Q5_1,
+            39 => Format::Mxfp4,
+            40 => Format::Nvfp4,
             other => panic!("{name}: GGUF type {other}"),
         };
         let k = dims[0] as usize;
@@ -126,6 +131,11 @@ impl Gguf {
             Format::Q6K => 210,
             Format::Q8 => 34,
             Format::Iq4 => 136,
+            Format::Q4_0 => 18,
+            Format::Q5_0 => 22,
+            Format::Q5_1 => 24,
+            Format::Mxfp4 => 17,
+            Format::Nvfp4 => 36,
         };
         let row_bytes = k / format.block_values() * block_bytes;
         let start = self.data + offset + first * row_bytes;
@@ -309,7 +319,9 @@ fn real_4b_projections_match_their_operand_emulation() {
                         &mapping.dense_expand_params(
                             NativeSpecialization::new()
                                 .with_static("H", h as u64)
-                                .with_static("F", f as u64),
+                                .with_static("F", f as u64)
+                                .with_static("GS", 0)
+                                .with_static("US", 0),
                         ),
                     )
                     .unwrap();
@@ -322,6 +334,9 @@ fn real_4b_projections_match_their_operand_emulation() {
                                 up_weight: &up.tensor,
                                 out_rows: &out_rows,
                                 eps: EPSILON,
+                                activation: 0,
+                                gate_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[]).unwrap(),
+                                up_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[]).unwrap(),
                             })
                             .unwrap()
                             .value,

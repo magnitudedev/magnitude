@@ -1,5 +1,6 @@
 // dense_expand: RMS prologue over the `out_rows` residual rows, the
-// paired gate/up projection, and SiLU(gate)·up.
+// paired gate/up projection, and act(gate)·up (`activation`: SiLU or
+// GELU-tanh).
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
 #include "lib/projection/projection.h"
@@ -15,14 +16,19 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     device const int *out_rows [[buffer(SEISMIC_BUFFER_OUT_ROWS)]],                     \
     device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
+    device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],               \
+    device const float *up_scale [[buffer(SEISMIC_BUFFER_UP_SCALE)]],                   \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define DENSE_EXPAND_OPERANDS                                                           \
     projection::Rms<activation, norm_element, projection::SelectedRows> in{residual,    \
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0, \
         as_type<float>(uint(SEISMIC_PARAM_EPS)), uint(SEISMIC_DIM_H), {out_rows}};      \
-    projection::SiluMul<activation> out{result, SEISMIC_RESULT_0_STRIDE_0,              \
-        SEISMIC_RESULT_0_STRIDE_1};                                                     \
+    const auto out = projection::scaling<(SEISMIC_DIM_GS != 0 || SEISMIC_DIM_US != 0)>::wrap( \
+        projection::Glu<activation>{result, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+            int(SEISMIC_PARAM_ACTIVATION)},                                             \
+        projection::scale_factor(gate_scale, SEISMIC_DIM_GS, 0, 0),                     \
+        projection::scale_factor(up_scale, SEISMIC_DIM_US, 0, 0));                      \
     projection::Weights<packets::W0> gate{gate_weight, KERNEL_W0_LAYOUT(SEISMIC_DIM_H), \
         uint(SEISMIC_DIM_H)};                                                           \
     projection::Weights<packets::W1> up{up_weight, KERNEL_W1_LAYOUT(SEISMIC_DIM_H), uint(SEISMIC_DIM_H)}

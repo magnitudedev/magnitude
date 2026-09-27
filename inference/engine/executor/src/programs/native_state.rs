@@ -36,27 +36,32 @@ pub(crate) fn state_copy_classes(
 ) -> Result<Vec<StateCopyGraphClass>, String> {
     let mut classes = Vec::new();
     for state in std::iter::once(target).chain(head) {
-        for component in &state.history_components {
-            for plane in component.planes() {
-                let width = u64::try_from(plane.row_elements)
-                    .map_err(|_| "state plane width exceeds u64")?;
-                let extents = vec![
-                    u64::try_from(state.history_rows)
-                        .map_err(|_| "state history rows exceed u64")?,
-                    1,
-                    width,
-                ];
-                for &rows in row_classes {
-                    let class = StateCopyGraphClass {
-                        element: Element::dense(plane.dtype),
-                        source_extents: extents.clone(),
-                        destination_extents: extents.clone(),
-                        map_rows: rows,
-                        slab_rows: state.history_slab_rows()?,
-                    };
-                    if !classes.contains(&class) {
-                        classes.push(class);
-                    }
+        // Every stored history domain's planes, over its own rows and slabs.
+        let planes = state.domains.iter().flat_map(|domain| {
+            domain
+                .components
+                .iter()
+                .flat_map(|component| component.planes())
+                .map(move |plane| (domain, plane))
+        });
+        for (domain, plane) in planes {
+            let width =
+                u64::try_from(plane.row_elements).map_err(|_| "state plane width exceeds u64")?;
+            let extents = vec![
+                u64::try_from(domain.rows).map_err(|_| "state history rows exceed u64")?,
+                1,
+                width,
+            ];
+            for &rows in row_classes {
+                let class = StateCopyGraphClass {
+                    element: Element::dense(plane.dtype),
+                    source_extents: extents.clone(),
+                    destination_extents: extents.clone(),
+                    map_rows: rows,
+                    slab_rows: domain.slab_rows,
+                };
+                if !classes.contains(&class) {
+                    classes.push(class);
                 }
             }
         }
@@ -528,8 +533,9 @@ mod tests {
     fn state_copy_classes_include_recurrent_banks() {
         let plan = StateStorePlan {
             context_rows: 8,
-            history_rows: 0,
-            history_components: Vec::new(),
+            max_advance: 8,
+            history: Vec::new(),
+            domains: Vec::new(),
             recurrent_components: vec![ComponentSpec {
                 shape: vec![4],
                 dtype: seismic::DType::F32,
@@ -539,8 +545,6 @@ mod tests {
                 in_flight: 1,
                 retained: 0,
             },
-            history_row_bytes: 0,
-            history_bytes: 0,
             recurrent_bank_bytes: 16,
             zero_seed_bytes: 16,
             recurrent_pool_bytes: 48,

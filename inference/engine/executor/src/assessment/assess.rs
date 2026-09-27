@@ -79,16 +79,23 @@ pub struct PreparedExecutionAssessment {
     memory: Result<(u32, AssessmentMemoryCharge), AssessmentError>,
 }
 
+impl PreparedExecutionAssessment {
+    /// The plain decode step's demand under the planned history codec.
+    pub fn demand(&self) -> &DecodeDemand {
+        &self.demand
+    }
+}
+
 /// Perform model-specific arithmetic while the fixed generic basis is measured.
 pub fn prepare_execution_assessment(
     definition: &ModelDefinition,
     draft: &ExecutionPlanDraft,
     context_limit: u32,
 ) -> Result<PreparedExecutionAssessment, AssessmentError> {
-    if definition.geometry.context_limit != u64::from(context_limit) {
+    if definition.decoder.context_limit != u64::from(context_limit) {
         return Err(AssessmentError::Plan(format!(
             "assessed context limit {} differs from the planned model's {}",
-            context_limit, definition.geometry.context_limit
+            context_limit, definition.decoder.context_limit
         )));
     }
     let policy = draft.policy();
@@ -161,10 +168,7 @@ pub fn finish_execution_assessment(
     if !unmeasured.is_empty() {
         return Ok(ExecutionAssessment::Incompatible {
             reason: IncompatibleReason::OutsideBasis {
-                classes: unmeasured
-                    .into_iter()
-                    .map(|(key, reason)| (key.clone(), reason.map(str::to_owned)))
-                    .collect(),
+                classes: unmeasured,
             },
         });
     }
@@ -223,7 +227,10 @@ pub fn assess_execution(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assessment::{BasisIdentity, ClassCost, ClassMeasurement, CostModel, MeasuredPoint};
+    use crate::assessment::{
+        BasisIdentity, ClassCost, ClassMeasurement, CostModel, HistoryCost, MeasurementKey,
+        ProjectionCost, TermShape,
+    };
     use crate::{
         ComponentSelection, ExecutionPath, ExecutionPlanner, PlannedMethod, ResourceLimits,
     };
@@ -246,7 +253,7 @@ mod tests {
         )
         .unwrap();
         let mut definition = crate::planning::tests::fixture_definition();
-        definition.geometry.context_limit = context_limit;
+        definition.decoder.context_limit = context_limit;
         let manifest = crate::planning::tests::fixture_manifest(&definition);
         let draft = ExecutionPlanner::prepare(
             &selected,
@@ -285,7 +292,9 @@ mod tests {
         }
     }
 
-    /// A basis measuring every class the fixture's decode launches.
+    /// A basis holding every entry the fixture's decode needs: each term's
+    /// cost key timed at 10 µs a launch, its weight format and its exact
+    /// representation binding formed.
     fn complete_basis(environment: &Environment) -> MeasurementBasis {
         let demand = DecodeDemand::from_model(
             &environment.definition,
@@ -293,28 +302,53 @@ mod tests {
             environment.draft.policy().codec(),
         )
         .unwrap();
+        let measured = |model| ClassMeasurement::Measured {
+            points: Vec::new(),
+            cost: ClassCost {
+                model,
+                slow_factor: 1.1,
+                fast_factor: 0.9,
+            },
+        };
+        let mut classes: Vec<(MeasurementKey, ClassMeasurement)> = Vec::new();
+        let mut hold = |key: MeasurementKey, measurement: ClassMeasurement| {
+            if classes.iter().all(|(known, _)| *known != key) {
+                classes.push((key, measurement));
+            }
+        };
+        for term in &demand.terms {
+            let model = match term.shape {
+                TermShape::Plain => CostModel::PerLaunch { seconds: 1e-5 },
+                TermShape::Projection { weight, .. } => {
+                    hold(
+                        MeasurementKey::weight_format(weight, term.key.cost().bindings[0]),
+                        measured(CostModel::PerByte {
+                            seconds_per_byte: 1e-12,
+                        }),
+                    );
+                    CostModel::Projection(ProjectionCost {
+                        launch_seconds: 1e-5,
+                        weight,
+                        seconds_per_byte: vec![(1, 0.0)],
+                    })
+                }
+                TermShape::Attention(reference) => CostModel::History(HistoryCost {
+                    launch_seconds: 1e-5,
+                    seconds_per_byte: 0.0,
+                    reference,
+                    kv_heads: vec![(reference.kv_heads, 1.0)],
+                    group: vec![(reference.group, 1.0)],
+                    width: vec![(reference.width, 1.0)],
+                }),
+            };
+            hold(term.key.cost(), measured(model));
+            if term.key.class.binds_representation() {
+                hold(term.key.clone(), ClassMeasurement::Formed);
+            }
+        }
         MeasurementBasis {
             identity: identity(),
-            classes: demand
-                .terms
-                .iter()
-                .map(|term| {
-                    (
-                        term.key.clone(),
-                        ClassMeasurement::Measured {
-                            points: vec![MeasuredPoint {
-                                bytes: 1 << 20,
-                                samples: vec![9e-6, 1e-5, 1.1e-5],
-                            }],
-                            cost: ClassCost {
-                                model: CostModel::PerLaunch { seconds: 1e-5 },
-                                slow_factor: 1.1,
-                                fast_factor: 0.9,
-                            },
-                        },
-                    )
-                })
-                .collect(),
+            classes,
         }
     }
 

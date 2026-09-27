@@ -181,6 +181,7 @@ impl Vocabulary {
     ) -> Result<GenerationSeed, String> {
         if options.vocabulary != self.projection
             || &options.stop_tokens != self.tokenizer.stop_tokens()
+            || &options.suppressed_tokens != self.tokenizer.suppressed_tokens()
             || tokens.iter().any(|t| {
                 t.0 as usize >= self.tokenizer.vocabulary()
                     || self.tokenizer.kind(*t).ok() == Some(PieceKind::Unused)

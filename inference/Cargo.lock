@@ -2084,6 +2084,12 @@ dependencies = [
  "magnitude-chat",
  "magnitude-executor",
  "magnitude-family-contracts",
+ "magnitude-family-dflash",
+ "magnitude-family-gemma4",
+ "magnitude-family-lfm2",
+ "magnitude-family-llama",
+ "magnitude-family-muse-glimmer",
+ "magnitude-family-nemotron-h",
  "magnitude-family-qwen35",
  "magnitude-generation",
  "magnitude-scheduler",
@@ -2122,10 +2128,36 @@ dependencies = [
  "libc",
  "magnitude-artifacts",
  "magnitude-batching",
+ "magnitude-family-common",
  "magnitude-family-contracts",
+ "magnitude-family-gemma4",
+ "magnitude-family-lfm2",
+ "magnitude-family-llama",
+ "magnitude-family-muse-glimmer",
+ "magnitude-family-nemotron-h",
+ "magnitude-family-qwen35",
  "magnitude-kernels",
  "magnitude-state",
  "seismic",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "magnitude-family-common"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
+ "magnitude-family-dflash",
+ "magnitude-family-gemma4",
+ "magnitude-family-lfm2",
+ "magnitude-family-llama",
+ "magnitude-family-muse-glimmer",
+ "magnitude-family-nemotron-h",
+ "magnitude-family-qwen35",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2137,6 +2169,66 @@ version = "0.1.0"
 dependencies = [
  "magnitude-artifacts",
  "serde",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "magnitude-family-dflash"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
+ "magnitude-family-lfm2",
+ "magnitude-family-llama",
+ "magnitude-family-muse-glimmer",
+ "magnitude-family-nemotron-h",
+ "magnitude-family-qwen35",
+]
+
+[[package]]
+name = "magnitude-family-gemma4"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
+]
+
+[[package]]
+name = "magnitude-family-lfm2"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
+]
+
+[[package]]
+name = "magnitude-family-llama"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
+]
+
+[[package]]
+name = "magnitude-family-muse-glimmer"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
+]
+
+[[package]]
+name = "magnitude-family-nemotron-h"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
 ]
 
 [[package]]
@@ -2144,6 +2236,7 @@ name = "magnitude-family-qwen35"
 version = "0.1.0"
 dependencies = [
  "magnitude-artifacts",
+ "magnitude-family-common",
  "magnitude-family-contracts",
  "sha2 0.11.0",
 ]

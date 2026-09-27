@@ -238,24 +238,37 @@ pub enum Operation {
         select: Vec<SelectSpec>,
         committed: usize,
     },
-    /// One draft-head transaction. The entry rows pair each accepted token
-    /// with the target's normalized output feature of the preceding row
-    /// (`conditioning`, in row order) and are committed to head state at
-    /// `position`. With proposals, the head then chains one speculative row
-    /// per proposal on the device: each step's selection (keyed by its
-    /// `SelectSpec`) is the next step's token, and its output feature the
-    /// next step's conditioning. Speculative rows are never committed.
+    /// One drafter transaction. The entry rows pair each accepted token with
+    /// the target's feature of the preceding row (`conditioning`, in row
+    /// order) and are committed to drafter state at `position`. With
+    /// proposals, the drafter then drafts one token per `SelectSpec` in its
+    /// `form`; its speculative work is never committed.
     Head {
         request: RequestId,
         tokens: Vec<TokenId>,
         conditioning: FeatureRows,
         position: usize,
         proposals: Vec<SelectSpec>,
+        form: DraftForm,
     },
     Encode {
         request: RequestId,
         image: ImageRef,
     },
+}
+
+/// How a drafter drafts its proposals after entering its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DraftForm {
+    /// An embedded head (MTP) chains one speculative row per proposal on the
+    /// device: each step's selection is the next step's token and its output
+    /// feature the next step's conditioning. The chained rows append to head
+    /// state as tentative rows (all but the last proposal's).
+    Chained,
+    /// A separate draft (DFlash, DSpark) reads one non-causal block
+    /// `[anchor, mask, …]` after its history, the anchor being the last entry
+    /// token, and appends nothing beyond its entry rows.
+    Block,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -305,14 +318,22 @@ impl Operation {
     }
 
     /// Rows this operation advances in its lane's state. A head writes its
-    /// entry rows and one speculative row per chained proposal step (the
+    /// entry rows and, chained, one speculative row per proposal step (the
     /// last proposal needs no row of its own).
     pub fn row_count(&self) -> usize {
         match self {
             Self::Forward { tokens, .. } => tokens.len(),
             Self::Head {
-                tokens, proposals, ..
+                tokens,
+                proposals,
+                form: DraftForm::Chained,
+                ..
             } => tokens.len() + proposals.len().saturating_sub(1),
+            Self::Head {
+                tokens,
+                form: DraftForm::Block,
+                ..
+            } => tokens.len(),
             Self::Encode { image, .. } => image.patches(),
         }
     }

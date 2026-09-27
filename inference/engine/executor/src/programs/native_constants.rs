@@ -51,6 +51,71 @@ impl GraphConstant {
         )
     }
 
+    /// A zero-extent scale port for a weight without a second-level scale.
+    pub(crate) fn absent_scale<G: GraphDraft>(
+        graph: &mut G,
+        constants: &mut Vec<Self>,
+    ) -> Result<seismic::WorkflowTensor, String> {
+        let scale = Self::f32(graph, &[])?;
+        let tensor = scale.port().tensor().clone();
+        constants.push(scale);
+        Ok(tensor)
+    }
+
+    /// An `f32` constant of the given extents, possibly empty.
+    pub(crate) fn f32_shaped<G: GraphDraft>(
+        graph: &mut G,
+        extents: &[u64],
+        values: &[f32],
+    ) -> Result<Self, String> {
+        if extents.iter().product::<u64>() != values.len() as u64 {
+            return Err("constant values disagree with its extents".into());
+        }
+        let port = graph
+            .port(Element::f32(), extents)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            port: Some(port),
+            element: Element::f32(),
+            extents: extents.to_vec(),
+            bytes: values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        })
+    }
+
+    /// An `f32` constant value of the given extents, for resource accounting
+    /// without a graph port.
+    pub(crate) fn f32_value(extents: &[u64], values: &[f32]) -> Result<Self, String> {
+        if extents.iter().product::<u64>() != values.len() as u64 {
+            return Err("constant values disagree with its extents".into());
+        }
+        Ok(Self {
+            port: None,
+            element: Element::f32(),
+            extents: extents.to_vec(),
+            bytes: values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        })
+    }
+
+    /// A rank-1 `i32` constant value, for resource accounting without a
+    /// graph port.
+    pub(crate) fn i32_value(values: &[i32]) -> Self {
+        Self {
+            port: None,
+            element: Element::i32(),
+            extents: vec![values.len() as u64],
+            bytes: values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        }
+    }
+
     /// The rank-1 `i32` constant `0, 1, …, count - 1`.
     pub(crate) fn identity<G: GraphDraft>(graph: &mut G, count: u64) -> Result<Self, String> {
         Self::identity_for_class(graph, count, None)
@@ -85,6 +150,39 @@ impl GraphConstant {
             None => graph.port(Element::i32(), &constant.extents)?,
         };
         constant.port = Some(port);
+        Ok(constant)
+    }
+
+    /// The `f32` zero matrix `[count, width]`, for resource accounting
+    /// without a graph port.
+    pub(crate) fn zeros_value(count: u64, width: u64) -> Result<Self, String> {
+        let bytes = Element::f32()
+            .canonical_byte_len(&[count, width])
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            port: None,
+            element: Element::f32(),
+            extents: vec![count, width],
+            bytes: vec![0; usize::try_from(bytes).map_err(|_| "constant exceeds host memory")?]
+                .into(),
+        })
+    }
+
+    /// The `f32` zero matrix `[count, width]` whose rows follow the class
+    /// dimension `class_dimension` (a zero base for a sum).
+    pub(crate) fn zeros_for_class<G: GraphDraft>(
+        graph: &mut G,
+        count: u64,
+        width: u64,
+        class_dimension: &'static str,
+    ) -> Result<Self, String> {
+        let mut constant = Self::zeros_value(count, width)?;
+        constant.port = Some(graph.port_with_class_extent(
+            Element::f32(),
+            &constant.extents,
+            0,
+            class_dimension,
+        )?);
         Ok(constant)
     }
 

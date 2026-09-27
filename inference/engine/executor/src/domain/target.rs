@@ -95,7 +95,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .checked_add(tokens.len())
                 .ok_or("target row count overflow")?;
             demand |= *next;
-            segments = segments.max(advance.history_ranges().len());
+            segments = segments.max(reserved_segments(
+                &self.target_store,
+                advance.span_count(),
+                tokens.len(),
+            ));
         }
         let limits = self.execution.policy().limits();
         let class = crate::LaunchClass::covering(rows, segments, demand, limits.max_launch_rows)
@@ -133,10 +137,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         };
         let (slots, conditioning_slices): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
-        let batch = match ValidatedTargetBatch::from_slots(
+        let batch = match ValidatedTargetBatch::covering(
             &slots,
-            self.definition.geometry.vocabulary as usize,
+            self.definition.decoder.vocabulary as usize,
             limits.max_launch_rows,
+            segments,
         ) {
             Ok(batch) if batch.class() == class => batch,
             Ok(_) => {
@@ -167,7 +172,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             inputs,
             &self.target_store,
             self.domain.id(),
-            self.definition.geometry.hidden as usize,
+            self.definition.decoder.hidden as usize,
         ) {
             Ok(launch) => launch,
             Err((inputs, error)) => {
@@ -439,6 +444,27 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
+    /// Per history read of the target store (`StateStore::history_reads`),
+    /// whether its layers attend media rows bidirectionally
+    /// (`operators::attention::admit_media`).
+    fn bidirectional_reads(&self) -> Result<Vec<bool>, String> {
+        let mut reads = vec![false; self.target_store.history_reads()];
+        for (index, sublayer) in self.definition.decoder.sublayers() {
+            let magnitude_family_contracts::Operator::Attention(attention) = &sublayer.op else {
+                continue;
+            };
+            if attention.media_rows == magnitude_family_contracts::MediaRowAttention::Bidirectional
+            {
+                let read = self
+                    .target_store
+                    .history_read(magnitude_state::LayerRef::Target(index.block))
+                    .ok_or("an attention layer has no history read")?;
+                reads[read] = true;
+            }
+        }
+        Ok(reads)
+    }
+
     pub(super) fn target_slot(
         &self,
         operation: &Operation,
@@ -454,31 +480,33 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Err("non-forward target operation".into());
         };
         let (coordinates, slices) = self.input_rows(*request, *position, tokens)?;
-        let visible = advance
-            .history_ranges()
-            .into_iter()
-            .map(|(start, count)| {
-                Ok([
-                    i32::try_from(start).map_err(|_| "history start exceeds i32")?,
-                    i32::try_from(start.checked_add(count).ok_or("history end overflow")?)
-                        .map_err(|_| "history end exceeds i32")?,
-                ])
-            })
-            .collect::<Result<Vec<_>, String>>()?;
         let binding = advance.bindings();
+        // A media row's span end; an advance never splits a span. The
+        // history reads whose layers attend media bidirectionally read every
+        // fresh row of the span.
+        let bidirectional = self.bidirectional_reads()?;
+        let span_end = |index: usize| {
+            slices
+                .iter()
+                .map(|slice| (slice.destination, slice.destination + slice.source.count))
+                .find(|(start, end)| (*start..*end).contains(&index))
+                .map(|(_, end)| end)
+        };
         let mut rows = Vec::with_capacity(tokens.len());
         for (index, token) in tokens.iter().enumerate() {
             let coordinates = *coordinates
                 .get(index)
                 .ok_or("prepared input coordinate count differs from tokens")?;
-            let destination = binding.destinations.get(index).map_or(Ok(-1), |value| {
-                i32::try_from(*value).map_err(|_| "target destination exceeds i32")
-            })?;
             rows.push(Row {
                 token: i32::try_from(token.0).map_err(|_| "token exceeds i32")?,
                 coordinates,
-                visible: visible.clone(),
-                destination,
+                histories: row_histories(
+                    &self.target_store,
+                    advance,
+                    index,
+                    span_end(index),
+                    &bidirectional,
+                )?,
                 demand: row_demand(operation, index),
                 select: selection(operation, index),
             });
@@ -496,6 +524,133 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             slices,
         ))
     }
+}
+
+/// The histories row `index` of `advance` reads and writes, one per history
+/// read of `store` (`StateStore::history_reads`). A stored domain's: its
+/// accepted rows from the query's window start, the advance's fresh rows
+/// from the same start (through the row, or, for a media row of a read in
+/// `bidirectional`, through its media span's end `span_end`), and the row's
+/// destination. A Shared source domain's (`shared_read_history`) follow.
+pub(super) fn row_histories(
+    store: &StateStore,
+    advance: &TentativeAdvance,
+    index: usize,
+    span_end: Option<usize>,
+    bidirectional: &[bool],
+) -> Result<Vec<RowHistory>, String> {
+    let binding = advance.bindings();
+    let end = |read: usize| span_end.filter(|_| bidirectional[read]);
+    let stored = store.history_domains().map(|domain| {
+        let (visible, fresh_start) = accepted_history(store, advance, domain, index)?;
+        let destination = binding.destinations[domain.0]
+            .get(index)
+            .map_or(Ok(-1), |value| {
+                i32::try_from(*value).map_err(|_| "target destination exceeds i32")
+            })?;
+        Ok(RowHistory {
+            visible,
+            fresh_start: i32::try_from(fresh_start).map_err(|_| "fresh start exceeds i32")?,
+            bidirectional_end: end(domain.0)
+                .map(|end| i32::try_from(end).map_err(|_| "media span end exceeds i32"))
+                .transpose()?,
+            destination,
+        })
+    });
+    let stored_reads = store.history_domains().count();
+    let shared = store
+        .shared_source_domains()
+        .into_iter()
+        .enumerate()
+        .map(|(position, domain)| {
+            shared_read_history(store, advance, domain, index, end(stored_reads + position))
+        });
+    stored.chain(shared).collect()
+}
+
+/// The history ranges a launch reserves per row for an advance of `rows`
+/// rows over a state of `spans` accepted ranges: those ranges, and for a
+/// store with Shared reads (`shared_read_history`) the ranges of the rows
+/// the advance appends, at most one per slab they touch.
+pub(super) fn reserved_segments(store: &StateStore, spans: usize, rows: usize) -> usize {
+    spans
+        + store
+            .shared_source_domains()
+            .into_iter()
+            .map(|domain| rows.div_ceil(store.history_slab_rows(domain)) + 1)
+            .max()
+            .unwrap_or(0)
+}
+
+/// The accepted-history ranges row `index` of `advance` reads in stored
+/// `domain` (from the query's window start), and the offset in the slot of
+/// its first fresh row. The window start never exceeds the row's own
+/// position.
+pub(crate) fn accepted_history(
+    store: &StateStore,
+    advance: &TentativeAdvance,
+    domain: magnitude_state::HistoryDomainId,
+    index: usize,
+) -> Result<(Vec<[i32; 2]>, usize), String> {
+    let position = advance
+        .position()
+        .checked_add(index)
+        .ok_or("target row position overflows")?;
+    let from = store.history_domain_kind(domain).visible_from(position);
+    let visible = advance
+        .visible_ranges(domain, from)
+        .into_iter()
+        .map(|(start, count)| {
+            Ok([
+                i32::try_from(start).map_err(|_| "history start exceeds i32")?,
+                i32::try_from(start.checked_add(count).ok_or("history end overflow")?)
+                    .map_err(|_| "history end exceeds i32")?,
+            ])
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((visible, from.saturating_sub(advance.position())))
+}
+
+/// The history a Shared layer reads for row `index` of `advance` from its
+/// source's stored `domain`. It appends nothing and projects no fresh keys,
+/// so it reads the source's accepted rows and, as history, the rows the
+/// source appended for the advance from the window start through the row
+/// (through its media span's end `bidirectional_end` for a row attending its
+/// span bidirectionally), each range within one slab. Its fresh span and
+/// destination are unused.
+pub(crate) fn shared_read_history(
+    store: &StateStore,
+    advance: &TentativeAdvance,
+    domain: magnitude_state::HistoryDomainId,
+    index: usize,
+    bidirectional_end: Option<usize>,
+) -> Result<RowHistory, String> {
+    let (mut visible, fresh_start) = accepted_history(store, advance, domain, index)?;
+    let destinations = &advance.bindings().destinations[domain.0];
+    // An advance that appends nothing to the domain has no batch rows in it.
+    let appended = if destinations.is_empty() {
+        &[][..]
+    } else {
+        destinations
+            .get(fresh_start..bidirectional_end.unwrap_or(index + 1))
+            .ok_or("shared history row exceeds the advance's destinations")?
+    };
+    let rows = appended
+        .iter()
+        .map(|&row| {
+            let row = i32::try_from(row).map_err(|_| "history row exceeds i32")?;
+            Ok([row, row + 1])
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let slab_rows =
+        u32::try_from(store.history_slab_rows(domain)).map_err(|_| "slab rows exceed u32")?;
+    visible.extend(super::draft::coalesce_within_slabs(&rows, slab_rows));
+    Ok(RowHistory {
+        visible,
+        fresh_start: i32::try_from(index).map_err(|_| "fresh start exceeds i32")?,
+        bidirectional_end: None,
+        destination: -1,
+    })
 }
 
 fn row_demand(operation: &Operation, row: usize) -> crate::batching::Demand {

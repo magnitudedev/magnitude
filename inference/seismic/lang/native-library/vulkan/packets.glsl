@@ -36,12 +36,27 @@
 #define PACKETS_F16 5
 #define PACKETS_F32 6
 #define PACKETS_IQ4 7
+// The rest of the 4-bit coded family (iq4g32 is PACKETS_IQ4) and q5g32.
+#define PACKETS_Q4G32S 8
+#define PACKETS_MXFP4 9
+#define PACKETS_NVFP4 10
+#define PACKETS_Q5G32S 11
+#define PACKETS_Q5G32 12
+// Every kind, as PROJECTION_GEMM_KINDS bits.
+#define PACKETS_ALL_KINDS 0x1fff
 
-// Coefficient groups per packet (q6k: one per 16 elements).
-uint packets_groups(const int kind) { return kind == PACKETS_Q6K ? 2u : 1u; }
+// Coefficient groups per packet (q6k, nvfp4g16: one per 16 elements).
+uint packets_groups(const int kind) { return kind == PACKETS_Q6K || kind == PACKETS_NVFP4 ? 2u : 1u; }
 
 // The kind has a per-group bias term (the factored `bias * sum(x)`).
-bool packets_biased(const int kind) { return kind <= PACKETS_Q6K; }
+bool packets_biased(const int kind) {
+    return kind <= PACKETS_Q6K || kind == PACKETS_Q4G32S || kind == PACKETS_Q5G32S || kind == PACKETS_Q5G32;
+}
+
+// Nibble codes with a fifth bit in the high plane.
+bool packets_high1(const int kind) {
+    return kind == PACKETS_Q5K || kind == PACKETS_Q5G32S || kind == PACKETS_Q5G32;
+}
 
 // Dense weights: the element kind of their storage.
 bool packets_dense(const int kind) { return kind >= PACKETS_BF16 && kind <= PACKETS_F32; }
@@ -68,7 +83,8 @@ struct packets_rows16 {
 #define PACKETS_ROWS16_Q4K(T) packets_rows16(T##_ROW_STRIDE_BYTES, T##_PLANE_CODES_LO_ROW_OFFSET, 0ul, T##_PLANE_SCALES_ROW_OFFSET, T##_PLANE_SUPERS_ROW_OFFSET)
 #define PACKETS_ROWS16_HIGH(T) packets_rows16(T##_ROW_STRIDE_BYTES, T##_PLANE_CODES_LO_ROW_OFFSET, T##_PLANE_CODES_HI_ROW_OFFSET, T##_PLANE_SCALES_ROW_OFFSET, T##_PLANE_SUPERS_ROW_OFFSET)
 #define PACKETS_ROWS16_Q8(T) packets_rows16(T##_ROW_STRIDE_BYTES, T##_PLANE_CODES_ROW_OFFSET, 0ul, 0ul, T##_PLANE_SUPERS_ROW_OFFSET)
-#define PACKETS_ROWS16_IQ4(T) packets_rows16(T##_ROW_STRIDE_BYTES, T##_PLANE_CODES_LO_ROW_OFFSET, 0ul, 0ul, T##_PLANE_SUPERS_ROW_OFFSET)
+#define PACKETS_ROWS16_C4(T) packets_rows16(T##_ROW_STRIDE_BYTES, T##_PLANE_CODES_LO_ROW_OFFSET, 0ul, 0ul, T##_PLANE_SUPERS_ROW_OFFSET)
+#define PACKETS_ROWS16_Q5(T) packets_rows16(T##_ROW_STRIDE_BYTES, T##_PLANE_CODES_LO_ROW_OFFSET, T##_PLANE_CODES_HI_ROW_OFFSET, 0ul, T##_PLANE_SUPERS_ROW_OFFSET)
 #define PACKETS_ROWS16_DENSE(T, BYTES) packets_rows16(T##_STRIDE_0 * uint64_t(BYTES), 0ul, 0ul, 0ul, 0ul)
 
 // One loaded packet of any kind.
@@ -110,6 +126,42 @@ float packets_iq4_code(uint code) {
     return float(values[code]);
 }
 
+// E2M1 doubled (GGUF kvalues_mxfp4), shared by mxfp4g32 and nvfp4g16; their
+// scales carry the compensating factor 1/2.
+float packets_e2m1_code(uint code) {
+    const int values[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+    return float(values[code]);
+}
+
+// The eight table values of one step word's codes, as (0,2,4,6), (1,3,5,7).
+void packets_table_codes(const int kind, uint word, out vec4 even, out vec4 odd) {
+    if (kind == PACKETS_IQ4) {
+        even = vec4(packets_iq4_code(word & 15u), packets_iq4_code((word >> 8u) & 15u),
+            packets_iq4_code((word >> 16u) & 15u), packets_iq4_code((word >> 24u) & 15u));
+        odd = vec4(packets_iq4_code((word >> 4u) & 15u), packets_iq4_code((word >> 12u) & 15u),
+            packets_iq4_code((word >> 20u) & 15u), packets_iq4_code((word >> 28u) & 15u));
+    } else {
+        even = vec4(packets_e2m1_code(word & 15u), packets_e2m1_code((word >> 8u) & 15u),
+            packets_e2m1_code((word >> 16u) & 15u), packets_e2m1_code((word >> 24u) & 15u));
+        odd = vec4(packets_e2m1_code((word >> 4u) & 15u), packets_e2m1_code((word >> 12u) & 15u),
+            packets_e2m1_code((word >> 20u) & 15u), packets_e2m1_code((word >> 28u) & 15u));
+    }
+}
+
+// E8M0 2^(e - 127) halved: 2^(e - 128) (e < 2 are F32 subnormals); 0xff is NaN.
+float packets_e8m0_half(uint e) {
+    return uintBitsToFloat(e < 2u ? 0x00200000u << e : e == 255u ? 0x7fc00000u : (e - 1u) << 23);
+}
+
+// UE4M3 (sign bit ignored; 0x7f is NaN) halved: (1 + m/8) 2^(e - 8), or
+// m 2^-10 when e = 0.
+float packets_ue4m3_half(uint raw) {
+    raw &= 0x7fu;
+    const uint e = raw >> 3, m = raw & 7u;
+    const float normal = uintBitsToFloat(((e + 119u) << 23) | (m << 20));
+    return raw == 0x7fu ? uintBitsToFloat(0x7fc00000u) : e == 0u ? float(m) * 0.0009765625 : normal;
+}
+
 // The (scale6, min6) pair of k-quant packet `p` and its super factors.
 void packets_kquant_coefficients(uint64_t row, packets_rows16 geometry, uint p, out float scale, out float bias) {
     const uint block = p >> 3, local = p & 7u;
@@ -147,6 +199,31 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
     } else if (kind == PACKETS_IQ4) {
         packet.low = element_uvec4_at(row + geometry.codes + 16ul * p);
         packet.scale0 = element_f32_at(row + geometry.supers + 4ul * p);
+    } else if (kind == PACKETS_Q4G32S) {
+        // Codes 0..15 with the exact bias -8 d: value = d * (code - 8).
+        packet.low = element_uvec4_at(row + geometry.codes + 16ul * p);
+        packet.scale0 = seismic_f16_to_f32(uint16_t(element_u16_at(row + geometry.supers + 2ul * p)));
+        packet.bias = -8.0 * packet.scale0;
+    } else if (kind == PACKETS_MXFP4) {
+        packet.low = element_uvec4_at(row + geometry.codes + 16ul * p);
+        packet.scale0 = packets_e8m0_half(element_u8_at(row + geometry.supers + uint64_t(p)));
+    } else if (kind == PACKETS_NVFP4) {
+        packet.low = element_uvec4_at(row + geometry.codes + 16ul * p);
+        const uint fields = element_u16_at(row + geometry.supers + 2ul * p);
+        packet.scale0 = packets_ue4m3_half(fields & 0xffu);
+        packet.scale1 = packets_ue4m3_half(fields >> 8);
+    } else if (kind == PACKETS_Q5G32S || kind == PACKETS_Q5G32) {
+        // q5g32s: the exact bias -16 d; q5g32: the f16 minimum m.
+        packet.low = element_uvec4_at(row + geometry.codes + 16ul * p);
+        packet.high.x = element_u32_at(row + geometry.high + 4ul * p);
+        if (kind == PACKETS_Q5G32) {
+            const uint64_t fields = row + geometry.supers + 4ul * p;
+            packet.scale0 = seismic_f16_to_f32(uint16_t(element_u16_at(fields)));
+            packet.bias = seismic_f16_to_f32(uint16_t(element_u16_at(fields + 2ul)));
+        } else {
+            packet.scale0 = seismic_f16_to_f32(uint16_t(element_u16_at(row + geometry.supers + 2ul * p)));
+            packet.bias = -16.0 * packet.scale0;
+        }
     } else if (kind == PACKETS_Q8) {
         const uint64_t codes = row + geometry.codes + 32ul * p;
         packet.low = element_uvec4_at(codes);
@@ -166,17 +243,13 @@ float packets_dense_element(const int kind, packets_packet packet, uint i) {
 
 // The codes of sub-step `step` (elements 8 step ..) as (0,2,4,6), (1,3,5,7).
 void packets_codes(const int kind, packets_packet packet, uint step, out vec4 even, out vec4 odd) {
-    if (kind == PACKETS_IQ4) {
-        const uint word = packet.low[step];
-        even = vec4(packets_iq4_code((word >> 0u) & 15u), packets_iq4_code((word >> 8u) & 15u),
-            packets_iq4_code((word >> 16u) & 15u), packets_iq4_code((word >> 24u) & 15u));
-        odd = vec4(packets_iq4_code((word >> 4u) & 15u), packets_iq4_code((word >> 12u) & 15u),
-            packets_iq4_code((word >> 20u) & 15u), packets_iq4_code((word >> 28u) & 15u));
-    } else if (kind == PACKETS_Q4K) {
+    if (kind == PACKETS_IQ4 || kind == PACKETS_MXFP4 || kind == PACKETS_NVFP4) {
+        packets_table_codes(kind, packet.low[step], even, odd);
+    } else if (kind == PACKETS_Q4K || kind == PACKETS_Q4G32S) {
         const uint word = packet.low[step];
         even = packets_unsigned_bytes(word & 0x0f0f0f0fu);
         odd = packets_unsigned_bytes((word >> 4) & 0x0f0f0f0fu);
-    } else if (kind == PACKETS_Q5K) {
+    } else if (packets_high1(kind)) {
         const uint word = packet.low[step];
         uint he, ho;
         packets_split_high1((packet.high.x >> (8u * step)) & 0xffu, he, ho);
@@ -209,29 +282,29 @@ void packets_codes(const int kind, packets_packet packet, uint step, out vec4 ev
 }
 
 float packets_scale(const int kind, packets_packet packet, uint step) {
-    if (kind == PACKETS_Q6K)
+    if (packets_groups(kind) == 2u)
         return step < 2u ? packet.scale0 : packet.scale1;
     return packets_dense(kind) ? 1.0 : packet.scale0;
 }
 
 // The bias of coefficient group `group` (q6k: -32 * scale of the group).
 float packets_bias(const int kind, packets_packet packet, uint group) {
-    if (kind == PACKETS_Q4K || kind == PACKETS_Q5K)
-        return packet.bias;
     if (kind == PACKETS_Q6K)
         return -32.0 * (group == 0u ? packet.scale0 : packet.scale1);
+    if (packets_biased(kind))
+        return packet.bias;
     return 0.0;
 }
 
 // The logical value of a decoded code of sub-step `step`.
 float packets_value(const int kind, packets_packet packet, uint step, float code) {
-    if (kind == PACKETS_Q4K || kind == PACKETS_Q5K)
-        return seismic_fma_rn(packet.scale0, code, packet.bias);
     if (kind == PACKETS_Q6K)
         return packets_scale(kind, packet, step) * (code - 32.0);
-    if (kind == PACKETS_Q8 || kind == PACKETS_IQ4)
-        return packet.scale0 * code;
-    return code;
+    if (packets_biased(kind))
+        return seismic_fma_rn(packet.scale0, code, packet.bias);
+    if (packets_dense(kind))
+        return code;
+    return packets_scale(kind, packet, step) * code;
 }
 
 // One decoded logical weight value (used by gathers such as the embedding).

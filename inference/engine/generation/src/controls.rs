@@ -157,27 +157,29 @@ impl Controlled {
         inner: Option<Box<dyn Constraint>>,
         end_of_generation: EndOfGeneration,
         stop_tokens: &BTreeSet<TokenId>,
+        never: &BTreeSet<TokenId>,
         budget: Option<&ReasoningBudget>,
         vocabulary: usize,
     ) -> Result<Option<Box<dyn Constraint>>, String> {
-        if end_of_generation == EndOfGeneration::Stop && budget.is_none() {
+        // The tokens selection excludes: the model's never-selected tokens,
+        // plus its stop tokens when end of generation is suppressed.
+        let suppressed: BTreeSet<TokenId> = match end_of_generation {
+            EndOfGeneration::Suppress => never.union(stop_tokens).copied().collect(),
+            EndOfGeneration::Stop => never.clone(),
+        };
+        if suppressed.is_empty() && budget.is_none() {
             return Ok(inner);
         }
         if let Some(budget) = budget {
             budget.validate(vocabulary)?;
-            if budget
-                .end
-                .iter()
-                .any(|token| end_of_generation == EndOfGeneration::Suppress && stop_tokens.contains(token))
-            {
-                return Err("reasoning end tag cannot use a suppressed stop token".into());
+            if budget.end.iter().any(|token| suppressed.contains(token)) {
+                return Err("reasoning end tag cannot use a suppressed token".into());
             }
         }
         let position = inner.as_ref().map_or(0, |inner| inner.position());
         Ok(Some(Box::new(Self {
             inner,
-            suppressed: (end_of_generation == EndOfGeneration::Suppress)
-                .then(|| Arc::new(stop_tokens.clone())),
+            suppressed: (!suppressed.is_empty()).then(|| Arc::new(suppressed)),
             budget: budget.cloned().map(Budget::new),
             vocabulary,
             position,
@@ -209,7 +211,7 @@ impl Constraint for Controlled {
     fn stage(&self, tokens: &[TokenId]) -> Result<Box<dyn Constraint>, String> {
         if let Some(suppressed) = &self.suppressed {
             if tokens.iter().any(|token| suppressed.contains(token)) {
-                return Err("suppressed end-of-generation token was selected".into());
+                return Err("suppressed token was selected".into());
             }
         }
         let mut budget = self.budget.clone();
@@ -312,6 +314,7 @@ mod tests {
             None,
             end_of_generation,
             &BTreeSet::from([TokenId(13)]),
+            &BTreeSet::new(),
             budget.as_ref(),
             14,
         )
@@ -325,11 +328,34 @@ mod tests {
             None,
             EndOfGeneration::Stop,
             &BTreeSet::from([TokenId(13)]),
+            &BTreeSet::new(),
             None,
             14
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn never_selected_tokens_are_masked_whether_or_not_generation_can_end() {
+        for end_of_generation in [EndOfGeneration::Stop, EndOfGeneration::Suppress] {
+            let state = Controlled::compose(
+                None,
+                end_of_generation,
+                &BTreeSet::from([TokenId(13)]),
+                &BTreeSet::from([TokenId(3), TokenId(7)]),
+                None,
+                14,
+            )
+            .unwrap()
+            .unwrap();
+            let mut expected: Vec<u32> = (0..14).filter(|id| ![3, 7].contains(id)).collect();
+            if end_of_generation == EndOfGeneration::Suppress {
+                expected.retain(|id| *id != 13);
+            }
+            assert_eq!(allowed(&state.mask().unwrap()), expected);
+            assert!(state.stage(&[TokenId(7)]).is_err());
+        }
     }
 
     #[test]

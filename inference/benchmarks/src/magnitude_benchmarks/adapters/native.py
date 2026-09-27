@@ -121,6 +121,7 @@ class Native(Adapter):
                 if native.mtp_proposals is not None
                 else []
             ),
+            *(["--draft", str(native.draft)] if native.draft is not None else []),
         ]
 
     def verify_ready(self, data, context, parallel):

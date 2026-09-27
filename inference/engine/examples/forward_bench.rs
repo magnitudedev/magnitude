@@ -58,7 +58,7 @@ use magnitude_executor::{
     Demand, DomainError, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision,
     RequestId, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
 };
-use magnitude_family_contracts::DecoderGeometry;
+use magnitude_family_contracts::Decoder;
 use magnitude_scheduler::{
     domain::{self as service_domain, DomainFlight},
     ServiceLimits,
@@ -512,7 +512,7 @@ pub(crate) struct Bench {
     device: seismic::Device,
     vocabulary: usize,
     /// The loaded model's decoder geometry (`qualify` selects the D4 limits by it).
-    geometry: DecoderGeometry,
+    geometry: Decoder,
     next_request: u64,
     /// Cross-step pipelining: traces are collected once per measurement
     /// window (a per-step collect would wait for the step queued behind it).
@@ -554,6 +554,7 @@ impl Bench {
             package: PackageOptions {
                 target: model.to_path_buf(),
                 projector: ProjectorSelection::Disabled,
+                draft: None,
             },
             model: ModelPolicy {
                 method: ModelMethod::Plain,
@@ -575,9 +576,9 @@ impl Bench {
         }
         .resolve()
         .map_err(|error| error.to_string())?;
-        let vocabulary = usize::try_from(resolved.manifest.definition.geometry.vocabulary)
+        let vocabulary = usize::try_from(resolved.manifest.definition.decoder.vocabulary)
             .map_err(|_| "vocabulary exceeds host domain")?;
-        let geometry = resolved.manifest.definition.geometry.clone();
+        let geometry = resolved.manifest.definition.decoder.clone();
         let package = resolved.host.shared_package();
         let (domain, _) =
             build_native_domain(&resolved.manifest, package).map_err(|error| error.to_string())?;
@@ -1381,12 +1382,10 @@ fn verify_cell(
 /// `--kl-divergence-base` file, with llama.cpp's own KL and same-top
 /// definitions (`validation/precision/README.md` documents the file).
 mod qualify {
-    use super::{
-        host, Bench, DecoderGeometry, Demand, Operation, Options, Outcome, Sequence, WorkKind,
-    };
+    use super::{host, Bench, Decoder, Demand, Operation, Options, Outcome, Sequence, WorkKind};
     use magnitude_executor::TokenId;
-    use magnitude_family_contracts::FeedForwardGeometry;
-    use serde_json::json;
+    use magnitude_family_contracts::Operator;
+    use serde_json::{json, Value};
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
 
@@ -1401,6 +1400,10 @@ mod qualify {
         tokens: Vec<i32>,
         rows_offset: u64,
         row_bytes: usize,
+        /// The BOS the base's forward substituted at every chunk start
+        /// (llama-perplexity's rule for a model that adds BOS); the stored
+        /// tokens keep the corpus token there.
+        bos: Option<i32>,
     }
 
     fn read_i32s(file: &mut File, count: usize) -> Result<Vec<i32>, String> {
@@ -1440,6 +1443,7 @@ mod qualify {
                 tokens,
                 rows_offset: 20 + 4 * (n_chunk * n_ctx) as u64,
                 row_bytes: 2 * nv,
+                bos: None,
             })
         }
 
@@ -1452,9 +1456,11 @@ mod qualify {
         }
 
         fn chunk_tokens(&self, chunk: usize) -> Result<Vec<TokenId>, String> {
-            self.tokens[chunk * self.n_ctx..(chunk + 1) * self.n_ctx]
-                .iter()
-                .map(|&token| {
+            let stored = &self.tokens[chunk * self.n_ctx..(chunk + 1) * self.n_ctx];
+            self.bos
+                .into_iter()
+                .chain(stored[usize::from(self.bos.is_some())..].iter().copied())
+                .map(|token| {
                     u32::try_from(token)
                         .map(TokenId)
                         .map_err(|_| "negative token id".to_owned())
@@ -1572,21 +1578,125 @@ mod qualify {
         kld_p99_category: 0.23,
     };
 
+    /// MiniCPM5-2B, against its model-definition reference
+    /// (`ref-model-minicpm5-2b-q4km`); the rule applied to llama.cpp CUDA
+    /// (GB10, b10998): mean KL 0.00306 overall, worst category 0.00399
+    /// (prose), same-top 97.09 % overall, worst category 95.95 % (prose),
+    /// worst p99 0.0325 (tool JSON).
+    const MINICPM5_2B: Limits = Limits {
+        model: "MiniCPM5 2B",
+        mean_kld_overall: 0.0070,
+        mean_kld_category: 0.010,
+        same_top_overall: 0.960,
+        same_top_category: 0.949,
+        kld_p99_category: 0.066,
+    };
+
+    /// Nemotron 3.5 Lightning 30B-A3B, against its model-definition reference
+    /// (`ref-model-nemotron-3.5-lightning-q4km`); the rule applied to llama.cpp
+    /// CUDA (GB10, b10998): mean KL 0.00798 overall, worst category 0.01587
+    /// (prose), same-top 96.65 % overall, worst category 95.02 % (prose),
+    /// worst p99 0.183 (prose).
+    const NEMOTRON_LIGHTNING: Limits = Limits {
+        model: "Nemotron 3.5 Lightning 30B-A3B",
+        mean_kld_overall: 0.018,
+        mean_kld_category: 0.041,
+        same_top_overall: 0.956,
+        same_top_category: 0.940,
+        kld_p99_category: 0.37,
+    };
+
+    /// LFM2.5-2.6B, against its model-definition reference
+    /// (`ref-model-lfm2.5-2.6b-q4km`); the rule applied to llama.cpp CUDA
+    /// (GB10, b10998): mean KL 0.01781 overall, worst category 0.0397
+    /// (tool JSON), same-top 94.64 % overall, worst category 91.88 % (tool
+    /// JSON), worst p99 0.549 (tool JSON).
+    const LFM2_5_2_6B: Limits = Limits {
+        model: "LFM2.5 2.6B",
+        mean_kld_overall: 0.041,
+        mean_kld_category: 0.10,
+        same_top_overall: 0.936,
+        same_top_category: 0.908,
+        kld_p99_category: 1.1,
+    };
+
+    /// LFM2.5-8B-A1B, against its model-definition reference
+    /// (`ref-model-lfm2.5-8b-a1b-q4km`); the rule applied to llama.cpp CUDA
+    /// (GB10, b10998): mean KL 0.0519 overall, worst category 0.0938 (tool
+    /// JSON), same-top 90.92 % overall, worst category 89.05 % (tool JSON),
+    /// worst p99 1.54 (tool JSON).
+    const LFM2_5_8B_A1B: Limits = Limits {
+        model: "LFM2.5 8B-A1B",
+        mean_kld_overall: 0.12,
+        mean_kld_category: 0.24,
+        same_top_overall: 0.899,
+        same_top_category: 0.880,
+        kld_p99_category: 3.1,
+    };
+
+    /// Muse Glimmer 30B, against its model-definition reference
+    /// (`ref-model-muse-glimmer-30b-q4`); the rule applied to llama.cpp CUDA
+    /// (GB10, b10998): mean KL 0.00529 overall, worst category 0.01222
+    /// (prose), same-top 97.75 % overall, worst category 96.39 % (prose),
+    /// worst p99 0.164 (prose).
+    const MUSE_GLIMMER_30B: Limits = Limits {
+        model: "Muse Glimmer 30B",
+        mean_kld_overall: 0.012,
+        mean_kld_category: 0.032,
+        same_top_overall: 0.967,
+        same_top_category: 0.953,
+        kld_p99_category: 0.33,
+    };
+
+    /// Gemma 4 12B, against its model-definition reference
+    /// (`ref-model-gemma-4-12b-q4`); the rule applied to llama.cpp CUDA
+    /// (GB10, b10998): mean KL 0.0529 overall, worst category 0.0778 (tool
+    /// JSON), same-top 93.01 % overall, worst category 91.99 % (prose), worst
+    /// p99 1.235 (tool JSON).
+    const GEMMA4_12B: Limits = Limits {
+        model: "Gemma 4 12B",
+        mean_kld_overall: 0.12,
+        mean_kld_category: 0.20,
+        same_top_overall: 0.920,
+        same_top_category: 0.909,
+        kld_p99_category: 2.5,
+    };
+
+    /// Gemma 4 31B, against its model-definition reference
+    /// (`ref-model-gemma-4-31b-q4`); the rule applied to llama.cpp CUDA
+    /// (GB10, b10998): mean KL 0.0135 overall, worst category 0.0229 (prose),
+    /// same-top 97.33 % overall, worst category 95.93 % (prose), worst p99
+    /// 0.409 (prose).
+    const GEMMA4_31B: Limits = Limits {
+        model: "Gemma 4 31B",
+        mean_kld_overall: 0.031,
+        mean_kld_category: 0.060,
+        same_top_overall: 0.963,
+        same_top_category: 0.949,
+        kld_p99_category: 0.82,
+    };
+
     /// The D4 limits of the loaded model, identified by its geometry: hidden
     /// width, block count and feed-forward kind (expert count when routed).
-    fn limits(geometry: &DecoderGeometry) -> Result<&'static Limits, String> {
+    fn limits(geometry: &Decoder) -> Result<&'static Limits, String> {
         let experts = geometry
-            .blocks
-            .iter()
-            .map(|block| match &block.feedforward {
-                FeedForwardGeometry::Dense { .. } => None,
-                FeedForwardGeometry::Routed(experts) => Some(experts.count),
+            .sublayers()
+            .map(|(_, sublayer)| match &sublayer.op {
+                Operator::RoutedFfn(routed) => Some(routed.experts),
+                _ => None,
             })
             .max()
             .flatten();
         match (geometry.hidden, geometry.blocks.len(), experts) {
             (2560, 32, None) => Ok(&QWEN35_4B),
             (2048, 40, Some(256)) => Ok(&QWEN35_35B_A3B),
+            (2048, 42, None) => Ok(&MINICPM5_2B),
+            (2688, 29, Some(128)) => Ok(&NEMOTRON_LIGHTNING),
+            (2048, 30, None) => Ok(&LFM2_5_2_6B),
+            (2048, 24, Some(32)) => Ok(&LFM2_5_8B_A1B),
+            (6656, 52, None) => Ok(&MUSE_GLIMMER_30B),
+            (3840, 48, None) => Ok(&GEMMA4_12B),
+            (5376, 60, None) => Ok(&GEMMA4_31B),
             (hidden, blocks, experts) => Err(format!(
                 "no D4 limits for this model (hidden {hidden}, {blocks} blocks, experts {experts:?}); \
                  derive them per spec D4 from its own F32 reference and llama.cpp spreads"
@@ -1716,6 +1826,25 @@ mod qualify {
                 BaseFile::open(&directory.join(format!("{name}.bin"))).map(|base| (*name, base))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // A model-definition base records whether its forward put BOS at
+        // every chunk start (`reference.json`); llama.cpp's own bases of
+        // models that add no BOS carry none.
+        let description = directory.join("reference.json");
+        if description.exists() {
+            let text = std::fs::read_to_string(&description)
+                .map_err(|error| format!("{}: {error}", description.display()))?;
+            let description: Value = serde_json::from_str(&text)
+                .map_err(|error| format!("{}: {error}", description.display()))?;
+            if description["add_bos"].as_bool() == Some(true) {
+                let bos = description["bos"]
+                    .as_i64()
+                    .and_then(|bos| i32::try_from(bos).ok())
+                    .ok_or("reference.json adds BOS but names no BOS token")?;
+                for (_, base) in &mut bases {
+                    base.bos = Some(bos);
+                }
+            }
+        }
         let n_ctx = bases[0].1.n_ctx;
         for (name, base) in &bases {
             if base.n_ctx != n_ctx || base.evaluated() == 0 {

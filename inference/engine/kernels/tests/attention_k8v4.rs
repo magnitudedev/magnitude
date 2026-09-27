@@ -1,13 +1,12 @@
-// `gated_attention_decode_k8v4` and `gated_attention_prefill_k8v4` (affine K8/V4
-// history) on every accelerator present and the CPU: against their portable body (the
-// reference interpreter, small shapes) and against a host model of that body
-// (the dense host model over the decoded history, Qwen3.5-4B geometry, long
-// contexts). Timings are ignored tests.
+// `attention_decode_k8v4` and `attention_prefill_k8v4` (affine K8/V4 history)
+// in Qwen's form on every accelerator present and the CPU: against their
+// portable body (the reference interpreter, small shapes) and against a host
+// model of that body (the dense host model over the decoded history, Qwen3.5
+// geometries and 512-column heads, long contexts). Timings are ignored tests.
 #![allow(dead_code)]
 
 use magnitude_kernels::{
-    gated_attention_decode, gated_attention_decode_k8v4, gated_attention_prefill,
-    gated_attention_prefill_k8v4,
+    attention_decode, attention_decode_k8v4, attention_prefill, attention_prefill_k8v4,
 };
 use seismic::{
     BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor,
@@ -211,15 +210,20 @@ fn halves(tensor: &Tensor) -> Vec<u16> {
         .collect()
 }
 
-/// Device tensors of one case.
+/// Device tensors of one case, in the family's Qwen form: queries with their
+/// interleaved gates, no separate gate, one fresh layer, q/k norms, no value
+/// norm, unit rotary amplitudes.
 struct Bound {
-    query_gate: Tensor,
+    query: Tensor,
+    gate: Tensor,
     key: Tensor,
     value: Tensor,
     query_norm: Tensor,
     key_norm: Tensor,
+    value_norm: Tensor,
     components: Tensor,
     frequencies: Tensor,
+    amplitudes: Tensor,
     coordinates: Tensor,
     visible: Tensor,
     fresh: Tensor,
@@ -322,13 +326,16 @@ impl Bound {
         let value_codes = slabs.logical_region(2).unwrap();
         let value_coefficients = slabs.logical_region(3).unwrap();
         Self {
-            query_gate: bf16_tensor(device, &[m, kv * g * 2 * w], &case.query_gate),
-            key: bf16_tensor(device, &[m, kv * w], &case.key),
-            value: bf16_tensor(device, &[m, kv * w], &case.value),
-            query_norm: f32_tensor(device, &[w], &case.query_norm),
-            key_norm: f32_tensor(device, &[w], &case.key_norm),
+            query: bf16_tensor(device, &[m, kv * g, 2 * w], &case.query_gate),
+            gate: bf16_tensor(device, &[m, kv * g, 0], &[]),
+            key: bf16_tensor(device, &[1, m, kv * w], &case.key),
+            value: bf16_tensor(device, &[1, m, kv * w], &case.value),
+            query_norm: f32_tensor(device, &[1, w], &case.query_norm),
+            key_norm: f32_tensor(device, &[1, w], &case.key_norm),
+            value_norm: f32_tensor(device, &[0, w], &[]),
             components: i32_tensor(device, &[p], &case.components),
             frequencies: f32_tensor(device, &[p], &case.frequencies),
+            amplitudes: f32_tensor(device, &[p], &vec![1.0; p]),
             coordinates: i32_tensor(device, &[m, 4], &case.coordinates),
             visible: i32_tensor(device, &[m, case.spans, 2], &case.visible),
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
@@ -355,13 +362,16 @@ impl Bound {
 macro_rules! args {
     ($module:ident, $bound:expr, $case:expr) => {
         $module::Args {
-            query_gate: &$bound.query_gate,
+            query: &$bound.query,
+            gate: &$bound.gate,
             key: &$bound.key,
             value: &$bound.value,
             query_norm: &$bound.query_norm,
             key_norm: &$bound.key_norm,
+            value_norm: &$bound.value_norm,
             rotary_components: &$bound.components,
             rotary_frequencies: &$bound.frequencies,
+            rotary_amplitudes: &$bound.amplitudes,
             coordinates: &$bound.coordinates,
             visible: &$bound.visible,
             fresh: &$bound.fresh,
@@ -372,6 +382,7 @@ macro_rules! args {
             history_value_coefficients: &mut $bound.value_coefficients,
             epsilon: $case.epsilon,
             scale: $case.scale,
+            gate_function: 0,
             slab_rows: $bound.slab_rows,
         }
     };
@@ -404,18 +415,30 @@ fn k8v4_devices() -> Vec<Device> {
 /// Declared decode configurations of `backend`.
 fn decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, u64)>> {
     match backend {
-        BackendName::Cuda => [(12, 4), (24, 8), (48, 4), (48, 8)]
-            .into_iter()
-            .map(|(parts, warps)| vec![("PARTS", parts), ("WARPS", warps)])
-            .collect(),
+        // The last configuration slices the query group as finely as the
+        // group and the warps admit.
+        BackendName::Cuda => {
+            let slices = [8u64, 4, 2, 1].into_iter().find(|s| group as u64 % s == 0).unwrap();
+            [(12, 4, 1), (24, 8, 1), (48, 4, 1), (48, 8, slices)]
+                .into_iter()
+                .map(|(parts, warps, slices)| vec![("PARTS", parts), ("WARPS", warps), ("SLICES", slices)])
+                .collect()
+        }
         BackendName::Cpu => [8, 4, 16, 1]
             .into_iter()
             .map(|parts| vec![("PARTS", parts)])
             .collect(),
-        BackendName::Metal => [(32, 16, 4), (64, 32, 8), (256, 8, 8), (32, 16, 8)]
-            .into_iter()
-            .map(|(span, parts, simds)| vec![("SPAN", span), ("PARTS", parts), ("SIMDS", simds)])
-            .collect(),
+        // The last configuration slices the query group as finely as the
+        // group and the simdgroups admit.
+        BackendName::Metal => {
+            let slices = [8u64, 4, 2, 1].into_iter().find(|s| group as u64 % s == 0).unwrap();
+            [(32, 16, 4, 1), (64, 32, 8, 1), (256, 8, 8, 1), (32, 16, 8, slices)]
+                .into_iter()
+                .map(|(span, parts, simds, slices)| {
+                    vec![("SPAN", span), ("PARTS", parts), ("SIMDS", simds), ("SLICES", slices)]
+                })
+                .collect()
+        }
         // A slice count must divide the geometry's query group. The portable
         // comparison also uses a two-query group.
         BackendName::Vulkan => [
@@ -424,6 +447,7 @@ fn decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, 
             (256, 8, 8, 4),
             (32, 16, 8, 2),
             (32, 16, 4, 4),
+            (32, 16, 8, 8),
         ]
         .into_iter()
         .filter(|(_, _, _, slices)| group.is_multiple_of(*slices as usize))
@@ -439,12 +463,20 @@ fn decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, 
     }
 }
 
-/// Declared prefill configurations of `backend`.
-fn prefill_configs(backend: BackendName) -> Vec<Vec<(&'static str, u64)>> {
+/// Declared prefill configurations of `backend` admissible at `geometry`
+/// (CUDA's 8-warp block fits shared memory up to 192-column heads).
+fn prefill_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> {
     match backend {
-        BackendName::Cuda => [4, 2]
+        BackendName::Cuda => [(4, 1), (2, 1), (4, 256), (2, 512), (8, 1), (8, 256)]
             .into_iter()
-            .map(|warps| vec![("WARPS", warps)])
+            .filter(|(warps, _)| {
+                // The declaration's shared bound: the query tile and two
+                // K-piece + V-window stages (16-key tiles above W = 256).
+                let w = geometry.w();
+                let keys = if w > 256 { 16 } else { 32 };
+                (*warps as usize * 16 * w + 4 * keys * w.min(256)) * 2 <= 98304
+            })
+            .map(|(warps, split)| vec![("WARPS", warps), ("SPLIT_GROUPS", split)])
             .collect(),
         // One CPU form, without parameters.
         BackendName::Cpu => vec![Vec::new()],
@@ -477,6 +509,7 @@ fn specialization_on(
     } else {
         statics(geometry)
     };
+    let base = qwen_form(base, geometry);
     params
         .iter()
         .fold(base, |spec, (name, value)| spec.with_param(*name, *value))
@@ -486,10 +519,10 @@ fn decode_kernel(
     device: &Device,
     geometry: Geometry,
     params: &[(&'static str, u64)],
-) -> seismic::NativeKernel<gated_attention_decode_k8v4::Entry> {
-    gated_attention_decode_k8v4::native_for_device_with(
+) -> seismic::NativeKernel<attention_decode_k8v4::Entry> {
+    attention_decode_k8v4::native_for_device_with(
         device,
-        gated_attention_decode_k8v4::Elements { A: Element::bf16() },
+        attention_decode_k8v4::Elements { A: Element::bf16() },
         &specialization_on(device, geometry, params),
     )
     .unwrap()
@@ -499,10 +532,10 @@ fn prefill_kernel(
     device: &Device,
     geometry: Geometry,
     params: &[(&'static str, u64)],
-) -> seismic::NativeKernel<gated_attention_prefill_k8v4::Entry> {
-    gated_attention_prefill_k8v4::native_for_device_with(
+) -> seismic::NativeKernel<attention_prefill_k8v4::Entry> {
+    attention_prefill_k8v4::native_for_device_with(
         device,
-        gated_attention_prefill_k8v4::Elements { A: Element::bf16() },
+        attention_prefill_k8v4::Elements { A: Element::bf16() },
         &specialization_on(device, geometry, params),
     )
     .unwrap()
@@ -629,15 +662,18 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     let args = vec![
         tensor(
             DType::BF16,
-            vec![m, kv * g * 2 * w],
+            vec![m, kv * g, 2 * w],
             floats(&case.query_gate),
         ),
-        tensor(DType::BF16, vec![m, kv * w], floats(&case.key)),
-        tensor(DType::BF16, vec![m, kv * w], floats(&case.value)),
-        tensor(DType::F32, vec![w], floats(&case.query_norm)),
-        tensor(DType::F32, vec![w], floats(&case.key_norm)),
+        tensor(DType::BF16, vec![m, kv * g, 0], Vec::new()),
+        tensor(DType::BF16, vec![1, m, kv * w], floats(&case.key)),
+        tensor(DType::BF16, vec![1, m, kv * w], floats(&case.value)),
+        tensor(DType::F32, vec![1, w], floats(&case.query_norm)),
+        tensor(DType::F32, vec![1, w], floats(&case.key_norm)),
+        tensor(DType::F32, vec![0, w], Vec::new()),
         tensor(DType::I32, vec![p], ints(&case.components)),
         tensor(DType::F32, vec![p], floats(&case.frequencies)),
+        tensor(DType::F32, vec![p], vec![1.0; p]),
         tensor(DType::I32, vec![m, 4], ints(&case.coordinates)),
         tensor(DType::I32, vec![m, case.spans, 2], ints(&case.visible)),
         tensor(DType::I32, vec![m, 2], ints(&case.fresh)),
@@ -660,6 +696,7 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
         ),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
+        Arg::Scalar(ReferenceScalar::I32(0)),
         Arg::Scalar(ReferenceScalar::U32(t as u32)),
     ];
     let outcome = interpreter.run(&args).unwrap();
@@ -690,10 +727,10 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
             .collect::<Vec<_>>()
     };
     let portable = Planes {
-        key_codes: read(11).into_iter().map(|x| x as u32).collect(),
-        key_coefficients: read(12).into_iter().map(|x| f16_bits(x as f32)).collect(),
-        value_codes: read(13).into_iter().map(|x| x as u32).collect(),
-        value_coefficients: read(14).into_iter().map(|x| f16_bits(x as f32)).collect(),
+        key_codes: read(14).into_iter().map(|x| x as u32).collect(),
+        key_coefficients: read(15).into_iter().map(|x| f16_bits(x as f32)).collect(),
+        value_codes: read(16).into_iter().map(|x| x as u32).collect(),
+        value_coefficients: read(17).into_iter().map(|x| f16_bits(x as f32)).collect(),
     };
     assert_eq!(
         portable.value_codes, expected.1.value_codes,
@@ -724,7 +761,7 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
 #[test]
 fn decode_matches_portable_body() {
     let encoded = Encoded::new(Case::new(GROUPED, 64, 2, &decode_rows(5), 11));
-    check_host_model_against_portable_body("gated_attention_decode_k8v4", &encoded);
+    check_host_model_against_portable_body("attention_decode_k8v4", &encoded);
     for device in k8v4_devices() {
         decode_matches_portable_body_on(&device, &encoded);
     }
@@ -737,7 +774,7 @@ fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
         let kernel = decode_kernel(device, GROUPED, &config);
         let mut bound = Bound::new(device, encoded);
         let gated = kernel
-            .call(args!(gated_attention_decode_k8v4, bound, encoded.case))
+            .call(args!(attention_decode_k8v4, bound, encoded.case))
             .unwrap()
             .value;
         check(
@@ -778,7 +815,7 @@ fn decode_reads_and_writes_across_affine_history_slabs() {
         for reused in [false, true] {
             let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, reused);
             let gated = kernel
-                .call(args!(gated_attention_decode_k8v4, bound, encoded.case))
+                .call(args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -792,6 +829,41 @@ fn decode_reads_and_writes_across_affine_history_slabs() {
     }
 }
 
+/// Visible spans crossing slab edges, as the device measurement binds them
+/// (one span over the whole synthetic history, several slabs deep), at every
+/// decode configuration: the entry walks each slab's part of a span.
+#[test]
+fn decode_reads_spans_crossing_affine_history_slabs() {
+    let rows = [
+        Row { spans: vec![(0, 200)], fresh: (0, 1), destination: 200, position: 200 },
+        Row { spans: vec![(7, 150), (170, 199)], fresh: (1, 2), destination: 201, position: 199 },
+    ];
+    let encoded = Encoded::new(Case::new(GROUPED, 224, 2, &rows, 79));
+    let expected = encoded.expected();
+    for device in k8v4_devices() {
+        let backend = device.backend();
+        for config in decode_configs(backend, GROUPED.g) {
+            let kernel = decode_kernel(&device, GROUPED, &config);
+            // A reused middle slab puts consecutive slabs at unrelated
+            // addresses.
+            for reused in [false, true] {
+                let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, reused);
+                let gated = kernel
+                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .unwrap()
+                    .value;
+                check(
+                    &format!("{backend:?} affine crossing-span decode {config:?} reused={reused}"),
+                    &encoded,
+                    &gated,
+                    &bound,
+                    &expected,
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn prefill_matches_portable_body() {
     // 300 history rows are 10 key tiles: the split configurations split the
@@ -799,7 +871,7 @@ fn prefill_matches_portable_body() {
     // One affine group per vector keeps the interpreter's prefill affordable;
     // the Qwen geometry test covers eight groups.
     let encoded = Encoded::new(Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23));
-    check_host_model_against_portable_body("gated_attention_prefill_k8v4", &encoded);
+    check_host_model_against_portable_body("attention_prefill_k8v4", &encoded);
     for device in k8v4_devices() {
         prefill_matches_portable_body_on(&device, &encoded);
     }
@@ -808,11 +880,11 @@ fn prefill_matches_portable_body() {
 fn prefill_matches_portable_body_on(device: &Device, encoded: &Encoded) {
     let backend = device.backend();
     let expected = encoded.expected();
-    for config in prefill_configs(backend) {
+    for config in prefill_configs(backend, SMALL) {
         let kernel = prefill_kernel(device, SMALL, &config);
         let mut bound = Bound::new(device, encoded);
         let gated = kernel
-            .call(args!(gated_attention_prefill_k8v4, bound, encoded.case))
+            .call(args!(attention_prefill_k8v4, bound, encoded.case))
             .unwrap()
             .value;
         check(
@@ -851,11 +923,11 @@ fn prefill_reads_and_writes_across_affine_history_slabs() {
     let expected = encoded.expected();
     for device in k8v4_devices() {
         let backend = device.backend();
-        let config = prefill_configs(backend).into_iter().next().unwrap();
+        let config = prefill_configs(backend, GROUPED).into_iter().next().unwrap();
         let kernel = prefill_kernel(&device, GROUPED, &config);
         let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, true);
         let gated = kernel
-            .call(args!(gated_attention_prefill_k8v4, bound, encoded.case))
+            .call(args!(attention_prefill_k8v4, bound, encoded.case))
             .unwrap()
             .value;
         check(
@@ -890,7 +962,7 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
             let kernel = decode_kernel(device, QWEN, &config);
             let mut bound = Bound::new(device, &encoded);
             let gated = kernel
-                .call(args!(gated_attention_decode_k8v4, bound, encoded.case))
+                .call(args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -914,7 +986,7 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
             let kernel = decode_kernel(device, QWEN, config);
             let mut bound = Bound::new(device, &encoded);
             let gated = kernel
-                .call(args!(gated_attention_decode_k8v4, bound, encoded.case))
+                .call(args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -935,11 +1007,11 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
             7,
         ));
         let expected = encoded.expected();
-        for config in prefill_configs(backend) {
+        for config in prefill_configs(backend, QWEN) {
             let kernel = prefill_kernel(device, QWEN, &config);
             let mut bound = Bound::new(device, &encoded);
             let gated = kernel
-                .call(args!(gated_attention_prefill_k8v4, bound, encoded.case))
+                .call(args!(attention_prefill_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -983,6 +1055,58 @@ fn sixteen_query_group_decode_and_prefill_at_4k_match_host_model() {
     large_group_decode_and_prefill_at_4k_match_host_model(QWEN122B);
 }
 
+/// 512-column heads (Gemma 4 full layers: 4 kv heads of 8, 64 rotated pairs):
+/// decode and a prefill chunk over 1k of affine history, on the backends
+/// whose declarations take them (the others refuse by `where`).
+#[test]
+fn wide_head_decode_and_prefill_match_host_model() {
+    let geometry = Geometry { kv: 2, g: 8, p: 64, s: 384 };
+    for device in k8v4_devices() {
+        let backend = device.backend();
+        let context = 1024;
+        let decode = Encoded::new(Case::new(geometry, context + 128, 2, &decode_rows(context as i32 - 40), 5));
+        let prefill = Encoded::new(Case::new(geometry, context + 256, 2, &prefill_rows(40, context as i32), 7));
+        for (encoded, configs, is_decode) in [
+            (&decode, decode_configs(backend, geometry.g), true),
+            (&prefill, prefill_configs(backend, geometry), false),
+        ] {
+            let expected = encoded.expected();
+            for config in configs {
+                let specialization = specialization_on(&device, geometry, &config);
+                let label = format!("{backend:?} wide {} {config:?}", if is_decode { "decode" } else { "prefill" });
+                let mut bound = Bound::new(&device, encoded);
+                let result = if is_decode {
+                    attention_decode_k8v4::native_for_device_with(
+                        &device,
+                        attention_decode_k8v4::Elements { A: Element::bf16() },
+                        &specialization,
+                    )
+                    .map(|kernel| kernel.call(args!(attention_decode_k8v4, bound, encoded.case)).unwrap().value)
+                } else {
+                    attention_prefill_k8v4::native_for_device_with(
+                        &device,
+                        attention_prefill_k8v4::Elements { A: Element::bf16() },
+                        &specialization,
+                    )
+                    .map(|kernel| kernel.call(args!(attention_prefill_k8v4, bound, encoded.case)).unwrap().value)
+                };
+                match result {
+                    Ok(gated) => check(&label, encoded, &gated, &bound, &expected),
+                    Err(error) => {
+                        let error = error.to_string();
+                        assert!(
+                            error.contains("violates the native `where` condition")
+                                && matches!(backend, BackendName::Cuda | BackendName::Vulkan),
+                            "{label}: {error}"
+                        );
+                        eprintln!("{label}: rejected by the declaration's `where`");
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn large_group_decode_and_prefill_at_4k_match_host_model(geometry: Geometry) {
     let group = geometry.g;
     for device in k8v4_devices() {
@@ -1000,7 +1124,7 @@ fn large_group_decode_and_prefill_at_4k_match_host_model(geometry: Geometry) {
             let kernel = decode_kernel(&device, geometry, &config);
             let mut bound = Bound::new(&device, &encoded);
             let gated = kernel
-                .call(args!(gated_attention_decode_k8v4, bound, encoded.case))
+                .call(args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -1019,11 +1143,11 @@ fn large_group_decode_and_prefill_at_4k_match_host_model(geometry: Geometry) {
             7,
         ));
         let expected = encoded.expected();
-        for config in prefill_configs(backend) {
+        for config in prefill_configs(backend, geometry) {
             let kernel = prefill_kernel(&device, geometry, &config);
             let mut bound = Bound::new(&device, &encoded);
             let gated = kernel
-                .call(args!(gated_attention_prefill_k8v4, bound, encoded.case))
+                .call(args!(attention_prefill_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -1090,13 +1214,16 @@ impl DenseHistory {
 macro_rules! dense_args {
     ($module:ident, $bound:expr, $dense:expr, $case:expr) => {
         $module::Args {
-            query_gate: &$bound.query_gate,
+            query: &$bound.query,
+            gate: &$bound.gate,
             key: &$bound.key,
             value: &$bound.value,
             query_norm: &$bound.query_norm,
             key_norm: &$bound.key_norm,
+            value_norm: &$bound.value_norm,
             rotary_components: &$bound.components,
             rotary_frequencies: &$bound.frequencies,
+            rotary_amplitudes: &$bound.amplitudes,
             coordinates: &$bound.coordinates,
             visible: &$bound.visible,
             fresh: &$bound.fresh,
@@ -1105,6 +1232,7 @@ macro_rules! dense_args {
             history_value: &mut $dense.value,
             epsilon: $case.epsilon,
             scale: $case.scale,
+            gate_function: 0,
             slab_rows: $case.history_rows as u32,
         }
     };
@@ -1122,11 +1250,54 @@ fn decode_timing() {
     }
 }
 
+/// MiniCPM5-2B's attention: 2 kv heads of 8 query heads, W = 128, full
+/// rotation.
+const MINICPM5: Geometry = Geometry { kv: 2, g: 8, p: 64, s: 0 };
+
+/// Gemma 4 31B's full-attention layers: 4 kv heads of 8 query heads,
+/// W = 512.
+const GEMMA31_FULL: Geometry = Geometry { kv: 4, g: 8, p: 64, s: 384 };
+
+/// The decode configurations a timing sweeps: the test configurations plus
+/// the larger partition counts long histories over few kv heads need.
+fn timing_decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, u64)>> {
+    let mut configs = decode_configs(backend, group);
+    let slicings = [1u64, 2, 4, 8].into_iter().filter(|s| group as u64 % s == 0).collect::<Vec<_>>();
+    match backend {
+        BackendName::Metal | BackendName::Vulkan => {
+            for parts in [64u64, 128] {
+                for simds in [4u64, 8] {
+                    for &slices in slicings.iter().filter(|s| simds % **s == 0) {
+                        configs.push(vec![("SPAN", 32), ("PARTS", parts), ("SIMDS", simds), ("SLICES", slices)]);
+                    }
+                }
+            }
+        }
+        BackendName::Cuda => {
+            for warps in [4u64, 8] {
+                for &slices in slicings.iter().filter(|s| warps % **s == 0) {
+                    configs.push(vec![("PARTS", 96), ("WARPS", warps), ("SLICES", slices)]);
+                }
+            }
+        }
+        _ => {}
+    }
+    configs
+}
+
 fn decode_timing_on(device: &Device) {
     let backend = device.backend();
-    for (geometry, context) in [QWEN, QWEN35B, QWEN122B]
+    // `K8V4_DECODE_GEOMETRY=minicpm5` times MiniCPM5-2B's heads over the
+    // wider configuration sweep instead of the Qwen geometries.
+    let (geometries, contexts, sweep): (Vec<Geometry>, Vec<usize>, bool) =
+        match std::env::var("K8V4_DECODE_GEOMETRY").as_deref() {
+            Ok("minicpm5") => (vec![MINICPM5], vec![256, 4096, 16384], true),
+            Ok("gemma31") => (vec![GEMMA31_FULL], vec![4096, 16384], true),
+            _ => (vec![QWEN, QWEN35B, QWEN122B], vec![1, 256, 4096, 16384, 65536], false),
+        };
+    for (geometry, context) in geometries
         .into_iter()
-        .flat_map(|geometry| [1usize, 256, 4096, 16384, 65536].map(|context| (geometry, context)))
+        .flat_map(|geometry| contexts.clone().into_iter().map(move |context| (geometry, context)))
     {
         let rows = [Row {
             spans: vec![(0, context as i32 - 1)],
@@ -1136,12 +1307,21 @@ fn decode_timing_on(device: &Device) {
         }];
         let encoded = Encoded::new(Case::new(geometry, context + 64, 1, &rows, 3));
         let mut dense = DenseHistory::new(device, &encoded.case);
-        for config in decode_configs(backend, geometry.g) {
-            let kernel = decode_kernel(device, geometry, &config);
+        let configs = if sweep { timing_decode_configs(backend, geometry.g) } else { decode_configs(backend, geometry.g) };
+        for config in configs {
+            // A sweep configuration the declaration's `where` refuses at this
+            // geometry is skipped.
+            let Ok(kernel) = attention_decode_k8v4::native_for_device_with(
+                device,
+                attention_decode_k8v4::Elements { A: Element::bf16() },
+                &specialization_on(device, geometry, &config),
+            ) else {
+                continue;
+            };
             let mut bound = Bound::new(device, &encoded);
             let affine = kernel
                 .measure(
-                    vec![args!(gated_attention_decode_k8v4, bound, encoded.case)],
+                    vec![args!(attention_decode_k8v4, bound, encoded.case)],
                     &TIMING,
                 )
                 .unwrap()
@@ -1152,9 +1332,9 @@ fn decode_timing_on(device: &Device) {
                 as f64;
             let dense_bytes = (context * geometry.kv * geometry.w() * 4) as f64;
             // The dense entry's domain may not admit this configuration.
-            let dense_time = gated_attention_decode::native_for_device_with(
+            let dense_time = attention_decode::native_for_device_with(
                 device,
-                gated_attention_decode::Elements { A: Element::bf16() },
+                attention_decode::Elements { A: Element::bf16() },
                 &specialization_on(device, geometry, &config),
             )
             .ok()
@@ -1162,7 +1342,7 @@ fn decode_timing_on(device: &Device) {
                 dense_kernel
                     .measure(
                         vec![dense_args!(
-                            gated_attention_decode,
+                            attention_decode,
                             bound,
                             dense,
                             encoded.case
@@ -1223,6 +1403,14 @@ fn prefill_timing_on(device: &Device) {
             (512, 65536),
         ],
     };
+    // `K8V4_PREFILL_GEOMETRY=minicpm5` times MiniCPM5-2B's heads (2 kv heads
+    // of 8, W = 128), `gemma31` Gemma 4 31B's full layers, instead of
+    // Qwen3.5-4B's.
+    let geometry = match std::env::var("K8V4_PREFILL_GEOMETRY").as_deref() {
+        Ok("minicpm5") => MINICPM5,
+        Ok("gemma31") => GEMMA31_FULL,
+        _ => QWEN,
+    };
     for (rows, history) in rows_history {
         let spans = if history > 0 {
             vec![(0, history)]
@@ -1241,29 +1429,29 @@ fn prefill_timing_on(device: &Device) {
             .iter()
             .map(|row| (history + row.fresh.1 - row.fresh.0) as f64)
             .sum::<f64>();
-        let flop = pairs * (QWEN.kv * QWEN.g * QWEN.w() * 4) as f64;
-        let encoded = Encoded::new(Case::new(QWEN, history as usize + rows.len(), 1, &rows, 9));
+        let flop = pairs * (geometry.kv * geometry.g * geometry.w() * 4) as f64;
+        let encoded = Encoded::new(Case::new(geometry, history as usize + rows.len(), 1, &rows, 9));
         let mut dense = DenseHistory::new(device, &encoded.case);
-        for config in prefill_configs(backend) {
-            let kernel = prefill_kernel(device, QWEN, &config);
+        for config in prefill_configs(backend, geometry) {
+            let kernel = prefill_kernel(device, geometry, &config);
             let mut bound = Bound::new(device, &encoded);
             let affine = kernel
                 .measure(
-                    vec![args!(gated_attention_prefill_k8v4, bound, encoded.case)],
+                    vec![args!(attention_prefill_k8v4, bound, encoded.case)],
                     &TIMING,
                 )
                 .unwrap()
                 .median;
-            let dense_kernel = gated_attention_prefill::native_for_device_with(
+            let dense_kernel = attention_prefill::native_for_device_with(
                 device,
-                gated_attention_prefill::Elements { A: Element::bf16() },
-                &specialization_on(device, QWEN, &config),
+                attention_prefill::Elements { A: Element::bf16() },
+                &specialization_on(device, geometry, &config),
             )
             .unwrap();
             let dense_time = dense_kernel
                 .measure(
                     vec![dense_args!(
-                        gated_attention_prefill,
+                        attention_prefill,
                         bound,
                         dense,
                         encoded.case

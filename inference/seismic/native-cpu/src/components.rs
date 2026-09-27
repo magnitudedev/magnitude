@@ -9,10 +9,13 @@
 
 use crate::isa::Tier;
 use crate::quant::Q8Block;
-use crate::weights::{self, DenseRows, Format, Iq4, RowGeometry, Rows8, Q4K, Q5K, Q6K, Q8};
+use crate::weights::{
+    self, DenseRows, Format, Iq4, Mxfp4, Nvfp4, RowGeometry, Rows8, Q4G32, Q4K, Q5G32M, Q5G32S, Q5K,
+    Q6K, Q8,
+};
 
 /// Weight representations with components.
-const REPRESENTATIONS: usize = 13;
+const REPRESENTATIONS: usize = 23;
 
 /// Row blocks of the dot component, in the order of [`WeightKernels::dot`].
 pub const ROW_BLOCKS: [usize; 4] = [1, 2, 4, 8];
@@ -266,11 +269,21 @@ macro_rules! tier_components {
                 kernels::<Q6K>(),
                 kernels::<Q8>(),
                 kernels::<Iq4>(),
+                kernels::<Q4G32>(),
+                kernels::<Q5G32S>(),
+                kernels::<Q5G32M>(),
+                kernels::<Mxfp4>(),
+                kernels::<Nvfp4>(),
                 kernels::<Rows8<Q4K>>(),
                 kernels::<Rows8<Q5K>>(),
                 kernels::<Rows8<Q6K>>(),
                 kernels::<Rows8<Q8>>(),
                 kernels::<Rows8<Iq4>>(),
+                kernels::<Rows8<Q4G32>>(),
+                kernels::<Rows8<Q5G32S>>(),
+                kernels::<Rows8<Q5G32M>>(),
+                kernels::<Rows8<Mxfp4>>(),
+                kernels::<Rows8<Nvfp4>>(),
             ];
         }
     };
@@ -394,7 +407,8 @@ mod tests {
             let mut geometry = kernels.geometry(k, 0);
             let mut data = vec![0u8; rows.div_ceil(8) * 8 * geometry.stride];
             let groups = match format {
-                "q8g32s" => k.div_ceil(32),
+                "q8g32s" | "q4g32s" | "q5g32s" | "q5g32" | "mxfp4g32" => k.div_ceil(32),
+                "nvfp4g16" => k.div_ceil(64),
                 _ => k.div_ceil(256),
             };
             let offsets = [
@@ -479,6 +493,24 @@ mod tests {
                         let at = base + geometry.supers + 4 * packet;
                         data[at..at + 4]
                             .copy_from_slice(&(0.0003 * (packet % 3 + 1) as f32).to_le_bytes());
+                    }
+                }
+                "q4g32s@rows16" | "q5g32s@rows16" | "q5g32@rows16" => {
+                    for field in 0..(geometry.stride - geometry.supers) / 2 {
+                        let at = base + geometry.supers + 2 * field;
+                        data[at..at + 2].copy_from_slice(&half(0.004 + (field % 3) as f32 * 1e-3));
+                    }
+                }
+                "mxfp4g32@rows16" => {
+                    // 2^(e - 127) for e in 117..=120.
+                    for field in 0..geometry.stride - geometry.supers {
+                        data[base + geometry.supers + field] = 117 + (field % 4) as u8;
+                    }
+                }
+                "nvfp4g16@rows16" => {
+                    // UE4M3 exponent codes 1..=4 (2^-6 ..= 2^-3), varied mantissas.
+                    for field in 0..geometry.stride - geometry.supers {
+                        data[base + geometry.supers + field] = 8 + (field % 32) as u8;
                     }
                 }
                 other => panic!("no generator for {other}"),
@@ -794,11 +826,21 @@ mod tests {
                     "q6k@rows16" => by_block!(Q6K),
                     "q8g32s@rows16" => by_block!(Q8),
                     "iq4g32@rows16" => by_block!(Iq4),
+                    "q4g32s@rows16" => by_block!(Q4G32),
+                    "q5g32s@rows16" => by_block!(Q5G32S),
+                    "q5g32@rows16" => by_block!(Q5G32M),
+                    "mxfp4g32@rows16" => by_block!(Mxfp4),
+                    "nvfp4g16@rows16" => by_block!(Nvfp4),
                     "q4k@rows8" => by_block!(Rows8<Q4K>),
                     "q5k@rows8" => by_block!(Rows8<Q5K>),
                     "q6k@rows8" => by_block!(Rows8<Q6K>),
                     "q8g32s@rows8" => by_block!(Rows8<Q8>),
                     "iq4g32@rows8" => by_block!(Rows8<Iq4>),
+                    "q4g32s@rows8" => by_block!(Rows8<Q4G32>),
+                    "q5g32s@rows8" => by_block!(Rows8<Q5G32S>),
+                    "q5g32@rows8" => by_block!(Rows8<Q5G32M>),
+                    "mxfp4g32@rows8" => by_block!(Rows8<Mxfp4>),
+                    "nvfp4g16@rows8" => by_block!(Rows8<Nvfp4>),
                     other => panic!("no format for {other}"),
                 }
             }};

@@ -25,7 +25,7 @@ use std::sync::{
 fn tiny_definition() -> ModelDefinition {
     let mut definition = crate::planning::tests::fixture_definition();
     definition.family = FamilyId("controlled-target-domain".into());
-    definition.geometry.context_limit = 8;
+    definition.decoder.context_limit = 8;
     definition
 }
 
@@ -98,14 +98,14 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         .prepare_target_graphs(
             &device,
             draft.load(),
-            &definition.geometry,
+            &definition.decoder,
             &state,
             draft.programs().target(),
             limits,
         )
         .unwrap();
     let target_readout_graphs = programs
-        .prepare_target_readout_graphs(&device, draft.load(), &definition.geometry, limits)
+        .prepare_target_readout_graphs(&device, draft.load(), &definition.decoder, limits)
         .unwrap();
     programs
         .prepare_auxiliary_graphs(
@@ -585,7 +585,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops_without_pois
     let vision_features = FeatureRef::logical(
         domain.resource_identity().clone(),
         1,
-        domain.definition.geometry.hidden as usize,
+        domain.definition.decoder.hidden as usize,
     )
     .unwrap();
     domain

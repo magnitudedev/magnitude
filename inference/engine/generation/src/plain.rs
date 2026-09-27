@@ -32,8 +32,8 @@ impl Method for Plain {
     ) -> Result<Box<dyn MethodState>, String> {
         match checkpoint {
             None | Some(MethodCheckpoint::Plain) => Ok(Box::new(PlainState)),
-            Some(MethodCheckpoint::Mtp(_)) => {
-                Err("an MTP checkpoint cannot restore plain state".into())
+            Some(MethodCheckpoint::Mtp(_) | MethodCheckpoint::DFlash(_)) => {
+                Err("a drafter checkpoint cannot restore plain state".into())
             }
         }
     }

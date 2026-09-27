@@ -1,22 +1,26 @@
-// `gated_attention_decode` and `gated_attention_prefill` against their portable
-// body (the reference interpreter, small shapes) and against a host model of
-// that body (Qwen3.5-4B geometry, long contexts), on the local GPU (Metal, or
-// Vulkan elsewhere) and the CPU.
+// `attention_decode` and `attention_prefill` in Qwen's form against their
+// portable body (the reference interpreter, small shapes) and against a host
+// model of that body (Qwen3.5-4B geometry, long contexts), on the local GPU
+// (Metal, or Vulkan elsewhere) and the CPU.
 
-use magnitude_kernels::{gated_attention_decode, gated_attention_prefill};
+use magnitude_kernels::{attention_decode, attention_prefill};
 use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
 
 include!("attention_common/fixtures.rs");
 
-/// Device tensors of one case.
+/// Device tensors of one case, in the family's Qwen form (see
+/// `attention_k8v4.rs`).
 struct Bound {
-    query_gate: Tensor,
+    query: Tensor,
+    gate: Tensor,
     key: Tensor,
     value: Tensor,
     query_norm: Tensor,
     key_norm: Tensor,
+    value_norm: Tensor,
     components: Tensor,
     frequencies: Tensor,
+    amplitudes: Tensor,
     coordinates: Tensor,
     visible: Tensor,
     fresh: Tensor,
@@ -28,31 +32,44 @@ struct Bound {
     slab_rows: u32,
 }
 
-fn history_slabs(device: &Device, rows: usize, kv: usize, width: usize, values: &[f32], slab_rows: u32, reuse_middle: bool) -> (SlabTensor, Tensor) {
+/// Slab-stored key and value history. The two tensors' slabs are allocated
+/// alternately, so a slab's successor in one tensor never follows it in
+/// memory (a read running past a slab's rows lands in the other tensor).
+fn history_slabs(device: &Device, case: &Case, slab_rows: u32, reuse_middle: bool) -> [(SlabTensor, Tensor); 2] {
+    let (rows, kv, width) = (case.history_rows, case.geometry.kv, case.geometry.w());
     let slab_rows = u64::from(slab_rows);
-    let mut slabs = SlabTensor::new(device, slab_rows, rows as u64,
-        vec![SlabRegion { element: Element::bf16(), row_shape: vec![kv as u64, width as u64] }]).unwrap();
-    let bytes = values.iter().flat_map(|value| bf16_bits(*value).to_le_bytes()).collect::<Vec<_>>();
     let row_bytes = kv * width * 2;
+    let mut tensors = [&case.history_key, &case.history_value].map(|values| {
+        let slabs = SlabTensor::new(device, slab_rows, rows as u64,
+            vec![SlabRegion { element: Element::bf16(), row_shape: vec![kv as u64, width as u64] }]).unwrap();
+        let bytes = values.iter().flat_map(|value| bf16_bits(*value).to_le_bytes()).collect::<Vec<_>>();
+        (slabs, bytes)
+    });
     for index in 0..(rows as u64).div_ceil(slab_rows) {
-        slabs.add_slab().unwrap();
-        let start = index * slab_rows;
-        let count = slab_rows.min(rows as u64 - start);
-        slabs.region_rows(0, start, count).unwrap()
-            .write_from_host(&bytes[start as usize * row_bytes..(start + count) as usize * row_bytes]).unwrap();
+        for (slabs, bytes) in &mut tensors {
+            slabs.add_slab().unwrap();
+            let start = index * slab_rows;
+            let count = slab_rows.min(rows as u64 - start);
+            slabs.region_rows(0, start, count).unwrap()
+                .write_from_host(&bytes[start as usize * row_bytes..(start + count) as usize * row_bytes]).unwrap();
+        }
     }
     if reuse_middle {
         assert!(rows as u64 > 2 * slab_rows);
-        let old = slabs.slab(1).unwrap().observe_storage();
-        slabs.free_slab(1).unwrap();
-        assert_eq!(slabs.add_slab().unwrap(), 1);
-        assert_ne!(old.identity(), slabs.slab(1).unwrap().observe_storage().identity());
-        let start = slab_rows as usize;
-        slabs.region_rows(0, slab_rows, slab_rows).unwrap()
-            .write_from_host(&bytes[start * row_bytes..(start + slab_rows as usize) * row_bytes]).unwrap();
+        for (slabs, bytes) in &mut tensors {
+            let old = slabs.slab(1).unwrap().observe_storage();
+            slabs.free_slab(1).unwrap();
+            assert_eq!(slabs.add_slab().unwrap(), 1);
+            assert_ne!(old.identity(), slabs.slab(1).unwrap().observe_storage().identity());
+            let start = slab_rows as usize;
+            slabs.region_rows(0, slab_rows, slab_rows).unwrap()
+                .write_from_host(&bytes[start * row_bytes..(start + slab_rows as usize) * row_bytes]).unwrap();
+        }
     }
-    let logical = slabs.logical_region(0).unwrap();
-    (slabs, logical)
+    tensors.map(|(slabs, _)| {
+        let logical = slabs.logical_region(0).unwrap();
+        (slabs, logical)
+    })
 }
 
 impl Bound {
@@ -70,17 +87,20 @@ impl Bound {
 
     fn new_with_options(device: &Device, case: &Case, slab_rows: u32, reuse_middle: bool) -> Self {
         let Geometry { kv, g, p, .. } = case.geometry;
-        let (m, w, t) = (case.rows, case.geometry.w(), case.history_rows);
-        let (history_key_slabs, history_key) = history_slabs(device, t, kv, w, &case.history_key, slab_rows, reuse_middle);
-        let (history_value_slabs, history_value) = history_slabs(device, t, kv, w, &case.history_value, slab_rows, reuse_middle);
+        let (m, w) = (case.rows, case.geometry.w());
+        let [(history_key_slabs, history_key), (history_value_slabs, history_value)] =
+            history_slabs(device, case, slab_rows, reuse_middle);
         Self {
-            query_gate: bf16_tensor(device, &[m, kv * g * 2 * w], &case.query_gate),
-            key: bf16_tensor(device, &[m, kv * w], &case.key),
-            value: bf16_tensor(device, &[m, kv * w], &case.value),
-            query_norm: f32_tensor(device, &[w], &case.query_norm),
-            key_norm: f32_tensor(device, &[w], &case.key_norm),
+            query: bf16_tensor(device, &[m, kv * g, 2 * w], &case.query_gate),
+            gate: bf16_tensor(device, &[m, kv * g, 0], &[]),
+            key: bf16_tensor(device, &[1, m, kv * w], &case.key),
+            value: bf16_tensor(device, &[1, m, kv * w], &case.value),
+            query_norm: f32_tensor(device, &[1, w], &case.query_norm),
+            key_norm: f32_tensor(device, &[1, w], &case.key_norm),
+            value_norm: f32_tensor(device, &[0, w], &[]),
             components: i32_tensor(device, &[p], &case.components),
             frequencies: f32_tensor(device, &[p], &case.frequencies),
+            amplitudes: f32_tensor(device, &[p], &vec![1.0; p]),
             coordinates: i32_tensor(device, &[m, 4], &case.coordinates),
             visible: i32_tensor(device, &[m, case.spans, 2], &case.visible),
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
@@ -111,7 +131,7 @@ fn decode_specializations_on(
             .map(|parts| {
                 (
                     format!("Cpu PARTS {parts}"),
-                    NativeSpecialization::new().with_param("PARTS", *parts),
+                    cpu_statics(geometry).with_param("PARTS", *parts),
                 )
             })
             .collect();
@@ -119,22 +139,28 @@ fn decode_specializations_on(
     configs
         .iter()
         .flat_map(|&(span, parts, simds)| {
-            let base = statics(geometry)
+            let base = qwen_form(statics(geometry), geometry)
                 .with_param("SPAN", span)
                 .with_param("PARTS", parts)
                 .with_param("SIMDS", simds);
             let label = format!("{:?} (SPAN, PARTS, SIMDS) {:?}", device.backend(), (span, parts, simds));
-            // Vulkan also splits the query group across subgroups: every
+            // The query group also splits across simdgroups/subgroups: every
             // admissible slicing.
-            if device.backend() == BackendName::Vulkan {
-                vulkan_slices(geometry, simds)
-                    .map(|slices| (format!("{label} SLICES {slices}"), base.clone().with_param("SLICES", slices)))
-                    .collect::<Vec<_>>()
-            } else {
-                vec![(label, base)]
-            }
+            decode_slices(geometry, simds)
+                .map(|slices| (format!("{label} SLICES {slices}"), base.clone().with_param("SLICES", slices)))
+                .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// The CPU forms' statics: the head width and Qwen's form.
+fn cpu_statics(geometry: Geometry) -> NativeSpecialization {
+    qwen_form(
+        NativeSpecialization::new()
+            .with_static("P", geometry.p as u64)
+            .with_static("S", geometry.s as u64),
+        geometry,
+    )
 }
 
 /// The prefill specializations to run on `device`, labelled: on the GPU the
@@ -146,7 +172,7 @@ fn prefill_specializations_on(
     configs: &[(u64, u64)],
 ) -> Vec<(String, NativeSpecialization)> {
     if is_cpu(device) {
-        return vec![("Cpu".to_owned(), NativeSpecialization::new())];
+        return vec![("Cpu".to_owned(), cpu_statics(geometry))];
     }
     configs
         .iter()
@@ -164,7 +190,7 @@ fn prefill_specializations_on(
                     device.backend(),
                     (query_tile, split_groups)
                 ),
-                statics(geometry)
+                qwen_form(statics(geometry), geometry)
                     .with_param(tile.0, tile.1)
                     .with_param("SPLIT_GROUPS", split_groups),
             )
@@ -175,10 +201,10 @@ fn prefill_specializations_on(
 fn decode_kernel(
     device: &Device,
     specialization: &NativeSpecialization,
-) -> seismic::NativeKernel<gated_attention_decode::Entry> {
-    gated_attention_decode::native_for_device_with(
+) -> seismic::NativeKernel<attention_decode::Entry> {
+    attention_decode::native_for_device_with(
         device,
-        gated_attention_decode::Elements { A: Element::bf16() },
+        attention_decode::Elements { A: Element::bf16() },
         specialization,
     )
     .unwrap()
@@ -187,69 +213,57 @@ fn decode_kernel(
 fn prefill_kernel(
     device: &Device,
     specialization: &NativeSpecialization,
-) -> seismic::NativeKernel<gated_attention_prefill::Entry> {
-    gated_attention_prefill::native_for_device_with(
+) -> seismic::NativeKernel<attention_prefill::Entry> {
+    attention_prefill::native_for_device_with(
         device,
-        gated_attention_prefill::Elements { A: Element::bf16() },
+        attention_prefill::Elements { A: Element::bf16() },
         specialization,
     )
     .unwrap()
 }
 
+/// The family entries' arguments of a bound case.
+macro_rules! args {
+    ($module:ident, $bound:expr, $case:expr) => {
+        $module::Args {
+            query: &$bound.query,
+            gate: &$bound.gate,
+            key: &$bound.key,
+            value: &$bound.value,
+            query_norm: &$bound.query_norm,
+            key_norm: &$bound.key_norm,
+            value_norm: &$bound.value_norm,
+            rotary_components: &$bound.components,
+            rotary_frequencies: &$bound.frequencies,
+            rotary_amplitudes: &$bound.amplitudes,
+            coordinates: &$bound.coordinates,
+            visible: &$bound.visible,
+            fresh: &$bound.fresh,
+            destinations: &$bound.destinations,
+            history_key: &mut $bound.history_key,
+            history_value: &mut $bound.history_value,
+            epsilon: $case.epsilon,
+            scale: $case.scale,
+            gate_function: 0,
+            slab_rows: $bound.slab_rows,
+        }
+    };
+}
+
 fn run_decode(
-    kernel: &seismic::NativeKernel<gated_attention_decode::Entry>,
+    kernel: &seismic::NativeKernel<attention_decode::Entry>,
     bound: &mut Bound,
     case: &Case,
 ) -> Tensor {
-    kernel
-        .call(gated_attention_decode::Args {
-            query_gate: &bound.query_gate,
-            key: &bound.key,
-            value: &bound.value,
-            query_norm: &bound.query_norm,
-            key_norm: &bound.key_norm,
-            rotary_components: &bound.components,
-            rotary_frequencies: &bound.frequencies,
-            coordinates: &bound.coordinates,
-            visible: &bound.visible,
-            fresh: &bound.fresh,
-            destinations: &bound.destinations,
-            history_key: &mut bound.history_key,
-            history_value: &mut bound.history_value,
-            epsilon: case.epsilon,
-            scale: case.scale,
-            slab_rows: bound.slab_rows,
-        })
-        .unwrap()
-        .value
+    kernel.call(args!(attention_decode, bound, case)).unwrap().value
 }
 
 fn run_prefill(
-    kernel: &seismic::NativeKernel<gated_attention_prefill::Entry>,
+    kernel: &seismic::NativeKernel<attention_prefill::Entry>,
     bound: &mut Bound,
     case: &Case,
 ) -> Tensor {
-    kernel
-        .call(gated_attention_prefill::Args {
-            query_gate: &bound.query_gate,
-            key: &bound.key,
-            value: &bound.value,
-            query_norm: &bound.query_norm,
-            key_norm: &bound.key_norm,
-            rotary_components: &bound.components,
-            rotary_frequencies: &bound.frequencies,
-            coordinates: &bound.coordinates,
-            visible: &bound.visible,
-            fresh: &bound.fresh,
-            destinations: &bound.destinations,
-            history_key: &mut bound.history_key,
-            history_value: &mut bound.history_value,
-            epsilon: case.epsilon,
-            scale: case.scale,
-            slab_rows: bound.slab_rows,
-        })
-        .unwrap()
-        .value
+    kernel.call(args!(attention_prefill, bound, case)).unwrap().value
 }
 
 /// Gated outputs agree within bf16 publication plus reduced-precision query
@@ -327,15 +341,18 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     let args = vec![
         tensor(
             DType::BF16,
-            vec![m, kv * g * 2 * w],
+            vec![m, kv * g, 2 * w],
             floats(&case.query_gate),
         ),
-        tensor(DType::BF16, vec![m, kv * w], floats(&case.key)),
-        tensor(DType::BF16, vec![m, kv * w], floats(&case.value)),
-        tensor(DType::F32, vec![w], floats(&case.query_norm)),
-        tensor(DType::F32, vec![w], floats(&case.key_norm)),
+        tensor(DType::BF16, vec![m, kv * g, 0], Vec::new()),
+        tensor(DType::BF16, vec![1, m, kv * w], floats(&case.key)),
+        tensor(DType::BF16, vec![1, m, kv * w], floats(&case.value)),
+        tensor(DType::F32, vec![1, w], floats(&case.query_norm)),
+        tensor(DType::F32, vec![1, w], floats(&case.key_norm)),
+        tensor(DType::F32, vec![0, w], Vec::new()),
         tensor(DType::I32, vec![p], ints(&case.components)),
         tensor(DType::F32, vec![p], floats(&case.frequencies)),
+        tensor(DType::F32, vec![p], vec![1.0; p]),
         tensor(DType::I32, vec![m, 4], ints(&case.coordinates)),
         tensor(DType::I32, vec![m, case.spans, 2], ints(&case.visible)),
         tensor(DType::I32, vec![m, 2], ints(&case.fresh)),
@@ -344,6 +361,7 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_value)),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
+        Arg::Scalar(ReferenceScalar::I32(0)),
         Arg::Scalar(ReferenceScalar::U32(t as u32)),
     ];
     let outcome = interpreter.run(&args).unwrap();
@@ -364,8 +382,8 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     }
     let inputs = outcome.inputs().collect::<Vec<_>>();
     for (ordinal, expected, name) in [
-        (11, &expected.1, "history_key"),
-        (12, &expected.2, "history_value"),
+        (14, &expected.1, "history_key"),
+        (15, &expected.2, "history_value"),
     ] {
         let input = inputs
             .iter()
@@ -385,7 +403,7 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
 #[test]
 fn decode_matches_portable_body() {
     let case = Case::new(SMALL, 64, 2, &decode_rows(5), 11);
-    check_host_model_against_portable_body("gated_attention_decode", &case);
+    check_host_model_against_portable_body("attention_decode", &case);
     for device in devices() {
         decode_matches_portable_body_on(&device, &case);
     }
@@ -416,7 +434,7 @@ fn prefill_matches_portable_body() {
     // spans over two partitions and merges them, while its short second
     // sequence stays unsplit.
     let case = Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23);
-    check_host_model_against_portable_body("gated_attention_prefill", &case);
+    check_host_model_against_portable_body("attention_prefill", &case);
     for device in devices() {
         prefill_matches_portable_body_on(&device, &case);
     }
@@ -450,6 +468,40 @@ fn attention_reads_and_writes_across_history_slabs() {
     check_attention_slab_case(&case, false);
 }
 
+/// Visible spans crossing slab edges, as the device measurement binds them
+/// (one span over the whole synthetic history, several slabs deep): the
+/// entries walk each slab's part of a span.
+#[test]
+fn attention_reads_spans_crossing_history_slabs() {
+    let rows = [
+        Row { spans: vec![(0, 200)], fresh: (0, 1), destination: 200, position: 200 },
+        Row { spans: vec![(7, 150), (170, 199)], fresh: (1, 2), destination: 201, position: 199 },
+    ];
+    let case = Case::new(SMALL, 224, 2, &rows, 43);
+    // A reused middle slab puts consecutive slabs at unrelated addresses.
+    check_attention_slab_case(&case, false);
+    check_attention_slab_case(&case, true);
+    // Every decode configuration's walk.
+    let expected = case.expected();
+    for device in devices() {
+        for (config, specialization) in
+            decode_specializations_on(&device, SMALL, &[(32, 16, 4), (64, 8, 8), (128, 32, 4)])
+        {
+            for reused in [false, true] {
+                let mut bound = Bound::new_with_options(&device, &case, 32, reused);
+                let gated = run_decode(&decode_kernel(&device, &specialization), &mut bound, &case);
+                check(
+                    &format!("crossing-span decode {config} reused={reused}"),
+                    &case,
+                    &gated,
+                    &bound,
+                    &expected,
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn attention_reads_and_writes_after_reusing_an_interior_slab() {
     let rows = [
@@ -466,7 +518,10 @@ fn check_attention_slab_case(case: &Case, reused: bool) {
     for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
         let Ok(device) = catalog.open_backend(backend) else { continue };
         let decode_spec = if backend == BackendName::Cuda {
-            statics(SMALL).with_param("PARTS", 12).with_param("WARPS", 4)
+            qwen_form(statics(SMALL), SMALL)
+                .with_param("PARTS", 12)
+                .with_param("WARPS", 4)
+                .with_param("SLICES", 1)
         } else {
             decode_specializations_on(&device, SMALL, &[(32, 16, 4)])
                 .into_iter().next().unwrap().1
@@ -480,7 +535,9 @@ fn check_attention_slab_case(case: &Case, reused: bool) {
         check(&format!("{backend:?} slab decode"), case, &gated, &bound, &expected);
 
         let prefill_spec = if backend == BackendName::Cuda {
-            statics(SMALL).with_param("WARPS", 4)
+            qwen_form(statics(SMALL), SMALL)
+                .with_param("WARPS", 4)
+                .with_param("SPLIT_GROUPS", 1)
         } else {
             prefill_specializations_on(&device, SMALL, &[(8, 1)])
                 .into_iter().next().unwrap().1
@@ -585,27 +642,7 @@ fn decode_timing_on(device: &Device) {
             let kernel = decode_kernel(device, &specialization);
             let mut bound = Bound::new(device, &case);
             let measurement = kernel
-                .measure(
-                    vec![gated_attention_decode::Args {
-                        query_gate: &bound.query_gate,
-                        key: &bound.key,
-                        value: &bound.value,
-                        query_norm: &bound.query_norm,
-                        key_norm: &bound.key_norm,
-                        rotary_components: &bound.components,
-                        rotary_frequencies: &bound.frequencies,
-                        coordinates: &bound.coordinates,
-                        visible: &bound.visible,
-                        fresh: &bound.fresh,
-                        destinations: &bound.destinations,
-                        history_key: &mut bound.history_key,
-                        history_value: &mut bound.history_value,
-                        epsilon: case.epsilon,
-                        scale: case.scale,
-                        slab_rows: bound.slab_rows,
-                    }],
-                    &TIMING,
-                )
+                .measure(vec![args!(attention_decode, bound, case)], &TIMING)
                 .unwrap();
             let kv_bytes = (context * QWEN.kv * QWEN.w() * 2 * 2) as f64;
             eprintln!(
@@ -656,27 +693,7 @@ fn prefill_timing_on(device: &Device) {
             let kernel = prefill_kernel(device, &specialization);
             let mut bound = Bound::new(device, &case);
             let measurement = kernel
-                .measure(
-                    vec![gated_attention_prefill::Args {
-                        query_gate: &bound.query_gate,
-                        key: &bound.key,
-                        value: &bound.value,
-                        query_norm: &bound.query_norm,
-                        key_norm: &bound.key_norm,
-                        rotary_components: &bound.components,
-                        rotary_frequencies: &bound.frequencies,
-                        coordinates: &bound.coordinates,
-                        visible: &bound.visible,
-                        fresh: &bound.fresh,
-                        destinations: &bound.destinations,
-                        history_key: &mut bound.history_key,
-                        history_value: &mut bound.history_value,
-                        epsilon: case.epsilon,
-                        scale: case.scale,
-                        slab_rows: bound.slab_rows,
-                    }],
-                    &TIMING,
-                )
+                .measure(vec![args!(attention_prefill, bound, case)], &TIMING)
                 .unwrap();
             eprintln!(
                 "prefill {} rows after {history} history {config}: {:.1} us ({:.2} TFLOP/s)",

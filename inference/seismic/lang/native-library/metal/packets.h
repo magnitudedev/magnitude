@@ -241,41 +241,177 @@ struct Q8 {
     static float value(thread const packet &k, uint, float code) { return k.scale * code; }
 };
 
-// iq4g32 (GGUF IQ4_XS / IQ4_NL): 4-bit codes naming the registry's sixteen
-// integer table values, one f32 scale per 32: value = scale*table[code]. The
-// code plane is q4k's low-nibble plane, so a packet is one 16-byte load plus
-// its scale; the decoded "code" is the (exact integer) table value.
+// ---------------------------------------------------------------------------
+// 4-bit coded weights (the registry's c4 family: iq4g32, q4g32s, mxfp4g32,
+// nvfp4g16): a nibble code names one of sixteen exact integer values of a
+// codebook, and every group of 32 (or 16) values has one scale. The code plane
+// is q4k's low-nibble plane, so a packet is one 16-byte load plus its scale
+// fields; a value is `scale * value(code)` with one F32 rounding.
+//
+// Codebooks decode one step word's eight codes. A linear codebook yields the
+// unsigned nibble and names its offset (the value is nibble - offset, applied
+// as the exact bias -offset * scale); a table codebook yields the (exact
+// integer) table value. E2M1 values are held doubled, so its scales carry the
+// exact factor 1/2.
+
+// The IQ4 table (GGUF kvalues_iq4nl), the registry's iq4g32 interpretation.
 constant float iq4_table[16] = {
     -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
     1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f,
 };
+// E2M1 doubled (GGUF kvalues_mxfp4), shared by MXFP4 and NVFP4.
+constant float e2m1_doubled[16] = {
+    0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+    0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f,
+};
 
-struct IQ4 {
+// Codes 0..15 as themselves; value = code - 8 (q4g32s).
+struct LinearCodes {
+    static constant constexpr bool biased = true;
+    static constant constexpr float offset = 8.0f;
+    static void codes(uint word, thread float4 &even, thread float4 &odd) {
+        uint e, o;
+        split_nibbles(word, e, o);
+        even = unsigned_bytes(e);
+        odd = unsigned_bytes(o);
+    }
+    static float2 pair(uint b) { return code_pair((b & 15u) | ((b >> 4) << 16), 1024.0h); }
+};
+
+inline void table_codes(constant float *table, uint word, thread float4 &even, thread float4 &odd) {
+    even = float4(table[word & 15u], table[(word >> 8) & 15u], table[(word >> 16) & 15u],
+        table[(word >> 24) & 15u]);
+    odd = float4(table[(word >> 4) & 15u], table[(word >> 12) & 15u], table[(word >> 20) & 15u],
+        table[word >> 28]);
+}
+
+struct Iq4Codes {
+    static constant constexpr bool biased = false;
+    static constant constexpr float offset = 0.0f;
+    static void codes(uint word, thread float4 &even, thread float4 &odd) { table_codes(iq4_table, word, even, odd); }
+    static float2 pair(uint b) { return float2(iq4_table[b & 15u], iq4_table[b >> 4]); }
+};
+
+struct E2M1Codes {
+    static constant constexpr bool biased = false;
+    static constant constexpr float offset = 0.0f;
+    static void codes(uint word, thread float4 &even, thread float4 &odd) { table_codes(e2m1_doubled, word, even, odd); }
+    static float2 pair(uint b) { return float2(e2m1_doubled[b & 15u], e2m1_doubled[b >> 4]); }
+};
+
+// Scale fields of packet p in the supers plane, as the (one or two) group
+// scales of the packet.
+struct F32Scale {
     static constant constexpr uint groups = 1;
+    static float2 load(device const uchar *supers, uint p) {
+        return float2(*reinterpret_cast<device const float *>(supers + 4ul * p));
+    }
+};
+struct F16Scale {
+    static constant constexpr uint groups = 1;
+    static float2 load(device const uchar *supers, uint p) {
+        return float2(float(*reinterpret_cast<device const half *>(supers + 2ul * p)));
+    }
+};
+// E8M0 2^(e - 127), halved for the doubled E2M1 codebook: 2^(e - 128) (e < 2
+// are F32 subnormals); 0xff is NaN.
+struct E8M0Scale {
+    static constant constexpr uint groups = 1;
+    static float2 load(device const uchar *supers, uint p) {
+        uint e = supers[p];
+        uint bits = e < 2u ? 0x00200000u << e : e == 255u ? 0x7fc00000u : (e - 1u) << 23;
+        return float2(as_type<float>(bits));
+    }
+};
+// Two UE4M3 scales (sign bit ignored; 0x7f is NaN), halved for the doubled
+// E2M1 codebook: (1 + m/8) 2^(e - 8), or m 2^-10 when e = 0.
+struct UE4M3Scale {
+    static constant constexpr uint groups = 2;
+    static float ue4m3_half(uint raw) {
+        raw &= 0x7fu;
+        uint e = raw >> 3, m = raw & 7u;
+        float normal = as_type<float>(((e + 119u) << 23) | (m << 20));
+        return raw == 0x7fu ? as_type<float>(0x7fc00000u) : e == 0u ? float(m) * 0.0009765625f : normal;
+    }
+    static float2 load(device const uchar *supers, uint p) {
+        uint fields = *reinterpret_cast<device const ushort *>(supers + 2ul * p);
+        return float2(ue4m3_half(fields & 0xffu), ue4m3_half(fields >> 8));
+    }
+};
+
+template <typename C, typename S>
+struct Coded4 {
+    static constant constexpr uint groups = S::groups;
     struct packet {
         uint4 low;
-        float scale;
+        float2 scale;
     };
     static packet load(device const uchar *row, Rows16 layout, uint p) {
         packet k;
         k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
-        k.scale = *reinterpret_cast<device const float *>(row + layout.supers + 4ul * p);
+        k.scale = S::load(row + layout.supers, p);
         return k;
     }
     static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
-        uint word = k.low[step];
-        even = float4(iq4_table[word & 15u], iq4_table[(word >> 8) & 15u],
-            iq4_table[(word >> 16) & 15u], iq4_table[(word >> 24) & 15u]);
-        odd = float4(iq4_table[(word >> 4) & 15u], iq4_table[(word >> 12) & 15u],
-            iq4_table[(word >> 20) & 15u], iq4_table[word >> 28]);
+        C::codes(k.low[step], even, odd);
+    }
+    static float2 pair(thread const packet &k, uint step, uint j) { return C::pair((k.low[step] >> (8u * j)) & 0xffu); }
+    static float scale(thread const packet &k, uint step) { return groups == 1 || step < 2 ? k.scale.x : k.scale.y; }
+    static float bias(thread const packet &k, uint group) {
+        return C::biased ? -C::offset * (group == 0 ? k.scale.x : k.scale.y) : 0.0f;
+    }
+    static float value(thread const packet &k, uint step, float code) {
+        return C::biased ? metal::fma(scale(k, step), code, bias(k, step / 2u)) : scale(k, step) * code;
+    }
+};
+
+typedef Coded4<Iq4Codes, F32Scale> IQ4;
+typedef Coded4<LinearCodes, F16Scale> Q4G32S;
+typedef Coded4<E2M1Codes, E8M0Scale> MXFP4;
+typedef Coded4<E2M1Codes, UE4M3Scale> NVFP4;
+
+// q5g32s (GGUF Q5_0: value = d * (code - 16)) and q5g32 (GGUF Q5_1: value =
+// d * code + m): q5k's code planes, one f16 d (and m) per 32.
+template <bool MINIMUM>
+struct Q5G32 {
+    static constant constexpr uint groups = 1;
+    struct packet {
+        uint4 low;
+        uint high;
+        float scale;
+        float bias;
+    };
+    static packet load(device const uchar *row, Rows16 layout, uint p) {
+        packet k;
+        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
+        k.high = *reinterpret_cast<device const uint *>(row + layout.high + 4ul * p);
+        if (MINIMUM) {
+            half2 factors = *reinterpret_cast<device const half2 *>(row + layout.supers + 4ul * p);
+            k.scale = float(factors.x);
+            k.bias = float(factors.y);
+        } else {
+            k.scale = float(*reinterpret_cast<device const half *>(row + layout.supers + 2ul * p));
+            k.bias = -16.0f * k.scale;
+        }
+        return k;
+    }
+    static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
+        uint e, o, he, ho;
+        split_nibbles(k.low[step], e, o);
+        split_high1((k.high >> (8u * step)) & 0xffu, he, ho);
+        even = unsigned_bytes(e | he);
+        odd = unsigned_bytes(o | ho);
     }
     static float2 pair(thread const packet &k, uint step, uint j) {
         uint b = (k.low[step] >> (8u * j)) & 0xffu;
-        return float2(iq4_table[b & 15u], iq4_table[b >> 4]);
+        uint h = (k.high >> (8u * step + 2u * j)) & 3u;
+        return code_pair((b & 15u) | ((h & 1u) << 4) | (((b >> 4) | ((h >> 1) << 4)) << 16), 1024.0h);
     }
     static float scale(thread const packet &k, uint) { return k.scale; }
-    static float bias(thread const packet &, uint) { return 0.0f; }
-    static float value(thread const packet &k, uint, float code) { return k.scale * code; }
+    static float bias(thread const packet &k, uint) { return k.bias; }
+    static float value(thread const packet &k, uint, float code) {
+        return metal::fma(k.scale, code, k.bias);
+    }
 };
 
 // Dense weights of element type E (element::Bf16, F16 or F32). The row's
@@ -361,9 +497,12 @@ inline float value_at(thread const typename W::packet &k, uint i) {
 #define PACKETS_ROWS16_Q8(P)                                                                         \
     packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _PLANE_CODES_ROW_OFFSET), 0, 0, \
         ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET) }
-#define PACKETS_ROWS16_IQ4(P)                                                                        \
+#define PACKETS_ROWS16_C4(P)                                                                         \
     packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _PLANE_CODES_LO_ROW_OFFSET), 0, 0, \
         ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET) }
+#define PACKETS_ROWS16_Q5(P)                                                                         \
+    packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _PLANE_CODES_LO_ROW_OFFSET),   \
+        ELEMENT_CAT(P, _PLANE_CODES_HI_ROW_OFFSET), 0, ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET) }
 #define PACKETS_ROWS16_DENSE(E, k) packets::Rows16 { ulong(k) * E::bytes, 0, 0, 0, 0 }
 
 // Binds slot `SLOT` to the decoder type `TYPE`.
@@ -395,7 +534,22 @@ PACKETS_BIND(W0, packets::Q8)
 #define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_Q8(KERNEL_W0)
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_IQ4G32)
 PACKETS_BIND(W0, packets::IQ4)
-#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_IQ4(KERNEL_W0)
+#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W0)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q4G32S)
+PACKETS_BIND(W0, packets::Q4G32S)
+#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W0)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_MXFP4G32)
+PACKETS_BIND(W0, packets::MXFP4)
+#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W0)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_NVFP4G16)
+PACKETS_BIND(W0, packets::NVFP4)
+#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W0)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q5G32S)
+PACKETS_BIND(W0, packets::Q5G32<false>)
+#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_Q5(KERNEL_W0)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q5G32)
+PACKETS_BIND(W0, packets::Q5G32<true>)
+#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_Q5(KERNEL_W0)
 #else
 #error "KERNEL_W0: unsupported weight representation"
 #endif
@@ -427,7 +581,22 @@ PACKETS_BIND(W1, packets::Q8)
 #define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_Q8(KERNEL_W1)
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_IQ4G32)
 PACKETS_BIND(W1, packets::IQ4)
-#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_IQ4(KERNEL_W1)
+#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W1)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q4G32S)
+PACKETS_BIND(W1, packets::Q4G32S)
+#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W1)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_MXFP4G32)
+PACKETS_BIND(W1, packets::MXFP4)
+#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W1)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_NVFP4G16)
+PACKETS_BIND(W1, packets::NVFP4)
+#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W1)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q5G32S)
+PACKETS_BIND(W1, packets::Q5G32<false>)
+#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_Q5(KERNEL_W1)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q5G32)
+PACKETS_BIND(W1, packets::Q5G32<true>)
+#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_Q5(KERNEL_W1)
 #else
 #error "KERNEL_W1: unsupported weight representation"
 #endif
@@ -459,7 +628,22 @@ PACKETS_BIND(W2, packets::Q8)
 #define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_Q8(KERNEL_W2)
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_IQ4G32)
 PACKETS_BIND(W2, packets::IQ4)
-#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_IQ4(KERNEL_W2)
+#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W2)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q4G32S)
+PACKETS_BIND(W2, packets::Q4G32S)
+#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W2)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_MXFP4G32)
+PACKETS_BIND(W2, packets::MXFP4)
+#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W2)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_NVFP4G16)
+PACKETS_BIND(W2, packets::NVFP4)
+#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W2)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q5G32S)
+PACKETS_BIND(W2, packets::Q5G32<false>)
+#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_Q5(KERNEL_W2)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q5G32)
+PACKETS_BIND(W2, packets::Q5G32<true>)
+#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_Q5(KERNEL_W2)
 #else
 #error "KERNEL_W2: unsupported weight representation"
 #endif
@@ -491,7 +675,22 @@ PACKETS_BIND(W3, packets::Q8)
 #define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_Q8(KERNEL_W3)
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_IQ4G32)
 PACKETS_BIND(W3, packets::IQ4)
-#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_IQ4(KERNEL_W3)
+#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W3)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q4G32S)
+PACKETS_BIND(W3, packets::Q4G32S)
+#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W3)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_MXFP4G32)
+PACKETS_BIND(W3, packets::MXFP4)
+#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W3)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_NVFP4G16)
+PACKETS_BIND(W3, packets::NVFP4)
+#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_C4(KERNEL_W3)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q5G32S)
+PACKETS_BIND(W3, packets::Q5G32<false>)
+#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_Q5(KERNEL_W3)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q5G32)
+PACKETS_BIND(W3, packets::Q5G32<true>)
+#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_Q5(KERNEL_W3)
 #else
 #error "KERNEL_W3: unsupported weight representation"
 #endif

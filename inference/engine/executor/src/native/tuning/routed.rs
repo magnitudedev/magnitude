@@ -13,8 +13,8 @@
 use super::{
     row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs, TuningLimits,
 };
-use crate::programs::graph::routed::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
-use magnitude_family_contracts::{FeedForwardGeometry, WeightKind, WeightScope};
+use crate::operators::routed::fused_graph::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
+use magnitude_family_contracts::{Operator, RouteNormalization, WeightKind, WeightScope};
 use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
 };
@@ -31,12 +31,12 @@ pub(crate) struct RoutedShape {
 }
 
 /// The decode points: row counts the decode form serves.
-fn decode_points(limits: TuningLimits) -> Vec<PointShape> {
+pub(crate) fn decode_points(limits: TuningLimits) -> Vec<PointShape> {
     served_row_points(limits.max_rows, |rows| rows <= DECODE_ROWS)
 }
 
 /// The grouped points: row counts past the decode form.
-fn grouped_points(limits: TuningLimits) -> Vec<PointShape> {
+pub(crate) fn grouped_points(limits: TuningLimits) -> Vec<PointShape> {
     served_row_points(limits.max_rows, |rows| rows > DECODE_ROWS)
 }
 
@@ -46,7 +46,7 @@ fn grouped_points(limits: TuningLimits) -> Vec<PointShape> {
 /// and each row draws its choices by popularity without replacement from a
 /// fixed-seed generator. A grouped point then holds blocks of every live-row
 /// count, from one row to full tiles, and experts with no rows.
-fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
+pub(crate) fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
     let experts = shape.experts as usize;
     let popularity = (0..experts)
         .map(|rank| 1.0 / ((rank + 1) as f64).sqrt())
@@ -81,7 +81,7 @@ fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
 
 /// The tables `routed_group` forms from `routes`: (order [B, T],
 /// inverse [M, K], blocks [B]).
-fn group(
+pub(crate) fn group(
     routes: &[i32],
     rows: u64,
     shape: RoutedShape,
@@ -159,22 +159,11 @@ impl RoutedRouteTuning {
 
     /// Whether the model divides the selected scores by their sum.
     fn normalize(&self, inputs: &TuningInputs<'_, '_>) -> Result<bool, String> {
-        let scope = *self
-            .scopes
-            .first()
-            .ok_or("a tuning case needs at least one layer")?;
-        let WeightScope::TargetBlock(index) = scope else {
-            return Err(format!("routed layers are target blocks, not {scope:?}"));
-        };
-        match inputs
-            .definition
-            .geometry
-            .blocks
-            .get(index as usize)
-            .map(|block| &block.feedforward)
-        {
-            Some(FeedForwardGeometry::Routed(experts)) => Ok(experts.normalize_selected),
-            _ => Err(format!("block {index} has no routed feed-forward")),
+        match inputs.operator(&self.scopes)? {
+            Operator::RoutedFfn(routed) => {
+                Ok(routed.router.normalization == RouteNormalization::Sum)
+            }
+            other => Err(format!("a {} layer has no routed feed-forward", other.name())),
         }
     }
 }
@@ -224,7 +213,7 @@ impl EntryTuning for RoutedRouteTuning {
                         &[rows, shape.hidden],
                         index as u64 + 1,
                     )?,
-                    norm: inputs.weight(scope, WeightKind::FeedForwardNorm)?,
+                    norm: inputs.weight(scope, WeightKind::InputNorm)?,
                     router: inputs.weight(scope, WeightKind::Router)?,
                     shared_router: inputs.weight(scope, WeightKind::SharedRouter)?,
                     routes: inputs.state(routes, 0..rows)?,
@@ -623,6 +612,7 @@ impl EntryTuning for RoutedExpertsTuning {
             expert_gate: &case.expert_gate,
             expert_up: &case.expert_up,
             expert_down: &case.expert_down,
+            activation: 0,
         }
     }
 

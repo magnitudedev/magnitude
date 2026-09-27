@@ -250,6 +250,10 @@ pub enum LayoutError {
     InvalidGroup { width: usize, group: usize },
     InvalidPacking(u8),
     DuplicateLayer(LayerRef),
+    EmptyHistoryDomain,
+    ZeroWindow,
+    UnknownSharedSource(LayerRef),
+    SharedDomainRows(LayerRef),
     ArithmeticOverflow(&'static str),
 }
 
@@ -271,6 +275,14 @@ impl fmt::Display for LayoutError {
             Self::InvalidPacking(packing) => write!(f, "packing version {packing} is invalid"),
             Self::DuplicateLayer(layer) => {
                 write!(f, "duplicate attention-history component for {layer:?}")
+            }
+            Self::EmptyHistoryDomain => f.write_str("a history domain needs a layer"),
+            Self::ZeroWindow => f.write_str("a window history domain needs a row"),
+            Self::UnknownSharedSource(layer) => {
+                write!(f, "shared history source {layer:?} is not a stored layer")
+            }
+            Self::SharedDomainRows(layer) => {
+                write!(f, "shared history domain of {layer:?} reserves rows")
             }
             Self::ArithmeticOverflow(field) => write!(f, "{field} arithmetic overflow"),
         }

@@ -1,6 +1,7 @@
-//! The CUDA `gated_attention_decode` / `gated_attention_prefill` against the
-//! same cases, host model and portable-body pin as the Metal tests (included
-//! verbatim; their Metal tests skip without a Metal device), plus timings.
+//! The CUDA `attention_decode` / `attention_prefill` in Qwen's form against
+//! the same cases, host model and portable-body pin as the Metal tests
+//! (included verbatim; their Metal tests skip without a Metal device), plus
+//! timings.
 
 include!("attention.rs");
 
@@ -14,14 +15,15 @@ fn cuda() -> Option<Device> {
 fn cuda_decode(
     device: &Device,
     geometry: Geometry,
-    (parts, warps): (u64, u64),
-) -> seismic::NativeKernel<gated_attention_decode::Entry> {
-    gated_attention_decode::native_for_device_with(
+    (parts, warps, slices): (u64, u64, u64),
+) -> seismic::NativeKernel<attention_decode::Entry> {
+    attention_decode::native_for_device_with(
         device,
-        gated_attention_decode::Elements { A: Element::bf16() },
-        &statics(geometry)
+        attention_decode::Elements { A: Element::bf16() },
+        &qwen_form(statics(geometry), geometry)
             .with_param("PARTS", parts)
-            .with_param("WARPS", warps),
+            .with_param("WARPS", warps)
+            .with_param("SLICES", slices),
     )
     .unwrap()
 }
@@ -29,23 +31,28 @@ fn cuda_decode(
 fn cuda_prefill(
     device: &Device,
     geometry: Geometry,
-    warps: u64,
-) -> seismic::NativeKernel<gated_attention_prefill::Entry> {
-    gated_attention_prefill::native_for_device_with(
+    (warps, split_groups): (u64, u64),
+) -> seismic::NativeKernel<attention_prefill::Entry> {
+    attention_prefill::native_for_device_with(
         device,
-        gated_attention_prefill::Elements { A: Element::bf16() },
-        &statics(geometry).with_param("WARPS", warps),
+        attention_prefill::Elements { A: Element::bf16() },
+        &qwen_form(statics(geometry), geometry)
+            .with_param("WARPS", warps)
+            .with_param("SPLIT_GROUPS", split_groups),
     )
     .unwrap()
 }
 
-const DECODE_CONFIGS: [(u64, u64); 4] = [(12, 4), (24, 8), (48, 4), (12, 8)];
+/// (PARTS, WARPS, SLICES); every tested group divides by 2.
+const DECODE_CONFIGS: [(u64, u64, u64); 4] = [(12, 4, 1), (24, 8, 2), (48, 4, 1), (12, 8, 1)];
+/// (WARPS, SPLIT_GROUPS).
+const PREFILL_CONFIGS: [(u64, u64); 3] = [(4, 1), (2, 1), (4, 256)];
 
 #[test]
 fn cuda_decode_matches_portable_body() {
     let Some(device) = cuda() else { return };
     let case = Case::new(SMALL, 64, 2, &decode_rows(5), 11);
-    check_host_model_against_portable_body("gated_attention_decode", &case);
+    check_host_model_against_portable_body("attention_decode", &case);
     let expected = case.expected();
     for config in DECODE_CONFIGS {
         let kernel = cuda_decode(&device, SMALL, config);
@@ -61,18 +68,46 @@ fn cuda_decode_matches_portable_body() {
     }
 }
 
+/// Visible spans crossing slab edges (the device measurement's binding: one
+/// span over several slabs) at every decode configuration.
+#[test]
+fn cuda_decode_reads_spans_crossing_history_slabs() {
+    let Some(device) = cuda() else { return };
+    let rows = [
+        Row { spans: vec![(0, 200)], fresh: (0, 1), destination: 200, position: 200 },
+        Row { spans: vec![(7, 150), (170, 199)], fresh: (1, 2), destination: 201, position: 199 },
+    ];
+    let case = Case::new(SMALL, 224, 2, &rows, 43);
+    let expected = case.expected();
+    for config in DECODE_CONFIGS {
+        let kernel = cuda_decode(&device, SMALL, config);
+        // A reused middle slab puts consecutive slabs at unrelated addresses.
+        for reused in [false, true] {
+            let mut bound = Bound::new_with_options(&device, &case, 32, reused);
+            let gated = run_decode(&kernel, &mut bound, &case);
+            check(
+                &format!("cuda crossing-span decode {config:?} reused={reused}"),
+                &case,
+                &gated,
+                &bound,
+                &expected,
+            );
+        }
+    }
+}
+
 #[test]
 fn cuda_prefill_matches_portable_body() {
     let Some(device) = cuda() else { return };
     let case = Case::new(SMALL, 128, 2, &prefill_rows(20, 23), 23);
-    check_host_model_against_portable_body("gated_attention_prefill", &case);
+    check_host_model_against_portable_body("attention_prefill", &case);
     let expected = case.expected();
-    for warps in [4, 2] {
-        let kernel = cuda_prefill(&device, SMALL, warps);
+    for config in PREFILL_CONFIGS {
+        let kernel = cuda_prefill(&device, SMALL, config);
         let mut bound = Bound::new(&device, &case);
         let gated = run_prefill(&kernel, &mut bound, &case);
         check(
-            &format!("cuda small prefill WARPS={warps}"),
+            &format!("cuda small prefill {config:?}"),
             &case,
             &gated,
             &bound,
@@ -109,12 +144,12 @@ fn cuda_qwen_geometry_decode_and_prefill_match_host_model() {
             7,
         );
         let expected = case.expected();
-        for warps in [4, 2] {
-            let kernel = cuda_prefill(&device, QWEN, warps);
+        for config in PREFILL_CONFIGS {
+            let kernel = cuda_prefill(&device, QWEN, config);
             let mut bound = Bound::new(&device, &case);
             let gated = run_prefill(&kernel, &mut bound, &case);
             check(
-                &format!("cuda prefill {rows} rows WARPS={warps}"),
+                &format!("cuda prefill {rows} rows {config:?}"),
                 &case,
                 &gated,
                 &bound,
@@ -158,12 +193,12 @@ fn cuda_eight_query_group_decode_and_prefill_match_host_model() {
             7,
         );
         let expected = case.expected();
-        for warps in [4, 2] {
-            let kernel = cuda_prefill(&device, QWEN35B, warps);
+        for config in PREFILL_CONFIGS {
+            let kernel = cuda_prefill(&device, QWEN35B, config);
             let mut bound = Bound::new(&device, &case);
             let gated = run_prefill(&kernel, &mut bound, &case);
             check(
-                &format!("cuda group-8 prefill {rows} rows WARPS={warps}"),
+                &format!("cuda group-8 prefill {rows} rows {config:?}"),
                 &case,
                 &gated,
                 &bound,
@@ -201,29 +236,12 @@ fn cuda_attention_timings() {
             let kernel = cuda_decode(&device, QWEN, config);
             let args = bounds
                 .iter_mut()
-                .map(|bound| gated_attention_decode::Args {
-                    query_gate: &bound.query_gate,
-                    key: &bound.key,
-                    value: &bound.value,
-                    query_norm: &bound.query_norm,
-                    key_norm: &bound.key_norm,
-                    rotary_components: &bound.components,
-                    coordinates: &bound.coordinates,
-                    visible: &bound.visible,
-                    fresh: &bound.fresh,
-                    destinations: &bound.destinations,
-                    history_key: &mut bound.history_key,
-                    history_value: &mut bound.history_value,
-                    rotary_frequencies: &bound.frequencies,
-                    epsilon: case.epsilon,
-                    scale: case.scale,
-                    slab_rows: bound.slab_rows,
-                })
+                .map(|bound| args!(attention_decode, bound, case))
                 .collect();
             let measured = kernel.measure(args, &options).unwrap();
             let bytes = (context * QWEN.kv * QWEN.w() * 2 * 2) as f64;
             println!(
-                "decode context {context} PARTS,WARPS {config:?}: {:.1} us, KV read {:.0} GB/s",
+                "decode context {context} PARTS,WARPS,SLICES {config:?}: {:.1} us, KV read {:.0} GB/s",
                 measured.median * 1e6,
                 bytes / measured.median / 1e9
             );
@@ -245,29 +263,11 @@ fn cuda_attention_timings() {
             .collect::<Vec<_>>();
         let case = Case::new(QWEN, history as usize + rows, 1, &rows_spec, 9);
         let mut bound = Bound::new(&device, &case);
-        for warps in [4, 2] {
-            let kernel = cuda_prefill(&device, QWEN, warps);
-            let args = vec![gated_attention_prefill::Args {
-                query_gate: &bound.query_gate,
-                key: &bound.key,
-                value: &bound.value,
-                query_norm: &bound.query_norm,
-                key_norm: &bound.key_norm,
-                rotary_components: &bound.components,
-                coordinates: &bound.coordinates,
-                visible: &bound.visible,
-                fresh: &bound.fresh,
-                destinations: &bound.destinations,
-                history_key: &mut bound.history_key,
-                history_value: &mut bound.history_value,
-                rotary_frequencies: &bound.frequencies,
-                epsilon: case.epsilon,
-                scale: case.scale,
-                slab_rows: bound.slab_rows,
-            }];
-            let measured = kernel.measure(args, &options).unwrap();
+        for config in PREFILL_CONFIGS {
+            let kernel = cuda_prefill(&device, QWEN, config);
+            let measured = kernel.measure(vec![args!(attention_prefill, bound, case)], &options).unwrap();
             println!(
-                "prefill {rows} rows after {history} history WARPS={warps}: {:.1} us",
+                "prefill {rows} rows after {history} history WARPS,SPLIT_GROUPS {config:?}: {:.1} us",
                 measured.median * 1e6
             );
         }

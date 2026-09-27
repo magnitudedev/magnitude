@@ -7,9 +7,10 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use magnitude_service_contracts::models::{
-    CatalogBaseId, CatalogDiagnostic, CatalogIntelligence, CatalogVariantId,
+    CatalogBaseId, CatalogDiagnostic, CatalogIntelligence, CatalogSupport, CatalogVariantId,
     IntelligenceProvenance, ModelFailure, ModelFileRole, ModelPackage, ModelPackageSource,
     ModelParameterization, ModelReleaseDate, ModelServingConfiguration, PackageValidation,
+    ParsedModelId,
     RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
     ResolvedServableModelBundle, ServableModelBundle, ServingProfile, SpeculativeDraftSource,
     SpeculativeMethod,
@@ -61,6 +62,7 @@ struct CatalogModel {
     speculative_decoding: Option<CatalogSpeculativeDecoding>,
     license: String,
     intelligence: CatalogIntelligence,
+    support: CatalogSupport,
 }
 
 #[derive(Clone, Deserialize)]
@@ -205,7 +207,6 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
     }
     let mut ids = BTreeSet::new();
     let mut presentations = BTreeSet::new();
-    let mut intelligence_methodology_versions = BTreeSet::new();
     for model in &source.models {
         let variant_ids = model
             .variants
@@ -275,15 +276,53 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                 model.id
             )));
         }
-        intelligence_methodology_versions
-            .insert(intelligence_methodology_version(&model.intelligence));
     }
-    if intelligence_methodology_versions.len() != 1 {
-        return Err(InventoryError::Integrity(
-            "catalog intelligence assessments must use one methodology version".to_owned(),
-        ));
+    if let Some(model) = source
+        .models
+        .iter()
+        .find(|model| !valid_catalog_support(model, &source))
+    {
+        return Err(InventoryError::Integrity(format!(
+            "invalid catalog support declaration {}",
+            model.id
+        )));
     }
     Ok(source)
+}
+
+/// A deprecation names its date and reason, and its replacement is an exact supported catalog
+/// configuration of another model.
+fn valid_catalog_support(model: &CatalogModel, source: &CatalogSource) -> bool {
+    match &model.support {
+        CatalogSupport::Supported => true,
+        CatalogSupport::Disabled { reason } => valid_non_empty(reason),
+        CatalogSupport::Deprecated {
+            since,
+            replacement,
+            reason,
+        } => {
+            ModelReleaseDate::new(since.clone()).is_ok()
+                && valid_non_empty(reason)
+                && {
+                    let ParsedModelId::Catalog {
+                        base_id,
+                        variant_id,
+                    } = replacement.parsed()
+                    else {
+                        return false;
+                    };
+                    base_id.as_str() != model.id
+                        && source.models.iter().any(|candidate| {
+                            candidate.id == base_id.as_str()
+                                && candidate.support.is_available()
+                                && candidate
+                                    .variants
+                                    .iter()
+                                    .any(|variant| variant.variant_id == variant_id.as_str())
+                        })
+                }
+        }
+    }
 }
 
 fn valid_catalog_intelligence(intelligence: &CatalogIntelligence) -> bool {
@@ -313,19 +352,6 @@ fn valid_catalog_intelligence(intelligence: &CatalogIntelligence) -> bool {
                 && !evidence_urls.is_empty()
                 && evidence_urls.iter().all(|url| valid_https_url(url))
         }
-    }
-}
-
-fn intelligence_methodology_version(intelligence: &CatalogIntelligence) -> &str {
-    match &intelligence.provenance {
-        IntelligenceProvenance::ArtificialAnalysisIntelligenceIndex {
-            methodology_version,
-            ..
-        }
-        | IntelligenceProvenance::Estimate {
-            methodology_version,
-            ..
-        } => methodology_version,
     }
 }
 
@@ -427,15 +453,56 @@ pub fn model_catalog_lock() -> Result<ModelCatalogLock, InventoryError> {
     model_catalog_lock_from(CATALOG_LOCK.as_bytes(), &catalog_source()?)
 }
 
+/// Which catalog entries a lock update resolves to their repositories' current commits. Every
+/// other entry keeps its locked revisions.
+pub enum CatalogLockAdvance {
+    All,
+    Models(BTreeSet<String>),
+}
+
+/// Advance the selected catalog entries to their repositories' current commits. A deprecated
+/// model is never advanced: its locked revisions are what keep existing installs identifiable.
 pub async fn advance_model_catalog_lock(
     models: Arc<ManagedModelStore>,
+    advance: CatalogLockAdvance,
 ) -> Result<ModelCatalogLock, InventoryError> {
     let source = catalog_source()?;
-    let resolved = stream::iter(source.models)
+    // The compiled lock need not cover models declared since it was written, so only its
+    // syntax is checked here; the advanced lock is validated in full below.
+    let current: ModelCatalogLock = serde_json::from_str(CATALOG_LOCK).map_err(|error| {
+        InventoryError::Integrity(format!("invalid model catalog lock: {error}"))
+    })?;
+    if let CatalogLockAdvance::Models(ids) = &advance
+        && let Some(id) = ids.iter().find(|id| {
+            source
+                .models
+                .iter()
+                .find(|model| model.id == **id)
+                .is_none_or(|model| model.support.is_deprecated())
+        })
+    {
+        return Err(InventoryError::InvalidRequest(format!(
+            "{id} is not an advanceable catalog model; deprecated models keep their locked revisions"
+        )));
+    }
+    let resolved = stream::iter(source.models.clone())
         .map(|declaration| {
             let models = Arc::clone(&models);
+            let advanced = !declaration.support.is_deprecated()
+                && match &advance {
+                    CatalogLockAdvance::All => true,
+                    CatalogLockAdvance::Models(ids) => ids.contains(&declaration.id),
+                };
+            let locked = current.get(&declaration.id).cloned();
             async move {
                 let entry_id = declaration.id;
+                if !advanced {
+                    return locked.map(|entry| (entry_id.clone(), entry)).ok_or_else(|| {
+                        InventoryError::Integrity(format!(
+                            "catalog entry {entry_id} has no locked revision to keep"
+                        ))
+                    });
+                }
                 let target_repository = declaration.repository;
                 let target = refresh_hugging_face_repository(
                     &models,
@@ -491,7 +558,9 @@ pub async fn advance_model_catalog_lock(
         .buffer_unordered(12)
         .collect::<Vec<_>>()
         .await;
-    resolved.into_iter().collect()
+    let lock = resolved.into_iter().collect::<Result<ModelCatalogLock, _>>()?;
+    validate_model_catalog_lock(&lock, &source)?;
+    Ok(lock)
 }
 
 fn model_catalog_lock_from(
@@ -1223,6 +1292,7 @@ fn recommendable_model(
         license: declaration.license.clone(),
         parameterization: declaration.parameterization.clone(),
         intelligence: declaration.intelligence.clone(),
+        support: declaration.support.clone(),
         fidelity_rank: variant.fidelity_rank,
         quantization_aware: variant.quantization_aware,
     })
@@ -1846,6 +1916,80 @@ mod tests {
         });
         let error = resolve_projector_path(&declaration, &snapshot).unwrap_err();
         assert!(error.to_string().contains("combines a projector with MTP"));
+    }
+
+    #[test]
+    fn deprecation_names_a_supported_exact_replacement() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let mut model = source
+            .models
+            .iter()
+            .find(|model| model.support.is_deprecated())
+            .expect("the authored catalog deprecates a model")
+            .clone();
+        assert!(valid_catalog_support(&model, &source));
+        let deprecated = |since: &str, replacement: &str, reason: &str| {
+            CatalogSupport::Deprecated {
+                since: since.to_owned(),
+                replacement: replacement.parse().expect("model ID"),
+                reason: reason.to_owned(),
+            }
+        };
+        for (support, valid) in [
+            (deprecated("2026-09-27", "qwen3.5-4b:gguf:q4", "x"), true),
+            (deprecated("2026-02-30", "qwen3.5-4b:gguf:q4", "unsupported"), false),
+            (deprecated("2026-09-27", "qwen3.5-4b:gguf:q4", ""), false),
+            (deprecated("2026-09-27", "qwen3.5-4b:gguf:q3", "x"), false),
+            (deprecated("2026-09-27", "missing:gguf:q4", "x"), false),
+            (deprecated("2026-09-27", &format!("{}:gguf:q1-qat", model.id), "x"), false),
+            (
+                deprecated("2026-09-27", "hf:owner/repo/model.gguf", "x"),
+                false,
+            ),
+            (
+                CatalogSupport::Disabled {
+                    reason: String::new(),
+                },
+                false,
+            ),
+        ] {
+            model.support = support;
+            assert_eq!(valid_catalog_support(&model, &source), valid);
+        }
+    }
+
+    #[test]
+    fn authored_lock_covers_every_model_including_deprecated_ones() {
+        let lock = model_catalog_lock().expect("authored lock should be valid");
+        let source = catalog_source().expect("catalog source should be valid");
+        assert!(
+            source
+                .models
+                .iter()
+                .filter(|model| model.support.is_deprecated())
+                .all(|model| lock.contains_key(&model.id))
+        );
+    }
+
+    #[test]
+    fn a_replacement_is_never_itself_deprecated() {
+        let mut source = catalog_source().expect("catalog source should be valid");
+        let replacement = source
+            .models
+            .iter_mut()
+            .find(|model| model.id == "qwen3.5-4b")
+            .expect("replacement model");
+        replacement.support = CatalogSupport::Deprecated {
+            since: "2026-09-27".to_owned(),
+            replacement: "qwen3.5-4b:gguf:q4".parse().expect("model ID"),
+            reason: "superseded".to_owned(),
+        };
+        let deprecated = source
+            .models
+            .iter()
+            .find(|model| model.id == "bonsai-8b-q1")
+            .expect("deprecated model");
+        assert!(!valid_catalog_support(deprecated, &source));
     }
 
     #[test]

@@ -71,7 +71,7 @@ impl AssessmentEnvironment {
         .map_err(|error| EnvironmentError::Task(error.to_string()))?
     }
 
-    /// Add the measured basis to the one selected setup and derive its cache identity.
+    /// Add the device's measured basis to the one selected setup and derive its cache identity.
     pub async fn establish(
         setup: Arc<AssessmentSetup>,
         measurement: &MeasurementJob,
@@ -107,15 +107,16 @@ fn log_basis(
     elapsed: Duration,
     basis: &MeasurementBasis,
 ) {
-    let (source, measured_seconds) = match source {
-        BasisSource::Cached => ("cached", None),
-        BasisSource::Measured { seconds } => ("measured", Some(seconds)),
+    let (source, measured_entries, measured_seconds) = match source {
+        BasisSource::Cached => ("cached", 0, None),
+        BasisSource::Measured { entries, seconds } => ("measured", entries, Some(seconds)),
     };
     tracing::info!(
         device = %device,
         basis.source = source,
+        basis.measured_entries = measured_entries,
         basis.measured_seconds = measured_seconds,
-        basis.classes = basis.classes.len(),
+        basis.entries = basis.classes.len(),
         job.seconds = elapsed.as_secs_f64(),
         "assessment measurement basis established"
     );

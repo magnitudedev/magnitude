@@ -37,7 +37,7 @@ impl NativeImportProgram {
                 }));
             }
             if let Some(upload) = workspace.staged_mut() {
-                fill_staged_source(core.source().stored(), upload)?;
+                fill_staged_source(core.source().stored(), core.plan(), upload)?;
             }
             enqueue_into(
                 &self.handle,
@@ -69,7 +69,7 @@ impl ImportProgram for NativeImportProgram {
                 }));
             }
             if let Some(upload) = workspace.staged_mut() {
-                fill_staged_source(core.source().stored(), upload)?;
+                fill_staged_source(core.source().stored(), core.plan(), upload)?;
             }
             import_into(&self.handle, workspace.source(), destination.tensor())?;
             Ok(())
@@ -82,7 +82,40 @@ impl ImportProgram for NativeImportProgram {
     }
 }
 
-fn fill_staged_source(stored: &Stored, upload: &mut Tensor) -> Result<(), SubmitError> {
+fn fill_staged_source(
+    stored: &Stored,
+    plan: &crate::WeightPlan,
+    upload: &mut Tensor,
+) -> Result<(), SubmitError> {
+    let transfer = |error: String| SubmitError::Device(DeviceError::Transfer(error));
+    if plan.host_prepared() {
+        let (source, offset, length) = stored.file_range();
+        let length = usize::try_from(length)
+            .map_err(|_| transfer("stored tensor exceeds the host address range".into()))?;
+        let bytes = source
+            .read(offset, length)
+            .map_err(|error| transfer(error.to_string()))?;
+        let bytes =
+            crate::import_transforms::apply(&plan.descriptor, stored.shape(), plan.source, bytes)
+                .map_err(transfer)?;
+        let bytes = if plan.upload == plan.source {
+            bytes
+        } else {
+            let encoding = stored
+                .packed_encoding()
+                .ok_or_else(|| transfer("a dequantized weight is stored dense".into()))?;
+            crate::import_transforms::dequantize(encoding, plan.source, &plan.shape, &bytes)
+                .map_err(transfer)?
+        };
+        if upload.byte_len() != bytes.len() as u64 {
+            return Err(transfer(
+                "transformed source byte length differs from its tensor".into(),
+            ));
+        }
+        return upload
+            .write_from_host(&bytes)
+            .map_err(|error| transfer(error.to_string()));
+    }
     let (source, offset, bytes) = stored.file_range();
     if upload.byte_len() != bytes {
         return Err(SubmitError::Device(DeviceError::Transfer(
@@ -247,12 +280,45 @@ mod tests {
             dtype: seismic::DType::F32,
             shape: vec![values.len() as u64 / 4],
         });
+        let rows = values.len() as u64 / 4;
+        let plan = |transforms| crate::WeightPlan {
+            role: magnitude_family_contracts::WeightRole {
+                scope: magnitude_family_contracts::WeightScope::Target,
+                kind: magnitude_family_contracts::WeightKind::OutputNorm,
+            },
+            component: crate::ArtifactComponent {
+                kind: crate::ArtifactComponentKind::Target,
+                identity: magnitude_artifacts::ArtifactIdentity([0; 32]),
+            },
+            source: Element::f32(),
+            upload: Element::f32(),
+            resident: Element::f32(),
+            shape: vec![rows],
+            descriptor: magnitude_family_contracts::WeightDescriptor {
+                name: "staged".into(),
+                shape: vec![rows],
+                transforms,
+            },
+            source_bytes: values.len() as u64,
+            resident_bytes: values.len() as u64,
+        };
         // SAFETY: fill_staged_source writes every physical upload byte.
         let mut upload =
-            unsafe { Tensor::uninitialized(&device, Element::f32(), &[values.len() as u64 / 4]) }
-                .unwrap();
-        fill_staged_source(&stored, &mut upload).unwrap();
+            unsafe { Tensor::uninitialized(&device, Element::f32(), &[rows]) }.unwrap();
+        fill_staged_source(&stored, &plan(Vec::new()), &mut upload).unwrap();
         assert_eq!(upload.read_to_host().unwrap(), values);
+
+        // A transformed weight uploads the host's transformed bytes: swapping
+        // adjacent elements swaps each pair of words.
+        let swap = vec![magnitude_family_contracts::ImportTransform::PermuteRows {
+            order: vec![1, 0],
+        }];
+        fill_staged_source(&stored, &plan(swap), &mut upload).unwrap();
+        let swapped = values
+            .chunks(8)
+            .flat_map(|pair| pair[4..].iter().chain(&pair[..4]).copied())
+            .collect::<Vec<_>>();
+        assert_eq!(upload.read_to_host().unwrap(), swapped);
     }
 
     #[test]

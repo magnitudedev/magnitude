@@ -1,3 +1,4 @@
+use magnitude_chat::{Normalization, PieceEncoding, Split, SplitBehavior};
 use magnitude_engine::inputs::{
     BoundaryRule, BpeConfig, ByteBpeTokenizer, InputLayout, InputSpan, PieceKind, SpecialTokens,
     TokenId,
@@ -29,9 +30,16 @@ fn byte_config() -> BpeConfig {
         pieces,
         kinds,
         merges: vec![],
-        pattern: r".+|\s".into(),
-        normalize_nfc: true,
+        normalization: Normalization::Nfc,
+        splits: vec![Split {
+            pattern: r".+|\s".into(),
+            behavior: SplitBehavior::Isolated,
+        }],
+        encoding: PieceEncoding::ByteLevel,
+        ignore_merges: false,
+        implicit_bos: None,
         stop_tokens: BTreeSet::from([TokenId(256)]),
+        suppressed_tokens: BTreeSet::new(),
     }
 }
 

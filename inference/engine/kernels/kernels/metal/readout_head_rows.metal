@@ -1,5 +1,6 @@
 // readout_head_rows: final RMS prologue over the `out_rows` hidden rows and the
-// vocabulary projection into F32 logits.
+// vocabulary projection into F32 logits, softcapped from the accumulator when
+// `softcap` > 0.
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.h"
 
@@ -20,7 +21,8 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     projection::Rms<activation, norm_element, projection::SelectedRows> in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
         SEISMIC_HIDDEN_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0,                           \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {out_rows}};                    \
-    projection::Store<element::F32> out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0}; \
+    projection::Logits out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,         \
+        as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))};                                   \
     projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(k), k}
 
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV

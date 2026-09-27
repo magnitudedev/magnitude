@@ -46,7 +46,7 @@ pub fn plan_execution(
     selected: &SelectedDevice,
 ) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
     let selection = ComponentSelection {
-        head: matches!(manifest.model.method, ResolvedMethod::Mtp { .. }),
+        head: !matches!(manifest.model.method, ResolvedMethod::Plain),
         vision: manifest.definition.vision.is_some(),
     };
     let method = match manifest.model.method {
@@ -58,6 +58,7 @@ pub fn plan_execution(
             greedy_proposals,
             sampled_proposals,
         },
+        ResolvedMethod::DFlash { proposals } => PlannedMethod::DFlash { proposals },
     };
     let limits = resource_limits(&manifest.service, manifest.model.lookahead)?;
     ExecutionPlanner::prepare(

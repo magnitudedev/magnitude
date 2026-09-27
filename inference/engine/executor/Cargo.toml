@@ -28,6 +28,17 @@ pinned-tuning = []
 # feature by `forward_bench`; never by a served engine.
 tuning-survey = []
 
+# The catalog's families and headers, for the assessment terms of every
+# catalog target (`assessment::catalog`).
+[dev-dependencies]
+magnitude-family-common = { path = "../families/common", features = ["catalog-headers"] }
+magnitude-family-gemma4 = { path = "../families/gemma4" }
+magnitude-family-lfm2 = { path = "../families/lfm2" }
+magnitude-family-llama = { path = "../families/llama" }
+magnitude-family-muse-glimmer = { path = "../families/muse_glimmer" }
+magnitude-family-nemotron-h = { path = "../families/nemotron_h" }
+magnitude-family-qwen35 = { path = "../families/qwen35" }
+
 # Development-only: replays the tuning search against survey records.
 [[example]]
 name = "tuning_replay"

@@ -172,7 +172,7 @@ pub(crate) fn build(
         .prepare_target_graphs(
             opened.device(),
             draft.load(),
-            &manifest.definition.geometry,
+            &manifest.definition.decoder,
             &state,
             draft.programs().target(),
             limits,
@@ -182,7 +182,7 @@ pub(crate) fn build(
         .prepare_target_readout_graphs(
             opened.device(),
             draft.load(),
-            &manifest.definition.geometry,
+            &manifest.definition.decoder,
             limits,
         )
         .map_err(internal)?;
@@ -202,7 +202,7 @@ pub(crate) fn build(
         state,
         &target_graphs,
         &target_readout_graphs,
-        programs.head_graphs().map(|graphs| graphs.as_ref()),
+        programs.drafter_graphs(),
         programs.vision_graphs().map(|graphs| graphs.as_ref()),
         programs
             .state_graphs()
@@ -259,7 +259,7 @@ pub(crate) fn build(
         resource_identity.clone(),
         target_graphs,
         target_readout_graphs,
-        programs.head_graphs().map(|graphs| graphs.as_ref()),
+        programs.drafter_graphs(),
         programs.vision_graphs().map(|graphs| graphs.as_ref()),
         state_graphs.as_ref(),
     )
@@ -281,6 +281,12 @@ pub(crate) fn build(
         .target_weights
         .checked_add(target_upload)
         .ok_or_else(|| internal("target import peak byte count overflow"))?;
+    startup.hold_host_tables(
+        execution_plan
+            .load()
+            .host_table_bytes()
+            .map_err(|error| internal(error.to_string()))?,
+    )?;
     startup.claim("target import", target_peak, target_upload)?;
     let import_progress = progress.clone();
     let target = residency
@@ -411,45 +417,67 @@ impl StartupClaims {
         if let Some(held) = self.held.take() {
             self.heap.release(held);
         }
+        let claim = self
+            .heap
+            .claim(allocation, staged, HoldingClass::Model)
+            .map_err(|refusal| {
+                self.refusal(purpose, refusal, |role| match role {
+                    DomainRole::Allocation => allocation,
+                    DomainRole::Staging => staged,
+                })
+            })?;
+        self.held = Some(claim);
+        Ok(())
+    }
+
+    /// Hold the model's host-resident tables (`bytes`) in the host-RAM
+    /// domain for the model's lifetime.
+    fn hold_host_tables(&mut self, bytes: u64) -> Result<(), LoadError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.heap
+            .hold_host_table(bytes)
+            .map_err(|refusal| self.refusal("host tables", refusal, |_| bytes))
+    }
+
+    fn refusal(
+        &self,
+        purpose: &str,
+        refusal: ClaimRefusal,
+        required: impl Fn(DomainRole) -> u64,
+    ) -> LoadError {
         let domain = |role: DomainRole| match role {
             DomainRole::Allocation => self.allocation_domain,
             DomainRole::Staging => MemoryDomain::HostRam,
         };
-        let claim = self
-            .heap
-            .claim(allocation, staged, HoldingClass::Model)
-            .map_err(|refusal| match refusal {
-                ClaimRefusal::Blind(error) => platform_error(PlatformError::Memory(error)),
-                ClaimRefusal::Reclaim { role } => LoadError::InsufficientMemory {
-                    purpose: format!("{purpose} (memory at or below the planning reserve)"),
-                    domain: domain(role),
-                    memory: InsufficientMemory {
-                        required: match role {
-                            DomainRole::Allocation => allocation,
-                            DomainRole::Staging => staged,
-                        },
-                        available: 0,
-                    },
+        match refusal {
+            ClaimRefusal::Blind(error) => platform_error(PlatformError::Memory(error)),
+            ClaimRefusal::Reclaim { role } => LoadError::InsufficientMemory {
+                purpose: format!("{purpose} (memory at or below the planning reserve)"),
+                domain: domain(role),
+                memory: InsufficientMemory {
+                    required: required(role),
+                    available: 0,
                 },
-                ClaimRefusal::Deficit {
-                    role,
-                    constraint,
+            },
+            ClaimRefusal::Deficit {
+                role,
+                constraint,
+                required,
+                available,
+            } => LoadError::InsufficientMemory {
+                purpose: format!("{purpose} ({constraint})"),
+                domain: domain(role),
+                memory: InsufficientMemory {
                     required,
                     available,
-                } => LoadError::InsufficientMemory {
-                    purpose: format!("{purpose} ({constraint})"),
-                    domain: domain(role),
-                    memory: InsufficientMemory {
-                        required,
-                        available,
-                    },
                 },
-                ClaimRefusal::Accounting(error) => {
-                    internal(format!("{purpose}: memory accounting: {error:?}"))
-                }
-            })?;
-        self.held = Some(claim);
-        Ok(())
+            },
+            ClaimRefusal::Accounting(error) => {
+                internal(format!("{purpose}: memory accounting: {error:?}"))
+            }
+        }
     }
 
     /// The heap with every startup claim released, for the loaded domain.

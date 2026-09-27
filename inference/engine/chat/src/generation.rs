@@ -13,6 +13,9 @@ pub enum MethodPolicy {
         greedy_proposals: u8,
         sampled_proposals: u8,
     },
+    /// A separate draft (DFlash, DSpark) drafting `proposals` tokens per
+    /// block, greedy and sampled alike.
+    DFlash { proposals: u8 },
 }
 
 impl MethodPolicy {
@@ -38,6 +41,17 @@ impl MethodPolicy {
                 }
                 Ok(())
             }
+            Self::DFlash { proposals } => {
+                let prepared = identity
+                    .strip_prefix("dflash:")
+                    .and_then(|value| value.rsplit_once(':'))
+                    .and_then(|(_, proposals)| proposals.parse::<u8>().ok())
+                    .ok_or("DFlash policy requires a prepared DFlash generation method")?;
+                if proposals == 0 || proposals != prepared {
+                    return Err("DFlash proposal width differs from the prepared draft's".into());
+                }
+                Ok(())
+            }
         }
     }
 
@@ -53,6 +67,7 @@ impl MethodPolicy {
                     Sampling::Categorical => sampled_proposals,
                 },
             },
+            Self::DFlash { proposals } => MethodChoice::DFlash { proposals },
         }
     }
 }
@@ -118,6 +133,7 @@ pub fn generation_options(
         context_limit: limits.context_tokens,
         vocabulary: limits.vocabulary,
         stop_tokens: tokenizer.stop_tokens().clone(),
+        suppressed_tokens: tokenizer.suppressed_tokens().clone(),
         sampling,
         shaping,
         seed: controls.sampling.seed,

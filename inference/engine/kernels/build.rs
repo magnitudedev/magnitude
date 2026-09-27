@@ -38,6 +38,21 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         &[BackendName::Vulkan],
         "rotary sin/cos shared by attention and vision; inside `attention.h` / `attention.cuh` elsewhere",
     ),
+    (
+        "lib/routed/expert_gate",
+        &[BackendName::Vulkan],
+        "representation ladder of `expert_gate` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
+    ),
+    (
+        "lib/routed/expert_up",
+        &[BackendName::Vulkan],
+        "representation ladder of `expert_up` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
+    ),
+    (
+        "lib/routed/expert_down",
+        &[BackendName::Vulkan],
+        "representation ladder of `expert_down` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
+    ),
 ];
 
 fn main() {
@@ -49,6 +64,10 @@ fn main() {
         .source("kernels/readout.seismic")
         .source("kernels/vision.seismic")
         .source("kernels/recurrent.seismic")
+        .source("kernels/short_conv.seismic")
+        .source("kernels/state_space.seismic")
+        .source("kernels/residual.seismic")
+        .source("kernels/functions.seismic")
         .run()
         .unwrap_or_else(|error| {
             panic!("checking engine Seismic sources and generating bindings failed: {error}")

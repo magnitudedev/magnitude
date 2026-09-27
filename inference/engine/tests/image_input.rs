@@ -33,6 +33,7 @@ fn artifacts() -> HostArtifacts {
     HostArtifacts::open(&PackageOptions {
         target,
         projector: ProjectorSelection::Explicit(home(PROJECTOR)),
+        draft: None,
     })
     .unwrap()
 }

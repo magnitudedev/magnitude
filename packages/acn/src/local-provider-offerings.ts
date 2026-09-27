@@ -1,5 +1,7 @@
 import { Context, Effect, Layer, Option, Stream } from "effect"
 import {
+  localModelDeprecation,
+  localModelIsAvailable,
   localModelProviderModelId,
   localModelServingState,
   LocalModelMutationFailed,
@@ -34,6 +36,12 @@ const providerAvailability = (
   model: LocalModel,
   serving: AssessedServingState,
 ): ProviderModelCatalogEntry["availability"] => {
+  if (Option.isSome(localModelDeprecation(model))) {
+    return { _tag: "Disabled", reason: "deprecated" }
+  }
+  if (!localModelIsAvailable(model)) {
+    return { _tag: "Disabled", reason: "catalog_disabled" }
+  }
   if (serving.assessment._tag === "DoesNotFit") {
     return { _tag: "Disabled", reason: "insufficient_resources" }
   }

@@ -1268,29 +1268,165 @@ impl Format for Q8 {
     }
 }
 
-/// The code values of registry `iq4g32`: a 4-bit code selects one.
-pub const IQ4_VALUES: [i8; 16] = [
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-];
+/// A 4-bit coded representation (the `c4g{16,32}` family): a 4-bit code
+/// names one of sixteen exact integer values, and every `GROUP` values share
+/// one scale. A value is `scale * VALUES[code]`, rounded once to `f32` as the
+/// registry's decode rounds it. An E2M1 codebook holds its values doubled
+/// (integers), and its scales carry the compensating factor 1/2, exactly.
+/// Rows are `rows16`: the nibble code plane, then the scale fields of each
+/// storage group (one converted source packet).
+pub trait Codebook4: Copy + Send + Sync + 'static {
+    const NAME: &'static str;
+    const ROWS8_NAME: &'static str;
+    /// Values per storage group.
+    const STORAGE: usize;
+    /// Values per scale: 32 or 16.
+    const GROUP: usize;
+    /// Bytes of one stored scale field.
+    const SCALE_BYTES: usize;
+    const VALUES: [i8; 16];
 
-/// Registry `iq4g32` in the `rows16` layout: nibble codes into
-/// [`IQ4_VALUES`], one `f32` scale per packet (eight per 256-value group).
+    /// The scale of one stored field (`SCALE_BYTES` bytes).
+    fn scale(field: &[u8]) -> f32;
+}
+
+/// The E2M1 values doubled, shared by MXFP4 and NVFP4.
+const E2M1_DOUBLED: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// Registry `iq4g32` (GGUF IQ4_XS, IQ4_NL): the IQ4 codebook, one `f32`
+/// scale per 32, eight per 256-value storage group.
 #[derive(Clone, Copy, Debug)]
-pub struct Iq4;
+pub struct Iq4Book;
 
-impl Format for Iq4 {
+impl Codebook4 for Iq4Book {
     const NAME: &'static str = "iq4g32@rows16";
+    const ROWS8_NAME: &'static str = "iq4g32@rows8";
+    const STORAGE: usize = 256;
+    const GROUP: usize = 32;
+    const SCALE_BYTES: usize = 4;
+    const VALUES: [i8; 16] = [
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    ];
+
+    #[inline(always)]
+    fn scale(field: &[u8]) -> f32 {
+        f32::from_le_bytes([field[0], field[1], field[2], field[3]])
+    }
+}
+
+/// Registry `q4g32s` (GGUF Q4_0): codes offset by 8, one f16 scale per 32.
+#[derive(Clone, Copy, Debug)]
+pub struct Q4Book;
+
+impl Codebook4 for Q4Book {
+    const NAME: &'static str = "q4g32s@rows16";
+    const ROWS8_NAME: &'static str = "q4g32s@rows8";
+    const STORAGE: usize = 32;
+    const GROUP: usize = 32;
+    const SCALE_BYTES: usize = 2;
+    const VALUES: [i8; 16] = [-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7];
+
+    #[inline(always)]
+    fn scale(field: &[u8]) -> f32 {
+        f16_to_f32(u16::from_le_bytes([field[0], field[1]]))
+    }
+}
+
+/// Registry `mxfp4g32` (GGUF MXFP4): E2M1 codes, one E8M0 scale per 32:
+/// `2^(e - 127)`, halved for the doubled codebook to `2^(e - 128)`.
+#[derive(Clone, Copy, Debug)]
+pub struct Mxfp4Book;
+
+impl Codebook4 for Mxfp4Book {
+    const NAME: &'static str = "mxfp4g32@rows16";
+    const ROWS8_NAME: &'static str = "mxfp4g32@rows8";
+    const STORAGE: usize = 32;
+    const GROUP: usize = 32;
+    const SCALE_BYTES: usize = 1;
+    const VALUES: [i8; 16] = E2M1_DOUBLED;
+
+    #[inline(always)]
+    fn scale(field: &[u8]) -> f32 {
+        match field[0] {
+            0 => f32::from_bits(0x0020_0000),
+            1 => f32::from_bits(0x0040_0000),
+            0xff => f32::NAN,
+            exponent => f32::from_bits(u32::from(exponent - 1) << 23),
+        }
+    }
+}
+
+/// Registry `nvfp4g16` (GGUF NVFP4): E2M1 codes, one UE4M3 scale per 16
+/// (sign bit ignored), four per 64-value storage group; halved for the
+/// doubled codebook.
+#[derive(Clone, Copy, Debug)]
+pub struct Nvfp4Book;
+
+impl Codebook4 for Nvfp4Book {
+    const NAME: &'static str = "nvfp4g16@rows16";
+    const ROWS8_NAME: &'static str = "nvfp4g16@rows8";
+    const STORAGE: usize = 64;
+    const GROUP: usize = 16;
+    const SCALE_BYTES: usize = 1;
+    const VALUES: [i8; 16] = E2M1_DOUBLED;
+
+    #[inline(always)]
+    fn scale(field: &[u8]) -> f32 {
+        let raw = field[0] & 0x7f;
+        let (exponent, mantissa) = (u32::from(raw >> 3), u32::from(raw & 7));
+        if raw == 0x7f {
+            f32::NAN
+        } else if exponent == 0 {
+            // mantissa * 2^-9, halved.
+            mantissa as f32 * f32::from_bits(0x3a80_0000)
+        } else {
+            f32::from_bits(((exponent + 119) << 23) | (mantissa << 20))
+        }
+    }
+}
+
+/// A [`Codebook4`] representation in the `rows16` layout.
+#[derive(Clone, Copy, Debug)]
+pub struct Coded4<B: Codebook4>(B);
+
+pub type Iq4 = Coded4<Iq4Book>;
+pub type Q4G32 = Coded4<Q4Book>;
+pub type Mxfp4 = Coded4<Mxfp4Book>;
+pub type Nvfp4 = Coded4<Nvfp4Book>;
+
+impl<B: Codebook4> Coded4<B> {
+    /// Scales per packet (1 or 2).
+    const SCALES: usize = PACKET / B::GROUP;
+
+    /// The (up to two) scales of packet `p`, in value order.
+    #[inline(always)]
+    unsafe fn scales(row: *const u8, geometry: &RowGeometry, p: usize) -> [f32; 2] {
+        let bytes = Self::SCALES * B::SCALE_BYTES;
+        // A packet's fields are contiguous within one storage group.
+        let at = unsafe { geometry.address(row, Plane::Supers, p * bytes) };
+        let fields = unsafe { std::slice::from_raw_parts(at, bytes) };
+        let mut scales = [0.0f32; 2];
+        for (scale, field) in scales.iter_mut().zip(fields.chunks_exact(B::SCALE_BYTES)) {
+            *scale = B::scale(field);
+        }
+        scales
+    }
+}
+
+impl<B: Codebook4> Format for Coded4<B> {
+    const NAME: &'static str = B::NAME;
     const DENSE_BYTES: usize = 0;
 
     fn geometry(k: usize, _dense_stride: usize) -> RowGeometry {
-        let ([codes, supers, _, _], stride) = rows16(k, 256, &[128, 32]);
+        let (code_bytes, scale_bytes) = (B::STORAGE / 2, B::STORAGE / B::GROUP * B::SCALE_BYTES);
+        let ([codes, supers, _, _], stride) = rows16(k, B::STORAGE, &[code_bytes, scale_bytes]);
         RowGeometry {
             stride,
             codes,
             high: 0,
             scales: 0,
             supers,
-            groups: [128, 0, 0, 32],
+            groups: [code_bytes, 0, 0, scale_bytes],
             base: 0,
             matrix_rows: 0,
             rows8: false,
@@ -1307,9 +1443,9 @@ impl Format for Iq4 {
         out: &mut [f32; PACKET],
     ) {
         let codes = unsafe { nibbles(row, geometry, p) };
-        let scale: f32 = unsafe { read(geometry.address(row, Plane::Supers, 4 * p)) };
-        for (target, code) in out.iter_mut().zip(codes) {
-            *target = scale * f32::from(IQ4_VALUES[usize::from(code)]);
+        let scales = unsafe { Self::scales(row, geometry, p) };
+        for (i, (target, code)) in out.iter_mut().zip(codes).enumerate() {
+            *target = scales[i / B::GROUP] * f32::from(B::VALUES[usize::from(code)]);
         }
     }
 
@@ -1324,17 +1460,141 @@ impl Format for Iq4 {
         let mut sum = 0.0f32;
         for p in block_packets(b, k) {
             let codes = unsafe { nibbles(row, geometry, p) };
-            let scale: f32 = unsafe { read(geometry.address(row, Plane::Supers, 4 * p)) };
+            let scales = unsafe { Self::scales(row, geometry, p) };
             let activations: &[i8; 32] = x.codes[32 * (p - 8 * b)..32 * (p - 8 * b) + 32]
                 .try_into()
                 .expect("one packet");
-            let weights = codes.map(|code| IQ4_VALUES[usize::from(code)]);
-            let exact = dot_i8_i8::<MODE>(&weights, activations);
-            sum = scale.mul_add(exact as f32, sum);
+            let weights = codes.map(|code| B::VALUES[usize::from(code)]);
+            if Self::SCALES == 1 {
+                let exact = dot_i8_i8::<MODE>(&weights, activations);
+                sum = scales[0].mul_add(exact as f32, sum);
+            } else {
+                // Each sixteen-value group alone: the other half is zero.
+                for (group, scale) in scales.iter().enumerate() {
+                    let mut half = [0i8; PACKET];
+                    half[16 * group..16 * group + 16]
+                        .copy_from_slice(&weights[16 * group..16 * group + 16]);
+                    let exact = dot_i8_i8::<MODE>(&half, activations);
+                    sum = scale.mul_add(exact as f32, sum);
+                }
+            }
         }
         x.d * sum
     }
 }
+
+/// Registry `q5g32s` (GGUF Q5_0, `MINIMUM = false`: `d * (code - 16)`) and
+/// `q5g32` (GGUF Q5_1: `d * code + m`, fused) in the `rows16` layout: the
+/// nibble plane, a high-bit plane (one bit per value) and, per 32 values,
+/// `d` (and `m`) as f16.
+#[derive(Clone, Copy, Debug)]
+pub struct Q5G32<const MINIMUM: bool>;
+
+impl<const MINIMUM: bool> Q5G32<MINIMUM> {
+    const SUPER_BYTES: usize = if MINIMUM { 4 } else { 2 };
+
+    /// The 32 codes of packet `p`.
+    #[inline(always)]
+    unsafe fn codes(row: *const u8, geometry: &RowGeometry, p: usize) -> [u8; PACKET] {
+        let mut codes = unsafe { nibbles(row, geometry, p) };
+        let high: u32 = unsafe { read(geometry.address(row, Plane::High, 4 * p)) };
+        for (i, code) in codes.iter_mut().enumerate() {
+            *code |= (((high >> i) & 1) as u8) << 4;
+        }
+        codes
+    }
+
+    /// `(d, m)` of packet `p` (`m` is zero without a minimum).
+    #[inline(always)]
+    unsafe fn coefficients(row: *const u8, geometry: &RowGeometry, p: usize) -> (f32, f32) {
+        let at = unsafe { geometry.address(row, Plane::Supers, Self::SUPER_BYTES * p) };
+        let d = f16_to_f32(unsafe { read::<u16>(at) });
+        let m = if MINIMUM {
+            f16_to_f32(unsafe { read::<u16>(at.add(2)) })
+        } else {
+            0.0
+        };
+        (d, m)
+    }
+}
+
+impl<const MINIMUM: bool> Format for Q5G32<MINIMUM> {
+    const NAME: &'static str = if MINIMUM {
+        "q5g32@rows16"
+    } else {
+        "q5g32s@rows16"
+    };
+    const DENSE_BYTES: usize = 0;
+
+    fn geometry(k: usize, _dense_stride: usize) -> RowGeometry {
+        let ([codes, high, supers, _], stride) = rows16(k, 32, &[16, 4, Self::SUPER_BYTES]);
+        RowGeometry {
+            stride,
+            codes,
+            high,
+            scales: 0,
+            supers,
+            groups: [16, 4, 0, Self::SUPER_BYTES],
+            base: 0,
+            matrix_rows: 0,
+            rows8: false,
+            row_address: None,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn decode(
+        row: *const u8,
+        geometry: &RowGeometry,
+        p: usize,
+        _k: usize,
+        out: &mut [f32; PACKET],
+    ) {
+        let codes = unsafe { Self::codes(row, geometry, p) };
+        let (d, m) = unsafe { Self::coefficients(row, geometry, p) };
+        for (target, code) in out.iter_mut().zip(codes) {
+            *target = if MINIMUM {
+                d.mul_add(f32::from(code), m)
+            } else {
+                d * f32::from(i16::from(code) - 16)
+            };
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn dot_q8<const MODE: u8>(
+        row: *const u8,
+        geometry: &RowGeometry,
+        b: usize,
+        k: usize,
+        x: &Q8Block,
+    ) -> f32 {
+        let mut sum = 0.0f32;
+        for p in block_packets(b, k) {
+            let local = p - 8 * b;
+            let codes = unsafe { Self::codes(row, geometry, p) };
+            let (d, m) = unsafe { Self::coefficients(row, geometry, p) };
+            let activations: &[i8; 32] = x.codes[32 * local..32 * local + 32]
+                .try_into()
+                .expect("one packet");
+            if MINIMUM {
+                // Codes are at most 31, so they are also signed bytes.
+                let exact = dot_i8_i8::<MODE>(&codes.map(|code| code as i8), activations);
+                let codes_sum = i32::from(x.sums[2 * local]) + i32::from(x.sums[2 * local + 1]);
+                sum = d.mul_add(exact as f32, sum);
+                sum = m.mul_add(codes_sum as f32, sum);
+            } else {
+                let weights = codes.map(|code| code as i8 - 16);
+                let exact = dot_i8_i8::<MODE>(&weights, activations);
+                sum = d.mul_add(exact as f32, sum);
+            }
+        }
+        x.d * sum
+    }
+}
+
+pub type Q5G32S = Q5G32<false>;
+pub type Q5G32M = Q5G32<true>;
 
 impl Rows8Format for Q4K {
     const ROWS8_NAME: &'static str = "q4k@rows8";
@@ -1509,8 +1769,14 @@ unsafe fn q6_tile_dot_q8(
 impl Rows8Format for Q8 {
     const ROWS8_NAME: &'static str = "q8g32s@rows8";
 }
-impl Rows8Format for Iq4 {
-    const ROWS8_NAME: &'static str = "iq4g32@rows8";
+impl<B: Codebook4> Rows8Format for Coded4<B> {
+    const ROWS8_NAME: &'static str = B::ROWS8_NAME;
+}
+impl Rows8Format for Q5G32S {
+    const ROWS8_NAME: &'static str = "q5g32s@rows8";
+}
+impl Rows8Format for Q5G32M {
+    const ROWS8_NAME: &'static str = "q5g32@rows8";
 }
 
 /// The body of the row-decode component: the `k` values of one row.
@@ -1721,6 +1987,43 @@ mod tests {
                 (iq4.stride as u64, vec![iq4.codes as u64, iq4.supers as u64])
             );
         }
+        // The 32-granular formats also at the Gemma K = 704, 2112 and the
+        // Nemotron K = 2688.
+        for k in [64usize, 256, 704, 2112, 2560, 2688] {
+            fn coded<W: Format>(k: usize) {
+                let geometry = W::geometry(k, 0);
+                assert_eq!(
+                    registry_geometry(W::NAME, k as u64),
+                    (
+                        geometry.stride as u64,
+                        vec![geometry.codes as u64, geometry.supers as u64]
+                    ),
+                    "{} k {k}",
+                    W::NAME
+                );
+            }
+            fn five<W: Format>(k: usize) {
+                let geometry = W::geometry(k, 0);
+                assert_eq!(
+                    registry_geometry(W::NAME, k as u64),
+                    (
+                        geometry.stride as u64,
+                        vec![
+                            geometry.codes as u64,
+                            geometry.high as u64,
+                            geometry.supers as u64
+                        ]
+                    ),
+                    "{} k {k}",
+                    W::NAME
+                );
+            }
+            coded::<Q4G32>(k);
+            coded::<Mxfp4>(k);
+            coded::<Nvfp4>(k);
+            five::<Q5G32S>(k);
+            five::<Q5G32M>(k);
+        }
     }
 
     /// Every packed format decodes a row to exactly the registry's decode of
@@ -1749,6 +2052,18 @@ mod tests {
                 if W::NAME.starts_with("iq4") {
                     for (i, chunk) in span.chunks_exact_mut(4).enumerate() {
                         chunk.copy_from_slice(&(0.001 * (i % 7 + 1) as f32).to_le_bytes());
+                    }
+                } else if W::NAME.starts_with("mxfp4") {
+                    // Every exponent but the NaN code 0xff, including the
+                    // subnormal scales of codes 0 and 1.
+                    for (i, byte) in span.iter_mut().enumerate() {
+                        *byte = ((i * 37) % 255) as u8;
+                    }
+                } else if W::NAME.starts_with("nvfp4") {
+                    // Every UE4M3 code but NaN, with and without the ignored
+                    // sign bit.
+                    for (i, byte) in span.iter_mut().enumerate() {
+                        *byte = ((i * 37) % 127) as u8 | if i % 2 == 1 { 0x80 } else { 0 };
                     }
                 } else {
                     for (i, chunk) in span.chunks_exact_mut(2).enumerate() {
@@ -1789,6 +2104,13 @@ mod tests {
             check::<Q6K>(k);
             check::<Q8>(k);
             check::<Iq4>(k);
+        }
+        for k in [64usize, 704, 2112, 2688] {
+            check::<Q4G32>(k);
+            check::<Mxfp4>(k);
+            check::<Nvfp4>(k);
+            check::<Q5G32S>(k);
+            check::<Q5G32M>(k);
         }
     }
 }

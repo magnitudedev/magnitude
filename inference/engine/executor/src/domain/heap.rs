@@ -70,6 +70,10 @@ pub struct DeviceHeap {
     device: Rc<Device>,
     capacity_bytes: u64,
     heap: MemoryHeap,
+    /// Host-resident gathered tables' bytes (§3.7 of the model-family plan):
+    /// mapped pages the model reads every step, held in the host-RAM domain
+    /// for the model's lifetime and never counted as free page cache.
+    host_table_bytes: u64,
 }
 
 impl DeviceHeap {
@@ -96,6 +100,7 @@ impl DeviceHeap {
             device,
             capacity_bytes,
             heap: MemoryHeap::new(),
+            host_table_bytes: 0,
         };
         heap.refresh()?;
         Ok(heap)
@@ -123,11 +128,7 @@ impl DeviceHeap {
             crate::platform::refresh_device_ceiling(&self.catalog, &self.device, &self.reserves);
         let (available_bytes, band) = match &readings {
             Ok(readings) => (
-                readings
-                    .iter()
-                    .find(|reading| reading.role == DomainRole::Allocation)
-                    .expect("readings include the allocation domain")
-                    .ceiling_bytes,
+                self.ceiling(readings, DomainRole::Allocation),
                 MemoryBand::from(crate::platform::band_of(readings)),
             ),
             Err(_) => (0, MemoryBand::Blind),
@@ -190,16 +191,90 @@ impl DeviceHeap {
             .iter()
             .find(|reading| reading.role == DomainRole::Staging)
         {
-            if staged > staging.ceiling_bytes {
+            let available = self.ceiling(&readings, DomainRole::Staging);
+            if staged > available {
                 return Err(ClaimRefusal::Deficit {
                     role: DomainRole::Staging,
                     constraint: staging.constraint,
                     required: staged,
-                    available: staging.ceiling_bytes,
+                    available,
                 });
             }
         }
         Ok(())
+    }
+
+    /// The host-RAM domain's role: the staging domain of a dedicated device,
+    /// the allocation domain of a host-backed one.
+    fn host_role(readings: &[DomainReading]) -> DomainRole {
+        if readings
+            .iter()
+            .any(|reading| reading.role == DomainRole::Staging)
+        {
+            DomainRole::Staging
+        } else {
+            DomainRole::Allocation
+        }
+    }
+
+    /// A domain's ceiling above its planning reserve, less the host tables
+    /// held in it.
+    fn ceiling(&self, readings: &[DomainReading], role: DomainRole) -> u64 {
+        let ceiling = readings
+            .iter()
+            .find(|reading| reading.role == role)
+            .expect("readings include the domain")
+            .ceiling_bytes;
+        if Self::host_role(readings) == role {
+            ceiling.saturating_sub(self.host_table_bytes)
+        } else {
+            ceiling
+        }
+    }
+
+    /// Hold a host-resident table's `bytes` in the host-RAM domain for the
+    /// model's lifetime, from a fresh reading within the domain's ceiling
+    /// above its planning reserve. Its mapped pages then count against every
+    /// later decision in that domain.
+    pub fn hold_host_table(&mut self, bytes: u64) -> Result<(), ClaimRefusal> {
+        let readings = self.refresh().map_err(ClaimRefusal::Blind)?;
+        let role = Self::host_role(&readings);
+        let reading = readings
+            .iter()
+            .find(|reading| reading.role == role)
+            .expect("readings include the host domain");
+        if reading.band == ReadingBand::Reclaim {
+            return Err(ClaimRefusal::Reclaim { role });
+        }
+        // Outstanding claims on a host-backed device hold host bytes too.
+        let claimed = match role {
+            DomainRole::Allocation => self
+                .heap
+                .claims()
+                .try_fold(0u64, |total, claim| total.checked_add(claim.bytes))
+                .ok_or(ClaimRefusal::Accounting(MemoryError::HoldingOverflow))?,
+            DomainRole::Staging => 0,
+        };
+        let available = self.ceiling(&readings, role).saturating_sub(claimed);
+        if bytes > available {
+            return Err(ClaimRefusal::Deficit {
+                role,
+                constraint: reading.constraint,
+                required: bytes,
+                available,
+            });
+        }
+        self.host_table_bytes = self
+            .host_table_bytes
+            .checked_add(bytes)
+            .ok_or(ClaimRefusal::Accounting(MemoryError::HoldingOverflow))?;
+        self.refresh().map_err(ClaimRefusal::Blind)?;
+        Ok(())
+    }
+
+    /// Bytes of the host-resident tables held in the host-RAM domain.
+    pub fn host_table_bytes(&self) -> u64 {
+        self.host_table_bytes
     }
 
     /// Claim the peak new charge of one physical operation. The claim holds
@@ -268,5 +343,32 @@ mod tests {
             Err(ClaimRefusal::Deficit { required, .. }) if required == u64::MAX / 2
         ));
         assert_eq!(heap.heap().claims().count(), 0);
+    }
+
+    /// A held host table counts against every later decision in the host
+    /// domain (the CPU device's allocation domain), and a table beyond the
+    /// ceiling is refused.
+    #[test]
+    fn host_tables_hold_their_bytes_in_the_host_domain() {
+        let mut heap = cpu_heap();
+        let ceiling = heap.heap().standing().unwrap().observation.available_bytes;
+        assert!(matches!(
+            heap.hold_host_table(u64::MAX / 2),
+            Err(ClaimRefusal::Deficit {
+                role: DomainRole::Allocation,
+                ..
+            })
+        ));
+        assert_eq!(heap.host_table_bytes(), 0);
+        heap.hold_host_table(ceiling / 2).unwrap();
+        assert_eq!(heap.host_table_bytes(), ceiling / 2);
+        assert!(heap.heap().standing().unwrap().observation.available_bytes <= ceiling - ceiling / 2 + ceiling / 8);
+        assert!(matches!(
+            heap.check(ceiling / 4 * 3, 0),
+            Err(ClaimRefusal::Deficit {
+                role: DomainRole::Allocation,
+                ..
+            })
+        ));
     }
 }

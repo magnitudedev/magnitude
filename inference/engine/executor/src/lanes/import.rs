@@ -96,14 +96,22 @@ impl ValidatedImportLaunch {
             .iter()
             .try_fold(1u64, |count, extent| count.checked_mul(*extent));
         let source_tensor = inputs.workspace.source();
-        let source_matches = source_tensor.element() == inputs.plan.source
+        let source_matches = source_tensor.element() == inputs.plan.upload
             && count.is_some_and(|count| source_tensor.extents() == [count])
             && source_tensor.byte_len() == inputs.plan.source_bytes
             && source_tensor.belongs_to(&inputs.destination.tensor().device());
+        // A transformed weight uploads the transformed bytes of the stored
+        // tensor: the plan holds their logical shape and byte count.
+        let stored = inputs.source.stored();
+        let transformed = inputs.plan.host_prepared();
         let valid = inputs.source.artifact() == inputs.plan.component.identity
-            && inputs.source.stored().shape() == inputs.plan.shape
-            && inputs.source.stored().source_element() == Some(inputs.plan.source)
-            && inputs.source.stored().source_bytes() == inputs.plan.source_bytes
+            && inputs
+                .plan
+                .descriptor
+                .transformed_shape(stored.shape())
+                .is_ok_and(|shape| shape == inputs.plan.shape)
+            && stored.source_element() == Some(inputs.plan.source)
+            && (transformed || stored.source_bytes() == inputs.plan.source_bytes)
             && inputs.destination.identity() == &inputs.plan.storage_identity()
             && inputs.workspace.domain() == domain
             && inputs.workspace.class()

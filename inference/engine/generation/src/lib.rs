@@ -2,6 +2,7 @@
 //! generation accepts them independently after shared physical completion.
 mod acceptance;
 mod controls;
+mod dflash;
 pub mod grammar;
 mod method;
 mod mtp;
@@ -15,9 +16,10 @@ pub use magnitude_executor::{
     Demand, FeatureReader, FeatureRef, Operation, RequestId, Sampling, SelectSpec, Shaping,
     TokenId, WorkKind,
 };
+pub use dflash::DFlash;
 pub use method::{
-    Method, MethodCheckpoint, MethodCheckpointError, MethodChoice, MethodEffects,
-    MethodRequirements, MethodState, MtpCheckpoint, Propose, Verification,
+    DraftCheckpoint, Method, MethodCheckpoint, MethodCheckpointError, MethodChoice,
+    MethodEffects, MethodRequirements, MethodState, Propose, Verification,
 };
 pub use mtp::Mtp;
 pub use plain::Plain;
@@ -84,6 +86,9 @@ pub struct Options {
     pub context_limit: usize,
     pub vocabulary: usize,
     pub stop_tokens: BTreeSet<TokenId>,
+    /// Tokens the model never selects (a tokenizer fact, such as a GGUF's
+    /// `suppress_tokens`).
+    pub suppressed_tokens: BTreeSet<TokenId>,
     pub sampling: Sampling,
     pub shaping: Shaping,
     pub seed: u64,
@@ -302,6 +307,7 @@ impl Generation {
             constraint,
             options.end_of_generation,
             &options.stop_tokens,
+            &options.suppressed_tokens,
             options.reasoning_budget.as_ref(),
             options.vocabulary,
         )?;
@@ -414,6 +420,7 @@ impl Generation {
         match (self.options.method, checkpoint) {
             (MethodChoice::Plain, MethodCheckpoint::Plain) => {}
             (MethodChoice::Mtp { .. }, MethodCheckpoint::Mtp(state))
+            | (MethodChoice::DFlash { .. }, MethodCheckpoint::DFlash(state))
                 if state.target_rows() == position => {}
             _ => {
                 return Err("retained method checkpoint does not match the generation".into());
@@ -546,10 +553,7 @@ impl Generation {
                     credit,
                     self.options.method == MethodChoice::Plain,
                 )
-                .min(match self.options.method {
-                    MethodChoice::Plain => 0,
-                    MethodChoice::Mtp { proposals } => usize::from(proposals),
-                });
+                .min(self.options.method.proposals());
                 let selects = self.proposal_selects(limit)?;
                 let proposal = match self.method.propose(request, &selects) {
                     Propose::Tokens(tokens) => tokens,
@@ -1105,6 +1109,7 @@ fn validate_input(
         || prompt
             .iter()
             .chain(options.stop_tokens.iter())
+            .chain(options.suppressed_tokens.iter())
             .any(|id| id.0 as usize >= options.vocabulary)
         || constraint.is_some_and(|value| value.position() != 0)
     {
@@ -1137,8 +1142,13 @@ fn method_matches_choice(choice: MethodChoice, method: &dyn Method) -> bool {
                         head: false,
                     })
         }
-        MethodChoice::Mtp { proposals } => {
+        MethodChoice::Mtp { proposals } | MethodChoice::DFlash { proposals } => {
+            let prefix = match choice {
+                MethodChoice::Mtp { .. } => "mtp:",
+                _ => "dflash:",
+            };
             proposals > 0
+                && method.identity().starts_with(prefix)
                 && requirements.head
                 && requirements.prefill_demand.contains(Demand::FEATURES)
                 && requirements.verify_demand.contains(Demand::FEATURES)

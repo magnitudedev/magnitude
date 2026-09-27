@@ -1,7 +1,19 @@
 use magnitude_state::{
-    BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, Holder, LayerRef,
-    OwnedAdvanceResolution, OwnedStateAdvance, SequenceState, StateStore,
+    BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, HistoryDomainId,
+    HistoryDomainLayout, HistoryDomainPlan, Holder, LayerRef, OwnedAdvanceResolution,
+    OwnedStateAdvance, SequenceState, StateStore,
 };
+
+/// The one history domain of these stores.
+const TOKEN: HistoryDomainId = HistoryDomainId(0);
+
+/// Rows referenced in every history domain of the store.
+fn occupied(store: &StateStore) -> usize {
+    store
+        .history_domains()
+        .map(|domain| store.occupied_rows(domain))
+        .sum()
+}
 use seismic::{BackendName, DType, Device, DeviceCatalog, Tensor};
 use std::rc::Rc;
 fn device() -> Device {
@@ -36,9 +48,14 @@ fn store(history: bool, values: bool) -> Rc<StateStore> {
     StateStore::new(
         Rc::new(device()),
         16,
-        32,
+        16,
         if history {
-            vec![history_component(4, DType::F32)]
+            vec![HistoryDomainPlan {
+                layout: HistoryDomainLayout::Token {
+                    components: vec![history_component(4, DType::F32)],
+                },
+                logical_rows: 32,
+            }]
         } else {
             vec![]
         },
@@ -77,21 +94,21 @@ fn shared_prefix_private_tail_and_parent_first_drop() {
     parent = accept(&store, parent, 8);
     let checkpoint = parent.checkpoint();
     let mut branches = (0..6).map(|_| checkpoint.fork()).collect::<Vec<_>>();
-    assert_eq!(store.occupied_rows(), 8);
-    assert!(branches.iter().all(|b| b.history_ranges() == [(0, 8)]));
+    assert_eq!(occupied(&store), 8);
+    assert!(branches.iter().all(|b| b.history_ranges(TOKEN) == [(0, 8)]));
     parent = accept(&store, parent, 2);
     let branch = branches.remove(0);
     branches.insert(0, accept(&store, branch, 3));
     assert_eq!(checkpoint.position(), 8);
     // The parent grew in place into [8, 10); the branch starts mid-hole.
-    assert_eq!(branches[0].history_ranges(), [(0, 8), (19, 3)]);
-    assert_eq!(branches[1].history_ranges(), [(0, 8)]);
-    assert_eq!(store.occupied_rows(), 13);
+    assert_eq!(branches[0].history_ranges(TOKEN), [(0, 8), (19, 3)]);
+    assert_eq!(branches[1].history_ranges(TOKEN), [(0, 8)]);
+    assert_eq!(occupied(&store), 13);
     drop(parent);
     drop(checkpoint);
     assert_eq!(branches[0].position(), 11);
     drop(branches);
-    assert_eq!(store.occupied_rows(), 0);
+    assert_eq!(occupied(&store), 0);
     assert!(store.idle());
 }
 #[test]
@@ -103,8 +120,8 @@ fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     let before = read(&original);
     let advance = OwnedStateAdvance::begin(state, 5).ok().unwrap();
     let bindings = advance.bindings();
-    assert_eq!(bindings.destinations, [0, 1, 2, 3, 4]);
-    assert_eq!(store.occupied_rows(), 5);
+    assert_eq!(bindings.destinations[0], [0, 1, 2, 3, 4]);
+    assert_eq!(occupied(&store), 5);
     write(&bank(&store, bindings.following_bank), &[0xff; 16]).unwrap();
     write(
         &bindings.history[0].buffer.slice_leading(0, 1).unwrap(),
@@ -112,10 +129,10 @@ fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     )
     .unwrap();
     // A failed physical submission returns ownership for abort, never commit.
-    assert_eq!(store.occupied_rows(), 5);
+    assert_eq!(occupied(&store), 5);
     let state = advance.abort();
     assert_eq!(state.position(), 0);
-    assert_eq!(store.occupied_rows(), 0);
+    assert_eq!(occupied(&store), 0);
     let after = read(&original);
     assert_eq!(before, after);
     let advance = OwnedStateAdvance::begin(state, 5).ok().unwrap();
@@ -127,9 +144,9 @@ fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     let state = advance.abort();
     assert_eq!(read(&bank(&store, state.bank_index())), before);
     assert_eq!(state.position(), 0);
-    assert_eq!(store.occupied_rows(), 0);
+    assert_eq!(occupied(&store), 0);
     let advance = OwnedStateAdvance::begin(state, 5).ok().unwrap();
-    assert_eq!(advance.bindings().destinations, [0, 1, 2, 3, 4]);
+    assert_eq!(advance.bindings().destinations[0], [0, 1, 2, 3, 4]);
 }
 #[test]
 #[ignore = "requires a Metal device"]
@@ -152,7 +169,7 @@ fn accepted_component_versions_survive_checkpoint_and_fork() {
     let child_bytes = read(&bank(&store, child.bank_index()));
     assert_eq!(parent_bytes, [0x22; 16]);
     assert_eq!(child_bytes, [0; 16]);
-    assert_eq!(store.occupied_rows(), 0);
+    assert_eq!(occupied(&store), 0);
 }
 #[test]
 #[ignore = "requires a Metal device"]
@@ -161,31 +178,31 @@ fn fragmented_reservation_and_capacity_failure_are_atomic() {
     let a = accept(&store, store.create().unwrap(), 8);
     let b = accept(&store, store.create().unwrap(), 8);
     let c = accept(&store, store.create().unwrap(), 8);
-    assert_eq!(b.history_ranges(), [(16, 8)]);
+    assert_eq!(b.history_ranges(TOKEN), [(16, 8)]);
     // Placement: a [0, 8), b mid-hole [16, 24), c [8, 16).
     drop(c);
     let advance = OwnedStateAdvance::begin(a, 8).ok().unwrap();
-    assert_eq!(advance.bindings().destinations, (8..16).collect::<Vec<_>>());
+    assert_eq!(advance.bindings().destinations[0], (8..16).collect::<Vec<_>>());
     let _a = advance.abort();
-    assert_eq!(store.occupied_rows(), 16);
+    assert_eq!(occupied(&store), 16);
     let d = store.create().unwrap();
     let advance = OwnedStateAdvance::begin(d, 16).ok().unwrap();
     assert_eq!(
-        advance.bindings().destinations,
+        advance.bindings().destinations[0],
         (8..16).chain(24..32).collect::<Vec<_>>()
     );
     let OwnedAdvanceResolution::Committed(d) = advance.commit_all().ok().unwrap() else {
         panic!("full advance must commit");
     };
-    assert_eq!(store.occupied_rows(), 32);
+    assert_eq!(occupied(&store), 32);
     let e = store.create().unwrap();
     let Err((e, _)) = OwnedStateAdvance::begin(e, 1) else {
         panic!("exhausted arena must reject reservation");
     };
     assert_eq!(e.position(), 0);
-    assert_eq!(store.occupied_rows(), 32);
+    assert_eq!(occupied(&store), 32);
     drop(d);
-    assert_eq!(store.occupied_rows(), 16);
+    assert_eq!(occupied(&store), 16);
 }
 #[test]
 #[ignore = "requires a Metal device"]
@@ -196,23 +213,23 @@ fn trim_preserves_checkpoint_logical_history_and_position() {
     let checkpoint = parent.checkpoint();
     parent.trim_history(5).unwrap();
     assert_eq!(parent.position(), 8);
-    assert_eq!(parent.history_ranges(), [(5, 3)]);
+    assert_eq!(parent.history_ranges(TOKEN), [(5, 3)]);
     let descendant = parent.checkpoint();
     let fork = descendant.fork();
     let original = checkpoint.fork();
-    assert_eq!(fork.history_ranges(), [(5, 3)]);
-    assert_eq!(original.history_ranges(), [(0, 8)]);
+    assert_eq!(fork.history_ranges(TOKEN), [(5, 3)]);
+    assert_eq!(original.history_ranges(TOKEN), [(0, 8)]);
     parent = accept(&store, parent, 2);
     parent.trim_history(8).unwrap();
-    assert_eq!(parent.history_ranges(), [(8, 2)]);
-    assert_eq!(store.occupied_rows(), 10);
+    assert_eq!(parent.history_ranges(TOKEN), [(8, 2)]);
+    assert_eq!(occupied(&store), 10);
     drop(original);
     drop(checkpoint);
     drop(fork);
     drop(descendant);
-    assert_eq!(store.occupied_rows(), 2);
+    assert_eq!(occupied(&store), 2);
     parent.trim_history(10).unwrap();
-    assert_eq!(store.occupied_rows(), 0);
+    assert_eq!(occupied(&store), 0);
     assert_eq!(parent.position(), 10);
 }
 #[test]
@@ -226,21 +243,21 @@ fn adjacent_claims_merge_but_checkpoint_boundaries_do_not_grow() {
     drop(a);
     b = accept(&store, b, 2);
     // The fork grew in place and joined its rows; the checkpoint still sees 4.
-    assert_eq!(b.history_ranges(), [(0, 6)]);
-    assert_eq!(cp.fork().history_ranges(), [(0, 4)]);
+    assert_eq!(b.history_ranges(TOKEN), [(0, 6)]);
+    assert_eq!(cp.fork().history_ranges(TOKEN), [(0, 4)]);
     drop(cp);
     let cp = b.checkpoint();
     let mut c = cp.fork();
     drop(b);
     drop(cp);
     assert_eq!(c.position(), 6);
-    assert_eq!(c.history_ranges(), [(0, 6)]);
+    assert_eq!(c.history_ranges(TOKEN), [(0, 6)]);
     // Trimming releases exactly the trimmed rows.
     c.trim_history(4).unwrap();
-    assert_eq!(store.occupied_rows(), 2);
+    assert_eq!(occupied(&store), 2);
     c = accept(&store, c, 1);
-    assert_eq!(c.history_ranges(), [(4, 3)]);
-    assert_eq!(store.occupied_rows(), 3);
+    assert_eq!(c.history_ranges(TOKEN), [(4, 3)]);
+    assert_eq!(occupied(&store), 3);
 }
 #[test]
 #[ignore = "requires a Metal device"]
@@ -248,8 +265,8 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
     for (history, values) in [(true, false), (false, true), (true, true)] {
         let store = store(history, values);
         let mut parent = store.create().unwrap();
-        // History backing is committed on demand, not at creation.
-        assert!(store.history_planes().unwrap().is_empty());
+        // A store starts with one backed history slab per history domain.
+        assert_eq!(store.history_planes().unwrap().is_empty(), !history);
         assert_eq!(store.release_idle().unwrap(), 0);
         parent = accept(&store, parent, 4);
         let old = store.history_planes().unwrap();
@@ -258,25 +275,31 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
         branch = accept(&store, branch, 2);
         assert_eq!(parent.position(), 4);
         assert_eq!(branch.position(), 6);
-        assert_eq!(store.occupied_rows(), if history { 6 } else { 0 });
+        assert_eq!(occupied(&store), if history { 6 } else { 0 });
         drop(parent);
         drop(branch);
         drop(checkpoint);
-        // Explicitly retained physical pins keep their bytes and stay usable
-        // after logical release.
-        assert_eq!(store.release_idle().unwrap(), 0);
+        // Slab placement cannot change under a live binding of its planes:
+        // releasing them is refused until the binding is dropped.
         for buffer in &old {
             let bytes = read(&buffer.buffer.slice_leading(0, 4).unwrap());
             assert!(!bytes.is_empty());
         }
-        assert!(store.history_planes().unwrap().is_empty());
+        assert_eq!(store.release_idle().is_err(), history);
         drop(old);
-        // Without pins, an idle store returns its committed history.
+        store.release_idle().unwrap();
+        assert!(store.history_planes().unwrap().is_empty());
+        // An idle store returns its committed history.
         parent = accept(&store, store.create().unwrap(), 4);
         drop(parent);
+        // Its one history slab, the full slab byte target.
         assert_eq!(
-            store.release_idle().unwrap(),
-            if history { 1024 } else { 0 }
+            store.release_idle().unwrap() as u64,
+            if history {
+                magnitude_state::SLAB_BYTE_TARGET
+            } else {
+                0
+            }
         );
     }
 }
@@ -336,7 +359,7 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
     let other = StateStore::new(
         Rc::new(device()),
         16,
-        32,
+        16,
         vec![],
         vec![],
         BankCapacity {
@@ -367,10 +390,9 @@ fn owned_advances_reconcile_independently_after_shared_completion() {
         second_bindings.following_bank
     );
     assert!(first_bindings.recurrent[0].shares_allocation(&second_bindings.recurrent[0]));
-    assert!(first_bindings
-        .destinations
+    assert!(first_bindings.destinations[0]
         .iter()
-        .all(|row| !second_bindings.destinations.contains(row)));
+        .all(|row| !second_bindings.destinations[0].contains(row)));
     write(&bank(&store, first_bindings.following_bank), &[1; 16]).unwrap();
     write(&bank(&store, second_bindings.following_bank), &[2; 16]).unwrap();
     let OwnedAdvanceResolution::Committed(first) = first_advance.commit_all().ok().unwrap() else {
@@ -379,13 +401,13 @@ fn owned_advances_reconcile_independently_after_shared_completion() {
     let second = second_advance.abort();
     assert_eq!(first.position(), 2);
     assert_eq!(second.position(), 0);
-    assert_eq!(store.occupied_rows(), 2);
+    assert_eq!(occupied(&store), 2);
     assert_eq!(read(&bank(&store, first.bank_index())), [1; 16]);
     assert_eq!(read(&bank(&store, second.bank_index())), [0; 16]);
 
     // A launch provisions backing for all of its advances before they begin.
     store
-        .provision(&[first.demand(1), second.demand(1)], 2)
+        .provision(&[first.demands(1), second.demands(1)].concat(), 2)
         .unwrap();
     let first_advance = OwnedStateAdvance::begin(first, 1).ok().unwrap();
     let second_advance = OwnedStateAdvance::begin(second, 1).ok().unwrap();
@@ -399,5 +421,5 @@ fn owned_advances_reconcile_independently_after_shared_completion() {
     let second = second_advance.abort();
     assert_eq!(first.position(), 2);
     assert_eq!(second.position(), 0);
-    assert_eq!(store.occupied_rows(), 2);
+    assert_eq!(occupied(&store), 2);
 }

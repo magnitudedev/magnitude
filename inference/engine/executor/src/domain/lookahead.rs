@@ -100,7 +100,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 || state.position() != advance.position()
                 || state.bank_index() != advance.bindings().previous_bank
                 || state.tape_rows() != advance.bindings().previous_tape
-                || state.history_ranges() != advance.history_ranges()
+                || state.domain_ranges() != advance.domain_ranges()
             {
                 return None;
             }
@@ -264,7 +264,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let limits = self.execution.policy().limits();
         let batch = ValidatedTargetBatch::from_slots(
             &slots,
-            self.definition.geometry.vocabulary as usize,
+            self.definition.decoder.vocabulary as usize,
             limits.max_launch_rows,
         )
         .map_err(|error| DomainError::Input(error.to_string()))?;
@@ -321,7 +321,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             inputs,
             &self.target_store,
             self.domain.id(),
-            self.definition.geometry.hidden as usize,
+            self.definition.decoder.hidden as usize,
         ) {
             Ok(launch) => launch,
             Err((_, error)) => {

@@ -1013,6 +1013,7 @@ mod internals {
                                     registry::FloatCodeFormat::E2M1 => "E2M1",
                                     registry::FloatCodeFormat::E4M3 => "E4M3",
                                     registry::FloatCodeFormat::UE4M3 => "UE4M3",
+                                    registry::FloatCodeFormat::E8M0 => "E8M0",
                                 };
                                 symbols
                                     .insert(format!("{plane_prefix}_ENCODING_FLOAT_CODE_{format}"));

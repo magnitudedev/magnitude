@@ -645,6 +645,7 @@ mod overlap_tests {
                 context_limit: 8,
                 vocabulary: 16,
                 stop_tokens: BTreeSet::new(),
+                suppressed_tokens: BTreeSet::new(),
                 sampling: Sampling::Greedy,
                 shaping: Shaping {
                     temperature: 0.0,

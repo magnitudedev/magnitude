@@ -1,13 +1,14 @@
 //! head lifecycle for the executor domain.
 
 use super::*;
-use crate::batching::HeadSlot;
+use crate::batching::{HeadPasses, HeadSlot};
+use crate::DraftForm;
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Bytes of one head conditioning row: the target's normalized output
     /// feature in the activation representation.
     pub(super) fn head_conditioning_bytes(&self) -> usize {
-        self.definition.geometry.hidden as usize * self.definition.geometry.activation_dtype.bytes()
+        self.definition.decoder.hidden as usize * self.definition.decoder.activation_dtype.bytes()
     }
 
     /// Submit one batch of head transactions. Each commits its entry rows to
@@ -54,6 +55,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             steps = steps.max(proposals.len());
         }
+        if std::env::var_os("MAGNITUDE_TRACE_DRAFT").is_some() {
+            for operation in operations {
+                if let Operation::Head {
+                    request,
+                    tokens,
+                    position,
+                    proposals,
+                    ..
+                } = operation
+                {
+                    eprintln!(
+                        "draft transaction request={request:?} position={position} proposals={} entry={:?}",
+                        proposals.len(),
+                        tokens.iter().map(|token| token.0).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
         let metadata = operations
             .iter()
             .map(|operation| match operation {
@@ -66,23 +85,48 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 _ => unreachable!("validated head group"),
             })
             .collect::<Vec<_>>();
-        let slots = operations
-            .iter()
-            .zip(&advances)
-            .map(|(operation, advance)| self.head_slot(operation, advance, steps))
-            .collect::<Result<Vec<_>, _>>();
-        let slots = match slots {
-            Ok(slots) => slots,
-            Err(error) => {
-                self.restore_head_advances(&metadata, advances);
-                return Err(error.into());
-            }
+        let form = match &operations[0] {
+            Operation::Head { form, .. } => *form,
+            _ => unreachable!("validated head group"),
         };
-        let batch = match crate::batching::ValidatedHeadBatch::from_slots(
-            &slots,
-            self.definition.geometry.vocabulary as usize,
-            self.execution.policy().limits().max_launch_rows,
-        ) {
+        if operations
+            .iter()
+            .any(|operation| !matches!(operation, Operation::Head { form: other, .. } if *other == form))
+        {
+            self.restore_head_advances(&metadata, advances);
+            return Err("head group mixes draft forms".into());
+        }
+        // A drafting block drafts the load's proposals; a request takes its
+        // leading ones.
+        let steps = match form {
+            DraftForm::Block if steps > 0 => self.execution.policy().method().draft_rows(),
+            DraftForm::Chained | DraftForm::Block => steps,
+        };
+        let vocabulary = self.definition.decoder.vocabulary as usize;
+        let row_limit = self.execution.policy().limits().max_launch_rows;
+        let batch = match form {
+            DraftForm::Chained => operations
+                .iter()
+                .zip(&advances)
+                .map(|(operation, advance)| self.head_slot(operation, advance, steps))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|slots| {
+                    crate::batching::ValidatedHeadBatch::from_slots(&slots, vocabulary, row_limit)
+                        .map_err(|error| error.to_string())
+                }),
+            DraftForm::Block => operations
+                .iter()
+                .zip(&advances)
+                .map(|(operation, advance)| self.draft_slot(operation, advance, steps))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|slots| {
+                    crate::batching::ValidatedHeadBatch::from_block_slots(
+                        &slots, vocabulary, row_limit,
+                    )
+                    .map_err(|error| error.to_string())
+                }),
+        };
+        let batch = match batch {
             Ok(batch) => batch,
             Err(error) => {
                 self.restore_head_advances(&metadata, advances);
@@ -168,8 +212,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let i32_of = |value: usize, what: &str| {
             i32::try_from(value).map_err(|_| format!("head {what} exceeds i32"))
         };
+        // The draft head's store has one Token domain.
+        let domain = self
+            .head_store
+            .as_ref()
+            .ok_or("a head operation without a head store")?
+            .sole_history_domain()
+            .map_err(|error| error.to_string())?;
         let history = advance
-            .history_ranges()
+            .history_ranges(domain)
             .into_iter()
             .map(|(start, count)| {
                 Ok([
@@ -184,8 +235,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             })
             .collect::<Result<Vec<[i32; 2]>, String>>()?;
         let destination = |row: usize| -> Result<i32, String> {
-            binding
-                .destinations
+            binding.destinations[domain.0]
                 .get(row)
                 .map_or(Ok(-1), |value| i32_of(*value, "destination"))
         };
@@ -199,8 +249,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 coordinates: *coordinates
                     .get(index)
                     .ok_or("prepared input coordinate count differs from head rows")?,
-                visible,
-                destination: destination(index)?,
+                histories: vec![RowHistory {
+                    visible,
+                    fresh_start: 0,
+                    bidirectional_end: None,
+                    destination: destination(index)?,
+                }],
                 demand: crate::batching::Demand::NONE,
                 select: None,
             })
@@ -297,6 +351,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 "head selections differ from the batch's steps and slots",
             ));
         }
+        let passes = core.batch().passes();
+        if std::env::var_os("MAGNITUDE_TRACE_DRAFT").is_some() {
+            for (slot, (request, _, proposals)) in flight.requests.iter().enumerate() {
+                eprintln!(
+                    "draft proposals request={request:?} {:?}",
+                    (0..*proposals)
+                        .map(|step| {
+                            let selected = selected[step * slot_class + slot];
+                            (selected.token.0, selected.status)
+                        })
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
         let (_, advances, _) = core.into_parts();
         Ok(flight
             .requests
@@ -312,7 +380,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             .collect(),
                     },
                     advance: Some(advance),
-                    rows: advance_rows(rows, proposals),
+                    rows: advance_rows(passes, rows, proposals),
                     committed_rows: rows,
                     kind: WorkKind::Decode,
                     physical_duration: duration,
@@ -323,8 +391,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 }
 
-fn advance_rows(entry: usize, proposals: usize) -> usize {
-    entry + proposals.saturating_sub(1)
+/// Rows a head transaction advances its state by: the entry rows, and a
+/// chained head's speculative rows (block rows append nowhere).
+fn advance_rows(passes: HeadPasses, entry: usize, proposals: usize) -> usize {
+    match passes {
+        HeadPasses::Chained => entry + proposals.saturating_sub(1),
+        HeadPasses::Block => entry,
+    }
 }
 
 /// Ascending visible spans with adjacent spans merged.

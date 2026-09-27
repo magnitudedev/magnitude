@@ -1,5 +1,6 @@
 //! Closed numerical execution failures at the program boundary.
 
+use magnitude_family_contracts::DeferredForm;
 use std::{error, fmt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +26,13 @@ impl error::Error for DeviceError {}
 pub enum PlanError {
     InvalidDefinition(String),
     Unsupported(&'static str),
+    /// A sublayer operator the executor does not implement at `position`.
+    UnsupportedOperator {
+        operator: &'static str,
+        position: &'static str,
+    },
+    /// A form the family contract defines only as an interface point.
+    Deferred(DeferredForm),
     Topology(&'static str),
     Arithmetic(&'static str),
     ResourcePlanning(String),
@@ -36,6 +44,10 @@ impl fmt::Display for PlanError {
         match self {
             Self::InvalidDefinition(detail) => formatter.write_str(detail),
             Self::Unsupported(feature) => write!(formatter, "unsupported {feature}"),
+            Self::UnsupportedOperator { operator, position } => {
+                write!(formatter, "unsupported {operator} operator as {position}")
+            }
+            Self::Deferred(form) => write!(formatter, "unsupported {} (deferred)", form.name()),
             Self::Topology(detail) => formatter.write_str(detail),
             Self::Arithmetic(detail) => write!(formatter, "plan arithmetic failed: {detail}"),
             Self::ResourcePlanning(detail) => {

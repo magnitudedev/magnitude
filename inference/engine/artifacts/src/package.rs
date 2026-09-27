@@ -61,6 +61,8 @@ pub struct PackageManifest {
     pub identity: PackageIdentity,
     pub target: ComponentManifest,
     pub projector: Option<ComponentManifest>,
+    /// A separate draft model, carrying its own component identity.
+    pub draft: Option<ComponentManifest>,
 }
 
 /// Validated package metadata when tensor payloads have not been downloaded.
@@ -70,6 +72,7 @@ pub struct PackageManifest {
 pub struct PackageHeaders {
     target: HeaderComponent,
     projector: Option<HeaderComponent>,
+    draft: Option<(HeaderComponent, ArtifactIdentity)>,
     identity: PackageIdentity,
 }
 
@@ -126,8 +129,28 @@ impl PackageHeaders {
         Ok(Self {
             target,
             projector,
+            draft: None,
             identity,
         })
+    }
+
+    /// Add a separate draft model's header as a component of the package.
+    pub fn with_draft(mut self, draft: &Path) -> Result<Self, Error> {
+        let component = HeaderComponent::inspect(draft)?;
+        let others = self
+            .target
+            .files
+            .iter()
+            .chain(self.projector.iter().flat_map(|projector| &projector.files));
+        for file in others {
+            if file.path.canonicalize()? == draft.canonicalize()? {
+                return Err(Error::Invalid(
+                    "the draft must be a distinct package component".into(),
+                ));
+            }
+        }
+        self.draft = Some((component, ArtifactIdentity::for_open()));
+        Ok(self)
     }
 
     pub fn target(&self) -> &Directory {
@@ -138,6 +161,10 @@ impl PackageHeaders {
         self.projector
             .as_ref()
             .map(|projector| &projector.directory)
+    }
+
+    pub fn draft(&self) -> Option<&Directory> {
+        self.draft.as_ref().map(|(draft, _)| &draft.directory)
     }
 
     pub fn identity(&self) -> PackageIdentity {
@@ -156,11 +183,15 @@ impl PackageHeaders {
                 .as_ref()
                 .zip(self.identity.projector)
                 .map(|(projector, identity)| projector.manifest(identity)),
+            draft: self
+                .draft
+                .as_ref()
+                .map(|(draft, identity)| draft.manifest(*identity)),
         }
     }
 }
 
-/// A target GGUF and its optional projector component.
+/// A target GGUF and its optional projector and draft components.
 ///
 /// The package establishes component ownership and identity only. A model-family
 /// adapter decides whether the metadata describes a supported target/projector.
@@ -168,6 +199,7 @@ impl PackageHeaders {
 pub struct Package {
     target: GgufArtifact,
     projector: Option<GgufArtifact>,
+    draft: Option<GgufArtifact>,
     identity: PackageIdentity,
     tokenizer: TokenizerPayload,
     templates: TemplatePayload,
@@ -215,14 +247,43 @@ impl Package {
             artifact.adopt_identity(component.identity);
             Ok(())
         };
+        if let Some(draft) = &manifest.draft {
+            package = package.with_draft(draft.path())?;
+        }
         admitted(&mut package.target, &manifest.target)?;
         if let (Some(artifact), Some(component)) =
             (package.projector.as_mut(), manifest.projector.as_ref())
         {
             admitted(artifact, component)?;
         }
+        if let (Some(artifact), Some(component)) =
+            (package.draft.as_mut(), manifest.draft.as_ref())
+        {
+            admitted(artifact, component)?;
+        }
         package.identity = manifest.identity;
         Ok(package)
+    }
+
+    /// Add a separate draft model (a DFlash or DSpark GGUF) as a component
+    /// of the package.
+    pub fn with_draft(mut self, draft: impl AsRef<Path>) -> Result<Self, Error> {
+        let draft = GgufArtifact::open(draft.as_ref())?;
+        let others = self
+            .target
+            .sources()
+            .chain(self.projector.iter().flat_map(GgufArtifact::sources));
+        for other in others {
+            for source in draft.sources() {
+                if same_file(other, source)? {
+                    return Err(Error::Invalid(
+                        "the draft must be a distinct package component".into(),
+                    ));
+                }
+            }
+        }
+        self.draft = Some(draft);
+        Ok(self)
     }
 
     fn open_paths(target_path: &Path, projector_path: Option<&Path>) -> Result<Self, Error> {
@@ -258,6 +319,7 @@ impl Package {
         Ok(Self {
             target,
             projector,
+            draft: None,
             identity,
             tokenizer,
             templates,
@@ -270,6 +332,10 @@ impl Package {
 
     pub fn projector(&self) -> Option<&GgufArtifact> {
         self.projector.as_ref()
+    }
+
+    pub fn draft(&self) -> Option<&GgufArtifact> {
+        self.draft.as_ref()
     }
 
     pub fn identity(&self) -> PackageIdentity {
@@ -289,6 +355,7 @@ impl Package {
             identity: self.identity,
             target: component_manifest(&self.target),
             projector: self.projector.as_ref().map(component_manifest),
+            draft: self.draft.as_ref().map(component_manifest),
         }
     }
 }

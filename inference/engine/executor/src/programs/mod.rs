@@ -2,6 +2,8 @@
 
 pub(crate) mod graph;
 pub(crate) mod native_constants;
+pub(crate) mod native_draft;
+pub(crate) mod native_drafter;
 pub(crate) mod native_head;
 pub(crate) mod native_import;
 pub(crate) mod native_state;
@@ -11,6 +13,8 @@ pub(crate) mod native_vision;
 mod submission;
 
 pub use graph::readout::PreparedTargetReadoutGraphs;
+pub use native_draft::PreparedDraftGraphs;
+pub use native_drafter::PreparedDrafterGraphs;
 pub use native_head::PreparedHeadGraphs;
 pub use native_state::PreparedStateCopyGraphs;
 pub use native_target::{CommitSpan, TargetOutput, TargetReadoutGraphResult};

@@ -34,6 +34,7 @@ fn main() -> Result<(), String> {
         package: PackageOptions {
             target: model.ok_or("--model is required")?,
             projector,
+            draft: None,
         },
         model: ModelPolicy::default(),
         context_tokens: None,

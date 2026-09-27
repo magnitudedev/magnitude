@@ -20,13 +20,17 @@ class NativeOptions(Record):
     binary: Path = Field(default_factory=default_native_binary)
     device: str = "auto"
     cache_dir: Path | None = None
-    method: Literal["auto", "plain", "mtp"] = "auto"
+    method: Literal["auto", "plain", "mtp", "dflash"] = "auto"
     mtp_proposals: int | None = Field(default=None, gt=0)
+    #: A separate draft model (DFlash, DSpark) for the target.
+    draft: Path | None = None
 
     @model_validator(mode="after")
-    def proposals_need_mtp(self) -> Self:
-        if self.mtp_proposals is not None and self.method != "mtp":
-            raise ValueError("--native-mtp-proposals requires --native-method mtp")
+    def proposals_need_a_drafter(self) -> Self:
+        if self.mtp_proposals is not None and self.method not in ("mtp", "dflash"):
+            raise ValueError("--native-mtp-proposals requires --native-method mtp or dflash")
+        if self.method == "dflash" and self.draft is None:
+            raise ValueError("--native-method dflash requires --native-draft")
         return self
 
     def arguments(self) -> list[str]:
@@ -37,6 +41,8 @@ class NativeOptions(Record):
         args += ["--native-method", self.method]
         if self.mtp_proposals is not None:
             args += ["--native-mtp-proposals", str(self.mtp_proposals)]
+        if self.draft is not None:
+            args += ["--native-draft", str(self.draft)]
         return args
 
 

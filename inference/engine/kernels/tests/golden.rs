@@ -558,7 +558,6 @@ const FFN: usize = 9216;
 const KV: usize = 4;
 const GROUP: usize = 4;
 const HEAD: usize = 256;
-const PAIRS: usize = 32;
 const KEY_HEADS: usize = 16;
 const VALUE_HEADS: usize = 32;
 const STATE: usize = 128;
@@ -601,6 +600,8 @@ fn dense_expand(ctx: &Ctx) -> Vec<Variant> {
                         Arg::Shared(up.clone()),
                         ctx.ints(&[o as u64], &out_rows(m, o)),
                         f32s(1e-6),
+                        // SiLU: the Qwen feed-forward.
+                        i32s(0),
                     ],
                 })
                 .collect();
@@ -673,8 +674,10 @@ fn attention_project(ctx: &Ctx) -> Vec<Variant> {
             let (k, kf) = ctx.real("blk.3.attn_k.weight", KV * HEAD, dense);
             let (v, vf) = ctx.real("blk.3.attn_v.weight", KV * HEAD, dense);
             let norm = ctx.norm("blk.3.attn_norm.weight", nw);
-            let query_norm = ctx.norm("blk.3.attn_q_norm.weight", f32e());
             let element = |f: Format| dense.unwrap_or_else(|| ctx.resident(f));
+            // Qwen's form: the gate is interleaved in the query segment, so
+            // the gate segment is zero rows of the query's element.
+            let gate = ctx.tensor(element(qf), &[0, HIDDEN as u64], &[]);
             let mut rng = Rng::new(3);
             let cases = rows_only()
                 .into_iter()
@@ -687,8 +690,8 @@ fn attention_project(ctx: &Ctx) -> Vec<Variant> {
                             &activations(&mut rng, m, HIDDEN, 1.0),
                         ),
                         norm.clone(),
-                        query_norm.clone(),
                         Arg::Shared(q.clone()),
+                        Arg::Shared(gate.clone()),
                         Arg::Shared(k.clone()),
                         Arg::Shared(v.clone()),
                         f32s(1e-6),
@@ -700,15 +703,17 @@ fn attention_project(ctx: &Ctx) -> Vec<Variant> {
                 elements: vec![
                     ("NW", nw),
                     ("QW", element(qf)),
+                    ("GW", element(qf)),
                     ("KW", element(kf)),
                     ("VW", element(vf)),
                     ("A", a),
                 ],
                 statics: vec![
                     ("D", HIDDEN as u64),
-                    ("KV", KV as u64),
-                    ("G", GROUP as u64),
-                    ("W", HEAD as u64),
+                    ("Q", (KV * GROUP * 2 * HEAD) as u64),
+                    ("GR", 0),
+                    ("K", (KV * HEAD) as u64),
+                    ("V", (KV * HEAD) as u64),
                 ],
                 every_configuration: every,
                 cases,
@@ -747,282 +752,6 @@ fn attention_output(ctx: &Ctx) -> Vec<Variant> {
                 label: label.into(),
                 elements: vec![("OW", dense.unwrap_or_else(|| ctx.resident(wf))), ("A", a)],
                 statics: vec![("D", HIDDEN as u64), ("Q", q as u64), ("W", HEAD as u64)],
-                every_configuration: every,
-                cases,
-            }
-        })
-        .collect()
-}
-
-/// One attention row: visible history spans, fresh span, destination and
-/// position.
-struct AttentionRow {
-    spans: Vec<(i32, i32)>,
-    fresh: (i32, i32),
-    destination: i32,
-    position: i32,
-}
-
-fn speculative_rows(rows: usize, context: i32) -> Vec<AttentionRow> {
-    (0..rows)
-        .map(|row| AttentionRow {
-            spans: vec![(0, context)],
-            fresh: (0, row as i32 + 1),
-            destination: context + row as i32,
-            position: context + row as i32,
-        })
-        .collect()
-}
-
-fn mixed_decode_rows(base: i32) -> Vec<AttentionRow> {
-    vec![
-        AttentionRow {
-            spans: vec![(0, base), (base + 7, base + 19)],
-            fresh: (0, 1),
-            destination: base + 40,
-            position: base + 12,
-        },
-        AttentionRow {
-            spans: vec![(0, base), (base + 7, base + 19)],
-            fresh: (0, 2),
-            destination: base + 41,
-            position: base + 13,
-        },
-        AttentionRow {
-            spans: vec![(base + 20, base + 33)],
-            fresh: (2, 3),
-            destination: -1,
-            position: 13,
-        },
-        AttentionRow {
-            spans: vec![],
-            fresh: (0, 0),
-            destination: -1,
-            position: 0,
-        },
-    ]
-}
-
-fn prefill_rows(rows: usize, history: i32) -> Vec<AttentionRow> {
-    let boundary = rows * 2 / 3;
-    (0..rows)
-        .map(|row| {
-            let r = row as i32;
-            if row + 2 >= rows {
-                AttentionRow {
-                    spans: vec![],
-                    fresh: (0, 0),
-                    destination: -1,
-                    position: 0,
-                }
-            } else if row < boundary {
-                AttentionRow {
-                    spans: if history == 0 {
-                        vec![]
-                    } else {
-                        vec![(0, history / 2), (history / 2 + 9, history)]
-                    },
-                    fresh: (0, r + 1),
-                    destination: if row % 5 == 3 { -1 } else { history + 64 + r },
-                    position: history - 9 + r,
-                }
-            } else {
-                let first = boundary as i32;
-                AttentionRow {
-                    spans: if history == 0 {
-                        vec![]
-                    } else {
-                        vec![(history + 3, history + 17)]
-                    },
-                    fresh: (first, r + 1),
-                    destination: history + 64 + r,
-                    position: 14 + r - first,
-                }
-            }
-        })
-        .collect()
-}
-
-fn attention_case(
-    ctx: &Ctx,
-    a: Element,
-    label: String,
-    history: usize,
-    spans: usize,
-    rows: &[AttentionRow],
-    seed: u64,
-) -> Case {
-    let mut rng = Rng::new(seed);
-    let m = rows.len();
-    let w = 2 * PAIRS + (HEAD - 2 * PAIRS);
-    let heads = KV * GROUP;
-    let components = (0..PAIRS)
-        .map(|pair| match pair % 3 {
-            1 if pair < 3 * PAIRS * 11 / 32 => 1,
-            2 if pair < 3 * PAIRS * 10 / 32 => 2,
-            _ => 0,
-        })
-        .collect::<Vec<i32>>();
-    let frequencies = (0..PAIRS)
-        .map(|pair| 1.0e7f64.powf(-((2 * pair) as f64) / (2 * PAIRS) as f64) as f32)
-        .collect::<Vec<_>>();
-    let coordinates = rows
-        .iter()
-        .flat_map(|row| [row.position, row.position + 3, row.position / 2, 0])
-        .collect::<Vec<_>>();
-    let visible = rows
-        .iter()
-        .flat_map(|row| {
-            row.spans
-                .iter()
-                .copied()
-                .chain(std::iter::repeat((0, 0)))
-                .take(spans)
-                .flat_map(|(lo, hi)| [lo, hi])
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let values = |rng: &mut Rng, count: usize, scale: f32| {
-        (0..count).map(|_| rng.unit() * scale).collect::<Vec<_>>()
-    };
-    let (m64, w64, t64) = (m as u64, w as u64, history as u64);
-    Case {
-        label,
-        args: vec![
-            ctx.dense(
-                a,
-                &[m64, (heads * 2 * w) as u64],
-                &values(&mut rng, m * heads * 2 * w, 2.0),
-            ),
-            ctx.dense(
-                a,
-                &[m64, (KV * w) as u64],
-                &values(&mut rng, m * KV * w, 2.0),
-            ),
-            ctx.dense(
-                a,
-                &[m64, (KV * w) as u64],
-                &values(&mut rng, m * KV * w, 1.0),
-            ),
-            ctx.norm("blk.3.attn_q_norm.weight", f32e()),
-            ctx.norm("blk.3.attn_k_norm.weight", f32e()),
-            ctx.ints(&[PAIRS as u64], &components),
-            ctx.dense(f32e(), &[PAIRS as u64], &frequencies),
-            ctx.ints(&[m64, 4], &coordinates),
-            ctx.ints(&[m64, spans as u64, 2], &visible),
-            ctx.ints(
-                &[m64, 2],
-                &rows
-                    .iter()
-                    .flat_map(|r| [r.fresh.0, r.fresh.1])
-                    .collect::<Vec<_>>(),
-            ),
-            ctx.ints(
-                &[m64],
-                &rows.iter().map(|r| r.destination).collect::<Vec<_>>(),
-            ),
-            ctx.dense_mut(
-                a,
-                &[t64, KV as u64, w64],
-                &values(&mut rng, history * KV * w, 3.0),
-            ),
-            ctx.dense_mut(
-                a,
-                &[t64, KV as u64, w64],
-                &values(&mut rng, history * KV * w, 1.0),
-            ),
-            f32s(1e-6),
-            f32s(1.0 / (w as f32).sqrt()),
-        ],
-    }
-}
-
-fn attention_statics() -> Vec<(&'static str, u64)> {
-    vec![
-        ("KV", KV as u64),
-        ("G", GROUP as u64),
-        ("P", PAIRS as u64),
-        ("S", (HEAD - 2 * PAIRS) as u64),
-    ]
-}
-
-fn attention_decode(ctx: &Ctx) -> Vec<Variant> {
-    [("bf16", bf16(), true), ("f16", f16(), false)]
-        .into_iter()
-        .map(|(label, a, every)| {
-            let cases = vec![
-                attention_case(
-                    ctx,
-                    a,
-                    "spec1@256".into(),
-                    256 + 64,
-                    1,
-                    &speculative_rows(1, 256),
-                    11,
-                ),
-                attention_case(
-                    ctx,
-                    a,
-                    "spec8@4096".into(),
-                    4096 + 64,
-                    1,
-                    &speculative_rows(8, 4096),
-                    12,
-                ),
-                attention_case(
-                    ctx,
-                    a,
-                    "mixed4@300".into(),
-                    300 + 128,
-                    2,
-                    &mixed_decode_rows(300),
-                    13,
-                ),
-                attention_case(
-                    ctx,
-                    a,
-                    "spec2@16384".into(),
-                    16384 + 64,
-                    1,
-                    &speculative_rows(2, 16384),
-                    14,
-                ),
-                attention_case(ctx, a, "spec1@1".into(), 64, 1, &speculative_rows(1, 1), 15),
-            ];
-            Variant {
-                label: label.into(),
-                elements: vec![("A", a)],
-                statics: attention_statics(),
-                every_configuration: every,
-                cases,
-            }
-        })
-        .collect()
-}
-
-fn attention_prefill(ctx: &Ctx) -> Vec<Variant> {
-    [("bf16", bf16(), true), ("f16", f16(), false)]
-        .into_iter()
-        .map(|(label, a, every)| {
-            let cases = [(16usize, 0usize), (40, 300), (128, 1000), (64, 4096)]
-                .into_iter()
-                .enumerate()
-                .map(|(i, (rows, history))| {
-                    attention_case(
-                        ctx,
-                        a,
-                        format!("m{rows}@{history}"),
-                        history + 256,
-                        2,
-                        &prefill_rows(rows, history as i32),
-                        20 + i as u64,
-                    )
-                })
-                .collect();
-            Variant {
-                label: label.into(),
-                elements: vec![("A", a)],
-                statics: attention_statics(),
                 every_configuration: every,
                 cases,
             }
@@ -1392,6 +1121,8 @@ fn head_rows(ctx: &Ctx) -> Vec<Variant> {
                         Arg::Shared(weight.clone()),
                         ctx.ints(&[o as u64], &out_rows(m, o)),
                         f32s(1e-6),
+                        // No softcap: the Qwen head.
+                        f32s(0.0),
                     ],
                 })
                 .collect();
@@ -1437,6 +1168,7 @@ fn selected_rows(ctx: &Ctx) -> Vec<Variant> {
                             ctx.ints(&[o as u64], &out_rows(m, o)),
                             ctx.ints(&[sv as u64], &selected),
                             f32s(1e-6),
+                            f32s(0.0),
                         ],
                     }
                 })
@@ -1573,6 +1305,10 @@ fn embedding_rows(ctx: &Ctx) -> Vec<Variant> {
                             .flat_map(|_| [rng.below(VOCABULARY_SLICE) as i32, 0])
                             .collect::<Vec<_>>(),
                     ),
+                    // The Qwen entry: unscaled, not normalized.
+                    f32s(1.0),
+                    i32s(0),
+                    f32s(0.0),
                 ],
             })
             .collect();
@@ -1947,6 +1683,8 @@ fn routed_experts(ctx: &Ctx) -> Vec<Variant> {
                             Arg::Shared(weights.tensors[0].clone()),
                             Arg::Shared(weights.tensors[1].clone()),
                             Arg::Shared(weights.tensors[2].clone()),
+                            // SiLU: the Qwen experts.
+                            i32s(0),
                         ],
                     }
                 })
@@ -2306,7 +2044,8 @@ fn conditioning_overlay(ctx: &Ctx) -> Vec<Variant> {
 }
 
 fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
-    // Qwen3.5 vision stem at a reduced width: C 3, P 16.
+    // The Qwen3.5 vision stem (two frames, a bias) at a reduced width: C 3,
+    // P 16.
     let (c, p, h, l) = (3usize, 16usize, 64usize, 49usize);
     [("f16", f16(), f32e()), ("bf16", bf16(), bf16())]
         .into_iter()
@@ -2329,10 +2068,10 @@ fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
                         ),
                         ctx.dense(
                             w,
-                            &[h as u64, c as u64, p as u64, p as u64],
+                            &[1, h as u64, c as u64, p as u64, p as u64],
                             &uniform(&mut rng, p * p * c * h, -0.05, 0.05),
                         ),
-                        ctx.dense(b, &[h as u64], &uniform(&mut rng, h, -0.1, 0.1)),
+                        ctx.dense(b, &[1, h as u64], &uniform(&mut rng, h, -0.1, 0.1)),
                         ctx.dense(
                             b,
                             &[l as u64, h as u64],
@@ -2349,7 +2088,13 @@ fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
             Variant {
                 label: label.into(),
                 elements: vec![("W0", w), ("W1", w), ("B", b), ("PE", b)],
-                statics: vec![("C", c as u64), ("P", p as u64), ("H", h as u64)],
+                statics: vec![
+                    ("C", c as u64),
+                    ("S", 1),
+                    ("P", p as u64),
+                    ("H", h as u64),
+                    ("NB", 1),
+                ],
                 every_configuration: true,
                 cases,
             }
@@ -2357,155 +2102,169 @@ fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
         .collect()
 }
 
-fn vision_block(ctx: &Ctx) -> Vec<Variant> {
-    // Two heads of 64 (the kernels specialize on H, P, F).
-    let (h, p, f) = (2usize, 16usize, 128usize);
-    let width = h * 4 * p;
+/// The Qwen forms of the vision norm: a layer norm of single rows to A, and
+/// of cells of four rows side by side.
+fn vision_norm(ctx: &Ctx) -> Vec<Variant> {
+    let h = 128usize;
     [
-        ("f16", f16(), f16(), f32e()),
-        ("bf16", bf16(), bf16(), bf16()),
+        ("f16", f16(), f32e()),
+        ("bf16", bf16(), bf16()),
     ]
     .into_iter()
-    .map(|(label, a, w, n)| {
-        let mut rng = Rng::new(25);
-        let cases = [2usize, 70]
-            .into_iter()
-            .map(|m| {
-                let mut vector = |len: usize, low: f32, high: f32, element: Element| {
-                    ctx.dense(element, &[len as u64], &uniform(&mut rng, len, low, high))
-                };
-                let n1w = vector(width, 0.5, 1.5, n);
-                let n1b = vector(width, -0.1, 0.1, n);
-                let qb = vector(3 * width, -0.1, 0.1, n);
-                let pb = vector(width, -0.1, 0.1, n);
-                let n2w = vector(width, 0.5, 1.5, n);
-                let n2b = vector(width, -0.1, 0.1, n);
-                let ub = vector(f, -0.1, 0.1, n);
-                let db = vector(width, -0.1, 0.1, n);
-                Case {
-                    label: format!("m{m}"),
+    .flat_map(|(label, a, n)| {
+        [1usize, 4].into_iter().map(move |g| {
+            let mut rng = Rng::new(25);
+            let cases = [2usize, 70]
+                .into_iter()
+                .map(|cells| Case {
+                    label: format!("c{cells}"),
                     args: vec![
                         ctx.dense(
                             f32e(),
-                            &[m as u64, h as u64, 4, p as u64],
-                            &uniform(&mut rng, m * width, -1.0, 1.0),
+                            &[cells as u64, g as u64, h as u64],
+                            &uniform(&mut rng, cells * g * h, -1.0, 1.0),
                         ),
-                        ctx.ints(
-                            &[m as u64, 2],
-                            &(0..m * 2).map(|i| (i % 9) as i32).collect::<Vec<_>>(),
-                        ),
-                        n1w,
-                        n1b,
-                        ctx.dense(
-                            w,
-                            &[3 * width as u64, width as u64],
-                            &uniform(&mut rng, width * 3 * width, -0.1, 0.1),
-                        ),
-                        qb,
-                        ctx.dense(
-                            w,
-                            &[width as u64, width as u64],
-                            &uniform(&mut rng, width * width, -0.1, 0.1),
-                        ),
-                        pb,
-                        n2w,
-                        n2b,
-                        ctx.dense(
-                            w,
-                            &[f as u64, width as u64],
-                            &uniform(&mut rng, width * f, -0.1, 0.1),
-                        ),
-                        ub,
-                        ctx.dense(
-                            w,
-                            &[width as u64, f as u64],
-                            &uniform(&mut rng, f * width, -0.1, 0.1),
-                        ),
-                        db,
+                        ctx.dense(n, &[1, h as u64], &uniform(&mut rng, h, 0.5, 1.5)),
+                        ctx.dense(n, &[1, h as u64], &uniform(&mut rng, h, -0.1, 0.1)),
+                        ctx.ints(&[0, (cells * g) as u64], &[]),
                         f32s(1e-6),
+                        i32s(1),
+                        i32s(0),
                     ],
-                }
-            })
-            .collect();
-        Variant {
-            label: label.into(),
-            elements: vec![
-                ("N1W", n),
-                ("N1B", n),
-                ("QW", w),
-                ("QB", n),
-                ("PW", w),
-                ("PB", n),
-                ("N2W", n),
-                ("N2B", n),
-                ("UW", w),
-                ("UB", n),
-                ("DW", w),
-                ("DB", n),
-                ("A", a),
-            ],
-            statics: vec![("H", h as u64), ("P", p as u64), ("F", f as u64)],
-            every_configuration: true,
-            cases,
-        }
+                })
+                .collect();
+            Variant {
+                label: format!("{label}_g{g}"),
+                elements: vec![("NWE", n), ("NBE", n), ("Y", a)],
+                statics: vec![
+                    ("G", g as u64),
+                    ("H", h as u64),
+                    ("NW", 1),
+                    ("NB", 1),
+                    ("NO", 0),
+                ],
+                every_configuration: true,
+                cases,
+            }
+        })
     })
     .collect()
 }
 
-fn vision_merger(ctx: &Ctx) -> Vec<Variant> {
-    let (g, h, d) = (4usize, 32usize, 48usize);
+/// The Qwen forms of the vision linear: a projection to A, the tanh and erf
+/// GELU forms, and the F32 forms with and without a residual.
+fn vision_linear(ctx: &Ctx) -> Vec<Variant> {
+    let (n, k) = (192usize, 128usize);
+    // (label, activation, residual, output in F32)
+    let forms = [
+        ("plain", 0, false, false),
+        ("tanh", 1, false, false),
+        ("erf", 2, false, false),
+        ("residual", 0, true, true),
+        ("f32", 0, false, true),
+    ];
     [
         ("f16", f16(), f16(), f32e()),
         ("bf16", bf16(), bf16(), bf16()),
     ]
     .into_iter()
-    .map(|(label, a, w, n)| {
-        let mut rng = Rng::new(26);
-        let cases = [1usize, 3]
-            .into_iter()
-            .map(|m| Case {
-                label: format!("m{m}"),
-                args: vec![
-                    ctx.dense(
-                        f32e(),
-                        &[(m * g) as u64, h as u64],
-                        &uniform(&mut rng, m * g * h, -1.0, 1.0),
-                    ),
-                    ctx.dense(n, &[h as u64], &uniform(&mut rng, h, 0.5, 1.5)),
-                    ctx.dense(n, &[h as u64], &uniform(&mut rng, h, -0.1, 0.1)),
-                    ctx.dense(
-                        w,
-                        &[(g * h) as u64, (g * h) as u64],
-                        &uniform(&mut rng, g * h * g * h, -0.2, 0.2),
-                    ),
-                    ctx.dense(n, &[(g * h) as u64], &uniform(&mut rng, g * h, -0.1, 0.1)),
-                    ctx.dense(
-                        w,
-                        &[d as u64, (g * h) as u64],
-                        &uniform(&mut rng, g * h * d, -0.2, 0.2),
-                    ),
-                    ctx.dense(n, &[d as u64], &uniform(&mut rng, d, -0.1, 0.1)),
-                    f32s(1e-6),
+    .flat_map(|(label, a, w, b)| {
+        forms.into_iter().map(move |(form, activation, residual, f32_output)| {
+            let mut rng = Rng::new(26);
+            let nr = u64::from(residual);
+            let cases = [2usize, 70]
+                .into_iter()
+                .map(|m| Case {
+                    label: format!("m{m}"),
+                    args: vec![
+                        ctx.dense(a, &[m as u64, k as u64], &uniform(&mut rng, m * k, -1.0, 1.0)),
+                        ctx.dense(w, &[n as u64, k as u64], &uniform(&mut rng, n * k, -0.1, 0.1)),
+                        ctx.dense(b, &[1, n as u64], &uniform(&mut rng, n, -0.1, 0.1)),
+                        ctx.dense(
+                            f32e(),
+                            &[nr, m as u64, n as u64],
+                            &uniform(&mut rng, nr as usize * m * n, -1.0, 1.0),
+                        ),
+                        ctx.dense(a, &[0, m as u64, n as u64], &[]),
+                        ctx.dense(f32e(), &[0], &[]),
+                        ctx.dense(f32e(), &[0], &[]),
+                        i32s(activation),
+                    ],
+                })
+                .collect();
+            Variant {
+                label: format!("{label}_{form}"),
+                elements: vec![
+                    ("A", a),
+                    ("W", w),
+                    ("B", b),
+                    ("Y", if f32_output { f32e() } else { a }),
                 ],
-            })
-            .collect();
-        Variant {
-            label: label.into(),
-            elements: vec![
-                ("NW", n),
-                ("NB", n),
-                ("UW", w),
-                ("UB", n),
-                ("DW", w),
-                ("DB", n),
-                ("A", a),
-            ],
-            statics: vec![("G", g as u64), ("H", h as u64), ("D", d as u64)],
-            every_configuration: true,
-            cases,
-        }
+                statics: vec![
+                    ("N", n as u64),
+                    ("K", k as u64),
+                    ("NB", 1),
+                    ("NR", nr),
+                    ("NG", 0),
+                    ("NC", 0),
+                ],
+                every_configuration: true,
+                cases,
+            }
+        })
     })
     .collect()
+}
+
+/// The Qwen form of the vision attention: two heads of 64, full spans.
+fn vision_attention(ctx: &Ctx) -> Vec<Variant> {
+    let (heads, p) = (2usize, 16usize);
+    let width = 4 * p;
+    [("f16", f16()), ("bf16", bf16())]
+        .into_iter()
+        .map(|(label, a)| {
+            let mut rng = Rng::new(27);
+            let cases = [2usize, 70]
+                .into_iter()
+                .map(|m| {
+                    let shape = [m as u64, heads as u64, width as u64];
+                    let count = m * heads * width;
+                    Case {
+                        label: format!("m{m}"),
+                        args: vec![
+                            ctx.dense(a, &shape, &uniform(&mut rng, count, -1.0, 1.0)),
+                            ctx.dense(a, &shape, &uniform(&mut rng, count, -1.0, 1.0)),
+                            ctx.dense(a, &shape, &uniform(&mut rng, count, -1.0, 1.0)),
+                            ctx.dense(f32e(), &[0, width as u64], &[]),
+                            ctx.dense(f32e(), &[0, width as u64], &[]),
+                            ctx.dense(f32e(), &[0, width as u64], &[]),
+                            ctx.ints(
+                                &[m as u64, 2],
+                                &(0..m * 2).map(|i| (i % 9) as i32).collect::<Vec<_>>(),
+                            ),
+                            ctx.ints(&[0, m as u64, 2], &[]),
+                            f32s(10000f32.ln()),
+                            f32s(1e-6),
+                            i32s(0),
+                        ],
+                    }
+                })
+                .collect();
+            Variant {
+                label: label.into(),
+                elements: vec![("A", a)],
+                statics: vec![
+                    ("H", heads as u64),
+                    ("P", p as u64),
+                    ("NQ", 0),
+                    ("NV", 0),
+                    ("WS", 0),
+                ],
+                every_configuration: true,
+                cases,
+            }
+        })
+        .collect()
 }
 
 /// A harness entry: a stable id (golden file name), the function names it
@@ -2537,7 +2296,7 @@ const ENTRIES: &[EntrySpec] = &[
     },
     EntrySpec {
         id: "attention_project",
-        names: &["gated_attention_project"],
+        names: &["attention_project"],
         family: "attention",
         library: true,
         build: attention_project,
@@ -2548,20 +2307,6 @@ const ENTRIES: &[EntrySpec] = &[
         family: "attention",
         library: true,
         build: attention_output,
-    },
-    EntrySpec {
-        id: "attention_decode",
-        names: &["gated_attention_decode"],
-        family: "attention",
-        library: false,
-        build: attention_decode,
-    },
-    EntrySpec {
-        id: "attention_prefill",
-        names: &["gated_attention_prefill"],
-        family: "attention",
-        library: false,
-        build: attention_prefill,
     },
     EntrySpec {
         id: "recurrent_project",
@@ -2718,31 +2463,60 @@ const ENTRIES: &[EntrySpec] = &[
         build: conditioning_overlay,
     },
     EntrySpec {
-        id: "vision_stem",
-        names: &["qwen_vision_stem"],
+        id: "vision_patch_stem",
+        names: &["vision_patch_stem"],
         family: "vision",
         library: false,
         build: vision_stem,
     },
     EntrySpec {
-        id: "vision_block",
-        names: &["qwen_vision_block"],
+        id: "vision_norm",
+        names: &["vision_norm"],
         family: "vision",
         library: false,
-        build: vision_block,
+        build: vision_norm,
     },
     EntrySpec {
-        id: "vision_merger",
-        names: &["qwen_vision_merger"],
+        id: "vision_linear",
+        names: &["vision_linear"],
         family: "vision",
         library: false,
-        build: vision_merger,
+        build: vision_linear,
+    },
+    EntrySpec {
+        id: "vision_attention",
+        names: &["vision_attention"],
+        family: "vision",
+        library: false,
+        build: vision_attention,
     },
 ];
 
 // ---------------------------------------------------------------------------
 // Configurations
 // ---------------------------------------------------------------------------
+
+/// A tuning parameter of the configuration domain: an entry parameter by its
+/// name, a launch-scoped one as `name@launch` (see `specialization`).
+struct Parameter {
+    name: String,
+    values: Vec<u64>,
+}
+
+/// The entry's parameters, then every launch's scoped parameters.
+fn parameters(native: &NativeImplementation) -> Vec<Parameter> {
+    let entry = native.params.iter().map(|p| Parameter {
+        name: p.name.clone(),
+        values: p.values.clone(),
+    });
+    let scoped = native.launches.iter().enumerate().flat_map(|(launch, declared)| {
+        declared.params.iter().map(move |p| Parameter {
+            name: format!("{}@{launch}", p.name),
+            values: p.values.clone(),
+        })
+    });
+    entry.chain(scoped).collect()
+}
 
 /// Every configuration when the domain has at most 48; otherwise the
 /// defaults, each single-parameter variation of them and 8 pseudo-random
@@ -2752,7 +2526,7 @@ fn configurations(
     statics: &[(&str, u64)],
     seed: &str,
 ) -> Vec<Vec<(String, u64)>> {
-    let params = &native.params;
+    let params = &parameters(native);
     let total = params.iter().map(|p| p.values.len()).product::<usize>();
     let default = params.iter().map(|p| p.values[0]).collect::<Vec<_>>();
     let mut chosen: Vec<Vec<u64>> = Vec::new();
@@ -2820,7 +2594,15 @@ fn configurations(
                 .zip(config)
                 .collect::<Vec<_>>()
         })
-        .filter(|config| native.validate(&specialization(statics, config)).is_ok())
+        .filter(|config| match native.validate(&specialization(statics, config)) {
+            Ok(_) => true,
+            Err(error) => {
+                if std::env::var_os("GOLDEN_VERBOSE").is_some() {
+                    println!("{seed}: configuration {config:?} rejected: {error:?}");
+                }
+                false
+            }
+        })
         .collect()
 }
 
@@ -2830,9 +2612,12 @@ fn specialization(statics: &[(&str, u64)], config: &[(String, u64)]) -> NativeSp
         .fold(NativeSpecialization::new(), |s, (name, value)| {
             s.with_static(*name, *value)
         });
-    config.iter().fold(with_statics, |s, (name, value)| {
-        s.with_param(name.clone(), *value)
-    })
+    config
+        .iter()
+        .fold(with_statics, |s, (name, value)| match name.split_once('@') {
+            Some((scoped, launch)) => s.with_launch_param(launch.parse().unwrap(), scoped, *value),
+            None => s.with_param(name.clone(), *value),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -2936,7 +2721,23 @@ fn run_entry(
     };
     let function = module.function(name).unwrap();
     let started = std::time::Instant::now();
-    let variants = (spec.build)(ctx);
+    // `GOLDEN_VARIANTS` runs only the listed variants (a long entry split
+    // over several runs); their keys go to their own golden file.
+    let only = std::env::var("GOLDEN_VARIANTS").ok().filter(|list| !list.is_empty());
+    // `GOLDEN_CONFIGURATIONS=a..b` runs configurations a..b of each variant
+    // (a variant whose configurations outlast one run); its keys go to their
+    // own golden file too.
+    let slice = std::env::var("GOLDEN_CONFIGURATIONS").ok().filter(|range| !range.is_empty()).map(|range| {
+        let (start, end) = range.split_once("..").expect("GOLDEN_CONFIGURATIONS is a..b");
+        start.parse::<usize>().unwrap()..end.parse::<usize>().unwrap()
+    });
+    let variants = (spec.build)(ctx)
+        .into_iter()
+        .filter(|variant| {
+            only.as_deref()
+                .is_none_or(|list| list.split(',').any(|label| label.trim() == variant.label))
+        })
+        .collect::<Vec<_>>();
     let mut lines: BTreeMap<String, String> = BTreeMap::new();
     let mut prepared = 0usize;
     for variant in &variants {
@@ -2950,6 +2751,9 @@ fn run_entry(
         let mut configs = configurations(native, &statics, spec.id);
         if !variant.every_configuration {
             configs.truncate(3);
+        }
+        if let Some(range) = &slice {
+            configs = configs.into_iter().skip(range.start).take(range.end - range.start).collect();
         }
         let elements = variant
             .elements
@@ -3019,7 +2823,9 @@ fn run_entry(
             }
         }
     }
-    let path = dir.join(format!("{}.golden", spec.id));
+    let variants_part = only.as_ref().map_or(String::new(), |list| format!(".{}", list.replace(',', "+")));
+    let slice_part = slice.as_ref().map_or(String::new(), |range| format!(".c{}-{}", range.start, range.end));
+    let path = dir.join(format!("{}{variants_part}{slice_part}.golden", spec.id));
     match mode {
         Mode::Record => {
             let mut text = String::new();

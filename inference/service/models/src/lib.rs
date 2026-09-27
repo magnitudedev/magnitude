@@ -24,7 +24,7 @@ pub use cache::{
     CachedModelAssessment, ModelBlobKind, ModelCache, ModelCacheWorkspace, ModelIndexKind,
 };
 pub use catalog::{
-    GeneratedReleaseCatalog, ReleaseCatalog, ReleaseRecommendableCatalog,
+    CatalogLockAdvance, GeneratedReleaseCatalog, ReleaseCatalog, ReleaseRecommendableCatalog,
     ResolvingRecommendableCatalog, advance_model_catalog_lock, load_release_catalog,
     model_catalog_lock,
 };

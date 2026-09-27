@@ -35,6 +35,9 @@ pub struct AssessmentMemoryTerms {
     /// in-flight successor the planned lookahead keeps, and the pristine seed.
     pub recurrent_banks: u64,
     pub fit_depth: u64,
+    /// Host-resident gathered tables (model-family plan §3.7): claims in the
+    /// system-RAM domain, never device weights.
+    pub host_table_bytes: u64,
 }
 
 /// Upper bounds for every nonresident charge of a clean load. The prepared
@@ -70,6 +73,9 @@ pub struct AssessmentMemoryCharge {
     pub allocation_bytes: u64,
     /// Host RAM a dedicated device's staged import holds at its peak.
     pub staging_bytes: u64,
+    /// Host-resident tables: system RAM, which is the allocation domain of a
+    /// unified-memory device and the staging domain of a dedicated one.
+    pub host_table_bytes: u64,
 }
 
 /// A complete fit result: every domain the load touches, and whether the
@@ -117,59 +123,88 @@ impl AssessmentGraphResourceBounds {
         let plan = load
             .program_plan(definition, codec)
             .map_err(|error| error.to_string())?;
-        if plan.head().is_some() != matches!(method, PlannedMethod::Mtp { .. }) {
-            return Err("assessment method and head program disagree".into());
+        if plan.head().is_some() != matches!(method, PlannedMethod::Mtp { .. })
+            || plan.draft().is_some() != matches!(method, PlannedMethod::DFlash { .. })
+        {
+            return Err("assessment method and drafter program disagree".into());
         }
         // The same startup slots a load commits: one request's need.
         let slots = limits.startup_slots();
         let target_graph = crate::programs::native_target_graph::checked_target_family_storage(
             backend,
             load,
-            &definition.geometry,
+            &definition.decoder,
             state,
             plan.target(),
             limits,
         )?;
         let target = NativeGraphCharge::from_checked(
             target_graph.storage,
-            1 + definition.geometry.blocks.len(),
+            crate::programs::native_target_graph::target_runs_per_step(&definition.decoder),
             slots.target,
         )?;
         let readout = NativeGraphCharge::from_checked(
             crate::programs::graph::readout::checked_readout_family_storage(
                 backend,
                 load,
-                &definition.geometry,
+                &definition.decoder,
                 limits,
             )?,
             1,
             slots.readout,
         )?;
-        let (head, head_constant_bytes) = match (plan.head(), state.head_state()) {
-            (Some(head), Some(head_state)) => {
+        let (head, head_constant_bytes) = match (plan.head(), plan.draft(), state.head_state()) {
+            (None, Some(draft_plan), Some(head_state)) => {
+                let block = definition
+                    .draft
+                    .as_ref()
+                    .ok_or("a draft program without a draft")?
+                    .block_size;
+                let geometry = crate::programs::native_draft::DraftGeometry::new(
+                    definition,
+                    head_state,
+                    method.draft_rows(),
+                )?;
+                let draft_graph = crate::programs::native_draft::checked_draft_family_storage(
+                    backend,
+                    load,
+                    draft_plan,
+                    &geometry,
+                    crate::programs::native_draft::draft_graph_classes(
+                        limits,
+                        method.draft_rows(),
+                        block,
+                    )?,
+                )?;
+                (
+                    Some(NativeGraphCharge::from_checked(
+                        draft_graph.storage,
+                        1,
+                        slots.head,
+                    )?),
+                    draft_graph.binding_constant_bytes,
+                )
+            }
+            (Some(head), None, Some(head_state)) => {
                 let binding = *head.blocks().first().ok_or("head program has no block")?;
-                let attention = definition
-                    .geometry
-                    .blocks
-                    .iter()
-                    .rev()
-                    .find_map(|block| match &block.mixer {
-                        magnitude_family_contracts::MixerGeometry::Attention(shape) => Some(shape),
-                        _ => None,
-                    })
-                    .ok_or("head graph requires target attention geometry")?;
-                let history_rows = u64::try_from(head_state.history_rows)
-                    .map_err(|_| "head history rows exceed u64")?;
+                let head_block = definition
+                    .head
+                    .as_ref()
+                    .and_then(|head| head.blocks.first())
+                    .ok_or("head graph requires a draft head block")?;
+                let history = head_state.sole_history()?;
+                let history_rows =
+                    u64::try_from(history.rows).map_err(|_| "head history rows exceed u64")?;
                 let head_graph = crate::programs::native_head::checked_head_family_storage(
                     backend,
                     load,
-                    &definition.geometry,
-                    attention,
+                    &definition.decoder,
+                    head_block,
                     binding,
                     crate::programs::native_head::head_graph_classes(
                         limits,
                         history_rows,
-                        head_state.history_slab_rows()?,
+                        history.slab_rows,
                         head_state.context_rows,
                         method.draft_rows(),
                     )?,
@@ -183,38 +218,37 @@ impl AssessmentGraphResourceBounds {
                     head_graph.binding_constant_bytes,
                 )
             }
-            (None, None) => (None, 0),
-            _ => return Err("head program and state disagree".into()),
+            (None, None, None) => (None, 0),
+            _ => return Err("drafter program and state disagree".into()),
         };
-        let vision = match (plan.vision(), definition.vision.as_ref()) {
+        let (vision, vision_constant_bytes) = match (plan.vision(), definition.vision.as_ref()) {
             (Some(vision_plan), Some(vision_definition)) => {
                 let max_rows = magnitude_batching::row_classes(limits.max_launch_rows)
                     .last()
                     .copied()
                     .ok_or("batch row bound has no class")? as u64;
-                let merge = vision_definition
-                    .geometry
-                    .merge
-                    .checked_mul(vision_definition.geometry.merge)
-                    .ok_or("vision merge area overflow")?;
+                let merge = vision_definition.cell_rows();
                 max_rows
                     .checked_mul(merge)
                     .ok_or("vision patch row bound overflow")?;
                 let patch_rows = (1..=max_rows).map(|rows| rows * merge);
-                Some(NativeGraphCharge::from_checked(
-                    crate::programs::native_vision::checked_vision_family_storage(
-                        backend,
-                        load,
-                        &vision_definition.geometry,
-                        definition.geometry.hidden,
-                        vision_plan,
-                        patch_rows,
-                    )?,
-                    1,
-                    slots.vision,
-                )?)
+                let vision_graph = crate::programs::native_vision::checked_vision_family_resources(
+                    backend,
+                    load,
+                    vision_definition,
+                    vision_plan,
+                    patch_rows,
+                )?;
+                (
+                    Some(NativeGraphCharge::from_checked(
+                        vision_graph.storage,
+                        1,
+                        slots.vision,
+                    )?),
+                    vision_graph.binding_constant_bytes,
+                )
             }
-            (None, None) => None,
+            (None, None) => (None, 0),
             _ => return Err("vision program and definition disagree".into()),
         };
         let row_classes = magnitude_batching::row_classes(limits.max_launch_rows)
@@ -236,6 +270,7 @@ impl AssessmentGraphResourceBounds {
         let binding_constant_bytes = target_graph
             .binding_constant_bytes
             .checked_add(head_constant_bytes)
+            .and_then(|bytes| bytes.checked_add(vision_constant_bytes))
             .ok_or("checked graph constant charge overflow")?;
         let total_bytes = target
             .committed_bytes
@@ -364,24 +399,20 @@ impl AssessmentMemoryTerms {
         method: PlannedMethod,
         limits: ResourceLimits,
     ) -> Result<Self, String> {
-        if selection.head != matches!(method, PlannedMethod::Mtp { .. }) {
+        if selection.head != method.drafts() {
             return Err("assessment method and head selection disagree".into());
         }
         if selection.head != load.head().is_some() || selection.vision != load.vision().is_some() {
             return Err("assessment selection disagrees with the load plan".into());
         }
         let weights = weight_bytes_by_component(load)?;
-        let head_depth = if selection.head {
-            definition
-                .head
-                .as_ref()
-                .ok_or("selected draft head is absent from the model definition")?
-                .depth()
+        let drafter = if selection.head {
+            crate::operators::draft::drafter_blocks(definition)
         } else {
-            0
+            Vec::new()
         };
         let layout =
-            ModelStateLayout::derive(&definition.geometry, head_depth, codec, method.draft_rows())?;
+            ModelStateLayout::derive(&definition.decoder, &drafter, codec, method.draft_rows())?;
         let history_per_token = history_row_bytes(&layout.target_history)?
             .checked_add(history_row_bytes(&layout.head_history)?)
             .ok_or("history row bytes overflow")?;
@@ -404,7 +435,8 @@ impl AssessmentMemoryTerms {
             recurrent_per_bank,
             recurrent_banks: u64::try_from(recurrent_banks)
                 .map_err(|_| "assessment bank count exceeds u64")?,
-            fit_depth: definition.geometry.context_limit.min(100_000),
+            fit_depth: definition.decoder.context_limit.min(100_000),
+            host_table_bytes: load.host_table_bytes()?,
         })
     }
 
@@ -455,6 +487,7 @@ impl AssessmentMemoryTerms {
             bounds,
             allocation_bytes,
             staging_bytes: bounds.staging_upload_bytes,
+            host_table_bytes: self.host_table_bytes,
         })
     }
 }
@@ -474,12 +507,23 @@ impl AssessmentMemoryCharge {
         {
             return Err("fit capacities have no allocation domain".into());
         }
+        // Host tables are system RAM: the staging domain of a dedicated
+        // device, the allocation domain of a unified one.
+        let dedicated = capacities
+            .iter()
+            .any(|(role, _)| *role == DomainRole::Staging);
+        let with_tables = |bytes: u64| {
+            bytes
+                .checked_add(self.host_table_bytes)
+                .ok_or_else(|| "domain charge with host tables overflows".to_owned())
+        };
         let domains = capacities
             .iter()
             .map(|&(role, capacity)| {
                 let required_bytes = match role {
-                    DomainRole::Allocation => self.allocation_bytes,
-                    DomainRole::Staging => self.staging_bytes,
+                    DomainRole::Allocation if dedicated => self.allocation_bytes,
+                    DomainRole::Allocation => with_tables(self.allocation_bytes)?,
+                    DomainRole::Staging => with_tables(self.staging_bytes)?,
                 };
                 let signed = |bytes: u64| {
                     i64::try_from(bytes).map_err(|_| "domain byte count exceeds i64".to_owned())
@@ -544,7 +588,7 @@ mod tests {
             BackendName::Cpu,
             &[("DW", Element::f32()), ("A", Element::f32())],
             "down_weight",
-            &[("M", 4), ("O", 2), ("H", 16), ("F", 32)],
+            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0)],
         )
         .unwrap();
         assert_eq!(
@@ -558,7 +602,7 @@ mod tests {
         let results = seismic::generated::checked_native_tensor_results::<dense_output::Entry>(
             BackendName::Cpu,
             &[("DW", Element::f32()), ("A", Element::f32())],
-            &[("M", 4), ("O", 2), ("H", 16), ("F", 32)],
+            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0)],
         )
         .unwrap();
         assert_eq!(
@@ -572,7 +616,7 @@ mod tests {
         let call = seismic::generated::checked_native_graph_call::<dense_output::Entry>(
             BackendName::Cpu,
             &[("DW", Element::f32()), ("A", Element::f32())],
-            &[("M", 4), ("O", 2), ("H", 16), ("F", 32)],
+            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0)],
         )
         .unwrap();
         let seismic::generated::CheckedNativeGraphCall::Checked {
@@ -610,7 +654,7 @@ mod tests {
         let uploaded = crate::programs::native_target_graph::checked_entry_graph_storage(
             BackendName::Cpu,
             &load,
-            &definition.geometry,
+            &definition.decoder,
             2,
             true,
         )
@@ -618,7 +662,7 @@ mod tests {
         let selected = crate::programs::native_target_graph::checked_entry_graph_storage(
             BackendName::Cpu,
             &load,
-            &definition.geometry,
+            &definition.decoder,
             2,
             false,
         )
@@ -633,8 +677,8 @@ mod tests {
         let elements = [("EW", Element::f32()), ("A", Element::f32())];
         let dimensions = [
             ("M", 2),
-            ("V", definition.geometry.vocabulary),
-            ("D", definition.geometry.hidden),
+            ("V", definition.decoder.vocabulary),
+            ("D", definition.decoder.hidden),
         ];
         let mut invalid = NativeGraphMetadata::new(BackendName::Cpu);
         let wrong_table = invalid.port(Element::f32(), &[1, 1]).unwrap();
@@ -647,6 +691,9 @@ mod tests {
             magnitude_kernels::embedding_rows::WorkflowArgs {
                 table: wrong_table.tensor().into(),
                 tokens: tokens.tensor().into(),
+                scale: 1.0,
+                normalize: 0,
+                epsilon: 0.0,
             },
         );
         assert!(matches!(
@@ -695,7 +742,7 @@ mod tests {
         let family = crate::programs::native_target_graph::checked_target_family_storage(
             BackendName::Cpu,
             &load,
-            &definition.geometry,
+            &definition.decoder,
             &state,
             plan.target(),
             limits,
@@ -704,14 +751,13 @@ mod tests {
         let (block, _) = crate::programs::native_target_graph::checked_block_graph_resources(
             BackendName::Cpu,
             &load,
-            &definition.geometry,
+            &definition.decoder,
             &state,
             plan.target().blocks()[0],
             0,
             2,
             4,
             2,
-            state.target_state().history_rows as u64,
         )
         .unwrap();
         assert!(family.storage.workspace >= block.workspace);
@@ -736,7 +782,7 @@ mod tests {
         assert!(pools.binding_constant_bytes > 0);
         assert_eq!(
             pools.target.upload_regions,
-            1 + definition.geometry.blocks.len()
+            1 + definition.decoder.blocks.len()
         );
         assert!(pools.total_bytes >= pools.target.committed_bytes);
     }
@@ -745,78 +791,68 @@ mod tests {
     fn checked_head_family_includes_chained_and_shaped_classes() {
         use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
         use magnitude_family_contracts::{
-            AttentionWeights, DenseFeedForwardWeights, HeadBlock, HeadWeights, WeightDescriptor,
+            ActivationFunction, ExitNorm, ExpertSelection, FeedForwardUp, Head, HeadBlock,
+            InputNorm, Operator, RmsNorm, RouteNormalization, RoutedFfn, Router, RouterInput,
+            ScoreFunction, SharedExpert, SharedExpertGate, WeightDescriptor,
         };
 
         let mut definition = crate::planning::tests::fixture_definition();
-        let descriptor = |name: &str, shape: &[u64]| WeightDescriptor {
-            name: format!("head_{name}"),
-            shape: shape.to_vec(),
+        let descriptor =
+            |name: &str, shape: &[u64]| WeightDescriptor::stored(format!("head_{name}"), shape);
+        let rms = |name: &str| RmsNorm {
+            weight: descriptor(name, &[128]),
+            epsilon: 1e-6,
         };
-        let block = HeadBlock {
-            embedding_norm: descriptor("embedding_norm", &[128]),
-            hidden_norm: descriptor("hidden_norm", &[128]),
-            combine: descriptor("combine", &[128, 256]),
-            input_norm: descriptor("input_norm", &[128]),
-            attention: AttentionWeights {
-                query_gate: descriptor("query_gate", &[128, 128]),
-                key: descriptor("key", &[64, 128]),
-                value: descriptor("value", &[64, 128]),
-                query_norm: descriptor("query_norm", &[64]),
-                key_norm: descriptor("key_norm", &[64]),
-                output: descriptor("attention_output", &[128, 64]),
-            },
-            feedforward_norm: descriptor("feedforward_norm", &[128]),
-            feedforward_geometry: magnitude_family_contracts::FeedForwardGeometry::Dense {
-                intermediate: 128,
-            },
-            feedforward: magnitude_family_contracts::FeedForwardWeights::Dense(Box::new(
-                DenseFeedForwardWeights {
-                    gate: descriptor("gate", &[128, 128]),
-                    up: descriptor("up", &[128, 128]),
-                    down: descriptor("down", &[128, 128]),
-                },
-            )),
-            output_norm: descriptor("output_norm", &[128]),
-        };
-        let mut manifest = crate::planning::tests::fixture_manifest(&definition);
-        let magnitude_family_contracts::FeedForwardWeights::Dense(dense) = &block.feedforward
-        else {
-            unreachable!()
-        };
-        let descriptors = [
-            &block.embedding_norm,
-            &block.hidden_norm,
-            &block.combine,
-            &block.input_norm,
-            &block.attention.query_gate,
-            &block.attention.key,
-            &block.attention.value,
-            &block.attention.query_norm,
-            &block.attention.key_norm,
-            &block.attention.output,
-            &block.feedforward_norm,
-            &dense.gate,
-            &dense.up,
-            &dense.down,
-            &block.output_norm,
-        ];
-        let mut offset = manifest.target.files[0].size;
-        for descriptor in descriptors {
-            let nbytes = descriptor.shape.iter().product::<u64>() * 2;
-            manifest.target.tensors.push(TensorDescriptor {
-                name: descriptor.name.clone(),
-                shape: descriptor.shape.clone(),
-                encoding: Encoding::F16,
-                offset,
-                nbytes,
-            });
-            offset += nbytes;
+        // The head block is the target block (attention, dense) under head
+        // names, between its own norms and combine.
+        let mut head_layer = definition.decoder.blocks[0].clone();
+        let rename = |weight: &mut WeightDescriptor| weight.name = format!("head_{}", weight.name);
+        for sublayer in &mut head_layer.sublayers {
+            if let InputNorm::Rms(norm) = &mut sublayer.input {
+                rename(&mut norm.weight);
+            }
+            match &mut sublayer.op {
+                Operator::Attention(attention) => {
+                    rename(&mut attention.query);
+                    rename(&mut attention.output);
+                    if let magnitude_family_contracts::HeadNorm::Rms(norm) =
+                        &mut attention.query_norm
+                    {
+                        rename(&mut norm.weight);
+                    }
+                    if let magnitude_family_contracts::KeyValue::Owned {
+                        key,
+                        value: magnitude_family_contracts::ValueSource::Projected(value),
+                        key_norm: magnitude_family_contracts::HeadNorm::Rms(key_norm),
+                        ..
+                    } = &mut attention.key_value
+                    {
+                        rename(key);
+                        rename(value);
+                        rename(&mut key_norm.weight);
+                    }
+                }
+                Operator::DenseFfn(dense) => {
+                    if let FeedForwardUp::Gated { gate, up, .. } = &mut dense.up {
+                        rename(gate);
+                        rename(up);
+                    }
+                    rename(&mut dense.down);
+                }
+                _ => unreachable!(),
+            }
         }
-        manifest.target.files[0].size = offset;
-        definition.head = Some(HeadWeights {
-            blocks: vec![block],
+        definition.head = Some(Head {
+            blocks: vec![HeadBlock {
+                embedding_norm: rms("embedding_norm"),
+                hidden_norm: rms("hidden_norm"),
+                combine: descriptor("combine", &[128, 256]),
+                block: head_layer,
+                output_norm: ExitNorm::Rms(rms("output_norm")),
+            }],
         });
+        let mut manifest = crate::planning::tests::fixture_manifest(&definition);
+        let mut offset = manifest.target.files[0].size;
         let load = ModelLoadPlan::derive(
             &manifest,
             &definition,
@@ -850,15 +886,13 @@ mod tests {
         )
         .unwrap();
         let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
-        let attention = match &definition.geometry.blocks[0].mixer {
-            magnitude_family_contracts::MixerGeometry::Attention(shape) => shape,
-            _ => unreachable!(),
-        };
+        let head_block = definition.head.as_ref().unwrap().blocks[0].clone();
         let head_state = state.head_state().unwrap();
+        let head_history = head_state.sole_history().unwrap();
         let classes = crate::programs::native_head::head_graph_classes(
             limits,
-            head_state.history_rows as u64,
-            head_state.history_slab_rows().unwrap(),
+            head_history.rows as u64,
+            head_history.slab_rows,
             head_state.context_rows,
             method.draft_rows(),
         )
@@ -866,12 +900,12 @@ mod tests {
         assert!(classes.iter().any(|class| class.steps == 1 && class.shaped));
         assert!(classes
             .iter()
-            .any(|class| class.entry_rows > crate::programs::graph::routed::DECODE_ROWS));
+            .any(|class| class.entry_rows > crate::operators::routed::fused_graph::DECODE_ROWS));
         let family = crate::programs::native_head::checked_head_family_storage(
             BackendName::Cpu,
             &load,
-            &definition.geometry,
-            attention,
+            &definition.decoder,
+            &head_block,
             plan.head().unwrap().blocks()[0],
             classes.clone(),
         )
@@ -879,8 +913,8 @@ mod tests {
         crate::programs::native_head::verify_head_family_certificates(
             BackendName::Cpu,
             &load,
-            &definition.geometry,
-            attention,
+            &definition.decoder,
+            &head_block,
             plan.head().unwrap().blocks()[0],
             &classes,
         )
@@ -904,7 +938,7 @@ mod tests {
         let target = crate::programs::native_target_graph::checked_target_family_storage(
             BackendName::Cpu,
             &load,
-            &definition.geometry,
+            &definition.decoder,
             &state,
             plan.target(),
             limits,
@@ -915,29 +949,55 @@ mod tests {
             target.binding_constant_bytes + family.binding_constant_bytes
         );
 
-        let descriptor = |name: &str, shape: &[u64]| WeightDescriptor {
-            name: format!("routed_head_{name}"),
-            shape: shape.to_vec(),
+        let descriptor = |name: &str, shape: &[u64]| {
+            WeightDescriptor::stored(format!("routed_head_{name}"), shape)
         };
-        let routed = magnitude_family_contracts::RoutedFeedForwardWeights {
-            router: descriptor("router", &[4, 128]),
-            shared_router: descriptor("shared_router", &[128]),
-            expert_gate: descriptor("expert_gate", &[4, 64, 128]),
-            expert_up: descriptor("expert_up", &[4, 64, 128]),
+        let silu = |gate, up| FeedForwardUp::Gated {
+            activation: ActivationFunction::Silu,
+            gate,
+            up,
+        };
+        let routed = RoutedFfn {
+            experts: 4,
+            selected: 2,
+            intermediate: 64,
+            router: Router {
+                weight: descriptor("router", &[4, 128]),
+                input: RouterInput::Operator,
+                score: ScoreFunction::Softmax,
+                selection: ExpertSelection::TopK { bias: None },
+                normalization: RouteNormalization::Sum,
+                scale: 1.0,
+            },
+            expert_up: silu(
+                descriptor("expert_gate", &[4, 64, 128]),
+                descriptor("expert_up", &[4, 64, 128]),
+            ),
             expert_down: descriptor("expert_down", &[4, 128, 64]),
-            shared_gate: descriptor("shared_gate", &[64, 128]),
-            shared_up: descriptor("shared_up", &[64, 128]),
-            shared_down: descriptor("shared_down", &[128, 64]),
+            expert_scale: None,
+            latent: None,
+            shared: Some(SharedExpert {
+                intermediate: 64,
+                up: silu(
+                    descriptor("shared_gate", &[64, 128]),
+                    descriptor("shared_up", &[64, 128]),
+                ),
+                down: descriptor("shared_down", &[128, 64]),
+                gate: SharedExpertGate::Sigmoid(descriptor("shared_router", &[128])),
+            }),
         };
         for weight in [
-            &routed.router,
-            &routed.shared_router,
-            &routed.expert_gate,
-            &routed.expert_up,
+            &routed.router.weight,
+            routed.expert_up.gate().unwrap(),
+            routed.expert_up.up(),
             &routed.expert_down,
-            &routed.shared_gate,
-            &routed.shared_up,
-            &routed.shared_down,
+            routed.shared.as_ref().unwrap().up.gate().unwrap(),
+            routed.shared.as_ref().unwrap().up.up(),
+            &routed.shared.as_ref().unwrap().down,
+            match &routed.shared.as_ref().unwrap().gate {
+                SharedExpertGate::Sigmoid(gate) => gate,
+                SharedExpertGate::None => unreachable!(),
+            },
         ] {
             let nbytes = weight.shape.iter().product::<u64>() * 2;
             manifest.target.tensors.push(TensorDescriptor {
@@ -951,16 +1011,8 @@ mod tests {
         }
         manifest.target.files[0].size = offset;
         let head = &mut definition.head.as_mut().unwrap().blocks[0];
-        head.feedforward_geometry = magnitude_family_contracts::FeedForwardGeometry::Routed(
-            magnitude_family_contracts::ExpertGeometry {
-                count: 4,
-                selected: 2,
-                intermediate: 64,
-                shared_intermediate: 64,
-                normalize_selected: true,
-            },
-        );
-        head.feedforward = magnitude_family_contracts::FeedForwardWeights::Routed(Box::new(routed));
+        head.block.sublayers[1].op = Operator::RoutedFfn(Box::new(routed));
+        let head_block = head.clone();
         let load = ModelLoadPlan::derive(
             &manifest,
             &definition,
@@ -979,13 +1031,13 @@ mod tests {
         let routed_family = crate::programs::native_head::checked_head_family_storage(
             BackendName::Cpu,
             &load,
-            &definition.geometry,
-            attention,
+            &definition.decoder,
+            &head_block,
             plan.head().unwrap().blocks()[0],
             crate::programs::native_head::head_graph_classes(
                 limits,
-                head_state.history_rows as u64,
-                head_state.history_slab_rows().unwrap(),
+                head_history.rows as u64,
+                head_history.slab_rows,
                 head_state.context_rows,
                 method.draft_rows(),
             )
@@ -1037,7 +1089,7 @@ mod tests {
             .unwrap();
         let storage = crate::programs::graph::readout::checked_features_graph_storage(
             BackendName::Cpu,
-            &definition.geometry,
+            &definition.decoder,
             norm,
             2,
             1,
@@ -1077,7 +1129,7 @@ mod tests {
         };
         let features = crate::programs::graph::readout::checked_features_graph_storage(
             BackendName::Cpu,
-            &definition.geometry,
+            &definition.decoder,
             weight(WeightKind::OutputNorm),
             2,
             1,
@@ -1085,7 +1137,7 @@ mod tests {
         .unwrap();
         let projected = crate::programs::graph::readout::checked_projected_graph_storage(
             BackendName::Cpu,
-            &definition.geometry,
+            &definition.decoder,
             weight(WeightKind::OutputNorm),
             weight(WeightKind::Output),
             2,
@@ -1128,7 +1180,7 @@ mod tests {
         let selection = |shaped| {
             crate::programs::graph::readout::checked_selection_graph_storage(
                 BackendName::Cpu,
-                &definition.geometry,
+                &definition.decoder,
                 weight(WeightKind::OutputNorm),
                 weight(WeightKind::Output),
                 2,
@@ -1170,7 +1222,7 @@ mod tests {
         let family = crate::programs::graph::readout::checked_readout_family_storage(
             BackendName::Cpu,
             &load,
-            &definition.geometry,
+            &definition.decoder,
             limits,
         )
         .unwrap();
@@ -1181,162 +1233,147 @@ mod tests {
 
     #[test]
     fn checked_vision_family_bounds_exact_patch_classes() {
-        use crate::{
-            ArtifactComponent, ArtifactComponentKind, VisionBlockBinding, VisionMergerBinding,
-            VisionPatchBinding, VisionProgramPlan, WeightPlan,
-        };
+        use crate::{ArtifactComponent, ArtifactComponentKind, VisionProgramPlan, WeightPlan};
         use magnitude_artifacts::ArtifactIdentity;
         use magnitude_family_contracts::{
-            ActivationDType, VisionActivation, VisionGeometry, WeightDescriptor, WeightKind,
-            WeightRole, WeightScope,
+            ActivationDType, CellReduction, MergerStage, PositionSampling, VisionActivation,
+            VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
+            VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm,
+            VisionPositions, VisionPreprocessing, VisionResampling, VisionResize, VisionStem,
+            VisionUp, WeightDescriptor,
         };
 
         let f32 = Element::f32();
-        let bf16 = Element::bf16();
+        let stored = |name: &str, shape: &[u64]| WeightDescriptor::stored(name, shape);
+        let linear = |name: &str, outputs: u64, inputs: u64| VisionLinear {
+            weight: stored(&format!("{name}.weight"), &[outputs, inputs]),
+            bias: Some(stored(&format!("{name}.bias"), &[outputs])),
+            clamp: None,
+        };
+        let layer_norm = |name: &str, width: u64| VisionNorm::Layer {
+            weight: stored(&format!("{name}.weight"), &[width]),
+            bias: stored(&format!("{name}.bias"), &[width]),
+            epsilon: 1e-6,
+        };
+        // A Qwen3-VL-shaped tower at width 128: one block of one 128-wide
+        // head, 2 x 2 cells.
+        let description = VisionDescription {
+            activation_dtype: ActivationDType::BF16,
+            hidden: 128,
+            output_hidden: 128,
+            preprocessing: VisionPreprocessing {
+                resize: VisionResize::PixelBounds {
+                    min_pixels: 16,
+                    max_pixels: 64,
+                },
+                resampling: VisionResampling::Bicubic,
+                mean: [0.5; 3],
+                std: [0.5; 3],
+                channels: 3,
+                patch: 2,
+                merge: 2,
+            },
+            stem: VisionStem::Patch {
+                frames: vec![stored("patch.0", &[128, 3, 2, 2]), stored("patch.1", &[128, 3, 2, 2])],
+                bias: Some(stored("patch.bias", &[128])),
+                positions: VisionPositions {
+                    table: stored("position", &[16, 128]),
+                    sampling: PositionSampling::AlignedCorners { side: 4 },
+                },
+                norm: None,
+            },
+            window: None,
+            blocks: vec![VisionBlock {
+                attention_norm: layer_norm("ln1", 128),
+                attention: VisionAttention {
+                    heads: 1,
+                    width: 128,
+                    query: linear("q", 128, 128),
+                    key: linear("k", 128, 128),
+                    value: linear("v", 128, 128),
+                    query_norm: None,
+                    key_norm: None,
+                    value_norm: None,
+                    rotary_base: 10000.0,
+                    scale: VisionAttentionScale::InverseSqrtWidth,
+                    span: VisionAttentionSpan::Full,
+                    output: linear("o", 128, 128),
+                },
+                attention_post_norm: None,
+                feedforward_norm: layer_norm("ln2", 128),
+                feedforward: VisionFeedForward {
+                    up: VisionUp::Plain(linear("up", 128, 128)),
+                    activation: VisionActivation::GeluTanh,
+                    down: linear("down", 128, 128),
+                },
+                feedforward_post_norm: None,
+            }],
+            merger: VisionMerger {
+                norm: Some(layer_norm("post", 128)),
+                reduction: CellReduction::Concatenate,
+                standardize: None,
+                projection_norm: None,
+                stages: vec![
+                    MergerStage {
+                        linear: linear("mm.0", 512, 512),
+                        activation: Some(VisionActivation::GeluErf),
+                    },
+                    MergerStage {
+                        linear: linear("mm.2", 128, 512),
+                        activation: None,
+                    },
+                ],
+                output_norm: None,
+            },
+        };
         let component = ArtifactComponent {
             kind: ArtifactComponentKind::Projector,
             identity: ArtifactIdentity([9; 32]),
         };
-        let mut weights = Vec::new();
-        let mut add = |scope, kind, shape: &[u64]| {
-            let name = format!("{scope:?}:{kind:?}");
-            let bytes = shape.iter().product::<u64>() * 4;
-            weights.push(WeightPlan {
-                role: WeightRole { scope, kind },
-                component,
-                source: f32,
-                resident: f32,
-                shape: shape.to_vec(),
-                descriptor: WeightDescriptor {
-                    name,
-                    shape: shape.to_vec(),
-                },
-                source_bytes: bytes,
-                resident_bytes: bytes,
-            });
-        };
-        let vision = WeightScope::Vision;
-        add(
-            WeightScope::VisionPatch(0),
-            WeightKind::PatchEmbedding,
-            &[128, 3, 2, 2],
-        );
-        add(
-            WeightScope::VisionPatch(1),
-            WeightKind::PatchEmbedding,
-            &[128, 3, 2, 2],
-        );
-        add(vision, WeightKind::PatchBias, &[128]);
-        add(vision, WeightKind::PositionEmbedding, &[16, 128]);
-        let block = WeightScope::VisionBlock(0);
-        for kind in [
-            WeightKind::InputNormWeight,
-            WeightKind::InputNormBias,
-            WeightKind::AttentionOutputBias,
-            WeightKind::FeedForwardNormWeight,
-            WeightKind::FeedForwardNormBias,
-            WeightKind::FeedForwardUpBias,
-            WeightKind::FeedForwardDownBias,
-        ] {
-            add(block, kind, &[128]);
-        }
-        add(block, WeightKind::FusedQkvWeight, &[384, 128]);
-        add(block, WeightKind::FusedQkvBias, &[384]);
-        add(block, WeightKind::AttentionOutput, &[128, 128]);
-        add(block, WeightKind::DenseUp, &[128, 128]);
-        add(block, WeightKind::DenseDown, &[128, 128]);
-        add(vision, WeightKind::NormWeight, &[128]);
-        add(vision, WeightKind::NormBias, &[128]);
-        add(vision, WeightKind::MergerHidden, &[512, 512]);
-        add(vision, WeightKind::MergerHiddenBias, &[512]);
-        add(vision, WeightKind::MergerOutput, &[128, 512]);
-        add(vision, WeightKind::MergerOutputBias, &[128]);
+        let weights = description
+            .weights()
+            .into_iter()
+            .map(|(role, descriptor)| {
+                let bytes = descriptor.shape.iter().product::<u64>() * 4;
+                WeightPlan {
+                    role,
+                    component,
+                    source: f32,
+                    upload: f32,
+                    resident: f32,
+                    shape: descriptor.shape.clone(),
+                    descriptor: descriptor.clone(),
+                    source_bytes: bytes,
+                    resident_bytes: bytes,
+                }
+            })
+            .collect();
         let load = ModelLoadPlan {
             target: Vec::new(),
             head: None,
             vision: Some(weights),
+            host_tables: Vec::new(),
         };
-        let geometry = VisionGeometry {
-            activation_dtype: ActivationDType::BF16,
-            depth: 1,
-            hidden: 128,
-            intermediate: 128,
-            heads: 1,
-            patch: 2,
-            merge: 2,
-            image_size: 8,
-            output_hidden: 128,
-            epsilon: 1e-6,
-            table_side: 4,
-            temporal_patch: 2,
-            channels: 3,
-            block_activation: VisionActivation::GeluTanh,
-            merger_activation: VisionActivation::GeluErf,
+        let program = crate::operators::vision::vision_program(&description, &|_| Ok(f32)).unwrap();
+        let plan = VisionProgramPlan::new(program.kernels().into_iter().cloned().collect());
+        let resources = |classes: &[u64]| {
+            crate::programs::native_vision::checked_vision_family_resources(
+                BackendName::Cpu,
+                &load,
+                &description,
+                &plan,
+                classes.iter().copied(),
+            )
+            .unwrap()
+            .storage
         };
-        let plan = VisionProgramPlan::new(
-            VisionPatchBinding {
-                temporal_weight_0: f32,
-                temporal_weight_1: f32,
-                bias: f32,
-                position: f32,
-            },
-            vec![VisionBlockBinding {
-                input_norm_weight: f32,
-                input_norm_bias: f32,
-                qkv_weight: f32,
-                qkv_bias: f32,
-                attention_output: f32,
-                attention_output_bias: f32,
-                feedforward_norm_weight: f32,
-                feedforward_norm_bias: f32,
-                up: f32,
-                up_bias: f32,
-                down: f32,
-                down_bias: f32,
-                activation: bf16,
-            }],
-            VisionMergerBinding {
-                output_norm_weight: f32,
-                output_norm_bias: f32,
-                hidden: f32,
-                hidden_bias: f32,
-                output: f32,
-                output_bias: f32,
-                activation: bf16,
-            },
-        );
-        let single = crate::programs::native_vision::checked_vision_family_storage(
-            BackendName::Cpu,
-            &load,
-            &geometry,
-            128,
-            &plan,
-            [4],
-        )
-        .unwrap();
-        let double = crate::programs::native_vision::checked_vision_family_storage(
-            BackendName::Cpu,
-            &load,
-            &geometry,
-            128,
-            &plan,
-            [8],
-        )
-        .unwrap();
-        let family = crate::programs::native_vision::checked_vision_family_storage(
-            BackendName::Cpu,
-            &load,
-            &geometry,
-            128,
-            &plan,
-            [4, 8],
-        )
-        .unwrap();
+        let single = resources(&[4]);
+        let double = resources(&[8]);
+        let family = resources(&[4, 8]);
         crate::programs::native_vision::verify_vision_family_certificates(
             BackendName::Cpu,
             &load,
-            &geometry,
-            128,
+            &description,
             &plan,
             &[4, 8],
         )
@@ -1464,10 +1501,9 @@ mod tests {
         let state_bytes = state
             .fit_state_bytes(terms.fit_depth, terms.recurrent_banks)
             .unwrap();
-        let history_layout = state.target_state().history_slab_layout().unwrap().unwrap();
-        let history_slabs = terms
-            .fit_depth
-            .div_ceil(u64::from(state.target_state().history_slab_rows().unwrap()));
+        let history = state.target_state().sole_history().unwrap();
+        let history_layout = history.slab_layout().unwrap();
+        let history_slabs = terms.fit_depth.div_ceil(u64::from(history.slab_rows));
         assert_eq!(
             state_bytes,
             history_layout.address_table_bytes + history_slabs * history_layout.slab_bytes
@@ -1483,7 +1519,7 @@ mod tests {
         assert_eq!(charge.staging_bytes, header.staging_upload_bytes);
 
         // The fit depth is the context limit capped at 100,000 tokens.
-        definition.geometry.context_limit = 262_144;
+        definition.decoder.context_limit = 262_144;
         let long = AssessmentMemoryTerms::derive(
             &definition,
             &load,
@@ -1520,6 +1556,7 @@ mod tests {
             },
             allocation_bytes,
             staging_bytes,
+            host_table_bytes: 0,
         }
     }
 
@@ -1533,6 +1570,7 @@ mod tests {
             recurrent_per_bank: 10,
             recurrent_banks: 3,
             fit_depth: 10,
+            host_table_bytes: 30,
         };
         assert_eq!(terms.exact_resident_bytes(50).unwrap(), 100 + 20 + 5 + 50);
         let charge = terms
@@ -1635,5 +1673,17 @@ mod tests {
         assert!(fixture_charge(1, 0)
             .assess_fit(&[(DomainRole::Staging, domain(100, 0))])
             .is_err());
+
+        // Host tables are system RAM: charged to a unified device's
+        // allocation domain, and to a dedicated device's staging domain.
+        let tables = AssessmentMemoryCharge {
+            host_table_bytes: 50,
+            ..fixture_charge(800, 300)
+        };
+        let unified_tables = tables.assess_fit(&unified).unwrap();
+        assert_eq!(unified_tables.domains[0].required_bytes, 850);
+        let dedicated_tables = tables.assess_fit(&dedicated).unwrap();
+        assert_eq!(dedicated_tables.domains[0].required_bytes, 800);
+        assert_eq!(dedicated_tables.domains[1].required_bytes, 350);
     }
 }

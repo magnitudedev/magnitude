@@ -1,5 +1,7 @@
 use magnitude_artifacts::InputLayout;
-use magnitude_chat::{CacheLimits, ConstraintPlan, Vocabulary};
+use magnitude_chat::{
+    CacheLimits, ConstraintPlan, Normalization, PieceEncoding, Split, SplitBehavior, Vocabulary,
+};
 use magnitude_engine::{
     generation::{
         grammar::{to_lark, CONVERTER_IDENTITY},
@@ -46,9 +48,16 @@ fn tokenizer() -> Arc<ByteBpeTokenizer> {
             pieces,
             kinds,
             merges: vec![],
-            pattern: r".+|\s".into(),
-            normalize_nfc: false,
+            normalization: Normalization::None,
+            splits: vec![Split {
+                pattern: r".+|\s".into(),
+                behavior: SplitBehavior::Isolated,
+            }],
+            encoding: PieceEncoding::ByteLevel,
+            ignore_merges: false,
+            implicit_bos: None,
             stop_tokens: BTreeSet::from([TokenId(256), TokenId(257)]),
+            suppressed_tokens: BTreeSet::new(),
         })
         .unwrap(),
     )
@@ -281,6 +290,7 @@ fn host_preparation_binds_before_generation_and_rejects_identity_mismatches() {
         context_limit: 4096,
         vocabulary: 272,
         stop_tokens: tokenizer.stop_tokens().clone(),
+        suppressed_tokens: tokenizer.suppressed_tokens().clone(),
         sampling: Sampling::Greedy,
         shaping: Shaping {
             temperature: 0.0,

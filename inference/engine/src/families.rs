@@ -4,9 +4,21 @@
 use crate::error::UnsupportedModel;
 use magnitude_artifacts::gguf::{Directory, Value};
 use magnitude_family_contracts::ModelFamily;
+use magnitude_family_gemma4::Gemma4Family;
+use magnitude_family_lfm2::Lfm2Family;
+use magnitude_family_llama::LlamaFamily;
+use magnitude_family_muse_glimmer::MuseGlimmerFamily;
+use magnitude_family_nemotron_h::NemotronHFamily;
 use magnitude_family_qwen35::Qwen35Family;
 
-static FAMILIES: &[&dyn ModelFamily] = &[&Qwen35Family];
+static FAMILIES: &[&dyn ModelFamily] = &[
+    &Qwen35Family,
+    &LlamaFamily,
+    &NemotronHFamily,
+    &Lfm2Family,
+    &Gemma4Family,
+    &MuseGlimmerFamily,
+];
 
 /// The one family that recognizes `target`.
 pub fn recognize(target: &Directory) -> Result<&'static dyn ModelFamily, UnsupportedModel> {
@@ -54,16 +66,16 @@ mod tests {
             data_offset: 0,
             metadata: vec![Metadata {
                 name: "general.architecture".into(),
-                value: Value::Scalar(Scalar::String("gemma4".into())),
+                value: Value::Scalar(Scalar::String("deepseek4".into())),
             }],
             tensors: Vec::new(),
         };
         let Err(unsupported) = recognize(&directory) else {
-            panic!("no family recognizes gemma4");
+            panic!("no family recognizes deepseek4");
         };
         assert_eq!(
             unsupported.to_string(),
-            "unsupported model family: no registered model family recognizes architecture \"gemma4\""
+            "unsupported model family: no registered model family recognizes architecture \"deepseek4\""
         );
     }
 }

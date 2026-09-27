@@ -26,6 +26,14 @@ into `iq4g32` (the same table). Such a format adds no execution class, so the as
 measurement basis, keyed by resident representation, covers it unchanged, and the plan charges
 the wider representation's resident bytes. A format no representation holds exactly is not
 imported; its model is `Incompatible`.
+Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4 import into representations of their own, moving codes and
+scale fields bit for bit: the 4-bit coded family (a codebook and one scale per 32 or 16 values:
+`q4g32s` offset codes with f16 scales, `mxfp4g32` E2M1 with an E8M0 exponent per 32, `nvfp4g16`
+E2M1 with a UE4M3 scale per 16, beside `iq4g32`) and the 5-bit `q5g32s` (f16 scale) and `q5g32`
+(f16 scale and minimum). E2M1 −0 imports as +0, as the reference dequantization decodes it. A
+scale field that is NaN in its format (E8M0 0xff, UE4M3 0x7f) decodes as NaN. NVFP4's per-tensor
+or per-expert F32 scale is a separate tensor, not part of the representation; the family applies
+it.
 
 Each import takes an immutable artifact source and validates its exact WeightPlan. On Metal,
 component weights are visited in source-file order. Consecutive whole tensors whose combined
@@ -41,5 +49,8 @@ The target component is imported before engine readiness. Enabled optional head 
 components are held by typed one-shot ComponentLoaders. Each loader owns its import store and
 caches either its assembled component or its typed failure. The head loader inherits the target
 store so tied embedding and output weights retain their exact resident tensors; the vision loader
-owns an isolated projector store. Numerical stages receive loaders rather than shared mutable
+owns an isolated projector store. A separate draft (DFlash, DSpark) is the head lane's drafter: its
+fusion weights are target weights (every target step fuses the draft's taps), imported with the
+target from the draft component, and its loader imports the rest of the draft component through
+the inherited target store. Numerical stages receive loaders rather than shared mutable
 cache access. No warm token path prepares or searches for an import kernel.

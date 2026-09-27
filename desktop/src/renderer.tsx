@@ -40,7 +40,7 @@ import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "rea
 import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet, useAtomRefresh } from "@effect-atom/atom-react"
 import { Cause, Effect, Exit, Layer, Option, Runtime, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { MagnitudeClient, ProviderModelIdSchema, type ProviderModelId, type CatalogLocalModel, type LocalInferenceHardware, type ModelResidency } from "@magnitudedev/sdk"
+import { MagnitudeClient, ProviderModelIdSchema, localModelDeprecation, type ProviderModelId, type CatalogDeprecation, type CatalogLocalModel, type LocalInferenceHardware, type ModelResidency } from "@magnitudedev/sdk"
 import { ApplicationSnapshot, LoginStartupState, type NetworkAccessChange } from "@magnitudedev/sdk/desktop-host"
 import {
   DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, ModelTrayPresentation, DesktopConnectionsSnapshot, activeLocalModel, modelDownloadFailureMessage,
@@ -48,6 +48,7 @@ import {
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, localModelFailureMessage, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, formatModelLoadPercentage, formatModelMemory,
   formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
+  catalogSupportLabel, catalogModelReplacement, describeCatalogDeprecation,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
 import { HardwareOverview, ModelRadar } from "./discovery-visuals"
@@ -102,14 +103,19 @@ const hostState = Atom.keepAlive(Atom.make(observation))
 const pageNames: Record<Page, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
 const pageIcons = { discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
 
-function ModelFit({ model }: { model: CatalogLocalModel }) {
+/** One line beneath a model's controls: it never widens them, and its full text shows on hover. */
+function ControlNotice({ text, alert = false }: { text: string; alert?: boolean }) {
+  return <ActionTooltip side="bottom" label={text} trigger={<p tabIndex={0} role={alert ? "alert" : undefined} className="mt-2 w-0 min-w-full truncate text-right text-sm text-slate-500 focus-visible:outline-2 focus-visible:outline-blue-500">{text}</p>} />
+}
+/** Why a supported model cannot be downloaded to this machine, while that is so. */
+const fitNotice = (model: CatalogLocalModel): string | null => {
   const serving = model.servingState
-  if (serving._tag === "Assessing") return <p className="mt-3 text-sm text-slate-500">Checking compatibility with your machine…</p>
-  if (serving._tag === "Failed") return <p className="mt-3 text-sm text-slate-500">Assessment unavailable: {serving.failure.message}</p>
+  if (serving._tag === "Assessing") return "Checking compatibility with your machine…"
+  if (serving._tag === "Failed") return `Assessment unavailable: ${serving.failure.message}`
   const assessment = serving.assessment
-  if (assessment._tag === "Incompatible") return <p className="mt-3 text-sm text-slate-500">Not compatible: {assessment.failure.message}</p>
-  if (assessment._tag === "DoesNotFit") return <p className="mt-3 text-sm text-slate-500">Doesn’t fit this machine · short by {formatMemorySize(assessment.deficitBytes, { rounding: "up" })} of memory.</p>
-  return <p className="mt-3 text-sm text-blue-700 dark:text-blue-400">Fits your machine · {formatMemorySize(assessment.memory.totalRequiredBytes)} estimated memory</p>
+  if (assessment._tag === "Incompatible") return `Not compatible: ${assessment.failure.message}`
+  if (assessment._tag === "DoesNotFit") return `Doesn’t fit this machine · short by ${formatMemorySize(assessment.deficitBytes, { rounding: "up" })} of memory.`
+  return null
 }
 function ModelDetails({ model, radar = false, open, contentId, compact = false }: { model: CatalogLocalModel; radar?: boolean; open?: boolean; contentId?: string; compact?: boolean }) {
   const serving = model.servingState
@@ -167,6 +173,40 @@ function DownloadProgress({ acquisition, modelName, onCancel, pending = false }:
     {onCancel && <div className="mt-7 flex justify-center"><Button variant="ghost" className="hover:bg-transparent hover:text-red-600 dark:hover:bg-transparent dark:hover:text-red-400" disabled={pending} onClick={onCancel}><XIcon />Cancel download</Button></div>}
   </div>
 }
+function SupportBadge({ model }: { model: CatalogLocalModel }) {
+  const support = model.catalogData.support
+  return Option.match(catalogSupportLabel(support), {
+    onNone: () => null,
+    onSome: label => <TooltipProvider><ActionTooltip label={support._tag === "Supported" ? label : support.reason} trigger={<span tabIndex={0} className={`shrink-0 cursor-default rounded border px-1.5 py-0.5 text-xs font-medium focus-visible:outline-2 focus-visible:outline-blue-500 ${support._tag === "Deprecated" ? "border-red-300 text-red-700 dark:border-red-800 dark:text-red-400" : "border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-400"}`}>{label}</span>} /></TooltipProvider>,
+  })
+}
+/** One step from a deprecated model to its replacement: download it, or load it once downloaded. */
+function SwitchToReplacement({ target }: { target: CatalogLocalModel }) {
+  const { install, load } = useLocalModelMutations()
+  const command = useLocalModelCommandStatus(target.modelId)
+  const fits = target.servingState._tag === "Assessed" && target.servingState.assessment._tag === "Fits"
+  const transferring = target.acquisitionState._tag === "Installing" || target.acquisitionState._tag === "Updating"
+  return <>
+    <Button disabled={command.pending || transferring || !fits} onClick={() => localModelIsInstalled(target) ? load(target.modelId) : install(target.modelId)}>Switch to {formatLocalModelDisplayName(target)}</Button>
+    {command.failures.map(message => <p key={message} role="alert" className="w-full text-sm">{message}</p>)}
+  </>
+}
+/** An installed deprecated model is removable and offers one step to its replacement; it never loads. */
+function DeprecatedModelControls({ model, deprecation, replacement, children }: { model: CatalogLocalModel; deprecation: CatalogDeprecation; replacement: Option.Option<CatalogLocalModel>; children?: ReactNode }) {
+  const { remove } = useLocalModelMutations()
+  const command = useLocalModelCommandStatus(model.modelId)
+  const acquisition = model.acquisitionState
+  const pending = command.pending || acquisition._tag === "Removing"
+  return <TooltipProvider><div className="grid">
+    <div className="flex flex-wrap items-center justify-end gap-2">{children}
+      {Option.match(replacement, { onNone: () => null, onSome: target => <SwitchToReplacement target={target} /> })}
+      {localModelIsInstalled(model) && <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><TrashIcon /></Button>}
+    </div>
+    <ControlNotice text={describeCatalogDeprecation(deprecation, replacement)} />
+    {acquisition._tag === "RemoveFailed" && <ControlNotice alert text={acquisition.failure.message} />}
+    {command.failures.map(message => <ControlNotice key={message} alert text={message} />)}
+  </div></TooltipProvider>
+}
 function ModelControls({ model, replacing, children, onConnectAgent }: { model: CatalogLocalModel; replacing?: string; children?: ReactNode; onConnectAgent?: () => void }) {
   const { install, load, stop, cancel, remove, dismissFailure: dismiss } = useLocalModelMutations()
   const command = useLocalModelCommandStatus(model.modelId)
@@ -177,35 +217,39 @@ function ModelControls({ model, replacing, children, onConnectAgent }: { model: 
   const residency = installed ? acquisition.residencyState : undefined
   const canStop = residency !== undefined && ["Ready", "Loading", "Requested", "Stopping"].includes(residency._tag)
   const transferring = acquisition._tag === "Installing" || acquisition._tag === "Updating"
-  return <div>
-    <div className="flex flex-wrap items-center gap-2">{children}
-      {transferring ? <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
-        {onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : <Button className="min-w-28" disabled={pending} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }}><PlayIcon />Load model</Button>}
+  const fit = model.catalogData.support._tag === "Supported" ? fitNotice(model) : null
+  return <TooltipProvider><div className="grid">
+    <div className="flex flex-wrap items-center justify-end gap-2">{children}
+      {transferring ? <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /> : !installed ? <Button disabled={pending || model.catalogData.support._tag !== "Supported" || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
+        {model.catalogData.support._tag === "Supported" && (onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : <Button className="min-w-28" disabled={pending} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }}><PlayIcon />Load model</Button>)}
         {!onConnectAgent && <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><TrashIcon /></Button>}
-        {(acquisition._tag === "UpdateAvailable" || acquisition._tag === "UpdateFailed") && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
+        {model.catalogData.support._tag === "Supported" && (acquisition._tag === "UpdateAvailable" || acquisition._tag === "UpdateFailed") && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
       </>}
       {(acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && <Button variant="outline" onClick={() => dismiss(model.modelId)}>Dismiss error</Button>}
     </div>
-    {(model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits") && <ModelFit model={model} />}
-    {"failure" in acquisition && <p role="alert" className="mt-3 text-sm">{acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed" ? modelDownloadFailureMessage(acquisition.failure) : acquisition.failure.message}</p>}
-    {residency?._tag === "Failed" && <p role="alert" className="mt-3 text-sm">{residency.failure.message}</p>}
-    {command.failures.map(message => <p key={message} role="alert" className="mt-3 text-sm">{message}</p>)}
-    {residency?._tag === "Stopping" && Option.isSome(stopping.failure) && <p role="alert" className="mt-3 text-sm">{stopping.failure.value}</p>}
-  </div>
+    {fit !== null && <ControlNotice text={fit} />}
+    {"failure" in acquisition && <ControlNotice alert text={acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed" ? modelDownloadFailureMessage(acquisition.failure) : acquisition.failure.message} />}
+    {residency?._tag === "Failed" && <ControlNotice alert text={residency.failure.message} />}
+    {command.failures.map(message => <ControlNotice key={message} alert text={message} />)}
+    {residency?._tag === "Stopping" && Option.isSome(stopping.failure) && <ControlNotice alert text={stopping.failure.value} />}
+  </div></TooltipProvider>
 }
-function ModelCard({ model, showMemory = false, replacing }: { model: CatalogLocalModel; showMemory?: boolean; replacing?: string }) {
+function ModelCard({ model, models, showMemory = false, replacing }: { model: CatalogLocalModel; models: readonly CatalogLocalModel[]; showMemory?: boolean; replacing?: string }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const detailsId = useId()
+  const deprecation = localModelDeprecation(model)
+  const detailsToggle = <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
   const acquisition = model.acquisitionState
   const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
   const statusLabel = acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" ? "Downloaded" : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag)
   const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} memory</span></>}</div>
   return <article className={pageLayout.modelCard}>
     <div className={pageLayout.modelRow}>
-      <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="text-lg font-semibold">{formatLocalModelDisplayName(model)}</h2>{status}</div></div>
-      <ModelControls model={model} {...(replacing ? { replacing } : {})}>
-        <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
-      </ModelControls>
+      <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="flex flex-wrap items-center gap-2 text-lg font-semibold">{formatLocalModelDisplayName(model)}<SupportBadge model={model} /></h2>{status}</div></div>
+      {Option.match(deprecation, {
+        onNone: () => <ModelControls model={model} {...(replacing ? { replacing } : {})}>{detailsToggle}</ModelControls>,
+        onSome: value => <DeprecatedModelControls model={model} deprecation={value} replacement={catalogModelReplacement(models, value)}>{detailsToggle}</DeprecatedModelControls>,
+      })}
     </div>
     <ModelDetails model={model} radar open={detailsOpen} contentId={detailsId} />
   </article>
@@ -261,6 +305,7 @@ function Recommendations({ models, active, preference }: { models: readonly Cata
           >{model.presentation.displayName}{"\u00a0"}</span>
           <span className="shrink-0 whitespace-nowrap">({model.presentation.variantLabel})</span>
         </span>
+        <SupportBadge model={model} />
       </button>)}</div>
       <SelectedRecommendation model={selected} active={active} />
     </div>
@@ -298,7 +343,9 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const recommendationsPending = !Result.isFailure(hardware) && (Result.isInitial(hardware) || !assessment?.complete)
   const rankedIds = new Set(ranked.map(model => model.modelId))
   const ordered = installedOnly ? models : [...ranked, ...models.filter(model => !rankedIds.has(model.modelId))]
-  const library = ordered.filter(model => !installedOnly || model.acquisitionState._tag !== "NotInstalled")
+  // A deprecated model is listed only where installed; disabled models explain their unavailability.
+  const library = ordered.filter(model => model.acquisitionState._tag !== "NotInstalled"
+    || !installedOnly && model.catalogData.support._tag !== "Deprecated")
   const visible = library.filter(model => {
     const acquisition = model.acquisitionState
     const matchesFilter = filter === "all"
@@ -339,7 +386,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
       ? <RecommendationsSkeleton assessment={assessment} waitingForHardware={Result.isInitial(hardware)} />
       : <Recommendations preference={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />)}
     {!discover && <>
-    <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
+    <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} models={models} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
     {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
     </>}
     {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for compatibility details.</p>}

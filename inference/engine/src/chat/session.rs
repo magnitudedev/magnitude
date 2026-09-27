@@ -120,8 +120,8 @@ async fn run(
     };
     let ready = engine.ready_info();
     let model_limits = ModelLimits {
-        context_tokens: host.definition().geometry.context_limit as usize,
-        vocabulary: host.definition().geometry.vocabulary as usize,
+        context_tokens: host.definition().decoder.context_limit as usize,
+        vocabulary: host.definition().decoder.vocabulary as usize,
         output_capacity: limits.output_capacity,
         forced_quantum: 0,
         method: ready.model.method.policy(),

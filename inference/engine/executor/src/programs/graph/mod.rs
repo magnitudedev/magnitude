@@ -1,12 +1,13 @@
-//! Per-family decoder block graph construction. `native_target_graph` seals
-//! each block by calling its mixer and feed-forward family here.
+//! Graph construction shared by every operator: the draft abstraction over
+//! prepared and checked entries, the readout, and the draft taps. Each
+//! operator's own block fragment lives with the operator
+//! (`operators::<op>::graph`).
 
-pub(crate) mod attention;
-pub(crate) mod dense;
 pub(crate) mod draft;
 pub(crate) mod readout;
-pub(crate) mod recurrent;
-pub(crate) mod routed;
+pub(crate) mod tap;
+
+use crate::operators::{attention, gated_delta, routed};
 
 /// The structural form a row class selects in every row-dependent branch of
 /// graph construction. The topology code branches on these same predicates,
@@ -22,9 +23,9 @@ pub(crate) struct RowForm {
 impl RowForm {
     pub(crate) fn of(rows: u64) -> Self {
         Self {
-            attention_decode: attention::decodes(rows),
-            recurrent_chunked: recurrent::chunked(rows),
-            routed_decode: routed::decodes(rows),
+            attention_decode: attention::graph::decodes(rows),
+            recurrent_chunked: gated_delta::graph::chunked(rows),
+            routed_decode: routed::fused_graph::decodes(rows),
         }
     }
 }

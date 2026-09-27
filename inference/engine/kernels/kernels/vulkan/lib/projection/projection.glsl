@@ -64,60 +64,147 @@
 // This file is independent of any entry ABI.
 #include <seismic/packets.glsl>
 #include "../core/reduce.glsl"
+#include "../core/functions.glsl"
 
 #include "stage.glsl"
 
 #ifndef PROJECTION_GEMM_KINDS
-#define PROJECTION_GEMM_KINDS 0xff
+#define PROJECTION_GEMM_KINDS PACKETS_ALL_KINDS
 #endif
 
 #define PROJECTION_STORE 0
 #define PROJECTION_RESIDUAL 1
 #define PROJECTION_SILU_MUL 2
+#define PROJECTION_GLU 3
+#define PROJECTION_ACTIVATED 4
+#define PROJECTION_MUL 5
+#define PROJECTION_ACTIVATED_MUL 6
+#define PROJECTION_LOGITS 7
 
+// Further epilogues (the Metal and CUDA vocabulary):
+//   Glu           y = round_A(round_A(act(round_A(gate))) * round_A(up))  (paired)
+//   Activated     y = round_A(act(round_A(acc)))                  (up-only, ReLU²)
+//   Mul           y = gate * up                           (paired; F32, unrounded)
+//   ActivatedMul  y = round_A(round_A(act(round_A(acc))) * external[m, n])
+//   Logits        y = acc, or cap * tanh(acc / cap) when cap > 0              (F32)
+// with `act` a FUNCTIONS_* code (`../core/functions.glsl`).
 struct projection_epilogue {
     int kind;
-    int act;            // Store: the stored element E; Residual/SiluMul: A
+    int act;            // Store: the stored element E; the others: A
     uint64_t y;
     uint64_t y0;
     uint64_t y1;
     uint64_t column;    // Store: first destination column
-    uint64_t residual;  // Residual: F32 residual rows
+    uint64_t residual;  // Residual: F32 residual rows; ActivatedMul: F32 multipliers
     uint64_t r0;
     uint64_t r1;
     uint64_t rows;      // Residual: row map of the residual (0: AllRows)
+    int function;       // Glu, Activated, ActivatedMul: FUNCTIONS_* code
+    float cap;          // Logits: the softcap (0: none)
+    float scale;        // a weight's second-level scale on the accumulator (paired: the gate stream's)
+    float scale2;       // paired: the up stream's second-level scale
 };
 
+// A weight's second-level scale (NVFP4 `.scale`, per tensor or per expert)
+// on the F32 accumulator, before the epilogue. The library applies it only
+// in entries that define PROJECTION_SCALED before including this file (an
+// entry with a scale port of static extent 1), so an unscaled entry
+// compiles as before.
+projection_epilogue projection_scaled(projection_epilogue out_, float first, float second) {
+    out_.scale = first;
+    out_.scale2 = second;
+    return out_;
+}
+
+// A scale port's value at `index` along its expert axis (0 for a
+// per-tensor port; `stride` that axis' stride), or 1 for an absent port
+// (static `extent` 0: the port is never read).
+float projection_scale_factor(uint64_t scale, uint64_t extent, uint64_t stride, uint64_t index) {
+    return extent == 0ul ? 1.0 : element_f32_at(scale + index * stride * 4ul);
+}
+
 projection_epilogue projection_store(const int element, uint64_t y, uint64_t stride0, uint64_t stride1, uint64_t column) {
-    return projection_epilogue(PROJECTION_STORE, element, y, stride0, stride1, column, 0ul, 0ul, 0ul, 0ul);
+    return projection_epilogue(PROJECTION_STORE, element, y, stride0, stride1, column, 0ul, 0ul, 0ul, 0ul, 0, 0.0, 1.0,
+        1.0);
 }
 
 projection_epilogue projection_residual(const int act, uint64_t y, uint64_t stride0, uint64_t stride1,
     uint64_t residual, uint64_t residual0, uint64_t residual1, uint64_t rows) {
-    return projection_epilogue(PROJECTION_RESIDUAL, act, y, stride0, stride1, 0ul, residual, residual0, residual1, rows);
+    return projection_epilogue(PROJECTION_RESIDUAL, act, y, stride0, stride1, 0ul, residual, residual0, residual1, rows,
+        0, 0.0, 1.0, 1.0);
 }
 
 projection_epilogue projection_silu_mul(const int act, uint64_t y, uint64_t stride0, uint64_t stride1) {
-    return projection_epilogue(PROJECTION_SILU_MUL, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul);
+    return projection_epilogue(PROJECTION_SILU_MUL, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0, 0.0, 1.0,
+        1.0);
 }
 
-// Publishes one output of a Store or Residual epilogue.
+projection_epilogue projection_glu(const int act, uint64_t y, uint64_t stride0, uint64_t stride1, int function) {
+    return projection_epilogue(PROJECTION_GLU, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, function, 0.0, 1.0,
+        1.0);
+}
+
+projection_epilogue projection_activated(const int act, uint64_t y, uint64_t stride0, uint64_t stride1, int function) {
+    return projection_epilogue(PROJECTION_ACTIVATED, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, function, 0.0,
+        1.0, 1.0);
+}
+
+projection_epilogue projection_mul(uint64_t y, uint64_t stride0, uint64_t stride1) {
+    return projection_epilogue(PROJECTION_MUL, ELEMENT_F32, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0, 0.0, 1.0,
+        1.0);
+}
+
+projection_epilogue projection_activated_mul(const int act, uint64_t y, uint64_t stride0, uint64_t stride1,
+    uint64_t multiplier, uint64_t multiplier0, uint64_t multiplier1, int function) {
+    return projection_epilogue(PROJECTION_ACTIVATED_MUL, act, y, stride0, stride1, 0ul, multiplier, multiplier0,
+        multiplier1, 0ul, function, 0.0, 1.0, 1.0);
+}
+
+projection_epilogue projection_logits(uint64_t y, uint64_t stride0, uint64_t stride1, float cap) {
+    return projection_epilogue(PROJECTION_LOGITS, ELEMENT_F32, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0, cap, 1.0,
+        1.0);
+}
+
+// Publishes one output of an unpaired epilogue.
 void projection_put(projection_epilogue out_, uint m, uint n, float value) {
+#if defined(PROJECTION_SCALED)
+    value *= out_.scale;
+#endif
+    const uint64_t at = uint64_t(m) * out_.y0 + uint64_t(n) * out_.y1;
     if (out_.kind == PROJECTION_STORE) {
         element_put(out_.act, out_.y, uint64_t(m) * out_.y0 + (out_.column + uint64_t(n)) * out_.y1, value);
+    } else if (out_.kind == PROJECTION_ACTIVATED) {
+        element_put(out_.act, out_.y, at, functions_activate(out_.function, element_round(out_.act, value)));
+    } else if (out_.kind == PROJECTION_ACTIVATED_MUL) {
+        const float activated = element_round(out_.act,
+            functions_activate(out_.function, element_round(out_.act, value)));
+        const uint64_t source = uint64_t(m) * out_.r0 + uint64_t(n) * out_.r1;
+        element_put(out_.act, out_.y, at, activated * element_f32_at(out_.residual + source * 4ul));
+    } else if (out_.kind == PROJECTION_LOGITS) {
+        element_f32_put(out_.y + at * 4ul, out_.cap > 0.0 ? functions_softcap(out_.cap, value) : value);
     } else {
         const uint64_t source = uint64_t(projection_row(out_.rows, m)) * out_.r0 + uint64_t(n) * out_.r1;
-        element_f32_put(out_.y + (uint64_t(m) * out_.y0 + uint64_t(n) * out_.y1) * 4ul,
-            element_f32_at(out_.residual + source * 4ul) + element_round(out_.act, value));
+        element_f32_put(out_.y + at * 4ul, element_f32_at(out_.residual + source * 4ul) + element_round(out_.act, value));
     }
 }
 
-// Publishes one SiluMul feature from its gate and up sums.
+// Publishes one paired feature from its gate and up sums.
 void projection_put_pair(projection_epilogue out_, uint m, uint n, float gate_sum, float up_sum) {
+#if defined(PROJECTION_SCALED)
+    gate_sum *= out_.scale;
+    up_sum *= out_.scale2;
+#endif
+    const uint64_t at = uint64_t(m) * out_.y0 + uint64_t(n) * out_.y1;
+    if (out_.kind == PROJECTION_MUL) {
+        element_f32_put(out_.y + at * 4ul, gate_sum * up_sum);
+        return;
+    }
     const float gate = element_round(out_.act, gate_sum);
     const float up = element_round(out_.act, up_sum);
-    element_put(out_.act, out_.y, uint64_t(m) * out_.y0 + uint64_t(n) * out_.y1,
-        projection_silu_rounded(out_.act, gate) * up);
+    const float activated = out_.kind == PROJECTION_GLU
+        ? element_round(out_.act, functions_activate(out_.function, gate))
+        : projection_silu_rounded(out_.act, gate);
+    element_put(out_.act, out_.y, at, activated * up);
 }
 
 void projection_emit(projection_epilogue out_, const bool paired, uint m, uint n, float first, float second) {
@@ -670,6 +757,16 @@ void projection_gemm_load_b(int kind, const uint threads, projection_weights w, 
         projection_gemm_load_b_of(PACKETS_Q8, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_IQ4))
         projection_gemm_load_b_of(PACKETS_IQ4, threads, w, first, count, rows, k0, k, regs);
+    else if (projection_gemm_kind_is(kind, PACKETS_Q4G32S))
+        projection_gemm_load_b_of(PACKETS_Q4G32S, threads, w, first, count, rows, k0, k, regs);
+    else if (projection_gemm_kind_is(kind, PACKETS_MXFP4))
+        projection_gemm_load_b_of(PACKETS_MXFP4, threads, w, first, count, rows, k0, k, regs);
+    else if (projection_gemm_kind_is(kind, PACKETS_NVFP4))
+        projection_gemm_load_b_of(PACKETS_NVFP4, threads, w, first, count, rows, k0, k, regs);
+    else if (projection_gemm_kind_is(kind, PACKETS_Q5G32S))
+        projection_gemm_load_b_of(PACKETS_Q5G32S, threads, w, first, count, rows, k0, k, regs);
+    else if (projection_gemm_kind_is(kind, PACKETS_Q5G32))
+        projection_gemm_load_b_of(PACKETS_Q5G32, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_BF16))
         projection_gemm_load_b_of(PACKETS_BF16, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_F16))
@@ -690,6 +787,16 @@ void projection_gemm_store_b(int kind, const uint threads, projection_gemm_b reg
         projection_gemm_store_b_of(PACKETS_Q8, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_IQ4))
         projection_gemm_store_b_of(PACKETS_IQ4, threads, regs, count, tile_row0, spacing, b_word);
+    else if (projection_gemm_kind_is(kind, PACKETS_Q4G32S))
+        projection_gemm_store_b_of(PACKETS_Q4G32S, threads, regs, count, tile_row0, spacing, b_word);
+    else if (projection_gemm_kind_is(kind, PACKETS_MXFP4))
+        projection_gemm_store_b_of(PACKETS_MXFP4, threads, regs, count, tile_row0, spacing, b_word);
+    else if (projection_gemm_kind_is(kind, PACKETS_NVFP4))
+        projection_gemm_store_b_of(PACKETS_NVFP4, threads, regs, count, tile_row0, spacing, b_word);
+    else if (projection_gemm_kind_is(kind, PACKETS_Q5G32S))
+        projection_gemm_store_b_of(PACKETS_Q5G32S, threads, regs, count, tile_row0, spacing, b_word);
+    else if (projection_gemm_kind_is(kind, PACKETS_Q5G32))
+        projection_gemm_store_b_of(PACKETS_Q5G32, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_BF16))
         projection_gemm_store_b_of(PACKETS_BF16, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_F16))

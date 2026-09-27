@@ -21,20 +21,23 @@ pub use execution_plan::{
     ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,
 };
 pub use programs::{
-    FeedForwardProgramSlot, HeadProgramPlan, ImportProgramSlot, MixerProgramSlot, ProgramPlan,
-    StateProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, VisionProgramPlan,
+    DraftBlockBinding, DraftProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
+    ImportProgramSlot, MarkovBinding, MixerProgramSlot, ProgramPlan, StateProgramPlan,
+    TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    GraphSlots, NativeGraphCharge, ResourceBytes, ResourceCapacity, ResourceLimits, ResourcePlan,
-    ResourcePlanner, StartupSlots, StateCapacityPlan, StateResourcePlan, StateStorePlan,
+    GraphSlots, HistoryStorePlan, LayerHistory, NativeGraphCharge, ResourceBytes,
+    ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
+    StateCapacityPlan, StateResourcePlan, StateStorePlan,
 };
 pub use weights::{
     resident_element, resident_layout, source_element, AttentionBinding, AttentionShape,
-    DenseBinding, EmbeddingBinding, FeaturesBinding, HeadBinding, ModelLoadPlan, ReadoutBinding,
-    RecurrentBinding, RoutedBinding, VisionBlockBinding, VisionMergerBinding, VisionPatchBinding,
-    WeightPlan, WeightStorageIdentity,
+    DenseBinding, DenseBranchBinding, EmbeddingBinding, FeaturesBinding, HeadBinding,
+    HostTablePlan, ModelLoadPlan, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding,
+    RecurrentBinding, RoutedBinding, SublayerTail, WeightPlan, WeightStorageIdentity,
 };
 
+pub(crate) use weights::activation_dtype;
 use weights::{planned_element, source_import_peak_bytes, weight_bytes_by_component};
 #[cfg(test)]
 use weights::{resident_dtype, validate_unique_roles};
@@ -47,10 +50,12 @@ pub(crate) mod tests {
         ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
     };
     use magnitude_family_contracts::{
-        ActivationDType, AttentionGeometry, AttentionWeights, BlockGeometry, BlockWeights,
-        DenseFeedForwardWeights, FeedForwardGeometry, FeedForwardWeights, InputSemantics,
-        MixerWeights, ModelDefinition, RotarySemantics, TextCoordinateSemantics, WeightDescriptor,
-        WeightKind, WeightRole, WeightScope,
+        ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
+        EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, HeadNorm,
+        HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue, MediaRowAttention,
+        ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Rotary, SublayerIndex,
+        Sublayer, TextCoordinateSemantics, ValueNorm, ValueSource, WeightDescriptor, WeightKind,
+        WeightRole, WeightScope,
     };
     use magnitude_state::KvCodec;
     use seismic::{DType, Element};
@@ -63,12 +68,10 @@ pub(crate) mod tests {
                 identity: ArtifactIdentity([7; 32]),
             },
             source: Element::f16(),
+            upload: Element::f16(),
             resident: Element::f16(),
             shape: vec![1],
-            descriptor: WeightDescriptor {
-                name: name.into(),
-                shape: vec![1],
-            },
+            descriptor: WeightDescriptor::stored(name, [1]),
             source_bytes: 2,
             resident_bytes: 2,
         }
@@ -78,7 +81,7 @@ pub(crate) mod tests {
     fn semantic_roles_are_unique_within_an_artifact_component() {
         let role = WeightRole {
             scope: WeightScope::VisionBlock(0),
-            kind: WeightKind::InputNormWeight,
+            kind: WeightKind::Vision(magnitude_family_contracts::VisionWeight::PatchBias),
         };
         let plans = [weight(role, "a"), weight(role, "b")];
         assert!(validate_unique_roles(plans.iter()).is_err());
@@ -87,7 +90,10 @@ pub(crate) mod tests {
     #[test]
     fn semantic_roles_select_the_exact_kernel_resident_dtype() {
         let role = |kind| WeightRole {
-            scope: WeightScope::TargetBlock(0),
+            scope: WeightScope::TargetSublayer(SublayerIndex {
+                block: 0,
+                sublayer: 0,
+            }),
             kind,
         };
         for kind in [
@@ -104,18 +110,17 @@ pub(crate) mod tests {
             WeightKind::QueryGate,
             WeightKind::RecurrentAlpha,
             WeightKind::Router,
-            WeightKind::FusedQkvWeight,
-            WeightKind::MergerOutput,
+            WeightKind::Vision(magnitude_family_contracts::VisionWeight::Linear {
+                site: magnitude_family_contracts::VisionLinearSite::Merger,
+                part: magnitude_family_contracts::LinearPart::Weight,
+            }),
         ] {
             assert_eq!(resident_dtype(role(kind), DType::BF16), DType::BF16);
         }
     }
 
     fn descriptor(name: &str, shape: &[u64]) -> WeightDescriptor {
-        WeightDescriptor {
-            name: name.into(),
-            shape: shape.to_vec(),
-        }
+        WeightDescriptor::stored(name, shape)
     }
 
     /// The smallest geometry every native kernel admits: hidden and
@@ -126,17 +131,44 @@ pub(crate) mod tests {
         const WIDTH: u64 = 64;
         const FEATURES: u64 = 128;
         const VOCABULARY: u64 = 256;
-        let attention = || AttentionWeights {
-            query_gate: descriptor("qg", &[2 * WIDTH, HIDDEN]),
-            key: descriptor("k", &[WIDTH, HIDDEN]),
-            value: descriptor("v", &[WIDTH, HIDDEN]),
-            query_norm: descriptor("qn", &[WIDTH]),
-            key_norm: descriptor("kn", &[WIDTH]),
+        let rms = |name: &str, width| RmsNorm {
+            weight: descriptor(name, &[width]),
+            epsilon: 1e-6,
+        };
+        let attention = Attention {
+            heads: 1,
+            kv_heads: 1,
+            width: WIDTH,
+            query: descriptor("qg", &[2 * WIDTH, HIDDEN]),
+            gate: AttentionGate::Interleaved {
+                function: GateFunction::Sigmoid,
+            },
+            query_norm: HeadNorm::Rms(rms("qn", WIDTH)),
+            key_value: KeyValue::Owned {
+                key: descriptor("k", &[WIDTH, HIDDEN]),
+                value: ValueSource::Projected(descriptor("v", &[WIDTH, HIDDEN])),
+                key_norm: HeadNorm::Rms(rms("kn", WIDTH)),
+                value_norm: ValueNorm::None,
+                domain: HistoryDomain::Token,
+            },
+            rotary: Rotary::Interleaved {
+                width: WIDTH / 2,
+                base: 10_000.0,
+                sections: vec![WIDTH / 4],
+                axis_pattern: vec![0],
+            },
+            scale: 1.0 / (WIDTH as f64).sqrt(),
+            reads: HistoryReads::Visible,
+            media_rows: MediaRowAttention::Causal,
             output: descriptor("o", &[HIDDEN, WIDTH]),
         };
-        let dense = || DenseFeedForwardWeights {
-            gate: descriptor("gate", &[FEATURES, HIDDEN]),
-            up: descriptor("up", &[FEATURES, HIDDEN]),
+        let dense = DenseFfn {
+            intermediate: FEATURES,
+            up: FeedForwardUp::Gated {
+                activation: ActivationFunction::Silu,
+                gate: descriptor("gate", &[FEATURES, HIDDEN]),
+                up: descriptor("up", &[FEATURES, HIDDEN]),
+            },
             down: descriptor("down", &[HIDDEN, FEATURES]),
         };
         ModelDefinition {
@@ -149,72 +181,60 @@ pub(crate) mod tests {
                 text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
                 coordinate_axes: 1,
             },
-            geometry: magnitude_family_contracts::DecoderGeometry {
+            decoder: Decoder {
                 activation_dtype: ActivationDType::BF16,
                 hidden: HIDDEN,
                 vocabulary: VOCABULARY,
                 context_limit: 128,
-                epsilon: 1e-6,
-                blocks: vec![BlockGeometry {
-                    mixer: magnitude_family_contracts::MixerGeometry::Attention(
-                        AttentionGeometry {
-                            heads: 1,
-                            kv_heads: 1,
-                            width: WIDTH,
-                            rotary: RotarySemantics::Interleaved {
-                                width: WIDTH / 2,
-                                base: 10_000.0,
-                                sections: vec![WIDTH / 4],
-                                axis_pattern: vec![0],
-                            },
+                residual: ResidualForm::Single,
+                entry: EntryForm {
+                    embedding: descriptor("embedding", &[VOCABULARY, HIDDEN]),
+                    scale: EmbeddingScale::Unit,
+                    norm: None,
+                    per_layer: None,
+                    hash_routing: None,
+                },
+                blocks: vec![Block {
+                    sublayers: vec![
+                        Sublayer {
+                            input: InputNorm::Rms(rms("input_norm", HIDDEN)),
+                            op: Operator::Attention(Box::new(attention)),
+                            output: OutputForm::Residual,
                         },
-                    ),
-                    feedforward: FeedForwardGeometry::Dense {
-                        intermediate: FEATURES,
-                    },
+                        Sublayer {
+                            input: InputNorm::Rms(rms("ffn_norm", HIDDEN)),
+                            op: Operator::DenseFfn(Box::new(dense)),
+                            output: OutputForm::Residual,
+                        },
+                    ],
                 }],
+                exit: ExitForm {
+                    norm: ExitNorm::Rms(rms("output_norm", HIDDEN)),
+                    output: descriptor("output", &[VOCABULARY, HIDDEN]),
+                    softcap: None,
+                },
             },
-            embedding: descriptor("embedding", &[VOCABULARY, HIDDEN]),
-            blocks: vec![BlockWeights {
-                input_norm: descriptor("input_norm", &[HIDDEN]),
-                mixer: MixerWeights::Attention(Box::new(attention())),
-                feedforward_norm: descriptor("ffn_norm", &[HIDDEN]),
-                feedforward: FeedForwardWeights::Dense(Box::new(dense())),
-            }],
-            output_norm: descriptor("output_norm", &[HIDDEN]),
-            output: descriptor("output", &[VOCABULARY, HIDDEN]),
             head: None,
             vision: None,
+            draft: None,
         }
     }
 
     pub(crate) fn fixture_manifest(definition: &ModelDefinition) -> PackageManifest {
-        let block = &definition.blocks[0];
-        let MixerWeights::Attention(attention) = &block.mixer else {
-            unreachable!()
-        };
-        let FeedForwardWeights::Dense(dense) = &block.feedforward else {
-            unreachable!()
-        };
-        let descriptors = [
-            &definition.embedding,
-            &block.input_norm,
-            &attention.query_gate,
-            &attention.key,
-            &attention.value,
-            &attention.query_norm,
-            &attention.key_norm,
-            &attention.output,
-            &block.feedforward_norm,
-            &dense.gate,
-            &dense.up,
-            &dense.down,
-            &definition.output_norm,
-            &definition.output,
-        ];
+        let decoder = &definition.decoder;
+        let head = definition.head.as_ref().map_or_else(Vec::new, |head| {
+            crate::operators::head_weights(head).expect("fixture head block indices fit u32")
+        });
+        let descriptors = std::iter::once(&decoder.entry.embedding)
+            .chain(
+                crate::operators::decoder_weights(decoder)
+                    .into_iter()
+                    .chain(head)
+                    .map(|(_, descriptor)| descriptor),
+            )
+            .chain([decoder.exit.norm.weight(), &decoder.exit.output]);
         let mut offset = 0;
         let tensors = descriptors
-            .into_iter()
             .map(|descriptor| {
                 let nbytes = descriptor.shape.iter().product::<u64>() * 2;
                 let tensor = TensorDescriptor {
@@ -239,6 +259,7 @@ pub(crate) mod tests {
                 tensors,
             },
             projector: None,
+            draft: None,
         }
     }
 
@@ -306,19 +327,19 @@ pub(crate) mod tests {
             .prepare_target_graphs(
                 &device,
                 draft.load(),
-                &definition.geometry,
+                &definition.decoder,
                 &state,
                 draft.programs().target(),
                 limits,
             )
             .unwrap();
         let readout = programs
-            .prepare_target_readout_graphs(&device, draft.load(), &definition.geometry, limits)
+            .prepare_target_readout_graphs(&device, draft.load(), &definition.decoder, limits)
             .unwrap();
         let assessed_target = crate::programs::native_target_graph::checked_target_family_storage(
             device.backend(),
             draft.load(),
-            &definition.geometry,
+            &definition.decoder,
             &state,
             draft.programs().target(),
             limits,
@@ -339,7 +360,7 @@ pub(crate) mod tests {
         let assessed_readout = crate::programs::graph::readout::checked_readout_family_storage(
             device.backend(),
             draft.load(),
-            &definition.geometry,
+            &definition.decoder,
             limits,
         )
         .unwrap();

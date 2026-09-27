@@ -84,6 +84,8 @@ as its defaults. It prints a finite result and does not render a chooser or keyb
 
 - ACN publishes `LocalModelRankingScores`, never server-selected preference tiers or explanations.
 - Scores belong to one exact catalog model configuration with a terminal `Fits` assessment.
+- A deprecated catalog model is never a ranked choice. A best-effort model is ranked like any other
+  `Fits` configuration and is labeled wherever it is shown.
 - A model with distinct desired and effective installed configurations may temporarily have scores
   for both; the local product row uses the scores matching the configuration it currently exposes.
 - Normalized score fields are named `intelligence`, `speed`, and `fidelity`; `quality` is not a

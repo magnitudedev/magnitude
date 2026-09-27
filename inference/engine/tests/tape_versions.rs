@@ -36,6 +36,7 @@ fn open_domain() -> Option<(ExecutorDomain, usize)> {
         package: PackageOptions {
             target: model,
             projector: ProjectorSelection::Disabled,
+            draft: None,
         },
         model: ModelPolicy {
             method: ModelMethod::Mtp,
@@ -57,7 +58,7 @@ fn open_domain() -> Option<(ExecutorDomain, usize)> {
     }
     .resolve()
     .unwrap();
-    let vocabulary = resolved.manifest.definition.geometry.vocabulary as usize;
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let package = resolved.host.shared_package();
     let (domain, _) = build_native_domain(&resolved.manifest, package).unwrap();
     Some((domain, vocabulary))

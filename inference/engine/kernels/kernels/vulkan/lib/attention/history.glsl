@@ -1,5 +1,5 @@
 // The two forms of attention history: dense (rows of A) and affine K8/V4
-// (`gated_attention_*_k8v4`). The counterpart of the affine part of
+// (`attention_*_k8v4`). The counterpart of the affine part of
 // `metal/lib/attention/attention.h`.
 //
 // An affine (history row, kv head) vector is a code row of W * B / 32 u32
@@ -26,6 +26,9 @@
 #define HISTORY_GROUP 32u
 #define HISTORY_PAIRS (ATTENTION_W / HISTORY_GROUP)
 #define HISTORY_PAIR_LANES (HISTORY_GROUP / ATTENTION_E)
+// The words a lane's codes of one vector span (keys, the wider codes): two
+// up to W = 256, four at W = 512.
+#define HISTORY_LANE_WORDS (ATTENTION_E > 8u ? ATTENTION_E / 4u : 2u)
 
 struct attention_history {
     bool affine;
@@ -47,7 +50,7 @@ attention_history attention_affine_history(uint64_t key_codes, uint64_t key_coef
 
 uint64_t history_address(uint64_t table, uint64_t row, uint64_t slab_rows, uint64_t row_bytes,
     uint64_t head_bytes, uint kv_head) {
-    return slab_row(table, row, slab_rows, row_bytes) + uint64_t(kv_head) * head_bytes;
+    return slab_row(table, uint(row), uint(slab_rows), row_bytes) + uint64_t(kv_head) * head_bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -58,11 +61,15 @@ uint history_row_words(const uint b) { return ATTENTION_W * b / 32u; }
 
 // This lane's codes of one vector's code row at byte address `row`, shifted so
 // its code i sits at bits B * i of word (i * B) / 32.
-void history_lane_load(const uint b, uint64_t row, uint lane, out uint w[2]) {
+void history_lane_load(const uint b, uint64_t row, uint lane, out uint w[HISTORY_LANE_WORDS]) {
     const uint bits = ATTENTION_E * b;
-    w[0] = 0u;
-    w[1] = 0u;
-    if (bits == 64u) {
+    [[unroll]] for (uint j = 0u; j < HISTORY_LANE_WORDS; ++j)
+        w[j] = 0u;
+    if (bits == 128u) {
+        const uvec4 words = element_uvec4_at(row + uint64_t(lane) * 16ul);
+        [[unroll]] for (uint j = 0u; j < 4u; ++j)
+            w[j] = words[j];
+    } else if (bits == 64u) {
         const uvec2 pair = element_uvec2_at(row + uint64_t(lane) * 8ul);
         w[0] = pair.x;
         w[1] = pair.y;
@@ -74,7 +81,7 @@ void history_lane_load(const uint b, uint64_t row, uint lane, out uint w[2]) {
 }
 
 // Code i of this lane's columns, as F32 (exact).
-float history_code(const uint b, uint w[2], uint i) {
+float history_code(const uint b, uint w[HISTORY_LANE_WORDS], uint i) {
     return float((w[(i * b) / 32u] >> ((i * b) % 32u)) & history_levels(b));
 }
 
@@ -101,9 +108,9 @@ void history_encode(const uint b, float x[ATTENTION_E], uint64_t row, uint64_t c
     const float zero = element_round(ELEMENT_F16, low);
     const float scale = element_round(ELEMENT_F16, seismic_div_rn(high - low, float(levels)));
     const float inverse = scale > 0.0 ? seismic_div_rn(1.0, scale) : 0.0;
-    uint w[2];
-    w[0] = 0u;
-    w[1] = 0u;
+    uint w[HISTORY_LANE_WORDS];
+    [[unroll]] for (uint j = 0u; j < HISTORY_LANE_WORDS; ++j)
+        w[j] = 0u;
     [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
         const float t = seismic_fma_rn(x[i] - zero, inverse, 0.5);
         const uint c = min(uint(max(t, 0.0)), levels);
@@ -111,7 +118,7 @@ void history_encode(const uint b, float x[ATTENTION_E], uint64_t row, uint64_t c
     }
     if (bits >= 32u) {
         const uint words = bits / 32u;
-        [[unroll]] for (uint j = 0u; j < 2u; ++j)
+        [[unroll]] for (uint j = 0u; j < HISTORY_LANE_WORDS; ++j)
             if (j < words)
                 element_u32_put(row + uint64_t(lane * words + j) * 4ul, w[j]);
     } else {
@@ -151,24 +158,26 @@ void history_append(attention_history h, const bool is_key, int destination, uin
 }
 
 // ---------------------------------------------------------------------------
-// Staging history rows [first, first + FLASH_KEYS) of one kv head as the f16
-// tile at shared half `base` (row pitch W + 8); rows at or past `end` are
-// zero. Affine rows decode as code * scale + zero rounded to f16 directly (a
-// rounding to a BF16 A first would cost the 8-bit keys up to a code step).
-// Every invocation of the workgroup takes part.
-void history_stage(attention_history h, const bool is_key, int first, int end, uint kv_head, uint base) {
+// Staging columns [column, column + w) of history rows [first, first +
+// FLASH_KEYS) of one kv head as the f16 tile at shared half `base` (row pitch
+// w + 8); rows at or past `end` are zero. Affine rows decode as code * scale
+// + zero rounded to f16 directly (a rounding to a BF16 A first would cost the
+// 8-bit keys up to a code step). Every invocation of the workgroup takes part.
+void history_stage(attention_history h, const bool is_key, int first, int end, uint kv_head, uint column,
+    const uint w, uint base) {
     if (!h.affine) {
-        flash_stage_slab(ELEMENT_ACT, is_key ? h.key : h.value, h.slab_rows, kv_head,
-            ATTENTION_KV, ATTENTION_W, first, end, base);
+        flash_stage_slab(ELEMENT_ACT, is_key ? h.key : h.value, h.slab_rows, ATTENTION_KV * ATTENTION_W,
+            kv_head * ATTENTION_W + column, w, first, end, base);
         return;
     }
     const uint b = is_key ? HISTORY_KEY_BITS : HISTORY_VALUE_BITS;
     const uint64_t codes = is_key ? h.key : h.value;
     const uint64_t coefficients = is_key ? h.key_coefficients : h.value_coefficients;
-    const uint pieces = ATTENTION_W / 8u;
+    const uint pieces = w / 8u;
     for (uint item = gl_LocalInvocationIndex; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
         const uint k = item / pieces;
-        const uint c = (item % pieces) * 8u;
+        const uint staged = (item % pieces) * 8u;
+        const uint c = column + staged;
         const int t = first + int(k);
         uvec4 bits = uvec4(0u);
         if (t < end) {
@@ -179,7 +188,10 @@ void history_stage(attention_history h, const bool is_key, int first, int end, u
             const vec2 sz = unpackHalf2x16(element_u32_at(pair_row + uint64_t(c / HISTORY_GROUP) * 4ul));
             const uint64_t word = history_address(codes, uint64_t(t), h.slab_rows,
                 uint64_t(ATTENTION_KV) * code_bytes, code_bytes, kv_head) + uint64_t((c * b) / 32u) * 4ul;
-            uint w[2];
+            // Eight codes: two key words or one value word.
+            uint w[HISTORY_LANE_WORDS];
+            [[unroll]] for (uint j = 0u; j < HISTORY_LANE_WORDS; ++j)
+                w[j] = 0u;
             w[0] = element_u32_at(word);
             w[1] = b == 8u ? element_u32_at(word + 4ul) : 0u;
             float v[8];
@@ -187,7 +199,7 @@ void history_stage(attention_history h, const bool is_key, int first, int end, u
                 v[i] = seismic_fma_rn(history_code(b, w, i), sz.x, sz.y);
             bits = element_pack8(ELEMENT_F16, vec4(v[0], v[2], v[4], v[6]), vec4(v[1], v[3], v[5], v[7]));
         }
-        seismic_shared_uvec4[(base + k * flash_pitch(ATTENTION_W) + c) / 8u] = bits;
+        seismic_shared_uvec4[(base + k * flash_pitch(w) + staged) / 8u] = bits;
     }
 }
 
@@ -203,7 +215,8 @@ void history_stage(attention_history h, const bool is_key, int first, int end, u
 #define HISTORY_BATCH 8u
 
 void history_absorb_affine(const uint n, float q[ATTENTION_HEADS][ATTENTION_E], float qsum[ATTENTION_HEADS],
-    uint key[HISTORY_BATCH][2], vec2 key_coefficients[HISTORY_BATCH], uint value[HISTORY_BATCH][2],
+    uint key[HISTORY_BATCH][HISTORY_LANE_WORDS], vec2 key_coefficients[HISTORY_BATCH],
+    uint value[HISTORY_BATCH][HISTORY_LANE_WORDS],
     vec2 value_coefficients[HISTORY_BATCH], inout float maximum[ATTENTION_HEADS],
     inout float denominator[ATTENTION_HEADS], inout float result[ATTENTION_HEADS][ATTENTION_E],
     inout float bias[ATTENTION_HEADS]) {

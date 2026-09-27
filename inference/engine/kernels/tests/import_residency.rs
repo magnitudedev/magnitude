@@ -19,7 +19,7 @@ fn dense_bytes(name: &str, values: &[f32]) -> Vec<u8> {
 }
 
 /// GGUF sources and their resident representations.
-const FORMATS: [(&str, &str); 8] = [
+const FORMATS: [(&str, &str); 13] = [
     ("gguf_q8_0", "q8g32s"),
     ("gguf_q3_k", "q6k"),
     ("gguf_q4_k", "q4k"),
@@ -28,6 +28,11 @@ const FORMATS: [(&str, &str); 8] = [
     ("gguf_iq3_s", "q6k"),
     ("gguf_iq4_nl", "iq4g32"),
     ("gguf_iq4_xs", "iq4g32"),
+    ("gguf_q4_0", "q4g32s"),
+    ("gguf_q5_0", "q5g32s"),
+    ("gguf_q5_1", "q5g32"),
+    ("gguf_mxfp4", "mxfp4g32"),
+    ("gguf_nvfp4", "nvfp4g16"),
 ];
 
 /// ggml's `dequantize_row_q3_K` for one 110-byte block, in its operation
@@ -176,6 +181,100 @@ fn exact_imports_match_the_gguf_reference_dequantization() {
             });
             assert_eq!(actual, digest, "{source_name} -> {}", element.name());
         }
+    }
+}
+
+/// The formats with a representation of their own (Q4_0, Q5_0, Q5_1, MXFP4,
+/// NVFP4) decode, in every layout, to exactly llama.cpp's reference
+/// dequantization (`dequantize_row_*` of ggml-quants.c at 18443257a30c) of 64
+/// blocks of `golden_bytes(.., 12345)` whose scale fields are made finite: the
+/// FNV-1a digests `validation/gguf_codec_reference.py --digests` prints (gguf-py
+/// `quants.dequantize` gives the same values). Q5_1's `x0 * d + m` is rounded
+/// once, as C compilers contract it.
+#[test]
+fn own_representation_imports_match_llama_cpp_dequantization() {
+    for (source_name, resident, block_bytes, block_values, digest) in [
+        ("gguf_q4_0", "q4g32s", 18usize, 32u64, 0xb5c2_5214_8b2d_eb25u64),
+        ("gguf_q5_0", "q5g32s", 22, 32, 0x1fe5_1e4c_22ed_9325),
+        ("gguf_q5_1", "q5g32", 24, 32, 0x63c4_5260_7d3e_19d9),
+        ("gguf_mxfp4", "mxfp4g32", 17, 32, 0xd827_1dd4_f8ce_c325),
+        ("gguf_nvfp4", "nvfp4g16", 36, 64, 0xa417_0901_6b8f_6325),
+    ] {
+        let blocks = 64u64;
+        let mut bytes = golden_bytes(blocks * block_bytes as u64, 12345);
+        for block in bytes.chunks_exact_mut(block_bytes) {
+            // Finite scales: f16 exponents below 31, no E8M0 or UE4M3 NaN code.
+            match source_name {
+                "gguf_q4_0" | "gguf_q5_0" => block[1] &= 0xbf,
+                "gguf_q5_1" => {
+                    block[1] &= 0xbf;
+                    block[3] &= 0xbf;
+                }
+                "gguf_mxfp4" if block[0] == 0xff => block[0] = 0xfe,
+                "gguf_nvfp4" => {
+                    for scale in &mut block[..4] {
+                        if *scale & 0x7f == 0x7f {
+                            *scale -= 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let source = seismic::Element::named(source_name).unwrap();
+        let shape = [1, blocks * block_values];
+        for layout in seismic::Layout::ALL {
+            let element = seismic::Element::stored(resident, layout).unwrap();
+            let stored = element.repack_host(source, &shape, &bytes).unwrap();
+            let values = element.decode_host(&shape, &stored).unwrap();
+            let actual = values.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, value| {
+                (hash ^ u64::from((*value as f32).to_bits())).wrapping_mul(0x0100_0000_01b3)
+            });
+            assert_eq!(actual, digest, "{source_name} -> {}", element.name());
+        }
+    }
+}
+
+/// Real tensors of released GGUF files (Gemma Q4_0, Nemotron Q5_0 / Q5_1 /
+/// MXFP4 / NVFP4) import, in every layout, to exactly the reference
+/// dequantization of their blocks. The dump comes from
+/// `validation/gguf_codec_reference.py --gguf <file> --dump <dir>`, named by
+/// `CODEC_REAL_DIR`.
+#[test]
+#[ignore = "needs CODEC_REAL_DIR, a real-tensor dump of validation/gguf_codec_reference.py"]
+fn real_gguf_tensors_import_as_the_reference_dequantizes() {
+    let directory =
+        std::path::PathBuf::from(std::env::var("CODEC_REAL_DIR").expect("CODEC_REAL_DIR"));
+    let index = std::fs::read_to_string(directory.join("index.tsv")).unwrap();
+    for line in index.lines() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let [source_name, rows, k, stem] = fields.as_slice() else {
+            panic!("index line `{line}`")
+        };
+        let shape = [rows.parse::<u64>().unwrap(), k.parse::<u64>().unwrap()];
+        let blocks = std::fs::read(directory.join(format!("{stem}.blocks"))).unwrap();
+        let reference = std::fs::read(directory.join(format!("{stem}.values"))).unwrap();
+        let source = seismic::Element::named(source_name).unwrap();
+        let resident = FORMATS
+            .iter()
+            .find(|(name, _)| name == source_name)
+            .unwrap()
+            .1;
+        for layout in seismic::Layout::ALL {
+            let element = seismic::Element::stored(resident, layout).unwrap();
+            let stored = element.repack_host(source, &shape, &blocks).unwrap();
+            let values = element.decode_host(&shape, &stored).unwrap();
+            let mismatches = values
+                .iter()
+                .zip(reference.chunks_exact(4))
+                .filter(|(value, bytes)| {
+                    (**value as f32).to_bits() != u32::from_le_bytes((*bytes).try_into().unwrap())
+                })
+                .count();
+            assert_eq!(values.len() * 4, reference.len(), "{stem}");
+            assert_eq!(mismatches, 0, "{stem} -> {}", element.name());
+        }
+        println!("{stem}: {shape:?} exact in every layout");
     }
 }
 

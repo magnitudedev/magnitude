@@ -3,7 +3,7 @@
 //   stage (O blocks): the final RMS rows as A, into scratch.
 //   logits (Sv blocks): one block per selected vocabulary row decodes
 //     that weight row once per feature row (mma16 lane chunks) and sums the
-//     products in a fixed thread order.
+//     products in a fixed thread order, softcapped when `softcap` > 0.
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.cuh"
 
@@ -49,7 +49,9 @@ extern "C" __global__ void readout_selected_rows_logits(SEISMIC_KERNEL_PARAMS) {
                 }
         }
         const float total = reduce::group_sum(partial, scratch);
+        const float cap = __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP);
         if (threadIdx.x == 0)
-            logits[o * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1] = total;
+            logits[o * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1] =
+                cap > 0.0f ? functions::softcap(cap, total) : total;
     }
 }

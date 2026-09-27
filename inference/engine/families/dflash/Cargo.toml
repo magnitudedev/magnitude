@@ -1,0 +1,18 @@
+[package]
+name = "magnitude-family-dflash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "../../artifacts" }
+magnitude-family-common = { path = "../common" }
+magnitude-family-contracts = { path = "../contracts" }
+
+[dev-dependencies]
+magnitude-family-common = { path = "../common", features = ["catalog-headers"] }
+magnitude-family-qwen35 = { path = "../qwen35" }
+magnitude-family-llama = { path = "../llama" }
+magnitude-family-lfm2 = { path = "../lfm2" }
+magnitude-family-muse-glimmer = { path = "../muse_glimmer" }
+magnitude-family-nemotron-h = { path = "../nemotron_h" }

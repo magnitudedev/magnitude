@@ -959,23 +959,29 @@ void common_chat_peg_gemma4_mapper::from_ast(const common_peg_ast_arena & arena,
     }
 }
 
+// Schema-constrained argument rules are named `<kind>--<path>`.
+static std::string_view gemma4_kind(const std::string & rule) {
+    return std::string_view(rule).substr(0, rule.find("--"));
+}
+
 static common_peg_text gemma4_to_json(const common_peg_ast_arena & arena, common_peg_ast_id id) {
     return arena.output(id, 1, [&]() -> common_peg_text {
     const auto & node = arena.get(id);
+    const auto   kind = gemma4_kind(node.rule);
 
     if (node.text.empty()) {
         return "";
     }
 
-    if (node.rule == "gemma4-number" || node.rule == "gemma4-bool" || node.rule == "gemma4-null") {
+    if (kind == "gemma4-number" || kind == "gemma4-bool" || kind == "gemma4-null") {
         return common_peg_text::source(node.start, node.end);
     }
 
-    if (node.rule == "gemma4-string-content") {
+    if (kind == "gemma4-string-content") {
         return common_peg_text::source(node.start, node.end).escaped();
     }
 
-    if (node.rule == "gemma4-string") {
+    if (kind == "gemma4-string") {
         common_peg_text result = "\"";
         if (!node.children.empty()) {
             result += gemma4_to_json(arena, node.children[0]);
@@ -986,7 +992,7 @@ static common_peg_text gemma4_to_json(const common_peg_ast_arena & arena, common
         return result;
     }
 
-    if (node.rule == "gemma4-array") {
+    if (kind == "gemma4-array") {
         common_peg_text result = "[";
 
         result += arena.output_children(node, 1, node.children, ",",
@@ -998,11 +1004,11 @@ static common_peg_text gemma4_to_json(const common_peg_ast_arena & arena, common
         return result;
     }
 
-    if (node.rule == "gemma4-dict-key-name") {
+    if (kind == "gemma4-dict-key-name") {
         return common_peg_text::source(node.start, node.end);
     }
 
-    if (node.rule == "gemma4-dict-key") {
+    if (kind == "gemma4-dict-key") {
         common_peg_text result = "\"";
         if (!node.children.empty()) {
             result += gemma4_to_json(arena, node.children[0]).escaped();
@@ -1013,14 +1019,14 @@ static common_peg_text gemma4_to_json(const common_peg_ast_arena & arena, common
         return result;
     }
 
-    if (node.rule == "gemma4-dict-kv") {
+    if (kind == "gemma4-dict-kv") {
         common_peg_text result;
         result += arena.output_children(node, 2, node.children, "",
             [&](common_peg_ast_id child) { return gemma4_to_json(arena, child); });
         return result;
     }
 
-    if (node.rule == "gemma4-dict") {
+    if (kind == "gemma4-dict") {
         common_peg_text result = "{";
 
         result += arena.output_children(node, 1, node.children, ",",
@@ -1032,7 +1038,7 @@ static common_peg_text gemma4_to_json(const common_peg_ast_arena & arena, common
         return result;
     }
 
-    if (node.rule == "gemma4-value") {
+    if (kind == "gemma4-value") {
         if (!node.children.empty()) {
             return gemma4_to_json(arena, node.children[0]);
         }

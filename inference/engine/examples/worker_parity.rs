@@ -76,6 +76,7 @@ fn configuration(arguments: &Arguments) -> EngineConfiguration {
         package: PackageOptions {
             target: arguments.model.clone(),
             projector: ProjectorSelection::Disabled,
+            draft: None,
         },
         model: ModelPolicy::default(),
         context_tokens: Some(4096),
@@ -122,16 +123,18 @@ fn generate(engine: &ReadyEngine, tokens: usize) -> Result<(Vec<TokenId>, Finish
         } => MethodChoice::Mtp {
             proposals: greedy_proposals,
         },
+        ResolvedMethod::DFlash { proposals } => MethodChoice::DFlash { proposals },
     };
     let definition = host.definition();
     let options = Options {
         max_tokens: tokens,
         output_capacity: 16,
-        context_limit: usize::try_from(definition.geometry.context_limit)
+        context_limit: usize::try_from(definition.decoder.context_limit)
             .map_err(|_| "context exceeds the host domain")?,
-        vocabulary: usize::try_from(definition.geometry.vocabulary)
+        vocabulary: usize::try_from(definition.decoder.vocabulary)
             .map_err(|_| "vocabulary exceeds the host domain")?,
         stop_tokens: host.tokenizer().stop_tokens().clone(),
+        suppressed_tokens: host.tokenizer().suppressed_tokens().clone(),
         sampling: Sampling::Greedy,
         shaping: Shaping {
             temperature: 0.0,

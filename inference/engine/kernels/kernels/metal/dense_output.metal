@@ -13,14 +13,17 @@ typedef element::Act activation;
     device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],                 \
     device float *small_partials [[buffer(SEISMIC_BUFFER_SCRATCH_SMALL_PARTIALS)]],     \
+    device const float *down_scale [[buffer(SEISMIC_BUFFER_DOWN_SCALE)]],               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define DENSE_OUTPUT_OPERANDS                                                         \
     projection::Plain<activation, projection::AllRows> in{product, SEISMIC_PRODUCT_STRIDE_0, \
         SEISMIC_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_F), {}};                             \
-    projection::Residual<activation, projection::SelectedRows> out{result,              \
-        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, residual, SEISMIC_RESIDUAL_STRIDE_0, \
-        SEISMIC_RESIDUAL_STRIDE_1, {out_rows}};                                         \
+    const auto out = projection::scaling<(SEISMIC_DIM_DS != 0)>::wrap(                  \
+        projection::Residual<activation, projection::SelectedRows>{result,              \
+            SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, residual, SEISMIC_RESIDUAL_STRIDE_0, \
+            SEISMIC_RESIDUAL_STRIDE_1, {out_rows}},                                     \
+        projection::scale_factor(down_scale, SEISMIC_DIM_DS, 0, 0), 1.0f);              \
     projection::Weights<packets::W0> w{down_weight, KERNEL_W0_LAYOUT(SEISMIC_DIM_F), uint(SEISMIC_DIM_F)}
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV

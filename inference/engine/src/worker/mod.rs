@@ -191,7 +191,10 @@ fn load(
     let host_package = package.clone();
     let progress_outbound = outbound.clone();
     let owner_notice = notice.clone();
-    let factory = move || -> Result<(Box<dyn Driven>, (ExecutionReady, u64, MemoryDomain)), LoadError> {
+    // Readiness, the compute bytes, the host-table bytes and the allocation
+    // domain.
+    type Built = (ExecutionReady, u64, u64, MemoryDomain);
+    let factory = move || -> Result<(Box<dyn Driven>, Built), LoadError> {
         let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
         let built = crate::execution::build(
             catalog,
@@ -210,6 +213,7 @@ fn load(
         }
         let backend = built.domain.execution_backend();
         let compute_bytes = built.plan.bytes().scratch;
+        let host_table_bytes = built.domain.host_table_bytes();
         let domain = MemoryDomain::of(built.device, built.pool);
         let resources = ResourcePlanSummary::from_plan(&built.plan).map_err(internal)?;
         let owner = Owner::with_resource_plan(built.domain, manifest.service.clone(), &built.plan)
@@ -220,7 +224,13 @@ fn load(
                 let standing = heap
                     .standing()
                     .map_err(|error| format!("memory standing is unavailable: {error:?}"))?;
-                AllocationCensus::classify(&standing, heap.holdings(), compute_bytes, domain)
+                AllocationCensus::classify(
+                    &standing,
+                    heap.holdings(),
+                    compute_bytes,
+                    host_table_bytes,
+                    domain,
+                )
             })
             .map_err(internal)?;
         let ready = ExecutionReady {
@@ -236,7 +246,7 @@ fn load(
                 wakes: None,
                 notice: owner_notice,
             }) as Box<dyn Driven>,
-            (ready, compute_bytes, domain),
+            (ready, compute_bytes, host_table_bytes, domain),
         ))
     };
     let host = move || -> Result<(Vocabulary, RetentionKey, ChatIdentity), LoadError> {
@@ -260,9 +270,9 @@ fn load(
                 definition.artifact_identity.target.to_string(),
             )
             .and_then(ByteBpeTokenizer::new)
-            .map_err(unsupported)?,
+            .map_err(|error| unsupported(error.to_string()))?,
         );
-        let projection = usize::try_from(definition.geometry.vocabulary)
+        let projection = usize::try_from(definition.decoder.vocabulary)
             .map_err(|_| internal("model vocabulary exceeds the host domain"))?;
         let retention = RetentionKey::new(
             host_package.identity(),
@@ -274,7 +284,11 @@ fn load(
             .with_cache_limits(CONSTRAINT_CACHE);
         Ok((vocabulary, retention, chat))
     };
-    let (execution, (execution_ready, compute_bytes, domain), (vocabulary, retention, chat)) =
+    let (
+        execution,
+        (execution_ready, compute_bytes, host_table_bytes, domain),
+        (vocabulary, retention, chat),
+    ) =
         Worker::spawn_ready_with(factory, usize::MAX, host).map_err(|error| match error {
             SpawnError::Factory(error) | SpawnError::Host(error) => error,
             error @ (SpawnError::Capacity | SpawnError::Thread(_) | SpawnError::Panicked) => {
@@ -300,6 +314,7 @@ fn load(
             retention,
             definition: session_definition,
             compute_bytes,
+            host_table_bytes,
             domain,
             notice,
         },

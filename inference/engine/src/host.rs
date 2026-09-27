@@ -57,6 +57,40 @@ impl MarkerTokens for TokenizerMarkers<'_> {
     }
 }
 
+/// An opened package's family and declared definition: the recognized
+/// target family's definition, with the package's separate draft bound
+/// against it (the target family maps the draft's tapped layers onto its
+/// sublayers). Reads no tokenizer or template.
+pub fn package_definition(
+    package: &Package,
+) -> Result<(&'static dyn ModelFamily, ModelDefinition), ResolveError> {
+    let unsupported =
+        |reason: String| ResolveError::Unsupported(UnsupportedModel::Representation { reason });
+    let target = package.target().directory();
+    let family = families::recognize(target).map_err(ResolveError::Unsupported)?;
+    let declared = family
+        .inspect(
+            target,
+            package.projector().map(|projector| projector.directory()),
+            package.identity(),
+        )
+        .map_err(|error| unsupported(error.0))?;
+    let Some(draft) = package.draft() else {
+        return Ok((family, declared));
+    };
+    let draft = magnitude_family_dflash::inspect(draft.directory(), &declared, &|layer| {
+        family.layer_entry(&declared, layer)
+    })
+    .map_err(|error| unsupported(format!("draft: {error}")))?;
+    Ok((
+        family,
+        ModelDefinition {
+            draft: Some(draft),
+            ..declared
+        },
+    ))
+}
+
 impl HostArtifacts {
     /// Interpret an opened package: family recognition, definition,
     /// tokenizer, templates, media processor and input adapter.
@@ -65,20 +99,10 @@ impl HostArtifacts {
         package: Package,
         served_context: Option<usize>,
     ) -> Result<Self, ResolveError> {
-        let target = package.target().directory();
-        let family = families::recognize(target).map_err(ResolveError::Unsupported)?;
-        let declared = family
-            .inspect(
-                target,
-                package.projector().map(|projector| projector.directory()),
-                package.identity(),
-            )
-            .map_err(|error| {
-                ResolveError::Unsupported(UnsupportedModel::Representation { reason: error.0 })
-            })?;
+        let (family, declared) = package_definition(&package)?;
         let mut definition = declared.clone();
-        definition.geometry.context_limit =
-            resolve_served_context(served_context, declared.geometry.context_limit)?;
+        definition.decoder.context_limit =
+            resolve_served_context(served_context, declared.decoder.context_limit)?;
         let unsupported = |reason: String| {
             ResolveError::Unsupported(UnsupportedModel::Representation { reason })
         };
@@ -88,9 +112,9 @@ impl HostArtifacts {
                 definition.artifact_identity.target.to_string(),
             )
             .and_then(ByteBpeTokenizer::new)
-            .map_err(unsupported)?,
+            .map_err(|error| unsupported(error.to_string()))?,
         );
-        if u64::try_from(tokenizer.vocabulary()).ok() != Some(definition.geometry.vocabulary) {
+        if u64::try_from(tokenizer.vocabulary()).ok() != Some(definition.decoder.vocabulary) {
             return Err(unsupported(
                 "tokenizer vocabulary differs from model vocabulary".into(),
             ));
@@ -151,7 +175,7 @@ impl HostArtifacts {
 
     /// The artifact's declared context capability.
     pub fn declared_context_limit(&self) -> u64 {
-        self.declared.geometry.context_limit
+        self.declared.decoder.context_limit
     }
 
     pub fn tokenizer(&self) -> &ByteBpeTokenizer {

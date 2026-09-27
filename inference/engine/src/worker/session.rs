@@ -129,6 +129,8 @@ pub(crate) struct Loaded {
     pub retention: RetentionKey,
     pub definition: ModelDefinition,
     pub compute_bytes: u64,
+    /// Bytes of the model's host-resident tables held in host RAM.
+    pub host_table_bytes: u64,
     pub domain: MemoryDomain,
     pub notice: Arc<UnloadNotice>,
 }
@@ -348,7 +350,7 @@ impl Session {
         let input = input
             .validated(&self.loaded.definition)
             .map_err(|error| invalid(error.to_string()))?;
-        let limit = self.loaded.definition.geometry.context_limit;
+        let limit = self.loaded.definition.decoder.context_limit;
         let required = input.tokens().len() as u64;
         if required >= limit {
             return Err(RequestError::ContextLengthExceeded { required, limit });
@@ -444,6 +446,7 @@ impl Session {
                     &standing,
                     holdings,
                     self.loaded.compute_bytes,
+                    self.loaded.host_table_bytes,
                     self.loaded.domain,
                 ) {
                     Ok(census) => {

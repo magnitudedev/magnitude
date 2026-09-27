@@ -1,0 +1,21 @@
+// attention_prefill: streaming attention for prefill rows over dense history.
+// The body (three launches) is `lib/attention/prefill.glsl`.
+#define ATTENTION_I uint(SEISMIC_DIM_I)
+#define ATTENTION_U uint(SEISMIC_DIM_U)
+#define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
+#define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
+#define ATTENTION_SOFTPLUS (SEISMIC_PARAM_GATE_FUNCTION != 0)
+#define ATTENTION_QUERY_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_QUERY)
+#define ATTENTION_GATE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_GATE)
+#define ATTENTION_AMPLITUDE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)
+#define ATTENTION_VALUE_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_VALUE_NORM)
+#include "lib/attention/prefill.glsl"
+
+attention_history prefill_history() {
+    return attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE));
+}
+
+void attention_prefill_prepare() { prefill_prepare(prefill_history()); }
+void attention_prefill_attend() { prefill_attend(prefill_history()); }
+void attention_prefill_merge() { prefill_merge(); }

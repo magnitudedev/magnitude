@@ -62,6 +62,10 @@ inline float seismic_decode_e4m3(uint raw) {
 inline float seismic_decode_ue4m3(uint raw) {
   return seismic_decode_float_code(raw, 7u, 4u, 3u, 120u, 0.001953125f, true, true);
 }
+inline float seismic_decode_e8m0(uint raw) {
+  uint exponent = raw & 255u;
+  return as_type<float>(exponent == 0u ? 0x00400000u : exponent == 255u ? 0x7fc00000u : exponent << 23u);
+}
 inline bool seismic_f32_nan(float value) {
   return (as_type<uint>(value) & 0x7fffffffu) > 0x7f800000u;
 }
@@ -1764,6 +1768,7 @@ fn float_code_function(format: FloatCodeFormat) -> &'static str {
         FloatCodeFormat::E2M1 => "seismic_decode_e2m1",
         FloatCodeFormat::E4M3 => "seismic_decode_e4m3",
         FloatCodeFormat::UE4M3 => "seismic_decode_ue4m3",
+        FloatCodeFormat::E8M0 => "seismic_decode_e8m0",
     }
 }
 

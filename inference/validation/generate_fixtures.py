@@ -3,12 +3,16 @@
 # requires-python = ">=3.12"
 # dependencies = ["numpy==2.5.3"]
 # ///
-"""Generate historical reference fixtures; optionally run Cargo afterward.
+"""Generate reference fixtures; optionally run Cargo afterward.
 
-uv run inference/validation/generate_fixtures.py
+uv run inference/validation/generate_fixtures.py [--set all|v3|families] [--cases a,b]
 uv run inference/validation/generate_fixtures.py --test -- -p seismic-engine
 Outputs live under ignored validation/results/fixtures; commit generators only.
-No model downloads, GPU execution, or benchmark results are required/generated.
+
+`v3`: the historical V3-primitive fixtures (NumPy only, no downloads).
+`families`: the synthetic model-family variation fixtures of `family_fixtures.py` under
+`results/fixtures/families/` (synthetic GGUFs plus the independent references' outputs; the first run
+reads the real headers they mirror from Hugging Face by byte range). No GPU is used.
 """
 import argparse
 from contextlib import contextmanager, nullcontext
@@ -77,6 +81,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", type=Path, help="Override the pinned historical V3 source")
     parser.add_argument("--output", type=Path, default=OUTPUT)
+    parser.add_argument("--set", choices=("all", "v3", "families"), default="all")
+    parser.add_argument("--cases", help="family fixture cases (default: all; see family_fixtures.py --list)")
     parser.add_argument("--test", action="store_true", help="Run cargo test with arguments after --")
     parser.add_argument("cargo_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -84,14 +90,22 @@ def main():
         parser.error("Cargo arguments require --test")
     if args.test and args.output.resolve() != OUTPUT.resolve():
         parser.error("--test requires the default fixture output directory")
-    if args.source is None:
-        source_context = pinned_source()
-    else:
-        source_context = nullcontext(args.source.resolve(strict=True))
-    with source_context as source:
-        if not (source / "src/ops/tensor/ops.py").is_file():
-            parser.error(f"{source} is not an inference-v3 source directory")
-        generate(source, args.output)
+    if args.set in ("all", "v3"):
+        if args.source is None:
+            source_context = pinned_source()
+        else:
+            source_context = nullcontext(args.source.resolve(strict=True))
+        with source_context as source:
+            if not (source / "src/ops/tensor/ops.py").is_file():
+                parser.error(f"{source} is not an inference-v3 source directory")
+            generate(source, args.output)
+    if args.set in ("all", "families"):
+        # The family fixtures need torch and gguf; family_fixtures.py declares its own environment,
+        # which the uv running this driver (`uv run` exports its path as UV) provides.
+        command = [os.environ["UV"], "run", str(ROOT / "family_fixtures.py"), "--output", str(args.output / "families")]
+        if args.cases:
+            command += ["--cases", args.cases]
+        subprocess.run(command, check=True)
     if args.test:
         cargo_args = args.cargo_args
         if cargo_args[:1] == ["--"]:

@@ -30,6 +30,7 @@ use std::time::Instant;
 struct Options {
     target: PathBuf,
     projector: ProjectorSelection,
+    draft: Option<PathBuf>,
     host: String,
     port: u16,
     served_model: String,
@@ -45,8 +46,8 @@ struct Options {
 }
 
 const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
-[--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
-[--output-capacity N] [--method auto|plain|mtp] [--mtp-proposals N] \
+[--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
+[--output-capacity N] [--method auto|plain|mtp|dflash] [--mtp-proposals N] \
 [--kv-codec dense|affine-k8v4] [--lookahead on|off] [--telemetry URL] \
 [--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR]";
 
@@ -79,6 +80,7 @@ fn parse() -> Result<Options, String> {
     let defaults = ModelPolicy::default();
     let mut target = None;
     let mut projector = ProjectorSelection::Discover;
+    let mut draft = None;
     let mut host = "127.0.0.1".to_owned();
     let mut port = 8080;
     let mut served_model = None;
@@ -99,6 +101,7 @@ fn parse() -> Result<Options, String> {
                 projector = ProjectorSelection::Explicit(PathBuf::from(value(&flag, &mut args)?))
             }
             "--no-projector" => projector = ProjectorSelection::Disabled,
+            "--draft" => draft = Some(PathBuf::from(value(&flag, &mut args)?)),
             "--host" => host = value(&flag, &mut args)?,
             "--port" => port = number(&flag, &mut args)?,
             "--served-model" => served_model = Some(value(&flag, &mut args)?),
@@ -109,6 +112,7 @@ fn parse() -> Result<Options, String> {
                     "auto" => ModelMethod::Auto,
                     "plain" => ModelMethod::Plain,
                     "mtp" => ModelMethod::Mtp,
+                    "dflash" => ModelMethod::DFlash,
                     other => return Err(format!("unknown generation method: {other}")),
                 }
             }
@@ -143,6 +147,7 @@ fn parse() -> Result<Options, String> {
     Ok(Options {
         target,
         projector,
+        draft,
         host,
         port,
         served_model,
@@ -235,6 +240,7 @@ fn run() -> Result<(), String> {
         package: PackageOptions {
             target: options.target,
             projector: options.projector,
+            draft: options.draft,
         },
         model: ModelPolicy {
             method: options.method,
@@ -255,7 +261,7 @@ fn run() -> Result<(), String> {
         "magnitude-engine: host resolution in {:.2} s",
         load_started.elapsed().as_secs_f64()
     );
-    let geometry = &resolved.host.definition().geometry;
+    let geometry = &resolved.host.definition().decoder;
     let (context_tokens, vocabulary) = (geometry.context_limit, geometry.vocabulary);
     let worker_started = Instant::now();
     let mut reported = None;

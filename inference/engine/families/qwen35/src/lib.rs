@@ -14,16 +14,20 @@ use magnitude_artifacts::{
     Package, PackageIdentity,
 };
 use magnitude_family_contracts::{
-    checked_product, ActivationDType, AttentionGeometry, AttentionWeights, BlockGeometry,
-    BlockWeights, DecoderGeometry, DenseFeedForwardWeights, ExpertGeometry, FamilyId,
-    FeedForwardGeometry, FeedForwardWeights, FusedQkvWeights, HeadBlock, HeadWeights,
-    InputSemantics, LayerNormWeights, MixerGeometry, MixerWeights, ModelDefinition,
-    RecurrentGeometry, RecurrentHeadMapping, RecurrentWeights, RotarySemantics,
-    RoutedFeedForwardWeights, RowRange, TextCoordinateSemantics, VisionActivation,
-    VisionAttentionWeights, VisionBlockWeights, VisionDescription, VisionFeedForwardWeights,
-    VisionGeometry, VisionMergerWeights, VisionPreprocessing, WeightDescriptor,
+    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block,
+    CellReduction, Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm,
+    ExpertSelection, FamilyId, FeedForwardUp, GateFunction, GatedDelta, Head, HeadBlock,
+    HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics, KeyValue,
+    MediaRowAttention, MergerStage, ModelDefinition, Operator, OutputForm, PositionSampling,
+    RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router,
+    RouterInput, RowRange, ScoreFunction, SharedExpert, SharedExpertGate, Sublayer,
+    TextCoordinateSemantics, ValueNorm, ValueSource, VisionActivation, VisionAttention,
+    VisionAttentionScale, VisionAttentionSpan, VisionBlock, VisionDescription, VisionFeedForward,
+    VisionLinear, VisionMerger, VisionNorm, VisionPositions, VisionPreprocessing,
+    VisionResampling, VisionResize, VisionStem, VisionUp, WeightDescriptor,
 };
-use std::{collections::HashSet, error, fmt};
+use magnitude_family_common::{HeaderError, Tensors};
+use std::{error, fmt};
 
 /// Qwen 3.5 architecture recognized from literal artifact metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +67,12 @@ impl fmt::Display for Error {
 
 impl error::Error for Error {}
 
+impl From<HeaderError> for Error {
+    fn from(error: HeaderError) -> Self {
+        invalid(error.to_string())
+    }
+}
+
 fn invalid(message: impl Into<String>) -> Error {
     Error::invalid(message)
 }
@@ -75,6 +85,14 @@ fn product(dimensions: &[u64]) -> Result<u64, Error> {
 enum LocalMixerKind {
     Attention,
     Recurrent,
+}
+
+/// Expert widths of a routed (`qwen35moe`) artifact.
+struct Experts {
+    count: u64,
+    selected: u64,
+    intermediate: u64,
+    shared_intermediate: u64,
 }
 struct Metadata<'a> {
     directory: &'a Directory,
@@ -198,25 +216,9 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
         }
     }
 
-    let mut consumed = HashSet::new();
-    let mut tensor = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
-        let value = directory
-            .tensor(name)
-            .ok_or_else(|| invalid(format!("missing projector weight {name:?}")))?;
-        if value.shape != shape {
-            return Err(invalid(format!(
-                "projector weight {name:?}: expected {shape:?}, received {:?}",
-                value.shape
-            )));
-        }
-        product(shape)?;
-        consumed.insert(name.to_string());
-        Ok(WeightDescriptor {
-            name: name.into(),
-            shape: shape.into(),
-        })
-    };
-    let patch_embeddings = ["v.patch_embd.weight", "v.patch_embd.weight.1"]
+    let mut tensors = Tensors::new(directory);
+    let mut tensor = |name: &str, shape: &[u64]| tensors.bind(name, shape);
+    let patch_frames = ["v.patch_embd.weight", "v.patch_embd.weight.1"]
         .into_iter()
         .map(|name| tensor(name, &[hidden, 3, patch, patch]))
         .collect::<Result<Vec<_>, _>>()?;
@@ -232,103 +234,151 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
     if table_side.checked_mul(table_side) != Some(table_rows) {
         return Err(invalid("projector position table is not square"));
     }
-    let position_embedding = tensor("v.position_embd.weight", &[table_rows, hidden])?;
+    if image_size.checked_rem(patch) != Some(0) || image_size / patch != table_side {
+        return Err(invalid(
+            "projector position table does not cover the nominal image",
+        ));
+    }
+    let table = tensor("v.position_embd.weight", &[table_rows, hidden])?;
+    if heads == 0 || hidden % heads != 0 || (hidden / heads) % 4 != 0 {
+        return Err(invalid("projector heads do not split into 2-D rotary heads"));
+    }
+    let layer_norm = |weight: WeightDescriptor, bias: WeightDescriptor| VisionNorm::Layer {
+        weight,
+        bias,
+        epsilon,
+    };
+    // One stored QKV projection, imported as three row ranges.
+    let rows = |weight: &WeightDescriptor, part: u64| WeightDescriptor {
+        name: weight.name.clone(),
+        shape: {
+            let mut shape = weight.shape.clone();
+            shape[0] = hidden;
+            shape
+        },
+        transforms: vec![ImportTransform::Rows(RowRange {
+            start: part * hidden,
+            rows: hidden,
+        })],
+    };
     let qkv_rows = product(&[3, hidden])?;
-    let norm = |weight: WeightDescriptor, bias: WeightDescriptor| LayerNormWeights { weight, bias };
     let mut blocks = Vec::with_capacity(depth as usize);
     for index in 0..depth {
         let p = format!("v.blk.{index}.");
         let mut weight = |name: &str, shape: &[u64]| tensor(&format!("{p}{name}"), shape);
-        blocks.push(VisionBlockWeights {
-            input_norm: norm(
+        let qkv = weight("attn_qkv.weight", &[qkv_rows, hidden])?;
+        let qkv_bias = weight("attn_qkv.bias", &[qkv_rows])?;
+        let split = |part| VisionLinear {
+            weight: rows(&qkv, part),
+            bias: Some(rows(&qkv_bias, part)),
+            clamp: None,
+        };
+        blocks.push(VisionBlock {
+            attention_norm: layer_norm(
                 weight("ln1.weight", &[hidden])?,
                 weight("ln1.bias", &[hidden])?,
             ),
-            attention: VisionAttentionWeights {
-                qkv: FusedQkvWeights {
-                    weight: weight("attn_qkv.weight", &[qkv_rows, hidden])?,
-                    bias: weight("attn_qkv.bias", &[qkv_rows])?,
-                    query: RowRange {
-                        start: 0,
-                        rows: hidden,
-                    },
-                    key: RowRange {
-                        start: hidden,
-                        rows: hidden,
-                    },
-                    value: RowRange {
-                        start: hidden * 2,
-                        rows: hidden,
-                    },
+            attention: VisionAttention {
+                heads,
+                width: hidden / heads,
+                query: split(0),
+                key: split(1),
+                value: split(2),
+                query_norm: None,
+                key_norm: None,
+                value_norm: None,
+                rotary_base: 10_000.0,
+                scale: VisionAttentionScale::InverseSqrtWidth,
+                span: VisionAttentionSpan::Full,
+                output: VisionLinear {
+                    weight: weight("attn_out.weight", &[hidden, hidden])?,
+                    bias: Some(weight("attn_out.bias", &[hidden])?),
+                    clamp: None,
                 },
-                output: weight("attn_out.weight", &[hidden, hidden])?,
-                output_bias: weight("attn_out.bias", &[hidden])?,
             },
-            feedforward_norm: norm(
+            attention_post_norm: None,
+            feedforward_norm: layer_norm(
                 weight("ln2.weight", &[hidden])?,
                 weight("ln2.bias", &[hidden])?,
             ),
-            feedforward: VisionFeedForwardWeights {
-                up: weight("ffn_up.weight", &[intermediate, hidden])?,
-                up_bias: weight("ffn_up.bias", &[intermediate])?,
-                down: weight("ffn_down.weight", &[hidden, intermediate])?,
-                down_bias: weight("ffn_down.bias", &[hidden])?,
+            feedforward: VisionFeedForward {
+                up: VisionUp::Plain(VisionLinear {
+                    weight: weight("ffn_up.weight", &[intermediate, hidden])?,
+                    bias: Some(weight("ffn_up.bias", &[intermediate])?),
+                    clamp: None,
+                }),
+                activation: VisionActivation::GeluTanh,
+                down: VisionLinear {
+                    weight: weight("ffn_down.weight", &[hidden, intermediate])?,
+                    bias: Some(weight("ffn_down.bias", &[hidden])?),
+                    clamp: None,
+                },
             },
+            feedforward_post_norm: None,
         });
     }
-    let output_norm = norm(
+    let merger_norm = layer_norm(
         tensor("v.post_ln.weight", &[hidden])?,
         tensor("v.post_ln.bias", &[hidden])?,
     );
     let merger_hidden = product(&[hidden, merge, merge])?;
-    let merger = VisionMergerWeights {
-        hidden: tensor("mm.0.weight", &[merger_hidden, merger_hidden])?,
-        hidden_bias: tensor("mm.0.bias", &[merger_hidden])?,
-        output: tensor("mm.2.weight", &[output_hidden, merger_hidden])?,
-        output_bias: tensor("mm.2.bias", &[output_hidden])?,
-    };
-    for value in &directory.tensors {
-        if !consumed.contains(&value.name) {
-            return Err(invalid(format!(
-                "projector contains unbound weight role {:?}",
-                value.name
-            )));
-        }
-    }
-    let description = VisionDescription {
-        geometry: VisionGeometry {
-            // f16 intermediates around an F32 residual stream: 1.9% relative
-            // RMS from an F64 forward of the 4B projector, where bf16 puts
-            // the features 12.7% away (see the vision kernel family).
-            activation_dtype: ActivationDType::F16,
-            depth,
-            hidden,
-            intermediate,
-            heads,
-            patch,
-            merge,
-            image_size,
-            output_hidden,
-            epsilon,
-            table_side,
-            temporal_patch: patch_embeddings.len() as u64,
-            channels: 3,
-            block_activation: VisionActivation::GeluTanh,
-            merger_activation: VisionActivation::GeluErf,
+    let stages = vec![
+        MergerStage {
+            linear: VisionLinear {
+                weight: tensor("mm.0.weight", &[merger_hidden, merger_hidden])?,
+                bias: Some(tensor("mm.0.bias", &[merger_hidden])?),
+                clamp: None,
+            },
+            activation: Some(VisionActivation::GeluErf),
         },
+        MergerStage {
+            linear: VisionLinear {
+                weight: tensor("mm.2.weight", &[output_hidden, merger_hidden])?,
+                bias: Some(tensor("mm.2.bias", &[output_hidden])?),
+                clamp: None,
+            },
+            activation: None,
+        },
+    ];
+    tensors.finish()?;
+    let description = VisionDescription {
+        // f16 intermediates around an F32 residual stream: 1.9% relative
+        // RMS from an F64 forward of the 4B projector, where bf16 puts the
+        // features 12.7% away (see the vision kernel family).
+        activation_dtype: ActivationDType::F16,
+        hidden,
+        output_hidden,
         preprocessing: VisionPreprocessing {
-            processor: "qwen3vl_merger".into(),
+            resize: VisionResize::PixelBounds {
+                min_pixels,
+                max_pixels,
+            },
+            resampling: VisionResampling::Bicubic,
             mean,
             std,
-            min_pixels,
-            max_pixels,
+            channels: 3,
+            patch,
+            merge,
         },
-        patch_embeddings,
-        patch_bias,
-        position_embedding,
+        stem: VisionStem::Patch {
+            frames: patch_frames,
+            bias: Some(patch_bias),
+            positions: VisionPositions {
+                table,
+                sampling: PositionSampling::AlignedCorners { side: table_side },
+            },
+            norm: None,
+        },
+        window: None,
         blocks,
-        output_norm,
-        merger,
+        merger: VisionMerger {
+            norm: Some(merger_norm),
+            reduction: CellReduction::Concatenate,
+            standardize: None,
+            projection_norm: None,
+            stages,
+            output_norm: None,
+        },
     };
     description
         .validate()
@@ -445,12 +495,11 @@ pub fn inspect_components(
         return Err(invalid("Qwen rotary fourth section must be zero"));
     }
     let experts = if architecture.is_routed() {
-        Some(ExpertGeometry {
+        Some(Experts {
             count: m.integer("expert_count")?,
             selected: m.integer("expert_used_count")?,
             intermediate: m.integer("expert_feed_forward_length")?,
             shared_intermediate: m.integer("expert_shared_feed_forward_length")?,
-            normalize_selected: true,
         })
     } else {
         None
@@ -475,256 +524,212 @@ pub fn inspect_components(
             "Qwen attention/recurrent inner size differs from head geometry",
         ));
     }
-    let attention = AttentionGeometry {
-        heads: attention_heads,
-        kv_heads,
-        width: attention_width,
-        rotary: RotarySemantics::Interleaved {
-            width: m.integer("rope.dimension_count")?,
-            base: m.number("rope.freq_base")?,
-            sections: sections.into(),
-            axis_pattern: vec![0, 1, 2],
-        },
+    let epsilon = m.number("attention.layer_norm_rms_epsilon")?;
+    let rotary = Rotary::Interleaved {
+        width: m.integer("rope.dimension_count")?,
+        base: m.number("rope.freq_base")?,
+        sections: sections.into(),
+        axis_pattern: vec![0, 1, 2],
     };
-    let recurrent = RecurrentGeometry {
-        convolution_width: m.integer("ssm.conv_kernel")?,
-        key_heads: recurrent_key_heads,
-        value_heads: recurrent_value_heads,
-        width: recurrent_width,
-        head_mapping: RecurrentHeadMapping::Tiled,
-    };
-    let feedforward = match &experts {
-        Some(experts) => FeedForwardGeometry::Routed(experts.clone()),
-        None => FeedForwardGeometry::Dense { intermediate },
-    };
-    let block_geometry = layers
-        .iter()
-        .map(|kind| BlockGeometry {
-            mixer: match kind {
-                LocalMixerKind::Attention => MixerGeometry::Attention(attention.clone()),
-                LocalMixerKind::Recurrent => MixerGeometry::Recurrent(recurrent.clone()),
-            },
-            feedforward: feedforward.clone(),
-        })
-        .collect();
-    let g = DecoderGeometry {
-        activation_dtype: ActivationDType::BF16,
-        hidden,
-        vocabulary: embedding.shape[0],
-        context_limit: m.integer("context_length")?,
-        epsilon: m.number("attention.layer_norm_rms_epsilon")?,
-        blocks: block_geometry,
-    };
-    g.validate().map_err(|error| invalid(error.to_string()))?;
-    let mut consumed = HashSet::new();
+    let convolution_width = m.integer("ssm.conv_kernel")?;
+    let vocabulary = embedding.shape[0];
+    let context_limit = m.integer("context_length")?;
+    let recurrent_channels = product(&[
+        recurrent_key_heads
+            .checked_mul(2)
+            .and_then(|heads| heads.checked_add(recurrent_value_heads))
+            .ok_or_else(|| invalid("Qwen recurrent dimensions overflow"))?,
+        recurrent_width,
+    ])?;
+    let mut tensors = Tensors::new(directory);
     let mut tensor = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
-        let value = directory
-            .tensor(name)
-            .ok_or_else(|| invalid(format!("missing Qwen weight {name:?}")))?;
-        if value.shape != shape {
-            return Err(invalid(format!(
-                "Qwen weight {name:?}: expected {shape:?}, received {:?}",
-                value.shape
-            )));
-        }
-        product(shape)?;
-        consumed.insert(name.to_string());
-        Ok(WeightDescriptor {
-            name: name.into(),
-            shape: shape.into(),
-        })
+        Ok(tensors.bind(name, shape)?)
     };
-    let embedding = tensor(&embedding.name, &[g.vocabulary, g.hidden])?;
-    let output_norm = tensor("output_norm.weight", &[g.hidden])?;
+    let embedding = tensor(&embedding.name, &[vocabulary, hidden])?;
+    let output_norm = tensor("output_norm.weight", &[hidden])?;
     let output = tensor(
         if directory.tensor("output.weight").is_some() {
             "output.weight"
         } else {
             &embedding.name
         },
-        &[g.vocabulary, g.hidden],
+        &[vocabulary, hidden],
     )?;
-    let mut blocks = Vec::new();
-    for (i, kind) in layers.iter().enumerate() {
-        let p = format!("blk.{i}.");
-        let mut weight = |name: &str, shape: &[u64]| tensor(&format!("{p}{name}"), shape);
-        let mixer = if *kind == LocalMixerKind::Attention {
-            MixerWeights::Attention(Box::new(AttentionWeights {
-                query_gate: weight(
-                    "attn_q.weight",
-                    &[product(&[2, attention_heads, attention_width])?, g.hidden],
-                )?,
-                key: weight(
-                    "attn_k.weight",
-                    &[product(&[kv_heads, attention_width])?, g.hidden],
-                )?,
-                value: weight(
-                    "attn_v.weight",
-                    &[product(&[kv_heads, attention_width])?, g.hidden],
-                )?,
-                query_norm: weight("attn_q_norm.weight", &[attention_width])?,
-                key_norm: weight("attn_k_norm.weight", &[attention_width])?,
-                output: weight(
-                    "attn_output.weight",
-                    &[g.hidden, product(&[attention_heads, attention_width])?],
-                )?,
-            }))
-        } else {
-            MixerWeights::Recurrent(Box::new(RecurrentWeights {
-                query_key_value: weight(
-                    "attn_qkv.weight",
-                    &[
-                        recurrent
-                            .channels()
-                            .map_err(|error| invalid(error.to_string()))?,
-                        g.hidden,
-                    ],
-                )?,
-                gate: weight("attn_gate.weight", &[recurrent_inner, g.hidden])?,
-                alpha: weight("ssm_alpha.weight", &[recurrent_value_heads, g.hidden])?,
-                beta: weight("ssm_beta.weight", &[recurrent_value_heads, g.hidden])?,
-                convolution: weight(
-                    "ssm_conv1d.weight",
-                    &[
-                        recurrent
-                            .channels()
-                            .map_err(|error| invalid(error.to_string()))?,
-                        recurrent.convolution_width,
-                    ],
-                )?,
-                decay: weight("ssm_a", &[recurrent_value_heads])?,
-                time_bias: weight("ssm_dt.bias", &[recurrent_value_heads])?,
-                norm: weight("ssm_norm.weight", &[recurrent_width])?,
-                output: weight("ssm_out.weight", &[g.hidden, recurrent_inner])?,
-            }))
+    let rms = |weight: WeightDescriptor| RmsNorm { weight, epsilon };
+    // One attention sublayer and one feed-forward sublayer, as every target
+    // layer and every MTP block has them.
+    let block = |tensor: &mut dyn FnMut(&str, &[u64]) -> Result<WeightDescriptor, Error>,
+                 p: &str,
+                 kind: LocalMixerKind,
+                 intermediate: u64|
+     -> Result<Block, Error> {
+            let mut weight = |name: &str, shape: &[u64]| tensor(&format!("{p}{name}"), shape);
+            let mixer = match kind {
+                LocalMixerKind::Attention => Operator::Attention(Box::new(Attention {
+                    heads: attention_heads,
+                    kv_heads,
+                    width: attention_width,
+                    query: weight(
+                        "attn_q.weight",
+                        &[product(&[2, attention_heads, attention_width])?, hidden],
+                    )?,
+                    gate: AttentionGate::Interleaved {
+                        function: GateFunction::Sigmoid,
+                    },
+                    query_norm: HeadNorm::Rms(rms(weight(
+                        "attn_q_norm.weight",
+                        &[attention_width],
+                    )?)),
+                    key_value: KeyValue::Owned {
+                        key: weight(
+                            "attn_k.weight",
+                            &[product(&[kv_heads, attention_width])?, hidden],
+                        )?,
+                        value: ValueSource::Projected(weight(
+                            "attn_v.weight",
+                            &[product(&[kv_heads, attention_width])?, hidden],
+                        )?),
+                        key_norm: HeadNorm::Rms(rms(weight(
+                            "attn_k_norm.weight",
+                            &[attention_width],
+                        )?)),
+                        value_norm: ValueNorm::None,
+                        domain: HistoryDomain::Token,
+                    },
+                    rotary: rotary.clone(),
+                    scale: 1.0 / (attention_width as f64).sqrt(),
+                    reads: HistoryReads::Visible,
+                    media_rows: MediaRowAttention::Causal,
+                    output: weight(
+                        "attn_output.weight",
+                        &[hidden, product(&[attention_heads, attention_width])?],
+                    )?,
+                })),
+                LocalMixerKind::Recurrent => Operator::GatedDelta(Box::new(GatedDelta {
+                    convolution_width,
+                    key_heads: recurrent_key_heads,
+                    value_heads: recurrent_value_heads,
+                    width: recurrent_width,
+                    head_mapping: RecurrentHeadMapping::Tiled,
+                    query_key_value: weight("attn_qkv.weight", &[recurrent_channels, hidden])?,
+                    gate: weight("attn_gate.weight", &[recurrent_inner, hidden])?,
+                    alpha: weight("ssm_alpha.weight", &[recurrent_value_heads, hidden])?,
+                    beta: weight("ssm_beta.weight", &[recurrent_value_heads, hidden])?,
+                    convolution: weight(
+                        "ssm_conv1d.weight",
+                        &[recurrent_channels, convolution_width],
+                    )?,
+                    decay: weight("ssm_a", &[recurrent_value_heads])?,
+                    time_bias: weight("ssm_dt.bias", &[recurrent_value_heads])?,
+                    norm: rms(weight("ssm_norm.weight", &[recurrent_width])?),
+                    output: weight("ssm_out.weight", &[hidden, recurrent_inner])?,
+                })),
+            };
+            let feed_forward = if let Some(e) = &experts {
+                Operator::RoutedFfn(Box::new(RoutedFfn {
+                    experts: e.count,
+                    selected: e.selected,
+                    intermediate: e.intermediate,
+                    router: Router {
+                        weight: weight("ffn_gate_inp.weight", &[e.count, hidden])?,
+                        input: RouterInput::Operator,
+                        score: ScoreFunction::Softmax,
+                        selection: ExpertSelection::TopK { bias: None },
+                        normalization: RouteNormalization::Sum,
+                        scale: 1.0,
+                    },
+                    expert_up: FeedForwardUp::Gated {
+                        activation: ActivationFunction::Silu,
+                        gate: weight("ffn_gate_exps.weight", &[e.count, e.intermediate, hidden])?,
+                        up: weight("ffn_up_exps.weight", &[e.count, e.intermediate, hidden])?,
+                    },
+                    expert_down: weight(
+                        "ffn_down_exps.weight",
+                        &[e.count, hidden, e.intermediate],
+                    )?,
+                    expert_scale: None,
+                    latent: None,
+                    shared: Some(SharedExpert {
+                        intermediate: e.shared_intermediate,
+                        up: FeedForwardUp::Gated {
+                            activation: ActivationFunction::Silu,
+                            gate: weight(
+                                "ffn_gate_shexp.weight",
+                                &[e.shared_intermediate, hidden],
+                            )?,
+                            up: weight("ffn_up_shexp.weight", &[e.shared_intermediate, hidden])?,
+                        },
+                        down: weight("ffn_down_shexp.weight", &[hidden, e.shared_intermediate])?,
+                        gate: SharedExpertGate::Sigmoid(weight(
+                            "ffn_gate_inp_shexp.weight",
+                            &[hidden],
+                        )?),
+                    }),
+                }))
+            } else {
+                Operator::DenseFfn(Box::new(DenseFfn {
+                    intermediate,
+                    up: FeedForwardUp::Gated {
+                        activation: ActivationFunction::Silu,
+                        gate: weight("ffn_gate.weight", &[intermediate, hidden])?,
+                        up: weight("ffn_up.weight", &[intermediate, hidden])?,
+                    },
+                    down: weight("ffn_down.weight", &[hidden, intermediate])?,
+                }))
+            };
+            Ok(Block {
+                sublayers: vec![
+                    Sublayer {
+                        input: InputNorm::Rms(rms(weight("attn_norm.weight", &[hidden])?)),
+                        op: mixer,
+                        output: OutputForm::Residual,
+                    },
+                    Sublayer {
+                        input: InputNorm::Rms(rms(weight(
+                            "post_attention_norm.weight",
+                            &[hidden],
+                        )?)),
+                        op: feed_forward,
+                        output: OutputForm::Residual,
+                    },
+                ],
+            })
         };
-        let feedforward = if let Some(e) = &experts {
-            FeedForwardWeights::Routed(Box::new(RoutedFeedForwardWeights {
-                router: weight("ffn_gate_inp.weight", &[e.count, g.hidden])?,
-                shared_router: weight("ffn_gate_inp_shexp.weight", &[g.hidden])?,
-                expert_gate: weight("ffn_gate_exps.weight", &[e.count, e.intermediate, g.hidden])?,
-                expert_up: weight("ffn_up_exps.weight", &[e.count, e.intermediate, g.hidden])?,
-                expert_down: weight("ffn_down_exps.weight", &[e.count, g.hidden, e.intermediate])?,
-                shared_gate: weight("ffn_gate_shexp.weight", &[e.shared_intermediate, g.hidden])?,
-                shared_up: weight("ffn_up_shexp.weight", &[e.shared_intermediate, g.hidden])?,
-                shared_down: weight("ffn_down_shexp.weight", &[g.hidden, e.shared_intermediate])?,
-            }))
-        } else {
-            FeedForwardWeights::Dense(Box::new(DenseFeedForwardWeights {
-                gate: weight("ffn_gate.weight", &[intermediate, g.hidden])?,
-                up: weight("ffn_up.weight", &[intermediate, g.hidden])?,
-                down: weight("ffn_down.weight", &[g.hidden, intermediate])?,
-            }))
-        };
-        blocks.push(BlockWeights {
-            input_norm: weight("attn_norm.weight", &[g.hidden])?,
-            mixer,
-            feedforward_norm: weight("post_attention_norm.weight", &[g.hidden])?,
-            feedforward,
-        });
-    }
+    let blocks = layers
+        .iter()
+        .enumerate()
+        .map(|(i, kind)| block(&mut tensor, &format!("blk.{i}."), *kind, intermediate))
+        .collect::<Result<Vec<_>, _>>()?;
     let head = if speculative == 0 {
         None
     } else {
-        let head_intermediate = if experts.is_none() {
-            Some(m.integer("feed_forward_length")?)
-        } else {
-            None
+        // A routed head's experts carry their own widths; only a dense head
+        // reads the dense intermediate width.
+        let head_intermediate = match &experts {
+            Some(experts) => experts.intermediate,
+            None => m.integer("feed_forward_length")?,
         };
         let mut head_blocks = Vec::with_capacity(speculative as usize);
         for offset in 0..speculative {
-            let index = layer_count + offset;
-            let p = format!("blk.{index}.");
+            let p = format!("blk.{}.", layer_count + offset);
+            let block = block(&mut tensor, &p, LocalMixerKind::Attention, head_intermediate)?;
             let mut weight = |name: &str, shape: &[u64]| tensor(&format!("{p}{name}"), shape);
             head_blocks.push(HeadBlock {
-                embedding_norm: weight("nextn.enorm.weight", &[g.hidden])?,
-                hidden_norm: weight("nextn.hnorm.weight", &[g.hidden])?,
-                combine: weight(
-                    "nextn.eh_proj.weight",
-                    &[g.hidden, product(&[2, g.hidden])?],
-                )?,
-                input_norm: weight("attn_norm.weight", &[g.hidden])?,
-                attention: AttentionWeights {
-                    query_gate: weight(
-                        "attn_q.weight",
-                        &[product(&[2, attention_heads, attention_width])?, g.hidden],
-                    )?,
-                    key: weight(
-                        "attn_k.weight",
-                        &[product(&[kv_heads, attention_width])?, g.hidden],
-                    )?,
-                    value: weight(
-                        "attn_v.weight",
-                        &[product(&[kv_heads, attention_width])?, g.hidden],
-                    )?,
-                    query_norm: weight("attn_q_norm.weight", &[attention_width])?,
-                    key_norm: weight("attn_k_norm.weight", &[attention_width])?,
-                    output: weight(
-                        "attn_output.weight",
-                        &[g.hidden, product(&[attention_heads, attention_width])?],
-                    )?,
-                },
-                feedforward_norm: weight("post_attention_norm.weight", &[g.hidden])?,
-                feedforward_geometry: if let Some(shape) = &experts {
-                    FeedForwardGeometry::Routed(shape.clone())
-                } else {
-                    FeedForwardGeometry::Dense {
-                        intermediate: head_intermediate.unwrap(),
-                    }
-                },
-                feedforward: if let Some(shape) = &experts {
-                    FeedForwardWeights::Routed(Box::new(RoutedFeedForwardWeights {
-                        router: weight("ffn_gate_inp.weight", &[shape.count, g.hidden])?,
-                        shared_router: weight("ffn_gate_inp_shexp.weight", &[g.hidden])?,
-                        expert_gate: weight(
-                            "ffn_gate_exps.weight",
-                            &[shape.count, shape.intermediate, g.hidden],
-                        )?,
-                        expert_up: weight(
-                            "ffn_up_exps.weight",
-                            &[shape.count, shape.intermediate, g.hidden],
-                        )?,
-                        expert_down: weight(
-                            "ffn_down_exps.weight",
-                            &[shape.count, g.hidden, shape.intermediate],
-                        )?,
-                        shared_gate: weight(
-                            "ffn_gate_shexp.weight",
-                            &[shape.shared_intermediate, g.hidden],
-                        )?,
-                        shared_up: weight(
-                            "ffn_up_shexp.weight",
-                            &[shape.shared_intermediate, g.hidden],
-                        )?,
-                        shared_down: weight(
-                            "ffn_down_shexp.weight",
-                            &[g.hidden, shape.shared_intermediate],
-                        )?,
-                    }))
-                } else {
-                    let intermediate = head_intermediate.unwrap();
-                    FeedForwardWeights::Dense(Box::new(DenseFeedForwardWeights {
-                        gate: weight("ffn_gate.weight", &[intermediate, g.hidden])?,
-                        up: weight("ffn_up.weight", &[intermediate, g.hidden])?,
-                        down: weight("ffn_down.weight", &[g.hidden, intermediate])?,
-                    }))
-                },
-                output_norm: weight("nextn.shared_head_norm.weight", &[g.hidden])?,
+                embedding_norm: rms(weight("nextn.enorm.weight", &[hidden])?),
+                hidden_norm: rms(weight("nextn.hnorm.weight", &[hidden])?),
+                combine: weight("nextn.eh_proj.weight", &[hidden, product(&[2, hidden])?])?,
+                block,
+                output_norm: ExitNorm::Rms(rms(weight(
+                    "nextn.shared_head_norm.weight",
+                    &[hidden],
+                )?)),
             });
         }
-        Some(HeadWeights {
+        Some(Head {
             blocks: head_blocks,
         })
     };
-    for t in &directory.tensors {
-        if consumed.contains(&t.name) {
-            continue;
-        }
-        return Err(invalid(format!(
-            "Qwen artifact contains unbound weight role {:?}",
-            t.name
-        )));
-    }
+    tensors.finish()?;
     if let Some(projector) = projector {
         // A derived target (a quantization, a fine-tune) names its base model
         // exactly as the projector does; an original model is its own base.
@@ -750,13 +755,29 @@ pub fn inspect_components(
             text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
             coordinate_axes: 3,
         },
-        geometry: g,
-        embedding,
-        output_norm,
-        output,
-        blocks,
+        decoder: Decoder {
+            activation_dtype: ActivationDType::BF16,
+            hidden,
+            vocabulary,
+            context_limit,
+            residual: ResidualForm::Single,
+            entry: EntryForm {
+                embedding,
+                scale: EmbeddingScale::Unit,
+                norm: None,
+                per_layer: None,
+                hash_routing: None,
+            },
+            blocks,
+            exit: ExitForm {
+                norm: ExitNorm::Rms(rms(output_norm)),
+                output,
+                softcap: None,
+            },
+        },
         head,
         vision,
+        draft: None,
     };
     definition
         .validate()

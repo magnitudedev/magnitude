@@ -1,4 +1,5 @@
 mod attestation;
+mod draft;
 mod glue;
 mod head;
 mod import;
@@ -12,9 +13,11 @@ mod vision;
 pub(crate) use attestation::AttestedImport;
 pub use attestation::AttestedPrograms;
 pub(crate) use attestation::{
-    AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedMixer, AttestedState,
-    AttestedTarget, AttestedTargetBlock, AttestedVision,
+    AttestedDraft, AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedMixer,
+    AttestedState, AttestedTarget, AttestedTargetBlock, AttestedVision, OutputScales,
 };
+use draft::DraftKernels;
+pub(crate) use draft::{DraftBlockKernels, MarkovKernels};
 use glue::GlueKernels;
 pub(crate) use head::draft_vocabulary;
 use head::HeadKernels;
@@ -23,8 +26,11 @@ use preparation::NativePreparationCache;
 use qualification::QualificationView;
 use target::TargetKernels;
 pub(crate) use target::{
-    AttentionHistoryKernels, AttentionKernels, DenseKernels, ReadoutKernels, RecurrentKernels,
-    RoutedKernels,
+    AttentionHistoryKernels, AttentionKernels, DenseKernels, PostNormKernels, ReadoutKernels,
+    DenseExpansionKernel, ExpertKernels, GeneralRoutedKernels, RecurrentKernels, RoutedKernels,
+    ParallelKernels, PerLayerEntryKernels, PerLayerKernels, ShortConvKernels, StateSpaceKernels,
+    SublayerOutput,
+    TableConversion, TapKernels,
 };
 #[cfg(feature = "pinned-tuning")]
 pub use tuning::pinned as pinned_tuning;
@@ -35,20 +41,25 @@ pub use tuning::{
     TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ZeroTuningWeights,
     ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
 };
-use vision::VisionKernels;
+pub(crate) use vision::VisionKernels;
 
 use crate::{
-    AttentionShape, ExecutionPath, FeedForwardProgramSlot, ImportProgramSlot, MixerProgramSlot,
-    ProgramPlan, RecurrentBinding, RoutedBinding,
+    AttentionBinding, ExecutionPath, FeedForwardProgramSlot, ImportProgramSlot, MixerProgramSlot,
+    ProgramPlan, RecurrentBinding, RoutedBinding, SublayerTail, VisionEntry,
 };
 use magnitude_kernels::{
     attention_output, conditioning_overlay, copy_rows, dense_expand, dense_output, draft_rows,
-    embedding_rows, gated_attention_decode, gated_attention_decode_k8v4, gated_attention_prefill,
-    gated_attention_prefill_k8v4, gated_attention_project, gated_delta_chunk, gated_delta_output,
-    gated_delta_project, gated_delta_step, head_logits_rows, import_dense, qwen_vision_block,
-    qwen_vision_merger, qwen_vision_stem, readout_features_rows, readout_head_rows,
-    readout_selected_rows, repack_weight, routed_combine, routed_expand, routed_experts,
-    routed_group, routed_output, routed_route, sample_rows, shape_rows,
+    embedding_rows, attention_decode, attention_decode_k8v4, attention_prefill, moe_tail,
+    per_layer_gate, per_layer_inputs,
+    attention_prefill_k8v4, attention_project, gated_delta_chunk, gated_delta_output,
+    gated_delta_project, gated_delta_step, head_logits_rows, import_dense, post_norm_residual,
+    project_rows, readout_features_rows, readout_head_rows, readout_selected_rows, repack_weight,
+    routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
+    sample_rows, shape_rows, short_conv_project, short_conv_rows, state_space_chunk,
+    state_space_gate, state_space_step,
+    dense_up, routed_down, routed_experts_up, routed_gate_up, routed_scatter, routed_select,
+    routed_up, vision_attention, vision_clamp, vision_linear, vision_norm, vision_patch_stem, vision_pool,
+    vision_position,
 };
 use seismic::{BackendName, DType, Device, Element, NativeKernel, Tensor};
 use std::{collections::HashMap, fmt};
@@ -133,8 +144,11 @@ pub enum QualificationCase {
     TargetEmbedding,
     TargetAttention,
     TargetRecurrent,
+    TargetStateSpace,
+    TargetShortConv,
     TargetDense,
     TargetRouted,
+    TargetGeneralRouted,
     Readout,
     Sampling,
     Head,

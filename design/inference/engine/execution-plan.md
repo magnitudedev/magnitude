@@ -20,14 +20,15 @@ bank bytes from this same model load plan and state layout, for a one-conversati
 lesser of supported context and 100,000 tokens. It does not read weight payloads or open a device.
 The recurrent fit charge includes the bank slabs needed for the accepted bank, one in-flight
 successor, the lookahead successor when lookahead is enabled, and the pristine seed. State startup
-includes one history slab and the zero-seed bank slab per store; later slabs are heap claims.
+includes one history slab per history domain and the zero-seed bank slab per store; later slabs
+are heap claims.
 Those exact model terms alone do not establish fit: prepared graph resources, workspace, startup
 transients and the device's stable fit capacity are added as upper bounds derived from the same
 header-only program plan, so a fit result never undercounts. Assessment results are complete:
 Fits, DoesNotFit or Incompatible; there is no unconfirmed fit.
-Speed assessment uses a fixed measurement basis per device: every operation class the execution
-implementation can run, timed once with shipped default configurations on synthetic
-device-resident inputs, keeping every sample. Each model's decode speed at each requested depth is
+Speed assessment uses a measurement basis per device: every operation class the known targets'
+plans need, timed once with shipped default configurations on synthetic device-resident inputs,
+keeping every sample. Each model's decode speed at each requested depth is
 computed analytically from its header-derived launch and byte demand. The basis is also the
 qualified support set: a model needing a class the basis could not form or measure is
 Incompatible. A failed measurement supplies no prediction; real-model validation cannot be used to
@@ -163,8 +164,8 @@ request.
 
 The target and head workflows cover the admitted row and history-span ladders. Row classes are
 powers of two up to 32 rows (decode, verification, concurrency) and multiples of 64 above, up to
-512; span classes are powers of two through the per-model bound
-`ceil(context limit / rows per slab) + 16`. Blocks whose sealed workflow would be identical apart from
+512; span classes are powers of two through the per-model bound, the largest history domain's
+`ceil(row limit / rows per slab) + 16`. Blocks whose sealed workflow would be identical apart from
 their layer (same geometry, weight representations and shapes, and state layout) share one sealed
 plan per class and bind their own weights to it; the composition root reports the class count,
 sealed graph count and sealing time. Decoder numerical
@@ -172,11 +173,24 @@ pipelines share projection results through checked Seismic result edges. Dense f
 its activation product; attention owns the normed Q/K/V projection and one fused entry that prepares
 queries and keys (norms, rotary) in place, accumulates the stable softmax and gates the values
 (decode row classes use the partitioned decode entry, larger classes the streaming prefill entry);
-routed feed-forward owns normalized input, routes and scores (ranked once by probability), and the
+a state-space (Mamba-2) mixer owns its normed projected row (gate, convolved channels and time
+steps together) and runs the checked step entry for decode row classes or the chunked entry
+above them over its bank's window and state slabs, then its gated group norm and output
+projection; a gated short-convolution (LFM2) mixer owns its normed `B⊙X` and `C` rows in F32,
+then one entry for every row class convolves them over its bank's F32 window (its only bank
+component, whose rows are also its tape), gates, and publishes the successor window, then the
+output projection; a block may hold a lone mixer with no feed-forward, and its output is the mixer's
+residual row; routed feed-forward owns normalized input, routes and scores (ranked once by probability), and the
 shared coefficient, then either the per-choice expert and shared products (row classes within the
 GEMV bound) or, for larger classes, grouped tables and grouped expert outputs: choices grouped by
 expert into tile-aligned blocks whose capacity derives from the class, the selected-expert count and
-the tile rows, so no table is uploaded per step and no host readback sizes a launch. Seismic prepares an
+the tile rows, so no table is uploaded per step and no host readback sizes a launch. The general
+routed form (every family without that gated shared expert) owns the normalized input, routes and
+weights in one selection entry (softmax, sigmoid or square-root softplus scores; a selection-only
+bias; slot-order renormalization; the post-scale and per-expert output scales folded into the
+weights), and adds the routed sum to a base row that already holds the residual and any shared
+expert's output. A zero base serves a routed sum that is normalized alone or projected out of a
+latent width. Its grouped capacity counts at most min(E, M·K) receiving experts. Seismic prepares an
 exact workflow for the selected physical batch class, so a small decode batch does not execute the
 maximum class width. Draft head blocks use their declared dense or routed feed-forward geometry
 and the same routed numerical composition as target blocks. Header assessment includes the head's
@@ -200,6 +214,19 @@ sampling applies the same mask to unshaped rows. The projected-row
 capacity follows the selected per-step token and memory allowance; prefill row capacity does
 not imply the same number of logits rows. Features, logits and selection stay inside one checked
 Seismic workflow with one owned output lifetime.
+A separate draft (DFlash, DSpark) conditions on target taps instead of the final features. A
+tapped block's workflow rounds the residual entering it, entering its feed-forward, or leaving it
+(the exit tap is the last block's output) into that tap's column block of a draft-input buffer
+the bound target workflows own (charged with their bound constants); the
+readout's demanded feature rows are then the draft's fusion (one projection of the concatenated
+taps) rather than the normalized final rows. The draft runs as the head lane's drafter, one sealed
+workflow per class and transaction: each draft layer's attention appends the entry rows' context
+keys and values (the fusion norm as its input norm, each row attending only itself); when
+drafting, one non-causal pass over each slot's block `[anchor, mask, …]` reads its domain's
+accepted and injected rows plus the whole slot block, and the target's vocabulary projection and
+selection read the proposing rows. DSpark then chains its slots through the Markov bias and
+declines a proposal below its confidence threshold. The block always has the draft's trained width;
+a load's proposal width selects its leading proposing rows. Block rows append nowhere.
 Conditioning overlays are Seismic workflows with only external ports, sealed once per overlaid row
 count and never per request. A step with conditioning queues, after its embedding entry, one
 overlay run per contiguous range, binding the source span and the matching row view of the
@@ -208,15 +235,34 @@ result storage; the embedding result remains under its original output lease.
 The fused attention entry appends each row's key and value at its destination while other rows read
 history. History and recurrent state ports bind slab address tables, with each slab retained and
 ordered as a used resource until submitted work completes. The entry resolves one slab base per
-visible span, one per destination row, or one per recurrent bank; its inner loops retain their
-direct component layout. This is ordered by construction: destinations are freshly reserved rows,
+slab-contained part of a visible span (a span may cross slab edges), one per destination row, or
+one per recurrent bank; its inner loops retain their direct component layout. This is ordered by construction: destinations are freshly reserved rows,
 so no row of the batch sees one through its visible spans, and fresh rows are read from the batch's
 own projections. The fixed device measurement basis uses the same slab binding as served work.
+An attention sublayer is one segmented query | gate | key | value projection, the fused entry and
+the output projection, whatever its form: each optional part of the operator (interleaved or
+separate gate, own keys and values, head norms, value norm, rotated pairs) is a static axis of
+extent 0 or 1, so a form is a kernel specialization, never a different graph. An absent weight
+segment binds zero rows of the query weight and an absent head norm zero rows of a unit norm row;
+the rotary table (axis, frequency and amplitude per pair), the unit row, the score scale and the
+gate function come from the operator. Attention decode measurements are keyed by head geometry;
+the per-row work a form adds is small beside the history the entry streams. Wide heads (up to 512
+columns, query groups up to 16) stay within each backend's workgroup memory (the 32 KiB floor on
+Metal and Vulkan, 32-lane subgroups): decode splits a kv head's query group into register-resident slices that each
+stream the history once, and prefill scores whole heads but accumulates outputs one 256-column
+window per pass, so a wide form is a specialization of the same entries. Few kv heads over long
+history are parallelized across the history, never across a different graph: decode splits a row's
+keys into tuned partitions, and prefill may split a tile's history keys across tuned partition
+groups whose partial softmax states merge in fixed order in a second launch.
 
 Vision patch capacity is the admitted merged output row limit times the merge area; input validation
 rejects a larger aggregate before reserving a vision slot. Vision attention sees every physical
-patch row, so its prepared workflow uses the exact admitted patch-row count; padding with additional
-patches would alter real outputs. Seismic's recurrent workflow derives
+patch row of its image (or of its row's window, a contiguous tower-row range the family supplies),
+so its prepared workflow uses the exact admitted patch-row count; padding with additional patches
+would alter real outputs. The tower is one program of vision operators the projector description
+composes (patch stem, row norms, projections with their epilogues, rotary attention, cell pooling
+or concatenation); a form a backend's operators do not run is refused when the program is
+prepared, never approximated. Seismic's recurrent workflow derives
 the exact window and delta state contracts from its checked entries. Each recurrent block binds
 the store's bank slabs and, per run, bank tables for its exact active request slots: each slot's
 state entry reads the slot's accepted bank and writes only its successor bank, in place, within

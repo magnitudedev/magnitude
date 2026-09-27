@@ -9,13 +9,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use magnitude_engine::assessment::{
-    AssessmentSetup, ModelAssessment as EngineAssessment, ModelCapabilities as EngineCapabilities,
-    ModelPackagePaths, PreparedModelAssessment, finish_model_assessment, prepare_model_assessment,
+    AssessmentSetup, ModelAssessment as EngineAssessment, ModelAssessmentError,
+    ModelCapabilities as EngineCapabilities, ModelPackagePaths, PreparedModelAssessment,
+    finish_model_assessment, prepare_model_assessment,
 };
 use magnitude_engine::error::UnsupportedModel;
 use magnitude_executor::assessment::{
-    DomainFit, ExecutionAssessment, IncompatibleReason, MeasurementKey,
-    PerformanceConfidence as EngineConfidence, PerformanceEstimate,
+    DomainFit, ExecutionAssessment, IncompatibleReason, PerformanceConfidence as EngineConfidence,
+    PerformanceEstimate,
 };
 use magnitude_service_contracts::models::{
     AssessmentEnvironmentId, InstalledModelPackages as _, MemoryAssessment, ModelAssessment,
@@ -55,6 +56,20 @@ pub struct AssessmentWork {
 }
 
 pub type PreparationResult = Result<Arc<PreparedModelAssessment>, ModelFailure>;
+
+fn preparation_task_failure(error: impl std::fmt::Display) -> ModelFailure {
+    inventory_model_failure(InventoryError::Internal(format!(
+        "model preparation task failed: {error}"
+    )))
+}
+
+fn preparation_failure(error: ModelAssessmentError) -> ModelFailure {
+    inventory_model_failure(InventoryError::ModelOperation {
+        code: "assessment_failed".to_owned(),
+        message: error.to_string(),
+        retryable: true,
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AssessmentWorkKey(pub String);
@@ -111,6 +126,7 @@ impl ModelAssessor {
         AssessmentEnvironment::select(Arc::clone(&self.catalog)).await
     }
 
+    /// The environment of `setup` with the device's measured basis.
     pub async fn establish_with_setup(
         &self,
         setup: Arc<AssessmentSetup>,
@@ -145,6 +161,7 @@ impl ModelAssessor {
         })
     }
 
+    /// Resolve and prepare one bundle from its headers, independent of the measurement basis.
     pub async fn prepare_bundle(
         &self,
         configuration: ModelServingConfiguration,
@@ -157,22 +174,14 @@ impl ModelAssessor {
             .map_err(assessment_drop_failure)?;
         let package = engine_material(&resolved).map_err(assessment_drop_failure)?;
         let prepared = crate::spawn_blocking_traced(move || {
+            // The resolved material (a catalog bundle's materialized headers) lives until
+            // preparation has read it.
             let _material = resolved;
             prepare_model_assessment(&package, &setup)
         })
         .await
-        .map_err(|error| {
-            inventory_model_failure(InventoryError::Internal(format!(
-                "model preparation task failed: {error}"
-            )))
-        })?
-        .map_err(|error| {
-            inventory_model_failure(InventoryError::ModelOperation {
-                code: "assessment_failed".to_owned(),
-                message: error.to_string(),
-                retryable: true,
-            })
-        })?;
+        .map_err(preparation_task_failure)?
+        .map_err(preparation_failure)?;
         Ok(Arc::new(prepared))
     }
 
@@ -419,8 +428,8 @@ fn model_assessment(
                         classes
                             .iter()
                             .map(|(key, reason)| match reason {
-                                Some(reason) => format!("{}: {reason}", measurement_key(key)),
-                                None => measurement_key(key),
+                                Some(reason) => format!("{key}: {reason}"),
+                                None => key.to_string(),
                             })
                             .collect::<Vec<_>>()
                             .join("; ")
@@ -445,23 +454,6 @@ fn model_assessment(
         template_fingerprint: facts.template_fingerprint,
         profile: assessment,
     })
-}
-
-fn measurement_key(key: &MeasurementKey) -> String {
-    format!(
-        "{}[{}]({})",
-        key.class.name(),
-        key.bindings
-            .iter()
-            .map(|element| element.name())
-            .collect::<Vec<_>>()
-            .join(","),
-        key.geometry
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
 }
 
 /// A package the engine cannot interpret has no engine-derived capabilities or template.

@@ -5,7 +5,7 @@
 //! policy. Everything downstream consumes the definition and the adapter
 //! trait only, so adding a family changes nothing above this contract.
 
-use crate::{ModelDefinition, ModelInputAdapter};
+use crate::{ModelDefinition, ModelInputAdapter, SublayerIndex, TapPoint};
 use magnitude_artifacts::{gguf::Directory, PackageIdentity, TokenId};
 use std::{error, fmt};
 
@@ -57,4 +57,28 @@ pub trait ModelFamily: Send + Sync {
     /// The text one image renders as in the family's chat template, when the
     /// definition has a vision component.
     fn media_placeholder(&self, definition: &ModelDefinition) -> Option<&'static str>;
+
+    /// The target residual a draft component taps at the artifact's layer
+    /// `layer` (a draft names target layers by their GGUF index): the input
+    /// of that layer. By default a GGUF layer is one decoder block, and
+    /// `layer == blocks` is the final pre-norm residual; a family whose
+    /// layers are not blocks overrides this.
+    fn layer_entry(
+        &self,
+        definition: &ModelDefinition,
+        layer: u64,
+    ) -> Result<TapPoint, FamilyError> {
+        let blocks = definition.decoder.blocks.len() as u64;
+        match layer.cmp(&blocks) {
+            std::cmp::Ordering::Less => Ok(TapPoint::Sublayer(SublayerIndex {
+                block: u32::try_from(layer)
+                    .map_err(|_| FamilyError(format!("target layer {layer} exceeds u32")))?,
+                sublayer: 0,
+            })),
+            std::cmp::Ordering::Equal => Ok(TapPoint::Exit),
+            std::cmp::Ordering::Greater => Err(FamilyError(format!(
+                "target layer {layer} is beyond the target's {blocks} layers"
+            ))),
+        }
+    }
 }

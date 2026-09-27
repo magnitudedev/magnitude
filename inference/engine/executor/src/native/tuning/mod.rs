@@ -106,11 +106,16 @@ macro_rules! generated_entry {
 
 pub(crate) mod attention;
 pub(crate) mod cases;
+pub(crate) mod general_routed;
 #[cfg(feature = "pinned-tuning")]
 pub mod pinned;
+pub(crate) mod per_layer;
+pub(crate) mod post_norm;
 pub(crate) mod readout;
 pub(crate) mod recurrent;
 pub(crate) mod routed;
+pub(crate) mod short_conv;
+pub(crate) mod state_space;
 #[cfg(feature = "tuning-survey")]
 pub mod survey;
 mod weights;
@@ -120,8 +125,8 @@ pub use weights::{TuningWeightSource, ZeroTuningWeights};
 
 use super::CatalogFailure;
 use crate::kernel_cache::{KernelCache, TuningCacheKey};
-use magnitude_batching::{Demand, PackedRowTables, Row, Slot};
-use magnitude_family_contracts::{ModelDefinition, WeightKind, WeightScope};
+use magnitude_batching::{Demand, PackedRowTables, Row, RowHistory, Slot};
+use magnitude_family_contracts::{ModelDefinition, Operator, WeightKind, WeightScope};
 use seismic::{
     Configuration, DType, Device, Element, NativeImplementation, NativeKernel,
     NativeSpecialization, ParameterValues, ScreeningPoint, SearchPlan, SearchSettings, SearchStop,
@@ -589,6 +594,58 @@ pub(crate) struct TuningInputs<'w, 'a> {
 }
 
 impl TuningInputs<'_, '_> {
+    /// The operator of the sublayer whose weights `scope` names: the first
+    /// scope of a case's layers (every layer of one binding shares its
+    /// statics).
+    pub fn operator(&self, scopes: &[WeightScope]) -> Result<&Operator, String> {
+        let scope = *scopes
+            .first()
+            .ok_or("a tuning case needs at least one layer")?;
+        // A branch's operator is its own within its sublayer's branches.
+        if let WeightScope::TargetBranch { sublayer, branch } = scope {
+            let Operator::Parallel(branches) =
+                self.operator(&[WeightScope::TargetSublayer(sublayer)])?
+            else {
+                return Err(format!("{scope:?} names no parallel sublayer"));
+            };
+            return branches
+                .get(branch as usize)
+                .map(|value| &value.op)
+                .ok_or_else(|| format!("{scope:?} names no branch of the model"));
+        }
+        let (blocks, index) = match scope {
+            WeightScope::TargetSublayer(index) => (
+                self.definition
+                    .decoder
+                    .blocks
+                    .get(index.block as usize)
+                    .map(|block| &block.sublayers),
+                index,
+            ),
+            WeightScope::HeadSublayer(index) => (
+                self.definition
+                    .head
+                    .as_ref()
+                    .and_then(|head| head.blocks.get(index.block as usize))
+                    .map(|block| &block.block.sublayers),
+                index,
+            ),
+            WeightScope::DraftSublayer(index) => (
+                self.definition
+                    .draft
+                    .as_ref()
+                    .and_then(|draft| draft.blocks.get(index.block as usize))
+                    .map(|block| &block.sublayers),
+                index,
+            ),
+            other => return Err(format!("{other:?} names no sublayer")),
+        };
+        blocks
+            .and_then(|sublayers| sublayers.get(index.sublayer as usize))
+            .map(|sublayer| &sublayer.op)
+            .ok_or_else(|| format!("{scope:?} names no sublayer of the model"))
+    }
+
     /// The layers of `point`'s argument sets: up to [`ROTATION_LAYERS`] of
     /// `scopes`, spread over the model's depth, for decode rows (up to
     /// [`STREAMING_ROWS`]); the first layer alone for prefill rows.
@@ -805,12 +862,17 @@ impl TuningInputs<'_, '_> {
                             Row {
                                 token: (offset as i32 * 7919 + slot as i32) % 1024,
                                 coordinates: [position, position, position, 0],
-                                visible: if context == 0 {
-                                    Vec::new()
-                                } else {
-                                    vec![[base, base + context]]
-                                },
-                                destination,
+                                // One Token history domain.
+                                histories: vec![RowHistory {
+                                    visible: if context == 0 {
+                                        Vec::new()
+                                    } else {
+                                        vec![[base, base + context]]
+                                    },
+                                    fresh_start: 0,
+                                    bidirectional_end: None,
+                                    destination,
+                                }],
                                 demand: Demand::NONE,
                                 select: None,
                             }
@@ -823,7 +885,7 @@ impl TuningInputs<'_, '_> {
                 }
             })
             .collect::<Vec<_>>();
-        let vocabulary = usize::try_from(self.definition.geometry.vocabulary)
+        let vocabulary = usize::try_from(self.definition.decoder.vocabulary)
             .map_err(|_| "vocabulary exceeds usize")?;
         PackedRowTables::pack(&packed, vocabulary, rows).map_err(|error| error.to_string())
     }

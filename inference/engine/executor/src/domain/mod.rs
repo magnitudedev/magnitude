@@ -3,7 +3,7 @@
 //! proposal until its owner supplies an exact reconciliation decision.
 
 use crate::batching::{
-    Draw, DrawKind, Row, Select, Shaping as RowShaping, Slot, ValidatedTargetBatch,
+    Draw, DrawKind, Row, RowHistory, Select, Shaping as RowShaping, Slot, ValidatedTargetBatch,
 };
 use crate::memory::{HoldingClass, HoldingId, MemoryHeap};
 use crate::platform::{DomainReading, DomainRole};
@@ -23,6 +23,7 @@ use magnitude_state::{
     OwnedStateAdvance, SequenceState, StateCheckpoint, StateStore, TentativeAdvance,
 };
 use seismic::Tensor;
+mod draft;
 mod family;
 mod features;
 mod head;
@@ -45,6 +46,7 @@ use in_flight::decode_selected;
 pub use in_flight::{HeadFlight, TargetFlight, VisionFlight};
 pub use ownership::{OpenRequirements, OpenReservation};
 pub use state::MemoryChargeReconciliation;
+pub(crate) use target::accepted_history;
 pub use target::TargetHostTiming;
 
 use std::{
@@ -384,8 +386,9 @@ impl ExecutorDomain<NativeFamily> {
         target_store: Rc<StateStore>,
         head_store: Option<Rc<StateStore>>,
     ) -> Result<Self, String> {
-        // A model's draft head is enabled only when its method drafts.
-        if (head_loader.is_some() && definition.head.is_none())
+        // A model's drafter (its draft head or separate draft) is enabled
+        // only when its method drafts.
+        if (head_loader.is_some() && definition.head.is_none() && definition.draft.is_none())
             || vision_loader.is_some() != definition.vision.is_some()
         {
             return Err("component loaders differ from enabled model components".into());
@@ -393,7 +396,7 @@ impl ExecutorDomain<NativeFamily> {
         if head_loader.is_some() != head_store.is_some() {
             return Err("head state arena differs from enabled head component".into());
         }
-        let family = NativeFamily::new(programs, resident, definition.geometry.clone())?;
+        let family = NativeFamily::new(programs, resident, definition.decoder.clone())?;
         Ok(Self::with_family(
             execution,
             definition,
@@ -548,6 +551,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         std::cell::Ref::map(self.memory.borrow(), DeviceHeap::heap)
     }
 
+    /// Bytes of the model's host-resident tables held in host RAM.
+    pub fn host_table_bytes(&self) -> u64 {
+        self.memory.borrow().host_table_bytes()
+    }
+
     pub fn requirements(
         &self,
         operations: &[Operation],
@@ -649,7 +657,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         }
                         _ => {}
                     }
-                    segments = segments.max(state.history_ranges().len());
+                    segments = segments.max(if lane == ReservationLane::Target {
+                        target::reserved_segments(
+                            &self.target_store,
+                            state.span_count(),
+                            operation.row_count(),
+                        )
+                    } else {
+                        state.span_count()
+                    });
                 }
                 let class =
                     crate::LaunchClass::covering(rows, segments, demand, limits.max_launch_rows)

@@ -45,6 +45,7 @@
 // small tiles, beyond them the large ones, and the few-column entries the
 // split up to 128 rows.
 #include "../core/activation.cuh"
+#include "../core/functions.cuh"
 #include <seismic/packets.cuh>
 #include "../core/reduce.cuh"
 
@@ -138,6 +139,91 @@ template <class E> struct SiluMul {
     }
     __device__ __forceinline__ void pair(u32 m, u64 n, float gate0, float gate1, float up0, float up1) const {
         element::put2<E>(out, m * stride + n, value(gate0, up0), value(gate1, up1));
+    }
+};
+
+// Activation-generic GLU (paired), `function` a `functions::` code (SiLU
+// gives SiluMul's bits):
+// out[m, n] = round(round_A(act(round_A(gate))) * round_A(up)).
+template <class E> struct Glu {
+    u8 *out;
+    u64 stride;
+    int function;
+    __device__ __forceinline__ float value(float gate, float up) const {
+        return Act::round(functions::activate(function, Act::round(gate))) * Act::round(up);
+    }
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float gate, float up) const {
+        element::put<E>(out, m * stride + n, value(gate, up));
+    }
+    __device__ __forceinline__ void pair(u32 m, u64 n, float gate0, float gate1, float up0, float up1) const {
+        element::put2<E>(out, m * stride + n, value(gate0, up0), value(gate1, up1));
+    }
+};
+
+// A plain activated projection (up-only feed-forward, ReLU²):
+// out[m, n] = round(act(round_A(projection))).
+template <class E> struct Activated {
+    u8 *out;
+    u64 stride;
+    int function;
+    __device__ __forceinline__ float value(float projected) const {
+        return functions::activate(function, Act::round(projected));
+    }
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
+        element::put<E>(out, m * stride + n, value(projected));
+    }
+    __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
+        element::put2<E>(out, m * stride + n, value(first), value(second));
+    }
+};
+
+// The F32 product of two projections of one input (paired), unrounded:
+// out[m, n] = gate * up.
+struct Mul {
+    float *out;
+    u64 stride;
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float gate, float up) const {
+        out[m * stride + n] = gate * up;
+    }
+    __device__ __forceinline__ void pair(u32 m, u64 n, float gate0, float gate1, float up0, float up1) const {
+        out[m * stride + n] = gate0 * up0;
+        out[m * stride + n + 1] = gate1 * up1;
+    }
+};
+
+// An activated projection times an external F32 multiplier:
+// out[m, n] = round(round_A(act(round_A(projection))) * external[m, n]).
+template <class E> struct ActivatedMul {
+    u8 *out;
+    u64 stride;
+    const float *external;
+    u64 external_stride;
+    int function;
+    __device__ __forceinline__ float value(u32 m, u64 n, float projected) const {
+        return Act::round(functions::activate(function, Act::round(projected))) * external[m * external_stride + n];
+    }
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
+        element::put<E>(out, m * stride + n, value(m, n, projected));
+    }
+    __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
+        element::put2<E>(out, m * stride + n, value(m, n, first), value(m, n + 1, second));
+    }
+};
+
+// F32 logits, softcapped in F32 from the accumulator when `cap` > 0:
+// out[m, n] = cap > 0 ? cap * tanh(projection / cap) : projection.
+struct Logits {
+    u8 *out;
+    u64 stride;
+    float cap;
+    __device__ __forceinline__ float value(float projected) const {
+        return cap > 0.0f ? functions::softcap(cap, projected) : projected;
+    }
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
+        element::put<element::F32>(out, m * stride + n, value(projected));
+    }
+    __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
+        element::put2<element::F32>(out, m * stride + n, value(first), value(second));
     }
 };
 
@@ -525,6 +611,41 @@ __device__ __forceinline__ void epilogue_pair(const Epi &epi, u32 m, u64 n, floa
     epi(m, n + 1, a1, b1);
 }
 
+// A weight's second-level scale (NVFP4 `.scale`, per tensor or per expert)
+// on the F32 accumulator, before the wrapped epilogue: `first` scales the
+// projection (a paired epilogue's first stream), `second` the second
+// stream. Entries wrap their epilogue only when a scale port is present
+// (static extent 1; `scaling`), so an unscaled entry compiles as before.
+template <class Epi> struct Scaled {
+    Epi epi;
+    float first, second;
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float a, float b) const {
+        epi(m, n, a * first, b * second);
+    }
+    __device__ __forceinline__ void pair(u32 m, u64 n, float a0, float a1, float b0, float b1) const {
+        epilogue_pair(epi, m, n, a0 * first, a1 * first, b0 * second, b1 * second, 0);
+    }
+};
+
+template <bool SCALED> struct scaling;
+template <> struct scaling<false> {
+    template <class Epi> using type = Epi;
+    template <class Epi> __device__ __forceinline__ static Epi wrap(const Epi &epi, float, float) { return epi; }
+};
+template <> struct scaling<true> {
+    template <class Epi> using type = Scaled<Epi>;
+    template <class Epi> __device__ __forceinline__ static Scaled<Epi> wrap(const Epi &epi, float first, float second) {
+        return Scaled<Epi>{epi, first, second};
+    }
+};
+
+// A scale port's value at `index` along its expert axis (0 for a
+// per-tensor port; `stride` that axis' stride), or 1 for an absent port
+// (static `extent` 0: the port is never read).
+__device__ __forceinline__ float scale_factor(const u8 *scale, u64 extent, u64 stride, u64 index) {
+    return extent == 0 ? 1.0f : reinterpret_cast<const float *>(scale)[index * stride];
+}
+
 // The C fragment of one warp tile: acc[j][mi][h][e] is row m0 + mi * 16 + g +
 // 8 * (e / 2), column (tile0 + j) * 16 + h * 8 + 2 * t + e % 2.
 template <int NJ, int MI, class Epi>
@@ -556,12 +677,66 @@ __device__ __forceinline__ void gemm_publish(const float (&acc)[2][NJ][MI][2][4]
 // acc[mi][h] += x . w over the 32-code half `half` (k16 steps 2 * half,
 // 2 * half + 1) of the warp's weight tile j, its codes dequantized to A with
 // the warp's decoded coefficients (a holds the half's two steps).
+//
+// A representation with `SCALED_GEMM` keeps its codes exact in the operand
+// (they are small integers) and scales each group's F32 partial product, as
+// the GEMV does: acc += scale * (x . code) - bias * sum(x), the group's
+// activation sum formed by the same MMA against an all-ones operand. Its
+// weights are then never rounded to A, whose 8-bit mantissa (bf16) would
+// otherwise round every dequantized weight.
 template <class Shape, class W>
 __device__ __forceinline__ void gemm_tile_half(float acc[Shape::MI][2][4], const W &w, const typename W::Raw &raw,
                                                const float *coefficients, int j_tile, int half,
                                                const u32 a[2][Shape::MI][4]) {
     const u32 g = (threadIdx.x % 32) / 4;
     constexpr int STEPS = W::GROUP / 16;
+    if constexpr (W::SCALED_GEMM) {
+        const u32 t = threadIdx.x % 4;
+        const u32 ones[2] = {Op::ONES, Op::ONES};
+        u32 r[2][4];
+#pragma unroll
+        for (int local = 0; local < 2; ++local)
+            w.template decode<Op>(raw, 2 * half + local, r[local]);
+        // One partial product per coefficient group: both steps of the half
+        // for 32-code groups, each step for 16-code groups.
+        constexpr int FOLDS = 2 / STEPS;
+#pragma unroll
+        for (int fold = 0; fold < FOLDS; ++fold) {
+            const int group = (2 * half) / STEPS + fold;
+            // The C columns of this lane: weight rows h * 8 + 2t + c, with
+            // their (scale, -bias).
+            float2 k[2][2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int c = 0; c < 2; ++c)
+                    k[h][c] = gemm_coefficient<W>(coefficients, j_tile * 16 + h * 8 + 2 * t + c, group);
+#pragma unroll
+            for (int mi = 0; mi < Shape::MI; ++mi) {
+                float p[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+                // sum(x) of the group per C row (every column equal).
+                float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                for (int local = fold * STEPS; local < (fold + 1) * STEPS; ++local) {
+                    const u32 b0[2] = {r[local][0], r[local][2]};
+                    const u32 b1[2] = {r[local][1], r[local][3]};
+                    Op::mma(p[0], a[local][mi], b0);
+                    Op::mma(p[1], a[local][mi], b1);
+                    if constexpr (W::BIAS)
+                        Op::mma(s, a[local][mi], ones);
+                }
+#pragma unroll
+                for (int h = 0; h < 2; ++h)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        acc[mi][h][e] = seismic_fma_rn(k[h][e % 2].x, p[h][e], acc[mi][h][e]);
+                        if constexpr (W::BIAS)
+                            acc[mi][h][e] = seismic_fma_rn(k[h][e % 2].y, s[e], acc[mi][h][e]);
+                    }
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int local = 0; local < 2; ++local) {
         const int step = 2 * half + local;

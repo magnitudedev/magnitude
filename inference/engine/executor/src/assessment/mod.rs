@@ -1,13 +1,16 @@
 //! Metadata-only model assessment.
 //!
-//! A fixed measurement basis is taken once per device ([`basis`],
-//! [`measure`]). Every model is then assessed analytically from its headers
-//! and allocation-free execution plan: decode demand ([`demand`]), speed at
-//! each requested depth ([`estimate`]), and memory fit and compatibility
-//! ([`assess`]). No model is loaded, benchmarked or tuned.
+//! A fixed, model-free measurement basis is taken once per device
+//! ([`plan`], [`basis`], [`measure`]). Every model is then assessed
+//! analytically from its headers and allocation-free execution plan: decode
+//! demand ([`demand`]), speed at each requested depth ([`estimate`]), and
+//! memory fit and compatibility ([`assess`]). No model is loaded, benchmarked
+//! or tuned.
 
 pub mod assess;
 pub mod basis;
+#[cfg(test)]
+mod catalog;
 pub mod demand;
 pub mod estimate;
 pub mod measure;
@@ -19,19 +22,21 @@ pub use assess::{
     DomainFit, ExecutionAssessment, IncompatibleReason, PreparedExecutionAssessment,
 };
 pub use basis::{
-    BasisIdentity, ClassCost, ClassMeasurement, CostModel, MeasuredPoint, MeasurementBasis,
-    MeasurementKey, OperationClass, SecondsBand, MEASUREMENT_PROTOCOL_VERSION,
+    BasisIdentity, ClassCost, ClassMeasurement, CostModel, HeadGeometry, HistoryCost,
+    MeasuredPoint, MeasurementBasis, MeasurementKey, OperationClass, PointShape, ProjectionCost,
+    SecondsBand, MEASUREMENT_PROTOCOL_VERSION,
 };
-pub use demand::{DecodeDemand, DemandTerm};
+pub use demand::{DecodeDemand, DemandTerm, TermShape};
 pub use estimate::{
-    estimate_performance, performance_depths, PerformanceConfidence, PerformanceEstimate,
-    HIGH_CONFIDENCE_RANGE, MODERATE_CONFIDENCE_RANGE,
+    estimate_performance, performance_depths, term_seconds, PerformanceConfidence,
+    PerformanceEstimate, HIGH_CONFIDENCE_RANGE, MODERATE_CONFIDENCE_RANGE,
 };
 pub use measure::{
-    measure_basis, measure_basis_observed, measure_class, ClassProfile, MeasurementError,
+    complete_basis, measure_basis, measure_entry, ClassProfile, MeasurementError,
+    MeasurementFailure,
 };
 pub use persist::{basis_file_name, basis_json, load_basis, parse_basis, store_basis};
-pub use plan::{measurement_plan, DeclaredConfiguration, QWEN35_CONFIGURATIONS};
+pub use plan::{measurement_plan, PlannedKey};
 
 use std::fmt;
 

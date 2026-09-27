@@ -16,28 +16,44 @@
 # projection); larger classes the GEMM over tuned TILE_M x TILE_N tiles
 # (activations staged as stored, weights decoded to half once per tile), with
 # SPLIT-way split-K on the down projection.
-fn dense_expand[M, O, H, F](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+# `activation` is the gate's function code (`functions.seismic`: 0 SiLU,
+# 1 GELU-tanh); the product is A(A(act(A(gate))) * A(up)).
+#
+# Second-level weight scales (every entry reading packed weights): one
+# `<weight>_scale` port per weight, after every other argument, in weight
+# order, `[S] f32` per tensor (or `[S, E] f32` per expert in the routed
+# entries). S = 1 carries the scale (NVFP4 `.scale`), applied to that
+# projection's F32 accumulator before anything else (`scale_rows`); S = 0 is
+# no scale, and the natives compile the scaling out. S is static on every
+# backend.
+fn dense_expand[M, O, H, F, GS, US](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
     gate_weight: &tensor[F, H] GW, up_weight: &tensor[F, H] UW,
-    out_rows: &tensor[O] i32, eps: f32) -> tensor[O, F] A:
+    out_rows: &tensor[O] i32, eps: f32, activation: i32,
+    gate_scale: &tensor[GS] f32, up_scale: &tensor[US] f32) -> tensor[O, F] A where GS >= 0 and US >= 0 and GS <= 1 and US <= 1:
     let mut selected = tensor[O, H] f32
     parallel for row in 0..O:
         parallel for col in 0..H:
             selected[row, col] = residual[out_rows[row], col]
     let mut normalized = tensor[O, H] A
+    let mut gate_sum = tensor[O, F] f32
+    let mut up_sum = tensor[O, F] f32
     let mut gate = tensor[O, F] A
     let mut up = tensor[O, F] A
     let mut activated = tensor[O, F] A
     let mut product = tensor[O, F] A
     rms_norm(selected, norm, normalized, eps)
-    linear(normalized, gate_weight, gate)
-    linear(normalized, up_weight, up)
-    silu(gate, activated)
+    linear(normalized, gate_weight, gate_sum)
+    linear(normalized, up_weight, up_sum)
+    scale_rows(gate_sum, gate_scale, gate)
+    scale_rows(up_sum, up_scale, up)
+    activate(gate, activated, activation)
     multiply(activated, up, product)
     return product
 
 native dense_expand for metal from "metal/dense_expand.metal":
-    static (H, F)
+    static (H, F, GS, US)
     params (arithmetic BATCH_FROM in [5, 3, 9])
+    where GS <= 1 and US <= 1
     scratch normalized bytes (O * H * 2) when O > 16
     launch dense_expand_normalize when O > 16:
         threadgroups (O, 1, 1)
@@ -68,10 +84,10 @@ native dense_expand for metal from "metal/dense_expand.metal":
 # paired gate/up GEMM over TILE_M x TILE_N tiles (cooperative-matrix f16
 # multiplies under SEISMIC_HAS_MATRIX, F32 FMAs otherwise).
 native dense_expand for vulkan from "vulkan/dense_expand.comp":
-    static (H, F)
+    static (H, F, GS, US)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
-    where SUB_M <= TILE_M and SUB_N <= TILE_N
+    where SUB_M <= TILE_M and SUB_N <= TILE_N and GS <= 1 and US <= 1
     scratch normalized bytes (O * H * 2) when O > 8
     launch dense_expand_stage when O > 8:
         threadgroups (O, 1, 1)
@@ -87,20 +103,23 @@ native dense_expand for vulkan from "vulkan/dense_expand.comp":
         shared_bytes ((TILE_M + TILE_N) * 80)
 
 
-fn dense_output[M, O, H, F](residual: &tensor[M, H] f32,
+fn dense_output[M, O, H, F, DS](residual: &tensor[M, H] f32,
     product: &tensor[O, F] A, down_weight: &tensor[H, F] DW,
-    out_rows: &tensor[O] i32) -> tensor[O, H] f32:
+    out_rows: &tensor[O] i32, down_scale: &tensor[DS] f32) -> tensor[O, H] f32 where DS >= 0 and DS <= 1:
+    let mut down_sum = tensor[O, H] f32
     let mut projected = tensor[O, H] A
     let mut result = tensor[O, H] f32
-    linear(product, down_weight, projected)
+    linear(product, down_weight, down_sum)
+    scale_rows(down_sum, down_scale, projected)
     parallel for row in 0..O:
         parallel for col in 0..H:
             result[row, col] = residual[out_rows[row], col] + f32(projected[row, col])
     return result
 
 native dense_output for metal from "metal/dense_output.metal":
-    static (H, F)
+    static (H, F, DS)
     params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4])
+    where DS <= 1
     scratch partials bytes (SPLIT * O * H * 4) when O > 64 and SPLIT > 1
     scratch small_partials bytes (4 * O * H * 4) when O > 16 and O <= 64
     launch dense_output_gemv when O < BATCH_FROM:
@@ -130,11 +149,11 @@ native dense_output for metal from "metal/dense_output.metal":
 # Vulkan: the K1 projection (see `dense_expand`): GEMV to 8 rows, GEMM
 # beyond with SPLIT-way split-K summed in order by `finalize`.
 native dense_output for vulkan from "vulkan/dense_output.comp":
-    static (H, F)
+    static (H, F, DS)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64],
             arithmetic SPLIT in [1, 2, 4])
-    where SUB_M <= TILE_M and SUB_N <= TILE_N
+    where SUB_M <= TILE_M and SUB_N <= TILE_N and DS <= 1
     scratch partials bytes (SPLIT * O * H * 4) when O > 8 and SPLIT > 1
     launch dense_output_gemv when O <= 8:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
@@ -148,12 +167,341 @@ native dense_output for vulkan from "vulkan/dense_output.comp":
         threadgroups (ceil_div(O * H, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
+# The up-only feed-forward expansion (Nemotron-H's ReLU² dense layers and
+# shared expert): `dense_expand` with one up projection and the activated
+# product A(act(A(up))) (`activation`: 2 ReLU²).
+fn dense_up[M, O, H, F, US](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+    up_weight: &tensor[F, H] UW, out_rows: &tensor[O] i32, eps: f32,
+    activation: i32, up_scale: &tensor[US] f32) -> tensor[O, F] A where US >= 0 and US <= 1:
+    let mut selected = tensor[O, H] f32
+    parallel for row in 0..O:
+        parallel for col in 0..H:
+            selected[row, col] = residual[out_rows[row], col]
+    let mut normalized = tensor[O, H] A
+    let mut up_sum = tensor[O, F] f32
+    let mut up = tensor[O, F] A
+    let mut product = tensor[O, F] A
+    rms_norm(selected, norm, normalized, eps)
+    linear(normalized, up_weight, up_sum)
+    scale_rows(up_sum, up_scale, up)
+    activate(up, product, activation)
+    return product
+
+# LFM2's short-convolution input projection over every residual row: the RMS
+# prologue, the B, C and X row ranges of `in_proj` (bound as three weights),
+# and one F32 row per residual row, u = B ⊙ X in columns 0..CH and C in
+# CH..2CH, both from the F32 accumulators (`short_conv_rows` consumes them
+# unrounded).
+fn short_conv_project[M, H, CH, BS, CS, XS](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+    b_weight: &tensor[CH, H] BW, c_weight: &tensor[CH, H] CW,
+    x_weight: &tensor[CH, H] XW, eps: f32, b_scale: &tensor[BS] f32,
+    c_scale: &tensor[CS] f32, x_scale: &tensor[XS] f32) -> tensor[M, 2 * CH] f32 where BS >= 0 and CS >= 0 and XS >= 0 and BS <= 1 and CS <= 1 and XS <= 1:
+    let mut normalized = tensor[M, H] A
+    let mut b_sum = tensor[M, CH] f32
+    let mut c_sum = tensor[M, CH] f32
+    let mut x_sum = tensor[M, CH] f32
+    let mut b = tensor[M, CH] f32
+    let mut c = tensor[M, CH] f32
+    let mut x = tensor[M, CH] f32
+    let mut result = tensor[M, 2 * CH] f32
+    rms_norm(residual, norm, normalized, eps)
+    linear(normalized, b_weight, b_sum)
+    linear(normalized, c_weight, c_sum)
+    linear(normalized, x_weight, x_sum)
+    scale_rows(b_sum, b_scale, b)
+    scale_rows(c_sum, c_scale, c)
+    scale_rows(x_sum, x_scale, x)
+    parallel for row in 0..M:
+        parallel for channel in 0..CH:
+            result[row, channel] = b[row, channel] * x[row, channel]
+            result[row, CH + channel] = c[row, channel]
+    return result
+
+# Gemma's per-layer input gate: the gate projection of the hidden rows (the
+# F32 residual after the layer, rounded to A as a projection input), then
+# A(A(act(A(gate))) * inputs[m, layer, p]) with the layer's per-layer input
+# (`per_layer_inputs`' [M, L * P] output viewed as [M, L, P]; `activation`:
+# 1 GELU-tanh). Its projection back to D is `project_rows` into the layer's
+# `post_norm_residual`.
+fn per_layer_gate[M, D, L, P, GS](hidden: &tensor[M, D] f32, gate_weight: &tensor[P, D] GW,
+    inputs: &tensor[M, L, P] f32, layer: i32, activation: i32,
+    gate_scale: &tensor[GS] f32) -> tensor[M, P] A where GS >= 0 and GS <= 1:
+    let mut rounded = tensor[M, D] A
+    let mut gate_sum = tensor[M, P] f32
+    let mut gate = tensor[M, P] A
+    let mut activated = tensor[M, P] A
+    let mut product = tensor[M, P] A
+    parallel for row in 0..M:
+        parallel for col in 0..D:
+            rounded[row, col] = hidden[row, col]
+    linear(rounded, gate_weight, gate_sum)
+    scale_rows(gate_sum, gate_scale, gate)
+    activate(gate, activated, activation)
+    parallel for row in 0..M:
+        parallel for col in 0..P:
+            product[row, col] = f32(activated[row, col]) * inputs[row, layer, col]
+    return product
+
+# Metal: `dense_expand`'s row classes with one weight stream (the GEMM tiles
+# span TILE_N features instead of TILE_N / 2 pairs).
+native dense_up for metal from "metal/dense_up.metal":
+    static (H, F, US)
+    params (arithmetic BATCH_FROM in [5, 3, 9])
+    where US <= 1
+    scratch normalized bytes (O * H * 2) when O > 16
+    launch dense_up_normalize when O > 16:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_up_gemv when O < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+        threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(H, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
+    launch dense_up_batch when O >= BATCH_FROM and O <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
+        threadgroups (ceil_div(F, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16640)
+    launch dense_up_gemm_small when O > 16 and O <= 64:
+        threadgroups (ceil_div(F, 64), ceil_div(O, 32), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch dense_up_gemm when O > 64:
+        params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
+        threadgroups (ceil_div(F, TILE_N), ceil_div(O, TILE_M), 1)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+
+native dense_up for vulkan from "vulkan/dense_up.comp":
+    static (H, F, US)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    where SUB_M <= TILE_M and SUB_N <= TILE_N and US <= 1
+    scratch normalized bytes (O * H * 2) when O > 8
+    launch dense_up_stage when O > 8:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+    launch dense_up_gemv when O <= 8:
+        threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (256 + min(8 * ceil_div(H, 32), 288) * 72)
+    launch dense_up_gemm when O > 8:
+        threadgroups (ceil_div(F, TILE_N), ceil_div(O, TILE_M), 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
+        shared_bytes ((TILE_M + TILE_N) * 80)
+
+native dense_up for cpu from "cpu/dense_up.rs":
+    static (US)
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    where US <= 1
+    scratch quantized bytes (O * ceil_div(H, 256) * 292)
+    scratch normalized bytes (O * H * 4)
+    launch dense_up_normalize:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 4)
+    launch dense_up_rows:
+        threadgroups (ceil_div(F, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# All backends: one segmented launch per row class, the u segment (the B and
+# X streams paired, their F32 product) in the first threadgroups along x and
+# the C segment (one stream, stored F32) after it; the CPU splits its row
+# items the same way.
+native short_conv_project for metal from "metal/short_conv_project.metal":
+    static (H, CH, BS, CS, XS)
+    params (arithmetic BATCH_FROM in [5, 3, 9])
+    where BS <= 1 and CS <= 1 and XS <= 1
+    scratch normalized bytes (M * H * 2) when M > 16
+    launch short_conv_project_normalize when M > 16:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch short_conv_project_gemv when M < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+        threadgroups (2 * ceil_div(CH, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch short_conv_project_batch when M >= BATCH_FROM and M <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
+        threadgroups (2 * ceil_div(CH, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16640)
+    launch short_conv_project_gemm_small when M > 16 and M <= 64:
+        threadgroups (ceil_div(CH, 32) + ceil_div(CH, 64), ceil_div(M, 32), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch short_conv_project_gemm when M > 64:
+        params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
+        threadgroups (ceil_div(CH, TILE_N / 2) + ceil_div(CH, TILE_N), ceil_div(M, TILE_M), 1)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+
+native short_conv_project for vulkan from "vulkan/short_conv_project.comp":
+    static (H, CH, BS, CS, XS)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    where SUB_M <= TILE_M and SUB_N <= TILE_N and BS <= 1 and CS <= 1 and XS <= 1
+    scratch normalized bytes (M * H * 2) when M > 8
+    launch short_conv_project_stage when M > 8:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+    launch short_conv_project_gemv when M <= 8:
+        threadgroups (2 * ceil_div(CH, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (256 + min(8 * ceil_div(H, 32), 288) * 72)
+    launch short_conv_project_gemm when M > 8:
+        threadgroups (ceil_div(CH, TILE_N / 2) + ceil_div(CH, TILE_N), ceil_div(M, TILE_M), 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
+        shared_bytes ((TILE_M + TILE_N) * 80)
+
+native short_conv_project for cpu from "cpu/short_conv_project.rs":
+    static (BS, CS, XS)
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    where BS <= 1 and CS <= 1 and XS <= 1
+    scratch quantized bytes (M * ceil_div(H, 256) * 292)
+    scratch normalized bytes (M * H * 4)
+    launch short_conv_project_normalize:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 4)
+    launch short_conv_project_rows:
+        threadgroups (2 * ceil_div(CH, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# All backends: a stage launch rounds the hidden rows to A in scratch, then
+# `project_rows`' row classes over them with the activated-product epilogue
+# (the multiplier row is `inputs[m, layer]`).
+native per_layer_gate for metal from "metal/per_layer_gate.metal":
+    static (D, L, P, GS)
+    params (arithmetic BATCH_FROM in [5, 3, 9])
+    where GS <= 1
+    scratch rounded bytes (M * D * 2)
+    launch per_layer_gate_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch per_layer_gate_gemv when M < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+        threadgroups (ceil_div(P, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch per_layer_gate_batch when M >= BATCH_FROM and M <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
+        threadgroups (ceil_div(P, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16640)
+    launch per_layer_gate_gemm_small when M > 16 and M <= 64:
+        threadgroups (ceil_div(P, 64), ceil_div(M, 32), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch per_layer_gate_gemm when M > 64:
+        params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
+        threadgroups (ceil_div(P, TILE_N), ceil_div(M, TILE_M), 1)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+
+native per_layer_gate for vulkan from "vulkan/per_layer_gate.comp":
+    static (D, L, P, GS)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    where SUB_M <= TILE_M and SUB_N <= TILE_N and GS <= 1
+    scratch rounded bytes (M * D * 2)
+    launch per_layer_gate_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch per_layer_gate_gemv when M <= 8:
+        threadgroups (ceil_div(P, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (256 + min(8 * ceil_div(D, 32), 288) * 72)
+    launch per_layer_gate_gemm when M > 8:
+        threadgroups (ceil_div(P, TILE_N), ceil_div(M, TILE_M), 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
+        shared_bytes ((TILE_M + TILE_N) * 80)
+
+native per_layer_gate for cpu from "cpu/per_layer_gate.rs":
+    static (GS)
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    where GS <= 1
+    scratch quantized bytes (M * ceil_div(D, 256) * 292)
+    scratch staged bytes (M * D * 4)
+    launch per_layer_gate_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch per_layer_gate_rows:
+        threadgroups (ceil_div(P, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# A plain projection of A rows, published in Y: F32 where a row op consumes
+# the projection before the residual (`post_norm_residual`'s projected rows:
+# attention and feed-forward outputs of post-norm blocks, the per-layer
+# input's projection back to the hidden width), A where it feeds another
+# projection (Nemotron's latent down).
+fn project_rows[M, K, N, WS](source: &tensor[M, K] A, weight: &tensor[N, K] W,
+    weight_scale: &tensor[WS] f32) -> tensor[M, N] Y where WS >= 0 and WS <= 1:
+    let mut sum = tensor[M, N] f32
+    let mut result = tensor[M, N] Y
+    linear(source, weight, sum)
+    scale_rows(sum, weight_scale, result)
+    return result
+
+# Metal: the `attention_output` launch structure (GEMV below BATCH_FROM rows,
+# batched GEMV to 16, the fixed small GEMM with its 4-way split to 64, tuned
+# GEMM beyond with SPLIT-way split-K summed in order by `finalize`) with a
+# store epilogue in Y.
+native project_rows for metal from "metal/project_rows.metal":
+    static (K, N, WS)
+    params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4])
+    where WS <= 1
+    scratch partials bytes (SPLIT * M * N * 4) when M > 64 and SPLIT > 1
+    scratch small_partials bytes (4 * M * N * 4) when M > 16 and M <= 64
+    launch project_rows_gemv when M < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+        threadgroups (ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(K, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch project_rows_batch when M >= BATCH_FROM and M <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
+        threadgroups (ceil_div(N, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16640)
+    launch project_rows_gemm_small when M > 16 and M <= 64:
+        threadgroups (ceil_div(N, 64), ceil_div(M, 32), 4)
+        threads_per_threadgroup (128, 1, 1)
+    launch project_rows_finalize_small when M > 16 and M <= 64:
+        threadgroups (ceil_div(M * N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch project_rows_gemm when M > 64:
+        params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
+        threadgroups (ceil_div(N, TILE_N), ceil_div(M, TILE_M), SPLIT)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    launch project_rows_finalize when M > 64 and SPLIT > 1:
+        threadgroups (ceil_div(M * N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: the `attention_output` form (GEMV to 8 rows, GEMM beyond with
+# SPLIT-way split-K summed in order by `finalize`).
+native project_rows for vulkan from "vulkan/project_rows.comp":
+    static (K, N, WS)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64],
+            arithmetic SPLIT in [1, 2, 4])
+    where SUB_M <= TILE_M and SUB_N <= TILE_N and WS <= 1
+    scratch partials bytes (SPLIT * M * N * 4) when M > 8 and SPLIT > 1
+    launch project_rows_gemv when M <= 8:
+        threadgroups (ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (256 + min(8 * ceil_div(K, 32), 288) * 72)
+    launch project_rows_gemm when M > 8:
+        threadgroups (ceil_div(N, TILE_N), ceil_div(M, TILE_M), SPLIT)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
+        shared_bytes ((TILE_M + TILE_N) * 80)
+    launch project_rows_finalize when M > 8 and SPLIT > 1:
+        threadgroups (ceil_div(M * N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
 # CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). A
 # stage launch writes each normalized (expand) or product (output) row as F32
 # to scratch; the row launch gives each work item ROWS weight rows, projected
 # against every staged row through the weight representation's dot component.
 native dense_expand for cpu from "cpu/dense_expand.rs":
+    static (GS, US)
     params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    where GS <= 1 and US <= 1
     scratch quantized bytes (O * ceil_div(H, 256) * 292)
     scratch normalized bytes (O * H * 4)
     launch dense_expand_normalize:
@@ -165,7 +513,9 @@ native dense_expand for cpu from "cpu/dense_expand.rs":
         threads_per_threadgroup (1, 1, 1)
 
 native dense_output for cpu from "cpu/dense_output.rs":
+    static (DS)
     params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    where DS <= 1
     scratch quantized bytes (O * ceil_div(F, 256) * 292)
     scratch staged bytes (O * F * 4)
     launch dense_output_stage:
@@ -173,4 +523,17 @@ native dense_output for cpu from "cpu/dense_output.rs":
         threads_per_threadgroup (1, 1, 1)
     launch dense_output_rows:
         threadgroups (ceil_div(H, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+native project_rows for cpu from "cpu/project_rows.rs":
+    static (WS)
+    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    where WS <= 1
+    scratch quantized bytes (M * ceil_div(K, 256) * 292)
+    scratch staged bytes (M * K * 4)
+    launch project_rows_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch project_rows_rows:
+        threadgroups (ceil_div(N, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)

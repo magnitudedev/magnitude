@@ -1,11 +1,9 @@
-// Shared pieces of the Qwen3-VL vision entries on CPU (`qwen_vision_stem`,
-// `qwen_vision_block`, `qwen_vision_merger`; contracts and portable bodies in
-// vision.seismic). The counterpart of `metal/lib/vision/vision.h`,
+// Shared pieces of the vision entries on CPU (contracts and portable bodies
+// in vision.seismic). The counterpart of `metal/lib/vision/vision.h`,
 // `cuda/lib/vision/vision.cuh` and `vulkan/lib/vision/vision.glsl`: the
 // projections with their bias epilogues run on the projection library's
-// row-block driver; the layer norm, the 2D rotary embedding, the full
-// (non-causal) attention and the two GELU forms are the vision-specific
-// pieces.
+// row-block driver; the row norms, the 2D rotary embedding, the non-causal
+// attention and the GELU forms are the vision-specific pieces.
 //
 // Numerics: the residual stream is F32; the published intermediates
 // (normalized rows, projections feeding a projection or the attention,
@@ -118,22 +116,50 @@ pub fn gelu_erf(value: f32) -> f32 {
     0.5 * value * (1.0 + erf(value * 0.707_106_781_186_547_6))
 }
 
-// ---------------------------------------------------------------------------
-// Layer norm.
-
-/// The portable `layer_norm` of one F32 row with the decoded `weight` and
-/// `bias`: two-pass centered F32 statistics, each value published to `A`.
+/// The portable quick GELU: `x / (1 + exp(-1.702 x))`.
 #[inline(always)]
-pub fn layer_norm<A: Dense>(x: &[f32], weight: &[f32], bias: &[f32], epsilon: f32, out: &mut [f32]) {
+pub fn gelu_quick(value: f32) -> f32 {
+    value / (1.0 + (-1.702 * value).exp())
+}
+
+/// The activation of `vision_linear`'s code (1 tanh, 2 erf, 3 quick GELU).
+#[inline(always)]
+pub fn activate(code: i32, value: f32) -> f32 {
+    match code {
+        1 => gelu_tanh(value),
+        2 => gelu_erf(value),
+        3 => gelu_quick(value),
+        _ => unreachable!("activation code {code}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row norms.
+
+/// The portable `vision_norm` of one F32 row, unpublished: centered
+/// (`centered`) or root-mean-square two-pass F32 statistics, times the
+/// decoded `weight` and plus the decoded `bias` when bound.
+#[inline(always)]
+pub fn norm(x: &[f32], centered: bool, weight: Option<&[f32]>, bias: Option<&[f32]>, epsilon: f32, out: &mut [f32]) {
     let width = x.len() as f32;
     let out = &mut out[..x.len()];
-    let mean = reduce::sum(x) / width;
+    let mean = if centered { reduce::sum(x) / width } else { 0.0 };
     for (target, value) in out.iter_mut().zip(x) {
         *target = value - mean;
     }
     let inverse = 1.0 / (reduce::sum_squares(out) / width + epsilon).sqrt();
-    for ((target, w), b) in out.iter_mut().zip(&weight[..x.len()]).zip(&bias[..x.len()]) {
-        *target = activation::publish::<A>(*target * inverse * w + b);
+    for target in out.iter_mut() {
+        *target *= inverse;
+    }
+    if let Some(weight) = weight {
+        for (target, w) in out.iter_mut().zip(weight) {
+            *target *= w;
+        }
+    }
+    if let Some(bias) = bias {
+        for (target, b) in out.iter_mut().zip(bias) {
+            *target += b;
+        }
     }
 }
 
@@ -175,16 +201,16 @@ pub fn project_bias(
 // ---------------------------------------------------------------------------
 // 2D rotary embedding.
 
-/// The portable `qwen_vision_rotate` of one head row of width 4P, in place,
-/// each value published to `A`: column i < 2P pairs with i + 2P; pair
-/// p = i % 2P turns by coordinates[p / P] * 10000^(-(p % P) / P).
+/// The portable `vision_rotate` of one head row of width 4P, in place, each
+/// value published to `A`: column i < 2P pairs with i + 2P; pair p = i % 2P
+/// turns by coordinates[p / P] * exp(-log_base * (p % P) / P).
 #[inline(always)]
-pub fn rotate<A: Dense>(head: &mut [f32], coordinates: [i32; 2], quarter: usize) {
+pub fn rotate<A: Dense>(head: &mut [f32], coordinates: [i32; 2], quarter: usize, log_base: f32) {
     let half = 2 * quarter;
     let (first, second) = head[..2 * half].split_at_mut(half);
     for (pair, (x, partner)) in first.iter_mut().zip(second.iter_mut()).enumerate() {
         let frequency = (pair % quarter) as f32;
-        let angle = coordinates[pair / quarter] as f32 * (-(10000f32.ln()) * frequency / quarter as f32).exp();
+        let angle = coordinates[pair / quarter] as f32 * (-log_base * frequency / quarter as f32).exp();
         let (s, c) = seismic::cpu::math::sin_cos(angle);
         let (a, b) = (*x, *partner);
         *x = activation::publish::<A>(a * c - b * s);
@@ -195,26 +221,27 @@ pub fn rotate<A: Dense>(head: &mut [f32], coordinates: [i32; 2], quarter: usize)
 // ---------------------------------------------------------------------------
 // Full attention.
 
-/// The portable `qwen_vision_full_attention` of one query row of one head
-/// over every key: `key(j)` and `value(j)` are the head rows of patch row j
-/// of `keys` patch rows, `scores` holds `keys` values, and `out` receives
-/// the attention output published to `A`. One online-softmax update over the
-/// whole history: scores accumulate the A-valued products in F32, the
-/// probabilities are exp(s * scale - max(s) * scale), and the value product
-/// visits the history in ascending order.
+/// The portable `vision_attention` of one query row of one head over the
+/// keys `span`: `key(j)` and `value(j)` are the head rows of patch row j,
+/// `scores` holds the span's values, and `out` receives the attention output
+/// published to `A`. One online-softmax update over the whole span: scores
+/// accumulate the A-valued products in F32, the probabilities are
+/// exp(s * scale - max(s) * scale), and the value product visits the span in
+/// ascending order. The scale is 1 / sqrt(width), or 1 when `unit_scale`.
 #[inline(always)]
 pub fn attend<'k, A: Dense>(
     query: &[f32],
-    keys: usize,
+    span: std::ops::Range<usize>,
     key: impl Fn(usize) -> &'k [f32],
     value: impl Fn(usize) -> &'k [f32],
+    unit_scale: bool,
     scores: &mut [f32],
     out: &mut [f32],
 ) {
     let width = query.len();
-    let scale = 1.0 / (width as f32).sqrt();
-    let scores = &mut scores[..keys];
-    for (j, score) in scores.iter_mut().enumerate() {
+    let scale = if unit_scale { 1.0 } else { 1.0 / (width as f32).sqrt() };
+    let scores = &mut scores[..span.len()];
+    for (j, score) in span.clone().zip(scores.iter_mut()) {
         *score = reduce::dot(query, key(j));
     }
     let maximum = f32::NEG_INFINITY.max(reduce::max(scores) * scale);
@@ -224,7 +251,7 @@ pub fn attend<'k, A: Dense>(
     let denominator = reduce::sum(scores);
     let out = &mut out[..width];
     out.fill(0.0);
-    for (j, probability) in scores.iter().enumerate() {
+    for (j, probability) in span.zip(scores.iter()) {
         for (acc, v) in out.iter_mut().zip(value(j)) {
             *acc += probability * v;
         }

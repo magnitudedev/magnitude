@@ -1904,6 +1904,7 @@ mod tests {
                     url: "https://example.com/model".to_owned(),
                 },
             },
+            support: magnitude_service_contracts::models::CatalogSupport::Supported,
             fidelity_rank: 0,
             quantization_aware: false,
         }

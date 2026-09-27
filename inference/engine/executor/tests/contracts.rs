@@ -171,6 +171,7 @@ fn head_conditioning_rows_must_match_its_entry_rows() {
         conditioning: rows(conditioning),
         position: 0,
         proposals: vec![select(); proposals],
+        form: magnitude_executor::DraftForm::Chained,
     };
     assert!(matches!(
         head(2, 1, 0).validate(),

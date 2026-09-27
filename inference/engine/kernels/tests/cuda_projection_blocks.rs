@@ -7,7 +7,7 @@ mod cuda_common;
 
 use cuda_common::*;
 use magnitude_kernels::{
-    attention_output, gated_attention_project, gated_delta_output, gated_delta_project,
+    attention_output, attention_project, gated_delta_output, gated_delta_project,
 };
 use seismic::{Element, Layout, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
@@ -420,13 +420,15 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
             weight(&device, formats[1], keys, d, &mut rng),
             weight(&device, formats[2], keys, d, &mut rng),
         ];
+        // Qwen's form: the gate is interleaved in the query segment, so the
+        // gate segment is zero rows of the query weight.
+        let gate = weights[0].tensor.slice_leading(0, 0).unwrap();
         for m in ROWS {
             let hidden_values: Vec<f32> = (0..m * d).map(|_| rng.uniform(-3.0, 3.0)).collect();
             let norm_values: Vec<f32> = (0..d).map(|_| rng.uniform(0.25, 1.25)).collect();
             let normed = normalized(&hidden_values, &norm_values, m, d);
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
             let norm = f32_tensor(&device, &[d as u64], &norm_values);
-            let query_norm = f32_tensor(&device, &[w as u64], &vec![1.0; w]);
             for &mapping in mappings(m) {
                 let (x, slack) = operand_rows(&normed, d, mapping);
                 let expected: Vec<(Vec<f64>, Vec<f64>)> = weights
@@ -434,37 +436,39 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                     .zip([query, keys, keys])
                     .map(|(weight, n)| rounded_segment(&x, &slack, weight, m, n, d, mapping))
                     .collect();
-                let results = gated_attention_project::native_for_device_with(
+                let results = attention_project::native_for_device_with(
                     &device,
-                    gated_attention_project::Elements {
+                    attention_project::Elements {
                         NW: Element::f32(),
                         QW: formats[0].resident(),
+                        GW: formats[0].resident(),
                         KW: formats[1].resident(),
                         VW: formats[2].resident(),
                         A: Element::bf16(),
                     },
-                    &mapping.gated_attention_project_params(statics_specialization(&[
+                    &mapping.attention_project_params(statics_specialization(&[
                         ("D", d),
-                        ("KV", kv),
-                        ("G", g),
-                        ("W", w),
+                        ("Q", query),
+                        ("GR", 0),
+                        ("K", keys),
+                        ("V", keys),
                     ])),
                 )
                 .unwrap()
-                .call(gated_attention_project::Args {
+                .call(attention_project::Args {
                     hidden: &hidden,
                     input_norm: &norm,
-                    query_norm: &query_norm,
-                    query_gate_weight: &weights[0].tensor,
+                    query_weight: &weights[0].tensor,
+                    gate_weight: &gate,
                     key_weight: &weights[1].tensor,
                     value_weight: &weights[2].tensor,
                     epsilon: EPSILON,
                 })
                 .unwrap();
                 for (name, tensor, (values, tolerance)) in [
-                    ("query_gate", &results.r0, &expected[0]),
-                    ("key", &results.r1, &expected[1]),
-                    ("value", &results.r2, &expected[2]),
+                    ("query", &results.r0, &expected[0]),
+                    ("key", &results.r2, &expected[1]),
+                    ("value", &results.r3, &expected[2]),
                 ] {
                     check(
                         &format!("attention project {name} {formats:?} M={m} {mapping:?}"),

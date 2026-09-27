@@ -9,7 +9,7 @@ use crate::{
     AttestedPrograms, ResidentHead, ResidentTarget, ResidentVision, SubmitError,
     ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch,
 };
-use magnitude_family_contracts::{DecoderGeometry, ModelDefinition};
+use magnitude_family_contracts::{Decoder, ModelDefinition};
 use std::rc::Rc;
 
 pub trait ProgramFamily: 'static {
@@ -82,7 +82,7 @@ pub struct NativeFamily {
     resident: ResidentTarget,
     target: crate::programs::native_target::NativeTargetProgram,
     state: crate::programs::native_state::NativeStateProgram,
-    head: Option<crate::programs::native_head::NativeHeadProgram>,
+    head: Option<crate::programs::native_drafter::NativeDrafterProgram>,
     vision: Option<crate::programs::native_vision::NativeVisionProgram>,
 }
 
@@ -90,7 +90,7 @@ impl NativeFamily {
     pub(crate) fn new(
         programs: Rc<AttestedPrograms>,
         resident: ResidentTarget,
-        geometry: DecoderGeometry,
+        geometry: Decoder,
     ) -> Result<Self, String> {
         let binding_constants = programs
             .target_graphs()
@@ -118,7 +118,7 @@ impl ProgramFamily for NativeFamily {
     type TargetSubmission =
         <crate::programs::native_target::NativeTargetProgram as TargetProgram>::Submission;
     type HeadSubmission =
-        <crate::programs::native_head::NativeHeadProgram as HeadProgram>::Submission;
+        <crate::programs::native_drafter::NativeDrafterProgram as HeadProgram>::Submission;
     type VisionSubmission =
         <crate::programs::native_vision::NativeVisionProgram as VisionProgram>::Submission;
     type StateSubmission =
@@ -132,7 +132,7 @@ impl ProgramFamily for NativeFamily {
         if self.head.is_none() {
             let binding_constants = self
                 .programs
-                .head_graphs()
+                .drafter_graphs()
                 .ok_or("head graph family was not prepared")?
                 .binding_constant_bytes()?;
             let head = self

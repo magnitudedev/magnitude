@@ -1,6 +1,6 @@
 //! Opaque, device-independent target row semantics.
 
-use crate::{LaunchClass, PackError, PackedRowTables, Slot};
+use crate::{HistoryTables, LaunchClass, PackError, PackedRowTables, Slot};
 use std::sync::Arc;
 
 /// The packed controls and their row mapping are validated together once.
@@ -18,6 +18,19 @@ impl ValidatedTargetBatch {
     ) -> Result<Self, PackError> {
         Ok(Self {
             packed: PackedRowTables::pack(slots, vocabulary_size, row_limit)?,
+        })
+    }
+
+    /// Validate into a launch class covering at least `segments` history
+    /// ranges per row (`PackedRowTables::pack_covering`).
+    pub fn covering(
+        slots: &[Slot],
+        vocabulary_size: usize,
+        row_limit: usize,
+        segments: usize,
+    ) -> Result<Self, PackError> {
+        Ok(Self {
+            packed: PackedRowTables::pack_covering(slots, vocabulary_size, row_limit, segments)?,
         })
     }
 
@@ -49,9 +62,7 @@ impl ValidatedTargetBatch {
             mask_count: packed.mask_count,
             tokens: &packed.tokens,
             coordinates: &packed.coordinates,
-            visible: &packed.visible,
-            fresh: &packed.fresh,
-            destinations: &packed.destinations,
+            histories: &packed.histories,
             row_slots: &packed.row_slots,
             demand: &packed.demand,
             segments: &packed.segments,
@@ -80,8 +91,9 @@ impl ValidatedTargetBatch {
         Some(TargetBatchSlot {
             bank: self.packed.bank[index],
             following_bank: self.packed.following_bank[index],
-            destinations: &self.packed.destinations[start..end],
-            visible: &self.packed.visible[start..end],
+            start,
+            end,
+            histories: &self.packed.histories,
         })
     }
 
@@ -101,9 +113,8 @@ pub struct TargetBatchUpload<'a> {
     pub mask_count: usize,
     pub tokens: &'a [i32],
     pub coordinates: &'a [[i32; 4]],
-    pub visible: &'a [Vec<[i32; 2]>],
-    pub fresh: &'a [[i32; 2]],
-    pub destinations: &'a [i32],
+    /// One table set per history domain of the store, in domain order.
+    pub histories: &'a [HistoryTables],
     pub row_slots: &'a [i32],
     pub demand: &'a [u32],
     pub segments: &'a [[i32; 2]],
@@ -124,11 +135,19 @@ pub struct TargetBatchUpload<'a> {
 pub struct TargetBatchSlot<'a> {
     bank: i32,
     following_bank: i32,
-    destinations: &'a [i32],
-    visible: &'a [Vec<[i32; 2]>],
+    start: usize,
+    end: usize,
+    histories: &'a [HistoryTables],
 }
 
-impl TargetBatchSlot<'_> {
+/// One slot's rows in one history domain.
+pub struct SlotHistory<'a> {
+    pub destinations: &'a [i32],
+    pub visible: &'a [Vec<[i32; 2]>],
+    pub fresh: &'a [[i32; 2]],
+}
+
+impl<'a> TargetBatchSlot<'a> {
     pub fn bank(&self) -> i32 {
         self.bank
     }
@@ -138,22 +157,29 @@ impl TargetBatchSlot<'_> {
     }
 
     pub fn rows(&self) -> usize {
-        self.destinations.len()
+        self.end - self.start
     }
 
-    pub fn destinations(&self) -> &[i32] {
-        self.destinations
+    /// History domains of the slot's store.
+    pub fn history_domains(&self) -> usize {
+        self.histories.len()
     }
 
-    pub fn visible(&self) -> &[Vec<[i32; 2]>] {
-        self.visible
+    /// The slot's rows in history domain `domain`.
+    pub fn history(&self, domain: usize) -> Option<SlotHistory<'a>> {
+        let tables = self.histories.get(domain)?;
+        Some(SlotHistory {
+            destinations: &tables.destinations[self.start..self.end],
+            visible: &tables.visible[self.start..self.end],
+            fresh: &tables.fresh[self.start..self.end],
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Demand, Row};
+    use crate::{Demand, Row, RowHistory};
 
     #[test]
     fn batch_exposes_the_validated_slot_and_upload_together() {
@@ -166,8 +192,12 @@ mod tests {
                 rows: vec![Row {
                     token: 7,
                     coordinates: [1, 1, 1, 0],
-                    visible: vec![],
-                    destination: 3,
+                    histories: vec![RowHistory {
+                        visible: vec![],
+                        fresh_start: 0,
+                        bidirectional_end: None,
+                        destination: 3,
+                    }],
                     demand: Demand::NONE,
                     select: None,
                 }],
@@ -181,7 +211,9 @@ mod tests {
         let slot = batch.slot(0).unwrap();
         assert_eq!(slot.bank(), 2);
         assert_eq!(slot.following_bank(), 3);
-        assert_eq!(slot.destinations(), &[3]);
+        assert_eq!(slot.rows(), 1);
+        assert_eq!(slot.history(0).unwrap().destinations, &[3]);
+        assert!(slot.history(1).is_none());
         assert!(batch.slot(1).is_none());
     }
 }

@@ -271,6 +271,7 @@ export const CatalogModel = S.Struct({
   quantizationAware: S.Boolean,
   releaseDate: S.suspend((): S.Schema<ModelReleaseDate, ModelReleaseDateEncoded> => ModelReleaseDate),
   sourceUrls: S.Array(S.String),
+  support: S.suspend((): S.Schema<CatalogSupport, CatalogSupportEncoded> => CatalogSupport),
   variantLabel: S.String,
 })
 export type CatalogModel = S.Schema.Type<typeof CatalogModel>
@@ -313,6 +314,33 @@ export const CatalogModelUpdate = S.Union(
 )
 export type CatalogModelUpdate = S.Schema.Type<typeof CatalogModelUpdate>
 export type CatalogModelUpdateEncoded = S.Schema.Encoded<typeof CatalogModelUpdate>
+
+export const CatalogSupport = S.Union(
+  S.extend(
+    S.Struct({
+      level: S.Literal("supported"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      level: S.Literal("disabled"),
+      reason: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      level: S.Literal("deprecated"),
+      reason: S.String,
+      replacement: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+      since: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CatalogSupport = S.Schema.Type<typeof CatalogSupport>
+export type CatalogSupportEncoded = S.Schema.Encoded<typeof CatalogSupport>
 
 export const ChatCompletionChoice = S.Struct({
   finish_reason: S.String,

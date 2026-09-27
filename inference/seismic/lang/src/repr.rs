@@ -71,7 +71,12 @@ pub(crate) enum Coefficients {
         bias_sign: i32,
     },
     /// One floating scale code shared by the representation group.
-    BlockFloat { format: FloatCodeFormat },
+    BlockFloat {
+        format: FloatCodeFormat,
+        /// Logical values carried by one physical packet (a multiple of
+        /// the representation group).
+        packet_group: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,17 +99,21 @@ pub enum FloatCodeFormat {
     /// NVIDIA unsigned E4M3 scale code. Its physical byte is E4M3FN with
     /// the sign bit ignored by NVFP4 matrix hardware.
     UE4M3,
+    /// OCP microscaling E8M0 scale code: the power of two `2^(raw - 127)`,
+    /// with no sign and no mantissa; 0xff is NaN. `2^-127` (raw 0) is an F32
+    /// subnormal, so every code decodes exactly.
+    E8M0,
 }
 
 impl FloatCodeFormat {
     pub const fn bits(self) -> u32 {
         match self {
             Self::E2M1 => 4,
-            Self::E4M3 | Self::UE4M3 => 8,
+            Self::E4M3 | Self::UE4M3 | Self::E8M0 => 8,
         }
     }
 
-    /// Exact value of the closed NVIDIA floating-code format.
+    /// Exact value of the closed NVIDIA / OCP floating-code format.
     pub fn decode(self, raw: u32) -> f32 {
         let bits = self.bits();
         let raw = raw & ((1u32 << bits) - 1);
@@ -114,6 +123,11 @@ impl FloatCodeFormat {
             -1.0
         };
         match self {
+            Self::E8M0 => match raw {
+                0 => f32::from_bits(0x0040_0000),
+                0xff => f32::NAN,
+                exponent => f32::from_bits(exponent << 23),
+            },
             Self::E2M1 => {
                 let exponent = (raw >> 1) & 0x3;
                 let mantissa = raw & 0x1;
@@ -655,11 +669,83 @@ pub(crate) const REPRS: &[Repr] = &[
         bits: 4,
         coefficients: Coefficients::BlockFloat {
             format: FloatCodeFormat::UE4M3,
+            packet_group: 16,
         },
         // Physical extraction is unsigned; interpretation is the explicit
         // floating-code decode below.
         code: CodeInterpretation::Unsigned,
         float_code: Some(FloatCodeFormat::E2M1),
+    },
+    // The 4-bit coded families (plan: c4g{16,32}) are a codebook, a group
+    // and a scale kind; `iq4g32` above is the IQ4 codebook with f32 scales.
+    // GGUF Q4_0: codes offset by 8, one f16 scale per 32.
+    Repr {
+        name: "q4g32s",
+        packing_axis: PackingAxisRule::Last,
+        group: 32,
+        bits: 4,
+        coefficients: Coefficients::Direct {
+            dtype: DType::F16,
+            bias: false,
+            packet_group: 32,
+        },
+        code: CodeInterpretation::Offset(8),
+        float_code: None,
+    },
+    // GGUF MXFP4 (OCP MX): E2M1 codes, one E8M0 power-of-two scale per 32.
+    Repr {
+        name: "mxfp4g32",
+        packing_axis: PackingAxisRule::Last,
+        group: 32,
+        bits: 4,
+        coefficients: Coefficients::BlockFloat {
+            format: FloatCodeFormat::E8M0,
+            packet_group: 32,
+        },
+        code: CodeInterpretation::Unsigned,
+        float_code: Some(FloatCodeFormat::E2M1),
+    },
+    // GGUF NVFP4: E2M1 codes, one UE4M3 scale per 16, packets of 64 values
+    // (the GGUF block).
+    Repr {
+        name: "nvfp4g16",
+        packing_axis: PackingAxisRule::Last,
+        group: 16,
+        bits: 4,
+        coefficients: Coefficients::BlockFloat {
+            format: FloatCodeFormat::UE4M3,
+            packet_group: 64,
+        },
+        code: CodeInterpretation::Unsigned,
+        float_code: Some(FloatCodeFormat::E2M1),
+    },
+    // GGUF Q5_0: 5-bit codes offset by 16, one f16 scale per 32.
+    Repr {
+        name: "q5g32s",
+        packing_axis: PackingAxisRule::Last,
+        group: 32,
+        bits: 5,
+        coefficients: Coefficients::Direct {
+            dtype: DType::F16,
+            bias: false,
+            packet_group: 32,
+        },
+        code: CodeInterpretation::Offset(16),
+        float_code: None,
+    },
+    // GGUF Q5_1: unsigned 5-bit codes, one f16 scale and one f16 min per 32.
+    Repr {
+        name: "q5g32",
+        packing_axis: PackingAxisRule::Last,
+        group: 32,
+        bits: 5,
+        coefficients: Coefficients::Direct {
+            dtype: DType::F16,
+            bias: true,
+            packet_group: 32,
+        },
+        code: CodeInterpretation::Unsigned,
+        float_code: None,
     },
 ];
 
@@ -697,7 +783,7 @@ impl Repr {
         match self.coefficients {
             Coefficients::Direct { packet_group, .. } => packet_group,
             Coefficients::Hierarchical { factor_group, .. } => factor_group,
-            Coefficients::BlockFloat { .. } => self.group,
+            Coefficients::BlockFloat { packet_group, .. } => packet_group,
         }
     }
     /// Ordered physical ABI planes with their typed field identities.
@@ -781,7 +867,7 @@ impl Repr {
                     ));
                 }
             }
-            Coefficients::BlockFloat { format } => result.push((
+            Coefficients::BlockFloat { format, .. } => result.push((
                 PlaneField::BlockScale,
                 Plane {
                     name: "block_scale",
@@ -884,7 +970,7 @@ impl Repr {
                 };
                 (scale, bias)
             }
-            Coefficients::BlockFloat { format } => {
+            Coefficients::BlockFloat { format, .. } => {
                 let raw = recipe.read(PlaneField::BlockScale, 0);
                 (recipe.float_code(raw, *format), None)
             }
@@ -1179,6 +1265,7 @@ mod tests {
                                 FloatCodeFormat::E2M1
                                     | FloatCodeFormat::E4M3
                                     | FloatCodeFormat::UE4M3
+                                    | FloatCodeFormat::E8M0
                             ));
                         }
                         DecodeStep::ConvertToF32 { into, .. } => {
@@ -1222,6 +1309,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn e8m0_codes_are_exact_powers_of_two() {
+        for raw in 1u32..255 {
+            assert_eq!(
+                FloatCodeFormat::E8M0.decode(raw),
+                2.0f32.powi(raw as i32 - 127),
+                "{raw}"
+            );
+        }
+        // 2^-127 is an F32 subnormal; 0xff is NaN.
+        assert_eq!(FloatCodeFormat::E8M0.decode(0).to_bits(), 0x0040_0000);
+        assert!(FloatCodeFormat::E8M0.decode(0xff).is_nan());
     }
 
     #[test]

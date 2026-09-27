@@ -13,8 +13,8 @@ use super::{
     cpu_projection_screening, row_points, served_row_points, CaseState, EntryTuning, PointShape,
     TuningInputs, TuningLimits,
 };
-use crate::programs::graph::recurrent::CHUNKED_ROWS;
-use magnitude_family_contracts::{MixerGeometry, RecurrentHeadMapping, WeightKind, WeightScope};
+use crate::operators::gated_delta::graph::CHUNKED_ROWS;
+use magnitude_family_contracts::{Operator, RecurrentHeadMapping, WeightKind, WeightScope};
 use magnitude_kernels::{
     gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
 };
@@ -340,26 +340,12 @@ impl RecurrentState {
 
     /// Whether the model's q/k heads map to value heads in groups.
     fn grouped(&self, inputs: &TuningInputs<'_, '_>) -> Result<bool, String> {
-        let scope = *self
-            .shape
-            .scopes
-            .first()
-            .ok_or("a tuning case needs at least one layer")?;
-        let WeightScope::TargetBlock(index) = scope else {
-            return Err(format!("recurrent layers are target blocks, not {scope:?}"));
-        };
-        match inputs
-            .definition
-            .geometry
-            .blocks
-            .get(index as usize)
-            .map(|block| &block.mixer)
-        {
-            Some(MixerGeometry::Recurrent(geometry)) => Ok(matches!(
-                geometry.head_mapping,
+        match inputs.operator(&self.shape.scopes)? {
+            Operator::GatedDelta(delta) => Ok(matches!(
+                delta.head_mapping,
                 RecurrentHeadMapping::Grouped
             )),
-            _ => Err(format!("block {index} has no recurrent mixer")),
+            other => Err(format!("a {} layer has no recurrent mixer", other.name())),
         }
     }
 

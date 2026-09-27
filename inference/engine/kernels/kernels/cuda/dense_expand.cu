@@ -1,5 +1,6 @@
 // dense_expand: RMS prologue over the `out_rows` rows of the F32
-// residual, paired gate/up projection, SiLU(gate) * up epilogue. GEMV for
+// residual, paired gate/up projection, act(gate) * up epilogue (`activation`:
+// SiLU or GELU-tanh). GEMV for
 // O <= 16 (`gemv` to 8 rows, `gemv16` beyond; at O = 1 the block forms the A
 // row in shared memory, else `stage` forms the A rows first), GEMM otherwise:
 // `gemm_small` to 64 rows (A rows, or the INT8 candidate's q8_1 rows staged
@@ -11,7 +12,8 @@
 
 using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
 using Source = projection::GemvSource<Pro>;
-using Epi = projection::SiluMul<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
+using Scaling = projection::scaling<(SEISMIC_DIM_GS != 0 || SEISMIC_DIM_US != 0)>;
+using Epi = Scaling::type<projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>>;
 
 #define PROLOGUE                                                                                          \
     Pro {                                                                                                 \
@@ -23,7 +25,12 @@ using Epi = projection::SiluMul<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 #define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
 #define GATE KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT))
 #define UP KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT))
-#define EPILOGUE Epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0}
+#define EPILOGUE                                                                                          \
+    Scaling::wrap(projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),     \
+                                                                 SEISMIC_RESULT_0_STRIDE_0,               \
+                                                                 (int)SEISMIC_PARAM_ACTIVATION},          \
+                  projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, 0, 0), \
+                  projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, 0, 0))
 
 // The GEMV over NB column blocks of 8 rows.
 template <int NB, int KSPLIT>

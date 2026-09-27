@@ -186,7 +186,12 @@ def spread(options) -> None:
     record = {"kind": "spread", "reference": str(options.reference), "reference_llama_cpp": reference["llama_cpp"],
               "model": str(options.model), "model_sha256": sha256_file(options.model),
               **host_record(options.binary_dir), "categories": {}}
-    if record["model_sha256"] != reference["model_sha256"] and record["model_sha256"] != reference.get("source_model_sha256"):
+    # An F32 model dequantized from the reference's model (e.g. llama.cpp's CPU F32 forward scored
+    # against a model-definition base) names that model with --source-model.
+    if options.source_model:
+        record["source_model_sha256"] = sha256_file(options.source_model)
+    identities = {record["model_sha256"], record.get("source_model_sha256")}
+    if not identities & {reference["model_sha256"], reference.get("source_model_sha256")} - {None}:
         raise SystemExit("spread model differs from the reference model and its source model")
     selected = selected_categories(options.categories)
     existing_path = output / "spread.json"
@@ -256,6 +261,7 @@ def main() -> None:
                                   "longer chunks check long-context numerics such as quantized KV)")
         else:
             sub.add_argument("--reference", type=Path, required=True)
+            sub.add_argument("--source-model", type=Path, help="quantized GGUF an F32 --model was derived from")
             sub.add_argument("--ngl", type=int, default=99)
             sub.add_argument("--save-base", action="store_true",
                              help="also write this backend's own base files and compare them with kl_base")

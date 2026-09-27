@@ -1,5 +1,5 @@
-// Tile pieces of the streaming ("flash") attention bodies: the gated
-// attention prefill (`gated_attention_prefill`) and the vision full attention
+// Tile pieces of the streaming ("flash") attention bodies: the attention
+// prefill (`attention_prefill`) and the vision full attention
 // (`qwen_vision_block`). Each subgroup owns a block of 16 query rows of head
 // width `w` (a multiple of 16, at most FLASH_MAX_W); keys stream through
 // the shared region in tiles of FLASH_KEYS rows as f16 with rows padded to
@@ -73,10 +73,11 @@ void flash_stage(const int kind, uint64_t plane, uint64_t row_stride, uint64_t c
     }
 }
 
-// Stages a component whose rows live in separately allocated slabs. Each
-// table address already points to the component's region of its slab.
-void flash_stage_slab(const int kind, uint64_t table, uint64_t slab_rows, uint kv_head,
-    uint kv_heads, uint w, int first, int end, uint base) {
+// Stages a component whose rows live in separately allocated slabs: the w
+// columns from `column` of rows of `row_elements` elements. Each table
+// address already points to the component's region of its slab.
+void flash_stage_slab(const int kind, uint64_t table, uint64_t slab_rows, uint row_elements, uint column,
+    uint w, int first, int end, uint base) {
     const uint pieces = w / 8u;
     for (uint item = gl_LocalInvocationIndex; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
         const uint k = item / pieces;
@@ -84,9 +85,9 @@ void flash_stage_slab(const int kind, uint64_t table, uint64_t slab_rows, uint k
         const int t = first + int(k);
         uvec4 bits = uvec4(0u);
         if (t < end) {
-            const uint64_t row = slab_row(table, uint64_t(t), slab_rows,
-                uint64_t(kv_heads * w) * ELEMENT_BYTES(kind));
-            bits = element_uvec4_at(row + uint64_t(kv_head * w + c) * ELEMENT_BYTES(kind));
+            const uint64_t row = slab_row(table, uint(t), uint(slab_rows),
+                uint64_t(row_elements) * ELEMENT_BYTES(kind));
+            bits = element_uvec4_at(row + uint64_t(column + c) * ELEMENT_BYTES(kind));
             if (kind == ELEMENT_BF16) {
                 vec4 even, odd;
                 element_split8(ELEMENT_BF16, bits, even, odd);
@@ -97,16 +98,34 @@ void flash_stage_slab(const int kind, uint64_t table, uint64_t slab_rows, uint k
     }
 }
 
-// The block's scores S = Q K^T (16 rows x FLASH_KEYS keys, F32) into its
-// shared scratch (row-major, 32 floats per row). `q` is the block's first
-// query row (f16 elements, rows `q_stride` apart); the K tile is at shared
-// half `k_base`.
-void flash_scores(uint64_t q, uint64_t q_stride, const uint w, uint k_base, uint scratch) {
-    const uint pitch = flash_pitch(w);
+// The block's scores S = Q K^T (16 rows x FLASH_KEYS keys, F32), held in
+// registers while they accumulate: a head wider than FLASH_MAX_W is scored
+// over column chunks staged in turn (`flash_scores_add` per chunk), then
+// published to the block's shared scratch (row-major, 32 floats per row).
+struct flash_scores_state {
 #if SEISMIC_HAS_MATRIX
     FLASH_FRAGMENT_C s[2];
-    s[0] = FLASH_FRAGMENT_C(0.0);
-    s[1] = FLASH_FRAGMENT_C(0.0);
+#else
+    float s[16];
+#endif
+};
+
+void flash_scores_clear(out flash_scores_state state) {
+#if SEISMIC_HAS_MATRIX
+    state.s[0] = FLASH_FRAGMENT_C(0.0);
+    state.s[1] = FLASH_FRAGMENT_C(0.0);
+#else
+    [[unroll]] for (uint j = 0u; j < 16u; ++j)
+        state.s[j] = 0.0;
+#endif
+}
+
+// Adds the products of w columns: `q` is the block's first query row at
+// those columns (f16 elements, rows `q_stride` apart); their K tile is at
+// shared half `k_base` (row pitch w + 8).
+void flash_scores_add(uint64_t q, uint64_t q_stride, const uint w, uint k_base, inout flash_scores_state state) {
+    const uint pitch = flash_pitch(w);
+#if SEISMIC_HAS_MATRIX
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W; d += 16u) {
         if (d < w) {
             FLASH_FRAGMENT_A a;
@@ -114,36 +133,46 @@ void flash_scores(uint64_t q, uint64_t q_stride, const uint w, uint k_base, uint
             [[unroll]] for (uint j = 0u; j < 2u; ++j) {
                 FLASH_FRAGMENT_B b;
                 coopMatLoad(b, seismic_shared_f16, k_base + j * 16u * pitch + d, pitch, gl_CooperativeMatrixLayoutColumnMajor);
-                s[j] = coopMatMulAdd(a, b, s[j]);
+                state.s[j] = coopMatMulAdd(a, b, state.s[j]);
             }
         }
     }
-    subgroupBarrier();
-    coopMatStore(s[0], seismic_shared_f32, scratch, 32u, gl_CooperativeMatrixLayoutRowMajor);
-    coopMatStore(s[1], seismic_shared_f32, scratch + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
-    subgroupMemoryBarrierShared();
-    subgroupBarrier();
 #else
     const uint lane = SEISMIC_LANE;
     const uint r = lane % 16u, h = lane / 16u;
-    float s[16];
-    [[unroll]] for (uint j = 0u; j < 16u; ++j)
-        s[j] = 0.0;
     for (uint d = 0u; d < w; d += 2u) {
         const vec2 x = vec2(element_at(ELEMENT_F16, q, uint64_t(r) * q_stride + d),
             element_at(ELEMENT_F16, q, uint64_t(r) * q_stride + d + 1u));
         [[unroll]] for (uint j = 0u; j < 16u; ++j) {
             const vec2 k = unpackHalf2x16(seismic_shared_u32[(k_base + (16u * h + j) * pitch + d) / 2u]);
-            s[j] = seismic_fma_rn(x.x, k.x, s[j]);
-            s[j] = seismic_fma_rn(x.y, k.y, s[j]);
+            state.s[j] = seismic_fma_rn(x.x, k.x, state.s[j]);
+            state.s[j] = seismic_fma_rn(x.y, k.y, state.s[j]);
         }
     }
+#endif
+}
+
+void flash_scores_publish(flash_scores_state state, uint scratch) {
     subgroupBarrier();
+#if SEISMIC_HAS_MATRIX
+    coopMatStore(state.s[0], seismic_shared_f32, scratch, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(state.s[1], seismic_shared_f32, scratch + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+#else
+    const uint lane = SEISMIC_LANE;
+    const uint r = lane % 16u, h = lane / 16u;
     [[unroll]] for (uint j = 0u; j < 16u; ++j)
-        seismic_shared_f32[scratch + r * 32u + 16u * h + j] = s[j];
+        seismic_shared_f32[scratch + r * 32u + 16u * h + j] = state.s[j];
+#endif
     subgroupMemoryBarrierShared();
     subgroupBarrier();
-#endif
+}
+
+// The scores of a head of w <= FLASH_MAX_W columns, published to `scratch`.
+void flash_scores(uint64_t q, uint64_t q_stride, const uint w, uint k_base, uint scratch) {
+    flash_scores_state state;
+    flash_scores_clear(state);
+    flash_scores_add(q, q_stride, w, k_base, state);
+    flash_scores_publish(state, scratch);
 }
 
 // The lane's 16 raw scores of the last `flash_scores`.

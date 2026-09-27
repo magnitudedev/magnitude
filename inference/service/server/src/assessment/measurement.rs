@@ -1,10 +1,11 @@
-//! The measurement job: the environment's fixed measurement basis, measured once in one contained
-//! child process on the selected device and cached in the service's assessment cache.
+//! The measurement job: the environment's measurement basis, established in one contained child
+//! process on the selected device and cached in the service's assessment cache.
 //!
-//! The child opens only the device it is given, loads the basis stored for that device's exact
-//! measurement identity or measures and stores it, and reports the identity. The service then
-//! reads the basis from the shared cache directory. Opening a device, forming kernels and timing
-//! them never happens in the service process.
+//! The basis is the engine's fixed, model-free plan for the device. The child opens only the
+//! device it is given, loads the basis stored for that device's exact measurement identity,
+//! measures what it lacks (all of it on a first run), stores it, and reports the identity. The
+//! service then reads the basis from the shared cache directory. Opening a device, forming
+//! kernels and timing them never happens in the service process.
 
 use std::fmt;
 use std::io::Write as _;
@@ -14,8 +15,7 @@ use std::time::{Duration, Instant};
 
 use magnitude_engine::worker::protocol::EngineBuild;
 use magnitude_executor::assessment::{
-    BasisIdentity, MeasurementBasis, MeasurementError, load_basis, measure_basis_observed,
-    store_basis,
+    BasisIdentity, MeasurementBasis, MeasurementError, complete_basis, load_basis, store_basis,
 };
 use magnitude_executor::platform::{self, MemoryReserves, PlatformConfig, PlatformError};
 use magnitude_executor::{DEFAULT_KERNEL_CACHE_BYTES, ExecutionPath, KernelCache};
@@ -56,10 +56,10 @@ impl MeasurementWorkerArgs {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BasisSource {
-    /// The basis stored for this identity was reused.
+    /// The basis stored for this identity was complete.
     Cached,
-    /// The basis was measured now.
-    Measured { seconds: f64 },
+    /// The entries the stored basis lacked were measured now.
+    Measured { entries: usize, seconds: f64 },
 }
 
 /// The child's single stdout record.
@@ -128,37 +128,50 @@ pub fn run_measurement_worker(args: MeasurementWorkerArgs) -> Result<(), Measure
     )
     .map_err(MeasurementWorkerError::Platform)?;
     let identity = BasisIdentity::for_device(opened.device(), &EngineBuild::current().0);
-    let source = if load_basis(&args.basis_directory, &identity).is_some() {
-        BasisSource::Cached
-    } else {
-        let started = Instant::now();
-        let basis = measure_basis_observed(
-            &catalog,
-            opened.device(),
-            reserves,
-            identity.clone(),
-            |key, _, profile| {
-                tracing::debug!(
-                    ?key,
-                    formation.seconds = profile.formation.as_secs_f64(),
-                    allocation.seconds = profile.allocation.as_secs_f64(),
-                    timing.seconds = profile.timing.as_secs_f64(),
-                    sealing.seconds = profile.sealing.as_secs_f64(),
-                    submission.seconds = profile.submission.as_secs_f64(),
-                    encoding.seconds = profile.encoding.as_secs_f64(),
-                    dispatch.seconds = profile.dispatch.as_secs_f64(),
-                    device.seconds = profile.device.as_secs_f64(),
-                    waiting.seconds = profile.waiting.as_secs_f64(),
-                    tracing.seconds = profile.tracing.as_secs_f64(),
-                    total.seconds = profile.total.as_secs_f64(),
-                    "generic measurement class completed"
-                );
-            },
-        )
-        .map_err(MeasurementWorkerError::Measurement)?;
-        let seconds = started.elapsed().as_secs_f64();
-        store_basis(&args.basis_directory, &basis).map_err(MeasurementWorkerError::Store)?;
-        BasisSource::Measured { seconds }
+    let stored = load_basis(&args.basis_directory, &identity).unwrap_or(MeasurementBasis {
+        identity: identity.clone(),
+        classes: Vec::new(),
+    });
+    let known = stored.classes.len();
+    let started = Instant::now();
+    let basis = complete_basis(&catalog, opened.device(), reserves, stored, |key, _, profile| {
+        tracing::debug!(
+            %key,
+            formation.seconds = profile.formation.as_secs_f64(),
+            allocation.seconds = profile.allocation.as_secs_f64(),
+            timing.seconds = profile.timing.as_secs_f64(),
+            sealing.seconds = profile.sealing.as_secs_f64(),
+            submission.seconds = profile.submission.as_secs_f64(),
+            encoding.seconds = profile.encoding.as_secs_f64(),
+            dispatch.seconds = profile.dispatch.as_secs_f64(),
+            device.seconds = profile.device.as_secs_f64(),
+            waiting.seconds = profile.waiting.as_secs_f64(),
+            tracing.seconds = profile.tracing.as_secs_f64(),
+            total.seconds = profile.total.as_secs_f64(),
+            "measurement entry completed"
+        );
+    });
+    let basis = match basis {
+        Ok(basis) => basis,
+        // The entries measured before the failure are kept, so the next job measures only the
+        // rest (and a faulted entry stays unsupported).
+        Err(failure) => {
+            if failure.basis.classes.len() > known {
+                store_basis(&args.basis_directory, &failure.basis)
+                    .map_err(MeasurementWorkerError::Store)?;
+            }
+            return Err(MeasurementWorkerError::Measurement(failure.error));
+        }
+    };
+    let source = match basis.classes.len() - known {
+        0 => BasisSource::Cached,
+        entries => {
+            store_basis(&args.basis_directory, &basis).map_err(MeasurementWorkerError::Store)?;
+            BasisSource::Measured {
+                entries,
+                seconds: started.elapsed().as_secs_f64(),
+            }
+        }
     };
     let report = MeasurementReport {
         engine_build: identity.engine_build,
@@ -255,6 +268,7 @@ impl MeasurementJob {
         }
     }
 
+    /// Establish the basis of `device`.
     pub async fn establish(
         &self,
         device: DeviceSelector,
@@ -281,7 +295,6 @@ impl MeasurementJob {
             .launcher
             .spawn(command)
             .map_err(|error| MeasurementJobError::Spawn(format!("{error:#}")))?;
-        drop(child.stdin.take());
         let stdout = child.stdout.take().ok_or_else(|| {
             MeasurementJobError::Spawn("measurement worker stdout is unavailable".to_owned())
         })?;
@@ -405,12 +418,21 @@ mod tests {
             backend: "metal".to_owned(),
             device: "device".to_owned(),
             protocol_version: 7,
-            source: BasisSource::Measured { seconds: 1.5 },
+            source: BasisSource::Measured {
+                entries: 3,
+                seconds: 1.5,
+            },
         };
         let decoded: MeasurementReport =
             serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
         assert_eq!(decoded.identity(), report.identity());
-        assert_eq!(decoded.source, BasisSource::Measured { seconds: 1.5 });
+        assert_eq!(
+            decoded.source,
+            BasisSource::Measured {
+                entries: 3,
+                seconds: 1.5
+            }
+        );
     }
 
     #[tokio::test]

@@ -188,8 +188,21 @@ impl ExecutionPlanner {
         if path == ExecutionPath::Native && codec == KvCodec::RotatedK4V4 {
             return Err(PlanError::Unsupported("native rotated K4/V4 KV codec"));
         }
-        if selection.head != matches!(method, PlannedMethod::Mtp { .. }) {
+        if selection.head != method.drafts() {
             return Err(PlanError::Topology("method and head selection disagree"));
+        }
+        match method {
+            PlannedMethod::Mtp { .. } if definition.head.is_none() || definition.draft.is_some() => {
+                return Err(PlanError::Topology("MTP drafts with the definition's head alone"));
+            }
+            PlannedMethod::DFlash { .. }
+                if definition.draft.is_none() || definition.head.is_some() =>
+            {
+                return Err(PlanError::Topology(
+                    "DFlash drafts with the definition's separate draft alone",
+                ));
+            }
+            _ => {}
         }
         let load = ModelLoadPlan::derive(
             manifest,
@@ -235,14 +248,41 @@ impl ExecutionPlanner {
                 }
                 Some(greedy_proposals.max(sampled_proposals))
             }
+            // One block pass drafts every proposal, so the width is bounded
+            // by the draft's block, not by sealed chains.
+            PlannedMethod::DFlash { proposals } => {
+                let block = definition
+                    .draft
+                    .as_ref()
+                    .map_or(0, magnitude_family_contracts::DraftDefinition::max_proposals);
+                if proposals == 0 || u64::from(proposals) > block {
+                    return Err(PlanError::Unsupported("DFlash proposal width"));
+                }
+                Some(proposals)
+            }
         };
-        if programs.head().is_some() != selection.head
+        if programs.head().is_some() != matches!(method, PlannedMethod::Mtp { .. })
+            || programs.draft().is_some() != matches!(method, PlannedMethod::DFlash { .. })
             || programs.vision().is_some() != selection.vision
         {
             return Err(PlanError::Topology(
                 "enabled components and program slots disagree",
             ));
         }
+        // The drafter's component: the target's embedded head, or the
+        // separate draft.
+        let head = match method {
+            PlannedMethod::Plain => None,
+            PlannedMethod::Mtp { .. } => Some(target),
+            PlannedMethod::DFlash { .. } => Some(ArtifactComponent {
+                kind: ArtifactComponentKind::Draft,
+                identity: manifest
+                    .draft
+                    .as_ref()
+                    .ok_or(PlanError::Topology("DFlash has no draft component"))?
+                    .identity,
+            }),
+        };
         Ok(ExecutionPlanDraft {
             device: PlannedDevice {
                 selector: device.info.selector,
@@ -252,7 +292,7 @@ impl ExecutionPlanner {
             },
             components: ComponentPlan {
                 target,
-                head: selection.head.then_some(target),
+                head,
                 vision,
             },
             load,

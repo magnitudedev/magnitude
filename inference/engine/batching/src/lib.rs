@@ -13,11 +13,11 @@ pub use classes::{
     PREFILL_ROW_QUANTUM, SMALL_CLASS_ROWS,
 };
 pub use demand::Demand;
-pub use head::{HeadSlot, ValidatedHeadBatch};
+pub use head::{BlockSlot, HeadPasses, HeadSlot, ValidatedHeadBatch};
 pub use rows::{
-    Draw, DrawKind, PackError, PackedRowTables, Row, Select, Shaping, Slot, HISTORY_WIDTH,
-    SHAPING_WIDTH,
+    Draw, DrawKind, HistoryTables, PackError, PackedRowTables, Row, RowHistory, Select, Shaping,
+    Slot, HISTORY_WIDTH, SHAPING_WIDTH,
 };
 pub use state::{StateBatchError, StateBatchKind, ValidatedStateBatch};
-pub use target::{TargetBatchSlot, TargetBatchUpload, ValidatedTargetBatch};
+pub use target::{SlotHistory, TargetBatchSlot, TargetBatchUpload, ValidatedTargetBatch};
 pub use vision::{ValidatedVisionBatch, VisionBatchError};

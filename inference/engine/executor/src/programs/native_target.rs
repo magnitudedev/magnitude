@@ -6,10 +6,10 @@ use super::{
     graph::readout::{
         shapes, write_selection, BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind,
     },
-    graph::recurrent::RECURRENT_COMPONENTS,
-    native_target_graph::{BlockControlPorts, BlockStatePorts, BoundTargetGraphs, EntryTokens},
+    native_target_graph::{BoundTargetGraphs, EntryTokens},
     DeviceSubmission, TargetProgram,
 };
+use crate::operators::block::{BlockControlPorts, BlockStatePorts};
 use crate::{
     completion::CompletionWaiter, native::AttestedState, ConditioningRef, ConditioningSlice,
     DeviceError, GraphOutputTensor, InvariantError, NativeGraphOutputLease,
@@ -17,7 +17,7 @@ use crate::{
     TargetLaunchCore, TargetLaunchWorkspace, TargetTokens, ValidatedTargetLaunch,
 };
 use magnitude_batching::{Demand, TargetBatchUpload};
-use magnitude_family_contracts::{DecoderGeometry, MixerGeometry};
+use magnitude_family_contracts::Decoder;
 use magnitude_kernels::conditioning_overlay;
 use magnitude_state::LayerRef;
 use seismic::{
@@ -139,7 +139,7 @@ struct OverlayGraph {
 pub struct NativeTargetProgram {
     device: Device,
     state: AttestedState,
-    geometry: DecoderGeometry,
+    geometry: Decoder,
     graphs: Rc<BoundTargetGraphs>,
     readout_graphs: Rc<BoundTargetReadoutGraphs>,
     /// Overlay plans by row count, sealed on first use.
@@ -197,20 +197,29 @@ impl RowState<'_> {
             .map(|advance| advance.bindings().recurrent)
             .ok_or_else(|| invalid("recurrent batch has no state advance"))
     }
-    /// `layer`'s history planes in the codec's plane-descriptor order, as
-    /// the attention graph's state ports take them.
-    fn history(&self, layer: LayerRef) -> Result<Vec<&Tensor>, SubmitError> {
+    /// `layer`'s history read (`StateStore::history_read`, the index of its
+    /// controls) and planes in the codec's plane-descriptor order, as the
+    /// attention graph's state ports take them. A Shared layer binds its
+    /// source layer's planes and its source domain's shared read.
+    fn history(&self, layer: LayerRef) -> Result<(usize, Vec<&Tensor>), SubmitError> {
+        let store = self.0.store();
+        let missing = || invalid("attention layer has no history in its store");
+        let source = store.history_source(layer).ok_or_else(missing)?;
+        let read = store.history_read(layer).ok_or_else(missing)?;
         let planes = self
             .0
             .advances()
             .first()
             .map(|advance| advance.bindings().history)
             .ok_or_else(|| invalid("attention batch has no state advance"))?;
-        Ok(planes
-            .iter()
-            .filter(|plane| plane.layer == layer)
-            .map(|plane| &plane.buffer)
-            .collect())
+        Ok((
+            read,
+            planes
+                .iter()
+                .filter(|plane| plane.domain == source.domain && plane.layer == source.layer)
+                .map(|plane| &plane.buffer)
+                .collect(),
+        ))
     }
     fn conditioning(&self, slot: usize) -> Option<&ConditioningRef> {
         self.0.conditioning().get(slot).and_then(Option::as_ref)
@@ -232,7 +241,7 @@ impl NativeTargetProgram {
     pub(crate) fn new(
         device: Device,
         state: AttestedState,
-        geometry: DecoderGeometry,
+        geometry: Decoder,
         graphs: BoundTargetGraphs,
         readout_graphs: BoundTargetReadoutGraphs,
     ) -> Result<Self, SubmitError> {
@@ -325,8 +334,18 @@ impl NativeTargetProgram {
         };
         let (graph, bound) = self.readout_graphs.class(class).map_err(invalid)?;
         let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
+        let tap_rows = graph
+            .taps
+            .as_ref()
+            .map(|_| self.tap_rows(class.rows))
+            .transpose()?;
         let mut bindings = bound.bindings();
-        bindings.set(&graph.hidden, hidden).map_err(device)?;
+        if let Some(rows) = &graph.final_rows {
+            bindings.set(&rows.hidden, hidden).map_err(device)?;
+        }
+        if let (Some(ports), Some(tap_rows)) = (&graph.taps, &tap_rows) {
+            bindings.set(&ports.taps, tap_rows).map_err(device)?;
+        }
         let mut out_rows = vec![0_i32; output_class];
         out_rows[..actual_outputs].copy_from_slice(batch.out_rows);
         active
@@ -387,6 +406,16 @@ impl NativeTargetProgram {
         }))
     }
 
+    /// The leading `rows` draft input rows of a tapped target.
+    fn tap_rows(&self, rows: u64) -> Result<Tensor, SubmitError> {
+        self.graphs
+            .taps
+            .as_ref()
+            .ok_or_else(|| invalid("a tapped graph has no bound draft input rows"))?
+            .slice_leading(0, rows)
+            .map_err(device)
+    }
+
     fn overlay(&self, rows: u64) -> Result<OverlayGraph, SubmitError> {
         if let Some(overlay) = self.overlays.borrow().get(&rows) {
             return Ok(overlay.clone());
@@ -425,6 +454,73 @@ impl NativeTargetProgram {
         };
         self.overlays.borrow_mut().insert(rows, overlay.clone());
         Ok(overlay)
+    }
+
+    /// Queue a per-layer model's per-layer entry over the step's embedded
+    /// and overlaid `hidden` rows, and return the per-layer rows its blocks
+    /// read. Each batch row gathers its token's table row, a media row the
+    /// entry's media row.
+    fn queue_per_layer_entry(
+        &self,
+        batch: &TargetBatchUpload<'_>,
+        tokens: &TargetTokens,
+        rows: u64,
+        hidden: &Tensor,
+        media_rows: &[std::ops::Range<usize>],
+        graph_workspace: &mut TargetGraphWorkspaceLease,
+        submitter: &mut StepSubmitter,
+    ) -> Result<Option<Tensor>, SubmitError> {
+        let Some(entry) = self.graphs.per_layer_entry(rows) else {
+            return Ok(None);
+        };
+        let (graph, bound, per_layer) = entry.map_err(invalid)?;
+        let TargetTokens::Host = tokens else {
+            return Err(invalid("a per-layer entry gathers table rows by host tokens"));
+        };
+        let media_row = self
+            .geometry
+            .entry
+            .per_layer
+            .as_ref()
+            .ok_or_else(|| invalid("a per-layer entry graph without its geometry"))?
+            .media_row;
+        let media_row =
+            i64::try_from(media_row).map_err(|_| invalid("per-layer media row exceeds i64"))?;
+        let table_rows = batch
+            .tokens
+            .iter()
+            .enumerate()
+            .map(|(row, token)| {
+                if media_rows.iter().any(|range| range.contains(&row)) {
+                    media_row
+                } else {
+                    i64::from(*token)
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut gathered = vec![0; table_rows.len() * per_layer.table.row_bytes()];
+        per_layer
+            .table
+            .gather(&table_rows, &mut gathered)
+            .map_err(|error| invalid(error.to_string()))?;
+        let inputs = per_layer.rows.slice_leading(0, rows).map_err(device)?;
+        let mut active = graph_workspace
+            .slot_mut()
+            .activate(&graph.plan)
+            .map_err(device)?;
+        active
+            .write_input(&graph.ports.gathered, &gathered)
+            .map_err(device)?;
+        let mut bindings = bound.bindings();
+        bindings.set(&graph.ports.hidden, hidden).map_err(device)?;
+        bindings
+            .set(&graph.ports.rows, &inputs)
+            .map_err(device)?;
+        let ready = active
+            .attach(bindings, graph.plan.new_outputs().map_err(device)?)
+            .map_err(device)?;
+        submitter.queue(ready)?;
+        Ok(Some(inputs))
     }
 
     /// Conditioning rows that replace embedding rows, as (source, first
@@ -582,7 +678,12 @@ impl NativeTargetProgram {
         let mut hidden = entry_outputs
             .exported(&entry.hidden)
             .ok_or_else(|| invalid("target embedding hidden was not exported"))?;
-        for (source, start, end) in self.conditioning_sources(state, batch)? {
+        let conditioning = self.conditioning_sources(state, batch)?;
+        let media_rows = conditioning
+            .iter()
+            .map(|(_, start, end)| *start..*end)
+            .collect::<Vec<_>>();
+        for (source, start, end) in conditioning {
             let overlay = self.overlay((end - start) as u64)?;
             let destination = hidden
                 .slice_leading(start as u64, end as u64)
@@ -598,6 +699,15 @@ impl NativeTargetProgram {
                 .map_err(device)?;
             submitter.queue(ready)?;
         }
+        let per_layer_rows = self.queue_per_layer_entry(
+            batch,
+            tokens,
+            rows,
+            &hidden,
+            &media_rows,
+            graph_workspace,
+            submitter,
+        )?;
         pending[0] = Some(entry_outputs);
         let mut recurrent_component = 0usize;
         if self.trace.batch {
@@ -610,7 +720,7 @@ impl NativeTargetProgram {
                 batch.select_rows.len()
             );
         }
-        for (index, geometry) in self.geometry.blocks.iter().enumerate() {
+        for index in 0..self.geometry.blocks.len() {
             let block_started = self.trace.blocks.then(Instant::now);
             let (graph, bound) = self
                 .graphs
@@ -621,9 +731,38 @@ impl NativeTargetProgram {
                 .slot_mut()
                 .activate(&graph.plan)
                 .map_err(device)?;
+            let tap_rows = graph
+                .taps
+                .as_ref()
+                .map(|_| self.tap_rows(rows))
+                .transpose()?;
             let mut bindings = bound.bindings();
             bindings.set(&graph.hidden, &hidden).map_err(device)?;
-            match (&graph.state, &graph.controls, &geometry.mixer) {
+            match (&graph.per_layer, &per_layer_rows) {
+                (None, _) => {}
+                (Some(port), Some(inputs)) => bindings.set(port, inputs).map_err(device)?,
+                (Some(_), None) => {
+                    return Err(invalid("a per-layer block graph has no per-layer rows"))
+                }
+            }
+            if let (Some(ports), Some(tap_rows)) = (&graph.taps, &tap_rows) {
+                let taps = self.graphs.prepared.block_taps(index);
+                bindings.set(&ports.taps, tap_rows).map_err(device)?;
+                for (port, tap) in [
+                    (&ports.entry, taps.entry),
+                    (&ports.middle, taps.middle),
+                    (&ports.output, taps.output),
+                ] {
+                    match (port, tap) {
+                        (Some(port), Some(tap)) => active
+                            .write_input(port, &i32_bytes(&[tap as i32]))
+                            .map_err(device)?,
+                        (None, None) => {}
+                        _ => return Err(invalid("a block's tap ports differ from its taps")),
+                    }
+                }
+            }
+            match (&graph.state, &graph.controls) {
                 (
                     BlockStatePorts::Attention(ports),
                     BlockControlPorts::Attention {
@@ -632,9 +771,8 @@ impl NativeTargetProgram {
                         fresh,
                         destinations,
                     },
-                    MixerGeometry::Attention(_),
                 ) => {
-                    let history = state.history(LayerRef::Target(index as u32))?;
+                    let (read, history) = state.history(LayerRef::Target(index as u32))?;
                     if history.len() != ports.len() {
                         return Err(invalid(
                             "the layer's history planes disagree with its attention entry",
@@ -643,47 +781,35 @@ impl NativeTargetProgram {
                     for (port, plane) in ports.iter().zip(history) {
                         bindings.set(port, plane).map_err(device)?;
                     }
+                    let history_controls = controls
+                        .histories
+                        .get(read)
+                        .ok_or_else(|| invalid("the batch lacks the layer's history read"))?;
                     active
                         .write_input(coordinates, &controls.coordinates)
                         .map_err(device)?;
                     active
-                        .write_input(visible, &controls.visible)
+                        .write_input(visible, &history_controls.visible)
                         .map_err(device)?;
-                    active.write_input(fresh, &controls.fresh).map_err(device)?;
                     active
-                        .write_input(destinations, &controls.destinations)
+                        .write_input(fresh, &history_controls.fresh)
+                        .map_err(device)?;
+                    active
+                        .write_input(destinations, &history_controls.destinations)
                         .map_err(device)?;
                 }
-                (
-                    BlockStatePorts::Recurrent(ports),
-                    BlockControlPorts::Recurrent(recurrent),
-                    MixerGeometry::Recurrent(_),
-                ) => {
+                (BlockStatePorts::Recurrent(ports), BlockControlPorts::Recurrent(recurrent)) => {
                     let arenas = state.recurrent_arenas()?;
-                    bindings
-                        .set(
-                            &ports.window,
-                            arenas
-                                .get(recurrent_component)
-                                .ok_or_else(|| invalid("recurrent window arena is absent"))?,
-                        )
-                        .map_err(device)?;
-                    bindings
-                        .set(
-                            &ports.delta,
-                            arenas
-                                .get(recurrent_component + 1)
-                                .ok_or_else(|| invalid("recurrent delta arena is absent"))?,
-                        )
-                        .map_err(device)?;
-                    bindings
-                        .set(
-                            &ports.tape,
-                            arenas
-                                .get(recurrent_component + 2)
-                                .ok_or_else(|| invalid("recurrent tape arena is absent"))?,
-                        )
-                        .map_err(device)?;
+                    for (offset, port) in ports.iter().enumerate() {
+                        bindings
+                            .set(
+                                port,
+                                arenas
+                                    .get(recurrent_component + offset)
+                                    .ok_or_else(|| invalid("recurrent bank arena is absent"))?,
+                            )
+                            .map_err(device)?;
+                    }
                     active
                         .write_input(&recurrent.segments, &controls.segments)
                         .map_err(device)?;
@@ -700,7 +826,7 @@ impl NativeTargetProgram {
                         .write_input(&recurrent.following_bank, &controls.following_bank)
                         .map_err(device)?;
                 }
-                _ => return Err(invalid("sealed graph block differs from decoder geometry")),
+                _ => return Err(invalid("sealed graph block state and controls disagree")),
             }
             let ready = active
                 .attach(
@@ -711,8 +837,8 @@ impl NativeTargetProgram {
                 )
                 .map_err(device)?;
             let outputs = submitter.queue(ready)?;
-            if matches!(&graph.state, BlockStatePorts::Recurrent(_)) {
-                recurrent_component += RECURRENT_COMPONENTS;
+            if let BlockStatePorts::Recurrent(ports) = &graph.state {
+                recurrent_component += ports.len();
             }
             hidden = outputs
                 .exported(&graph.output)
@@ -727,9 +853,9 @@ impl NativeTargetProgram {
                 .map_err(SubmitError::Invariant)?;
             pending[parity] = Some(outputs);
             if let Some(started) = block_started {
-                let kind = match &geometry.mixer {
-                    MixerGeometry::Attention(_) => "attention",
-                    MixerGeometry::Recurrent(_) => "recurrent",
+                let kind = match &graph.state {
+                    BlockStatePorts::Attention(_) => "attention",
+                    BlockStatePorts::Recurrent(_) => "recurrent",
                 };
                 eprintln!(
                     "target block {index} {kind} {:.3}s",
@@ -764,9 +890,9 @@ impl NativeTargetProgram {
 
 struct GraphControls {
     coordinates: Vec<u8>,
-    visible: Vec<u8>,
-    fresh: Vec<u8>,
-    destinations: Vec<u8>,
+    /// One control set per history domain, in domain order: an attention
+    /// block reads its own domain's.
+    histories: Vec<HistoryControls>,
     segments: Vec<u8>,
     /// Rows after which each slot publishes its recurrent state; later rows
     /// are recorded on the successor bank's tape.
@@ -775,6 +901,13 @@ struct GraphControls {
     previous_bank: Vec<u8>,
     previous_tape: Vec<u8>,
     following_bank: Vec<u8>,
+}
+
+/// One history domain's attention controls.
+struct HistoryControls {
+    visible: Vec<u8>,
+    fresh: Vec<u8>,
+    destinations: Vec<u8>,
 }
 
 impl GraphControls {
@@ -791,10 +924,12 @@ impl GraphControls {
             || batch.actual_rows > rows
             || batch.tokens.len() != rows
             || batch.coordinates.len() != rows
-            || batch.visible.len() != rows
-            || batch.fresh.len() != rows
-            || batch.destinations.len() != rows
-            || batch.visible.iter().any(|ranges| ranges.len() != segments)
+            || batch.histories.iter().any(|history| {
+                history.visible.len() != rows
+                    || history.fresh.len() != rows
+                    || history.destinations.len() != rows
+                    || history.visible.iter().any(|ranges| ranges.len() != segments)
+            })
         {
             return Err(invalid(
                 "validated batch does not match exact graph row, segment, and slot classes",
@@ -807,20 +942,26 @@ impl GraphControls {
                 .flatten()
                 .flat_map(|value| value.to_le_bytes())
                 .collect(),
-            visible: batch
-                .visible
+            histories: batch
+                .histories
                 .iter()
-                .flatten()
-                .flatten()
-                .flat_map(|value| value.to_le_bytes())
+                .map(|history| HistoryControls {
+                    visible: history
+                        .visible
+                        .iter()
+                        .flatten()
+                        .flatten()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect(),
+                    fresh: history
+                        .fresh
+                        .iter()
+                        .flatten()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect(),
+                    destinations: i32_bytes(&history.destinations),
+                })
                 .collect(),
-            fresh: batch
-                .fresh
-                .iter()
-                .flatten()
-                .flat_map(|value| value.to_le_bytes())
-                .collect(),
-            destinations: i32_bytes(batch.destinations),
             segments: batch.segments[..=batch.actual_slots]
                 .iter()
                 .flatten()

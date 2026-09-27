@@ -50,7 +50,7 @@ impl PreparedChat {
         let (native, reasoning) = bundle.prepare(request, selection)?;
         let description = native.description();
         let tokens = tokenizer
-            .encode(&description.prompt, SpecialTokens::Recognize)
+            .encode_sequence(&description.prompt)
             .map_err(internal)?;
         if tokens.is_empty() {
             return Err(ChatError::InvalidRequest(

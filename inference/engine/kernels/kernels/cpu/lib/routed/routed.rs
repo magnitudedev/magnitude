@@ -12,7 +12,7 @@
 // publishes `silu(gate) * up` rounded once to the activation element; down
 // projections are published to it before they are weighted.
 
-use super::super::core::{activation, reduce};
+use super::super::core::{activation, functions, reduce};
 use super::super::projection::projection;
 use seismic::cpu::quant::Q8Block;
 use seismic::cpu::{Dense, Weights};
@@ -27,7 +27,8 @@ pub fn expert_row(expert: i32, rows: usize) -> usize {
 /// The expansion of weight rows `first..first + out.len()` (at most
 /// `projection::MAX_ROWS`) of a paired gate/up operand against the F32
 /// activation row `x` (or its quantized form `q8`):
-/// `out[i] = A(silu(gate_i) * up_i)`, as published F32.
+/// `out[i] = A(act(gate_i) * up_i)`, as published F32 (`functions` code
+/// `function`; SiLU for the Qwen entries).
 #[inline(always)]
 pub fn expand<A: Dense>(
     gate: &Weights<'_>,
@@ -35,6 +36,7 @@ pub fn expand<A: Dense>(
     first: usize,
     x: &[f32],
     q8: Option<&[Q8Block]>,
+    function: i32,
     out: &mut [f32],
 ) {
     let mut up_sums = [0.0f32; projection::MAX_ROWS];
@@ -42,7 +44,7 @@ pub fn expand<A: Dense>(
     projection::project_arithmetic(gate, first, x, q8, out);
     projection::project_arithmetic(up, first, x, q8, up_sums);
     for (target, up) in out.iter_mut().zip(up_sums.iter()) {
-        *target = activation::publish::<A>(activation::silu(*target) * up);
+        *target = activation::publish::<A>(functions::activate(function, *target) * up);
     }
 }
 
@@ -58,8 +60,54 @@ pub fn expand_into<A: Dense>(
 ) {
     let mut values = [0.0f32; projection::MAX_ROWS];
     let values = &mut values[..out.len()];
-    expand::<A>(gate, up, first, x, q8, values);
+    expand::<A>(gate, up, first, x, q8, functions::SILU, values);
     activation::store::<A>(values, out);
+}
+
+/// The activation-generic GLU of weight rows `first..first + out.len()` of a
+/// paired gate/up operand against the F32 activation row `x` (or its
+/// quantized form `q8`), stored to a row span of `A` elements:
+/// `A(A(act(A(gate))) * A(up))` (`functions` code `function`).
+#[inline(always)]
+pub fn glu_into<A: Dense>(
+    gate: &Weights<'_>,
+    up: &Weights<'_>,
+    first: usize,
+    x: &[f32],
+    q8: Option<&[Q8Block]>,
+    function: i32,
+    out: &mut [A::Storage],
+) {
+    let (mut gates, mut ups) = ([0.0f32; projection::MAX_ROWS], [0.0f32; projection::MAX_ROWS]);
+    let (gates, ups) = (&mut gates[..out.len()], &mut ups[..out.len()]);
+    projection::project_arithmetic(gate, first, x, q8, gates);
+    projection::project_arithmetic(up, first, x, q8, ups);
+    for ((target, gate), up) in out.iter_mut().zip(gates.iter()).zip(ups.iter()) {
+        let activated = activation::publish::<A>(functions::activate(function, activation::publish::<A>(*gate)));
+        *target = A::narrow(activated * activation::publish::<A>(*up));
+    }
+}
+
+/// The activated projection of weight rows `first..first + out.len()` of an
+/// up-only operand against the F32 activation row `x` (or `q8`), stored to a
+/// row span of `A` elements: `A(act(A(scale * up)))` (`scale`: the weight's
+/// second-level scale on the accumulator).
+#[inline(always)]
+pub fn activated_into<A: Dense>(
+    up: &Weights<'_>,
+    first: usize,
+    x: &[f32],
+    q8: Option<&[Q8Block]>,
+    function: i32,
+    scale: f32,
+    out: &mut [A::Storage],
+) {
+    let mut ups = [0.0f32; projection::MAX_ROWS];
+    let ups = &mut ups[..out.len()];
+    projection::project_arithmetic(up, first, x, q8, ups);
+    for (target, up) in out.iter_mut().zip(ups.iter()) {
+        *target = A::narrow(functions::activate(function, activation::publish::<A>(scale * *up)));
+    }
 }
 
 /// The live rows of a grouped block: its `order` row is one expert's source

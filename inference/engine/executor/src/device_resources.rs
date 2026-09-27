@@ -213,6 +213,24 @@ impl FeatureRef {
             }),
         })
     }
+
+    /// Read the leased `[rows, width]` F32 features to the host, waiting for
+    /// the work that produced them.
+    pub fn read_to_host(&self) -> Result<Vec<f32>, ResourceError> {
+        let bytes = self
+            .allocation
+            .tensor()?
+            .read_to_host()
+            .map_err(|error| ResourceError::Tensor(error.to_string()))?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|word| f32::from_le_bytes(word.try_into().expect("four bytes")))
+            .collect())
+    }
+
+    pub fn rows(&self) -> usize {
+        self.allocation.rows()
+    }
 }
 
 impl ConditioningRef {

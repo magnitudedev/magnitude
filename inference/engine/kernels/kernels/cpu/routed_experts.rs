@@ -3,7 +3,7 @@
 // work item per row. `routed_experts_expand`: work item (x, b) owns ROWS
 // features of block b and expands its expert's gate/up rows against every
 // live row of the block (the source rows `order` names) into the `product`
-// scratch [B * T, F], each A(silu(gate) * up) as F32.
+// scratch [B * T, F], each A(act(gate) * up) as F32 (`activation`).
 // `routed_experts_down`: work item (x, b) owns ROWS output channels of block
 // b and projects its expert's down rows against every live row's product,
 // published in A. Blocks of expert -1 and padding rows carry no contract and
@@ -80,6 +80,7 @@ fn routed_experts_expand<L: Isa, E: Elements>(
             first,
             &staged[source * h..(source + 1) * h],
             q8,
+            cx.arg_activation(),
             out,
         );
     }

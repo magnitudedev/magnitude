@@ -9,7 +9,7 @@
 //! tensors; [`rows`] resolves the conversion from their representations.
 
 use crate::element::f16_to_f32;
-use crate::weights::{Format, Iq4, RowGeometry, Q4K, Q5K, Q6K, Q8};
+use crate::weights::{Format, Iq4, Mxfp4, Nvfp4, RowGeometry, Q4G32, Q4K, Q5G32, Q5K, Q6K, Q8};
 use std::marker::PhantomData;
 
 /// One registered conversion of an external packet format into a `rows16`
@@ -332,6 +332,107 @@ impl Conversion for GgufIq4Nl {
     }
 }
 
+/// The nibble of value `p` of a 32-value GGUF block whose `qs[16]` start at
+/// byte `at`: the low (p < 16) or high nibble of `qs[p % 16]`.
+fn block_nibble(packet: &[u8], at: usize, p: usize) -> u8 {
+    (packet[at + p % 16] >> ((p / 16) * 4)) & 15
+}
+
+/// GGUF q4_0 (`d | qs[16]`) into q4g32s.
+struct GgufQ4_0;
+
+impl Conversion for GgufQ4_0 {
+    const SOURCE: &'static str = "gguf_q4_0";
+    type Target = Q4G32;
+    const PACKET_BYTES: usize = 18;
+    const GROUP: usize = 32;
+    const BITS: u32 = 4;
+    const SCALE_BYTES: usize = 0;
+    const SUPER_BYTES: usize = 2;
+
+    fn code(packet: &[u8], p: usize) -> u8 {
+        block_nibble(packet, 2, p)
+    }
+    fn supers(packet: &[u8], out: &mut [u8]) {
+        out.copy_from_slice(&packet[..2]);
+    }
+}
+
+/// GGUF q5_0 (`d | qh[4] | qs[16]`) and q5_1 (`d | m | qh[4] | qs[16]`) into
+/// q5g32s and q5g32: bit p of `qh` is the fifth bit of value p.
+struct GgufQ5<const MINIMUM: bool>;
+
+impl<const MINIMUM: bool> Conversion for GgufQ5<MINIMUM> {
+    const SOURCE: &'static str = if MINIMUM { "gguf_q5_1" } else { "gguf_q5_0" };
+    type Target = Q5G32<MINIMUM>;
+    const PACKET_BYTES: usize = if MINIMUM { 24 } else { 22 };
+    const GROUP: usize = 32;
+    const BITS: u32 = 5;
+    const SCALE_BYTES: usize = 0;
+    const SUPER_BYTES: usize = if MINIMUM { 4 } else { 2 };
+
+    fn code(packet: &[u8], p: usize) -> u8 {
+        let high = Self::SUPER_BYTES;
+        block_nibble(packet, high + 4, p) | (((packet[high + p / 8] >> (p % 8)) & 1) << 4)
+    }
+    fn supers(packet: &[u8], out: &mut [u8]) {
+        out.copy_from_slice(&packet[..Self::SUPER_BYTES]);
+    }
+}
+
+/// The resident E2M1 code of a GGUF MXFP4 / NVFP4 code: code 8 (E2M1 -0),
+/// which ggml decodes as +0, becomes code 0.
+fn e2m1_positive_zero(code: u8) -> u8 {
+    if code == 8 {
+        0
+    } else {
+        code
+    }
+}
+
+/// GGUF mxfp4 (`e | qs[16]`) into mxfp4g32.
+struct GgufMxfp4;
+
+impl Conversion for GgufMxfp4 {
+    const SOURCE: &'static str = "gguf_mxfp4";
+    type Target = Mxfp4;
+    const PACKET_BYTES: usize = 17;
+    const GROUP: usize = 32;
+    const BITS: u32 = 4;
+    const SCALE_BYTES: usize = 0;
+    const SUPER_BYTES: usize = 1;
+
+    fn code(packet: &[u8], p: usize) -> u8 {
+        e2m1_positive_zero(block_nibble(packet, 1, p))
+    }
+    fn supers(packet: &[u8], out: &mut [u8]) {
+        out.copy_from_slice(&packet[..1]);
+    }
+}
+
+/// GGUF nvfp4 (`d[4] | qs[32]`) into nvfp4g16: value p of sixteen-value
+/// sub-block s = p / 16 is the low (p % 16 < 8) or high nibble of
+/// `qs[8 s + p % 8]`.
+struct GgufNvfp4;
+
+impl Conversion for GgufNvfp4 {
+    const SOURCE: &'static str = "gguf_nvfp4";
+    type Target = Nvfp4;
+    const PACKET_BYTES: usize = 36;
+    const GROUP: usize = 64;
+    const BITS: u32 = 4;
+    const SCALE_BYTES: usize = 0;
+    const SUPER_BYTES: usize = 4;
+
+    fn code(packet: &[u8], p: usize) -> u8 {
+        let (block, within) = (p / 16, p % 16);
+        e2m1_positive_zero((packet[4 + 8 * block + within % 8] >> ((within / 8) * 4)) & 15)
+    }
+    fn supers(packet: &[u8], out: &mut [u8]) {
+        out.copy_from_slice(&packet[..4]);
+    }
+}
+
 /// Converts the source row at `source` (whole packets of `k` values) into the
 /// target row at `row`, zeroing every stored byte no plane occupies.
 ///
@@ -419,7 +520,17 @@ const fn conversion<C: Conversion>(
     }
 }
 
-static CONVERSIONS: [RowConversion; 16] = [
+static CONVERSIONS: [RowConversion; 26] = [
+    conversion::<GgufQ4_0>("q4g32s@rows16", false, &[16, 2]),
+    conversion::<GgufQ5<false>>("q5g32s@rows16", false, &[16, 4, 2]),
+    conversion::<GgufQ5<true>>("q5g32@rows16", false, &[16, 4, 4]),
+    conversion::<GgufMxfp4>("mxfp4g32@rows16", false, &[16, 1]),
+    conversion::<GgufNvfp4>("nvfp4g16@rows16", false, &[32, 4]),
+    conversion::<GgufQ4_0>("q4g32s@rows8", true, &[16, 2]),
+    conversion::<GgufQ5<false>>("q5g32s@rows8", true, &[16, 4, 2]),
+    conversion::<GgufQ5<true>>("q5g32@rows8", true, &[16, 4, 4]),
+    conversion::<GgufMxfp4>("mxfp4g32@rows8", true, &[16, 1]),
+    conversion::<GgufNvfp4>("nvfp4g16@rows8", true, &[32, 4]),
     conversion::<GgufQ3K>("q6k@rows16", false, &[128, 64, 16, 2]),
     conversion::<GgufIq3S>("q6k@rows16", false, &[128, 64, 16, 2]),
     conversion::<GgufQ4K>("q4k@rows16", false, &[128, 12, 4]),

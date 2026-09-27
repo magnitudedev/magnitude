@@ -24,6 +24,10 @@ fn module() -> CheckedModule {
         path: "routed.seismic".into(),
         text: include_str!("../kernels/routed.seismic").into(),
     });
+    sources.push(SourceFile {
+        path: "functions.seismic".into(),
+        text: include_str!("../kernels/functions.seismic").into(),
+    });
     check_source(sources).unwrap()
 }
 
@@ -809,6 +813,7 @@ impl Block {
                 floats(&[e, f, h], &self.expert_gate),
                 floats(&[e, f, h], &self.expert_up),
                 floats(&[e, h, f], &self.expert_down),
+                Input::I32(0),
             ],
         );
         let combined = interpret(
@@ -1230,6 +1235,19 @@ fn decode_packed_planes(
                     let unit = noise[(index * size + start + 4 * field) % noise.len()].abs();
                     word.copy_from_slice(&((1.0 + 3.0 * unit) / 4096.0).to_le_bytes());
                 }
+            } else if plane.name == "block_scale" {
+                // Floating scale codes of GGUF-like magnitudes: E8M0 2^-10 ..
+                // 2^-7, UE4M3 2^-6 .. 2^-4 with every mantissa.
+                for (offset, byte) in packet_bytes[start..end].iter_mut().enumerate() {
+                    let unit = noise[(index * size + start + offset) % noise.len()].abs();
+                    let code = (unit * 32.0) as u8 % 32;
+                    *byte = match plane.encoding {
+                        registry::PlaneEncoding::FloatCode {
+                            format: registry::FloatCodeFormat::E8M0,
+                        } => 117 + code % 4,
+                        _ => (1 + code / 8) << 3 | code % 8,
+                    };
+                }
             } else {
                 for (offset, byte) in packet_bytes[start..end].iter_mut().enumerate() {
                     let unit = noise[(index * size + start + offset) % noise.len()];
@@ -1282,6 +1300,11 @@ enum Experts {
     Iq4,
     /// Dense bf16 (GGUF F32/F16/BF16 experts are resident bf16).
     Bf16,
+    /// Gemma / Nemotron formats: gate q4g32s (Q4_0), up mxfp4g32, down q5g32
+    /// (Q5_1).
+    Coded,
+    /// Gate and up nvfp4g16, down q5g32s (Q5_0).
+    Fp4,
 }
 
 /// The 35B-A3B storage mix at reduced width: expert weights per `Experts`,
@@ -1310,14 +1333,21 @@ impl PackedBlock {
             Self::FEATURES as u64,
             Self::SHARED as u64,
         );
-        let expert_weight = |representation: &str, shape: &[u64], seed: u32| match experts {
-            Experts::Packed => packed_weight(device, representation, shape, seed),
+        // The representations of gate, up and down.
+        let expert_weight = |which: usize, shape: &[u64], seed: u32| match experts {
+            Experts::Packed => packed_weight(device, ["q4k", "q4k", "q5k"][which], shape, seed),
             Experts::Iq4 => packed_weight(device, "iq4g32", shape, seed),
             Experts::Bf16 => bf16_weight(device, shape, seed),
+            Experts::Coded => {
+                packed_weight(device, ["q4g32s", "mxfp4g32", "q5g32"][which], shape, seed)
+            }
+            Experts::Fp4 => {
+                packed_weight(device, ["nvfp4g16", "nvfp4g16", "q5g32s"][which], shape, seed)
+            }
         };
-        let (expert_gate, gate) = expert_weight("q4k", &[e, f, h], 41);
-        let (expert_up, up) = expert_weight("q4k", &[e, f, h], 42);
-        let (expert_down, down) = expert_weight("q5k", &[e, h, f], 43);
+        let (expert_gate, gate) = expert_weight(0, &[e, f, h], 41);
+        let (expert_up, up) = expert_weight(1, &[e, f, h], 42);
+        let (expert_down, down) = expert_weight(2, &[e, h, f], 43);
         let (shared_gate, sgate) = packed_weight(device, "q8g32s", &[s, h], 44);
         let (shared_up, sup) = packed_weight(device, "q8g32s", &[s, h], 45);
         let (shared_down, sdown) = packed_weight(device, "q8g32s", &[h, s], 46);
@@ -1501,6 +1531,22 @@ fn native_decode_expand_and_output_match_reference_with_bf16_experts() {
             &[1, 3, 8],
             decode_mappings(&device),
         );
+    }
+}
+
+/// Experts in the representations of Q4_0, MXFP4, Q5_1, NVFP4 and Q5_0.
+#[test]
+fn native_decode_expand_and_output_match_reference_with_coded_experts() {
+    for device in devices() {
+        for experts in [Experts::Coded, Experts::Fp4] {
+            native_decode_expand_and_output_match_reference_rows(
+                &device,
+                experts,
+                false,
+                &[1, 3, 8],
+                decode_mappings(&device),
+            );
+        }
     }
 }
 
@@ -1943,6 +1989,7 @@ fn native_grouped_prefill_matches_reference_on(
                 expert_gate: &block.expert_gate,
                 expert_up: &block.expert_up,
                 expert_down: &block.expert_down,
+                activation: 0,
             })
             .unwrap()
             .value;
@@ -2566,6 +2613,7 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
                 expert_gate: &block.expert_gate,
                 expert_up: &block.expert_up,
                 expert_down: &block.expert_down,
+                activation: 0,
             })
             .unwrap()
             .value;
@@ -2603,6 +2651,127 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
                 })
                 .collect::<Vec<_>>();
             assert_near(&format!("{label} output"), &sampled, &reference, 2e-2, 4e-3);
+        }
+    }
+}
+
+/// The grouped capacity the executor sizes (`grouped_blocks`): tiles for
+/// `m·k` choices plus one partial tile per receiving expert, of which there
+/// are at most `min(e, m·k)`. Every row class from 9 rows (the first grouped
+/// class) to 32 rows: below 32 rows the bound is smaller than the one padded
+/// for all 256 experts, and the combined rows must keep every bit.
+#[test]
+fn native_35b_grouped_capacity_keeps_every_bit() {
+    for device in devices() {
+        native_35b_grouped_capacity_keeps_every_bit_on(&device);
+    }
+}
+
+fn native_35b_grouped_capacity_keeps_every_bit_on(device: &seismic::Device) {
+    let block = Qwen35b::new(device);
+    let (h, e, k, f, s, t) = (
+        Qwen35b::HIDDEN as u64,
+        Qwen35b::EXPERTS as u64,
+        Qwen35b::CHOICES as u64,
+        Qwen35b::FEATURES as u64,
+        Qwen35b::SHARED as u64,
+        Qwen35b::TILE as u64,
+    );
+    let bf16 = seismic::Element::bf16();
+    for rows in 9usize..=32 {
+        let residual = Qwen35b::residual(rows);
+        let m = rows as u64;
+        let routing = block.route(device, &residual);
+        let residual_tensor = f32_tensor(device, &[m, h], &residual);
+        let padded = (m * k + e * (t - 1)).div_ceil(t);
+        let bounded = (m * k + e.min(m * k) * (t - 1)).div_ceil(t);
+        for mapping in grouped_mappings(device) {
+            let specialization = |statics: &[(&str, u64)]| {
+                let specialization = specialization_on(device, statics, &mapping);
+                if is_cpu(device) {
+                    specialization.with_param("INT8", 0)
+                } else {
+                    specialization
+                }
+            };
+            let combined = |blocks: u64| {
+                let fill = |shape: &[u64]| {
+                    i32_tensor(
+                        device,
+                        shape,
+                        &vec![-9; shape.iter().product::<u64>() as usize],
+                    )
+                };
+                let mut counts = fill(&[e]);
+                let mut order = fill(&[blocks, t]);
+                let mut inverse = fill(&[m, k]);
+                let mut table = fill(&[blocks]);
+                routed_group::native_for_device(device, &group_specialization(device, e, k, 4))
+                    .unwrap()
+                    .call(routed_group::Args {
+                        routes: &routing.routes,
+                        counts: &mut counts,
+                        order: &mut order,
+                        inverse: &mut inverse,
+                        blocks: &mut table,
+                    })
+                    .unwrap();
+                let experts = routed_experts::native_for_device_with(
+                    device,
+                    routed_experts::Elements {
+                        A: bf16,
+                        EGW: element(device, "q4k"),
+                        EUW: element(device, "q4k"),
+                        EDW: element(device, "q5k"),
+                    },
+                    &specialization(&[("H", h), ("F", f)]),
+                )
+                .unwrap()
+                .call(routed_experts::Args {
+                    normalized: &routing.normalized,
+                    order: &order,
+                    blocks: &table,
+                    expert_gate: &block.expert_gate,
+                    expert_up: &block.expert_up,
+                    expert_down: &block.expert_down,
+                    activation: 0,
+                })
+                .unwrap()
+                .value;
+                let combined = routed_combine::native_for_device_with(
+                    device,
+                    routed_combine::Elements {
+                        A: bf16,
+                        SGW: element(device, "q8g32s"),
+                        SUW: element(device, "q8g32s"),
+                        SDW: element(device, "q8g32s"),
+                    },
+                    &specialization(&[("H", h), ("K", k), ("S", s)]),
+                )
+                .unwrap()
+                .call(routed_combine::Args {
+                    residual: &residual_tensor,
+                    expert_output: &experts,
+                    inverse: &inverse,
+                    scores: &routing.scores,
+                    normalized: &routing.normalized,
+                    coefficient: &routing.coefficient,
+                    shared_gate: &block.shared_gate,
+                    shared_up: &block.shared_up,
+                    shared_down: &block.shared_down,
+                })
+                .unwrap()
+                .value;
+                read_f32(&combined)
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                combined(bounded),
+                combined(padded),
+                "35B grouped rows {rows} mapping {mapping:?}: capacity {bounded} vs {padded}"
+            );
         }
     }
 }
@@ -2938,6 +3107,7 @@ fn routed_kernel_timings() {
                     expert_gate: &layer.0,
                     expert_up: &layer.1,
                     expert_down: &layer.2,
+                    activation: 0,
                 })
                 .collect(),
             initialize: None,

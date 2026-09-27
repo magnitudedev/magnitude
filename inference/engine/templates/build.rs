@@ -114,6 +114,11 @@ fn main() {
         .include(root.join("native/source/vendor"))
         .flag_if_supported("-fvisibility=hidden")
         .flag_if_supported("-fvisibility-inlines-hidden");
+    // The sources carry UTF-8 string literals (template tokens); MSVC otherwise
+    // reads them in the system code page, as upstream's CMake also prevents.
+    if build.get_compiler().is_like_msvc() {
+        build.flag("/utf-8");
+    }
     for source in SOURCES {
         build.file(root.join(source));
     }

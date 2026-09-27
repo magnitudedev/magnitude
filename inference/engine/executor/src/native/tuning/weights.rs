@@ -13,17 +13,28 @@ use std::collections::HashMap;
 
 /// Where tuning reads weights from.
 pub trait TuningWeightSource {
-    /// The bytes of `weight` in its source representation.
+    /// The bytes of `weight` in its upload representation.
     fn source_bytes(&self, weight: &WeightPlan) -> Result<Vec<u8>, String>;
 }
 
 impl TuningWeightSource for Package {
+    /// The transformed (and dequantized) source bytes, as loading uploads
+    /// them.
     fn source_bytes(&self, weight: &WeightPlan) -> Result<Vec<u8>, String> {
         let artifact = artifact(self, weight.component)?;
         let stored =
             Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
-        crate::programs::native_import::stored_source_bytes(&stored)
-            .map_err(|error| error.to_string())
+        let bytes = crate::programs::native_import::stored_source_bytes(&stored)
+            .map_err(|error| error.to_string())?;
+        let bytes =
+            crate::import_transforms::apply(&weight.descriptor, stored.shape(), weight.source, bytes)?;
+        if weight.upload == weight.source {
+            return Ok(bytes);
+        }
+        let encoding = stored
+            .packed_encoding()
+            .ok_or("a dequantized weight is stored dense")?;
+        crate::import_transforms::dequantize(encoding, weight.source, &weight.shape, &bytes)
     }
 }
 
@@ -33,6 +44,7 @@ fn artifact(package: &Package, component: ArtifactComponent) -> Result<&GgufArti
         ArtifactComponentKind::Projector => package
             .projector()
             .ok_or("the package has no projector artifact")?,
+        ArtifactComponentKind::Draft => package.draft().ok_or("the package has no draft artifact")?,
     };
     if artifact.identity() != component.identity {
         return Err("the package artifact differs from the planned component".into());
@@ -49,7 +61,7 @@ pub struct ZeroTuningWeights;
 impl TuningWeightSource for ZeroTuningWeights {
     fn source_bytes(&self, weight: &WeightPlan) -> Result<Vec<u8>, String> {
         let bytes = weight
-            .source
+            .upload
             .canonical_byte_len(&[logical_count(&weight.shape)?])
             .map_err(|error| error.to_string())?;
         Ok(vec![
@@ -116,11 +128,11 @@ impl<'a> TuningWeights<'a> {
         let plan = self.plan(scope, kind)?;
         let bytes = self.source.source_bytes(plan)?;
         let logical = logical_count(&plan.shape)?;
-        let source = Tensor::from_host(self.device, plan.source, &[logical], &bytes)
+        let source = Tensor::from_host(self.device, plan.upload, &[logical], &bytes)
             .map_err(|error| error.to_string())?;
         let destination = Tensor::zeros(self.device, plan.resident, &plan.shape)
             .map_err(|error| error.to_string())?;
-        let handle = match (plan.source.dtype(), plan.resident.dtype()) {
+        let handle = match (plan.upload.dtype(), plan.resident.dtype()) {
             (Some(source), Some(resident)) => self
                 .import
                 .import_dense
@@ -130,7 +142,7 @@ impl<'a> TuningWeights<'a> {
             _ => self
                 .import
                 .repack_weight
-                .get(&(plan.source, plan.resident))
+                .get(&(plan.upload, plan.resident))
                 .cloned()
                 .map(AttestedImport::Repack),
         }

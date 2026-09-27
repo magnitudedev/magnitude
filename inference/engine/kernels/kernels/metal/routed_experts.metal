@@ -6,8 +6,8 @@
 //
 // L1 (`routed_experts_expand`): K1 paired projection of the block's
 // expert gate/up rows with a row-gather A loader (tile row t reads normalized
-// row order[b, t]; padding rows read zeros) and the SiLU . mul epilogue into
-// the `product` scratch [B * T, F].
+// row order[b, t]; padding rows read zeros) and the activation-generic GLU
+// epilogue (`activation`) into the `product` scratch [B * T, F].
 // L2 (`routed_experts_down`): K1 projection of the block's products
 // against the expert's down rows, published in A.
 
@@ -43,8 +43,8 @@ kernel void routed_experts_expand(
         routed::expert_row(ulong(expert), SEISMIC_DIM_F), SEISMIC_DIM_H);
     const auto up = routed::weights<packets::W1>(expert_up, KERNEL_W1_LAYOUT(SEISMIC_DIM_H),
         routed::expert_row(ulong(expert), SEISMIC_DIM_F), SEISMIC_DIM_H);
-    const projection::SiluMul<A> out{product + block * SEISMIC_DIM_T * SEISMIC_DIM_F * A::bytes,
-        SEISMIC_DIM_F, 1};
+    const projection::Glu<A> out{product + block * SEISMIC_DIM_T * SEISMIC_DIM_F * A::bytes,
+        SEISMIC_DIM_F, 1, int(SEISMIC_PARAM_ACTIVATION)};
     const uint live = routed::block_rows(order + block * SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1,
         uint(SEISMIC_DIM_T));
     routed::expert_paired<packets::W0, packets::W1, BM, BN>(in, out, gate, up, live, uint(SEISMIC_DIM_T),

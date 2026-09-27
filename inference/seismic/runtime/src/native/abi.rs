@@ -731,6 +731,7 @@ fn render_plane_encoding(out: &mut String, prefix: &str, encoding: &registry::Pl
                 registry::FloatCodeFormat::E2M1 => "E2M1",
                 registry::FloatCodeFormat::E4M3 => "E4M3",
                 registry::FloatCodeFormat::UE4M3 => "UE4M3",
+                registry::FloatCodeFormat::E8M0 => "E8M0",
             };
             out.push_str(&format!(
                 "#define {prefix}_ENCODING_FLOAT_CODE 1\n#define {prefix}_ENCODING_FLOAT_CODE_{name} 1\n#define {prefix}_ENCODING_BITS {}\n",

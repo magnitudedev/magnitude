@@ -148,46 +148,99 @@ impl TargetLaunchInputs {
                     "slot {index} publishes to another recurrent successor bank"
                 )));
             }
-            if !binding.destinations.is_empty()
-                && binding.destinations.len() != slot.destinations().len()
-            {
-                return Err(invalid(format!("slot {index} destination count differs")));
+            if slot.history_domains() != store.history_reads() {
+                return Err(invalid(format!(
+                    "slot {index} history domain count differs from its store"
+                )));
             }
-            for (row, packed) in slot.destinations().iter().enumerate() {
-                let expected = binding
-                    .destinations
-                    .get(row)
-                    .map(|destination| i32::try_from(*destination).ok())
-                    .unwrap_or(Some(-1));
-                if expected != Some(*packed) {
-                    return Err(invalid(format!(
-                        "slot {index} row {row} destination differs"
-                    )));
+            // A Shared source domain's reads: its accepted rows, then rows its
+            // source appends in this advance.
+            for (read, domain) in store
+                .shared_source_domains()
+                .into_iter()
+                .enumerate()
+                .map(|(position, domain)| (store.history_domains().count() + position, domain))
+            {
+                let packed = slot
+                    .history(read)
+                    .ok_or_else(|| invalid(format!("slot {index} lacks a shared history read")))?;
+                let appended = &binding.destinations[domain.0];
+                for (row, visible) in packed.visible.iter().enumerate() {
+                    let (accepted, _) =
+                        crate::domain::accepted_history(store, advance, domain, row)
+                            .map_err(invalid)?;
+                    let appends_only = |ranges: &[[i32; 2]]| {
+                        ranges.iter().all(|&[start, end]| {
+                            (start..end).all(|row| {
+                                usize::try_from(row)
+                                    .is_ok_and(|row| appended.contains(&row))
+                            })
+                        })
+                    };
+                    if visible.len() < accepted.len()
+                        || visible[..accepted.len()] != accepted
+                        || !appends_only(
+                            &visible[accepted.len()..]
+                                .iter()
+                                .copied()
+                                .filter(|range| *range != [0, 0])
+                                .collect::<Vec<_>>(),
+                        )
+                    {
+                        return Err(invalid(format!(
+                            "slot {index} shared visibility differs from accepted state"
+                        )));
+                    }
                 }
             }
-            let visible = advance
-                .history_ranges()
-                .into_iter()
-                .map(|(start, count)| {
-                    let end = start.checked_add(count)?;
-                    Some([i32::try_from(start).ok()?, i32::try_from(end).ok()?])
-                })
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "slot {index} history range exceeds packed coordinates"
-                    ))
-                })?;
-            if slot.visible().iter().any(|row| {
-                row.len() < visible.len()
-                    || &row[..visible.len()] != visible.as_slice()
-                    || row[visible.len()..]
-                        .iter()
-                        .any(|padding| *padding != [0, 0])
-            }) {
-                return Err(invalid(format!(
-                    "slot {index} visibility differs from accepted state"
-                )));
+            for domain in store.history_domains() {
+                let packed = slot
+                    .history(domain.0)
+                    .ok_or_else(|| invalid(format!("slot {index} lacks a history domain")))?;
+                let destinations = &binding.destinations[domain.0];
+                if !destinations.is_empty() && destinations.len() != packed.destinations.len() {
+                    return Err(invalid(format!("slot {index} destination count differs")));
+                }
+                let kind = store.history_domain_kind(domain);
+                for (row, (destination, visible)) in
+                    packed.destinations.iter().zip(packed.visible).enumerate()
+                {
+                    let expected = destinations
+                        .get(row)
+                        .map(|destination| i32::try_from(*destination).ok())
+                        .unwrap_or(Some(-1));
+                    if expected != Some(*destination) {
+                        return Err(invalid(format!(
+                            "slot {index} row {row} destination differs"
+                        )));
+                    }
+                    // Each row reads its domain's accepted rows from its
+                    // query's window start.
+                    let from = kind.visible_from(advance.position() + row);
+                    let expected = advance
+                        .visible_ranges(domain, from)
+                        .into_iter()
+                        .map(|(start, count)| {
+                            let end = start.checked_add(count)?;
+                            Some([i32::try_from(start).ok()?, i32::try_from(end).ok()?])
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "slot {index} history range exceeds packed coordinates"
+                            ))
+                        })?;
+                    if visible.len() < expected.len()
+                        || visible[..expected.len()] != expected
+                        || visible[expected.len()..]
+                            .iter()
+                            .any(|padding| *padding != [0, 0])
+                    {
+                        return Err(invalid(format!(
+                            "slot {index} visibility differs from accepted state"
+                        )));
+                    }
+                }
             }
             if let Some(lease) = conditioning {
                 let allocation = lease.allocation();
@@ -274,6 +327,7 @@ impl ValidatedTargetLaunch {
                 advances,
                 conditioning,
                 conditioning_slices,
+                store: store.clone(),
                 domain: domain.clone(),
             },
             graph_workspace,
@@ -342,12 +396,19 @@ pub struct TargetLaunchCore {
     advances: Vec<TentativeAdvance>,
     conditioning: Vec<Option<ConditioningRef>>,
     conditioning_slices: Vec<Vec<ConditioningSlice>>,
+    /// The store every advance belongs to: it names each attention layer's
+    /// history domain and the layer whose regions it binds.
+    store: Rc<StateStore>,
     domain: ResourceDomainId,
 }
 
 impl TargetLaunchCore {
     pub fn batch(&self) -> &ValidatedTargetBatch {
         &self.batch
+    }
+
+    pub fn store(&self) -> &Rc<StateStore> {
+        &self.store
     }
 
     pub fn tokens(&self) -> &TargetTokens {

@@ -11,6 +11,7 @@ use magnitude_service_contracts::models::{
 };
 
 use crate::ManagedModelDownloads;
+use crate::catalog_models::reject_unavailable;
 use crate::model_domains::ModelDomainResolver;
 
 #[derive(Debug, Clone)]
@@ -90,6 +91,7 @@ impl ManagedCatalogInstallations {
     ) -> Result<CatalogInstallationAdmission, InventoryError> {
         let _mutation = self.mutations.lock().await;
         let definition = self.resolver.catalog_definition(id)?;
+        reject_unavailable(id, definition)?;
         let existing_operation_ids = self
             .operations
             .read()

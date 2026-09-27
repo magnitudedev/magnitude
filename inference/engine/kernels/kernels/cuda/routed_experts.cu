@@ -1,7 +1,8 @@
 // Grouped expert projections; the CUDA form of `metal/routed_experts.metal`.
 //   expand  block (column block, row tile, b): paired gate/up GEMM of expert
 //           blocks[b] over the block's rows (tile row t reads normalized row
-//           order[b, t]) with SiLU . mul into `product` [B * T, F];
+//           order[b, t]) with the activation-generic GLU (`activation`)
+//           into `product` [B * T, F];
 //   down    block (column block, row tile, b): down GEMM of expert blocks[b]
 //           into the result [B, T, H].
 // Both GEMMs run over the block's live rows only (the rows before its first
@@ -33,8 +34,8 @@ extern "C" __global__ void routed_experts_expand(SEISMIC_KERNEL_PARAMS) {
     if ((projection::u64)blockIdx.y * GShape::BM >= live)
         return;
     const projection::u64 rows = block * SEISMIC_DIM_T;
-    const projection::SiluMul<Act> epi{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
-                               SEISMIC_DIM_F};
+    const projection::Glu<Act> epi{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
+                                   SEISMIC_DIM_F, (int)SEISMIC_PARAM_ACTIVATION};
     const routed::GroupedRows source{SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED), SEISMIC_NORMALIZED_STRIDE_0, order,
                                      SEISMIC_ORDER_STRIDE_1};
     projection::gemm_segment<GShape>(

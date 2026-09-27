@@ -248,19 +248,6 @@ int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_
         }
         auto prepared = std::make_shared<prepared_state>();
         prepared->parameters = common_chat_templates_apply(state.compiled.get(), request);
-        if (prepared->parameters.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
-            // This upstream handler constrains names but parses an arbitrary
-            // Gemma dictionary. It cannot advertise strict argument schemas.
-            for (const auto & tool : request.tools) {
-                const auto schema = json::parse(tool.parameters);
-                for (const auto & [key, value] : schema.items()) {
-                    if (key == "type" && value == "object") { continue; }
-                    if (key == "additionalProperties" && value == true) { continue; }
-                    if (key == "description" || key == "title") { continue; }
-                    throw std::invalid_argument("Unsupported JSON schema: Gemma tool argument constraints");
-                }
-            }
-        }
         // Extracted generators enforce the whole completion. Specialized handlers
         // may still provide activation metadata, which has no meaning in this mode.
         if (prepared->parameters.grammar_lazy) {

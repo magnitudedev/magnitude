@@ -1,8 +1,9 @@
 //! Owned tentative state, movable through an in-flight program submission.
 
 use super::{
-    append_ranges, install_commit, BankHandle, Claims, Codec, ComponentDescriptor, Error, KvCodec,
-    LayerRef, PlaneBuffer, PlaneCopy, SequenceState, StateStore, Transaction, VectorKind,
+    append_ranges, install_commit, ranges_from, BankHandle, Claims, Codec, ComponentDescriptor,
+    Error, HistoryDomainId, KvCodec, LayerRef, PlaneBuffer, PlaneCopy, SequenceState, StateStore,
+    Transaction, VectorKind,
 };
 use seismic::Tensor;
 use std::rc::Rc;
@@ -11,7 +12,10 @@ use std::rc::Rc;
 /// `recurrent` holds one arena per recurrent component; the advance reads
 /// version (`previous_bank`, `previous_tape`) and writes only bank
 /// `following_bank` of each. It publishes its recurrent state after `stop`
-/// rows and records the tape of the rows after it.
+/// rows and records the tape of the rows after it. `history` holds the
+/// planes of every stored domain ([`StateStore::history_planes`]);
+/// `destinations[domain]` holds the advance's fresh rows in that domain, one
+/// per advance row.
 #[derive(Clone, Copy)]
 pub struct OwnedAdvanceBindings<'a> {
     pub recurrent: &'a [Tensor],
@@ -20,7 +24,21 @@ pub struct OwnedAdvanceBindings<'a> {
     pub following_bank: usize,
     pub stop: usize,
     pub history: &'a [PlaneBuffer],
-    pub destinations: &'a [usize],
+    pub destinations: &'a [Vec<usize>],
+}
+
+/// Each domain's reserved rows, as row indices in logical order.
+fn destinations(claims: &[Claims]) -> Vec<Vec<usize>> {
+    claims
+        .iter()
+        .map(|claims| {
+            claims
+                .ranges()
+                .into_iter()
+                .flat_map(|(start, count)| start..start + count)
+                .collect()
+        })
+        .collect()
 }
 
 /// Tentative successor state. Moving this value into a launch and submission
@@ -32,11 +50,12 @@ pub struct OwnedStateAdvance {
     /// The rows that always commit; the recurrent state is published after
     /// them and every later row is recorded on the tape.
     committed: usize,
-    claims: Claims,
+    /// The advance's tentative rows, per stored domain.
+    claims: Vec<Claims>,
     following: BankHandle,
     history: Vec<PlaneBuffer>,
     recurrent: Rc<[Tensor]>,
-    destinations: Vec<usize>,
+    destinations: Vec<Vec<usize>>,
     _transaction: Transaction,
 }
 
@@ -52,10 +71,12 @@ pub enum OwnedCompactionPreparation {
     },
 }
 
-/// Tentative history copy with a reserved contiguous destination. Its source
-/// extents remain accepted until the state program completes and commits it.
+/// Tentative history copy of one domain with a reserved contiguous
+/// destination. Its source extents remain accepted until the state program
+/// completes and commits it.
 pub struct OwnedCompaction {
     state: SequenceState,
+    domain: HistoryDomainId,
     destination: Claims,
     copies: Vec<PlaneCopy>,
     history: Vec<PlaneBuffer>,
@@ -71,8 +92,11 @@ pub struct OwnedCompactionBindings<'a> {
 
 /// One semantic vector conversion. A codec can use several physical planes;
 /// their indices are carried together rather than mistaken for one copy plane.
+/// Planes index the stores' [`StateStore::history_planes`]; rows are rows of
+/// the layer's `domain`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodecConversionStep {
+    pub domain: HistoryDomainId,
     pub layer: LayerRef,
     pub vector: VectorKind,
     pub source_codec: Codec,
@@ -102,7 +126,7 @@ pub struct OwnedCodecBindings<'a> {
 pub struct OwnedCodecAdvance {
     source: SequenceState,
     destination: SequenceState,
-    claims: Claims,
+    claims: Vec<Claims>,
     destination_bank: BankHandle,
     source_history: Vec<PlaneBuffer>,
     destination_history: Vec<PlaneBuffer>,
@@ -122,8 +146,9 @@ impl OwnedCodecAdvance {
         destination: SequenceState,
     ) -> Result<Self, (SequenceState, SequenceState, Error)> {
         match Self::prepare(&source, &destination) {
-            Ok((source_codec, destination_codec, from, rows)) => {
-                let claims = match destination.store.reserve(None, rows) {
+            Ok((source_codec, destination_codec, from)) => {
+                let counts = from.iter().map(Vec::len).collect::<Vec<_>>();
+                let claims = match destination.store.reserve_rows(None, &counts) {
                     Ok(claims) => claims,
                     Err(error) => return Err((source, destination, error)),
                 };
@@ -131,11 +156,8 @@ impl OwnedCodecAdvance {
                     Ok(bank) => bank,
                     Err(error) => return Err((source, destination, error)),
                 };
-                let to = claims
-                    .ranges()
-                    .into_iter()
-                    .flat_map(|(start, count)| start..start + count)
-                    .collect::<Vec<_>>();
+                let to = destinations(&claims);
+                let rows = counts.iter().sum::<usize>();
                 let source_history = match source.store.history_planes() {
                     Ok(planes) => planes,
                     Err(error) => return Err((source, destination, error)),
@@ -171,16 +193,19 @@ impl OwnedCodecAdvance {
         }
     }
 
+    /// Check a conversion and return both codecs and, per stored domain, the
+    /// source rows to convert.
     fn prepare(
         source: &SequenceState,
         destination: &SequenceState,
-    ) -> Result<(KvCodec, KvCodec, Vec<usize>, usize), Error> {
+    ) -> Result<(KvCodec, KvCodec, Vec<Vec<usize>>), Error> {
         if Rc::ptr_eq(&source.store, &destination.store)
             || !Rc::ptr_eq(&source.store.device, &destination.store.device)
             || destination.position != 0
-            || !destination.claims.is_empty()
+            || destination.claims.iter().any(|claims| !claims.is_empty())
             || destination.history_start != 0
             || source.store.component_specs != destination.store.component_specs
+            || source.store.shared != destination.store.shared
             || source.position > destination.store.context_capacity
             || source.expected_end > destination.store.context_capacity
         {
@@ -189,21 +214,37 @@ impl OwnedCodecAdvance {
                     .into(),
             ));
         }
-        let source_components = &source.store.components;
-        let destination_components = &destination.store.components;
-        if source_components.is_empty() || source_components.len() != destination_components.len() {
+        let source_domains = &source.store.domains;
+        let destination_domains = &destination.store.domains;
+        if source_domains.is_empty()
+            || source_domains.len() != destination_domains.len()
+            || source_domains
+                .iter()
+                .zip(destination_domains)
+                .any(|(before, after)| {
+                    before.kind != after.kind || before.components.len() != after.components.len()
+                })
+        {
             return Err(Error::Request(
                 "codec conversion requires matching nonempty history layouts".into(),
             ));
         }
-        let source_codec = identify_codec(source_components)?;
-        let destination_codec = identify_codec(destination_components)?;
+        let source_components = source_domains
+            .iter()
+            .flat_map(|domain| domain.components.iter().cloned())
+            .collect::<Vec<_>>();
+        let destination_components = destination_domains
+            .iter()
+            .flat_map(|domain| domain.components.iter().cloned())
+            .collect::<Vec<_>>();
+        let source_codec = identify_codec(&source_components)?;
+        let destination_codec = identify_codec(&destination_components)?;
         if source_codec == destination_codec {
             return Err(Error::Request(
                 "codec conversion requires distinct codecs".into(),
             ));
         }
-        for (before, after) in source_components.iter().zip(destination_components) {
+        for (before, after) in source_components.iter().zip(&destination_components) {
             if before.layer != after.layer
                 || before.codec.key_width != after.codec.key_width
                 || before.codec.value_width != after.codec.value_width
@@ -214,22 +255,30 @@ impl OwnedCodecAdvance {
             }
         }
         let from = source
-            .history_ranges()
+            .domain_ranges()
             .into_iter()
-            .flat_map(|(start, count)| start..start + count)
+            .map(|ranges| {
+                ranges
+                    .into_iter()
+                    .flat_map(|(start, count)| start..start + count)
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
-        if from.is_empty() {
+        if from.iter().all(Vec::is_empty) {
             return Err(Error::Request(
                 "codec conversion requires visible history rows".into(),
             ));
         }
-        let rows = from.len();
-        if rows > destination.store.history_capacity {
+        if from
+            .iter()
+            .zip(destination_domains)
+            .any(|(rows, domain)| rows.len() > domain.capacity)
+        {
             return Err(Error::Request(
                 "codec conversion exceeds destination history capacity".into(),
             ));
         }
-        Ok((source_codec, destination_codec, from, rows))
+        Ok((source_codec, destination_codec, from))
     }
 
     pub fn source_belongs_to(&self, store: &Rc<StateStore>) -> bool {
@@ -275,7 +324,10 @@ impl OwnedCodecAdvance {
         destination.position = source.position;
         destination.expected_end = source.expected_end;
         destination.history_start = source.history_start;
-        destination.claims.append(claims);
+        destination.starts = source.starts.clone();
+        for (history, claims) in destination.claims.iter_mut().zip(claims) {
+            history.append(claims);
+        }
         std::mem::swap(&mut destination.bank, &mut destination_bank);
         destination.tape = source.tape;
         destination
@@ -304,21 +356,36 @@ fn identify_codec(components: &[ComponentDescriptor]) -> Result<KvCodec, Error> 
     ))
 }
 
+/// One step per (layer, vector) of every stored domain, carrying that
+/// domain's rows. Plane indices number the planes of every domain in order.
 fn conversion_steps(
     source: &SequenceState,
     destination: &SequenceState,
-    from: &[usize],
-    to: &[usize],
+    from: &[Vec<usize>],
+    to: &[Vec<usize>],
 ) -> Vec<CodecConversionStep> {
-    let mut steps = Vec::with_capacity(source.store.components.len() * 2);
+    let mut steps = Vec::new();
     let mut source_base = 0;
     let mut destination_base = 0;
-    for (before, after) in source
+    let pairs = source
         .store
-        .components
+        .domains
         .iter()
-        .zip(&destination.store.components)
-    {
+        .zip(&destination.store.domains)
+        .enumerate()
+        .flat_map(|(domain, (before, after))| {
+            before
+                .components
+                .iter()
+                .zip(&after.components)
+                .map(move |pair| (domain, pair))
+        });
+    for (domain, (before, after)) in pairs {
+        if from[domain].is_empty() {
+            source_base += before.planes().len();
+            destination_base += after.planes().len();
+            continue;
+        }
         for vector in [VectorKind::Key, VectorKind::Value] {
             let source_planes = before
                 .planes()
@@ -337,6 +404,7 @@ fn conversion_steps(
                 })
                 .collect();
             steps.push(CodecConversionStep {
+                domain: HistoryDomainId(domain),
                 layer: before.layer,
                 vector,
                 source_codec: if vector == VectorKind::Key {
@@ -351,8 +419,8 @@ fn conversion_steps(
                 },
                 source_planes,
                 destination_planes,
-                from: from.to_vec(),
-                to: to.to_vec(),
+                from: from[domain].clone(),
+                to: to[domain].clone(),
             });
         }
         source_base += before.planes().len();
@@ -362,16 +430,17 @@ fn conversion_steps(
 }
 
 impl OwnedCompaction {
-    /// Join the longest suffix of a history's runs (at least two) holding at
-    /// most `max_rows` rows into one contiguous run: the recent small runs
-    /// decode leaves, moved with one bounded copy. Histories below the
-    /// segment limit need nothing.
+    /// Join the longest suffix of a domain's history runs (at least two)
+    /// holding at most `max_rows` rows into one contiguous run: the recent
+    /// small runs decode leaves, moved with one bounded copy. Histories below
+    /// the domain's span bound need nothing.
     pub fn prepare(
         state: SequenceState,
+        domain: HistoryDomainId,
         max_rows: usize,
     ) -> Result<OwnedCompactionPreparation, (SequenceState, Error)> {
-        let ranges = state.history_ranges();
-        if ranges.len() < state.store.max_visible_spans() {
+        let ranges = state.history_ranges(domain);
+        if ranges.len() < state.store.span_bound(domain) {
             return Ok(OwnedCompactionPreparation::NotNeeded(state));
         }
         let visible_rows = ranges.iter().map(|(_, count)| count).sum::<usize>();
@@ -385,7 +454,7 @@ impl OwnedCompaction {
             suffix += 1;
         }
         let destination = (suffix >= 2)
-            .then(|| state.store.reserve_contiguous(moved))
+            .then(|| state.store.reserve_contiguous(domain, moved))
             .flatten();
         let Some(destination) = destination else {
             return Ok(OwnedCompactionPreparation::Deferred {
@@ -407,23 +476,21 @@ impl OwnedCompaction {
             .into_iter()
             .flat_map(|(start, count)| start..start + count)
             .collect::<Vec<_>>();
-        let copies = state
-            .store
-            .components
+        let copies = history
             .iter()
-            .flat_map(ComponentDescriptor::planes)
-            .enumerate()
-            .map(|(plane_index, _)| PlaneCopy {
-                plane_index,
+            .filter(|plane| plane.domain == domain)
+            .map(|plane| PlaneCopy {
+                plane_index: plane.plane_index,
                 from: from.clone(),
                 to: to.clone(),
             })
             .collect();
         let mut transaction = state.store.begin_transaction();
         transaction.track(&state.claims, &state.bank);
-        transaction.track_history(&destination);
+        transaction.track_history(domain, &destination);
         Ok(OwnedCompactionPreparation::Ready(Self {
             state,
+            domain,
             destination,
             copies,
             history,
@@ -433,6 +500,10 @@ impl OwnedCompaction {
 
     pub fn belongs_to(&self, store: &Rc<StateStore>) -> bool {
         self.state.belongs_to(store)
+    }
+    /// The domain whose rows this compaction moves.
+    pub fn domain(&self) -> HistoryDomainId {
+        self.domain
     }
     pub fn rows(&self) -> usize {
         self.destination.rows()
@@ -451,12 +522,14 @@ impl OwnedCompaction {
     pub fn commit(self) -> SequenceState {
         let Self {
             mut state,
+            domain,
             destination,
             ..
         } = self;
-        let kept = state.claims.rows() - destination.rows();
-        drop(state.claims.split_off(kept));
-        state.claims.append(destination);
+        let claims = &mut state.claims[domain.0];
+        let kept = claims.rows() - destination.rows();
+        drop(claims.split_off(kept));
+        claims.append(destination);
         state
     }
 
@@ -504,11 +577,7 @@ impl OwnedStateAdvance {
             Ok(history) => history,
             Err(error) => return Err((state, error)),
         };
-        let destinations = claims
-            .ranges()
-            .into_iter()
-            .flat_map(|(start, count)| start..start + count)
-            .collect();
+        let destinations = destinations(&claims);
         let recurrent = state.store.recurrent_arenas();
         let mut transaction = state.store.begin_transaction();
         transaction.track(&state.claims, &state.bank);
@@ -540,8 +609,23 @@ impl OwnedStateAdvance {
         self.state.belongs_to(store)
     }
 
-    pub fn history_ranges(&self) -> Vec<(usize, usize)> {
-        self.state.history_ranges()
+    /// The accepted rows the advance reads in a domain, in logical order,
+    /// from position [`OwnedStateAdvance::history_start`].
+    pub fn history_ranges(&self, domain: HistoryDomainId) -> Vec<(usize, usize)> {
+        self.state.history_ranges(domain)
+    }
+    pub fn domain_ranges(&self) -> Vec<Vec<(usize, usize)>> {
+        self.state.domain_ranges()
+    }
+    pub fn history_start(&self, domain: HistoryDomainId) -> usize {
+        self.state.history_start(domain)
+    }
+    /// The accepted rows of a domain at positions `from` and later.
+    pub fn visible_ranges(&self, domain: HistoryDomainId, from: usize) -> Vec<(usize, usize)> {
+        self.state.visible_ranges(domain, from)
+    }
+    pub fn span_count(&self) -> usize {
+        self.state.span_count()
     }
 
     pub fn bindings(&self) -> OwnedAdvanceBindings<'_> {
@@ -602,7 +686,9 @@ impl OwnedStateAdvance {
             0
         };
         let mut kept = claims;
-        drop(kept.split_off(accepted));
+        for claims in &mut kept {
+            drop(claims.split_off(accepted));
+        }
         install_commit(&mut state, kept, &mut following, tape, accepted);
         Ok(OwnedAdvanceResolution::Committed(state))
     }
@@ -622,15 +708,24 @@ impl OwnedStateAdvance {
     /// Tentative rows following this advance's rows, formed before this
     /// advance is reconciled; see [`OwnedSuccessorAdvance`].
     pub fn successor(&self, count: usize) -> Result<OwnedSuccessorAdvance, Error> {
-        let mut ranges = self.state.history_ranges();
-        append_ranges(&mut ranges, self.claims.ranges(), self.claims.slab_rows());
+        let end = self.state.position + self.count;
+        let (starts, ranges) = following_history(
+            &self.state.store,
+            self.state.history_start,
+            &self.state.starts,
+            self.state.domain_ranges(),
+            &self.claims,
+            end,
+        );
         OwnedSuccessorAdvance::reserve(
             &self.state.store,
             Predecessor {
-                end: self.state.position + self.count,
+                end,
                 bank: self.following.index(),
                 tape: published_tape(&self.state.store, self.count, self.committed),
                 claims: &self.claims,
+                floor: self.state.history_start,
+                starts,
                 ranges,
                 history: &self.history,
                 recurrent: &self.recurrent,
@@ -640,6 +735,32 @@ impl OwnedStateAdvance {
     }
 }
 
+/// Each domain's history once a predecessor ending at `end` commits: its
+/// accepted `ranges` (from `starts`) followed by the predecessor's tentative
+/// rows, less the rows the domain no longer references at `end` (exactly
+/// what committing trims).
+fn following_history(
+    store: &StateStore,
+    floor: usize,
+    starts: &[usize],
+    ranges: Vec<Vec<(usize, usize)>>,
+    claims: &[Claims],
+    end: usize,
+) -> (Vec<usize>, Vec<Vec<(usize, usize)>>) {
+    store
+        .domains
+        .iter()
+        .zip(starts)
+        .zip(ranges)
+        .zip(claims)
+        .map(|(((domain, &start), mut ranges), claims)| {
+            append_ranges(&mut ranges, claims.ranges(), claims.slab_rows());
+            let retained = domain.history_start(end, floor).max(start);
+            (retained, ranges_from(&ranges, start, retained))
+        })
+        .unzip()
+}
+
 /// What a successor needs of the tentative rows it follows.
 struct Predecessor<'a> {
     /// The position after the predecessor's rows.
@@ -647,9 +768,12 @@ struct Predecessor<'a> {
     /// The version the predecessor publishes when all its rows commit.
     bank: usize,
     tape: usize,
-    claims: &'a Claims,
-    /// Visible history once the predecessor commits.
-    ranges: Vec<(usize, usize)>,
+    claims: &'a [Claims],
+    /// The trim floor, and per domain the first position and the rows of
+    /// the history once the predecessor commits.
+    floor: usize,
+    starts: Vec<usize>,
+    ranges: Vec<Vec<(usize, usize)>>,
     history: &'a [PlaneBuffer],
     recurrent: &'a Rc<[Tensor]>,
 }
@@ -666,13 +790,15 @@ pub struct OwnedSuccessorAdvance {
     position: usize,
     previous_bank: usize,
     previous_tape: usize,
-    ranges: Vec<(usize, usize)>,
+    floor: usize,
+    starts: Vec<usize>,
+    ranges: Vec<Vec<(usize, usize)>>,
     count: usize,
-    claims: Claims,
+    claims: Vec<Claims>,
     following: BankHandle,
     history: Vec<PlaneBuffer>,
     recurrent: Rc<[Tensor]>,
-    destinations: Vec<usize>,
+    destinations: Vec<Vec<usize>>,
     transaction: Transaction,
 }
 
@@ -685,18 +811,17 @@ impl OwnedSuccessorAdvance {
         if count == 0 || count > store.context_capacity.saturating_sub(predecessor.end) {
             return Err(Error::from("successor advance exceeds context capacity"));
         }
-        if predecessor.ranges.len() >= store.max_visible_spans() {
+        if store
+            .history_domains()
+            .any(|domain| predecessor.ranges[domain.0].len() >= store.span_bound(domain))
+        {
             return Err(Error::from(
                 "successor advance would exceed the segment limit",
             ));
         }
         let claims = store.reserve(Some(predecessor.claims), count)?;
         let following = store.successor_bank()?;
-        let destinations = claims
-            .ranges()
-            .into_iter()
-            .flat_map(|(start, count)| start..start + count)
-            .collect();
+        let destinations = destinations(&claims);
         let mut transaction = store.begin_transaction();
         transaction.track(&claims, &following);
         Ok(Self {
@@ -704,6 +829,8 @@ impl OwnedSuccessorAdvance {
             position: predecessor.end,
             previous_bank: predecessor.bank,
             previous_tape: predecessor.tape,
+            floor: predecessor.floor,
+            starts: predecessor.starts,
             ranges: predecessor.ranges,
             count,
             claims,
@@ -717,15 +844,24 @@ impl OwnedSuccessorAdvance {
 
     /// Tentative rows following this successor's rows.
     pub fn successor(&self, count: usize) -> Result<OwnedSuccessorAdvance, Error> {
-        let mut ranges = self.ranges.clone();
-        append_ranges(&mut ranges, self.claims.ranges(), self.claims.slab_rows());
+        let end = self.position + self.count;
+        let (starts, ranges) = following_history(
+            &self.store,
+            self.floor,
+            &self.starts,
+            self.ranges.clone(),
+            &self.claims,
+            end,
+        );
         Self::reserve(
             &self.store,
             Predecessor {
-                end: self.position + self.count,
+                end,
                 bank: self.following.index(),
                 tape: 0,
                 claims: &self.claims,
+                floor: self.floor,
+                starts,
                 ranges,
                 history: &self.history,
                 recurrent: &self.recurrent,
@@ -746,8 +882,22 @@ impl OwnedSuccessorAdvance {
         Rc::ptr_eq(&self.store, store)
     }
 
-    pub fn history_ranges(&self) -> Vec<(usize, usize)> {
+    /// The rows the successor reads in a domain once its predecessor
+    /// commits, from position [`OwnedSuccessorAdvance::history_start`].
+    pub fn history_ranges(&self, domain: HistoryDomainId) -> Vec<(usize, usize)> {
+        self.ranges[domain.0].clone()
+    }
+    pub fn domain_ranges(&self) -> Vec<Vec<(usize, usize)>> {
         self.ranges.clone()
+    }
+    pub fn history_start(&self, domain: HistoryDomainId) -> usize {
+        self.starts[domain.0]
+    }
+    pub fn visible_ranges(&self, domain: HistoryDomainId, from: usize) -> Vec<(usize, usize)> {
+        ranges_from(&self.ranges[domain.0], self.starts[domain.0], from)
+    }
+    pub fn span_count(&self) -> usize {
+        self.ranges.iter().map(Vec::len).max().unwrap_or(0)
     }
 
     pub fn bindings(&self) -> OwnedAdvanceBindings<'_> {
@@ -770,7 +920,8 @@ impl OwnedSuccessorAdvance {
             || state.position != self.position
             || state.bank.index() != self.previous_bank
             || state.tape != self.previous_tape
-            || state.history_ranges() != self.ranges
+            || state.starts != self.starts
+            || state.domain_ranges() != self.ranges
         {
             return Err((
                 state,
@@ -831,10 +982,39 @@ impl TentativeAdvance {
         }
     }
 
-    pub fn history_ranges(&self) -> Vec<(usize, usize)> {
+    pub fn history_ranges(&self, domain: HistoryDomainId) -> Vec<(usize, usize)> {
         match self {
-            Self::Accepted(advance) => advance.history_ranges(),
-            Self::Successor(advance) => advance.history_ranges(),
+            Self::Accepted(advance) => advance.history_ranges(domain),
+            Self::Successor(advance) => advance.history_ranges(domain),
+        }
+    }
+
+    pub fn domain_ranges(&self) -> Vec<Vec<(usize, usize)>> {
+        match self {
+            Self::Accepted(advance) => advance.domain_ranges(),
+            Self::Successor(advance) => advance.domain_ranges(),
+        }
+    }
+
+    pub fn history_start(&self, domain: HistoryDomainId) -> usize {
+        match self {
+            Self::Accepted(advance) => advance.history_start(domain),
+            Self::Successor(advance) => advance.history_start(domain),
+        }
+    }
+
+    pub fn visible_ranges(&self, domain: HistoryDomainId, from: usize) -> Vec<(usize, usize)> {
+        match self {
+            Self::Accepted(advance) => advance.visible_ranges(domain, from),
+            Self::Successor(advance) => advance.visible_ranges(domain, from),
+        }
+    }
+
+    /// The most spans any domain's history has.
+    pub fn span_count(&self) -> usize {
+        match self {
+            Self::Accepted(advance) => advance.span_count(),
+            Self::Successor(advance) => advance.span_count(),
         }
     }
 
@@ -862,9 +1042,34 @@ pub enum OwnedAdvanceResolution {
 mod tests {
     use super::*;
     use crate::{
-        BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, LayerRef, StateStore,
+        BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, HistoryDomainLayout,
+        HistoryDomainPlan, LayerRef, StateStore,
     };
-    use seismic::{BackendName, DType, DeviceCatalog};
+    use seismic::{BackendName, DType, Device, DeviceCatalog};
+
+    const TOKEN: HistoryDomainId = HistoryDomainId(0);
+
+    /// A store of one Token domain, as Qwen's stores are.
+    fn token_store(
+        device: Rc<Device>,
+        context: usize,
+        rows: usize,
+        components: Vec<ComponentDescriptor>,
+        specs: Vec<ComponentSpec>,
+        banks: BankCapacity,
+    ) -> Result<Rc<StateStore>, Error> {
+        StateStore::new(
+            device,
+            context,
+            context,
+            vec![HistoryDomainPlan {
+                layout: HistoryDomainLayout::Token { components },
+                logical_rows: rows,
+            }],
+            specs,
+            banks,
+        )
+    }
 
     #[test]
     fn abort_recovers_source_and_releases_tentative_capacity() {
@@ -874,7 +1079,7 @@ mod tests {
         else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             Rc::new(device),
             4,
             4,
@@ -894,27 +1099,27 @@ mod tests {
         .unwrap();
         let state = store.create().unwrap();
         let advance = OwnedStateAdvance::begin(state, 2).ok().unwrap();
-        assert_eq!(advance.bindings().destinations.len(), 2);
-        assert_eq!(store.occupied_rows(), 2);
+        assert_eq!(advance.bindings().destinations[0].len(), 2);
+        assert_eq!(store.occupied_rows(TOKEN), 2);
         let in_flight = store.holding_census(&[], &[], &[]).unwrap();
-        assert_eq!(in_flight.in_flight, 2 * store.total_history_row_bytes());
+        assert_eq!(in_flight.in_flight, 2 * store.history_row_bytes(TOKEN));
         assert_eq!(in_flight.total(), store.committed_bytes());
         let state = advance.abort();
         assert_eq!(state.position(), 0);
-        assert_eq!(store.occupied_rows(), 0);
+        assert_eq!(store.occupied_rows(TOKEN), 0);
 
         let advance = OwnedStateAdvance::begin(state, 2).ok().unwrap();
         let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap() else {
             panic!("full accepted prefix must commit");
         };
         assert_eq!(state.position(), 2);
-        assert_eq!(store.occupied_rows(), 2);
+        assert_eq!(store.occupied_rows(TOKEN), 2);
         let retained = state.checkpoint();
         let advance = OwnedStateAdvance::begin(state, 1).ok().unwrap();
         let during = store
             .holding_census(&[], &[crate::Holder::Checkpoint(&retained)], &[])
             .unwrap();
-        assert_eq!(during.in_flight, 3 * store.total_history_row_bytes());
+        assert_eq!(during.in_flight, 3 * store.history_row_bytes(TOKEN));
         assert_eq!(during.retained, 0);
         assert_eq!(during.total(), store.committed_bytes());
         let state = advance.abort();
@@ -926,12 +1131,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after.in_flight, 0);
-        assert_eq!(after.live, 2 * store.total_history_row_bytes());
+        assert_eq!(after.live, 2 * store.history_row_bytes(TOKEN));
         let flight = crate::InFlightState::new(state);
         let held = store
             .holding_census(&[], &[crate::Holder::Checkpoint(&retained)], &[])
             .unwrap();
-        assert_eq!(held.in_flight, 2 * store.total_history_row_bytes());
+        assert_eq!(held.in_flight, 2 * store.history_row_bytes(TOKEN));
         let state = flight.into_state();
         assert_eq!(state.position(), 2);
     }
@@ -944,7 +1149,7 @@ mod tests {
         else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             Rc::new(device),
             8,
             8,
@@ -976,10 +1181,8 @@ mod tests {
             second.bindings().following_bank
         );
         assert_eq!(
-            second.history_ranges(),
-            first
-                .bindings()
-                .destinations
+            second.history_ranges(TOKEN),
+            first.bindings().destinations[0]
                 .iter()
                 .map(|&row| (row, 1))
                 .fold(Vec::new(), |mut ranges, range| {
@@ -989,16 +1192,16 @@ mod tests {
         );
         // Rows follow their predecessors physically: one run.
         assert_eq!(
-            second.bindings().destinations,
-            [first.bindings().destinations[1] + 1]
+            second.bindings().destinations[0],
+            [first.bindings().destinations[0][1] + 1]
         );
         assert_eq!(
-            third.bindings().destinations,
-            [second.bindings().destinations[0] + 1]
+            third.bindings().destinations[0],
+            [second.bindings().destinations[0][0] + 1]
         );
-        assert_eq!(store.occupied_rows(), 4);
+        assert_eq!(store.occupied_rows(TOKEN), 4);
         let submitted = store.holding_census(&[], &[], &[]).unwrap();
-        assert_eq!(submitted.in_flight, 4 * store.total_history_row_bytes());
+        assert_eq!(submitted.in_flight, 4 * store.history_row_bytes(TOKEN));
         assert_eq!(submitted.total(), store.committed_bytes());
 
         let OwnedAdvanceResolution::Committed(state) = first.commit_all().ok().unwrap() else {
@@ -1011,16 +1214,16 @@ mod tests {
             panic!("full accepted prefix must commit");
         };
         assert_eq!(state.position(), 3);
-        assert_eq!(state.history_ranges().len(), 1);
+        assert_eq!(state.history_ranges(TOKEN).len(), 1);
         // The dropped third successor released its row and bank.
-        assert_eq!(store.occupied_rows(), 3);
+        assert_eq!(store.occupied_rows(TOKEN), 3);
         let next = OwnedStateAdvance::begin(state, 1).ok().unwrap();
         let orphan = next.successor(1).unwrap();
         drop(orphan);
-        assert_eq!(store.occupied_rows(), 4);
+        assert_eq!(store.occupied_rows(TOKEN), 4);
         let state = next.abort();
         assert_eq!(state.position(), 3);
-        assert_eq!(store.occupied_rows(), 3);
+        assert_eq!(store.occupied_rows(TOKEN), 3);
     }
 
     #[test]
@@ -1032,7 +1235,7 @@ mod tests {
             return;
         };
         let device = Rc::new(device);
-        let source_store = StateStore::new(
+        let source_store = token_store(
             device.clone(),
             4,
             4,
@@ -1050,7 +1253,7 @@ mod tests {
             },
         )
         .unwrap();
-        let destination_store = StateStore::new(
+        let destination_store = token_store(
             device,
             4,
             4,
@@ -1082,16 +1285,16 @@ mod tests {
         assert_eq!(conversion.conversions().len(), 2);
         // Codes and coefficient planes per vector kind.
         assert_eq!(conversion.bindings().destination_history.len(), 4);
-        assert_eq!(destination_store.occupied_rows(), 2);
+        assert_eq!(destination_store.occupied_rows(TOKEN), 2);
         let source_flight = source_store.holding_census(&[], &[], &[]).unwrap();
         let destination_flight = destination_store.holding_census(&[], &[], &[]).unwrap();
         assert_eq!(
             source_flight.in_flight,
-            2 * source_store.total_history_row_bytes()
+            2 * source_store.history_row_bytes(TOKEN)
         );
         assert_eq!(
             destination_flight.in_flight,
-            2 * destination_store.total_history_row_bytes()
+            2 * destination_store.history_row_bytes(TOKEN)
         );
         assert_eq!(source_flight.total(), source_store.committed_bytes());
         assert_eq!(
@@ -1101,19 +1304,19 @@ mod tests {
         let (source, destination) = conversion.abort();
         assert_eq!(source.position(), 2);
         assert_eq!(destination.position(), 0);
-        assert_eq!(destination_store.occupied_rows(), 0);
+        assert_eq!(destination_store.occupied_rows(TOKEN), 0);
         let conversion = OwnedCodecAdvance::begin(source, destination).ok().unwrap();
         let destination = conversion.commit();
         assert_eq!(destination.position(), 2);
         assert_eq!(
             destination
-                .history_ranges()
+                .history_ranges(TOKEN)
                 .iter()
                 .map(|(_, rows)| rows)
                 .sum::<usize>(),
             2
         );
-        assert_eq!(destination_store.occupied_rows(), 2);
+        assert_eq!(destination_store.occupied_rows(TOKEN), 2);
     }
 
     fn recurrent_store(context: usize, in_flight: usize) -> Option<Rc<StateStore>> {
@@ -1121,7 +1324,7 @@ mod tests {
             .ok()
             .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())?;
         Some(
-            StateStore::new(
+            token_store(
                 Rc::new(device),
                 context,
                 context,
@@ -1162,7 +1365,7 @@ mod tests {
         let first_census = store.holding_census(&[], &[], &[]).unwrap();
         assert_eq!(
             first_census.in_flight,
-            4 * store.total_history_row_bytes() + bank_bytes
+            4 * store.history_row_bytes(TOKEN) + bank_bytes
         );
         assert_eq!(first_census.model_seed, bank_bytes);
         let bindings = advance.bindings();
@@ -1175,7 +1378,7 @@ mod tests {
             (state.position(), state.bank_index(), state.tape_rows()),
             (3, following, 2)
         );
-        assert_eq!(store.occupied_rows(), 3);
+        assert_eq!(store.occupied_rows(TOKEN), 3);
 
         // The next advance reads the version; a checkpoint and its forks keep it.
         let checkpoint = state.checkpoint();
@@ -1188,7 +1391,7 @@ mod tests {
         assert_eq!(shared_census.retained, 0);
         assert_eq!(
             shared_census.in_flight,
-            4 * store.total_history_row_bytes() + 2 * bank_bytes
+            4 * store.history_row_bytes(TOKEN) + 2 * bank_bytes
         );
         let bindings = advance.bindings();
         assert_eq!(
@@ -1210,7 +1413,7 @@ mod tests {
             .unwrap();
         let (state, _) = advance.commit(1).err().unwrap();
         assert_eq!((state.position(), state.tape_rows()), (4, 0));
-        assert_eq!(store.occupied_rows(), 4);
+        assert_eq!(store.occupied_rows(TOKEN), 4);
         let advance = OwnedStateAdvance::begin_speculative(state, 3, 2)
             .ok()
             .unwrap();

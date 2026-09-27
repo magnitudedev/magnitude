@@ -1,6 +1,6 @@
 // history shared attention mechanisms; included at the original declaration point.
 // ---------------------------------------------------------------------------
-// Affine K8/V4 history (`gated_attention_*_k8v4`). A (history row, kv head)
+// Affine K8/V4 history (`attention_*_k8v4`). A (history row, kv head)
 // vector is a code row of W * B / 32 u32 words (code i at bits B * (i % (32 /
 // B)) of word i / (32 / B)) plus one F16 (scale, zero) pair per group of
 // GROUP consecutive columns, pairs in group order; decoded value = code *
@@ -32,13 +32,6 @@ struct lane_codes {
         "a lane's codes are whole words or a power-of-two part of one");
     static_assert(ATTENTION_W % ATTENTION_GROUP == 0 && ATTENTION_GROUP % ATTENTION_E == 0,
         "a lane's columns lie in one group");
-
-    // The (scale, zero) pair of this lane's group of vector `vector`, whose
-    // pairs start at `coefficients + vector * pairs * 2`.
-    static inline float2 pair(device const half *coefficients, ulong vector, uint lane) {
-        return float2(*reinterpret_cast<device const half2 *>(
-            coefficients + (vector * pairs + lane / pair_lanes) * 2));
-    }
 
     // This lane's codes of one vector's code row, shifted so its code i sits
     // at bits B * i of the (i * B / 32)-th word.
@@ -144,25 +137,25 @@ inline void encode(thread const float (&x)[ATTENTION_E], device uint *row,
     }
 }
 
-// The online-softmax state of G query heads absorbing N affine-coded keys and
-// values, with this lane's group pairs. Scores are corrected, not decoded:
-// the sum over groups of scale * (q . code) + zero * sum(q), each lane adding
-// its columns' share (`qsum` is the sum of this lane's query columns). The
-// value product accumulates (p * scale) * code into `output` and
-// sum(p * zero) into this lane's per-head `bias`, both carried by the same
-// factor, so output + bias is the attended sum.
-template <uint N>
-inline void absorb_affine(thread const float (&q)[SEISMIC_DIM_G][ATTENTION_E],
-    thread const float (&qsum)[SEISMIC_DIM_G],
+// The online-softmax state of G query heads (or a slice of H of them)
+// absorbing N affine-coded keys and values, with this lane's group pairs.
+// Scores are corrected, not decoded: the sum over groups of scale * (q .
+// code) + zero * sum(q), each lane adding its columns' share (`qsum` is the
+// sum of this lane's query columns). The value product accumulates (p *
+// scale) * code into `output` and sum(p * zero) into this lane's per-head
+// `bias`, both carried by the same factor, so output + bias is the attended
+// sum.
+template <uint N, uint G>
+inline void absorb_affine(thread const float (&q)[G][ATTENTION_E],
+    thread const float (&qsum)[G],
     thread const uint (&key)[N][lane_codes<ATTENTION_KEY_BITS>::words],
     thread const float2 (&key_coefficients)[N],
     thread const uint (&value)[N][lane_codes<ATTENTION_VALUE_BITS>::words],
     thread const float2 (&value_coefficients)[N],
-    thread float (&maximum)[SEISMIC_DIM_G], thread float (&denominator)[SEISMIC_DIM_G],
-    thread float (&output)[SEISMIC_DIM_G][ATTENTION_E], thread float (&bias)[SEISMIC_DIM_G]) {
+    thread float (&maximum)[G], thread float (&denominator)[G],
+    thread float (&output)[G][ATTENTION_E], thread float (&bias)[G]) {
     typedef lane_codes<ATTENTION_KEY_BITS> key_codes;
     typedef lane_codes<ATTENTION_VALUE_BITS> value_codes;
-    constexpr uint G = SEISMIC_DIM_G;
     // Codes unpack one token at a time, so only one token's columns are live
     // as F32 next to the scores and the output.
     float score[G][N];

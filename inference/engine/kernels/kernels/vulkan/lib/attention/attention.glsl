@@ -1,8 +1,9 @@
-// Shared pieces of the gated attention entries (`gated_attention_decode`,
-// `gated_attention_prefill`): the per-head preparation (RMS norm and partial
-// M-RoPE) held in one subgroup's registers, a row's span walk, decode
-// partition bounds, the online-softmax absorb, the fixed-order merge of
-// partial states, the decode partition publication and gated merge, and the
+// Shared pieces of the attention family entries (`attention_decode`,
+// `attention_prefill` and their K8/V4 forms): the per-head preparation
+// (optional RMS norm and amplitude-scaled partial M-RoPE) held in one
+// subgroup's registers, a row's span walk, decode partition bounds, the
+// online-softmax absorb, the fixed-order merge of partial states, the decode
+// partition publication and gated merge, and the
 // K/V append. The counterpart of `metal/lib/attention/attention.h`.
 //
 // Every dense operand is bound canonically (row-major, unit innermost
@@ -30,6 +31,14 @@
 
 #define ATTENTION_INF uintBitsToFloat(0x7f800000u)
 
+// The entry's form (contract in attention.seismic), defined by every entry
+// before including this file: ATTENTION_I interleaved gate columns after each
+// query head's W columns (0 or W), ATTENTION_U separate gate values per query
+// head (0, 1 or W), ATTENTION_FRESH (the layer has fresh rows),
+// ATTENTION_NORM (q/k RMS norm), ATTENTION_VALUE_NORM (value RMS norm) and
+// ATTENTION_SOFTPLUS (the gate function is softplus rather than sigmoid).
+#define ATTENTION_QUERY_STRIDE (ATTENTION_W + ATTENTION_I)
+
 // E consecutive A elements from element `index` (aligned to E) as F32.
 void attention_load_row(uint64_t base, uint64_t index, out float x[ATTENTION_E]) {
     if (ELEMENT_ACT != ELEMENT_F32 && ATTENTION_E % 8u == 0u) {
@@ -47,14 +56,9 @@ void attention_load_row(uint64_t base, uint64_t index, out float x[ATTENTION_E])
     }
 }
 
-// One head row at `raw` (A elements), RMS-normalized with `norm` (F32) and
-// rotated on its first 2P columns (pair p by coordinate axis components[p] at
-// frequencies[p]), into lane `lane`'s E columns. The whole subgroup calls it:
-// the square sum is a subgroup reduction and each rotated column's pair
-// partner lives P / E lanes away.
-void attention_prepare(uint64_t raw, uint64_t norm, uint64_t coordinates, uint64_t components, uint64_t frequencies,
-    float epsilon, uint lane, out float x[ATTENTION_E]) {
-    attention_load_row(raw, uint64_t(lane) * ATTENTION_E, x);
+// Lane `lane`'s E columns of `x` RMS-normalized with `norm` (F32 weights). The
+// whole subgroup calls it: the square sum is a subgroup reduction.
+void attention_normalize(uint64_t norm, float epsilon, uint lane, inout float x[ATTENTION_E]) {
     float squares = 0.0;
     [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
         squares = seismic_fma_rn(x[i], x[i], squares);
@@ -62,6 +66,32 @@ void attention_prepare(uint64_t raw, uint64_t norm, uint64_t coordinates, uint64
     const float inverse = inversesqrt(seismic_div_rn(squares, float(ATTENTION_W)) + epsilon);
     [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
         x[i] = x[i] * inverse * element_f32_at(norm + uint64_t(lane * ATTENTION_E + i) * 4ul);
+}
+
+// One value head row at `raw` (A elements) into lane `lane`'s E columns,
+// RMS-normalized with `norm` and rounded to A when ATTENTION_VALUE_NORM.
+void attention_value(uint64_t raw, uint64_t norm, float epsilon, uint lane, out float x[ATTENTION_E]) {
+    attention_load_row(raw, uint64_t(lane) * ATTENTION_E, x);
+    if (ATTENTION_VALUE_NORM) {
+        attention_normalize(norm, epsilon, lane, x);
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+            x[i] = element_round(ELEMENT_ACT, x[i]);
+    }
+}
+
+// One head row at `raw` (A elements), RMS-normalized with `norm` (F32) when
+// ATTENTION_NORM and rotated on its first 2P columns (pair p by coordinate
+// axis components[p] at frequencies[p], cosine and sine scaled by
+// amplitudes[p]), into lane `lane`'s E columns. The
+// whole subgroup calls it: each rotated column's pair partner lives P / E
+// lanes away.
+void attention_prepare(uint64_t raw, uint64_t norm, uint64_t coordinates, uint64_t components, uint64_t frequencies,
+    uint64_t amplitudes, float epsilon, uint lane, out float x[ATTENTION_E]) {
+    attention_load_row(raw, uint64_t(lane) * ATTENTION_E, x);
+    if (ATTENTION_NORM)
+        attention_normalize(norm, epsilon, lane, x);
+    if (ATTENTION_P == 0u)
+        return;
     const uint half_lanes = ATTENTION_P / ATTENTION_E;
     const uint partner_lane = lane < half_lanes ? lane + half_lanes : (lane < 2u * half_lanes ? lane - half_lanes : lane);
     float partner[ATTENTION_E];
@@ -71,12 +101,15 @@ void attention_prepare(uint64_t raw, uint64_t norm, uint64_t coordinates, uint64
         return;
     [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
         const uint column = lane * ATTENTION_E + i;
-        const uint pair = column % ATTENTION_P;
+        const uint pair = column % max(ATTENTION_P, 1u);
         float c;
         const int axis = element_i32_at(components + uint64_t(pair) * 4ul);
         const float angle = float(element_i32_at(coordinates + uint64_t(axis) * 4ul))
             * element_f32_at(frequencies + uint64_t(pair) * 4ul);
-        const float s = rotary_sincos(angle, c);
+        float s = rotary_sincos(angle, c);
+        const float amplitude = element_f32_at(amplitudes + uint64_t(pair) * 4ul);
+        c *= amplitude;
+        s *= amplitude;
         x[i] = column < ATTENTION_P ? x[i] * c - partner[i] * s : x[i] * c + partner[i] * s;
     }
 }
@@ -99,8 +132,13 @@ void attention_append(uint64_t history, int destination, uint kv_head, uint lane
 }
 
 // Span `span` of `row`'s keys: visible history spans 0..R-1, then the fresh
-// span R (rows of this batch).
+// span R (rows of this batch; empty for a layer without fresh rows).
 void attention_span(uint64_t visible, uint64_t fresh, uint64_t row, uint64_t spans, uint64_t span, out int lo, out int hi) {
+    if (span == spans && !ATTENTION_FRESH) {
+        lo = 0;
+        hi = 0;
+        return;
+    }
     const uint64_t at = span < spans ? visible + ((row * spans + span) * 2ul) * 4ul : fresh + row * 8ul;
     lo = element_i32_at(at);
     hi = element_i32_at(at + 4ul);
@@ -260,23 +298,34 @@ void attention_publish(float maximum[ATTENTION_HEADS], float denominator[ATTENTI
     }
 }
 
-// The sigmoid-gated store of one attended column of query head `head` of
-// `row`: the gate is the second W of the head's query_gate slice.
-void attention_store_gated(uint64_t query_gate, uint64_t gated, uint64_t row, uint64_t head, uint column, float attended) {
+// The store of one attended column of query head `head` of `row` times its
+// output gate: value column % count of the head's ATTENTION_I interleaved
+// gate columns (after its W query columns in `query`) or its ATTENTION_U
+// separate ones (in `gate`); sigmoid, or softplus under ATTENTION_SOFTPLUS.
+void attention_store_gated(uint64_t query, uint64_t gate, uint64_t result, uint64_t row, uint64_t head, uint column,
+    float attended) {
     const uint64_t heads = uint64_t(ATTENTION_KV * ATTENTION_G);
-    const float gate = element_at(ELEMENT_ACT, query_gate, (row * heads + head) * 2ul * ATTENTION_W + ATTENTION_W + column);
-    element_put(ELEMENT_ACT, gated, (row * heads + head) * ATTENTION_W + column, seismic_div_rn(attended, 1.0 + exp(-gate)));
+    float value = attended;
+    if (ATTENTION_I > 0u || ATTENTION_U > 0u) {
+        const float g = ATTENTION_I > 0u
+            ? element_at(ELEMENT_ACT, query, (row * heads + head) * ATTENTION_QUERY_STRIDE + ATTENTION_W + column)
+            : element_at(ELEMENT_ACT, gate, (row * heads + head) * ATTENTION_U + column % max(ATTENTION_U, 1u));
+        value = ATTENTION_SOFTPLUS ? attended * (max(g, 0.0) + log(1.0 + exp(-abs(g))))
+                                   : seismic_div_rn(attended, 1.0 + exp(-g));
+    }
+    element_put(ELEMENT_ACT, result, (row * heads + head) * ATTENTION_W + column, value);
 }
 
 // The decode merge of one (query head, row) column over the row's `spans`
 // visible spans: the row's non-empty partitions in partition order, then the
-// sigmoid gate. A row that sees no key attends to zero.
-void attention_decode_gate(uint64_t query_gate, uint64_t visible, uint64_t fresh, uint64_t gated, uint64_t partials,
-    uint64_t statistics, uint64_t spans, uint64_t head, uint64_t row, uint column, uint span, uint parts) {
+// output gate. A row that sees no key attends to zero.
+void attention_decode_gate(uint64_t query, uint64_t gate, uint64_t visible, uint64_t fresh, uint64_t result,
+    uint64_t partials, uint64_t statistics, uint64_t spans, uint64_t head, uint64_t row, uint column, uint span,
+    uint parts) {
     const uint total = attention_visible_total(visible, fresh, row, spans);
     const uint span_keys = attention_partition_span(total, span, parts);
     const uint used = (total + span_keys - 1u) / span_keys;
     const float attended = attention_merge(partials, statistics,
         (row * ATTENTION_KV * ATTENTION_G + head) * parts, 1ul, used, column);
-    attention_store_gated(query_gate, gated, row, head, column, attended);
+    attention_store_gated(query, gate, result, row, head, column, attended);
 }

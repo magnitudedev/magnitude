@@ -1,16 +1,15 @@
 //! Persistence of a measured basis. The caller names the directory; each
-//! basis is one JSON file whose name is the content address of its identity
-//! and the backend's declared plan, so a change to either is a new file.
-//! Elements are stored by name. An absent, unreadable or unparseable file,
-//! an unknown class or element name, or an identity or protocol mismatch is
-//! a cache miss.
+//! device's basis is one JSON file whose name is the content address of its
+//! identity. A file holds what was measured (every entry's points, or that it
+//! was formed or is unsupported); costs are fitted from the points when the
+//! file is read. Elements are stored by name. An absent, unreadable or
+//! unparseable file, an unknown class or element name, points that do not fit
+//! their class, or an identity or protocol mismatch is a cache miss.
 
 use super::basis::{
-    BasisIdentity, ClassCost, ClassMeasurement, CostModel, MeasuredPoint, MeasurementBasis,
-    MeasurementKey, OperationClass, MEASUREMENT_PROTOCOL_VERSION,
+    BasisIdentity, ClassCost, ClassMeasurement, HeadGeometry, MeasuredPoint, MeasurementBasis,
+    MeasurementKey, OperationClass, PointShape, MEASUREMENT_PROTOCOL_VERSION,
 };
-use super::plan::measurement_plan;
-use crate::StreamingCost;
 use seismic::{BackendName, Element};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -21,15 +20,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The cache file name of a basis with `identity`, or `None` when the
 /// identity names no backend this build knows.
 pub fn basis_file_name(identity: &BasisIdentity) -> Option<String> {
-    let backend = BackendName::parse(&identity.backend)?;
-    let mut material = format!(
-        "engine {}\nbackend {}\ndevice {}\nprotocol {}\nplan",
+    BackendName::parse(&identity.backend)?;
+    let material = format!(
+        "engine {}\nbackend {}\ndevice {}\nprotocol {}",
         identity.engine_build, identity.backend, identity.device, identity.protocol_version
     );
-    for key in measurement_plan(backend) {
-        material.push('\n');
-        material.push_str(&key_json(&key).to_string());
-    }
     let digest = Sha256::digest(material.as_bytes());
     let hex = digest
         .iter()
@@ -42,7 +37,6 @@ fn key_json(key: &MeasurementKey) -> Value {
     json!({
         "class": key.class.name(),
         "bindings": key.bindings.iter().map(|element| element.name()).collect::<Vec<_>>(),
-        "geometry": key.geometry.iter().map(|(name, value)| json!([name, value])).collect::<Vec<_>>(),
     })
 }
 
@@ -55,29 +49,35 @@ fn identity_json(identity: &BasisIdentity) -> Value {
     })
 }
 
+fn shape_json(shape: &PointShape) -> Value {
+    match shape {
+        PointShape::Size => json!("size"),
+        PointShape::Launch {
+            rows,
+            reduction,
+            weight,
+        } => json!({ "launch": { "rows": rows, "reduction": reduction, "weight": weight.name() } }),
+        PointShape::Heads(heads) => json!({ "heads": {
+            "kv_heads": heads.kv_heads,
+            "group": heads.group,
+            "width": heads.width,
+        } }),
+    }
+}
+
 fn measurement_json(measurement: &ClassMeasurement) -> Value {
     match measurement {
         ClassMeasurement::Unsupported { reason } => json!({ "unsupported": reason }),
-        ClassMeasurement::Measured { points, cost } => json!({
+        ClassMeasurement::Formed => json!({ "formed": true }),
+        ClassMeasurement::Measured { points, .. } => json!({
             "points": points
                 .iter()
-                .map(|point| json!({ "bytes": point.bytes, "samples": point.samples }))
+                .map(|point| json!({
+                    "shape": shape_json(&point.shape),
+                    "bytes": point.bytes,
+                    "samples": point.samples,
+                }))
                 .collect::<Vec<_>>(),
-            "cost": match &cost.model {
-                CostModel::PerLaunch { seconds } => json!({ "per_launch_seconds": seconds }),
-                CostModel::Linear(linear) => json!({
-                    "launch_seconds": linear.launch_seconds,
-                    "seconds_per_byte": linear.seconds_per_byte,
-                }),
-                CostModel::Curve(points) => json!({
-                    "launch_curve": points
-                        .iter()
-                        .map(|(bytes, seconds)| json!([bytes, seconds]))
-                        .collect::<Vec<_>>(),
-                }),
-            },
-            "slow_factor": cost.slow_factor,
-            "fast_factor": cost.fast_factor,
         }),
     }
 }
@@ -105,29 +105,36 @@ fn parse_key(value: &Value) -> Option<MeasurementKey> {
         .iter()
         .map(|name| Element::named(name.as_str()?))
         .collect::<Option<Vec<_>>>()?;
-    let geometry = value
-        .get("geometry")?
-        .as_array()?
-        .iter()
-        .map(|entry| {
-            let [name, value] = entry.as_array()?.as_slice() else {
-                return None;
-            };
-            Some((name.as_str()?.to_owned(), value.as_u64()?))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(MeasurementKey {
-        class,
-        bindings,
-        geometry,
-    })
+    Some(MeasurementKey { class, bindings })
 }
 
-fn parse_measurement(value: &Value) -> Option<ClassMeasurement> {
+fn parse_shape(value: &Value) -> Option<PointShape> {
+    if value.as_str() == Some("size") {
+        return Some(PointShape::Size);
+    }
+    if let Some(launch) = value.get("launch") {
+        return Some(PointShape::Launch {
+            rows: launch.get("rows")?.as_u64()?,
+            reduction: launch.get("reduction")?.as_u64()?,
+            weight: Element::named(launch.get("weight")?.as_str()?)?,
+        });
+    }
+    let heads = value.get("heads")?;
+    Some(PointShape::Heads(HeadGeometry {
+        kv_heads: heads.get("kv_heads")?.as_u64()?,
+        group: heads.get("group")?.as_u64()?,
+        width: heads.get("width")?.as_u64()?,
+    }))
+}
+
+fn parse_measurement(class: OperationClass, value: &Value) -> Option<ClassMeasurement> {
     if let Some(reason) = value.get("unsupported") {
         return Some(ClassMeasurement::Unsupported {
             reason: reason.as_str()?.to_owned(),
         });
+    }
+    if value.get("formed").and_then(Value::as_bool) == Some(true) {
+        return Some(ClassMeasurement::Formed);
     }
     let points = value
         .get("points")?
@@ -135,6 +142,7 @@ fn parse_measurement(value: &Value) -> Option<ClassMeasurement> {
         .iter()
         .map(|point| {
             Some(MeasuredPoint {
+                shape: parse_shape(point.get("shape")?)?,
                 bytes: point.get("bytes")?.as_u64()?,
                 samples: point
                     .get("samples")?
@@ -145,38 +153,8 @@ fn parse_measurement(value: &Value) -> Option<ClassMeasurement> {
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    let cost = value.get("cost")?;
-    let model = if let Some(seconds) = cost.get("per_launch_seconds") {
-        CostModel::PerLaunch {
-            seconds: seconds.as_f64()?,
-        }
-    } else if let Some(curve) = cost.get("launch_curve") {
-        CostModel::Curve(
-            curve
-                .as_array()?
-                .iter()
-                .map(|entry| {
-                    let [bytes, seconds] = entry.as_array()?.as_slice() else {
-                        return None;
-                    };
-                    Some((bytes.as_u64()?, seconds.as_f64()?))
-                })
-                .collect::<Option<Vec<_>>>()?,
-        )
-    } else {
-        CostModel::Linear(StreamingCost {
-            launch_seconds: cost.get("launch_seconds")?.as_f64()?,
-            seconds_per_byte: cost.get("seconds_per_byte")?.as_f64()?,
-        })
-    };
-    Some(ClassMeasurement::Measured {
-        points,
-        cost: ClassCost {
-            model,
-            slow_factor: value.get("slow_factor")?.as_f64()?,
-            fast_factor: value.get("fast_factor")?.as_f64()?,
-        },
-    })
+    let cost = ClassCost::from_points(class, &points).ok()?;
+    Some(ClassMeasurement::Measured { points, cost })
 }
 
 /// The basis in `document`, when it is well formed and has `identity`.
@@ -196,10 +174,9 @@ pub fn parse_basis(document: &Value, identity: &BasisIdentity) -> Option<Measure
         .as_array()?
         .iter()
         .map(|entry| {
-            Some((
-                parse_key(entry.get("key")?)?,
-                parse_measurement(entry.get("measurement")?)?,
-            ))
+            let key = parse_key(entry.get("key")?)?;
+            let measurement = parse_measurement(key.class, entry.get("measurement")?)?;
+            Some((key, measurement))
         })
         .collect::<Option<Vec<_>>>()?;
     Some(MeasurementBasis {
@@ -260,73 +237,82 @@ mod tests {
         }
     }
 
+    fn measured(class: OperationClass, points: Vec<MeasuredPoint>) -> ClassMeasurement {
+        let cost = ClassCost::from_points(class, &points).unwrap();
+        ClassMeasurement::Measured { points, cost }
+    }
+
     fn basis() -> MeasurementBasis {
         let q4k = Element::stored("q4k", Layout::Rows16).unwrap();
+        let bf16 = Element::bf16();
+        let launch = |rows, reduction, seconds| MeasuredPoint {
+            shape: PointShape::Launch {
+                rows,
+                reduction,
+                weight: q4k,
+            },
+            bytes: rows * reduction / 2,
+            samples: vec![seconds, 2.0e-4],
+        };
+        let heads = |kv_heads, bytes, seconds| MeasuredPoint {
+            shape: PointShape::Heads(HeadGeometry {
+                kv_heads,
+                group: 8,
+                width: 256,
+            }),
+            bytes,
+            samples: vec![seconds],
+        };
         MeasurementBasis {
             identity: identity(),
             classes: vec![
                 (
-                    MeasurementKey::dense_output(q4k, Element::bf16()),
-                    ClassMeasurement::Measured {
-                        points: vec![
-                            MeasuredPoint {
-                                bytes: 2_359_296,
-                                samples: vec![9.68e-6, 9.7123456789e-6, 1.0e-5],
-                            },
-                            MeasuredPoint {
-                                bytes: 67_108_864,
-                                samples: vec![1.6635e-4, 1.7e-4],
-                            },
+                    MeasurementKey::new(OperationClass::DenseOutput, &[bf16]),
+                    measured(
+                        OperationClass::DenseOutput,
+                        vec![
+                            launch(768, 4096, 9.7123456789e-6),
+                            launch(6144, 4096, 3.1e-5),
+                            launch(49_152, 4096, 1.9e-4),
+                            launch(6144, 1024, 1.2e-5),
                         ],
-                        cost: ClassCost {
-                            model: CostModel::Linear(StreamingCost {
-                                launch_seconds: 3.99e-6,
-                                seconds_per_byte: 2.41e-12,
-                            }),
-                            slow_factor: 1.0312,
-                            fast_factor: 0.9876,
-                        },
-                    },
+                    ),
                 ),
                 (
-                    MeasurementKey::dense_expand(Element::bf16(), q4k, Element::bf16()),
-                    ClassMeasurement::Measured {
-                        points: vec![
-                            MeasuredPoint {
-                                bytes: 1_048_576,
-                                samples: vec![1.7e-5],
-                            },
-                            MeasuredPoint {
-                                bytes: 2_097_152,
-                                samples: vec![2.0e-5],
-                            },
+                    MeasurementKey::new(OperationClass::AttentionDecode, &[bf16]),
+                    measured(
+                        OperationClass::AttentionDecode,
+                        vec![
+                            heads(2, 1_000_000, 2e-5),
+                            heads(2, 8_000_000, 9e-5),
+                            heads(4, 16_000_000, 1.2e-4),
                         ],
-                        cost: ClassCost {
-                            model: CostModel::Curve(vec![(1_048_576, 1.7e-5), (2_097_152, 2.0e-5)]),
-                            slow_factor: 1.0,
-                            fast_factor: 1.0,
-                        },
-                    },
+                    ),
                 ),
                 (
-                    MeasurementKey::delta_step(16, 32, 128, 4, Element::bf16()),
-                    ClassMeasurement::Measured {
-                        points: vec![MeasuredPoint {
-                            bytes: 3,
-                            samples: vec![1.0e-5],
-                        }],
-                        cost: ClassCost {
-                            model: CostModel::PerLaunch { seconds: 1.0e-5 },
-                            slow_factor: 1.0,
-                            fast_factor: 1.0,
-                        },
-                    },
+                    MeasurementKey::delta_step(bf16),
+                    measured(
+                        OperationClass::DeltaStep,
+                        vec![
+                            MeasuredPoint {
+                                shape: PointShape::Size,
+                                bytes: 3_000,
+                                samples: vec![1.0e-5],
+                            },
+                            MeasuredPoint {
+                                shape: PointShape::Size,
+                                bytes: 9_000,
+                                samples: vec![1.5e-5],
+                            },
+                        ],
+                    ),
                 ),
+                (MeasurementKey::dense_output(q4k, bf16), ClassMeasurement::Formed),
                 (
                     MeasurementKey::dense_expand(
-                        Element::bf16(),
+                        bf16,
                         Element::stored("iq4g32", Layout::Rows16).unwrap(),
-                        Element::bf16(),
+                        bf16,
                     ),
                     ClassMeasurement::Unsupported {
                         reason: "no formation".into(),
@@ -371,8 +357,9 @@ mod tests {
         unknown.backend = "abacus".into();
         assert_eq!(load_basis(&dir, &unknown), None);
 
-        // A stored file whose identity disagrees with its name, or whose
-        // element or class names are unknown, is not a basis.
+        // A stored file whose identity disagrees with its name, whose
+        // element or class names are unknown, or whose points do not fit
+        // their class, is not a basis.
         let path = dir.join(basis_file_name(&basis.identity).unwrap());
         let mut document = basis_json(&basis);
         document["identity"]["protocol_version"] = json!(MEASUREMENT_PROTOCOL_VERSION + 1);
@@ -384,6 +371,10 @@ mod tests {
         assert_eq!(load_basis(&dir, &basis.identity), None);
         let mut document = basis_json(&basis);
         document["classes"][0]["key"]["class"] = json!("dense_teleport");
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert_eq!(load_basis(&dir, &basis.identity), None);
+        let mut document = basis_json(&basis);
+        document["classes"][2]["measurement"]["points"] = json!([]);
         std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
         assert_eq!(load_basis(&dir, &basis.identity), None);
         std::fs::write(&path, b"{ truncated").unwrap();

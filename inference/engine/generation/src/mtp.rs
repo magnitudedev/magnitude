@@ -1,20 +1,22 @@
-//! Multi-token prediction with the model's draft head.
+//! Multi-token prediction with the model's draft head, and the
+//! target-conditioned drafter state it shares with DFlash (`dflash.rs`).
 //!
-//! The head's committed rows pair each accepted token with the target's
-//! normalized output feature of the row before it (the feature that
-//! selected that token). Those rows are target-conditioned only: rows the
-//! head conditioned on its own features while drafting are never kept.
-//! A round's draft is one head transaction whose entry rows are every pair
-//! not yet entered, ending with the anchor (the last accepted token); the
-//! executor chains the proposals on the device.
+//! The drafter's committed rows pair each accepted token with the target's
+//! feature of the row before it (the feature that selected that token).
+//! Those rows are target-conditioned only: rows the drafter conditioned on
+//! its own features while drafting are never kept. A round's draft is one
+//! drafter transaction whose entry rows are every pair not yet entered,
+//! ending with the anchor (the last accepted token); the executor drafts the
+//! proposals on the device, in the drafter's form (MTP chains head rows, a
+//! DFlash draft reads one block).
 
 use crate::{
-    method::PendingRows, Method, MethodCheckpoint, MethodCheckpointError, MethodEffects,
-    MethodRequirements, MethodState, MtpCheckpoint, Propose, Verification,
+    method::PendingRows, DraftCheckpoint, Method, MethodCheckpoint, MethodCheckpointError,
+    MethodEffects, MethodRequirements, MethodState, Propose, Verification,
 };
 use magnitude_executor::{
-    Demand, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Operation, Outcome, RequestId,
-    SelectSpec, TokenId,
+    Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Operation, Outcome,
+    RequestId, SelectSpec, TokenId,
 };
 
 #[derive(Clone, Debug)]
@@ -54,65 +56,113 @@ impl Method for Mtp {
         &self,
         checkpoint: Option<&MethodCheckpoint>,
     ) -> Result<Box<dyn MethodState>, String> {
-        let checkpoint = match checkpoint {
-            None => None,
-            Some(MethodCheckpoint::Mtp(checkpoint)) => Some(checkpoint.clone()),
-            Some(MethodCheckpoint::Plain) => {
-                return Err("a plain checkpoint cannot restore MTP state".into());
-            }
-        };
-        Ok(Box::new(MtpState::new(self.proposals, checkpoint)))
+        Ok(Box::new(DrafterState::restore(
+            Drafter::Mtp,
+            self.proposals,
+            checkpoint,
+        )?))
+    }
+}
+
+/// Which target-conditioned drafter a state drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Drafter {
+    Mtp,
+    DFlash,
+}
+
+impl Drafter {
+    fn form(self) -> DraftForm {
+        match self {
+            Self::Mtp => DraftForm::Chained,
+            Self::DFlash => DraftForm::Block,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Mtp => "MTP",
+            Self::DFlash => "DFlash",
+        }
+    }
+
+    fn checkpoint(self, state: DraftCheckpoint) -> MethodCheckpoint {
+        match self {
+            Self::Mtp => MethodCheckpoint::Mtp(state),
+            Self::DFlash => MethodCheckpoint::DFlash(state),
+        }
+    }
+
+    /// This drafter's state in `checkpoint`; another method's checkpoint
+    /// cannot restore it.
+    fn restored(self, checkpoint: &MethodCheckpoint) -> Option<&DraftCheckpoint> {
+        match (self, checkpoint) {
+            (Self::Mtp, MethodCheckpoint::Mtp(state))
+            | (Self::DFlash, MethodCheckpoint::DFlash(state)) => Some(state),
+            _ => None,
+        }
     }
 }
 
 #[derive(Clone)]
-struct MtpState {
+pub(crate) struct DrafterState {
+    drafter: Drafter,
     proposals: usize,
-    /// Head rows entered so far; the next entry row's head position.
+    /// Drafter rows entered so far; the next entry row's position.
     position: usize,
     /// Complete pairs not yet entered; the last is the anchor.
     pending: Option<PendingRows>,
     /// A committed feature whose successor token is not known yet.
     open: Option<FeatureRows>,
-    /// The head transaction `propose` returned, until it reconciles.
+    /// The drafter transaction `propose` returned, until it reconciles.
     head: Option<Operation>,
     /// Reconciled proposals awaiting their verification.
     proposal: Option<Vec<TokenId>>,
 }
 
-impl MtpState {
-    fn new(proposals: usize, checkpoint: Option<MtpCheckpoint>) -> Self {
-        let checkpoint = checkpoint.unwrap_or(MtpCheckpoint {
-            position: 0,
-            pending: None,
-            open: None,
-        });
-        Self {
+impl DrafterState {
+    pub(crate) fn restore(
+        drafter: Drafter,
+        proposals: usize,
+        checkpoint: Option<&MethodCheckpoint>,
+    ) -> Result<Self, String> {
+        let checkpoint = match checkpoint {
+            None => DraftCheckpoint {
+                position: 0,
+                pending: None,
+                open: None,
+            },
+            Some(checkpoint) => drafter.restored(checkpoint).cloned().ok_or_else(|| {
+                format!("another method's checkpoint cannot restore {} state", drafter.name())
+            })?,
+        };
+        Ok(Self {
+            drafter,
             proposals,
             position: checkpoint.position,
             pending: checkpoint.pending,
             open: checkpoint.open,
             head: None,
             proposal: None,
-        }
+        })
     }
 
-    /// Entry rows a drafting head admits per request: a verification's
-    /// accepted prefix and its anchor.
+    /// Entry rows a drafting transaction admits per request: a
+    /// verification's accepted prefix and its anchor.
     fn entry_bound(&self) -> usize {
         self.proposals + 1
     }
 
     fn ensure_idle(&self) -> Result<(), String> {
         if self.head.is_some() || self.proposal.is_some() {
-            return Err("MTP method already has unresolved work".into());
+            return Err(format!("{} method already has unresolved work", self.drafter.name()));
         }
         Ok(())
     }
 
     fn append(&mut self, tokens: Vec<TokenId>, features: FeatureRows) -> Result<(), String> {
         if tokens.len() != features.rows() {
-            return Err("MTP pairs differ from their feature rows".into());
+            return Err(format!("{} pairs differ from their feature rows", self.drafter.name()));
         }
         self.pending = Some(match self.pending.take() {
             None => PendingRows { tokens, features },
@@ -128,8 +178,8 @@ impl MtpState {
         Ok(())
     }
 
-    /// Enter every pending pair but the last `keep` as a causal head
-    /// transaction.
+    /// Enter every pending pair but the last `keep` as a drafter transaction
+    /// without proposals.
     fn flush(&mut self, request: RequestId, keep: usize) -> Result<MethodEffects, String> {
         let Some(pending) = self.pending.take() else {
             return Ok(MethodEffects::default());
@@ -159,6 +209,7 @@ impl MtpState {
             conditioning,
             position: self.position,
             proposals: Vec::new(),
+            form: self.drafter.form(),
         };
         operation.validate().map_err(|error| error.to_string())?;
         self.head = Some(operation.clone());
@@ -177,7 +228,7 @@ impl MtpState {
     }
 }
 
-impl MethodState for MtpState {
+impl MethodState for DrafterState {
     fn fork_transition(&self) -> Box<dyn MethodState> {
         Box::new(self.clone())
     }
@@ -192,7 +243,7 @@ impl MethodState for MtpState {
     ) -> Result<MethodEffects, String> {
         self.ensure_idle()?;
         let Some((&first, rest)) = tokens.split_first() else {
-            return Err("MTP cannot prime an empty target chunk".into());
+            return Err(format!("{} cannot prime an empty target chunk", self.drafter.name()));
         };
         let rows = Self::read(reader, features, tokens.len())?;
         // The open feature selected this chunk's first token; each chunk
@@ -239,6 +290,7 @@ impl MethodState for MtpState {
             conditioning: pending.features.clone(),
             position: self.position,
             proposals: selects[..selects.len().min(self.proposals)].to_vec(),
+            form: self.drafter.form(),
         };
         if operation.validate().is_err() {
             return Propose::Tokens(Vec::new());
@@ -253,16 +305,19 @@ impl MethodState for MtpState {
         verification: Verification<'_>,
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
+        let name = self.drafter.name();
         if self.head.is_some() {
-            return Err("MTP cannot observe while a head transaction is unresolved".into());
+            return Err(format!(
+                "{name} cannot observe while a drafter transaction is unresolved"
+            ));
         }
         self.proposal = None;
         let features = verification
             .features
-            .ok_or("MTP verification requires target features")?;
+            .ok_or_else(|| format!("{name} verification requires target features"))?;
         let accepted = verification.accepted;
         if verification.inputs.is_empty() || accepted == 0 || accepted > verification.inputs.len() {
-            return Err("MTP verification prefix is invalid".into());
+            return Err(format!("{name} verification prefix is invalid"));
         }
         // After a replay the last replayed row's feature selected the anchor.
         if let Some(open) = self.open.take() {
@@ -274,7 +329,7 @@ impl MethodState for MtpState {
             .and_then(|pending| pending.tokens.last())
             .is_some_and(|anchor| *anchor != verification.inputs[0])
         {
-            return Err("MTP pending anchor differs from the verified anchor".into());
+            return Err(format!("{name} pending anchor differs from the verified anchor"));
         }
         // Committed row i's feature selected the token after it: the next
         // accepted input, or the round's successor after the last row.
@@ -294,10 +349,11 @@ impl MethodState for MtpState {
     }
 
     fn reconcile(&mut self, operation: &Operation, outcome: Outcome) -> Result<(), String> {
+        let name = self.drafter.name();
         let head = self
             .head
             .take()
-            .ok_or("MTP has no pending head transaction")?;
+            .ok_or_else(|| format!("{name} has no pending drafter transaction"))?;
         let (
             Operation::Head {
                 tokens, proposals, ..
@@ -307,15 +363,15 @@ impl MethodState for MtpState {
             },
         ) = (&head, outcome)
         else {
-            return Err("MTP head outcome has the wrong kind".into());
+            return Err(format!("{name} drafter outcome has the wrong kind"));
         };
         if head != *operation || selected.len() != proposals.len() {
-            return Err("MTP head outcome differs from its transaction".into());
+            return Err(format!("{name} drafter outcome differs from its transaction"));
         }
         self.position = self
             .position
             .checked_add(tokens.len())
-            .ok_or("MTP head position exhausted")?;
+            .ok_or_else(|| format!("{name} drafter position exhausted"))?;
         if !proposals.is_empty() {
             self.pending = None;
             self.proposal = Some(
@@ -333,7 +389,7 @@ impl MethodState for MtpState {
         if self.head.is_some() || self.proposal.is_some() {
             return Err(MethodCheckpointError::Unresolved);
         }
-        Ok(MethodCheckpoint::Mtp(MtpCheckpoint {
+        Ok(self.drafter.checkpoint(DraftCheckpoint {
             position: self.position,
             pending: self.pending.clone(),
             open: self.open.clone(),

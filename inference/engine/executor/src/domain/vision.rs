@@ -82,17 +82,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let duration = flight.started.elapsed();
         let (core, output) = completed.into_parts();
         let patch_rows = core.batch().patch_rows();
-        let merge = self
-            .definition
-            .vision
-            .as_ref()
-            .ok_or_else(|| DomainError::invariant("vision definition is absent"))?
-            .geometry
-            .merge;
         let merge = usize::try_from(
-            merge
-                .checked_mul(merge)
-                .ok_or_else(|| DomainError::invariant("vision merge area overflow"))?,
+            self.definition
+                .vision
+                .as_ref()
+                .ok_or_else(|| DomainError::invariant("vision definition is absent"))?
+                .cell_rows(),
         )
         .map_err(|_| DomainError::invariant("vision merge area exceeds host domain"))?;
         if merge == 0 || !patch_rows.is_multiple_of(merge) {

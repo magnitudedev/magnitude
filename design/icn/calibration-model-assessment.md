@@ -29,7 +29,7 @@ applies_to:
 
 | Term | Meaning |
 | ---- | ------- |
-| **Measurement basis** | The engine's fixed, model-free set of kernel measurements for one execution environment |
+| **Measurement basis** | The engine's kernel measurements for one execution environment, holding every class the known targets' headers need |
 | **Assessment environment** | The selected device, its basis and the engine configuration every model is assessed with |
 | **Model assessment** | Analytical evaluation of one exact resolved model at its serving profile |
 | **Assessing** | Ephemeral observable state while an admitted assessment scope is alive |
@@ -37,29 +37,55 @@ applies_to:
 
 ## Measurement basis
 
-The engine declares the operation classes and representations it can execute and times each on the
-actual device with shipped default configurations at fixed sizes. There is no search, tuning or
-per-model measurement. Forming and timing a class proves the device executes it: the basis is also
-the compatibility set.
+The engine times each operation class on the actual device with shipped default configurations at
+fixed sizes. There is no search, tuning or per-model measurement. Forming and timing a class proves
+the device executes it: the basis is also the compatibility set.
+
+The classes are derived from GGUF headers, never declared by hand. A target needs exactly the
+classes of its decode step under every native history codec, read from its family's definition and
+its execution plan, keyed by the resident representations its load plan binds; nothing else is
+measured. The basis to measure is the union over every known target: catalog targets from the
+release catalog's header bundle and discovered targets from their own files. A target that appears
+later and needs classes the stored basis lacks has only those measured.
+
+A point's variants (arithmetic parameters such as `INT8`, `PARTS` and `SLICES`) are screened with
+one sample each and only the fastest is timed with the full protocol.
+
+- Host work in the measuring process or the service (kernel formation, model preparation) biases
+  device times, so every kernel is formed first and classes are timed only once the service's own
+  concurrent work has ended.
+- Work by other processes on the device is not observable. Their load is timed as it falls and
+  stored; the basis is an estimate either way.
+- A timed submission that faults on the device (for example an illegal memory access) records the
+  class unsupported, naming the fault, and ends the job; the classes measured before it are kept,
+  so the retried job measures only the rest and the models that need the faulted class are
+  `Incompatible` with that reason.
 
 ### Measurement job
 
 ```text
 service start -> device discovery -> automatic device selection
-                                                    ├── measurement job ───┐
-                                                    └── model preparation ──┴── complete assessment
+    -> planning of every known target (headers, definition, execution plan, measurement classes)
+         ├── measurement job: form kernels ──(preparation ended)── time classes ──┐
+         └── preparation: capabilities, demand, certified memory charge ─────────┤
+                                                                        complete assessment
 ```
 
-- One contained child process of the service executable opens exactly the selected device, reuses
-  the basis stored for that device's measurement identity or measures and stores it, and reports
-  the identity. The service reads the basis from its assessment cache. The service process never
-  opens a device, forms kernels or times them.
+- Planning reads headers, recognizes the family and plans execution with the selected execution
+  configuration; it yields the target's measurement classes. The measurement job starts as soon as
+  every known target is planned.
+- Preparation then inspects tokenizer and template capabilities and derives decode demand and the
+  certified memory charge, while the job forms its kernels. The basis is needed only for support
+  and performance evaluation and final assessment publication.
+- One contained child process of the service executable opens exactly the selected device, loads
+  the basis stored for that device's measurement identity, forms the kernels of the requested
+  classes it lacks, waits until the service closes its input (preparation has ended), times them,
+  stores the grown basis, and reports the identity. The service reads the basis from its assessment
+  cache. The service process never opens a device, forms kernels or times them.
+- Classes a stored basis already holds are never re-measured, so targets whose classes were present
+  are unaffected by a new target's classes.
 - The assessment pool is `Preparing` until the basis is available. A failed job publishes a
   retryable pool failure and is retried with bounded backoff; it never blocks service health.
-- Exact model preparation starts while the measurement job runs. It can read headers, inspect
-  tokenizer and template capabilities, plan execution and certify resources using the selected
-  execution configuration. The basis is needed only for support and performance evaluation and
-  final assessment publication. A basis-dependent cache identity does not delay preparation.
 - Measurement and model residency exclude each other on the device: measurement waits for no
   instance to be loading or resident, and loads wait for measurement to finish.
 - Measurement allocations are engine claims above the planning reserve.

@@ -1,17 +1,23 @@
 //! Ordered checked-entry topology. A slot is the requirement and the recipe;
 //! there is no second kernel-key set or broad semantic coverage class here.
 
-use super::weights::activation_dtype;
+use super::weights::{activation_dtype, ParallelBinding, PerLayerBinding, PerLayerEntryBinding};
 use super::{
-    planned_element, AttentionBinding, AttentionShape, DenseBinding, EmbeddingBinding,
-    FeaturesBinding, HeadBinding, ReadoutBinding, RecurrentBinding, RoutedBinding,
-    VisionBlockBinding, VisionMergerBinding, VisionPatchBinding, WeightPlan,
+    planned_element, AttentionBinding, DenseBinding, EmbeddingBinding, FeaturesBinding,
+    HeadBinding, HostTablePlan, ReadoutBinding, RecurrentBinding, RoutedBinding, WeightPlan,
 };
 use crate::error::PlanError;
-use magnitude_family_contracts::{
-    AttentionGeometry, FeedForwardGeometry, MixerGeometry, ModelDefinition, RotarySemantics,
+use crate::operators::routed::GeneralRoutedBinding;
+use crate::operators::short_conv::ShortConvBinding;
+use crate::operators::state_space::StateSpaceBinding;
+use crate::operators::vision::VisionKernel;
+use crate::operators::{
+    self, attention_slot, dense_slot, feed_forward_slot, mixer_slot, paired_block,
 };
-use magnitude_family_contracts::{FeedForwardWeights, MixerWeights, WeightKind, WeightScope};
+use magnitude_family_contracts::{
+    DraftDefinition, DraftEmbedding, DraftMethod, ModelDefinition, SublayerIndex, TapPoint,
+    WeightKind, WeightScope,
+};
 use magnitude_state::KvCodec;
 use seismic::{DType, Element};
 use std::collections::HashSet;
@@ -26,35 +32,61 @@ pub enum ImportProgramSlot {
 pub enum MixerProgramSlot {
     Attention(AttentionBinding),
     Recurrent(RecurrentBinding),
+    StateSpace(StateSpaceBinding),
+    ShortConv(ShortConvBinding),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FeedForwardProgramSlot {
     Dense(DenseBinding),
     Routed(RoutedBinding),
+    GeneralRouted(GeneralRoutedBinding),
+    Parallel(ParallelBinding),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TargetBlockProgramSlot {
     mixer: MixerProgramSlot,
-    feed_forward: FeedForwardProgramSlot,
+    /// Absent for a lone mixer block.
+    feed_forward: Option<FeedForwardProgramSlot>,
+    /// The per-layer input sublayer after the feed-forward.
+    per_layer: Option<PerLayerBinding>,
 }
 
 impl TargetBlockProgramSlot {
-    pub fn new(mixer: MixerProgramSlot, feed_forward: FeedForwardProgramSlot) -> Self {
+    pub fn new(mixer: MixerProgramSlot, feed_forward: Option<FeedForwardProgramSlot>) -> Self {
         Self {
             mixer,
             feed_forward,
+            per_layer: None,
         }
+    }
+
+    pub fn with_per_layer(self, per_layer: Option<PerLayerBinding>) -> Self {
+        Self { per_layer, ..self }
+    }
+
+    pub fn per_layer(&self) -> Option<PerLayerBinding> {
+        self.per_layer
     }
 
     pub fn mixer(&self) -> MixerProgramSlot {
         self.mixer
     }
 
-    pub fn feed_forward(&self) -> FeedForwardProgramSlot {
+    pub fn feed_forward(&self) -> Option<FeedForwardProgramSlot> {
         self.feed_forward
     }
+}
+
+/// The target taps a separate draft reads: each tap rounds the residual rows
+/// the readout publishes into its column block of the draft input rows, and
+/// the readout's features are their fusion (`project_rows` into F32).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TapProgramPlan {
+    pub points: Vec<TapPoint>,
+    pub fusion: Element,
+    pub activation: Element,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,7 +95,10 @@ pub struct TargetProgramPlan {
     blocks: Vec<TargetBlockProgramSlot>,
     readout: ReadoutBinding,
     features: Option<FeaturesBinding>,
+    taps: Option<TapProgramPlan>,
     selection: DType,
+    /// The per-layer entry the blocks' per-layer inputs come from.
+    per_layer: Option<PerLayerEntryBinding>,
 }
 
 impl TargetProgramPlan {
@@ -72,6 +107,7 @@ impl TargetProgramPlan {
         blocks: Vec<TargetBlockProgramSlot>,
         readout: ReadoutBinding,
         features: Option<FeaturesBinding>,
+        taps: Option<TapProgramPlan>,
         selection: DType,
     ) -> Self {
         Self {
@@ -79,8 +115,24 @@ impl TargetProgramPlan {
             blocks,
             readout,
             features,
+            taps,
             selection,
+            per_layer: None,
         }
+    }
+
+    pub fn with_per_layer(self, per_layer: Option<PerLayerEntryBinding>) -> Self {
+        Self { per_layer, ..self }
+    }
+
+    /// The per-layer entry, when the model has per-layer inputs.
+    pub fn per_layer(&self) -> Option<PerLayerEntryBinding> {
+        self.per_layer
+    }
+
+    /// The draft taps whose fusion replaces the readout's features.
+    pub fn taps(&self) -> Option<&TapProgramPlan> {
+        self.taps.as_ref()
     }
 
     pub fn embedding(&self) -> EmbeddingBinding {
@@ -104,6 +156,64 @@ impl TargetProgramPlan {
     }
 }
 
+/// One draft layer: its attention over the fresh block, the same attention
+/// injecting context K/V (its input norm the draft's fusion norm), and its
+/// dense feed-forward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DraftBlockBinding {
+    pub attention: AttentionBinding,
+    pub injection: AttentionBinding,
+    pub feed_forward: DenseBinding,
+}
+
+/// DSpark's Markov table (an embedding) and its projection onto the
+/// vocabulary (a `dense_output` over the slot logits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MarkovBinding {
+    pub embedding: Element,
+    pub projection: Element,
+    /// The table's width.
+    pub rank: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftProgramPlan {
+    blocks: Vec<DraftBlockBinding>,
+    /// The block's token table: the draft's own or the target's.
+    embedding: EmbeddingBinding,
+    output_norm: Element,
+    /// The target's vocabulary projection.
+    projection: Element,
+    markov: Option<MarkovBinding>,
+    activation: Element,
+}
+
+impl DraftProgramPlan {
+    pub fn blocks(&self) -> &[DraftBlockBinding] {
+        &self.blocks
+    }
+
+    pub fn embedding(&self) -> EmbeddingBinding {
+        self.embedding
+    }
+
+    pub fn output_norm(&self) -> Element {
+        self.output_norm
+    }
+
+    pub fn projection(&self) -> Element {
+        self.projection
+    }
+
+    pub fn markov(&self) -> Option<MarkovBinding> {
+        self.markov
+    }
+
+    pub fn activation(&self) -> Element {
+        self.activation
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadProgramPlan {
     blocks: Vec<HeadBinding>,
@@ -119,36 +229,20 @@ impl HeadProgramPlan {
     }
 }
 
+/// The distinct kernel specializations of the projector's vision program
+/// (`operators::vision`), in first-use order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VisionProgramPlan {
-    patch: VisionPatchBinding,
-    blocks: Vec<VisionBlockBinding>,
-    merger: VisionMergerBinding,
+    kernels: Vec<VisionKernel>,
 }
 
 impl VisionProgramPlan {
-    pub fn new(
-        patch: VisionPatchBinding,
-        blocks: Vec<VisionBlockBinding>,
-        merger: VisionMergerBinding,
-    ) -> Self {
-        Self {
-            patch,
-            blocks,
-            merger,
-        }
+    pub(crate) fn new(kernels: Vec<VisionKernel>) -> Self {
+        Self { kernels }
     }
 
-    pub fn patch(&self) -> VisionPatchBinding {
-        self.patch
-    }
-
-    pub fn blocks(&self) -> &[VisionBlockBinding] {
-        &self.blocks
-    }
-
-    pub fn merger(&self) -> VisionMergerBinding {
-        self.merger
+    pub fn kernels(&self) -> &[VisionKernel] {
+        &self.kernels
     }
 }
 
@@ -174,39 +268,41 @@ pub struct ProgramPlan {
     imports: Vec<ImportProgramSlot>,
     target: TargetProgramPlan,
     head: Option<HeadProgramPlan>,
+    draft: Option<DraftProgramPlan>,
     vision: Option<VisionProgramPlan>,
     state: StateProgramPlan,
 }
 
 impl ProgramPlan {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         definition: &ModelDefinition,
         imports: Vec<ImportProgramSlot>,
         target: TargetProgramPlan,
         head: Option<HeadProgramPlan>,
+        draft: Option<DraftProgramPlan>,
         vision: Option<VisionProgramPlan>,
         state: StateProgramPlan,
     ) -> Result<Self, PlanError> {
-        if target.blocks.len() != definition.geometry.blocks.len()
+        if draft.as_ref().is_some_and(|draft| {
+            definition
+                .draft
+                .as_ref()
+                .map(|description| description.blocks.len())
+                != Some(draft.blocks.len())
+        }) || draft.is_some() != target.taps.is_some()
+        {
+            return Err(PlanError::Topology(
+                "draft program slots disagree with the draft and its taps",
+            ));
+        }
+        if target.blocks.len() != definition.decoder.blocks.len()
             || target
                 .blocks
                 .iter()
-                .zip(&definition.geometry.blocks)
+                .zip(&definition.decoder.blocks)
                 .any(|(slot, block)| {
-                    !matches!(
-                        (&slot.mixer, &block.mixer),
-                        (MixerProgramSlot::Attention(_), MixerGeometry::Attention(_))
-                            | (MixerProgramSlot::Recurrent(_), MixerGeometry::Recurrent(_))
-                    ) || !matches!(
-                        (&slot.feed_forward, &block.feedforward),
-                        (
-                            FeedForwardProgramSlot::Dense(_),
-                            FeedForwardGeometry::Dense { .. }
-                        ) | (
-                            FeedForwardProgramSlot::Routed(_),
-                            FeedForwardGeometry::Routed(_)
-                        )
-                    )
+                    paired_block(block).map_or(true, |paired| !operators::slot_matches(&paired, slot))
                 })
             || head.as_ref().is_some_and(|head| {
                 definition
@@ -215,13 +311,7 @@ impl ProgramPlan {
                     .map(|description| description.blocks.len())
                     != Some(head.blocks.len())
             })
-            || vision.as_ref().is_some_and(|vision| {
-                definition
-                    .vision
-                    .as_ref()
-                    .map(|description| description.blocks.len())
-                    != Some(vision.blocks.len())
-            })
+            || vision.is_some() != definition.vision.is_some()
         {
             return Err(PlanError::Topology(
                 "program slots disagree with model topology",
@@ -231,6 +321,7 @@ impl ProgramPlan {
             imports,
             target,
             head,
+            draft,
             vision,
             state,
         })
@@ -248,6 +339,11 @@ impl ProgramPlan {
         self.head.as_ref()
     }
 
+    /// The separate draft's program, when it drafts.
+    pub fn draft(&self) -> Option<&DraftProgramPlan> {
+        self.draft.as_ref()
+    }
+
     pub fn vision(&self) -> Option<&VisionProgramPlan> {
         self.vision.as_ref()
     }
@@ -262,136 +358,122 @@ pub(super) fn derive_program_plan(
     target: &[WeightPlan],
     head: Option<&[WeightPlan]>,
     vision: Option<&[WeightPlan]>,
+    host_tables: &[HostTablePlan],
     history: KvCodec,
 ) -> Result<ProgramPlan, PlanError> {
+    operators::admit(definition, head.is_some())?;
     let lookup = |weights: &[WeightPlan], scope, kind| {
         planned_element(weights, scope, kind).map_err(PlanError::InvalidDefinition)
     };
     let mut seen_imports = HashSet::new();
     let mut imports = Vec::new();
-    for weight in target
+    for (source, resident) in target
         .iter()
         .chain(head.unwrap_or_default())
         .chain(vision.unwrap_or_default())
+        .map(|weight| (weight.upload, weight.resident))
     {
-        let slot = match (weight.source.dtype(), weight.resident.dtype()) {
+        let slot = match (source.dtype(), resident.dtype()) {
             (Some(source), Some(resident)) => ImportProgramSlot::Dense { source, resident },
-            _ => ImportProgramSlot::Repack {
-                source: weight.source,
-                resident: weight.resident,
-            },
+            _ => ImportProgramSlot::Repack { source, resident },
         };
         if seen_imports.insert(slot) {
             imports.push(slot);
         }
     }
-    let activation = activation_dtype(definition.geometry.activation_dtype);
+    let activation = activation_dtype(definition.decoder.activation_dtype);
     let active_element = Element::dense(activation);
     let embedding = EmbeddingBinding {
         table: lookup(target, WeightScope::Target, WeightKind::Embedding)?,
         activation: active_element,
     };
-    let mut blocks = Vec::with_capacity(definition.blocks.len());
-    for (index, block) in definition.blocks.iter().enumerate() {
-        let scope = WeightScope::TargetBlock(
-            u32::try_from(index)
-                .map_err(|_| PlanError::Arithmetic("target block index exceeds u32"))?,
-        );
-        let mixer = match &block.mixer {
-            MixerWeights::Attention(_) => MixerProgramSlot::Attention(AttentionBinding {
-                shape: match definition
-                    .geometry
-                    .blocks
-                    .get(index)
-                    .map(|block| &block.mixer)
-                {
-                    Some(MixerGeometry::Attention(geometry)) => {
-                        attention_shape(definition.geometry.hidden, geometry)?
-                    }
-                    _ => {
-                        return Err(PlanError::Topology(
-                            "attention program slot geometry differs",
-                        ))
-                    }
-                },
-                norm: lookup(target, scope, WeightKind::InputNorm)?,
-                query_gate: lookup(target, scope, WeightKind::QueryGate)?,
-                key: lookup(target, scope, WeightKind::Key)?,
-                value: lookup(target, scope, WeightKind::Value)?,
-                output: lookup(target, scope, WeightKind::AttentionOutput)?,
-                activation: active_element,
+    let decoder = &definition.decoder;
+    let mut blocks = Vec::with_capacity(decoder.blocks.len());
+    for (index, block) in decoder.blocks.iter().enumerate() {
+        let index =
+            u32::try_from(index).map_err(|_| PlanError::Arithmetic("target block index exceeds u32"))?;
+        let paired = paired_block(block)?;
+        let [mixer, feed_forward] = paired_scopes(index, WeightScope::TargetSublayer);
+        blocks.push(TargetBlockProgramSlot::new(
+            mixer_slot(
+                &paired,
+                decoder.hidden,
+                |kind| lookup(target, mixer, kind),
+                active_element,
                 history,
-            }),
-            MixerWeights::Recurrent(_) => {
-                let Some(MixerGeometry::Recurrent(geometry)) = definition
-                    .geometry
-                    .blocks
-                    .get(index)
-                    .map(|block| &block.mixer)
-                else {
-                    return Err(PlanError::Topology(
-                        "recurrent program slot geometry differs",
-                    ));
-                };
-                MixerProgramSlot::Recurrent(RecurrentBinding {
-                    key_heads: geometry.key_heads,
-                    value_heads: geometry.value_heads,
-                    width: geometry.width,
-                    convolution_width: geometry.convolution_width,
-                    norm: lookup(target, scope, WeightKind::InputNorm)?,
-                    qkv: lookup(target, scope, WeightKind::RecurrentQueryKeyValue)?,
-                    gate: lookup(target, scope, WeightKind::RecurrentGate)?,
-                    alpha: lookup(target, scope, WeightKind::RecurrentAlpha)?,
-                    beta: lookup(target, scope, WeightKind::RecurrentBeta)?,
-                    recurrent_norm: lookup(target, scope, WeightKind::RecurrentNorm)?,
-                    output: lookup(target, scope, WeightKind::RecurrentOutput)?,
-                    activation: active_element,
+            )?,
+            paired
+                .feed_forward
+                .map(|sublayer| {
+                    feed_forward_slot(
+                        &sublayer,
+                        decoder.hidden,
+                        feed_forward,
+                        |scope, kind| lookup(target, scope, kind),
+                        active_element,
+                    )
                 })
-            }
-        };
-        let feed_forward = match &block.feedforward {
-            FeedForwardWeights::Dense(_) => FeedForwardProgramSlot::Dense(DenseBinding {
-                norm: lookup(target, scope, WeightKind::FeedForwardNorm)?,
-                gate: lookup(target, scope, WeightKind::DenseGate)?,
-                up: lookup(target, scope, WeightKind::DenseUp)?,
-                down: lookup(target, scope, WeightKind::DenseDown)?,
-                activation: active_element,
-            }),
-            FeedForwardWeights::Routed(_) => {
-                let Some(FeedForwardGeometry::Routed(geometry)) = definition
-                    .geometry
-                    .blocks
-                    .get(index)
-                    .map(|block| &block.feedforward)
-                else {
-                    return Err(PlanError::Topology("routed program slot geometry differs"));
-                };
-                FeedForwardProgramSlot::Routed(RoutedBinding {
-                    hidden: definition.geometry.hidden,
-                    experts: geometry.count,
-                    selected: geometry.selected,
-                    features: geometry.intermediate,
-                    shared: geometry.shared_intermediate,
-                    normalize_selected: geometry.normalize_selected,
-                    norm: lookup(target, scope, WeightKind::FeedForwardNorm)?,
-                    router: lookup(target, scope, WeightKind::Router)?,
-                    expert_gate: lookup(target, scope, WeightKind::ExpertGate)?,
-                    expert_up: lookup(target, scope, WeightKind::ExpertUp)?,
-                    expert_down: lookup(target, scope, WeightKind::ExpertDown)?,
-                    shared_gate: lookup(target, scope, WeightKind::SharedGate)?,
-                    shared_up: lookup(target, scope, WeightKind::SharedUp)?,
-                    shared_down: lookup(target, scope, WeightKind::SharedDown)?,
-                    activation: active_element,
+                .transpose()?,
+        )
+        .with_per_layer(
+            paired
+                .per_layer
+                .map(|sublayer| {
+                    let scope = WeightScope::TargetSublayer(SublayerIndex {
+                        block: index,
+                        sublayer: 2,
+                    });
+                    let entry = decoder.entry.per_layer.as_ref().ok_or(PlanError::Topology(
+                        "a per-layer input sublayer without a per-layer entry",
+                    ))?;
+                    operators::per_layer::binding(
+                        sublayer,
+                        entry,
+                        decoder.hidden,
+                        |kind| lookup(target, scope, kind),
+                        active_element,
+                    )
                 })
-            }
-        };
-        blocks.push(TargetBlockProgramSlot::new(mixer, feed_forward));
+                .transpose()?,
+        ));
     }
+    let per_layer_entry = decoder
+        .entry
+        .per_layer
+        .as_ref()
+        .map(|entry| {
+            let table = host_tables
+                .iter()
+                .find(|table| table.role.kind == WeightKind::PerLayerTable)
+                .ok_or(PlanError::Topology("a per-layer entry without its host table"))?;
+            Ok::<_, PlanError>(PerLayerEntryBinding {
+                hidden: decoder.hidden,
+                layers: entry.layers,
+                width: entry.width,
+                table_source: table.source,
+                table: table.resident,
+                projection: lookup(target, WeightScope::Target, WeightKind::PerLayerModelProjection)?,
+                norm: lookup(target, WeightScope::Target, WeightKind::PerLayerProjectionNorm)?,
+                activation: active_element,
+            })
+        })
+        .transpose()?;
     let readout = ReadoutBinding {
         norm: lookup(target, WeightScope::Target, WeightKind::OutputNorm)?,
         weight: lookup(target, WeightScope::Target, WeightKind::Output)?,
         activation: active_element,
     };
+    // A selected separate draft is the drafter; an embedded head otherwise.
+    let separate = head.and(definition.draft.as_ref());
+    let taps = separate
+        .map(|draft| {
+            Ok::<_, PlanError>(TapProgramPlan {
+                points: draft.taps.clone(),
+                fusion: lookup(target, WeightScope::Draft, WeightKind::DraftFusion)?,
+                activation: active_element,
+            })
+        })
+        .transpose()?;
     let target_program = TargetProgramPlan::new(
         embedding,
         blocks,
@@ -400,78 +482,52 @@ pub(super) fn derive_program_plan(
             norm: readout.norm,
             activation: active_element,
         }),
+        taps,
         activation,
-    );
+    )
+    .with_per_layer(per_layer_entry);
+    let draft_program = separate
+        .zip(head)
+        .map(|(draft, weights)| {
+            draft_program_plan(draft, decoder.hidden, target, weights, active_element)
+        })
+        .transpose()?;
     let head_program = head
+        .filter(|_| separate.is_none())
         .map(|weights| {
-            let mut slots =
-                Vec::with_capacity(definition.head.as_ref().map_or(0, |head| head.depth()));
-            for index in 0..definition.head.as_ref().map_or(0, |head| head.depth()) {
-                let head_block = &definition.head.as_ref().expect("head is selected").blocks[index];
-                let scope = WeightScope::HeadBlock(
-                    u32::try_from(index)
-                        .map_err(|_| PlanError::Arithmetic("head block index exceeds u32"))?,
-                );
+            let head = definition
+                .head
+                .as_ref()
+                .ok_or(PlanError::Topology("head weights without a head definition"))?;
+            let mut slots = Vec::with_capacity(head.depth());
+            for (index, head_block) in head.blocks.iter().enumerate() {
+                let index = u32::try_from(index)
+                    .map_err(|_| PlanError::Arithmetic("head block index exceeds u32"))?;
+                let scope = WeightScope::HeadBlock(index);
+                let paired = paired_block(&head_block.block)?;
+                let [mixer, feed_forward] = paired_scopes(index, WeightScope::HeadSublayer);
+                let attention = attention_slot(
+                    &paired,
+                    decoder.hidden,
+                    |kind| lookup(weights, mixer, kind),
+                    active_element,
+                    KvCodec::Dense,
+                )?;
                 slots.push(HeadBinding {
-                    attention_shape: definition
-                        .geometry
-                        .blocks
-                        .iter()
-                        .find_map(|block| match &block.mixer {
-                            MixerGeometry::Attention(geometry) => Some(geometry),
-                            MixerGeometry::Recurrent(_) => None,
-                        })
-                        .ok_or(PlanError::Topology(
-                            "head requires target attention geometry",
-                        ))
-                        .and_then(|geometry| {
-                            attention_shape(definition.geometry.hidden, geometry)
-                        })?,
                     embedding_table: lookup(target, WeightScope::Target, WeightKind::Embedding)?,
                     embedding_norm: lookup(weights, scope, WeightKind::HeadEmbeddingNorm)?,
                     hidden_norm: lookup(weights, scope, WeightKind::HeadHiddenNorm)?,
                     combine: lookup(weights, scope, WeightKind::HeadCombine)?,
-                    input_norm: lookup(weights, scope, WeightKind::InputNorm)?,
-                    query_gate: lookup(weights, scope, WeightKind::QueryGate)?,
-                    key: lookup(weights, scope, WeightKind::Key)?,
-                    value: lookup(weights, scope, WeightKind::Value)?,
-                    attention_output: lookup(weights, scope, WeightKind::AttentionOutput)?,
-                    feed_forward: match (&head_block.feedforward_geometry, &head_block.feedforward)
-                    {
-                        (FeedForwardGeometry::Dense { .. }, FeedForwardWeights::Dense(_)) => {
-                            FeedForwardProgramSlot::Dense(DenseBinding {
-                                norm: lookup(weights, scope, WeightKind::FeedForwardNorm)?,
-                                gate: lookup(weights, scope, WeightKind::DenseGate)?,
-                                up: lookup(weights, scope, WeightKind::DenseUp)?,
-                                down: lookup(weights, scope, WeightKind::DenseDown)?,
-                                activation: active_element,
-                            })
-                        }
-                        (FeedForwardGeometry::Routed(shape), FeedForwardWeights::Routed(_)) => {
-                            FeedForwardProgramSlot::Routed(RoutedBinding {
-                                hidden: definition.geometry.hidden,
-                                experts: shape.count,
-                                selected: shape.selected,
-                                features: shape.intermediate,
-                                shared: shape.shared_intermediate,
-                                normalize_selected: shape.normalize_selected,
-                                norm: lookup(weights, scope, WeightKind::FeedForwardNorm)?,
-                                router: lookup(weights, scope, WeightKind::Router)?,
-                                expert_gate: lookup(weights, scope, WeightKind::ExpertGate)?,
-                                expert_up: lookup(weights, scope, WeightKind::ExpertUp)?,
-                                expert_down: lookup(weights, scope, WeightKind::ExpertDown)?,
-                                shared_gate: lookup(weights, scope, WeightKind::SharedGate)?,
-                                shared_up: lookup(weights, scope, WeightKind::SharedUp)?,
-                                shared_down: lookup(weights, scope, WeightKind::SharedDown)?,
-                                activation: active_element,
-                            })
-                        }
-                        _ => {
-                            return Err(PlanError::Topology(
-                                "head feed-forward geometry and weights disagree",
-                            ))
-                        }
-                    },
+                    attention,
+                    feed_forward: feed_forward_slot(
+                        &paired
+                            .feed_forward
+                            .ok_or(PlanError::Unsupported("draft head block without feed-forward"))?,
+                        decoder.hidden,
+                        feed_forward,
+                        |scope, kind| lookup(weights, scope, kind),
+                        active_element,
+                    )?,
                     output_norm: lookup(weights, scope, WeightKind::OutputNorm)?,
                     projection: lookup(target, WeightScope::Target, WeightKind::Output)?,
                     activation: active_element,
@@ -482,60 +538,12 @@ pub(super) fn derive_program_plan(
         .transpose()?;
     let vision_program = match (definition.vision.as_ref(), vision) {
         (Some(description), Some(weights)) => {
-            if description.geometry.temporal_patch != 2 || description.patch_embeddings.len() != 2 {
-                return Err(PlanError::Unsupported("vision temporal patch topology"));
-            }
-            let active = Element::dense(activation_dtype(description.geometry.activation_dtype));
-            let patch = VisionPatchBinding {
-                temporal_weight_0: lookup(
-                    weights,
-                    WeightScope::VisionPatch(0),
-                    WeightKind::PatchEmbedding,
-                )?,
-                temporal_weight_1: lookup(
-                    weights,
-                    WeightScope::VisionPatch(1),
-                    WeightKind::PatchEmbedding,
-                )?,
-                bias: lookup(weights, WeightScope::Vision, WeightKind::PatchBias)?,
-                position: lookup(weights, WeightScope::Vision, WeightKind::PositionEmbedding)?,
-            };
-            let mut slots = Vec::with_capacity(description.blocks.len());
-            for index in 0..description.blocks.len() {
-                let scope = WeightScope::VisionBlock(
-                    u32::try_from(index)
-                        .map_err(|_| PlanError::Arithmetic("vision block index exceeds u32"))?,
-                );
-                slots.push(VisionBlockBinding {
-                    input_norm_weight: lookup(weights, scope, WeightKind::InputNormWeight)?,
-                    input_norm_bias: lookup(weights, scope, WeightKind::InputNormBias)?,
-                    qkv_weight: lookup(weights, scope, WeightKind::FusedQkvWeight)?,
-                    qkv_bias: lookup(weights, scope, WeightKind::FusedQkvBias)?,
-                    attention_output: lookup(weights, scope, WeightKind::AttentionOutput)?,
-                    attention_output_bias: lookup(weights, scope, WeightKind::AttentionOutputBias)?,
-                    feedforward_norm_weight: lookup(
-                        weights,
-                        scope,
-                        WeightKind::FeedForwardNormWeight,
-                    )?,
-                    feedforward_norm_bias: lookup(weights, scope, WeightKind::FeedForwardNormBias)?,
-                    up: lookup(weights, scope, WeightKind::DenseUp)?,
-                    up_bias: lookup(weights, scope, WeightKind::FeedForwardUpBias)?,
-                    down: lookup(weights, scope, WeightKind::DenseDown)?,
-                    down_bias: lookup(weights, scope, WeightKind::FeedForwardDownBias)?,
-                    activation: active,
-                });
-            }
-            let merger = VisionMergerBinding {
-                output_norm_weight: lookup(weights, WeightScope::Vision, WeightKind::NormWeight)?,
-                output_norm_bias: lookup(weights, WeightScope::Vision, WeightKind::NormBias)?,
-                hidden: lookup(weights, WeightScope::Vision, WeightKind::MergerHidden)?,
-                hidden_bias: lookup(weights, WeightScope::Vision, WeightKind::MergerHiddenBias)?,
-                output: lookup(weights, WeightScope::Vision, WeightKind::MergerOutput)?,
-                output_bias: lookup(weights, WeightScope::Vision, WeightKind::MergerOutputBias)?,
-                activation: active,
-            };
-            Some(VisionProgramPlan::new(patch, slots, merger))
+            let program = operators::vision::vision_program(description, &|role| {
+                lookup(weights, role.scope, role.kind)
+            })?;
+            Some(VisionProgramPlan::new(
+                program.kernels().into_iter().cloned().collect(),
+            ))
         }
         (_, None) => None,
         _ => {
@@ -555,25 +563,84 @@ pub(super) fn derive_program_plan(
         imports,
         target_program,
         head_program,
+        draft_program,
         vision_program,
         state,
     )
 }
 
-/// The attention kernel dimensions of one attention geometry.
-fn attention_shape(hidden: u64, geometry: &AttentionGeometry) -> Result<AttentionShape, PlanError> {
-    let RotarySemantics::Interleaved { width: rotary, .. } = &geometry.rotary;
-    if geometry.kv_heads == 0 || geometry.heads % geometry.kv_heads != 0 || *rotary > geometry.width
-    {
-        return Err(PlanError::Topology(
-            "attention heads or rotary width are inconsistent",
-        ));
+/// The separate draft's program slots from its weights (`weights`, the
+/// drafter's own) and the target's (the fusion norm, the target's embedding
+/// and vocabulary projection).
+fn draft_program_plan(
+    draft: &DraftDefinition,
+    hidden: u64,
+    target: &[WeightPlan],
+    weights: &[WeightPlan],
+    activation: Element,
+) -> Result<DraftProgramPlan, PlanError> {
+    let lookup = |weights: &[WeightPlan], scope, kind| {
+        planned_element(weights, scope, kind).map_err(PlanError::InvalidDefinition)
+    };
+    let fusion_norm = lookup(target, WeightScope::Draft, WeightKind::DraftFusionNorm)?;
+    let mut blocks = Vec::with_capacity(draft.blocks.len());
+    for index in 0..draft.blocks.len() {
+        let paired = operators::draft::draft_block(draft, index)?;
+        let block =
+            u32::try_from(index).map_err(|_| PlanError::Arithmetic("draft block index exceeds u32"))?;
+        let [mixer, feed_forward] = paired_scopes(block, WeightScope::DraftSublayer);
+        // Draft history is dense, as a draft head's is.
+        let attention = attention_slot(
+            &paired,
+            hidden,
+            |kind| lookup(weights, mixer, kind),
+            activation,
+            KvCodec::Dense,
+        )?;
+        let dense = dense_slot(
+            &paired
+                .feed_forward
+                .ok_or(PlanError::Unsupported("draft layer without feed-forward"))?,
+            |kind| lookup(weights, feed_forward, kind),
+            activation,
+        )?;
+        blocks.push(DraftBlockBinding {
+            attention,
+            injection: AttentionBinding {
+                norm: fusion_norm,
+                ..attention
+            },
+            feed_forward: dense,
+        });
     }
-    Ok(AttentionShape {
-        hidden,
-        kv_heads: geometry.kv_heads,
-        group: geometry.heads / geometry.kv_heads,
-        rotary_pairs: rotary / 2,
-        width: geometry.width,
+    Ok(DraftProgramPlan {
+        blocks,
+        embedding: EmbeddingBinding {
+            table: match &draft.embedding {
+                DraftEmbedding::Target => {
+                    lookup(target, WeightScope::Target, WeightKind::Embedding)?
+                }
+                DraftEmbedding::Own(_) => lookup(weights, WeightScope::Draft, WeightKind::Embedding)?,
+            },
+            activation,
+        },
+        output_norm: lookup(weights, WeightScope::Draft, WeightKind::OutputNorm)?,
+        projection: lookup(target, WeightScope::Target, WeightKind::Output)?,
+        markov: match &draft.method {
+            DraftMethod::DFlash => None,
+            DraftMethod::DSpark { markov, .. } => Some(MarkovBinding {
+                embedding: lookup(weights, WeightScope::Draft, WeightKind::MarkovEmbedding)?,
+                projection: lookup(weights, WeightScope::Draft, WeightKind::MarkovProjection)?,
+                rank: markov.rank,
+            }),
+        },
+        activation,
     })
 }
+
+/// The weight scopes of a paired block's mixer and feed-forward sublayers.
+fn paired_scopes(block: u32, scope: fn(SublayerIndex) -> WeightScope) -> [WeightScope; 2] {
+    [0, 1].map(|sublayer| scope(SublayerIndex { block, sublayer }))
+}
+
+

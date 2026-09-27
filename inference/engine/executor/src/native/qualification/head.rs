@@ -3,6 +3,7 @@ use super::*;
 
 impl<'a> QualificationView<'a> {
     pub(super) fn qualify_head(&self, device: &Device) -> Result<(), CatalogFailure> {
+        let absent_scale = semantic_zeros(device, Element::f32(), &[0], "head", "scale")?;
         let (Some(head_plan), Some(head)) = (self.plan.head(), self.programs.head.as_ref()) else {
             return Ok(());
         };
@@ -12,8 +13,13 @@ impl<'a> QualificationView<'a> {
         );
         for (index, (&binding, block)) in head_plan.blocks().iter().zip(&head.blocks).enumerate() {
             let label = format!("{binding:?}");
-            let scope = magnitude_family_contracts::WeightScope::HeadBlock(
-                u32::try_from(index).map_err(|error| qualification("head", "fixture", error))?,
+            // The head block's feed-forward sublayer.
+            let scope = magnitude_family_contracts::WeightScope::HeadSublayer(
+                magnitude_family_contracts::SublayerIndex {
+                    block: u32::try_from(index)
+                        .map_err(|error| qualification("head", "fixture", error))?,
+                    sublayer: 1,
+                },
             );
             // One (token, status) selection row.
             let tokens = semantic_zeros(device, Element::i32(), &[1, 2], "head", &label)?;
@@ -59,20 +65,7 @@ impl<'a> QualificationView<'a> {
                 })
                 .map_err(|error| qualification_dynamic("draft_rows", &label, error))?
                 .value;
-            qualify_attention(
-                device,
-                &block.attention,
-                binding.attention_shape,
-                &AttentionElements {
-                    input_norm: binding.input_norm,
-                    query_gate: binding.query_gate,
-                    key: binding.key,
-                    value: binding.value,
-                    output: binding.attention_output,
-                    activation: binding.activation,
-                },
-                &label,
-            )?;
+            qualify_attention(device, &block.attention, binding.attention, &label)?;
             // The attention block keeps its residual (zero weights), so the
             // feed-forward stage continues from the head input.
             let attended = features;
@@ -115,16 +108,26 @@ impl<'a> QualificationView<'a> {
                             up_weight: &up,
                             out_rows: &out_rows,
                             eps: 1.0e-5,
+                            activation: 0,
+                            gate_scale: &absent_scale,
+                            up_scale: &absent_scale,
                         })
                         .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                         .value;
-                    kernels
-                        .output
+                    let SublayerOutput::Residual(output) = &kernels.output else {
+                        return Err(qualification_dynamic(
+                            "dense_output",
+                            &label,
+                            "draft head feed-forward has a post-norm tail",
+                        ));
+                    };
+                    output
                         .call(dense_output::Args {
                             residual: &attended,
                             product: &product,
                             down_weight: &down,
                             out_rows: &out_rows,
+                            down_scale: &absent_scale,
                         })
                         .map_err(|error| qualification_dynamic("dense_output", &label, error))?
                         .value

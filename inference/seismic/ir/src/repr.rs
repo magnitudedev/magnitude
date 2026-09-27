@@ -306,6 +306,28 @@ representation!(Q6K, "q6k", F32, 3);
 representation!(Q8G32S, "q8g32s", F32, 2);
 representation!(IQ4G32, "iq4g32", F32, 2);
 representation!(Q8G32, "q8g32", F32, 2);
+representation!(Q4G32S, "q4g32s", F32, 2);
+representation!(Q5G32S, "q5g32s", F32, 2);
+representation!(Q5G32, "q5g32", F32, 3);
+// Row layouts split 5-bit codes into `codes_lo` and `codes_hi`, and carry
+// every per-group coefficient in `supers`.
+representation!(MXFP4G32, "mxfp4g32", F32, 2);
+representation!(NVFP4G16, "nvfp4g16", F32, 2);
+representation!(Q4G32SRows16, "q4g32s", Rows16, F32, 2);
+representation!(Q5G32SRows16, "q5g32s", Rows16, F32, 3);
+representation!(Q5G32Rows16, "q5g32", Rows16, F32, 3);
+representation!(MXFP4G32Rows16, "mxfp4g32", Rows16, F32, 2);
+representation!(NVFP4G16Rows16, "nvfp4g16", Rows16, F32, 2);
+representation!(Q4G32SRows8, "q4g32s", Rows8, F32, 2);
+representation!(Q5G32SRows8, "q5g32s", Rows8, F32, 3);
+representation!(Q5G32Rows8, "q5g32", Rows8, F32, 3);
+representation!(MXFP4G32Rows8, "mxfp4g32", Rows8, F32, 2);
+representation!(NVFP4G16Rows8, "nvfp4g16", Rows8, F32, 2);
+representation!(Q4G32SMma16, "q4g32s", Mma16, F32, 2);
+representation!(Q5G32SMma16, "q5g32s", Mma16, F32, 3);
+representation!(Q5G32Mma16, "q5g32", Mma16, F32, 3);
+representation!(MXFP4G32Mma16, "mxfp4g32", Mma16, F32, 2);
+representation!(NVFP4G16Mma16, "nvfp4g16", Mma16, F32, 2);
 representation!(Q4KRows16, "q4k", Rows16, F32, 3);
 representation!(Q5KRows16, "q5k", Rows16, F32, 4);
 representation!(Q6KRows16, "q6k", Rows16, F32, 4);
@@ -352,6 +374,21 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q6k", registry::Layout::Mma16) => return visitor.visit::<Q6KMma16>(),
         ("q8g32s", registry::Layout::Mma16) => return visitor.visit::<Q8G32SMma16>(),
         ("iq4g32", registry::Layout::Mma16) => return visitor.visit::<IQ4G32Mma16>(),
+        ("q4g32s", registry::Layout::Rows16) => return visitor.visit::<Q4G32SRows16>(),
+        ("q5g32s", registry::Layout::Rows16) => return visitor.visit::<Q5G32SRows16>(),
+        ("q5g32", registry::Layout::Rows16) => return visitor.visit::<Q5G32Rows16>(),
+        ("mxfp4g32", registry::Layout::Rows16) => return visitor.visit::<MXFP4G32Rows16>(),
+        ("nvfp4g16", registry::Layout::Rows16) => return visitor.visit::<NVFP4G16Rows16>(),
+        ("q4g32s", registry::Layout::Rows8) => return visitor.visit::<Q4G32SRows8>(),
+        ("q5g32s", registry::Layout::Rows8) => return visitor.visit::<Q5G32SRows8>(),
+        ("q5g32", registry::Layout::Rows8) => return visitor.visit::<Q5G32Rows8>(),
+        ("mxfp4g32", registry::Layout::Rows8) => return visitor.visit::<MXFP4G32Rows8>(),
+        ("nvfp4g16", registry::Layout::Rows8) => return visitor.visit::<NVFP4G16Rows8>(),
+        ("q4g32s", registry::Layout::Mma16) => return visitor.visit::<Q4G32SMma16>(),
+        ("q5g32s", registry::Layout::Mma16) => return visitor.visit::<Q5G32SMma16>(),
+        ("q5g32", registry::Layout::Mma16) => return visitor.visit::<Q5G32Mma16>(),
+        ("mxfp4g32", registry::Layout::Mma16) => return visitor.visit::<MXFP4G32Mma16>(),
+        ("nvfp4g16", registry::Layout::Mma16) => return visitor.visit::<NVFP4G16Mma16>(),
         (_, registry::Layout::Packet) => {}
         (other, layout) => panic!(
             "registry storage `{other}` in layout `{}` has no type-level marker",
@@ -373,6 +410,11 @@ pub fn with_representation<V: RepresentationVisitor>(
         "q8g32s" => visitor.visit::<Q8G32S>(),
         "iq4g32" => visitor.visit::<IQ4G32>(),
         "q8g32" => visitor.visit::<Q8G32>(),
+        "q4g32s" => visitor.visit::<Q4G32S>(),
+        "q5g32s" => visitor.visit::<Q5G32S>(),
+        "q5g32" => visitor.visit::<Q5G32>(),
+        "mxfp4g32" => visitor.visit::<MXFP4G32>(),
+        "nvfp4g16" => visitor.visit::<NVFP4G16>(),
         other => panic!("registry representation `{other}` has no type-level marker"),
     }
 }

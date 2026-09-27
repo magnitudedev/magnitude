@@ -113,7 +113,7 @@ impl ExecutionManifest {
         .try_fold(0u64, |total, bytes| total.checked_add(bytes))
         .ok_or_else(|| internal("startup byte count overflow"))?;
         Ok(LoadPreview {
-            context_tokens: definition.geometry.context_limit,
+            context_tokens: definition.decoder.context_limit,
             device: selected.info.selector,
             backend,
             required_bytes,

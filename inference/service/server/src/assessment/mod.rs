@@ -881,10 +881,6 @@ impl ManagedModelAssessments {
                     continue;
                 }
             };
-            let assessor = Arc::clone(&self.assessor);
-            let measurement_setup = Arc::clone(&setup);
-            let measurement =
-                tokio::spawn(async move { assessor.establish_with_setup(measurement_setup).await });
             let preparations =
                 PreparationCoordinator::new(Arc::clone(&self.assessor), Arc::clone(&setup));
             let preparing_started = std::time::Instant::now();
@@ -913,14 +909,11 @@ impl ManagedModelAssessments {
                 preparation_admission.seconds = preparing_started.elapsed().as_secs_f64(),
                 "initial model preparation admitted"
             );
-            match measurement.await {
-                Ok(Ok(environment)) => break (Arc::new(environment), preparations),
-                result => {
-                    let message = match result {
-                        Ok(Err(error)) => error.to_string(),
-                        Err(error) => error.to_string(),
-                        Ok(Ok(_)) => unreachable!(),
-                    };
+            // The basis is model-free: it is measured while the models are prepared.
+            match self.assessor.establish_with_setup(Arc::clone(&setup)).await {
+                Ok(environment) => break (Arc::new(environment), preparations),
+                Err(error) => {
+                    let message = error.to_string();
                     tracing::error!(%message, "assessment environment unavailable");
                     self.publish_pool_failure(InventoryError::ModelOperation {
                         code: "assessment_environment_unavailable".to_owned(),

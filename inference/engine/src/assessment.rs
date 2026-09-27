@@ -5,16 +5,16 @@
 //! configuration does, plans it through [`crate::planning::plan_execution`]
 //! (the production planning inputs) and assesses the draft against the
 //! environment's measurement basis and stable memory capacity. Chat
-//! capabilities come from the engine's own tokenizer, template and reasoning
-//! inspection over header metadata. No device is opened, no weight payload
-//! is read and nothing is decoded.
+//! capabilities come from the engine's own tokenizer validation and
+//! template and reasoning inspection over header metadata. No device is
+//! opened, no weight payload is read and nothing is decoded.
 
 use crate::error::UnsupportedModel;
 use crate::options::{ExecutionManifest, ModelPolicy};
 use crate::planning::{ExecutionPlanningError, plan_execution};
 use magnitude_artifacts::PackageHeaders;
 use magnitude_chat::{
-    ByteBpeTokenizer, TemplateInspection,
+    TemplateInspection,
     artifacts::{gguf_byte_bpe, gguf_templates},
 };
 use magnitude_executor::{
@@ -26,6 +26,7 @@ use magnitude_executor::{
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
 };
+use magnitude_family_contracts::ModelDefinition;
 use magnitude_scheduler::ServiceLimits;
 use seismic::{DeviceCatalog, DeviceTopology, HostMemoryStatus};
 use std::fmt;
@@ -264,20 +265,6 @@ pub fn finish_model_assessment(
     })
 }
 
-/// Prepare one package while the environment's generic measurements run.
-pub fn prepare_model_assessment(
-    package: &ModelPackagePaths,
-    setup: &AssessmentSetup,
-) -> Result<PreparedModelAssessment, ModelAssessmentError> {
-    prepare_model_with_configuration(
-        package,
-        setup.device,
-        &setup.selected,
-        setup.reserves,
-        &setup.policy,
-        &setup.service,
-    )
-}
 
 /// Assess one package on the environment's selected device.
 pub fn assess_model(
@@ -285,24 +272,19 @@ pub fn assess_model(
     environment: &AssessmentEnvironment,
     performance_depths: &[u32],
 ) -> Result<ModelAssessment, ModelAssessmentError> {
-    let prepared = prepare_model_with_configuration(
-        package,
-        environment.setup.device,
-        &environment.setup.selected,
-        environment.setup.reserves,
-        &environment.setup.policy,
-        &environment.setup.service,
-    )?;
+    let prepared = prepare_model_assessment(package, &environment.setup)?;
     finish_model_assessment(&prepared, environment, performance_depths)
 }
 
-fn prepare_model_with_configuration(
+/// Prepare one package from its headers on the selected execution
+/// configuration, independent of the measurement basis: recognition, the
+/// family definition, capabilities from the engine's own chat inspection,
+/// the execution manifest and its allocation-free plan, then decode demand
+/// and the checked memory charge. A tokenizer or template the engine cannot
+/// prepare makes the package unsupported whatever its plan.
+pub fn prepare_model_assessment(
     package: &ModelPackagePaths,
-    device: DeviceRequest,
-    selected: &SelectedDevice,
-    reserves: MemoryReserves,
-    policy: &ModelPolicy,
-    service: &ServiceLimits,
+    setup: &AssessmentSetup,
 ) -> Result<PreparedModelAssessment, ModelAssessmentError> {
     let headers = PackageHeaders::open(&package.target, package.projector.as_deref())
         .map_err(ModelAssessmentError::Artifact)?;
@@ -319,45 +301,28 @@ fn prepare_model_with_configuration(
             ));
         }
     };
-    let context_limit = u32::try_from(definition.geometry.context_limit)
-        .map_err(|_| ModelAssessmentError::ContextLimit(definition.geometry.context_limit))?;
-    let chat = match inspect_chat(&headers, package, &definition) {
-        Ok(chat) => chat,
+    let context_limit = u32::try_from(definition.decoder.context_limit)
+        .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
+    let facts = match model_facts(&headers, package, &definition, context_limit) {
+        Ok(facts) => facts,
         Err(unsupported) => return Ok(PreparedModelAssessment::Unsupported(unsupported)),
     };
-    let facts = ModelFacts {
-        capabilities: ModelCapabilities {
-            vision: definition.vision.is_some(),
-            tools: chat.tools,
-            structured_output: chat.structured_output,
-            reasoning: ReasoningCapabilities {
-                efforts: chat
-                    .reasoning
-                    .mappings
-                    .iter()
-                    .map(|mapping| mapping.effort.clone())
-                    .collect(),
-                default_effort: chat.reasoning.default_effort.clone(),
-            },
-        },
-        template_fingerprint: chat.fingerprint,
-        context_limit,
-    };
-    let model = policy
+    let model = setup
+        .policy
         .resolve(&definition)
         .map_err(ModelAssessmentError::Configuration)?;
     let manifest = ExecutionManifest::new(
         headers.manifest(),
         definition,
         model,
-        service.clone(),
+        setup.service.clone(),
         ExecutionPath::Native,
-        device,
+        setup.device,
         None,
-        reserves,
+        setup.reserves,
     )
     .map_err(ModelAssessmentError::Configuration)?;
-    let draft = match plan_execution(&manifest, selected) {
+    let draft = match plan_execution(&manifest, &setup.selected) {
         Ok(draft) => draft,
         Err(ExecutionPlanningError::Plan(error)) if is_unsupported(&error) => {
             return Ok(PreparedModelAssessment::Incompatible {
@@ -376,14 +341,45 @@ fn prepare_model_with_configuration(
     })
 }
 
+/// The package's host-side facts: capabilities and template fingerprint
+/// from the engine's own chat inspection over header metadata.
+fn model_facts(
+    headers: &PackageHeaders,
+    package: &ModelPackagePaths,
+    definition: &ModelDefinition,
+    context_limit: u32,
+) -> Result<ModelFacts, UnsupportedModel> {
+    let chat = inspect_chat(headers, package, definition)?;
+    Ok(ModelFacts {
+        capabilities: ModelCapabilities {
+            vision: definition.vision.is_some(),
+            tools: chat.tools,
+            structured_output: chat.structured_output,
+            reasoning: ReasoningCapabilities {
+                efforts: chat
+                    .reasoning
+                    .mappings
+                    .iter()
+                    .map(|mapping| mapping.effort.clone())
+                    .collect(),
+                default_effort: chat.reasoning.default_effort.clone(),
+            },
+        },
+        template_fingerprint: chat.fingerprint,
+        context_limit,
+    })
+}
+
 /// Planner rejections of a recognized, validated definition are properties
 /// of the artifact's representation or topology on this execution path; the
 /// remaining variants are arithmetic or resource failures.
 fn is_unsupported(error: &PlanError) -> bool {
     match error {
-        PlanError::Unsupported(_) | PlanError::InvalidDefinition(_) | PlanError::Topology(_) => {
-            true
-        }
+        PlanError::Unsupported(_)
+        | PlanError::UnsupportedOperator { .. }
+        | PlanError::Deferred(_)
+        | PlanError::InvalidDefinition(_)
+        | PlanError::Topology(_) => true,
         PlanError::Arithmetic(_) | PlanError::ResourcePlanning(_) | PlanError::Resource(_) => false,
     }
 }
@@ -399,31 +395,15 @@ fn inspect_chat(
 ) -> Result<TemplateInspection, UnsupportedModel> {
     let unsupported = |reason: String| UnsupportedModel::Representation { reason };
     let tokenizer_payload = magnitude_artifacts::TokenizerPayload::from_directory(headers.target());
-    let mut config = gguf_byte_bpe(
+    // The tokenizer a load builds from this configuration, validated without
+    // building it: only its support verdict and vocabulary are needed here.
+    let vocabulary = gguf_byte_bpe(
         &tokenizer_payload,
         definition.artifact_identity.target.to_string(),
     )
-    .map_err(unsupported)?;
-    // Only the vocabulary and support verdict are needed for metadata assessment.
-    // The artifact identity affects the tokenizer's identity, but not its
-    // construction or support checks. Equal literal tokenizer configurations
-    // across quantizations therefore share one exact construction verdict.
-    config.artifact_identity = "assessment-validation".into();
-    let key = serde_json::to_vec(&config).map_err(|error| unsupported(error.to_string()))?;
-    static VALIDATED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<Vec<u8>, Result<usize, String>>>,
-    > = std::sync::OnceLock::new();
-    let cache = VALIDATED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let vocabulary = cache
-        .entry(key)
-        .or_insert_with(|| ByteBpeTokenizer::new(config).map(|tokenizer| tokenizer.vocabulary()))
-        .clone()
-        .map_err(unsupported)?;
-    drop(cache);
-    if u64::try_from(vocabulary).ok() != Some(definition.geometry.vocabulary) {
+    .and_then(|config| config.validate())
+    .map_err(|error| unsupported(error.to_string()))?;
+    if u64::try_from(vocabulary).ok() != Some(definition.decoder.vocabulary) {
         return Err(unsupported(
             "tokenizer vocabulary differs from model vocabulary".into(),
         ));

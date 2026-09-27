@@ -330,10 +330,22 @@ fn statics(geometry: Geometry) -> NativeSpecialization {
         .with_static("S", geometry.s as u64)
 }
 
-/// The declared Vulkan decode `SLICES` (query-group splits across subgroups)
-/// admissible for `geometry` with `simds` subgroups.
-fn vulkan_slices(geometry: Geometry, simds: u64) -> impl Iterator<Item = u64> {
-    [1u64, 2, 4]
+/// The `attention_*` family's statics of Qwen's form (attention.seismic):
+/// gates interleaved after each query head (I = W), no separate gate, one
+/// fresh layer, q/k norms, no value norm.
+fn qwen_form(specialization: NativeSpecialization, geometry: Geometry) -> NativeSpecialization {
+    specialization
+        .with_static("I", geometry.w() as u64)
+        .with_static("U", 0)
+        .with_static("F", 1)
+        .with_static("N", 1)
+        .with_static("NV", 0)
+}
+
+/// The declared decode `SLICES` (query-group splits across simdgroups, warps
+/// or subgroups) admissible for `geometry` with `simds` of them.
+fn decode_slices(geometry: Geometry, simds: u64) -> impl Iterator<Item = u64> {
+    [1u64, 2, 4, 8]
         .into_iter()
         .filter(move |slices| geometry.g as u64 % slices == 0 && simds % slices == 0)
 }

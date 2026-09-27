@@ -2010,18 +2010,41 @@ impl<'a> Emitter<'a> {
         }
         out
     }
+    /// E8M0: the exponent byte is the F32 exponent field (2^(raw - 127));
+    /// raw 0 is the F32 subnormal 2^-127 and raw 255 is NaN.
+    fn decode_e8m0(&mut self, raw: &str) -> String {
+        let exponent = self.t32();
+        self.line(format!("and.b32 {exponent}, {raw}, 255;"));
+        let bits = self.t32();
+        self.line(format!("shl.b32 {bits}, {exponent}, 23;"));
+        let zero = self.pred();
+        self.line(format!("setp.eq.u32 {zero}, {exponent}, 0;"));
+        self.line(format!("selp.b32 {bits}, 0x00400000, {bits}, {zero};"));
+        let nan = self.pred();
+        self.line(format!("setp.eq.u32 {nan}, {exponent}, 255;"));
+        self.line(format!("selp.b32 {bits}, 0x7fc00000, {bits}, {nan};"));
+        let out = self.f32();
+        self.line(format!("mov.b32 {out}, {bits};"));
+        out
+    }
     fn decode_float_code(&mut self, raw: &str, format: FloatCodeFormat) -> String {
+        if format == FloatCodeFormat::E8M0 {
+            return self.decode_e8m0(raw);
+        }
         let sign_shift = match format {
             FloatCodeFormat::E2M1 => 3,
             FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 => 7,
+            FloatCodeFormat::E8M0 => unreachable!("decoded above"),
         };
         let exponent_bits = match format {
             FloatCodeFormat::E2M1 => 2,
             FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 => 4,
+            FloatCodeFormat::E8M0 => unreachable!("decoded above"),
         };
         let mantissa_bits = match format {
             FloatCodeFormat::E2M1 => 1,
             FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 => 3,
+            FloatCodeFormat::E8M0 => unreachable!("decoded above"),
         };
         let sign = self.t32();
         if format == FloatCodeFormat::UE4M3 {
@@ -2046,6 +2069,7 @@ impl<'a> Emitter<'a> {
         let exponent_bias = match format {
             FloatCodeFormat::E2M1 => 126,
             FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 => 120,
+            FloatCodeFormat::E8M0 => unreachable!("decoded above"),
         };
         self.line(format!(
             "add.u32 {normal_exponent}, {exponent}, {exponent_bias};"
@@ -2065,6 +2089,7 @@ impl<'a> Emitter<'a> {
         let subnormal_scale = match format {
             FloatCodeFormat::E2M1 => "0f3f000000", // 2^-1
             FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 => "0f3b000000", // 2^-9
+            FloatCodeFormat::E8M0 => unreachable!("decoded above"),
         };
         self.line(format!(
             "mul.rn.f32 {subnormal}, {subnormal}, {subnormal_scale};"

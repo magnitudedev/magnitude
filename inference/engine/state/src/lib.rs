@@ -2,7 +2,9 @@
 //! Owned transactions can cross a submission boundary. Their callers reconcile
 //! only after physical completion has been observed.
 mod advance;
+mod bank;
 mod codec;
+mod domain;
 mod layout;
 pub mod placement;
 
@@ -10,6 +12,11 @@ pub use advance::{
     CodecConversionStep, OwnedAdvanceBindings, OwnedAdvanceResolution, OwnedCodecAdvance,
     OwnedCodecBindings, OwnedCompaction, OwnedCompactionBindings, OwnedCompactionPreparation,
     OwnedStateAdvance, OwnedSuccessorAdvance, TentativeAdvance,
+};
+pub use bank::{recurrent_bank_bytes, BankComponent};
+pub use domain::{
+    HistoryDomainId, HistoryDomainKind, HistoryDomainLayout, HistoryDomainPlan, HistoryFootprint,
+    HistorySource,
 };
 
 pub use codec::{
@@ -35,9 +42,21 @@ pub enum Error {
     Request(String),
     Tensor(seismic::TensorError),
     Layout(LayoutError),
-    Capacity { required: u64, available_bytes: u64 },
-    BanksExhausted { capacity: usize },
+    Capacity {
+        required: u64,
+        available_bytes: u64,
+    },
+    BanksExhausted {
+        capacity: usize,
+    },
     Placement(PlacementError),
+    UnsupportedHistoryDomain(HistoryDomainKind),
+    UnsupportedBankComponent(BankComponent),
+    /// A caller whose launch format carries one history domain met a store
+    /// with another number of them.
+    HistoryDomains {
+        count: usize,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -57,6 +76,18 @@ impl std::fmt::Display for Error {
                 write!(f, "all {capacity} recurrent banks have live claims")
             }
             Self::Placement(error) => write!(f, "recurrent bank placement: {error:?}"),
+            Self::UnsupportedHistoryDomain(kind) => {
+                write!(f, "history domain {kind:?} is not supported")
+            }
+            Self::UnsupportedBankComponent(component) => {
+                write!(f, "recurrent bank component {component:?} is not supported")
+            }
+            Self::HistoryDomains { count } => {
+                write!(
+                    f,
+                    "the store has {count} history domains where one is required"
+                )
+            }
         }
     }
 }
@@ -122,12 +153,15 @@ impl ComponentSpec {
     }
 }
 
-/// One logical attention-history component view over the store's slab table.
-/// `base_row` is stable and currently always zero because all components
-/// share the arena-global row domain.
+/// One logical attention-history component view over its domain's slab
+/// table. `plane_index` numbers the planes of every stored domain of the
+/// store in order (the index into [`StateStore::history_planes`]);
+/// `component_index` is the component within its domain. `base_row` is
+/// always zero: the plane's rows are its domain's rows.
 #[derive(Clone)]
 pub struct PlaneBuffer {
     pub plane_index: usize,
+    pub domain: HistoryDomainId,
     pub component_index: usize,
     pub layer: LayerRef,
     pub vector: VectorKind,
@@ -886,16 +920,26 @@ impl BankCapacity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateAllocationTrace {
     pub context_capacity: usize,
-    pub history_capacity: usize,
-    pub history_row_bytes: u64,
-    pub history_bytes: u64,
+    pub history: Vec<HistoryDomainTrace>,
     pub bank_capacity: BankCapacity,
     pub recurrent_bank_bytes: u64,
     pub zero_seed_bytes: u64,
     pub recurrent_pool_bytes: u64,
+}
+
+/// One stored history domain as allocated: `capacity` reserved rows of
+/// `row_bytes`, `slab_rows` per slab and its span bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryDomainTrace {
+    pub kind: HistoryDomainKind,
+    pub capacity: usize,
+    pub row_bytes: u64,
+    pub bytes: u64,
+    pub slab_rows: usize,
+    pub span_bound: usize,
 }
 
 /// The permanently pristine bank every new sequence starts from. It is never
@@ -1056,14 +1100,25 @@ impl BankPool {
     }
 }
 
-/// Slab-backed history rows and recurrent banks. Graphs are sealed over the
-/// logical shapes; only backed rows and banks are handed out.
+/// Slab-backed history rows (one slab tensor per stored domain) and
+/// recurrent banks. Graphs are sealed over the logical shapes; only backed
+/// rows and banks are handed out.
 struct StoreSlabs {
-    history: Option<SlabTensor>,
-    rows: usize,
+    history: Vec<HistorySlabs>,
     recurrent: Option<SlabTensor>,
     banks: usize,
 }
+
+/// One stored domain's history slab tensor and one past its highest backed
+/// row.
+struct HistorySlabs {
+    slabs: SlabTensor,
+    rows: usize,
+}
+
+/// A registered history claim: its domain and its entry in that domain's
+/// arena.
+type HistoryKey = (usize, u64);
 
 /// Counts transactions that captured this store's tensors and write them
 /// later (advances, compactions, conversions). The backing may be
@@ -1072,7 +1127,7 @@ struct StoreSlabs {
 #[derive(Default)]
 struct TransactionClaims {
     active: usize,
-    histories: BTreeMap<u64, usize>,
+    histories: BTreeMap<HistoryKey, usize>,
     banks: BTreeMap<LogicalId, usize>,
 }
 
@@ -1081,7 +1136,7 @@ struct Transactions(Rc<RefCell<TransactionClaims>>);
 
 struct Transaction {
     claims: Rc<RefCell<TransactionClaims>>,
-    histories: Vec<u64>,
+    histories: Vec<HistoryKey>,
     banks: Vec<LogicalId>,
 }
 
@@ -1100,18 +1155,17 @@ impl Transactions {
 }
 
 impl Transaction {
-    fn track(&mut self, claims: &Claims, bank: &BankHandle) {
-        self.track_history(claims);
+    /// Track one claim per stored domain, in domain order, and a bank.
+    fn track(&mut self, claims: &[Claims], bank: &BankHandle) {
+        for (domain, claims) in claims.iter().enumerate() {
+            self.track_history(HistoryDomainId(domain), claims);
+        }
         self.track_bank(bank);
     }
-    fn track_history(&mut self, claims: &Claims) {
-        self.histories.push(claims.id);
-        *self
-            .claims
-            .borrow_mut()
-            .histories
-            .entry(claims.id)
-            .or_default() += 1;
+    fn track_history(&mut self, domain: HistoryDomainId, claims: &Claims) {
+        let key = (domain.0, claims.id);
+        self.histories.push(key);
+        *self.claims.borrow_mut().histories.entry(key).or_default() += 1;
     }
     fn track_bank(&mut self, bank: &BankHandle) {
         self.banks.push(bank.id());
@@ -1142,20 +1196,133 @@ impl Drop for Transaction {
         }
     }
 }
-/// History rows are a shared arena; recurrent components are arenas of banks,
-/// and each accepted version is one immutable bank. A checkpoint retains both
-/// without copying tensor contents.
+/// One stored history domain of a store: its layout, rows per slab, span
+/// bound and the arena of its rows (free space and per-row references).
+struct HistoryDomain {
+    kind: HistoryDomainKind,
+    components: Vec<ComponentDescriptor>,
+    row_bytes: u64,
+    slab_rows: usize,
+    /// Row addresses reserved for the domain and sealed into graphs.
+    capacity: usize,
+    span_bound: usize,
+    arena: Rc<RefCell<Arena>>,
+}
+
+impl HistoryDomain {
+    /// Whole slabs to add, lowest unbacked indices first, so that `rows`
+    /// more rows are free.
+    fn growth_slabs(&self, rows: usize) -> Result<usize, Error> {
+        if rows == 0 {
+            return Ok(0);
+        }
+        let arena = self.arena.borrow();
+        let available = arena.available();
+        let shortage = rows.saturating_sub(available);
+        let mut additional_slabs = 0;
+        let mut added_rows = 0;
+        for slab in 0..self.capacity.div_ceil(self.slab_rows) {
+            if !arena.backed.contains(&slab) && added_rows < shortage {
+                let start = slab * self.slab_rows;
+                added_rows += (start + self.slab_rows).min(self.capacity) - start;
+                additional_slabs += 1;
+            }
+        }
+        if added_rows < shortage {
+            return Err(Error::Capacity {
+                required: rows as u64 * self.row_bytes,
+                available_bytes: (added_rows + available) as u64 * self.row_bytes,
+            });
+        }
+        Ok(additional_slabs)
+    }
+
+    /// One past the highest row of the backed slabs.
+    fn backed_extent(&self, slabs: &SlabTensor) -> usize {
+        slabs
+            .slabs()
+            .map(|(index, _)| ((index + 1) * self.slab_rows).min(self.capacity))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The first position a history at `position`, trimmed at `floor`,
+    /// references.
+    fn history_start(&self, position: usize, floor: usize) -> usize {
+        self.kind.retained_from(position).max(floor)
+    }
+
+    /// Plan one shrink of this domain against its published arena: the
+    /// slabs kept (idle: every occupied slab and one spare; reclaim: the
+    /// most occupied slabs that hold every referenced row), the row moves
+    /// out of the others, and the arena to publish once they are copied.
+    fn shrink_plan(&self, policy: ShrinkPolicy, rows: usize) -> ShrinkPlan {
+        let arena = self.arena.borrow();
+        let mut slabs = arena
+            .backed
+            .iter()
+            .map(|&index| {
+                let start = index * self.slab_rows;
+                let end = (start + self.slab_rows).min(self.capacity);
+                let occupied = arena
+                    .runs
+                    .range(start..end)
+                    .map(|(_, run)| run.count)
+                    .sum::<usize>();
+                (index, end - start, occupied)
+            })
+            .collect::<Vec<_>>();
+        slabs.sort_unstable_by_key(|&(index, _, occupied)| (std::cmp::Reverse(occupied), index));
+        let mut keep = BTreeSet::new();
+        match policy {
+            ShrinkPolicy::Idle => {
+                keep.extend(
+                    slabs
+                        .iter()
+                        .filter(|(_, _, occupied)| *occupied > 0)
+                        .map(|(index, _, _)| *index),
+                );
+                if let Some(&(index, _, _)) = slabs.iter().find(|(_, _, occupied)| *occupied == 0) {
+                    keep.insert(index);
+                }
+            }
+            ShrinkPolicy::Reclaim => {
+                let mut capacity = 0;
+                for &(index, rows, _) in &slabs {
+                    if capacity >= arena.referenced {
+                        break;
+                    }
+                    keep.insert(index);
+                    capacity += rows;
+                }
+            }
+        }
+        let (arena, moves) = arena.compact_into_slabs(rows, &keep);
+        ShrinkPlan { arena, moves, keep }
+    }
+}
+
+/// One domain's planned shrink (see [`HistoryDomain::shrink_plan`]).
+struct ShrinkPlan {
+    arena: Arena,
+    moves: Vec<(usize, usize, usize)>,
+    keep: BTreeSet<usize>,
+}
+
+/// Each stored history domain's rows are a shared arena; recurrent
+/// components are arenas of banks, and each accepted version is one
+/// immutable bank. A checkpoint retains both without copying tensor
+/// contents.
 ///
-/// `history_capacity` rows and the bank capacity are reservations sealed into
-/// graphs. Backing slabs are added as demand grows and released when empty
-/// ([`StateStore::provision`], [`StateStore::shrink_with`]).
+/// Each domain's reserved rows and the bank capacity are reservations
+/// sealed into graphs. Backing slabs are added as demand grows and released
+/// when empty ([`StateStore::provision`], [`StateStore::shrink_with`]).
 pub struct StateStore {
     device: Rc<Device>,
     context_capacity: usize,
-    history_capacity: usize,
-    components: Vec<ComponentDescriptor>,
-    total_history_row_bytes: u64,
-    history_slab_rows: usize,
+    domains: Vec<HistoryDomain>,
+    /// Layers of Shared domains and the stored layers they read.
+    shared: Vec<(LayerRef, HistorySource)>,
     bank_capacity: BankCapacity,
     recurrent_bank_bytes: u64,
     bank_slab_banks: usize,
@@ -1164,7 +1331,6 @@ pub struct StateStore {
     history_views: RefCell<Option<Vec<PlaneBuffer>>>,
     recurrent_views: RefCell<Option<Rc<[Tensor]>>>,
     retired_storage: RefCell<Vec<TensorStorageObserver>>,
-    arena: Rc<RefCell<Arena>>,
     banks: BankPool,
     zero_seed: BankHandle,
     /// Live sequences and checkpoints: the store is idle only without both.
@@ -1194,11 +1360,12 @@ pub struct Compactions {
     pub banks: usize,
 }
 
-/// One store's demand for history rows: a sequence whose history ends at
-/// `after` (none for a fresh one) appending `rows`.
+/// One store's demand for `rows` free rows in one stored history domain.
+/// An advance of `n` rows demands `n` rows in every domain of its store
+/// ([`SequenceState::demands`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowDemand {
-    pub after: Option<usize>,
+    pub domain: HistoryDomainId,
     pub rows: usize,
 }
 
@@ -1232,41 +1399,26 @@ pub enum GrowthChoice {
     Preferred,
 }
 
-struct HistoryGrowthPlan {
-    additional_slabs: usize,
-    total: usize,
-}
 impl StateStore {
+    /// A store of the given history domains and recurrent bank components.
+    /// Every domain's reserved rows cover its row limit: the context for
+    /// Token, `n` plus one advance of at most `max_advance` rows for
+    /// Window(n). Each stored domain starts with one backed slab.
     pub fn new(
         device: Rc<Device>,
         context_capacity: usize,
-        history_capacity: usize,
-        components: Vec<ComponentDescriptor>,
+        max_advance: usize,
+        domains: Vec<HistoryDomainPlan>,
         component_specs: Vec<ComponentSpec>,
         bank_capacity: BankCapacity,
     ) -> Result<Rc<Self>, Error> {
-        if context_capacity == 0 || context_capacity > history_capacity {
+        if context_capacity == 0 {
             return Err(Error::Request(
                 "history capacity must fit a positive sequence context".into(),
             ));
         }
-        let total_history_row_bytes = validate_history_layout(&components, history_capacity)?;
-        for spec in &component_specs {
-            spec.bytes().map_err(Error::Request)?;
-        }
-        let recurrent_bank_bytes = component_specs.iter().try_fold(0_u64, |total, spec| {
-            total
-                .checked_add(
-                    u64::try_from(spec.bytes().map_err(Error::Request)?)
-                        .map_err(|_| Error::Request("recurrent bank bytes exceed u64".into()))?,
-                )
-                .ok_or_else(|| Error::Request("recurrent bank byte count overflow".into()))
-        })?;
-        let history_slab_rows = if components.is_empty() {
-            0
-        } else {
-            history_rows_per_slab(total_history_row_bytes).map_err(Error::Request)?
-        };
+        let (stored, shared) = domain::validate_domains(domains, context_capacity, max_advance)?;
+        let recurrent_bank_bytes = recurrent_bank_bytes(&component_specs)?;
         let bank_slab_banks = if component_specs.is_empty() {
             0
         } else {
@@ -1299,14 +1451,15 @@ impl StateStore {
         if let Some(recurrent) = &mut recurrent {
             recurrent.add_slab()?;
         }
-        let mut history = if components.is_empty() {
-            None
-        } else {
-            Some(SlabTensor::new(
+        let mut history = Vec::with_capacity(stored.len());
+        let mut domains = Vec::with_capacity(stored.len());
+        for domain in stored {
+            let mut slabs = SlabTensor::new(
                 &device,
-                history_slab_rows as u64,
-                history_capacity as u64,
-                components
+                domain.slab_rows as u64,
+                domain.logical_rows as u64,
+                domain
+                    .components
                     .iter()
                     .flat_map(ComponentDescriptor::planes)
                     .map(|plane| SlabRegion {
@@ -1314,38 +1467,37 @@ impl StateStore {
                         row_shape: plane.row_extents.iter().map(|&size| size as u64).collect(),
                     })
                     .collect(),
-            )?)
-        };
-        let committed_rows = if let Some(history) = &mut history {
-            history.add_slab()?;
-            history_slab_rows.min(history_capacity)
-        } else {
-            0
-        };
+            )?;
+            slabs.add_slab()?;
+            let rows = domain.slab_rows.min(domain.logical_rows);
+            history.push(HistorySlabs { slabs, rows });
+            domains.push(HistoryDomain {
+                kind: domain.kind,
+                components: domain.components,
+                row_bytes: domain.row_bytes,
+                slab_rows: domain.slab_rows,
+                capacity: domain.logical_rows,
+                span_bound: domain.span_bound,
+                arena: Rc::new(RefCell::new(Arena::new(rows, domain.slab_rows))),
+            });
+        }
         Ok(Rc::new(Self {
             device,
             context_capacity,
-            history_capacity,
-            components,
-            total_history_row_bytes,
-            history_slab_rows,
+            domains,
+            shared,
             bank_capacity,
             recurrent_bank_bytes,
             bank_slab_banks,
             component_specs,
             backing: RefCell::new(StoreSlabs {
                 history,
-                rows: committed_rows,
                 recurrent,
                 banks: committed_banks,
             }),
             history_views: RefCell::new(None),
             recurrent_views: RefCell::new(None),
             retired_storage: RefCell::new(Vec::new()),
-            arena: Rc::new(RefCell::new(Arena::new(
-                committed_rows,
-                history_slab_rows.max(1),
-            ))),
             banks,
             zero_seed,
             owners: Cell::new(0),
@@ -1386,20 +1538,24 @@ impl StateStore {
     pub fn recurrent_bank_count(&self) -> Result<usize, Error> {
         self.bank_capacity.storage_total()
     }
-    /// One past the highest backed history row and recurrent bank. These
-    /// extents may include unbacked slots after an interior slab is freed;
+    /// One past the highest backed row of a domain. The extent may include
+    /// unbacked rows after an interior slab is freed;
     /// [`StateStore::committed_bytes`] measures the actual backing.
-    pub fn committed(&self) -> (usize, usize) {
-        let backing = self.backing.borrow();
-        (backing.rows, backing.banks)
+    pub fn committed_rows(&self, domain: HistoryDomainId) -> usize {
+        self.backing.borrow().history[domain.0].rows
+    }
+    /// One past the highest backed recurrent bank.
+    pub fn committed_banks(&self) -> usize {
+        self.backing.borrow().banks
     }
     /// Physical bytes of the committed backing.
     pub fn committed_bytes(&self) -> u64 {
         let backing = self.backing.borrow();
         backing
             .history
-            .as_ref()
-            .map_or(0, SlabTensor::storage_bytes)
+            .iter()
+            .map(|history| history.slabs.storage_bytes())
+            .sum::<u64>()
             + backing
                 .recurrent
                 .as_ref()
@@ -1422,7 +1578,7 @@ impl StateStore {
         let current = backing
             .history
             .iter()
-            .flat_map(SlabTensor::slab_storage_observers)
+            .flat_map(|history| history.slabs.slab_storage_observers())
             .chain(
                 backing
                     .recurrent
@@ -1465,7 +1621,14 @@ impl StateStore {
             .chain(retained)
             .chain(in_flight)
             .collect::<Vec<_>>();
-        let arena = self.arena.borrow();
+        let keys = |holder: &Holder<'_>| {
+            holder
+                .claims()
+                .iter()
+                .enumerate()
+                .map(|(domain, claims)| (domain, claims.id))
+                .collect::<Vec<HistoryKey>>()
+        };
         let mut supplied = BTreeSet::new();
         let mut banks = BTreeSet::new();
         for holder in &holders {
@@ -1474,10 +1637,12 @@ impl StateStore {
                     "state census holder belongs to another store".into(),
                 ));
             }
-            if !supplied.insert(holder.claims().id) {
-                return Err(Error::Request(
-                    "state census holder appears more than once".into(),
-                ));
+            for key in keys(holder) {
+                if !supplied.insert(key) {
+                    return Err(Error::Request(
+                        "state census holder appears more than once".into(),
+                    ));
+                }
             }
             banks.insert(holder.bank().id());
         }
@@ -1485,22 +1650,34 @@ impl StateStore {
         if live
             .iter()
             .chain(retained)
-            .any(|holder| tracked.histories.contains_key(&holder.claims().id))
+            .flat_map(keys)
+            .any(|key| tracked.histories.contains_key(&key))
         {
             return Err(Error::Request(
                 "state census marks a submitted history as live or retained".into(),
             ));
         }
-        if arena
-            .entries
-            .keys()
-            .any(|id| !supplied.contains(id) && !tracked.histories.contains_key(id))
-        {
-            return Err(Error::Request(
-                "state census omits a registered history claim".into(),
-            ));
+        let mut occupied_history = 0u64;
+        for (index, domain) in self.domains.iter().enumerate() {
+            let arena = domain.arena.borrow();
+            if arena.entries.keys().any(|&id| {
+                !supplied.contains(&(index, id)) && !tracked.histories.contains_key(&(index, id))
+            }) {
+                return Err(Error::Request(
+                    "state census omits a registered history claim".into(),
+                ));
+            }
+            if self.backing.borrow().history[index].rows < arena.referenced {
+                return Err(Error::Request(
+                    "state census does not reconcile to committed backing".into(),
+                ));
+            }
+            occupied_history = u64::try_from(arena.referenced)
+                .ok()
+                .and_then(|rows| rows.checked_mul(domain.row_bytes))
+                .and_then(|bytes| occupied_history.checked_add(bytes))
+                .ok_or_else(|| Error::Request("state census byte count overflow".into()))?;
         }
-        let rows = self.committed().0;
         let placement = self.banks.inner.placement.borrow();
         let claimed_banks = placement
             .resources()
@@ -1515,17 +1692,11 @@ impl StateStore {
                 "state census omits a recurrent bank claim".into(),
             ));
         }
-        let occupied_rows = u64::try_from(arena.referenced)
-            .map_err(|_| Error::Request("occupied row count exceeds u64".into()))?;
         let used_banks = u64::try_from(claimed_banks.len())
             .map_err(|_| Error::Request("occupied bank count exceeds u64".into()))?;
-        let occupied = occupied_rows
-            .checked_mul(self.total_history_row_bytes)
-            .and_then(|history| {
-                used_banks
-                    .checked_mul(self.recurrent_bank_bytes)
-                    .and_then(|bank| history.checked_add(bank))
-            })
+        let occupied = used_banks
+            .checked_mul(self.recurrent_bank_bytes)
+            .and_then(|bank| occupied_history.checked_add(bank))
             .ok_or_else(|| Error::Request("state census byte count overflow".into()))?;
         let model_seed = self.recurrent_bank_bytes;
         let committed = self.committed_bytes();
@@ -1534,7 +1705,6 @@ impl StateStore {
             .and_then(|bytes| bytes.checked_sub(model_seed))
             .ok_or_else(|| Error::Request("state census exceeds Seismic charged backing".into()))?;
         drop(placement);
-        drop(arena);
         drop(tracked);
         let retained_only = self.exclusive_bytes(retained)?;
         let non_flight = live.iter().chain(retained).copied().collect::<Vec<_>>();
@@ -1552,34 +1722,103 @@ impl StateStore {
             in_flight: in_flight_bytes,
             model_seed,
         };
-        if census.total() != committed || rows < self.occupied_rows() {
+        if census.total() != committed {
             return Err(Error::Request(
                 "state census does not reconcile to committed backing".into(),
             ));
         }
         Ok(census)
     }
-    pub fn history_capacity(&self) -> usize {
-        self.history_capacity
+    /// The store's stored history domains, in plan order.
+    pub fn history_domains(&self) -> impl Iterator<Item = HistoryDomainId> {
+        (0..self.domains.len()).map(HistoryDomainId)
     }
-    pub fn history_components(&self) -> &[ComponentDescriptor] {
-        &self.components
+    /// The store's one stored history domain, for a caller whose launch
+    /// format carries exactly one.
+    pub fn sole_history_domain(&self) -> Result<HistoryDomainId, Error> {
+        match self.domains.len() {
+            1 => Ok(HistoryDomainId(0)),
+            count => Err(Error::HistoryDomains { count }),
+        }
     }
-    pub fn total_history_row_bytes(&self) -> u64 {
-        self.total_history_row_bytes
+    pub fn history_domain_kind(&self, domain: HistoryDomainId) -> HistoryDomainKind {
+        self.domains[domain.0].kind
     }
-    pub fn history_slab_rows(&self) -> usize {
-        self.history_slab_rows
+    /// Where `layer`'s history lives: its own stored domain, or the source
+    /// layer and domain a Shared domain binds. `None` for a layer without
+    /// history in this store.
+    pub fn history_source(&self, layer: LayerRef) -> Option<HistorySource> {
+        self.domains
+            .iter()
+            .position(|domain| {
+                domain
+                    .components
+                    .iter()
+                    .any(|component| component.layer == layer)
+            })
+            .map(|domain| HistorySource {
+                domain: HistoryDomainId(domain),
+                layer,
+            })
+            .or_else(|| {
+                self.shared
+                    .iter()
+                    .find(|(shared, _)| *shared == layer)
+                    .map(|(_, source)| *source)
+            })
     }
-    pub fn max_visible_spans(&self) -> usize {
-        max_visible_spans(self.context_capacity, self.history_slab_rows.max(1))
-            .expect("validated context and slab rows")
+    /// The stored domains Shared layers read, ascending. A Shared layer
+    /// appends nothing, so it reads its source domain's accepted rows and
+    /// the rows its source appended for the advance: one read beyond the
+    /// stored domains per such source domain.
+    pub fn shared_source_domains(&self) -> Vec<HistoryDomainId> {
+        let mut domains = self
+            .shared
+            .iter()
+            .map(|(_, source)| source.domain)
+            .collect::<Vec<_>>();
+        domains.sort_unstable_by_key(|domain| domain.0);
+        domains.dedup();
+        domains
+    }
+    /// The history reads of a launch row, in order: every stored domain,
+    /// then every Shared source domain (`shared_source_domains`).
+    pub fn history_reads(&self) -> usize {
+        self.domains.len() + self.shared_source_domains().len()
+    }
+    /// The history read `layer`'s attention takes (an index into
+    /// `history_reads`): its own stored domain's, or its Shared source
+    /// domain's. `None` for a layer without history in this store.
+    pub fn history_read(&self, layer: LayerRef) -> Option<usize> {
+        match self.shared.iter().find(|(shared, _)| *shared == layer) {
+            Some((_, source)) => self
+                .shared_source_domains()
+                .iter()
+                .position(|domain| *domain == source.domain)
+                .map(|position| self.domains.len() + position),
+            None => self.history_source(layer).map(|source| source.domain.0),
+        }
+    }
+    /// Row addresses reserved for a domain: an exclusive bound on its rows.
+    pub fn history_capacity(&self, domain: HistoryDomainId) -> usize {
+        self.domains[domain.0].capacity
+    }
+    pub fn history_components(&self, domain: HistoryDomainId) -> &[ComponentDescriptor] {
+        &self.domains[domain.0].components
+    }
+    pub fn history_row_bytes(&self, domain: HistoryDomainId) -> u64 {
+        self.domains[domain.0].row_bytes
+    }
+    pub fn history_slab_rows(&self, domain: HistoryDomainId) -> usize {
+        self.domains[domain.0].slab_rows
+    }
+    /// The most spans a history of the domain may reach before compaction:
+    /// `ceil(row limit / rows per slab) + 16`.
+    pub fn span_bound(&self, domain: HistoryDomainId) -> usize {
+        self.domains[domain.0].span_bound
     }
     pub fn bank_slab_banks(&self) -> usize {
         self.bank_slab_banks
-    }
-    pub fn total_history_bytes(&self) -> u64 {
-        self.total_history_row_bytes * self.history_capacity as u64
     }
     pub fn allocation_trace(&self) -> Result<StateAllocationTrace, Error> {
         let zero_seed_bytes = self.recurrent_bank_bytes;
@@ -1592,9 +1831,19 @@ impl StateStore {
             .ok_or_else(|| Error::Request("recurrent pool byte count overflow".into()))?;
         Ok(StateAllocationTrace {
             context_capacity: self.context_capacity,
-            history_capacity: self.history_capacity,
-            history_row_bytes: self.total_history_row_bytes,
-            history_bytes: self.total_history_bytes(),
+            history: self
+                .domains
+                .iter()
+                .map(|domain| HistoryDomainTrace {
+                    kind: domain.kind,
+                    capacity: domain.capacity,
+                    row_bytes: domain.row_bytes,
+                    // Validated not to overflow at construction.
+                    bytes: domain.row_bytes * domain.capacity as u64,
+                    slab_rows: domain.slab_rows,
+                    span_bound: domain.span_bound,
+                })
+                .collect(),
             bank_capacity: self.bank_capacity,
             recurrent_bank_bytes: self.recurrent_bank_bytes,
             zero_seed_bytes,
@@ -1602,7 +1851,11 @@ impl StateStore {
         })
     }
     pub fn history_allocated(&self) -> bool {
-        self.backing.borrow().rows != 0
+        self.backing
+            .borrow()
+            .history
+            .iter()
+            .any(|history| history.rows != 0)
     }
 
     /// Slab bindings cannot change while an accepted advance holds them.
@@ -1640,15 +1893,19 @@ impl StateStore {
         if !self.transactions.idle() {
             return Ok(0);
         }
-        let history = self.history_growth_plan(demands, choice)?;
+        let plans = self.history_growth_plans(demands, choice)?;
         let backing = self.backing.borrow();
         let bank_slabs = self.bank_growth_slabs(banks)?;
-        let history_slabs = history.additional_slabs;
-        let history_bytes = backing
-            .history
-            .as_ref()
-            .map_or(0, SlabTensor::slab_bytes)
-            .checked_mul(history_slabs as u64)
+        let history_bytes = plans
+            .iter()
+            .zip(&backing.history)
+            .try_fold(0u64, |total, (&slabs, history)| {
+                history
+                    .slabs
+                    .slab_bytes()
+                    .checked_mul(slabs as u64)
+                    .and_then(|bytes| total.checked_add(bytes))
+            })
             .ok_or_else(|| Error::Request("history slab claim overflows".into()))?;
         let bank_bytes = backing
             .recurrent
@@ -1671,47 +1928,52 @@ impl StateStore {
             return Ok(());
         }
         let bank_slabs = self.bank_growth_slabs(banks)?;
-        let history_before = (bank_slabs != 0 && !self.components.is_empty())
-            .then(|| self.arena.borrow().backed.clone());
-        if !self.components.is_empty() {
-            self.provision_history(demands, choice)?;
+        let plans = self.history_growth_plans(demands, choice)?;
+        // Growth of every domain and the banks is one fallible operation.
+        let before = self
+            .domains
+            .iter()
+            .map(|domain| domain.arena.borrow().backed.clone())
+            .collect::<Vec<_>>();
+        for (index, &slabs) in plans.iter().enumerate() {
+            if let Err(error) = self.add_history_slabs(HistoryDomainId(index), slabs) {
+                self.rollback_history_growth(&before)?;
+                return Err(error);
+            }
         }
         if bank_slabs != 0 {
             if let Err(error) = self.add_bank_slabs(bank_slabs) {
-                if let Some(before) = &history_before {
-                    self.rollback_history_growth(before)?;
-                }
+                self.rollback_history_growth(&before)?;
                 return Err(error);
             }
         }
         Ok(())
     }
 
-    /// Restore the published history backing when the bank half of one
-    /// aggregate growth fails. No advance has claimed the newly added rows.
-    fn rollback_history_growth(&self, before: &BTreeSet<usize>) -> Result<(), Error> {
-        let added = self
-            .arena
-            .borrow()
-            .backed
-            .difference(before)
-            .copied()
-            .collect::<Vec<_>>();
-        if added.is_empty() {
-            return Ok(());
+    /// Restore every domain's published history backing when a later part
+    /// of one aggregate growth fails. No advance has claimed the newly added
+    /// rows.
+    fn rollback_history_growth(&self, before: &[BTreeSet<usize>]) -> Result<(), Error> {
+        for (index, (domain, before)) in self.domains.iter().zip(before).enumerate() {
+            let added = domain
+                .arena
+                .borrow()
+                .backed
+                .difference(before)
+                .copied()
+                .collect::<Vec<_>>();
+            if added.is_empty() {
+                continue;
+            }
+            self.history_views.borrow_mut().take();
+            let mut backing = self.backing.borrow_mut();
+            let history = &mut backing.history[index];
+            for slab in added {
+                history.slabs.free_slab(slab)?;
+                domain.arena.borrow_mut().unback_empty_slab(slab);
+            }
+            history.rows = domain.backed_extent(&history.slabs);
         }
-        self.history_views.borrow_mut().take();
-        let mut backing = self.backing.borrow_mut();
-        let slabs = backing.history.as_mut().expect("history layout has slabs");
-        for index in added {
-            slabs.free_slab(index)?;
-            self.arena.borrow_mut().unback_empty_slab(index);
-        }
-        backing.rows = slabs
-            .slabs()
-            .map(|(index, _)| ((index + 1) * self.history_slab_rows).min(self.history_capacity))
-            .max()
-            .unwrap_or(0);
         Ok(())
     }
 
@@ -1747,53 +2009,33 @@ impl StateStore {
         Ok(additional)
     }
 
-    /// Plan whole slab additions for the rows a launch needs beyond the
-    /// backing's free rows. A history may continue in another span.
-    fn history_growth_plan(
+    /// Plan whole slab additions, per stored domain, for the rows a launch
+    /// needs beyond each domain's free rows. A history may continue in
+    /// another span.
+    fn history_growth_plans(
         &self,
         demands: &[RowDemand],
         _choice: GrowthChoice,
-    ) -> Result<HistoryGrowthPlan, Error> {
-        let total = demands.iter().map(|demand| demand.rows).sum::<usize>();
-        if total == 0 || self.components.is_empty() {
-            return Ok(HistoryGrowthPlan {
-                additional_slabs: 0,
-                total: 0,
-            });
+    ) -> Result<Vec<usize>, Error> {
+        let mut plans = Vec::with_capacity(self.domains.len());
+        for (index, domain) in self.domains.iter().enumerate() {
+            let total = demands
+                .iter()
+                .filter(|demand| demand.domain.0 == index)
+                .map(|demand| demand.rows)
+                .sum::<usize>();
+            plans.push(domain.growth_slabs(total)?);
         }
-        let arena = self.arena.borrow();
-        let available = arena.available();
-        let shortage = total.saturating_sub(available);
-        let mut additional_slabs = 0;
-        let mut added_rows = 0;
-        for slab in 0..self.history_capacity.div_ceil(self.history_slab_rows) {
-            if !arena.backed.contains(&slab) && added_rows < shortage {
-                let start = slab * self.history_slab_rows;
-                added_rows += (start + self.history_slab_rows).min(self.history_capacity) - start;
-                additional_slabs += 1;
-            }
+        if let Some(demand) = demands
+            .iter()
+            .find(|demand| demand.domain.0 >= self.domains.len())
+        {
+            return Err(Error::Request(format!(
+                "row demand names absent history domain {:?}",
+                demand.domain
+            )));
         }
-        if added_rows < shortage {
-            return Err(Error::Capacity {
-                required: total as u64 * self.total_history_row_bytes,
-                available_bytes: (added_rows + available) as u64 * self.total_history_row_bytes,
-            });
-        }
-        Ok(HistoryGrowthPlan {
-            additional_slabs,
-            total,
-        })
-    }
-
-    fn provision_history(&self, demands: &[RowDemand], choice: GrowthChoice) -> Result<(), Error> {
-        let plan = self.history_growth_plan(demands, choice)?;
-        if plan.total == 0 {
-            return Ok(());
-        }
-        if plan.additional_slabs > 0 {
-            self.add_history_slabs(plan.additional_slabs)?;
-        }
-        Ok(())
+        Ok(plans)
     }
 
     /// Release empty history and bank slabs, retaining one spare of each at
@@ -1812,51 +2054,13 @@ impl StateStore {
         }
         let before = self.device.memory_usage().charged;
         let backing = self.backing.borrow();
-        let arena = self.arena.borrow();
-        let mut history_slabs = arena
-            .backed
+        // Each stored domain plans against its own published arena.
+        let history_plans = self
+            .domains
             .iter()
-            .map(|&index| {
-                let start = index * self.history_slab_rows;
-                let end = (start + self.history_slab_rows).min(self.history_capacity);
-                let occupied = arena
-                    .runs
-                    .range(start..end)
-                    .map(|(_, run)| run.count)
-                    .sum::<usize>();
-                (index, end - start, occupied)
-            })
+            .zip(&backing.history)
+            .map(|(domain, history)| domain.shrink_plan(policy, history.rows))
             .collect::<Vec<_>>();
-        history_slabs
-            .sort_unstable_by_key(|&(index, _, occupied)| (std::cmp::Reverse(occupied), index));
-        let mut history_keep = BTreeSet::new();
-        match policy {
-            ShrinkPolicy::Idle => {
-                history_keep.extend(
-                    history_slabs
-                        .iter()
-                        .filter(|(_, _, occupied)| *occupied > 0)
-                        .map(|(index, _, _)| *index),
-                );
-                if let Some(&(index, _, _)) =
-                    history_slabs.iter().find(|(_, _, occupied)| *occupied == 0)
-                {
-                    history_keep.insert(index);
-                }
-            }
-            ShrinkPolicy::Reclaim => {
-                let mut capacity = 0;
-                for &(index, rows, _) in &history_slabs {
-                    if capacity >= arena.referenced {
-                        break;
-                    }
-                    history_keep.insert(index);
-                    capacity += rows;
-                }
-            }
-        }
-        let (planned_arena, history_moves) = arena.compact_into_slabs(backing.rows, &history_keep);
-        drop(arena);
 
         let published_banks = self.banks.inner.placement.borrow().clone();
         let reserved = self.bank_capacity.storage_total().map_err(E::from)?;
@@ -1949,16 +2153,17 @@ impl StateStore {
                 .map_err(E::from)?
         };
 
-        // Both plans read the same published generation. Every destination is
-        // free there, so even a later failed copy leaves both stores readable
-        // and no physical slab has been released.
-        if !history_moves.is_empty() {
-            let slabs = backing.history.as_ref().expect("history layout has slabs");
-            copy(
-                slabs,
-                self.history_copy_plan(slabs, &history_moves)
-                    .map_err(E::from)?,
-            )?;
+        // Every plan reads the same published generation. Every destination
+        // is free there, so even a later failed copy leaves every domain and
+        // the banks readable and no physical slab has been released.
+        for (plan, history) in history_plans.iter().zip(&backing.history) {
+            if !plan.moves.is_empty() {
+                copy(
+                    &history.slabs,
+                    self.history_copy_plan(&history.slabs, &plan.moves)
+                        .map_err(E::from)?,
+                )?;
+            }
         }
         if !bank_moves.is_empty() {
             let slabs = backing
@@ -1972,18 +2177,30 @@ impl StateStore {
         }
         drop(backing);
 
-        *self.arena.borrow_mut() = planned_arena;
+        let history_rows = history_plans
+            .iter()
+            .flat_map(|plan| plan.moves.iter())
+            .map(|(_, _, count)| count)
+            .sum::<usize>();
         *self.banks.inner.placement.borrow_mut() = planned_banks;
         let mut backing = self.backing.borrow_mut();
-        if let Some(slabs) = backing.history.as_mut() {
+        for ((domain, plan), history) in self
+            .domains
+            .iter()
+            .zip(history_plans)
+            .zip(&mut backing.history)
+        {
+            *domain.arena.borrow_mut() = plan.arena;
             self.history_views.borrow_mut().take();
-            let victims = slabs
+            let victims = history
+                .slabs
                 .slabs()
                 .map(|(index, _)| index)
-                .filter(|index| !history_keep.contains(index))
+                .filter(|index| !plan.keep.contains(index))
                 .collect::<Vec<_>>();
             for index in victims {
-                if let Some(observer) = slabs
+                if let Some(observer) = history
+                    .slabs
                     .free_slab(index)
                     .map_err(Error::from)
                     .map_err(E::from)?
@@ -1991,11 +2208,7 @@ impl StateStore {
                     self.record_retired_storage(observer);
                 }
             }
-            backing.rows = slabs
-                .slabs()
-                .map(|(index, _)| ((index + 1) * self.history_slab_rows).min(self.history_capacity))
-                .max()
-                .unwrap_or(0);
+            history.rows = domain.backed_extent(&history.slabs);
         }
         if let Some(slabs) = backing.recurrent.as_mut() {
             self.recurrent_views.borrow_mut().take();
@@ -2027,15 +2240,11 @@ impl StateStore {
             }
         }
         drop(backing);
-        if !history_moves.is_empty() || !bank_moves.is_empty() {
+        if history_rows != 0 || !bank_moves.is_empty() {
             let stats = self.compactions.get();
             self.compactions.set(Compactions {
                 count: stats.count + 1,
-                history_rows: stats.history_rows
-                    + history_moves
-                        .iter()
-                        .map(|(_, _, count)| count)
-                        .sum::<usize>(),
+                history_rows: stats.history_rows + history_rows,
                 banks: stats.banks + bank_moves.len(),
             });
         }
@@ -2097,13 +2306,14 @@ impl StateStore {
         self.banks.generation()
     }
 
-    /// Add whole history slabs into the lowest unbacked slots.
-    fn add_history_slabs(&self, count: usize) -> Result<(), Error> {
+    /// Add whole history slabs to a domain, into its lowest unbacked slots.
+    fn add_history_slabs(&self, domain: HistoryDomainId, count: usize) -> Result<(), Error> {
         let mut backing = self.backing.borrow_mut();
         if count == 0 {
             return Ok(());
         }
-        let slab = backing.history.as_mut().expect("history layout has slabs");
+        let history = &mut backing.history[domain.0];
+        let slab = &mut history.slabs;
         self.history_views.borrow_mut().take();
         let mut added = Vec::new();
         for _ in 0..count {
@@ -2117,12 +2327,13 @@ impl StateStore {
                 }
             }
         }
-        let mut arena = self.arena.borrow_mut();
+        let domain = &self.domains[domain.0];
+        let mut arena = domain.arena.borrow_mut();
         for index in added {
-            arena.back_slab(index, self.history_capacity);
-            backing.rows = backing
+            arena.back_slab(index, domain.capacity);
+            history.rows = history
                 .rows
-                .max(((index + 1) * self.history_slab_rows).min(self.history_capacity));
+                .max(((index + 1) * domain.slab_rows).min(domain.capacity));
         }
         Ok(())
     }
@@ -2168,41 +2379,44 @@ impl StateStore {
             return Ok(views.clone());
         }
         let backing = self.backing.borrow();
-        if backing.rows == 0 {
+        if backing.history.iter().all(|history| history.rows == 0) {
             return Ok(Vec::new());
         }
-        let slabs = backing.history.as_ref().expect("history layout has slabs");
-        let views = self
-            .components
-            .iter()
-            .enumerate()
-            .flat_map(|(component_index, component)| {
-                component
-                    .planes()
+        let mut views = Vec::new();
+        for (index, (domain, history)) in self.domains.iter().zip(&backing.history).enumerate() {
+            let planes =
+                domain
+                    .components
                     .iter()
-                    .map(move |plane| (component_index, component.layer, plane))
-            })
-            .enumerate()
-            .map(|(plane_index, (component_index, layer, plane))| {
-                Ok(PlaneBuffer {
-                    plane_index,
+                    .enumerate()
+                    .flat_map(|(component_index, component)| {
+                        component
+                            .planes()
+                            .iter()
+                            .map(move |plane| (component_index, component.layer, plane))
+                    });
+            for (region, (component_index, layer, plane)) in planes.enumerate() {
+                views.push(PlaneBuffer {
+                    plane_index: views.len(),
+                    domain: HistoryDomainId(index),
                     component_index,
                     layer,
                     vector: plane.vector,
                     name: plane.name,
                     row_bytes: plane.row_bytes,
-                    slab_rows: u32::try_from(self.history_slab_rows).expect("slab rows fit u32"),
+                    slab_rows: u32::try_from(domain.slab_rows).expect("slab rows fit u32"),
                     base_row: 0,
-                    buffer: slabs.logical_region(plane_index)?,
-                })
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
+                    buffer: history.slabs.logical_region(region)?,
+                });
+            }
+        }
         *self.history_views.borrow_mut() = Some(views.clone());
         Ok(views)
     }
-    /// History rows referenced by at least one claim; a shared row counts once.
-    pub fn occupied_rows(&self) -> usize {
-        self.arena.borrow().referenced
+    /// A domain's rows referenced by at least one claim; a shared row counts
+    /// once.
+    pub fn occupied_rows(&self, domain: HistoryDomainId) -> usize {
+        self.domains[domain.0].arena.borrow().referenced
     }
     /// Bytes released if exactly the given holders were dropped: history rows
     /// and recurrent banks that no claim outside the set references. Shared
@@ -2221,11 +2435,18 @@ impl StateStore {
                 distinct.push(holder);
             }
         }
-        let ranges = distinct
-            .iter()
-            .flat_map(|holder| holder.claims().ranges())
-            .collect::<Vec<_>>();
-        let rows = self.arena.borrow().exclusive_rows(&ranges);
+        let mut history = 0u64;
+        for (index, domain) in self.domains.iter().enumerate() {
+            let ranges = distinct
+                .iter()
+                .flat_map(|holder| holder.claims()[index].ranges())
+                .collect::<Vec<_>>();
+            let rows = domain.arena.borrow().exclusive_rows(&ranges);
+            history = (rows as u64)
+                .checked_mul(domain.row_bytes)
+                .and_then(|bytes| history.checked_add(bytes))
+                .ok_or_else(|| Error::Request("exclusive state byte count overflow".into()))?;
+        }
         let mut banks = 0u64;
         let mut counted: Vec<*const BankClaim> = Vec::new();
         for holder in &distinct {
@@ -2243,13 +2464,9 @@ impl StateStore {
                 banks += 1;
             }
         }
-        (rows as u64)
-            .checked_mul(self.total_history_row_bytes)
-            .and_then(|history| {
-                self.recurrent_bank_bytes
-                    .checked_mul(banks)
-                    .and_then(|recurrent| history.checked_add(recurrent))
-            })
+        self.recurrent_bank_bytes
+            .checked_mul(banks)
+            .and_then(|recurrent| history.checked_add(recurrent))
             .ok_or_else(|| Error::Request("exclusive state byte count overflow".into()))
     }
     pub fn idle(&self) -> bool {
@@ -2259,11 +2476,17 @@ impl StateStore {
     pub fn available_banks(&self) -> usize {
         self.banks.available()
     }
+    /// Free backed rows of one domain.
+    pub fn free_rows(&self, domain: HistoryDomainId) -> usize {
+        self.domains[domain.0].arena.borrow().available()
+    }
+    /// Rows every stored domain can provide without growth: an advance of
+    /// `n` rows needs `n` free rows in each. Unbounded without history.
     pub fn available_rows(&self) -> usize {
-        if self.components.is_empty() {
-            return usize::MAX;
-        }
-        self.arena.borrow().available()
+        self.history_domains()
+            .map(|domain| self.free_rows(domain))
+            .min()
+            .unwrap_or(usize::MAX)
     }
     /// Drop the store's arena allocations when no sequence/checkpoint owns them.
     /// External completion/buffer pins may still retain physical storage.
@@ -2273,33 +2496,37 @@ impl StateStore {
         }
         let before = self.device.memory_usage().charged;
         let mut backing = self.backing.borrow_mut();
-        let StoreSlabs { rows, history, .. } = &mut *backing;
-        if let Some(slabs) = history.as_mut() {
+        for (domain, history) in self.domains.iter().zip(&mut backing.history) {
             self.history_views.borrow_mut().take();
-            let held = slabs.slabs().map(|(index, _)| index).collect::<Vec<_>>();
+            let held = history
+                .slabs
+                .slabs()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
             for index in held {
-                if let Some(observer) = slabs.free_slab(index)? {
-                    self.arena.borrow_mut().unback_empty_slab(index);
+                if let Some(observer) = history.slabs.free_slab(index)? {
+                    domain.arena.borrow_mut().unback_empty_slab(index);
                     self.record_retired_storage(observer);
                 }
-                *rows = slabs
-                    .slabs()
-                    .map(|(index, _)| {
-                        ((index + 1) * self.history_slab_rows).min(self.history_capacity)
-                    })
-                    .max()
-                    .unwrap_or(0);
+                history.rows = domain.backed_extent(&history.slabs);
             }
+            *domain.arena.borrow_mut() = Arena::new(0, domain.slab_rows);
         }
         drop(backing);
-        *self.arena.borrow_mut() = Arena::new(0, self.history_slab_rows.max(1));
         usize::try_from(before.saturating_sub(self.device.memory_usage().charged))
             .map_err(|_| Error::Request("reclaimable history bytes exceed host range".into()))
     }
     pub fn create(self: &Rc<Self>) -> Result<SequenceState, Error> {
         let bank = self.zero_seed.clone();
-        let claims = Claims::new(&self.arena, vec![]);
-        claims.set_live(true);
+        let claims = self
+            .domains
+            .iter()
+            .map(|domain| {
+                let claims = Claims::new(&domain.arena, vec![]);
+                claims.set_live(true);
+                claims
+            })
+            .collect::<Vec<_>>();
         self.owners.set(self.owners.get() + 1);
         self.sequences.set(self.sequences.get() + 1);
         Ok(SequenceState {
@@ -2307,37 +2534,59 @@ impl StateStore {
             position: 0,
             expected_end: 0,
             history_start: 0,
+            starts: vec![0; claims.len()],
             claims,
             bank,
             tape: 0,
         })
     }
-    /// Reserve `count` rows, in logical order, to follow `history` (none for
-    /// rows of a new history; see [`Arena`] for placement). Provisioning may
-    /// relay the history out, so its end is read again before claiming.
-    fn reserve(&self, history: Option<&Claims>, count: usize) -> Result<Claims, Error> {
-        if self.components.is_empty() {
-            return Ok(Claims::new(&self.arena, vec![]));
+    /// Reserve `count` rows in every stored domain, in logical order, each
+    /// following that domain's `histories` claim (none for rows of a new
+    /// history; see [`Arena`] for placement). One domain's refusal releases
+    /// the rows already reserved in the others. Provisioning may add slabs,
+    /// so each history's end is read when claiming.
+    fn reserve(&self, histories: Option<&[Claims]>, count: usize) -> Result<Vec<Claims>, Error> {
+        self.reserve_rows(histories, &vec![count; self.domains.len()])
+    }
+
+    /// Reserve `counts[domain]` rows in every stored domain (see
+    /// [`StateStore::reserve`]).
+    fn reserve_rows(
+        &self,
+        histories: Option<&[Claims]>,
+        counts: &[usize],
+    ) -> Result<Vec<Claims>, Error> {
+        if self
+            .domains
+            .iter()
+            .zip(counts)
+            .any(|(domain, &count)| domain.arena.borrow().available() < count)
+        {
+            self.provision(
+                &self
+                    .history_domains()
+                    .zip(counts)
+                    .map(|(domain, &rows)| RowDemand { domain, rows })
+                    .collect::<Vec<_>>(),
+                0,
+            )?;
         }
-        let after = history.and_then(Claims::end);
-        let needs_preparation = self.arena.borrow().available() < count;
-        if needs_preparation {
-            self.provision(&[RowDemand { after, rows: count }], 0)?;
+        let mut reserved = Vec::with_capacity(self.domains.len());
+        for (index, (domain, &count)) in self.domains.iter().zip(counts).enumerate() {
+            let after = histories.and_then(|histories| histories[index].end());
+            let mut arena = domain.arena.borrow_mut();
+            let available_rows = arena.available();
+            if available_rows < count {
+                return Err(Error::Capacity {
+                    required: count as u64 * domain.row_bytes,
+                    available_bytes: available_rows as u64 * domain.row_bytes,
+                });
+            }
+            let ranges = arena.claim(after, count);
+            drop(arena);
+            reserved.push(Claims::new(&domain.arena, ranges));
         }
-        let after = history.and_then(Claims::end);
-        let mut arena = self.arena.borrow_mut();
-        let available_rows = arena.available();
-        if available_rows < count {
-            let capacity = self.history_capacity as u64;
-            let total_bytes = self.total_history_bytes();
-            return Err(Error::Capacity {
-                required: capacity_charge(count, total_bytes, capacity, true)?,
-                available_bytes: capacity_charge(available_rows, total_bytes, capacity, false)?,
-            });
-        }
-        let ranges = arena.claim(after, count);
-        drop(arena);
-        Ok(Claims::new(&self.arena, ranges))
+        Ok(reserved)
     }
 
     /// A free successor bank, committing more banks first when none is free
@@ -2353,12 +2602,13 @@ impl StateStore {
         self.transactions.begin()
     }
 
-    fn reserve_contiguous(&self, count: usize) -> Option<Claims> {
-        if count == 0 || self.components.is_empty() {
+    fn reserve_contiguous(&self, domain: HistoryDomainId, count: usize) -> Option<Claims> {
+        if count == 0 {
             return None;
         }
-        let start = self.arena.borrow_mut().claim_contiguous(count)?;
-        Some(Claims::new(&self.arena, vec![(start, count)]))
+        let arena = &self.domains[domain.0].arena;
+        let start = arena.borrow_mut().claim_contiguous(count)?;
+        Some(Claims::new(arena, vec![(start, count)]))
     }
 }
 
@@ -2376,7 +2626,7 @@ impl Holder<'_> {
             Self::Checkpoint(checkpoint) => &checkpoint.store,
         }
     }
-    fn claims(&self) -> &Claims {
+    fn claims(&self) -> &[Claims] {
         match self {
             Self::State(state) => &state.claims,
             Self::Checkpoint(checkpoint) => &checkpoint.claims,
@@ -2397,56 +2647,24 @@ impl Holder<'_> {
     }
 }
 
-fn validate_history_layout(
-    components: &[ComponentDescriptor],
-    history_capacity: usize,
-) -> Result<u64, LayoutError> {
-    let mut layers = BTreeSet::new();
-    let mut total_row_bytes = 0u64;
-    for component in components {
-        if !layers.insert(component.layer) {
-            return Err(LayoutError::DuplicateLayer(component.layer));
-        }
-        for plane in component.planes() {
-            let row_bytes = u64::try_from(plane.row_bytes)
-                .map_err(|_| LayoutError::ArithmeticOverflow("plane row bytes"))?;
-            row_bytes
-                .checked_mul(history_capacity as u64)
-                .ok_or(LayoutError::ArithmeticOverflow("history plane capacity"))?;
-            total_row_bytes = total_row_bytes
-                .checked_add(row_bytes)
-                .ok_or(LayoutError::ArithmeticOverflow("history row bytes"))?;
-        }
-    }
-    total_row_bytes
-        .checked_mul(history_capacity as u64)
-        .ok_or(LayoutError::ArithmeticOverflow("total history capacity"))?;
-    Ok(total_row_bytes)
+/// The rows of `ranges` (a history whose first row is at logical position
+/// `start`) at positions `from` and later.
+fn ranges_from(ranges: &[(usize, usize)], start: usize, from: usize) -> Vec<(usize, usize)> {
+    split_ranges(ranges, from.saturating_sub(start)).1
 }
 
-fn capacity_charge(
-    rows: usize,
-    total_bytes: u64,
-    history_capacity: u64,
-    round_up: bool,
-) -> Result<u64, LayoutError> {
-    let numerator = (rows as u64)
-        .checked_mul(total_bytes)
-        .ok_or(LayoutError::ArithmeticOverflow("state capacity charge"))?;
-    Ok(if round_up {
-        numerator.div_ceil(history_capacity)
-    } else {
-        numerator / history_capacity
-    })
-}
 pub struct SequenceState {
     store: Rc<StateStore>,
     position: usize,
     expected_end: usize,
+    /// The trim floor: no domain references rows before it.
     history_start: usize,
-    /// Claims on exactly the visible rows `[history_start, position)`, in
+    /// Per stored domain, the first position its history references: the
+    /// trim floor, or for Window(n) at least `position - n`.
+    starts: Vec<usize>,
+    /// Per stored domain, claims on exactly the rows `[start, position)`, in
     /// logical order; a live history.
-    claims: Claims,
+    claims: Vec<Claims>,
     bank: BankHandle,
     /// Rows of `bank`'s tape that complete the accepted recurrent state: the
     /// bank holds the state `tape` rows before `position`, and the next
@@ -2488,47 +2706,103 @@ impl SequenceState {
         self.expected_end = self.expected_end.max(position);
         Ok(())
     }
-    /// The arena row just past this sequence's last accepted row: where its
-    /// next rows continue its history without a new segment.
-    fn history_end(&self) -> Option<usize> {
-        self.claims.end()
+    /// This sequence's demand for appending `rows`: `rows` in every stored
+    /// domain, for provisioning a launch's backing before its advances
+    /// begin.
+    pub fn demands(&self, rows: usize) -> Vec<RowDemand> {
+        self.store
+            .history_domains()
+            .map(|domain| RowDemand { domain, rows })
+            .collect()
     }
-    /// This sequence's demand for appending `rows`, for provisioning a
-    /// launch's backing before its advances begin.
-    pub fn demand(&self, rows: usize) -> RowDemand {
-        RowDemand {
-            after: self.history_end(),
-            rows,
-        }
+    /// The rows this history references in one domain, in logical order:
+    /// positions `[history_start(domain), position)`.
+    pub fn history_ranges(&self, domain: HistoryDomainId) -> Vec<(usize, usize)> {
+        self.claims[domain.0].ranges()
     }
-    pub fn history_ranges(&self) -> Vec<(usize, usize)> {
-        self.claims.ranges()
+    /// Every domain's ranges, in domain order.
+    pub fn domain_ranges(&self) -> Vec<Vec<(usize, usize)>> {
+        self.claims.iter().map(Claims::ranges).collect()
     }
-    /// Stop seeing rows before logical position `before`. Exactly the trimmed
-    /// rows lose this sequence's reference.
+    /// The logical position of the first row this history references in a
+    /// domain.
+    pub fn history_start(&self, domain: HistoryDomainId) -> usize {
+        self.starts[domain.0]
+    }
+    /// The referenced rows of a domain at positions `from` and later: the
+    /// visible rows of a query whose window begins at `from`.
+    pub fn visible_ranges(&self, domain: HistoryDomainId, from: usize) -> Vec<(usize, usize)> {
+        ranges_from(&self.history_ranges(domain), self.starts[domain.0], from)
+    }
+    /// The most spans any domain's history has.
+    pub fn span_count(&self) -> usize {
+        self.claims
+            .iter()
+            .map(|claims| claims.entry(|entry| entry.ranges.len()))
+            .max()
+            .unwrap_or(0)
+    }
+    /// Stop seeing rows before logical position `before` in every domain.
+    /// Exactly the trimmed rows lose this sequence's reference.
     pub fn trim_history(&mut self, before: usize) -> Result<(), String> {
         if before < self.history_start || before > self.position {
             return Err("history trim must lie within accepted logical positions".into());
         }
-        if !self.store.components.is_empty() {
-            self.claims.drop_front(before - self.history_start);
-        }
         self.history_start = before;
+        self.trim();
         Ok(())
     }
 
-    /// At the launch segment limit: the next advance could start one more
-    /// run, so the history is repacked before its next launch.
-    pub fn compaction_needed(&self) -> bool {
-        self.history_ranges().len() >= self.store.max_visible_spans()
+    /// Release each domain's references before its first retained position:
+    /// the trim floor, and for Window(n) `position - n`.
+    fn trim(&mut self) {
+        for ((domain, claims), start) in self
+            .store
+            .domains
+            .iter()
+            .zip(&mut self.claims)
+            .zip(&mut self.starts)
+        {
+            let retained = domain.history_start(self.position, self.history_start);
+            if retained > *start {
+                claims.drop_front(retained - *start);
+                *start = retained;
+            }
+        }
     }
 
+    /// The first domain whose history is at its span bound: the next
+    /// advance could start one more span, so that history is repacked
+    /// before its next launch.
+    pub fn compaction_needed(&self) -> Option<HistoryDomainId> {
+        self.store
+            .history_domains()
+            .find(|&domain| self.history_ranges(domain).len() >= self.store.span_bound(domain))
+    }
+
+    /// The growth each domain needing compaction may claim for its
+    /// destination: its whole history.
+    pub fn compaction_demands(&self) -> Vec<RowDemand> {
+        self.store
+            .history_domains()
+            .filter(|&domain| self.history_ranges(domain).len() >= self.store.span_bound(domain))
+            .map(|domain| RowDemand {
+                domain,
+                rows: self.claims[domain.0].rows(),
+            })
+            .collect()
+    }
+
+    /// A checkpoint at this position: it references the same rows (for
+    /// Window(n), rows `[position - n, position)`), which forks and resumed
+    /// requests share without copying.
     pub fn checkpoint(&self) -> StateCheckpoint {
         self.store.owners.set(self.store.owners.get() + 1);
         StateCheckpoint {
             store: self.store.clone(),
             position: self.position,
             history_start: self.history_start,
+            starts: self.starts.clone(),
             claims: self.claims.clone(),
             bank: self.bank.clone(),
             tape: self.tape,
@@ -2620,7 +2894,8 @@ pub struct StateCheckpoint {
     store: Rc<StateStore>,
     position: usize,
     history_start: usize,
-    claims: Claims,
+    starts: Vec<usize>,
+    claims: Vec<Claims>,
     bank: BankHandle,
     tape: usize,
 }
@@ -2668,12 +2943,18 @@ impl StateCheckpoint {
     pub fn store(&self) -> &Rc<StateStore> {
         &self.store
     }
-    pub fn history_ranges(&self) -> Vec<(usize, usize)> {
-        self.claims.ranges()
+    pub fn history_ranges(&self, domain: HistoryDomainId) -> Vec<(usize, usize)> {
+        self.claims[domain.0].ranges()
     }
+    pub fn history_start(&self, domain: HistoryDomainId) -> usize {
+        self.starts[domain.0]
+    }
+    /// A live sequence sharing every row this checkpoint references.
     pub fn fork(&self) -> SequenceState {
         let claims = self.claims.clone();
-        claims.set_live(true);
+        for claims in &claims {
+            claims.set_live(true);
+        }
         self.store.owners.set(self.store.owners.get() + 1);
         self.store.sequences.set(self.store.sequences.get() + 1);
         SequenceState {
@@ -2681,32 +2962,90 @@ impl StateCheckpoint {
             position: self.position,
             expected_end: self.position,
             history_start: self.history_start,
+            starts: self.starts.clone(),
             claims,
             bank: self.bank.clone(),
             tape: self.tape,
         }
     }
 }
-/// Publish `count` rows whose recurrent version is (`following`, `tape`).
+/// Publish `count` rows, one per stored domain in `claims`, whose recurrent
+/// version is (`following`, `tape`), then release the rows each window
+/// domain no longer references.
 fn install_commit(
     state: &mut SequenceState,
-    claims: Claims,
+    claims: Vec<Claims>,
     following: &mut BankHandle,
     tape: usize,
     count: usize,
 ) {
     // Appending moves references: what a checkpoint or fork sharing this
     // history's rows sees never changes.
-    state.claims.append(claims);
+    for (history, claims) in state.claims.iter_mut().zip(claims) {
+        history.append(claims);
+    }
     std::mem::swap(&mut state.bank, following);
     state.tape = tape;
     state.position += count;
+    state.trim();
 }
+
+#[cfg(test)]
+mod domain_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use seismic::{BackendName, DeviceCatalog};
+    use std::cell::Ref;
+
+    /// The one domain of a Qwen-shaped store.
+    const TOKEN: HistoryDomainId = HistoryDomainId(0);
+
+    /// A store of one Token domain (none without components), as Qwen's
+    /// target and head stores are.
+    fn token_store(
+        device: Rc<Device>,
+        context: usize,
+        rows: usize,
+        components: Vec<ComponentDescriptor>,
+        specs: Vec<ComponentSpec>,
+        banks: BankCapacity,
+    ) -> Result<Rc<StateStore>, Error> {
+        let domains = if components.is_empty() {
+            vec![]
+        } else {
+            vec![HistoryDomainPlan {
+                layout: HistoryDomainLayout::Token { components },
+                logical_rows: rows,
+            }]
+        };
+        StateStore::new(device, context, context, domains, specs, banks)
+    }
+
+    impl StateStore {
+        fn arena(&self) -> &Rc<RefCell<Arena>> {
+            &self.domains[TOKEN.0].arena
+        }
+
+        fn history_slabs(&self) -> Ref<'_, SlabTensor> {
+            Ref::map(self.backing.borrow(), |backing| {
+                &backing.history[TOKEN.0].slabs
+            })
+        }
+    }
+
+    /// One past the highest backed row and bank, as the one-domain store
+    /// reported them.
+    fn committed_extent(store: &StateStore) -> (usize, usize) {
+        (
+            store
+                .history_domains()
+                .next()
+                .map_or(0, |domain| store.committed_rows(domain)),
+            store.committed_banks(),
+        )
+    }
 
     fn cpu_device() -> Option<Rc<Device>> {
         DeviceCatalog::discover()
@@ -2813,7 +3152,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             8192,
             8192,
@@ -2829,11 +3168,11 @@ mod tests {
             },
         )
         .unwrap();
-        store.add_history_slabs(1).unwrap();
+        store.add_history_slabs(TOKEN, 1).unwrap();
         store.add_bank_slabs(1).unwrap();
-        let rows = store.history_slab_rows();
-        let _low = claim_rows(&store.arena, 0, 1);
-        let high = claim_rows(&store.arena, rows, 1);
+        let rows = store.history_slab_rows(TOKEN);
+        let _low = claim_rows(&store.arena(), 0, 1);
+        let high = claim_rows(&store.arena(), rows, 1);
         let mut claims = (0..4)
             .map(|_| Some(store.banks.acquire().unwrap()))
             .collect::<Vec<_>>();
@@ -2842,7 +3181,7 @@ mod tests {
         let bank = claims[3].as_ref().unwrap();
         let before = (
             device.memory_usage().charged,
-            store.committed(),
+            committed_extent(&store),
             high.ranges(),
             bank.index(),
             store.bank_placement_generation(),
@@ -2859,7 +3198,7 @@ mod tests {
         assert_eq!(
             (
                 device.memory_usage().charged,
-                store.committed(),
+                committed_extent(&store),
                 high.ranges(),
                 bank.index(),
                 store.bank_placement_generation(),
@@ -2874,7 +3213,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             8192,
             8192,
@@ -2887,8 +3226,8 @@ mod tests {
             },
         )
         .unwrap();
-        store.add_history_slabs(2).unwrap();
-        let occupied = claim_rows(&store.arena, 0, 1);
+        store.add_history_slabs(TOKEN, 2).unwrap();
+        let occupied = claim_rows(&store.arena(), 0, 1);
         let before = device.memory_usage().charged;
         assert!(
             store
@@ -2900,11 +3239,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .backing
-                .borrow()
-                .history
-                .as_ref()
-                .unwrap()
+                .history_slabs()
                 .slabs()
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>(),
@@ -2915,11 +3250,7 @@ mod tests {
         store.shrink(ShrinkPolicy::Idle).unwrap();
         assert_eq!(
             store
-                .backing
-                .borrow()
-                .history
-                .as_ref()
-                .unwrap()
+                .history_slabs()
                 .slabs()
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>(),
@@ -2949,7 +3280,7 @@ mod tests {
     }
 
     fn reclaim_compacts_partial_final_history_and_bank_slabs_on(device: Rc<Device>) {
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             5000,
             5000,
@@ -2965,20 +3296,16 @@ mod tests {
             },
         )
         .unwrap();
-        store.add_history_slabs(1).unwrap();
+        store.add_history_slabs(TOKEN, 1).unwrap();
         store.add_bank_slabs(1).unwrap();
-        let rows = store.history_slab_rows();
+        let rows = store.history_slab_rows(TOKEN);
         assert!(rows < 5000);
         assert_eq!(store.bank_slab_banks(), 4);
-        let _low = claim_rows(&store.arena, 0, 2);
-        let high = claim_rows(&store.arena, rows, 1);
+        let _low = claim_rows(&store.arena(), 0, 2);
+        let high = claim_rows(&store.arena(), rows, 1);
         let history_value = vec![29u8; 4096 * 4];
         store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .region_rows(0, rows as u64, 1)
             .unwrap()
             .write_from_host(&history_value)
@@ -2993,16 +3320,12 @@ mod tests {
         write_bank(&store, bank.index(), &bank_value);
         let before = device.memory_usage().charged;
         assert!(store.shrink(ShrinkPolicy::Reclaim).unwrap() > 0);
-        assert_eq!(store.committed(), (rows, 4));
+        assert_eq!(committed_extent(&store), (rows, 4));
         assert!(high.ranges()[0].0 < rows);
         assert!(bank.index() < 4);
         assert_eq!(
             store
-                .backing
-                .borrow()
-                .history
-                .as_ref()
-                .unwrap()
+                .history_slabs()
                 .region_rows(0, high.ranges()[0].0 as u64, 1)
                 .unwrap()
                 .read_to_host()
@@ -3040,7 +3363,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             8192,
             8192,
@@ -3053,28 +3376,20 @@ mod tests {
             },
         )
         .unwrap();
-        store.add_history_slabs(2).unwrap();
-        let rows = store.history_slab_rows();
-        let _low = claim_rows(&store.arena, 0, rows);
-        let sparse = claim_rows(&store.arena, rows, 1);
-        let _high = claim_rows(&store.arena, 2 * rows, rows - 1);
+        store.add_history_slabs(TOKEN, 2).unwrap();
+        let rows = store.history_slab_rows(TOKEN);
+        let _low = claim_rows(&store.arena(), 0, rows);
+        let sparse = claim_rows(&store.arena(), rows, 1);
+        let _high = claim_rows(&store.arena(), 2 * rows, rows - 1);
         let value = vec![43u8; 4096 * 4];
         store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .region_rows(0, rows as u64, 1)
             .unwrap()
             .write_from_host(&value)
             .unwrap();
         let slab_bytes = store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .slab_bytes();
         let charged = device.memory_usage().charged;
         device.set_memory_limit(Some(charged));
@@ -3083,20 +3398,12 @@ mod tests {
         assert_eq!(store.compactions().history_rows, 1);
         assert_eq!(sparse.ranges(), vec![(3 * rows - 1, 1)]);
         assert!(store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .slab(1)
             .is_none());
         assert_eq!(
             store
-                .backing
-                .borrow()
-                .history
-                .as_ref()
-                .unwrap()
+                .history_slabs()
                 .region_rows(0, (3 * rows - 1) as u64, 1)
                 .unwrap()
                 .read_to_host()
@@ -3110,7 +3417,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             8192,
             8192,
@@ -3123,11 +3430,11 @@ mod tests {
             },
         )
         .unwrap();
-        store.add_history_slabs(2).unwrap();
-        let rows = store.history_slab_rows();
-        let _low = claim_rows(&store.arena, 0, rows);
-        let sparse = claim_rows(&store.arena, rows, 1);
-        let _high = claim_rows(&store.arena, 2 * rows, rows - 1);
+        store.add_history_slabs(TOKEN, 2).unwrap();
+        let rows = store.history_slab_rows(TOKEN);
+        let _low = claim_rows(&store.arena(), 0, rows);
+        let sparse = claim_rows(&store.arena(), rows, 1);
+        let _high = claim_rows(&store.arena(), 2 * rows, rows - 1);
         let before_charge = device.memory_usage().charged;
         let before_ranges = sparse.ranges();
         let before_stats = store.compactions();
@@ -3142,11 +3449,7 @@ mod tests {
         assert_eq!(store.compactions(), before_stats);
         assert_eq!(device.memory_usage().charged, before_charge);
         assert!(store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .slab(1)
             .is_some());
     }
@@ -3156,7 +3459,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             4096,
             4096,
@@ -3170,35 +3473,23 @@ mod tests {
         )
         .unwrap();
         let slab_bytes = store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .slab_bytes();
         let binding = store.history_planes().unwrap()[0].buffer.clone();
         let charged = device.memory_usage().charged;
         assert!(store.shrink(ShrinkPolicy::Reclaim).is_err());
         assert!(store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .slab(0)
             .is_some());
         assert_eq!(device.memory_usage().charged, charged);
         drop(binding);
         let pinned = store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .region_rows(0, 0, 1)
             .unwrap();
         assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 0);
-        assert_eq!(store.committed().0, 0);
+        assert_eq!(committed_extent(&store).0, 0);
         assert_eq!(device.memory_usage().charged, charged);
         assert_eq!(store.external_pinned_bytes().unwrap(), slab_bytes);
         assert_eq!(
@@ -3293,7 +3584,7 @@ mod tests {
             // under a noisy test host. Never substitute an accelerator here.
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device,
             4,
             8,
@@ -3307,14 +3598,14 @@ mod tests {
         )
         .unwrap();
         assert!(store.history_allocated());
-        assert_eq!(store.committed().0, 8);
-        assert_eq!(store.total_history_row_bytes(), 32);
-        assert_eq!(store.total_history_bytes(), 256);
+        assert_eq!(committed_extent(&store).0, 8);
+        assert_eq!(store.history_row_bytes(TOKEN), 32);
+        assert_eq!(store.allocation_trace().unwrap().history[0].bytes, 256);
 
         store
             .provision(
                 &[RowDemand {
-                    after: None,
+                    domain: TOKEN,
                     rows: 1,
                 }],
                 0,
@@ -3343,20 +3634,23 @@ mod tests {
             .all(|(left, right)| left.buffer.shares_allocation(&right.buffer)));
     }
 
-    #[test]
-    fn capacity_error_uses_all_plane_bytes() {
-        let row_bytes = validate_history_layout(&[dense_component(4)], 8).unwrap();
-        let total_bytes = row_bytes * 8;
-        assert_eq!(capacity_charge(3, total_bytes, 8, true).unwrap(), 96);
-        assert_eq!(capacity_charge(2, total_bytes, 8, false).unwrap(), 64);
+    fn validate(plans: Vec<HistoryDomainPlan>) -> Result<(), Error> {
+        domain::validate_domains(plans, 2, 1).map(|_| ())
+    }
+
+    fn token(components: Vec<ComponentDescriptor>, logical_rows: usize) -> HistoryDomainPlan {
+        HistoryDomainPlan {
+            layout: HistoryDomainLayout::Token { components },
+            logical_rows,
+        }
     }
 
     #[test]
     fn store_rejects_total_capacity_overflow_before_allocation() {
         let component = dense_component(usize::MAX / 4);
         assert!(matches!(
-            validate_history_layout(&[component], 2),
-            Err(LayoutError::ArithmeticOverflow(_))
+            validate(vec![token(vec![component], 2)]),
+            Err(Error::Layout(LayoutError::ArithmeticOverflow(_)))
         ));
     }
 
@@ -3364,8 +3658,71 @@ mod tests {
     fn duplicate_layer_descriptors_are_rejected() {
         let component = dense_component(4);
         assert!(matches!(
-            validate_history_layout(&[component.clone(), component], 2),
-            Err(LayoutError::DuplicateLayer(LayerRef::Target(0)))
+            validate(vec![token(vec![component.clone(), component], 2)]),
+            Err(Error::Layout(LayoutError::DuplicateLayer(LayerRef::Target(0))))
+        ));
+        // A layer belongs to one domain, stored or shared.
+        assert!(matches!(
+            validate(vec![
+                token(vec![dense_component(4)], 2),
+                HistoryDomainPlan {
+                    layout: HistoryDomainLayout::Shared {
+                        source: LayerRef::Target(0),
+                        layers: vec![LayerRef::Target(0)],
+                    },
+                    logical_rows: 0,
+                },
+            ]),
+            Err(Error::Layout(LayoutError::DuplicateLayer(LayerRef::Target(0))))
+        ));
+    }
+
+    #[test]
+    fn domain_layouts_are_validated() {
+        let shared = |source, logical_rows| HistoryDomainPlan {
+            layout: HistoryDomainLayout::Shared {
+                source,
+                layers: vec![LayerRef::Target(5)],
+            },
+            logical_rows,
+        };
+        assert!(matches!(
+            validate(vec![token(vec![dense_component(4)], 2), shared(LayerRef::Target(3), 0)]),
+            Err(Error::Layout(LayoutError::UnknownSharedSource(LayerRef::Target(3))))
+        ));
+        assert!(matches!(
+            validate(vec![token(vec![dense_component(4)], 2), shared(LayerRef::Target(0), 2)]),
+            Err(Error::Layout(LayoutError::SharedDomainRows(LayerRef::Target(0))))
+        ));
+        assert!(validate(vec![token(vec![dense_component(4)], 2), shared(LayerRef::Target(0), 0)]).is_ok());
+        assert!(matches!(
+            validate(vec![HistoryDomainPlan {
+                layout: HistoryDomainLayout::Window {
+                    rows: 0,
+                    components: vec![dense_component(4)],
+                },
+                logical_rows: 2,
+            }]),
+            Err(Error::Layout(LayoutError::ZeroWindow))
+        ));
+        assert!(matches!(
+            validate(vec![token(vec![], 2)]),
+            Err(Error::Layout(LayoutError::EmptyHistoryDomain))
+        ));
+        // A Token domain reserves at least a context of rows.
+        assert!(matches!(
+            validate(vec![token(vec![dense_component(4)], 1)]),
+            Err(Error::Request(_))
+        ));
+        assert!(matches!(
+            validate(vec![HistoryDomainPlan {
+                layout: HistoryDomainLayout::Block {
+                    rate: 4,
+                    components: vec![dense_component(4)],
+                },
+                logical_rows: 2,
+            }]),
+            Err(Error::UnsupportedHistoryDomain(HistoryDomainKind::Block { rate: 4 }))
         ));
     }
 
@@ -3407,7 +3764,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device,
             8,
             8,
@@ -3434,11 +3791,11 @@ mod tests {
         assert_eq!(advance.bindings().previous_bank, original);
         assert_ne!(advance.bindings().following_bank, original);
         assert!(advance.bindings().recurrent[0].shares_allocation(&store.recurrent_arenas()[0]));
-        assert_eq!(store.occupied_rows(), 3);
+        assert_eq!(store.occupied_rows(TOKEN), 3);
         let state = advance.abort();
         assert_eq!(state.position(), 0);
         assert_eq!(state.bank_index(), original);
-        assert_eq!(store.occupied_rows(), 0);
+        assert_eq!(store.occupied_rows(TOKEN), 0);
 
         let advance = OwnedStateAdvance::begin_speculative(state, 3, 1)
             .ok()
@@ -3449,12 +3806,12 @@ mod tests {
         };
         assert_eq!(state.position(), 2);
         assert_eq!((state.bank_index(), state.tape_rows()), (successor, 1));
-        assert_eq!(store.occupied_rows(), 2);
+        assert_eq!(store.occupied_rows(TOKEN), 2);
         assert_eq!(checkpoint.position(), 0);
         let checkpoint_fork = checkpoint.fork();
         assert_eq!(checkpoint_fork.position(), 0);
         assert_eq!(checkpoint_fork.bank_index(), original);
-        assert!(checkpoint_fork.history_ranges().is_empty());
+        assert!(checkpoint_fork.history_ranges(TOKEN).is_empty());
         drop(checkpoint_fork);
 
         let advance = OwnedStateAdvance::begin(state, 2).ok().unwrap();
@@ -3462,18 +3819,18 @@ mod tests {
             panic!("zero prefix must abort");
         };
         assert_eq!(state.position(), 2);
-        assert_eq!(store.occupied_rows(), 2);
+        assert_eq!(store.occupied_rows(TOKEN), 2);
         // A plain advance has no interior recurrent version.
         let advance = OwnedStateAdvance::begin(state, 2).ok().unwrap();
         let (state, _) = advance.commit(1).err().unwrap();
         assert_eq!((state.position(), state.tape_rows()), (2, 1));
-        assert_eq!(store.occupied_rows(), 2);
+        assert_eq!(store.occupied_rows(TOKEN), 2);
         let advance = OwnedStateAdvance::begin(state, 2).ok().unwrap();
         let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap() else {
             panic!("full prefix must commit");
         };
         assert_eq!(state.position(), 4);
-        assert_eq!(store.occupied_rows(), 4);
+        assert_eq!(store.occupied_rows(TOKEN), 4);
     }
 
     /// Shared system prompt, two divergent requests and retained checkpoints
@@ -3484,7 +3841,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             64,
             256,
@@ -3500,7 +3857,7 @@ mod tests {
             },
         )
         .unwrap();
-        let row = store.total_history_row_bytes();
+        let row = store.history_row_bytes(TOKEN);
         let bank = store.allocation_trace().unwrap().recurrent_bank_bytes;
         let commit = |state: SequenceState, rows: usize| {
             let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
@@ -3513,18 +3870,18 @@ mod tests {
         // The system prompt is one prefill run.
         let prompt = commit(store.create().unwrap(), 24);
         let system = prompt.checkpoint();
-        assert_eq!(system.history_ranges(), [(0, 24)]);
+        assert_eq!(system.history_ranges(TOKEN), [(0, 24)]);
         // Request A continues the path; requests B and C branch at the prompt.
         let a = commit(prompt, 8);
         let b = commit(system.fork(), 6);
         let c = commit(system.fork(), 3);
         let a_turn = a.checkpoint();
-        assert_eq!(a.history_ranges(), [(0, 32)]);
+        assert_eq!(a.history_ranges(TOKEN), [(0, 32)]);
         for branch in [&b, &c] {
-            assert_eq!(branch.history_ranges()[0], (0, 24));
-            assert_eq!(branch.history_ranges().len(), 2);
+            assert_eq!(branch.history_ranges(TOKEN)[0], (0, 24));
+            assert_eq!(branch.history_ranges(TOKEN).len(), 2);
         }
-        assert_eq!(store.occupied_rows(), 24 + 8 + 6 + 3);
+        assert_eq!(store.occupied_rows(TOKEN), 24 + 8 + 6 + 3);
         let census = store
             .holding_census(
                 &[Holder::State(&a), Holder::State(&b), Holder::State(&c)],
@@ -3593,7 +3950,7 @@ mod tests {
             32 * row + 2 * bank
         );
         drop((system, a_turn));
-        assert_eq!(store.occupied_rows(), 0);
+        assert_eq!(store.occupied_rows(TOKEN), 0);
     }
 
     /// A history without room in place is relaid out, not split: the
@@ -3604,7 +3961,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device,
             8,
             8,
@@ -3636,20 +3993,20 @@ mod tests {
         // Placement: first [0, 2), middle mid-hole at [4, 6), last [2, 4).
         let checkpoint = first.checkpoint();
         drop(last);
-        assert_eq!(middle.history_ranges(), [(4, 2)]);
+        assert_eq!(middle.history_ranges(TOKEN), [(4, 2)]);
         // Two free rows follow `first`, so its third new row uses another span.
         let advance = OwnedStateAdvance::begin(first, 3).ok().unwrap();
-        assert_eq!(store.committed().0, 8);
-        assert_eq!(advance.bindings().destinations, [2, 3, 6]);
-        assert_eq!(middle.history_ranges(), [(4, 2)]);
+        assert_eq!(committed_extent(&store).0, 8);
+        assert_eq!(advance.bindings().destinations[0], [2, 3, 6]);
+        assert_eq!(middle.history_ranges(TOKEN), [(4, 2)]);
         let OwnedAdvanceResolution::Committed(first) = advance.commit(2).ok().unwrap() else {
             panic!("attention prefix must commit without repair");
         };
         assert_eq!(first.position(), 4);
-        assert_eq!(first.history_ranges(), [(0, 4)]);
+        assert_eq!(first.history_ranges(TOKEN), [(0, 4)]);
         assert_eq!(checkpoint.position(), 2);
-        assert_eq!(checkpoint.fork().history_ranges(), [(0, 2)]);
-        assert_eq!(store.occupied_rows(), 6);
+        assert_eq!(checkpoint.fork().history_ranges(TOKEN), [(0, 2)]);
+        assert_eq!(store.occupied_rows(TOKEN), 6);
         assert_eq!(middle.position(), 2);
     }
 
@@ -3658,7 +4015,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device,
             8,
             8,
@@ -3720,7 +4077,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device,
             16,
             16,
@@ -3761,7 +4118,7 @@ mod tests {
         store
             .provision(
                 &[2, 1, 3].map(|rows| RowDemand {
-                    after: Some(0),
+                    domain: TOKEN,
                     rows,
                 }),
                 3,
@@ -3804,7 +4161,7 @@ mod tests {
         assert!(!readable(&[&left, &right, &parent], &[&root, &branch]).contains(&following));
         drop(advance);
         drop((left, right, parent, root, branch));
-        assert_eq!(store.available_banks(), store.committed().1 - 1);
+        assert_eq!(store.available_banks(), committed_extent(&store).1 - 1);
     }
 
     #[test]
@@ -3812,7 +4169,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device,
             8,
             8,
@@ -3858,14 +4215,14 @@ mod tests {
     /// A sequence whose 17 visible rows are the even rows 0..34, with every
     /// row outside `free` and the sequence held by filler claims.
     fn fragmented(store: &Rc<StateStore>, free: &[(usize, usize)]) -> (SequenceState, Vec<Claims>) {
-        let rows = store.history_capacity();
+        let rows = store.history_capacity(TOKEN);
         store
-            .provision(&[RowDemand { after: None, rows }], 0)
+            .provision(&[RowDemand { domain: TOKEN, rows }], 0)
             .unwrap();
-        assert_eq!(store.committed().0, rows);
+        assert_eq!(committed_extent(&store).0, rows);
         let mut state = store.create().unwrap();
         let even = (0..17).map(|row| (row * 2, 1)).collect::<Vec<_>>();
-        state.claims.append(history(&store.arena, &even));
+        state.claims[0].append(history(&store.arena(), &even));
         state.position = 17;
         let held = |row: usize| {
             (row < 34 && row % 2 == 0)
@@ -3873,9 +4230,9 @@ mod tests {
                     .iter()
                     .any(|(start, count)| *start <= row && row < start + count)
         };
-        let fillers = (0..store.history_capacity())
+        let fillers = (0..store.history_capacity(TOKEN))
             .filter(|row| !held(*row))
-            .map(|row| claim_rows(&store.arena, row, 1))
+            .map(|row| claim_rows(&store.arena(), row, 1))
             .collect();
         assert_eq!(store.available_rows(), free.iter().map(|(_, n)| n).sum());
         (state, fillers)
@@ -3886,7 +4243,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device,
             64,
             64,
@@ -3912,19 +4269,19 @@ mod tests {
             buffer.write_from_host(&bytes).unwrap();
         }
 
-        assert!(state.compaction_needed());
-        let old_ranges = state.history_ranges();
+        assert!(state.compaction_needed().is_some());
+        let old_ranges = state.history_ranges(TOKEN);
         let OwnedCompactionPreparation::Ready(failed) =
-            OwnedCompaction::prepare(state, 64).ok().unwrap()
+            OwnedCompaction::prepare(state, TOKEN, 64).ok().unwrap()
         else {
             panic!("contiguous destination must prepare compaction")
         };
         // A failed copy submission aborts its owned destination.
         let state = failed.abort();
-        assert_eq!(state.history_ranges(), old_ranges);
+        assert_eq!(state.history_ranges(TOKEN), old_ranges);
 
         let OwnedCompactionPreparation::Ready(compaction) =
-            OwnedCompaction::prepare(state, 64).ok().unwrap()
+            OwnedCompaction::prepare(state, TOKEN, 64).ok().unwrap()
         else {
             panic!("released destination must be reusable")
         };
@@ -3945,8 +4302,8 @@ mod tests {
             buffer.write_from_host(&bytes).unwrap();
         }
         let state = compaction.commit();
-        assert_eq!(state.history_ranges(), [(40, 17)]);
-        assert!(!state.compaction_needed());
+        assert_eq!(state.history_ranges(TOKEN), [(40, 17)]);
+        assert!(!state.compaction_needed().is_some());
         for plane in store.history_planes().unwrap() {
             let bytes = plane.buffer.read_to_host().unwrap();
             for (logical, row) in (40..57).enumerate() {
@@ -3963,7 +4320,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device,
             64,
             64,
@@ -3977,17 +4334,17 @@ mod tests {
         )
         .unwrap();
         let (state, _fillers) = fragmented(&store, &[(40, 8), (50, 9)]);
-        assert!(state.compaction_needed());
+        assert!(state.compaction_needed().is_some());
         let OwnedCompactionPreparation::Deferred {
             state,
             segments,
             visible_rows,
-        } = OwnedCompaction::prepare(state, 64).ok().unwrap()
+        } = OwnedCompaction::prepare(state, TOKEN, 64).ok().unwrap()
         else {
             panic!("fragmented capacity must defer compaction");
         };
         assert_eq!((segments, visible_rows), (17, 17));
-        assert_eq!(state.history_ranges().len(), 17);
+        assert_eq!(state.history_ranges(TOKEN).len(), 17);
     }
 
     #[test]
@@ -3995,7 +4352,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             64,
             64,
@@ -4009,7 +4366,7 @@ mod tests {
         )
         .unwrap();
         let (state, _fillers) = fragmented(&store, &[(40, 8), (50, 9)]);
-        let demand = [state.demand(9)];
+        let demand = state.demands(9);
         let claim = store.growth_claim(&demand, 0).unwrap();
         assert_eq!(claim.minimum_bytes, 0);
         let charged = device.memory_usage().charged;
@@ -4028,7 +4385,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device,
             512,
             1024,
@@ -4044,7 +4401,7 @@ mod tests {
         store
             .provision(
                 &[RowDemand {
-                    after: None,
+                    domain: TOKEN,
                     rows: 1024,
                 }],
                 0,
@@ -4053,20 +4410,20 @@ mod tests {
         // A 200-row prefix (retained by a checkpoint), then 16 one-row runs
         // separated by rows other histories hold.
         let mut state = store.create().unwrap();
-        state.claims.append(claim_rows(&store.arena, 0, 200));
+        state.claims[0].append(claim_rows(&store.arena(), 0, 200));
         state.position = 200;
         let prefix = state.checkpoint();
         let mut fillers = Vec::new();
         for run in 0..16 {
             let row = 300 + 2 * run;
-            fillers.push(claim_rows(&store.arena, row + 1, 1));
-            state.claims.append(claim_rows(&store.arena, row, 1));
+            fillers.push(claim_rows(&store.arena(), row + 1, 1));
+            state.claims[0].append(claim_rows(&store.arena(), row, 1));
             state.position += 1;
         }
-        assert_eq!(state.history_ranges().len(), store.max_visible_spans());
-        assert!(state.compaction_needed());
+        assert_eq!(state.history_ranges(TOKEN).len(), store.span_bound(TOKEN));
+        assert!(state.compaction_needed().is_some());
         let OwnedCompactionPreparation::Ready(compaction) =
-            OwnedCompaction::prepare(state, 64).ok().unwrap()
+            OwnedCompaction::prepare(state, TOKEN, 64).ok().unwrap()
         else {
             panic!("the recent runs fit one bounded copy")
         };
@@ -4079,10 +4436,10 @@ mod tests {
         // The first free run that fits is the one right after the prefix.
         assert_eq!(copy.to, (200..216).collect::<Vec<_>>());
         let state = compaction.commit();
-        assert_eq!(state.history_ranges(), [(0, 216)]);
-        assert_eq!(prefix.history_ranges(), [(0, 200)]);
+        assert_eq!(state.history_ranges(TOKEN), [(0, 216)]);
+        assert_eq!(prefix.history_ranges(TOKEN), [(0, 200)]);
         // The moved runs' rows are free again; the prefix is held once.
-        assert_eq!(store.occupied_rows(), 200 + 16 + fillers.len());
+        assert_eq!(store.occupied_rows(TOKEN), 200 + 16 + fillers.len());
     }
 
     /// Lock-step serving of `active` requests for `steps` steps: chunked
@@ -4096,7 +4453,7 @@ mod tests {
         const CONTEXT: usize = 512;
         const BATCH_ROWS: usize = 64;
         let device = cpu_device().expect("the CPU backend is available");
-        let store = StateStore::new(
+        let store = token_store(
             device,
             CONTEXT,
             contexts * CONTEXT + BATCH_ROWS,
@@ -4130,7 +4487,7 @@ mod tests {
             let plane = store.history_planes().unwrap()[0].buffer.clone();
             let rows = request
                 .state
-                .history_ranges()
+                .history_ranges(TOKEN)
                 .into_iter()
                 .flat_map(|(start, count)| start..start + count)
                 .map(|row| {
@@ -4185,13 +4542,13 @@ mod tests {
             // The launch provisions the backing for all of its advances.
             let demands = planned
                 .iter()
-                .map(|(_, request, rows)| RowDemand {
-                    after: request.state.history_end(),
+                .map(|(_, _, rows)| RowDemand {
+                    domain: TOKEN,
                     rows: *rows,
                 })
                 .collect::<Vec<_>>();
             store.provision(&demands, 0).unwrap();
-            peak_committed = peak_committed.max(store.committed().0);
+            peak_committed = peak_committed.max(committed_extent(&store).0);
             let mut advances = Vec::with_capacity(active);
             for (index, request, rows) in planned {
                 let advance = match OwnedStateAdvance::begin(request.state, rows) {
@@ -4199,7 +4556,7 @@ mod tests {
                     Err((_, error)) => panic!("step {step}: {error}"),
                 };
                 let plane = &advance.bindings().history[0].buffer;
-                for (offset, &row) in advance.bindings().destinations.iter().enumerate() {
+                for (offset, &row) in advance.bindings().destinations[0].iter().enumerate() {
                     let value = tag(request.serial, advance.position() + offset);
                     plane
                         .slice_leading(row as u64, row as u64 + 1)
@@ -4228,7 +4585,7 @@ mod tests {
                 };
                 written += accepted;
                 let decode_steps = decode_steps + usize::from(decode);
-                max_segments = max_segments.max(state.history_ranges().len());
+                max_segments = max_segments.max(state.history_ranges(TOKEN).len());
                 max_decode_steps = max_decode_steps.max(decode_steps);
                 let request = Request {
                     serial,
@@ -4248,7 +4605,7 @@ mod tests {
             let mut ranges = slots
                 .iter()
                 .flatten()
-                .flat_map(|request| request.state.history_ranges())
+                .flat_map(|request| request.state.history_ranges(TOKEN))
                 .collect::<Vec<_>>();
             ranges.sort_unstable();
             assert!(
@@ -4257,10 +4614,10 @@ mod tests {
                     .all(|pair| pair[0].0 + pair[0].1 <= pair[1].0),
                 "live histories overlap"
             );
-            let committed = store.committed().0;
+            let committed = committed_extent(&store).0;
             peak_committed = peak_committed.max(committed);
             assert!(
-                store.occupied_rows() <= committed,
+                store.occupied_rows(TOKEN) <= committed,
                 "claims lie in committed rows"
             );
         }
@@ -4273,7 +4630,7 @@ mod tests {
             segments: max_segments,
             decode_steps: max_decode_steps,
             peak_committed,
-            released_to: store.committed().0,
+            released_to: committed_extent(&store).0,
             written,
         }
     }
@@ -4286,7 +4643,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             16384,
             16384,
@@ -4305,26 +4662,26 @@ mod tests {
         let charged = || device.memory_usage().charged;
         let base = charged();
         assert_eq!(
-            store.committed(),
-            (store.history_slab_rows(), store.bank_slab_banks().min(49))
+            committed_extent(&store),
+            (store.history_slab_rows(TOKEN), store.bank_slab_banks().min(49))
         );
         // A 1,000-row prefill commits exactly one slab.
         let advance = OwnedStateAdvance::begin(store.create().unwrap(), 1000)
             .ok()
             .unwrap();
-        let rows = store.committed().0;
-        assert_eq!(rows, store.history_slab_rows());
+        let rows = committed_extent(&store).0;
+        assert_eq!(rows, store.history_slab_rows(TOKEN));
         // Growth is refused while a transaction holds the tensors.
         store
             .provision(
                 &[RowDemand {
-                    after: None,
+                    domain: TOKEN,
                     rows: 5000,
                 }],
                 8,
             )
             .unwrap();
-        assert_eq!(store.committed().0, rows);
+        assert_eq!(committed_extent(&store).0, rows);
         let written = (0..1000u32)
             .flat_map(|row| (row as f32).to_le_bytes().repeat(4096))
             .collect::<Vec<_>>();
@@ -4341,7 +4698,7 @@ mod tests {
         assert_eq!(grown, base);
         // Without transactions, growth commits more rows and banks and keeps
         // the accepted rows' contents.
-        let demand = [state.demand(10000)];
+        let demand = state.demands(10000);
         let claim = store.growth_claim(&demand, 8).unwrap();
         assert!(claim.preferred_bytes >= claim.minimum_bytes);
         assert!(claim.minimum_bytes > 0);
@@ -4353,11 +4710,11 @@ mod tests {
                 seismic::ExecutionError::AllocationCapacity { .. }
             )))
         ));
-        assert_eq!(store.committed().0, rows);
-        assert_eq!(state.history_ranges(), [(0, 1000)]);
+        assert_eq!(committed_extent(&store).0, rows);
+        assert_eq!(state.history_ranges(TOKEN), [(0, 1000)]);
         device.set_memory_limit(previous_limit);
         store.provision(&demand, 8).unwrap();
-        let (rows, banks) = store.committed();
+        let (rows, banks) = committed_extent(&store);
         assert!(rows >= 11000 && rows <= 16384, "committed {rows} rows");
         assert!(banks >= 9, "committed {banks} banks");
         assert!(charged() > grown);
@@ -4370,19 +4727,19 @@ mod tests {
                 .unwrap(),
             written
         );
-        assert_eq!(state.history_ranges(), [(0, 1000)]);
+        assert_eq!(state.history_ranges(TOKEN), [(0, 1000)]);
         // A launch binding must be released before placement changes.
         drop(plane);
         let before = charged();
         let released = store.shrink(ShrinkPolicy::Reclaim).unwrap();
         assert_eq!(released, before.saturating_sub(charged()));
-        assert!(store.committed().0 < rows);
-        assert!(store.committed().0 >= 1000);
+        assert!(committed_extent(&store).0 < rows);
+        assert!(committed_extent(&store).0 >= 1000);
         assert_eq!(store.external_pinned_bytes().unwrap(), 0);
         drop(state);
         // Idle hysteresis keeps a small backing; reclaim releases it all.
         store.shrink(ShrinkPolicy::Reclaim).unwrap();
-        assert_eq!(store.committed().0, 0);
+        assert_eq!(committed_extent(&store).0, 0);
         store.release_idle().unwrap();
         assert!(charged() < base);
     }
@@ -4393,7 +4750,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             32768,
             32768,
@@ -4409,34 +4766,26 @@ mod tests {
         let encoded = (0..1024u32)
             .flat_map(|value| (value as f32).to_le_bytes())
             .collect::<Vec<_>>();
-        {
-            let backing = store.backing.borrow();
-            backing
-                .history
-                .as_ref()
-                .unwrap()
-                .region_rows(0, 0, 1)
-                .unwrap()
-                .write_from_host(&encoded)
-                .unwrap();
-        }
+        store
+            .history_slabs()
+            .region_rows(0, 0, 1)
+            .unwrap()
+            .write_from_host(&encoded)
+            .unwrap();
         let baseline = device.memory_usage().charged;
         device.set_memory_limit(Some(baseline));
         assert!(matches!(
-            store.add_history_slabs(1),
+            store.add_history_slabs(TOKEN, 1),
             Err(Error::Tensor(seismic::TensorError::Execution(
                 seismic::ExecutionError::AllocationCapacity { .. }
             )))
         ));
         device.set_memory_limit(None);
-        assert_eq!(store.committed().0, store.history_slab_rows());
+        assert_eq!(committed_extent(&store).0, store.history_slab_rows(TOKEN));
         assert_eq!(device.memory_usage().charged, baseline);
-        let backing = store.backing.borrow();
         assert_eq!(
-            backing
-                .history
-                .as_ref()
-                .unwrap()
+            store
+                .history_slabs()
                 .region_rows(0, 0, 1)
                 .unwrap()
                 .read_to_host()
@@ -4450,7 +4799,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             8192,
             8192,
@@ -4467,17 +4816,13 @@ mod tests {
         )
         .unwrap();
         let demand = [RowDemand {
-            after: None,
-            rows: store.history_slab_rows() + 1,
+            domain: TOKEN,
+            rows: store.history_slab_rows(TOKEN) + 1,
         }];
         let baseline = device.memory_usage().charged;
-        let committed = store.committed();
+        let committed = committed_extent(&store);
         let history_bytes = store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .slab_bytes();
         let bank_bytes = store
             .backing
@@ -4498,15 +4843,15 @@ mod tests {
             )))
         ));
         device.set_memory_limit(None);
-        assert_eq!(store.committed(), committed);
+        assert_eq!(committed_extent(&store), committed);
         assert_eq!(device.memory_usage().charged, baseline);
-        assert_eq!(store.arena.borrow().backed, BTreeSet::from([0]));
+        assert_eq!(store.arena().borrow().backed, BTreeSet::from([0]));
 
         store
             .provision_with_growth(&demand, 4, GrowthChoice::Minimum)
             .unwrap();
-        assert_eq!(store.arena.borrow().backed, BTreeSet::from([0, 1]));
-        assert_eq!(store.committed().1, committed.1 + store.bank_slab_banks());
+        assert_eq!(store.arena().borrow().backed, BTreeSet::from([0, 1]));
+        assert_eq!(committed_extent(&store).1, committed.1 + store.bank_slab_banks());
         assert_eq!(
             device.memory_usage().charged,
             baseline + history_bytes + bank_bytes
@@ -4523,7 +4868,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device,
             4096,
             4 * 4096,
@@ -4540,7 +4885,7 @@ mod tests {
         )
         .unwrap();
         let step = |state: SequenceState, rows: usize| {
-            store.provision(&[state.demand(rows)], 1).unwrap();
+            store.provision(&state.demands(rows), 1).unwrap();
             let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
             let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap()
             else {
@@ -4551,10 +4896,10 @@ mod tests {
         };
         let mut state = step(store.create().unwrap(), 500);
         let _prompt = state.checkpoint();
-        let mut committed = store.committed();
+        let mut committed = committed_extent(&store);
         for _ in 0..300 {
             state = step(state, 1);
-            let now = store.committed();
+            let now = committed_extent(&store);
             assert!(
                 now.0 >= committed.0 && now.1 >= committed.1,
                 "decode shrank the backing from {committed:?} to {now:?}"
@@ -4570,7 +4915,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             4096,
             8192,
@@ -4587,7 +4932,7 @@ mod tests {
         let commit = |state: SequenceState, rows: usize| {
             let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
             let plane = &advance.bindings().history[0].buffer;
-            for (offset, &row) in advance.bindings().destinations.iter().enumerate() {
+            for (offset, &row) in advance.bindings().destinations[0].iter().enumerate() {
                 plane
                     .slice_leading(row as u64, row as u64 + 1)
                     .unwrap()
@@ -4623,13 +4968,13 @@ mod tests {
         let system = prompt.checkpoint();
         let long = commit(prompt, 50);
         let short = commit(system.fork(), 20);
-        let long_ranges = long.history_ranges();
-        let system_ranges = system.history_ranges();
-        let short_ranges = short.history_ranges();
-        assert!(long.history_ranges()[0].0 >= store.history_slab_rows());
+        let long_ranges = long.history_ranges(TOKEN);
+        let system_ranges = system.history_ranges(TOKEN);
+        let short_ranges = short.history_ranges(TOKEN);
+        assert!(long.history_ranges(TOKEN)[0].0 >= store.history_slab_rows(TOKEN));
         drop(large);
-        let before = (store.committed().0, device.memory_usage().charged);
-        let occupied = store.occupied_rows();
+        let before = (committed_extent(&store).0, device.memory_usage().charged);
+        let occupied = store.occupied_rows(TOKEN);
         assert_eq!(occupied, 100 + 50 + 20);
         // Reclaim copies only into space held by the store and succeeds when
         // the device refuses all new allocations.
@@ -4637,40 +4982,32 @@ mod tests {
         let released = store.shrink(ShrinkPolicy::Reclaim).unwrap();
         device.set_memory_limit(None);
         assert!(released > 0);
-        assert!(store.committed().0 <= before.0);
+        assert!(committed_extent(&store).0 <= before.0);
         assert!(device.memory_usage().charged < before.1);
         assert_eq!(store.compactions(), Compactions::default());
-        assert_eq!(read(long.history_ranges()), expected(150));
+        assert_eq!(read(long.history_ranges(TOKEN)), expected(150));
         assert_eq!(store.compactions().count, 0);
         assert!(device.memory_usage().charged < before.1);
-        assert_eq!(store.occupied_rows(), occupied);
-        assert_eq!(long.history_ranges(), long_ranges);
-        assert_eq!(system.history_ranges(), system_ranges);
-        assert_eq!(short.history_ranges(), short_ranges);
-        assert_eq!(read(long.history_ranges()), expected(150));
-        assert_eq!(read(short.history_ranges()), expected(120));
-        assert_eq!(read(system.history_ranges()), expected(100));
+        assert_eq!(store.occupied_rows(TOKEN), occupied);
+        assert_eq!(long.history_ranges(TOKEN), long_ranges);
+        assert_eq!(system.history_ranges(TOKEN), system_ranges);
+        assert_eq!(short.history_ranges(TOKEN), short_ranges);
+        assert_eq!(read(long.history_ranges(TOKEN)), expected(150));
+        assert_eq!(read(short.history_ranges(TOKEN)), expected(120));
+        assert_eq!(read(system.history_ranges(TOKEN)), expected(100));
         let demand = [RowDemand {
-            after: None,
-            rows: store.history_slab_rows(),
+            domain: TOKEN,
+            rows: store.history_slab_rows(TOKEN),
         }];
         let claim = store.growth_claim(&demand, 0).unwrap();
         let slab_bytes = store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .slab_bytes();
         assert_eq!(claim.minimum_bytes, slab_bytes);
         assert_eq!(claim.preferred_bytes, slab_bytes);
         store.provision(&demand, 0).unwrap();
         assert!(store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .slab(0)
             .is_some());
     }
@@ -4688,7 +5025,7 @@ mod tests {
                 continue;
             };
             let device = Rc::new(device);
-            let store = StateStore::new(
+            let store = token_store(
                 device.clone(),
                 8192,
                 8192,
@@ -4701,43 +5038,31 @@ mod tests {
                 },
             )
             .unwrap();
-            let slab_rows = store.history_slab_rows();
-            store.add_history_slabs(2).unwrap();
-            let _low = claim_rows(&store.arena, 0, 1);
-            let high = claim_rows(&store.arena, 2 * slab_rows + 1, 1);
+            let slab_rows = store.history_slab_rows(TOKEN);
+            store.add_history_slabs(TOKEN, 2).unwrap();
+            let _low = claim_rows(&store.arena(), 0, 1);
+            let high = claim_rows(&store.arena(), 2 * slab_rows + 1, 1);
             let value = (19f32).to_le_bytes().repeat(4096);
             store
-                .backing
-                .borrow()
-                .history
-                .as_ref()
-                .unwrap()
+                .history_slabs()
                 .region_rows(0, (2 * slab_rows + 1) as u64, 1)
                 .unwrap()
                 .write_from_host(&value)
                 .unwrap();
             let slab_bytes = store
-                .backing
-                .borrow()
-                .history
-                .as_ref()
-                .unwrap()
+                .history_slabs()
                 .slab_bytes();
             let charged = device.memory_usage().charged;
             device.set_memory_limit(Some(charged));
             assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 2 * slab_bytes);
             device.set_memory_limit(None);
-            assert_eq!(store.committed().0, slab_rows);
+            assert_eq!(committed_extent(&store).0, slab_rows);
             assert_eq!(store.compactions().history_rows, 1);
             let moved = high.ranges()[0].0;
             assert!(moved < slab_rows);
             assert_eq!(
                 store
-                    .backing
-                    .borrow()
-                    .history
-                    .as_ref()
-                    .unwrap()
+                    .history_slabs()
                     .region_rows(0, moved as u64, 1)
                     .unwrap()
                     .read_to_host()
@@ -4760,7 +5085,7 @@ mod tests {
                 continue;
             };
             let device = Rc::new(device);
-            let store = StateStore::new(
+            let store = token_store(
                 device.clone(),
                 64,
                 256,
@@ -4829,7 +5154,7 @@ mod tests {
             let released = store.shrink(ShrinkPolicy::Reclaim).unwrap();
             device.set_memory_limit(None);
             assert!(released > 0);
-            assert_eq!(store.committed().1, 4);
+            assert_eq!(committed_extent(&store).1, 4);
             let after = placed();
             assert!(after.iter().all(|&slot| slot < 4));
             assert!(store.bank_placement_generation() > generation);
@@ -4848,7 +5173,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             64,
             64,
@@ -4919,7 +5244,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             64,
             64,
@@ -4961,7 +5286,7 @@ mod tests {
         assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 2 * slab_bytes);
         device.set_memory_limit(None);
         assert_eq!(high.index(), 1);
-        assert_eq!(store.committed().1, 4);
+        assert_eq!(committed_extent(&store).1, 4);
         assert_eq!(store.compactions().banks, 1);
         assert_eq!(
             store.recurrent_arenas()[0]
@@ -4978,7 +5303,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             64,
             64,
@@ -5044,7 +5369,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             64,
             64,
@@ -5096,7 +5421,7 @@ mod tests {
     #[test]
     fn later_copy_failure_preserves_both_placements_values_and_charge() {
         let Some(device) = cpu_device() else { return };
-        let store = StateStore::new(
+        let store = token_store(
             device.clone(),
             8192,
             8192,
@@ -5112,19 +5437,15 @@ mod tests {
             },
         )
         .unwrap();
-        store.add_history_slabs(2).unwrap();
+        store.add_history_slabs(TOKEN, 2).unwrap();
         store.add_bank_slabs(2).unwrap();
-        let rows = store.history_slab_rows();
-        let _low = claim_rows(&store.arena, 0, rows);
-        let sparse = claim_rows(&store.arena, rows, 1);
-        let _high = claim_rows(&store.arena, 2 * rows, rows - 1);
+        let rows = store.history_slab_rows(TOKEN);
+        let _low = claim_rows(&store.arena(), 0, rows);
+        let sparse = claim_rows(&store.arena(), rows, 1);
+        let _high = claim_rows(&store.arena(), 2 * rows, rows - 1);
         let history_value = vec![41u8; 4096 * 4];
         store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .region_rows(0, rows as u64, 1)
             .unwrap()
             .write_from_host(&history_value)
@@ -5144,11 +5465,7 @@ mod tests {
         let before_generation = store.bank_placement_generation();
         let before_stats = store.compactions();
         let before_history_slabs = store
-            .backing
-            .borrow()
-            .history
-            .as_ref()
-            .unwrap()
+            .history_slabs()
             .slabs()
             .count();
         let before_bank_slabs = store
@@ -5188,11 +5505,7 @@ mod tests {
         assert_eq!(store.compactions(), before_stats);
         assert_eq!(
             store
-                .backing
-                .borrow()
-                .history
-                .as_ref()
-                .unwrap()
+                .history_slabs()
                 .slabs()
                 .count(),
             before_history_slabs
@@ -5211,11 +5524,7 @@ mod tests {
         assert_eq!(device.memory_usage().charged, before_charge);
         assert_eq!(
             store
-                .backing
-                .borrow()
-                .history
-                .as_ref()
-                .unwrap()
+                .history_slabs()
                 .region_rows(0, rows as u64, 1)
                 .unwrap()
                 .read_to_host()

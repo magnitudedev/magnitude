@@ -3,6 +3,8 @@ applies_to:
   - inference/engine/artifacts/**
   - inference/engine/families/**
   - inference/engine/executor/**
+  - inference/engine/chat/src/artifacts.rs
+  - inference/engine/chat/src/tokenizer.rs
 ---
 
 # Model input boundary
@@ -23,11 +25,19 @@ representation, never a malformed artifact. Artifact preparation does not assign
 position-table interpolation. A family adapter consumes
 the model definition, token plan, and generic prepared media to create one closed numerical input
 contract. The contract contains the final token coordinates, media spans, patch order, attention
-coordinates, and position-encoding interpolation indices and coefficients needed by execution.
+coordinates, attention window ranges, and position-encoding interpolation indices and coefficients
+needed by execution.
 The adapter is configured with tokenizer-derived family marker identities before it prepares a
 request; the model definition and media alone cannot identify those tokens.
 For text-only input, the same closed contract records the family-supplied coordinates directly;
 constructing it performs alignment checks and does not derive coordinate semantics.
+
+The tokenizer is adapted from the container's tokenizer facts, never from the model family: the
+declared scheme selects one implemented profile, and an unimplemented scheme or uninterpreted
+tokenizer metadata is an unsupported representation. Implicit sequence-start insertion is such a
+fact. A tokenizer that begins every sequence with its BOS applies it exactly once: a prompt whose
+rendered text already begins with the BOS (templates that render it) is not given a second one.
+End-of-generation and never-generated tokens are likewise tokenizer facts.
 
 Generic execution validates shapes and bounds against the model definition and consumes the
 prepared contract. It does not repeat family-specific spatial derivation or infer semantic meaning
@@ -43,4 +53,6 @@ identity, so both sides name one package. Live device resources remain worker-co
 - Any valid GGUF header, split or not, parses; a split package plans and loads as one package.
 - The family adapter computes every spatial value consumed by the vision lane.
 - A prepared numerical input cannot contain mismatched token, span, media, or patch domains.
+- A prepared prompt holds the tokenizer's implicit BOS exactly once, and no BOS otherwise beyond
+  what the template renders.
 - Execution performs no model-family coordinate or interpolation calculation.

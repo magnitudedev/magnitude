@@ -64,9 +64,10 @@ must also fit the working set's remaining bytes. The observation already exclude
 charges and other processes' use, so an existing charge is never subtracted again. A load onto a
 dedicated device also claims its staged uploads against host RAM under the host's reserve.
 
-State is stored in fixed-size history and bank slabs on every backend. The 64 MiB slab target is
-fixed for an engine build and contributes to its build identity. A growth claim covers one
-new slab, which joins the store without copying existing rows or banks. The store releases an empty
+State is stored in fixed-size history and bank slabs on every backend: one history slab tensor per
+history domain of a store, and one bank slab tensor. The 64 MiB slab target is fixed for an engine
+build and contributes to its build identity. A growth claim covers one new slab per domain that
+needs one, each joining its domain without copying existing rows or banks. The store releases an empty
 slab without a new claim. A slab bound by submitted work remains charged until that work and its
 binding views finish; its holding class reflects its strongest remaining holder. Reclamation
 receives credit only for a decrease in Seismic's measured charge, never for the removal of a state
@@ -148,7 +149,8 @@ kill is independent fault containment; it chooses nothing to release.
 - Threshold values exist in one policy definition; no code path reads an OS pressure signal.
 - Stable fit capacity is capacity under process limits (and the Metal working set) less the
   planning reserve.
-- State growth allocates exactly one claimed slab without copying existing history or banks.
+- State growth allocates exactly one claimed slab per growing domain without copying existing
+  history or banks.
 - Reclaim releases empty slabs and compacts referenced rows and banks into free space in held slabs
   without a new claim, including on Metal, Vulkan, CPU and CUDA.
 - Startup, lazy component and state-growth allocations all claim from the one device heap.
@@ -157,11 +159,23 @@ kill is independent fault containment; it chooses nothing to release.
 
 Logical state ownership and physical backing are separate authorities. The
 model-state subsystem owns logical histories, recurrent banks, codec components and references.
-Each store has history slabs and bank slabs. A history slab contains fixed-offset regions for every
-history component; a bank slab contains complete recurrent banks. Row numbers identify a slab and
-an offset within it. Every history span lies within one slab. Free space is tracked within each
-slab, and a freed slab index may be reused. Callers retain logical identities and published
-placement snapshots, never mutable physical bank indices.
+Each store has history slabs for each of its history domains and bank slabs. A history domain is a
+set of attention layers sharing one row numbering: Token (a row per token of the context),
+Window(n) (a history references its last `n` rows plus tentative rows) or Shared (no storage; its
+layers read a source layer's regions). A history slab contains fixed-offset regions for every
+component of its domain; a bank slab contains complete recurrent banks, whose bytes follow from
+their components (convolution windows, gated delta and F32 state-space states, and their tapes).
+Row numbers identify a slab of their domain and an offset within it. Every history span lies within
+one slab. Free space is tracked within each slab, and a freed slab index may be reused. A Window(n)
+history releases its references on rows before `n` behind its accepted position after each
+advance; those rows are ordinary free space, and a slab left empty is released by the rules below.
+Callers retain logical identities and published placement snapshots, never mutable physical bank
+indices.
+
+Assessment charges history per domain at slab granularity: a Token domain by the rows of the
+assessed context, and a Window(n) domain by its steady footprint of `n` plus one advance per live
+history and `n` per checkpoint, independent of the context, rounded up to whole slabs of the
+domain.
 
 Compaction is the single mechanism for moving referenced rows or claimed banks. It plans
 destinations in free space of slabs already held, submits all copies, waits for completion, then

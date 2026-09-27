@@ -389,9 +389,12 @@ impl TemplateBundle {
     /// Reuse exact header inspection for bundles with identical literal
     /// variants and special tokens. Preparation still uses this bundle's own
     /// sources; the cache contains only the immutable inspection result.
+    /// Each bundle has its own cell: the map is locked only to find it, so
+    /// distinct bundles are inspected concurrently and equal ones once.
     pub fn inspect_cached(&self) -> Result<TemplateInspection, String> {
+        type Inspection = std::sync::Arc<std::sync::OnceLock<Result<TemplateInspection, String>>>;
         static INSPECTIONS: std::sync::OnceLock<
-            Mutex<std::collections::HashMap<Vec<u8>, Result<TemplateInspection, String>>>,
+            Mutex<std::collections::HashMap<Vec<u8>, Inspection>>,
         > = std::sync::OnceLock::new();
         let sources = self
             .variants
@@ -400,11 +403,15 @@ impl TemplateBundle {
             .collect::<Vec<_>>();
         let key = serde_json::to_vec(&(&sources, &self.default, &self.special_tokens))
             .map_err(|error| error.to_string())?;
-        let cache = INSPECTIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-        let mut cache = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.entry(key).or_insert_with(|| self.inspect()).clone()
+        let inspection = std::sync::Arc::clone(
+            INSPECTIONS
+                .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key)
+                .or_default(),
+        );
+        inspection.get_or_init(|| self.inspect()).clone()
     }
 
     /// The default variant's source text.

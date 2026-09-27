@@ -612,7 +612,8 @@ pub struct PackedRowLayout {
     /// Row planes in storage order.
     pub planes: Vec<RowPlaneInfo>,
     /// Storage groups per row round up to a multiple of this (`mma16`
-    /// stores whole 64-column k-blocks).
+    /// stores whole 64-column k-blocks, and whole 16-byte chunks of every
+    /// code plane).
     pub group_multiple: u32,
 }
 
@@ -1280,7 +1281,8 @@ pub(crate) mod internals {
         // values, odd grid magnitude `g` <= 15) is q6k's with `s' = 1 + 2 s`
         // and `c = 32 ± g`. An IQ4_NL packet is eight consecutive 32-value
         // blocks (one iq4g32 storage group), each block's f16 scale widened
-        // exactly.
+        // exactly. Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4 move their codes and
+        // scale fields bit for bit into representations of their own.
         let external_specs = [
             ("gguf_q3_k", 110, 256, "q6k"),
             ("gguf_iq3_s", 110, 256, "q6k"),
@@ -1290,6 +1292,11 @@ pub(crate) mod internals {
             ("gguf_q8_0", 34, 32, "q8g32s"),
             ("gguf_iq4_nl", 144, 256, "iq4g32"),
             ("gguf_iq4_xs", 136, 256, "iq4g32"),
+            ("gguf_q4_0", 18, 32, "q4g32s"),
+            ("gguf_q5_0", 22, 32, "q5g32s"),
+            ("gguf_q5_1", 24, 32, "q5g32"),
+            ("gguf_mxfp4", 17, 32, "mxfp4g32"),
+            ("gguf_nvfp4", 36, 64, "nvfp4g16"),
         ];
         for (name, packet_size, logical_group, _) in external_specs {
             representations.push(RepresentationInfo {
@@ -1674,7 +1681,24 @@ pub(crate) mod internals {
                     "`{}` groups do not tile 64-column k-blocks",
                     repr.name
                 );
-                (block / group).max(1)
+                // Whole 64-column k-blocks, and a whole number of 16-byte
+                // chunks in every code plane of a row: the GEMM stages a
+                // tile's code planes in 16-byte pieces, which must not
+                // straddle two rows (a 32-value group's one-bit high plane
+                // is 4 bytes, so its rows hold groups in fours).
+                let gcd = |mut a: u32, mut b: u32| {
+                    while b != 0 {
+                        (a, b) = (b, a % b);
+                    }
+                    a
+                };
+                planes.iter().fold((block / group).max(1), |multiple, plane| {
+                    let chunk = 16 / gcd(16, plane.bytes_per_group);
+                    match plane.content {
+                        RowPlaneContent::Codes { .. } => multiple / gcd(multiple, chunk) * chunk,
+                        RowPlaneContent::Groups { .. } => multiple,
+                    }
+                })
             }
             Layout::Packet => unreachable!("a row layout is never `packet`"),
         };
@@ -1705,6 +1729,15 @@ pub(crate) mod internals {
                 }
             })
             .collect()
+    }
+
+    /// The resident E2M1 code of the GGUF nibble at source bit `bit` (code 8,
+    /// E2M1 -0, becomes ggml's +0).
+    fn e2m1_positive_zero(bit: u32) -> RepackExpr {
+        RepackExpr::Lookup {
+            index: Box::new(RepackExpr::SourceBits { bit, width: 4 }),
+            table: &crate::external_tables::E2M1_POSITIVE_ZERO,
+        }
     }
 
     fn external_repack_recipe(
@@ -2034,6 +2067,92 @@ pub(crate) mod internals {
                     ),
                 ));
             }
+            "gguf_q4_0" => {
+                // block_q4_0: d (f16) | qs[16]. Value p is the low (p < 16)
+                // or high nibble of qs[p % 16]; d moves bit for bit.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..128)
+                            .map(|bit| {
+                                let position = bit / 4;
+                                (2 + position % 16) * 8 + (position / 16) * 4 + bit % 4
+                            })
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+            }
+            "gguf_mxfp4" => {
+                // block_mxfp4: e (E8M0) | qs[16]. Value p is the low (p < 16)
+                // or high nibble of qs[p % 16], with ggml's +0 for code 8;
+                // e moves bit for bit.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::PackedEntries(
+                        (0..32)
+                            .map(|p| e2m1_positive_zero((1 + p % 16) * 8 + (p / 16) * 4))
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "block_scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 1)),
+                ));
+            }
+            "gguf_q5_0" | "gguf_q5_1" => {
+                // block_q5_0: d (f16) | qh[4] | qs[16]; block_q5_1: d | m
+                // (f16) | qh[4] | qs[16]. Value p: the low (p < 16) or high
+                // nibble of qs[p % 16], and bit p of qh as its fifth bit.
+                let minimum = source_name == "gguf_q5_1";
+                let high = if minimum { 4 } else { 2 };
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..160)
+                            .map(|bit| {
+                                let (position, code_bit) = (bit / 5, bit % 5);
+                                if code_bit < 4 {
+                                    (high + 4 + position % 16) * 8 + (position / 16) * 4 + code_bit
+                                } else {
+                                    high * 8 + position
+                                }
+                            })
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+                if minimum {
+                    push(plane("bias", PlaneRepackRecipe::BitRoutes(direct_bits(2, 2))));
+                }
+            }
+            "gguf_nvfp4" => {
+                // block_nvfp4: d[4] (UE4M3) | qs[32]. Value p of sixteen-value
+                // sub-block s = p / 16, w = p % 16, is the low (w < 8) or high
+                // nibble of qs[8 s + w % 8], with ggml's +0 for code 8; scale
+                // s is d[s].
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::PackedEntries(
+                        (0..64)
+                            .map(|p| {
+                                let (block, within) = (p / 16, p % 16);
+                                e2m1_positive_zero((4 + 8 * block + within % 8) * 8 + (within / 8) * 4)
+                            })
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "block_scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 4)),
+                ));
+            }
             _ => panic!("unknown external representation `{source_name}`"),
         }
         recipes.sort_by_key(|(index, _)| *index);
@@ -2138,10 +2257,6 @@ pub(crate) mod internals {
                     }
                 }
                 PlaneRepackRecipe::PackedEntries(values) => {
-                    assert!(
-                        matches!(plane.encoding, PlaneEncoding::Packed { .. }),
-                        "packed-entry conversion recipe targets a non-packed plane"
-                    );
                     assert_eq!(
                         u32::try_from(values.len())
                             .ok()
@@ -2149,18 +2264,19 @@ pub(crate) mod internals {
                         Some(plane_bits),
                         "packed-entry conversion does not initialize its entire plane"
                     );
-                    let PlaneEncoding::Packed {
-                        bits,
-                        interpretation,
-                    } = &plane.encoding
-                    else {
-                        unreachable!("checked above")
-                    };
-                    let (low, high) = match interpretation {
-                        CodeInterpretation::TwosComplement => {
-                            (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
+                    // Integer codes, or the raw payloads of a floating code.
+                    let (bits, low, high) = match &plane.encoding {
+                        PlaneEncoding::Packed {
+                            bits,
+                            interpretation: CodeInterpretation::TwosComplement,
+                        } => (*bits, -(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1),
+                        PlaneEncoding::Packed { bits, .. } => (*bits, 0, (1i64 << bits) - 1),
+                        PlaneEncoding::FloatCode { format } => {
+                            (format.bits(), 0, (1i64 << format.bits()) - 1)
                         }
-                        _ => (0, (1i64 << bits) - 1),
+                        PlaneEncoding::Dense(_) => {
+                            panic!("packed-entry conversion recipe targets a dense plane")
+                        }
                     };
                     for expression in values {
                         validate_expr(expression, source_bits);
@@ -2599,6 +2715,24 @@ mod tests {
         );
         assert_eq!(canonical_bytes(q8_mma, &[2, 17, 96]), Some(2 * 32 * 144));
         assert_eq!(canonical_bytes(q8_mma, &[96]), None);
+        // mma16 rows hold whole k-blocks and whole 16-byte chunks of every
+        // code plane: a 32-value group's one-bit high plane (4 bytes) takes
+        // groups in fours, so Gemma's K = 704 stores 24 groups.
+        for (name, multiple) in [
+            ("q4k@mma16", 1),
+            ("q6k@mma16", 1),
+            ("iq4g32@mma16", 1),
+            ("q8g32s@mma16", 2),
+            ("q4g32s@mma16", 2),
+            ("mxfp4g32@mma16", 2),
+            ("nvfp4g16@mma16", 1),
+            ("q5g32s@mma16", 4),
+            ("q5g32@mma16", 4),
+        ] {
+            assert_eq!(row_layout(name).group_multiple, multiple, "{name}");
+        }
+        assert_eq!(row_layout("q5g32@mma16").row_groups(704), Some(24));
+        assert_eq!(row_layout("q5g32@rows16").row_groups(704), Some(22));
     }
 
     /// `mma16` code placement re-derived from the PTX m16n8k16 A fragment:

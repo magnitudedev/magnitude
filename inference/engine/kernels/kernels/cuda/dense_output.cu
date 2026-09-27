@@ -9,7 +9,8 @@
 #include "lib/projection/projection.cuh"
 
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
-using Epi = projection::Residual<projection::SelectedRows>;
+using Scaling = projection::scaling<(SEISMIC_DIM_DS != 0)>;
+using Epi = Scaling::type<projection::Residual<projection::SelectedRows>>;
 
 #define PRODUCT Pro{SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT), SEISMIC_PRODUCT_STRIDE_0, projection::AllRows{}}
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
@@ -17,11 +18,12 @@ using Epi = projection::Residual<projection::SelectedRows>;
 #define DOWN KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT))
 #define PARTIALS reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS))
 #define EPILOGUE                                                                                          \
-    Epi {                                                                                                 \
-        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0,  \
-            projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))}, \
-            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), SEISMIC_RESULT_0_STRIDE_0    \
-    }
+    Scaling::wrap(                                                                                        \
+        projection::Residual<projection::SelectedRows>{                                                   \
+            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0, \
+            projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))},    \
+            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), SEISMIC_RESULT_0_STRIDE_0},     \
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_SCALE), SEISMIC_DIM_DS, 0, 0), 1.0f)
 
 // The GEMV over NB column blocks of 8 rows.
 template <int NB, int KSPLIT>

@@ -13,8 +13,8 @@ use super::*;
 pub(super) struct QualificationView<'a> {
     programs: &'a AttestedPrograms,
     plan: &'a ProgramPlan,
-    geometry: &'a magnitude_family_contracts::DecoderGeometry,
-    vision: Option<&'a magnitude_family_contracts::VisionGeometry>,
+    geometry: &'a magnitude_family_contracts::Decoder,
+    vision: Option<&'a magnitude_family_contracts::VisionDescription>,
     load: &'a crate::ModelLoadPlan,
 }
 
@@ -22,8 +22,8 @@ impl<'a> QualificationView<'a> {
     pub(super) fn new(
         programs: &'a AttestedPrograms,
         plan: &'a ProgramPlan,
-        geometry: &'a magnitude_family_contracts::DecoderGeometry,
-        vision: Option<&'a magnitude_family_contracts::VisionGeometry>,
+        geometry: &'a magnitude_family_contracts::Decoder,
+        vision: Option<&'a magnitude_family_contracts::VisionDescription>,
         load: &'a crate::ModelLoadPlan,
     ) -> Self {
         Self {

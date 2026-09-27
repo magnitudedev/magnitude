@@ -12,8 +12,9 @@ coordinates, visibility, destinations, demands, selection controls, and physical
 once, then produces an opaque domain-specific batch. A row's visible history spans keep the
 history's logical order and must not share a row; their addresses need not ascend. The state
 store coalesces logically adjacent spans within one slab, and batching preserves its boundaries
-so no span crosses a slab. The span class limit is the loaded store's bound,
-`ceil(context limit / rows per slab) + 16`.
+so no span crosses a slab. The span class limit is the largest span bound of the loaded store's
+history domains, each `ceil(row limit / rows per slab) + 16` (see
+[state transactions](state-transactions.md)).
 Its row tables are the only upload source;
 programs encode each graph's inputs from them directly, with no separate packed control image.
 Selection masks are shared with their producer rather than copied into the batch, and an

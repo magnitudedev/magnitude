@@ -4,7 +4,9 @@
 // scratch, one work item per row. `readout_selected_rows_rows` gives each work
 // item ROWS selected vocabulary rows; the selected weight rows are not
 // adjacent, so each is one single-row component call per normalized row.
+// Logits are softcapped when `softcap` > 0.
 
+use lib::core::functions;
 use lib::projection::projection;
 
 fn readout_selected_rows_normalize<L: Isa, E: Elements>(
@@ -59,14 +61,16 @@ fn readout_selected_rows_rows<L: Isa, E: Elements>(
         cx.scratch_quantized()
             .slice::<seismic::cpu::quant::Q8Block>(0, o * blocks)
     });
+    let cap = cx.arg_softcap();
     for column in columns {
         let vocabulary = selected.get([column]) as usize;
         for (row, x) in normalized.chunks_exact(d).enumerate() {
             let mut logit = [0.0f32];
             let q8 = quantized.map(|q8| &q8[row * blocks..(row + 1) * blocks]);
             projection::project_arithmetic(&weight, vocabulary, x, q8, &mut logit);
+            let logit = if cap > 0.0 { functions::softcap(cap, logit[0]) } else { logit[0] };
             // SAFETY: each work item writes its own columns of every row.
-            unsafe { result.set([row, column], logit[0]) };
+            unsafe { result.set([row, column], logit) };
         }
     }
 }

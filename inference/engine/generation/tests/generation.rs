@@ -67,6 +67,7 @@ fn options() -> Options {
         context_limit: 32,
         vocabulary: 100,
         stop_tokens: BTreeSet::from([TokenId(99)]),
+        suppressed_tokens: BTreeSet::new(),
         sampling: Sampling::Greedy,
         shaping: Shaping {
             temperature: 0.0,
