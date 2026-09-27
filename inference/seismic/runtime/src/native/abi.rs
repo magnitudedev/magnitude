@@ -245,52 +245,13 @@ pub(crate) fn render_source(
     )
 }
 
-/// One Metal launch source. The asset guards each templated kernel with its
-/// `SEISMIC_FORMING_<kernel>` name. Code variants become explicit template
-/// instantiations in one library; runtime parameter values never enter it.
-pub(crate) fn render_metal_launch_source(
-    logical: &LogicalEntry,
-    bindings: &ElementBindings,
-    implementation: &NativeImplementation,
-    specialization: &NativeSpecialization,
-    asset: &str,
-    launch_source: &super::plan::LaunchSource,
-) -> String {
-    let kernel = &implementation.launches[launch_source.ordinal].kernel;
-    let mut source = render_source_with(
-        Dialect::Metal,
-        logical,
-        bindings,
-        implementation,
-        specialization,
-        asset,
-        Some(kernel),
-    );
-    for variant in &launch_source.code_variants {
-        if variant.is_empty() {
-            continue;
-        }
-        let values = variant
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let suffix = variant
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join("_");
-        source.push_str(&format!(
-            "\ntemplate [[host_name(\"{kernel}${suffix}\")]] [[kernel]] decltype({kernel}<{values}>) {kernel}<{values}>;\n"
-        ));
-    }
-    source
-}
-
-/// One CUDA launch source. The asset guards templated kernels with their
-/// `SEISMIC_FORMING_<kernel>` names; NVRTC requests the required instances by
-/// name expression and supplies their lowered linker names after compilation.
-pub(crate) fn render_cuda_launch_source(
+/// One launch's source (Metal or CUDA). The asset guards each templated
+/// kernel with its `SEISMIC_FORMING_<kernel>` name. Code variants are not in
+/// the text: they are the program's entries, template instances the
+/// toolchain requests, so every variant of a launch shares one source.
+/// Runtime parameter values never enter it.
+pub(crate) fn render_launch_source(
+    dialect: Dialect,
     logical: &LogicalEntry,
     bindings: &ElementBindings,
     implementation: &NativeImplementation,
@@ -299,7 +260,7 @@ pub(crate) fn render_cuda_launch_source(
     ordinal: usize,
 ) -> String {
     render_source_with(
-        Dialect::Cuda,
+        dialect,
         logical,
         bindings,
         implementation,
@@ -855,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_launch_source_contains_only_its_form_and_code_instantiations() {
+    fn a_launch_source_contains_only_its_form() {
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "probe.seismic".to_owned(),
             text: PROBE.to_owned(),
@@ -870,21 +831,18 @@ mod tests {
         let specialization = NativeSpecialization::new()
             .with_static("K", 64)
             .with_param("TILE", 4);
-        let source = render_metal_launch_source(
+        let source = render_launch_source(
+            Dialect::Metal,
             &logical,
             &bindings,
             implementation,
             &specialization,
             "\n#ifdef SEISMIC_FORMING_PROBE\ntemplate <uint TILE> kernel void probe() {}\n#endif\n",
-            &super::super::plan::LaunchSource {
-                ordinal: 0,
-                code_variants: vec![vec![4], vec![8]],
-            },
+            0,
         );
         assert!(source.contains("#define SEISMIC_FORMING_PROBE 1\n"));
         assert!(!source.contains("SEISMIC_TUNE_TILE"));
-        assert!(source.contains("host_name(\"probe$4\")"));
-        assert!(source.contains("host_name(\"probe$8\")"));
+        assert!(!source.contains("host_name"));
     }
 
     #[test]
@@ -909,16 +867,14 @@ mod tests {
             native_word_count(logical.schema(), implementation),
             base + 3
         );
-        let source = render_metal_launch_source(
+        let source = render_launch_source(
+            Dialect::Metal,
             &logical,
             &bindings,
             implementation,
             &defaults,
             "\n#ifdef SEISMIC_FORMING_SMALL\ntemplate <uint ROWS> kernel void small() {}\n#endif\n",
-            &super::super::plan::LaunchSource {
-                ordinal: 0,
-                code_variants: vec![vec![1], vec![2]],
-            },
+            0,
         );
         assert!(source.contains(&format!(
             "#define SEISMIC_RUNTIME_SPLIT (seismic_words[{base}])\n"

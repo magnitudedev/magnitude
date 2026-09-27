@@ -28,7 +28,7 @@ pub use seismic_lang::precision::PrecisionPolicy;
 pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
 }
-pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactKind, ArtifactStore, DeviceOptions};
+pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
 /// Replay of the tuning search against recorded surveys (development).
 pub use seismic_runtime::native::replay;
 pub use seismic_runtime::native::search::{

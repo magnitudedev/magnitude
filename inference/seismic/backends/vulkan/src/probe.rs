@@ -17,8 +17,9 @@
 
 use crate::device::{OpenError, Rounded};
 use crate::direct::{DirectBatch, DirectLaunch};
-use crate::formation::{DirectModule, Kernel};
+use crate::toolchain::VulkanToolchain;
 use crate::Device;
+use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
 
 const PRELUDE: &str = "#version 460
 #extension GL_EXT_buffer_reference : require
@@ -44,18 +45,18 @@ fn run(
         OpenError::Creation(format!("a numerical probe failed: {error}"))
     };
     let source = format!("{PRELUDE}{body}\nvoid main() {{\n    SEISMIC_KERNEL();\n}}\n");
-    let module = DirectModule::form(
-        device,
-        &source,
-        &[Kernel {
-            name: "probe",
-            threads: [threads, 1, 1],
-            constants: &[],
-        }],
-        |_| None,
-        |_, _| {},
-    )
-    .map_err(|error| failed(&format!("{error:?}")))?;
+    let module = VulkanToolchain::new(device.clone())
+        .compile(
+            &ProgramSource {
+                text: source,
+                entries: vec![ProgramEntry {
+                    symbol: "probe".into(),
+                    constants: vec![threads, 1, 1],
+                }],
+            },
+            None,
+        )
+        .map_err(|error| failed(&format!("{error:?}")))?;
     let bytes = ((input.len() + outputs) * 4) as u64;
     let values = device.allocate(bytes, 16).map_err(|error| failed(&error))?;
     let input_bytes = input

@@ -36,6 +36,7 @@ pub mod devices;
 mod backends;
 mod driver;
 mod execution;
+pub mod formation;
 mod layout;
 mod memory;
 pub mod native;

@@ -339,16 +339,10 @@ pub fn release() -> Result<(u32, u32), NvrtcError> {
 }
 
 /// Compile `source` to a CUBIN for `sm_<architecture>` with the NVRTC of the
-/// resolved directory.
-pub fn compile_cubin(source: &str, name: &str, architecture: u32) -> Result<Cubin, NvrtcError> {
-    Nvrtc::get()
-        .map_err(NvrtcError::Unavailable)?
-        .compile(source, name, architecture, &[])
-}
-
-/// Compile template kernel instances named by C++ expressions. NVRTC gives
-/// their linker symbols back in request order; callers retain those symbols
-/// alongside the image when caching the result.
+/// resolved directory, requesting each kernel by a C++ name expression (a
+/// plain `extern "C"` name or a template instance). NVRTC gives their linker
+/// symbols back in request order; callers retain those symbols alongside the
+/// image when keeping it.
 pub fn compile_cubin_named(
     source: &str,
     name: &str,

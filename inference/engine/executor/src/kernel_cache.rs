@@ -5,8 +5,9 @@
 //! one, nothing is cached. Layout:
 //!
 //! ```text
-//! <root>/cuda/<key>.cubin      CUDA images Seismic formed (its ArtifactStore)
-//! <root>/tuning/<key>.json     one Seismic TuningResult per tuning key
+//! <root>/artifacts/<namespace>/<key>   compiled programs Seismic formed,
+//!                                      one namespace per toolchain (its ArtifactStore)
+//! <root>/tuning/<key>.json             one Seismic TuningResult per tuning key
 //! ```
 //!
 //! Every key is a content address, so nothing is ever invalidated: a changed
@@ -17,7 +18,7 @@
 //! time, and opening the cache evicts the least recently used files above
 //! its capacity.
 
-use seismic::{ArtifactKey, ArtifactKind, ArtifactStore, TuningResult};
+use seismic::{ArtifactKey, ArtifactStore, TuningResult};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
@@ -32,11 +33,8 @@ pub const DEFAULT_KERNEL_CACHE_BYTES: u64 = 1 << 30;
 /// removes them.
 const ABANDONED_WRITE: Duration = Duration::from_secs(60 * 60);
 
-const CUDA: &str = "cuda";
-const VULKAN: &str = "vulkan";
+const ARTIFACTS: &str = "artifacts";
 const TUNING: &str = "tuning";
-/// Every directory of the cache.
-const DIRECTORIES: [&str; 3] = [CUDA, VULKAN, TUNING];
 
 #[derive(Debug)]
 pub enum KernelCacheError {
@@ -89,7 +87,7 @@ impl KernelCache {
     /// Open the cache at `root`, creating it, and evict the least recently
     /// used entries beyond `capacity` bytes.
     pub fn open(root: PathBuf, capacity: u64) -> Result<Self, KernelCacheError> {
-        for directory in DIRECTORIES {
+        for directory in [ARTIFACTS, TUNING] {
             let path = root.join(directory);
             fs::create_dir_all(&path).map_err(|error| KernelCacheError::Create { path, error })?;
         }
@@ -109,6 +107,10 @@ impl KernelCache {
         self.root.join(directory).join(format!("{key}.{extension}"))
     }
 
+    fn artifact(&self, namespace: &str, key: &ArtifactKey) -> PathBuf {
+        self.root.join(ARTIFACTS).join(namespace).join(key.as_str())
+    }
+
     /// The bytes at `path`, refreshing its use time; `None` on any failure.
     fn read(&self, path: &Path) -> Option<Vec<u8>> {
         let bytes = fs::read(path).ok()?;
@@ -124,6 +126,13 @@ impl KernelCache {
     /// directory. A failure is reported and leaves no partial entry.
     fn write(&self, path: &Path, bytes: &[u8]) {
         let directory = path.parent().expect("cache entries live in a directory");
+        if let Err(error) = fs::create_dir_all(directory) {
+            eprintln!(
+                "magnitude-engine: kernel cache: cannot create {}: {error}",
+                directory.display()
+            );
+            return;
+        }
         let temporary = directory.join(format!(
             ".{}.{}.{}.tmp",
             path.file_name()
@@ -156,20 +165,26 @@ impl KernelCache {
     }
 
     /// Remove abandoned temporary files, then the least recently used
-    /// entries until the rest fit `capacity`.
+    /// entries until the rest fit `capacity`. Every file under the root is
+    /// an entry.
     fn evict(&self, capacity: u64) {
         let now = SystemTime::now();
         let mut entries = Vec::new();
-        for directory in DIRECTORIES {
-            let Ok(listing) = fs::read_dir(self.root.join(directory)) else {
+        let mut directories = vec![self.root.clone()];
+        while let Some(directory) = directories.pop() {
+            let Ok(listing) = fs::read_dir(&directory) else {
                 continue;
             };
             for item in listing.flatten() {
                 let Ok(metadata) = item.metadata() else {
                     continue;
                 };
-                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 let path = item.path();
+                if metadata.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 if item.file_name().to_string_lossy().starts_with('.') {
                     if now.duration_since(modified).unwrap_or_default() > ABANDONED_WRITE {
                         let _ = fs::remove_file(&path);
@@ -191,18 +206,12 @@ impl KernelCache {
 }
 
 impl ArtifactStore for KernelCache {
-    fn get(&self, kind: ArtifactKind, key: &ArtifactKey) -> Option<Vec<u8>> {
-        match kind {
-            ArtifactKind::CudaImage => self.read(&self.entry(CUDA, key.as_str(), "cubin")),
-            ArtifactKind::SpirV => self.read(&self.entry(VULKAN, key.as_str(), "spv")),
-        }
+    fn get(&self, namespace: &str, key: &ArtifactKey) -> Option<Vec<u8>> {
+        self.read(&self.artifact(namespace, key))
     }
 
-    fn put(&self, kind: ArtifactKind, key: &ArtifactKey, bytes: &[u8]) {
-        match kind {
-            ArtifactKind::CudaImage => self.write(&self.entry(CUDA, key.as_str(), "cubin"), bytes),
-            ArtifactKind::SpirV => self.write(&self.entry(VULKAN, key.as_str(), "spv"), bytes),
-        }
+    fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {
+        self.write(&self.artifact(namespace, key), bytes);
     }
 }
 
@@ -246,8 +255,8 @@ mod tests {
     fn opening_evicts_the_least_recently_used_beyond_capacity() {
         let root = scratch("evict");
         let cache = KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-        let old = cache.entry(CUDA, "old", "cubin");
-        let recent = cache.entry(CUDA, "recent", "cubin");
+        let old = cache.root.join(ARTIFACTS).join("metal").join("old");
+        let recent = cache.entry(TUNING, "recent", "json");
         cache.write(&old, &[0; 600]);
         cache.write(&recent, &[0; 600]);
         let file = fs::File::options().write(true).open(&old).unwrap();

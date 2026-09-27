@@ -93,7 +93,7 @@ fn each_launch(
     for index in 0..list.count() {
         buffers.clear();
         let dispatch = list.dispatch(index, &mut buffers);
-        let NativeRoute::Vulkan { module, .. } = &dispatch.kernel.route else {
+        let NativeRoute::Vulkan { launches, .. } = &dispatch.kernel.route else {
             unreachable!("one device has one native route");
         };
         typed.clear();
@@ -103,7 +103,8 @@ fn each_launch(
                 .map(|(allocation, offset)| (vulkan_buffer(allocation), *offset)),
         );
         let scalars = vulkan_buffer(&dispatch.kernel.scalars);
-        for (function, launch) in dispatch.launches.iter().enumerate() {
+        for (ordinal, launch) in dispatch.launches.iter().enumerate() {
+            let (module, function) = launches.launch(ordinal);
             let launch = launch.map(|launch| DirectLaunch {
                 module,
                 function,

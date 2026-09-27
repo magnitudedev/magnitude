@@ -1,20 +1,19 @@
-//! Compilation and execution of explicitly authored top-level Metal
-//! implementations. This path deliberately consumes source plus a closed ABI;
-//! it does not construct compiler kernels, plans, schedules, or portfolios.
+//! Execution of explicitly authored top-level Metal implementations, whose
+//! pipelines the Metal toolchain forms. This path deliberately consumes
+//! source plus a closed ABI; it does not construct compiler kernels, plans,
+//! schedules, or portfolios.
 
 use crate::{MetalBuffer, MetalDevice};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSRange, NSString};
+use objc2_foundation::NSRange;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
     MTLComputePipelineState, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor,
-    MTLCounterSamplingPoint, MTLCounterSet, MTLDevice, MTLDispatchType, MTLLibrary, MTLSize,
-    MTLStorageMode,
+    MTLCounterSamplingPoint, MTLCounterSet, MTLDevice, MTLDispatchType, MTLSize, MTLStorageMode,
 };
 use seismic_compiler::errors::ExecutionError;
-use seismic_native_target::NativeCompilationError;
 
 /// Metal's `setBytes` limit, which bounds a direct entry's argument words.
 pub const DIRECT_WORD_BYTES_LIMIT: usize = 4096;
@@ -35,39 +34,8 @@ unsafe impl Send for DirectPipeline {}
 unsafe impl Sync for DirectPipeline {}
 
 impl DirectPipeline {
-    /// Compile `source` once and form a pipeline for each named kernel, in
-    /// the given order.
-    pub fn compile_all(
-        device: &MetalDevice,
-        source: &str,
-        kernels: &[&str],
-    ) -> Result<Vec<Self>, NativeCompilationError> {
-        let source = NSString::from_str(source);
-        let options = objc2_metal::MTLCompileOptions::new();
-        options.setMathMode(objc2_metal::MTLMathMode::Safe);
-        options.setMathFloatingPointFunctions(objc2_metal::MTLMathFloatingPointFunctions::Precise);
-        let library = device
-            .handle()
-            .raw()
-            .newLibraryWithSource_options_error(&source, Some(&options))
-            .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))?;
-        kernels
-            .iter()
-            .map(|kernel| {
-                let name = NSString::from_str(kernel);
-                let function = library.newFunctionWithName(&name).ok_or_else(|| {
-                    NativeCompilationError::MalformedToolchainOutput(format!(
-                        "Metal library does not define kernel `{kernel}`"
-                    ))
-                })?;
-                let state = device
-                    .handle()
-                    .raw()
-                    .newComputePipelineStateWithFunction_error(&function)
-                    .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))?;
-                Ok(Self { state })
-            })
-            .collect()
+    pub(crate) fn from_state(state: Retained<ProtocolObject<dyn MTLComputePipelineState>>) -> Self {
+        Self { state }
     }
 
     pub fn max_threads_per_threadgroup(&self) -> u64 {

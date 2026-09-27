@@ -34,7 +34,7 @@ use super::search::{
     SearchSpaceError, SearchStop,
 };
 use super::timing::{self, PointTiming};
-use super::{MeasureOptions, Measurement, NativeLaunchForms, NativePrepared};
+use super::{MeasureOptions, Measurement, NativePrepared};
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{DecodedValue, EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
@@ -410,7 +410,6 @@ struct Formation<'s> {
     bindings: &'s ElementBindings,
     cpu: Option<&'static CpuNativeKernels>,
     implementation: &'s NativeImplementation,
-    forms: Option<&'s NativeLaunchForms>,
 }
 
 impl Formation<'_> {
@@ -432,7 +431,7 @@ impl Formation<'_> {
                         chunk
                             .iter()
                             .map(|specialization| {
-                                NativePrepared::prepare_with_forms(
+                                NativePrepared::prepare_implementation(
                                     self.device,
                                     self.module,
                                     self.entry,
@@ -440,7 +439,6 @@ impl Formation<'_> {
                                     specialization.clone(),
                                     self.cpu,
                                     self.implementation.clone(),
-                                    self.forms,
                                 )
                                 .map_err(|error| Exclusion::Formation(prepare_message(error)))
                             })
@@ -1364,7 +1362,6 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
         bindings: &bindings,
         cpu,
         implementation: &implementation,
-        forms: None,
     };
     let tuned = Tuned {
         formation: &formation,
@@ -1436,41 +1433,21 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
     let partition = plan::partition(implementation, statics, &shapes)
         .map_err(|error| TuneError::Declaration(format!("factored native plan: {error:?}")))?;
     let began = Instant::now();
-    let forms = match super::backend_name(&device.kind) {
-        #[cfg(target_os = "macos")]
-        seismic_lang::registry::BackendName::Metal => Some(
-            NativePrepared::form_metal_launches(
-                device,
-                module,
-                entry,
-                bindings,
-                default,
-                implementation,
-                &partition.sources,
-            )
-            .map_err(|error| {
-                TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error)))
-            })?,
-        ),
-        seismic_lang::registry::BackendName::Cuda => Some(
-            NativePrepared::form_cuda_launches(
-                device,
-                module,
-                entry,
-                bindings,
-                default,
-                implementation,
-                &partition.sources,
-            )
-            .map_err(|error| {
-                TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error)))
-            })?,
-        ),
-        _ => None,
-    };
+    // Each launch formed once with all its code variants and held, so that
+    // every specialization assembled below shares them.
+    let _held = NativePrepared::hold_launch_variants(
+        device,
+        module,
+        entry,
+        bindings,
+        default,
+        implementation,
+        &partition.sources,
+    )
+    .map_err(|error| TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error))))?;
     time.forming_seconds += began.elapsed().as_secs_f64();
     let form = |specialization: &NativeSpecialization| {
-        NativePrepared::prepare_with_forms(
+        NativePrepared::prepare_implementation(
             device,
             module,
             entry,
@@ -1478,7 +1455,6 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
             specialization.clone(),
             cpu,
             implementation.clone(),
-            forms.as_ref(),
         )
         .map_err(|error| Exclusion::Formation(prepare_message(error)))
     };

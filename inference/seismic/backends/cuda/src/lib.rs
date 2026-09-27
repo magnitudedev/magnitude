@@ -14,6 +14,7 @@ mod open;
 mod profile;
 mod ptx;
 mod registry;
+pub mod toolchain;
 
 pub use buffer::Buffer;
 pub use capability::CudaIntrinsic;

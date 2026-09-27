@@ -1,12 +1,12 @@
-//! The embedder's artifact store around native formation (tuning spec §C1):
-//! CUDA images and Vulkan SPIR-V are looked up before the toolchain runs and
-//! kept after it; a stored artifact the driver refuses (CUDA) or that fails
-//! validation (Vulkan) is a miss and is formed and stored again. Metal and
-//! CPU formation never consult the store.
+//! The embedder's artifact store around native formation: CUDA keeps CUBINs
+//! and Vulkan keeps SPIR-V, looked up before the toolchain runs and kept
+//! after; a damaged entry is a miss and is compiled and stored again. Metal
+//! (whose compiles the OS caches) and CPU (compiled into the binary) keep
+//! nothing.
 
 use seismic::{
-    ArtifactKey, ArtifactKind, ArtifactStore, Availability, BackendName, Device, DeviceCatalog,
-    DeviceOptions, Element, NativeSpecialization, Tensor,
+    ArtifactKey, ArtifactStore, Availability, BackendName, Device, DeviceCatalog, DeviceOptions,
+    Element, NativeSpecialization, Tensor,
 };
 use seismic_native_tests::split_sum;
 use std::collections::HashMap;
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 /// An in-memory store that counts lookups, hits and writes.
 #[derive(Default)]
 struct RecordingStore {
-    entries: Mutex<HashMap<(ArtifactKind, ArtifactKey), Vec<u8>>>,
+    entries: Mutex<HashMap<(String, ArtifactKey), Vec<u8>>>,
     counts: Mutex<Counts>,
 }
 
@@ -31,21 +31,21 @@ impl RecordingStore {
         *self.counts.lock().unwrap()
     }
 
-    /// Replace every stored image with bytes no driver loads.
+    /// Replace every stored artifact with bytes no toolchain loads.
     fn corrupt(&self) {
         for bytes in self.entries.lock().unwrap().values_mut() {
-            *bytes = b"not a cubin".to_vec();
+            *bytes = b"not an artifact".to_vec();
         }
     }
 }
 
 impl ArtifactStore for RecordingStore {
-    fn get(&self, kind: ArtifactKind, key: &ArtifactKey) -> Option<Vec<u8>> {
+    fn get(&self, namespace: &str, key: &ArtifactKey) -> Option<Vec<u8>> {
         let found = self
             .entries
             .lock()
             .unwrap()
-            .get(&(kind, key.clone()))
+            .get(&(namespace.to_owned(), key.clone()))
             .cloned();
         let mut counts = self.counts.lock().unwrap();
         counts.gets += 1;
@@ -53,11 +53,11 @@ impl ArtifactStore for RecordingStore {
         found
     }
 
-    fn put(&self, kind: ArtifactKind, key: &ArtifactKey, bytes: &[u8]) {
+    fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {
         self.entries
             .lock()
             .unwrap()
-            .insert((kind, key.clone()), bytes.to_vec());
+            .insert((namespace.to_owned(), key.clone()), bytes.to_vec());
         self.counts.lock().unwrap().puts += 1;
     }
 }
@@ -93,13 +93,6 @@ fn devices_of(backends: &[BackendName], store: &Arc<RecordingStore>) -> Vec<Devi
         .collect()
 }
 
-fn devices(store: &Arc<RecordingStore>) -> Vec<Device> {
-    devices_of(
-        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
-        store,
-    )
-}
-
 /// Form and run the defaults of `split_sum` at N = 1000.
 fn form_and_run(device: &Device) {
     let n = 1000u64;
@@ -120,106 +113,75 @@ fn form_and_run(device: &Device) {
     assert_eq!(sum, n as f32, "{:?}", device.backend());
 }
 
-#[test]
-fn cuda_images_are_kept_in_the_embedders_store_and_a_refused_image_is_a_miss() {
+/// Form `split_sum` on a fresh device of `backend` three times: into an
+/// empty store, from the store, and after the store's entries are damaged.
+fn formation_uses_the_store(backend: BackendName) {
     let store = Arc::new(RecordingStore::default());
-    let backends = devices(&store)
-        .iter()
-        .map(Device::backend)
-        .collect::<Vec<_>>();
-    let cuda = backends.contains(&BackendName::Cuda);
-
-    // First formation: a miss, formed by NVRTC and stored.
-    for device in devices(&store) {
-        form_and_run(&device);
-    }
-    let first = store.counts();
-    if !cuda {
-        assert_eq!(
-            first,
-            Counts::default(),
-            "only CUDA formation uses the store"
-        );
+    let formed = |store: &Arc<RecordingStore>| {
+        let devices = devices_of(&[backend], store);
+        devices.iter().for_each(form_and_run);
+        !devices.is_empty()
+    };
+    if !formed(&store) {
         return;
     }
+    let first = store.counts();
+    if matches!(backend, BackendName::Cpu | BackendName::Metal) {
+        assert_eq!(first, Counts::default(), "{backend:?} keeps nothing");
+        return;
+    }
+    // Every program is a miss, compiled and stored.
+    let programs = first.gets;
+    assert!(programs > 0);
     assert_eq!(
         first,
         Counts {
-            gets: 1,
+            gets: programs,
             hits: 0,
-            puts: 1
+            puts: programs
         }
     );
 
-    // A fresh device forms the same source and formation: the stored image
-    // is loaded and NVRTC does not run (nothing is stored again).
-    for device in devices(&store) {
-        form_and_run(&device);
-    }
+    // A fresh device forms the same programs from the store: nothing compiles.
+    formed(&store);
     assert_eq!(
         store.counts(),
         Counts {
-            gets: 2,
-            hits: 1,
-            puts: 1
+            gets: 2 * programs,
+            hits: programs,
+            puts: programs
         }
     );
 
-    // A stored image the driver refuses is a miss: formed and stored again.
+    // A damaged entry is a miss: compiled and stored again.
     store.corrupt();
-    for device in devices(&store) {
-        form_and_run(&device);
-    }
+    formed(&store);
     assert_eq!(
         store.counts(),
         Counts {
-            gets: 3,
-            hits: 2,
-            puts: 2
+            gets: 3 * programs,
+            hits: 2 * programs,
+            puts: 2 * programs
         }
     );
 }
 
-/// Vulkan keeps each launch's sealed SPIR-V (two launches of `split_sum`);
-/// a stored module that fails validation is a miss.
 #[test]
-fn spirv_modules_are_kept_in_the_embedders_store_and_an_invalid_module_is_a_miss() {
-    let store = Arc::new(RecordingStore::default());
-    if devices_of(&[BackendName::Vulkan], &store).is_empty() {
-        return;
-    }
-    for device in devices_of(&[BackendName::Vulkan], &store) {
-        form_and_run(&device);
-    }
-    assert_eq!(
-        store.counts(),
-        Counts {
-            gets: 2,
-            hits: 0,
-            puts: 2
-        }
-    );
-    for device in devices_of(&[BackendName::Vulkan], &store) {
-        form_and_run(&device);
-    }
-    assert_eq!(
-        store.counts(),
-        Counts {
-            gets: 4,
-            hits: 2,
-            puts: 2
-        }
-    );
-    store.corrupt();
-    for device in devices_of(&[BackendName::Vulkan], &store) {
-        form_and_run(&device);
-    }
-    assert_eq!(
-        store.counts(),
-        Counts {
-            gets: 6,
-            hits: 4,
-            puts: 4
-        }
-    );
+fn cpu_formation_never_uses_the_store() {
+    formation_uses_the_store(BackendName::Cpu);
+}
+
+#[test]
+fn metal_formation_never_uses_the_store() {
+    formation_uses_the_store(BackendName::Metal);
+}
+
+#[test]
+fn cuda_programs_are_kept_in_the_embedders_store() {
+    formation_uses_the_store(BackendName::Cuda);
+}
+
+#[test]
+fn vulkan_programs_are_kept_in_the_embedders_store() {
+    formation_uses_the_store(BackendName::Vulkan);
 }

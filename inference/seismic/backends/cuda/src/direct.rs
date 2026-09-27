@@ -5,7 +5,7 @@
 use crate::buffer::Buffer;
 use crate::driver::{self, DriverError, Event, Handle, JitError, Module};
 use crate::executor::Device;
-use crate::nvrtc::{self, NvrtcError};
+use crate::nvrtc::NvrtcError;
 use seismic_compiler::errors::ExecutionError;
 use seismic_native_target::NativeCompilationError;
 use std::ffi::c_void;
@@ -17,12 +17,11 @@ const MAX_THREADS_PER_BLOCK: i32 = 0;
 const SHARED_SIZE_BYTES: i32 = 1;
 const MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 
-/// The kernel functions of one authored CUDA source, formed for one device.
+/// The kernel functions of one CUDA program, loaded on one device.
 pub struct DirectModule {
     /// Keeps the functions' module loaded.
     _module: Arc<Module>,
     functions: Vec<DirectFunction>,
-    formation: nvrtc::Formation,
 }
 
 struct DirectFunction {
@@ -38,7 +37,7 @@ struct DirectFunction {
 unsafe impl Send for DirectModule {}
 unsafe impl Sync for DirectModule {}
 
-fn formation_error(error: NvrtcError) -> NativeCompilationError {
+pub(crate) fn formation_error(error: NvrtcError) -> NativeCompilationError {
     match error {
         NvrtcError::Unavailable(reason) => NativeCompilationError::ToolchainUnavailable(reason),
         NvrtcError::UnsupportedArchitecture {
@@ -79,69 +78,10 @@ fn submission(error: DriverError) -> ExecutionError {
 }
 
 impl DirectModule {
-    /// Form `source` for `sm_<architecture>` and load each named kernel, in
-    /// the given order. `stored` may supply an image formed earlier under the
-    /// same formation (compiler release, architecture, options); an image
-    /// the driver does not load is ignored. Otherwise NVRTC compiles the
-    /// source and `store` receives the new image.
-    pub fn form(
-        device: &Device,
-        source: &str,
-        name: &str,
-        architecture: u32,
-        kernels: &[&str],
-        stored: impl FnOnce(&nvrtc::Formation) -> Option<Vec<u8>>,
-        store: impl FnOnce(&nvrtc::Formation, &[u8]),
-    ) -> Result<Self, NativeCompilationError> {
-        let formation = nvrtc::formation(architecture).map_err(formation_error)?;
-        if let Some(image) = stored(&formation) {
-            if let Ok(module) = Self::load(device, &image, formation, kernels) {
-                return Ok(module);
-            }
-        }
-        let cubin = nvrtc::compile_cubin(source, name, architecture).map_err(formation_error)?;
-        store(&cubin.formation, &cubin.image);
-        Self::load(device, &cubin.image, cubin.formation, kernels)
-    }
-
-    /// Form one source containing requested template kernel instances. The
-    /// cached artifact carries NVRTC's lowered linker names with the CUBIN,
-    /// since those names cannot be recovered from a cache hit by NVRTC.
-    pub fn form_named(
-        device: &Device,
-        source: &str,
-        name: &str,
-        architecture: u32,
-        expressions: &[&str],
-        stored: impl FnOnce(&nvrtc::Formation) -> Option<Vec<u8>>,
-        store: impl FnOnce(&nvrtc::Formation, &[u8]),
-    ) -> Result<Self, NativeCompilationError> {
-        let formation = nvrtc::formation(architecture).map_err(formation_error)?;
-        if let Some(image) = stored(&formation) {
-            if let Some((names, cubin)) = unpack_named_image(&image, expressions.len()) {
-                let kernels = names.iter().map(String::as_str).collect::<Vec<_>>();
-                if let Ok(module) = Self::load(device, cubin, formation.clone(), &kernels) {
-                    return Ok(module);
-                }
-            }
-        }
-        let cubin = nvrtc::compile_cubin_named(source, name, architecture, expressions)
-            .map_err(formation_error)?;
-        let image = pack_named_image(&cubin.lowered_names, &cubin.image);
-        store(&cubin.formation, &image);
-        let kernels = cubin
-            .lowered_names
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        Self::load(device, &cubin.image, cubin.formation, &kernels)
-    }
-
-    /// Load a CUBIN image and each named kernel of it.
-    fn load(
+    /// Load a CUBIN image and each named kernel of it, in order.
+    pub(crate) fn load(
         device: &Device,
         image: &[u8],
-        formation: nvrtc::Formation,
         kernels: &[&str],
     ) -> Result<Self, NativeCompilationError> {
         let context = device.context();
@@ -167,14 +107,7 @@ impl DirectModule {
         Ok(Self {
             _module: Arc::new(module),
             functions,
-            formation,
         })
-    }
-
-    /// The compiler release, architecture and options that formed this
-    /// module; together with the source they determine its code.
-    pub fn formation(&self) -> &nvrtc::Formation {
-        &self.formation
     }
 
     pub fn max_threads_per_block(&self, function: usize) -> u64 {
@@ -186,67 +119,6 @@ impl DirectModule {
     }
 }
 
-const NAMED_IMAGE_MAGIC: &[u8; 8] = b"SCUNAM01";
-
-fn pack_named_image(names: &[String], cubin: &[u8]) -> Vec<u8> {
-    let mut image = Vec::new();
-    image.extend_from_slice(NAMED_IMAGE_MAGIC);
-    image.extend_from_slice(
-        &u32::try_from(names.len())
-            .expect("kernel count fits u32")
-            .to_le_bytes(),
-    );
-    for name in names {
-        image.extend_from_slice(
-            &u32::try_from(name.len())
-                .expect("kernel name fits u32")
-                .to_le_bytes(),
-        );
-        image.extend_from_slice(name.as_bytes());
-    }
-    image.extend_from_slice(cubin);
-    image
-}
-
-fn unpack_named_image(image: &[u8], expected: usize) -> Option<(Vec<String>, &[u8])> {
-    let mut remaining = image.strip_prefix(NAMED_IMAGE_MAGIC)?;
-    let read_len = |remaining: &mut &[u8]| {
-        let bytes: [u8; 4] = remaining.get(..4)?.try_into().ok()?;
-        *remaining = remaining.get(4..)?;
-        Some(u32::from_le_bytes(bytes) as usize)
-    };
-    if read_len(&mut remaining)? != expected {
-        return None;
-    }
-    let mut names = Vec::with_capacity(expected);
-    for _ in 0..expected {
-        let len = read_len(&mut remaining)?;
-        let name = std::str::from_utf8(remaining.get(..len)?).ok()?.to_owned();
-        remaining = remaining.get(len..)?;
-        names.push(name);
-    }
-    (!remaining.is_empty()).then_some((names, remaining))
-}
-
-#[cfg(test)]
-mod named_image_tests {
-    use super::*;
-
-    #[test]
-    fn named_image_preserves_compiler_symbols_and_rejects_wrong_shape() {
-        let names = vec![
-            "_Z5probeILi2EEvPf".to_owned(),
-            "_Z5probeILi4EEvPf".to_owned(),
-        ];
-        let image = pack_named_image(&names, b"cubin");
-        assert_eq!(
-            unpack_named_image(&image, 2),
-            Some((names, b"cubin".as_slice()))
-        );
-        assert_eq!(unpack_named_image(&image, 1), None);
-        assert_eq!(unpack_named_image(&image[..image.len() - 6], 2), None);
-    }
-}
 
 /// One direct launch as issued.
 pub struct DirectLaunch<'a> {

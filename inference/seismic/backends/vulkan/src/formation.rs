@@ -1,15 +1,16 @@
 //! Formation (§7.2): GLSL → SPIR-V with glslang, the seal pass,
-//! SPIRV-Tools validation and dead-code cleanup, the `OpFmaKHR` binding of
-//! `fma` on devices with `VK_KHR_shader_fma` (§16.1), then one compute
-//! pipeline per launch with its workgroup size and group-memory views as
-//! specialization constants, a required subgroup size of 32 where the device
-//! takes one, and the device's pipeline cache.
+//! SPIRV-Tools validation and dead-code cleanup ([`compile`]); then, for a
+//! module, the `OpFmaKHR` binding of `fma` on devices with
+//! `VK_KHR_shader_fma` (§16.1) and one compute pipeline per entry with its
+//! workgroup size and group-memory views as specialization constants, a
+//! required subgroup size of 32 where the device takes one, and the device's
+//! pipeline cache ([`DirectModule::new`]).
 
 use crate::device::Device;
 use crate::facts::{SubgroupWidth, SUBGROUP_WIDTH};
 use crate::seal::{self, SEAL_VERSION};
 use ash::vk;
-use seismic_native_target::NativeCompilationError;
+use seismic_native_target::{NativeCompilationError, ProgramEntry};
 use spirv_tools::opt::Optimizer;
 use spirv_tools::val::Validator;
 
@@ -19,19 +20,11 @@ pub const GLSLANG_RELEASE: &str = "glslang 0.8.1+275822a";
 /// Everything besides the source that determines a formed module: the
 /// compiler, target, seal passes and the device facts they and the driver
 /// consume (§7.5).
-pub fn formation(device: &Device) -> String {
+pub(crate) fn formation(device: &Device) -> String {
     format!(
         "vulkan;{GLSLANG_RELEASE};spirv 1.6;seal {SEAL_VERSION};{}",
         device.facts().formation_identity()
     )
-}
-
-/// One launch of a module: its kernel function, workgroup size, and the
-/// specialization constants after the workgroup size (ids 3..).
-pub struct Kernel<'a> {
-    pub name: &'a str,
-    pub threads: [u32; 3],
-    pub constants: &'a [u32],
 }
 
 fn toolchain(error: impl std::fmt::Display) -> NativeCompilationError {
@@ -123,19 +116,6 @@ fn clean(module: &[u32]) -> Result<Vec<u32>, NativeCompilationError> {
         })
 }
 
-fn bytes_of(words: &[u32]) -> Vec<u8> {
-    words.iter().flat_map(|word| word.to_le_bytes()).collect()
-}
-
-fn words_of(bytes: &[u8]) -> Option<Vec<u32>> {
-    (bytes.len() % 4 == 0).then(|| {
-        bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
-            .collect()
-    })
-}
-
 /// The pipelines of one specialization, one per launch in order.
 pub struct DirectModule {
     device: Device,
@@ -143,44 +123,27 @@ pub struct DirectModule {
 }
 
 impl DirectModule {
-    /// Form every launch of `source`. `stored` may return SPIR-V formed
-    /// earlier for a kernel under [`formation`]; a stored module
-    /// that fails validation is a miss. `store` receives newly formed
-    /// SPIR-V. A pipeline-creation failure is a toolchain failure at
-    /// preparation.
-    pub fn form(
+    /// The pipelines of `entries`, each from its sealed SPIR-V, with its
+    /// constants: the workgroup size (ids 0..3), then the rest (ids 3..). A
+    /// pipeline-creation failure is a toolchain failure.
+    pub(crate) fn new(
         device: &Device,
-        source: &str,
-        kernels: &[Kernel<'_>],
-        stored: impl Fn(&str) -> Option<Vec<u8>>,
-        store: impl Fn(&str, &[u8]),
+        entries: &[(&[u32], &ProgramEntry)],
     ) -> Result<Self, NativeCompilationError> {
-        let facts = device.facts();
         let mut module = Self {
             device: device.clone(),
-            pipelines: Vec::with_capacity(kernels.len()),
+            pipelines: Vec::with_capacity(entries.len()),
         };
-        for kernel in kernels {
-            let words = match stored(kernel.name)
-                .and_then(|bytes| words_of(&bytes))
-                .filter(|words| validate(words).is_ok())
-            {
-                Some(words) => words,
-                None => {
-                    let words = compile(source, kernel.name, facts.environment())?;
-                    store(kernel.name, &bytes_of(&words));
-                    words
-                }
-            };
-            // Stored modules precede the `OpFmaKHR` binding, which the
-            // linked validator does not know.
-            let words = if facts.shader_fma.float32 {
-                seal::fma_khr(&words)
-                    .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?
+        for (words, entry) in entries {
+            // The `OpFmaKHR` binding follows validation, which the linked
+            // validator does not know.
+            let pipeline = if device.facts().shader_fma.float32 {
+                let bound = seal::fma_khr(words)
+                    .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?;
+                module.pipeline(&bound, entry)?
             } else {
-                words
+                module.pipeline(words, entry)?
             };
-            let pipeline = module.pipeline(&words, kernel)?;
             module.pipelines.push(pipeline);
         }
         Ok(module)
@@ -189,8 +152,14 @@ impl DirectModule {
     fn pipeline(
         &self,
         words: &[u32],
-        kernel: &Kernel<'_>,
+        entry: &ProgramEntry,
     ) -> Result<vk::Pipeline, NativeCompilationError> {
+        let threads = entry.constants.get(..3).ok_or_else(|| {
+            NativeCompilationError::MalformedToolchainOutput(format!(
+                "`{}` carries no workgroup size",
+                entry.symbol
+            ))
+        })?;
         let inner = &self.device.inner;
         let device = &inner.device;
         let shader = unsafe {
@@ -199,15 +168,10 @@ impl DirectModule {
         .map_err(|error| {
             toolchain(format!(
                 "vkCreateShaderModule of `{}` failed: {error}",
-                kernel.name
+                entry.symbol
             ))
         })?;
-        let values = kernel
-            .threads
-            .iter()
-            .chain(kernel.constants)
-            .copied()
-            .collect::<Vec<u32>>();
+        let values = &entry.constants;
         let entries = (0..values.len() as u32)
             .map(|id| vk::SpecializationMapEntry {
                 constant_id: id,
@@ -215,7 +179,10 @@ impl DirectModule {
                 size: 4,
             })
             .collect::<Vec<_>>();
-        let data = bytes_of(&values);
+        let data = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
         let specialization = vk::SpecializationInfo::default()
             .map_entries(&entries)
             .data(&data);
@@ -225,7 +192,7 @@ impl DirectModule {
         // Full subgroups are required whenever the X extent allows it (a
         // multiple of the hardware subgroup); smaller groups run one partial
         // subgroup, as a partial CUDA warp does.
-        let flags = if kernel.threads[0] % width.lanes() == 0 {
+        let flags = if threads[0] % width.lanes() == 0 {
             vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS
         } else {
             vk::PipelineShaderStageCreateFlags::empty()
@@ -249,7 +216,7 @@ impl DirectModule {
         created.map(|pipelines| pipelines[0]).map_err(|(_, error)| {
             toolchain(format!(
                 "vkCreateComputePipelines of `{}` failed: {error}",
-                kernel.name
+                entry.symbol
             ))
         })
     }

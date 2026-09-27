@@ -37,6 +37,8 @@ use crate::api::kernel::{DecodedResults, DecodedValue, EncodedArgs, EncodedOutpu
 use crate::api::tensor::TensorInner;
 use crate::api::{CallError, OutputError};
 use crate::backends::{CpuOpened, CudaOpened, OpenedKind};
+use crate::formation::{Formed, ProgramFormer};
+use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
 use crate::driver::{
     collect_native_access, typed_buffer, write_zeros, Allocation, DeviceCompletion,
 };
@@ -123,58 +125,56 @@ enum NativeRoute {
     #[cfg(target_os = "macos")]
     Metal {
         opened: Arc<MetalOpened>,
-        pipelines: Vec<seismic_metal::DirectPipeline>,
+        launches: Launches<Vec<seismic_metal::DirectPipeline>>,
     },
     Cuda {
         opened: Arc<CudaOpened>,
-        functions: CudaFunctions,
+        launches: Launches<seismic_cuda::direct::DirectModule>,
     },
     #[cfg(not(target_os = "macos"))]
     Vulkan {
         opened: Arc<crate::backends::VulkanOpened>,
-        module: seismic_vulkan::formation::DirectModule,
+        launches: Launches<seismic_vulkan::formation::DirectModule>,
     },
 }
 
-/// Maps declaration-order CUDA launches to functions in formed modules.
-/// Legacy sources share one module; scoped sources form one module per launch.
-struct CudaFunctions {
-    modules: Vec<Arc<seismic_cuda::direct::DirectModule>>,
+/// An implementation's launches in programs formed on its device: each
+/// launch's program and entry, by launch ordinal. A whole-entry source is one
+/// program with one entry per launch; a launch-scoped source is one program
+/// per launch, which may hold more variants than the launch uses.
+struct Launches<P> {
+    programs: Vec<Arc<Formed<P>>>,
     locations: Vec<(usize, usize)>,
 }
 
-impl CudaFunctions {
-    fn entry(module: seismic_cuda::direct::DirectModule, launches: usize) -> Self {
-        Self {
-            modules: vec![Arc::new(module)],
-            locations: (0..launches).map(|function| (0, function)).collect(),
+impl<P> Launches<P> {
+    fn launch(&self, ordinal: usize) -> (&P, usize) {
+        let (program, entry) = self.locations[ordinal];
+        (self.programs[program].program(), entry)
+    }
+
+    /// Each launch's program text address and entry, which with the
+    /// toolchain identity determine the implementation's code.
+    fn identify(&self, digest: &mut Sha256) {
+        for (program, entry) in &self.locations {
+            let program = &self.programs[*program];
+            digest.update(program.key().as_str());
+            digest.update(format!("{:?}", program.entries()[*entry]));
         }
     }
+}
 
-    fn scoped(modules: Vec<(Arc<seismic_cuda::direct::DirectModule>, usize)>) -> Self {
-        let locations = modules
-            .iter()
-            .enumerate()
-            .map(|(module, (_, function))| (module, *function))
-            .collect();
-        let modules = modules.into_iter().map(|(module, _)| module).collect();
-        Self { modules, locations }
-    }
-
-    fn function(&self, ordinal: usize) -> (&seismic_cuda::direct::DirectModule, usize) {
-        let (module, function) = self.locations[ordinal];
-        (&self.modules[module], function)
+#[cfg(target_os = "macos")]
+impl Launches<Vec<seismic_metal::DirectPipeline>> {
+    fn pipeline(&self, ordinal: usize) -> &seismic_metal::DirectPipeline {
+        let (pipelines, entry) = self.launch(ordinal);
+        &pipelines[entry]
     }
 }
 
-/// Functions formed once for one tuning run. The selected specialization
-/// assembles immutable functions without recompiling unchanged launches.
-pub(crate) struct NativeLaunchForms {
-    #[cfg(target_os = "macos")]
-    metal: Vec<BTreeMap<Vec<u64>, seismic_metal::DirectPipeline>>,
-    cuda: Vec<BTreeMap<Vec<u64>, (Arc<seismic_cuda::direct::DirectModule>, usize)>>,
-    sources: Vec<String>,
-}
+/// Programs held so that implementations formed while they live share them:
+/// a tuning run holds every launch variant it may assemble.
+pub(crate) struct HeldPrograms(#[allow(dead_code)] Box<dyn Send + Sync>);
 
 /// What was formed, for tuning records and measurement attribution: the
 /// backend, entry, element bindings, specialization, rendered-source digest
@@ -415,8 +415,14 @@ fn preparation(message: impl Into<String>) -> PrepareError {
     PrepareError::Preparation(PreparationError::NativeSpecialization(message.into()))
 }
 
-fn cuda_expression(kernel: &str, values: &[u64]) -> String {
-    if values.is_empty() {
+fn compilation(error: seismic_native_target::NativeCompilationError) -> PrepareError {
+    PrepareError::Preparation(PreparationError::NativeCompilation(error))
+}
+
+/// The entry of one code variant of `kernel`: the kernel itself, or its
+/// template instance for the variant's code values.
+fn template_instance(kernel: &str, values: &[u64]) -> ProgramEntry {
+    ProgramEntry::named(if values.is_empty() {
         kernel.to_owned()
     } else {
         format!(
@@ -427,47 +433,56 @@ fn cuda_expression(kernel: &str, values: &[u64]) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         )
+    })
+}
+
+/// One launch's program with `variants` as its entries. Every variant of a
+/// launch shares its source, so tuning forms all of them in one compile and
+/// preparation's single variant is served from that program.
+fn launch_program(
+    dialect: abi::Dialect,
+    logical: &LogicalEntry,
+    bindings: &ElementBindings,
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+    asset: &str,
+    ordinal: usize,
+    variants: &[Vec<u64>],
+) -> ProgramSource {
+    let kernel = &implementation.launches[ordinal].kernel;
+    ProgramSource {
+        text: abi::render_launch_source(
+            dialect,
+            logical,
+            bindings,
+            implementation,
+            specialization,
+            asset,
+            ordinal,
+        ),
+        entries: variants
+            .iter()
+            .map(|values| template_instance(kernel, values))
+            .collect(),
     }
 }
 
-fn form_cuda_source(
-    opened: &CudaOpened,
-    store: Option<&dyn crate::artifacts::ArtifactStore>,
-    source: &str,
-    name: &str,
-    architecture: u32,
-    expressions: &[String],
-) -> Result<seismic_cuda::direct::DirectModule, seismic_native_target::NativeCompilationError> {
-    let expression_key = expressions.join("\0");
-    let key = |formation: &seismic_cuda::nvrtc::Formation| {
-        crate::artifacts::ArtifactKey::of(&[
-            source.as_bytes(),
-            expression_key.as_bytes(),
-            formation.to_string().as_bytes(),
-        ])
-    };
-    let names = expressions.iter().map(String::as_str).collect::<Vec<_>>();
-    seismic_cuda::direct::DirectModule::form_named(
-        opened.service(),
-        source,
-        name,
-        architecture,
-        &names,
-        |formation| {
-            store.and_then(|store| {
-                store.get(crate::artifacts::ArtifactKind::CudaImage, &key(formation))
-            })
-        },
-        |formation, image| {
-            if let Some(store) = store {
-                store.put(
-                    crate::artifacts::ArtifactKind::CudaImage,
-                    &key(formation),
-                    image,
-                );
-            }
-        },
-    )
+/// Form `sources` and place each launch at its entry: `requests` names, by
+/// launch ordinal, the source and entry it runs.
+fn form_launches<T: Toolchain>(
+    former: &ProgramFormer<T>,
+    sources: &[ProgramSource],
+    requests: &[(usize, ProgramEntry)],
+) -> Result<Launches<T::Program>, PrepareError> {
+    let programs = former.form(sources).map_err(compilation)?;
+    let locations = requests
+        .iter()
+        .map(|(source, entry)| (*source, programs[*source].entry(entry)))
+        .collect();
+    Ok(Launches {
+        programs,
+        locations,
+    })
 }
 
 pub(crate) fn backend_name(kind: &OpenedKind) -> BackendName {
@@ -482,8 +497,11 @@ pub(crate) fn backend_name(kind: &OpenedKind) -> BackendName {
 }
 
 impl NativePrepared {
-    #[cfg(target_os = "macos")]
-    pub(crate) fn form_metal_launches(
+    /// Form each launch in `sources` with all its code variants, one
+    /// program per launch, and hold the programs, so that each
+    /// specialization a tuning run assembles from them while they are held
+    /// forms nothing. Backends without launch-scoped programs hold none.
+    pub(crate) fn hold_launch_variants(
         device: &Arc<DeviceInner>,
         module: &CheckedModule,
         entry: EntryId,
@@ -491,180 +509,47 @@ impl NativePrepared {
         statics: &NativeSpecialization,
         implementation: &NativeImplementation,
         sources: &[plan::LaunchSource],
-    ) -> Result<NativeLaunchForms, PrepareError> {
-        let OpenedKind::Metal(opened) = &device.kind else {
-            return Err(preparation(
-                "Metal launch formation requires a Metal device",
-            ));
+    ) -> Result<HeldPrograms, PrepareError> {
+        let backend = backend_name(&device.kind);
+        let dialect = match backend {
+            BackendName::Metal => abi::Dialect::Metal,
+            BackendName::Cuda => abi::Dialect::Cuda,
+            _ => return Ok(HeldPrograms(Box::new(()))),
         };
         let logical = module
             .entry(entry, bindings)
             .map_err(PrepareError::Source)?;
-        let asset = module
-            .native_asset(entry, BackendName::Metal)
-            .ok_or_else(|| {
-                preparation(format!(
-                    "native Metal asset of `{}` is absent",
-                    entry_name(module, entry)
-                ))
-            })?;
-        let rendered = sources
+        let asset = module.native_asset(entry, backend).ok_or_else(|| {
+            preparation(format!(
+                "native asset of `{}` is absent from the module",
+                entry_name(module, entry)
+            ))
+        })?;
+        let programs = sources
             .iter()
             .map(|source| {
-                let kernel = &implementation.launches[source.ordinal].kernel;
-                let names = source
-                    .code_variants
-                    .iter()
-                    .map(|values| {
-                        if values.is_empty() {
-                            kernel.clone()
-                        } else {
-                            format!(
-                                "{kernel}${}",
-                                values
-                                    .iter()
-                                    .map(u64::to_string)
-                                    .collect::<Vec<_>>()
-                                    .join("_")
-                            )
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let text = abi::render_metal_launch_source(
+                launch_program(
+                    dialect,
                     &logical,
                     bindings,
                     implementation,
                     statics,
                     asset,
-                    source,
-                );
-                (text, names, source.code_variants.clone())
+                    source.ordinal,
+                    &source.code_variants,
+                )
             })
             .collect::<Vec<_>>();
-        let formed = std::thread::scope(|scope| {
-            rendered
-                .iter()
-                .map(|(text, names, _)| {
-                    scope.spawn(move || {
-                        let names = names.iter().map(String::as_str).collect::<Vec<_>>();
-                        seismic_metal::DirectPipeline::compile_all(opened.service(), text, &names)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|thread| {
-                    thread
-                        .join()
-                        .expect("Metal launch formation thread panicked")
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|error| PrepareError::Preparation(PreparationError::NativeCompilation(error)))?;
-        let metal = rendered
-            .iter()
-            .zip(formed)
-            .map(|((_, _, variants), functions)| {
-                variants
-                    .iter()
-                    .cloned()
-                    .zip(functions)
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .collect();
-        Ok(NativeLaunchForms {
-            metal,
-            cuda: Vec::new(),
-            sources: rendered.into_iter().map(|(text, _, _)| text).collect(),
-        })
-    }
-
-    pub(crate) fn form_cuda_launches(
-        device: &Arc<DeviceInner>,
-        module: &CheckedModule,
-        entry: EntryId,
-        bindings: &ElementBindings,
-        statics: &NativeSpecialization,
-        implementation: &NativeImplementation,
-        sources: &[plan::LaunchSource],
-    ) -> Result<NativeLaunchForms, PrepareError> {
-        let OpenedKind::Cuda(opened) = &device.kind else {
-            return Err(preparation("CUDA launch formation requires a CUDA device"));
-        };
-        let logical = module
-            .entry(entry, bindings)
-            .map_err(PrepareError::Source)?;
-        let asset = module
-            .native_asset(entry, BackendName::Cuda)
-            .ok_or_else(|| {
-                preparation(format!(
-                    "native CUDA asset of `{}` is absent",
-                    entry_name(module, entry)
-                ))
-            })?;
-        let rendered = sources
-            .iter()
-            .map(|launch_source| {
-                let kernel = &implementation.launches[launch_source.ordinal].kernel;
-                let expressions = launch_source
-                    .code_variants
-                    .iter()
-                    .map(|values| cuda_expression(kernel, values))
-                    .collect::<Vec<_>>();
-                let text = abi::render_cuda_launch_source(
-                    &logical,
-                    bindings,
-                    implementation,
-                    statics,
-                    asset,
-                    launch_source.ordinal,
-                );
-                (text, expressions, launch_source.code_variants.clone())
-            })
-            .collect::<Vec<_>>();
-        let facts = opened.device_description().facts();
-        let architecture = u32::from(facts.compute_capability.major) * 10
-            + u32::from(facts.compute_capability.minor);
-        let store = device.artifacts.as_deref();
-        let entry_name = entry_name(module, entry);
-        let formed = std::thread::scope(|scope| {
-            rendered
-                .iter()
-                .enumerate()
-                .map(|(ordinal, (source, expressions, _))| {
-                    let name = format!("{entry_name}-{ordinal}.cu");
-                    scope.spawn(move || {
-                        form_cuda_source(opened, store, source, &name, architecture, expressions)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|thread| {
-                    thread
-                        .join()
-                        .expect("CUDA launch formation thread panicked")
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|error| PrepareError::Preparation(PreparationError::NativeCompilation(error)))?;
-        let cuda = rendered
-            .iter()
-            .zip(formed)
-            .map(|((_, _, variants), module)| {
-                let module = Arc::new(module);
-                variants
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(function, values)| (values, (module.clone(), function)))
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .collect();
-        Ok(NativeLaunchForms {
+        Ok(HeldPrograms(match &device.programs {
             #[cfg(target_os = "macos")]
-            metal: Vec::new(),
-            cuda,
-            sources: rendered.into_iter().map(|(text, _, _)| text).collect(),
-        })
+            crate::backends::DevicePrograms::Metal(former) => {
+                Box::new(former.form(&programs).map_err(compilation)?)
+            }
+            crate::backends::DevicePrograms::Cuda(former) => {
+                Box::new(former.form(&programs).map_err(compilation)?)
+            }
+            _ => unreachable!("only Metal and CUDA form launch-scoped programs"),
+        }))
     }
 
     /// Form the entry's native implementation for `device`'s backend.
@@ -711,28 +596,6 @@ impl NativePrepared {
         specialization: NativeSpecialization,
         cpu: Option<&'static CpuNativeKernels>,
         implementation: NativeImplementation,
-    ) -> Result<Arc<Self>, PrepareError> {
-        Self::prepare_with_forms(
-            device,
-            module,
-            entry,
-            bindings,
-            specialization,
-            cpu,
-            implementation,
-            None,
-        )
-    }
-
-    pub(crate) fn prepare_with_forms(
-        device: &Arc<DeviceInner>,
-        module: &CheckedModule,
-        entry: EntryId,
-        bindings: ElementBindings,
-        specialization: NativeSpecialization,
-        cpu: Option<&'static CpuNativeKernels>,
-        implementation: NativeImplementation,
-        forms: Option<&NativeLaunchForms>,
     ) -> Result<Arc<Self>, PrepareError> {
         let backend = backend_name(&device.kind);
         let name = entry_name(module, entry);
@@ -795,14 +658,58 @@ impl NativePrepared {
             .iter()
             .map(|launch| launch.kernel.as_str())
             .collect::<Vec<_>>();
-        let compilation =
-            |error| PrepareError::Preparation(PreparationError::NativeCompilation(error));
         let asset = |backend| {
             module.native_asset(entry, backend).ok_or_else(|| {
                 preparation(format!(
                     "native asset of `{name}` is absent from the module"
                 ))
             })
+        };
+        let launches = implementation.launches.len();
+        // The implementation's programs: one per launch for launch-scoped
+        // parameters, else the whole entry's source with one entry per
+        // launch.
+        let programs = |dialect: abi::Dialect, asset: &str| {
+            if scoped {
+                let sources = (0..launches)
+                    .map(|ordinal| {
+                        launch_program(
+                            dialect,
+                            &logical,
+                            &bindings,
+                            &implementation,
+                            &specialization,
+                            asset,
+                            ordinal,
+                            &[plan::code_values(&implementation, &specialization, ordinal)],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let requests = sources
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, source)| (ordinal, source.entries[0].clone()))
+                    .collect::<Vec<_>>();
+                (sources, requests)
+            } else {
+                let entries = kernels
+                    .iter()
+                    .map(|kernel| ProgramEntry::named(*kernel))
+                    .collect::<Vec<_>>();
+                let requests = entries.iter().map(|entry| (0, entry.clone())).collect();
+                let source = ProgramSource {
+                    text: abi::render_source(
+                        dialect,
+                        &logical,
+                        &bindings,
+                        &implementation,
+                        &specialization,
+                        asset,
+                    ),
+                    entries,
+                };
+                (vec![source], requests)
+            }
         };
         let mut digest = Sha256::new();
         let (route, toolchain) = match &device.kind {
@@ -847,260 +754,74 @@ impl NativePrepared {
                         words * 8
                     )));
                 }
-                let pipelines = if scoped {
-                    if let Some(forms) = forms {
-                        implementation.launches.iter().enumerate().map(|(ordinal, _)| {
-                            let values = plan::code_values(&implementation, &specialization, ordinal);
-                            digest.update(forms.sources[ordinal].as_bytes());
-                            forms.metal[ordinal].get(&values).cloned().ok_or_else(|| {
-                                preparation(format!("no formed Metal function for launch {ordinal} code values {values:?}"))
-                            })
-                        }).collect::<Result<Vec<_>, _>>()?
-                    } else {
-                        let asset = asset(BackendName::Metal)?;
-                        let sources = implementation
-                            .launches
-                            .iter()
-                            .enumerate()
-                            .map(|(ordinal, launch)| {
-                                let values =
-                                    plan::code_values(&implementation, &specialization, ordinal);
-                                let name = if values.is_empty() {
-                                    launch.kernel.clone()
-                                } else {
-                                    format!(
-                                        "{}${}",
-                                        launch.kernel,
-                                        values
-                                            .iter()
-                                            .map(u64::to_string)
-                                            .collect::<Vec<_>>()
-                                            .join("_")
-                                    )
-                                };
-                                let source = abi::render_metal_launch_source(
-                                    &logical,
-                                    &bindings,
-                                    &implementation,
-                                    &specialization,
-                                    asset,
-                                    &plan::LaunchSource {
-                                        ordinal,
-                                        code_variants: vec![values],
-                                    },
-                                );
-                                (source, name)
-                            })
-                            .collect::<Vec<_>>();
-                        let formed = std::thread::scope(|scope| {
-                            sources
-                                .iter()
-                                .map(|(source, name)| {
-                                    scope.spawn(move || {
-                                        seismic_metal::DirectPipeline::compile_all(
-                                            opened.service(),
-                                            source,
-                                            &[name.as_str()],
-                                        )
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .map(|thread| {
-                                    thread.join().expect("Metal formation thread panicked")
-                                })
-                                .collect::<Result<Vec<_>, _>>()
-                        })
-                        .map_err(compilation)?;
-                        for (source, _) in &sources {
-                            digest.update(source.as_bytes());
-                        }
-                        formed
-                            .into_iter()
-                            .map(|pipelines| {
-                                pipelines
-                                    .into_iter()
-                                    .next()
-                                    .expect("one requested Metal function")
-                            })
-                            .collect()
-                    }
-                } else {
-                    let source = abi::render_source(
-                        abi::Dialect::Metal,
-                        &logical,
-                        &bindings,
-                        &implementation,
-                        &specialization,
-                        asset(BackendName::Metal)?,
-                    );
-                    digest.update(source.as_bytes());
-                    seismic_metal::DirectPipeline::compile_all(opened.service(), &source, &kernels)
-                        .map_err(compilation)?
-                };
+                let (sources, requests) = programs(abi::Dialect::Metal, asset(BackendName::Metal)?);
+                let former = device.programs.metal();
+                let launches = form_launches(former, &sources, &requests)?;
+                launches.identify(&mut digest);
                 (
                     NativeRoute::Metal {
                         opened: opened.clone(),
-                        pipelines,
+                        launches,
                     },
-                    format!(
-                        "metal;{}",
-                        opened.device_description().facts().operating_system()
-                    ),
+                    former.toolchain().identity().material.clone(),
                 )
             }
             OpenedKind::Cuda(opened) => {
-                let facts = opened.device_description().facts();
-                let architecture = u32::from(facts.compute_capability.major) * 10
-                    + u32::from(facts.compute_capability.minor);
-                let kind = crate::artifacts::ArtifactKind::CudaImage;
-                let store = device.artifacts.as_deref();
-                let (functions, formation) = if scoped {
-                    let modules = if let Some(forms) = forms {
-                        implementation.launches.iter().enumerate().map(|(ordinal, launch)| {
-                            let values = plan::code_values(&implementation, &specialization, ordinal);
-                            let expression = cuda_expression(&launch.kernel, &values);
-                            digest.update(forms.sources[ordinal].as_bytes());
-                            digest.update(expression.as_bytes());
-                            forms.cuda[ordinal].get(&values).cloned().ok_or_else(|| {
-                                preparation(format!("no formed CUDA function for launch {ordinal} code values {values:?}"))
-                            })
-                        }).collect::<Result<Vec<_>, _>>()?
-                    } else {
-                        let asset = asset(BackendName::Cuda)?;
-                        implementation
-                            .launches
-                            .iter()
-                            .enumerate()
-                            .map(|(ordinal, launch)| {
-                                let values =
-                                    plan::code_values(&implementation, &specialization, ordinal);
-                                let expression = cuda_expression(&launch.kernel, &values);
-                                let source = abi::render_cuda_launch_source(
-                                    &logical,
-                                    &bindings,
-                                    &implementation,
-                                    &specialization,
-                                    asset,
-                                    ordinal,
-                                );
-                                digest.update(source.as_bytes());
-                                digest.update(expression.as_bytes());
-                                form_cuda_source(
-                                    opened,
-                                    store,
-                                    &source,
-                                    &format!("{name}-{ordinal}.cu"),
-                                    architecture,
-                                    &[expression],
-                                )
-                                .map(|module| (Arc::new(module), 0))
-                                .map_err(compilation)
-                            })
-                            .collect::<Result<Vec<_>, _>>()?
-                    };
-                    let formation = modules
-                        .first()
-                        .expect("checked implementation has launches")
-                        .0
-                        .formation()
-                        .to_string();
-                    (CudaFunctions::scoped(modules), formation)
-                } else {
-                    let source = abi::render_source(
-                        abi::Dialect::Cuda,
-                        &logical,
-                        &bindings,
-                        &implementation,
-                        &specialization,
-                        asset(BackendName::Cuda)?,
-                    );
-                    digest.update(source.as_bytes());
-                    let key = |formation: &seismic_cuda::nvrtc::Formation| {
-                        crate::artifacts::ArtifactKey::of(&[
-                            source.as_bytes(),
-                            formation.to_string().as_bytes(),
-                        ])
-                    };
-                    let module = seismic_cuda::direct::DirectModule::form(
-                        opened.service(),
-                        &source,
-                        &format!("{name}.cu"),
-                        architecture,
-                        &kernels,
-                        |formation| store.and_then(|store| store.get(kind, &key(formation))),
-                        |formation, image| {
-                            if let Some(store) = store {
-                                store.put(kind, &key(formation), image);
-                            }
-                        },
-                    )
-                    .map_err(compilation)?;
-                    let formation = module.formation().to_string();
-                    (CudaFunctions::entry(module, kernels.len()), formation)
-                };
-                let toolchain = format!("cuda;{formation};driver {}", facts.driver_api.0);
+                let (sources, requests) = programs(abi::Dialect::Cuda, asset(BackendName::Cuda)?);
+                let former = device.programs.cuda();
+                let launches = form_launches(former, &sources, &requests)?;
+                launches.identify(&mut digest);
+                // Measurements depend on the driver the CUBIN runs under.
+                let toolchain = format!(
+                    "{};driver {}",
+                    former.toolchain().identity().material,
+                    opened.device_description().facts().driver_api.0
+                );
                 (
                     NativeRoute::Cuda {
                         opened: opened.clone(),
-                        functions,
+                        launches,
                     },
                     toolchain,
                 )
             }
             #[cfg(not(target_os = "macos"))]
             OpenedKind::Vulkan(opened) => {
-                let source = abi::render_source(
-                    abi::Dialect::Vulkan(opened.features()),
-                    &logical,
-                    &bindings,
-                    &implementation,
-                    &specialization,
-                    asset(BackendName::Vulkan)?,
-                );
-                digest.update(source.as_bytes());
                 let geometry = vulkan_geometry(opened, &name, &implementation, &specialization)?;
-                let formation = seismic_vulkan::formation::formation(opened.service());
-                // A launch's SPIR-V is determined by the source, its kernel
-                // and the formation: the store's key.
-                let key = |kernel: &str| {
-                    crate::artifacts::ArtifactKey::of(&[
-                        source.as_bytes(),
-                        kernel.as_bytes(),
-                        formation.as_bytes(),
-                    ])
+                // Each entry's constants are its workgroup size, then its
+                // group-memory views: the pipeline's specialization.
+                let source = ProgramSource {
+                    text: abi::render_source(
+                        abi::Dialect::Vulkan(opened.features()),
+                        &logical,
+                        &bindings,
+                        &implementation,
+                        &specialization,
+                        asset(BackendName::Vulkan)?,
+                    ),
+                    entries: kernels
+                        .iter()
+                        .zip(&geometry)
+                        .map(|(kernel, (threads, views))| ProgramEntry {
+                            symbol: (*kernel).to_owned(),
+                            constants: threads.iter().chain(views).copied().collect(),
+                        })
+                        .collect(),
                 };
-                let kind = crate::artifacts::ArtifactKind::SpirV;
-                let store = device.artifacts.as_deref();
-                let formed = geometry
+                let requests = source
+                    .entries
                     .iter()
-                    .zip(&kernels)
-                    .map(
-                        |((threads, views), kernel)| seismic_vulkan::formation::Kernel {
-                            name: kernel,
-                            threads: *threads,
-                            constants: views,
-                        },
-                    )
+                    .map(|entry| (0, entry.clone()))
                     .collect::<Vec<_>>();
-                let module = seismic_vulkan::formation::DirectModule::form(
-                    opened.service(),
-                    &source,
-                    &formed,
-                    |kernel| store.and_then(|store| store.get(kind, &key(kernel))),
-                    |kernel, spirv| {
-                        if let Some(store) = store {
-                            store.put(kind, &key(kernel), spirv);
-                        }
-                    },
-                )
-                .map_err(compilation)?;
+                let former = device.programs.vulkan();
+                let launches = form_launches(former, &[source], &requests)?;
+                launches.identify(&mut digest);
                 (
                     NativeRoute::Vulkan {
                         opened: opened.clone(),
-                        module,
+                        launches,
                     },
-                    formation,
+                    former.toolchain().identity().material.clone(),
                 )
             }
         };
@@ -1306,8 +1027,8 @@ impl NativePrepared {
             match &self.route {
                 NativeRoute::Cpu(_) => {}
                 #[cfg(target_os = "macos")]
-                NativeRoute::Metal { opened, pipelines } => {
-                    let pipeline = &pipelines[ordinal];
+                NativeRoute::Metal { opened, launches } => {
+                    let pipeline = launches.pipeline(ordinal);
                     if participants > pipeline.max_threads_per_threadgroup() {
                         return Err(limit(format!(
                             "launch `{}` requests {participants} threads per threadgroup; the pipeline allows {}",
@@ -1324,8 +1045,8 @@ impl NativePrepared {
                         )));
                     }
                 }
-                NativeRoute::Cuda { opened, functions } => {
-                    let (module, function) = functions.function(ordinal);
+                NativeRoute::Cuda { opened, launches } => {
+                    let (module, function) = launches.launch(ordinal);
                     if participants > module.max_threads_per_block(function) {
                         return Err(limit(format!(
                             "launch `{}` requests {participants} threads per block; the function allows {}",
@@ -2013,7 +1734,7 @@ fn encode(
                 for index in 0..list.count() {
                     buffers.clear();
                     let dispatch = list.dispatch(index, &mut buffers);
-                    let NativeRoute::Metal { pipelines, .. } = &dispatch.kernel.route else {
+                    let NativeRoute::Metal { launches: pipelines, .. } = &dispatch.kernel.route else {
                         unreachable!("one device has one native route");
                     };
                     typed.clear();
@@ -2021,7 +1742,8 @@ fn encode(
                         (typed_buffer::<Metal, Executor>(allocation), *offset)
                     }));
                     let scalars = typed_buffer::<Metal, Executor>(&dispatch.kernel.scalars);
-                    for (pipeline, launch) in pipelines.iter().zip(dispatch.launches) {
+                    for (ordinal, launch) in dispatch.launches.iter().enumerate() {
+                        let pipeline = pipelines.pipeline(ordinal);
                         let Some(launch) = launch else {
                             batch.skip();
                             continue;

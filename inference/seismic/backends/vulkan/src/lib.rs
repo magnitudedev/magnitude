@@ -14,6 +14,7 @@ mod instance;
 mod memory;
 mod probe;
 pub mod seal;
+pub mod toolchain;
 
 pub use device::{Device, MemoryBudget, OpenError, Rounded};
 pub use facts::{

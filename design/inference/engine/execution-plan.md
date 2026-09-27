@@ -87,8 +87,9 @@ On CPU, expensive projection cases screen candidates at a few representative row
 row shares. The default and shortlisted configurations are still confirmed, ranked and validated
 at every served row; the full workload remains the final objective.
 The engine owns every cache, under a directory the host names (`--cache-dir`; without one nothing
-is cached). It holds CUDA images Seismic formed, through the device's artifact store, and one
-tuning result per tuning key. The key is a digest over the device and toolchain identity (Metal OS
+is cached). It holds the program artifacts Seismic keeps (CUDA CUBINs, Vulkan SPIR-V), through
+the device's artifact store, one directory per toolchain namespace, and one tuning result per
+tuning key. The key is a digest over the device and toolchain identity (Metal OS
 build; CUDA driver and NVRTC release), the unit, the implementation digest (declaration and
 rendered source), and the search definition (search version, budget, settings, point labels and
 weights, screening points and folded weights, validation rule, sample time). A hit prepares the

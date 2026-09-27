@@ -174,8 +174,9 @@ pub(super) const SUFFIX: &str = "\nvoid main() {\n    SEISMIC_KERNEL();\n}\n";
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
+    use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
     use seismic_vulkan::direct::{DirectBatch, DirectLaunch};
-    use seismic_vulkan::formation::{DirectModule, Kernel};
+    use seismic_vulkan::toolchain::VulkanToolchain;
 
     const KERNEL: &str = "
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
@@ -238,18 +239,18 @@ void main() {
             shared_int64_atomics: false,
         };
         let source = format!("{}{KERNEL}", header(features));
-        let module = DirectModule::form(
-            &device,
-            &source,
-            &[Kernel {
-                name: "numerics",
-                threads: [64, 1, 1],
-                constants: &[],
-            }],
-            |_| None,
-            |_, _| {},
-        )
-        .expect("the numerics kernel forms");
+        let module = VulkanToolchain::new(device.clone())
+            .compile(
+                &ProgramSource {
+                    text: source,
+                    entries: vec![ProgramEntry {
+                        symbol: "numerics".into(),
+                        constants: vec![64, 1, 1],
+                    }],
+                },
+                None,
+            )
+            .expect("the numerics kernel forms");
 
         let specials = [
             0.0f32,
@@ -437,18 +438,18 @@ void main() {
             shared_int64_atomics: false,
         };
         let source = format!("{}{HALVES}", header(features));
-        let module = DirectModule::form(
-            &device,
-            &source,
-            &[Kernel {
-                name: "halves",
-                threads: [64, 1, 1],
-                constants: &[],
-            }],
-            |_| None,
-            |_, _| {},
-        )
-        .expect("the conversion kernel forms");
+        let module = VulkanToolchain::new(device.clone())
+            .compile(
+                &ProgramSource {
+                    text: source,
+                    entries: vec![ProgramEntry {
+                        symbol: "halves".into(),
+                        constants: vec![64, 1, 1],
+                    }],
+                },
+                None,
+            )
+            .expect("the conversion kernel forms");
 
         let mut inputs = Vec::new();
         for half in 0..=u16::MAX {

@@ -9,6 +9,7 @@
 mod description;
 mod error;
 mod native;
+mod program;
 
 pub use description::{
     CompatibilityIdentity, DeviceDescription, DeviceDescriptionIdentity, DeviceDescriptionParts,
@@ -21,3 +22,4 @@ pub use native::{
     NativeKernelDescription, NativeKernelIdentity, NativeKernelReflection, NativeLaunchDomain,
     NativeResourceUsage, NativeResources,
 };
+pub use program::{ProgramCache, ProgramEntry, ProgramSource, Toolchain, ToolchainIdentity};

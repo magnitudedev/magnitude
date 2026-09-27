@@ -24,6 +24,7 @@ pub mod executor;
 pub mod facts;
 pub mod intrinsic;
 pub mod profile;
+pub mod toolchain;
 
 mod command;
 mod compile;

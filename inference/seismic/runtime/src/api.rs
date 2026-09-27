@@ -328,9 +328,13 @@ pub mod device {
         pub(crate) info: DeviceInfo,
         pub(crate) capabilities: std::sync::OnceLock<Vec<String>>,
         pub(crate) kind: OpenedKind,
+        /// Forms this device's native programs.
+        pub(crate) programs: crate::backends::DevicePrograms,
         /// The active submission trace, if any (`native::trace`).
         pub(crate) trace: std::sync::Mutex<Option<Arc<crate::native::trace::TraceSink>>>,
-        /// Where formed native artifacts are looked up and kept.
+        /// The artifact store this device was opened with; its program
+        /// former keeps artifacts there. A device is shared only with callers
+        /// asking for the same store.
         pub(crate) artifacts: Option<Arc<dyn crate::artifacts::ArtifactStore>>,
         /// Native submission order and CUDA graph replays.
         pub(crate) native: crate::native::NativeQueue,

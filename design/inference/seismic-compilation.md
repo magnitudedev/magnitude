@@ -83,31 +83,37 @@ determine the groups that must be measured together. The tuner measures every ca
 group at the points where that group contributes work, evaluates boundary parameters that move
 points between launches, then confirms each group's shortlisted candidates against its defaults
 before assembling one choice per group. An independent launch group outside the consumer's
-served points keeps its declared default. Code variants of a Metal launch are
-formed together into one library; a candidate selects immutable formed functions and supplies
-its runtime geometry. A safety deadline leaves unmeasured groups at their defaults and prevents
+served points keeps its declared default. Each launch is formed up front as one program holding
+all its code variants and held for the whole run, so a candidate forms nothing and supplies its
+runtime geometry. A safety deadline leaves unmeasured groups at their defaults and prevents
 that incomplete result from being cached. An interrupted group's already formed candidates are
 measured and ranked; the tuner skips further group confirmation. The assembled choice is
 remeasured and validated against the defaults before it may replace them. The assembled
 candidate and the all-defaults reference are measured in shared sample rounds, so clock drift
 affects both together.
-Seismic performs no file I/O for formed artifacts and knows no cache locations. An embedder that
-keeps them between processes passes an `ArtifactStore` when it opens a device. CUDA formation
-computes a content address over the rendered source and the NVRTC formation (release,
-architecture, options), asks the store before running NVRTC, loads a stored CUBIN instead of
-compiling, and hands every newly formed CUBIN to the store; a stored image the driver refuses is a
-miss and is formed again. Metal and CPU formation do not use the store.
+Native programs are formed uniformly. A caller renders a program: source text and the entries it
+needs, with any launch constants. Code variants of a launch are template instances of one source,
+so they share its text and differ only in their entry. Each backend's toolchain compiles a program
+in one pass into executable entries. Each opened device owns one program former, which keys a
+program by the toolchain identity and its text, serves it from a live program of the same text
+that holds every requested entry, and otherwise has the toolchain compile it; independent programs
+compile concurrently. What is kept between processes is each toolchain's choice: CUDA keeps the
+CUBIN with each requested instance's lowered linker name, Vulkan keeps each entry's sealed
+SPIR-V, and Metal keeps nothing, since the OS caches its compiles. A kept entry that no longer
+loads, validates or holds the requested entries is compiled again and replaced. CPU kernels are
+compiled into the binary and render no programs.
+Seismic performs no file I/O for artifacts and knows no cache locations. An embedder that keeps
+them between processes passes an `ArtifactStore` when it opens a device; the store sees opaque
+namespaced, content-addressed bytes.
 NVRTC is an owned dependency of the CUDA backend, loaded from exactly one directory: the
 installation's `runtime/` beside `bin/` (`<executable>/../runtime/`), where the release, the local
 development installation and every test layout place it together with its builtins library of the
 same release. `SEISMIC_NVRTC_DIRECTORY` replaces that directory only for engine development outside
 an installation layout. There is no search-path fallback: a missing NVRTC is a typed
 toolchain-unavailable failure, never a lookup elsewhere.
-For launch-scoped CUDA formation, each guarded launch source is addressed separately with its
-requested template expression and NVRTC formation. The stored artifact carries both the CUBIN
-and NVRTC's lowered linker name, which dispatch needs on a cache hit. The factored tuner forms
-all code variants of each CUDA launch in one NVRTC program, then assembles candidate functions
-from those modules.
+For launch-scoped Metal and CUDA formation, each launch is its own program: the same rendering
+serves preparation and the factored tuner, so a tuned choice prepares from the programs tuning
+formed or CUDA kept.
 For keying the embedder's
 own records of tuning results, Seismic exposes a device tuning identity that includes the Metal OS
 build, the CUDA driver and NVRTC release, or the CPU's detected instruction-set tier and CPU library

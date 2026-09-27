@@ -18,6 +18,7 @@ use crate::devices::{
     DeviceSelector, DiscoveryDiagnostic, LedgerKey, ObservationError, OpenError,
 };
 use crate::driver::{self, Opened, PreparedHandle};
+use crate::formation::ProgramFormer;
 use crate::memory::MemoryDomain;
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::NativeExecutor;
@@ -421,6 +422,7 @@ pub(crate) fn open(
     options: crate::artifacts::DeviceOptions,
 ) -> Result<Arc<DeviceInner>, OpenError> {
     let descriptor = info.descriptor.clone();
+    let mut programs = DevicePrograms::Cpu;
     let kind = match descriptor.as_ref() {
         Descriptor::Cpu => {
             let seismic_cpu::OpenedCpu {
@@ -444,6 +446,10 @@ pub(crate) fn open(
             let device =
                 seismic_metal::profile::open_device(&service).map_err(OpenError::Backend)?;
             let executor = seismic_metal::MetalExecutor::new(service.clone());
+            programs = DevicePrograms::Metal(ProgramFormer::new(
+                seismic_metal::toolchain::MetalToolchain::new(service.clone(), device.facts()),
+                options.artifacts.clone(),
+            ));
             OpenedKind::Metal(Arc::new(Opened::new(
                 service,
                 executor,
@@ -463,6 +469,14 @@ pub(crate) fn open(
             let seismic_cuda::OpenedCuda { service, device } =
                 seismic_cuda::open(*ordinal).map_err(open_error)?;
             let executor = seismic_cuda::Executor::new(service.clone());
+            let capability = device.facts().compute_capability;
+            programs = DevicePrograms::Cuda(ProgramFormer::new(
+                seismic_cuda::toolchain::CudaToolchain::new(
+                    service.clone(),
+                    u32::from(capability.major) * 10 + u32::from(capability.minor),
+                ),
+                options.artifacts.clone(),
+            ));
             OpenedKind::Cuda(Arc::new(Opened::new(
                 service,
                 executor,
@@ -474,17 +488,59 @@ pub(crate) fn open(
         }
         #[cfg(not(target_os = "macos"))]
         Descriptor::Vulkan { uuid } => {
-            OpenedKind::Vulkan(Arc::new(VulkanOpened::open(*uuid, &info, memory)?))
+            let opened = VulkanOpened::open(*uuid, &info, memory)?;
+            programs = DevicePrograms::Vulkan(ProgramFormer::new(
+                seismic_vulkan::toolchain::VulkanToolchain::new(opened.service().clone()),
+                options.artifacts.clone(),
+            ));
+            OpenedKind::Vulkan(Arc::new(opened))
         }
     };
     Ok(Arc::new(DeviceInner {
         info,
         capabilities: std::sync::OnceLock::new(),
         kind,
+        programs,
         trace: std::sync::Mutex::new(None),
         artifacts: options.artifacts,
         native: crate::native::NativeQueue::default(),
     }))
+}
+
+/// The program former of an opened device, by backend. The CPU backend
+/// renders no programs.
+pub(crate) enum DevicePrograms {
+    Cpu,
+    #[cfg(target_os = "macos")]
+    Metal(ProgramFormer<seismic_metal::toolchain::MetalToolchain>),
+    Cuda(ProgramFormer<seismic_cuda::toolchain::CudaToolchain>),
+    #[cfg(not(target_os = "macos"))]
+    Vulkan(ProgramFormer<seismic_vulkan::toolchain::VulkanToolchain>),
+}
+
+impl DevicePrograms {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal(&self) -> &ProgramFormer<seismic_metal::toolchain::MetalToolchain> {
+        let Self::Metal(former) = self else {
+            unreachable!("a Metal device forms Metal programs");
+        };
+        former
+    }
+
+    pub(crate) fn cuda(&self) -> &ProgramFormer<seismic_cuda::toolchain::CudaToolchain> {
+        let Self::Cuda(former) = self else {
+            unreachable!("a CUDA device forms CUDA programs");
+        };
+        former
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn vulkan(&self) -> &ProgramFormer<seismic_vulkan::toolchain::VulkanToolchain> {
+        let Self::Vulkan(former) = self else {
+            unreachable!("a Vulkan device forms Vulkan programs");
+        };
+        former
+    }
 }
 
 fn open_error(error: ExecutionError) -> OpenError {
