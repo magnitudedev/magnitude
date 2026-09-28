@@ -7,7 +7,7 @@
 //! access overlaps a launch that binds the buffer, which is what makes the
 //! raw address a valid kernel operand.
 
-use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -34,7 +34,10 @@ impl std::fmt::Display for AllocationFailure {
 
 struct Allocation {
     pointer: NonNull<u8>,
-    layout: Layout,
+    /// The layout used to allocate and release the physical backing.
+    physical_layout: Layout,
+    /// The logical byte range exposed to the runtime and transfer methods.
+    logical_bytes: u64,
 }
 
 // The allocation is plain bytes owned by this struct; sharing it across
@@ -45,10 +48,9 @@ unsafe impl Sync for Allocation {}
 
 impl Drop for Allocation {
     fn drop(&mut self) {
-        if self.layout.size() != 0 {
-            // `pointer` came from `alloc_zeroed(self.layout)` in `Buffer::new`.
-            unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
-        }
+        // `pointer` came from `alloc_zeroed(self.physical_layout)` in
+        // `Buffer::new`; physical storage is always non-zero-sized.
+        unsafe { dealloc(self.pointer.as_ptr(), self.physical_layout) };
     }
 }
 
@@ -63,26 +65,28 @@ impl Buffer {
     pub fn new(bytes: u64, alignment: u64) -> Result<Self, AllocationFailure> {
         let size = usize::try_from(bytes).map_err(|_| AllocationFailure::Unrepresentable)?;
         let align = usize::try_from(alignment).map_err(|_| AllocationFailure::Unrepresentable)?;
-        let layout =
-            Layout::from_size_align(size, align).map_err(|_| AllocationFailure::Unrepresentable)?;
-        let pointer = if size == 0 {
-            NonNull::<u8>::dangling()
-        } else {
-            // A non-zero-sized layout, as `alloc_zeroed` requires.
-            let raw = unsafe { alloc_zeroed(layout) };
-            NonNull::new(raw).ok_or(AllocationFailure::OutOfMemory)?
-        };
+        // A zero logical allocation still needs a live, aligned address for
+        // typed native views. Keep that physical minimum private: the runtime
+        // and transfer bounds continue to observe `logical_bytes`.
+        let physical_layout = Layout::from_size_align(size.max(1), align)
+            .map_err(|_| AllocationFailure::Unrepresentable)?;
+        let raw = unsafe { alloc_zeroed(physical_layout) };
+        let pointer = NonNull::new(raw).ok_or(AllocationFailure::OutOfMemory)?;
         Ok(Self {
-            inner: Arc::new(Allocation { pointer, layout }),
+            inner: Arc::new(Allocation {
+                pointer,
+                physical_layout,
+                logical_bytes: bytes,
+            }),
         })
     }
 
     pub fn len(&self) -> u64 {
-        self.inner.layout.size() as u64
+        self.inner.logical_bytes
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.layout.size() == 0
+        self.inner.logical_bytes == 0
     }
 
     /// The host address of byte 0. Valid while any handle is alive.
@@ -128,6 +132,29 @@ impl Buffer {
                 self.len()
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Buffer;
+
+    #[test]
+    fn zero_logical_bytes_have_live_aligned_backing() {
+        let buffer = Buffer::new(0, 64).expect("empty buffer");
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.is_empty());
+        let pointer = buffer.data_pointer() as usize;
+        assert_ne!(pointer, 0);
+        assert_eq!(pointer % 64, 0);
+    }
+
+    #[test]
+    fn empty_transfers_are_bounded_by_logical_length() {
+        let buffer = Buffer::new(0, 64).expect("empty buffer");
+        buffer.write(0, &[]);
+        let mut bytes = [];
+        buffer.read(0, &mut bytes);
     }
 }
 

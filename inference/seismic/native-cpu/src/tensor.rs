@@ -46,7 +46,12 @@ macro_rules! addressing {
             /// A view of `base` with `extents` and `strides` in elements.
             ///
             /// # Safety
-            /// Every addressed element lies in storage valid for `'a`.
+            /// `base` points into live storage valid for `'a` and is aligned
+            /// for the view's element storage type. Every addressed element
+            /// lies within that storage.
+            /// This remains required when an extent is zero: Rust typed
+            /// slices require a non-null, correctly aligned pointer even
+            /// when their length is zero.
             pub unsafe fn from_raw(base: *mut u8, extents: [u64; RANK], strides: [u64; RANK]) -> Self {
                 Self {
                     base: base.cast(),
@@ -321,5 +326,20 @@ pub fn narrow_row<E: Dense>(values: &[f32], row: &mut [E::Storage]) {
     let row = &mut row[..values.len()];
     for (value, target) in values.iter().zip(row) {
         *target = E::narrow(*value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Tensor;
+    use crate::element::Bf16;
+
+    #[test]
+    fn empty_typed_rows_require_and_accept_aligned_live_storage() {
+        let mut backing = [0u16; 1];
+        let tensor = unsafe {
+            Tensor::<Bf16, 3>::from_raw(backing.as_mut_ptr().cast(), [1, 1, 0], [0, 0, 1])
+        };
+        assert!(tensor.row([0, 0, 0]).is_empty());
     }
 }
