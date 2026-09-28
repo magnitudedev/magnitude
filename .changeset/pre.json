@@ -39,5 +39,9 @@
     "@magnitudedev/vcs": "0.0.1",
     "@magnitudedev/version": "0.0.1"
   },
-  "changesets": []
+  "changesets": [
+    "headless-serve",
+    "native-inference-engine",
+    "remote-gate-case-insensitive-paths"
+  ]
 }
