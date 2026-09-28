@@ -94,7 +94,8 @@ export const validateDesktopDistribution = (options: { readonly image: string; r
         MAGNITUDE_TEST_EXPECT_VERSION: options.version, MAGNITUDE_TEST_EXPECT_REVISION: String(options.revision), MAGNITUDE_TEST_EXPECT_RPC_VERSION: String(options.rpcVersion),
       }),
       Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
-      Effect.timeout("3 minutes"),
+      // Leaves room for a stalled contender's limit and stack samples on the slowest (Intel) host.
+      Effect.timeout("5 minutes"),
     )
     if (code !== 0) return yield* new AppleDistributionFailed({ message: `Desktop lifecycle acceptance exited ${code}` })
   }

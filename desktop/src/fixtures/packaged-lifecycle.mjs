@@ -35,11 +35,47 @@ const eventually = async (read, expected, timeout = 10000) => {
   } while (Date.now() < deadline);
   assert.deepEqual(actual, expected);
 };
+// The owning application's recent main-process output, reported when a contender stalls.
+let ownerOutput = '';
+const launchOwner = async options => {
+  const launched = await electron.launch(options);
+  ownerOutput = '';
+  const collect = chunk => { ownerOutput = (ownerOutput + chunk.toString()).slice(-32000); };
+  launched.process().stdout.on('data', collect);
+  launched.process().stderr.on('data', collect);
+  return launched;
+};
+// Native stacks show whether a stalled process waits on the control socket or is busy.
+const sampleStack = pid => {
+  try { return execFileSync('/usr/bin/sample', [String(pid), '2'], { encoding: 'utf8', timeout: 20000, maxBuffer: 16 * 1024 * 1024 }).slice(0, 16000); }
+  catch (error) { return `sample failed: ${error.message}`; }
+};
+// A contender cold-starts Electron, then makes two handoff exchanges (Observe, then its intent),
+// each of which the application allows 5 seconds (application-control.ts).
+const contenderLimit = 30000;
 const invoke = args => new Promise((resolve, reject) => {
-  const child = spawn(executablePath, args, { env, stdio: 'ignore' });
-  const timeout = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Application contender did not exit')); }, 10000);
+  const started = Date.now();
+  const child = spawn(executablePath, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '';
+  const collect = chunk => { output = (output + chunk.toString()).slice(-32000); };
+  child.stdout.on('data', collect); child.stderr.on('data', collect);
+  const timeout = setTimeout(() => {
+    const owner = application?.process();
+    const report = [
+      `Application contender [${args.join(' ')}] did not exit within ${contenderLimit} ms.`,
+      `Contender output:\n${output}`,
+      `Contender stack:\n${sampleStack(child.pid)}`,
+      ...(owner ? [`Owner stack:\n${sampleStack(owner.pid)}`, `Owner output:\n${ownerOutput}`] : []),
+    ].join('\n\n');
+    child.kill('SIGKILL');
+    reject(new Error(report));
+  }, contenderLimit);
   child.once('error', error => { clearTimeout(timeout); reject(error); });
-  child.once('exit', code => { clearTimeout(timeout); resolve(code); });
+  child.once('exit', code => {
+    clearTimeout(timeout);
+    console.log(`Application contender [${args.join(' ')}] exited ${code} after ${Date.now() - started} ms`);
+    resolve(code);
+  });
 });
 let application;
 let probeOwner;
@@ -67,7 +103,7 @@ try {
   assert.match(rejected.output, /ApplicationOwnershipFailed|EEXIST/);
   assert.doesNotMatch(rejected.output, /Cause\.reduceWithContext|UnhandledPromiseRejection/);
   console.log('Rejected ownership path: original failure reported and background process exited');
-  application = await electron.launch({ chromiumSandbox: true, executablePath, args: [], env: {
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: [], env: {
     ...env, MAGNITUDE_DEV_DATA_DIR: failedProfile,
     MAGNITUDE_ICN_PATH: join(failedProfile, 'absent-engine.json'),
   }, timeout: 30000 });
@@ -108,7 +144,7 @@ try {
   await writeFile(join(profile, 'preserved.txt'), 'preserve user data');
   incumbent = createServer((_request, response) => response.end('unrelated service'));
   await new Promise((resolve, reject) => { incumbent.once('error', reject); incumbent.listen(11109, '127.0.0.1', resolve); });
-  application = await electron.launch({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
   const app = application;
   const visibility = () => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => ({ visible: window.isVisible(), minimized: window.isMinimized() })));
   const health = () => fetch('http://127.0.0.1:11109/health').then(response => response.json()).catch(() => null);
@@ -254,7 +290,7 @@ try {
   await eventually(health, null);
   console.log('Forced owner death during shell discovery: observed live probe and descendant retired');
 
-  application = await electron.launch({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
   const reopened = await application.firstWindow();
   await reopened.getByText('Find your balance', { exact: true }).waitFor();
@@ -274,7 +310,7 @@ try {
   await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)), false);
   console.log('Forced owner death after Ready: service and inference removed by lifetime guards');
 
-  application = await electron.launch({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
   assert.notEqual((await health()).pid, replacement.pid);
   const terminatedService = (await health()).pid;
@@ -290,7 +326,7 @@ try {
   await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)), false);
   console.log('Relaunch after crash and SIGTERM: ownership reacquired, graceful exit0 retires service and shell probes');
 
-  application = await electron.launch({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
   const shutdownService = (await health()).pid;
   const shutdownProcess = application.process();
