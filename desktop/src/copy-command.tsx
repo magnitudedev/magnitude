@@ -1,3 +1,4 @@
+import { ErrorNotice, NoticeAction } from "./error-notice"
 import { Effect, Fiber } from "effect"
 import { Atom, useAtomMount } from "@effect-atom/atom-react"
 import { useMemo, useRef, useState } from "react"
@@ -24,6 +25,6 @@ export function CopyCommand({ command, label }: { command: string; label: string
       {copied ? <CheckIcon aria-hidden="true" className="size-4 shrink-0 text-green-500" /> : <CopyIcon aria-hidden="true" className="size-4 shrink-0" />}
     </button>
     {copied && <span role="status" className="sr-only">Command copied</span>}
-    {failed && <p role="alert" className="mt-2 text-xs">Could not copy. Try again.</p>}
+    {failed && <ErrorNotice title="Couldn’t copy to the clipboard" className="mt-2" actions={<NoticeAction onClick={copy}>Copy again</NoticeAction>} />}
   </div>
 }

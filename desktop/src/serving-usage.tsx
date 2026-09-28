@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./error-notice"
 import { UsageActivity } from "./serving-usage-activity"
 import { LoadingRegion, SkeletonLine } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
@@ -42,7 +43,7 @@ export function ServingUsage() {
     </div>
     {snapshot?._tag === "Available" ? <UsageActivity days={snapshot.dailyActivity} /> : Result.isInitial(result) ? <UsageActivity days={null} /> : null}
     <div className="space-y-6 border-t border-slate-200 pt-6 dark:border-slate-750">
-      {snapshot?._tag === "Available" ? <UsageFigures usage={snapshot} /> : Result.isInitial(result) ? <LoadingRegion label="Loading usage"><div className="space-y-6"><UsageFigures usage={null} /></div></LoadingRegion> : <p role="alert" className="text-sm text-slate-500">{snapshot?._tag === "Unavailable" ? snapshot.message : Result.isFailure(result) ? "Usage history is unavailable. Reconnecting…" : "Reading usage history…"}</p>}
+      {snapshot?._tag === "Available" ? <UsageFigures usage={snapshot} /> : Result.isInitial(result) ? <LoadingRegion label="Loading usage"><div className="space-y-6"><UsageFigures usage={null} /></div></LoadingRegion> : <ErrorNotice title="Couldn’t load usage history" description="Usage information is unavailable right now. This does not mean there has been no activity." />}
     </div>
   </section>
 }

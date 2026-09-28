@@ -8,8 +8,9 @@ import { makeSetupModel } from "../../../packages/client-common/src/desktop/fixt
 import { hardware as makeHardware } from "../hardware/fixtures"
 import { useSyncExternalStore } from "react"
 
-let phase = 'loading'
-let page = 'discover'
+const params = new URLSearchParams(location.search)
+let phase = params.get('phase') ?? 'loading'
+let page = params.get('page') ?? 'discover'
 const listeners = new Set<() => void>()
 const models = ['Qwen3.6 35B-A3B','Gemma 4 26B-A4B','Nemotron 3.5 Lightning 30B-A3B','Qwen3.5 4B','Gemma 4 12B'].map((name,index) => ({...makeSetupModel(true), modelId: `${['qwen','gemma','nemotron','qwen','gemma'][index]}-${index}:gguf:q4`, presentation:{...makeSetupModel(true).presentation,displayName:name}, storageBytes:17800000000, servingState:{...makeSetupModel(false).servingState,assessment:{...makeSetupModel(false).servingState.assessment,performance:[{contextTokens:25000,estimatedTokensPerSecond:66},{contextTokens:50000,estimatedTokensPerSecond:59},{contextTokens:75000,estimatedTokensPerSecond:54},{contextTokens:100000,estimatedTokensPerSecond:49}]}}}))
 const preferenceModels = models.map((model, index) => ({ ...model,
@@ -19,11 +20,12 @@ const preferenceModels = models.map((model, index) => ({ ...model,
 const modelState = {models, preparation:{assessment:{complete:true,settledModels:5,totalModels:5}}}
 const hardware = makeHardware('Apple M4 Max', 64, 16, [{ name: 'Apple M4 Max', memory: 64, shared: true }])
 const usePhase = () => useSyncExternalStore(callback => {listeners.add(callback);return()=>listeners.delete(callback)},()=>phase)
-export const useCatalogModels = () => {const value=usePhase();return value === 'loading' ? Result.initial() : value === 'error' ? Result.fail('offline') : Result.success({...modelState,preparation:{assessment:{complete:!value.startsWith("assessing"),settledModels:value==="assessing"?2:value==="assessing-more"?4:5,totalModels:5}},models:page === "models" ? models : (value === "preference" ? preferenceModels : models).map(model=>({...model,acquisitionState:value.startsWith("download-") ? {_tag:"Installing",progress:{stage:value === "download-verifying" ? "verifying" : "downloading",bytesPerSecond:value === "download-unknown" ? Option.none() : Option.some(12500000),completedBytes:value === "download-unknown" ? 0 : value === "download-complete" ? 2300000000 : 295000000,totalBytes:value === "download-unknown" ? 0 : 2300000000}} : {_tag:"NotInstalled"}}))})}
+const failureModels = () => models.map((model, index) => index !== 0 ? model : {...model, acquisitionState: phase === 'disk-error' ? {_tag:'InstallFailed',failure:{_tag:'InsufficientDiskSpace',requiredBytes:20000000000,availableBytes:5000000000,message:'private diagnostic bytes'}} : {...model.acquisitionState,residencyState:phase === 'load-pending' ? {_tag:'Requested'} : phase === 'memory-error' ? {_tag:'Failed',failure:{_tag:'LowMemory',code:'low_memory',message:'not enough memory available: model requires 32358673408 bytes plus 6871947673 bytes reserved for the system',retryable:true,requiredMemoryBytes:32358673408,systemReserveBytes:6871947673,allocationHeadroomBytes:33741848576,loadBoundaryBytes:26869900903,minimumAdditionalAvailableBytes:5488772506}} : model.acquisitionState.residencyState}})
+export const useCatalogModels = () => {const value=usePhase();if (['memory-error','disk-error','load-pending'].includes(value)) return Result.success({...modelState,models:failureModels()});return value === 'loading' ? Result.initial() : value === 'error' ? Result.fail('offline') : Result.success({...modelState,preparation:{assessment:{complete:!value.startsWith("assessing"),settledModels:value==="assessing"?2:value==="assessing-more"?4:5,totalModels:5}},models:page === "models" ? models : (value === "preference" ? preferenceModels : models).map(model=>({...model,acquisitionState:value.startsWith("download-") ? {_tag:"Installing",progress:{stage:value === "download-verifying" ? "verifying" : "downloading",bytesPerSecond:value === "download-unknown" ? Option.none() : Option.some(12500000),completedBytes:value === "download-unknown" ? 0 : value === "download-complete" ? 2300000000 : 295000000,totalBytes:value === "download-unknown" ? 0 : 2300000000}} : {_tag:"NotInstalled"}}))})}
 export const useLocalModels = () => {const value=usePhase();return value === "loading" ? Result.initial() : value === "error" ? Result.fail("offline") : Result.success(value === "status-ready" ? {...modelState,models:models.map((model,index)=>index === 0 ? {...model,acquisitionState:{...model.acquisitionState,residencyState:{_tag:"Ready",allocation:{contextWindowTokens:4096,memoryDomains:[{memoryDomainId:"system",modelBytes:2300000000,contextBytes:100000000,computeBytes:100000000,auxiliaryBytes:0}]}}}} : model)} : modelState,{waiting:value==="refreshing"})}
 export const useLocalInferenceHardware = () => {const value=usePhase();return value === 'loading' || value === 'hardware-loading' ? Result.initial() : value === 'error' ? Result.fail('offline') : Result.success(hardware,{waiting:value==="refreshing"})}
-export const useLocalModelMutations = () => ({ install(){},load(){},stop(){},cancel(){},remove(){},dismissFailure(){} })
-export const useLocalModelCommandStatus = () => ({pending:false,failures:[]})
+export const useLocalModelMutations = () => ({ install(){setPhase("download-unknown")},load(){setPhase("load-pending")},stop(){},cancel(){setPhase("ready")},remove(){},dismissFailure(){setPhase("ready")} })
+export const useLocalModelCommandStatus = () => ({pending:false,pendingOperations:[],failures:[]})
 export const useLocalModelStopStatus = () => ({pending:false,failure:Option.none()})
 // Hardware budget is intentionally independent of platform-specific fixture domain schemas.
 export const targetPhysicalMemoryBytes = () => 68719476736
@@ -45,7 +47,7 @@ export const useAgentClient = () => client
 export const AgentClientProvider = ({children}:any) => children
 // Renderer has its own provider; use this same registry for controlled fixture transitions.
 export { registry }
-const connections = ['pi','opencode','hermes','openclaw','codex','claude-code','oh-my-pi','cline'].map((id,index)=>({id,name:['Pi','OpenCode','Hermes','OpenClaw','Codex','Claude Code','Oh My Pi','Cline'][index],installed:index<4,managed:false,plugin:Option.none(),inspection:{_tag:'Disconnected'},configurationFiles:[]}))
+const connections = ['pi','opencode','hermes','openclaw','codex','claude-code','oh-my-pi','cline'].map((id,index)=>({id,name:['Pi','OpenCode','Hermes','OpenClaw','Codex','Claude Code','Oh My Pi','Cline'][index],installed:index<4,managed:false,plugin:Option.none(),inspection:phase==='connection-error'?{_tag:'Unavailable',reason:'private diagnostic'}:{_tag:'Disconnected'},configurationFiles:[]}))
 export function setPhase(value:string) {
  phase=value
  const result=(data:any)=>value==='loading'?Result.initial():value==='error'?Result.fail('offline'):Result.success(data,{waiting:value==="refreshing"})
@@ -53,8 +55,9 @@ export function setPhase(value:string) {
  registry.set(service.loginStartup,result({_tag:'Disabled'}))
  registry.set(service.machineIdentity,result({_tag:'Identified',manufacturer:'Apple Inc.',model:'Mac16,5',family:Option.none(),version:Option.none(),formFactor:'Unknown'}))
  registry.set(service.connections,result({_tag:'Available',connections}))
- registry.set(service.updates,result({preference:{_tag:'Known',autoDownload:true},transfer:{_tag:'Idle'},check:{_tag:'Idle'}}))
+ registry.set(service.updates,result({preference:{_tag:'Known',autoDownload:true},transfer:value==='update-error'?{_tag:'InstallationFailed',version:'0.1.6',message:'private installer diagnostic'}:{_tag:'Idle'},check:{_tag:'Idle'}}))
  registry.set(usage,{result:result({_tag:'Available',dailyActivity:Array.from({length:368},(_,index)=>({date:new Date(Date.UTC(2025,8,14+index)).toISOString().slice(0,10),totalTokens:index%5===0?0:Math.round((Math.sin(index*7)+1)*50000)})),requests:2,inputTokens:100,cachedInputTokens:40,outputTokens:20,cachedInputRequests:2,tokensPerSecond:80,timeToFirstTokenMs:125,incompleteRequests:0,recordingFailures:0,speedSamples:2,latencySamples:2,models:[],since:null})})
  for (const listener of listeners) listener()
 }
+setPhase(phase)
 window.loadingFixture={setPhase,navigate:(value:string)=>{page=value;registry.set(service.page,value)}}

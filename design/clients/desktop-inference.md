@@ -116,8 +116,21 @@ platforms show the same line as the item's plain label, current each time the me
 Main independently displays owned-service startup, recovery, failure, and shutdown.
 Stop remains available for an observed Stopping model, allowing explicit escalation or retry after
 cleanup failure. Window actions suppress duplicate requests while their mutation is pending and
-display declared model failure messages without internal Effect stacks; unknown failures use
-actionable fallback wording. ACN resolves both active and slot Stop against Stopping as well as Loading
+present compact, wrapping notices below the affected controls. Notices use the canonical error,
+warning, or information palette, an icon and concise title; optional actions are plain text with
+hover underline, keyboard focus and pending/eligibility guards. Actions invoke existing feature
+operations; observing or expanding a notice never retries work. Essential text is never truncated.
+User-facing content is authored from typed facts: diagnostics, raw byte counts, internal IDs and
+backend prose never appear in notices, tooltips, expanded details, or native dialogs. Unknown
+failures use truthful operation-specific wording; original diagnostics remain available to logging.
+Memory admission explains the additional memory needed and offers a human-readable breakdown using
+the shared memory units, rounding minimum requirements upward. Storage uses the shared disk units.
+A matching model-command rejection is represented once by its richer authoritative failure;
+unrelated commands and transport failures remain separate. Retry supersedes only the same command's
+feedback; authoritative readiness also retires obsolete load feedback. Stop rejection has one page-level placement. Failed reads replace loading placeholders
+without implying an empty, stopped, disconnected or zero state. Settings save failures take precedence
+over older warnings, and persistent restart guidance remains derived from saved-versus-active state.
+Native dialogs retain their existing native controls and cleanup decisions with safe explanations. ACN resolves both active and slot Stop against Stopping as well as Loading
 and Ready instances, so retry never silently succeeds without contacting the retained instance.
 Main retains the current tray menu independently of its native icon. Linux host recovery replaces
 the preceding icon before creating one replacement and restores the latest menu. Host loss never

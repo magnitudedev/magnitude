@@ -14,8 +14,8 @@ import {
 } from "@magnitudedev/client-common"
 
 const sourceRoot = fileURLToPath(new URL("../", import.meta.url))
-const desktopRenderer = fileURLToPath(
-  new URL("../../../desktop/src/renderer.tsx", import.meta.url)
+const desktopSource = fileURLToPath(
+  new URL("../../../desktop/src/", import.meta.url)
 )
 
 const sourceFiles = (directory: string): readonly string[] =>
@@ -44,11 +44,10 @@ describe("Tailwind styling boundary", () => {
     )
   })
 
-  it("keeps component colors in the Tailwind palette", () => {
-    const components = sourceFiles(sourceRoot)
+  it.each([["web", sourceRoot], ["desktop", desktopSource]])("keeps %s component colors in the Tailwind palette", (_name, directory) => {
+    const components = sourceFiles(directory)
       .filter((path) => extname(path) === ".tsx")
       .map((path) => readFileSync(path, "utf8"))
-      .concat(readFileSync(desktopRenderer, "utf8"))
       .join("\n")
 
     expect(components).not.toMatch(/#[\da-f]{3,8}\b/i)
@@ -77,6 +76,6 @@ describe("Tailwind styling boundary", () => {
     )
 
     expect(stylesheet).toContain('@import "tailwindcss" source(none)')
-    expect(stylesheet).toContain('@source "../../../desktop/src/renderer.tsx"')
+    expect(stylesheet).toContain('@source "../../../desktop/src/"')
   })
 })
