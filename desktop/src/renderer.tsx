@@ -33,6 +33,7 @@ import {
   SunIcon,
   MoonIcon,
   FolderOpenIcon,
+  BuildingsIcon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./copy-command"
 import { createRoot } from "react-dom/client"
@@ -54,7 +55,7 @@ import {
 import { HardwareOverview, ModelRadar } from "./discovery-visuals"
 import { MemoryBreakdown } from "./memory-breakdown"
 import { HarnessConnections } from "./harness-connections"
-import { ModelLogo } from "./model-logo"
+import { LabLogo, ModelLogo, modelLab, modelLabs, type ModelLab } from "./model-logo"
 import type { DesktopApi, Page } from "./desktop-rpc"
 import "@web-styles/tailwind.css"
 
@@ -304,6 +305,9 @@ function Recommendations({ models, active, preference }: { models: readonly Cata
     </div>
   </section>
 }
+function LabOption({ lab }: { lab: ModelLab | null }) {
+  return <span className="flex items-center gap-2">{lab ? <LabLogo lab={lab} className="size-4" /> : <BuildingsIcon aria-hidden="true" className="size-4 text-slate-500" />}{lab ? lab.name : "Any lab"}</span>
+}
 function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const installedOnly = page === "models"
   const discover = page === "discover"
@@ -321,6 +325,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     { value: "name", label: "Name A–Z" }, { value: "smallest", label: "Smallest download" }, { value: "largest", label: "Largest download" },
   ]
   const [filter, setFilter] = useState("all")
+  const [lab, setLab] = useState<ModelLab | null>(null)
   const [sort, setSort] = useState(installedOnly ? "name" : "recommended")
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
@@ -339,13 +344,14 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   // Deprecated and disabled models are listed only where installed.
   const library = ordered.filter(model => model.acquisitionState._tag !== "NotInstalled"
     || !installedOnly && model.catalogData.support._tag === "Supported")
+  const labOptions = modelLabs.filter(entry => library.some(model => modelLab(model) === entry))
   const visible = library.filter(model => {
     const acquisition = model.acquisitionState
     const matchesFilter = filter === "all"
       || filter === "fits" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
       || filter === "downloaded" && localModelIsInstalled(model)
       || filter === "downloading" && (acquisition._tag === "Installing" || acquisition._tag === "Updating")
-    return matchesFilter && `${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.trim().toLowerCase())
+    return matchesFilter && (lab === null || modelLab(model) === lab) && `${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.trim().toLowerCase())
   })
   if (sort !== "recommended") visible.sort((a, b) => {
     const byName = formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b), undefined, { numeric: true }) || a.modelId.localeCompare(b.modelId)
@@ -362,6 +368,10 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
           <Select items={filterOptions} value={filter} onValueChange={value => { if (value !== null) setFilter(value) }}>
             <SelectTrigger aria-label="Filter models"><SelectValue /></SelectTrigger>
             <SelectContent>{filterOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+          </Select>
+          <Select value={lab} onValueChange={setLab}>
+            <SelectTrigger aria-label="Filter by lab"><SelectValue>{(value: ModelLab | null) => <LabOption lab={value} />}</SelectValue></SelectTrigger>
+            <SelectContent>{[<SelectItem key="any" value={null}><LabOption lab={null} /></SelectItem>, ...labOptions.map(option => <SelectItem key={option.name} value={option}><LabOption lab={option} /></SelectItem>)]}</SelectContent>
           </Select>
           <Select items={sortOptions} value={sort} onValueChange={value => { if (value !== null) setSort(value) }}>
             <SelectTrigger aria-label="Sort models"><span className="text-slate-500">Sort:</span><SelectValue /></SelectTrigger>
@@ -380,7 +390,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
       : <Recommendations preference={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />)}
     {!discover && <>
     <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} models={models} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
-    {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
+    {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
     </>}
     {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for compatibility details.</p>}
   </>
