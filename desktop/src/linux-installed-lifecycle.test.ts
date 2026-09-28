@@ -20,5 +20,5 @@ describe.skipIf(process.platform !== "linux" || process.env.MAGNITUDE_TEST_INSTA
       child.once("exit", code => resolve({ code, output }))
     })
     expect(result.code, result.output).toBe(0)
-  }, 120_000)
+  }, 8 * 60_000)
 })

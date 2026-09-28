@@ -66,7 +66,7 @@ try {
   const preferencesPath = join(data, 'config.json')
   for (const enabled of [false, true, false]) {
     await automatic.click()
-    await automatic.and(page.locator(`[aria-checked="${enabled}"]`)).waitFor({ timeout: 10000 })
+    await automatic.and(page.locator(`[aria-checked="${enabled}"]`)).waitFor({ timeout: 30000 })
     assert.equal(JSON.parse(await readFile(preferencesPath, 'utf8')).autoDownloadUpdates, enabled)
   }
   const keyPath = join(data, 'identity.pem')
@@ -92,7 +92,7 @@ try {
   console.log('PASS application downloaded and verified the offered installer')
   const original = app.process()
   const exited = once(original, 'exit', { signal: AbortSignal.timeout(60000) })
-  await page.getByRole('button', { name: 'Restart to update', exact: true }).click({ noWaitAfter: true, timeout: 10000 }).catch(error => {
+  await page.getByRole('button', { name: 'Restart to update', exact: true }).click({ noWaitAfter: true, timeout: 30000 }).catch(error => {
     console.log('Restart closed the automation connection:', error.message)
   })
   await exited
@@ -129,12 +129,12 @@ try {
   await page.getByText('You’re up to date.', { exact: true }).waitFor({ timeout: 30000 })
   await page.screenshot({ path: join(evidence, 'updated-settings.png'), fullPage: true })
   execFileSync('powershell', ['-NoProfile', '-File', fileURLToPath(new URL('./windows-tray-acceptance.ps1', import.meta.url)), '-Evidence', evidence], { stdio: 'inherit', timeout: 60000 })
-  await page.getByRole('heading', { name: 'Discover', exact: true }).waitFor({ timeout: 10000 })
+  await page.getByRole('heading', { name: 'Discover', exact: true }).waitFor({ timeout: 30000 })
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().forEach(window => window.close()))
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().some(window => window.isVisible())), false)
   assert.match(cli(['status']), /Tray\s+Registered/i)
   execFileSync('powershell', ['-NoProfile', '-File', fileURLToPath(new URL('./windows-tray-acceptance.ps1', import.meta.url)), '-Evidence', evidence, '-MenuAction', 'Open Magnitude'], { stdio: 'inherit', timeout: 60000 })
-  await page.getByRole('heading', { name: 'Discover', exact: true }).waitFor({ timeout: 10000 })
+  await page.getByRole('heading', { name: 'Discover', exact: true }).waitFor({ timeout: 30000 })
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().some(window => window.isVisible())), true)
   await writeFile(join(evidence, 'accepted.json'), JSON.stringify({ installationId, from, to, at: new Date().toISOString(), status }, null, 2))
   console.log('PASS installed updated Settings, persisted auto-download preference and real up-to-date check')

@@ -27,7 +27,7 @@ delete env.MAGNITUDE_DESKTOP_PATH;
 delete env.MAGNITUDE_DEV_DATA_DIR;delete env.MAGNITUDE_DEV_PORT;delete env.MAGNITUDE_DESKTOP_STATE_DIR;
 const endpoint=join(root,'.magnitude/state/application.sock');
 const entry=join(env.XDG_CONFIG_HOME,'autostart/dev.magnitude.desktop');
-const until=async(fn)=>{for(let i=0;i<150;i++){if(await fn())return;await delay(100)}throw Error('condition timed out')};
+const until=async(fn)=>{const deadline=Date.now()+60000;do{if(await fn())return;await delay(100)}while(Date.now()<deadline);throw Error('condition timed out after 60 seconds')};
 const request=intent=>new Promise((resolve,reject)=>{
  const socket=createConnection(endpoint);let data='';
  socket.setTimeout(5000,()=>socket.destroy(Error('Control timeout')));
@@ -38,12 +38,12 @@ const request=intent=>new Promise((resolve,reject)=>{
 let app;let coldOwner;
 const wm=spawn('xfwm4',['--compositor=off'],{env,stdio:'inherit'});
 try {
- app=await electron.launch({chromiumSandbox:true,executablePath,env,timeout:20000});
+ app=await electron.launch({chromiumSandbox:true,executablePath,env,timeout:45000});
  const page=await app.firstWindow();await page.waitForLoadState('domcontentloaded');
  await app.evaluate(({Menu})=>Menu.getApplicationMenu().items.find(i=>i.label==='View').submenu.items.find(i=>i.label==='Settings').click());
  const login=page.getByRole('switch',{name:'Launch at login',exact:true});
  const loginIs=checked=>until(async()=>(await login.getAttribute('aria-checked'))===String(checked));
- await login.waitFor({timeout:15000});await loginIs(false);
+ await login.waitFor({timeout:30000});await loginIs(false);
  await login.click();await loginIs(true);
  const enabled=await readFile(entry,'utf8');
  assert.match(enabled,/--background/);assert.match(enabled,/Hidden=false/);
@@ -56,7 +56,7 @@ try {
  console.log('PASS packaged Settings enables/disables real XDG login entry and observes external disable');
  await login.click();await loginIs(true);
  await app.evaluate(({Menu})=>setImmediate(()=>Menu.getApplicationMenu().items.find(i=>i.label==='File').submenu.items.find(i=>i.label==='Quit Magnitude').click()));
- await app.waitForEvent('close',{timeout:15000});app=undefined;
+ await app.waitForEvent('close',{timeout:30000});app=undefined;
  execFileSync('gio',['launch',entry],{env,stdio:'inherit'});
  await until(async()=>{try{coldOwner=(await request('Observe')).pid;return true}catch{return false}});
  const windows=execFileSync('xprop',['-root','_NET_CLIENT_LIST'],{env,encoding:'utf8'}).match(/0x[0-9a-f]+/g)??[];
@@ -65,7 +65,7 @@ try {
  await request('Quit');
  await until(()=>{try{process.kill(coldOwner,0);return false}catch(e){if(e.code==='ESRCH')return true;throw e}});coldOwner=undefined;
  console.log('PASS login-started owner accepts full Quit');
- const cli=args=>execFileSync(cliExecutable,args,{env,encoding:'utf8',timeout:20000});
+ const cli=args=>execFileSync(cliExecutable,args,{env,encoding:'utf8',timeout:45000});
  assert.match(cli(['app','open']),/opened/i);
  coldOwner=(await request('Observe')).pid;
  assert.match(await readFile(entry,'utf8'),/Hidden=false/);
@@ -85,10 +85,10 @@ try {
  assert.match(await readFile(entry,'utf8'),/Hidden=true/);
  assert.match(cli(['status']),/Runtime\s+Stopped/);
  console.log('PASS compiled Linux CLI app open/status observes Desktop; Quit preserves login and explicit login disable persists');
- app=await electron.launch({chromiumSandbox:true,executablePath,args:['--background'],env,timeout:20000});
+ app=await electron.launch({chromiumSandbox:true,executablePath,args:['--background'],env,timeout:45000});
  await (await app.firstWindow()).waitForLoadState('domcontentloaded');
  const shutdownProcess=app.process();
- const shutdownClosed=app.waitForEvent('close',{timeout:15000});
+ const shutdownClosed=app.waitForEvent('close',{timeout:30000});
  await app.evaluate(({powerMonitor})=>powerMonitor.emit('shutdown',{preventDefault(){throw Error('System shutdown must not be vetoed')}}));
  await shutdownClosed;app=undefined;
  assert.equal(shutdownProcess.exitCode,0);

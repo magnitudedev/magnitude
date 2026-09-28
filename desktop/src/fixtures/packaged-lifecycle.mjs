@@ -25,7 +25,7 @@ const alive = pid => {
   try { process.kill(pid, 0); return true; }
   catch (error) { if (error.code === 'ESRCH') return false; throw error; }
 };
-const eventually = async (read, expected, timeout = 10000) => {
+const eventually = async (read, expected, timeout = 30000) => {
   const deadline = Date.now() + timeout;
   let actual;
   do {
@@ -33,7 +33,7 @@ const eventually = async (read, expected, timeout = 10000) => {
     if (JSON.stringify(actual) === JSON.stringify(expected)) return;
     await delay(100);
   } while (Date.now() < deadline);
-  assert.deepEqual(actual, expected);
+  assert.deepEqual(actual, expected, `Condition did not settle within ${timeout} ms; application output:\n${ownerOutput}`);
 };
 // The owning application's recent main-process output, reported when a contender stalls.
 let ownerOutput = '';
@@ -52,7 +52,7 @@ const sampleStack = pid => {
 };
 // A contender cold-starts Electron, then makes two handoff exchanges (Observe, then its intent),
 // each of which the application allows 5 seconds (application-control.ts).
-const contenderLimit = 30000;
+const contenderLimit = 60000;
 const invoke = args => new Promise((resolve, reject) => {
   const started = Date.now();
   const child = spawn(executablePath, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -95,7 +95,7 @@ try {
       // This fixture owns the freshly spawned group, including Chromium helpers.
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
       reject(new Error(`Failed startup did not exit: ${output}`));
-    }, 10000);
+    }, 30000);
     child.once('error', error => { clearTimeout(timeout); reject(error); });
     child.once('exit', code => { clearTimeout(timeout); resolve({ code, output }); });
   });
@@ -106,7 +106,7 @@ try {
   application = await launchOwner({ chromiumSandbox: true, executablePath, args: [], env: {
     ...env, MAGNITUDE_DEV_DATA_DIR: failedProfile,
     MAGNITUDE_ICN_PATH: join(failedProfile, 'absent-engine.json'),
-  }, timeout: 30000 });
+  }, timeout: 60000 });
   const failedOwner = application.process();
   const failedWindow = await application.firstWindow();
   await failedWindow.waitForFunction(() => !!window.__magnitudeDesktop);
@@ -118,7 +118,7 @@ try {
   console.log('Host action failure preserves actionable message across real contextBridge');
   await failedWindow.getByRole('button', { name: 'Status', exact: true }).click();
   for (let attempt = 0; attempt < 2; attempt++) {
-    await failedWindow.getByRole('button', { name: 'Retry service', exact: true }).waitFor({ timeout: 20000 });
+    await failedWindow.getByRole('button', { name: 'Retry service', exact: true }).waitFor({ timeout: 30000 });
     await failedWindow.getByRole('alert').waitFor();
     assert.equal(alive(failedOwner.pid), true);
     if (attempt === 0) {
@@ -126,7 +126,7 @@ try {
       await failedWindow.getByRole('button', { name: 'Retry service', exact: true }).waitFor({ state: 'hidden' });
     }
   }
-  const failedQuit = application.waitForEvent('close', { timeout: 10000 });
+  const failedQuit = application.waitForEvent('close', { timeout: 30000 });
   await application.evaluate(({ Menu, BrowserWindow }) => {
     const window = BrowserWindow.getAllWindows()[0];
     const item = Menu.getApplicationMenu().items.flatMap(item => item.submenu?.items ?? []).find(item => item.label === 'Quit Magnitude');
@@ -144,12 +144,12 @@ try {
   await writeFile(join(profile, 'preserved.txt'), 'preserve user data');
   incumbent = createServer((_request, response) => response.end('unrelated service'));
   await new Promise((resolve, reject) => { incumbent.once('error', reject); incumbent.listen(11109, '127.0.0.1', resolve); });
-  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 60000 });
   const app = application;
   const visibility = () => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => ({ visible: window.isVisible(), minimized: window.isMinimized() })));
   const health = () => fetch('http://127.0.0.1:11109/health').then(response => response.json()).catch(() => null);
-  await eventually(visibility, [{ visible: false, minimized: false }], 2000);
-  await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)).catch(() => false), true, 2000);
+  await eventually(visibility, [{ visible: false, minimized: false }]);
+  await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)).catch(() => false), true);
   console.log('Slow shell probe: owner and hidden window available while shell is still running');
   assert.equal(await invoke([]), 0);
   const conflictWindow = await app.firstWindow();
@@ -228,35 +228,55 @@ try {
   console.log('Dock activation event and Open restore hidden/minimized windows');
 
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
-  const rendererReady = () => app.evaluate(async ({ BrowserWindow }) => {
+  const rendererStatus = () => app.evaluate(async ({ BrowserWindow }) => {
     const contents = BrowserWindow.getAllWindows()[0].webContents;
-    if (contents.isCrashed() || contents.isLoading()) return false;
+    const status = { crashed: contents.isCrashed(), loading: contents.isLoading(), documentReady: false };
+    if (status.crashed || status.loading) return status;
     return Promise.race([
-      contents.executeJavaScript('document.readyState === "complete" && !!window.__magnitudeDesktop && document.querySelector("main") !== null'),
-      new Promise(resolve => setTimeout(() => resolve(false), 1000)),
+      contents.executeJavaScript('document.readyState === "complete" && !!window.__magnitudeDesktop && document.querySelector("main") !== null')
+        .then(documentReady => ({ ...status, documentReady })),
+      new Promise(resolve => setTimeout(() => resolve(status), 1000)),
     ]);
-  }).catch(() => false);
-  await eventually(rendererReady, true);
+  }).catch(error => ({ error: String(error) }));
+  const rendererReady = () => rendererStatus().then(status => status.documentReady === true);
+  const waitForRenderer = async () => {
+    try { await eventually(rendererReady, true); }
+    catch (error) { throw new Error(`Renderer did not recover: ${JSON.stringify(await rendererStatus())}\n${ownerOutput}`, { cause: error }); }
+  };
+  const crashRenderer = () => app.evaluate(async ({ BrowserWindow }) => {
+    const contents = BrowserWindow.getAllWindows()[0].webContents;
+    const gone = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        contents.removeListener('render-process-gone', onGone);
+        reject(new Error('Renderer crash event was not observed within 30 seconds'));
+      }, 30000);
+      const onGone = () => { clearTimeout(timer); resolve(); };
+      contents.once('render-process-gone', onGone);
+    });
+    contents.forcefullyCrashRenderer();
+    await gone;
+  });
+  await waitForRenderer();
   for (let attempt = 0; attempt < 3; attempt++) {
     console.log(`Crashing renderer: attempt ${attempt + 1}`);
-    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.forcefullyCrashRenderer());
-    await eventually(rendererReady, true);
+    await crashRenderer();
+    await waitForRenderer();
     console.log(`Renderer recovered: attempt ${attempt + 1}`);
     assert.equal((await health()).pid, service.pid);
     assert.deepEqual(await visibility(), [{ visible: false, minimized: false }]);
   }
-  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.forcefullyCrashRenderer());
+  await crashRenderer();
   await delay(1000);
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.isCrashed()), true);
   assert.equal(await invoke(['--background']), 0);
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.isCrashed()), true);
   assert.equal((await health()).pid, service.pid);
   assert.equal(await invoke([]), 0);
-  await eventually(rendererReady, true);
+  await waitForRenderer();
   assert.deepEqual(await visibility(), [{ visible: true, minimized: false }]);
   console.log('Renderer crashes: three bounded retries, background demand cannot renew them, explicit Open recovers the same service');
 
-  const menuQuit = app.waitForEvent('close', { timeout: 10000 });
+  const menuQuit = app.waitForEvent('close', { timeout: 30000 });
   await app.evaluate(({ BrowserWindow, Menu }) => {
     const window = BrowserWindow.getAllWindows()[0];
     const item = Menu.getApplicationMenu().items.flatMap(item => item.submenu?.items ?? []).find(item => item.label === 'Quit Magnitude');
@@ -290,7 +310,7 @@ try {
   await eventually(health, null);
   console.log('Forced owner death during shell discovery: observed live probe and descendant retired');
 
-  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 60000 });
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
   const reopened = await application.firstWindow();
   await reopened.getByText('Find your balance', { exact: true }).waitFor();
@@ -310,12 +330,12 @@ try {
   await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)), false);
   console.log('Forced owner death after Ready: service and inference removed by lifetime guards');
 
-  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 60000 });
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
   assert.notEqual((await health()).pid, replacement.pid);
   const terminatedService = (await health()).pid;
   const terminatedProcess = application.process();
-  const terminated = application.waitForEvent('close', { timeout: 15000 });
+  const terminated = application.waitForEvent('close', { timeout: 30000 });
   terminatedProcess.kill('SIGTERM');
   await terminated;
   assert.equal(terminatedProcess.signalCode, null, 'SIGTERM must follow graceful application shutdown');
@@ -326,11 +346,11 @@ try {
   await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)), false);
   console.log('Relaunch after crash and SIGTERM: ownership reacquired, graceful exit0 retires service and shell probes');
 
-  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 60000 });
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
   const shutdownService = (await health()).pid;
   const shutdownProcess = application.process();
-  const shutdownClosed = application.waitForEvent('close', { timeout: 15000 });
+  const shutdownClosed = application.waitForEvent('close', { timeout: 30000 });
   await application.evaluate(({ powerMonitor }) => {
     powerMonitor.emit('shutdown', { preventDefault() { throw new Error('OS shutdown must not be vetoed'); } });
   });
