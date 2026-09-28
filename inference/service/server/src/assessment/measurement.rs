@@ -9,7 +9,7 @@
 
 use std::fmt;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use magnitude_executor::platform::{self, MemoryReserves, PlatformConfig, Platfor
 use magnitude_executor::{DEFAULT_KERNEL_CACHE_BYTES, ExecutionPath, KernelCache};
 use seismic::{DeviceCatalog, DeviceSelector};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::AsyncReadExt as _;
 
 use crate::worker_process::{WorkerLauncher, WorkerRole};
 
@@ -29,6 +29,7 @@ use crate::worker_process::{WorkerLauncher, WorkerRole};
 const MEASUREMENT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const RETIREMENT_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_REPORT_BYTES: usize = 64 * 1024;
+const MAX_DIAGNOSTIC_TAIL_BYTES: usize = 64 * 1024;
 
 /// The arguments of the `measurement-worker` subcommand.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -322,14 +323,12 @@ impl MeasurementJob {
         let stderr = child.stderr.take().ok_or_else(|| {
             MeasurementJobError::Spawn("measurement worker stderr is unavailable".to_owned())
         })?;
-        let diagnostic_path =
-            std::env::var_os("MAGNITUDE_MEASUREMENT_DIAGNOSTICS_PATH").map(PathBuf::from);
         let (report, diagnostics, status) = tokio::time::timeout(
             MEASUREMENT_DEADLINE + RETIREMENT_DEADLINE + Duration::from_secs(5),
             async {
                 tokio::join!(
                     drain_report(stdout),
-                    drain_diagnostics(stderr, profile, diagnostic_path.as_deref()),
+                    drain_diagnostics(stderr, profile),
                     async {
                         match tokio::time::timeout(MEASUREMENT_DEADLINE, child.wait()).await {
                             Ok(status) => status.map(Some),
@@ -344,12 +343,7 @@ impl MeasurementJob {
         )
         .await
         .map_err(|_| MeasurementJobError::Deadline {
-            diagnostics: format!(
-                "worker streams did not close after retirement; raw output: {}",
-                diagnostic_path
-                    .as_ref()
-                    .map_or("unavailable".to_owned(), |path| path.display().to_string())
-            ),
+            diagnostics: "worker streams did not close after retirement".to_owned(),
         })?;
         let (report, report_complete) = report.map_err(MeasurementJobError::Io)?;
         let diagnostics = diagnostics.map_err(MeasurementJobError::Io)?;
@@ -410,41 +404,21 @@ async fn drain_report(
     }
 }
 
-/// Preserve every worker diagnostic, including output emitted immediately
-/// before a deadline kills the child. Acceptance also writes the raw stream
-/// to a file independently of the service's own logging path.
+/// Forward worker stderr into the service log and retain a bounded failure tail.
 async fn drain_diagnostics(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     profile: bool,
-    path: Option<&Path>,
 ) -> std::io::Result<Vec<u8>> {
-    let mut file = match path {
-        Some(path) => Some(
-            tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .await?,
-        ),
-        None => None,
-    };
-    if let Some(file) = &mut file {
-        file.write_all(b"\n--- measurement worker stderr ---\n")
-            .await?;
-    }
     let mut kept = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
-            if let Some(file) = &mut file {
-                file.flush().await?;
-            }
             return Ok(kept);
         }
         kept.extend_from_slice(&chunk[..read]);
-        if let Some(file) = &mut file {
-            file.write_all(&chunk[..read]).await?;
+        if kept.len() > MAX_DIAGNOSTIC_TAIL_BYTES {
+            kept.drain(..kept.len() - MAX_DIAGNOSTIC_TAIL_BYTES);
         }
         if profile {
             tracing::info!(worker.stderr = %String::from_utf8_lossy(&chunk[..read]), "measurement worker progress");
@@ -531,6 +505,20 @@ mod tests {
                 seconds: 1.5
             }
         );
+    }
+
+    #[tokio::test]
+    async fn worker_stderr_drains_and_retains_its_failure_tail() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer
+            .write_all(b"underlying worker failure")
+            .await
+            .unwrap();
+        drop(writer);
+        let diagnostics = drain_diagnostics(reader, false).await.unwrap();
+        assert_eq!(diagnostics, b"underlying worker failure");
     }
 
     #[tokio::test]

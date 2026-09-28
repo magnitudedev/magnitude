@@ -233,6 +233,8 @@ const program = Effect.gen(function* () {
           const acceptance = yield* Command.make(process.execPath, "run", resolve(import.meta.dir, "acceptance/test-installed-headless.ts")).pipe(
             Command.env({
               MAGNITUDE_INSTALLED_ACCEPTANCE_OUTPUT: acceptanceRoot,
+              MAGNITUDE_INSTALLED_ACCEPTANCE_PROFILE: resolve(acceptanceRoot, "profile"),
+              MAGNITUDE_INSTALLED_ACCEPTANCE_RESULT: resolve(acceptanceRoot, "result.json"),
               MAGNITUDE_INSTALLED_ACCEPTANCE_CLI: resolve(resources, "magnitude"),
               MAGNITUDE_INSTALLED_ACCEPTANCE_ADDON: resolve(resources, "desktop-host.node"),
               MAGNITUDE_INSTALLED_ACCEPTANCE_VERSION: release.version,

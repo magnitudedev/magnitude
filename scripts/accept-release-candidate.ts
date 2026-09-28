@@ -29,14 +29,23 @@ const run = (
     readonly cwd?: string
     readonly env?: Readonly<Record<string, string | undefined>>
     readonly timeout?: "5 minutes" | "25 minutes"
+    readonly output?: "inherit"
   } = {},
 ): Promise<string> => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const executable = command[0]
   if (!executable) return yield* new CandidateAcceptanceFailed({ message: "Empty acceptance command" })
   const environment = Object.fromEntries(Object.entries(options.env ?? {}).filter((entry): entry is [string, string] => entry[1] !== undefined))
-  const child = yield* Command.make(executable, ...command.slice(1)).pipe(
-    Command.workingDirectory(options.cwd ?? process.cwd()), Command.env(environment), Command.start,
+  const configured = Command.make(executable, ...command.slice(1)).pipe(
+    Command.workingDirectory(options.cwd ?? process.cwd()), Command.env(environment),
   )
+  const child = yield* (options.output === "inherit"
+    ? configured.pipe(Command.stdout("inherit"), Command.stderr("inherit"), Command.start)
+    : configured.pipe(Command.start))
+  if (options.output === "inherit") {
+    const code = yield* child.exitCode
+    if (code !== 0) return yield* new CandidateAcceptanceFailed({ message: `${executable} failed with exit ${code}; see acceptance.log for complete output` })
+    return ""
+  }
   const read = (stream: typeof child.stdout) => stream.pipe(Stream.decodeText(), Stream.runFold("", (previous, chunk) => previous + chunk))
   const [code, stdout, stderr] = yield* Effect.all([child.exitCode, read(child.stdout), read(child.stderr)], { concurrency: "unbounded" })
   // Report both streams: a process may log to stderr while its failure is on stdout.
@@ -74,8 +83,12 @@ const server = Bun.serve({
 })
 const baseUrl = `http://127.0.0.1:${server.port}`
 const diagnosticParent = process.env.MAGNITUDE_CANDIDATE_DIAGNOSTICS ?? tmpdir()
-const root = await mkdtemp(resolve(diagnosticParent, "magnitude-candidate-"))
-const headlessRoot = await mkdtemp(resolve(diagnosticParent, "mag-candidate-headless-"))
+const root = await mkdtemp(resolve(tmpdir(), "magnitude-candidate-"))
+const headlessRoot = await mkdtemp(process.platform === "win32" ? resolve(tmpdir(), "mag-candidate-headless-") : "/tmp/mag-candidate-headless-")
+const diagnosticRoot = await mkdtemp(resolve(diagnosticParent, "mag-candidate-headless-")).catch(async error => {
+  console.warn(`Could not retain candidate diagnostics under ${diagnosticParent}: ${String(error)}`)
+  return mkdtemp(resolve(tmpdir(), "mag-candidate-diagnostics-"))
+})
 const dataDir = resolve(root, "home-bootstrap", ".magnitude")
 let desktopApplication = "/usr/bin/magnitude-desktop"
 let cliExecutable = "/usr/bin/magnitude"
@@ -160,7 +173,9 @@ try {
   await Effect.runPromise(acceptBootstrap)
   const headlessEnvironment = {
     ...environment(resolve(headlessRoot, "home")),
-    MAGNITUDE_INSTALLED_ACCEPTANCE_OUTPUT: headlessRoot,
+    MAGNITUDE_INSTALLED_ACCEPTANCE_OUTPUT: diagnosticRoot,
+    MAGNITUDE_INSTALLED_ACCEPTANCE_PROFILE: resolve(headlessRoot, "profile"),
+    MAGNITUDE_INSTALLED_ACCEPTANCE_RESULT: resolve(headlessRoot, "result.json"),
     MAGNITUDE_INSTALLED_ACCEPTANCE_CLI: cliExecutable,
     MAGNITUDE_INSTALLED_ACCEPTANCE_ADDON: process.platform === "darwin"
       ? resolve(desktopApplication, "Contents/Resources/desktop-host.node")
@@ -172,6 +187,7 @@ try {
     cwd: root,
     env: headlessEnvironment,
     timeout: "25 minutes",
+    output: "inherit",
   })
   await Effect.runPromise(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ engineAcquired: Schema.Literal(true), rankingReady: Schema.Literal(true) })))(
     await readFile(resolve(headlessRoot, "result.json"), "utf8"),
@@ -183,6 +199,7 @@ try {
     cwd: root,
     env: { ...headlessEnvironment, MAGNITUDE_RELEASE_BASE_URL: "http://127.0.0.1:1", MAGNITUDE_INSTALLED_ACCEPTANCE_OFFLINE: "true" },
     timeout: "25 minutes",
+    output: "inherit",
   })
   await Effect.runPromise(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ offlineCachedStart: Schema.Literal(true), rankingReady: Schema.Literal(true) })))(
     await readFile(resolve(headlessRoot, "result.json"), "utf8"),
@@ -193,9 +210,12 @@ try {
 } finally {
   server.stop(true)
   if (accepted) {
-    await rm(headlessRoot, { recursive: true, force: true })
-    await rm(root, { recursive: true, force: true })
+    for (const path of [headlessRoot, root, diagnosticRoot]) {
+      await rm(path, { recursive: true, force: true }).catch(error => {
+        console.warn(`Could not remove candidate temporary directory ${path}: ${String(error)}`)
+      })
+    }
   } else {
-    console.error(`Candidate diagnostics preserved at ${headlessRoot} and ${root}`)
+    console.error(`Candidate diagnostics preserved at ${diagnosticRoot}; runtime state at ${headlessRoot} and ${root}`)
   }
 }

@@ -67,6 +67,8 @@ const run = Effect.gen(function* () {
   yield* command("/bin/bash", [join(import.meta.dir, "test-mac-install-script.sh"), hosting, bundle, versions[0], dataDirectory, stateDirectory], environment)
   yield* command(process.execPath, [join(import.meta.dir, "test-installed-headless.ts")], {
     MAGNITUDE_INSTALLED_ACCEPTANCE_OUTPUT: join(output, "script-serve"),
+    MAGNITUDE_INSTALLED_ACCEPTANCE_PROFILE: join(output, "script-serve", "profile"),
+    MAGNITUDE_INSTALLED_ACCEPTANCE_RESULT: join(output, "script-serve", "result.json"),
     MAGNITUDE_INSTALLED_ACCEPTANCE_CLI: join(resources, "magnitude"),
     MAGNITUDE_INSTALLED_ACCEPTANCE_ADDON: join(resources, "desktop-host.node"),
     MAGNITUDE_INSTALLED_ACCEPTANCE_VERSION: versions[0], MAGNITUDE_ICN_PATH: inference,

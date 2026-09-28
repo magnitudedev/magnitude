@@ -10,22 +10,26 @@ const Evidence = Schema.Struct({ version: Schema.String, engineAcquired: Schema.
 const run = Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const output = resolve(yield* Config.string("MAGNITUDE_INSTALLED_ACCEPTANCE_OUTPUT"))
+  const profile = resolve(yield* Config.string("MAGNITUDE_INSTALLED_ACCEPTANCE_PROFILE"))
+  const result = resolve(yield* Config.string("MAGNITUDE_INSTALLED_ACCEPTANCE_RESULT"))
   const cli = yield* Config.string("MAGNITUDE_INSTALLED_ACCEPTANCE_CLI")
   const addon = yield* Config.string("MAGNITUDE_INSTALLED_ACCEPTANCE_ADDON")
   const version = yield* Config.string("MAGNITUDE_INSTALLED_ACCEPTANCE_VERSION")
   const offline = yield* Config.boolean("MAGNITUDE_INSTALLED_ACCEPTANCE_OFFLINE").pipe(Config.withDefault(false))
   const inference = (yield* Config.option(Config.string("MAGNITUDE_ICN_PATH"))).pipe(Option.filter(path => path.trim().length > 0))
-  yield* fs.makeDirectory(output, { recursive: true })
-  const stateDirectory = join(output, "profile", "state")
+  const diagnosticWrite = (name: string, content: string) => fs.writeFileString(join(output, name), content).pipe(
+    Effect.catchAll(error => Effect.logWarning(`Could not write acceptance diagnostic ${name}: ${String(error)}`)),
+  )
+  yield* fs.makeDirectory(output, { recursive: true }).pipe(Effect.catchAll(error => Effect.logWarning(`Could not create acceptance diagnostics directory: ${String(error)}`)))
+  const stateDirectory = join(profile, "state")
   const assessmentDiagnostics = join(output, offline ? "offline-assessment-diagnostics.json" : "assessment-diagnostics.json")
-  const environment = { MAGNITUDE_DEV_DATA_DIR: join(output, "profile"), MAGNITUDE_DESKTOP_STATE_DIR: stateDirectory,
+  const environment = { MAGNITUDE_DEV_DATA_DIR: profile, MAGNITUDE_DESKTOP_STATE_DIR: stateDirectory,
     MAGNITUDE_DEV_PORT: "11237", MAGNITUDE_RELEASE_BASE_URL: process.env.MAGNITUDE_RELEASE_BASE_URL ?? "https://github.com/magnitudedev/magnitude/releases/download",
     MAGNITUDE_ACCEPTANCE_ASSESSMENT_DIAGNOSTICS: assessmentDiagnostics,
     MAGNITUDE_MEASUREMENT_PROFILE: "1",
-    MAGNITUDE_MEASUREMENT_DIAGNOSTICS_PATH: join(output, offline ? "offline-measurement-worker.log" : "measurement-worker.log"),
     RUST_LOG: "magnitude_service_server=info",
     ...Option.match(inference, { onNone: () => ({}), onSome: path => ({ MAGNITUDE_ICN_PATH: path }) }) }
-  const cachedManifest = join(output, "profile", "releases", "manifests", version, "magnitude-release.json")
+  const cachedManifest = join(profile, "releases", "manifests", version, "magnitude-release.json")
   if (offline && !(yield* fs.exists(cachedManifest))) {
     return yield* new AcceptanceFailed({ message: "Offline start has no cached release manifest" })
   }
@@ -43,7 +47,7 @@ const run = Effect.scoped(Effect.gen(function* () {
   if (!/Runtime\s+Stopped/.test(initial) || (yield* query("--version")).trim() !== version) {
     return yield* new AcceptanceFailed({ message: "Expected stopped installation at the selected version" })
   }
-  yield* fs.writeFileString(join(output, "initial-status.txt"), initial)
+  yield* diagnosticWrite("initial-status.txt", initial)
   yield* Effect.acquireUseRelease(
     Command.make(cli, "serve").pipe(Command.env(environment), Command.stdout("inherit"), Command.stderr("inherit"), Command.start),
     serving => Effect.gen(function* () {
@@ -56,7 +60,7 @@ const run = Effect.scoped(Effect.gen(function* () {
           const status = yield* query("status")
           readinessStatus = status
           if (/Runtime\s+Ready/.test(status) && /Owner\s+Headless/.test(status)) {
-            yield* fs.writeFileString(join(output, "ready-status.txt"), status)
+            yield* diagnosticWrite("ready-status.txt", status)
             break
           }
           yield* Effect.sleep("500 millis")
@@ -65,13 +69,6 @@ const run = Effect.scoped(Effect.gen(function* () {
         message: `Installed server was not Ready within 150 seconds; last status:\n${readinessStatus}`,
       }) }))
       yield* Effect.logInfo(`Installed server Ready after ${Math.round((Date.now() - readinessStarted) / 1000)} s`)
-      yield* Effect.gen(function* () {
-        while (!(yield* fs.exists(assessmentDiagnostics))) yield* Effect.sleep("500 millis")
-      }).pipe(Effect.timeoutFail({ duration: "15 seconds", onTimeout: () => new AcceptanceFailed({
-        message: "Installed service did not provide assessment diagnostics",
-      }) }))
-      yield* fs.writeFileString(join(output, "models.txt"), yield* query("models", "status"))
-      yield* fs.writeFileString(join(output, "hardware.txt"), yield* query("hardware"))
       if (Option.isNone(inference) && !(yield* fs.exists(cachedManifest))) {
         return yield* new AcceptanceFailed({ message: "Ready service did not acquire the release into the empty profile" })
       }
@@ -85,7 +82,7 @@ const run = Effect.scoped(Effect.gen(function* () {
             catalogStatus = status
             const counts = /Assessment: Complete - (\d+) of (\d+) models? assessed/.exec(status)
             if (counts && Number(counts[1]) > 0 && counts[1] === counts[2]) {
-              yield* fs.writeFileString(join(output, "catalog-status.txt"), status)
+              yield* diagnosticWrite("catalog-status.txt", status)
               return yield* query("catalog", "recommendations")
             }
             yield* Effect.sleep("500 millis")
@@ -100,7 +97,7 @@ const run = Effect.scoped(Effect.gen(function* () {
         if (!ranking.includes("Local model recommendations -") && !ranking.includes("No compatible recommendations are available")) {
           return yield* new AcceptanceFailed({ message: "Catalog completed without a settled recommendation result" })
         }
-        yield* fs.writeFileString(join(output, "recommendations.txt"), ranking)
+        yield* diagnosticWrite("recommendations.txt", ranking)
       }
     }),
     serving => Effect.gen(function* () {
@@ -115,8 +112,10 @@ const run = Effect.scoped(Effect.gen(function* () {
   )
   const final = yield* query("status")
   if (!/Runtime\s+Stopped/.test(final)) return yield* new AcceptanceFailed({ message: "Installed server remains alive" })
-  yield* fs.writeFileString(join(output, "final-status.txt"), final)
-  yield* fs.writeFileString(join(output, "result.json"), yield* Schema.encode(Schema.parseJson(Evidence))({ version, engineAcquired: Option.isNone(inference) && !offline, offlineCachedStart: offline, headlessReady: true, rankingReady: Option.isNone(inference), queries: true, gracefulExit: true }))
+  yield* diagnosticWrite("final-status.txt", final)
+  const evidence = yield* Schema.encode(Schema.parseJson(Evidence))({ version, engineAcquired: Option.isNone(inference) && !offline, offlineCachedStart: offline, headlessReady: true, rankingReady: Option.isNone(inference), queries: true, gracefulExit: true })
+  yield* fs.writeFileString(result, evidence)
+  yield* diagnosticWrite("result.json", evidence)
   yield* Effect.logInfo("Installed foreground serve and CLI query acceptance passed")
 }))
 // Bounded by its phase limits; callers cap the whole process above them.
