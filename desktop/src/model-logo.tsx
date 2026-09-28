@@ -8,6 +8,7 @@ import poolside from "../../assets/brand/model-providers/poolside.svg"
 import zai from "../../assets/brand/model-providers/zai.svg"
 import prism from "../../assets/brand/model-providers/prismml.svg"
 import meta from "../../assets/brand/model-providers/meta.svg"
+import openbmb from "../../assets/brand/model-providers/openbmb.svg"
 
 // Presentation artwork follows canonical catalog families; it does not infer model capabilities.
 const families = [
@@ -22,6 +23,7 @@ const families = [
   { prefix: "llama", name: "Meta", src: meta, theme: "" },
   { prefix: "muse", name: "Meta", src: meta, theme: "" },
   { prefix: "glimmer", name: "Meta", src: meta, theme: "" },
+  { prefix: "minicpm", name: "OpenBMB", src: openbmb, theme: "" },
 ] as const
 
 export function ModelLogo({ model, className = "size-10" }: {
