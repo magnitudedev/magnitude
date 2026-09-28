@@ -284,7 +284,8 @@ impl MeasurementJob {
             .launcher
             .command(WorkerRole::Measurement)
             .map_err(|error| MeasurementJobError::Spawn(format!("{error:#}")))?;
-        if std::env::var_os("MAGNITUDE_MEASUREMENT_PROFILE").is_some() {
+        let profile = std::env::var_os("MAGNITUDE_MEASUREMENT_PROFILE").is_some();
+        if profile {
             command.env(
                 "RUST_LOG",
                 "magnitude_service_server::assessment::measurement=debug",
@@ -303,8 +304,8 @@ impl MeasurementJob {
         })?;
         let outcome = tokio::time::timeout(MEASUREMENT_DEADLINE, async {
             let (report, diagnostics, status) = tokio::join!(
-                drain(stdout, MAX_REPORT_BYTES, Retain::First),
-                drain(stderr, MAX_DIAGNOSTIC_BYTES, Retain::Last),
+                drain(stdout, MAX_REPORT_BYTES, Retain::First, false),
+                drain(stderr, MAX_DIAGNOSTIC_BYTES, Retain::Last, profile),
                 child.wait(),
             );
             Ok::<_, std::io::Error>((report?, diagnostics?, status?))
@@ -368,6 +369,7 @@ async fn drain(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     maximum: usize,
     retain: Retain,
+    profile: bool,
 ) -> std::io::Result<(Vec<u8>, bool)> {
     let mut kept = std::collections::VecDeque::with_capacity(maximum);
     let mut complete = true;
@@ -376,6 +378,9 @@ async fn drain(
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
             return Ok((kept.into(), complete));
+        }
+        if profile {
+            tracing::info!(worker.stderr = %String::from_utf8_lossy(&chunk[..read]), "measurement worker progress");
         }
         for &byte in &chunk[..read] {
             if kept.len() < maximum {

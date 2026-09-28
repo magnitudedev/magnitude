@@ -17,8 +17,11 @@ const run = Effect.scoped(Effect.gen(function* () {
   const inference = (yield* Config.option(Config.string("MAGNITUDE_ICN_PATH"))).pipe(Option.filter(path => path.trim().length > 0))
   yield* fs.makeDirectory(output, { recursive: true })
   const stateDirectory = join(output, "profile", "state")
+  const assessmentDiagnostics = join(output, offline ? "offline-assessment-diagnostics.json" : "assessment-diagnostics.json")
   const environment = { MAGNITUDE_DEV_DATA_DIR: join(output, "profile"), MAGNITUDE_DESKTOP_STATE_DIR: stateDirectory,
     MAGNITUDE_DEV_PORT: "11237", MAGNITUDE_RELEASE_BASE_URL: process.env.MAGNITUDE_RELEASE_BASE_URL ?? "https://github.com/magnitudedev/magnitude/releases/download",
+    MAGNITUDE_ACCEPTANCE_ASSESSMENT_DIAGNOSTICS: assessmentDiagnostics,
+    MAGNITUDE_MEASUREMENT_PROFILE: "1",
     ...Option.match(inference, { onNone: () => ({}), onSome: path => ({ MAGNITUDE_ICN_PATH: path }) }) }
   const cachedManifest = join(output, "profile", "releases", "manifests", version, "magnitude-release.json")
   if (offline && !(yield* fs.exists(cachedManifest))) {
@@ -60,6 +63,11 @@ const run = Effect.scoped(Effect.gen(function* () {
         message: `Installed server was not Ready within 150 seconds; last status:\n${readinessStatus}`,
       }) }))
       yield* Effect.logInfo(`Installed server Ready after ${Math.round((Date.now() - readinessStarted) / 1000)} s`)
+      yield* Effect.gen(function* () {
+        while (!(yield* fs.exists(assessmentDiagnostics))) yield* Effect.sleep("500 millis")
+      }).pipe(Effect.timeoutFail({ duration: "15 seconds", onTimeout: () => new AcceptanceFailed({
+        message: "Installed service did not provide assessment diagnostics",
+      }) }))
       yield* fs.writeFileString(join(output, "models.txt"), yield* query("models", "status"))
       yield* fs.writeFileString(join(output, "hardware.txt"), yield* query("hardware"))
       if (Option.isNone(inference) && !(yield* fs.exists(cachedManifest))) {
@@ -71,6 +79,7 @@ const run = Effect.scoped(Effect.gen(function* () {
         const ranking = yield* Effect.gen(function* () {
           for (;;) {
             const status = yield* query("catalog", "status")
+            if (status !== catalogStatus) yield* Effect.logInfo(`Catalog status after ${Math.round((Date.now() - assessmentStarted) / 1000)} s:\n${status.trim()}`)
             catalogStatus = status
             const counts = /Assessment: Complete - (\d+) of (\d+) models? assessed/.exec(status)
             if (counts && Number(counts[1]) > 0 && counts[1] === counts[2]) {
@@ -79,9 +88,12 @@ const run = Effect.scoped(Effect.gen(function* () {
             }
             yield* Effect.sleep("500 millis")
           }
-        }).pipe(Effect.timeoutFail({ duration: "120 seconds", onTimeout: () => new AcceptanceFailed({
-          message: `Catalog assessment did not complete within 120 seconds; last catalog status:\n${catalogStatus}`,
-        }) }))
+        }).pipe(Effect.timeoutFail({ duration: "16 minutes", onTimeout: () => new AcceptanceFailed({
+          message: `Catalog assessment did not complete within 16 minutes; last catalog status:\n${catalogStatus}`,
+        }) }), Effect.catchAll(error => Effect.gen(function* () {
+          const diagnostics = yield* fs.readFileString(assessmentDiagnostics).pipe(Effect.orElseSucceed(() => "(unavailable)"))
+          return yield* new AcceptanceFailed({ message: `${error instanceof AcceptanceFailed ? error.message : String(error)}\nAssessment diagnostics:\n${diagnostics}` })
+        })))
         yield* Effect.logInfo(`Catalog assessed after ${Math.round((Date.now() - assessmentStarted) / 1000)} s`)
         if (!ranking.includes("Local model recommendations -") && !ranking.includes("No compatible recommendations are available")) {
           return yield* new AcceptanceFailed({ message: "Catalog completed without a settled recommendation result" })

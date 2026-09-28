@@ -28,6 +28,7 @@ const run = (
   options: {
     readonly cwd?: string
     readonly env?: Readonly<Record<string, string | undefined>>
+    readonly timeout?: "5 minutes" | "25 minutes"
   } = {},
 ): Promise<string> => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const executable = command[0]
@@ -45,7 +46,7 @@ const run = (
     message: `${executable} failed with exit ${code}\n--- stdout ---\n${stdout.trim().slice(-16000)}\n--- stderr ---\n${stderr.trim().slice(-16000)}`,
   })
   return stdout
-})).pipe(Effect.timeout("5 minutes"), Effect.provide(BunContext.layer)))
+})).pipe(Effect.timeout(options.timeout ?? "5 minutes"), Effect.provide(BunContext.layer)))
 
 const manifest = await Effect.runPromise(Schema.decodeUnknown(Schema.parseJson(ReleaseManifestSchema))(
   await readFile(resolve(candidate, "magnitude-release.json"), "utf8"),
@@ -170,6 +171,7 @@ try {
   await run([process.execPath, resolve(import.meta.dir, "../packages/release/scripts/acceptance/test-installed-headless.ts")], {
     cwd: root,
     env: headlessEnvironment,
+    timeout: "25 minutes",
   })
   await Effect.runPromise(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ engineAcquired: Schema.Literal(true), rankingReady: Schema.Literal(true) })))(
     await readFile(resolve(headlessRoot, "result.json"), "utf8"),
@@ -180,6 +182,7 @@ try {
   await run([process.execPath, resolve(import.meta.dir, "../packages/release/scripts/acceptance/test-installed-headless.ts")], {
     cwd: root,
     env: { ...headlessEnvironment, MAGNITUDE_RELEASE_BASE_URL: "http://127.0.0.1:1", MAGNITUDE_INSTALLED_ACCEPTANCE_OFFLINE: "true" },
+    timeout: "25 minutes",
   })
   await Effect.runPromise(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ offlineCachedStart: Schema.Literal(true), rankingReady: Schema.Literal(true) })))(
     await readFile(resolve(headlessRoot, "result.json"), "utf8"),

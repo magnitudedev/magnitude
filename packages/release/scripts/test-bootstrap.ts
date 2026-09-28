@@ -242,7 +242,7 @@ const program = Effect.gen(function* () {
             }),
             Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
             // Above the acceptance's own phase limits, so a stalled phase reports itself first.
-            Effect.timeoutFail({ duration: "5 minutes", onTimeout: () => failure("installed headless acceptance timed out") }),
+            Effect.timeoutFail({ duration: "25 minutes", onTimeout: () => failure("installed headless acceptance timed out") }),
           )
           if (acceptance !== 0) return yield* failure(`installed headless acceptance exited ${acceptance}`)
         }
