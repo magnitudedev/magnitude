@@ -67,6 +67,10 @@ def test_native_launch_passes_engine_selection(artifact_path, tmp_path):
     assert flag("--device") == "cpu" and flag("--mtp-proposals") == "2"
     with pytest.raises(ValueError, match="requires --native-method mtp"):
         NativeOptions(mtp_proposals=2)
+    for method in ("dflash", "dspark", "dflash2"):
+        with pytest.raises(ValueError, match=f"{method} requires --native-draft"):
+            NativeOptions(method=method)
+        assert NativeOptions(method=method, draft=tmp_path / "draft.gguf", mtp_proposals=7)
 
 
 def write(root: Path, name: str, content: str = "before") -> Path:

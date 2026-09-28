@@ -31,7 +31,8 @@ pub use decoder::{
     ShortConv, StateSpace, Sublayer, SublayerIndex, UnweightedRms, ValueNorm, ValueSource,
 };
 pub use draft::{
-    BlockLayout, ConfidenceHead, DraftDefinition, DraftEmbedding, DraftMethod, MarkovHead, TapPoint,
+    BlockLayout, CandidateSelector, ConfidenceHead, DraftDefinition, DraftEmbedding, DraftMethod,
+    DraftVariant, DynamicConvolution, LayerConvolutions, MarkovHead, TapPoint,
 };
 pub use family::{FamilyError, FamilyInputAdapter, MarkerTokens, ModelFamily};
 pub use images::{ImageMarkers, SequentialImageInput, SpatialControls};
@@ -300,6 +301,14 @@ pub enum WeightKind {
     MarkovProjection,
     ConfidenceWeight,
     ConfidenceBias,
+    /// DFlash2: a draft sublayer's convolution base `[2, kernel, hidden]`
+    /// and coefficient projection (scope `DraftSublayer`).
+    ConvolutionBase,
+    ConvolutionProjection,
+    /// DFlash2's candidate selector: hidden projection and codebooks.
+    SelectorHidden,
+    SelectorPredecessor,
+    SelectorSuccessor,
     /// A projector weight (scopes `Vision`, `VisionPatch`, `VisionBlock`,
     /// `VisionMerger`).
     Vision(VisionWeight),

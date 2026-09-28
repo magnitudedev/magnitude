@@ -7,7 +7,7 @@
 use crate::error::{ArtifactError, RequestError, ResolveError, UnsupportedModel};
 use crate::families;
 use crate::options::InputModalities;
-use magnitude_artifacts::{ImageProcessor, InputLayout, Package, TokenId};
+use magnitude_artifacts::{gguf::Directory, ImageProcessor, InputLayout, Package, TokenId};
 use magnitude_chat::{
     artifacts::{gguf_byte_bpe, gguf_templates},
     request::ImageInput,
@@ -75,20 +75,36 @@ pub fn package_definition(
             package.identity(),
         )
         .map_err(|error| unsupported(error.0))?;
-    let Some(draft) = package.draft() else {
-        return Ok((family, declared));
+    let declared = bind_draft(
+        family,
+        declared,
+        package.draft().map(|draft| draft.directory()),
+    )
+    .map_err(unsupported)?;
+    Ok((family, declared))
+}
+
+/// `declared` with the package's separate draft, when it has one, bound
+/// against it: the target family maps the draft's tapped layers onto its
+/// sublayers. A payload-backed load and a header-only assessment bind the
+/// same draft definition. A draft the draft family cannot interpret against
+/// this target is an unsupported representation of the package.
+pub fn bind_draft(
+    family: &dyn ModelFamily,
+    declared: ModelDefinition,
+    draft: Option<&Directory>,
+) -> Result<ModelDefinition, String> {
+    let Some(draft) = draft else {
+        return Ok(declared);
     };
-    let draft = magnitude_family_dflash::inspect(draft.directory(), &declared, &|layer| {
+    let draft = magnitude_family_dflash::inspect(draft, &declared, &|layer| {
         family.layer_entry(&declared, layer)
     })
-    .map_err(|error| unsupported(format!("draft: {error}")))?;
-    Ok((
-        family,
-        ModelDefinition {
-            draft: Some(draft),
-            ..declared
-        },
-    ))
+    .map_err(|error| format!("draft: {error}"))?;
+    Ok(ModelDefinition {
+        draft: Some(draft),
+        ..declared
+    })
 }
 
 impl HostArtifacts {

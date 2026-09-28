@@ -13,6 +13,7 @@ use crate::operators::output::{
     post_norm, CheckedPostNormEntries, PostNormEntries, PostNormShape,
 };
 use crate::programs::graph::draft::GraphDraft;
+use crate::programs::native_target_graph::ScaledWeight;
 use crate::native::{PerLayerEntryKernels, PerLayerKernels, TableConversion};
 use crate::{PerLayerBinding, PerLayerEntryBinding, SublayerTail, WeightPlan};
 use magnitude_family_contracts::PerLayerEntry;
@@ -315,8 +316,7 @@ pub(crate) fn per_layer<'a, G: GraphDraft + 'a>(
         entries.output,
         residual,
         (&gated).into(),
-        &weights.projection,
-        weight_scale,
+        &ScaledWeight::unscaled(weights.projection.clone(), weight_scale.clone()),
         &weights.post_norm,
         out_rows,
         PostNormShape {

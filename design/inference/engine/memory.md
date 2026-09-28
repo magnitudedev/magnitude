@@ -104,7 +104,11 @@ or available memory and commit, CUDA free bytes, or Vulkan budget less usage.
 | At or below the planning reserve | Reclaim | Only other programs cause this. Pause admission and growth, release, and unload if it persists |
 | At or below the emergency reserve | (still Reclaim) | The hosting service kills the worker on its first observation |
 
-An unavailable required observation, or hidden process limits, is Blind: growth stops
+Process limits are the visible ones. Inside a container the container's own cgroup limit is
+visible while cgroups above it may be hidden; hidden ancestors bound nothing beyond host headroom,
+so a contained process plans and claims against its own limit and host headroom.
+
+An unavailable required observation is Blind: growth stops
 immediately, and a continuous second of Blind is treated as Reclaim. If Reclaim persists for one
 second after releases are exhausted and in-flight work completes, the engine unloads the model. An
 admission attempted during Blind returns the typed `MemoryObservationUnavailable` result; during

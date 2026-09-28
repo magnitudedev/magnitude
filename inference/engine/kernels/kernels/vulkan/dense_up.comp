@@ -2,7 +2,7 @@
 // projection, and A(act(A(scale * up)) * product_scale). The Vulkan form of `metal/dense_up.metal`
 // over `lib/projection/projection.glsl`.
 #include "lib/core/activation.glsl"
-#if SEISMIC_DIM_US != 0
+#if SEISMIC_STATIC_US != 0
 #define PROJECTION_SCALED
 #endif
 #include "lib/projection/projection.glsl"

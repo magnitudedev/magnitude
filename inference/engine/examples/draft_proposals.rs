@@ -118,7 +118,8 @@ fn main() -> Result<(), String> {
         .context_limit
         .min(options.tokens.len().next_power_of_two().max(256) as u64);
     let model = ModelPolicy {
-        method: ModelMethod::DFlash,
+        // The draft's own variant (DFlash, DSpark or DFlash2).
+        method: ModelMethod::Auto,
         mtp_proposals: options.proposals,
         kv_codec: KvCodec::Dense,
         lookahead: false,

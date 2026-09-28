@@ -8,10 +8,10 @@
 //! graph plan charges them to the workspace; nothing is uploaded per step.
 
 use crate::programs::graph::draft::GraphDraft;
-use crate::programs::native_target_graph::weight;
+use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{native::RoutedKernels, ModelLoadPlan, RoutedBinding};
 use magnitude_family_contracts::{
-    RouteNormalization, RoutedFfn, WeightKind, WeightRole, WeightScope,
+    RouteNormalization, RoutedFfn, WeightKind, WeightScope,
 };
 use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
@@ -174,7 +174,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     handle: RoutedGraphEntries<'a, G>,
     load: &ModelLoadPlan,
     scope: WeightScope,
-    weights: &mut Vec<(WeightRole, NativePort)>,
+    weights: &mut Vec<(WeightPort, NativePort)>,
     residual: &WorkflowTensor,
     rows: u64,
     hidden: u64,

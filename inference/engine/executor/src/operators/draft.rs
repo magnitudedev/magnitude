@@ -1,4 +1,4 @@
-//! The separate draft (DFlash, DSpark; plan §3.8) forms this executor runs,
+//! The separate draft (DFlash, DSpark, DFlash2; plan §3.8) forms this executor runs,
 //! and the roles of a draft's weights.
 //!
 //! The draft's fusion (its projection of the concatenated target taps and the
@@ -9,8 +9,9 @@
 use super::{paired_block, role, sublayer_weights, FeedForward, Mixer, PairedBlock};
 use crate::error::PlanError;
 use magnitude_family_contracts::{
-    Block, DraftDefinition, DraftEmbedding, DraftMethod, ModelDefinition, OutputForm,
-    SublayerIndex, TapPoint, WeightDescriptor, WeightKind, WeightRole, WeightScope,
+    AttentionGate, Block, DraftDefinition, DraftEmbedding, DraftMethod, KeyValue,
+    ModelDefinition, OutputForm, SublayerIndex, TapPoint, ValueSource, WeightDescriptor,
+    WeightKind, WeightRole, WeightScope,
 };
 
 /// The draft weights a target step reads: the fusion projection and the
@@ -61,6 +62,34 @@ pub(crate) fn draft_weights(
             &confidence.weight,
         ));
         weights.push((role(WeightScope::Draft, WeightKind::ConfidenceBias), &confidence.bias));
+    }
+    if let DraftMethod::DFlash2 {
+        convolutions,
+        selector,
+        ..
+    } = &draft.method
+    {
+        for (block, layer) in convolutions.iter().enumerate() {
+            let block =
+                u32::try_from(block).map_err(|_| PlanError::Arithmetic("draft block index"))?;
+            for (sublayer, convolution) in [(0, &layer.attention), (1, &layer.feed_forward)] {
+                let scope = WeightScope::DraftSublayer(SublayerIndex { block, sublayer });
+                weights.push((role(scope, WeightKind::ConvolutionBase), &convolution.base));
+                weights.push((
+                    role(scope, WeightKind::ConvolutionProjection),
+                    &convolution.projection,
+                ));
+            }
+        }
+        weights.push((role(WeightScope::Draft, WeightKind::SelectorHidden), &selector.hidden));
+        weights.push((
+            role(WeightScope::Draft, WeightKind::SelectorPredecessor),
+            &selector.predecessor,
+        ));
+        weights.push((
+            role(WeightScope::Draft, WeightKind::SelectorSuccessor),
+            &selector.successor,
+        ));
     }
     Ok(weights)
 }
@@ -127,6 +156,22 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
                 .any(|output| **output != OutputForm::Residual)
         {
             return Err(PlanError::Unsupported("draft layer form"));
+        }
+        // DFlash2 runs its layers unfused: plain query, key and value
+        // projections of the convolved rows.
+        if matches!(draft.method, DraftMethod::DFlash2 { .. })
+            && (!matches!(attention.gate, AttentionGate::None)
+                || !matches!(
+                    attention.key_value,
+                    KeyValue::Owned {
+                        value: ValueSource::Projected(_),
+                        ..
+                    }
+                ))
+        {
+            return Err(PlanError::Unsupported(
+                "a DFlash2 draft layer other than ungated attention with projected values",
+            ));
         }
         if [paired.epsilon(), super::attention::head_norm_epsilon(attention, epsilon)?]
             .into_iter()

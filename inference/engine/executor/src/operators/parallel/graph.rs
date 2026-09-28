@@ -14,9 +14,9 @@ use crate::operators::routed::graph::{
 };
 use crate::programs::graph::draft::GraphDraft;
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::weight;
+use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{GeneralRoutedShape, ModelLoadPlan, ParallelBinding};
-use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{dense_expand, moe_tail, project_rows};
 use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
@@ -85,7 +85,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     entries: ParallelGraphEntries<'a, G>,
     load: &ModelLoadPlan,
     sublayer: SublayerIndex,
-    weights: &mut Vec<(WeightRole, NativePort)>,
+    weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     residual: &WorkflowTensor,
     rows: u64,

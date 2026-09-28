@@ -3,7 +3,7 @@
 // u = B * X (F32, columns 0..CH), the C segment stores C (F32, columns
 // CH..2CH). The Vulkan form of `metal/short_conv_project.metal`.
 #include "lib/core/activation.glsl"
-#if SEISMIC_DIM_BS != 0 || SEISMIC_DIM_CS != 0 || SEISMIC_DIM_XS != 0
+#if SEISMIC_STATIC_BS != 0 || SEISMIC_STATIC_CS != 0 || SEISMIC_STATIC_XS != 0
 #define PROJECTION_SCALED
 #endif
 #include "lib/projection/projection.glsl"

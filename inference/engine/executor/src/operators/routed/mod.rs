@@ -23,7 +23,7 @@ pub(crate) mod fused_graph;
 pub(crate) mod graph;
 
 use crate::error::PlanError;
-use crate::RoutedBinding;
+use crate::{DenseScales, RoutedBinding, ScalableWeight};
 use magnitude_family_contracts::{
     ActivationFunction, ExpertSelection, FeedForwardUp, RouteNormalization, RoutedFfn,
     RouterInput, ScoreFunction, SharedExpert, SharedExpertGate, WeightKind,
@@ -160,6 +160,24 @@ pub struct GeneralRoutedBinding {
     /// `(gate, up, down)` of the shared expert; `gate` absent for up-only.
     pub shared: Option<(Option<Element>, Element, Element)>,
     pub activation: Element,
+    pub scales: GeneralRoutedScales,
+}
+
+/// The extents of a general routed operator's accumulator-scale ports: its
+/// projection weights' resident second-level scales, 0 where a weight has
+/// none. Gated experts and the router bind no scale.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct GeneralRoutedScales {
+    /// Up-only experts' up weight, per expert (E): `routed_up` and
+    /// `routed_experts_up` scale each expert's accumulator.
+    pub expert_up: u64,
+    /// The experts' down weight, per expert (E): `routed_select` folds it
+    /// into each choice's combine weight, as it does stored expert scales.
+    pub expert_down: u64,
+    /// The shared expert's dense entries.
+    pub shared: DenseScales,
+    /// A latent operator's `(down, up)` projections, per tensor.
+    pub latent: (u64, u64),
 }
 
 /// The routed form Qwen's fused entries implement: a softmax top-k router on
@@ -300,35 +318,63 @@ pub(super) fn fused_binding(
 }
 
 /// The program binding of a general routed operator; `lookup` resolves the
-/// planned element of a role in its scope.
+/// planned element of a role in its scope that its entry binds without an
+/// accumulator-scale port, `scalable` one it binds with one.
 pub(super) fn binding(
     routed: &RoutedFfn,
     hidden: u64,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightKind) -> Result<ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<GeneralRoutedBinding, PlanError> {
     let shape = GeneralRoutedShape::of(hidden, routed)?;
     let norm = lookup(WeightKind::InputNorm)?;
-    let expert_gate = if shape.experts_expansion.gated {
-        Some(lookup(WeightKind::ExpertGate)?)
+    let mut scales = GeneralRoutedScales::default();
+    // `routed_gate_up` and `routed_experts` have no scale ports.
+    let (expert_gate, expert_up) = if shape.experts_expansion.gated {
+        (
+            Some(lookup(WeightKind::ExpertGate)?),
+            lookup(WeightKind::ExpertUp)?,
+        )
     } else {
-        None
+        let up = scalable(WeightKind::ExpertUp)?;
+        scales.expert_up = up.scale;
+        (None, up.element)
     };
+    let expert_down = scalable(WeightKind::ExpertDown)?;
+    if expert_down.scale != 0 && shape.expert_scale {
+        return Err(PlanError::Unsupported(
+            "a scaled expert down weight beside stored per-expert output scales",
+        ));
+    }
+    scales.expert_down = expert_down.scale;
     let latent = if shape.latent {
-        Some((lookup(WeightKind::LatentDown)?, lookup(WeightKind::LatentUp)?))
+        let (down, up) = (
+            scalable(WeightKind::LatentDown)?,
+            scalable(WeightKind::LatentUp)?,
+        );
+        scales.latent = (down.scale, up.scale);
+        Some((down.element, up.element))
     } else {
         None
     };
     let shared = match shape.shared {
-        Some((_, expansion)) => Some((
-            if expansion.gated {
-                Some(lookup(WeightKind::SharedGate)?)
-            } else {
-                None
-            },
-            lookup(WeightKind::SharedUp)?,
-            lookup(WeightKind::SharedDown)?,
-        )),
+        Some((_, expansion)) => {
+            let gate = expansion
+                .gated
+                .then(|| scalable(WeightKind::SharedGate))
+                .transpose()?;
+            let (up, down) = (
+                scalable(WeightKind::SharedUp)?,
+                scalable(WeightKind::SharedDown)?,
+            );
+            scales.shared = DenseScales {
+                gate: gate.map_or(0, |gate| gate.scale),
+                up: up.scale,
+                down: down.scale,
+            };
+            Some((gate.map(|gate| gate.element), up.element, down.element))
+        }
         None => None,
     };
     Ok(GeneralRoutedBinding {
@@ -341,10 +387,11 @@ pub(super) fn binding(
         },
         router: lookup(WeightKind::Router)?,
         expert_gate,
-        expert_up: lookup(WeightKind::ExpertUp)?,
-        expert_down: lookup(WeightKind::ExpertDown)?,
+        expert_up,
+        expert_down: expert_down.element,
         latent,
         shared,
         activation,
+        scales,
     })
 }

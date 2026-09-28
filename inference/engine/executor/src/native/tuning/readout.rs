@@ -158,6 +158,7 @@ pub(crate) struct HeadRowsCase {
     hidden: Tensor,
     norm: Tensor,
     weight: Tensor,
+    weight_scale: Tensor,
     out_rows: Tensor,
     epsilon: f32,
 }
@@ -187,7 +188,11 @@ impl EntryTuning for HeadRowsTuning {
 
     fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = vocabulary_shape(inputs)?;
-        Ok(vec![("V", vocabulary), ("D", hidden)])
+        Ok(vec![
+            ("V", vocabulary),
+            ("D", hidden),
+            ("WS", inputs.scale_extent(WeightScope::Target, WeightKind::Output)?),
+        ])
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -212,6 +217,8 @@ impl EntryTuning for HeadRowsTuning {
             norm: inputs.weight(WeightScope::Target, WeightKind::OutputNorm)?,
             out_rows: inputs.every_row(point.rows)?,
             weight,
+            weight_scale: inputs
+                .unit_scale(inputs.scale_extent(WeightScope::Target, WeightKind::Output)?)?,
             epsilon: self.epsilon,
         }])
     }
@@ -224,6 +231,7 @@ impl EntryTuning for HeadRowsTuning {
             out_rows: &case.out_rows,
             epsilon: case.epsilon,
             softcap: 0.0,
+            weight_scale: &case.weight_scale,
         }
     }
 

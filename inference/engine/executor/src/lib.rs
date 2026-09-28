@@ -75,7 +75,7 @@ pub use planning::{
     resident_element, resident_layout, source_element, ArtifactComponent, ArtifactComponentKind,
     AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding,
-    AttentionShape, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
+    AttentionShape, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding, DenseScales,
     EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
     FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HostTablePlan,
     ImportProgramSlot, MixerProgramSlot, ModelLoadPlan, NativeGraphCharge, DenseBranchBinding,
@@ -83,12 +83,15 @@ pub use planning::{
     PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
     ReadoutBinding, RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity,
     ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding, StartupSlots, StateCapacityPlan,
-    StateProgramPlan, StateResourcePlan, StateStorePlan, StreamingCost, SublayerTail,
-    TargetBlockProgramSlot, DraftBlockBinding, DraftProgramPlan, MarkovBinding, TapProgramPlan,
+    ScalableWeight, StateProgramPlan, StateResourcePlan, StateStorePlan, StreamingCost,
+    SublayerTail, WeightScalePlan,
+    TargetBlockProgramSlot, DraftBlockBinding, DraftProgramPlan, Dflash2Binding, MarkovBinding, SelectorBinding, TapProgramPlan,
     TargetProgramPlan, VisionProgramPlan, WeightPlan, WeightStorageIdentity,
     MAX_DRAFT_PROPOSALS,
 };
-pub use operators::routed::{Expansion, GeneralRoutedBinding, GeneralRoutedShape};
+pub use operators::routed::{
+    Expansion, GeneralRoutedBinding, GeneralRoutedScales, GeneralRoutedShape,
+};
 pub use operators::short_conv::{ShortConvBinding, ShortConvShape};
 pub use operators::state_space::{StateSpaceBinding, StateSpaceShape};
 pub use operators::vision::{VisionEntry, VisionKernel};

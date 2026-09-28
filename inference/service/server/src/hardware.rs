@@ -18,7 +18,7 @@ use magnitude_service_contracts::{
 };
 use seismic::{
     BackendName, DeviceCatalog, DeviceInfo, DeviceKind, DeviceMemory, DeviceTopology,
-    HostMemoryStatus, LimitVisibility,
+    HostMemoryStatus,
 };
 use sha2::{Digest, Sha256};
 
@@ -222,8 +222,7 @@ fn snapshot(
         },
         total_capacity_bytes: host_pool.capacity_bytes,
         stable_capacity_bytes: system_stable_capacity,
-        current_free_bytes: (host.limit_visibility == LimitVisibility::Complete)
-            .then_some(allocation_headroom_bytes),
+        current_free_bytes: Some(allocation_headroom_bytes),
         shares_system_memory: true,
         devices: system_devices,
     }];

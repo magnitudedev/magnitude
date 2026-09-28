@@ -283,12 +283,15 @@ fn flag(payload: &TokenizerPayload, key: &str) -> Result<Option<bool>, Tokenizer
     }
 }
 
-/// Select and adapt a supported BPE profile entirely from the package's
-/// literal tokenizer payload.
-pub fn gguf_byte_bpe(
-    payload: &TokenizerPayload,
-    artifact_identity: String,
-) -> Result<BpeConfig, TokenizerError> {
+/// The vocabulary size of a tokenizer this engine supports, from the
+/// payload's header facts alone: its profile, flags, array lengths and EOS.
+/// Building the tokenizer checks every piece and merge.
+pub fn gguf_tokenizer_vocabulary(payload: &TokenizerPayload) -> Result<usize, TokenizerError> {
+    tokenizer_header(payload).map(|(_, vocabulary)| vocabulary)
+}
+
+/// The supported profile a tokenizer payload names, and its vocabulary size.
+fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), TokenizerError> {
     if let Some(entry) = payload
         .metadata
         .iter()
@@ -317,6 +320,35 @@ pub fn gguf_byte_bpe(
             return Err(TokenizerError::UnsupportedMetadata { key: key.into() });
         }
     }
+    let length = |key: &str| match payload.value(key) {
+        Some(GgufValue::Array(values)) => Ok(values.len()),
+        _ => Err(TokenizerError::Invalid(format!("missing array {key}"))),
+    };
+    let vocabulary = length("tokenizer.ggml.tokens")?;
+    if vocabulary == 0 {
+        return Err("the GGUF vocabulary is empty".into());
+    }
+    if length("tokenizer.ggml.token_type")? != vocabulary {
+        return Err("GGUF token kinds do not cover the vocabulary".into());
+    }
+    length("tokenizer.ggml.merges")?;
+    match payload
+        .value("tokenizer.ggml.eos_token_id")
+        .and_then(|value| value.unsigned())
+    {
+        Some(eos) if eos < vocabulary as u64 => Ok((profile, vocabulary)),
+        Some(_) => Err("tokenizer.ggml.eos_token_id is not a vocabulary token".into()),
+        None => Err("missing EOS identity".into()),
+    }
+}
+
+/// Select and adapt a supported BPE profile entirely from the package's
+/// literal tokenizer payload.
+pub fn gguf_byte_bpe(
+    payload: &TokenizerPayload,
+    artifact_identity: String,
+) -> Result<BpeConfig, TokenizerError> {
+    let (profile, _) = tokenizer_header(payload)?;
     let pieces = strings(payload, "tokenizer.ggml.tokens")?;
     let kinds = match payload.value("tokenizer.ggml.token_type") {
         Some(GgufValue::Array(values)) => values

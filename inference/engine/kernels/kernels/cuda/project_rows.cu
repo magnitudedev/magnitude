@@ -3,19 +3,25 @@
 // `gemv16` beyond) reading the rows in place, GEMM otherwise: `gemm_small` to
 // 64 rows (the rows in place, or the INT8 candidate's q8_1 rows staged by
 // `stage_s8`), `gemm` beyond; up to 128 rows split over K into SPLIT shares
-// of partials that `finalize` sums in part order.
+// of partials that `finalize` sums in part order. A present `weight_scale`
+// (static WS = 1) scales the F32 accumulator in the epilogue (after
+// `finalize`'s sum when split).
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.cuh"
 
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
-using Epi = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_Y)>;
+using Scaling = projection::scaling<(SEISMIC_DIM_WS != 0)>;
+using Epi = Scaling::type<projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_Y)>>;
 
 #define SOURCE_ROWS Pro{SEISMIC_PTR(SEISMIC_BUFFER_SOURCE), SEISMIC_SOURCE_STRIDE_0, projection::AllRows{}}
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
 #define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
 #define WEIGHT KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT))
 #define PARTIALS reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS))
-#define EPILOGUE Epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, 0}
+#define EPILOGUE                                                                                          \
+    Scaling::wrap(projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_Y)>{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),   \
+                                                                  SEISMIC_RESULT_0_STRIDE_0, 0},          \
+                  projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0, 0), 1.0f)
 
 // The GEMV over NB column blocks of 8 rows.
 template <int NB, int KSPLIT>

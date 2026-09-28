@@ -714,7 +714,8 @@ fn cuda_head_rows_match_host_model() {
                     &mapping.head_params(
                         NativeSpecialization::new()
                             .with_static("V", v as u64)
-                            .with_static("D", d as u64),
+                            .with_static("D", d as u64)
+                            .with_static("WS", 0),
                     ),
                 )
                 .unwrap()
@@ -725,6 +726,7 @@ fn cuda_head_rows_match_host_model() {
                     out_rows: &out_rows,
                     epsilon: EPSILON,
                     softcap: 0.0,
+                    weight_scale: &f32_tensor(&device, &[0], &[]),
                 })
                 .unwrap()
                 .value;
@@ -1403,10 +1405,12 @@ fn cuda_head_timings() {
                 &mapping.head_params(
                     NativeSpecialization::new()
                         .with_static("V", v as u64)
-                        .with_static("D", d as u64),
+                        .with_static("D", d as u64)
+                        .with_static("WS", 0),
                 ),
             )
             .unwrap();
+            let absent_scale = f32_tensor(&device, &[0], &[]);
             let args = heads
                 .iter()
                 .map(|head| readout_head_rows::Args {
@@ -1416,6 +1420,7 @@ fn cuda_head_timings() {
                     out_rows: &out_rows,
                     epsilon: EPSILON,
                     softcap: 0.0,
+                    weight_scale: &absent_scale,
                 })
                 .collect();
             let measured = kernel.measure(args, &options).unwrap();

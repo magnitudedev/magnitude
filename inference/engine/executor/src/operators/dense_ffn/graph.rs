@@ -8,7 +8,7 @@
 use crate::operators::output::{post_norm, CheckedPostNormEntries, PostNormShape, TailEntries};
 use crate::programs::graph::draft::GraphDraft;
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::weight;
+use crate::programs::native_target_graph::{scaled_weight, weight, WeightPort};
 use crate::{native::DenseKernels, DenseBinding, ModelLoadPlan, SublayerTail};
 use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{dense_expand, dense_output};
@@ -96,7 +96,7 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
     kernels: DenseGraphEntries<'a, G>,
     load: &ModelLoadPlan,
     scope: WeightScope,
-    weights: &mut Vec<(WeightRole, NativePort)>,
+    weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     residual: &WorkflowTensor,
     rows: u64,
@@ -107,13 +107,16 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
 ) -> Result<WorkflowTensor, String> {
     let dimensions = dimensions(load, scope, rows)?;
     let norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
-    let gate = weight(graph, load, scope, WeightKind::DenseGate, weights)?;
-    let up = weight(graph, load, scope, WeightKind::DenseUp, weights)?;
-    let down = weight(graph, load, scope, WeightKind::DenseDown, weights)?;
+    let gate = scaled_weight(graph, load, scope, WeightKind::DenseGate, weights, constants)?;
+    let up = scaled_weight(graph, load, scope, WeightKind::DenseUp, weights, constants)?;
+    let down = scaled_weight(graph, load, scope, WeightKind::DenseDown, weights, constants)?;
     let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
-    let absent_scale = GraphConstant::absent_scale(graph, constants)?;
-    let expand_dimensions = [dimensions.as_slice(), &[("GS", 0), ("US", 0)]].concat();
-    let output_dimensions = [dimensions.as_slice(), &[("DS", 0)]].concat();
+    let expand_dimensions = [
+        dimensions.as_slice(),
+        &[("GS", gate.extent), ("US", up.extent)],
+    ]
+    .concat();
+    let output_dimensions = [dimensions.as_slice(), &[("DS", down.extent)]].concat();
     let product = graph
         .enqueue(
             kernels.expand,
@@ -121,13 +124,13 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
             dense_expand::WorkflowArgs {
                 residual: residual.into(),
                 norm: (&norm).into(),
-                gate_weight: (&gate).into(),
-                up_weight: (&up).into(),
+                gate_weight: (&gate.weight).into(),
+                up_weight: (&up.weight).into(),
                 out_rows: out_rows.port().tensor().into(),
                 eps: epsilon,
                 activation,
-                gate_scale: (&absent_scale).into(),
-                up_scale: (&absent_scale).into(),
+                gate_scale: (&gate.scale).into(),
+                up_scale: (&up.scale).into(),
             },
         )
         .map_err(|error| error.to_string())?
@@ -140,9 +143,9 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
                 dense_output::WorkflowArgs {
                     residual: residual.into(),
                     product: (&product).into(),
-                    down_weight: (&down).into(),
+                    down_weight: (&down.weight).into(),
                     out_rows: out_rows.port().tensor().into(),
-                    down_scale: (&absent_scale).into(),
+                    down_scale: (&down.scale).into(),
                 },
             )
             .map_err(|error| error.to_string())?
@@ -156,7 +159,6 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
                 residual,
                 (&product).into(),
                 &down,
-                &absent_scale,
                 &post_norm_weight,
                 out_rows.port().tensor(),
                 PostNormShape {

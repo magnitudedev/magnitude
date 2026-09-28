@@ -145,8 +145,9 @@ pub struct SealReport {
 #[derive(Debug, PartialEq)]
 struct BlockGraphShape {
     geometry: String,
-    /// (sublayer, branch) of each role.
-    weights: Vec<((u32, Option<u32>), WeightKind, Element, Vec<u64>)>,
+    /// (sublayer, branch) of each role, its resident element, shape and
+    /// accumulator-scale port extent.
+    weights: Vec<((u32, Option<u32>), WeightKind, Element, Vec<u64>, u64)>,
     state: String,
     /// Where a separate draft taps the block.
     tapped: TapPositions,
@@ -253,6 +254,7 @@ fn block_graph_shapes(
                             weight.role.kind,
                             weight.resident,
                             weight.shape.clone(),
+                            weight.scale_extent(),
                         ))
                     }
                     WeightScope::TargetBranch { sublayer, branch }
@@ -263,12 +265,13 @@ fn block_graph_shapes(
                             weight.role.kind,
                             weight.resident,
                             weight.shape.clone(),
+                            weight.scale_extent(),
                         ))
                     }
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            weights.sort_by_key(|(sublayer, kind, _, _)| (*sublayer, format!("{kind:?}")));
+            weights.sort_by_key(|(sublayer, kind, ..)| (*sublayer, format!("{kind:?}")));
             let state = match paired.mixer.kind() {
                 MixerKind::Recurrent => {
                     let first = operators::bank_component_index(&geometry.blocks, index)
@@ -544,12 +547,12 @@ impl PreparedTargetGraphs {
                 let fixed = graph
                     .weights
                     .iter()
-                    .map(|(role, port)| {
+                    .map(|(weight, port)| {
                         // A graph shared by equal-shape blocks names the
                         // roles of the block it was prepared for; each block
                         // binds its own.
-                        let role = block_role(*role, index)?;
-                        Ok((port, resident.sublayers.get(role)?.tensor()))
+                        let role = block_role(weight.role, index)?;
+                        Ok((port, weight.part.of(resident.sublayers.get(role)?)?))
                     })
                     .chain(
                         constant_tensors
@@ -932,7 +935,7 @@ pub(crate) fn checked_entry_graph_storage(
 pub(crate) struct PreparedTargetBlockGraph {
     pub plan: NativeGraphPlan,
     pub hidden: NativePort,
-    pub weights: Vec<(WeightRole, NativePort)>,
+    pub weights: Vec<(WeightPort, NativePort)>,
     /// Host constants bound statically with the weights.
     pub constants: Vec<GraphConstant>,
     pub state: BlockStatePorts,
@@ -944,24 +947,140 @@ pub(crate) struct PreparedTargetBlockGraph {
     pub output: WorkflowTensor,
 }
 
+/// What a graph's weight port binds of the resident weight of `role`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct WeightPort {
+    pub role: WeightRole,
+    pub part: WeightPart,
+}
+
+/// A resident weight's bound parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum WeightPart {
+    /// The weight in its resident representation.
+    Values,
+    /// Its resident second-level scale (`WeightPlan::scale`).
+    Scale,
+}
+
+impl WeightPart {
+    /// This part of `weight`.
+    pub(crate) fn of(self, weight: &crate::ResidentWeight) -> Result<&seismic::Tensor, String> {
+        match self {
+            Self::Values => Ok(weight.tensor()),
+            Self::Scale => weight.scale().ok_or_else(|| {
+                format!(
+                    "resident weight {:?} has no second-level scale",
+                    weight.descriptor().name
+                )
+            }),
+        }
+    }
+}
+
+/// The port of the planned weight of `role`'s `part`.
+fn weight_port<G: GraphDraft>(
+    graph: &mut G,
+    load: &ModelLoadPlan,
+    role: WeightRole,
+    part: WeightPart,
+    ports: &mut Vec<(WeightPort, NativePort)>,
+) -> Result<seismic::WorkflowTensor, String> {
+    let plan = load
+        .weights()
+        .find(|plan| plan.role == role)
+        .ok_or_else(|| format!("missing planned weight {role:?}"))?;
+    let port = match (part, &plan.scale) {
+        (WeightPart::Values, _) => graph.port(plan.resident, &plan.shape),
+        (WeightPart::Scale, Some(scale)) => graph.port(Element::f32(), &[scale.extent]),
+        (WeightPart::Scale, None) => {
+            return Err(format!("planned weight {role:?} has no second-level scale"))
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let tensor = port.tensor().clone();
+    ports.push((WeightPort { role, part }, port));
+    Ok(tensor)
+}
+
+/// The port of a weight an entry binds without an accumulator-scale port
+/// (plan admission refused a scaled one: `PlanError::UnportedScale`).
 pub(crate) fn weight<G: GraphDraft>(
     graph: &mut G,
     load: &ModelLoadPlan,
     scope: WeightScope,
     kind: WeightKind,
-    ports: &mut Vec<(WeightRole, NativePort)>,
+    ports: &mut Vec<(WeightPort, NativePort)>,
 ) -> Result<seismic::WorkflowTensor, String> {
+    weight_port(graph, load, WeightRole { scope, kind }, WeightPart::Values, ports)
+}
+
+/// A projection weight and the tensor its entry's accumulator-scale port
+/// binds: its resident second-level scale, else an absent scale (zero
+/// extent, never read), and that port's static extent.
+pub(crate) struct ScaledWeight {
+    pub weight: WorkflowTensor,
+    pub scale: WorkflowTensor,
+    pub extent: u64,
+}
+
+impl ScaledWeight {
+    /// A weight bound with the absent scale `absent` (zero extent).
+    pub(crate) fn unscaled(weight: WorkflowTensor, absent: WorkflowTensor) -> Self {
+        Self {
+            weight,
+            scale: absent,
+            extent: 0,
+        }
+    }
+}
+
+/// The port of a weight an entry binds with a per-tensor accumulator-scale
+/// port (`[S] f32`, S ∈ {0, 1}).
+pub(crate) fn scaled_weight<G: GraphDraft>(
+    graph: &mut G,
+    load: &ModelLoadPlan,
+    scope: WeightScope,
+    kind: WeightKind,
+    ports: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+) -> Result<ScaledWeight, String> {
     let role = WeightRole { scope, kind };
-    let plan = load
-        .weights()
+    let weight = weight_port(graph, load, role, WeightPart::Values, ports)?;
+    let extent = planned_scale_extent(load, role)?;
+    let scale = match extent {
+        0 => GraphConstant::absent_scale(graph, constants)?,
+        1 => weight_port(graph, load, role, WeightPart::Scale, ports)?,
+        _ => return Err(format!("{role:?} has a per-matrix scale at a per-tensor port")),
+    };
+    Ok(ScaledWeight {
+        weight,
+        scale,
+        extent,
+    })
+}
+
+/// The port of a weight's resident second-level scale (`[1] f32`, or
+/// `[E] f32` for a stacked expert weight), or `None` when it has none.
+pub(crate) fn resident_scale<G: GraphDraft>(
+    graph: &mut G,
+    load: &ModelLoadPlan,
+    scope: WeightScope,
+    kind: WeightKind,
+    ports: &mut Vec<(WeightPort, NativePort)>,
+) -> Result<Option<WorkflowTensor>, String> {
+    let role = WeightRole { scope, kind };
+    match planned_scale_extent(load, role)? {
+        0 => Ok(None),
+        _ => weight_port(graph, load, role, WeightPart::Scale, ports).map(Some),
+    }
+}
+
+fn planned_scale_extent(load: &ModelLoadPlan, role: WeightRole) -> Result<u64, String> {
+    load.weights()
         .find(|plan| plan.role == role)
-        .ok_or_else(|| format!("missing planned weight {role:?}"))?;
-    let port = graph
-        .port(plan.resident, &plan.shape)
-        .map_err(|error| error.to_string())?;
-    let tensor = port.tensor().clone();
-    ports.push((role, port));
-    Ok(tensor)
+        .map(crate::WeightPlan::scale_extent)
+        .ok_or_else(|| format!("missing planned weight {role:?}"))
 }
 
 pub(crate) fn activation(geometry: &Decoder) -> Element {
@@ -1069,7 +1188,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     per_layer_entries: Option<PerLayerParts<'a, G>>,
     hidden: &WorkflowTensor,
     inputs: BlockGraphInputs<'_>,
-    weights: &mut Vec<(WeightRole, NativePort)>,
+    weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<BlockGraphParts, String> {
     let BlockGraphInputs {

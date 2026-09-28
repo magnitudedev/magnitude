@@ -31,9 +31,15 @@ scale fields bit for bit: the 4-bit coded family (a codebook and one scale per 3
 `q4g32s` offset codes with f16 scales, `mxfp4g32` E2M1 with an E8M0 exponent per 32, `nvfp4g16`
 E2M1 with a UE4M3 scale per 16, beside `iq4g32`) and the 5-bit `q5g32s` (f16 scale) and `q5g32`
 (f16 scale and minimum). E2M1 −0 imports as +0, as the reference dequantization decodes it. A
-scale field that is NaN in its format (E8M0 0xff, UE4M3 0x7f) decodes as NaN. NVFP4's per-tensor
-or per-expert F32 scale is a separate tensor, not part of the representation; the family applies
-it.
+scale field that is NaN in its format (E8M0 0xff, UE4M3 0x7f) decodes as NaN. A second-level
+scale (NVFP4's per-tensor or per-expert F32 `.scale`) is a separate stored tensor, not part of the
+representation: the weight's bytes import as stored, and the scale becomes resident beside it as
+one F32 value per matrix (a stored single value repeats per matrix of a stack), keyed and charged
+with the weight identically by header assessment and load. Entries apply it to their F32
+accumulator through an accumulator-scale port; no import or family folds it into another weight.
+A missing or misshapen scale, a scaled weight dequantized for dense-only kernels, and a scaled
+weight bound by an entry without a scale port are refused at plan time, so the model is
+`Incompatible` rather than failing on a device.
 
 Each import takes an immutable artifact source and validates its exact WeightPlan. On Metal,
 component weights are visited in source-file order. Consecutive whole tensors whose combined
@@ -49,8 +55,9 @@ The target component is imported before engine readiness. Enabled optional head 
 components are held by typed one-shot ComponentLoaders. Each loader owns its import store and
 caches either its assembled component or its typed failure. The head loader inherits the target
 store so tied embedding and output weights retain their exact resident tensors; the vision loader
-owns an isolated projector store. A separate draft (DFlash, DSpark) is the head lane's drafter: its
+owns an isolated projector store. A separate draft (DFlash, DSpark, DFlash2) is the head lane's drafter: its
 fusion weights are target weights (every target step fuses the draft's taps), imported with the
 target from the draft component, and its loader imports the rest of the draft component through
-the inherited target store. Numerical stages receive loaders rather than shared mutable
+the inherited target store. Every preload reads each weight from the component that stores it.
+Numerical stages receive loaders rather than shared mutable
 cache access. No warm token path prepares or searches for an import kernel.

@@ -29,6 +29,7 @@ use crate::{
             distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
             ConstantTensors, GraphConstant,
         },
+        native_target_graph::{WeightPart, WeightPort},
     },
     DeviceError, FeedForwardProgramSlot, GraphOutputTensor, HeadBinding, HeadLaunchCore,
     InvariantError, ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead,
@@ -283,7 +284,7 @@ struct HeadGraphParts<P> {
     out_rows: NativePort,
     passes: Vec<PassPorts>,
     constants: Vec<GraphConstant>,
-    weights: Vec<(WeightRole, NativePort)>,
+    weights: Vec<(WeightPort, NativePort)>,
     /// The output weight's leading `draft_vocabulary` rows, when drafting.
     projection: Option<NativePort>,
     /// Selections `[steps * slots, 2]` when drafting; otherwise the entry
@@ -327,7 +328,7 @@ fn planned_weight<G: GraphDraft>(
     graph: &mut G,
     load: &ModelLoadPlan,
     role: WeightRole,
-    weights: &mut Vec<(WeightRole, NativePort)>,
+    weights: &mut Vec<(WeightPort, NativePort)>,
 ) -> Result<WorkflowTensor, String> {
     let plan = load
         .weights()
@@ -335,7 +336,13 @@ fn planned_weight<G: GraphDraft>(
         .ok_or_else(|| format!("planned head weight {role:?} is absent"))?;
     let port = graph.port(plan.resident, &plan.shape)?;
     let tensor = port.tensor().clone();
-    weights.push((role, port));
+    weights.push((
+        WeightPort {
+            role,
+            part: WeightPart::Values,
+        },
+        port,
+    ));
     Ok(tensor)
 }
 
@@ -979,7 +986,10 @@ impl PreparedHeadGraphs {
             let fixed = graph
                 .weights
                 .iter()
-                .map(|(role, port)| Ok((port, resident_head_weight(resident, *role)?.tensor())))
+                .map(|(weight, port)| {
+                    let resident = resident_head_weight(resident, weight.role)?;
+                    Ok((port, weight.part.of(resident).map_err(invalid)?))
+                })
                 .chain(constants.iter().map(|(port, tensor)| Ok((*port, tensor))))
                 .chain(graph.projection.iter().map(|port| Ok((port, &projection))))
                 .collect::<Result<Vec<_>, SubmitError>>()?;

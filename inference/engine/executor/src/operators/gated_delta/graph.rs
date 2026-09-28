@@ -5,9 +5,9 @@
 //! bank it publishes to.
 
 use crate::programs::graph::draft::GraphDraft;
-use crate::programs::native_target_graph::weight;
+use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{native::RecurrentKernels, ModelLoadPlan, RecurrentBinding, StateResourcePlan};
-use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
     gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
 };
@@ -167,7 +167,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     state: &StateResourcePlan,
     load: &ModelLoadPlan,
     scope: WeightScope,
-    weights: &mut Vec<(WeightRole, NativePort)>,
+    weights: &mut Vec<(WeightPort, NativePort)>,
     hidden: &WorkflowTensor,
     block: RecurrentBlock,
 ) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), String> {

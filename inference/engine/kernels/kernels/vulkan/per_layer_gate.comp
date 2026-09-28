@@ -3,7 +3,7 @@
 // activated-product epilogue A(A(act(A(gate))) * inputs[m, layer, p]). The
 // Vulkan form of `metal/per_layer_gate.metal`.
 #include "lib/core/activation.glsl"
-#if SEISMIC_DIM_GS != 0
+#if SEISMIC_STATIC_GS != 0
 #define PROJECTION_SCALED
 #endif
 #include "lib/projection/projection.glsl"

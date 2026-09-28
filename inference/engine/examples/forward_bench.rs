@@ -128,6 +128,12 @@ mod tuning_pin {
         /// Remove the pin flags from `args` and install the pin they ask for.
         pub(crate) fn extract(args: &mut Vec<String>) -> Result<Self, String> {
             let (mut record, mut replay) = (None, None);
+            if let Some(index) = args.iter().position(|arg| arg == "--tuning-defaults") {
+                args.remove(index);
+                pinned_tuning::install(TuningPin::Defaults);
+                eprintln!("forward_bench: running every entry's default configuration");
+                return Ok(Self { record: None });
+            }
             let mut index = 0;
             while index < args.len() {
                 let slot = match args[index].as_str() {
@@ -181,6 +187,11 @@ mod tuning_pin {
                         "bindings": pinned.bindings,
                         "statics": pinned.statics,
                         "params": pinned.params,
+                        "launch_params": pinned
+                            .launch_params
+                            .iter()
+                            .map(|((launch, name), value)| (format!("{launch}:{name}"), *value))
+                            .collect::<BTreeMap<_, _>>(),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -224,6 +235,13 @@ mod tuning_pin {
                     bindings: text("bindings")?,
                     statics: map(&entry["statics"])?,
                     params: map(&entry["params"])?,
+                    launch_params: map(&entry["launch_params"])?
+                        .into_iter()
+                        .map(|(key, value)| {
+                            let (launch, name) = key.split_once(':').ok_or_else(malformed)?;
+                            Ok(((launch.parse().map_err(|_| malformed())?, name.to_owned()), value))
+                        })
+                        .collect::<Result<_, String>>()?,
                 })
             })
             .collect()

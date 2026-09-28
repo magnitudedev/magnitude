@@ -30,15 +30,16 @@ The serving profile owns capacity and fit; performance samples create no serving
 
 ## Measurement basis
 
-The basis times every operation class of a plain decode step that some known target needs, at the
-representations its load plan binds (dense and paired projections, attention, recurrent steps,
-routed experts, row ops such as post-norms and per-layer inputs, readout, sampling, and the host
-gather and upload of a host-resident table's rows), plus the launch dependency between consecutive
-calls and the fixed per-step submission, with shipped default configurations at fixed sizes. The
-arithmetic parameters that move production speed most (`INT8`, `PARTS`, `SLICES`) are each varied
-alone from the default, screened by one sample, and the fastest is timed. Every repeated sample is
-kept. A class that does not grow with size, or a nonphysical fit, is a measurement error, never a
-guessed coefficient.
+The basis is a fixed, model-free plan (see the measurement basis design): every operation class of
+a plain decode step (dense and paired projections, attention, recurrent steps, routed experts, row
+ops such as post-norms and per-layer inputs, readout, sampling, conversions, and the host gather and
+upload of a host-resident table's rows), plus the launch dependency between consecutive calls and
+the fixed per-step submission, timed with shipped default configurations at synthetic sizes. Each
+class fits a cost model in the quantities a model's demand supplies: per launch, per byte,
+projection cost by output rows, attention history cost by head geometry and depth, and a
+weight-format factor per resident representation. The arithmetic parameters that move production
+speed most (`INT8`, `PARTS`, `SLICES`) are each varied alone from the default, screened by one
+sample, and the fastest is timed. Every repeated sample is kept; fits are clamped to physical values.
 
 ## Calculation
 

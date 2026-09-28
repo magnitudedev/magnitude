@@ -120,6 +120,11 @@ impl<'a> TuningWeights<'a> {
         Ok(self.plan(scope, kind)?.shape.clone())
     }
 
+    /// The planned extent of one weight role's accumulator-scale port.
+    pub fn scale_extent(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
+        Ok(self.plan(scope, kind)?.scale_extent())
+    }
+
     pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
         let role = WeightRole { scope, kind };
         if let Some(tensor) = self.resident.get(&role) {

@@ -2436,6 +2436,8 @@ struct ReadoutCheck {
     output_classes: &'static [usize],
     mappings: &'static [Mapping],
     softcap: f32,
+    /// The head's second-level weight scale (`weight_scale`, WS = 1).
+    weight_scale: Option<f32>,
     portable: bool,
 }
 
@@ -2448,6 +2450,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference() {
         output_classes: &ROW_CLASSES,
         mappings: &MAPPINGS,
         softcap: 0.0,
+        weight_scale: None,
         portable: true,
     };
     for device in devices() {
@@ -2467,10 +2470,35 @@ fn readout_softcap_matches_the_portable_bodies_and_the_host_reference() {
         output_classes: &[2, 12],
         mappings: &MAPPING,
         softcap: 30.0,
+        weight_scale: None,
         portable: true,
     };
     for device in devices() {
         readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device, &check);
+    }
+}
+
+/// An NVFP4 vocabulary projection's second-level scale (Nemotron's
+/// `output.scale` magnitude) on the F32 projection, before the softcap: the
+/// portable body and every native against the host reference, on the GEMV,
+/// batched and GEMM classes.
+#[test]
+fn readout_weight_scale_matches_the_portable_bodies_and_the_host_reference() {
+    const MAPPING: [Mapping; 1] = [MAPPINGS[0]];
+    for softcap in [0.0, 30.0] {
+        let check = ReadoutCheck {
+            v: 256,
+            d: 256,
+            reprs: &[Repr::Q6k],
+            output_classes: &[1, 12, 40],
+            mappings: &MAPPING,
+            softcap,
+            weight_scale: Some(3.0517578e-4),
+            portable: true,
+        };
+        for device in devices() {
+            readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device, &check);
+        }
     }
 }
 
@@ -2490,6 +2518,7 @@ fn metal_readout_scoped_launches_match_the_host() {
         output_classes: &[1, 8, 32, 128],
         mappings: &SCOPED,
         softcap: 0.0,
+        weight_scale: None,
         portable: false,
     };
     readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device, &check);
@@ -2622,6 +2651,16 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                 &features,
                 &feature_bound,
             );
+            // The head's weight scale multiplies each exact logit and its
+            // bound.
+            let factor = check.weight_scale.unwrap_or(1.0);
+            let scale_extent = usize::from(check.weight_scale.is_some());
+            let scale_values = check.weight_scale.into_iter().collect::<Vec<_>>();
+            let scaled_logits = logits.iter().map(|z| z * factor).collect::<Vec<_>>();
+            let scaled_logit_bound = logit_bound
+                .iter()
+                .map(|(magnitude, rest)| (magnitude * factor, rest * factor))
+                .collect::<Vec<_>>();
             // The softcap c * tanh(z / c) has slope at most 1, so a logit's
             // bound carries over; its exp form adds a few ulp of c.
             let bounds = |terms: &[(f32, f32)]| {
@@ -2637,6 +2676,17 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     .collect::<Vec<_>>()
             };
             for &mapping in check.mappings {
+                let specialization = readout_projection_specialization_on(
+                    device,
+                    &[("V", v), ("D", d), ("WS", scale_extent)],
+                    mapping,
+                );
+                // The CPU native's one static is the scale port's extent.
+                let specialization = if is_cpu(device) {
+                    specialization.with_static("WS", scale_extent as u64)
+                } else {
+                    specialization
+                };
                 let head_native = readout_head_rows::native_for_device_with(
                     &device,
                     readout_head_rows::Elements {
@@ -2644,7 +2694,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                         OW: repr.element(),
                         A: act.element(),
                     },
-                    &readout_projection_specialization_on(device, &[("V", v), ("D", d)], mapping),
+                    &specialization,
                 )
                 .unwrap()
                 .call(readout_head_rows::Args {
@@ -2654,14 +2704,18 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     out_rows: &rows_tensor,
                     epsilon: 1e-6,
                     softcap: cap,
+                    weight_scale: &f32_tensor(device, &[scale_extent], &scale_values),
                 })
                 .unwrap()
                 .value;
                 assert_within(
-                    &format!("head_rows {repr:?} O {outputs} {mapping:?} softcap {cap}"),
+                    &format!(
+                        "head_rows {repr:?} O {outputs} {mapping:?} softcap {cap} scale {:?}",
+                        check.weight_scale
+                    ),
                     &read_f32(&head_native),
-                    &capped(&logits),
-                    &bounds(&logit_bound),
+                    &capped(&scaled_logits),
+                    &bounds(&scaled_logit_bound),
                 );
                 let selected_native = readout_selected_rows::native_for_device_with(
                     &device,
@@ -2691,7 +2745,9 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     &bounds(&chosen_bound),
                 );
             }
-            if check.portable && outputs == 2 && repr == Repr::Q6k {
+            if check.portable && (outputs == 2 || check.weight_scale.is_some() && outputs == 1)
+                && repr == Repr::Q6k
+            {
                 let bindings = [
                     ("NW", registry::dense(DType::BF16)),
                     ("OW", repr.storage()),
@@ -2708,12 +2764,13 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                 let mut head_inputs = inputs();
                 head_inputs.push(Input::F32(1e-6));
                 head_inputs.push(Input::F32(cap));
+                head_inputs.push(floats(&[scale_extent], &scale_values));
                 let oracle = result(&interpret(&module, "readout_head_rows", &bindings, head_inputs), 0);
                 assert_within(
-                    &format!("head_rows portable softcap {cap}"),
+                    &format!("head_rows portable softcap {cap} scale {:?}", check.weight_scale),
                     &oracle,
-                    &capped(&logits),
-                    &bounds(&logit_bound),
+                    &capped(&scaled_logits),
+                    &bounds(&scaled_logit_bound),
                 );
                 let mut selected_inputs = inputs();
                 selected_inputs.push(ints(&[selected.len()], &selected));
@@ -3362,9 +3419,14 @@ fn timing_on(device: &Device) {
                         OW: repr.element(),
                         A: a,
                     },
-                    &readout_projection_specialization_on(device, &[("V", v), ("D", d)], mapping),
+                    &readout_projection_specialization_on(
+                        device,
+                        &[("V", v), ("D", d), ("WS", 0)],
+                        mapping,
+                    ),
                 )
                 .unwrap();
+                let absent_scale = f32_tensor(&device, &[0], &[]);
                 let rotation = vec![readout_head_rows::Args {
                     hidden: &hidden,
                     norm: &norm,
@@ -3372,6 +3434,7 @@ fn timing_on(device: &Device) {
                     out_rows: &out_rows,
                     epsilon: 1e-6,
                     softcap: 0.0,
+                    weight_scale: &absent_scale,
                 }];
                 let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
                 report(label, m, mapping, measured.median, bytes, m * v * d);

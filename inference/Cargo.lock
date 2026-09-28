@@ -2130,6 +2130,7 @@ dependencies = [
  "magnitude-batching",
  "magnitude-family-common",
  "magnitude-family-contracts",
+ "magnitude-family-dflash",
  "magnitude-family-gemma4",
  "magnitude-family-lfm2",
  "magnitude-family-llama",

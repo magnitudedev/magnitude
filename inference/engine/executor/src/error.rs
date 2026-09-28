@@ -1,6 +1,6 @@
 //! Closed numerical execution failures at the program boundary.
 
-use magnitude_family_contracts::DeferredForm;
+use magnitude_family_contracts::{DeferredForm, WeightRole};
 use std::{error, fmt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +33,9 @@ pub enum PlanError {
     },
     /// A form the family contract defines only as an interface point.
     Deferred(DeferredForm),
+    /// A weight with a resident second-level scale, bound by an entry that
+    /// has no accumulator-scale port for it.
+    UnportedScale(WeightRole),
     Topology(&'static str),
     Arithmetic(&'static str),
     ResourcePlanning(String),
@@ -48,6 +51,12 @@ impl fmt::Display for PlanError {
                 write!(formatter, "unsupported {operator} operator as {position}")
             }
             Self::Deferred(form) => write!(formatter, "unsupported {} (deferred)", form.name()),
+            Self::UnportedScale(role) => write!(
+                formatter,
+                "unsupported second-level scale of {:?}/{:?}: its entry has no \
+                 accumulator-scale port",
+                role.scope, role.kind
+            ),
             Self::Topology(detail) => formatter.write_str(detail),
             Self::Arithmetic(detail) => write!(formatter, "plan arithmetic failed: {detail}"),
             Self::ResourcePlanning(detail) => {

@@ -7,7 +7,7 @@
 use magnitude_artifacts::{Package, PackageIdentity, PackageManifest};
 use magnitude_chat::generation::MethodPolicy;
 use magnitude_generation::{DFlash, Method, Mtp, Plain};
-use magnitude_family_contracts::{ModelDefinition, ModelFamily, Operator};
+use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, Operator};
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     ExecutionPath, ResourcePlan, MAX_DRAFT_PROPOSALS,
@@ -71,7 +71,23 @@ pub enum ModelMethod {
     Auto,
     Plain,
     Mtp,
+    /// A separate draft of the named variant. The draft's own definition
+    /// decides its variant; requesting one the package's draft is not fails.
     DFlash,
+    DSpark,
+    DFlash2,
+}
+
+impl ModelMethod {
+    /// The separate-draft variant this method requests, if it requests one.
+    fn draft_variant(self) -> Option<DraftVariant> {
+        match self {
+            Self::DFlash => Some(DraftVariant::DFlash),
+            Self::DSpark => Some(DraftVariant::DSpark),
+            Self::DFlash2 => Some(DraftVariant::DFlash2),
+            Self::Auto | Self::Plain | Self::Mtp => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -341,16 +357,24 @@ fn resolve_method(
     definition: &ModelDefinition,
 ) -> Result<ResolvedMethod, String> {
     let head = definition.head.as_ref();
-    let use_dflash = match requested {
+    let use_draft = match requested {
         ModelMethod::Auto => definition.draft.is_some(),
-        ModelMethod::DFlash => true,
+        ModelMethod::DFlash | ModelMethod::DSpark | ModelMethod::DFlash2 => true,
         ModelMethod::Plain | ModelMethod::Mtp => false,
     };
-    if use_dflash {
+    if use_draft {
         let draft = definition
             .draft
             .as_ref()
-            .ok_or("DFlash was requested but the package has no draft")?;
+            .ok_or("a separate-draft method was requested but the package has no draft")?;
+        let variant = draft.method.variant();
+        if let Some(requested) = requested.draft_variant() {
+            if requested != variant {
+                return Err(format!(
+                    "{requested} was requested but the package's draft is {variant}"
+                ));
+            }
+        }
         let bound = u8::try_from(draft.max_proposals())
             .map_err(|_| "the draft's block exceeds the proposal width range")?;
         let proposals = match override_width {
@@ -366,7 +390,10 @@ fn resolve_method(
     let use_mtp = match requested {
         // A head this executor does not run leaves the model plain.
         ModelMethod::Auto => magnitude_executor::head_admitted(definition),
-        ModelMethod::Plain | ModelMethod::DFlash => false,
+        ModelMethod::Plain
+        | ModelMethod::DFlash
+        | ModelMethod::DSpark
+        | ModelMethod::DFlash2 => false,
         ModelMethod::Mtp => true,
     };
     if !use_mtp {
@@ -549,6 +576,60 @@ mod tests {
         assert!(options.resolve(&definition(true)).is_err());
         options.method = ModelMethod::Plain;
         assert!(options.resolve(&definition(true)).is_err());
+    }
+
+    fn with_draft(method: magnitude_family_contracts::DraftMethod) -> ModelDefinition {
+        use magnitude_family_contracts::{
+            BlockLayout, DraftDefinition, DraftEmbedding, SublayerIndex, TapPoint, TokenId,
+        };
+        ModelDefinition {
+            draft: Some(DraftDefinition {
+                method,
+                taps: vec![TapPoint::Sublayer(SublayerIndex {
+                    block: 0,
+                    sublayer: 0,
+                })],
+                fusion: weight("fc", &[2, 2]),
+                fusion_norm: rms("enc"),
+                embedding: DraftEmbedding::Target,
+                blocks: vec![block("d")],
+                output_norm: rms("don"),
+                block_size: 4,
+                mask_token: TokenId(7),
+                layout: BlockLayout::MaskSlots,
+            }),
+            ..definition(true)
+        }
+    }
+
+    /// A separate-draft method names the draft's variant; the package's
+    /// draft must be of it, and `auto` takes whichever the draft is.
+    #[test]
+    fn a_requested_draft_variant_must_be_the_packages() {
+        use magnitude_family_contracts::DraftMethod;
+        let draft = with_draft(DraftMethod::DFlash);
+        let policy = |method| ModelPolicy {
+            method,
+            ..ModelPolicy::default()
+        };
+        for method in [ModelMethod::Auto, ModelMethod::DFlash] {
+            assert_eq!(
+                policy(method).resolve(&draft).unwrap().method,
+                ResolvedMethod::DFlash { proposals: 3 }
+            );
+        }
+        for method in [ModelMethod::DSpark, ModelMethod::DFlash2] {
+            let error = policy(method).resolve(&draft).unwrap_err();
+            assert!(error.contains("the package's draft is DFlash"), "{error}");
+        }
+        assert!(policy(ModelMethod::DFlash)
+            .resolve(&definition(true))
+            .is_err());
+        // Plain and MTP loads ignore the draft.
+        assert_eq!(
+            policy(ModelMethod::Plain).resolve(&draft).unwrap().method,
+            ResolvedMethod::Plain
+        );
     }
 
     #[test]

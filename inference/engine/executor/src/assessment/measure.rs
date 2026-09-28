@@ -12,8 +12,9 @@
 //! - Every planned native form is formed first, in parallel, then every
 //!   timed entry is timed (see [`complete_basis`]).
 //! - Synthetic weights are views into one zero-filled pool per element and
-//!   row width, allocated once for the whole basis and reused by every
-//!   class. A point's rotation of views spans the backend's rotation bytes.
+//!   row width, shared by the points of one class and released when the
+//!   next class starts, so a basis holds at most one class's pools. A
+//!   point's rotation of views spans the backend's rotation bytes.
 //! - A point is timed as production runs its entries: one sealed native
 //!   graph holding one launch per rotation view, run [`RUNS`] times back to
 //!   back after one discarded run, with each run's device interval taken
@@ -561,8 +562,6 @@ struct Pool {
     tensor: Tensor,
     rows: u64,
     cursor: u64,
-    /// Shaped for one class: released when the next class starts.
-    transient: bool,
 }
 
 impl Pool {
@@ -660,7 +659,7 @@ impl<'a> Session<'a> {
     ) -> Result<(ClassMeasurement, ClassProfile), MeasurementError> {
         let began = Instant::now();
         let key = planned.key();
-        self.pools.borrow_mut().retain(|pool| !pool.transient);
+        self.pools.borrow_mut().clear();
         refresh_device_ceiling(catalog, self.device, reserves)
             .map_err(MeasurementError::Ceiling)?;
         let pass = match planned {
@@ -949,7 +948,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         if element.logical_group().is_none() {
             let length = extents.iter().product::<u64>();
             return self
-                .pooled(element, &[], length, count, false)?
+                .pooled(element, &[], length, count)?
                 .into_iter()
                 .map(|view| {
                     view.reshape(extents)
@@ -960,8 +959,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let [rows, trailing @ ..] = extents else {
             return Err(failed("a pooled view has at least one extent"));
         };
-        // Packed views of higher rank are shaped for one class.
-        self.pooled(element, trailing, *rows, count, trailing.len() > 1)
+        self.pooled(element, trailing, *rows, count)
     }
 
     /// Fresh slab storage for each launch in a rotation. The kernel sees
@@ -1012,35 +1010,27 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         Ok(self.copies(bytes))
     }
 
-    /// Packed matrix views whose row width only this class uses: their pool
-    /// is released when the next class starts.
-    fn transient_views(
-        &self,
-        element: Element,
-        inner: u64,
-        rows: u64,
-        count: u64,
-    ) -> Step<Vec<Tensor>> {
-        if element.logical_group().is_none() {
-            return self.views(element, inner, rows, count);
-        }
-        self.pooled(element, &[inner], rows, count, true)
-    }
-
     /// `count` consecutive leading-axis views of `rows` rows from the pool
     /// of `element` and `trailing` extents. The pool grows when a point asks
     /// for more than it holds; `begin` restarts a point's views at the
-    /// pool's start.
+    /// pool's start. A matrix of tiled rows that is not whole tiles cannot
+    /// be a pool view; each is its own tensor, as the programs form it.
     fn pooled(
         &self,
         element: Element,
         trailing: &[u64],
         rows: u64,
         count: u64,
-        transient: bool,
     ) -> Step<Vec<Tensor>> {
         if self.queuing() {
             return Err(Stop::Queued);
+        }
+        if let [inner] = trailing {
+            if rows % element.tile_rows() != 0 {
+                return (0..count)
+                    .map(|_| self.zeros(element, &[rows, *inner]))
+                    .collect();
+            }
         }
         let began = Instant::now();
         let alignment = Pool::alignment(element, trailing);
@@ -1055,7 +1045,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         {
             Some(index) => index,
             None => {
-                pools.push(self.pool(element, trailing, needed, transient)?);
+                pools.push(self.pool(element, trailing, needed)?);
                 pools.len() - 1
             }
         };
@@ -1067,7 +1057,6 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 element,
                 trailing,
                 (pool.cursor + needed).max(2 * pool.rows),
-                pool.transient,
             )?;
         }
         let views = (0..count)
@@ -1085,7 +1074,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
     }
 
     /// A pool spanning the session's rotation bytes, at least `rows` rows.
-    fn pool(&self, element: Element, trailing: &[u64], rows: u64, transient: bool) -> Step<Pool> {
+    fn pool(&self, element: Element, trailing: &[u64], rows: u64) -> Step<Pool> {
         let alignment = Pool::alignment(element, trailing);
         let group = bytes(
             element,
@@ -1104,7 +1093,6 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             tensor: self.zeros(element, &extents)?,
             rows,
             cursor: 0,
-            transient,
         })
     }
 
@@ -2436,8 +2424,8 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let launches = self.copies(point_bytes);
         let expert_gates = self.shaped(weight, &[experts, features, hidden], launches)?;
         let expert_ups = self.shaped(weight, &[experts, features, hidden], launches)?;
-        let shared_gates = self.transient_views(weight, hidden, features, launches)?;
-        let shared_ups = self.transient_views(weight, hidden, features, launches)?;
+        let shared_gates = self.views(weight, hidden, features, launches)?;
+        let shared_ups = self.views(weight, hidden, features, launches)?;
         let normalized = self.zeros(activation, &[1, hidden])?;
         let routes = self.i32s(
             &[1, ROUTED_SELECTED],
@@ -2624,7 +2612,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let device = self.device();
         let kernels = self.form::<readout_head_rows::Entry>(
             &[norm, weight, activation],
-            &[("M", 1), ("O", 1), ("V", vocabulary), ("D", hidden)],
+            &[("M", 1), ("O", 1), ("V", vocabulary), ("D", hidden), ("WS", 0)],
             move |specialization| {
                 readout_head_rows::native_for_device_with(
                     device,
@@ -2643,11 +2631,13 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let input = self.zeros(Element::f32(), &[1, hidden])?;
         let norm = self.zeros(norm, &[hidden])?;
         let out_rows = self.zeros(Element::i32(), &[1])?;
+        let scale = self.zeros(Element::f32(), &[0])?;
         let samples = self.fastest(&kernels, |kernel| {
             let mut timed = Timed::new(device);
             let hidden = timed.bound(&input)?;
             let norm = timed.bound(&norm)?;
             let out_rows = timed.bound(&out_rows)?;
+            let scale = timed.bound(&scale)?;
             for weight in &weights {
                 let weight = timed.bound(weight)?;
                 let result = timed
@@ -2661,6 +2651,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                             out_rows: out_rows.tensor().into(),
                             epsilon: 1e-6,
                             softcap: 0.0,
+                            weight_scale: scale.tensor().into(),
                         },
                     )
                     .map_err(failed)?;

@@ -4,6 +4,7 @@
 
 // for converting from JSON to jinja values
 #include "json.h"
+#include "templates-support.h"
 
 #include <sstream>
 #include <string>
@@ -374,7 +375,7 @@ const func_builtins & global_builtins() {
             // TODO: make sure this is the same behavior as Python's strftime
             char buf[100];
             std::tm utc_time{};
-            if (!gmtime_r(&args.ctx.current_time, &utc_time)) { throw raised_exception("Timestamp outside UTC calendar range"); }
+            if (!templates_utc_calendar(args.ctx.current_time, utc_time)) { throw raised_exception("Timestamp outside UTC calendar range"); }
             if (std::strftime(buf, sizeof(buf), format.c_str(), &utc_time)) {
                 return mk_val<value_string>(std::string(buf));
             } else {

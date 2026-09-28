@@ -317,6 +317,12 @@ fn render_source_with(
                     "#define SEISMIC_DIM_{name} {}\n",
                     literal(dialect, value)
                 ));
+                // GLSL's preprocessor evaluates no typed literal: an `#if`
+                // guard on a static extent reads it as a plain integer.
+                #[cfg(any(not(target_os = "macos"), test))]
+                if matches!(dialect, Dialect::Vulkan(_)) {
+                    prefix.push_str(&format!("#define SEISMIC_STATIC_{name} {value}\n"));
+                }
             }
             None => prefix.push_str(&format!(
                 "#define SEISMIC_DIM_{name} (seismic_words[{word}])\n"
@@ -1140,6 +1146,7 @@ mod tests {
             "#define SEISMIC_HAS_MATRIX 0\n",
             "#define SEISMIC_HAS_MIXED_DOT 1\n",
             "#define SEISMIC_DIM_K uint64_t(64ul)\n",
+            "#define SEISMIC_STATIC_K 64\n",
             "#define SEISMIC_X_EXTENT_1 uint64_t(64ul)\n",
             "#define SEISMIC_X_STRIDE_0 (seismic_words[",
             "#define SEISMIC_BUFFER_SCRATCH_PARTIALS 2\n",

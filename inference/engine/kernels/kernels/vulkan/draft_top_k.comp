@@ -1,0 +1,39 @@
+// draft_top_k: one workgroup of 256 invocations per row selects the row's K
+// highest logits in (value descending, token ascending) order. Round r scans
+// the tokens ordered strictly after round r - 1's choice. The Vulkan form of
+// `metal/draft_top_k.metal`.
+#include "lib/core/reduce.glsl"
+
+#define TOP_K_INF uintBitsToFloat(0x7f800000u)
+
+// Shared: one partial per subgroup (reduce_group_max at float 0).
+void draft_top_k() {
+    const uint64_t logits = SEISMIC_PTR(SEISMIC_BUFFER_LOGITS);
+    const uint64_t candidates = SEISMIC_PTR(SEISMIC_BUFFER_CANDIDATES);
+    const uint64_t unary = SEISMIC_PTR(SEISMIC_BUFFER_UNARY);
+    const uint64_t row = gl_WorkGroupID.x;
+    float previous = TOP_K_INF;
+    int previous_token = -1;
+    for (uint64_t rank = 0ul; rank < SEISMIC_DIM_K; ++rank) {
+        float best = -TOP_K_INF;
+        int best_token = 0x7fffffff;
+        for (uint64_t token = gl_LocalInvocationIndex; token < SEISMIC_DIM_V; token += gl_WorkGroupSize.x) {
+            const float value = element_f32_at(logits + (row * SEISMIC_LOGITS_STRIDE_0 + token * SEISMIC_LOGITS_STRIDE_1) * 4ul);
+            const bool after = value < previous || (value == previous && int(token) > previous_token);
+            if (after && (value > best || (value == best && int(token) < best_token))) {
+                best = value;
+                best_token = int(token);
+            }
+        }
+        const float chosen = reduce_group_max(best, 0u);
+        const float lowest = -reduce_group_max(best == chosen ? -float(best_token) : -TOP_K_INF, 0u);
+        previous = chosen;
+        previous_token = int(lowest);
+        if (gl_LocalInvocationIndex == 0u) {
+            const uint64_t at = row * SEISMIC_DIM_K + rank;
+            element_i32_put(candidates + at * SEISMIC_CANDIDATES_STRIDE_0 * 4ul, previous_token);
+            element_i32_put(candidates + (at * SEISMIC_CANDIDATES_STRIDE_0 + SEISMIC_CANDIDATES_STRIDE_1) * 4ul, 0);
+            element_f32_put(unary + (row * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1) * 4ul, chosen);
+        }
+    }
+}

@@ -36,7 +36,7 @@ using json = common_json;
 static std::string format_time(const std::chrono::system_clock::time_point & now, const std::string & format) {
     auto               time       = std::chrono::system_clock::to_time_t(now);
     std::tm local_time{};
-    if (!gmtime_r(&time, &local_time)) { throw std::invalid_argument("Timestamp outside UTC calendar range"); }
+    if (!templates_utc_calendar(time, local_time)) { throw std::invalid_argument("Timestamp outside UTC calendar range"); }
     std::ostringstream ss;
     ss.imbue(std::locale::classic());
     ss << std::put_time(&local_time, format.c_str());

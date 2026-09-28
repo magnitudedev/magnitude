@@ -14,23 +14,30 @@ def default_native_binary() -> Path:
     return project_root().parent / "target" / "release" / "magnitude-engine"
 
 
+#: Native methods that run a separate draft model.
+SEPARATE_DRAFTS = ("dflash", "dspark", "dflash2")
+
+
 class NativeOptions(Record):
     """Launch selection for the native engine; recorded in the reproduction command."""
 
     binary: Path = Field(default_factory=default_native_binary)
     device: str = "auto"
     cache_dir: Path | None = None
-    method: Literal["auto", "plain", "mtp", "dflash"] = "auto"
+    method: Literal["auto", "plain", "mtp", "dflash", "dspark", "dflash2"] = "auto"
     mtp_proposals: int | None = Field(default=None, gt=0)
-    #: A separate draft model (DFlash, DSpark) for the target.
+    #: A separate draft model (DFlash, DSpark, DFlash2) for the target; the
+    #: engine refuses a draft that is not the requested method's.
     draft: Path | None = None
 
     @model_validator(mode="after")
     def proposals_need_a_drafter(self) -> Self:
-        if self.mtp_proposals is not None and self.method not in ("mtp", "dflash"):
-            raise ValueError("--native-mtp-proposals requires --native-method mtp or dflash")
-        if self.method == "dflash" and self.draft is None:
-            raise ValueError("--native-method dflash requires --native-draft")
+        if self.mtp_proposals is not None and self.method not in ("mtp", *SEPARATE_DRAFTS):
+            raise ValueError(
+                "--native-mtp-proposals requires --native-method mtp, dflash, dspark or dflash2"
+            )
+        if self.method in SEPARATE_DRAFTS and self.draft is None:
+            raise ValueError(f"--native-method {self.method} requires --native-draft")
         return self
 
     def arguments(self) -> list[str]:

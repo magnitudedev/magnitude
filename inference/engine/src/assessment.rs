@@ -10,12 +10,12 @@
 //! opened, no weight payload is read and nothing is decoded.
 
 use crate::error::UnsupportedModel;
-use crate::options::{ExecutionManifest, ModelPolicy};
+use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy};
 use crate::planning::{ExecutionPlanningError, plan_execution};
 use magnitude_artifacts::PackageHeaders;
 use magnitude_chat::{
     TemplateInspection,
-    artifacts::{gguf_byte_bpe, gguf_templates},
+    artifacts::{gguf_templates, gguf_tokenizer_vocabulary},
 };
 use magnitude_executor::{
     ExecutionPath, ExecutionPlanDraft, PlanError,
@@ -33,13 +33,21 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// The package components to assess. Only their headers are read.
+/// The package components to assess and the generation method the bundle
+/// declares. Only their headers are read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelPackagePaths {
     /// The target GGUF, or the first shard of a split GGUF (the remaining
     /// shards are found beside it by the split naming convention).
     pub target: PathBuf,
     pub projector: Option<PathBuf>,
+    /// A separate draft model (DFlash, DSpark, DFlash2).
+    pub draft: Option<PathBuf>,
+    /// The bundle's method: `Auto` for a standalone package, the declared
+    /// method otherwise. A declared separate-draft method the draft does
+    /// not implement, or the executor cannot run, makes the bundle
+    /// unsupported or incompatible; it is never assessed as plain.
+    pub method: ModelMethod,
 }
 
 /// The selected execution configuration paired with its generic measurement basis.
@@ -287,17 +295,24 @@ pub fn prepare_model_assessment(
     setup: &AssessmentSetup,
 ) -> Result<PreparedModelAssessment, ModelAssessmentError> {
     let headers = PackageHeaders::open(&package.target, package.projector.as_deref())
+        .and_then(|headers| match &package.draft {
+            Some(draft) => headers.with_draft(draft),
+            None => Ok(headers),
+        })
         .map_err(ModelAssessmentError::Artifact)?;
     let family = match crate::families::recognize(headers.target()) {
         Ok(family) => family,
         Err(unsupported) => return Ok(PreparedModelAssessment::Unsupported(unsupported)),
     };
-    let definition = match family.inspect(headers.target(), headers.projector(), headers.identity())
+    let definition = match family
+        .inspect(headers.target(), headers.projector(), headers.identity())
+        .map_err(|error| error.0)
+        .and_then(|declared| crate::host::bind_draft(family, declared, headers.draft()))
     {
         Ok(definition) => definition,
-        Err(error) => {
+        Err(reason) => {
             return Ok(PreparedModelAssessment::Unsupported(
-                UnsupportedModel::Representation { reason: error.0 },
+                UnsupportedModel::Representation { reason },
             ));
         }
     };
@@ -307,10 +322,16 @@ pub fn prepare_model_assessment(
         Ok(facts) => facts,
         Err(unsupported) => return Ok(PreparedModelAssessment::Unsupported(unsupported)),
     };
-    let model = setup
-        .policy
-        .resolve(&definition)
-        .map_err(ModelAssessmentError::Configuration)?;
+    let policy = ModelPolicy {
+        method: package.method,
+        ..setup.policy.clone()
+    };
+    // A method the package cannot run (a declared draft of another variant)
+    // is a property of the bundle, not an assessment failure.
+    let model = match policy.resolve(&definition) {
+        Ok(model) => model,
+        Err(reason) => return Ok(PreparedModelAssessment::Incompatible { facts, reason }),
+    };
     let manifest = ExecutionManifest::new(
         headers.manifest(),
         definition,
@@ -378,6 +399,7 @@ fn is_unsupported(error: &PlanError) -> bool {
         PlanError::Unsupported(_)
         | PlanError::UnsupportedOperator { .. }
         | PlanError::Deferred(_)
+        | PlanError::UnportedScale(_)
         | PlanError::InvalidDefinition(_)
         | PlanError::Topology(_) => true,
         PlanError::Arithmetic(_) | PlanError::ResourcePlanning(_) | PlanError::Resource(_) => false,
@@ -395,14 +417,9 @@ fn inspect_chat(
 ) -> Result<TemplateInspection, UnsupportedModel> {
     let unsupported = |reason: String| UnsupportedModel::Representation { reason };
     let tokenizer_payload = magnitude_artifacts::TokenizerPayload::from_directory(headers.target());
-    // The tokenizer a load builds from this configuration, validated without
-    // building it: only its support verdict and vocabulary are needed here.
-    let vocabulary = gguf_byte_bpe(
-        &tokenizer_payload,
-        definition.artifact_identity.target.to_string(),
-    )
-    .and_then(|config| config.validate())
-    .map_err(|error| unsupported(error.to_string()))?;
+    // Support and vocabulary are header facts; a load builds the tokenizer.
+    let vocabulary = gguf_tokenizer_vocabulary(&tokenizer_payload)
+        .map_err(|error| unsupported(error.to_string()))?;
     if u64::try_from(vocabulary).ok() != Some(definition.decoder.vocabulary) {
         return Err(unsupported(
             "tokenizer vocabulary differs from model vocabulary".into(),

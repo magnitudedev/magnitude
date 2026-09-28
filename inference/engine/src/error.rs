@@ -462,7 +462,8 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
         error @ (PlanError::InvalidDefinition(_)
         | PlanError::Topology(_)
         | PlanError::UnsupportedOperator { .. }
-        | PlanError::Deferred(_)) => {
+        | PlanError::Deferred(_)
+        | PlanError::UnportedScale(_)) => {
             PlanOutcome::Unsupported(UnsupportedModel::Representation {
                 reason: error.to_string(),
             })

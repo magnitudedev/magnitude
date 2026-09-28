@@ -1345,6 +1345,7 @@ mod tests {
                     descriptor: descriptor.clone(),
                     source_bytes: bytes,
                     resident_bytes: bytes,
+                    scale: None,
                 }
             })
             .collect();

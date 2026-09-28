@@ -1,0 +1,33 @@
+// draft_convolve_residual: DFlash2's half-1 grouped dynamic causal convolution
+// of a sublayer's F32 output rows within each draft block, plus the residual;
+// one invocation per output element over a grid-stride loop. The Vulkan form
+// of `metal/draft_convolve_residual.metal`.
+#include <seismic/element.glsl>
+
+void draft_convolve_residual() {
+    const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL);
+    const uint64_t output = SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT);
+    const uint64_t dynamic = SEISMIC_PTR(SEISMIC_BUFFER_DYNAMIC);
+    const uint64_t base = SEISMIC_PTR(SEISMIC_BUFFER_BASE);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t channels = SEISMIC_DIM_C, width = SEISMIC_DIM_G * channels;
+    const uint64_t count = SEISMIC_DIM_M * width;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
+        const uint64_t row = index / width, column = index % width, group = column / channels;
+        const uint64_t position = row % uint64_t(SEISMIC_PARAM_BLOCK);
+        float sum = 0.0;
+        for (uint64_t offset = 0ul; offset < SEISMIC_DIM_K && offset <= position; ++offset) {
+            const float coefficient =
+                element_f32_at(base + (SEISMIC_BASE_STRIDE_0 + offset * SEISMIC_BASE_STRIDE_1
+                    + column * SEISMIC_BASE_STRIDE_2) * 4ul)
+                + element_f32_at(dynamic + (row * SEISMIC_DYNAMIC_STRIDE_0 + SEISMIC_DYNAMIC_STRIDE_1
+                    + offset * SEISMIC_DYNAMIC_STRIDE_2 + group * SEISMIC_DYNAMIC_STRIDE_3) * 4ul);
+            sum = seismic_fma_rn(coefficient,
+                element_f32_at(output + ((row - offset) * SEISMIC_OUTPUT_STRIDE_0 + column * SEISMIC_OUTPUT_STRIDE_1) * 4ul),
+                sum);
+        }
+        element_f32_put(result + (row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
+            element_f32_at(residual + (row * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1) * 4ul) + sum);
+    }
+}

@@ -196,7 +196,12 @@ maximum class width. Draft head blocks use their declared dense or routed feed-f
 and the same routed numerical composition as target blocks. Header assessment includes the head's
 routed weights, program entries, and class-dependent workspace before residency begins. Linear
 projection stages use cooperative subgroup reductions for the smallest row classes and subgroup
-matrix operations above them. A decode projection, normalization prologue
+matrix operations above them. A projection entry that reads packed weights has one
+accumulator-scale port per weight, whose static extent is 0 (absent, compiled out) or the extent of
+the weight's resident second-level scale: per tensor for dense feed-forward, latent, post-norm and
+vocabulary projections, per expert for up-only routed experts; a routed down weight's per-expert
+scales join the selection's per-expert output scales in the combine weights. Blocks share a sealed
+graph and a specialization only when their scale extents agree. A decode projection, normalization prologue
 included, is one launch: each workgroup reduces its few rows' norms while staging them. Larger classes
 normalize once per row into entry scratch, never per output tile. A monolithic entry that recomputes normalization,
 projection, routing, or softmax for each output coordinate is not an admissible production program.
@@ -214,7 +219,7 @@ sampling applies the same mask to unshaped rows. The projected-row
 capacity follows the selected per-step token and memory allowance; prefill row capacity does
 not imply the same number of logits rows. Features, logits and selection stay inside one checked
 Seismic workflow with one owned output lifetime.
-A separate draft (DFlash, DSpark) conditions on target taps instead of the final features. A
+A separate draft (DFlash, DSpark, DFlash2) conditions on target taps instead of the final features. A
 tapped block's workflow rounds the residual entering it, entering its feed-forward, or leaving it
 (the exit tap is the last block's output) into that tap's column block of a draft-input buffer
 the bound target workflows own (charged with their bound constants); the
@@ -225,7 +230,14 @@ keys and values (the fusion norm as its input norm, each row attending only itse
 drafting, one non-causal pass over each slot's block `[anchor, mask, …]` reads its domain's
 accepted and injected rows plus the whole slot block, and the target's vocabulary projection and
 selection read the proposing rows. DSpark then chains its slots through the Markov bias and
-declines a proposal below its confidence threshold. The block always has the draft's trained width;
+declines a proposal below its confidence threshold. DFlash2 runs every block-pass sublayer unfused:
+the normed rows project to per-row coefficients of a grouped causal convolution that restarts at
+each slot's block, its first half feeds the operator's plain projections and its second half
+convolves the operator's output before the residual add; its proposing rows keep their top-k
+logits, and one ordered step per proposal selects each slot's candidate from the predecessor and
+successor codebooks, the anchor preceding the first. Its proposals are that greedy path for
+greedy and sampled requests alike (the target's verification decides acceptance). Context
+injection is the same for every variant. The block always has the draft's trained width;
 a load's proposal width selects its leading proposing rows. Block rows append nowhere.
 Conditioning overlays are Seismic workflows with only external ports, sealed once per overlaid row
 count and never per request. A step with conditioning queues, after its embedding entry, one

@@ -297,11 +297,82 @@ pub fn partition(
             }
         }
     }
+    // Every parameter's value in each admissible configuration, resolved
+    // once: the projections below index it rather than look values up.
+    let addresses = implementation
+        .params
+        .iter()
+        .map(entry_address)
+        .chain(
+            implementation
+                .launches
+                .iter()
+                .enumerate()
+                .flat_map(|(launch, declaration)| {
+                    declaration
+                        .params
+                        .iter()
+                        .map(move |parameter| local_address(launch, parameter))
+                }),
+        )
+        .collect::<Vec<_>>();
+    let column = addresses
+        .iter()
+        .enumerate()
+        .map(|(column, address)| (address.clone(), column))
+        .collect::<BTreeMap<_, _>>();
+    let values = admissible
+        .iter()
+        .map(|specialization| {
+            addresses
+                .iter()
+                .map(|address| address.value(specialization))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let columns = |selected: &[ParameterAddress]| {
+        selected.iter().map(|address| column[address]).collect::<Vec<_>>()
+    };
+    let project = |configuration: usize, selected: &[usize]| {
+        selected
+            .iter()
+            .map(|&column| values[configuration][column])
+            .collect::<Vec<_>>()
+    };
+    // A condition's name resolves as its evaluation does: a launch's own
+    // parameter first, then the entry's.
+    let lookup = &column;
+    let condition_columns = condition_reads
+        .iter()
+        .enumerate()
+        .flat_map(|(ordinal, names)| {
+            names.iter().map(move |name| {
+                lookup
+                    .get(&ParameterAddress::Launch {
+                        ordinal,
+                        name: name.clone(),
+                    })
+                    .or_else(|| lookup.get(&ParameterAddress::Entry(name.clone())))
+                    .copied()
+            })
+        })
+        .collect::<Vec<_>>();
     let mut measured = BTreeSet::new();
     let mut activity = vec![Vec::<Vec<usize>>::with_capacity(points.len()); admissible.len()];
     let mut point_sets = vec![BTreeSet::<Vec<usize>>::new(); points.len()];
+    // A point's active launches depend only on the values the launch
+    // conditions read, which few configurations of a domain distinguish.
+    let mut decided = vec![BTreeMap::<Vec<Option<u64>>, Vec<usize>>::new(); points.len()];
     for (configuration, specialization) in admissible.iter().enumerate() {
+        let read = condition_columns
+            .iter()
+            .map(|column| column.map(|column| values[configuration][column]))
+            .collect::<Vec<_>>();
         for (index, point) in points.iter().enumerate() {
+            if let Some(active) = decided[index].get(&read) {
+                activity[configuration].push(active.clone());
+                continue;
+            }
             let dimension = |name: &str| {
                 point
                     .dimensions
@@ -340,6 +411,7 @@ pub fn partition(
                 union(&mut parents, pair[0], pair[1]);
             }
             point_sets[index].insert(active.clone());
+            decided[index].insert(read.clone(), active.clone());
             activity[configuration].push(active);
         }
     }
@@ -363,14 +435,9 @@ pub fn partition(
                 .filter(|(_, owned)| owned.iter().any(|launch| launches.contains(launch)))
                 .map(|(address, _)| address.clone())
                 .collect::<Vec<_>>();
-            let candidates = admissible
-                .iter()
-                .map(|specialization| {
-                    parameters
-                        .iter()
-                        .map(|address| address.value(specialization))
-                        .collect::<Vec<_>>()
-                })
+            let selected = columns(&parameters);
+            let candidates = (0..admissible.len())
+                .map(|configuration| project(configuration, &selected))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
@@ -405,13 +472,9 @@ pub fn partition(
                         .map(|parameter| local_address(ordinal, parameter)),
                 )
                 .collect::<Vec<_>>();
-            let code_variants = admissible
-                .iter()
-                .map(|specialization| {
-                    code.iter()
-                        .map(|address| address.value(specialization))
-                        .collect::<Vec<_>>()
-                })
+            let selected = columns(&code);
+            let code_variants = (0..admissible.len())
+                .map(|configuration| project(configuration, &selected))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
@@ -423,20 +486,19 @@ pub fn partition(
         .collect();
     let mut measurements = 0usize;
     for group in &groups {
+        let selected = columns(&group.parameters);
+        let mut configurations = BTreeMap::<Vec<u64>, Vec<usize>>::new();
+        for configuration in 0..admissible.len() {
+            configurations
+                .entry(project(configuration, &selected))
+                .or_default()
+                .push(configuration);
+        }
         for candidate in &group.candidates {
             for point in 0..points.len() {
-                let sets = admissible
+                let sets = configurations[candidate]
                     .iter()
-                    .enumerate()
-                    .filter_map(|(configuration, specialization)| {
-                        let values = group
-                            .parameters
-                            .iter()
-                            .map(|address| address.value(specialization))
-                            .collect::<Vec<_>>();
-                        if &values != candidate {
-                            return None;
-                        }
+                    .filter_map(|&configuration| {
                         let active = &activity[configuration][point];
                         active
                             .iter()

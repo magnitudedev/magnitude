@@ -252,17 +252,6 @@ impl ByteBpeTokenizer {
 }
 
 impl BpeConfig {
-    /// Whether a tokenizer builds from this configuration, without building
-    /// it: every check [`ByteBpeTokenizer::new`] makes of the vocabulary,
-    /// the merges and the split patterns. Its vocabulary size on success.
-    /// Pieces are unique, so adding the user-defined and control pieces
-    /// keeps their IDs.
-    pub fn validate(&self) -> Result<usize, TokenizerError> {
-        self.checked_pieces()?;
-        self.split_stages()?;
-        Ok(self.pieces.len())
-    }
-
     /// The split stages the pre-tokenizer applies before any byte-level
     /// stage.
     fn split_stages(&self) -> Result<Vec<PreTokenizerWrapper>, TokenizerError> {

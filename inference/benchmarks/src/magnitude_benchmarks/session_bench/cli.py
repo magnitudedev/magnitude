@@ -94,10 +94,12 @@ def parser() -> argparse.ArgumentParser:
     native.add_argument("--native-device", default="auto", help="auto, metal, cuda, vulkan, cpu")
     native.add_argument("--native-cache-dir", type=Path, help="persistent kernel and tuning cache")
     native.add_argument(
-        "--native-method", choices=("auto", "plain", "mtp", "dflash"), default="auto"
+        "--native-method",
+        choices=("auto", "plain", "mtp", "dflash", "dspark", "dflash2"),
+        default="auto",
     )
-    native.add_argument("--native-mtp-proposals", type=int, help="MTP or DFlash proposal width")
-    native.add_argument("--native-draft", type=Path, help="separate draft model (DFlash, DSpark)")
+    native.add_argument("--native-mtp-proposals", type=int, help="MTP or separate-draft proposal width")
+    native.add_argument("--native-draft", type=Path, help="separate draft model (DFlash, DSpark, DFlash2)")
     watchdog = execute.add_argument_group("watchdog")
     watchdog.add_argument(
         "--stall-seconds",

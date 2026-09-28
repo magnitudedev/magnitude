@@ -3,7 +3,7 @@
 // `metal/dense_output.metal` over `lib/projection/projection.glsl`; the GEMM
 // class may split K (SPLIT parts, then an in-order reduction).
 #include "lib/core/activation.glsl"
-#if SEISMIC_DIM_DS != 0
+#if SEISMIC_STATIC_DS != 0
 #define PROJECTION_SCALED
 #endif
 #include "lib/projection/projection.glsl"

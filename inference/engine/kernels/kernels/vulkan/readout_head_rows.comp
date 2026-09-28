@@ -2,6 +2,9 @@
 // vocabulary projection into F32 logits. The Vulkan form of
 // `metal/readout_head_rows.metal` over `lib/projection/projection.glsl`.
 #include "lib/core/activation.glsl"
+#if SEISMIC_STATIC_WS != 0
+#define PROJECTION_SCALED
+#endif
 #include "lib/projection/projection.glsl"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
@@ -74,8 +77,9 @@ projection_prologue head_rows_input() {
 }
 
 projection_epilogue head_rows_output() {
-    return projection_logits(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
-        SEISMIC_RESULT_0_STRIDE_1, element_word_f32(SEISMIC_PARAM_SOFTCAP));
+    return projection_scaled(projection_logits(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1, element_word_f32(SEISMIC_PARAM_SOFTCAP)),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0ul, 0ul), 1.0);
 }
 
 projection_weights head_rows_weight() {

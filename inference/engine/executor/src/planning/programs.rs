@@ -3,8 +3,9 @@
 
 use super::weights::{activation_dtype, ParallelBinding, PerLayerBinding, PerLayerEntryBinding};
 use super::{
-    planned_element, AttentionBinding, DenseBinding, EmbeddingBinding, FeaturesBinding,
-    HeadBinding, HostTablePlan, ReadoutBinding, RecurrentBinding, RoutedBinding, WeightPlan,
+    planned_element, planned_scalable, AttentionBinding, DenseBinding, EmbeddingBinding,
+    FeaturesBinding, HeadBinding, HostTablePlan, ReadoutBinding, RecurrentBinding, RoutedBinding,
+    ScalableWeight, WeightPlan,
 };
 use crate::error::PlanError;
 use crate::operators::routed::GeneralRoutedBinding;
@@ -86,6 +87,8 @@ impl TargetBlockProgramSlot {
 pub struct TapProgramPlan {
     pub points: Vec<TapPoint>,
     pub fusion: Element,
+    /// The extent of the fusion projection's accumulator-scale port.
+    pub fusion_scale: u64,
     pub activation: Element,
 }
 
@@ -176,6 +179,34 @@ pub struct MarkovBinding {
     pub rank: u64,
 }
 
+/// DFlash2's candidate selector: the hidden projection (a `project_rows`
+/// of the output-normed proposing rows) and its two codebooks (embedding
+/// gathers of the predecessor and of every candidate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SelectorBinding {
+    pub hidden: Element,
+    pub predecessor: Element,
+    pub successor: Element,
+    pub rank: u64,
+    pub top_k: u64,
+}
+
+/// DFlash2's block pass: every draft sublayer runs unfused (normed rows,
+/// half-0 convolution, plain projections, half-1 convolution plus the
+/// residual), so each layer's convolution coefficient projections bind here;
+/// the layers' own projection elements are their attention and dense
+/// bindings'.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Dflash2Binding {
+    /// Convolution taps and coefficient groups.
+    pub kernel: u64,
+    pub groups: u64,
+    /// Per draft layer, its attention's and its feed-forward's coefficient
+    /// projection elements.
+    pub convolutions: Vec<[Element; 2]>,
+    pub selector: SelectorBinding,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraftProgramPlan {
     blocks: Vec<DraftBlockBinding>,
@@ -185,10 +216,15 @@ pub struct DraftProgramPlan {
     /// The target's vocabulary projection.
     projection: Element,
     markov: Option<MarkovBinding>,
+    dflash2: Option<Dflash2Binding>,
     activation: Element,
 }
 
 impl DraftProgramPlan {
+    pub fn dflash2(&self) -> Option<&Dflash2Binding> {
+        self.dflash2.as_ref()
+    }
+
     pub fn blocks(&self) -> &[DraftBlockBinding] {
         &self.blocks
     }
@@ -363,7 +399,7 @@ pub(super) fn derive_program_plan(
 ) -> Result<ProgramPlan, PlanError> {
     operators::admit(definition, head.is_some())?;
     let lookup = |weights: &[WeightPlan], scope, kind| {
-        planned_element(weights, scope, kind).map_err(PlanError::InvalidDefinition)
+        planned_element(weights, scope, kind)
     };
     let mut seen_imports = HashSet::new();
     let mut imports = Vec::new();
@@ -410,6 +446,7 @@ pub(super) fn derive_program_plan(
                         decoder.hidden,
                         feed_forward,
                         |scope, kind| lookup(target, scope, kind),
+                        |scope, kind| planned_scalable(target, scope, kind),
                         active_element,
                     )
                 })
@@ -458,18 +495,22 @@ pub(super) fn derive_program_plan(
             })
         })
         .transpose()?;
+    let output = planned_scalable(target, WeightScope::Target, WeightKind::Output)?;
     let readout = ReadoutBinding {
         norm: lookup(target, WeightScope::Target, WeightKind::OutputNorm)?,
-        weight: lookup(target, WeightScope::Target, WeightKind::Output)?,
+        weight: output.element,
         activation: active_element,
+        weight_scale: output.scale,
     };
     // A selected separate draft is the drafter; an embedded head otherwise.
     let separate = head.and(definition.draft.as_ref());
     let taps = separate
         .map(|draft| {
+            let fusion = planned_scalable(target, WeightScope::Draft, WeightKind::DraftFusion)?;
             Ok::<_, PlanError>(TapProgramPlan {
                 points: draft.taps.clone(),
-                fusion: lookup(target, WeightScope::Draft, WeightKind::DraftFusion)?,
+                fusion: fusion.element,
+                fusion_scale: fusion.scale,
                 activation: active_element,
             })
         })
@@ -526,6 +567,11 @@ pub(super) fn derive_program_plan(
                         decoder.hidden,
                         feed_forward,
                         |scope, kind| lookup(weights, scope, kind),
+                        // Head graphs bind no scale ports.
+                        |scope, kind| {
+                            lookup(weights, scope, kind)
+                                .map(|element| ScalableWeight { element, scale: 0 })
+                        },
                         active_element,
                     )?,
                     output_norm: lookup(weights, scope, WeightKind::OutputNorm)?,
@@ -580,7 +626,7 @@ fn draft_program_plan(
     activation: Element,
 ) -> Result<DraftProgramPlan, PlanError> {
     let lookup = |weights: &[WeightPlan], scope, kind| {
-        planned_element(weights, scope, kind).map_err(PlanError::InvalidDefinition)
+        planned_element(weights, scope, kind)
     };
     let fusion_norm = lookup(target, WeightScope::Draft, WeightKind::DraftFusionNorm)?;
     let mut blocks = Vec::with_capacity(draft.blocks.len());
@@ -602,6 +648,16 @@ fn draft_program_plan(
                 .feed_forward
                 .ok_or(PlanError::Unsupported("draft layer without feed-forward"))?,
             |kind| lookup(weights, feed_forward, kind),
+            // DFlash and DSpark layers run the dense feed-forward graph, whose
+            // entries bind scale ports; DFlash2 layers project through their
+            // own entries, which bind none.
+            |kind| match draft.method {
+                DraftMethod::DFlash2 { .. } => lookup(weights, feed_forward, kind)
+                    .map(|element| ScalableWeight { element, scale: 0 }),
+                DraftMethod::DFlash | DraftMethod::DSpark { .. } => {
+                    planned_scalable(weights, feed_forward, kind)
+                }
+            },
             activation,
         )?;
         blocks.push(DraftBlockBinding {
@@ -625,13 +681,46 @@ fn draft_program_plan(
             activation,
         },
         output_norm: lookup(weights, WeightScope::Draft, WeightKind::OutputNorm)?,
-        projection: lookup(target, WeightScope::Target, WeightKind::Output)?,
+        // The draft's head entry binds the projection's scale port as the
+        // target readout does.
+        projection: planned_scalable(target, WeightScope::Target, WeightKind::Output)?.element,
         markov: match &draft.method {
-            DraftMethod::DFlash => None,
+            DraftMethod::DFlash | DraftMethod::DFlash2 { .. } => None,
             DraftMethod::DSpark { markov, .. } => Some(MarkovBinding {
                 embedding: lookup(weights, WeightScope::Draft, WeightKind::MarkovEmbedding)?,
                 projection: lookup(weights, WeightScope::Draft, WeightKind::MarkovProjection)?,
                 rank: markov.rank,
+            }),
+        },
+        dflash2: match &draft.method {
+            DraftMethod::DFlash | DraftMethod::DSpark { .. } => None,
+            DraftMethod::DFlash2 {
+                kernel,
+                group,
+                convolutions,
+                selector,
+            } => Some(Dflash2Binding {
+                kernel: *kernel,
+                groups: hidden / *group,
+                convolutions: (0..convolutions.len())
+                    .map(|index| {
+                        let block = u32::try_from(index)
+                            .map_err(|_| PlanError::Arithmetic("draft block index exceeds u32"))?;
+                        let [attention, feed_forward] =
+                            paired_scopes(block, WeightScope::DraftSublayer);
+                        Ok([
+                            lookup(weights, attention, WeightKind::ConvolutionProjection)?,
+                            lookup(weights, feed_forward, WeightKind::ConvolutionProjection)?,
+                        ])
+                    })
+                    .collect::<Result<Vec<_>, PlanError>>()?,
+                selector: SelectorBinding {
+                    hidden: lookup(weights, WeightScope::Draft, WeightKind::SelectorHidden)?,
+                    predecessor: lookup(weights, WeightScope::Draft, WeightKind::SelectorPredecessor)?,
+                    successor: lookup(weights, WeightScope::Draft, WeightKind::SelectorSuccessor)?,
+                    rank: selector.rank,
+                    top_k: selector.top_k,
+                },
             }),
         },
         activation,

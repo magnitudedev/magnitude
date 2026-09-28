@@ -184,7 +184,7 @@ pub(super) fn qualify_attention(
                 let source = gated
                     .reshape(&[1, heads * width])
                     .map_err(|e| qualification_dynamic("project_rows", label, e))?;
-                qualify_post_norm(device, tail, &residual, &source, &output, norm, label)?
+                qualify_post_norm(device, tail, &residual, &source, &output, 0, norm, label)?
             }
             _ => {
                 return Err(qualification_dynamic(
@@ -208,17 +208,19 @@ pub(super) fn qualify_post_norm(
     residual: &Tensor,
     source: &Tensor,
     weight: &Tensor,
+    weight_scale: u64,
     norm: Element,
     label: &str,
 ) -> Result<Tensor, CatalogFailure> {
     let hidden = residual.extents()[1];
-    let absent_scale = semantic_zeros(device, Element::f32(), &[0], "project_rows", label)?;
+    let weight_scale =
+        semantic_ones(device, Element::f32(), &[weight_scale], "project_rows", label)?;
     let projected = kernels
         .project
         .call(project_rows::Args {
             source,
             weight,
-            weight_scale: &absent_scale,
+            weight_scale: &weight_scale,
         })
         .map_err(|e| qualification_dynamic("project_rows", label, e))?
         .value;

@@ -212,6 +212,9 @@ impl Stored {
 pub struct ResidentWeight {
     descriptor: WeightDescriptor,
     tensor: Tensor,
+    /// The resident second-level scale (`WeightPlan::scale`): one F32 value
+    /// per matrix, bound to its entries' accumulator-scale ports.
+    scale: Option<Tensor>,
 }
 
 impl ResidentWeight {
@@ -230,6 +233,15 @@ impl ResidentWeight {
     pub fn tensor(&self) -> &Tensor {
         &self.tensor
     }
+
+    pub fn scale(&self) -> Option<&Tensor> {
+        self.scale.as_ref()
+    }
+
+    /// Every allocation of the weight: its representation and its scale.
+    pub(crate) fn storage_bytes(&self) -> u64 {
+        self.tensor.storage_bytes() + self.scale.as_ref().map_or(0, Tensor::storage_bytes)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -245,6 +257,7 @@ enum ImportPreparation {
     Pending {
         key: ResidencyKey,
         descriptor: WeightDescriptor,
+        scale: Option<Tensor>,
         launch: ValidatedImportLaunch,
         program: NativeImportProgram,
     },
@@ -328,7 +341,7 @@ impl ResidencyStore {
             // disagreement from reporting past completion.
             progress.completed = progress
                 .completed
-                .saturating_add(weight.tensor.storage_bytes())
+                .saturating_add(weight.storage_bytes())
                 .min(progress.total);
             (progress.observer)(progress.completed, progress.total);
         }
@@ -354,7 +367,7 @@ impl ResidencyStore {
     pub fn resident_bytes(&self) -> Result<u64, &'static str> {
         self.resident.values().try_fold(0u64, |bytes, weight| {
             bytes
-                .checked_add(weight.tensor.storage_bytes())
+                .checked_add(weight.storage_bytes())
                 .ok_or("resident cache charge overflows")
         })
     }
@@ -391,15 +404,16 @@ impl ResidencyStore {
         descriptor: &WeightDescriptor,
         target: DType,
     ) -> Result<ResidentWeight, WeightImportError> {
-        let (key, descriptor, launch, mut program) =
+        let (key, descriptor, scale, launch, mut program) =
             match self.prepare_gguf(artifact, descriptor, target, None)? {
                 ImportPreparation::Resident(weight) => return Ok(weight),
                 ImportPreparation::Pending {
                     key,
                     descriptor,
+                    scale,
                     launch,
                     program,
-                } => (key, descriptor, launch, program),
+                } => (key, descriptor, scale, launch, program),
             };
         let submission = program
             .submit(launch)
@@ -409,6 +423,7 @@ impl ResidencyStore {
         let weight = ResidentWeight {
             descriptor,
             tensor: destination.into_tensor(),
+            scale,
         };
         self.publish(key, weight.clone());
         Ok(weight)
@@ -524,12 +539,82 @@ impl ResidencyStore {
             .programs
             .bind_import(&planned)
             .map_err(WeightImportError::Attestation)?;
+        let scale = self.import_scale(artifact, &planned)?;
         Ok(ImportPreparation::Pending {
             key,
             descriptor: descriptor.clone(),
+            scale,
             launch,
             program,
         })
+    }
+
+    /// The resident second-level scale of `planned`: its stored F32 values,
+    /// one per matrix (a stored single value repeated per matrix of a
+    /// stack), uploaded as they are.
+    fn import_scale(
+        &self,
+        artifact: &GgufArtifact,
+        planned: &WeightPlan,
+    ) -> Result<Option<Tensor>, WeightImportError> {
+        let Some(scale) = &planned.scale else {
+            return Ok(None);
+        };
+        let descriptor = WeightDescriptor::stored(scale.tensor.as_str(), [scale.stored]);
+        let Stored::Dense(stored) = Stored::from_gguf(artifact, &descriptor)? else {
+            return Err(invalid(format!(
+                "second-level scale {:?} is not stored dense",
+                scale.tensor
+            )));
+        };
+        if stored.dtype != DType::F32 || stored.shape != [scale.stored] {
+            return Err(invalid(format!(
+                "second-level scale {:?} differs from the admitted WeightPlan",
+                scale.tensor
+            )));
+        }
+        let values = stored.read()?;
+        let extent = usize::try_from(scale.extent)
+            .map_err(|_| invalid("scale extent exceeds the host address range"))?;
+        let bytes = if scale.stored == scale.extent {
+            values
+        } else {
+            values.repeat(extent)
+        };
+        Tensor::from_host(&self.device, Element::f32(), &[scale.extent], &bytes)
+            .map(Some)
+            .map_err(|error| WeightImportError::Device(error.to_string()))
+    }
+
+    /// Preload `weights` from the component each is stored in: a target
+    /// load's weights include a separate draft's fusion (stored in the
+    /// draft), and a separate draft's include nothing of the projector.
+    fn preload_components(
+        &mut self,
+        package: &magnitude_artifacts::Package,
+        weights: &[WeightPlan],
+        activation: DType,
+    ) -> Result<(), WeightImportError> {
+        use crate::ArtifactComponentKind;
+        let mut target = Vec::new();
+        let mut draft = Vec::new();
+        for weight in weights {
+            match weight.component.kind {
+                ArtifactComponentKind::Target => target.push(weight.clone()),
+                ArtifactComponentKind::Draft => draft.push(weight.clone()),
+                ArtifactComponentKind::Projector => {
+                    return Err(invalid("a target or draft load plans a projector weight"))
+                }
+            }
+        }
+        self.preload_component(package.target(), &target, activation)?;
+        if !draft.is_empty() {
+            let artifact = package
+                .draft()
+                .ok_or_else(|| invalid("draft weights planned without the draft component"))?;
+            self.preload_component(artifact, &draft, activation)?;
+        }
+        Ok(())
     }
 
     /// Import one component in source-file order. Whole adjacent tensors
@@ -615,6 +700,7 @@ impl ResidencyStore {
                     ImportPreparation::Pending {
                         key,
                         descriptor,
+                        scale,
                         launch,
                         program,
                     } => {
@@ -628,7 +714,7 @@ impl ResidencyStore {
                                 item.plan.source_bytes,
                             ));
                         }
-                        pending.push((key, descriptor, launch));
+                        pending.push((key, descriptor, scale, launch));
                     }
                 }
             }
@@ -667,7 +753,7 @@ impl ResidencyStore {
                     }
                 }
                 let publishing = Instant::now();
-                for (key, descriptor, launch) in pending {
+                for (key, descriptor, scale, launch) in pending {
                     let (_, workspace, destination) = launch.into_submission_parts();
                     drop(workspace);
                     self.publish(
@@ -675,6 +761,7 @@ impl ResidencyStore {
                         ResidentWeight {
                             descriptor,
                             tensor: destination.into_tensor(),
+                            scale,
                         },
                     );
                 }
@@ -700,8 +787,9 @@ impl ResidencyStore {
         let total = weights
             .iter()
             .filter(|weight| storage.insert(weight.storage_identity()))
-            .map(|weight| weight.resident_bytes)
-            .sum();
+            .map(WeightPlan::storage_bytes)
+            .sum::<Result<u64, String>>()
+            .map_err(crate::ResidencyError::Invalid)?;
         observer(0, total);
         self.import_progress = Some(ImportProgress {
             completed: 0,
@@ -709,8 +797,8 @@ impl ResidencyStore {
             observer,
         });
         let target = self
-            .preload_component(
-                package.target(),
+            .preload_components(
+                package,
                 &weights,
                 crate::resident_weights::activation_dtype(definition.decoder.activation_dtype),
             )
@@ -734,15 +822,9 @@ impl ResidencyStore {
         crate::resident_weights::validate_definition_package(definition, package)?;
         if let Some(weights) = self.execution.load().head().map(|weights| weights.to_vec()) {
             // A draft head's weights are the target's; a separate draft's
-            // are its own component's.
-            let artifact = match &definition.draft {
-                Some(_) => package
-                    .draft()
-                    .expect("validated: a bound draft has its component"),
-                None => package.target(),
-            };
-            self.preload_component(
-                artifact,
+            // are its own component's, beside the target's tied ones.
+            self.preload_components(
+                package,
                 &weights,
                 crate::resident_weights::activation_dtype(definition.decoder.activation_dtype),
             )?;

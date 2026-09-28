@@ -642,6 +642,17 @@ pub struct CompiledEntryShapes {
     dimensions: Vec<(String, SymbolId)>,
     parameters: Vec<(String, Option<CompiledTensorShape>)>,
     results: Vec<Option<CompiledTensorShape>>,
+    /// Shapes already evaluated, by tensor and the values of the dimensions
+    /// that tensor's shape reads: graphs repeat the same node in every
+    /// layer, class and model of one geometry.
+    evaluated: std::sync::Mutex<std::collections::HashMap<(ShapeSlot, Vec<u64>), CheckedTensorShape>>,
+}
+
+/// One tensor of an entry's signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ShapeSlot {
+    Parameter(usize),
+    Result(usize),
 }
 
 impl CompiledEntryShapes {
@@ -657,14 +668,64 @@ impl CompiledEntryShapes {
         &self,
         name: &str,
     ) -> Result<&CompiledTensorShape, CheckedTensorShapeError> {
-        let (_, shape) = self
+        self.parameter_slot(name).map(|(_, shape)| shape)
+    }
+
+    fn parameter_slot(
+        &self,
+        name: &str,
+    ) -> Result<(ShapeSlot, &CompiledTensorShape), CheckedTensorShapeError> {
+        let (index, (_, shape)) = self
             .parameters
             .iter()
-            .find(|(candidate, _)| candidate == name)
+            .enumerate()
+            .find(|(_, (candidate, _))| candidate == name)
             .ok_or_else(|| CheckedTensorShapeError::UnknownParameter(name.to_owned()))?;
         shape
             .as_ref()
+            .map(|shape| (ShapeSlot::Parameter(index), shape))
             .ok_or_else(|| CheckedTensorShapeError::NotTensor(name.to_owned()))
+    }
+
+    /// `shape` at `dimensions`, evaluated once per distinct value of the
+    /// dimensions it reads. Every entry dimension must still be supplied.
+    fn evaluate(
+        &self,
+        slot: ShapeSlot,
+        shape: &CompiledTensorShape,
+        dimensions: &[(&str, u64)],
+    ) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
+        let value = |name: &str| {
+            dimensions
+                .iter()
+                .find(|(candidate, _)| *candidate == name)
+                .map(|(_, value)| *value)
+                .ok_or_else(|| CheckedTensorShapeError::MissingDimension(name.to_owned()))
+        };
+        for (name, _) in &self.dimensions {
+            value(name)?;
+        }
+        let key = (
+            slot,
+            shape
+                .dimensions
+                .iter()
+                .map(|&index| value(&self.dimensions[index].0))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        if let Some(evaluated) = self.lock().get(&key) {
+            return Ok(evaluated.clone());
+        }
+        let evaluated = Self::shape(shape, &self.values(dimensions)?)?;
+        self.lock().insert(key, evaluated.clone());
+        Ok(evaluated)
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<(ShapeSlot, Vec<u64>), CheckedTensorShape>>
+    {
+        self.evaluated.lock().expect("evaluated shape memo poisoned")
     }
 
     fn result_tensor(
@@ -697,7 +758,7 @@ impl CompiledEntryShapes {
         ordinal: usize,
         dimensions: &[(&str, u64)],
     ) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
-        Self::shape(self.result_tensor(ordinal)?, &self.values(dimensions)?)
+        self.evaluate(ShapeSlot::Result(ordinal), self.result_tensor(ordinal)?, dimensions)
     }
 
     fn values(&self, dimensions: &[(&str, u64)]) -> Result<InvocationValues, CheckedTensorShapeError> {
@@ -733,23 +794,35 @@ impl CompiledEntryShapes {
         name: &str,
         dimensions: &[(&str, u64)],
     ) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
-        Self::shape(self.parameter_tensor(name)?, &self.values(dimensions)?)
+        let (slot, shape) = self.parameter_slot(name)?;
+        self.evaluate(slot, shape, dimensions)
     }
 
     pub fn all_shapes(
         &self,
         dimensions: &[(&str, u64)],
     ) -> Result<(Vec<Option<CheckedTensorShape>>, Vec<Option<CheckedTensorShape>>), CheckedTensorShapeError> {
-        let values = self.values(dimensions)?;
         let parameters = self
             .parameters
             .iter()
-            .map(|(_, shape)| shape.as_ref().map(|shape| Self::shape(shape, &values)).transpose())
+            .enumerate()
+            .map(|(index, (_, shape))| {
+                shape
+                    .as_ref()
+                    .map(|shape| self.evaluate(ShapeSlot::Parameter(index), shape, dimensions))
+                    .transpose()
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let results = self
             .results
             .iter()
-            .map(|shape| shape.as_ref().map(|shape| Self::shape(shape, &values)).transpose())
+            .enumerate()
+            .map(|(ordinal, shape)| {
+                shape
+                    .as_ref()
+                    .map(|shape| self.evaluate(ShapeSlot::Result(ordinal), shape, dimensions))
+                    .transpose()
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((parameters, results))
     }
@@ -877,6 +950,7 @@ impl LogicalEntry {
                     _ => None,
                 })
                 .collect(),
+            evaluated: Default::default(),
         }
     }
 

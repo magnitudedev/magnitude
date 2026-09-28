@@ -7,11 +7,11 @@
 
 use crate::operators::gated_delta::graph::RecurrentControlPorts;
 use crate::programs::graph::draft::GraphDraft;
-use crate::programs::native_target_graph::weight;
+use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{
     native::ShortConvKernels, ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan,
 };
-use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project, short_conv_rows};
 use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
@@ -80,7 +80,7 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     state: &StateResourcePlan,
     load: &ModelLoadPlan,
     scope: WeightScope,
-    weights: &mut Vec<(WeightRole, NativePort)>,
+    weights: &mut Vec<(WeightPort, NativePort)>,
     weight_scale: &WorkflowTensor,
     hidden: &WorkflowTensor,
     block: ShortConvBlock,

@@ -98,13 +98,14 @@ enum FeatureEntries<'a, G: GraphDraft + 'a> {
     },
 }
 
-/// The draft input rows (bound per run) and the fusion weight of a readout
-/// graph that publishes a separate draft's conditioning.
+/// The draft input rows (bound per run), the fusion weight and its
+/// accumulator-scale port of a readout graph that publishes a separate
+/// draft's conditioning.
 #[derive(Clone)]
 pub(crate) struct ReadoutTapPorts {
     pub taps: NativePort,
     pub fusion: NativePort,
-    pub absent_scale: NativePort,
+    pub fusion_scale: NativePort,
 }
 
 #[derive(Clone)]
@@ -113,7 +114,8 @@ pub(crate) struct PreparedTargetReadoutGraph {
     /// Absent for a tapped readout's feature-only classes.
     pub final_rows: Option<FinalRowPorts>,
     pub taps: Option<ReadoutTapPorts>,
-    pub weight: Option<NativePort>,
+    /// The vocabulary projection and its accumulator-scale port.
+    pub weight: Option<(NativePort, NativePort)>,
     /// Hidden rows of the feature outputs.
     pub out_rows: NativePort,
     /// Hidden rows of the projected outputs, selected outputs first.
@@ -264,8 +266,9 @@ impl PreparedTargetReadoutGraphs {
             if let Some(rows) = &graph.final_rows {
                 fixed.push((&rows.norm, resident.output_norm.tensor()));
             }
-            if let Some(weight) = &graph.weight {
+            if let Some((weight, scale)) = &graph.weight {
                 fixed.push((weight, resident.output.tensor()));
+                fixed.push((scale, resident.output.scale().unwrap_or(&absent_scale)));
             }
             if let Some(taps) = &graph.taps {
                 let fusion = resident
@@ -273,7 +276,10 @@ impl PreparedTargetReadoutGraphs {
                     .as_ref()
                     .ok_or("a tapped readout has no resident draft fusion")?;
                 fixed.push((&taps.fusion, fusion.projection.tensor()));
-                fixed.push((&taps.absent_scale, &absent_scale));
+                fixed.push((
+                    &taps.fusion_scale,
+                    fusion.projection.scale().unwrap_or(&absent_scale),
+                ));
             }
             bound.insert(
                 *class,
@@ -488,15 +494,22 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
             };
             let taps = graph.port_with_class_extent(activation, &[class.rows, width], 0, "M")?;
             let weight = graph.port(plan.resident, &plan.shape)?;
-            let absent_scale = graph.port(Element::f32(), &[0])?;
+            // The fusion's resident second-level scale, or an absent scale.
+            let scale_extent = plan.scale_extent();
+            let fusion_scale = graph.port(Element::f32(), &[scale_extent])?;
             let fused = graph
                 .enqueue::<project_rows::Entry>(
                     fusion,
-                    &[("M", class.rows), ("K", width), ("N", geometry.hidden), ("WS", 0)],
+                    &[
+                        ("M", class.rows),
+                        ("K", width),
+                        ("N", geometry.hidden),
+                        ("WS", scale_extent),
+                    ],
                     project_rows::WorkflowArgs {
                         source: taps.tensor().into(),
                         weight: weight.tensor().into(),
-                        weight_scale: absent_scale.tensor().into(),
+                        weight_scale: fusion_scale.tensor().into(),
                     },
                 )?
                 .value;
@@ -522,7 +535,7 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
                 Some(ReadoutTapPorts {
                     taps,
                     fusion: weight,
-                    absent_scale,
+                    fusion_scale,
                 }),
             )
         }
@@ -540,13 +553,17 @@ fn projected_topology<'a, G: GraphDraft + 'a>(
     class: ReadoutClass,
     hidden: &NativePort,
     norm: &NativePort,
-) -> Result<(G, NativePort, NativePort, WorkflowTensor), String> {
+) -> Result<(G, (NativePort, NativePort), NativePort, WorkflowTensor), String> {
     let weight = graph.port(weight_plan.resident, &weight_plan.shape)?;
+    // The weight's resident second-level scale, or an absent scale.
+    let extent = weight_plan.scale_extent();
+    let scale = graph.port(Element::f32(), &[extent])?;
     let dimensions = [
         ("M", class.rows),
         ("O", class.projected),
         ("V", geometry.vocabulary),
         ("D", geometry.hidden),
+        ("WS", extent),
     ];
     let rows = graph.input_for(entry, "out_rows", &dimensions)?;
     let logits = graph
@@ -560,11 +577,12 @@ fn projected_topology<'a, G: GraphDraft + 'a>(
                 out_rows: rows.tensor().into(),
                 epsilon: readout_epsilon(geometry)?,
                 softcap: readout_softcap(geometry),
+                weight_scale: scale.tensor().into(),
             },
         )?
         .value;
     graph.export(&logits)?;
-    Ok((graph, weight, rows, logits))
+    Ok((graph, (weight, scale), rows, logits))
 }
 
 /// The epsilon of the decoder's final normalization, which the readout

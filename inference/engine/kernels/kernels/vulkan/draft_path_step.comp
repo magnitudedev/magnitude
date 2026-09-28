@@ -1,0 +1,42 @@
+// draft_path_step: one workgroup of 256 invocations per row reduces each
+// candidate's score unary + (predecessor * hidden) . successor, then selects
+// the first highest-scoring candidate. The Vulkan form of
+// `metal/draft_path_step.metal`.
+#include "lib/core/activation.glsl"
+#include "lib/core/reduce.glsl"
+
+// Shared: one partial per subgroup (reduce_group_sum at float 0).
+void draft_path_step() {
+    const uint64_t candidates = SEISMIC_PTR(SEISMIC_BUFFER_CANDIDATES);
+    const uint64_t unary = SEISMIC_PTR(SEISMIC_BUFFER_UNARY);
+    const uint64_t hidden = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN);
+    const uint64_t predecessor = SEISMIC_PTR(SEISMIC_BUFFER_PREDECESSOR);
+    const uint64_t successor = SEISMIC_PTR(SEISMIC_BUFFER_SUCCESSOR);
+    const uint64_t selection = SEISMIC_PTR(SEISMIC_BUFFER_SELECTION);
+    const uint64_t row = gl_WorkGroupID.x;
+    float best = -uintBitsToFloat(0x7f800000u);
+    uint64_t chosen = 0ul;
+    for (uint64_t candidate = 0ul; candidate < SEISMIC_DIM_K; ++candidate) {
+        const uint64_t at = row * SEISMIC_DIM_K + candidate;
+        float partial = 0.0;
+        for (uint64_t r = gl_LocalInvocationIndex; r < SEISMIC_DIM_R; r += gl_WorkGroupSize.x) {
+            const float joint =
+                element_at(ELEMENT_ACT, predecessor, row * SEISMIC_PREDECESSOR_STRIDE_0 + r * SEISMIC_PREDECESSOR_STRIDE_1)
+                * element_at(ELEMENT_ACT, hidden, row * SEISMIC_HIDDEN_STRIDE_0 + r * SEISMIC_HIDDEN_STRIDE_1);
+            partial = seismic_fma_rn(joint,
+                element_at(ELEMENT_ACT, successor, at * SEISMIC_SUCCESSOR_STRIDE_0 + r * SEISMIC_SUCCESSOR_STRIDE_1),
+                partial);
+        }
+        const float score = reduce_group_sum(partial, 0u)
+            + element_f32_at(unary + (row * SEISMIC_UNARY_STRIDE_0 + candidate * SEISMIC_UNARY_STRIDE_1) * 4ul);
+        if (score > best) {
+            best = score;
+            chosen = at;
+        }
+    }
+    if (gl_LocalInvocationIndex == 0u) {
+        element_i32_put(selection + row * SEISMIC_SELECTION_STRIDE_0 * 4ul,
+            element_i32_index(candidates, chosen * SEISMIC_CANDIDATES_STRIDE_0));
+        element_i32_put(selection + (row * SEISMIC_SELECTION_STRIDE_0 + SEISMIC_SELECTION_STRIDE_1) * 4ul, 0);
+    }
+}

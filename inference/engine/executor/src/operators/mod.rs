@@ -181,6 +181,7 @@ pub(crate) fn is_fixed_dense_role(kind: WeightKind) -> bool {
             | WeightKind::SharedRouter
             | WeightKind::ConfidenceWeight
             | WeightKind::ConfidenceBias
+            | WeightKind::ConvolutionBase
     )
 }
 
@@ -431,16 +432,18 @@ pub(crate) fn attention_slot(
 }
 
 /// The dense binding of a feed-forward that must be dense (a separate
-/// draft's); `lookup` resolves the planned element of a role in its scope.
+/// draft's); `lookup` resolves the planned element of a role in its scope,
+/// `scalable` that of a projection bound with an accumulator-scale port.
 pub(crate) fn dense_slot(
     sublayer: &FeedForwardSublayer,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightKind) -> Result<crate::ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<crate::DenseBinding, PlanError> {
     let FeedForward::Dense(operator) = sublayer.op else {
         return Err(PlanError::Unsupported("a draft feed-forward other than dense"));
     };
-    dense_ffn::binding(operator, sublayer.output, lookup, activation)
+    dense_ffn::binding(operator, sublayer.output, lookup, scalable, activation)
 }
 
 /// Whether a planned block slot binds the operators of `paired`.
@@ -494,26 +497,37 @@ pub(crate) fn mixer_slot(
 }
 
 /// The program slot of a paired block's feed-forward in `scope`; `lookup`
-/// resolves the planned element of a role in a scope.
+/// resolves the planned element of a role in a scope, `scalable` that of a
+/// projection bound with an accumulator-scale port.
 pub(crate) fn feed_forward_slot(
     sublayer: &FeedForwardSublayer,
     hidden: u64,
     scope: WeightScope,
     lookup: impl Fn(WeightScope, WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightScope, WeightKind) -> Result<crate::ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<crate::FeedForwardProgramSlot, PlanError> {
     use crate::FeedForwardProgramSlot as Slot;
     let local = |kind| lookup(scope, kind);
+    let local_scalable = |kind| scalable(scope, kind);
     Ok(match sublayer.op {
-        FeedForward::Dense(operator) => {
-            Slot::Dense(dense_ffn::binding(operator, sublayer.output, local, activation)?)
-        }
+        FeedForward::Dense(operator) => Slot::Dense(dense_ffn::binding(
+            operator,
+            sublayer.output,
+            local,
+            local_scalable,
+            activation,
+        )?),
         FeedForward::Routed(operator) => {
             Slot::Routed(routed::fused_binding(operator, hidden, local, activation)?)
         }
-        FeedForward::GeneralRouted(operator) => {
-            Slot::GeneralRouted(routed::binding(operator, hidden, local, activation)?)
-        }
+        FeedForward::GeneralRouted(operator) => Slot::GeneralRouted(routed::binding(
+            operator,
+            hidden,
+            local,
+            local_scalable,
+            activation,
+        )?),
         FeedForward::Parallel(branches) => {
             let WeightScope::TargetSublayer(index) = scope else {
                 return Err(PlanError::Unsupported("parallel branches outside the target"));

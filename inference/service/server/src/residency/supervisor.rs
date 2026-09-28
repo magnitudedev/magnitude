@@ -22,7 +22,7 @@ use magnitude_engine::worker::EngineClient;
 use magnitude_engine::worker::protocol::MemoryObservation;
 use magnitude_executor::platform::DomainThresholds;
 use magnitude_service_contracts::models::{ModelInstanceId, ModelReleaseReason};
-use seismic::{DeviceCatalog, DeviceTopology, LimitVisibility};
+use seismic::{DeviceCatalog, DeviceTopology};
 use tokio::time::Instant;
 
 use super::worker::worker_exit_code;
@@ -61,9 +61,6 @@ impl HostMemoryObserver for SeismicHostMemory {
             .catalog
             .host_memory_status()
             .map_err(|error| error.to_string())?;
-        if status.limit_visibility != LimitVisibility::Complete {
-            return Err("process memory limits are hidden from this process".to_owned());
-        }
         Ok(status
             .limits
             .iter()
