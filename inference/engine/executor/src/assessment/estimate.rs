@@ -140,6 +140,17 @@ pub fn estimate_performance(
     basis: &MeasurementBasis,
     depths: &[u32],
 ) -> Result<Vec<PerformanceEstimate>, AssessmentError> {
+    let limited_evidence = demand.terms.iter().any(|term| {
+        let key = term.key.cost();
+        let class_limited = basis.cost(&key).is_some_and(|cost| cost.limited_evidence);
+        let format_limited = match term.shape {
+            TermShape::Projection { weight, .. } => basis
+                .cost(&MeasurementKey::weight_format(weight, key.bindings[0]))
+                .is_some_and(|cost| cost.limited_evidence),
+            _ => false,
+        };
+        class_limited || format_limited
+    });
     depths
         .iter()
         .map(|&depth| {
@@ -162,7 +173,11 @@ pub fn estimate_performance(
                 lower_tokens_per_second: lower,
                 estimated_tokens_per_second: estimated,
                 upper_tokens_per_second: upper,
-                confidence: PerformanceConfidence::from_relative_range((upper - lower) / estimated),
+                confidence: if limited_evidence {
+                    PerformanceConfidence::Low
+                } else {
+                    PerformanceConfidence::from_relative_range((upper - lower) / estimated)
+                },
             })
         })
         .collect()
@@ -195,6 +210,7 @@ mod tests {
                 model,
                 slow_factor,
                 fast_factor,
+                limited_evidence: false,
             },
         }
     }
@@ -279,6 +295,7 @@ mod tests {
                 },
                 slow_factor: 1.0,
                 fast_factor: 1.0,
+                limited_evidence: false,
             },
         };
         demand.terms.truncate(1);
@@ -344,6 +361,17 @@ mod tests {
             PerformanceConfidence::from_relative_range(MODERATE_CONFIDENCE_RANGE),
             PerformanceConfidence::Moderate
         );
+    }
+
+    #[test]
+    fn sparse_or_extrapolated_evidence_cannot_report_high_confidence() {
+        let (demand, mut basis) = synthetic(1.0, 1.0);
+        let ClassMeasurement::Measured { cost, .. } = &mut basis.classes[0].1 else {
+            panic!("projection is measured");
+        };
+        cost.limited_evidence = true;
+        let estimate = estimate_performance(&demand, &basis, &[1_000]).unwrap();
+        assert_eq!(estimate[0].confidence, PerformanceConfidence::Low);
     }
 
     #[test]

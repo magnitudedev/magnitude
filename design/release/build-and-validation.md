@@ -231,6 +231,9 @@ On Linux this gate runs in a disposable Ubuntu consumer, explicitly installs the
 and passes the acquired candidate ICN installation to the installed desktop lifecycle test. It must
 observe a Ready service; an intentionally missing engine only certifies failure handling and cannot
 satisfy candidate bootstrap acceptance. Engine readiness does not imply model-serving acceptance.
+Candidate acceptance preserves complete process output and raw measurement-worker diagnostics on
+failure. The publish and build gates retain these as downloadable artifacts alongside the final
+assessment snapshot and last observed catalog status.
 
 A manual macOS Intel CPU consumer downloads a selected run's final host archive, verifies its
 digest and native identity, installs a selected shipped catalog model through the canonical
@@ -241,6 +244,10 @@ hardware, retaining results and server diagnostics without publishing or replaci
 
 Pull requests run the complete build and acceptance graph without publishing. A manually dispatched
 Linux x64 dry run exercises the CPU-only production path but cannot authorize publication.
+For local diagnosis, a final Linux inference archive can run from an isolated profile in a
+disposable Ubuntu container. The run verifies artifact integrity, records raw assessment state
+transitions and the complete service log, and needs no publication. Architecture emulation may
+change measurement timing; native-host acceptance remains authoritative for performance bounds.
 
 ## Publication gate
 

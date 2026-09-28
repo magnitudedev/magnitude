@@ -137,6 +137,17 @@ describe("inference command surface", () => {
     ].join("\n"))
   })
 
+  it("does not present an unknown assessment target count as progress", () => {
+    const catalog = catalogState()
+    expect(renderCatalogStatus({
+      ...catalog,
+      localModelPreparation: {
+        ...catalog.localModelPreparation,
+        assessment: { complete: false, settledModels: 0, totalModels: 0 },
+      },
+    })).toContain("Assessment: Not complete - no assessment targets reported")
+  })
+
   it("renders only fitting catalog evidence and exact model IDs", () => {
     const model = makeCatalogModel()
     const output = renderCatalog(catalogState(model))

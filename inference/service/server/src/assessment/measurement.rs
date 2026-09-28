@@ -9,7 +9,7 @@
 
 use std::fmt;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use magnitude_executor::platform::{self, MemoryReserves, PlatformConfig, Platfor
 use magnitude_executor::{DEFAULT_KERNEL_CACHE_BYTES, ExecutionPath, KernelCache};
 use seismic::{DeviceCatalog, DeviceSelector};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::worker_process::{WorkerLauncher, WorkerRole};
 
@@ -29,7 +29,6 @@ use crate::worker_process::{WorkerLauncher, WorkerRole};
 const MEASUREMENT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const RETIREMENT_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_REPORT_BYTES: usize = 64 * 1024;
-const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 /// The arguments of the `measurement-worker` subcommand.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,24 +132,40 @@ pub fn run_measurement_worker(args: MeasurementWorkerArgs) -> Result<(), Measure
         classes: Vec::new(),
     });
     let known = stored.classes.len();
+    tracing::info!(%args.device, known, "measurement basis started");
+    let mut checkpoint = stored.clone();
+    let mut last_checkpoint = Instant::now();
     let started = Instant::now();
-    let basis = complete_basis(&catalog, opened.device(), reserves, stored, |key, _, profile| {
-        tracing::debug!(
-            %key,
-            formation.seconds = profile.formation.as_secs_f64(),
-            allocation.seconds = profile.allocation.as_secs_f64(),
-            timing.seconds = profile.timing.as_secs_f64(),
-            sealing.seconds = profile.sealing.as_secs_f64(),
-            submission.seconds = profile.submission.as_secs_f64(),
-            encoding.seconds = profile.encoding.as_secs_f64(),
-            dispatch.seconds = profile.dispatch.as_secs_f64(),
-            device.seconds = profile.device.as_secs_f64(),
-            waiting.seconds = profile.waiting.as_secs_f64(),
-            tracing.seconds = profile.tracing.as_secs_f64(),
-            total.seconds = profile.total.as_secs_f64(),
-            "measurement entry completed"
-        );
-    });
+    let basis = complete_basis(
+        &catalog,
+        opened.device(),
+        reserves,
+        stored,
+        |key, measurement, profile| {
+            checkpoint.classes.push((key.clone(), measurement.clone()));
+            if last_checkpoint.elapsed() >= Duration::from_secs(5) {
+                if let Err(error) = store_basis(&args.basis_directory, &checkpoint) {
+                    tracing::warn!(%error, "measurement progress checkpoint failed");
+                }
+                last_checkpoint = Instant::now();
+            }
+            tracing::debug!(
+                %key,
+                formation.seconds = profile.formation.as_secs_f64(),
+                allocation.seconds = profile.allocation.as_secs_f64(),
+                timing.seconds = profile.timing.as_secs_f64(),
+                sealing.seconds = profile.sealing.as_secs_f64(),
+                submission.seconds = profile.submission.as_secs_f64(),
+                encoding.seconds = profile.encoding.as_secs_f64(),
+                dispatch.seconds = profile.dispatch.as_secs_f64(),
+                device.seconds = profile.device.as_secs_f64(),
+                waiting.seconds = profile.waiting.as_secs_f64(),
+                tracing.seconds = profile.tracing.as_secs_f64(),
+                total.seconds = profile.total.as_secs_f64(),
+                "measurement entry completed"
+            );
+        },
+    );
     let basis = match basis {
         Ok(basis) => basis,
         // The entries measured before the failure are kept, so the next job measures only the
@@ -200,9 +215,11 @@ pub struct EstablishedBasis {
 #[derive(Debug)]
 pub enum MeasurementJobError {
     Spawn(String),
-    Deadline,
+    Deadline {
+        diagnostics: String,
+    },
     Io(std::io::Error),
-    /// The child failed; its bounded diagnostic tail is kept.
+    /// The child failed; its complete standard error is kept.
     Failed {
         status: std::process::ExitStatus,
         diagnostics: String,
@@ -218,7 +235,10 @@ impl fmt::Display for MeasurementJobError {
             Self::Spawn(error) => {
                 write!(formatter, "failed to start the measurement worker: {error}")
             }
-            Self::Deadline => write!(formatter, "the measurement worker exceeded its deadline"),
+            Self::Deadline { diagnostics } => write!(
+                formatter,
+                "the measurement worker exceeded its deadline: {diagnostics}"
+            ),
             Self::Io(error) => write!(formatter, "measurement worker I/O: {error}"),
             Self::Failed {
                 status,
@@ -302,28 +322,46 @@ impl MeasurementJob {
         let stderr = child.stderr.take().ok_or_else(|| {
             MeasurementJobError::Spawn("measurement worker stderr is unavailable".to_owned())
         })?;
-        let outcome = tokio::time::timeout(MEASUREMENT_DEADLINE, async {
-            let (report, diagnostics, status) = tokio::join!(
-                drain(stdout, MAX_REPORT_BYTES, Retain::First, false),
-                drain(stderr, MAX_DIAGNOSTIC_BYTES, Retain::Last, profile),
-                child.wait(),
-            );
-            Ok::<_, std::io::Error>((report?, diagnostics?, status?))
-        })
-        .await;
-        let (report, diagnostics, status) = match outcome {
-            Ok(result) => result.map_err(MeasurementJobError::Io)?,
-            Err(_) => {
-                retire(&mut child).await;
-                return Err(MeasurementJobError::Deadline);
-            }
+        let diagnostic_path =
+            std::env::var_os("MAGNITUDE_MEASUREMENT_DIAGNOSTICS_PATH").map(PathBuf::from);
+        let (report, diagnostics, status) = tokio::time::timeout(
+            MEASUREMENT_DEADLINE + RETIREMENT_DEADLINE + Duration::from_secs(5),
+            async {
+                tokio::join!(
+                    drain_report(stdout),
+                    drain_diagnostics(stderr, profile, diagnostic_path.as_deref()),
+                    async {
+                        match tokio::time::timeout(MEASUREMENT_DEADLINE, child.wait()).await {
+                            Ok(status) => status.map(Some),
+                            Err(_) => {
+                                retire(&mut child).await;
+                                Ok(None)
+                            }
+                        }
+                    },
+                )
+            },
+        )
+        .await
+        .map_err(|_| MeasurementJobError::Deadline {
+            diagnostics: format!(
+                "worker streams did not close after retirement; raw output: {}",
+                diagnostic_path
+                    .as_ref()
+                    .map_or("unavailable".to_owned(), |path| path.display().to_string())
+            ),
+        })?;
+        let (report, report_complete) = report.map_err(MeasurementJobError::Io)?;
+        let diagnostics = diagnostics.map_err(MeasurementJobError::Io)?;
+        let status = status.map_err(MeasurementJobError::Io)?;
+        let diagnostics = String::from_utf8_lossy(&diagnostics).trim().to_owned();
+        let Some(status) = status else {
+            return Err(MeasurementJobError::Deadline { diagnostics });
         };
-        let (report, report_complete) = report;
-        let (diagnostics, _) = diagnostics;
         if !status.success() {
             return Err(MeasurementJobError::Failed {
                 status,
-                diagnostics: String::from_utf8_lossy(&diagnostics).trim().to_owned(),
+                diagnostics,
             });
         }
         if !report_complete {
@@ -333,7 +371,7 @@ impl MeasurementJob {
         }
         if !diagnostics.is_empty() {
             tracing::debug!(
-                worker.diagnostics = %String::from_utf8_lossy(&diagnostics),
+                worker.diagnostics = %diagnostics,
                 "measurement worker diagnostics"
             );
         }
@@ -353,45 +391,63 @@ impl MeasurementJob {
     }
 }
 
-/// Which bytes of an output stream are kept.
-#[derive(Clone, Copy)]
-enum Retain {
-    /// The first bytes: a report, complete only when it fits.
-    First,
-    /// The last bytes: diagnostics end with the failure.
-    Last,
-}
-
-/// Read `reader` to its end, keeping at most `maximum` bytes, and whether
-/// none were dropped. The whole stream is read so the worker never writes
-/// into a full or closed pipe.
-async fn drain(
+/// The report is small protocol data. Drain even an oversized report so the
+/// worker never blocks on its standard-output pipe.
+async fn drain_report(
     mut reader: impl tokio::io::AsyncRead + Unpin,
-    maximum: usize,
-    retain: Retain,
-    profile: bool,
 ) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut kept = std::collections::VecDeque::with_capacity(maximum);
+    let mut kept = Vec::new();
     let mut complete = true;
     let mut chunk = [0u8; 8192];
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
-            return Ok((kept.into(), complete));
+            return Ok((kept, complete));
+        }
+        let available = MAX_REPORT_BYTES.saturating_sub(kept.len());
+        kept.extend_from_slice(&chunk[..read.min(available)]);
+        complete &= read <= available;
+    }
+}
+
+/// Preserve every worker diagnostic, including output emitted immediately
+/// before a deadline kills the child. Acceptance also writes the raw stream
+/// to a file independently of the service's own logging path.
+async fn drain_diagnostics(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    profile: bool,
+    path: Option<&Path>,
+) -> std::io::Result<Vec<u8>> {
+    let mut file = match path {
+        Some(path) => Some(
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await?,
+        ),
+        None => None,
+    };
+    if let Some(file) = &mut file {
+        file.write_all(b"\n--- measurement worker stderr ---\n")
+            .await?;
+    }
+    let mut kept = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            if let Some(file) = &mut file {
+                file.flush().await?;
+            }
+            return Ok(kept);
+        }
+        kept.extend_from_slice(&chunk[..read]);
+        if let Some(file) = &mut file {
+            file.write_all(&chunk[..read]).await?;
         }
         if profile {
             tracing::info!(worker.stderr = %String::from_utf8_lossy(&chunk[..read]), "measurement worker progress");
-        }
-        for &byte in &chunk[..read] {
-            if kept.len() < maximum {
-                kept.push_back(byte);
-                continue;
-            }
-            complete = false;
-            if let Retain::Last = retain {
-                kept.pop_front();
-                kept.push_back(byte);
-            }
         }
     }
 }

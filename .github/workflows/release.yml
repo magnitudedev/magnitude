@@ -175,7 +175,25 @@ jobs:
         env:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-      - run: bun run scripts/accept-release-candidate.ts release-candidate
+      - name: Accept release candidate with complete diagnostics
+        shell: bash
+        env:
+          MAGNITUDE_CANDIDATE_DIAGNOSTICS: ${{ runner.temp }}/release-candidate-diagnostics
+        run: |
+          set -o pipefail
+          mkdir -p "$MAGNITUDE_CANDIDATE_DIAGNOSTICS"
+          bun run scripts/accept-release-candidate.ts release-candidate 2>&1 | tee "$MAGNITUDE_CANDIDATE_DIAGNOSTICS/acceptance.log"
+      - name: Retain failed candidate diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-diagnostics
+          path: |
+            ${{ runner.temp }}/release-candidate-diagnostics/acceptance.log
+            ${{ runner.temp }}/release-candidate-diagnostics/mag-candidate-headless-*/*.json
+            ${{ runner.temp }}/release-candidate-diagnostics/mag-candidate-headless-*/*.txt
+            ${{ runner.temp }}/release-candidate-diagnostics/mag-candidate-headless-*/*.log
+          if-no-files-found: warn
       - name: Commit-point recheck
         run: bun run packages/release/scripts/preflight.ts
         env:

@@ -60,10 +60,23 @@ can require a class it lacks.
   is arithmetic over the fitted costs. Demand that maps onto no measured or formed key makes the
   target `Incompatible` naming the key.
 
-A point's variants (arithmetic parameters such as `INT8`, `PARTS` and `SLICES`) are screened with
-one sample each and only the fastest is timed with the full protocol.
+A point's variants (arithmetic parameters such as `INT8`, `PARTS`, `SLICES` and `MATRIX`) are screened
+with one sample each. On CPU, the cold basis shares one wall-clock target across all still-missing
+points, weighted toward history points. Screening probes select the variant; each point receives
+at least one subsequent device interval for its fitted cost;
+the default and first alternative are screened, while further variants and samples use available
+time. The target includes formation and allocation.
+On other backends, the default and first alternative are screened and the fastest receives at
+least two steady samples. A native submission completes once started, so a single slow operation
+may overrun either target. Measurement records every sample actually taken.
 
-- Every kernel is formed before any class is timed, so formation does not bias device times.
+- Planned kernels are formed before timing. A dynamically selected extent may require a form
+  immediately before its point, never concurrently with its timed submissions.
+- CPU timing sizes the independent rotation views to the point's available time. For decode
+  attention it uses a 1,024-row reference floor and selects later history depths from the observed
+  rate when the requested depth would take too long. Every planned head geometry is still measured,
+  and each point records its actual streamed bytes and whether its depth was shortened. One sample
+  or a shortened depth supplies limited evidence to downstream confidence.
 - Work by other processes on the device is not observable: device times are taken as they fall and
   stored. The basis is an estimate either way; no contention is inferred or corrected.
 - A timed submission that faults on the device records the class unsupported, naming the fault;
@@ -85,7 +98,10 @@ service start -> device discovery -> automatic device selection
 - One contained child process of the service executable opens exactly the selected device, loads
   a stored basis for that device's measurement identity when one is complete, otherwise measures
   the plan, stores the basis and reports its identity. The service process never opens a device,
-  forms kernels or times them. The child's output streams are read to their end.
+  forms kernels or times them. The child checkpoints completed classes during a cold measurement;
+  after interruption, a new job measures only missing classes. The child's output streams are read
+  to their end, including after a deadline kills the child. Failure and deadline results retain
+  complete worker diagnostics; release acceptance also records the raw stream independently.
 - The assessment pool is `Preparing` until the basis is available. A failed job publishes a
   retryable pool failure and is retried with bounded backoff; it never blocks service health.
 - Measurement and model residency exclude each other on the device: measurement waits for no

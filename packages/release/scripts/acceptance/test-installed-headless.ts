@@ -22,6 +22,8 @@ const run = Effect.scoped(Effect.gen(function* () {
     MAGNITUDE_DEV_PORT: "11237", MAGNITUDE_RELEASE_BASE_URL: process.env.MAGNITUDE_RELEASE_BASE_URL ?? "https://github.com/magnitudedev/magnitude/releases/download",
     MAGNITUDE_ACCEPTANCE_ASSESSMENT_DIAGNOSTICS: assessmentDiagnostics,
     MAGNITUDE_MEASUREMENT_PROFILE: "1",
+    MAGNITUDE_MEASUREMENT_DIAGNOSTICS_PATH: join(output, offline ? "offline-measurement-worker.log" : "measurement-worker.log"),
+    RUST_LOG: "magnitude_service_server=info",
     ...Option.match(inference, { onNone: () => ({}), onSome: path => ({ MAGNITUDE_ICN_PATH: path }) }) }
   const cachedManifest = join(output, "profile", "releases", "manifests", version, "magnitude-release.json")
   if (offline && !(yield* fs.exists(cachedManifest))) {

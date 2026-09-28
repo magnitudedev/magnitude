@@ -60,7 +60,7 @@ const acceptanceAssessmentDiagnostics = Layer.scopedDiscard(Effect.gen(function*
     for (;;) {
       yield* Effect.gen(function* () {
         const snapshot = (yield* assessments.get).state;
-        const inferenceDiagnosticTail = (yield* icnProcess.diagnosticTail).slice(-16_000);
+        const inferenceDiagnosticTail = yield* icnProcess.diagnosticTail;
         const report = yield* Schema.encode(Schema.parseJson(AcceptanceAssessmentDiagnostics))({
           assessments: snapshot,
           inferenceDiagnosticTail,

@@ -76,6 +76,7 @@ fn measurement_json(measurement: &ClassMeasurement) -> Value {
                     "shape": shape_json(&point.shape),
                     "bytes": point.bytes,
                     "samples": point.samples,
+                    "extrapolated": point.extrapolated,
                 }))
                 .collect::<Vec<_>>(),
         }),
@@ -150,6 +151,7 @@ fn parse_measurement(class: OperationClass, value: &Value) -> Option<ClassMeasur
                     .iter()
                     .map(Value::as_f64)
                     .collect::<Option<Vec<_>>>()?,
+                extrapolated: point.get("extrapolated")?.as_bool()?,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -253,6 +255,7 @@ mod tests {
             },
             bytes: rows * reduction / 2,
             samples: vec![seconds, 2.0e-4],
+            extrapolated: false,
         };
         let heads = |kv_heads, bytes, seconds| MeasuredPoint {
             shape: PointShape::Heads(HeadGeometry {
@@ -262,6 +265,7 @@ mod tests {
             }),
             bytes,
             samples: vec![seconds],
+            extrapolated: false,
         };
         MeasurementBasis {
             identity: identity(),
@@ -298,11 +302,13 @@ mod tests {
                                 shape: PointShape::Size,
                                 bytes: 3_000,
                                 samples: vec![1.0e-5],
+                                extrapolated: false,
                             },
                             MeasuredPoint {
                                 shape: PointShape::Size,
                                 bytes: 9_000,
                                 samples: vec![1.5e-5],
+                                extrapolated: false,
                             },
                         ],
                     ),
@@ -335,7 +341,12 @@ mod tests {
     #[test]
     fn basis_round_trips_exactly_through_its_cache_file() {
         let dir = scratch("round-trip");
-        let basis = basis();
+        let mut basis = basis();
+        let (key, ClassMeasurement::Measured { points, cost }) = &mut basis.classes[1] else {
+            panic!("history cost is measured");
+        };
+        points[0].extrapolated = true;
+        *cost = ClassCost::from_points(key.class, points).unwrap();
         store_basis(&dir, &basis).unwrap();
         assert_eq!(load_basis(&dir, &basis.identity), Some(basis));
         std::fs::remove_dir_all(&dir).unwrap();

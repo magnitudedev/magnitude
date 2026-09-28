@@ -73,9 +73,15 @@ export const renderCatalogStatus = (catalog: ModelCatalogState): string => {
   ].join("\n"))
 
   const { assessment } = catalog.localModelPreparation
+  const progress = `${assessment.settledModels} of ${assessment.totalModels} model${assessment.totalModels === 1 ? "" : "s"} assessed`
+  const status = assessment.complete
+    ? `Complete - ${progress}`
+    : assessment.totalModels === 0
+      ? "Not complete - no assessment targets reported"
+      : `In progress - ${progress}`
   return ensureTrailingNewline([
     "Model catalog preparation",
-    `Assessment: ${assessment.complete ? "Complete" : "In progress"} - ${assessment.settledModels} of ${assessment.totalModels} model${assessment.totalModels === 1 ? "" : "s"} assessed`,
+    `Assessment: ${status}`,
   ].join("\n"))
 }
 

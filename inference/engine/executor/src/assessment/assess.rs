@@ -308,6 +308,7 @@ mod tests {
                 model,
                 slow_factor: 1.1,
                 fast_factor: 0.9,
+                limited_evidence: false,
             },
         };
         let mut classes: Vec<(MeasurementKey, ClassMeasurement)> = Vec::new();

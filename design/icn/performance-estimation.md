@@ -38,8 +38,12 @@ the fixed per-step submission, timed with shipped default configurations at synt
 class fits a cost model in the quantities a model's demand supplies: per launch, per byte,
 projection cost by output rows, attention history cost by head geometry and depth, and a
 weight-format factor per resident representation. The arithmetic parameters that move production
-speed most (`INT8`, `PARTS`, `SLICES`) are each varied alone from the default, screened by one
-sample, and the fastest is timed. Every repeated sample is kept; fits are clamped to physical values.
+speed most (`INT8`, `PARTS`, `SLICES`, `MATRIX`, `KEYWISE`) are each varied alone from the default (a value
+some default excludes takes the first other-parameter value that admits it), screened by one
+sample within the measurement budget, and the fastest screened variant is timed. A CPU basis
+shares one cold-run time target across its points and keeps at least one post-screening interval per point;
+other backends keep at least two steady intervals. Additional samples use available time. Fits are
+clamped to physical values.
 
 ## Calculation
 
@@ -51,7 +55,8 @@ sample, and the fastest is timed. Every repeated sample is kept; fits are clampe
 - Bounds come from measured variation only: each class's slowest and fastest sample relative to its
   median scale its time for the lower and upper rates. No fixed band is applied.
 - Confidence comes from the relative range `(upper − lower) / estimated` with thresholds fixed once
-  in the estimator: high ≤ 5%, moderate ≤ 15%, low otherwise.
+  in the estimator: high ≤ 5%, moderate ≤ 15%, low otherwise. A class used from a single sample or
+  shortened history depth makes the estimate low confidence even when observed spread is small.
 
 Every result has finite positive rates with `lower <= estimated <= upper`, one per requested depth
 in ascending order. A demand term outside the basis makes the model `Incompatible`; a missing

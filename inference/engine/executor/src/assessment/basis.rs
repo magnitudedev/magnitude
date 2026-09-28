@@ -18,7 +18,7 @@ use seismic::Element;
 
 /// Changes whenever the measured classes, key rules, sizes or timing rules
 /// change, so a cached basis from an older protocol is never reused.
-pub const MEASUREMENT_PROTOCOL_VERSION: u32 = 11;
+pub const MEASUREMENT_PROTOCOL_VERSION: u32 = 12;
 
 /// One native entry a plain target decode step launches. A plain step is one
 /// row through the embedding entry graph, every decoder block graph (decode
@@ -561,6 +561,8 @@ pub struct MeasuredPoint {
     pub shape: PointShape,
     pub bytes: u64,
     pub samples: Vec<f64>,
+    /// The requested production-size point was measured at a smaller size.
+    pub extrapolated: bool,
 }
 
 /// A weight-streaming class's cost at its reference representation: a
@@ -651,6 +653,8 @@ pub struct ClassCost {
     pub slow_factor: f64,
     /// `min(fastest / median)` over the class's points; at most 1.
     pub fast_factor: f64,
+    /// At least one point has one sample or requires size extrapolation.
+    pub limited_evidence: bool,
 }
 
 /// Seconds for a set of launches at the fastest, median and slowest measured
@@ -773,6 +777,9 @@ impl ClassCost {
             model,
             slow_factor,
             fast_factor: fast_factor.max(0.0),
+            limited_evidence: points
+                .iter()
+                .any(|point| point.samples.len() < 2 || point.extrapolated),
         })
     }
 
@@ -1002,6 +1009,7 @@ mod tests {
             shape: PointShape::Size,
             bytes,
             samples: samples.to_vec(),
+            extrapolated: false,
         }
     }
 
@@ -1014,6 +1022,7 @@ mod tests {
             },
             bytes: rows * reduction * 2,
             samples: vec![seconds],
+            extrapolated: false,
         }
     }
 
@@ -1026,6 +1035,7 @@ mod tests {
             }),
             bytes,
             samples: vec![seconds],
+            extrapolated: false,
         }
     }
 

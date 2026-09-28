@@ -22,7 +22,7 @@ import { ReleaseManifestSchema, validateReleaseManifest } from "@magnitudedev/re
 class CandidateAcceptanceFailed extends Schema.TaggedError<CandidateAcceptanceFailed>()("CandidateAcceptanceFailed", { message: Schema.String }) {}
 
 const candidate = resolve(process.argv[2] ?? "release-candidate")
-// Script entry points use Promises; subprocess lifetime and output bounds remain Effect-owned.
+// Script entry points use Promises; subprocess lifetime remains Effect-owned.
 const run = (
   command: readonly string[],
   options: {
@@ -37,13 +37,11 @@ const run = (
   const child = yield* Command.make(executable, ...command.slice(1)).pipe(
     Command.workingDirectory(options.cwd ?? process.cwd()), Command.env(environment), Command.start,
   )
-  const read = (stream: typeof child.stdout) => stream.pipe(Stream.decodeText(), Stream.runFoldEffect("", (previous, chunk) =>
-    previous.length + chunk.length <= 1024 * 1024 ? Effect.succeed(previous + chunk)
-      : Effect.fail(new CandidateAcceptanceFailed({ message: `${executable} exceeded its output limit` }))))
+  const read = (stream: typeof child.stdout) => stream.pipe(Stream.decodeText(), Stream.runFold("", (previous, chunk) => previous + chunk))
   const [code, stdout, stderr] = yield* Effect.all([child.exitCode, read(child.stdout), read(child.stderr)], { concurrency: "unbounded" })
   // Report both streams: a process may log to stderr while its failure is on stdout.
   if (code !== 0) return yield* new CandidateAcceptanceFailed({
-    message: `${executable} failed with exit ${code}\n--- stdout ---\n${stdout.trim().slice(-16000)}\n--- stderr ---\n${stderr.trim().slice(-16000)}`,
+    message: `${executable} failed with exit ${code}\n--- stdout ---\n${stdout.trim()}\n--- stderr ---\n${stderr.trim()}`,
   })
   return stdout
 })).pipe(Effect.timeout(options.timeout ?? "5 minutes"), Effect.provide(BunContext.layer)))
@@ -75,8 +73,9 @@ const server = Bun.serve({
   },
 })
 const baseUrl = `http://127.0.0.1:${server.port}`
-const root = await mkdtemp(resolve(tmpdir(), "magnitude-candidate-"))
-const headlessRoot = await mkdtemp("/tmp/mag-candidate-headless-")
+const diagnosticParent = process.env.MAGNITUDE_CANDIDATE_DIAGNOSTICS ?? tmpdir()
+const root = await mkdtemp(resolve(diagnosticParent, "magnitude-candidate-"))
+const headlessRoot = await mkdtemp(resolve(diagnosticParent, "mag-candidate-headless-"))
 const dataDir = resolve(root, "home-bootstrap", ".magnitude")
 let desktopApplication = "/usr/bin/magnitude-desktop"
 let cliExecutable = "/usr/bin/magnitude"
@@ -156,6 +155,7 @@ const invoke = async (
   }
 }
 
+let accepted = false
 try {
   await Effect.runPromise(acceptBootstrap)
   const headlessEnvironment = {
@@ -189,8 +189,13 @@ try {
   ))
   await invoke([cliExecutable, "--version"], root, resolve(root, "home-cli"))
   console.log("Installed service and bundled CLI work with the candidate artifact endpoint stopped")
+  accepted = true
 } finally {
   server.stop(true)
-  await rm(headlessRoot, { recursive: true, force: true })
-  await rm(root, { recursive: true, force: true })
+  if (accepted) {
+    await rm(headlessRoot, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true })
+  } else {
+    console.error(`Candidate diagnostics preserved at ${headlessRoot} and ${root}`)
+  }
 }

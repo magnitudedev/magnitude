@@ -7,25 +7,28 @@
 //! cannot form is recorded unsupported. Measured times are taken as they
 //! are.
 //!
-//! The measurement is built for a cold run of a few seconds:
+//! The measurement shares a cold CPU time target across all cost-model points:
 //!
-//! - Every planned native form is formed first, in parallel, then every
-//!   timed entry is timed (see [`complete_basis`]).
+//! - Planned native forms are formed first, in parallel, then every timed
+//!   entry is timed (see [`complete_basis`]). A dynamically sized extent may
+//!   require formation just before its point.
 //! - Synthetic weights are views into one zero-filled pool per element and
 //!   row width, shared by the points of one class and released when the
 //!   next class starts, so a basis holds at most one class's pools. A
 //!   point's rotation of views spans the backend's rotation bytes.
 //! - A point is timed as production runs its entries: one sealed native
-//!   graph holding one launch per rotation view, run [`RUNS`] times back to
-//!   back after one discarded run, with each run's device interval taken
-//!   from a submission trace. The device is warmed once, not per point.
+//!   graph holding one launch per rotation view. Screening probes choose the
+//!   variant; a subsequent submission supplies the first fitted sample on
+//!   every backend. CPU points admit further samples while time remains.
+//!   Device intervals come from submission traces.
+//!   The device is warmed once, not per point.
 //!
 //! Before each class allocates, the device's memory ceiling is refreshed, so
 //! Seismic refuses a measurement allocation that would leave less headroom
 //! than the planning reserve.
 
 use super::basis::{
-    median, BasisIdentity, ClassCost, ClassMeasurement, CostModel, HeadGeometry, MeasuredPoint,
+    median, BasisIdentity, ClassCost, ClassMeasurement, CostModel, CostShape, HeadGeometry, MeasuredPoint,
     MeasurementBasis, MeasurementKey, OperationClass, PointShape,
 };
 use super::plan::{activation, measurement_plan, reference_weight, PlannedKey};
@@ -111,6 +114,7 @@ fn launch_point(at: Launch, rows: u64, weight: Element, bytes: u64, samples: Vec
         },
         bytes,
         samples,
+        extrapolated: false,
     }
 }
 
@@ -120,6 +124,7 @@ fn size_point(bytes: u64, samples: Vec<f64>) -> MeasuredPoint {
         shape: PointShape::Size,
         bytes,
         samples,
+        extrapolated: false,
     }
 }
 
@@ -132,7 +137,8 @@ fn size_point(bytes: u64, samples: Vec<f64>) -> MeasuredPoint {
 ///   it matches the same kernel's time inside a decode step (nsys); flat
 ///   from 512 MB to 8 GB.
 ///
-/// Vulkan and CPU have no evidence yet and take the larger span.
+/// Vulkan takes the larger span. CPU starts there and reduces the span when
+/// measured graph time exceeds the point's useful work budget.
 ///
 /// History and state rotate over the same span, and need it: over 64 MB
 /// instead of 128 MB, M4 Pro dense attention at 4k history read 7–21% faster
@@ -144,6 +150,12 @@ fn rotation_bytes(backend: BackendName) -> u64 {
         _ => 512 << 20,
     }
 }
+
+/// Time available for a cold CPU basis, including formation and all timed points.
+/// A started native submission is allowed to finish past this target.
+const CPU_BASIS_TARGET: Duration = Duration::from_secs(40);
+/// A graph is submitted several times while one point is measured.
+const TARGET_GRAPH_SECONDS: f64 = 0.1;
 
 /// Declared parameters whose every value is timed, each one alone from the
 /// default configuration, with a point charged at its fastest value. Each
@@ -160,14 +172,29 @@ fn rotation_bytes(backend: BackendName) -> u64 {
 ///   groups (16 heads per KV head and more) are compute-bound on one slice;
 ///   tuning selects 2–4 on CUDA and Metal (M4 Pro K8/V4: 212 µs at the
 ///   default, 122 µs tuned).
+/// - `MATRIX`: the grouped-query matrix form of decode attention. Query
+///   heads sharing a KV head become the rows of one matrix product (M4 Pro
+///   K8/V4, 8 heads per KV head, width 128, 131k: 706 µs vector, 398 µs
+///   matrix; GB10 1.2–1.5×).
+/// - `TOKENS`: decode rows packed into one Metal matrix tile, so a
+///   verification step reads the history once for all its rows.
+/// - `KEYWISE`: Vulkan's key-parallel K8/V4 decode walk, a lane scoring a
+///   whole key instead of a subgroup reducing each key's score (GB10, 8
+///   heads per KV head, width 128, 131k: 688 µs vector, 266 µs keywise).
 ///
 /// Every variant is screened by one sample; only the fastest is timed.
-const VARIED_PARAMETERS: [&str; 3] = ["INT8", "PARTS", "SLICES"];
+const VARIED_PARAMETERS: [&str; 6] = ["INT8", "PARTS", "SLICES", "MATRIX", "TOKENS", "KEYWISE"];
 
 /// The most launches one timed graph holds.
 const MAX_LAUNCHES: u64 = 256;
-/// Timed samples of every point, after one discarded sample.
+/// Maximum timed samples of a point, after one discarded sample.
 const RUNS: usize = 3;
+/// A spread cannot be observed from one timed sample on the normal device path.
+const MIN_TIMED_SAMPLES: usize = 2;
+/// Per-point target on non-CPU backends. CPU points share a whole-basis budget.
+const POINT_BUDGET: Duration = Duration::from_secs(1);
+/// The normal device path screens its default and first alternative.
+const MIN_SCREENED_VARIANTS: usize = 2;
 /// Device time the device is kept busy before the first timed run.
 const WARM_SECONDS: f64 = 0.2;
 /// Device time of one sample: runs of a point's graph queued as one
@@ -194,6 +221,7 @@ const HISTORY_REFERENCE: HeadGeometry = HeadGeometry {
     width: 256,
 };
 const HISTORY_DEPTHS: [u64; 2] = [4096, 32_768];
+const CPU_HISTORY_DEPTHS: [u64; 2] = [1024, 32_768];
 const HISTORY_DEPTH: u64 = 32_768;
 /// The geometries decode attention is timed at beside the reference, each
 /// differing from it in one axis: the key/value heads (the attention's
@@ -207,9 +235,10 @@ const HISTORY_ROTARY_PAIRS: u64 = 32;
 
 /// Every decode attention point: the reference at both depths, then each
 /// axis's other values at one depth.
-fn history_points() -> Vec<(HeadGeometry, u64)> {
+fn history_points(backend: BackendName) -> Vec<(HeadGeometry, u64)> {
     let reference = HISTORY_REFERENCE;
-    HISTORY_DEPTHS
+    let depths = if backend == BackendName::Cpu { &CPU_HISTORY_DEPTHS } else { &HISTORY_DEPTHS };
+    depths
         .iter()
         .map(|&depth| (reference, depth))
         .chain(HISTORY_KV_HEADS.iter().map(|&kv_heads| {
@@ -422,6 +451,7 @@ pub fn complete_basis(
             return Ok(());
         }
         let session = Session::open(device)?;
+        session.begin_budget(&missing);
         let formation = session.form_all(&missing);
         for (index, planned) in missing.into_iter().enumerate() {
             let (measurement, mut profile) = match session.measure(catalog, &reserves, &planned) {
@@ -585,10 +615,36 @@ type FormJob<'a> = Box<dyn FnOnce() + Send + 'a>;
 /// reuses the classes the plan already timed.
 type Measured = RefCell<HashMap<MeasurementKey, Vec<MeasuredPoint>>>;
 
+/// A target shared by all still-missing timed points. Formed-only entries do
+/// not spend a point, but their formation time is charged to the same clock.
+#[derive(Clone, Copy)]
+struct MeasurementBudget {
+    deadline: Instant,
+    remaining_units: usize,
+}
+
+fn point_weight(class: OperationClass) -> usize {
+    if class.cost_shape() == CostShape::History { 4 } else { 1 }
+}
+
+fn planned_point_count(planned: &PlannedKey) -> usize {
+    if !matches!(planned, PlannedKey::Timed(_)) {
+        return 0;
+    }
+    match planned.key().class.cost_shape() {
+        CostShape::PerLaunch | CostShape::PerByte => 1,
+        CostShape::Linear => 2,
+        CostShape::Projection => projection_launches().len(),
+        CostShape::History => history_points(BackendName::Cpu).len(),
+    }
+}
+
 /// What one measurement run shares across its classes.
 struct Session<'a> {
     device: &'a Device,
-    rotation: u64,
+    rotation: Cell<u64>,
+    budget: Cell<Option<MeasurementBudget>>,
+    history_reference: RefCell<[Vec<(u64, f64)>; 2]>,
     trace: SubmissionTrace,
     pools: RefCell<Vec<Pool>>,
     warmed: Cell<bool>,
@@ -603,7 +659,9 @@ impl<'a> Session<'a> {
     fn open(device: &'a Device) -> Result<Self, MeasurementError> {
         Ok(Self {
             device,
-            rotation: rotation_bytes(device.backend()),
+            rotation: Cell::new(rotation_bytes(device.backend())),
+            budget: Cell::new(None),
+            history_reference: RefCell::new([Vec::new(), Vec::new()]),
             trace: device
                 .trace_submissions(TraceDetail::Submissions)
                 .map_err(|error| MeasurementError::Trace(error.to_string()))?,
@@ -613,6 +671,89 @@ impl<'a> Session<'a> {
             measured: RefCell::new(HashMap::new()),
             chained: RefCell::new(None),
         })
+    }
+
+    fn begin_budget(&self, missing: &[PlannedKey]) {
+        if self.device.backend() == BackendName::Cpu {
+            self.budget.set(Some(MeasurementBudget {
+                deadline: Instant::now() + CPU_BASIS_TARGET,
+                remaining_units: missing
+                    .iter()
+                    .map(|planned| planned_point_count(planned) * point_weight(planned.key().class))
+                    .sum(),
+            }));
+        }
+    }
+
+    fn point_budget(&self, weight: usize) -> Duration {
+        match self.budget.get() {
+            Some(budget) => budget
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .mul_f64(weight as f64 / budget.remaining_units.max(1) as f64),
+            None => POINT_BUDGET,
+        }
+    }
+
+    fn completed_point(&self, weight: usize) {
+        if let Some(mut budget) = self.budget.get() {
+            budget.remaining_units = budget.remaining_units.saturating_sub(weight);
+            self.budget.set(Some(budget));
+        }
+    }
+
+    /// Choose a history extent whose predicted graph can be sampled within
+    /// this point's allowance. The first reference extent establishes a rate;
+    /// its second extent separates the launch floor from streamed bytes.
+    fn history_depth(&self, affine: bool, heads: HeadGeometry, requested: u64, row_bytes: u64) -> u64 {
+        if self.budget.get().is_none() {
+            return requested;
+        }
+        let references = self.history_reference.borrow();
+        let points = &references[usize::from(affine)];
+        if points.is_empty() {
+            return requested;
+        }
+        let rate = if points.len() >= 2 && points[0].0 != points[1].0 {
+            let slope = (points[1].1 - points[0].1) / (points[1].0 as f64 - points[0].0 as f64);
+            if slope > 0.0 { slope } else { points[1].1 / points[1].0.max(1) as f64 }
+        } else {
+            (points[0].1 / points[0].0.max(1) as f64).max(f64::MIN_POSITIVE)
+        };
+        let group_factor = heads.group as f64 / HISTORY_REFERENCE.group as f64;
+        let seconds_per_row = rate * row_bytes as f64 * group_factor;
+        let available = self.point_budget(point_weight(OperationClass::AttentionDecode)).as_secs_f64() / 3.0;
+        let rows = (available / seconds_per_row).floor() as u64;
+        let mut depth = rows.clamp(256, requested).div_ceil(256).saturating_mul(256).min(requested);
+        if heads == HISTORY_REFERENCE && points.len() == 1 && depth * row_bytes == points[0].0 {
+            depth = if depth < requested { (depth * 2).min(requested) } else { depth / 2 };
+        }
+        depth
+    }
+
+    fn observe_history(&self, affine: bool, heads: HeadGeometry, bytes: u64, samples: &[f64]) {
+        if heads == HISTORY_REFERENCE && self.budget.get().is_some() {
+            if let Some(seconds) = median(samples) {
+                self.history_reference.borrow_mut()[usize::from(affine)].push((bytes, seconds));
+            }
+        }
+    }
+
+    fn history_rotation(&self, affine: bool, heads: HeadGeometry, bytes: u64) {
+        if self.budget.get().is_none() {
+            return;
+        }
+        let references = self.history_reference.borrow();
+        let points = &references[usize::from(affine)];
+        let launches = if let Some((reference_bytes, reference_seconds)) = points.last() {
+            let estimated = reference_seconds * bytes as f64 / *reference_bytes as f64
+                * heads.group as f64 / HISTORY_REFERENCE.group as f64;
+            let target = self.point_budget(point_weight(OperationClass::AttentionDecode)).as_secs_f64() / 3.0;
+            (target / estimated.max(f64::MIN_POSITIVE)).floor() as u64
+        } else {
+            1
+        };
+        self.rotation.set(bytes.saturating_mul(launches.clamp(1, MAX_LAUNCHES)).min(128 << 20));
     }
 
     /// Form every native kernel of `plan` in parallel: a formation pass over
@@ -660,6 +801,9 @@ impl<'a> Session<'a> {
         let began = Instant::now();
         let key = planned.key();
         self.pools.borrow_mut().clear();
+        if self.budget.get().is_some() && key.class.cost_shape() != CostShape::History {
+            self.rotation.set(128 << 20);
+        }
         refresh_device_ceiling(catalog, self.device, reserves)
             .map_err(MeasurementError::Ceiling)?;
         let pass = match planned {
@@ -783,6 +927,7 @@ enum Pass<'q, 's> {
 struct Runner<'q, 's, 'a> {
     session: &'s Session<'a>,
     pass: Pass<'q, 's>,
+    point_weight: usize,
     /// Whether forms include the varied parameters' variants: only a timed
     /// entry picks its fastest variant.
     variants: bool,
@@ -794,6 +939,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         Self {
             session,
             pass,
+            point_weight: point_weight(planned.key().class),
             variants: matches!(planned, PlannedKey::Timed(_)),
             profile: Cell::new(ClassProfile::default()),
         }
@@ -868,7 +1014,23 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             {
                 for value in &parameter.values[1..] {
                     let variant = defaults.clone().with_param(parameter.name.clone(), *value);
-                    if implementation.validate(&variant).is_ok() {
+                    // A value some default excludes (packed decode rows
+                    // need the matrix form) is timed with the first
+                    // other-parameter value that admits it.
+                    let admitted = std::iter::once(variant.clone())
+                        .chain(
+                            implementation
+                                .params
+                                .iter()
+                                .filter(|other| other.name != parameter.name)
+                                .flat_map(|other| {
+                                    other.values[1..].iter().map(|other_value| {
+                                        variant.clone().with_param(other.name.clone(), *other_value)
+                                    })
+                                }),
+                        )
+                        .find(|candidate| implementation.validate(candidate).is_ok());
+                    if let Some(variant) = admitted.filter(|variant| !specializations.contains(variant)) {
                         specializations.push(variant);
                     }
                 }
@@ -1082,7 +1244,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 .chain(trailing.iter().copied())
                 .collect::<Vec<_>>(),
         )?;
-        let spanning = self.session.rotation.div_ceil(group) * alignment;
+        let spanning = self.session.rotation.get().div_ceil(group) * alignment;
         let rows = rows.max(spanning).div_ceil(alignment) * alignment;
         let extents = std::iter::once(rows)
             .chain(trailing.iter().copied())
@@ -1128,6 +1290,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
     fn copies(&self, point_bytes: u64) -> u64 {
         self.session
             .rotation
+            .get()
             .div_ceil(point_bytes.max(1))
             .clamp(1, MAX_LAUNCHES)
     }
@@ -1232,37 +1395,92 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
 
     /// The samples of the fastest of `graphs` (each a graph and its launch
     /// count) and its position. Several variants are screened by one sample
-    /// each (the run that sized it, when one run fills a sample); the fastest is then timed as a single variant is: a leading
-    /// sample brings it to its sustained behavior and [`RUNS`] samples
-    /// follow back to back.
+    /// each. A subsequent sample of the chosen variant supplies fitted cost;
+    /// additional variants and repeats are admitted only while the point's share of the basis clock
+    /// can pay for them. A native submission already started may overrun.
     fn fastest_graph(
         &self,
         graphs: impl IntoIterator<Item = Step<(Timed, u64)>>,
     ) -> Step<(usize, Vec<f64>)> {
-        let mut sealed = graphs
-            .into_iter()
-            .map(|graph| graph.and_then(|(timed, launches)| self.seal(timed, launches)))
-            .collect::<Step<Vec<_>>>()?;
-        let chosen = match sealed.len() {
-            0 => return Err(failed("no formed variant was timed")),
-            1 => 0,
-            _ => {
-                let mut best: Option<(usize, f64)> = None;
-                for (index, variant) in sealed.iter_mut().enumerate() {
-                    // A run as long as a sample already is one.
-                    let sample = if variant.passes == 1 {
-                        variant.probe / variant.launches as f64
-                    } else {
-                        self.per_launch(variant, 1)?[0]
-                    };
-                    if best.is_none_or(|(_, fastest)| sample < fastest) {
-                        best = Some((index, sample));
-                    }
+        if self.session.budget.get().is_none() {
+            let began = Instant::now();
+            let mut chosen: Option<(usize, Sealed, f64)> = None;
+            let mut graphs = graphs.into_iter();
+            let mut index = 0;
+            loop {
+                if index >= MIN_SCREENED_VARIANTS && began.elapsed() >= POINT_BUDGET {
+                    break;
                 }
-                best.expect("several variants were screened").0
+                let Some(graph) = graphs.next() else { break };
+                let mut variant = graph.and_then(|(timed, launches)| self.seal(timed, launches))?;
+                let sample = if variant.passes == 1 {
+                    variant.probe / variant.launches as f64
+                } else {
+                    self.per_launch(&mut variant, 1)?[0]
+                };
+                if chosen.as_ref().is_none_or(|(_, _, fastest)| sample < *fastest) {
+                    chosen = Some((index, variant, sample));
+                }
+                index += 1;
             }
-        };
-        let samples = self.per_launch(&mut sealed[chosen], 1 + RUNS)?[1..].to_vec();
+            let (chosen, mut sealed, _) = chosen.ok_or_else(|| failed("no formed variant was timed"))?;
+            let probe = sealed.probe.max(1e-7) * sealed.passes as f64;
+            let remaining = POINT_BUDGET.saturating_sub(began.elapsed()).as_secs_f64();
+            let runs = ((remaining / probe).floor() as usize).clamp(MIN_TIMED_SAMPLES, RUNS);
+            let samples = self.per_launch(&mut sealed, 1 + runs)?[1..].to_vec();
+            return Ok((chosen, samples));
+        }
+        let mut allowance = self.session.point_budget(self.point_weight);
+        let mut began = Instant::now();
+        let mut chosen: Option<(usize, Sealed, f64)> = None;
+        let mut graphs = graphs.into_iter();
+        let mut index = 0;
+        loop {
+            if index >= MIN_SCREENED_VARIANTS && began.elapsed() >= allowance {
+                break;
+            }
+            let Some(graph) = graphs.next() else { break };
+            let warming = !self.session.warmed.get();
+            let mut variant = graph.and_then(|(timed, launches)| self.seal(timed, launches))?;
+            if warming {
+                // The once-per-session warmup is charged to the whole basis,
+                // then the first point receives its remaining fair share.
+                allowance = self.session.point_budget(self.point_weight);
+                began = Instant::now();
+            }
+            // A run as long as a sample already is one.
+            let sample = if variant.passes == 1 {
+                variant.probe / variant.launches as f64
+            } else {
+                self.per_launch(&mut variant, 1)?[0]
+            };
+            if chosen.as_ref().is_none_or(|(_, _, fastest)| sample < *fastest) {
+                chosen = Some((index, variant, sample));
+            }
+            index += 1;
+        }
+        let (chosen, mut sealed, _) = chosen.ok_or_else(|| failed("no formed variant was timed"))?;
+        // Screening includes the graph's first execution. Its cold bindings
+        // and native preparation can differ from a served steady launch, so
+        // it selects the variant but does not become fitted cost evidence.
+        let mut samples = self.per_launch(&mut sealed, 1)?;
+        let next_seconds = sealed.probe.max(1e-7) * sealed.passes as f64;
+        while samples.len() < RUNS
+            && allowance.saturating_sub(began.elapsed()).as_secs_f64() >= next_seconds
+        {
+            samples.extend(self.per_launch(&mut sealed, 1)?);
+        }
+        if self.device().backend() == BackendName::Cpu {
+            let graph_seconds = median(&samples).unwrap_or(0.0) * sealed.launches as f64;
+            if graph_seconds.is_finite() && graph_seconds > TARGET_GRAPH_SECONDS {
+                let current = self.session.rotation.get();
+                let floor = if self.point_weight > 1 { 1 } else { 16 << 20 };
+                let next = ((current as f64 * TARGET_GRAPH_SECONDS / graph_seconds) as u64)
+                    .clamp(floor.min(current), current);
+                self.session.rotation.set(next);
+            }
+        }
+        self.session.completed_point(self.point_weight);
         Ok((chosen, samples))
     }
 
@@ -1351,7 +1569,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             }
             (C::AttentionDecode | C::AttentionDecodeK8V4, &[activation]) => {
                 let affine = key.class == C::AttentionDecodeK8V4;
-                self.each(&history_points(), |(heads, depth)| {
+                self.each(&history_points(self.device().backend()), |(heads, depth)| {
                     self.attention_decode(affine, activation, heads, depth)
                 })
             }
@@ -1612,6 +1830,14 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             group,
             width,
         } = heads;
+        let planes = history_planes(affine, activation, kv_heads, width).map_err(failed)?;
+        let row_bytes = sum(&planes
+            .iter()
+            .map(|(_, _, bytes)| *bytes)
+            .collect::<Vec<_>>())?;
+        let requested_depth = depth;
+        let depth = self.session.history_depth(affine, heads, depth, row_bytes);
+        let extrapolated = depth < requested_depth;
         let pairs = HISTORY_ROTARY_PAIRS.min(width / 2);
         let rows = depth + 1;
         let dimensions = [
@@ -1657,12 +1883,8 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             (kernels, Vec::new())
         };
         self.begin()?;
-        let planes = history_planes(affine, activation, kv_heads, width).map_err(failed)?;
-        let row_bytes = sum(&planes
-            .iter()
-            .map(|(_, _, bytes)| *bytes)
-            .collect::<Vec<_>>())?;
         let history_bytes = depth * row_bytes;
+        self.session.history_rotation(affine, heads, history_bytes);
         let slab_rows = magnitude_state::history_rows_per_slab(row_bytes).map_err(failed)? as u64;
         let regions = planes
             .iter()
@@ -1805,10 +2027,12 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 Ok((timed, launches))
             })?
         };
+        self.session.observe_history(affine, heads, history_bytes, &samples);
         Ok(MeasuredPoint {
             shape: PointShape::Heads(heads),
             bytes: history_bytes,
             samples,
+            extrapolated,
         })
     }
 
@@ -2821,16 +3045,60 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         fn variant<K>(kernels: &[K], choice: usize) -> &K {
             &kernels[choice.min(kernels.len() - 1)]
         }
+        // The same standalone costs used to isolate dependency also predict
+        // how many chained cycles can fit the point allowance.
+        let class_seconds = |class: OperationClass, rows: u64, streamed: u64| -> Step<f64> {
+            let key = MeasurementKey::new(class, &[activation]);
+            let points = self.points(&key)?;
+            match ClassCost::from_points(class, &points).map_err(failed)?.model {
+                CostModel::Projection(projection) => Ok(projection.launch_seconds
+                    + projection.seconds_per_byte(rows) * streamed as f64),
+                _ => Err(failed(format!("{} is not a projection", class.name()))),
+            }
+        };
+        let project_bytes = sum(&[
+            bytes(weight, &[channels, hidden])?,
+            bytes(weight, &[inner, hidden])?,
+            bytes(weight, &[value_heads, hidden])?,
+            bytes(weight, &[value_heads, hidden])?,
+        ])?;
+        let expand_bytes = sum(&[
+            bytes(weight, &[features, hidden])?,
+            bytes(weight, &[features, hidden])?,
+        ])?;
+        let standalone_per_call = (class_seconds(
+            OperationClass::DeltaProject,
+            channels + inner + 2 * value_heads,
+            project_bytes,
+        )? + class_seconds(
+            OperationClass::DeltaOutput,
+            hidden,
+            bytes(weight, &[hidden, inner])?,
+        )? + class_seconds(OperationClass::DenseExpand, 2 * features, expand_bytes)?
+            + class_seconds(
+                OperationClass::DenseOutput,
+                hidden,
+                bytes(weight, &[hidden, features])?,
+            )?)
+            / CHAIN_CALLS_PER_CYCLE as f64;
         self.begin()?;
-        let cycles = CHAIN_CYCLES as u64;
-        let qkv = self.views(weight, hidden, channels, cycles)?;
-        let gates = self.views(weight, hidden, inner, cycles)?;
+        let cycles = if self.session.budget.get().is_some() {
+            (self.session.point_budget(1).as_secs_f64()
+                / (standalone_per_call * CHAIN_CALLS_PER_CYCLE as f64 * 3.0)
+                    .max(f64::MIN_POSITIVE))
+                .floor() as usize
+        } else {
+            CHAIN_CYCLES
+        }
+        .clamp(1, CHAIN_CYCLES);
+        let qkv = self.views(weight, hidden, channels, cycles as u64)?;
+        let gates = self.views(weight, hidden, inner, cycles as u64)?;
         let alpha = self.zeros(weight, &[value_heads, hidden])?;
         let beta = self.zeros(weight, &[value_heads, hidden])?;
-        let outputs = self.views(weight, inner, hidden, cycles)?;
-        let expand_gates = self.views(weight, hidden, features, cycles)?;
-        let expand_ups = self.views(weight, hidden, features, cycles)?;
-        let downs = self.views(weight, features, hidden, cycles)?;
+        let outputs = self.views(weight, inner, hidden, cycles as u64)?;
+        let expand_gates = self.views(weight, hidden, features, cycles as u64)?;
+        let expand_ups = self.views(weight, hidden, features, cycles as u64)?;
+        let downs = self.views(weight, features, hidden, cycles as u64)?;
         let residual = self.zeros(Element::f32(), &[1, hidden])?;
         let norm = self.zeros(activation, &[hidden])?;
         let recurrent_norm = self.zeros(activation, &[width])?;
@@ -2852,7 +3120,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             let rows = timed.bound(&self.zeros(Element::i32(), &[1])?)?;
             let scale = timed.bound(&self.zeros(Element::f32(), &[0])?)?;
             let mut current: Option<WorkflowTensor> = None;
-            for cycle in 0..CHAIN_CYCLES {
+            for cycle in 0..cycles {
                 let qkv = timed.bound(&qkv[cycle])?;
                 let gate = timed.bound(&gates[cycle])?;
                 let output_weight = timed.bound(&outputs[cycle])?;
@@ -2934,51 +3202,21 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             }
             Ok(timed)
         };
-        let calls = (CHAIN_CYCLES * CHAIN_CALLS_PER_CYCLE) as u64;
-        // What the basis's own classes predict for one cycle's four calls at
-        // the bytes they stream: the dependency cost is the chained time
-        // those standalone costs do not account for.
-        // The chain streams the reference representation, so no weight
-        // format enters.
-        let class_seconds = |class: OperationClass, rows: u64, streamed: u64| -> Step<f64> {
-            let key = MeasurementKey::new(class, &[activation]);
-            let points = self.points(&key)?;
-            match ClassCost::from_points(class, &points).map_err(failed)?.model {
-                CostModel::Projection(projection) => Ok(projection.launch_seconds
-                    + projection.seconds_per_byte(rows) * streamed as f64),
-                _ => Err(failed(format!("{} is not a projection", class.name()))),
-            }
-        };
-        let project_bytes = sum(&[
-            bytes(weight, &[channels, hidden])?,
-            bytes(weight, &[inner, hidden])?,
-            bytes(weight, &[value_heads, hidden])?,
-            bytes(weight, &[value_heads, hidden])?,
-        ])?;
-        let expand_bytes = sum(&[
-            bytes(weight, &[features, hidden])?,
-            bytes(weight, &[features, hidden])?,
-        ])?;
-        let standalone_per_call = (class_seconds(
-            OperationClass::DeltaProject,
-            channels + inner + 2 * value_heads,
-            project_bytes,
-        )? + class_seconds(
-            OperationClass::DeltaOutput,
-            hidden,
-            bytes(weight, &[hidden, inner])?,
-        )? + class_seconds(OperationClass::DenseExpand, 2 * features, expand_bytes)?
-            + class_seconds(
-                OperationClass::DenseOutput,
-                hidden,
-                bytes(weight, &[hidden, features])?,
-            )?)
-            / CHAIN_CALLS_PER_CYCLE as f64;
+        let calls = (cycles * CHAIN_CALLS_PER_CYCLE) as u64;
+        // The dependency is the chained time those standalone classes miss.
         let (choice, chained) =
             self.fastest_graph((0..variants).map(|choice| Ok((chain(choice)?, calls))))?;
         let chained_call = median(&chained).ok_or_else(|| failed("no chained median"))?;
-        let submission =
-            self.submissions(chain(choice)?, chained_call * calls as f64, CHAIN_SAMPLES)?;
+        let count = if self.session.budget.get().is_some() {
+            (self.session.point_budget(1).as_secs_f64()
+                / (chained_call * calls as f64).max(f64::MIN_POSITIVE))
+                .floor() as usize
+        } else {
+            CHAIN_SAMPLES
+        }
+        .clamp(1, CHAIN_SAMPLES);
+        let submission = self.submissions(chain(choice)?, chained_call * calls as f64, count)?;
+        self.session.completed_point(1);
         Ok(Chained {
             // A dependent call cannot cost less than its standalone launch: a
             // difference at or below zero measures none.
@@ -3034,9 +3272,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cpu_budget_covers_every_timed_point() {
+        let plan = measurement_plan(BackendName::Cpu);
+        assert_eq!(plan.iter().filter(|entry| matches!(entry, PlannedKey::Timed(_))).count(), 47);
+        assert_eq!(plan.iter().map(planned_point_count).sum::<usize>(), 131);
+    }
+
+    #[test]
     fn history_points_differ_from_the_reference_in_one_axis() {
-        let points = history_points();
-        assert_eq!(&points[..2], &[(HISTORY_REFERENCE, 4096), (HISTORY_REFERENCE, 32_768)]);
+        let points = history_points(BackendName::Cpu);
+        assert_eq!(&points[..2], &[(HISTORY_REFERENCE, 1024), (HISTORY_REFERENCE, 32_768)]);
+        let metal = history_points(BackendName::Metal);
+        assert_eq!(&metal[..2], &[(HISTORY_REFERENCE, 4096), (HISTORY_REFERENCE, 32_768)]);
         for (heads, depth) in &points[2..] {
             assert_eq!(*depth, HISTORY_DEPTH);
             let differing = [
