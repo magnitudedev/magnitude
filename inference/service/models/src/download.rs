@@ -830,12 +830,13 @@ async fn download_component_with_retry(
         progress(component.size_bytes, DownloadStage::Verifying);
         return Ok(());
     }
-    let mut integrity = recover_partial(&paths, component).await?;
-    progress(integrity.bytes, DownloadStage::Downloading);
-
     for attempt in 0..MAX_ATTEMPTS {
+        // Each attempt resumes from the durable checkpoint: streamed bytes
+        // past it may have been counted without reaching the file (a
+        // buffered write fails later, e.g. on a full disk).
+        let mut integrity = recover_partial(&paths, component).await?;
+        progress(integrity.bytes, DownloadStage::Downloading);
         if cancelled.load(Ordering::Acquire) {
-            persist_integrity_checkpoint(&paths, component, &mut integrity, None).await?;
             return Err(cancelled_error());
         }
         match download_component_once(
@@ -869,30 +870,6 @@ async fn download_component_once(
     cancelled: &AtomicBool,
 ) -> Result<(), DownloadError> {
     let mut offset = integrity.bytes;
-    let partial_len = tokio::fs::metadata(&paths.partial)
-        .await
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    if partial_len > offset {
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&paths.partial)
-            .await
-            .map_err(download_io)?
-            .set_len(offset)
-            .await
-            .map_err(download_io)?;
-    } else if partial_len < offset {
-        return Err(DownloadError {
-            kind: DownloadErrorKind::Integrity,
-            message: format!(
-                "partial download is shorter than verified progress for {}",
-                component.path.display()
-            ),
-            retryable: true,
-            resumable: false,
-        });
-    }
     if offset == component.size_bytes {
         progress(component.size_bytes, DownloadStage::Verifying);
         if let Err(error) = integrity.verify(component) {
@@ -959,7 +936,7 @@ async fn download_component_once(
     if offset != component.size_bytes {
         persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
         return Err(DownloadError {
-            kind: DownloadErrorKind::Integrity,
+            kind: DownloadErrorKind::Network,
             message: format!(
                 "download ended at {offset} bytes; expected {} for {}",
                 component.size_bytes,

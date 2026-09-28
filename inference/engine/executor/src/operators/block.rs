@@ -34,13 +34,13 @@ use super::{
 use crate::native::{AttestedFeedForward, AttestedMixer, OutputScales};
 use crate::programs::graph::draft::GraphDraft;
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{activation, weight};
+use crate::programs::native_target_graph::{activation, weight, WeightPort};
 use crate::{
     FeedForwardProgramSlot, GeneralRoutedShape, MixerProgramSlot, ModelLoadPlan, PerLayerBinding,
     ShortConvShape, StateResourcePlan, StateSpaceShape,
 };
 use magnitude_family_contracts::{
-    Decoder, RecurrentHeadMapping, SublayerIndex, WeightKind, WeightRole, WeightScope,
+    Decoder, RecurrentHeadMapping, SublayerIndex, WeightKind, WeightScope,
 };
 use magnitude_state::LayerRef;
 use seismic::{
@@ -228,7 +228,7 @@ impl BlockSublayers<'_> {
         graph: &mut G,
         entries: MixerEntries<'e, G>,
         hidden: &WorkflowTensor,
-        weights: &mut Vec<(WeightRole, NativePort)>,
+        weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<(WorkflowTensor, BlockStatePorts, BlockControlPorts), String> {
         let Self {
@@ -384,7 +384,7 @@ impl BlockSublayers<'_> {
         graph: &mut G,
         entries: Option<FeedForwardEntries<'e, G>>,
         mixed: WorkflowTensor,
-        weights: &mut Vec<(WeightRole, NativePort)>,
+        weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<WorkflowTensor, String> {
         let Self {
@@ -474,7 +474,7 @@ impl BlockSublayers<'_> {
         graph: &mut G,
         parts: Option<PerLayerParts<'e, G>>,
         residual: WorkflowTensor,
-        weights: &mut Vec<(WeightRole, NativePort)>,
+        weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<(WorkflowTensor, Option<NativePort>), String> {
         let Self {

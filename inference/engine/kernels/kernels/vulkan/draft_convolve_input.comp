@@ -1,0 +1,30 @@
+// draft_convolve_input: DFlash2's half-0 grouped dynamic causal convolution of
+// a sublayer's normed input rows within each draft block; one invocation per
+// output element over a grid-stride loop, summing its taps in offset order.
+// The Vulkan form of `metal/draft_convolve_input.metal`.
+#include "lib/core/activation.glsl"
+
+void draft_convolve_input() {
+    const uint64_t input = SEISMIC_PTR(SEISMIC_BUFFER_INPUT);
+    const uint64_t dynamic = SEISMIC_PTR(SEISMIC_BUFFER_DYNAMIC);
+    const uint64_t base = SEISMIC_PTR(SEISMIC_BUFFER_BASE);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t channels = SEISMIC_DIM_C, width = SEISMIC_DIM_G * channels;
+    const uint64_t count = SEISMIC_DIM_M * width;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
+        const uint64_t row = index / width, column = index % width, group = column / channels;
+        const uint64_t position = row % uint64_t(SEISMIC_PARAM_BLOCK);
+        float sum = 0.0;
+        for (uint64_t offset = 0ul; offset < SEISMIC_DIM_K && offset <= position; ++offset) {
+            const float coefficient =
+                element_f32_at(base + (offset * SEISMIC_BASE_STRIDE_1 + column * SEISMIC_BASE_STRIDE_2) * 4ul)
+                + element_f32_at(dynamic + (row * SEISMIC_DYNAMIC_STRIDE_0 + offset * SEISMIC_DYNAMIC_STRIDE_2
+                    + group * SEISMIC_DYNAMIC_STRIDE_3) * 4ul);
+            sum = seismic_fma_rn(coefficient,
+                element_at(ELEMENT_ACT, input, (row - offset) * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1),
+                sum);
+        }
+        element_put(ELEMENT_ACT, result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, sum);
+    }
+}

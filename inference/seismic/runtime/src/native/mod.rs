@@ -188,7 +188,7 @@ pub struct NativePrepared {
     name: String,
     device: DeviceIdentity,
     public_device: Arc<DeviceInner>,
-    logical: LogicalEntry,
+    logical: Arc<LogicalEntry>,
     invocation: InvocationContract,
     implementation: NativeImplementation,
     specialization: NativeSpecialization,
@@ -206,6 +206,9 @@ pub struct NativePrepared {
     scalar_bytes: u64,
     artifact: NativeArtifactIdentity,
     route: NativeRoute,
+    /// Whether a timed submission has completed: its first-use device costs
+    /// are paid.
+    pub(crate) exercised: std::sync::atomic::AtomicBool,
 }
 
 /// The pipeline geometry of every launch of a Vulkan implementation: its
@@ -574,10 +577,12 @@ impl NativePrepared {
                     backend.as_str()
                 ))
             })?;
+        let logical = Arc::new(module.entry(entry, &bindings).map_err(PrepareError::Source)?);
         Self::prepare_implementation(
             device,
             module,
             entry,
+            &logical,
             bindings,
             specialization,
             cpu,
@@ -588,10 +593,14 @@ impl NativePrepared {
     /// Form `implementation` of the entry, which may differ from the
     /// module's declaration in its parameter domains only (a tuning
     /// survey's widened domains).
+    /// `logical` is the entry at `bindings`, built once by the caller for
+    /// every configuration it forms.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_implementation(
         device: &Arc<DeviceInner>,
         module: &CheckedModule,
         entry: EntryId,
+        logical: &Arc<LogicalEntry>,
         bindings: ElementBindings,
         specialization: NativeSpecialization,
         cpu: Option<&'static CpuNativeKernels>,
@@ -611,9 +620,6 @@ impl NativePrepared {
         implementation
             .validate(&specialization)
             .map_err(|error| preparation(format!("`{name}`: {error}")))?;
-        let logical = module
-            .entry(entry, &bindings)
-            .map_err(PrepareError::Source)?;
         let schema = logical.schema();
         let statics = implementation
             .statics
@@ -862,7 +868,7 @@ impl NativePrepared {
             name,
             device: device.kind.identity(),
             public_device: device.clone(),
-            logical,
+            logical: logical.clone(),
             invocation,
             implementation,
             specialization,
@@ -875,6 +881,7 @@ impl NativePrepared {
             scalar_bytes,
             artifact,
             route,
+            exercised: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 

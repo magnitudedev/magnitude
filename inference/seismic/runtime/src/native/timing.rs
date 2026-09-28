@@ -12,7 +12,13 @@
 //!
 //! The first pass over a point's rotation calibrates the repetitions per
 //! sample so that a sample covers at least `min_sample_seconds` of device
-//! time. It is never a sample: it pays first-use device costs.
+//! time. The first pass of a kernel pays its first-use device costs and is
+//! never a sample; a later point's calibrating pass of the same kernel is one
+//! when it already covers a steady sample.
+//!
+//! Repeated samples average out a sample's fixed jitter. A sample of at
+//! least [`STEADY_SAMPLE_SECONDS`] holds that jitter to a small fraction of
+//! any margin that ranks configurations, so such a point takes one sample.
 //!
 //! A device that idled (while configurations were formed, for example) runs
 //! at a low clock until it has been busy for a while: on an M4 Pro the first
@@ -35,14 +41,38 @@ pub(crate) struct PointTiming {
     calls: Vec<NativeBoundCall>,
     /// Passes over the rotation per sample; `None` until calibrated.
     repetitions: Option<usize>,
+    /// Device time of one sample, as calibrated.
+    sample_seconds: Option<f64>,
     rotation_bytes: u64,
     samples: Vec<f64>,
+}
+
+/// Device time from which one sample measures a point.
+const STEADY_SAMPLE_SECONDS: f64 = 0.002;
+
+/// Result storage of each point's argument sets, shared by every placement at
+/// that point in one tuning run. Samples complete one at a time, so the
+/// configurations placed at a point can write the same results; none zeroes
+/// its own.
+#[derive(Default)]
+pub(crate) struct OutputPool(Vec<Vec<Vec<Arc<TensorInner>>>>);
+
+impl OutputPool {
+    /// The storage of `point`'s argument sets.
+    pub(crate) fn at(&mut self, point: usize) -> &mut Vec<Vec<Arc<TensorInner>>> {
+        if self.0.len() <= point {
+            self.0.resize_with(point + 1, Vec::new);
+        }
+        &mut self.0[point]
+    }
 }
 
 /// A submitted sample of one point.
 pub(crate) struct PendingSample {
     submission: NativeSubmission,
     calls: usize,
+    /// Whether the kernel had completed a timed submission before this one.
+    exercised: bool,
 }
 
 impl PendingSample {
@@ -63,9 +93,8 @@ impl PointTiming {
         Self::place(kernel, rotation, None)
     }
 
-    /// Place a candidate against a point's shared result storage. Group
-    /// sweeps submit one timing at a time and wait for its completion, so a
-    /// later candidate can safely write the same buffers.
+    /// Place a configuration against a point's shared result storage
+    /// ([`OutputPool`]).
     pub(crate) fn reusing_outputs(
         kernel: &Arc<NativePrepared>,
         rotation: Vec<EncodedArgs>,
@@ -122,6 +151,7 @@ impl PointTiming {
             kernel: kernel.clone(),
             calls,
             repetitions: None,
+            sample_seconds: None,
             rotation_bytes: distinct.into_iter().map(|(_, bytes)| bytes).sum(),
             samples: Vec::new(),
         })
@@ -157,6 +187,7 @@ impl PointTiming {
 
     /// Submit `passes` passes over the rotation as one unit of device work.
     fn submit_passes(&self, passes: usize) -> Result<PendingSample, CallError> {
+        let exercised = self.kernel.exercised.load(std::sync::atomic::Ordering::Acquire);
         let submission = StandaloneCalls {
             kernel: &self.kernel,
             calls: &self.calls,
@@ -165,22 +196,42 @@ impl PointTiming {
         Ok(PendingSample {
             submission,
             calls: passes * self.calls.len(),
+            exercised,
         })
     }
 
     /// Record a completed sample; the first calibrates and is not kept (it
     /// pays first-use costs: on an M4 Pro, twice the later samples).
-    pub(crate) fn record(&mut self, seconds: f64, min_sample_seconds: f64) {
+    pub(crate) fn record(&mut self, seconds: f64, exercised: bool, min_sample_seconds: f64) {
+        self.kernel
+            .exercised
+            .store(true, std::sync::atomic::Ordering::Release);
         if self.repetitions.is_some() {
             self.samples.push(seconds);
             return;
         }
         let pass = seconds * self.calls.len() as f64;
-        self.repetitions = Some(if pass > 0.0 {
+        let repetitions = if pass > 0.0 {
             ((min_sample_seconds / pass).ceil() as usize).max(1)
         } else {
             1
-        });
+        };
+        self.repetitions = Some(repetitions);
+        self.sample_seconds = Some(pass * repetitions as f64);
+        // A single pass that is already a steady sample, of a kernel past its
+        // first use, is exactly the sample the next submission would take.
+        if exercised && repetitions == 1 && pass >= STEADY_SAMPLE_SECONDS {
+            self.samples.push(seconds);
+        }
+    }
+
+    /// The samples this point needs of the `requested`: one once calibrated
+    /// long enough to be steady.
+    fn samples_needed(&self, requested: usize) -> usize {
+        match self.sample_seconds {
+            Some(seconds) if seconds >= STEADY_SAMPLE_SECONDS => requested.min(1),
+            _ => requested,
+        }
     }
 
     /// The samples so far as a measurement.
@@ -218,6 +269,10 @@ const WARM_LIMIT_SECONDS: f64 = 0.5;
 /// per pass within [`WARM_AGREEMENT`], at most [`WARM_LIMIT_SECONDS`].
 pub(crate) fn warm(point: &PointTiming) -> Result<(), CallError> {
     let pass = point.submit_passes(1)?.submission.device_seconds()?;
+    point
+        .kernel
+        .exercised
+        .store(true, std::sync::atomic::Ordering::Release);
     let passes = |seconds: f64| {
         if pass > 0.0 {
             ((seconds / pass).ceil() as usize).max(1)
@@ -256,11 +311,14 @@ fn collect(
     min_sample_seconds: f64,
 ) -> Result<(), PointFailure> {
     for &point in order {
-        let seconds = points[point]
+        let pending = points[point]
             .submit()
-            .and_then(PendingSample::seconds)
             .map_err(|error| PointFailure { point, error })?;
-        points[point].record(seconds, min_sample_seconds);
+        let exercised = pending.exercised;
+        let seconds = pending
+            .seconds()
+            .map_err(|error| PointFailure { point, error })?;
+        points[point].record(seconds, exercised, min_sample_seconds);
     }
     Ok(())
 }
@@ -278,7 +336,7 @@ pub(crate) fn sample(
     collect(points, &uncalibrated, options.min_sample_seconds)?;
     let missing = points
         .iter()
-        .map(|point| options.samples.saturating_sub(point.samples.len()))
+        .map(|point| point.samples_needed(options.samples).saturating_sub(point.samples.len()))
         .collect::<Vec<_>>();
     let rounds = missing.iter().copied().max().unwrap_or(0);
     let order = (0..rounds)

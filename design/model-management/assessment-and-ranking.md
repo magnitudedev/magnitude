@@ -40,10 +40,9 @@ retried, and is omitted by ACN. Catalog drops emit an OpenTelemetry error; disco
 silent.
 
 One assessment reads the target's Assessment Material headers once, in the service process.
-Planning (header, family definition and execution plan) yields each known target's measurement
-classes; the measurement job then measures only the classes the stored basis lacks (the classes come
-from headers, never a hand-written list) while tokenizer, template, reasoning and resource
-preparation finish, and times them once that preparation has ended. The engine's own tokenizer,
+The measurement basis is model-free and measured from service start, concurrently with every
+target's header preparation (family definition, execution plan, decode demand and resources);
+neither waits for the other. The engine's own tokenizer,
 template and reasoning inspection supplies capabilities and the template fingerprint; its method
 resolution decides speculative execution. Only the final support, memory-fit and performance
 calculation waits for the basis.

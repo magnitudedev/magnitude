@@ -17,7 +17,9 @@ pub(crate) use attestation::{
     AttestedState, AttestedTarget, AttestedTargetBlock, AttestedVision, OutputScales,
 };
 use draft::DraftKernels;
-pub(crate) use draft::{DraftBlockKernels, MarkovKernels};
+pub(crate) use draft::{
+    AttestedDflash2, DraftBlockKernels, Dflash2Kernels, Dflash2Projections, MarkovKernels,
+};
 use glue::GlueKernels;
 pub(crate) use head::draft_vocabulary;
 use head::HeadKernels;

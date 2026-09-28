@@ -37,7 +37,8 @@ use crate::{
 };
 use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{
-    conditioning_overlay, draft_confidence, feature_rows, import_dense, moe_tail,
+    conditioning_overlay, draft_confidence, draft_convolve_input, draft_convolve_residual,
+    draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, moe_tail,
     per_layer_inputs, post_norm_residual, repack_weight, tap_rows,
 };
 use magnitude_state::KvCodec;
@@ -848,6 +849,8 @@ impl<'a> Preparation<'a> {
             down,
             activation,
             tail,
+            // The tunings read their scale ports' extents from the plan.
+            scales: _,
         } = binding;
         let expand = self.spec.tuned(
             &mut self.tuner,
@@ -1606,11 +1609,134 @@ impl<'a> Preparation<'a> {
                 }
             }
         };
+        let dflash2 = match draft_plan.dflash2() {
+            None => None,
+            Some(binding) => self.dflash2(draft_plan, binding)?,
+        };
         let draft = self.draft_kernels();
         draft.embedding = embedding;
         draft.head = head;
         draft.markov = markov;
+        draft.dflash2 = dflash2;
         Ok(())
+    }
+
+    /// DFlash2's block pass and candidate path: the layer and output norms
+    /// over rows, every unfused projection (per kind, weight and published
+    /// element, over every layer sharing it), the two convolution halves,
+    /// the gated product, the top-k, both codebook gathers and the path
+    /// step. `None` during a tuning census.
+    fn dflash2(
+        &mut self,
+        plan: &crate::DraftProgramPlan,
+        binding: &crate::Dflash2Binding,
+    ) -> Result<Option<Dflash2Kernels>, CatalogFailure> {
+        let device = self.device;
+        let activation = plan.activation();
+        let selector = binding.selector;
+        let (projections, norm_elements) = super::draft::dflash2_entries(plan, binding);
+        let mut prepared = Dflash2Projections::new();
+        let mut complete = true;
+        for ((kind, weight, output), scopes) in projections {
+            match self.spec.tuned(
+                &mut self.tuner,
+                &ProjectRowsTuning {
+                    weight,
+                    activation,
+                    kind,
+                    output,
+                    scopes,
+                },
+            )? {
+                Some(kernel) => {
+                    prepared.insert((kind, weight, output), kernel);
+                }
+                None => complete = false,
+            }
+        }
+        let mut norms = HashMap::new();
+        for norm in norm_elements {
+            match self.features(&format!("dflash2 NW={}", norm.name()), norm, activation)? {
+                Some(kernel) => {
+                    norms.insert(norm, kernel);
+                }
+                None => complete = false,
+            }
+        }
+        let bindings = format!("A={}", activation.name());
+        let convolve_input = fixed!(
+            self.spec,
+            device,
+            draft_convolve_input,
+            bindings,
+            draft_convolve_input::Elements { A: activation }
+        );
+        let convolve_residual = fixed!(self.spec, device, draft_convolve_residual, "");
+        let gated = fixed!(
+            self.spec,
+            device,
+            draft_gated_rows,
+            bindings,
+            draft_gated_rows::Elements { A: activation }
+        );
+        let top_k = fixed!(self.spec, device, draft_top_k, "");
+        let path = fixed!(
+            self.spec,
+            device,
+            draft_path_step,
+            bindings,
+            draft_path_step::Elements { A: activation }
+        );
+        let codebook = |spec: &mut Specializer, table: Element| {
+            spec.fixed::<embedding_rows::Entry>(
+                &format!("dflash2 EW={}", table.name()),
+                &[("D", selector.rank)],
+                |specialization| {
+                    embedding_rows::native_for_device_with(
+                        device,
+                        embedding_rows::Elements {
+                            EW: table,
+                            A: activation,
+                        },
+                        specialization,
+                    )
+                },
+            )
+        };
+        let predecessor = codebook(&mut self.spec, selector.predecessor)?;
+        let successor = codebook(&mut self.spec, selector.successor)?;
+        Ok(match (
+            complete,
+            convolve_input,
+            convolve_residual,
+            gated,
+            top_k,
+            path,
+            predecessor,
+            successor,
+        ) {
+            (
+                true,
+                Some(convolve_input),
+                Some(convolve_residual),
+                Some(gated),
+                Some(top_k),
+                Some(path),
+                Some(predecessor),
+                Some(successor),
+            ) => Some(Dflash2Kernels {
+                norms,
+                projections: prepared,
+                convolve_input,
+                convolve_residual,
+                gated,
+                top_k,
+                predecessor,
+                successor,
+                path,
+            }),
+            _ => None,
+        })
     }
 
     fn draft_kernels(&mut self) -> &mut DraftKernels {

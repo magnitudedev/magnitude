@@ -744,11 +744,13 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     };
     let mut weights = TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
     let mut shared = HashMap::new();
+    let noise = Noise::default();
     let mut inputs = TuningInputs {
         device: &device,
         definition: &definition,
         limits: LIMITS,
         weights: &mut weights,
+        noise: &noise,
         shared: &mut shared,
     };
     let batch = inputs.batch(6, 256, 2, 512).unwrap();
@@ -792,11 +794,13 @@ fn case_state_restores_its_written_rows() {
     };
     let mut weights = TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
     let mut shared = HashMap::new();
+    let noise = Noise::default();
     let inputs = TuningInputs {
         device: &device,
         definition: &definition,
         limits: LIMITS,
         weights: &mut weights,
+        noise: &noise,
         shared: &mut shared,
     };
     let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();

@@ -14,6 +14,7 @@ use magnitude_engine::assessment::{
     finish_model_assessment, prepare_model_assessment,
 };
 use magnitude_engine::error::UnsupportedModel;
+use magnitude_engine::options::ModelMethod;
 use magnitude_executor::assessment::{
     DomainFit, ExecutionAssessment, IncompatibleReason, PerformanceConfidence as EngineConfidence,
     PerformanceEstimate,
@@ -23,9 +24,9 @@ use magnitude_service_contracts::models::{
     ModelAssessmentId, ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure,
     ModelPackageOperand, ModelReasoningCapabilities, ModelServingConfiguration,
     PerformanceConfidence, PerformanceEvidence, ResolvedServableModelBundle, ServableModelBundle,
-    SpeculativeDraftSource, SpeculativeDraftSourceInput,
+    SpeculativeDraftSource, SpeculativeDraftSourceInput, SpeculativeMethod,
 };
-use magnitude_service_contracts::{ComponentRole, InventoryError, MemoryDomainId};
+use magnitude_service_contracts::{ComponentRole, InventoryError, MemoryDomainId, ResolvedModel};
 use magnitude_service_models::{
     CachedModelAssessment, ManagedModelStore, ModelDomainResolver, ReleaseCatalog,
     ServableModelBundleKey, servable_model_bundle_key_for_bundle,
@@ -277,11 +278,49 @@ impl ModelAssessor {
 }
 
 /// The components the engine reads: the target GGUF (a split target by its first shard, beside
-/// which the engine finds the others) and its projector. A draft package is not executed by the
-/// engine.
+/// which the engine finds the others), its projector and a separate draft, with the method the
+/// bundle declares. A standalone package resolves its method from the package (`Auto`); a
+/// speculative bundle declares its method, and the engine rejects a draft that does not implement
+/// it rather than serving the target plain.
 pub(crate) fn engine_material(
     resolved: &ResolvedServableModelBundle,
 ) -> Result<ModelPackagePaths, InventoryError> {
+    let (method, draft) = match &resolved.bundle {
+        ServableModelBundle::Standalone { .. } => (ModelMethod::Auto, None),
+        ServableModelBundle::SpeculativeDecoding {
+            draft_source,
+            method,
+            ..
+        } => match (draft_source, method, &resolved.draft_model) {
+            (SpeculativeDraftSource::Embedded, SpeculativeMethod::Mtp, None) => {
+                (ModelMethod::Mtp, None)
+            }
+            (SpeculativeDraftSource::Separate { .. }, method, Some(draft)) => {
+                let method = match method {
+                    SpeculativeMethod::DFlash => ModelMethod::DFlash,
+                    SpeculativeMethod::DSpark => ModelMethod::DSpark,
+                    SpeculativeMethod::Mtp => {
+                        return Err(InventoryError::InvalidRequest(
+                            "MTP drafts with the target's own head, not a separate draft"
+                                .to_owned(),
+                        ));
+                    }
+                };
+                (method, Some(draft_weights(draft)?))
+            }
+            (SpeculativeDraftSource::Embedded, _, _) => {
+                return Err(InventoryError::InvalidRequest(
+                    "an embedded draft is an MTP head; DFlash and DSpark need a separate draft"
+                        .to_owned(),
+                ));
+            }
+            (SpeculativeDraftSource::Separate { .. }, _, None) => {
+                return Err(InventoryError::Integrity(
+                    "a separate-draft bundle resolved without its draft".to_owned(),
+                ));
+            }
+        },
+    };
     let components = &resolved.target_model.components;
     let target = components
         .iter()
@@ -308,7 +347,36 @@ pub(crate) fn engine_material(
             ));
         }
     };
-    Ok(ModelPackagePaths { target, projector })
+    Ok(ModelPackagePaths {
+        target,
+        projector,
+        draft,
+        method,
+    })
+}
+
+/// A separate draft package's one GGUF.
+fn draft_weights(draft: &ResolvedModel) -> Result<PathBuf, InventoryError> {
+    let weights = draft
+        .components
+        .iter()
+        .filter(|component| {
+            matches!(
+                component.role,
+                ComponentRole::Weights | ComponentRole::Draft
+            )
+        })
+        .map(|component| component.path.clone())
+        .collect::<Vec<_>>();
+    match weights.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err(InventoryError::NotReady(
+            "the draft has no runnable weights".to_owned(),
+        )),
+        _ => Err(InventoryError::InvalidRequest(
+            "the draft resolves more than one weights file".to_owned(),
+        )),
+    }
 }
 
 async fn assess_prepared(
@@ -623,6 +691,135 @@ pub fn inventory_model_failure(error: InventoryError) -> ModelFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved_model(path: &str) -> ResolvedModel {
+        use magnitude_service_contracts::{
+            ContentId, InventoryEntryId, InventoryModel, InventoryProperties, ModelAvailability,
+            ModelLocation, ModelSource, ResolvedComponent,
+        };
+        ResolvedModel {
+            model: InventoryModel {
+                id: InventoryEntryId(path.to_owned()),
+                content_id: ContentId(path.to_owned()),
+                created: 0,
+                name: path.to_owned(),
+                supported_parameters: Vec::new(),
+                availability: ModelAvailability::Available { ready_at: 0 },
+                source: ModelSource::Local {
+                    declared_by: magnitude_service_contracts::LocalDeclaration::Discovery,
+                },
+                location: ModelLocation::Directory {
+                    source_id: "source".to_owned(),
+                    root: PathBuf::from("/models"),
+                    components: Vec::new(),
+                    total_bytes: 1,
+                    integrity: magnitude_service_contracts::Integrity::Unverified {
+                        reason: "test".to_owned(),
+                    },
+                },
+                properties: InventoryProperties::Inspected {
+                    architecture: None,
+                    quantization: None,
+                    quantization_name: None,
+                    parameter_count: None,
+                    active_parameter_count: None,
+                    training_context_length: None,
+                    nextn_predict_layers: None,
+                    tokenizer: None,
+                    modalities: vec!["text".to_owned()],
+                    base_models: Vec::new(),
+                    evidence_fingerprint: "test".to_owned(),
+                },
+                operations: Vec::new(),
+                updated_at: 0,
+            },
+            components: vec![ResolvedComponent {
+                path: PathBuf::from("/models").join(path),
+                role: ComponentRole::Weights,
+                shard_index: None,
+                relationship: None,
+            }],
+        }
+    }
+
+    fn package(id: &str) -> magnitude_service_contracts::models::ModelPackage {
+        use magnitude_service_contracts::models::{
+            ModelFile, ModelFileId, ModelFileRole, ModelPackage, ModelPackageId,
+            ModelPackageProperties, ModelPackageSource,
+        };
+        ModelPackage {
+            id: ModelPackageId(id.to_owned()),
+            source: ModelPackageSource::Local {
+                path: PathBuf::from("/models"),
+            },
+            files: vec![ModelFile {
+                id: ModelFileId(id.to_owned()),
+                path: PathBuf::from(format!("{id}.gguf")),
+                role: ModelFileRole::Weights,
+                size_bytes: 1,
+                tensor_storage_bytes: None,
+                sha256: "a".repeat(64),
+            }],
+            relationships: Vec::new(),
+            properties: ModelPackageProperties {
+                format: "gguf".to_owned(),
+                quantization: "unknown".to_owned(),
+                quantization_name: "unknown".to_owned(),
+                architecture: "test".to_owned(),
+                maximum_context_length: None,
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
+            },
+        }
+    }
+
+    fn speculative(
+        draft: bool,
+        method: SpeculativeMethod,
+    ) -> ResolvedServableModelBundle {
+        ResolvedServableModelBundle::new(
+            ServableModelBundle::SpeculativeDecoding {
+                target: package("target"),
+                draft_source: if draft {
+                    SpeculativeDraftSource::Separate {
+                        draft: package("draft"),
+                    }
+                } else {
+                    SpeculativeDraftSource::Embedded
+                },
+                method,
+            },
+            resolved_model("target.gguf"),
+            draft.then(|| resolved_model("draft.gguf")),
+        )
+    }
+
+    /// The engine reads a separate-draft bundle's draft with the bundle's
+    /// declared method; a method its draft source cannot carry is refused.
+    #[test]
+    fn engine_material_carries_the_declared_draft_and_method() {
+        for (method, expected) in [
+            (SpeculativeMethod::DFlash, ModelMethod::DFlash),
+            (SpeculativeMethod::DSpark, ModelMethod::DSpark),
+        ] {
+            let material = engine_material(&speculative(true, method)).unwrap();
+            assert_eq!(material.target, PathBuf::from("/models/target.gguf"));
+            assert_eq!(material.draft, Some(PathBuf::from("/models/draft.gguf")));
+            assert_eq!(material.method, expected);
+        }
+        let embedded = engine_material(&speculative(false, SpeculativeMethod::Mtp)).unwrap();
+        assert_eq!((embedded.draft, embedded.method), (None, ModelMethod::Mtp));
+        for (draft, method) in [
+            (false, SpeculativeMethod::DFlash),
+            (false, SpeculativeMethod::DSpark),
+            (true, SpeculativeMethod::Mtp),
+        ] {
+            assert!(matches!(
+                engine_material(&speculative(draft, method)),
+                Err(InventoryError::InvalidRequest(_))
+            ));
+        }
+    }
 
     #[test]
     fn performance_depths_filter_to_the_context_and_end_at_it() {

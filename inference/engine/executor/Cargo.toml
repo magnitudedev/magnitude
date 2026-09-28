@@ -32,6 +32,7 @@ tuning-survey = []
 # catalog target (`assessment::catalog`).
 [dev-dependencies]
 magnitude-family-common = { path = "../families/common", features = ["catalog-headers"] }
+magnitude-family-dflash = { path = "../families/dflash" }
 magnitude-family-gemma4 = { path = "../families/gemma4" }
 magnitude-family-lfm2 = { path = "../families/lfm2" }
 magnitude-family-llama = { path = "../families/llama" }

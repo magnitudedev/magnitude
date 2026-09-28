@@ -1,6 +1,6 @@
 // readout_head_rows: final RMS prologue over the `out_rows` hidden rows and the
-// vocabulary projection into F32 logits, softcapped from the accumulator when
-// `softcap` > 0.
+// vocabulary projection into F32 logits, scaled by a present `weight_scale`
+// (static WS = 1) and softcapped from the accumulator when `softcap` > 0.
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.h"
 
@@ -14,6 +14,7 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     device const int *out_rows [[buffer(SEISMIC_BUFFER_OUT_ROWS)]],                     \
     device uchar *logits [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
+    device const float *weight_scale [[buffer(SEISMIC_BUFFER_WEIGHT_SCALE)]],           \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define HEAD_ROWS_OPERANDS                                                              \
@@ -21,8 +22,10 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     projection::Rms<activation, norm_element, projection::SelectedRows> in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
         SEISMIC_HIDDEN_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0,                           \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {out_rows}};                    \
-    projection::Logits out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,         \
-        as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))};                                   \
+    const auto out = projection::scaling<(SEISMIC_DIM_WS != 0)>::wrap(                  \
+        projection::Logits{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+            as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))},                               \
+        projection::scale_factor(weight_scale, SEISMIC_DIM_WS, 0, 0), 1.0f);            \
     projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(k), k}
 
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV

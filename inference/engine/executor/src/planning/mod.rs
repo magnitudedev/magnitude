@@ -21,9 +21,9 @@ pub use execution_plan::{
     ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,
 };
 pub use programs::{
-    DraftBlockBinding, DraftProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
-    ImportProgramSlot, MarkovBinding, MixerProgramSlot, ProgramPlan, StateProgramPlan,
-    TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, VisionProgramPlan,
+    Dflash2Binding, DraftBlockBinding, DraftProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
+    ImportProgramSlot, MarkovBinding, MixerProgramSlot, ProgramPlan, SelectorBinding,
+    StateProgramPlan, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
     GraphSlots, HistoryStorePlan, LayerHistory, NativeGraphCharge, ResourceBytes,
@@ -34,11 +34,14 @@ pub use weights::{
     resident_element, resident_layout, source_element, AttentionBinding, AttentionShape,
     DenseBinding, DenseBranchBinding, EmbeddingBinding, FeaturesBinding, HeadBinding,
     HostTablePlan, ModelLoadPlan, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding,
-    RecurrentBinding, RoutedBinding, SublayerTail, WeightPlan, WeightStorageIdentity,
+    DenseScales, RecurrentBinding, RoutedBinding, ScalableWeight, SublayerTail, WeightPlan, WeightScalePlan,
+    WeightStorageIdentity,
 };
 
 pub(crate) use weights::activation_dtype;
-use weights::{planned_element, source_import_peak_bytes, weight_bytes_by_component};
+use weights::{
+    planned_element, planned_scalable, source_import_peak_bytes, weight_bytes_by_component,
+};
 #[cfg(test)]
 use weights::{resident_dtype, validate_unique_roles};
 
@@ -74,6 +77,7 @@ pub(crate) mod tests {
             descriptor: WeightDescriptor::stored(name, [1]),
             source_bytes: 2,
             resident_bytes: 2,
+            scale: None,
         }
     }
 

@@ -28,8 +28,8 @@ use crate::worker_process::{WorkerLauncher, WorkerRole};
 /// Bounds the complete job, including a cold kernel cache on the slowest backend.
 const MEASUREMENT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const RETIREMENT_DEADLINE: Duration = Duration::from_secs(5);
-const MAX_REPORT_BYTES: u64 = 64 * 1024;
-const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
+const MAX_REPORT_BYTES: usize = 64 * 1024;
+const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 /// The arguments of the `measurement-worker` subcommand.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,8 +303,8 @@ impl MeasurementJob {
         })?;
         let outcome = tokio::time::timeout(MEASUREMENT_DEADLINE, async {
             let (report, diagnostics, status) = tokio::join!(
-                read_bounded(stdout, MAX_REPORT_BYTES),
-                read_bounded(stderr, MAX_DIAGNOSTIC_BYTES),
+                drain(stdout, MAX_REPORT_BYTES, Retain::First),
+                drain(stderr, MAX_DIAGNOSTIC_BYTES, Retain::Last),
                 child.wait(),
             );
             Ok::<_, std::io::Error>((report?, diagnostics?, status?))
@@ -317,11 +317,18 @@ impl MeasurementJob {
                 return Err(MeasurementJobError::Deadline);
             }
         };
+        let (report, report_complete) = report;
+        let (diagnostics, _) = diagnostics;
         if !status.success() {
             return Err(MeasurementJobError::Failed {
                 status,
                 diagnostics: String::from_utf8_lossy(&diagnostics).trim().to_owned(),
             });
+        }
+        if !report_complete {
+            return Err(MeasurementJobError::MalformedReport(format!(
+                "the report exceeds {MAX_REPORT_BYTES} bytes"
+            )));
         }
         if !diagnostics.is_empty() {
             tracing::debug!(
@@ -345,13 +352,43 @@ impl MeasurementJob {
     }
 }
 
-async fn read_bounded(
-    reader: impl tokio::io::AsyncRead + Unpin,
-    maximum: u64,
-) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader.take(maximum).read_to_end(&mut bytes).await?;
-    Ok(bytes)
+/// Which bytes of an output stream are kept.
+#[derive(Clone, Copy)]
+enum Retain {
+    /// The first bytes: a report, complete only when it fits.
+    First,
+    /// The last bytes: diagnostics end with the failure.
+    Last,
+}
+
+/// Read `reader` to its end, keeping at most `maximum` bytes, and whether
+/// none were dropped. The whole stream is read so the worker never writes
+/// into a full or closed pipe.
+async fn drain(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    maximum: usize,
+    retain: Retain,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut kept = std::collections::VecDeque::with_capacity(maximum);
+    let mut complete = true;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok((kept.into(), complete));
+        }
+        for &byte in &chunk[..read] {
+            if kept.len() < maximum {
+                kept.push_back(byte);
+                continue;
+            }
+            complete = false;
+            if let Retain::Last = retain {
+                kept.pop_front();
+                kept.push_back(byte);
+            }
+        }
+    }
 }
 
 async fn retire(child: &mut crate::worker_process::ContainedChild) {

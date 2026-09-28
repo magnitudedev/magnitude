@@ -5,6 +5,7 @@
 //! norm spans a whole output row that a column-tiled epilogue cannot form.
 
 use crate::programs::graph::draft::GraphDraft;
+use crate::programs::native_target_graph::ScaledWeight;
 use crate::native::{PostNormKernels, SublayerOutput};
 use magnitude_kernels::{post_norm_residual, project_rows};
 use seismic::{
@@ -72,7 +73,8 @@ impl CheckedPostNormEntries {
 }
 
 /// One post-norm tail over `source` (`[rows, K]` activation rows) with the
-/// `[N, K]` output projection `weight`: the `out_rows` rows of `residual`
+/// `[N, K]` output projection `weight` (and its accumulator-scale port):
+/// the `out_rows` rows of `residual`
 /// plus the normalized projection, times `scale` (1, or the layer's output
 /// scale of `OutputForm::ScaledPostNorm`), as `[out, N]` F32 rows.
 #[allow(clippy::too_many_arguments)]
@@ -81,8 +83,7 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
     entries: PostNormEntries<'a, G>,
     residual: &WorkflowTensor,
     source: WorkflowTensorRef<'_>,
-    weight: &WorkflowTensor,
-    weight_scale: &WorkflowTensor,
+    weight: &ScaledWeight,
     norm: &WorkflowTensor,
     out_rows: &WorkflowTensor,
     shape: PostNormShape,
@@ -98,11 +99,11 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
     let projected = graph
         .enqueue(
             entries.project,
-            &[("M", out), ("K", inputs), ("N", outputs), ("WS", 0)],
+            &[("M", out), ("K", inputs), ("N", outputs), ("WS", weight.extent)],
             project_rows::WorkflowArgs {
                 source,
-                weight: weight.into(),
-                weight_scale: weight_scale.into(),
+                weight: (&weight.weight).into(),
+                weight_scale: (&weight.scale).into(),
             },
         )?
         .value;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <ctime>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -13,6 +14,16 @@
 // Symbolic support only. No inference headers or numerical runtime dependencies.
 #define TEMPLATES_ASSERT(condition) do { if (!(condition)) throw std::logic_error("Native templates invariant: " #condition); } while (false)
 #define TEMPLATES_ABORT(message) throw std::logic_error(message)
+
+// The UTC calendar fields of `time`; false outside the representable range.
+// Windows provides the reentrant conversion as gmtime_s, POSIX as gmtime_r.
+inline bool templates_utc_calendar(std::time_t time, std::tm & calendar) {
+#if defined(_WIN32)
+    return gmtime_s(&calendar, &time) == 0;
+#else
+    return gmtime_r(&time, &calendar) != nullptr;
+#endif
+}
 
 enum common_grammar_trigger_type {
     COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN,

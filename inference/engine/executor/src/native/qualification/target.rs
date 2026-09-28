@@ -4,7 +4,6 @@ use crate::operators::routed::fused_graph::{grouped_blocks, DECODE_ROWS, TILE_RO
 
 impl<'a> QualificationView<'a> {
     pub(super) fn qualify_target(&self, device: &Device) -> Result<(), CatalogFailure> {
-        let absent_scale = semantic_zeros(device, Element::f32(), &[0], "target", "scale")?;
         let out_rows = semantic_i32(device, &[1], &[0], "target", "out_rows")?;
         let hidden = self.geometry.hidden;
         let hidden_values = vec![1.0_f32; hidden as usize];
@@ -333,6 +332,8 @@ impl<'a> QualificationView<'a> {
             let gate = semantic_zeros(device, binding.gate, &[f, hidden], "target_dense", &label)?;
             let up = semantic_zeros(device, binding.up, &[f, hidden], "target_dense", &label)?;
             let down = semantic_zeros(device, binding.down, &[hidden, f], "target_dense", &label)?;
+            let scale =
+                |extent| semantic_ones(device, Element::f32(), &[extent], "target_dense", &label);
             let product = kernels
                 .expand
                 .call(dense_expand::Args {
@@ -343,8 +344,8 @@ impl<'a> QualificationView<'a> {
                     out_rows: &out_rows,
                     eps: 1.0e-5,
                     activation: 0,
-                    gate_scale: &absent_scale,
-                    up_scale: &absent_scale,
+                    gate_scale: &scale(binding.scales.gate)?,
+                    up_scale: &scale(binding.scales.up)?,
                 })
                 .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                 .value;
@@ -355,12 +356,21 @@ impl<'a> QualificationView<'a> {
                         product: &product,
                         down_weight: &down,
                         out_rows: &out_rows,
-                        down_scale: &absent_scale,
+                        down_scale: &scale(binding.scales.down)?,
                     })
                     .map_err(|error| qualification_dynamic("dense_output", &label, error))?
                     .value,
                 (SublayerOutput::PostNorm(tail), SublayerTail::PostNorm { norm, .. }) => {
-                    qualify_post_norm(device, tail, &hidden_residual, &product, &down, norm, &label)?
+                    qualify_post_norm(
+                        device,
+                        tail,
+                        &hidden_residual,
+                        &product,
+                        &down,
+                        binding.scales.down,
+                        norm,
+                        &label,
+                    )?
                 }
                 _ => {
                     return Err(qualification_dynamic(
@@ -471,6 +481,13 @@ impl<'a> QualificationView<'a> {
                     out_rows: &out_rows,
                     epsilon: 1.0e-5,
                     softcap: 0.0,
+                    weight_scale: &semantic_ones(
+                        device,
+                        Element::f32(),
+                        &[binding.weight_scale],
+                        "target_readout",
+                        &label,
+                    )?,
                 })
                 .map_err(|error| qualification_dynamic("readout_head_rows", &label, error))?
                 .value;
@@ -715,7 +732,9 @@ fn qualify_general_routed(
 ) -> Result<(), CatalogFailure> {
     let label = format!("{binding:?}");
     let entry = "target_general_routed";
-    let absent_scale = semantic_zeros(device, Element::f32(), &[0], entry, &label)?;
+    // Each dense entry's scale ports at their bound extents.
+    let scale = |extent| semantic_ones(device, Element::f32(), &[extent], entry, &label);
+    let scales = binding.scales;
     let shape = binding.shape;
     let (h, e, k, f, x) = (
         shape.hidden,
@@ -766,8 +785,8 @@ fn qualify_general_routed(
                             out_rows: &out_rows,
                             eps: 1.0e-5,
                             activation: expansion_shape.activation,
-                            gate_scale: &absent_scale,
-                            up_scale: &absent_scale,
+                            gate_scale: &scale(scales.shared.gate)?,
+                            up_scale: &scale(scales.shared.up)?,
                         })
                         .map_err(failed!("dense_expand"))?
                         .value,
@@ -779,7 +798,7 @@ fn qualify_general_routed(
                             out_rows: &out_rows,
                             eps: 1.0e-5,
                             activation: expansion_shape.activation,
-                            up_scale: &absent_scale,
+                            up_scale: &scale(scales.shared.up)?,
                         })
                         .map_err(failed!("dense_up"))?
                         .value,
@@ -797,7 +816,7 @@ fn qualify_general_routed(
                         product: &product,
                         down_weight: &zeros(down, &[h, s])?,
                         out_rows: &out_rows,
-                        down_scale: &absent_scale,
+                        down_scale: &scale(scales.shared.down)?,
                     })
                     .map_err(failed!("dense_output"))?
                     .value
@@ -838,7 +857,7 @@ fn qualify_general_routed(
                     .call(project_rows::Args {
                         source: &normalized,
                         weight: &zeros(down, &[x, h])?,
-                        weight_scale: &absent_scale,
+                        weight_scale: &scale(scales.latent.0)?,
                     })
                     .map_err(failed!("project_rows"))?
                     .value,
@@ -942,7 +961,7 @@ fn qualify_general_routed(
                     product: &routed,
                     down_weight: &zeros(up, &[h, x])?,
                     out_rows: &out_rows,
-                    down_scale: &absent_scale,
+                    down_scale: &scale(scales.latent.1)?,
                 })
                 .map_err(failed!("dense_output"))?
                 .value,
@@ -1316,6 +1335,7 @@ impl QualificationView<'_> {
                 hidden_residual,
                 &gated,
                 &projection,
+                0,
                 norm,
                 &label,
             )?;

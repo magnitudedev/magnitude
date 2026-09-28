@@ -13,7 +13,7 @@ use magnitude_engine::{
         PreparedModelAssessment, finish_model_assessment, prepare_model_assessment,
     },
     error::UnsupportedModel,
-    options::{ModelPolicy, standard_service_limits},
+    options::{ModelMethod, ModelPolicy, standard_service_limits},
     worker::protocol::EngineBuild,
 };
 use magnitude_executor::{
@@ -43,7 +43,7 @@ struct Options {
 }
 
 const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu --cache-dir DIR \
-     [--depths 25000,50000,75000] [--breakdown] TARGET.gguf[,PROJECTOR.gguf]...";
+     [--depths 25000,50000,75000] [--breakdown] TARGET.gguf[,[PROJECTOR.gguf][,DRAFT.gguf]]...";
 
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
     args.next()
@@ -86,10 +86,16 @@ fn parse() -> Result<Options, String> {
                 return Err(format!("unknown flag: {flag} (try --help)"));
             }
             model => {
-                let mut components = model.splitn(2, ',');
+                // TARGET[,PROJECTOR[,DRAFT]]; an empty projector names none.
+                let mut components = model.splitn(3, ',');
+                let component = |path: Option<&str>| {
+                    path.filter(|path| !path.is_empty()).map(PathBuf::from)
+                };
                 models.push(ModelPackagePaths {
                     target: PathBuf::from(components.next().expect("split yields one part")),
-                    projector: components.next().map(PathBuf::from),
+                    projector: component(components.next()),
+                    draft: component(components.next()),
+                    method: ModelMethod::Auto,
                 });
             }
         }

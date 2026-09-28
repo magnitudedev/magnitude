@@ -287,6 +287,15 @@ impl Element {
             }
         }
     }
+    /// Rows of one row tile of row-layout storage (`rows8`: 8); 1 for every
+    /// other storage. A matrix view of tiled storage selects whole tiles, or
+    /// runs to the end of its tensor.
+    pub fn tile_rows(&self) -> u64 {
+        match &seismic_lang::registry::representation_info(self.0).kind {
+            seismic_lang::registry::RepresentationKind::PackedRows(layout) => layout.tile_rows(),
+            _ => 1,
+        }
+    }
     /// Host reference of the registered conversion from `source` into this
     /// storage over a tensor of `shape`. `None` when no conversion is
     /// registered or `bytes` is not the source's canonical byte count.
@@ -1427,7 +1436,23 @@ impl NativeGraphResourceTemplate {
             .collect::<Result<Vec<_>, _>>()?;
         let mut results = Vec::with_capacity(self.recorder.nodes.len());
         let mut scratch = Vec::with_capacity(self.recorder.nodes.len());
+        // A graph repeats the same node in every layer: the same checked
+        // contract at the same dimensions has the same buffer maxima.
+        let mut certified = std::collections::HashMap::<
+            (usize, Option<&'static str>, &[(String, u64)]),
+            (Vec<u64>, Vec<u64>),
+        >::new();
         for source in &self.recorder.nodes {
+            let key = (
+                source.checked.identity(),
+                source.class_scope,
+                source.dimensions.as_slice(),
+            );
+            if let Some((node_results, node_scratch)) = certified.get(&key) {
+                results.push(node_results.clone());
+                scratch.push(node_scratch.clone());
+                continue;
+            }
             let entry = source.entry_name;
             let maximum =
                 |reads: &[&str], measure: &dyn Fn(&[(&str, u64)]) -> Result<u64, String>| {
@@ -1477,6 +1502,13 @@ impl NativeGraphResourceTemplate {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
+            );
+            certified.insert(
+                key,
+                (
+                    results.last().expect("pushed above").clone(),
+                    scratch.last().expect("pushed above").clone(),
+                ),
             );
         }
         self.inner
@@ -2791,6 +2823,12 @@ pub mod generated {
 
         pub fn implementation(&self) -> &NativeImplementation {
             &self.implementation
+        }
+
+        /// The identity of the entry and element bindings this contract
+        /// checks: contracts share the module's one shape table for them.
+        pub(crate) fn identity(&self) -> usize {
+            Arc::as_ptr(&self.shapes) as usize
         }
 
         /// The entry dimensions a tensor parameter's checked shape reads.

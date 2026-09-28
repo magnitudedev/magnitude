@@ -16,6 +16,7 @@
 use crate::operators;
 use crate::operators::output::{post_norm, CheckedPostNormEntries, PostNormShape, TailEntries};
 use crate::programs::graph::draft::GraphDraft;
+use crate::programs::native_target_graph::ScaledWeight;
 use crate::{AttentionBinding, AttentionShape, SublayerTail};
 use crate::{
     native::{AttentionHistoryKernels, AttentionKernels},
@@ -262,8 +263,98 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             },
         )
         .map_err(|error| error.to_string())?;
+    // The mix entries read the projection per head.
+    let projected = ProjectedRows {
+        query: projected
+            .r0
+            .reshape(&[rows, heads, width + shape.interleaved_gate]),
+        gate: projected.r1.reshape(&[rows, heads, shape.separate_gate]),
+        key: projected.r2.reshape(&[shape.fresh, rows, shape.kv_heads * width]),
+        value: if shape.projected_value {
+            projected.r3.reshape(&[shape.fresh, rows, shape.kv_heads * width])
+        } else {
+            projected.r2.reshape(&[shape.fresh, rows, shape.kv_heads * width])
+        },
+    };
+    let (attended, state, controls) = mix(
+        graph,
+        kernels.history,
+        (&weights.query_norm, &weights.key_norm),
+        constants,
+        &projected,
+        &block,
+    )?;
+    let mixed = match (kernels.output, &weights.post_norm) {
+        (TailEntries::Residual(output), None) => graph
+            .enqueue(
+                output,
+                &[("M", rows), ("D", shape.hidden), ("Q", heads), ("W", width)],
+                attention_output::WorkflowArgs {
+                    hidden: hidden.into(),
+                    gated: (&attended).into(),
+                    output_weight: (&weights.output).into(),
+                },
+            )
+            .map_err(|error| error.to_string())?
+            .value,
+        (TailEntries::PostNorm(entries), Some(norm)) => {
+            let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
+            let absent_scale = GraphConstant::absent_scale(graph, constants)?;
+            let mixed = post_norm(
+                graph,
+                entries,
+                hidden,
+                (&attended.reshape(&[rows, heads * width])).into(),
+                &ScaledWeight::unscaled(weights.output.clone(), absent_scale),
+                norm,
+                out_rows.port().tensor(),
+                PostNormShape {
+                    rows,
+                    out: rows,
+                    inputs: heads * width,
+                    outputs: shape.hidden,
+                },
+                block.post_norm_epsilon,
+                block.post_norm_scale,
+            )?;
+            constants.push(out_rows);
+            mixed
+        }
+        _ => return Err("attention output entries disagree with its post-norm weight".into()),
+    };
+    Ok((mixed, state, controls))
+}
+
+/// The per-head rows the history codec's attention entry reads: the query
+/// (with its interleaved gate), the separate gate, and the fresh keys and
+/// values.
+#[derive(Clone)]
+pub(crate) struct ProjectedRows {
+    /// `[rows, heads, width + interleaved gate]`.
+    pub query: WorkflowTensorView,
+    /// `[rows, heads, separate gate]`.
+    pub gate: WorkflowTensorView,
+    /// `[fresh, rows, kv heads · width]`.
+    pub key: WorkflowTensorView,
+    pub value: WorkflowTensorView,
+}
+
+/// The history codec's fused attention entry over projected rows: head
+/// norms, rotary, K/V append at the rows' destinations and attention over
+/// the visible spans and fresh rows. Its rotary table and unit norm row join
+/// `constants`.
+pub(crate) fn mix<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    history: AttentionHistoryEntries<'a, G>,
+    (query_norm, key_norm): (&Option<WorkflowTensor>, &Option<WorkflowTensor>),
+    constants: &mut Vec<GraphConstant>,
+    projected: &ProjectedRows,
+    block: &AttentionBlock<'_>,
+) -> Result<(WorkflowTensor, AttentionStatePorts, AttentionControlPorts), String> {
+    let shape = block.shape;
+    let (rows, width) = (block.rows, shape.width);
     let dimensions = shape.mix_dimensions(rows, block.history_rows, block.segments);
-    let input = |graph: &mut G, name: &str| match &kernels.history {
+    let input = |graph: &mut G, name: &str| match &history {
         AttentionHistoryEntries::Dense { decode, .. } => {
             graph.input_for(*decode, name, &dimensions)
         }
@@ -289,31 +380,25 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         Some(weight) => weight.reshape(&[1, width]),
         None => absent_norm.clone(),
     };
-    let query_norm = head_norm(&weights.query_norm);
+    let query_norm = head_norm(query_norm);
     // The entries take equal query and key norm rows; a Shared layer's
     // unread key norm port takes its query norm.
     let key_norm = if shape.fresh == 0 {
         query_norm.clone()
     } else {
-        head_norm(&weights.key_norm)
+        head_norm(key_norm)
     };
     let value_norm = unit.port().tensor().slice_leading(0, shape.value_norm);
-    // The mix entries read the projection per head.
-    let query = projected
-        .r0
-        .reshape(&[rows, heads, width + shape.interleaved_gate]);
-    let gate = projected.r1.reshape(&[rows, heads, shape.separate_gate]);
-    let fresh_rows = [shape.fresh, rows, shape.kv_heads * width];
-    let key = projected.r2.reshape(&fresh_rows);
-    let value = if shape.projected_value {
-        projected.r3.reshape(&fresh_rows)
-    } else {
-        key.clone()
-    };
+    let ProjectedRows {
+        query,
+        gate,
+        key,
+        value,
+    } = projected.clone();
     let mut plane = |element: Element, elements: u64| {
         graph.port(element, &[block.history_rows, shape.kv_heads, elements])
     };
-    let mut planes = match &kernels.history {
+    let mut planes = match &history {
         AttentionHistoryEntries::Dense { .. } => vec![
             plane(block.activation, width)?,
             plane(block.activation, width)?,
@@ -364,7 +449,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         }};
     }
     let decode = decodes(rows);
-    let attended = match &kernels.history {
+    let attended = match &history {
         AttentionHistoryEntries::Dense { decode: kernel, .. } if decode => {
             mix!(kernel, attention_decode, history_key, history_value)
         }
@@ -392,47 +477,8 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             history_value_coefficients
         ),
     };
-    let mixed = match (kernels.output, &weights.post_norm) {
-        (TailEntries::Residual(output), None) => graph
-            .enqueue(
-                output,
-                &[("M", rows), ("D", shape.hidden), ("Q", heads), ("W", width)],
-                attention_output::WorkflowArgs {
-                    hidden: hidden.into(),
-                    gated: (&attended).into(),
-                    output_weight: (&weights.output).into(),
-                },
-            )
-            .map_err(|error| error.to_string())?
-            .value,
-        (TailEntries::PostNorm(entries), Some(norm)) => {
-            let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
-            let absent_scale = GraphConstant::absent_scale(graph, constants)?;
-            let mixed = post_norm(
-                graph,
-                entries,
-                hidden,
-                (&attended.reshape(&[rows, heads * width])).into(),
-                &weights.output,
-                &absent_scale,
-                norm,
-                out_rows.port().tensor(),
-                PostNormShape {
-                    rows,
-                    out: rows,
-                    inputs: heads * width,
-                    outputs: shape.hidden,
-                },
-                block.post_norm_epsilon,
-                block.post_norm_scale,
-            )?;
-            constants.push(out_rows);
-            mixed
-        }
-        _ => return Err("attention output entries disagree with its post-norm weight".into()),
-    };
     constants.extend([components, frequencies, amplitudes, unit]);
-    Ok((mixed, AttentionStatePorts { planes }, controls))
+    Ok((attended, AttentionStatePorts { planes }, controls))
 }
 
 /// A projection segment's weight, or zero rows of the query weight when the

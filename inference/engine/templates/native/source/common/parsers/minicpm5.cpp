@@ -51,7 +51,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
 
         auto reasoning = p.eps();
         if (extract_reasoning) {
-            reasoning = ("<think>" << p.reasoning(p.until("</think>")) << "</think>") + p.space();
+            reasoning = p.optional(("<think>" << p.reasoning(p.until("</think>")) << "</think>") + p.space());
         }
 
         // Response format parser
@@ -104,6 +104,10 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
 
             auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
             auto tool_calls = p.trigger_rule("tool-call", p.repeat(tool_choice + p.space(), 1, max_calls));
+            // The whole completion is constrained: under auto, a turn may end without a call.
+            if (inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+                tool_calls = p.optional(tool_calls);
+            }
 
             auto content = p.content(p.until("<function"));
 

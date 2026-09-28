@@ -111,6 +111,12 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                     continue;
                 }
             };
+            // Admission binds every weight to its entries' ports, a
+            // second-level scale included (`PlanError::UnportedScale`).
+            if let Err(error) = load.program_plan(&definition, KvCodec::AffineK8V4) {
+                failures.push(format!("{model} {role} {}: {error}", backend.as_str()));
+                continue;
+            }
             let plan = measurement_plan(backend);
             let covered = |key: &MeasurementKey, timed: bool| {
                 plan.contains(&if timed {
@@ -172,4 +178,114 @@ fn every_admitted_catalog_target_derives_complete_terms() {
     println!("refused:\n  {}", refused.join("\n  "));
     assert!(failures.is_empty(), "missing terms:\n  {}", failures.join("\n  "));
     assert!(!admitted.is_empty());
+}
+
+/// Separate drafts of the qualification artifacts (target header, draft
+/// header) and their target families. Each plans its draft program and
+/// charges its weights, state and every draft graph class from headers
+/// alone, on every backend: the draft graphs are sealed exactly, in
+/// metadata, for the planned method's proposals.
+const SEPARATE_DRAFTS: [(&str, &str, &dyn ModelFamily); 6] = [
+    ("qwen3.6-35b-a3b__target-gguf_q4.json", "qwen3.6-35b-a3b__draft.json", &Qwen35Family),
+    ("lfm2.5-2.6b__target-gguf_q4.json", "lfm2.5-2.6b__draft.json", &Lfm2Family),
+    ("qwen3.8-27b__target-gguf_q4.json", "qwen3.8-27b__draft-dspark.json", &Qwen35Family),
+    ("qwen3.8-27b__target-gguf_q4.json", "qwen3.8-27b__draft-dflash2.json", &Qwen35Family),
+    // An NVFP4 draft (scaled fusion and feed-forward) beside a Q4_K_M
+    // target, and beside the NVFP4 target (a scaled vocabulary projection).
+    (
+        "nemotron-3.5-lightning-30b-a3b__target-gguf_q4.json",
+        "nemotron-3.5-lightning-30b-a3b__draft.json",
+        &NemotronHFamily,
+    ),
+    (
+        "nemotron-3.5-lightning-30b-a3b__target-gguf_nvfp4-qat.json",
+        "nemotron-3.5-lightning-30b-a3b__draft.json",
+        &NemotronHFamily,
+    ),
+];
+
+#[test]
+fn separate_drafts_plan_and_charge_every_graph_class_from_headers() {
+    use crate::{AssessmentGraphResourceBounds, ResourceCapacity, ResourcePlanner};
+    let identity = PackageIdentity {
+        target: ArtifactIdentity([7; 32]),
+        projector: None,
+    };
+    let component = |file: &str, directory: &magnitude_artifacts::gguf::Directory, identity| {
+        ComponentManifest {
+            files: vec![ComponentFile {
+                path: file.into(),
+                size: directory.tensors.iter().map(|tensor| tensor.nbytes).sum(),
+            }],
+            identity,
+            tensors: directory.tensors.clone(),
+        }
+    };
+    for (target_file, draft_file, family) in SEPARATE_DRAFTS {
+        let target = headers::directory(target_file);
+        let draft = headers::directory(draft_file);
+        let declared = family.inspect(&target, None, identity).unwrap();
+        let bound = magnitude_family_dflash::inspect(&draft, &declared, &|layer| {
+            family.layer_entry(&declared, layer)
+        })
+        .unwrap_or_else(|error| panic!("{draft_file}: {error}"));
+        let proposals = u8::try_from(bound.max_proposals()).unwrap();
+        // A separate-draft load executes the draft, never an embedded head.
+        let definition = magnitude_family_contracts::ModelDefinition {
+            head: None,
+            draft: Some(bound),
+            ..declared
+        };
+        crate::operators::admit(&definition, true)
+            .unwrap_or_else(|error| panic!("{draft_file}: {error}"));
+        let manifest = PackageManifest {
+            identity,
+            target: component(target_file, &target, identity.target),
+            projector: None,
+            draft: Some(component(draft_file, &draft, ArtifactIdentity([9; 32]))),
+        };
+        let selection = ComponentSelection {
+            head: true,
+            vision: false,
+        };
+        let method = PlannedMethod::DFlash { proposals };
+        for backend in BACKENDS {
+            let context = format!("{draft_file} {}", backend.as_str());
+            let layout = resident_layout(ExecutionPath::Native, backend);
+            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout)
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
+            let terms = AssessmentMemoryTerms::derive(
+                &definition,
+                &load,
+                selection,
+                KvCodec::AffineK8V4,
+                method,
+                LIMITS,
+            )
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+            assert!(terms.head_weights > 0, "{context}: the draft's weights are charged");
+            let state = ResourcePlanner::state_plan(
+                &definition,
+                &load,
+                method,
+                KvCodec::AffineK8V4,
+                LIMITS,
+                ResourceCapacity {
+                    domain_bytes: 64 << 30,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+            let graph = AssessmentGraphResourceBounds::derive(
+                &definition,
+                &load,
+                &state,
+                method,
+                KvCodec::AffineK8V4,
+                LIMITS,
+                backend,
+            )
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+            assert!(graph.total_bytes > 0, "{context}");
+        }
+    }
 }

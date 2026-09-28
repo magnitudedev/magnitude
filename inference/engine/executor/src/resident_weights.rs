@@ -164,7 +164,7 @@ impl ResidentTarget {
             if seen.iter().any(|other| other.shares_allocation(tensor)) {
                 return;
             }
-            total = total.and_then(|bytes| bytes.checked_add(tensor.storage_bytes()));
+            total = total.and_then(|bytes| bytes.checked_add(weight.storage_bytes()));
             seen.push(tensor);
         });
         total.ok_or("resident target charge overflows")

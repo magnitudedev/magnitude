@@ -31,15 +31,64 @@ pub struct WeightPlan {
     pub descriptor: WeightDescriptor,
     /// Startup upload charge: the logical shape in `upload`.
     pub source_bytes: u64,
+    /// The resident representation's bytes, without `scale`.
     pub resident_bytes: u64,
+    /// The weight's resident second-level scale (`ImportTransform::
+    /// ScaleByTensor`), when it has one.
+    pub scale: Option<WeightScalePlan>,
 }
 
 impl WeightPlan {
     /// Whether the importer uploads host-prepared bytes (transformed or
-    /// dequantized) rather than the stored range as is.
+    /// dequantized) rather than the stored range as is. A second-level
+    /// scale leaves the weight's bytes as stored.
     pub fn host_prepared(&self) -> bool {
-        !self.descriptor.transforms.is_empty() || self.upload != self.source
+        self.descriptor
+            .transforms
+            .iter()
+            .any(|transform| !matches!(transform, ImportTransform::ScaleByTensor { .. }))
+            || self.upload != self.source
     }
+
+    /// Every resident byte of the weight: its representation and its scale.
+    pub fn storage_bytes(&self) -> Result<u64, String> {
+        self.resident_bytes
+            .checked_add(self.scale.as_ref().map_or(0, |scale| scale.resident_bytes))
+            .ok_or_else(|| "resident weight byte count overflows".into())
+    }
+
+    /// The extent of the weight's accumulator-scale port: 0 without a
+    /// second-level scale, else its resident scale's (1 for a matrix, the
+    /// stack's matrix count for a stacked weight).
+    pub fn scale_extent(&self) -> u64 {
+        self.scale.as_ref().map_or(0, |scale| scale.extent)
+    }
+}
+
+/// A packed weight's second-level scale (NVFP4's per-tensor or per-matrix
+/// F32 `.scale`): a stored tensor of its own, `[1]` or `[stack]`, resident
+/// beside the weight's representation as one F32 value per matrix. Entries
+/// multiply their F32 accumulator by it through their accumulator-scale
+/// port; an entry without one refuses the weight at plan time.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WeightScalePlan {
+    /// The stored scale tensor.
+    pub tensor: String,
+    /// Its stored extent: 1, or the weight's matrix count.
+    pub stored: u64,
+    /// Its resident extent: 1 for a matrix, the matrix count for a stacked
+    /// weight (a stored `[1]` is repeated per matrix).
+    pub extent: u64,
+    /// `extent` F32 values.
+    pub resident_bytes: u64,
+}
+
+/// A projection weight's planned form at an entry with an accumulator-scale
+/// port: its resident element and the port's extent (0 without a scale).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ScalableWeight {
+    pub element: Element,
+    pub scale: u64,
 }
 
 /// Physical resident storage identity. Multiple semantic roles may name one
@@ -242,6 +291,18 @@ pub struct DenseBinding {
     pub down: Element,
     pub activation: Element,
     pub tail: SublayerTail,
+    pub scales: DenseScales,
+}
+
+/// The extents of a dense feed-forward's per-tensor accumulator-scale ports
+/// (`dense_expand`/`dense_up` gate and up, `dense_output` or the post-norm
+/// tail's `project_rows` down): 1 where the weight has a resident
+/// second-level scale, else 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DenseScales {
+    pub gate: u64,
+    pub up: u64,
+    pub down: u64,
 }
 
 /// A dense branch beside a general routed branch
@@ -295,6 +356,8 @@ pub struct ReadoutBinding {
     pub norm: Element,
     pub weight: Element,
     pub activation: Element,
+    /// The extent of the vocabulary projection's accumulator-scale port.
+    pub weight_scale: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -409,27 +472,21 @@ pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3]
     .enumerate()
     {
         for weight in weights {
+            let storage = (
+                weight.upload,
+                weight.shape.clone(),
+                weight.source_bytes,
+                weight.resident_bytes,
+                weight.scale.clone(),
+            );
             match seen.entry(weight.storage_identity()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert((
-                        weight.upload,
-                        weight.shape.clone(),
-                        weight.source_bytes,
-                        weight.resident_bytes,
-                    ));
+                    entry.insert(storage);
                     bytes[index] = bytes[index]
-                        .checked_add(weight.resident_bytes)
+                        .checked_add(weight.storage_bytes()?)
                         .ok_or("resident weight byte count overflow")?;
                 }
-                std::collections::hash_map::Entry::Occupied(entry)
-                    if entry.get()
-                        != &(
-                            weight.upload,
-                            weight.shape.clone(),
-                            weight.source_bytes,
-                            weight.resident_bytes,
-                        ) =>
-                {
+                std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &storage => {
                     return Err("tied weight roles disagree on their physical storage".into());
                 }
                 std::collections::hash_map::Entry::Occupied(_) => {}
@@ -906,6 +963,14 @@ fn push_weight(
         ));
     }
     let resident_bytes = representation_bytes(resident, &logical)?;
+    let scale = weight_scale(inventory, descriptor, &logical)?;
+    if scale.is_some() && upload != source {
+        return Err(format!(
+            "weight {:?} ({role:?}) is dequantized for dense kernels, which have no \
+             accumulator-scale port for its second-level scale",
+            descriptor.name
+        ));
+    }
     out.push(WeightPlan {
         role,
         component,
@@ -918,8 +983,66 @@ fn push_weight(
         // upload representation.
         source_bytes: representation_bytes(upload, &logical)?,
         resident_bytes,
+        scale,
     });
     Ok(())
+}
+
+/// The resident second-level scale of a weight whose transforms name one
+/// (`import_transforms::admit` allows at most one): a stored F32 tensor of
+/// one value, or one per matrix of a stacked `logical` weight.
+fn weight_scale(
+    inventory: &[TensorDescriptor],
+    descriptor: &WeightDescriptor,
+    logical: &[u64],
+) -> Result<Option<WeightScalePlan>, String> {
+    let Some(tensor) = crate::import_transforms::scale_tensor(descriptor) else {
+        return Ok(None);
+    };
+    let stored = inventory
+        .iter()
+        .find(|stored| stored.name == tensor)
+        .ok_or_else(|| {
+            format!(
+                "second-level scale {tensor:?} of {:?} is absent from its component",
+                descriptor.name
+            )
+        })?;
+    let matrices = match logical {
+        [stack, _, _] => *stack,
+        [_, _] => 1,
+        _ => {
+            return Err(format!(
+                "second-level scale {tensor:?} scales {:?}, which is not a matrix or a stack of \
+                 matrices",
+                descriptor.name
+            ))
+        }
+    };
+    let [extent] = stored.shape[..] else {
+        return Err(format!(
+            "second-level scale {tensor:?} of {:?} has shape {:?}, not [1] or [{matrices}]",
+            descriptor.name, stored.shape
+        ));
+    };
+    if stored.encoding != Encoding::F32 || !(extent == 1 || extent == matrices) {
+        return Err(format!(
+            "second-level scale {tensor:?} of {:?} is {:?} {:?}, not F32 [1] or [{matrices}]",
+            descriptor.name, stored.encoding, stored.shape
+        ));
+    }
+    if representation_bytes(Element::f32(), &stored.shape)? != stored.nbytes {
+        return Err(format!(
+            "second-level scale {tensor:?} stores {} bytes for its shape {:?}",
+            stored.nbytes, stored.shape
+        ));
+    }
+    Ok(Some(WeightScalePlan {
+        tensor: tensor.to_owned(),
+        stored: extent,
+        extent: matrices,
+        resident_bytes: representation_bytes(Element::f32(), &[matrices])?,
+    }))
 }
 
 /// The resident dense element of a role (`operators::resident_dtype`).
@@ -946,16 +1069,36 @@ fn plan_vision(
     Ok(out)
 }
 
+/// The planned element of a role an entry binds without an accumulator-scale
+/// port: a weight with a second-level scale is refused.
 pub(super) fn planned_element(
     plans: &[WeightPlan],
     scope: WeightScope,
     kind: WeightKind,
-) -> Result<Element, String> {
+) -> Result<Element, PlanError> {
+    let weight = planned_scalable(plans, scope, kind)?;
+    if weight.scale != 0 {
+        return Err(PlanError::UnportedScale(WeightRole { scope, kind }));
+    }
+    Ok(weight.element)
+}
+
+/// The planned form of a role an entry binds with an accumulator-scale port.
+pub(super) fn planned_scalable(
+    plans: &[WeightPlan],
+    scope: WeightScope,
+    kind: WeightKind,
+) -> Result<ScalableWeight, PlanError> {
     plans
         .iter()
         .find(|plan| plan.role == WeightRole { scope, kind })
-        .map(|plan| plan.resident)
-        .ok_or_else(|| format!("load plan is missing {scope:?}/{kind:?}"))
+        .map(|plan| ScalableWeight {
+            element: plan.resident,
+            scale: plan.scale_extent(),
+        })
+        .ok_or_else(|| {
+            PlanError::InvalidDefinition(format!("load plan is missing {scope:?}/{kind:?}"))
+        })
 }
 
 /// How the weights of one component become resident: the activation dtype

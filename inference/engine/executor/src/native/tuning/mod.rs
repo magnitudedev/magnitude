@@ -584,11 +584,50 @@ pub struct TuningContext<'a> {
 
 /// Inputs a case builds its argument sets from. Every tensor it returns is
 /// owned by the caller's case.
+/// Pseudo-random activation values in [-1, 1), per element type, generated
+/// once and shared by every tuning input: a tensor is a window of the pool
+/// its seed places.
+#[derive(Default)]
+pub(crate) struct Noise(std::cell::RefCell<HashMap<DType, Vec<u8>>>);
+
+impl Noise {
+    /// `count` encoded values of `dtype` at the window `seed` places.
+    fn window(&self, dtype: DType, count: usize, seed: u64) -> Result<Vec<u8>, String> {
+        let (size, encode): (usize, fn(f32, &mut Vec<u8>)) = match dtype {
+            DType::F32 => (4, |value, bytes| bytes.extend_from_slice(&value.to_le_bytes())),
+            DType::BF16 => (2, |value, bytes| {
+                bytes.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes())
+            }),
+            DType::F16 => (2, |value, bytes| bytes.extend_from_slice(&f16_bits(value).to_le_bytes())),
+            other => return Err(format!("tuning activations support f32, bf16 and f16, not {other:?}")),
+        };
+        let mut pools = self.0.borrow_mut();
+        let pool = pools.entry(dtype).or_default();
+        // Twice the largest request, so windows at different seeds differ.
+        let wanted = count.checked_mul(2 * size).ok_or("tuning activation overflows")?;
+        if pool.len() < wanted {
+            let mut state = (pool.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            pool.reserve(wanted - pool.len());
+            while pool.len() < wanted {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                encode(((state >> 40) as f32 / (1u64 << 23) as f32) - 1.0, pool);
+            }
+        }
+        let windows = (pool.len() / size - count + 1) as u64;
+        let start = (seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 16) % windows;
+        let start = start as usize * size;
+        Ok(pool[start..start + count * size].to_vec())
+    }
+}
+
 pub(crate) struct TuningInputs<'w, 'a> {
     pub device: &'a Device,
     pub definition: &'a ModelDefinition,
     pub limits: TuningLimits,
     pub weights: &'w mut TuningWeights<'a>,
+    noise: &'w Noise,
     /// Tensors shared by every point of the entry being tuned.
     shared: &'w mut HashMap<String, Tensor>,
 }
@@ -674,6 +713,19 @@ impl TuningInputs<'_, '_> {
         self.weights.shape(scope, kind)
     }
 
+    /// The planned extent of one weight role's accumulator-scale port (0
+    /// without a second-level scale).
+    pub fn scale_extent(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
+        self.weights.scale_extent(scope, kind)
+    }
+
+    /// A unit accumulator-scale port of `extent` (absent at 0): the scale's
+    /// value does not bear on a configuration's timing or agreement.
+    pub fn unit_scale(&self, extent: u64) -> Result<Tensor, String> {
+        let count = usize::try_from(extent).map_err(|_| "scale extent exceeds usize")?;
+        self.f32s(&[extent], &vec![1.0; count])
+    }
+
     /// A deterministic pseudo-random activation in [-1, 1).
     pub fn activation(
         &self,
@@ -682,28 +734,10 @@ impl TuningInputs<'_, '_> {
         seed: u64,
     ) -> Result<Tensor, String> {
         let count = element_count(extents)?;
-        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-        let values = (0..count).map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            ((state >> 40) as f32 / (1u64 << 23) as f32) - 1.0
-        });
-        let bytes = match element.dtype() {
-            Some(DType::F32) => values.flat_map(f32::to_le_bytes).collect::<Vec<_>>(),
-            Some(DType::BF16) => values
-                .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
-                .collect(),
-            Some(DType::F16) => values
-                .flat_map(|value| f16_bits(value).to_le_bytes())
-                .collect(),
-            _ => {
-                return Err(format!(
-                    "tuning activations support f32, bf16 and f16, not {}",
-                    element.name()
-                ))
-            }
-        };
+        let dtype = element
+            .dtype()
+            .ok_or_else(|| format!("tuning activations are not {}", element.name()))?;
+        let bytes = self.noise.window(dtype, count, seed)?;
         Tensor::from_host(self.device, element, extents, &bytes).map_err(|error| error.to_string())
     }
 
@@ -1033,6 +1067,7 @@ pub(crate) struct Tuner<'a> {
     context: TuningContext<'a>,
     limits: TuningLimits,
     weights: TuningWeights<'a>,
+    noise: Noise,
     allocation: Allocation,
     /// The safety stop of this preparation's tuning.
     deadline: Instant,
@@ -1104,6 +1139,7 @@ impl<'a> Tuner<'a> {
             context,
             limits,
             weights,
+            noise: Noise::default(),
             allocation,
             deadline: Instant::now() + SAFETY_STOP,
             tuned: Vec::new(),
@@ -1266,6 +1302,7 @@ impl<'a> Tuner<'a> {
             definition: self.context.definition,
             limits: self.limits,
             weights: &mut self.weights,
+            noise: &self.noise,
             shared: &mut shared,
         };
         let mut rotations = shapes
@@ -1410,6 +1447,7 @@ impl<'a> Tuner<'a> {
             definition: self.context.definition,
             limits: self.limits,
             weights: &mut self.weights,
+            noise: &self.noise,
             shared: &mut shared,
         };
         case.statics(&inputs)

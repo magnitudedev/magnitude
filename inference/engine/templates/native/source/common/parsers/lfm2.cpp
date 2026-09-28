@@ -88,6 +88,11 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
             )
         );
 
+        // The whole completion is constrained: under auto, a turn may end without a call.
+        if (inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+            tool_calls = p.optional(tool_calls);
+        }
+
         auto content = p.content(p.until(TOOL_CALL_START));
 
         return generation_prompt + reasoning + content + tool_calls + end;

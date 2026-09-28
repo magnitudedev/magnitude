@@ -29,7 +29,7 @@ applies_to:
 
 | Term | Meaning |
 | ---- | ------- |
-| **Measurement basis** | The engine's kernel measurements for one execution environment, holding every class the known targets' headers need |
+| **Measurement basis** | The engine's model-free kernel measurements for one execution environment: a fixed plan of operation classes and their cost models |
 | **Assessment environment** | The selected device, its basis and the engine configuration every model is assessed with |
 | **Model assessment** | Analytical evaluation of one exact resolved model at its serving profile |
 | **Assessing** | Ephemeral observable state while an admitted assessment scope is alive |
@@ -37,60 +37,62 @@ applies_to:
 
 ## Measurement basis
 
-The engine times each operation class on the actual device with shipped default configurations at
-fixed sizes. There is no search, tuning or per-model measurement. Forming and timing a class proves
-the device executes it: the basis is also the compatibility set.
+The engine times a fixed, model-free plan of operation classes on the actual device with shipped
+default configurations. There is no search, tuning or per-model measurement: the plan depends only
+on the backend, never on which targets exist, so measurement starts at service start and no target
+can require a class it lacks.
 
-The classes are derived from GGUF headers, never declared by hand. A target needs exactly the
-classes of its decode step under every native history codec, read from its family's definition and
-its execution plan, keyed by the resident representations its load plan binds; nothing else is
-measured. The basis to measure is the union over every known target: catalog targets from the
-release catalog's header bundle and discovered targets from their own files. A target that appears
-later and needs classes the stored basis lacks has only those measured.
+- **Keys.** A measured key names an operation class and its exact element bindings (the activation
+  and, for classes that read weights, the resident weight representation); it carries no model
+  geometry. Every representation the backend can keep resident is formed; conversions are keyed by
+  their source and destination.
+- **Timed and formed entries.** Each class is timed at synthetic sizes chosen to fit its cost model;
+  every other binding is only formed, which proves the device executes it. The formed set is the
+  compatibility set.
+- **Cost models.** A class's points fit one of: a per-launch cost; a line in bytes; a projection cost
+  (launch overhead plus seconds per weight byte as a function of output rows, interpolated in log
+  rows over a fixed row ladder at a fixed reduction, with a floor point); a history cost (a
+  reference-geometry rate and per-axis factors for key-value heads, group and width across depths);
+  or a per-byte weight-format factor relative to the reference representation. Only points are
+  stored; costs are refitted when the basis is read.
+- **Demand.** A model's decode demand maps each term onto a measured key and a shape (plain,
+  projection with its weight and launch rows, or attention with its head geometry), so estimation
+  is arithmetic over the fitted costs. Demand that maps onto no measured or formed key makes the
+  target `Incompatible` naming the key.
 
 A point's variants (arithmetic parameters such as `INT8`, `PARTS` and `SLICES`) are screened with
 one sample each and only the fastest is timed with the full protocol.
 
-- Host work in the measuring process or the service (kernel formation, model preparation) biases
-  device times, so every kernel is formed first and classes are timed only once the service's own
-  concurrent work has ended.
-- Work by other processes on the device is not observable. Their load is timed as it falls and
-  stored; the basis is an estimate either way.
-- A timed submission that faults on the device (for example an illegal memory access) records the
-  class unsupported, naming the fault, and ends the job; the classes measured before it are kept,
-  so the retried job measures only the rest and the models that need the faulted class are
-  `Incompatible` with that reason.
+- Every kernel is formed before any class is timed, so formation does not bias device times.
+- Work by other processes on the device is not observable: device times are taken as they fall and
+  stored. The basis is an estimate either way; no contention is inferred or corrected.
+- A timed submission that faults on the device records the class unsupported, naming the fault;
+  models that need it are `Incompatible` with that reason.
 
 ### Measurement job
 
 ```text
 service start -> device discovery -> automatic device selection
-    -> planning of every known target (headers, definition, execution plan, measurement classes)
-         ├── measurement job: form kernels ──(preparation ended)── time classes ──┐
-         └── preparation: capabilities, demand, certified memory charge ─────────┤
-                                                                        complete assessment
+    ├── measurement job: form every planned kernel, time the timed entries ──┐
+    └── per-target preparation from headers (capabilities, demand, memory) ─┤
+                                                               complete assessment
 ```
 
-- Planning reads headers, recognizes the family and plans execution with the selected execution
-  configuration; it yields the target's measurement classes. The measurement job starts as soon as
-  every known target is planned.
-- Preparation then inspects tokenizer and template capabilities and derives decode demand and the
-  certified memory charge, while the job forms its kernels. The basis is needed only for support
-  and performance evaluation and final assessment publication.
+- The job and target preparation run concurrently from service start; neither waits for the other.
+- Preparation reads only headers: family recognition, the execution plan, chat capabilities
+  (tokenizer configuration validated without building a tokenizer, template inspected once per
+  template), decode demand and the certified memory charge. It is milliseconds of work per target.
 - One contained child process of the service executable opens exactly the selected device, loads
-  the basis stored for that device's measurement identity, forms the kernels of the requested
-  classes it lacks, waits until the service closes its input (preparation has ended), times them,
-  stores the grown basis, and reports the identity. The service reads the basis from its assessment
-  cache. The service process never opens a device, forms kernels or times them.
-- Classes a stored basis already holds are never re-measured, so targets whose classes were present
-  are unaffected by a new target's classes.
+  a stored basis for that device's measurement identity when one is complete, otherwise measures
+  the plan, stores the basis and reports its identity. The service process never opens a device,
+  forms kernels or times them. The child's output streams are read to their end.
 - The assessment pool is `Preparing` until the basis is available. A failed job publishes a
   retryable pool failure and is retried with bounded backoff; it never blocks service health.
 - Measurement and model residency exclude each other on the device: measurement waits for no
   instance to be loading or resident, and loads wait for measurement to finish.
 - Measurement allocations are engine claims above the planning reserve.
-- Measurement runs at startup. A changed engine, driver or toolchain, or device yields a new
-  measurement identity and therefore a new measurement; a basis is never revalidated or migrated.
+- A changed engine, driver or toolchain, device or plan yields a new measurement identity and
+  therefore a new measurement; a basis is never revalidated or migrated.
 
 ## Assessment environment identity
 
@@ -115,18 +117,24 @@ Material is exact: the release catalog's header bundle before download, installe
 
 One assessment is header arithmetic on the service's bounded blocking pool:
 
-1. the engine opens only the target and projector GGUF headers and recognizes the family;
+1. the engine opens only the target, projector and separate draft GGUF headers and recognizes the
+   family;
 2. it derives the model definition, chat capabilities and template fingerprint from its own
    tokenizer, template and reasoning inspection;
-3. it resolves the serving configuration (method, codec, limits) exactly as a load does and plans
-   the allocation-free execution plan on the selected device; and
+3. it resolves the serving configuration (the bundle's declared method, codec, limits) exactly as
+   a load does and plans the allocation-free execution plan on the selected device; and
 4. after the basis is ready, it computes memory fit, compatibility against the basis and decode
    speed at every requested depth.
 
 It reads no tensor payload, opens no device, allocates nothing and decodes nothing. A target split
 across several GGUF files is assessed as one package: the engine is given its first shard and
-reads every shard's header. A separate draft package is not executed by the engine and does not
-take part.
+reads every shard's header. A speculative bundle's separate draft is interpreted against its
+target from its header exactly as a load binds it: its weights, history and draft workflows join
+the memory charge, and its decode speed is the target's plain decode (no acceptance is modeled, so
+drafts add no demand terms outside the fixed basis). A draft the draft family cannot interpret
+against its target is an unsupported representation; a declared method the draft does not
+implement, or a draft the executor cannot run, makes the bundle `Incompatible`. Such a bundle is
+never assessed or served as plain decoding.
 
 ### Results
 

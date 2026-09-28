@@ -146,7 +146,17 @@ pub(super) fn binding(
             down: lookup(dense, WeightKind::DenseDown)?,
             activation,
         },
-        routed: routed::binding(branches.routed, hidden, |kind| lookup(routed, kind), activation)?,
+        // The parallel graph binds no scale ports: `lookup` refuses scaled
+        // weights.
+        routed: routed::binding(
+            branches.routed,
+            hidden,
+            |kind| lookup(routed, kind),
+            |kind| {
+                lookup(routed, kind).map(|element| crate::ScalableWeight { element, scale: 0 })
+            },
+            activation,
+        )?,
         norm,
         scaled,
     })

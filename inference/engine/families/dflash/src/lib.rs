@@ -1,11 +1,15 @@
-//! DFlash and DSpark draft components (GGUF architecture `dflash`, plan §3.8).
+//! DFlash, DSpark and DFlash2 draft components (GGUF architecture `dflash`,
+//! plan §3.8).
 //!
 //! A draft is a separate package component read against its target's
 //! definition: its taps name target layers, it has no vocabulary of its own
 //! (the target's embedding and vocabulary projection serve it, unless it
 //! ships its own embedding table), and its width is the target's. DSpark is
 //! the same architecture with a Markov bias and a confidence head, detected
-//! by `markov_w1.weight`.
+//! by `markov_w1.weight`. DFlash2 wraps every draft sublayer in a grouped
+//! dynamic causal convolution and selects an ordered candidate path, detected
+//! by its `selector_*` roles; the shared architecture label names none of
+//! them.
 //!
 //! GGUF stores the draft's `attn_q`/`attn_k` rows in the half-split (NEOX)
 //! rotary layout, the engine's own, so rotary is a plain frequency table (YaRN
@@ -21,7 +25,7 @@ use magnitude_family_common::{
 };
 use magnitude_family_contracts::{
     checked_product, ActivationFunction, Attention, AttentionGate, Block, BlockLayout,
-    ConfidenceHead, DefinitionError, DenseFfn, DraftDefinition, DraftEmbedding, DraftMethod,
+    CandidateSelector, ConfidenceHead, DynamicConvolution, LayerConvolutions, DefinitionError, DenseFfn, DraftDefinition, DraftEmbedding, DraftMethod,
     FamilyError, FeedForwardUp, HeadNorm, HistoryDomain, HistoryReads, ImportTransform,
     InputNorm, KeyValue, MarkovHead, MediaRowAttention, ModelDefinition, Operator, OutputForm,
     RmsNorm, Rotary, Sublayer, TapPoint, ValueNorm, ValueSource, WeightDescriptor,
@@ -33,7 +37,7 @@ const PREFIX: &str = "dflash.";
 
 /// Every admitted `dflash.*` key; any other key names a feature this family
 /// does not admit.
-const ADMITTED_KEYS: [&str; 22] = [
+const ADMITTED_KEYS: [&str; 28] = [
     "block_count",
     "context_length",
     "embedding_length",
@@ -45,7 +49,9 @@ const ADMITTED_KEYS: [&str; 22] = [
     "attention.layer_norm_rms_epsilon",
     "attention.sliding_window",
     "attention.sliding_window_pattern",
+    "attention.causal",
     "rope.freq_base",
+    "rope.dimension_sections",
     "rope.scaling.type",
     "rope.scaling.factor",
     "rope.scaling.original_context_length",
@@ -56,10 +62,18 @@ const ADMITTED_KEYS: [&str; 22] = [
     "target_layers",
     "sample_from_anchor",
     "has_confidence_head",
+    "conv_kernel_size",
+    "conv_group_size",
+    "selector_rank",
+    "selector_top_k",
 ];
 
 /// Keys that hold one value per draft layer or a list.
-const ARRAY_KEYS: [&str; 2] = ["target_layers", "attention.sliding_window_pattern"];
+const ARRAY_KEYS: [&str; 3] = [
+    "target_layers",
+    "attention.sliding_window_pattern",
+    "rope.dimension_sections",
+];
 
 /// Container and provenance namespaces without numerical meaning for the
 /// draft (its tokenizer is the target's; only the mask token is read).
@@ -67,9 +81,9 @@ const CONTAINER_NAMESPACES: [&str; 4] = ["general.", "tokenizer.", "quantize.", 
 
 const MASK_TOKEN: &str = "tokenizer.ggml.mask_token_id";
 
-/// Draft-wide roles. A draft's own vocabulary projection, a reduced
-/// vocabulary (`d2t`) and the `dflash2` selector are not admitted.
-const GLOBAL_ROLES: [&str; 9] = [
+/// Draft-wide roles. A draft's own vocabulary projection and a reduced
+/// vocabulary (`d2t`) are not admitted.
+const GLOBAL_ROLES: [&str; 12] = [
     "fc.weight",
     "fc.scale",
     "enc.output_norm.weight",
@@ -79,9 +93,12 @@ const GLOBAL_ROLES: [&str; 9] = [
     "markov_w2.weight",
     "conf_proj.weight",
     "conf_proj.bias",
+    "selector_hidden.weight",
+    "selector_predecessor.weight",
+    "selector_successor.weight",
 ];
 
-const BLOCK_ROLES: [&str; 11] = [
+const BLOCK_ROLES: [&str; 13] = [
     "attn_norm",
     "attn_q",
     "attn_k",
@@ -93,7 +110,12 @@ const BLOCK_ROLES: [&str; 11] = [
     "ffn_gate",
     "ffn_up",
     "ffn_down",
+    "attn_conv_proj",
+    "ffn_conv_proj",
 ];
+
+/// DFlash2's per-layer convolution bases, stored without a `.weight` suffix.
+const BLOCK_PARAMETERS: [&str; 2] = ["attn_conv_base", "ffn_conv_base"];
 
 /// Failure to recognize or interpret a `dflash` draft.
 #[derive(Clone, Debug, PartialEq)]
@@ -197,11 +219,10 @@ fn known_role(name: &str) -> bool {
         .is_some_and(|(index, role)| {
             !index.is_empty()
                 && index.bytes().all(|byte| byte.is_ascii_digit())
-                && role
-                    .rsplit_once('.')
-                    .is_some_and(|(role, suffix)| {
+                && (BLOCK_PARAMETERS.contains(&role)
+                    || role.rsplit_once('.').is_some_and(|(role, suffix)| {
                         BLOCK_ROLES.contains(&role) && matches!(suffix, "weight" | "scale")
-                    })
+                    }))
         })
 }
 
@@ -270,6 +291,24 @@ fn bind_vector(
 /// into each pair's frequency and amplitude exactly.
 fn rotary_table(m: &Metadata, width: u64) -> Result<Rotary, Error> {
     let base = m.positive_number("rope.freq_base")?;
+    // Multi-axis sections whose every pair rotates by the first (text
+    // position) axis are the plain table: the draft's rows are sequence
+    // positions.
+    if m.value("rope.dimension_sections").is_some() {
+        let sections = m.counts("rope.dimension_sections")?;
+        let pairs = sections.first().copied().unwrap_or(0);
+        if sections.iter().skip(1).any(|pairs| *pairs != 0) || pairs.checked_mul(2) != Some(width)
+        {
+            return Err(Error::Geometry(format!(
+                "rotary sections {sections:?} other than one text axis over the head"
+            )));
+        }
+        if m.optional_string("rope.scaling.type")?.is_some() {
+            return Err(Error::Geometry(
+                "a draft's rotary is either sectioned or scaled".into(),
+            ));
+        }
+    }
     match m.optional_string("rope.scaling.type")? {
         None => Ok(rotary::table(width, width, base)?),
         Some("yarn") => {
@@ -314,6 +353,12 @@ pub fn inspect(
     let width = m.integer("attention.key_length")?;
     let epsilon = m.positive_number("attention.layer_norm_rms_epsilon")?;
     let block_size = m.integer("block_size")?;
+    // A draft block is non-causal; only that is admitted.
+    if m.optional_flag("attention.causal")? == Some(true) {
+        return Err(Error::Geometry(
+            "a causal draft block is not admitted".into(),
+        ));
+    }
     if hidden != decoder.hidden {
         return Err(Error::Target(format!(
             "draft width {hidden} differs from the target's {}",
@@ -430,7 +475,22 @@ pub fn inspect(
         .collect::<Result<Vec<_>, Error>>()?;
 
     let dspark = binder.contains("markov_w1.weight");
-    let method = if dspark {
+    let dflash2 = binder.contains("selector_hidden.weight");
+    if dspark && dflash2 {
+        return Err(Error::Geometry(
+            "a draft carries both DSpark and DFlash2 roles".into(),
+        ));
+    }
+    let method = if dflash2 {
+        if m.optional_flag("has_confidence_head")?.is_some()
+            || m.optional_flag("sample_from_anchor")? == Some(true)
+        {
+            return Err(Error::Geometry(
+                "DFlash2 drafts propose from their mask slots without a confidence head".into(),
+            ));
+        }
+        dflash2_method(&m, &mut binder, hidden, decoder.vocabulary, block_count)?
+    } else if dspark {
         let rank = directory
             .tensor("markov_w1.weight")
             .and_then(|tensor| tensor.shape.get(1).copied())
@@ -460,6 +520,15 @@ pub fn inspect(
         }
         DraftMethod::DFlash
     };
+    if !dflash2
+        && ["conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"]
+            .iter()
+            .any(|key| m.value(key).is_some())
+    {
+        return Err(Error::Geometry(
+            "convolution or selector metadata without the DFlash2 roles".into(),
+        ));
+    }
     // DSpark samples from the anchor unless the header says otherwise.
     let layout = if m.optional_flag("sample_from_anchor")?.unwrap_or(dspark) {
         BlockLayout::AnchorFirst
@@ -484,6 +553,61 @@ pub fn inspect(
         .validate(decoder, target.inputs.coordinate_axes)
         .map_err(Error::Definition)?;
     Ok(draft)
+}
+
+/// DFlash2's convolutions around every draft sublayer and its candidate
+/// selector.
+fn dflash2_method(
+    m: &Metadata<'_>,
+    binder: &mut Tensors<'_>,
+    hidden: u64,
+    vocabulary: u64,
+    block_count: u64,
+) -> Result<DraftMethod, Error> {
+    let kernel = m.integer("conv_kernel_size")?;
+    let group = m.integer("conv_group_size")?;
+    if kernel == 0 || group == 0 || !hidden.is_multiple_of(group) {
+        return Err(Error::Geometry(
+            "convolution groups must divide the hidden width".into(),
+        ));
+    }
+    let coefficients = product(&[2, kernel, hidden / group])?;
+    let convolutions = (0..block_count)
+        .map(|index| {
+            let mut convolution = |name: &str| -> Result<DynamicConvolution, Error> {
+                Ok(DynamicConvolution {
+                    base: binder.bind(&format!("blk.{index}.{name}_conv_base"), &[2, kernel, hidden])?,
+                    projection: binder.bind_scaled(
+                        &format!("blk.{index}.{name}_conv_proj.weight"),
+                        &[coefficients, hidden],
+                    )?,
+                })
+            };
+            Ok(LayerConvolutions {
+                attention: convolution("attn")?,
+                feed_forward: convolution("ffn")?,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let rank = m.integer("selector_rank")?;
+    let top_k = m.integer("selector_top_k")?;
+    if rank == 0 || top_k == 0 || top_k > vocabulary {
+        return Err(Error::Geometry("candidate selector geometry".into()));
+    }
+    let codebook = [vocabulary, rank];
+    let selector = CandidateSelector {
+        rank,
+        top_k,
+        hidden: binder.bind_scaled("selector_hidden.weight", &[rank, hidden])?,
+        predecessor: binder.bind_scaled("selector_predecessor.weight", &codebook)?,
+        successor: binder.bind_scaled("selector_successor.weight", &codebook)?,
+    };
+    Ok(DraftMethod::DFlash2 {
+        kernel,
+        group,
+        convolutions,
+        selector,
+    })
 }
 
 /// Each draft layer's history: a window of `attention.sliding_window` keys

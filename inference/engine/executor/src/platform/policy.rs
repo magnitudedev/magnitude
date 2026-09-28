@@ -14,11 +14,14 @@
 //!   subtracted again.
 //! - Headroom at or below the planning reserve is the Reclaim band. Only
 //!   other programs can cause it, since no engine claim crosses the line.
+//!
+//! Process limits are the visible ones. A container's own cgroup limit is
+//! visible; limits of cgroups above it may be hidden, and are then bounded
+//! only by host headroom, which already reflects the host's memory.
 
 use seismic::{
     DeviceCatalog, DeviceInfo, DeviceMeasurements, DeviceMemory, DeviceMemoryInfo, DeviceSelector,
-    DeviceTopology, HostMemoryStatus, LimitVisibility, MemoryPoolId, MemoryPoolKind,
-    ObservationError,
+    DeviceTopology, HostMemoryStatus, MemoryPoolId, MemoryPoolKind, ObservationError,
 };
 use std::fmt;
 
@@ -47,8 +50,6 @@ impl fmt::Display for MemoryConstraint {
 pub enum MemoryPolicyError {
     /// Seismic reports the device's backing as not normalized.
     UnsupportedBacking { device: String, reason: String },
-    /// Some applicable limits are hidden and cannot be presumed unlimited.
-    HiddenLimits,
     /// A required observation is unavailable; missing observations never
     /// authorize allocation.
     Observation(ObservationError),
@@ -62,9 +63,6 @@ impl fmt::Display for MemoryPolicyError {
             Self::UnsupportedBacking { device, reason } => {
                 write!(formatter, "device {device} has no qualified memory backing: {reason}")
             }
-            Self::HiddenLimits => formatter.write_str(
-                "cgroup ancestors of this process are hidden; their memory limits cannot be established",
-            ),
             Self::Observation(error) => write!(formatter, "{error}"),
             Self::MismatchedObservation { device } => write!(
                 formatter,
@@ -83,13 +81,6 @@ fn established(device: &DeviceInfo) -> Result<&DeviceMemoryInfo, MemoryPolicyErr
             device: device.selector.to_string(),
             reason: reason.clone(),
         }),
-    }
-}
-
-fn visible_limits(host: &HostMemoryStatus) -> Result<(), MemoryPolicyError> {
-    match host.limit_visibility {
-        LimitVisibility::Complete => Ok(()),
-        LimitVisibility::CgroupAncestorsHidden => Err(MemoryPolicyError::HiddenLimits),
     }
 }
 
@@ -188,7 +179,6 @@ pub fn fit_capacities(
 ) -> Result<Vec<(DomainRole, FitCapacity)>, MemoryPolicyError> {
     let memory = established(device)?;
     let host_pool = topology.host_pool();
-    visible_limits(host)?;
     let host_capacity = host
         .limits
         .iter()
@@ -325,7 +315,6 @@ fn domain_readings(
     measurements: &DeviceMeasurements,
     reserves: &MemoryReserves,
 ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-    visible_limits(host)?;
     let host_headroom = host
         .limits
         .iter()
@@ -457,7 +446,8 @@ pub fn refresh_device_ceiling(
 mod tests {
     use super::*;
     use seismic::{
-        HeadroomBasis, HeadroomEstimate, HostMeasurements, ProcessLimitKind, ProcessMemoryLimit,
+        HeadroomBasis, HeadroomEstimate, HostMeasurements, LimitVisibility, ProcessLimitKind,
+        ProcessMemoryLimit,
     };
     use std::time::SystemTime;
 
@@ -572,11 +562,12 @@ mod tests {
         let reading = readings(&limited, 16 * GIB, None, DeviceMeasurements::Host).unwrap();
         assert_eq!(reading[0].headroom_bytes, 4 * GIB);
         assert_eq!(reading[0].ceiling_bytes, 2 * GIB);
-        let mut hidden = host(12 * GIB, vec![]);
-        hidden.limit_visibility = LimitVisibility::CgroupAncestorsHidden;
+        // A container's own limit bounds it though its ancestors are hidden.
+        let mut contained = limited.clone();
+        contained.limit_visibility = LimitVisibility::CgroupAncestorsHidden;
         assert_eq!(
-            readings(&hidden, 16 * GIB, None, DeviceMeasurements::Host),
-            Err(MemoryPolicyError::HiddenLimits)
+            readings(&contained, 16 * GIB, None, DeviceMeasurements::Host).unwrap(),
+            reading
         );
     }
 

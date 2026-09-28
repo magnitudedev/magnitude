@@ -1,7 +1,7 @@
 use magnitude_generation::{
     BoundaryRule, Constraint, Demand, EndOfGeneration, FinishReason, Generation, InputLayout, InputSpan, Method,
     MethodCheckpoint, MethodCheckpointError, MethodChoice, MethodEffects, MethodRequirements,
-    MethodState, Mtp, Options, Propose, ReasoningBudget, RequestId, RoundStart, Sampling,
+    MethodState, Mtp, DFlash, Options, Propose, ReasoningBudget, RequestId, RoundStart, Sampling,
     SelectSpec, Shaping,
     TokenId, Verification, WaitReason, WorkKind,
 };
@@ -778,4 +778,118 @@ fn spent_reasoning_budget_selects_only_the_end_tag() {
         1 << 11,
         "after one reasoning token only the end tag is selectable"
     );
+}
+
+fn dflash_generation(prompt: &[u32], proposals: u8) -> Generation {
+    let mut configured = options();
+    configured.method = MethodChoice::DFlash { proposals };
+    Generation::new_with_method(
+        prompt.iter().copied().map(TokenId).collect(),
+        InputLayout::new(prompt.len(), vec![]).unwrap(),
+        configured,
+        None,
+        Arc::new(DFlash::new("fixture", usize::from(proposals)).unwrap()),
+    )
+    .unwrap()
+}
+
+/// A separate draft's generation after its prefill: the prefill's entry
+/// transaction reconciled and the first block draft started.
+fn dflash_drafting(proposals: u8) -> (Generation, Operation) {
+    let request = RequestId(1);
+    let mut generation = dflash_generation(&[1, 2], proposals);
+    start(&mut generation, 2);
+    let effects = resolve(&mut generation, &[10], Some(feature(1)));
+    reconcile_head(&mut generation, &effects[0], &[]);
+    generation.take(4).unwrap();
+    let RoundStart::Method(draft) = generation.start_round(request, 4).unwrap() else {
+        panic!("decode drafts first")
+    };
+    let [draft] = <[Operation; 1]>::try_from(draft).unwrap();
+    let Operation::Head { form, .. } = &draft else {
+        panic!("a draft is a head transaction")
+    };
+    assert_eq!(*form, magnitude_executor::DraftForm::Block);
+    (generation, draft)
+}
+
+/// Zero, partial and full acceptance of a separate draft's block: the
+/// verified prefix plus the target's bonus token is published, and the next
+/// block draft enters exactly the accepted rows with their target features
+/// before anchoring on the bonus token.
+#[test]
+fn dflash_verification_publishes_the_accepted_prefix_and_re_enters_it() {
+    let request = RequestId(1);
+    for (samples, accepted, entered) in [
+        // Zero: the target rejects 11 and samples 21.
+        (vec![21, 30, 31, 32], 0, vec![21]),
+        // Partial: 11 and 12 agree; 20 follows them.
+        (vec![11, 12, 20, 30], 2, vec![11, 12, 20]),
+        // Full: every proposal agrees; 40 is the bonus token.
+        (vec![11, 12, 13, 40], 3, vec![11, 12, 13, 40]),
+    ] {
+        let (mut generation, draft) = dflash_drafting(3);
+        reconcile_head(&mut generation, &draft, &[(11, 0), (12, 0), (13, 0)]);
+        let verify = start(&mut generation, 4);
+        assert_eq!(verify.kind, WorkKind::Verify);
+        assert_eq!(
+            verify.tokens,
+            [TokenId(10), TokenId(11), TokenId(12), TokenId(13)]
+        );
+        assert!(resolve(&mut generation, &samples, Some(feature(2))).is_empty());
+        let mut generated = vec![TokenId(10)];
+        generated.extend(entered.iter().copied().map(TokenId));
+        assert_eq!(generation.generated(), generated, "{accepted} accepted");
+        assert_eq!(generation.resident_position(), 2 + accepted + 1);
+        assert_eq!(generation.detailed_usage().draft_n, 3);
+        assert_eq!(generation.detailed_usage().draft_n_accepted, accepted);
+        generation.take(8).unwrap();
+        let RoundStart::Method(next) = generation.start_round(request, 4).unwrap() else {
+            panic!("decode drafts again")
+        };
+        let (tokens, rows, position, _) = head_parts(&next[0]);
+        assert_eq!(tokens, entered.iter().copied().map(TokenId).collect::<Vec<_>>());
+        assert_eq!(
+            rows,
+            (0..=accepted as u8).map(|row| (2, row)).collect::<Vec<_>>()
+        );
+        assert_eq!(position, 2);
+    }
+}
+
+/// A separate draft's checkpoint is its own kind, is refused while a draft
+/// transaction is unreconciled, restores at its target boundary, and never
+/// restores another method's state.
+#[test]
+fn dflash_checkpoints_wait_for_reconciled_drafts_and_keep_their_kind() {
+    let mut source = dflash_generation(&[1, 2], 2);
+    start(&mut source, 2);
+    let effects = resolve(&mut source, &[10], Some(feature(3)));
+    assert!(source.method_checkpoint().is_err());
+    reconcile_head(&mut source, &effects[0], &[]);
+    let checkpoint = source.method_checkpoint().unwrap();
+    let MethodCheckpoint::DFlash(state) = &checkpoint else {
+        panic!("DFlash checkpoint")
+    };
+    assert_eq!((state.position(), state.target_rows()), (1, 2));
+    let fork = source.fork_at(source.resident_position()).unwrap();
+    assert_eq!(fork.method_checkpoint().unwrap(), checkpoint);
+    let mut fresh = dflash_generation(&[1, 2, 7], 2);
+    assert!(fresh.restore_prefix(1, &checkpoint).is_err());
+    fresh.restore_prefix(2, &checkpoint).unwrap();
+    assert_eq!(fresh.resident_position(), 2);
+    // An MTP generation never adopts a separate draft's state.
+    let mut mtp = mtp_generation(&[1, 2, 7], 2);
+    assert!(mtp.restore_prefix(2, &checkpoint).is_err());
+}
+
+/// Cancelling while a block draft is in flight finishes the generation
+/// without publishing its proposals.
+#[test]
+fn dflash_cancellation_discards_the_in_flight_draft() {
+    let (mut generation, _draft) = dflash_drafting(3);
+    generation.cancel();
+    assert_eq!(generation.finish_reason(), Some(FinishReason::Cancelled));
+    assert_eq!(generation.generated(), [TokenId(10)]);
+    assert_eq!(generation.detailed_usage().draft_n, 0);
 }

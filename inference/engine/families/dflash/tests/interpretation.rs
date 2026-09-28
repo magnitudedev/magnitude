@@ -3,7 +3,7 @@ use magnitude_artifacts::{
     ArtifactIdentity, PackageIdentity, TokenId,
 };
 use magnitude_family_contracts::{
-    AttentionGate, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod, HeadNorm, HistoryDomain, ImportTransform, KeyValue, ModelDefinition, ModelFamily, Operator,
+    AttentionGate, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod, DraftVariant, HeadNorm, HistoryDomain, ImportTransform, KeyValue, ModelDefinition, ModelFamily, Operator,
     Rotary, SublayerIndex, TapPoint,
 };
 use magnitude_family_common::headers;
@@ -405,4 +405,113 @@ fn signed_tap_indices_bind_as_unsigned_ones_do() {
         inspect_qwen(&directory, &model),
         Err(Error::Metadata { .. })
     ));
+}
+
+/// The released Qwen3.8 27B drafts (not catalog entries; headers of the exact
+/// qualification artifacts) against the Qwen3.8 27B target.
+const QWEN38_TARGET: &str = "qwen3.8-27b__target-gguf_q4.json";
+const QWEN38_DSPARK: &str = "qwen3.8-27b__draft-dspark.json";
+const QWEN38_DFLASH2: &str = "qwen3.8-27b__draft-dflash2.json";
+
+fn qwen38(draft: &str) -> Result<DraftDefinition, Error> {
+    let model = Qwen35Family
+        .inspect(&headers::directory(QWEN38_TARGET), None, identity())
+        .unwrap();
+    inspect(&headers::directory(draft), &model, &|layer| {
+        Qwen35Family.layer_entry(&model, layer)
+    })
+}
+
+#[test]
+fn qwen38_dspark_drafts_seven_from_the_anchor_with_yarn() {
+    let draft = qwen38(QWEN38_DSPARK).unwrap();
+    assert_eq!(draft.method.variant(), DraftVariant::DSpark);
+    assert_eq!(draft.layout, BlockLayout::AnchorFirst);
+    assert_eq!((draft.block_size, draft.max_proposals()), (7, 7));
+    assert_eq!(draft.mask_token, TokenId(248077));
+    assert_eq!(draft.taps, block_taps(&[5, 17, 29, 41, 53]));
+    let Operator::Attention(attention) = &draft.blocks[0].sublayers[0].op else {
+        unreachable!()
+    };
+    assert_eq!((attention.heads, attention.kv_heads, attention.width), (40, 8, 128));
+    // YaRN folds into the pairs: the scaled low frequencies differ from the
+    // plain table's.
+    let Rotary::Table { pairs, .. } = &attention.rotary else {
+        panic!("rotary table");
+    };
+    assert_eq!(pairs.len(), 64);
+    assert_ne!(pairs[63].frequency, 1e7f64.powf(-126.0 / 128.0));
+}
+
+#[test]
+fn qwen38_dflash2_convolves_every_sublayer_and_selects_a_path() {
+    let draft = qwen38(QWEN38_DFLASH2).unwrap();
+    assert_eq!(draft.method.variant(), DraftVariant::DFlash2);
+    assert_eq!(draft.layout, BlockLayout::MaskSlots);
+    assert_eq!((draft.block_size, draft.max_proposals()), (8, 7));
+    assert_eq!(draft.mask_token, TokenId(248070));
+    assert_eq!(draft.taps, block_taps(&[6, 20, 34, 48, 62]));
+    assert_eq!(domains(&draft), vec![HistoryDomain::Window { tokens: 2049 }; 5]);
+    let DraftMethod::DFlash2 {
+        kernel,
+        group,
+        convolutions,
+        selector,
+    } = &draft.method
+    else {
+        unreachable!()
+    };
+    assert_eq!((*kernel, *group), (2, 16));
+    assert_eq!(convolutions.len(), 5);
+    for layer in convolutions {
+        for convolution in [&layer.attention, &layer.feed_forward] {
+            assert_eq!(convolution.base.shape, [2, 2, 5120]);
+            assert_eq!(convolution.projection.shape, [1280, 5120]);
+        }
+    }
+    assert_eq!((selector.rank, selector.top_k), (256, 16));
+    assert_eq!(selector.hidden.shape, [256, 5120]);
+    assert_eq!(selector.predecessor.shape, [248320, 256]);
+    assert_eq!(selector.successor.shape, [248320, 256]);
+    // One text axis over the whole head is the plain table.
+    let Operator::Attention(attention) = &draft.blocks[0].sublayers[0].op else {
+        unreachable!()
+    };
+    let Rotary::Table { pairs, divisors: None } = &attention.rotary else {
+        panic!("plain rotary table");
+    };
+    assert_eq!(pairs.len(), 64);
+    assert_eq!(pairs[1].frequency, 1e7f64.powf(-2.0 / 128.0));
+}
+
+#[test]
+fn dflash2_roles_are_all_or_nothing() {
+    let model = Qwen35Family
+        .inspect(&headers::directory(QWEN38_TARGET), None, identity())
+        .unwrap();
+    let bind = |directory: &Directory| {
+        inspect(directory, &model, &|layer| Qwen35Family.layer_entry(&model, layer))
+    };
+    let mut missing = headers::directory(QWEN38_DFLASH2);
+    headers::remove_tensor(&mut missing, "blk.4.ffn_conv_proj.weight");
+    assert_eq!(
+        bind(&missing).unwrap_err(),
+        Error::MissingWeight("blk.4.ffn_conv_proj.weight".into())
+    );
+    // Selector metadata without the selector roles is not a DFlash draft.
+    let mut stray = headers::directory(QWEN38_DSPARK);
+    headers::set(
+        &mut stray,
+        "dflash.selector_rank",
+        Value::Scalar(Scalar::Unsigned(256)),
+    );
+    assert!(matches!(bind(&stray), Err(Error::Geometry(_))));
+    // Sections that rotate a pair by an image axis are refused.
+    let mut sectioned = headers::directory(QWEN38_DFLASH2);
+    headers::set(
+        &mut sectioned,
+        "dflash.rope.dimension_sections",
+        Value::Array(vec![Scalar::Unsigned(32), Scalar::Unsigned(32), Scalar::Unsigned(0), Scalar::Unsigned(0)]),
+    );
+    assert!(matches!(bind(&sectioned), Err(Error::Geometry(_))));
 }

@@ -11,8 +11,9 @@ use crate::{
 use crate::SublayerTail;
 use magnitude_family_contracts::SublayerIndex;
 use magnitude_kernels::{
-    draft_confidence, feature_rows, import_dense, post_norm_residual, project_rows, repack_weight,
-    tap_rows,
+    draft_confidence, draft_convolve_input, draft_convolve_residual, draft_gated_rows,
+    draft_path_step, draft_top_k, feature_rows, import_dense, post_norm_residual, project_rows,
+    repack_weight, tap_rows,
 };
 use magnitude_state::KvCodec;
 use std::{collections::HashSet, rc::Rc};
@@ -201,6 +202,7 @@ pub(crate) struct AttestedDraft {
     pub embedding: NativeKernel<embedding_rows::Entry>,
     pub head: NativeKernel<readout_head_rows::Entry>,
     pub markov: Option<MarkovKernels>,
+    pub dflash2: Option<super::AttestedDflash2>,
 }
 
 /// Every kernel of the projector's vision program.
@@ -657,6 +659,17 @@ impl AttestedPrograms {
                     + bytes!(readout_features_rows)
                     + bytes!(draft_confidence);
             }
+            if let Some(binding) = draft.dflash2() {
+                let (projections, norms) = super::draft::dflash2_entries(draft, binding);
+                bytes += projections.len() as u128 * bytes!(project_rows)
+                    + norms.len() as u128 * bytes!(readout_features_rows)
+                    + bytes!(draft_convolve_input)
+                    + bytes!(draft_convolve_residual)
+                    + bytes!(draft_gated_rows)
+                    + bytes!(draft_top_k)
+                    + 2 * bytes!(embedding_rows)
+                    + bytes!(draft_path_step);
+            }
         }
         if let Some(vision) = plan.vision() {
             for kernel in vision.kernels() {
@@ -1070,6 +1083,17 @@ impl AttestedPrograms {
                                 .ok_or_else(|| missing("draft_markov_stages", binding))
                         })
                         .transpose()?,
+                    dflash2: draft_plan
+                        .dflash2()
+                        .map(|binding| {
+                            handles
+                                .dflash2
+                                .as_ref()
+                                .ok_or_else(|| missing("dflash2_stages", binding.selector))?
+                                .attest(draft_plan, binding)
+                                .map_err(|entry| missing("dflash2_stages", entry))
+                        })
+                        .transpose()?,
                 })
             })
             .transpose()?;
@@ -1342,6 +1366,17 @@ impl AttestedPrograms {
                     + u128::from(markov.projection.invocation_workspace_bytes())
                     + u128::from(markov.features.invocation_workspace_bytes())
                     + u128::from(markov.confidence.invocation_workspace_bytes());
+            }
+            if let Some(dflash2) = &draft.dflash2 {
+                charge!(dflash2.norms.values());
+                charge!(dflash2.projections.values());
+                bytes += u128::from(dflash2.convolve_input.invocation_workspace_bytes())
+                    + u128::from(dflash2.convolve_residual.invocation_workspace_bytes())
+                    + u128::from(dflash2.gated.invocation_workspace_bytes())
+                    + u128::from(dflash2.top_k.invocation_workspace_bytes())
+                    + u128::from(dflash2.predecessor.invocation_workspace_bytes())
+                    + u128::from(dflash2.successor.invocation_workspace_bytes())
+                    + u128::from(dflash2.path.invocation_workspace_bytes());
             }
         }
         if let Some(vision) = &prepared.vision {
@@ -1808,6 +1843,30 @@ impl AttestedPrograms {
                 charge!(&markov.projection);
                 charge!(&markov.features);
                 charge!(&markov.confidence);
+            }
+            if let Some(dflash2) = &draft.dflash2 {
+                for layer in &dflash2.layers {
+                    charge!(&layer.attention_norm);
+                    charge!(&layer.attention_coefficients);
+                    charge!(&layer.query);
+                    charge!(&layer.key);
+                    charge!(&layer.value);
+                    charge!(&layer.output);
+                    charge!(&layer.feed_forward_norm);
+                    charge!(&layer.feed_forward_coefficients);
+                    charge!(&layer.gate);
+                    charge!(&layer.up);
+                    charge!(&layer.down);
+                }
+                charge!(&dflash2.features);
+                charge!(&dflash2.hidden);
+                charge!(&dflash2.convolve_input);
+                charge!(&dflash2.convolve_residual);
+                charge!(&dflash2.gated);
+                charge!(&dflash2.top_k);
+                charge!(&dflash2.predecessor);
+                charge!(&dflash2.successor);
+                charge!(&dflash2.path);
             }
         }
         if let Some(vision) = &self.vision {

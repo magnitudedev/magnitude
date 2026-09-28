@@ -5,7 +5,7 @@
 pub(crate) mod graph;
 
 use super::{tail, PlanError, WeightPush};
-use crate::DenseBinding;
+use crate::{DenseBinding, DenseScales, ScalableWeight};
 use magnitude_family_contracts::{
     ActivationFunction, DenseFfn, FeedForwardUp, OutputForm, WeightKind,
 };
@@ -48,20 +48,32 @@ pub(super) fn shape_key(dense: &DenseFfn) -> String {
 }
 
 /// The program binding of a dense sublayer with `output`; `lookup` resolves
-/// the planned element of a role in its scope.
+/// the planned element of a role in its scope, `scalable` that of a
+/// projection its entries bind with an accumulator-scale port.
 pub(super) fn binding(
     dense: &DenseFfn,
     output: &OutputForm,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightKind) -> Result<ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<DenseBinding, PlanError> {
+    let (gate, up, down) = (
+        scalable(WeightKind::DenseGate)?,
+        scalable(WeightKind::DenseUp)?,
+        scalable(WeightKind::DenseDown)?,
+    );
     Ok(DenseBinding {
         features: dense.intermediate,
         norm: lookup(WeightKind::InputNorm)?,
-        gate: lookup(WeightKind::DenseGate)?,
-        up: lookup(WeightKind::DenseUp)?,
-        down: lookup(WeightKind::DenseDown)?,
+        gate: gate.element,
+        up: up.element,
+        down: down.element,
         activation,
         tail: tail(output, &lookup)?,
+        scales: DenseScales {
+            gate: gate.scale,
+            up: up.scale,
+            down: down.scale,
+        },
     })
 }

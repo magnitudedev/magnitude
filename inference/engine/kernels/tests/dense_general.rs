@@ -536,31 +536,46 @@ fn native_project_rows_matches_host_reference() {
         let rounding = if shape.published == DType::F32 { 0.0 } else { 1.0 / 256.0 };
         for rows in ROW_CLASSES {
             let x = bf16s(pattern(rows * k, 7 + rows as u32, 1.5));
-            let (expected, magnitudes) = project(&x, &w, k, n);
-            for device in &devices {
-                let (source, weight) = (tensor(device, DType::BF16, &[rows, k], &x), tensor(device, DType::BF16, &[n, k], &w));
-                for mapping in mappings(device, launches) {
-                    let label = format!("{:?} {} rows {rows} {:?}", device.backend(), shape.name, mapping.params);
-                    let result = project_rows::native_for_device_with(
-                        device,
-                        project_rows::Elements {
-                            A: seismic::Element::bf16(),
-                            W: seismic::Element::bf16(),
-                            Y: if shape.published == DType::F32 { seismic::Element::f32() } else { seismic::Element::bf16() },
-                        },
-                        &specialization(device, &[("K", k), ("N", n)], &mapping).with_static("WS", 0),
-                    )
-                    .unwrap()
-                    .call(project_rows::Args { source: &source, weight: &weight,
-                        weight_scale: &tensor(device, DType::F32, &[0], &[]) })
-                    .unwrap()
-                    .value;
-                    let actual = read(&result, shape.published);
-                    if quantized(device, &mapping, rows) {
-                        let expected = expected.iter().map(|v| *v as f32).collect::<Vec<_>>();
-                        assert_norm(&label, &actual, &expected);
-                    } else {
-                        assert_terms(&label, &actual, &expected, &magnitudes, 1e-3, rounding);
+            let (unscaled, unscaled_magnitudes) = project(&x, &w, k, n);
+            // No scale port (WS = 0), and a weight's second-level scale on
+            // the accumulator (WS = 1): the reference scales the exact
+            // projection.
+            for scale in [None, Some(UP_SCALE)] {
+                let factor = f64::from(scale.unwrap_or(1.0));
+                let expected = unscaled.iter().map(|value| value * factor).collect::<Vec<_>>();
+                let magnitudes =
+                    unscaled_magnitudes.iter().map(|value| value * factor).collect::<Vec<_>>();
+                let extent = usize::from(scale.is_some());
+                for device in &devices {
+                    let (source, weight) = (tensor(device, DType::BF16, &[rows, k], &x), tensor(device, DType::BF16, &[n, k], &w));
+                    let weight_scale = tensor(device, DType::F32, &[extent], &scale.into_iter().collect::<Vec<_>>());
+                    for mapping in mappings(device, launches) {
+                        let label = format!(
+                            "{:?} {} rows {rows} scale {scale:?} {:?}",
+                            device.backend(),
+                            shape.name,
+                            mapping.params
+                        );
+                        let result = project_rows::native_for_device_with(
+                            device,
+                            project_rows::Elements {
+                                A: seismic::Element::bf16(),
+                                W: seismic::Element::bf16(),
+                                Y: if shape.published == DType::F32 { seismic::Element::f32() } else { seismic::Element::bf16() },
+                            },
+                            &specialization(device, &[("K", k), ("N", n)], &mapping).with_static("WS", extent as u64),
+                        )
+                        .unwrap()
+                        .call(project_rows::Args { source: &source, weight: &weight, weight_scale: &weight_scale })
+                        .unwrap()
+                        .value;
+                        let actual = read(&result, shape.published);
+                        if quantized(device, &mapping, rows) {
+                            let expected = expected.iter().map(|v| *v as f32).collect::<Vec<_>>();
+                            assert_norm(&label, &actual, &expected);
+                        } else {
+                            assert_terms(&label, &actual, &expected, &magnitudes, 1e-3, rounding);
+                        }
                     }
                 }
             }

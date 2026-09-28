@@ -4,7 +4,10 @@
 //! host over the stored bytes before the ordinary dense or repack import, so
 //! the device importers only ever see a plain tensor of the logical shape.
 //! Row operations move whole encoded rows and are exact for every encoding;
-//! a scale multiplies F32 values once in F32.
+//! a scale multiplies F32 values once in F32. A second-level scale
+//! (`ScaleByTensor`) leaves the stored bytes as they are: it becomes resident
+//! beside the weight (`WeightPlan::scale`) and entries apply it to their F32
+//! accumulator.
 
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_family_contracts::{ImportTransform, WeightDescriptor};
@@ -37,10 +40,22 @@ pub(crate) fn admit(
                     descriptor.name
                 ))
             }
-            ImportTransform::ScaleByTensor { tensor } => {
+            ImportTransform::ScaleByTensor { tensor }
+                if descriptor
+                    .transforms
+                    .iter()
+                    .filter(|other| {
+                        matches!(
+                            other,
+                            ImportTransform::Flatten | ImportTransform::ScaleByTensor { .. }
+                        )
+                    })
+                    .count()
+                    > 1 =>
+            {
                 return Err(format!(
-                    "{:?}: second-level scale tensor {tensor:?} needs a resident representation \
-                     that keeps it",
+                    "{:?}: second-level scale tensor {tensor:?} must be the weight's only scale \
+                     of its matrices",
                     descriptor.name
                 ))
             }
@@ -109,14 +124,20 @@ pub(crate) fn apply(
                     word.copy_from_slice(&(value * factor).to_le_bytes());
                 }
             }
-            ImportTransform::ScaleByTensor { tensor } => {
-                return Err(format!(
-                    "second-level scale tensor {tensor:?} is not applied at import"
-                ))
-            }
+            // Resident beside the weight, not applied to its bytes.
+            ImportTransform::ScaleByTensor { .. } => {}
         }
     }
     Ok(bytes)
+}
+
+/// The stored tensor holding `descriptor`'s second-level scale, when it has
+/// one (at most one, [`admit`]).
+pub(crate) fn scale_tensor(descriptor: &WeightDescriptor) -> Option<&str> {
+    descriptor.transforms.iter().find_map(|transform| match transform {
+        ImportTransform::ScaleByTensor { tensor } => Some(tensor.as_str()),
+        _ => None,
+    })
 }
 
 /// How a tensor's bytes divide into the rows its transforms address.
@@ -241,16 +262,31 @@ mod tests {
     }
 
     #[test]
-    fn flattening_keeps_bytes_and_second_level_scales_are_refused() {
+    fn flattening_keeps_bytes_and_second_level_scales_stay_apart_from_them() {
         let flat = descriptor(&[8], vec![ImportTransform::Flatten]);
         assert_eq!(admit(&flat, &[2, 4], Encoding::F32).unwrap(), [8]);
-        let scaled = descriptor(
+        let scale = || ImportTransform::ScaleByTensor {
+            tensor: "w.scale".into(),
+        };
+        let scaled = descriptor(&[2, 32], vec![scale()]);
+        assert_eq!(admit(&scaled, &[2, 32], Encoding::Q8_0).unwrap(), [2, 32]);
+        assert_eq!(scale_tensor(&scaled), Some("w.scale"));
+        let bytes = vec![7u8; 68];
+        let q8 = Element::named("gguf_q8_0").unwrap();
+        assert_eq!(apply(&scaled, &[2, 32], q8, bytes.clone()).unwrap(), bytes);
+        // A flattened matrix has no matrices to scale; one scale per weight.
+        let flattened = descriptor(&[64], vec![scale(), ImportTransform::Flatten]);
+        assert!(admit(&flattened, &[2, 32], Encoding::F32).is_err());
+        let twice = descriptor(
             &[2, 32],
-            vec![ImportTransform::ScaleByTensor {
-                tensor: "w.scale".into(),
-            }],
+            vec![
+                scale(),
+                ImportTransform::ScaleByTensor {
+                    tensor: "w.other".into(),
+                },
+            ],
         );
-        assert!(admit(&scaled, &[2, 32], Encoding::Q8_0).is_err());
+        assert!(admit(&twice, &[2, 32], Encoding::Q8_0).is_err());
     }
 
     /// A Q8_0 block (an f16 scale, then 32 int8 codes) dequantizes to the

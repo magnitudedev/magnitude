@@ -114,3 +114,217 @@ native draft_confidence for cpu from "cpu/draft_confidence.rs":
         threadgroups (S, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes ((D + R) * 4)
+
+
+# DFlash2's grouped dynamic causal convolution over the rows of each draft
+# block (`block` rows; a row's block position is `row % block`). The hidden
+# width is G coefficient groups of C channels; a row's coefficient
+# projection is viewed [2, K, G]. Half 0 convolves a sublayer's normed input
+# rows:
+#   out[r, g·C + c] = sum over o < K, o <= r % block of
+#                     (base[0, o, g·C + c] + dynamic[r, 0, o, g]) · input[r − o, g·C + c]
+fn draft_convolve_input[M, G, C, K](input: &tensor[M, G * C] A,
+    dynamic: &tensor[M, 2, K, G] f32, base: &tensor[2, K, G * C] f32,
+    block: u32) -> tensor[M, G * C] A:
+    let mut result = tensor[M, G * C] A
+    parallel for row in 0..M:
+        parallel for group in 0..G:
+            for lane in 0..C:
+                let column = group * C + lane
+                let position = row % block
+                let mut sum = f32(0.0)
+                for offset in 0..K:
+                    if offset <= position and offset <= row:
+                        let coefficient = base[0, offset, column] + dynamic[row, 0, offset, group]
+                        sum = fma(coefficient, f32(input[row - offset, column]), sum)
+                result[row, column] = sum
+    return result
+
+# Half 1 convolves the sublayer's F32 output rows with the same rows'
+# second-half coefficients and adds the residual:
+#   out[r, g·C + c] = residual[r, g·C + c] + sum over o < K, o <= r % block of
+#                     (base[1, o, g·C + c] + dynamic[r, 1, o, g]) · output[r − o, g·C + c]
+fn draft_convolve_residual[M, G, C, K](residual: &tensor[M, G * C] f32,
+    output: &tensor[M, G * C] f32, dynamic: &tensor[M, 2, K, G] f32,
+    base: &tensor[2, K, G * C] f32, block: u32) -> tensor[M, G * C] f32:
+    let mut result = tensor[M, G * C] f32
+    parallel for row in 0..M:
+        parallel for group in 0..G:
+            for lane in 0..C:
+                let column = group * C + lane
+                let position = row % block
+                let mut sum = f32(0.0)
+                for offset in 0..K:
+                    if offset <= position and offset <= row:
+                        let coefficient = base[1, offset, column] + dynamic[row, 1, offset, group]
+                        sum = fma(coefficient, output[row - offset, column], sum)
+                result[row, column] = residual[row, column] + sum
+    return result
+
+# A draft feed-forward's gated product silu(gate) · up of its projected rows,
+# rounded once to A.
+fn draft_gated_rows[M, F](gate: &tensor[M, F] A, up: &tensor[M, F] A) -> tensor[M, F] A:
+    let mut result = tensor[M, F] A
+    parallel for row in 0..M:
+        parallel for column in 0..F:
+            let a = f32(gate[row, column])
+            result[row, column] = a / (1.0 + exp(-a)) * f32(up[row, column])
+    return result
+
+# DFlash2's candidates: each row's K highest logits in descending order (a tie
+# keeps the lower token first), as (token, 0) rows `[M · K, 2]` an embedding
+# gather reads directly, and their logits.
+fn draft_top_k[M, V, K](logits: &tensor[M, V] f32, candidates: &mut tensor[M * K, 2] i32,
+    unary: &mut tensor[M, K] f32):
+    for row in 0..M:
+        let mut remaining = tensor[V] f32
+        for token in 0..V:
+            remaining[token] = logits[row, token]
+        for rank in 0..K:
+            let best = reduce(remaining, 0, max)
+            let mut chosen = i32(0)
+            let mut found = i32(0)
+            for token in 0..V:
+                if found == 0 and remaining[token] == best:
+                    chosen = i32(token)
+                    found = 1
+            candidates[row * K + rank, 0] = chosen
+            candidates[row * K + rank, 1] = 0
+            unary[row, rank] = best
+            remaining[chosen] = -inf
+
+# One ordered step of DFlash2's candidate path over S rows: each row selects
+# the candidate k maximizing
+#   unary[s, k] + sum_r predecessor[s, r] · hidden[s, r] · successor[s·K + k, r]
+# (the first on ties), where `predecessor` embeds the token the row follows
+# and `hidden` is the row's selector projection. The selection (token, 0)
+# becomes the next step's predecessor.
+fn draft_path_step[S, K, R](candidates: &tensor[S * K, 2] i32, unary: &tensor[S, K] f32,
+    hidden: &tensor[S, R] A, predecessor: &tensor[S, R] A, successor: &tensor[S * K, R] A,
+    selection: &mut tensor[S, 2] i32):
+    parallel for row in 0..S:
+        let mut best = -inf
+        let mut chosen = candidates[row * K, 0]
+        for candidate in 0..K:
+            let mut score = f32(0.0)
+            for rank in 0..R:
+                let joint = f32(predecessor[row, rank]) * f32(hidden[row, rank])
+                score = fma(joint, f32(successor[row * K + candidate, rank]), score)
+            score = score + unary[row, candidate]
+            if score > best:
+                best = score
+                chosen = candidates[row * K + candidate, 0]
+        selection[row, 0] = chosen
+        selection[row, 1] = 0
+
+# Metal, CUDA: one thread per output element. Vulkan: a grid-stride loop over
+# every element, the x grid capped at the 65535-group floor. CPU: one work
+# item per row.
+native draft_convolve_input for metal from "metal/draft_convolve_input.metal":
+    launch draft_convolve_input:
+        threadgroups (ceil_div(M * G * C, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_convolve_input for cuda from "cuda/draft_convolve_input.cu":
+    launch draft_convolve_input:
+        threadgroups (ceil_div(M * G * C, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_convolve_input for vulkan from "vulkan/draft_convolve_input.comp":
+    launch draft_convolve_input:
+        threadgroups (min(ceil_div(M * G * C, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_convolve_input for cpu from "cpu/draft_convolve_input.rs":
+    launch draft_convolve_input:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (G * C * 8)
+
+native draft_convolve_residual for metal from "metal/draft_convolve_residual.metal":
+    launch draft_convolve_residual:
+        threadgroups (ceil_div(M * G * C, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_convolve_residual for cuda from "cuda/draft_convolve_residual.cu":
+    launch draft_convolve_residual:
+        threadgroups (ceil_div(M * G * C, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_convolve_residual for vulkan from "vulkan/draft_convolve_residual.comp":
+    launch draft_convolve_residual:
+        threadgroups (min(ceil_div(M * G * C, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_convolve_residual for cpu from "cpu/draft_convolve_residual.rs":
+    launch draft_convolve_residual:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+native draft_gated_rows for metal from "metal/draft_gated_rows.metal":
+    launch draft_gated_rows:
+        threadgroups (ceil_div(M * F, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_gated_rows for cuda from "cuda/draft_gated_rows.cu":
+    launch draft_gated_rows:
+        threadgroups (ceil_div(M * F, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_gated_rows for vulkan from "vulkan/draft_gated_rows.comp":
+    launch draft_gated_rows:
+        threadgroups (min(ceil_div(M * F, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_gated_rows for cpu from "cpu/draft_gated_rows.rs":
+    launch draft_gated_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (F * 8)
+
+# Metal, CUDA, Vulkan: one threadgroup of 256 threads per row, K rounds of a
+# (value, token) arg-max reduction. CPU: one work item per row.
+native draft_top_k for metal from "metal/draft_top_k.metal":
+    launch draft_top_k:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_top_k for cuda from "cuda/draft_top_k.cu":
+    launch draft_top_k:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_top_k for vulkan from "vulkan/draft_top_k.comp":
+    launch draft_top_k:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+
+native draft_top_k for cpu from "cpu/draft_top_k.rs":
+    launch draft_top_k:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Metal, CUDA, Vulkan: one threadgroup of 256 threads per row reduces each
+# candidate's rank-R score. CPU: one work item per row.
+native draft_path_step for metal from "metal/draft_path_step.metal":
+    launch draft_path_step:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_path_step for cuda from "cuda/draft_path_step.cu":
+    launch draft_path_step:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native draft_path_step for vulkan from "vulkan/draft_path_step.comp":
+    launch draft_path_step:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+
+native draft_path_step for cpu from "cpu/draft_path_step.rs":
+    launch draft_path_step:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (R * 12)

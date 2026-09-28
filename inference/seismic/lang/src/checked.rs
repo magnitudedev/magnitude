@@ -1201,7 +1201,11 @@ impl NativeSpecialization {
         self.params.get(name).copied()
     }
     pub fn launch_param(&self, launch: usize, name: &str) -> Option<u64> {
-        self.launch_params.get(&(launch, name.to_owned())).copied()
+        // A launch declares few parameters; scanning its range allocates no key.
+        self.launch_params
+            .range((launch, String::new())..(launch + 1, String::new()))
+            .find(|((_, key), _)| key == name)
+            .map(|(_, value)| *value)
     }
 }
 

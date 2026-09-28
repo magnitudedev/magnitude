@@ -7,11 +7,12 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use magnitude_engine::assessment::ModelPackagePaths;
 use magnitude_engine::composition::EngineConfiguration;
 use magnitude_engine::error::{ResolveError, UnsupportedModel};
 use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::options::{
-    ExecutionManifest, PackageOptions, ProjectorSelection, standard_service_limits,
+    ExecutionManifest, ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits,
 };
 use magnitude_executor::ExecutionPath;
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
@@ -133,25 +134,11 @@ impl ResolvedConfigurations {
     ) -> Result<Arc<ResolvedConfiguration>, InventoryError> {
         let (input, package_ids) = installed_bundle(bundle);
         let material = self.models.resolve_bundle(input).await?;
-        let package = engine_material(&material)?;
-        let configuration = EngineConfiguration {
-            package: PackageOptions {
-                target: package.target,
-                projector: match package.projector {
-                    Some(projector) => ProjectorSelection::Explicit(projector),
-                    None => ProjectorSelection::Disabled,
-                },
-                // Drafts are served once DFlash is validated (dflash lane).
-                draft: None,
-            },
-            model: serving_policy(),
-            context_tokens: None,
-            service: standard_service_limits(),
-            path: ExecutionPath::Native,
-            device: DeviceRequest::Automatic,
-            kernel_cache: Some(self.kernel_directory.clone()),
-            reserves: self.reserves,
-        };
+        let configuration = engine_configuration(
+            engine_material(&material)?,
+            self.kernel_directory.clone(),
+            self.reserves,
+        );
         let resolved = crate::spawn_blocking_traced(move || configuration.resolve())
             .await
             .map_err(|error| {
@@ -164,6 +151,35 @@ impl ResolvedConfigurations {
             package_ids,
             _material: material,
         }))
+    }
+}
+
+/// The engine configuration serving a bundle's material: its components, its declared method
+/// (a separate draft's method is the bundle's, never `Auto`), the standard service limits.
+fn engine_configuration(
+    package: ModelPackagePaths,
+    kernel_directory: PathBuf,
+    reserves: MemoryReserves,
+) -> EngineConfiguration {
+    EngineConfiguration {
+        package: PackageOptions {
+            target: package.target,
+            projector: match package.projector {
+                Some(projector) => ProjectorSelection::Explicit(projector),
+                None => ProjectorSelection::Disabled,
+            },
+            draft: package.draft,
+        },
+        model: ModelPolicy {
+            method: package.method,
+            ..serving_policy()
+        },
+        context_tokens: None,
+        service: standard_service_limits(),
+        path: ExecutionPath::Native,
+        device: DeviceRequest::Automatic,
+        kernel_cache: Some(kernel_directory),
+        reserves,
     }
 }
 
@@ -220,5 +236,61 @@ pub fn resolve_failure(error: ResolveError) -> InventoryError {
         code: code.to_owned(),
         message: error.to_string(),
         retryable: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnitude_engine::options::{ModelMethod, ResolvedMethod};
+
+    fn material(method: ModelMethod) -> ModelPackagePaths {
+        let path = |variable: &str| {
+            PathBuf::from(std::env::var_os(variable).unwrap_or_else(|| panic!("set {variable}")))
+        };
+        ModelPackagePaths {
+            target: path("MAGNITUDE_TEST_TARGET_GGUF"),
+            projector: None,
+            draft: Some(path("MAGNITUDE_TEST_DRAFT_GGUF")),
+            method,
+        }
+    }
+
+    /// A speculative bundle serves its declared separate draft; a declared
+    /// method the draft does not implement refuses the bundle instead of
+    /// serving its target plain.
+    #[test]
+    #[ignore = "requires MAGNITUDE_TEST_TARGET_GGUF and its DSpark MAGNITUDE_TEST_DRAFT_GGUF"]
+    fn a_draft_bundle_serves_its_declared_method_or_is_refused() {
+        let kernels = std::env::temp_dir();
+        let resolved = engine_configuration(
+            material(ModelMethod::DSpark),
+            kernels.clone(),
+            MemoryReserves::standard(),
+        )
+        .resolve()
+        .unwrap();
+        assert!(matches!(
+            resolved.manifest.model.method,
+            ResolvedMethod::DFlash { proposals } if proposals > 0
+        ));
+        let draft = resolved.manifest.definition.draft.as_ref().unwrap();
+        assert_eq!(draft.method.variant().to_string(), "DSpark");
+        assert!(resolved.manifest.package.draft.is_some());
+
+        for method in [ModelMethod::DFlash, ModelMethod::DFlash2] {
+            let Err(error) =
+                engine_configuration(material(method), kernels.clone(), MemoryReserves::standard())
+                    .resolve()
+            else {
+                panic!("{method:?} resolved over a DSpark draft")
+            };
+            let InventoryError::ModelOperation { code, message, .. } = resolve_failure(error)
+            else {
+                panic!("a resolution failure is a model operation failure")
+            };
+            assert_eq!(code, "invalid_model_configuration");
+            assert!(message.contains("the package's draft is DSpark"), "{message}");
+        }
     }
 }

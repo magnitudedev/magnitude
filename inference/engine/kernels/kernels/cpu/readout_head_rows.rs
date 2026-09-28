@@ -2,8 +2,8 @@
 // `readout_head_rows_normalize` publishes the RMS-normalized hidden row of
 // each output row (rounded to A) as F32 into scratch, one work item per row.
 // `readout_head_rows_rows` gives each work item ROWS vocabulary weight rows,
-// which it projects against every normalized row into the F32 logits
-// (softcapped when `softcap` > 0).
+// which it projects against every normalized row into the F32 logits (scaled
+// by a present `weight_scale`, then softcapped when `softcap` > 0).
 
 use lib::core::functions;
 use lib::projection::projection;
@@ -61,6 +61,7 @@ fn readout_head_rows_rows<L: Isa, E: Elements>(
             .slice::<seismic::cpu::quant::Q8Block>(0, o * blocks)
     });
     let cap = cx.arg_softcap();
+    let scale = if cx.dim_ws() == 0 { 1.0 } else { cx.arg_weight_scale().get([0]) };
     projection::project_staged_arithmetic(
         &cx.arg_weight(),
         rows.clone(),
@@ -70,7 +71,8 @@ fn readout_head_rows_rows<L: Isa, E: Elements>(
             // SAFETY: each work item writes its own columns of every row.
             let logits = unsafe { result.span_mut([row, rows.start], rows.len()) };
             for (logit, value) in logits.iter_mut().zip(projected) {
-                *logit = if cap > 0.0 { functions::softcap(cap, *value) } else { *value };
+                let value = *value * scale;
+                *logit = if cap > 0.0 { functions::softcap(cap, value) } else { value };
             }
         },
     );

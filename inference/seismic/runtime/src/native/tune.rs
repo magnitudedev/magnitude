@@ -33,14 +33,14 @@ use super::search::{
     self, Cost, Evaluator, ParameterValues, PointKey, SearchSettings, SearchSpace,
     SearchSpaceError, SearchStop,
 };
-use super::timing::{self, PointTiming};
+use super::timing::{self, OutputPool, PointTiming};
 use super::{MeasureOptions, Measurement, NativePrepared};
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{DecodedValue, EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
 use seismic_compiler::prepared::{validate_invocation, ArgumentValue, InvocationContract};
 use seismic_lang::checked::{CheckedModule, NativeImplementation, NativeSpecialization};
-use seismic_lang::entry::{ElementBindings, ParameterKind, TensorAccess};
+use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::{EntryId, RepresentationId};
 use seismic_lang::registry::{self, RepresentationKind};
@@ -407,6 +407,7 @@ struct Formation<'s> {
     device: &'s Arc<DeviceInner>,
     module: &'s CheckedModule,
     entry: EntryId,
+    logical: &'s Arc<LogicalEntry>,
     bindings: &'s ElementBindings,
     cpu: Option<&'static CpuNativeKernels>,
     implementation: &'s NativeImplementation,
@@ -435,6 +436,7 @@ impl Formation<'_> {
                                     self.device,
                                     self.module,
                                     self.entry,
+                                    self.logical,
                                     self.bindings.clone(),
                                     specialization.clone(),
                                     self.cpu,
@@ -456,15 +458,10 @@ impl Formation<'_> {
 
 fn point_shapes(
     device: &Arc<DeviceInner>,
-    module: &CheckedModule,
-    entry: EntryId,
-    bindings: &ElementBindings,
+    logical: &LogicalEntry,
     points: &[TuningPoint<'_>],
 ) -> Result<Vec<PointShape>, TuneError> {
-    let logical = module
-        .entry(entry, bindings)
-        .map_err(|error| TuneError::Declaration(error.to_string()))?;
-    let contract = InvocationContract::compile_entry(&logical);
+    let contract = InvocationContract::compile_entry(logical);
     points
         .iter()
         .map(|point| {
@@ -594,6 +591,7 @@ fn measure_factored(
     affected_launches: Option<&[usize]>,
     baseline: Option<&[PointMeasurement]>,
     cache: Option<&mut BTreeMap<(usize, PointKey), PointMeasurement>>,
+    outputs: &mut OutputPool,
 ) -> Result<Vec<PointMeasurement>, Exclusion> {
     debug_assert!(cache.is_none() || baseline.is_some());
     let mut cache = cache;
@@ -601,7 +599,7 @@ fn measure_factored(
         .iter()
         .enumerate()
         .map(|(point, workload)| {
-            PointTiming::new(kernel, workload.rotation.clone())
+            PointTiming::reusing_outputs(kernel, workload.rotation.clone(), outputs.at(point))
                 .map_err(|error| measurement_failure(points, point, error))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -664,6 +662,36 @@ struct FactoredCandidate {
     kernel: Arc<NativePrepared>,
 }
 
+/// One sampled point/key of a sweep and the candidates it measures.
+type Slot = (usize, PointKey, Vec<usize>);
+
+/// Bring every placed slot to `options.samples` samples. A failing slot's
+/// candidates leave the sweep; the other slots keep their samples and finish.
+fn sample_slots(
+    placed: &mut Vec<PointTiming>,
+    slots: &mut Vec<Slot>,
+    failures: &mut [Option<Exclusion>],
+    points: &[TuningPoint<'_>],
+    options: &MeasureOptions,
+) {
+    while let Err(failure) = timing::sample(placed, options) {
+        let point = slots[failure.point].0;
+        for &candidate in &slots[failure.point].2 {
+            failures[candidate] = Some(measurement_failure(points, point, failure.error.clone()));
+        }
+        let (kept_timings, kept_slots) = std::mem::take(placed)
+            .into_iter()
+            .zip(std::mem::take(slots))
+            .filter_map(|(timing, mut slot)| {
+                slot.2.retain(|candidate| failures[*candidate].is_none());
+                (!slot.2.is_empty()).then_some((timing, slot))
+            })
+            .unzip();
+        *placed = kept_timings;
+        *slots = kept_slots;
+    }
+}
+
 /// Measure one launch group's candidate-point pairs in shared rounds. A
 /// failing candidate leaves the sweep; the others keep samples already taken
 /// and finish their remaining rounds.
@@ -676,6 +704,7 @@ fn measure_factored_group(
     affected_launches: &[usize],
     baseline: &[PointMeasurement],
     cache: Option<&mut BTreeMap<(usize, PointKey), PointMeasurement>>,
+    outputs: &mut OutputPool,
 ) -> Vec<Result<Vec<PointMeasurement>, Exclusion>> {
     let mut cache = cache;
     let mut measured = vec![baseline.to_vec(); candidates.len()];
@@ -685,9 +714,8 @@ fn measure_factored_group(
     // Those candidates execute the same active launches with the same values,
     // so one device timing serves all of them. The cross-sweep cache is only
     // populated after sampling and cannot catch duplicates within this sweep.
-    let mut slots: Vec<(usize, PointKey, Vec<usize>)> = Vec::new();
+    let mut slots: Vec<Slot> = Vec::new();
     let mut slot_by_key: BTreeMap<(usize, PointKey), usize> = BTreeMap::new();
-    let mut output_pool = vec![Vec::new(); points.len()];
     for (candidate, formed) in candidates.iter().enumerate() {
         let mut candidate_placed = Vec::new();
         let mut candidate_slots = Vec::new();
@@ -695,7 +723,7 @@ fn measure_factored_group(
             let timing = match PointTiming::reusing_outputs(
                 &formed.kernel,
                 workload.rotation.clone(),
-                &mut output_pool[point],
+                outputs.at(point),
             ) {
                 Ok(timing) => timing,
                 Err(error) => {
@@ -732,29 +760,7 @@ fn measure_factored_group(
             }
         }
     }
-    loop {
-        match timing::sample(&mut placed, options) {
-            Ok(()) => break,
-            Err(failure) => {
-                let point = slots[failure.point].0;
-                for &candidate in &slots[failure.point].2 {
-                    failures[candidate] =
-                        Some(measurement_failure(points, point, failure.error.clone()));
-                }
-                let mut remaining = Vec::new();
-                let mut remaining_slots = Vec::new();
-                for (timing, mut slot) in placed.into_iter().zip(slots) {
-                    slot.2.retain(|candidate| failures[*candidate].is_none());
-                    if !slot.2.is_empty() {
-                        remaining.push(timing);
-                        remaining_slots.push(slot);
-                    }
-                }
-                placed = remaining;
-                slots = remaining_slots;
-            }
-        }
-    }
+    sample_slots(&mut placed, &mut slots, &mut failures, points, options);
     for (timing, (point, key, candidates)) in placed.iter().zip(slots) {
         let result = point_measurement(&points[point].label, key.clone(), timing.measurement());
         if let Some(cache) = cache.as_deref_mut() {
@@ -868,12 +874,13 @@ fn place(
     points: &[TuningPoint<'_>],
     influence: &Influence,
     values: &ParameterValues,
+    outputs: &mut OutputPool,
 ) -> Result<Placed, Exclusion> {
     let timings = points
         .iter()
         .enumerate()
         .map(|(index, point)| {
-            PointTiming::new(kernel, point.rotation.clone())
+            PointTiming::reusing_outputs(kernel, point.rotation.clone(), outputs.at(index))
                 .map_err(|error| measurement_failure(points, index, error))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -889,6 +896,7 @@ struct Measurer {
     influence: Influence,
     /// Every point measured so far, by point and key.
     measured: HashMap<(usize, PointKey), PointMeasurement>,
+    outputs: OutputPool,
 }
 
 impl Measurer {
@@ -896,6 +904,7 @@ impl Measurer {
         Self {
             influence: Influence::of(implementation),
             measured: HashMap::new(),
+            outputs: OutputPool::default(),
         }
     }
 
@@ -908,7 +917,8 @@ impl Measurer {
         values: &ParameterValues,
         options: &MeasureOptions,
     ) -> Result<Vec<PointMeasurement>, Exclusion> {
-        let Placed { timings, keys } = place(kernel, points, &self.influence, values)?;
+        let Placed { timings, keys } =
+            place(kernel, points, &self.influence, values, &mut self.outputs)?;
         let (fresh, mut timings): (Vec<usize>, Vec<PointTiming>) = timings
             .into_iter()
             .enumerate()
@@ -1111,6 +1121,7 @@ impl Evaluator for Live<'_, '_> {
                     self.points,
                     &self.measurer.influence,
                     &self.space.values(*index),
+                    &mut self.measurer.outputs,
                 )?;
                 for (point, (timing, key)) in placed.into_iter().zip(&keys).enumerate() {
                     let id = (point, key.clone());
@@ -1295,7 +1306,13 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
     let default = implementation
         .default_specialization(&statics)
         .map_err(|error| TuneError::Declaration(error.to_string()))?;
-    let mutable = mutable_parameters(module, entry, &bindings)?;
+    // Every configuration formed below is this one entry at these bindings.
+    let logical = Arc::new(
+        module
+            .entry(entry, &bindings)
+            .map_err(|error| TuneError::Declaration(error.to_string()))?,
+    );
+    let mutable = mutable_parameters(&logical);
     if let (Some((_, parameter)), Some(point)) = (
         mutable.first(),
         points.iter().find(|point| point.initialize.is_none()),
@@ -1328,6 +1345,7 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
             device,
             module,
             entry,
+            logical: &logical,
             bindings: &bindings,
             statics: &statics,
             cpu,
@@ -1359,6 +1377,7 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
         device,
         module,
         entry,
+        logical: &logical,
         bindings: &bindings,
         cpu,
         implementation: &implementation,
@@ -1402,6 +1421,7 @@ struct FactoredRequest<'a, 'p> {
     device: &'a Arc<DeviceInner>,
     module: &'a CheckedModule,
     entry: EntryId,
+    logical: &'a Arc<LogicalEntry>,
     bindings: &'a ElementBindings,
     statics: &'a NativeSpecialization,
     cpu: Option<&'static CpuNativeKernels>,
@@ -1418,6 +1438,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
         device,
         module,
         entry,
+        logical,
         bindings,
         statics,
         cpu,
@@ -1429,7 +1450,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
         search,
     } = request;
     let mut time = TuningTime::default();
-    let shapes = point_shapes(device, module, entry, bindings, &points)?;
+    let shapes = point_shapes(device, logical, &points)?;
     let partition = plan::partition(implementation, statics, &shapes)
         .map_err(|error| TuneError::Declaration(format!("factored native plan: {error:?}")))?;
     let began = Instant::now();
@@ -1451,6 +1472,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
             device,
             module,
             entry,
+            logical,
             bindings.clone(),
             specialization.clone(),
             cpu,
@@ -1470,6 +1492,8 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
         samples: search.settings.confirmation_samples,
         min_sample_seconds: search.min_sample_seconds,
     };
+    // Every configuration placed in this run writes its results here.
+    let mut outputs = OutputPool::default();
     let began = Instant::now();
     let reference = measure_factored(
         implementation,
@@ -1481,6 +1505,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
         None,
         None,
         None,
+        &mut outputs,
     )
     .map_err(TuneError::DefaultUnusable)?;
     time.measuring_seconds += began.elapsed().as_secs_f64();
@@ -1565,6 +1590,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                 None,
                 Some(&reference),
                 Some(&mut sweep_cache),
+                &mut outputs,
             ) {
                 Ok(measured) => {
                     time.measuring_seconds += began.elapsed().as_secs_f64();
@@ -1643,6 +1669,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                 &group.launches,
                 &baseline,
                 Some(&mut sweep_cache),
+                &mut outputs,
             );
             time.measuring_seconds += began.elapsed().as_secs_f64();
             for (candidate, outcome) in ready.into_iter().zip(measured) {
@@ -1753,6 +1780,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                 None,
                 None,
                 None,
+                &mut outputs,
             ) {
                 Ok(baseline) => baseline,
                 Err(exclusion) => {
@@ -1824,6 +1852,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                     &partition.groups[group_index].launches,
                     &baseline,
                     None,
+                    &mut outputs,
                 );
                 time.measuring_seconds += began.elapsed().as_secs_f64();
                 let group_baseline = match &confirmed[0] {
@@ -1931,6 +1960,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                         &all_launches,
                         &reference,
                         None,
+                        &mut outputs,
                     );
                     time.measuring_seconds += began.elapsed().as_secs_f64();
                     let confirmed_reference =
@@ -2559,15 +2589,8 @@ fn arithmetic_values(
 }
 
 /// Ordinal and name of every `&mut` tensor parameter.
-fn mutable_parameters(
-    module: &CheckedModule,
-    entry: EntryId,
-    bindings: &ElementBindings,
-) -> Result<Vec<(usize, String)>, TuneError> {
-    let logical = module
-        .entry(entry, bindings)
-        .map_err(|error| TuneError::Declaration(error.to_string()))?;
-    Ok(logical
+fn mutable_parameters(logical: &LogicalEntry) -> Vec<(usize, String)> {
+    logical
         .schema()
         .parameters()
         .iter()
@@ -2582,7 +2605,7 @@ fn mutable_parameters(
             )
         })
         .map(|(ordinal, parameter)| (ordinal, parameter.name.clone()))
-        .collect())
+        .collect()
 }
 
 fn prepare_message(error: PrepareError) -> String {

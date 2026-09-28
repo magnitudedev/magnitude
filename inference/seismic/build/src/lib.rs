@@ -805,6 +805,10 @@ mod internals {
                 for view in VULKAN_SHARED_VIEWS {
                     symbols.insert(format!("SEISMIC_SHARED_{view}"));
                 }
+                // A static extent as a plain integer, for `#if` guards.
+                for dimension in &definition.statics {
+                    symbols.insert(format!("SEISMIC_STATIC_{}", native_macro(dimension)));
+                }
             }
             BackendName::Cpu | BackendName::Metal => {
                 symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());

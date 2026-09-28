@@ -9,12 +9,12 @@ use crate::operators::gated_delta::graph::{
     bank_ports, chunked, RecurrentControlPorts, RecurrentStatePorts,
 };
 use crate::programs::graph::draft::GraphDraft;
-use crate::programs::native_target_graph::weight;
+use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{
     native::StateSpaceKernels, ModelLoadPlan, StateResourcePlan, StateSpaceBinding,
     StateSpaceShape,
 };
-use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
     attention_output, attention_project, state_space_chunk, state_space_gate, state_space_step,
 };
@@ -96,7 +96,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     state: &StateResourcePlan,
     load: &ModelLoadPlan,
     scope: WeightScope,
-    weights: &mut Vec<(WeightRole, NativePort)>,
+    weights: &mut Vec<(WeightPort, NativePort)>,
     hidden: &WorkflowTensor,
     block: StateSpaceBlock,
 ) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), String> {
@@ -222,8 +222,10 @@ mod tests {
         LatentExperts, MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm,
         RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
         SharedExpert, SharedExpertGate, StateSpace, Sublayer, TextCoordinateSemantics, ValueNorm,
-        ValueSource, WeightDescriptor,
+        ValueSource, WeightDescriptor, ImportTransform, WeightKind, WeightRole, WeightScope,
+        SublayerIndex,
     };
+    use crate::{GeneralRoutedScales, DenseScales, PlanError};
     use magnitude_state::KvCodec;
     use seismic::BackendName;
 
@@ -236,27 +238,46 @@ mod tests {
     /// A Nemotron-H-shaped decoder: a lone state-space block, a state-space
     /// block with a feed-forward, and a NoPE attention block with one.
     fn hybrid() -> (ModelDefinition, PackageManifest) {
+        hybrid_stored(|_| None)
+    }
+
+    /// [`hybrid`] with the matrices `scaled` names stored NVFP4 beside a
+    /// second-level scale of the stored shape it returns
+    /// (`ImportTransform::ScaleByTensor`), as Nemotron's NVFP4 files are.
+    fn hybrid_stored(
+        scaled: impl Fn(&str) -> Option<Vec<u64>>,
+    ) -> (ModelDefinition, PackageManifest) {
         let mut tensors = Vec::new();
         let mut offset = 0;
         let mut tensor = |name: String, shape: Vec<u64>| {
-            let encoding = if shape.len() > 1 {
-                Encoding::BF16
-            } else {
-                Encoding::F32
+            let mut stored = |name: String, shape: Vec<u64>, encoding: Encoding| {
+                let nbytes = source_element(encoding)
+                    .unwrap()
+                    .canonical_byte_len(&shape)
+                    .unwrap();
+                tensors.push(TensorDescriptor {
+                    name,
+                    shape,
+                    encoding,
+                    offset,
+                    nbytes,
+                });
+                offset += nbytes;
             };
-            let nbytes = source_element(encoding)
-                .unwrap()
-                .canonical_byte_len(&shape)
-                .unwrap();
-            tensors.push(TensorDescriptor {
-                name: name.clone(),
-                shape: shape.clone(),
-                encoding,
-                offset,
-                nbytes,
-            });
-            offset += nbytes;
-            WeightDescriptor::stored(name, shape)
+            let mut descriptor = WeightDescriptor::stored(name.clone(), shape.clone());
+            match scaled(&name) {
+                Some(scale) => {
+                    stored(name.clone(), shape, Encoding::Nvfp4);
+                    let scale_name = format!("{name}.scale");
+                    stored(scale_name.clone(), scale, Encoding::F32);
+                    descriptor.transforms.push(ImportTransform::ScaleByTensor {
+                        tensor: scale_name,
+                    });
+                }
+                None if shape.len() > 1 => stored(name, shape, Encoding::BF16),
+                None => stored(name, shape, Encoding::F32),
+            }
+            descriptor
         };
         let rms = |weight| RmsNorm {
             weight,
@@ -513,5 +534,219 @@ mod tests {
                 assert!(classes.contains(&class), "{backend:?} lacks {class}");
             }
         }
+    }
+
+    /// The matrices Nemotron's NVFP4 files scale: routed experts per expert
+    /// (block 2's up weight stores one value for its whole stack), shared
+    /// experts, latent projections and the vocabulary projection per tensor.
+    fn nemotron_scales(name: &str) -> Option<Vec<u64>> {
+        match name {
+            "blk.4.ffn_up_exps" => Some(vec![1]),
+            name if name.ends_with("_exps") => Some(vec![32]),
+            name if name.ends_with("_shexp") || name.contains("ffn_latent") => Some(vec![1]),
+            "output" => Some(vec![1]),
+            _ => None,
+        }
+    }
+
+    fn feed_forward_scope(block: u32) -> WeightScope {
+        WeightScope::TargetSublayer(SublayerIndex { block, sublayer: 1 })
+    }
+
+    /// Second-level scales become resident beside their weights (one F32
+    /// value per matrix, charged in the component's weight bytes), bind the
+    /// accumulator-scale ports of every entry that reads them, and the
+    /// scaled graphs certify on every backend with the same decode demand
+    /// classes as unscaled weights.
+    #[test]
+    fn nvfp4_second_level_scales_plan_bind_and_certify_on_every_backend() {
+        let (definition, manifest) = hybrid_stored(nemotron_scales);
+        let (unscaled, unscaled_manifest) = hybrid();
+        let limits = ResourceLimits {
+            max_launch_rows: 64,
+            max_launch_slots: 8,
+            max_projected_rows: 64,
+            max_images_per_request: 1,
+            lookahead: false,
+        };
+        let selection = ComponentSelection {
+            head: false,
+            vision: false,
+        };
+        for backend in [
+            BackendName::Cpu,
+            BackendName::Metal,
+            BackendName::Cuda,
+            BackendName::Vulkan,
+        ] {
+            let layout = resident_layout(ExecutionPath::Native, backend);
+            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout).unwrap();
+            let extent = |scope, kind| {
+                let plan = load
+                    .target()
+                    .iter()
+                    .find(|weight| weight.role == WeightRole { scope, kind })
+                    .unwrap();
+                (plan.scale_extent(), plan.scale.as_ref().map(|scale| scale.resident_bytes))
+            };
+            let (latent, plain) = (feed_forward_scope(1), feed_forward_scope(2));
+            assert_eq!(extent(latent, WeightKind::ExpertUp), (32, Some(128)));
+            assert_eq!(extent(latent, WeightKind::ExpertDown), (32, Some(128)));
+            // A stored single value is resident once per matrix.
+            assert_eq!(extent(plain, WeightKind::ExpertUp), (32, Some(128)));
+            assert_eq!(extent(plain, WeightKind::SharedUp), (1, Some(4)));
+            assert_eq!(extent(latent, WeightKind::LatentDown), (1, Some(4)));
+            assert_eq!(extent(WeightScope::Target, WeightKind::Output), (1, Some(4)));
+            assert_eq!(extent(plain, WeightKind::Router), (0, None));
+            let scale_bytes = load
+                .target()
+                .iter()
+                .filter_map(|weight| weight.scale.as_ref())
+                .map(|scale| scale.resident_bytes)
+                .sum::<u64>();
+            let packed_bytes = load
+                .target()
+                .iter()
+                .map(|weight| weight.storage_bytes().unwrap())
+                .sum::<u64>();
+            assert_eq!(
+                packed_bytes,
+                load.target().iter().map(|weight| weight.resident_bytes).sum::<u64>() + scale_bytes
+            );
+
+            let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+            let blocks = plan.target().blocks();
+            let Some(FeedForwardProgramSlot::GeneralRouted(latent_binding)) =
+                blocks[1].feed_forward()
+            else {
+                panic!("block 1 is general routed");
+            };
+            assert_eq!(
+                latent_binding.scales,
+                GeneralRoutedScales {
+                    expert_up: 32,
+                    expert_down: 32,
+                    shared: DenseScales {
+                        gate: 0,
+                        up: 1,
+                        down: 1
+                    },
+                    latent: (1, 1),
+                }
+            );
+            assert_eq!(plan.target().readout().weight_scale, 1);
+
+            let state = ResourcePlanner::state_plan(
+                &definition,
+                &load,
+                PlannedMethod::Plain,
+                KvCodec::Dense,
+                limits,
+                ResourceCapacity {
+                    domain_bytes: 16 * 1024 * 1024 * 1024,
+                },
+            )
+            .unwrap();
+            checked_target_family_storage(
+                backend,
+                &load,
+                &definition.decoder,
+                &state,
+                plan.target(),
+                limits,
+            )
+            .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+
+            // Scales change no demand class: the measurement keys are the
+            // representation's.
+            let classes = |definition: &ModelDefinition, load: &ModelLoadPlan| {
+                crate::assessment::DecodeDemand::from_model(definition, load, KvCodec::Dense)
+                    .unwrap()
+                    .terms
+                    .into_iter()
+                    .map(|term| term.key.class.name())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let unscaled_load =
+                ModelLoadPlan::derive(&unscaled_manifest, &unscaled, selection, layout).unwrap();
+            assert_eq!(classes(&definition, &load), classes(&unscaled, &unscaled_load));
+        }
+    }
+
+    /// A scaled weight whose entry has no accumulator-scale port (the
+    /// attention projections, the router) is refused at plan time.
+    #[test]
+    fn a_scaled_weight_without_a_scale_port_is_refused_at_plan_time() {
+        for (name, role) in [
+            (
+                "blk.3.attn_q",
+                WeightRole {
+                    scope: WeightScope::TargetSublayer(SublayerIndex { block: 2, sublayer: 0 }),
+                    kind: WeightKind::Query,
+                },
+            ),
+            (
+                "blk.4.ffn_gate_inp",
+                WeightRole {
+                    scope: feed_forward_scope(2),
+                    kind: WeightKind::Router,
+                },
+            ),
+        ] {
+            let (definition, manifest) =
+                hybrid_stored(|stored| (stored == name).then(|| vec![1]));
+            let load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                ComponentSelection {
+                    head: false,
+                    vision: false,
+                },
+                resident_layout(ExecutionPath::Native, BackendName::Metal),
+            )
+            .unwrap();
+            assert_eq!(
+                load.program_plan(&definition, KvCodec::Dense).unwrap_err(),
+                PlanError::UnportedScale(role)
+            );
+        }
+    }
+
+    /// A scale that is not one F32 value, or one per matrix, is refused
+    /// when the load is planned.
+    #[test]
+    fn malformed_second_level_scales_are_refused_when_the_load_is_planned() {
+        let derive = |scale: fn(&str) -> Option<Vec<u64>>| {
+            let (definition, manifest) = hybrid_stored(scale);
+            ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                ComponentSelection {
+                    head: false,
+                    vision: false,
+                },
+                resident_layout(ExecutionPath::Native, BackendName::Cpu),
+            )
+        };
+        // Neither one value nor one per expert.
+        let error = derive(|name| (name == "blk.4.ffn_up_exps").then(|| vec![3])).unwrap_err();
+        assert!(error.contains("not F32 [1] or [32]"), "{error}");
+        // A matrix has one scale.
+        let error = derive(|name| (name == "blk.4.ffn_up_shexp").then(|| vec![2])).unwrap_err();
+        assert!(error.contains("not F32 [1] or [1]"), "{error}");
+        // A named scale the component lacks.
+        let (definition, mut manifest) = hybrid_stored(|name| (name == "output").then(|| vec![1]));
+        manifest.target.tensors.retain(|tensor| tensor.name != "output.scale");
+        let error = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            resident_layout(ExecutionPath::Native, BackendName::Cpu),
+        )
+        .unwrap_err();
+        assert!(error.contains("absent from its component"), "{error}");
     }
 }

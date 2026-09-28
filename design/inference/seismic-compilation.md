@@ -62,8 +62,14 @@ round, and ranked by those full-workload costs; the defaults rank first unless t
 them by δ. Screening can omit a candidate that would have won on the full workload, so it is an
 explicit search policy rather than an exact reduction. The search is a pure function of
 an evaluator's costs, so a recorded evaluator can replay it. Measurement is device time: a
-point's calls are placed once, calibrated so one sample covers a minimum device time, and every
-sample of every point is submitted before any is read. The consumer then prepares the chosen
+point's calls are placed once and calibrated so one sample covers a minimum device time. Each
+sample completes before the next is submitted, since a device queue overlaps independent work and
+back-to-back samples would each include the other's. A kernel's first pass pays its first-use costs
+and is never a sample; a later point's calibrating pass of the same kernel is one when it already
+covers a steady sample (2 ms), and a point whose sample is that long takes one sample rather than
+the requested count, because a sample's fixed jitter is then a small fraction of any ranking margin.
+Partition projects every admissible configuration's parameter values once and decides each point's
+active launches once per distinct value of what the launch conditions read. The consumer then prepares the chosen
 specialization explicitly. Validation walks the confirmed ranking until one configuration passes,
 so only the chosen configuration and any that beat it are validated: at each point, a configuration
 with the same active launches and the same arithmetic values read by them must be bit-identical

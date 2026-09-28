@@ -8,10 +8,12 @@
 use super::fused_graph::{decodes, grouped_blocks, TILE_ROWS};
 use crate::programs::graph::draft::GraphDraft;
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::weight;
+use crate::programs::native_target_graph::{
+    resident_scale, scaled_weight, weight, WeightPort,
+};
 use crate::native::{DenseExpansionKernel, ExpertKernels, GeneralRoutedKernels};
 use crate::{GeneralRoutedBinding, GeneralRoutedShape, ModelLoadPlan};
-use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
     dense_expand, dense_output, dense_up, project_rows, routed_down, routed_experts,
     routed_experts_up, routed_gate_up, routed_group, routed_scatter, routed_select, routed_up,
@@ -210,7 +212,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     entries: GeneralRoutedGraphEntries<'a, G>,
     load: &ModelLoadPlan,
     scope: WeightScope,
-    weights: &mut Vec<(WeightRole, NativePort)>,
+    weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     residual: &WorkflowTensor,
     sum: RoutedSum,
@@ -243,27 +245,34 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     };
     let expert_up = weight(graph, WeightKind::ExpertUp)?;
     let expert_down = weight(graph, WeightKind::ExpertDown)?;
+    // Per-expert scales of the stacked expert weights, when they have them.
+    let expert_up_scale = resident_scale(graph, load, scope, WeightKind::ExpertUp, weights)?;
+    let expert_down_scale = resident_scale(graph, load, scope, WeightKind::ExpertDown, weights)?;
+    let mut scaled =
+        |graph: &mut G, kind| scaled_weight(graph, load, scope, kind, weights, constants);
     let shared_weights = match shape.shared {
         Some((_, expansion)) => Some((
             if expansion.gated {
-                Some(weight(graph, WeightKind::SharedGate)?)
+                Some(scaled(graph, WeightKind::SharedGate)?)
             } else {
                 None
             },
-            weight(graph, WeightKind::SharedUp)?,
-            weight(graph, WeightKind::SharedDown)?,
+            scaled(graph, WeightKind::SharedUp)?,
+            scaled(graph, WeightKind::SharedDown)?,
         )),
         None => None,
     };
     let latent_weights = if shape.latent {
         Some((
-            weight(graph, WeightKind::LatentDown)?,
-            weight(graph, WeightKind::LatentUp)?,
+            scaled(graph, WeightKind::LatentDown)?,
+            scaled(graph, WeightKind::LatentUp)?,
         ))
     } else {
         None
     };
     // The selection bias a model lacks is zeros, absent expert scales ones.
+    // The down weight's per-expert second-level scales are the combine's
+    // expert scales (plan admission refuses both at once).
     let experts = usize::try_from(shape.experts).map_err(|_| "expert count exceeds host")?;
     let bias = match bias {
         Some(bias) => bias,
@@ -274,27 +283,31 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
             tensor
         }
     };
-    let expert_scale = match expert_scale {
-        Some(scale) => scale,
-        None => {
+    let expert_scale = match (expert_scale, expert_down_scale) {
+        (Some(scale), None) | (None, Some(scale)) => scale,
+        (Some(_), Some(_)) => {
+            return Err("stored expert scales beside a scaled expert down weight".into())
+        }
+        (None, None) => {
             let constant = GraphConstant::f32(graph, &vec![1.0; experts])?;
             let tensor = constant.port().tensor().clone();
             constants.push(constant);
             tensor
         }
     };
-    let absent_scale = (shape.shared.is_some() || shape.latent)
-        .then(|| GraphConstant::absent_scale(graph, constants))
-        .transpose()?;
-    // Up-only experts' accumulator scales: ones (a stored NVFP4 up scale,
-    // `ScaleByTensor`, is refused at plan time until core binds it here).
-    let up_scale = if shape.experts_expansion.gated {
-        None
-    } else {
-        let constant = GraphConstant::f32(graph, &vec![1.0; experts])?;
-        let tensor = constant.port().tensor().clone();
-        constants.push(constant);
-        Some(tensor)
+    // Up-only experts' accumulator scales: the up weight's per-expert
+    // second-level scales, else ones (gated experts bind none; plan
+    // admission refuses a scaled gated expert).
+    let up_scale = match (shape.experts_expansion.gated, expert_up_scale) {
+        (true, None) => None,
+        (true, Some(_)) => return Err("gated experts have no up scale port".into()),
+        (false, Some(scale)) => Some(scale),
+        (false, None) => {
+            let constant = GraphConstant::f32(graph, &vec![1.0; experts])?;
+            let tensor = constant.port().tensor().clone();
+            constants.push(constant);
+            Some(tensor)
+        }
     };
     // The row table of the dense projections (shared expert, latent up): a
     // graph port only when one reads it (an unread port is unbound).
@@ -331,17 +344,18 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     graph
                         .enqueue(
                             entry,
-                            &[dimensions.as_slice(), &[("GS", 0), ("US", 0)]].concat(),
+                            &[dimensions.as_slice(), &[("GS", gate.extent), ("US", up.extent)]]
+                                .concat(),
                             dense_expand::WorkflowArgs {
                                 residual: residual.into(),
                                 norm: (&norm).into(),
-                                gate_weight: gate.into(),
-                                up_weight: up.into(),
+                                gate_weight: (&gate.weight).into(),
+                                up_weight: (&up.weight).into(),
                                 out_rows: (&row_table()?).into(),
                                 eps: epsilon,
                                 activation,
-                                gate_scale: absent_scale.as_ref().ok_or("shared scale is absent")?.into(),
-                                up_scale: absent_scale.as_ref().ok_or("shared scale is absent")?.into(),
+                                gate_scale: (&gate.scale).into(),
+                                up_scale: (&up.scale).into(),
                             },
                         )
                         .map_err(failed)?
@@ -351,15 +365,15 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     graph
                         .enqueue(
                             entry,
-                            &[dimensions.as_slice(), &[("US", 0)]].concat(),
+                            &[dimensions.as_slice(), &[("US", up.extent)]].concat(),
                             dense_up::WorkflowArgs {
                                 residual: residual.into(),
                                 norm: (&norm).into(),
-                                up_weight: up.into(),
+                                up_weight: (&up.weight).into(),
                                 out_rows: (&row_table()?).into(),
                                 eps: epsilon,
                                 activation,
-                                up_scale: absent_scale.as_ref().ok_or("shared scale is absent")?.into(),
+                                up_scale: (&up.scale).into(),
                             },
                         )
                         .map_err(failed)?
@@ -370,13 +384,13 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
             graph
                 .enqueue(
                     output,
-                    &[dimensions.as_slice(), &[("DS", 0)]].concat(),
+                    &[dimensions.as_slice(), &[("DS", down.extent)]].concat(),
                     dense_output::WorkflowArgs {
                         residual: (&root).into(),
                         product: (&product).into(),
-                        down_weight: down.into(),
+                        down_weight: (&down.weight).into(),
                         out_rows: (&row_table()?).into(),
-                        down_scale: absent_scale.as_ref().ok_or("shared scale is absent")?.into(),
+                        down_scale: (&down.scale).into(),
                     },
                 )
                 .map_err(failed)?
@@ -423,11 +437,16 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
             let projected = graph
                 .enqueue(
                     down_entry,
-                    &[("M", rows), ("K", shape.hidden), ("N", shape.expert_hidden), ("WS", 0)],
+                    &[
+                        ("M", rows),
+                        ("K", shape.hidden),
+                        ("N", shape.expert_hidden),
+                        ("WS", down.extent),
+                    ],
                     project_rows::WorkflowArgs {
                         source: (&normalized).into(),
-                        weight: down.into(),
-                        weight_scale: absent_scale.as_ref().ok_or("latent scale is absent")?.into(),
+                        weight: (&down.weight).into(),
+                        weight_scale: (&down.scale).into(),
                     },
                 )
                 .map_err(failed)?
@@ -604,14 +623,14 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         ("O", rows),
                         ("H", shape.hidden),
                         ("F", shape.expert_hidden),
-                        ("DS", 0),
+                        ("DS", up.extent),
                     ],
                     dense_output::WorkflowArgs {
                         residual: (&base).into(),
                         product: (&routed).into(),
-                        down_weight: up.into(),
+                        down_weight: (&up.weight).into(),
                         out_rows: (&row_table()?).into(),
-                        down_scale: absent_scale.as_ref().ok_or("latent scale is absent")?.into(),
+                        down_scale: (&up.scale).into(),
                     },
                 )
                 .map_err(failed)?

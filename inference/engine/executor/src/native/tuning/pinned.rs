@@ -27,6 +27,8 @@ pub struct PinnedConfiguration {
     pub bindings: String,
     pub statics: BTreeMap<String, u64>,
     pub params: BTreeMap<String, u64>,
+    /// Launch-scoped parameters, by launch ordinal and name.
+    pub launch_params: BTreeMap<(usize, String), u64>,
 }
 
 pub enum TuningPin {
@@ -34,10 +36,13 @@ pub enum TuningPin {
     Record,
     /// Run exactly these configurations; tune nothing.
     Replay(Vec<PinnedConfiguration>),
+    /// Run every entry's declared default configuration; tune nothing.
+    Defaults,
 }
 
 struct Installed {
     replay: bool,
+    defaults: bool,
     configurations: Vec<PinnedConfiguration>,
 }
 
@@ -48,11 +53,18 @@ pub fn install(pin: TuningPin) {
     let installed = match pin {
         TuningPin::Record => Installed {
             replay: false,
+            defaults: false,
             configurations: Vec::new(),
         },
         TuningPin::Replay(configurations) => Installed {
             replay: true,
+            defaults: false,
             configurations,
+        },
+        TuningPin::Defaults => Installed {
+            replay: true,
+            defaults: true,
+            configurations: Vec::new(),
         },
     };
     *PIN.lock().expect("tuning pin lock poisoned") = Some(installed);
@@ -82,6 +94,16 @@ pub(super) fn lookup(
         return Ok(Pinned::Tune);
     };
     let (entry, bindings, statics) = key;
+    if installed.defaults {
+        let mut fixed = NativeSpecialization::new();
+        for (name, value) in statics {
+            fixed = fixed.with_static(name.clone(), *value);
+        }
+        return implementation
+            .default_specialization(&fixed)
+            .map(Pinned::Chosen)
+            .map_err(|error| format!("default configuration of {entry}: {error:?}"));
+    }
     let Some(pinned) = installed.configurations.iter().find(|pinned| {
         pinned.entry == *entry && pinned.bindings == *bindings && pinned.statics == *statics
     }) else {
@@ -99,6 +121,9 @@ pub(super) fn lookup(
     }
     for (name, value) in &pinned.params {
         specialization = specialization.with_param(name.clone(), *value);
+    }
+    for ((launch, name), value) in &pinned.launch_params {
+        specialization = specialization.with_launch_param(*launch, name.clone(), *value);
     }
     implementation
         .validate(&specialization)
@@ -118,5 +143,6 @@ pub(super) fn record(key: &TuningKey, chosen: &NativeSpecialization) {
         bindings: bindings.clone(),
         statics: statics.clone(),
         params: chosen.params().clone(),
+        launch_params: chosen.launch_params().clone(),
     });
 }

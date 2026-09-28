@@ -2,7 +2,7 @@
 // The Vulkan form of `metal/project_rows.metal` over
 // `lib/projection/projection.glsl`; the GEMM class may split K.
 #include "lib/core/activation.glsl"
-#if SEISMIC_DIM_WS != 0
+#if SEISMIC_STATIC_WS != 0
 #define PROJECTION_SCALED
 #endif
 #include "lib/projection/projection.glsl"

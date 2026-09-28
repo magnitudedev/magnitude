@@ -301,6 +301,7 @@ mod tests {
             },
             source_bytes: values.len() as u64,
             resident_bytes: values.len() as u64,
+            scale: None,
         };
         // SAFETY: fill_staged_source writes every physical upload byte.
         let mut upload =
