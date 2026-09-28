@@ -518,8 +518,6 @@ mod tests {
             },
             inputs: magnitude_family_contracts::InputSemantics {
                 coordinate_axes: 1,
-                text_coordinates:
-                    magnitude_family_contracts::TextCoordinateSemantics::ReplicatedPosition,
             },
             decoder: Decoder {
                 activation_dtype: ActivationDType::BF16,

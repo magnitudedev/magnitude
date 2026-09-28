@@ -317,7 +317,7 @@ pub(crate) mod tests {
         InputSemantics, KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm,
         RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn,
         Router, RouterInput,
-        ScoreFunction, SharedExpert, SharedExpertGate, Sublayer, TextCoordinateSemantics,
+        ScoreFunction, SharedExpert, SharedExpertGate, Sublayer,
         ValueNorm, ValueSource, WeightDescriptor,
     };
 
@@ -549,7 +549,6 @@ pub(crate) mod tests {
             family: magnitude_family_contracts::FamilyId("declared-qwen35".into()),
             artifact_identity: identity,
             inputs: InputSemantics {
-                text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
                 coordinate_axes: 1,
             },
             decoder: Decoder {

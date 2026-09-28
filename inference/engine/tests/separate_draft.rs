@@ -1,7 +1,8 @@
 //! Real-device qualification of a separate draft (DFlash, DSpark, DFlash2):
-//! its state transactions (checkpoint refusal while a draft transaction is in
-//! flight, state copy into another request, restore) reproduce its proposals
-//! exactly, and the header-only assessment charges exactly the weights a load
+//! its state transactions (resume-state refusal while a draft transaction is
+//! in flight, resuming another request from that state, resuming the evicted
+//! source from it) reproduce its proposals exactly, and the header-only
+//! assessment charges exactly the weights a load
 //! commits and bounds its graph holdings. Run on a host with a target and its
 //! draft:
 //! `MAGNITUDE_TEST_TARGET_GGUF=T.gguf MAGNITUDE_TEST_DRAFT_GGUF=D.gguf
@@ -22,8 +23,10 @@ use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     AssessmentGraphResourceBounds, AssessmentMemoryTerms, Demand, DraftForm, ExecutionPath,
     ExecutorDomain, FeatureReader, FeatureRows, FeatureSpan, Operation, Outcome, PhysicalDecision,
-    RequestId, ResourceCapacity, ResourcePlanner, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
+    RequestId, ResourceCapacity, ResourcePlanner, ResumeState, Sampling, SelectSpec, Shaping,
+    TokenId, WorkKind,
 };
+use magnitude_family_contracts::PreparedModelInput;
 use magnitude_scheduler::domain::{self as service_domain, DomainFlight};
 use std::path::PathBuf;
 
@@ -129,9 +132,18 @@ fn rows(features: &FeatureRows, rows: std::ops::Range<usize>) -> FeatureRows {
     .unwrap()
 }
 
+/// Install a request with no prompt rows and make it resident, fresh or from
+/// `from`.
+fn open(domain: &mut ExecutorDomain, request: RequestId, from: Option<&ResumeState>) {
+    domain
+        .install_input(request, PreparedModelInput::continuation_only())
+        .unwrap();
+    domain.open_state(request, from).unwrap();
+}
+
 /// One draft transaction at draft position `position` entering `tokens`
 /// (each paired with its row of `conditioning`), drafting `proposals` after
-/// the last. A request refuses a checkpoint while it is in flight. Returns
+/// the last. A request refuses a resume state while it is in flight. Returns
 /// the proposals.
 fn transact(
     domain: &mut ExecutorDomain,
@@ -158,8 +170,8 @@ fn transact(
         panic!("a draft transaction runs on the head lane")
     };
     assert!(
-        domain.checkpoint(request).is_err(),
-        "a checkpoint waits for the in-flight draft transaction"
+        domain.resume_state(request).is_err(),
+        "a resume state waits for the in-flight draft transaction"
     );
     let mut selected = Vec::new();
     for pending in domain.finish_head(flight).unwrap() {
@@ -235,22 +247,24 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
     let committed = tokens.len() - 1;
 
     let source = RequestId(1);
-    domain.open(source).unwrap();
+    open(&mut domain, source, None);
     let conditioning = prefill(&mut domain, source, &tokens[..committed]);
     inject(&mut domain, source, &tokens, &conditioning);
-    let before_draft = domain.checkpoint(source).unwrap();
+    let before_draft = domain.resume_state(source).unwrap();
     let drafted = draft(&mut domain, source, &tokens, &conditioning, proposals);
     assert_eq!(drafted.len(), proposals);
 
-    // A copy of the state before the draft drafts the same proposals.
+    // Another request resumed from the state before the draft drafts the
+    // same proposals.
     let copy = RequestId(2);
-    domain.open_checkpoint(copy, &before_draft).unwrap();
+    open(&mut domain, copy, Some(&before_draft));
     assert_eq!(
         draft(&mut domain, copy, &tokens, &conditioning, proposals),
         drafted
     );
-    // Restoring the source to that state and drafting again does too.
-    domain.restore(source, &before_draft).unwrap();
+    // Evicting the source and resuming it from that state drafts them too.
+    domain.release_state(&[source]).unwrap();
+    domain.open_state(source, Some(&before_draft)).unwrap();
     assert_eq!(
         draft(&mut domain, source, &tokens, &conditioning, proposals),
         drafted
@@ -260,7 +274,7 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
         domain.close(request).unwrap();
     }
     drop(before_draft);
-    let charge = domain.reconcile_memory_charge(&[], &[]).unwrap();
+    let charge = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(charge.unattributed, 0, "{charge:?}");
 }
 
@@ -328,7 +342,7 @@ fn header_only_assessment_charges_what_a_load_commits() {
     let (mut domain, _) =
         build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
     let request = RequestId(1);
-    domain.open(request).unwrap();
+    open(&mut domain, request, None);
     let tokens = [1, 2, 3, 4, 5].map(TokenId);
     let conditioning = prefill(&mut domain, request, &tokens[..4]);
     inject(&mut domain, request, &tokens, &conditioning);
@@ -339,9 +353,9 @@ fn header_only_assessment_charges_what_a_load_commits() {
         &conditioning,
         resolved.manifest.model.method.proposals(),
     );
-    let held = domain.checkpoint(request).unwrap();
+    let held = domain.resume_state(request).unwrap();
     domain.close(request).unwrap();
-    let charge = domain.reconcile_memory_charge(&[], &[&held]).unwrap();
+    let charge = domain.reconcile_memory_charge(&[&held]).unwrap();
     eprintln!("assessed {terms:?} graphs {graphs:?}\nloaded {charge:?}");
     assert_eq!(charge.unattributed, 0);
     assert_eq!(charge.target_weights, terms.target_weights, "target weights");

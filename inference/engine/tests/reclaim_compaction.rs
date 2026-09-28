@@ -22,6 +22,7 @@ use magnitude_scheduler::{
     domain::{self as service_domain, DomainFlight},
     ServiceLimits,
 };
+use magnitude_family_contracts::PreparedModelInput;
 use magnitude_state::{KvCodec, ShrinkPolicy};
 use std::path::PathBuf;
 
@@ -131,6 +132,14 @@ fn forward(
     result
 }
 
+/// Make `request` resident on fresh state with no prompt rows.
+fn open(domain: &mut ExecutorDomain, request: RequestId) {
+    domain
+        .install_input(request, PreparedModelInput::continuation_only())
+        .unwrap();
+    domain.open_state(request, None).unwrap();
+}
+
 fn prefill(domain: &mut ExecutorDomain, request: RequestId, vocabulary: usize, count: usize) {
     for start in (0..count).step_by(64) {
         let rows = (count - start).min(64);
@@ -146,7 +155,7 @@ fn prefill(domain: &mut ExecutorDomain, request: RequestId, vocabulary: usize, c
 }
 
 fn assert_accounted(domain: &ExecutorDomain) {
-    let charge = domain.reconcile_memory_charge(&[], &[]).unwrap();
+    let charge = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(charge.unattributed, 0, "{charge:?}");
 }
 
@@ -159,14 +168,14 @@ fn reclaim_relocates_live_banks_without_changing_continuation() {
     let peers = slab_banks * 2;
     let reference = RequestId(peers as u64 + 1);
     let relocated = RequestId(peers as u64 + 2);
-    domain.open(reference).unwrap();
+    open(&mut domain, reference);
     prefill(&mut domain, reference, vocabulary, 1);
     for index in 0..peers {
         let request = RequestId(index as u64 + 1);
-        domain.open(request).unwrap();
+        open(&mut domain, request);
         prefill(&mut domain, request, vocabulary, 1);
     }
-    domain.open(relocated).unwrap();
+    open(&mut domain, relocated);
     prefill(&mut domain, relocated, vocabulary, 1);
     for index in 0..peers {
         domain.close(RequestId(index as u64 + 1)).unwrap();
@@ -182,11 +191,11 @@ fn reclaim_relocates_live_banks_without_changing_continuation() {
     )
     .unwrap();
     let before = domain.state_compactions().0;
-    let charge_before = domain.reconcile_memory_charge(&[], &[]).unwrap();
+    let charge_before = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(charge_before.unattributed, 0, "{charge_before:?}");
     let released = domain.shrink_state(ShrinkPolicy::Reclaim).unwrap();
     let after = domain.state_compactions().0;
-    let charge_after = domain.reconcile_memory_charge(&[], &[]).unwrap();
+    let charge_after = domain.reconcile_memory_charge(&[]).unwrap();
     assert!(after.banks > before.banks, "banks were not relocated");
     assert!(released > 0 && charge_after.charged < charge_before.charged);
     assert_eq!(released, charge_before.charged - charge_after.charged);
@@ -224,16 +233,16 @@ fn reclaim_relocates_live_history_and_banks_without_changing_continuation() {
     assert!(peer_rows < 8192, "test context cannot span a history slab");
     let reference = RequestId(peers as u64 + 1);
     let relocated = RequestId(peers as u64 + 2);
-    domain.open(reference).unwrap();
+    open(&mut domain, reference);
     prefill(&mut domain, reference, vocabulary, 32);
     assert_accounted(&domain);
     for index in 0..peers {
         let request = RequestId(index as u64 + 1);
-        domain.open(request).unwrap();
+        open(&mut domain, request);
         prefill(&mut domain, request, vocabulary, peer_rows);
         assert_accounted(&domain);
     }
-    domain.open(relocated).unwrap();
+    open(&mut domain, relocated);
     prefill(&mut domain, relocated, vocabulary, 32);
     assert_accounted(&domain);
     for index in 0..peers {
@@ -249,11 +258,11 @@ fn reclaim_relocates_live_history_and_banks_without_changing_continuation() {
     )
     .unwrap();
     let before = domain.state_compactions().0;
-    let charge_before = domain.reconcile_memory_charge(&[], &[]).unwrap();
+    let charge_before = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(charge_before.unattributed, 0, "{charge_before:?}");
     let released = domain.shrink_state(ShrinkPolicy::Reclaim).unwrap();
     let after = domain.state_compactions().0;
-    let charge_after = domain.reconcile_memory_charge(&[], &[]).unwrap();
+    let charge_after = domain.reconcile_memory_charge(&[]).unwrap();
     eprintln!(
         "released={released} compactions={after:?} charge={}=>{}",
         charge_before.charged, charge_after.charged

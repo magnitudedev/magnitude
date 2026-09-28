@@ -194,7 +194,7 @@ mod tests {
         HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics,
         KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm,
         Rotary, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
-        ScoreFunction, ShortConv, Sublayer, TextCoordinateSemantics, ValueNorm, ValueSource,
+        ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
         WeightDescriptor,
     };
     use magnitude_state::KvCodec;
@@ -364,7 +364,6 @@ mod tests {
             family: FamilyId("lfm2-shaped".into()),
             artifact_identity: identity,
             inputs: InputSemantics {
-                text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
                 coordinate_axes: 1,
             },
             decoder: Decoder {

@@ -221,7 +221,7 @@ mod tests {
         HeadNorm, HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue,
         LatentExperts, MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm,
         RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
-        SharedExpert, SharedExpertGate, StateSpace, Sublayer, TextCoordinateSemantics, ValueNorm,
+        SharedExpert, SharedExpertGate, StateSpace, Sublayer, ValueNorm,
         ValueSource, WeightDescriptor, ImportTransform, WeightKind, WeightRole, WeightScope,
         SublayerIndex,
     };
@@ -407,7 +407,6 @@ mod tests {
             family: FamilyId("hybrid-state-space".into()),
             artifact_identity: identity,
             inputs: InputSemantics {
-                text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
                 coordinate_axes: 1,
             },
             decoder: Decoder {

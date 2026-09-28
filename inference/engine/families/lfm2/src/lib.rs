@@ -21,7 +21,7 @@ use magnitude_family_contracts::{
     FeedForwardUp, HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm,
     InputSemantics, KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm,
     ResidualForm, RmsNorm, RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
-    ScoreFunction, ShortConv, Sublayer, TextCoordinateSemantics, ValueNorm, ValueSource,
+    ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
     WeightDescriptor,
 };
 use std::{error, fmt};
@@ -395,7 +395,6 @@ pub fn inspect_components(
         family: FamilyId(family_id.into()),
         artifact_identity: identity,
         inputs: InputSemantics {
-            text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
             coordinate_axes: 1,
         },
         decoder: Decoder {

@@ -22,6 +22,7 @@ use magnitude_executor::{
     Demand, DomainError, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision,
     RequestId, TokenId, WorkKind,
 };
+use magnitude_family_contracts::PreparedModelInput;
 use magnitude_scheduler::{
     domain::{self as service_domain, DomainFlight},
     ServiceLimits,
@@ -173,7 +174,8 @@ fn main() -> Result<(), String> {
     let (mut domain, _) =
         build_native_domain(&resolved.manifest, package).map_err(|error| error.to_string())?;
     let request = RequestId(1);
-    domain.open(request).map_err(text)?;
+    domain.install_input(request, PreparedModelInput::continuation_only())?;
+    domain.open_state(request, None).map_err(text)?;
     let mut logits = Vec::new();
     let (prefill, decode) = options.tokens.split_at(options.prefill);
     forward(

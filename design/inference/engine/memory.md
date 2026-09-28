@@ -71,7 +71,7 @@ needs one, each joining its domain without copying existing rows or banks. The s
 slab without a new claim. A slab bound by submitted work remains charged until that work and its
 binding views finish; its holding class reflects its strongest remaining holder. Reclamation
 receives credit only for a decrease in Seismic's measured charge, never for the removal of a state
-or retention index entry. A failed allocation or copy preserves the published placement and charge.
+or prefix cache entry. A failed allocation or copy preserves the published placement and charge.
 
 The heap grants a claim only while every domain the load uses is in the Normal band. It tries the
 preferred charge first, then the minimum. It sets Seismic's enforced limit to current charges plus
@@ -86,7 +86,7 @@ Every charged byte belongs to exactly one release class:
 | Class | Contents |
 |---|---|
 | Surplus | Committed state headroom and idle scratch beyond active need |
-| Retained | Prefix checkpoints held only for reuse |
+| Retained | Cached prefixes held only for reuse ([prefix cache](prefix-cache.md)) |
 | Dormant component | Optional head or vision weights with no active consumer |
 | Live | State and method data needed by open requests |
 | In flight | Storage held by submitted work until completion |
@@ -120,7 +120,7 @@ retries its observation. The engine reads no OS pressure signal.
 The request owner applies the same order to every deficit and stops when that deficit clears:
 
 1. Release surplus backing and idle scratch.
-2. Evict retained prefixes, least recently used first.
+2. Evict cached prefixes, least recently used first.
 3. Unload dormant optional components.
 4. For a demand deficit, reduce the pending batch by removing its last request and then
    reducing its token allowance.
@@ -191,8 +191,8 @@ at idle, beyond one free slab per store. No compaction requires a memory claim.
 
 The memory heap is the sole authority for claims, bands, holding classes and
 release decisions. Seismic is the sole byte and allocation-charge authority.
-The state store does not infer global availability from row counts; retention
-owns no byte budget or cached price (it bounds its entry count and names the
+The state store does not infer global availability from row counts; the prefix
+cache owns no byte budget or cached price (it bounds its entry count and names the
 least recently used victim, and the heap observes what dropping it released);
 native resource preclaims enter the same
 heap; and process supervision chooses no release, reacting only to the heap's

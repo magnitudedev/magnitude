@@ -70,16 +70,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     pub fn reconcile_memory_charge(
         &self,
-        live_checkpoints: &[&DomainCheckpoint],
-        retained: &[&DomainCheckpoint],
+        retained: &[&ResumeState],
     ) -> Result<MemoryChargeReconciliation, String> {
-        let (target_state, head_state) = self.state_holding_census(live_checkpoints, retained)?;
+        let (target_state, head_state) = self.state_holding_census(retained)?;
         let state = target_state
             .total()
             .checked_add(head_state.map_or(0, StateHoldingCensus::total))
             .ok_or("state charge sum overflows")?;
         let graph_pools = self.resources.committed_bytes()?;
-        let owned_media = self.owned_media_bytes(live_checkpoints, retained)?;
+        let owned_media = self.owned_media_bytes(retained)?;
         let target_weights = self.family.target_weight_bytes()?;
         // The head loader inherits the target cache so tied weights are
         // represented by the same allocation. Vision has its own cache.
@@ -146,28 +145,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         })
     }
 
-    /// Count each standalone feature allocation once across live requests and
-    /// checkpoints. Graph-backed features already belong to a sealed output
-    /// arena in `graph_pools` and must not be counted again.
-    fn owned_media_bytes(
-        &self,
-        live_checkpoints: &[&DomainCheckpoint],
-        retained: &[&DomainCheckpoint],
-    ) -> Result<u64, String> {
-        let inputs = self.input.values().chain(
-            live_checkpoints
-                .iter()
-                .chain(retained.iter())
-                .filter_map(|checkpoint| checkpoint.input.as_ref()),
-        );
+    /// Count each standalone feature allocation once across request inputs
+    /// and retained resume states. Graph-backed features already belong to a
+    /// sealed output arena in `graph_pools` and must not be counted again.
+    fn owned_media_bytes(&self, retained: &[&ResumeState]) -> Result<u64, String> {
+        let features = self
+            .input
+            .values()
+            .flat_map(|input| {
+                input
+                    .images
+                    .values()
+                    .filter_map(|image| image.features.as_ref())
+            })
+            .chain(retained.iter().flat_map(|state| state.features.values()));
         let mut seen: Vec<&Tensor> = Vec::new();
         let mut bytes = 0u64;
-        for feature in inputs.flat_map(|input| {
-            input
-                .images
-                .values()
-                .filter_map(|image| image.features.as_ref())
-        }) {
+        for feature in features {
             if feature.allocation().is_graph_backed() {
                 continue;
             }
@@ -186,27 +180,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(bytes)
     }
 
-    /// Account for each state arena from current requests, checkpoints, and
-    /// the store's registered submitted transactions. Unregistered omissions
-    /// remain an error rather than being mislabeled as surplus.
+    /// Account for each state arena from resident requests, retained resume
+    /// states, and the store's registered submitted transactions.
+    /// Unregistered omissions remain an error rather than being mislabeled as
+    /// surplus.
     pub fn state_holding_census(
         &self,
-        live_checkpoints: &[&DomainCheckpoint],
-        retained: &[&DomainCheckpoint],
+        retained: &[&ResumeState],
     ) -> Result<(StateHoldingCensus, Option<StateHoldingCensus>), String> {
-        let target_live = self
-            .target
-            .values()
-            .map(Holder::State)
-            .chain(
-                live_checkpoints
-                    .iter()
-                    .map(|checkpoint| Holder::Checkpoint(&checkpoint.target)),
-            )
-            .collect::<Vec<_>>();
+        let target_live = self.target.values().map(Holder::State).collect::<Vec<_>>();
         let target_retained = retained
             .iter()
-            .map(|checkpoint| Holder::Checkpoint(&checkpoint.target))
+            .map(|state| Holder::Checkpoint(&state.target))
             .collect::<Vec<_>>();
         let target = self
             .target_store
@@ -216,31 +201,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .head_store
             .as_ref()
             .map(|store| {
-                let live = self
-                    .head
-                    .values()
-                    .map(Holder::State)
-                    .chain(
-                        live_checkpoints
-                            .iter()
-                            .map(|checkpoint| {
-                                checkpoint
-                                    .head
-                                    .as_ref()
-                                    .map(Holder::Checkpoint)
-                                    .ok_or("live checkpoint has no head state")
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )
-                    .collect::<Vec<_>>();
+                let live = self.head.values().map(Holder::State).collect::<Vec<_>>();
                 let retained = retained
                     .iter()
-                    .map(|checkpoint| {
-                        checkpoint
+                    .map(|state| {
+                        state
                             .head
                             .as_ref()
                             .map(Holder::Checkpoint)
-                            .ok_or("retained checkpoint has no head state")
+                            .ok_or("retained resume state has no head state")
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 store

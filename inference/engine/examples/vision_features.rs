@@ -150,9 +150,9 @@ fn main() -> Result<(), String> {
     println!("backend={:?} load={:.1}s", domain.execution_backend(), started.elapsed().as_secs_f64());
 
     let request = RequestId(1);
-    domain.open(request).map_err(|error| error.to_string())?;
+    domain.install_input(request, input)?;
     let operations = domain
-        .install_input(request, input)
+        .open_state(request, None)
         .map_err(|error| error.to_string())?;
     let groups = service_domain::group(&domain, operations);
     let [group] = groups.as_slice() else {

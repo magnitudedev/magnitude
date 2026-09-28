@@ -188,12 +188,20 @@ impl ProgramFamily for NativeFamily {
     }
 
     fn optional_constant_bytes(&self) -> Result<u64, &'static str> {
-        Ok(self
+        let head = self
             .head
             .as_ref()
             .map(|head| head.constant_bytes())
             .transpose()?
-            .unwrap_or(0))
+            .unwrap_or(0);
+        let vision = self
+            .vision
+            .as_ref()
+            .map(|vision| vision.constant_bytes())
+            .transpose()?
+            .unwrap_or(0);
+        head.checked_add(vision)
+            .ok_or("optional graph constant charge overflows")
     }
 
     fn submit_target(

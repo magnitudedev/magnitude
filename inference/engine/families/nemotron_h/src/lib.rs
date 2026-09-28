@@ -29,7 +29,7 @@ use magnitude_family_contracts::{
     ImportTransform, InputNorm, InputSemantics, KeyValue, LatentExperts, LayerNorm,
     MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Rotary,
     RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert, SharedExpertGate,
-    StateSpace, Sublayer, TextCoordinateSemantics, ValueNorm, ValueSource, WeightDescriptor,
+    StateSpace, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
 };
 use std::{error, fmt};
 
@@ -580,7 +580,6 @@ pub fn inspect_components(
         },
     };
     let inputs = InputSemantics {
-        text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
         coordinate_axes: 1,
     };
 

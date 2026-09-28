@@ -151,31 +151,14 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
             WorkerCommand::Admit(AdmitRequest {
                 seed,
                 input,
-                retention,
+                prefix_cache,
                 output_capacity,
             }) => {
                 if output_capacity == 0 {
                     return Err("request output capacity must be positive".into());
                 }
-                if seed.prompt() != input.tokens() || seed.layout() != input.layout() {
-                    return Err("generation seed does not match prepared input".into());
-                }
                 let generation = seed.into_generation(self.method.clone())?;
-                let admitted = match retention {
-                    Some(retention) => owner.admit_retained_with(
-                        generation,
-                        retention,
-                        now,
-                        move |domain, request, _, hit| match hit {
-                            Some(_) => domain.install_retained_input(request, input),
-                            None => domain.install_input(request, input),
-                        },
-                    ),
-                    None => owner.admit_with(generation, now, move |domain, request, _| {
-                        domain.install_input(request, input)
-                    }),
-                };
-                let request = match admitted {
+                let request = match owner.admit(generation, input, prefix_cache, now) {
                     Ok(request) => request,
                     Err(error) => return Ok(WorkerReply::AdmissionRefused(error)),
                 };

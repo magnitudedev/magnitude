@@ -6,10 +6,7 @@
 //! the host/worker IPC protocol is defined above this crate.
 
 use crate::publication::PublicationReceiver;
-use crate::{
-    owner::{AdmissionError, Status},
-    retention::RetentionRequest,
-};
+use crate::owner::{AdmissionError, Status};
 use magnitude_executor::memory::{Holding, MemoryStanding};
 use magnitude_executor::platform::DomainReading;
 use magnitude_executor::RequestId;
@@ -19,7 +16,8 @@ use magnitude_generation::GenerationSeed;
 pub struct AdmitRequest {
     pub seed: GenerationSeed,
     pub input: PreparedModelInput,
-    pub retention: Option<RetentionRequest>,
+    /// Whether the request resumes from and contributes to the prefix cache.
+    pub prefix_cache: bool,
     pub output_capacity: usize,
 }
 

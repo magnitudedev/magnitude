@@ -2,7 +2,7 @@
 //!
 //! Three threads: a reader decodes host messages into the session inbox; the
 //! execution thread owns the device, scheduler and publication queues; the
-//! session thread binds admissions (constraint matcher, retention key),
+//! session thread binds admissions (constraint matcher, prefix-cache opt-in),
 //! dispatches them to the execution owner and forwards each request's
 //! publications while the host holds credit for them.
 
@@ -23,7 +23,6 @@ use magnitude_scheduler::{
     owner::Status,
     protocol::{AdmitRequest, RequestSnapshot, WorkerCommand, WorkerReply},
     publication::{Publication, PublicationReceiver},
-    retention::{RetentionKey, RetentionRequest},
     worker::{Call, Client, Worker},
 };
 use std::{
@@ -126,7 +125,6 @@ struct Stream {
 pub(crate) struct Loaded {
     pub execution: Worker,
     pub vocabulary: Vocabulary,
-    pub retention: RetentionKey,
     pub definition: ModelDefinition,
     pub compute_bytes: u64,
     /// Bytes of the model's host-resident tables held in host RAM.
@@ -328,7 +326,8 @@ impl Session {
     }
 
     /// Validate the decoded input against the loaded definition, instantiate
-    /// the constraint with this worker's vocabulary and derive retention.
+    /// the constraint with this worker's vocabulary and bind the prefix-cache
+    /// opt-in.
     fn bind(&mut self, admission: Admission) -> Result<(WorkerCommand, usize), RequestError> {
         if let Some(cause) = &self.unloading {
             return Err(RequestError::ModelUnloaded {
@@ -360,17 +359,14 @@ impl Session {
             .vocabulary
             .prepare_generation(constraint.as_ref(), options, input.tokens(), input.layout())
             .map_err(invalid)?;
-        let retention = match retention {
-            RetentionPolicy::Retain => Some(
-                RetentionRequest::new(self.loaded.retention.clone(), &input).map_err(invalid)?,
-            ),
-            RetentionPolicy::Transient => None,
-        };
         Ok((
             WorkerCommand::Admit(AdmitRequest {
                 seed,
                 input,
-                retention,
+                prefix_cache: match retention {
+                    RetentionPolicy::Retain => true,
+                    RetentionPolicy::Transient => false,
+                },
                 output_capacity,
             }),
             output_capacity,

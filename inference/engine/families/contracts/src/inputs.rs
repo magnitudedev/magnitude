@@ -254,6 +254,19 @@ impl PreparedModelInput {
         })
     }
 
+    /// An input with no prompt rows: every row a request forwards is a
+    /// continuation row, at the coordinates [`Self::coordinates_at`] gives
+    /// continuation rows.
+    pub fn continuation_only() -> Self {
+        Self {
+            tokens: Vec::new(),
+            layout: InputLayout::new(0, Vec::new()).expect("an empty layout is valid"),
+            coordinates: Vec::new(),
+            continuation: 0,
+            vision: Vec::new(),
+        }
+    }
+
     pub fn new(
         definition: &ModelDefinition,
         tokens: TokenPlan,

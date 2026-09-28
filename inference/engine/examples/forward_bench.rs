@@ -58,7 +58,7 @@ use magnitude_executor::{
     Demand, DomainError, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision,
     RequestId, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
 };
-use magnitude_family_contracts::Decoder;
+use magnitude_family_contracts::{Decoder, PreparedModelInput};
 use magnitude_scheduler::{
     domain::{self as service_domain, DomainFlight},
     ServiceLimits,
@@ -620,7 +620,9 @@ impl Bench {
         let request = RequestId(self.next_request);
         self.next_request += 1;
         self.domain
-            .open(request)
+            .install_input(request, PreparedModelInput::continuation_only())?;
+        self.domain
+            .open_state(request, None)
             .map_err(|error| error.to_string())?;
         Ok(Sequence {
             request,

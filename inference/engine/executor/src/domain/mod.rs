@@ -17,7 +17,7 @@ use crate::{
     TargetTokens, ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
     ValidatedVisionLaunch, VisionLaunchInputs, WorkKind,
 };
-use magnitude_family_contracts::{ModelDefinition, PreparedModelInput, TextCoordinateSemantics};
+use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{
     Holder, InFlightState, OwnedAdvanceResolution, OwnedCompaction, OwnedCompactionPreparation,
     OwnedStateAdvance, SequenceState, StateCheckpoint, StateStore, TentativeAdvance,
@@ -44,7 +44,7 @@ pub use family::{NativeFamily, ProgramFamily};
 pub use heap::{ClaimRefusal, DeviceHeap};
 use in_flight::decode_selected;
 pub use in_flight::{HeadFlight, TargetFlight, VisionFlight};
-pub use ownership::{OpenRequirements, OpenReservation};
+pub use ownership::OpenRequirements;
 pub use state::MemoryChargeReconciliation;
 pub(crate) use target::accepted_history;
 pub use target::TargetHostTiming;
@@ -295,27 +295,31 @@ impl DomainReservation {
     }
 }
 
-#[derive(Clone)]
 struct InputImage {
     image: ImageRef,
     features: Option<FeatureRef>,
 }
 
-#[derive(Clone)]
+/// A request's prepared input, owned from admission until the request
+/// closes. Residency (numerical state in this domain) comes and goes within
+/// that lifetime; encoded features are released with it and re-encoded.
 struct RequestInput {
     input: PreparedModelInput,
     images: BTreeMap<String, InputImage>,
+    resident: bool,
 }
 
-/// Retains both numerical sequence lanes and admitted media claims for a
-/// fork, restoration, or cross-request retention entry.
-pub struct DomainCheckpoint {
+/// Everything needed to make a request resident at a position without
+/// recomputing the rows before it: both numerical sequence lanes and the
+/// features of the media spans that straddle the position. It holds no
+/// request's input: which path it represents is the prefix cache's record.
+pub struct ResumeState {
     target: StateCheckpoint,
     head: Option<StateCheckpoint>,
-    input: Option<RequestInput>,
+    features: BTreeMap<String, FeatureRef>,
 }
 
-impl DomainCheckpoint {
+impl ResumeState {
     pub fn position(&self) -> usize {
         self.target.position()
     }

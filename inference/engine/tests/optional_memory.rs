@@ -17,24 +17,24 @@ use magnitude_executor::{
 use magnitude_generation::{
     EndOfGeneration, Generation, InputLayout, MethodChoice, Mtp, Options, Sampling, Shaping,
 };
+use magnitude_family_contracts::{PreparedModelInput, TokenPlan};
 use magnitude_scheduler::{
     domain::{self as service_domain, DomainFlight},
-    owner::{Owner, Status, Step},
-    retention::{RetentionCapacity, RetentionKey, RetentionRequest, TokenizerIdentity},
+    owner::{AdmissionError, Owner, Status, Step},
+    prefix_cache::PrefixCacheCapacity,
     ServiceLimits,
 };
-use magnitude_state::{CodecIdentity, KvCodec};
+use magnitude_state::KvCodec;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// A plain-method owner over the test model with retention of up to
-/// `retained` prefixes, its vocabulary, the retention key of its model and
-/// its tokenizer.
+/// A plain-method owner over the test model caching up to `cached`
+/// prefixes, its vocabulary and its tokenizer.
 fn plain_owner(
     limits: ServiceLimits,
-    retained: usize,
-) -> (Owner, usize, RetentionKey, std::sync::Arc<ByteBpeTokenizer>) {
+    cached: usize,
+) -> (Owner, usize, std::sync::Arc<ByteBpeTokenizer>) {
     let model = PathBuf::from(
         std::env::var_os("MAGNITUDE_TEST_MTP_GGUF").expect("set MAGNITUDE_TEST_MTP_GGUF"),
     );
@@ -60,23 +60,18 @@ fn plain_owner(
     .resolve()
     .unwrap();
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
-    let key = RetentionKey::new(
-        resolved.manifest.package.identity.clone(),
-        TokenizerIdentity::new("optional-memory").unwrap(),
-        CodecIdentity::new("affine-k8v4").unwrap(),
-    );
     let tokenizer = resolved.host.shared_tokenizer();
     let package = resolved.host.shared_package();
     let (domain, _) = build_native_domain(&resolved.manifest, package).unwrap();
-    let owner = Owner::with_retention_capacity(
+    let owner = Owner::with_prefix_cache_capacity(
         domain,
         limits,
-        RetentionCapacity {
-            max_entries: retained,
+        PrefixCacheCapacity {
+            max_entries: cached,
         },
     )
     .unwrap();
-    (owner, vocabulary, key, tokenizer)
+    (owner, vocabulary, tokenizer)
 }
 
 /// The first `len` tokens of a deterministic English text; distinct seeds
@@ -127,13 +122,25 @@ fn greedy(prompt: &[TokenId], vocabulary: usize, max_tokens: usize) -> Generatio
     .unwrap()
 }
 
-fn retention(key: &RetentionKey, prompt: &[TokenId]) -> RetentionRequest {
-    let plan = magnitude_family_contracts::TokenPlan::new(
-        prompt.to_vec(),
-        InputLayout::new(prompt.len(), vec![]).unwrap(),
+/// Admit `generation` with the text input of its prompt, as the test
+/// model's family prepares one: each row at its own position.
+fn admit(
+    owner: &mut Owner,
+    generation: Generation,
+    prefix_cache: bool,
+    now: u64,
+) -> Result<RequestId, AdmissionError> {
+    let prompt = generation.prompt().to_vec();
+    let input = PreparedModelInput::from_text_coordinates(
+        TokenPlan::new(
+            prompt.clone(),
+            InputLayout::new(prompt.len(), vec![]).unwrap(),
+        )
+        .unwrap(),
+        (0..prompt.len()).map(|row| [row as i32; 3]).collect(),
     )
     .unwrap();
-    RetentionRequest::from_token_plan(key.clone(), &plan).unwrap()
+    owner.admit(generation, input, prefix_cache, now)
 }
 
 /// The owner's clock: every call advances it, as a worker's periodic
@@ -212,19 +219,17 @@ fn reconcile_terminal(owner: &mut Owner, clock: &mut Clock, request: RequestId, 
 fn retained_turn(
     owner: &mut Owner,
     clock: &mut Clock,
-    key: &RetentionKey,
     vocabulary: usize,
     tokens: &[TokenId],
     max_tokens: usize,
 ) -> (Vec<TokenId>, usize) {
-    let request = owner
-        .admit_retained_with(
-            greedy(tokens, vocabulary, max_tokens),
-            retention(key, tokens),
-            clock.tick(),
-            |_, _, _, _| Ok(Vec::new()),
-        )
-        .unwrap();
+    let request = admit(
+        owner,
+        greedy(tokens, vocabulary, max_tokens),
+        true,
+        clock.tick(),
+    )
+    .unwrap();
     let output = drive(owner, clock, &[request]).remove(0);
     reconcile_terminal(owner, clock, request, tokens.len() + output.len());
     let cached = owner.usage(request).unwrap().cached_tokens;
@@ -238,19 +243,17 @@ fn retained_turn(
 fn stopped_turn(
     owner: &mut Owner,
     clock: &mut Clock,
-    key: &RetentionKey,
     vocabulary: usize,
     tokens: &[TokenId],
     count: usize,
 ) -> (Vec<TokenId>, usize) {
-    let request = owner
-        .admit_retained_with(
-            greedy(tokens, vocabulary, 4 * count),
-            retention(key, tokens),
-            clock.tick(),
-            |_, _, _, _| Ok(Vec::new()),
-        )
-        .unwrap();
+    let request = admit(
+        owner,
+        greedy(tokens, vocabulary, 4 * count),
+        true,
+        clock.tick(),
+    )
+    .unwrap();
     let mut output = Vec::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while output.len() < count {
@@ -297,7 +300,7 @@ fn concurrent_cohort_memory_growth_and_idle_release() {
         decode_share: 0.5,
         locality_seconds: 1.0,
     };
-    let (mut owner, vocabulary, _, tokenizer) = plain_owner(limits, 0);
+    let (mut owner, vocabulary, tokenizer) = plain_owner(limits, 0);
     let mut clock = Clock(0);
     let baseline = owner.reconcile_memory_charge().unwrap();
     assert_eq!(baseline.unattributed, 0);
@@ -306,12 +309,13 @@ fn concurrent_cohort_memory_growth_and_idle_release() {
     for count in [1, 4, 16] {
         let requests = (0..count)
             .map(|seed| {
-                owner
-                    .admit(
-                        greedy(&prompt(&tokenizer, 1000 + seed, 658), vocabulary, 24),
-                        clock.tick(),
-                    )
-                    .unwrap()
+                admit(
+                    &mut owner,
+                    greedy(&prompt(&tokenizer, 1000 + seed, 658), vocabulary, 24),
+                    false,
+                    clock.tick(),
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
         let mut peak = owner.reconcile_memory_charge().unwrap();
@@ -405,7 +409,10 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
     let mut first_cycle = None;
 
     for request in [RequestId(1), RequestId(2)] {
-        domain.open(request).unwrap();
+        domain
+            .install_input(request, PreparedModelInput::continuation_only())
+            .unwrap();
+        domain.open_state(request, None).unwrap();
         let head = Operation::Head {
             request,
             tokens: vec![TokenId(1)],
@@ -427,9 +434,9 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
                 .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
                 .unwrap();
         }
-        let retained = domain.checkpoint(request).unwrap();
+        let retained = domain.resume_state(request).unwrap();
         domain.close(request).unwrap();
-        let resident = domain.reconcile_memory_charge(&[], &[&retained]).unwrap();
+        let resident = domain.reconcile_memory_charge(&[&retained]).unwrap();
         assert!(resident.optional_weights > 0);
         assert!(charge(&domain) > baseline);
         let before = charge(&domain);
@@ -437,7 +444,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         let after = charge(&domain);
         assert!(released > 0, "optional component held no physical charge");
         assert_eq!(before - after, released);
-        let idle = domain.reconcile_memory_charge(&[], &[&retained]).unwrap();
+        let idle = domain.reconcile_memory_charge(&[&retained]).unwrap();
         assert_eq!(idle.optional_weights, 0);
         assert_eq!(resident.unattributed, 0);
         assert_eq!(idle.unattributed, 0);
@@ -506,9 +513,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
     let tokenizer = resolved.host.shared_tokenizer();
     let package = resolved.host.shared_package();
     let (domain, _) = build_native_domain(&resolved.manifest, package).unwrap();
-    let mut owner =
-        Owner::with_retention_capacity(domain, limits, RetentionCapacity { max_entries: 0 })
-            .unwrap();
+    let mut owner = Owner::new(domain, limits).unwrap();
     let mut clock = Clock(0);
     let method = Arc::new(Mtp::new("optional-memory-first-bind", 4).unwrap());
     let requests = (0..4)
@@ -539,7 +544,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
                 method.clone(),
             )
             .unwrap();
-            owner.admit(generation, clock.tick()).unwrap()
+            admit(&mut owner, generation, false, clock.tick()).unwrap()
         })
         .collect::<Vec<_>>();
     let outputs = drive(&mut owner, &mut clock, &requests);
@@ -607,7 +612,7 @@ fn admission_reclaims_under_a_real_process_limit() {
     let available = allocation(domain.resources().device()).unwrap();
     assert_eq!(available.constraint, MemoryConstraint::HostRam);
     let planning = available.thresholds.planning_bytes;
-    let seed_bytes = domain.state_holding_census(&[], &[]).unwrap().0.model_seed;
+    let seed_bytes = domain.state_holding_census(&[]).unwrap().0.model_seed;
     assert!(seed_bytes > 0, "fixture needs recurrent banks");
     let mut owner = Owner::new(domain, limits).unwrap();
     let generation = |prompt_tokens: usize| {
@@ -639,7 +644,7 @@ fn admission_reclaims_under_a_real_process_limit() {
     // Keep several requests live with decoded output so a later growth
     // deficit has eligible replayable victims.
     let existing = (0..5)
-        .map(|_| owner.admit(generation(1), 0).unwrap())
+        .map(|_| admit(&mut owner, generation(1), false, 0).unwrap())
         .collect::<Vec<_>>();
     for tick in 0..128 {
         if existing
@@ -655,7 +660,7 @@ fn admission_reclaims_under_a_real_process_limit() {
         .iter()
         .all(|request| owner.output_len(*request).unwrap() > 0));
     let before = owner
-        .inspect_domain(|domain| domain.reconcile_memory_charge(&[], &[]))
+        .inspect_domain(|domain| domain.reconcile_memory_charge(&[]))
         .unwrap();
 
     let vm_kib = std::fs::read_to_string("/proc/self/status")
@@ -713,9 +718,13 @@ fn admission_reclaims_under_a_real_process_limit() {
                 .expect("incoming prompt tokens must be an integer")
         })
         .unwrap_or(256);
-    let incoming = owner
-        .admit(generation(prompt_tokens), 128 * 1_000_000_000)
-        .unwrap();
+    let incoming = admit(
+        &mut owner,
+        generation(prompt_tokens),
+        false,
+        128 * 1_000_000_000,
+    )
+    .unwrap();
     let mut saw_preemption = false;
     let mut lowest_charge = before.charged;
     let mut in_limit_output = 0;
@@ -755,7 +764,7 @@ fn admission_reclaims_under_a_real_process_limit() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let after = owner
-        .inspect_domain(|domain| domain.reconcile_memory_charge(&[], &[]))
+        .inspect_domain(|domain| domain.reconcile_memory_charge(&[]))
         .unwrap();
     eprintln!(
         "admission deficit result: saw_preemption={saw_preemption} existing={:?} errors={:?} incoming={:?} output={} charged_before={} lowest_charge={} charged_after={} state_after={:?} in_flight_before={} in_flight_after={} unattributed_before={} unattributed_after={}",
@@ -869,7 +878,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
         .unwrap()
     };
     let open = (0..2)
-        .map(|_| owner.admit(generation(), 0).unwrap())
+        .map(|_| admit(&mut owner, generation(), false, 0).unwrap())
         .collect::<Vec<_>>();
     for tick in 0..64 {
         if open
@@ -921,7 +930,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
     let start = 64 * 1_000_000_000;
     owner.periodic(start).unwrap();
     assert!(matches!(
-        owner.admit(generation(), start),
+        admit(&mut owner, generation(), false, start),
         Err(AdmissionError::MemoryReclaim)
     ));
     // Releases cannot restore half a planning reserve, so the model unloads
@@ -953,7 +962,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
         })
     )));
     assert!(matches!(
-        owner.admit(generation(), start + 5_000_000_000),
+        admit(&mut owner, generation(), false, start + 5_000_000_000),
         Err(AdmissionError::ModelUnloaded {
             cause: ModelUnloadCause::MemoryPressure
         })
@@ -973,30 +982,30 @@ fn idle_shrink_preserves_a_retained_session() {
         decode_share: 0.5,
         locality_seconds: 1.0,
     };
-    let (mut owner, vocabulary, key, tokenizer) = plain_owner(limits, 4);
+    let (mut owner, vocabulary, tokenizer) = plain_owner(limits, 4);
     let mut clock = Clock(0);
     let session = prompt(&tokenizer, 0, 96);
     // The peers finish but remain open, holding the low rows and banks; every
     // bank the session and its next turn acquire lies above theirs.
     let peers = (1..8)
         .map(|seed| {
-            owner
-                .admit(
-                    greedy(&prompt(&tokenizer, seed, 96), vocabulary, 96),
-                    clock.tick(),
-                )
-                .unwrap()
+            admit(
+                &mut owner,
+                greedy(&prompt(&tokenizer, seed, 96), vocabulary, 96),
+                false,
+                clock.tick(),
+            )
+            .unwrap()
         })
         .collect::<Vec<_>>();
     drive(&mut owner, &mut clock, &peers);
-    let first = owner
-        .admit_retained_with(
-            greedy(&session, vocabulary, 24),
-            retention(&key, &session),
-            clock.tick(),
-            |_, _, _, _| Ok(Vec::new()),
-        )
-        .unwrap();
+    let first = admit(
+        &mut owner,
+        greedy(&session, vocabulary, 24),
+        true,
+        clock.tick(),
+    )
+    .unwrap();
     let output = drive(&mut owner, &mut clock, &[first]).remove(0);
     // Retain the session's terminal prefix while its peers stay open.
     let resumed = session.len() + output.len();
@@ -1012,10 +1021,9 @@ fn idle_shrink_preserves_a_retained_session() {
     // shapes, so their numerics are comparable bit for bit.
     // Stopped turns retain nothing of their own: the session's prompt and
     // terminal prefixes stay the only retained state.
-    let (reference, cached) =
-        stopped_turn(&mut owner, &mut clock, &key, vocabulary, &next_turn, 16);
+    let (reference, cached) = stopped_turn(&mut owner, &mut clock, vocabulary, &next_turn, 16);
     assert_eq!(cached, resumed, "the next turn resumes from the session");
-    assert_eq!(owner.retained_entries(), 2);
+    assert_eq!(owner.cached_prefixes(), 2);
     let before = owner.reconcile_memory_charge().unwrap();
     for &request in &peers {
         owner.retire(request).unwrap();
@@ -1024,7 +1032,7 @@ fn idle_shrink_preserves_a_retained_session() {
     let after = owner.reconcile_memory_charge().unwrap();
     eprintln!(
         "idle shrink: retained={} charged {} -> {} state {:?} -> {:?} unattributed {} -> {}",
-        owner.retained_entries(),
+        owner.cached_prefixes(),
         before.charged,
         after.charged,
         before.target_state,
@@ -1036,7 +1044,7 @@ fn idle_shrink_preserves_a_retained_session() {
     // retained history for the turn below.
     assert!(after.charged < before.charged);
     assert_eq!((before.unattributed, after.unattributed), (0, 0));
-    let (replayed, cached) = stopped_turn(&mut owner, &mut clock, &key, vocabulary, &next_turn, 16);
+    let (replayed, cached) = stopped_turn(&mut owner, &mut clock, vocabulary, &next_turn, 16);
     eprintln!("idle shrink replay: reference={reference:?} replayed={replayed:?}");
     assert_eq!(
         cached, resumed,
@@ -1074,10 +1082,10 @@ fn reclaim_releases_retained_sessions_and_replays_them() {
         decode_share: 0.5,
         locality_seconds: 1.0,
     };
-    let (mut owner, vocabulary, key, tokenizer) = plain_owner(limits, 8);
+    let (mut owner, vocabulary, tokenizer) = plain_owner(limits, 8);
     let mut clock = Clock(0);
     let session = prompt(&tokenizer, 0, 96);
-    let (first, _) = retained_turn(&mut owner, &mut clock, &key, vocabulary, &session, 16);
+    let (first, _) = retained_turn(&mut owner, &mut clock, vocabulary, &session, 16);
     let resumed = session.len() + first.len();
     let next_turn = session
         .iter()
@@ -1085,17 +1093,21 @@ fn reclaim_releases_retained_sessions_and_replays_them() {
         .copied()
         .chain([TokenId(4242)])
         .collect::<Vec<_>>();
-    // Without a retention request nothing is looked up or retained.
-    let cold_request = owner
-        .admit(greedy(&next_turn, vocabulary, 16), clock.tick())
-        .unwrap();
+    // Without the prefix cache nothing is looked up or retained.
+    let cold_request = admit(
+        &mut owner,
+        greedy(&next_turn, vocabulary, 16),
+        false,
+        clock.tick(),
+    )
+    .unwrap();
     let cold = drive(&mut owner, &mut clock, &[cold_request]).remove(0);
     assert_eq!(owner.usage(cold_request).unwrap().cached_tokens, 0);
     owner.retire(cold_request).unwrap();
-    let (served, cached) = retained_turn(&mut owner, &mut clock, &key, vocabulary, &next_turn, 16);
+    let (served, cached) = retained_turn(&mut owner, &mut clock, vocabulary, &next_turn, 16);
     assert_eq!(cached, resumed);
     settle(&mut owner, &mut clock);
-    let retained = owner.retained_entries();
+    let retained = owner.cached_prefixes();
     let before = owner.reconcile_memory_charge().unwrap();
     assert!(retained >= 2 && before.target_state.retained > 0);
     assert_eq!(before.unattributed, 0);
@@ -1143,7 +1155,7 @@ fn reclaim_releases_retained_sessions_and_replays_them() {
     eprintln!(
         "reclaim retained release: entries {retained} -> {} charged {} -> {} state {:?} -> {:?} \
          unattributed {} -> {} unloading={unloading}",
-        owner.retained_entries(),
+        owner.cached_prefixes(),
         before.charged,
         released.charged,
         before.target_state,
@@ -1152,13 +1164,12 @@ fn reclaim_releases_retained_sessions_and_replays_them() {
         released.unattributed,
     );
     assert!(!unloading, "headroom returned within the unload interval");
-    assert_eq!(owner.retained_entries(), 0);
+    assert_eq!(owner.cached_prefixes(), 0);
     assert_eq!(released.target_state.retained, 0);
     assert!(released.charged < before.charged);
     assert_eq!(released.unattributed, 0);
 
-    let (replayed, cached) =
-        retained_turn(&mut owner, &mut clock, &key, vocabulary, &next_turn, 16);
+    let (replayed, cached) = retained_turn(&mut owner, &mut clock, vocabulary, &next_turn, 16);
     eprintln!(
         "reclaim replay: cold={cold:?} served={served:?} replayed={replayed:?} \
          served_matches_cold={}",

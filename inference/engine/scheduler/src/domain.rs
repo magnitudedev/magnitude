@@ -8,7 +8,7 @@ use magnitude_executor::{
     Completion, DomainError, DomainRequirements, GroupKey, HeadFlight, NativeFamily, Operation,
     ProgramFamily, ReservedResources, TargetFlight, VisionFlight,
 };
-pub use magnitude_executor::{DomainCheckpoint, ExecutorDomain};
+pub use magnitude_executor::{ExecutorDomain, ResumeState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DomainLane {

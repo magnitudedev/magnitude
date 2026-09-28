@@ -975,6 +975,10 @@ impl NativeVisionProgram {
         Self { graphs }
     }
 
+    pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
+        self.graphs.constant_bytes()
+    }
+
     fn execute_graph(
         &self,
         core: &VisionLaunchCore,
@@ -1055,7 +1059,7 @@ pub(crate) struct BoundVisionGraphs {
     prepared: Rc<PreparedVisionGraphs>,
     variants: Vec<BoundNativeGraphPlan>,
     /// The uploaded graph constants, held with the plans that bind them.
-    _constants: Vec<Tensor>,
+    constants: Vec<Tensor>,
 }
 
 pub(crate) struct VisionGraphUploads<'a> {
@@ -1161,7 +1165,7 @@ impl PreparedVisionGraphs {
         Ok(BoundVisionGraphs {
             prepared: self.clone(),
             variants,
-            _constants: uploaded.into_tensors(),
+            constants: uploaded.into_tensors(),
         })
     }
 
@@ -1209,6 +1213,14 @@ impl PreparedVisionGraphs {
 }
 
 impl BoundVisionGraphs {
+    fn constant_bytes(&self) -> Result<u64, &'static str> {
+        self.constants.iter().try_fold(0u64, |bytes, tensor| {
+            bytes
+                .checked_add(tensor.storage_bytes())
+                .ok_or("vision graph constant charge overflows")
+        })
+    }
+
     pub(crate) fn class(
         &self,
         patch_rows: u64,

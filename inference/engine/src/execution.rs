@@ -10,6 +10,7 @@ use crate::options::ExecutionManifest;
 use crate::worker::protocol::LoadProgress;
 use magnitude_artifacts::Package;
 use magnitude_batching::Demand;
+use magnitude_family_contracts::{InputLayout, PreparedModelInput, TokenPlan};
 use magnitude_executor::{
     memory::{ClaimId, HoldingClass},
     platform::{self, DomainRole, PlatformConfig, PlatformError},
@@ -498,8 +499,18 @@ fn warm_up(domain: &mut ExecutorDomain) -> Result<(), LoadError> {
     let began = std::time::Instant::now();
     let request = RequestId(u64::MAX);
     let failed = |error: String| internal(format!("load warm-up forward: {error}"));
+    let input = PreparedModelInput::from_text_coordinates(
+        TokenPlan::new(
+            vec![TokenId(0)],
+            InputLayout::new(1, Vec::new()).map_err(|error| failed(error.to_string()))?,
+        )
+        .map_err(|error| failed(error.to_string()))?,
+        vec![[0; 3]],
+    )
+    .map_err(|error| failed(error.to_string()))?;
+    domain.install_input(request, input).map_err(failed)?;
     domain
-        .open(request)
+        .open_state(request, None)
         .map_err(|error| failed(error.to_string()))?;
     let operations = [Operation::Forward {
         request,

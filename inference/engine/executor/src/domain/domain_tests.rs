@@ -172,6 +172,14 @@ fn forward(request: RequestId, position: usize) -> Operation {
     }
 }
 
+/// Make `request` resident on fresh state with no prompt rows.
+fn open<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, request: RequestId) {
+    domain
+        .install_input(request, PreparedModelInput::continuation_only())
+        .unwrap();
+    assert!(domain.open_state(request, None).unwrap().is_empty());
+}
+
 #[derive(Default)]
 struct PendingState {
     result: Option<Result<(), crate::DeviceError>>,
@@ -401,19 +409,19 @@ fn ready_target_can_abort_then_reconcile() {
         return;
     };
     let request = RequestId(1);
-    domain.open(request).unwrap();
+    open(&mut domain, request);
     let mut flight = submit_reserved_target(&mut domain, vec![forward(request, 0)]).unwrap();
     assert!(flight.completion().is_complete());
-    assert!(domain.checkpoint(request).is_err());
+    assert!(domain.resume_state(request).is_err());
     let pending = domain.finish_target(flight).unwrap().pop().unwrap();
     domain.abort(pending).unwrap();
-    assert_eq!(domain.checkpoint(request).unwrap().target.position(), 0);
+    assert_eq!(domain.resume_state(request).unwrap().target.position(), 0);
     let flight = submit_reserved_target(&mut domain, vec![forward(request, 0)]).unwrap();
     let pending = domain.finish_target(flight).unwrap().pop().unwrap();
     assert!(domain
         .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
         .is_ok());
-    assert_eq!(domain.checkpoint(request).unwrap().target.position(), 1);
+    assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
 }
 
 #[test]
@@ -423,10 +431,10 @@ fn pending_target_request_cancellation_aborts_without_poisoning_then_device_fail
         return;
     };
     let request = RequestId(2);
-    domain.open(request).unwrap();
+    open(&mut domain, request);
     let mut flight = submit_reserved_target(&mut domain, vec![forward(request, 0)]).unwrap();
     assert!(!flight.completion().is_complete());
-    assert!(domain.checkpoint(request).is_err());
+    assert!(domain.resume_state(request).is_err());
     let woke = Arc::new(AtomicBool::new(false));
     let observed = woke.clone();
     flight.completion().notify(CompletionWake::new(move || {
@@ -438,13 +446,13 @@ fn pending_target_request_cancellation_aborts_without_poisoning_then_device_fail
     let pending = domain.finish_target(flight).unwrap().pop().unwrap();
     domain.abort(pending).unwrap();
     assert!(domain.fatal_error().is_none());
-    assert_eq!(domain.checkpoint(request).unwrap().target.position(), 0);
+    assert_eq!(domain.resume_state(request).unwrap().target.position(), 0);
     let failed = PendingControl::default();
     let Some(mut failed_domain) = fixture(Some(failed.clone())) else {
         return;
     };
     let failed_request = RequestId(3);
-    failed_domain.open(failed_request).unwrap();
+    open(&mut failed_domain, failed_request);
     let flight =
         submit_reserved_target(&mut failed_domain, vec![forward(failed_request, 0)]).unwrap();
     failed.resolve(Err(crate::DeviceError::Execution(
@@ -452,7 +460,7 @@ fn pending_target_request_cancellation_aborts_without_poisoning_then_device_fail
     )));
     assert!(failed_domain.finish_target(flight).is_err());
     assert!(failed_domain.fatal_error().is_some());
-    assert!(failed_domain.checkpoint(failed_request).is_err());
+    assert!(failed_domain.resume_state(failed_request).is_err());
 }
 
 #[test]
@@ -462,11 +470,11 @@ fn pending_target_state_is_classified_as_in_flight() {
         return;
     };
     let request = RequestId(9);
-    domain.open(request).unwrap();
-    let before = domain.reconcile_memory_charge(&[], &[]).unwrap();
+    open(&mut domain, request);
+    let before = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(before.unattributed, 0, "{before:?}");
     let flight = submit_reserved_target(&mut domain, vec![forward(request, 0)]).unwrap();
-    let pending = domain.reconcile_memory_charge(&[], &[]).unwrap();
+    let pending = domain.reconcile_memory_charge(&[]).unwrap();
     assert!(pending.target_state.in_flight > before.target_state.in_flight);
     assert_eq!(pending.unattributed, 0);
     control.resolve(Ok(()));
@@ -555,7 +563,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops_without_pois
         return;
     };
     let request = RequestId(50);
-    domain.open(request).unwrap();
+    open(&mut domain, request);
 
     // A head advance is independent from the accepted target lane. The target
     // state remaining resident must not be mistaken for a conflicting owner.

@@ -18,6 +18,7 @@ use magnitude_executor::{
     Demand, ExecutionPath, ExecutorDomain, Operation, Outcome,
     PhysicalDecision, RequestId, RowResult, TokenId, WorkKind,
 };
+use magnitude_family_contracts::PreparedModelInput;
 use magnitude_state::KvCodec;
 use magnitude_scheduler::{
     domain::{self as service_domain, DomainFlight},
@@ -185,7 +186,10 @@ fn tape_versions_continue_exactly_like_runs_that_stopped_there() {
     };
     let mut open = |id| {
         let request = RequestId(id);
-        domain.open(request).unwrap();
+        domain
+            .install_input(request, PreparedModelInput::continuation_only())
+            .unwrap();
+        domain.open_state(request, None).unwrap();
         Sequence {
             request,
             position: 0,

@@ -3,14 +3,18 @@
 use super::*;
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
+    /// Install a request's prepared input for its lifetime. It is not
+    /// resident until [`Self::open_state`]; its images are encoded then.
     pub fn install_input(
         &mut self,
         request: RequestId,
         input: PreparedModelInput,
-    ) -> Result<Vec<Operation>, String> {
-        let state = self.target.get(&request).ok_or("request is not idle")?;
-        if state.position() != 0 || self.input.contains_key(&request) {
-            return Err("input must be installed once before target progress".into());
+    ) -> Result<(), String> {
+        if self.input.contains_key(&request)
+            || self.target.contains_key(&request)
+            || self.head.contains_key(&request)
+        {
+            return Err(format!("request {} is already open", request.0));
         }
         if input.vision().len() > self.execution.policy().limits().max_images_per_request {
             return Err("input exceeds planned image capacity".into());
@@ -41,82 +45,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         {
             return Err("prepared vision inputs differ from conditioned layout".into());
         }
-        let operations = images
-            .values()
-            .map(|slot| Operation::Encode {
-                request,
-                image: slot.image.clone(),
-            })
-            .collect();
-        self.input.insert(request, RequestInput { input, images });
-        Ok(operations)
+        self.input.insert(
+            request,
+            RequestInput {
+                input,
+                images,
+                resident: false,
+            },
+        );
+        Ok(())
     }
 
-    pub fn install_retained_input(
-        &mut self,
-        request: RequestId,
-        input: PreparedModelInput,
-    ) -> Result<Vec<Operation>, String> {
-        let position = self
-            .target
+    fn installed_input(&self, request: RequestId) -> Result<&RequestInput, String> {
+        self.input
             .get(&request)
-            .ok_or("request is not idle")?
-            .position();
-        let old = self
-            .input
-            .get(&request)
-            .ok_or("request has no retained input")?;
-        if position == 0
-            || !input.layout().boundary(position)
-            || position > input.tokens().len()
-            || position > old.input.tokens().len()
-            || input.tokens()[..position] != old.input.tokens()[..position]
-        {
-            return Err("retained input differs before accepted position".into());
-        }
-        if input.vision().len() > self.execution.policy().limits().max_images_per_request {
-            return Err("retained input exceeds planned image capacity".into());
-        }
-        let mut images = BTreeMap::new();
-        for prepared in input.vision() {
-            let image = ImageRef::prepared(self.domain.id().clone(), prepared.clone())
-                .map_err(|error| error.to_string())?;
-            images.insert(
-                prepared.identity().to_owned(),
-                InputImage {
-                    image,
-                    features: None,
-                },
-            );
-        }
-        for span in input
-            .layout()
-            .spans()
-            .iter()
-            .filter(|span| span.start < position)
-        {
-            let old_slot = old
-                .images
-                .get(&span.identity)
-                .ok_or("retained input lacks previously accepted vision feature")?;
-            images.insert(
-                span.identity.clone(),
-                InputImage {
-                    image: old_slot.image.clone(),
-                    features: old_slot.features.clone(),
-                },
-            );
-        }
-        let operations = images
-            .values()
-            .filter(|slot| slot.features.is_none())
-            .map(|slot| Operation::Encode {
-                request,
-                image: slot.image.clone(),
-            })
-            .collect();
-        self.input.insert(request, RequestInput { input, images });
-        Ok(operations)
+            .ok_or_else(|| format!("request {} lowers rows without installed input", request.0))
     }
 
     /// Rotary coordinates of the target rows `position..position + count`,
@@ -127,25 +70,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         position: usize,
         count: usize,
     ) -> Result<Vec<[i32; 4]>, String> {
-        let Some(state) = self.input.get(&request) else {
-            let end = position
-                .checked_add(count)
-                .ok_or("target input end overflows")?;
-            return (position..end)
-                .map(|position| {
-                    let position =
-                        i32::try_from(position).map_err(|_| "target position exceeds i32")?;
-                    let mut values = [0; 4];
-                    match self.definition.inputs.text_coordinates {
-                        TextCoordinateSemantics::ReplicatedPosition => values
-                            [..usize::from(self.definition.inputs.coordinate_axes)]
-                            .fill(position),
-                    }
-                    Ok(values)
-                })
-                .collect();
-        };
-        Ok(state
+        Ok(self
+            .installed_input(request)?
             .input
             .coordinates_at(position, count)
             .map_err(|error| error.to_string())?
@@ -161,9 +87,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         tokens: &[crate::TokenId],
     ) -> Result<(Vec<[i32; 4]>, Vec<crate::ConditioningSlice>), String> {
         let coordinates = self.input_coordinates(request, position, tokens.len())?;
-        let Some(state) = self.input.get(&request) else {
-            return Ok((coordinates, Vec::new()));
-        };
+        let state = self.installed_input(request)?;
         let end = position
             .checked_add(tokens.len())
             .ok_or("input end overflows")?;

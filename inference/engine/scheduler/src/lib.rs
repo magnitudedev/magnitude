@@ -7,9 +7,9 @@
 pub mod domain;
 pub mod owner;
 pub mod policy;
+pub mod prefix_cache;
 pub mod protocol;
 pub mod publication;
-pub mod retention;
 pub mod round_driver;
 pub mod worker;
 

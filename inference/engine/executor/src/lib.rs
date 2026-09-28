@@ -34,9 +34,9 @@ pub use device_resources::{
     ResourceError,
 };
 pub use domain::{
-    ClaimRefusal, DeviceHeap, DomainCheckpoint, DomainError, DomainRequirements, DomainReservation,
+    ClaimRefusal, DeviceHeap, DomainError, DomainRequirements, DomainReservation,
     ExecutorDomain, HeadFlight, MemoryChargeReconciliation, NativeFamily, OpenRequirements,
-    OpenReservation, PendingOperationOutcome, PhysicalDecision, ProgramFamily, ReservedResources,
+    PendingOperationOutcome, PhysicalDecision, ProgramFamily, ReservedResources, ResumeState,
     TargetFlight, TargetHostTiming, VisionFlight,
 };
 pub use error::{CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError};

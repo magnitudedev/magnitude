@@ -22,6 +22,7 @@ use magnitude_executor::{
     Demand, DomainError, ExecutionPath, ExecutorDomain, FeatureRows, Operation, Outcome, PhysicalDecision,
     RequestId, RowResult, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
 };
+use magnitude_family_contracts::PreparedModelInput;
 use magnitude_scheduler::{
     domain::{self as service_domain, DomainFlight},
     ServiceLimits,
@@ -115,7 +116,9 @@ impl Fingerprint {
 
     fn open(&mut self, id: u64) -> Result<Sequence, String> {
         let request = RequestId(id);
-        self.domain.open(request).map_err(text)?;
+        self.domain
+            .install_input(request, PreparedModelInput::continuation_only())?;
+        self.domain.open_state(request, None).map_err(text)?;
         Ok(Sequence {
             request,
             position: 0,

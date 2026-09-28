@@ -1,4 +1,4 @@
-//! Accepted request state, checkpoints, and reclaim.
+//! Request residency, resume states, and reclaim.
 
 use super::*;
 
@@ -15,12 +15,6 @@ impl OpenRequirements {
     pub fn head_banks(self) -> usize {
         self.head_banks
     }
-}
-
-pub struct OpenReservation {
-    request: RequestId,
-    target: SequenceState,
-    head: Option<SequenceState>,
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
@@ -64,9 +58,61 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
-    pub fn reserve_open(&mut self, request: RequestId) -> Result<OpenReservation, DomainError> {
+    /// Make a request with installed input resident: fresh state at zero, or
+    /// `from`'s state at its position. Features `from` holds for spans of
+    /// this input straddling that position are adopted; every span ending
+    /// after it that still lacks features is returned as an encode.
+    pub fn open_state(
+        &mut self,
+        request: RequestId,
+        from: Option<&ResumeState>,
+    ) -> Result<Vec<Operation>, DomainError> {
         self.healthy()?;
-        self.ensure_closed(request)?;
+        let installed = self
+            .input
+            .get(&request)
+            .ok_or_else(|| DomainError::invariant("request has no installed input"))?;
+        if installed.resident || self.target.contains_key(&request) || self.head.contains_key(&request)
+        {
+            return Err(DomainError::invariant(format!(
+                "request {} is already resident",
+                request.0
+            )));
+        }
+        let (target, head) = match from {
+            Some(from) => self.fork_resume_state(from)?,
+            None => self.fresh_state()?,
+        };
+        let position = target.position();
+        self.target.insert(request, target);
+        if let Some(head) = head {
+            self.head.insert(request, head);
+        }
+        let installed = self.input.get_mut(&request).expect("input checked above");
+        installed.resident = true;
+        let mut encodes = Vec::new();
+        for span in installed.input.layout().spans() {
+            if span.end <= position {
+                continue;
+            }
+            let slot = installed
+                .images
+                .get_mut(&span.identity)
+                .expect("installed input has a slot for every span");
+            if slot.features.is_none() && span.start < position {
+                slot.features = from.and_then(|from| from.features.get(&span.identity).cloned());
+            }
+            if slot.features.is_none() {
+                encodes.push(Operation::Encode {
+                    request,
+                    image: slot.image.clone(),
+                });
+            }
+        }
+        Ok(encodes)
+    }
+
+    fn fresh_state(&mut self) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
         self.provision_open()?;
         let requirements = self.open_requirements();
         self.can_open(requirements).map_err(DomainError::Capacity)?;
@@ -86,51 +132,37 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 })
             })
             .transpose()?;
-        Ok(OpenReservation {
-            request,
-            target,
-            head,
-        })
+        Ok((target, head))
     }
 
-    pub fn open_reserved(&mut self, reservation: OpenReservation) -> Result<(), DomainError> {
-        self.healthy()?;
-        self.ensure_closed(reservation.request)?;
-        self.target.insert(reservation.request, reservation.target);
-        if let Some(state) = reservation.head {
-            self.head.insert(reservation.request, state);
-        }
-        Ok(())
-    }
-
-    pub fn open(&mut self, request: RequestId) -> Result<(), DomainError> {
-        let reservation = self.reserve_open(request)?;
-        self.open_reserved(reservation)
-    }
-
-    fn ensure_closed(&self, request: RequestId) -> Result<(), DomainError> {
-        if self.target.contains_key(&request)
-            || self.head.contains_key(&request)
-            || self.input.contains_key(&request)
+    fn fork_resume_state(
+        &self,
+        from: &ResumeState,
+    ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
+        let target = from.target.fork();
+        if !target.belongs_to(&self.target_store) || from.head.is_some() != self.head_store.is_some()
         {
-            return Err(format!("request {} is already open", request.0).into());
+            return Err(DomainError::invariant(
+                "resume state differs from domain state arenas",
+            ));
         }
-        Ok(())
+        let head = from.head.as_ref().map(StateCheckpoint::fork);
+        if head.as_ref().is_some_and(|state| {
+            !self
+                .head_store
+                .as_ref()
+                .is_some_and(|store| state.belongs_to(store))
+        }) {
+            return Err(DomainError::invariant(
+                "resume state head belongs to another state arena",
+            ));
+        }
+        Ok((target, head))
     }
 
-    pub fn close(&mut self, request: RequestId) -> Result<(), String> {
-        if !self.target.contains_key(&request)
-            || (self.head_store.is_some() && !self.head.contains_key(&request))
-        {
-            return Err("request has unresolved work or is not open".into());
-        }
-        self.head.remove(&request);
-        self.input.remove(&request);
-        self.target.remove(&request);
-        Ok(())
-    }
-
-    pub fn checkpoint(&self, request: RequestId) -> Result<DomainCheckpoint, String> {
+    /// The request's reconciled state as a resume state: both lanes and the
+    /// features of spans straddling its position.
+    pub fn resume_state(&self, request: RequestId) -> Result<ResumeState, String> {
         let target = self
             .target
             .get(&request)
@@ -140,136 +172,47 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Err("request has unresolved head work".into());
         }
         let head = self.head.get(&request).map(SequenceState::checkpoint);
-        Ok(DomainCheckpoint {
+        let installed = self
+            .input
+            .get(&request)
+            .ok_or("resident request has no installed input")?;
+        let position = target.position();
+        let features = installed
+            .input
+            .layout()
+            .spans()
+            .iter()
+            .filter(|span| span.start < position && position < span.end)
+            .map(|span| {
+                let features = installed
+                    .images
+                    .get(&span.identity)
+                    .and_then(|slot| slot.features.clone())
+                    .ok_or("resident rows condition on an unencoded image")?;
+                Ok((span.identity.clone(), features))
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(ResumeState {
             target,
             head,
-            input: self.input.get(&request).cloned(),
+            features,
         })
     }
 
-    pub fn restore(
-        &mut self,
-        request: RequestId,
-        checkpoint: &DomainCheckpoint,
-    ) -> Result<(), DomainError> {
-        let current = self
-            .target
-            .get(&request)
-            .ok_or_else(|| "request is not idle".to_owned())?;
-        let replacement = checkpoint.target.fork();
-        if !replacement.belongs_to(&self.target_store)
-            || replacement.position() > current.position()
+    /// Drop a request's input and any numerical state. A resident request's
+    /// state must not be in flight.
+    pub fn close(&mut self, request: RequestId) -> Result<(), String> {
+        let installed = self.input.get(&request).ok_or("request is not open")?;
+        if installed.resident
+            && (!self.target.contains_key(&request)
+                || (self.head_store.is_some() && !self.head.contains_key(&request)))
         {
-            return Err(
-                "checkpoint belongs to another state arena or is ahead of the request".into(),
-            );
+            return Err("request has unresolved work".into());
         }
-        let head = checkpoint.head.as_ref().map(StateCheckpoint::fork);
-        if checkpoint.head.is_some() != self.head_store.is_some()
-            || head.as_ref().is_some_and(|state| {
-                !self
-                    .head_store
-                    .as_ref()
-                    .is_some_and(|store| state.belongs_to(store))
-            })
-        {
-            return Err("checkpoint head belongs to another state arena".into());
-        }
-        self.target.insert(request, replacement);
-        if let Some(head) = head {
-            self.head.insert(request, head);
-        }
-        if let Some(input) = &checkpoint.input {
-            self.input.insert(request, input.clone());
-        }
+        self.head.remove(&request);
+        self.input.remove(&request);
+        self.target.remove(&request);
         Ok(())
-    }
-
-    /// Open a request at a checkpoint: its state and the checkpoint source's
-    /// input (admission then installs the request's own retained input).
-    pub fn open_checkpoint(
-        &mut self,
-        request: RequestId,
-        checkpoint: &DomainCheckpoint,
-    ) -> Result<(), DomainError> {
-        self.open_checkpoint_state(request, checkpoint)?;
-        if let Some(input) = &checkpoint.input {
-            self.input.insert(request, input.clone());
-        }
-        Ok(())
-    }
-
-    /// Open a closed request at a checkpoint's state only, with no input:
-    /// the request replays its own accepted rows after the checkpoint (an
-    /// evicted request, whose input was released with its state).
-    pub fn open_checkpoint_state(
-        &mut self,
-        request: RequestId,
-        checkpoint: &DomainCheckpoint,
-    ) -> Result<(), DomainError> {
-        self.healthy()?;
-        if self.target.contains_key(&request)
-            || self.head.contains_key(&request)
-            || self.input.contains_key(&request)
-        {
-            return Err("checkpoint request is already open".into());
-        }
-        let (target, head) = self.fork_checkpoint(checkpoint)?;
-        self.target.insert(request, target);
-        if let Some(head) = head {
-            self.head.insert(request, head);
-        }
-        Ok(())
-    }
-
-    /// Replace an open request's fresh state (no accepted rows) with the
-    /// checkpoint's state, keeping the request's own installed input: a
-    /// request attaching to a shared prefix another request computed.
-    pub fn resume_from_checkpoint(
-        &mut self,
-        request: RequestId,
-        checkpoint: &DomainCheckpoint,
-    ) -> Result<(), DomainError> {
-        self.healthy()?;
-        let fresh = self
-            .target
-            .get(&request)
-            .is_some_and(|state| state.position() == 0)
-            && self
-                .head
-                .get(&request)
-                .is_none_or(|state| state.position() == 0);
-        if !fresh {
-            return Err("only an open request without accepted state can resume".into());
-        }
-        let (target, head) = self.fork_checkpoint(checkpoint)?;
-        self.target.insert(request, target);
-        if let Some(head) = head {
-            self.head.insert(request, head);
-        }
-        Ok(())
-    }
-
-    fn fork_checkpoint(
-        &self,
-        checkpoint: &DomainCheckpoint,
-    ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
-        let target = checkpoint.target.fork();
-        if !target.belongs_to(&self.target_store)
-            || checkpoint.head.is_some() != self.head_store.is_some()
-        {
-            return Err("checkpoint differs from domain state arenas".into());
-        }
-        let head = checkpoint.head.as_ref().map(StateCheckpoint::fork);
-        if head.as_ref().is_some_and(|state| {
-            !self
-                .head_store
-                .as_ref()
-                .is_some_and(|store| state.belongs_to(store))
-        }) {
-            return Err("checkpoint head belongs to another state arena".into());
-        }
-        Ok((target, head))
     }
 
     /// State bytes released by evicting exactly these requests, priced as a
@@ -307,12 +250,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(bytes)
     }
 
-    pub fn evict(&mut self, requests: &[RequestId]) -> Result<u64, String> {
+    /// Evict these requests: release their numerical state and encoded
+    /// features. Their input stays installed for when they are resident
+    /// again.
+    pub fn release_state(&mut self, requests: &[RequestId]) -> Result<u64, String> {
         let bytes = self.reclaimable(requests)?;
         for request in requests {
+            let installed = self
+                .input
+                .get_mut(request)
+                .ok_or("evicted request has no installed input")?;
+            installed.resident = false;
+            for slot in installed.images.values_mut() {
+                slot.features = None;
+            }
             self.target.remove(request);
             self.head.remove(request);
-            self.input.remove(request);
         }
         Ok(bytes)
     }
@@ -333,35 +286,5 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .ok_or("idle reclaim byte count overflow")?;
         }
         Ok(bytes)
-    }
-
-    pub fn fork(&mut self, source: RequestId, destination: RequestId) -> Result<(), String> {
-        if self.target.contains_key(&destination)
-            || self.head.contains_key(&destination)
-            || self.input.contains_key(&destination)
-        {
-            return Err("fork destination is already open".into());
-        }
-        let state = self
-            .target
-            .get(&source)
-            .ok_or_else(|| "fork source is not idle".to_owned())?
-            .checkpoint()
-            .fork();
-        if self.head_store.is_some() && !self.head.contains_key(&source) {
-            return Err("fork source has unresolved head work".into());
-        }
-        self.target.insert(destination, state);
-        if let Some(state) = self
-            .head
-            .get(&source)
-            .map(|state| state.checkpoint().fork())
-        {
-            self.head.insert(destination, state);
-        }
-        if let Some(input) = self.input.get(&source).cloned() {
-            self.input.insert(destination, input);
-        }
-        Ok(())
     }
 }

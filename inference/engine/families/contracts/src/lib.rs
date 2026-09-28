@@ -320,18 +320,10 @@ pub struct WeightRole {
     pub kind: WeightKind,
 }
 
-/// How ordinary text positions enter the model's coordinate table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TextCoordinateSemantics {
-    /// Repeat the absolute token position on each spatial rotary axis.
-    ReplicatedPosition,
-}
-
-/// Numerically relevant input rules supplied by a family adapter.
+/// Numerically relevant input rules supplied by a family adapter. Token
+/// coordinates themselves are part of each prepared input.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSemantics {
-    pub text_coordinates: TextCoordinateSemantics,
     pub coordinate_axes: u8,
 }
 
@@ -576,7 +568,6 @@ mod tests {
                 projector: None,
             },
             inputs: InputSemantics {
-                text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
                 coordinate_axes: 1,
             },
             decoder: Decoder {

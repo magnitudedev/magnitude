@@ -81,14 +81,22 @@ fn options() -> Options {
     }
 }
 
+/// A generation made resident on fresh numerical state.
+fn resident(mut generation: Generation) -> Generation {
+    generation.resume_at(None).unwrap();
+    generation
+}
+
 fn generation(constraint: Option<Box<dyn Constraint>>) -> Generation {
-    Generation::new(
-        vec![TokenId(1), TokenId(2)],
-        InputLayout::new(2, vec![]).unwrap(),
-        options(),
-        constraint,
+    resident(
+        Generation::new(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            options(),
+            constraint,
+        )
+        .unwrap(),
     )
-    .unwrap()
 }
 
 fn start(generation: &mut Generation, allowance: usize) -> magnitude_generation::RoundForward {
@@ -288,11 +296,10 @@ fn eviction_discards_suspended_work_and_replays_through_rounds() {
     let mut generation = generation(None);
     prefill(&mut generation, 10);
     generation.take(4).unwrap();
-    generation.credit_cached_tokens(1).unwrap();
     start(&mut generation, 1);
     generation.evicted().unwrap();
     assert_eq!(generation.wait_reason(), Some(WaitReason::Residency));
-    generation.restored().unwrap();
+    generation.resume_at(None).unwrap();
     for _ in 0..2 {
         let replay = start(&mut generation, 1);
         assert_eq!(replay.kind, WorkKind::Replay);
@@ -311,11 +318,14 @@ fn eviction_resumes_from_a_retained_prefix_and_replays_the_rest() {
     let checkpoint = generation.method_checkpoint().unwrap();
     generation.evicted().unwrap();
     // Accepted input includes the sampled successor, while the numerical
-    // prefix still ends at the two consumed prompt rows.
-    assert!(generation.restored_at(4, &checkpoint).is_err());
-    generation.restored_at(1, &checkpoint).unwrap();
-    assert!(generation.restored_at(1, &checkpoint).is_err());
+    // prefix still ends at the two consumed prompt rows. The row the next
+    // decode samples from bounds a resumed prefix.
+    assert_eq!(generation.resume_bound(), 3);
+    assert!(generation.resume_at(Some((3, &checkpoint))).is_err());
+    generation.resume_at(Some((1, &checkpoint))).unwrap();
+    assert!(generation.resume_at(Some((1, &checkpoint))).is_err());
     assert_eq!(generation.resident_position(), 1);
+    assert_eq!(generation.detailed_usage().cached_tokens, 0);
     let replay = start(&mut generation, 4);
     assert_eq!(replay.kind, WorkKind::Replay);
     assert_eq!(replay.tokens, [TokenId(2)]);
@@ -326,7 +336,8 @@ fn eviction_resumes_from_a_retained_prefix_and_replays_the_rest() {
     assert_eq!(decode.kind, WorkKind::Decode);
 }
 
-fn mtp_generation(prompt: &[u32], proposals: u8) -> Generation {
+/// An admitted MTP generation that is not yet resident.
+fn mtp_fresh(prompt: &[u32], proposals: u8) -> Generation {
     let mut configured = options();
     configured.method = MethodChoice::Mtp { proposals };
     Generation::new_with_method(
@@ -337,6 +348,10 @@ fn mtp_generation(prompt: &[u32], proposals: u8) -> Generation {
         Arc::new(Mtp::new("fixture", usize::from(proposals)).unwrap()),
     )
     .unwrap()
+}
+
+fn mtp_generation(prompt: &[u32], proposals: u8) -> Generation {
+    resident(mtp_fresh(prompt, proposals))
 }
 
 fn head_parts(operation: &Operation) -> (Vec<TokenId>, Vec<(u8, u8)>, usize, Vec<SelectSpec>) {
@@ -504,16 +519,14 @@ fn checkpoints_carry_host_rows_and_restore_at_their_target_boundary() {
     reconcile_head(&mut source, &effects[0], &[]);
     let checkpoint = source.method_checkpoint().unwrap();
     assert_eq!(checkpoint.retained_bytes(), 4);
-    let fork = source.fork_at(source.resident_position()).unwrap();
-    assert_eq!(fork.method_checkpoint().unwrap(), checkpoint);
     let MethodCheckpoint::Mtp(state) = &checkpoint else {
         panic!("MTP checkpoint")
     };
     // Head row 0 entered, the anchor pending: two target rows.
     assert_eq!((state.position(), state.target_rows()), (1, 2));
-    let mut fresh = mtp_generation(&[1, 2, 7], 2);
-    assert!(fresh.restore_prefix(1, &checkpoint).is_err());
-    fresh.restore_prefix(2, &checkpoint).unwrap();
+    let mut fresh = mtp_fresh(&[1, 2, 7], 2);
+    assert!(fresh.resume_at(Some((1, &checkpoint))).is_err());
+    fresh.resume_at(Some((2, &checkpoint))).unwrap();
     assert_eq!(fresh.resident_position(), 2);
     let _ = request;
 }
@@ -614,6 +627,7 @@ fn every_prefill_chunk_primes_the_method_with_its_selected_successor() {
         }),
     )
     .unwrap();
+    generation.resume_at(None).unwrap();
 
     start(&mut generation, 1);
     resolve(&mut generation, &[], Some(feature(1)));
@@ -641,13 +655,15 @@ fn retained_prefix_restores_position_into_a_fresh_extended_prompt() {
             reject: None,
         }) as Box<dyn Constraint>
     };
-    let mut source = Generation::new(
-        prompt.clone(),
-        InputLayout::new(prompt.len(), vec![]).unwrap(),
-        configured.clone(),
-        Some(grammar()),
-    )
-    .unwrap();
+    let mut source = resident(
+        Generation::new(
+            prompt.clone(),
+            InputLayout::new(prompt.len(), vec![]).unwrap(),
+            configured.clone(),
+            Some(grammar()),
+        )
+        .unwrap(),
+    );
     assert_eq!(start(&mut source, prompt.len()).tokens, prompt);
     resolve(&mut source, &[70], None);
     assert_eq!(source.resident_position(), 64);
@@ -664,7 +680,7 @@ fn retained_prefix_restores_position_into_a_fresh_extended_prompt() {
         Some(grammar()),
     )
     .unwrap();
-    fresh.restore_prefix(64, &checkpoint).unwrap();
+    fresh.resume_at(Some((64, &checkpoint))).unwrap();
     assert_eq!(fresh.prompt(), extended);
     assert_eq!(fresh.resident_position(), 64);
     assert_eq!(fresh.accepted_position(), 64);
@@ -693,7 +709,8 @@ fn retained_prefix_requires_an_exact_layout_boundary() {
     configured.context_limit = 128;
     configured.vocabulary = 256;
     let mut fresh = Generation::new(prompt, layout, configured, None).unwrap();
-    assert!(fresh.restore_prefix(64, &MethodCheckpoint::Plain).is_err());
+    assert!(fresh.resume_at(Some((64, &MethodCheckpoint::Plain))).is_err());
+    assert!(!fresh.is_resident());
     assert_eq!(fresh.resident_position(), 0);
     assert_eq!(fresh.detailed_usage().cached_tokens, 0);
 }
@@ -712,6 +729,7 @@ fn staged_causal_reconciliation_advances_after_finished_prefill() {
         None,
     )
     .unwrap();
+    generation.resume_at(None).unwrap();
     start(&mut generation, 64);
     let transition = generation
         .prepare_round_transition(RequestId(1), &[TokenId(70)], None, &mut Rows)
@@ -747,6 +765,7 @@ fn ignored_end_of_generation_masks_stop_tokens_from_every_selection() {
         None,
     )
     .unwrap();
+    generation.resume_at(None).unwrap();
     let round = start(&mut generation, 2);
     let mask = round.selects[0].mask.clone().expect("suppression masks selection");
     assert_eq!(mask[99 / 32] & (1 << (99 % 32)), 0);
@@ -772,6 +791,7 @@ fn spent_reasoning_budget_selects_only_the_end_tag() {
         None,
     )
     .unwrap();
+    generation.resume_at(None).unwrap();
     prefill(&mut generation, 5);
     assert_eq!(
         generation.selection_mask().unwrap().unwrap()[0],
@@ -780,7 +800,8 @@ fn spent_reasoning_budget_selects_only_the_end_tag() {
     );
 }
 
-fn dflash_generation(prompt: &[u32], proposals: u8) -> Generation {
+/// An admitted separate-draft generation that is not yet resident.
+fn dflash_fresh(prompt: &[u32], proposals: u8) -> Generation {
     let mut configured = options();
     configured.method = MethodChoice::DFlash { proposals };
     Generation::new_with_method(
@@ -791,6 +812,10 @@ fn dflash_generation(prompt: &[u32], proposals: u8) -> Generation {
         Arc::new(DFlash::new("fixture", usize::from(proposals)).unwrap()),
     )
     .unwrap()
+}
+
+fn dflash_generation(prompt: &[u32], proposals: u8) -> Generation {
+    resident(dflash_fresh(prompt, proposals))
 }
 
 /// A separate draft's generation after its prefill: the prefill's entry
@@ -872,15 +897,13 @@ fn dflash_checkpoints_wait_for_reconciled_drafts_and_keep_their_kind() {
         panic!("DFlash checkpoint")
     };
     assert_eq!((state.position(), state.target_rows()), (1, 2));
-    let fork = source.fork_at(source.resident_position()).unwrap();
-    assert_eq!(fork.method_checkpoint().unwrap(), checkpoint);
-    let mut fresh = dflash_generation(&[1, 2, 7], 2);
-    assert!(fresh.restore_prefix(1, &checkpoint).is_err());
-    fresh.restore_prefix(2, &checkpoint).unwrap();
+    let mut fresh = dflash_fresh(&[1, 2, 7], 2);
+    assert!(fresh.resume_at(Some((1, &checkpoint))).is_err());
+    fresh.resume_at(Some((2, &checkpoint))).unwrap();
     assert_eq!(fresh.resident_position(), 2);
     // An MTP generation never adopts a separate draft's state.
-    let mut mtp = mtp_generation(&[1, 2, 7], 2);
-    assert!(mtp.restore_prefix(2, &checkpoint).is_err());
+    let mut mtp = mtp_fresh(&[1, 2, 7], 2);
+    assert!(mtp.resume_at(Some((2, &checkpoint))).is_err());
 }
 
 /// Cancelling while a block draft is in flight finishes the generation

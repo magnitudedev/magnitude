@@ -21,7 +21,7 @@ use magnitude_family_contracts::{
     MediaRowAttention, MergerStage, ModelDefinition, Operator, OutputForm, PositionSampling,
     RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router,
     RouterInput, RowRange, ScoreFunction, SharedExpert, SharedExpertGate, Sublayer,
-    TextCoordinateSemantics, ValueNorm, ValueSource, VisionActivation, VisionAttention,
+    ValueNorm, ValueSource, VisionActivation, VisionAttention,
     VisionAttentionScale, VisionAttentionSpan, VisionBlock, VisionDescription, VisionFeedForward,
     VisionLinear, VisionMerger, VisionNorm, VisionPositions, VisionPreprocessing,
     VisionResampling, VisionResize, VisionStem, VisionUp, WeightDescriptor,
@@ -752,7 +752,6 @@ pub fn inspect_components(
         family: FamilyId(family_id.into()),
         artifact_identity: identity,
         inputs: InputSemantics {
-            text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
             coordinate_axes: 3,
         },
         decoder: Decoder {

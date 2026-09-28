@@ -668,7 +668,7 @@ mod overlap_tests {
         WorkerCommand::Admit(crate::protocol::AdmitRequest {
             seed,
             input,
-            retention: None,
+            prefix_cache: false,
             output_capacity: 1,
         })
     }

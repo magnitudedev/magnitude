@@ -22,6 +22,7 @@ use magnitude_executor::{
     Demand, DomainError, DraftForm, ExecutionPath, FeatureReader, FeatureSpan, Operation, Outcome,
     PhysicalDecision, RequestId, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
 };
+use magnitude_family_contracts::PreparedModelInput;
 use magnitude_scheduler::{
     domain::{self as service_domain, DomainFlight},
     ServiceLimits,
@@ -144,7 +145,8 @@ fn main() -> Result<(), String> {
     let (mut domain, _) = build_native_domain(&manifest, std::sync::Arc::new(package))
         .map_err(|error| error.to_string())?;
     let request = RequestId(1);
-    domain.open(request).map_err(text)?;
+    domain.install_input(request, PreparedModelInput::continuation_only())?;
+    domain.open_state(request, None).map_err(text)?;
 
     // The target runs the committed tokens; every row's features condition
     // the draft.

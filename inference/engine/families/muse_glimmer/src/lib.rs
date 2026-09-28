@@ -29,7 +29,7 @@ use magnitude_family_contracts::{
     Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId, FeedForwardUp,
     GateFunction, GateGranularity, HeadNorm, HistoryDomain, HistoryReads, ImportTransform,
     InputNorm, InputSemantics, KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-    ResidualForm, RmsNorm, Rotary, Sublayer, TextCoordinateSemantics, UnweightedRms, ValueNorm,
+    ResidualForm, RmsNorm, Rotary, Sublayer, UnweightedRms, ValueNorm,
     ValueSource, WeightDescriptor,
 };
 use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
@@ -272,7 +272,6 @@ pub fn inspect_components(
         family: FamilyId(ARCHITECTURE.into()),
         artifact_identity: identity,
         inputs: InputSemantics {
-            text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
             coordinate_axes: 1,
         },
         decoder: Decoder {

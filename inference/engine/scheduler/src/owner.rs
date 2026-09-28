@@ -1,20 +1,17 @@
 //! Serialized ownership of logical generation and one executor resource domain.
 use super::{
     domain::{
-        group, requirements, submit_group, DomainCheckpoint, DomainFlight, ExecutorDomain,
-        OperationGroup,
+        group, requirements, submit_group, DomainFlight, ExecutorDomain, OperationGroup,
+        ResumeState,
     },
     policy::{
         order_victims, AvailabilityEpoch, Operation as ScheduledOperation, Phase, Scheduler,
         Selection, ServiceLimits, Victim,
     },
+    prefix_cache::{PrefixCache, PrefixCacheCapacity, PrefixPath, MIN_BRANCH_GAIN, MIN_PREFIX_HIT},
     publication::{
         CapacityResource, ModelUnloadCause, PhysicalTimings, PublicationPermit, PublicationSender,
         PublicationWake, PublicationWakeKind, PublishError, RequestError, ServiceCapacityError,
-    },
-    retention::{
-        Retention, RetentionCapacity, RetentionKey, RetentionRequest, MIN_BRANCH_GAIN,
-        MIN_RETENTION_HIT,
     },
     round_driver::{lower_round, reconcile_forward, RoundError},
 };
@@ -23,6 +20,7 @@ use magnitude_executor::{
     MemoryChargeReconciliation, NativeFamily, OpenRequirements, Operation, Outcome,
     PhysicalDecision, ProgramFamily, RequestId, ResourceKind, ResourcePlan, SubmitError, WorkKind,
 };
+use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{
     DetailedUsage, FinishReason, Generation, OutputToken, RoundStart, WaitReason,
 };
@@ -31,9 +29,6 @@ use std::{
     collections::{BTreeMap, VecDeque},
     time::Duration,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct CheckpointId(u64);
 
 /// Where a newly admitted request stops its prefill to retain a branch
 /// point, or the shared prefix it waits for a live peer to retain.
@@ -48,10 +43,12 @@ struct BranchPlan {
 /// compute the row it samples from). None when that is not an exact input
 /// boundary, too short to be a hit, or already retained.
 fn prompt_boundary(record: &Record) -> Option<usize> {
-    let input = record.retention.as_ref()?;
     let boundary = record.generation.prompt().len().checked_sub(1)?;
-    (!record.prefill_retained && boundary >= MIN_RETENTION_HIT && input.exact_boundary(boundary))
-        .then_some(boundary)
+    (record.prefix_cache
+        && !record.prefill_retained
+        && boundary >= MIN_PREFIX_HIT
+        && record.generation.layout().boundary(boundary))
+    .then_some(boundary)
 }
 
 /// Whether `generation` is resident, unfinished, and not yet past `position`.
@@ -61,16 +58,11 @@ fn prefilling_toward(generation: &Generation, position: usize) -> bool {
         && generation.resident_position() < position
 }
 
-struct Checkpoint {
-    generation: Generation,
-    numerical: DomainCheckpoint,
-    error: Option<RequestError>,
-    protected_until: Option<usize>,
-}
-
 struct Record {
     generation: Generation,
-    admission: VecDeque<Operation>,
+    /// Image encodes the request must complete before its next round, from
+    /// its latest residency.
+    encodes: VecDeque<Operation>,
     waiting_since: u64,
     service_ns: u64,
     physical_timings: PhysicalTimings,
@@ -79,18 +71,20 @@ struct Record {
     preemption_debt: u32,
     protected_until: Option<usize>,
     retire_on_completion: bool,
-    retention: Option<RetentionRequest>,
-    retention_source: Option<u64>,
+    /// Whether the request resumes from and contributes to the prefix cache.
+    prefix_cache: bool,
+    /// The cached prefix the request's residency forked, protected while
+    /// work derived from it is submitted.
+    prefix_source: Option<u64>,
     prefill_retained: bool,
     terminal_retained: bool,
     /// A planned branch point: the prompt position where this request
     /// diverges from a path the engine holds. Prefill stops there so the
-    /// index can retain a checkpoint every later divergent request resumes
-    /// from.
+    /// cache can retain a state every later divergent request resumes from.
     branch: Option<usize>,
     /// A prompt position a live peer is prefilling toward and will retain:
-    /// this request is not scheduled until it attaches to that checkpoint
-    /// (or no peer computes it any more), so the prefix is computed once.
+    /// this request stays non-resident until that prefix is cached (or no
+    /// peer computes it any more), so the prefix is computed once.
     awaited_prefix: Option<usize>,
     publication: Option<PublicationSender>,
     publication_batch_limit: usize,
@@ -284,7 +278,7 @@ impl MemoryCondition {
 struct ActiveGroup<F: ProgramFamily> {
     flight: DomainFlight<F>,
     operations: Vec<Operation>,
-    retention_uses: Vec<u64>,
+    prefix_uses: Vec<u64>,
     publication_permits: BTreeMap<RequestId, Vec<PublicationPermit>>,
 }
 
@@ -297,26 +291,24 @@ struct Batch<F: ProgramFamily> {
 }
 
 pub struct Owner<F: ProgramFamily = NativeFamily> {
-    checkpoints: BTreeMap<CheckpointId, Checkpoint>,
     domain: ExecutorDomain<F>,
     scheduler: Scheduler,
     records: BTreeMap<RequestId, Record>,
     batch: Option<Batch<F>>,
     epoch: AvailabilityEpoch,
     next_id: u64,
-    next_checkpoint: u64,
     now: u64,
     /// The classified failure that stopped the owner; every live request
     /// terminated with it and every later admission is refused with it.
     fatal: Option<RequestError>,
-    retention: Retention<DomainCheckpoint>,
+    prefix_cache: PrefixCache<ResumeState>,
     reclaim_release_pending: bool,
     memory_condition: MemoryCondition,
-    memory_deficit: Option<MemoryDeficit>,
+    /// Per domain role, the least memory a capacity-blocked request still
+    /// needs from that domain's ceiling after every release was exhausted.
+    memory_deficits: Vec<MemoryDeficit>,
 }
 
-/// The memory a capacity-blocked batch still needs from one domain's
-/// ceiling after every release was exhausted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MemoryDeficit {
     role: DomainRole,
@@ -325,29 +317,27 @@ struct MemoryDeficit {
 
 impl<F: ProgramFamily> Owner<F> {
     pub fn new(domain: ExecutorDomain<F>, limits: ServiceLimits) -> Result<Self, String> {
-        Self::with_retention_capacity(domain, limits, RetentionCapacity::disabled())
+        Self::with_prefix_cache_capacity(domain, limits, PrefixCacheCapacity::disabled())
     }
 
-    pub fn with_retention_capacity(
+    pub fn with_prefix_cache_capacity(
         domain: ExecutorDomain<F>,
         limits: ServiceLimits,
-        retention_capacity: RetentionCapacity,
+        capacity: PrefixCacheCapacity,
     ) -> Result<Self, String> {
         Ok(Self {
-            checkpoints: BTreeMap::new(),
             domain,
             scheduler: Scheduler::new(limits)?,
             records: BTreeMap::new(),
             batch: None,
             epoch: AvailabilityEpoch::default(),
             next_id: 1,
-            next_checkpoint: 1,
             now: 0,
             fatal: None,
-            retention: Retention::new(retention_capacity),
+            prefix_cache: PrefixCache::new(capacity),
             reclaim_release_pending: false,
             memory_condition: MemoryCondition::Normal,
-            memory_deficit: None,
+            memory_deficits: Vec::new(),
         })
     }
 
@@ -356,7 +346,11 @@ impl<F: ProgramFamily> Owner<F> {
         limits: ServiceLimits,
         plan: &ResourcePlan,
     ) -> Result<Self, String> {
-        Self::with_retention_capacity(domain, limits, RetentionCapacity::from_resource_plan(plan))
+        Self::with_prefix_cache_capacity(
+            domain,
+            limits,
+            PrefixCacheCapacity::from_resource_plan(plan),
+        )
     }
 
     /// Bind the sole host-visible stream before the worker next advances this
@@ -441,11 +435,11 @@ impl<F: ProgramFamily> Owner<F> {
             return Ok(());
         }
         let observation = Self::memory_observation(self.domain.probe_memory())?;
-        self.memory_condition = self.memory_condition.observe(observation, now);
+        self.enter_memory_condition(self.memory_condition.observe(observation, now))?;
         if !matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
             self.reclaim_release_pending = false;
             if observation == MemoryObservation::Normal {
-                self.reopen_memory_deficit()?;
+                self.reopen_memory_deficits()?;
             }
             return Ok(());
         }
@@ -462,7 +456,7 @@ impl<F: ProgramFamily> Owner<F> {
         if observation == MemoryObservation::Reclaim && self.release_for_reclaim()? {
             self.memory_condition = self.memory_condition.released(now);
             let after = Self::memory_observation(self.domain.probe_memory())?;
-            self.memory_condition = self.memory_condition.observe(after, now);
+            self.enter_memory_condition(self.memory_condition.observe(after, now))?;
         }
         if self.memory_condition.should_unload(now) {
             self.begin_memory_unload();
@@ -470,13 +464,25 @@ impl<F: ProgramFamily> Owner<F> {
         Ok(())
     }
 
-    /// A batch blocked on a memory deficit waits for an availability change.
-    /// Memory another process frees is one: advance the epoch once the
-    /// deficit's domain ceiling covers it, so the batch retries.
-    fn reopen_memory_deficit(&mut self) -> Result<(), String> {
-        let Some(deficit) = self.memory_deficit else {
+    /// Enter `next`. Memory returning to Normal is an availability change:
+    /// every request waiting on memory retries.
+    fn enter_memory_condition(&mut self, next: MemoryCondition) -> Result<(), String> {
+        let recovered =
+            self.memory_condition != MemoryCondition::Normal && next == MemoryCondition::Normal;
+        self.memory_condition = next;
+        if recovered {
+            self.epoch.advance()?;
+        }
+        Ok(())
+    }
+
+    /// A request blocked on a memory deficit waits for an availability
+    /// change. Memory another process frees is one: advance the epoch once a
+    /// deficit's domain ceiling covers it, so blocked work retries.
+    fn reopen_memory_deficits(&mut self) -> Result<(), String> {
+        if self.memory_deficits.is_empty() {
             return Ok(());
-        };
+        }
         let readings = match self.domain.refresh_memory() {
             Ok(readings) => readings,
             // A failed reading says nothing about the deficit; the next
@@ -484,13 +490,75 @@ impl<F: ProgramFamily> Owner<F> {
             Err(DomainError::Blind(_)) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
-        if readings.iter().any(|reading| {
-            reading.role == deficit.role && reading.ceiling_bytes >= deficit.required
-        }) {
-            self.memory_deficit = None;
+        let before = self.memory_deficits.len();
+        self.memory_deficits.retain(|deficit| {
+            !readings.iter().any(|reading| {
+                reading.role == deficit.role && reading.ceiling_bytes >= deficit.required
+            })
+        });
+        if self.memory_deficits.len() != before {
             self.epoch.advance()?;
         }
         Ok(())
+    }
+
+    /// Record that blocked work needs `required` bytes from `role`'s domain,
+    /// keeping the least requirement per role so the earliest retry is kept.
+    fn record_memory_deficit(&mut self, role: DomainRole, required: u64) {
+        match self
+            .memory_deficits
+            .iter_mut()
+            .find(|deficit| deficit.role == role)
+        {
+            Some(deficit) => deficit.required = deficit.required.min(required),
+            None => self.memory_deficits.push(MemoryDeficit { role, required }),
+        }
+    }
+
+    /// Block `requests` on a capacity deficit until availability changes,
+    /// when a live request outside `excluded` can still finish, drain or
+    /// release; a memory deficit also reopens once another process frees the
+    /// memory. With nothing that could change, fail them with the typed
+    /// deficit. Returns whether they are blocked.
+    fn block_on_capacity(
+        &mut self,
+        requests: &[RequestId],
+        excluded: &[RequestId],
+        resource: ResourceKind,
+        required: u64,
+        available: u64,
+    ) -> Result<bool, String> {
+        let can_change = self.records.iter().any(|(id, record)| {
+            !excluded.contains(id)
+                && (record.generation.finish_reason().is_some()
+                    || record.generation.output_len() > 0
+                    || record.capacity.is_none())
+        });
+        if !can_change {
+            for &request in requests {
+                self.fail_request(
+                    request,
+                    RequestError::Capacity(ServiceCapacityError {
+                        resource: CapacityResource::Execution(resource),
+                        required,
+                        available,
+                    }),
+                );
+            }
+            self.epoch.advance()?;
+            return Ok(false);
+        }
+        for request in requests {
+            if let Some(record) = self.records.get_mut(request) {
+                record.capacity = Some((self.epoch, required, available));
+            }
+        }
+        match resource {
+            ResourceKind::DeviceMemory => self.record_memory_deficit(DomainRole::Allocation, required),
+            ResourceKind::HostStaging => self.record_memory_deficit(DomainRole::Staging, required),
+            _ => {}
+        }
+        Ok(true)
     }
 
     fn memory_observation(result: Result<(), DomainError>) -> Result<MemoryObservation, String> {
@@ -517,7 +585,7 @@ impl<F: ProgramFamily> Owner<F> {
     fn release_for_reclaim(&mut self) -> Result<bool, String> {
         let mut released = self.release_surplus()?;
         while self.reclaim_needed()? {
-            if !self.retention.evict_one() {
+            if !self.prefix_cache.evict_one() {
                 break;
             }
             // Eviction drops claims, but committed rows and banks remain
@@ -562,51 +630,15 @@ impl<F: ProgramFamily> Owner<F> {
         self.observe_periodic_memory(self.now)
     }
 
-    pub fn admit(&mut self, generation: Generation, now: u64) -> Result<RequestId, AdmissionError> {
-        self.admit_with(generation, now, |_, _, _| Ok(Vec::new()))
-    }
-
-    pub fn admit_with(
+    /// Admit a fresh generation with its prepared input. Unless it waits for
+    /// a live peer to compute a shared prefix, it becomes resident now, from
+    /// the deepest cached prefix of its path when `prefix_cache` allows.
+    pub fn admit(
         &mut self,
         generation: Generation,
+        input: PreparedModelInput,
+        prefix_cache: bool,
         now: u64,
-        prepare: impl FnOnce(
-            &mut ExecutorDomain<F>,
-            RequestId,
-            &Generation,
-        ) -> Result<Vec<Operation>, String>,
-    ) -> Result<RequestId, AdmissionError> {
-        self.admit_inner(generation, None, now, |domain, request, generation, _| {
-            prepare(domain, request, generation)
-        })
-    }
-
-    pub fn admit_retained_with(
-        &mut self,
-        generation: Generation,
-        retention: RetentionRequest,
-        now: u64,
-        prepare: impl FnOnce(
-            &mut ExecutorDomain<F>,
-            RequestId,
-            &Generation,
-            Option<usize>,
-        ) -> Result<Vec<Operation>, String>,
-    ) -> Result<RequestId, AdmissionError> {
-        self.admit_inner(generation, Some(retention), now, prepare)
-    }
-
-    fn admit_inner(
-        &mut self,
-        mut generation: Generation,
-        retention_request: Option<RetentionRequest>,
-        now: u64,
-        prepare: impl FnOnce(
-            &mut ExecutorDomain<F>,
-            RequestId,
-            &Generation,
-            Option<usize>,
-        ) -> Result<Vec<Operation>, String>,
     ) -> Result<RequestId, AdmissionError> {
         self.time(now)
             .map_err(AdmissionError::invariant("service clock"))?;
@@ -621,14 +653,10 @@ impl<F: ProgramFamily> Owner<F> {
         if let Some(error) = &self.fatal {
             return Err(AdmissionError::Refused(error.clone()));
         }
-        if generation.awaiting_completion()
-            || generation.resident_position() != 0
-            || generation.usage().completion_tokens != 0
-            || !generation.is_resident()
-        {
-            return Err(AdmissionError::Refused(RequestError::Input(
-                "continued generation requires checkpoint admission".into(),
-            )));
+        if generation.is_resident() || generation.usage().completion_tokens != 0 {
+            return Err(AdmissionError::invariant("admission")(
+                "only a fresh generation can be admitted".into(),
+            ));
         }
         // A Blind refusal must leave accepted peers and their numerical
         // holdings intact.
@@ -637,88 +665,19 @@ impl<F: ProgramFamily> Owner<F> {
         self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
             AdmissionError::invariant("service identity")("identity exhausted".into())
         })?;
-        let retained = AdmissionError::invariant("retention");
-        let hit = retention_request
-            .as_ref()
-            .map(|request| self.retention.lookup(request, request.tokens.len()))
-            .transpose()
-            .map_err(retained)?
-            .flatten();
-        let opened = match hit {
-            Some(hit) => {
-                let restored = self.retention.entry(hit).and_then(|retained| {
-                    generation.restore_prefix(hit.position(), retained.method())
-                });
-                restored.map_err(AdmissionError::invariant("retention"))?;
-                let retained = self
-                    .retention
-                    .entry(hit)
-                    .map_err(AdmissionError::invariant("retention"))?;
-                self.domain.open_checkpoint(id, retained.checkpoint())
-            }
-            None => {
-                self.ensure_open_capacity()?;
-                self.domain
-                    .reserve_open(id)
-                    .and_then(|reservation| self.domain.open_reserved(reservation))
-            }
+        self.domain
+            .install_input(id, input)
+            .map_err(|error| AdmissionError::Refused(RequestError::Input(error)))?;
+        let plan = if prefix_cache {
+            self.plan_branches(PrefixPath::of(&generation), generation.resume_bound())
+        } else {
+            BranchPlan::default()
         };
-        if let Err(error) = opened {
-            let error = AdmissionError::from(error);
-            if let Some(fatal) = self.domain.fatal_error().cloned() {
-                self.fail_domain_error(fatal);
-            }
-            return Err(error);
-        }
-        let admission = match prepare(
-            &mut self.domain,
-            id,
-            &generation,
-            hit.map(|hit| hit.position()),
-        ) {
-            Ok(operations) => operations,
-            Err(error) => {
-                let rollback = self.domain.close(id);
-                return Err(match rollback {
-                    // The request's input could not be installed.
-                    Ok(()) => AdmissionError::Refused(RequestError::Input(error)),
-                    Err(rollback) => {
-                        let fatal = format!(
-                            "admission failed ({error}); executor rollback failed ({rollback})"
-                        );
-                        self.fail_all(fatal.clone());
-                        AdmissionError::invariant("admission rollback")(fatal)
-                    }
-                });
-            }
-        };
-        if admission.iter().any(|operation| {
-            operation.request() != id || !matches!(operation, Operation::Encode { .. })
-        }) {
-            let rollback = self.domain.close(id);
-            return Err(AdmissionError::invariant("admission")(match rollback {
-                Ok(()) => "admission returned invalid initial operations".into(),
-                Err(rollback) => format!(
-                    "admission returned invalid initial operations; rollback failed: {rollback}"
-                ),
-            }));
-        }
-        let mut plan = retention_request
-            .as_ref()
-            .map(|request| self.plan_branches(request, hit.map_or(0, |hit| hit.position())))
-            .unwrap_or_default();
-        // Only a text prefix waits; a request with media encodes up front and
-        // computes the prefix itself, branching there.
-        if !admission.is_empty() {
-            if let Some(point) = plan.awaited.take() {
-                plan.branch = Some(point);
-            }
-        }
         self.records.insert(
             id,
             Record {
                 generation,
-                admission: admission.into(),
+                encodes: VecDeque::new(),
                 waiting_since: now,
                 service_ns: 0,
                 physical_timings: PhysicalTimings::default(),
@@ -727,8 +686,8 @@ impl<F: ProgramFamily> Owner<F> {
                 preemption_debt: 0,
                 protected_until: None,
                 retire_on_completion: false,
-                retention: retention_request,
-                retention_source: hit.map(|hit| hit.id()),
+                prefix_cache,
+                prefix_source: None,
                 prefill_retained: false,
                 terminal_retained: false,
                 branch: plan.branch,
@@ -740,41 +699,117 @@ impl<F: ProgramFamily> Owner<F> {
                 publication_blocked: false,
             },
         );
+        if plan.awaited.is_none() {
+            if let Err(error) = self.make_resident(id) {
+                self.records.remove(&id);
+                if let Err(rollback) = self.domain.close(id) {
+                    let fatal = format!("admission failed ({error}); rollback failed ({rollback})");
+                    self.fail_all(fatal.clone());
+                    return Err(AdmissionError::invariant("admission rollback")(fatal));
+                }
+                return Err(error);
+            }
+        }
         self.epoch
             .advance()
             .map_err(AdmissionError::invariant("availability epoch"))?;
         Ok(id)
     }
 
-    /// Branch points for a request resuming at `resumed` (zero or its
-    /// retention hit): the deepest position where it diverges from a
-    /// retained path or a live request's prompt. A live request that has not
-    /// yet prefilled to its divergence from this one stops there too, so the
-    /// shared prefix is retained by whichever request reaches it first and
-    /// every later request resumes at it instead of recomputing.
-    fn plan_branches(&mut self, request: &RetentionRequest, resumed: usize) -> BranchPlan {
-        let worthwhile = |point: usize, from: usize, prompt: usize| {
-            point >= MIN_RETENTION_HIT && point >= from + MIN_BRANCH_GAIN && point < prompt
+    /// The single transition that makes a request resident: from the deepest
+    /// cached prefix of its path below its resume bound, or from fresh state.
+    /// Admission, a waiting request whose prefix is ready, and an evicted
+    /// request all come through here.
+    fn make_resident(&mut self, id: RequestId) -> Result<(), AdmissionError> {
+        let invariant = |detail: String| AdmissionError::invariant("residency")(detail);
+        let record = self
+            .records
+            .get(&id)
+            .ok_or_else(|| invariant("unknown request".into()))?;
+        let hit = if record.prefix_cache {
+            self.prefix_cache
+                .lookup(
+                    PrefixPath::of(&record.generation),
+                    record.generation.resume_bound(),
+                )
+                .map_err(AdmissionError::invariant("prefix cache"))?
+        } else {
+            None
         };
-        let retained = self.retention.shared_boundary(request);
-        let mut deepest = retained;
-        // The deepest shared prefix a live peer is still prefilling toward
-        // and will retain at its branch point.
-        let mut in_flight = 0;
-        for record in self.records.values_mut() {
-            let Some(live) = record.retention.as_ref() else {
-                continue;
-            };
-            if live.key != request.key {
-                continue;
+        let opened = match hit {
+            Some(hit) => {
+                let cached = self
+                    .prefix_cache
+                    .entry(hit)
+                    .map_err(AdmissionError::invariant("prefix cache"))?;
+                self.domain.open_state(id, Some(cached.state()))
             }
-            let shared = request.shared_boundary(&live.tokens, &live.conditioning);
+            None => {
+                self.ensure_open_capacity()?;
+                self.domain.open_state(id, None)
+            }
+        };
+        let encodes = match opened {
+            Ok(encodes) => encodes,
+            Err(error) => {
+                if let Some(fatal) = self.domain.fatal_error().cloned() {
+                    self.fail_domain_error(fatal);
+                }
+                return Err(AdmissionError::from(error));
+            }
+        };
+        let record = self.records.get_mut(&id).expect("known request");
+        let resumed = match hit {
+            Some(hit) => self
+                .prefix_cache
+                .entry(hit)
+                .and_then(|cached| {
+                    record
+                        .generation
+                        .resume_at(Some((hit.position(), cached.method())))
+                }),
+            None => record.generation.resume_at(None),
+        };
+        if let Err(error) = resumed {
+            return Err(match self.domain.release_state(&[id]) {
+                Ok(_) => invariant(error),
+                Err(rollback) => {
+                    let fatal = format!("{error}; executor rollback failed ({rollback})");
+                    self.fail_all(fatal.clone());
+                    invariant(fatal)
+                }
+            });
+        }
+        record.encodes.extend(encodes);
+        record.prefix_source = hit.map(|hit| hit.id());
+        Ok(())
+    }
+
+    /// Branch points for a new request's `path`: the deepest position where
+    /// it diverges from a cached path or a live request's prompt. A live
+    /// request that has not yet prefilled to its divergence from this one
+    /// stops there too, so the shared prefix is cached by whichever request
+    /// reaches it first and every later request resumes at it instead of
+    /// recomputing.
+    fn plan_branches(&mut self, path: PrefixPath, bound: usize) -> BranchPlan {
+        let worthwhile = |point: usize, from: usize, prompt: usize| {
+            point >= MIN_PREFIX_HIT && point >= from + MIN_BRANCH_GAIN && point < prompt
+        };
+        let resumed = self.prefix_cache.deepest(path, bound);
+        let cached = self.prefix_cache.shared_boundary(path);
+        let mut deepest = cached;
+        // The deepest shared prefix a live peer is still prefilling toward
+        // and will cache at its branch point.
+        let mut in_flight = 0;
+        for record in self.records.values_mut().filter(|record| record.prefix_cache) {
+            let live = PrefixPath::of(&record.generation);
+            let shared = path.shared_with_prompt_of(live);
             deepest = deepest.max(shared);
             if record.branch.is_none()
                 && worthwhile(
                     shared,
                     record.generation.resident_position(),
-                    live.tokens.len(),
+                    record.generation.prompt().len(),
                 )
             {
                 record.branch = Some(shared);
@@ -783,11 +818,11 @@ impl<F: ProgramFamily> Owner<F> {
                 in_flight = in_flight.max(shared);
             }
         }
-        if !worthwhile(deepest, resumed, request.tokens.len()) {
+        if !worthwhile(deepest, resumed, path.len()) {
             return BranchPlan::default();
         }
-        if in_flight == deepest && deepest > retained {
-            // A peer computes this prefix now: wait for its checkpoint.
+        if in_flight == deepest && deepest > cached {
+            // A peer computes this prefix now: wait for it to be cached.
             return BranchPlan {
                 branch: None,
                 awaited: Some(deepest),
@@ -800,69 +835,41 @@ impl<F: ProgramFamily> Owner<F> {
     }
 
     /// Whether a live request other than `except` is still prefilling toward
-    /// a planned branch point at `position` on `key`'s paths.
-    fn prefix_pending(&self, key: &RetentionKey, position: usize, except: RequestId) -> bool {
+    /// a planned branch point at `position`.
+    fn prefix_pending(&self, position: usize, except: RequestId) -> bool {
         self.records.iter().any(|(&id, record)| {
             id != except
+                && record.prefix_cache
                 && record.branch == Some(position)
-                && record
-                    .retention
-                    .as_ref()
-                    .is_some_and(|live| &live.key == key)
                 && prefilling_toward(&record.generation, position)
         })
     }
 
-    /// Requests waiting for a peer's prefix attach to its retained
-    /// checkpoint once it exists, and compute the prefix themselves once no
-    /// peer is still computing it.
-    fn attach_awaited(&mut self) -> Result<(), String> {
+    /// A waiting request stops waiting once the prefix it awaits is cached,
+    /// or once no peer computes it any more. It then becomes resident
+    /// through the ordinary residency path, from the deepest cached prefix.
+    fn release_awaited(&mut self) -> Result<(), String> {
         let waiting = self
             .records
             .iter()
             .filter_map(|(&id, record)| record.awaited_prefix.map(|position| (id, position)))
             .collect::<Vec<_>>();
+        let mut released = false;
         for (id, awaited) in waiting {
-            let input = self.records[&id]
-                .retention
-                .clone()
-                .ok_or("an awaited prefix requires a retention request")?;
-            let hit = self
-                .retention
-                .lookup(&input, input.tokens.len())?
-                .filter(|hit| hit.position() >= awaited);
-            let Some(hit) = hit else {
-                if !self.prefix_pending(&input.key, awaited, id) {
-                    let record = self.records.get_mut(&id).expect("waiting request");
-                    record.awaited_prefix = None;
-                    self.epoch.advance()?;
-                }
-                continue;
-            };
-            let retained = self.retention.entry(hit)?;
-            if self
-                .domain
-                .resume_from_checkpoint(id, retained.checkpoint())
-                .is_err()
-            {
-                if let Some(fatal) = self.domain.fatal_error().cloned() {
-                    self.fail_domain_error(fatal);
-                    return Ok(());
-                }
-                // The request computes the prefix itself instead.
+            let generation = &self.records[&id].generation;
+            let cached = self
+                .prefix_cache
+                .deepest(PrefixPath::of(generation), generation.resume_bound())
+                >= awaited;
+            if cached || !self.prefix_pending(awaited, id) {
                 self.records
                     .get_mut(&id)
                     .expect("waiting request")
                     .awaited_prefix = None;
-                self.epoch.advance()?;
-                continue;
+                released = true;
             }
-            let record = self.records.get_mut(&id).expect("waiting request");
-            record
-                .generation
-                .restore_prefix(hit.position(), retained.method())?;
-            record.retention_source = Some(hit.id());
-            record.awaited_prefix = None;
+        }
+        if released {
             self.epoch.advance()?;
         }
         Ok(())
@@ -883,7 +890,7 @@ impl<F: ProgramFamily> Owner<F> {
                 current = self.open_capacity(requirements);
             }
             while matches!(current, Err(DomainError::Capacity(_))) {
-                if !self.retention.evict_one() {
+                if !self.prefix_cache.evict_one() {
                     break;
                 }
                 self.domain
@@ -918,114 +925,6 @@ impl<F: ProgramFamily> Owner<F> {
         self.domain
             .can_open(requirements)
             .map_err(DomainError::from)
-    }
-
-    pub fn checkpoint(&mut self, request: RequestId) -> Result<CheckpointId, String> {
-        if let Some(error) = &self.fatal {
-            return Err(error.to_string());
-        }
-        let record = self.records.get(&request).ok_or("unknown request")?;
-        if record.retire_on_completion
-            || !record.admission.is_empty()
-            || self.batch_contains(request)
-        {
-            return Err("cannot checkpoint submitted or releasing work".into());
-        }
-        let numerical = self.domain.checkpoint(request)?;
-        let generation = record.generation.fork_at(numerical.position())?;
-        let id = CheckpointId(self.next_checkpoint);
-        self.next_checkpoint = self
-            .next_checkpoint
-            .checked_add(1)
-            .ok_or("checkpoint identity exhausted")?;
-        self.checkpoints.insert(
-            id,
-            Checkpoint {
-                generation,
-                numerical,
-                error: record.error.clone(),
-                protected_until: record.protected_until,
-            },
-        );
-        Ok(id)
-    }
-
-    pub fn fork_checkpoint(
-        &mut self,
-        checkpoint: CheckpointId,
-        now: u64,
-    ) -> Result<RequestId, String> {
-        self.time(now)?;
-        if let Some(error) = &self.fatal {
-            return Err(error.to_string());
-        }
-        let generation = {
-            let checkpoint = self
-                .checkpoints
-                .get(&checkpoint)
-                .ok_or("unknown checkpoint")?;
-            checkpoint
-                .generation
-                .fork_at(checkpoint.numerical.position())?
-        };
-        let id = RequestId(self.next_id);
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or("service identity exhausted")?;
-        let opened = {
-            let checkpoint = self
-                .checkpoints
-                .get(&checkpoint)
-                .ok_or("unknown checkpoint")?;
-            self.domain.open_checkpoint(id, &checkpoint.numerical)
-        };
-        if let Err(error) = opened {
-            let error = error.to_string();
-            if let Some(fatal) = self.domain.fatal_error().cloned() {
-                self.fail_domain_error(fatal);
-            }
-            return Err(error);
-        }
-        let checkpoint = self
-            .checkpoints
-            .get(&checkpoint)
-            .ok_or("unknown checkpoint")?;
-        self.records.insert(
-            id,
-            Record {
-                generation,
-                admission: VecDeque::new(),
-                waiting_since: now,
-                service_ns: 0,
-                physical_timings: PhysicalTimings::default(),
-                error: checkpoint.error.clone(),
-                capacity: None,
-                preemption_debt: 0,
-                protected_until: checkpoint.protected_until,
-                retire_on_completion: false,
-                retention: None,
-                retention_source: None,
-                prefill_retained: false,
-                terminal_retained: false,
-                branch: None,
-                awaited_prefix: None,
-                publication: None,
-                publication_batch_limit: 0,
-                pending_publication: None,
-                publication_permits: VecDeque::new(),
-                publication_blocked: false,
-            },
-        );
-        self.epoch.advance()?;
-        Ok(id)
-    }
-
-    pub fn release_checkpoint(&mut self, checkpoint: CheckpointId) -> Result<(), String> {
-        if self.checkpoints.remove(&checkpoint).is_some() {
-            self.epoch.advance()?;
-        }
-        Ok(())
     }
 
     pub fn error(&self, id: RequestId) -> Option<&RequestError> {
@@ -1071,24 +970,16 @@ impl<F: ProgramFamily> Owner<F> {
     pub fn completed_service_ns(&self) -> u128 {
         self.scheduler.completed_service_ns()
     }
-    pub fn retained_entries(&self) -> usize {
-        self.retention.len()
-    }
-    pub const fn retention_entry_capacity(&self) -> usize {
-        self.retention.max_entries()
+    pub fn cached_prefixes(&self) -> usize {
+        self.prefix_cache.len()
     }
 
     /// Seismic's charge reconciled against every state holder the owner
-    /// keeps: open requests, explicit checkpoints (live) and retained
-    /// prefixes; submitted work is counted through its stores' transactions.
+    /// keeps: resident requests and cached prefixes; submitted work is
+    /// counted through its stores' transactions.
     pub fn reconcile_memory_charge(&self) -> Result<MemoryChargeReconciliation, String> {
-        let live = self
-            .checkpoints
-            .values()
-            .map(|checkpoint| &checkpoint.numerical)
-            .collect::<Vec<_>>();
-        let retained = self.retention.checkpoints().collect::<Vec<_>>();
-        self.domain.reconcile_memory_charge(&live, &retained)
+        let cached = self.prefix_cache.states().collect::<Vec<_>>();
+        self.domain.reconcile_memory_charge(&cached)
     }
 
     pub fn status(&self, id: RequestId) -> Result<Status, String> {
@@ -1112,6 +1003,8 @@ impl<F: ProgramFamily> Owner<F> {
         }
         Ok(match record.generation.wait_reason() {
             None => Status::Runnable,
+            // Waiting for a peer to compute a shared prefix is not preemption.
+            Some(WaitReason::Residency) if record.awaited_prefix.is_some() => Status::Runnable,
             Some(WaitReason::Output) => Status::OutputBlocked,
             Some(WaitReason::Residency) => Status::Preempted,
             Some(WaitReason::Completion) => Status::AwaitingCompletion,
@@ -1256,7 +1149,7 @@ impl<F: ProgramFamily> Owner<F> {
                             record.publication_permits.clear();
                         }
                     }
-                    let needs_reconciliation = record.retention.is_some()
+                    let needs_reconciliation = record.prefix_cache
                         && record.generation.pending_reconciliation().is_some()
                         && matches!(
                             record.generation.finish_reason(),
@@ -1450,10 +1343,16 @@ impl<F: ProgramFamily> Owner<F> {
         if self.fatal.is_some() {
             return Ok(Step::Idle);
         }
-        self.attach_awaited()?;
+        self.release_awaited()?;
         let mut candidates = Vec::new();
         for (&id, record) in &mut self.records {
             if record.awaited_prefix.is_some() {
+                continue;
+            }
+            // Becoming resident is growth: it waits for memory to be Normal,
+            // whose return advances the epoch.
+            if !record.generation.is_resident() && self.memory_condition != MemoryCondition::Normal
+            {
                 continue;
             }
             if record
@@ -1463,7 +1362,7 @@ impl<F: ProgramFamily> Owner<F> {
                 continue;
             }
             record.capacity = None;
-            let reconciliation = record.retention.is_some()
+            let reconciliation = record.prefix_cache
                 && !record.terminal_retained
                 && matches!(
                     record.generation.finish_reason(),
@@ -1569,49 +1468,28 @@ impl<F: ProgramFamily> Owner<F> {
         self.drive_batch(now)
     }
 
-    /// Reopen an evicted request. Replay resumes from the deepest retained
-    /// prefix of its input (its own prompt checkpoint, or a shared prefix
-    /// another request left in the index), or from the start without one.
-    fn restore(&mut self, request: RequestId) -> Result<(), String> {
-        let record = self.records.get(&request).ok_or("unknown request")?;
-        let accepted = record.generation.accepted_position();
-        let hit = match record.retention.as_ref() {
-            Some(input) => self.retention.lookup(input, accepted)?,
-            None => None,
+    /// Make a non-resident request (evicted, or done waiting for a peer's
+    /// prefix) resident. Returns false when it cannot be now: short of
+    /// capacity it is blocked (or failed) like any capacity-blocked work; in
+    /// Reclaim or without a memory reading, the owner records that reading
+    /// and residency waits until memory is Normal again.
+    fn restore(&mut self, request: RequestId) -> Result<bool, String> {
+        let observation = match self.make_resident(request) {
+            Ok(()) => return Ok(true),
+            Err(AdmissionError::Refused(RequestError::Capacity(ServiceCapacityError {
+                resource: CapacityResource::Execution(resource),
+                required,
+                available,
+            }))) => {
+                self.block_on_capacity(&[request], &[request], resource, required, available)?;
+                return Ok(false);
+            }
+            Err(AdmissionError::MemoryReclaim) => MemoryObservation::Reclaim,
+            Err(AdmissionError::MemoryObservationUnavailable(_)) => MemoryObservation::Blind,
+            Err(error) => return Err(error.to_string()),
         };
-        let Some(hit) = hit else {
-            self.ensure_open_capacity()
-                .map_err(|error| error.to_string())?;
-            let reservation = self
-                .domain
-                .reserve_open(request)
-                .map_err(|error| error.to_string())?;
-            self.domain
-                .open_reserved(reservation)
-                .map_err(|error| error.to_string())?;
-            return self
-                .records
-                .get_mut(&request)
-                .expect("known request")
-                .generation
-                .restored();
-        };
-        let retained = self.retention.entry(hit)?;
-        self.domain
-            .open_checkpoint_state(request, retained.checkpoint())
-            .map_err(|error| error.to_string())?;
-        let record = self.records.get_mut(&request).expect("known request");
-        if let Err(error) = record
-            .generation
-            .restored_at(hit.position(), retained.method())
-        {
-            return Err(match self.domain.close(request) {
-                Ok(()) => error,
-                Err(rollback) => format!("{error}; executor rollback failed ({rollback})"),
-            });
-        }
-        record.retention_source = Some(hit.id());
-        Ok(())
+        self.enter_memory_condition(self.memory_condition.observe(observation, self.now))?;
+        Ok(false)
     }
 
     fn start_request(
@@ -1625,12 +1503,12 @@ impl<F: ProgramFamily> Owner<F> {
             .ok_or("unknown request")?
             .generation
             .is_resident();
-        if needs_open {
-            self.restore(request)?;
+        if needs_open && !self.restore(request)? {
+            return Ok(Vec::new());
         }
         let record = self.records.get_mut(&request).expect("known request");
-        if !record.admission.is_empty() {
-            return Ok(record.admission.drain(..).collect());
+        if !record.encodes.is_empty() {
+            return Ok(record.encodes.drain(..).collect());
         }
         if matches!(
             record.generation.finish_reason(),
@@ -1806,7 +1684,7 @@ impl<F: ProgramFamily> Owner<F> {
                 current = self.provisioned_capacity(queued.operations(), &requirement);
             }
             while matches!(&current, Err(DomainError::Capacity(_))) {
-                if !self.retention.evict_one() {
+                if !self.prefix_cache.evict_one() {
                     break;
                 }
                 if let Err(error) = self.domain.shrink_state(ShrinkPolicy::Reclaim) {
@@ -1884,7 +1762,7 @@ impl<F: ProgramFamily> Owner<F> {
         match submitted {
             Ok(flight) => {
                 let operations = queued.into_operations();
-                let mut retention_uses = Vec::new();
+                let mut prefix_uses = Vec::new();
                 for request in operations
                     .iter()
                     .map(Operation::request)
@@ -1893,17 +1771,17 @@ impl<F: ProgramFamily> Owner<F> {
                     if let Some(source) = self
                         .records
                         .get(&request)
-                        .and_then(|record| record.retention_source)
+                        .and_then(|record| record.prefix_source)
                     {
-                        if self.retention.begin_submitted_if_resident(source)? {
-                            retention_uses.push(source);
+                        if self.prefix_cache.begin_submitted_if_cached(source)? {
+                            prefix_uses.push(source);
                         }
                     }
                 }
                 self.batch.as_mut().unwrap().active = Some(ActiveGroup {
                     flight,
                     operations,
-                    retention_uses,
+                    prefix_uses,
                     publication_permits,
                 });
                 Ok(Step::Submitted)
@@ -2056,48 +1934,12 @@ impl<F: ProgramFamily> Owner<F> {
             .map(Operation::request)
             .collect::<Vec<_>>();
         let selected = self.batch.as_ref().unwrap().selection.requests().to_vec();
-
-        let can_change = self.records.iter().any(|(id, record)| {
-            !selected.contains(id)
-                && (record.generation.finish_reason().is_some()
-                    || record.generation.output_len() > 0
-                    || record.capacity.is_none())
-        });
-        if can_change {
-            for request in &requests {
-                if let Some(record) = self.records.get_mut(request) {
-                    record.capacity = Some((self.epoch, required, available));
-                }
-            }
-            // Memory can also return from outside the engine; a later
-            // observation reopens the batch once the ceiling covers it.
-            self.memory_deficit = match resource {
-                ResourceKind::DeviceMemory => Some(MemoryDeficit {
-                    role: DomainRole::Allocation,
-                    required,
-                }),
-                ResourceKind::HostStaging => Some(MemoryDeficit {
-                    role: DomainRole::Staging,
-                    required,
-                }),
-                _ => None,
-            };
+        if self.block_on_capacity(&requests, &selected, resource, required, available)? {
             let batch = self.batch.as_mut().unwrap();
             batch.queued.push_front(queued);
             batch.blocked = Some(self.epoch);
             Ok(Step::Waiting)
         } else {
-            for request in requests {
-                self.fail_request(
-                    request,
-                    RequestError::Capacity(ServiceCapacityError {
-                        resource: CapacityResource::Execution(resource),
-                        required,
-                        available,
-                    }),
-                );
-            }
-            self.epoch.advance()?;
             Ok(Step::Progress)
         }
     }
@@ -2118,8 +1960,8 @@ impl<F: ProgramFamily> Owner<F> {
 
     fn reconcile_active(&mut self) -> Result<(), String> {
         let active = self.batch.as_mut().unwrap().active.take().unwrap();
-        for source in active.retention_uses {
-            self.retention.end_submitted(source)?;
+        for source in active.prefix_uses {
+            self.prefix_cache.end_submitted(source)?;
         }
         for (request, permits) in active.publication_permits {
             if let Some(record) = self.records.get_mut(&request) {
@@ -2399,19 +2241,22 @@ impl<F: ProgramFamily> Owner<F> {
             return Ok(());
         }
         record.branch = None;
-        let tokens = record.generation.prompt()[..branch].to_vec();
-        let numerical = self.domain.checkpoint(request)?;
-        let method = self.records[&request].generation.method_checkpoint()?;
-        let retained = self.retention.retain(
-            self.records[&request]
-                .retention
-                .as_ref()
-                .ok_or("a branch point requires a retention request")?,
-            tokens,
-            numerical,
-            method,
-        )?;
-        if retained {
+        self.cache_prefix(request, branch)
+    }
+
+    /// Cache the request's reconciled state as the prefix of its path ending
+    /// at `position`, where it is resident.
+    fn cache_prefix(&mut self, request: RequestId, position: usize) -> Result<(), String> {
+        let state = self.domain.resume_state(request)?;
+        if state.position() != position {
+            return Err("cached prefix state differs from its path position".into());
+        }
+        let generation = &self.records.get(&request).ok_or("unknown request")?.generation;
+        let method = generation.method_checkpoint()?;
+        if self
+            .prefix_cache
+            .retain(PrefixPath::of(generation), position, state, method)?
+        {
             self.epoch.advance()?;
         }
         Ok(())
@@ -2438,39 +2283,20 @@ impl<F: ProgramFamily> Owner<F> {
         {
             return Ok(());
         }
-        let prompt = record.generation.prompt()[..boundary].to_vec();
-        let numerical = self.domain.checkpoint(request)?;
-        if numerical.position() != boundary {
-            return Err("prefill retention checkpoint differs from the prompt boundary".into());
-        }
-        let method = self
-            .records
-            .get(&request)
-            .unwrap()
-            .generation
-            .method_checkpoint()?;
-        let retained = self.retention.retain(
-            self.records
-                .get(&request)
-                .unwrap()
-                .retention
-                .as_ref()
-                .unwrap(),
-            prompt,
-            numerical,
-            method,
-        )?;
-        self.records.get_mut(&request).unwrap().prefill_retained = true;
-        if retained {
-            self.epoch.advance()?;
-        }
+        self.cache_prefix(request, boundary)?;
+        self.records
+            .get_mut(&request)
+            .expect("known request")
+            .prefill_retained = true;
         Ok(())
     }
 
+    /// Cache a finished request's whole path, prompt and reply: the next turn
+    /// of a conversation extends it.
     fn retain_terminal(&mut self, request: RequestId) -> Result<(), String> {
         let record = self.records.get(&request).ok_or("unknown request")?;
         if record.terminal_retained
-            || record.retention.is_none()
+            || !record.prefix_cache
             || !record.generation.is_resident()
             || !matches!(
                 record.generation.finish_reason(),
@@ -2479,15 +2305,8 @@ impl<F: ProgramFamily> Owner<F> {
         {
             return Ok(());
         }
-        let tokens = record
-            .generation
-            .prompt()
-            .iter()
-            .chain(record.generation.generated())
-            .copied()
-            .collect::<Vec<_>>();
-        let numerical = self.domain.checkpoint(request)?;
-        if numerical.position() != tokens.len() {
+        let end = PrefixPath::of(&record.generation).len();
+        if record.generation.resident_position() != end {
             if record.generation.pending_reconciliation().is_some() {
                 return Ok(());
             }
@@ -2495,27 +2314,11 @@ impl<F: ProgramFamily> Owner<F> {
                 "terminal numerical state is not reconciled at the accepted boundary".into(),
             );
         }
-        let method = self
-            .records
-            .get(&request)
-            .unwrap()
-            .generation
-            .method_checkpoint()?;
-        let retained = self.retention.retain(
-            self.records
-                .get(&request)
-                .unwrap()
-                .retention
-                .as_ref()
-                .unwrap(),
-            tokens,
-            numerical,
-            method,
-        )?;
-        if retained {
-            self.epoch.advance()?;
-        }
-        self.records.get_mut(&request).unwrap().terminal_retained = true;
+        self.cache_prefix(request, end)?;
+        self.records
+            .get_mut(&request)
+            .expect("known request")
+            .terminal_retained = true;
         Ok(())
     }
 
@@ -2530,7 +2333,7 @@ impl<F: ProgramFamily> Owner<F> {
                 || !record.generation.is_resident()
                 || record.generation.awaiting_completion()
                 || record.generation.finish_reason().is_some()
-                || !record.admission.is_empty()
+                || !record.encodes.is_empty()
                 || self.batch_contains(id)
                 || record.protected_until.is_some()
             {
@@ -2567,7 +2370,7 @@ impl<F: ProgramFamily> Owner<F> {
             if !release_resident_slot && self.domain.reclaimable(&set)? == 0 && method_bytes == 0 {
                 continue;
             }
-            let executor_released = match self.domain.evict(&set) {
+            let executor_released = match self.domain.release_state(&set) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     if let Some(fatal) = self.domain.fatal_error().cloned() {
@@ -2671,7 +2474,6 @@ impl<F: ProgramFamily> super::worker::Driven for Owner<F> {
     }
 
     fn shutdown(&mut self) -> Result<bool, String> {
-        self.checkpoints.clear();
         let ids = self.records.keys().copied().collect::<Vec<_>>();
         for &id in &ids {
             self.cancel(id, true)?;
@@ -2688,7 +2490,7 @@ impl<F: ProgramFamily> super::worker::Driven for Owner<F> {
             self.domain.close(id)?;
             self.records.remove(&id);
         }
-        self.retention.evict_all();
+        self.prefix_cache.evict_all();
         Ok(true)
     }
 }

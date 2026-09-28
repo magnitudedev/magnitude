@@ -57,7 +57,7 @@ pub(crate) mod tests {
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, HeadNorm,
         HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue, MediaRowAttention,
         ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Rotary, SublayerIndex,
-        Sublayer, TextCoordinateSemantics, ValueNorm, ValueSource, WeightDescriptor, WeightKind,
+        Sublayer, ValueNorm, ValueSource, WeightDescriptor, WeightKind,
         WeightRole, WeightScope,
     };
     use magnitude_state::KvCodec;
@@ -182,7 +182,6 @@ pub(crate) mod tests {
                 projector: None,
             },
             inputs: InputSemantics {
-                text_coordinates: TextCoordinateSemantics::ReplicatedPosition,
                 coordinate_axes: 1,
             },
             decoder: Decoder {

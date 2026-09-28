@@ -27,10 +27,8 @@ use magnitude_chat::{
 };
 use magnitude_scheduler::{
     owner::Owner,
-    retention::{RetentionKey, TokenizerIdentity},
     worker::{Driven, SpawnError, Worker},
 };
-use magnitude_state::CodecIdentity;
 use protocol::{EngineBuild, HostMessage, WorkerMessage};
 use seismic::DeviceCatalog;
 use session::{Loaded, Outbound, Session, Signal};
@@ -160,8 +158,7 @@ struct ChatIdentity {
 }
 
 /// Build the execution owner on its own thread while this thread prepares
-/// the worker's tokenizer, constraint vocabulary, retention key and chat
-/// identity.
+/// the worker's tokenizer, constraint vocabulary and chat identity.
 fn load(
     manifest: ExecutionManifest,
     outbound: &Outbound,
@@ -187,7 +184,6 @@ fn load(
     let ready_model = manifest.model.clone();
     let ready_service = manifest.service.clone();
     let ready_path = manifest.path;
-    let codec = manifest.model.kv_codec;
     let host_package = package.clone();
     let progress_outbound = outbound.clone();
     let owner_notice = notice.clone();
@@ -249,7 +245,7 @@ fn load(
             (ready, compute_bytes, host_table_bytes, domain),
         ))
     };
-    let host = move || -> Result<(Vocabulary, RetentionKey, ChatIdentity), LoadError> {
+    let host = move || -> Result<(Vocabulary, ChatIdentity), LoadError> {
         let unsupported = |reason: String| {
             LoadError::Unsupported(crate::error::UnsupportedModel::Representation { reason })
         };
@@ -274,20 +270,15 @@ fn load(
         );
         let projection = usize::try_from(definition.decoder.vocabulary)
             .map_err(|_| internal("model vocabulary exceeds the host domain"))?;
-        let retention = RetentionKey::new(
-            host_package.identity(),
-            TokenizerIdentity::new(tokenizer.identity()).map_err(internal)?,
-            CodecIdentity::new(codec.identity()).map_err(internal)?,
-        );
         let vocabulary = PreparedVocabulary::new(tokenizer, projection)
             .map_err(unsupported)?
             .with_cache_limits(CONSTRAINT_CACHE);
-        Ok((vocabulary, retention, chat))
+        Ok((vocabulary, chat))
     };
     let (
         execution,
         (execution_ready, compute_bytes, host_table_bytes, domain),
-        (vocabulary, retention, chat),
+        (vocabulary, chat),
     ) =
         Worker::spawn_ready_with(factory, usize::MAX, host).map_err(|error| match error {
             SpawnError::Factory(error) | SpawnError::Host(error) => error,
@@ -311,7 +302,6 @@ fn load(
         Loaded {
             execution,
             vocabulary,
-            retention,
             definition: session_definition,
             compute_bytes,
             host_table_bytes,

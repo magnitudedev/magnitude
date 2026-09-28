@@ -29,7 +29,8 @@ so bank capacity can grow without waiting for an active generation to finish.
 Status and lifecycle commands remain
 available during the flight.
 Prefix reuse reduces remaining prompt work; reclaimable cached state can make
-room for active requests. Output-blocked requests are ineligible until ready
+room for active requests. The [prefix cache](prefix-cache.md) defines what is
+cached, when a request resumes from it, and how residency is regained. Output-blocked requests are ineligible until ready
 again. Cancellation removes future work, with resource release after in-flight
 execution completes.
 

@@ -322,7 +322,7 @@ impl Generation {
             resident_position: 0,
             accepted_position: 0,
             reconciliation_target: 0,
-            resident: true,
+            resident: false,
             finish,
             method_factory,
             method,
@@ -384,33 +384,6 @@ impl Generation {
         self.method.checkpoint().map_err(|error| error.to_string())
     }
 
-    /// Restore a fresh generation at an exact retained prompt boundary. Output,
-    /// grammar, and usage remain those of this fresh request; only numerical
-    /// progress and owned method state are restored.
-    pub fn restore_prefix(
-        &mut self,
-        position: usize,
-        checkpoint: &MethodCheckpoint,
-    ) -> Result<(), String> {
-        if self.resident_position != 0
-            || self.accepted_position != 0
-            || self.reconciliation_target != 0
-            || !self.generated.is_empty()
-            || !self.output.is_empty()
-            || self.round.is_some()
-            || position > self.prompt.len()
-            || !self.layout.boundary(position)
-        {
-            return Err("retained prefix does not match a fresh exact input boundary".into());
-        }
-        self.method = self.method_at(position, checkpoint)?;
-        self.resident_position = position;
-        self.accepted_position = position;
-        self.reconciliation_target = position;
-        self.cached_tokens = position;
-        Ok(())
-    }
-
     /// Method state restored from a retained checkpoint of `position` rows.
     fn method_at(
         &self,
@@ -427,13 +400,6 @@ impl Generation {
             }
         }
         self.method_factory.create(Some(checkpoint))
-    }
-    pub fn credit_cached_tokens(&mut self, count: usize) -> Result<(), String> {
-        if count > self.prompt.len() || count < self.cached_tokens {
-            return Err("cached-token credit must be monotonic and within the prompt".into());
-        }
-        self.cached_tokens = count;
-        Ok(())
     }
     pub fn finish_reason(&self) -> Option<FinishReason> {
         self.finish
@@ -1012,80 +978,43 @@ impl Generation {
         self.resident = false;
         Ok(())
     }
-    /// Called after fresh numerical state for the same retained input is installed.
-    /// Replay advances to the retained acceptance boundary without sampling.
-    pub fn restored(&mut self) -> Result<(), String> {
-        if self.resident || self.finish.is_some() {
-            return Err("only an evicted live request can restore".into());
-        }
-        self.resident_position = 0;
-        self.resident = true;
-        Ok(())
+    /// The exclusive bound on a resumable prefix: the request must still
+    /// compute the row it next samples from (the last prompt row before its
+    /// first token, the last accepted row after that).
+    pub fn resume_bound(&self) -> usize {
+        self.prompt.len().max(self.accepted_position)
     }
 
-    /// Called after numerical state of a retained prefix of this request's
-    /// accepted input (`position` rows, with its method checkpoint) is
-    /// installed. Replay advances from there to the acceptance boundary.
-    pub fn restored_at(
-        &mut self,
-        position: usize,
-        checkpoint: &MethodCheckpoint,
-    ) -> Result<(), String> {
-        if self.resident || self.finish.is_some() {
-            return Err("only an evicted live request can restore".into());
+    /// Become resident on numerical state the executor has just installed:
+    /// fresh state at zero, or a prefix of this request's path of `position`
+    /// rows with its method checkpoint. Replay advances from there to the
+    /// numerical boundary held before eviction; prompt rows the prefix covers
+    /// beyond that boundary are accepted as cached.
+    pub fn resume_at(&mut self, from: Option<(usize, &MethodCheckpoint)>) -> Result<(), String> {
+        if self.resident {
+            return Err("only a non-resident generation can resume".into());
         }
-        if position > self.accepted_position
-            || (position < self.prompt.len() && !self.layout.boundary(position))
-        {
-            return Err("retained prefix is not an exact boundary of the accepted input".into());
+        let position = match from {
+            None => 0,
+            Some((position, checkpoint)) => {
+                if position == 0
+                    || position >= self.resume_bound()
+                    || (position < self.prompt.len() && !self.layout.boundary(position))
+                {
+                    return Err("resumed prefix is not an exact boundary of the request path".into());
+                }
+                self.method = self.method_at(position, checkpoint)?;
+                position
+            }
+        };
+        if position > self.reconciliation_target {
+            self.reconciliation_target = position;
+            self.accepted_position = self.accepted_position.max(position);
+            self.cached_tokens = self.cached_tokens.max(position);
         }
-        self.method = self.method_at(position, checkpoint)?;
         self.resident_position = position;
         self.resident = true;
         Ok(())
-    }
-
-    /// Fork reconciled logical state at the executor's independently checked
-    /// numerical checkpoint position.
-    pub fn fork_at(&self, numerical_position: usize) -> Result<Self, String> {
-        if self.round.is_some() || !self.resident || numerical_position != self.resident_position {
-            return Err("checkpoint requires matching reconciled resident state".into());
-        }
-        let constraint = self
-            .constraint
-            .as_ref()
-            .map(|constraint| -> Result<_, String> {
-                let fork = constraint.fork();
-                if fork.position() != constraint.position() {
-                    return Err("checkpoint constraint fork changed its position".into());
-                }
-                Ok(fork)
-            })
-            .transpose()?;
-        let method_checkpoint = self
-            .method
-            .checkpoint()
-            .map_err(|error| error.to_string())?;
-        let method = self.method_factory.create(Some(&method_checkpoint))?;
-        Ok(Self {
-            prompt: self.prompt.clone(),
-            layout: self.layout.clone(),
-            options: self.options.clone(),
-            constraint,
-            generated: self.generated.clone(),
-            output: self.output.clone(),
-            published: self.published,
-            resident_position: self.resident_position,
-            accepted_position: self.accepted_position,
-            reconciliation_target: self.reconciliation_target,
-            resident: self.resident,
-            finish: self.finish,
-            method_factory: self.method_factory.clone(),
-            method,
-            cached_tokens: self.cached_tokens,
-            draft_stats: self.draft_stats,
-            round: None,
-        })
     }
 }
 
