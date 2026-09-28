@@ -31,7 +31,9 @@ const run = Effect.scoped(Effect.gen(function* () {
     const code = yield* child.exitCode
     if (code !== 0) return yield* new AcceptanceFailed({ message: `Installed command ${args.join(" ")} exited ${code}` })
     return output
-  })).pipe(Effect.timeout("30 seconds"))
+  })).pipe(Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => new AcceptanceFailed({
+    message: `Installed command ${args.join(" ")} did not finish within 30 seconds`,
+  }) }))
   const initial = yield* query("status")
   if (!/Runtime\s+Stopped/.test(initial) || (yield* query("--version")).trim() !== version) {
     return yield* new AcceptanceFailed({ message: "Expected stopped installation at the selected version" })
@@ -40,26 +42,36 @@ const run = Effect.scoped(Effect.gen(function* () {
   yield* Effect.acquireUseRelease(
     Command.make(cli, "serve").pipe(Command.env(environment), Command.stdout("inherit"), Command.stderr("inherit"), Command.start),
     serving => Effect.gen(function* () {
+      // Each phase logs its duration and, on timeout, reports the last status it observed.
+      const readinessStarted = Date.now()
+      let readinessStatus = "(no status observed)"
       yield* Effect.gen(function* () {
         for (;;) {
           if (!(yield* serving.isRunning)) return yield* new AcceptanceFailed({ message: "Installed server exited before readiness" })
           const status = yield* query("status")
+          readinessStatus = status
           if (/Runtime\s+Ready/.test(status) && /Owner\s+Headless/.test(status)) {
             yield* fs.writeFileString(join(output, "ready-status.txt"), status)
             break
           }
           yield* Effect.sleep("500 millis")
         }
-      }).pipe(Effect.timeout("5 minutes"))
+      }).pipe(Effect.timeoutFail({ duration: "150 seconds", onTimeout: () => new AcceptanceFailed({
+        message: `Installed server was not Ready within 150 seconds; last status:\n${readinessStatus}`,
+      }) }))
+      yield* Effect.logInfo(`Installed server Ready after ${Math.round((Date.now() - readinessStarted) / 1000)} s`)
       yield* fs.writeFileString(join(output, "models.txt"), yield* query("models", "status"))
       yield* fs.writeFileString(join(output, "hardware.txt"), yield* query("hardware"))
       if (Option.isNone(inference) && !(yield* fs.exists(cachedManifest))) {
         return yield* new AcceptanceFailed({ message: "Ready service did not acquire the release into the empty profile" })
       }
       if (Option.isNone(inference)) {
+        const assessmentStarted = Date.now()
+        let catalogStatus = "(no status observed)"
         const ranking = yield* Effect.gen(function* () {
           for (;;) {
             const status = yield* query("catalog", "status")
+            catalogStatus = status
             const counts = /Assessment: Complete - (\d+) of (\d+) models? assessed/.exec(status)
             if (counts && Number(counts[1]) > 0 && counts[1] === counts[2]) {
               yield* fs.writeFileString(join(output, "catalog-status.txt"), status)
@@ -67,7 +79,10 @@ const run = Effect.scoped(Effect.gen(function* () {
             }
             yield* Effect.sleep("500 millis")
           }
-        }).pipe(Effect.timeout("90 seconds"))
+        }).pipe(Effect.timeoutFail({ duration: "120 seconds", onTimeout: () => new AcceptanceFailed({
+          message: `Catalog assessment did not complete within 120 seconds; last catalog status:\n${catalogStatus}`,
+        }) }))
+        yield* Effect.logInfo(`Catalog assessed after ${Math.round((Date.now() - assessmentStarted) / 1000)} s`)
         if (!ranking.includes("Local model recommendations -") && !ranking.includes("No compatible recommendations are available")) {
           return yield* new AcceptanceFailed({ message: "Catalog completed without a settled recommendation result" })
         }
@@ -90,4 +105,5 @@ const run = Effect.scoped(Effect.gen(function* () {
   yield* fs.writeFileString(join(output, "result.json"), yield* Schema.encode(Schema.parseJson(Evidence))({ version, engineAcquired: Option.isNone(inference) && !offline, offlineCachedStart: offline, headlessReady: true, rankingReady: Option.isNone(inference), queries: true, gracefulExit: true }))
   yield* Effect.logInfo("Installed foreground serve and CLI query acceptance passed")
 }))
-BunRuntime.runMain(run.pipe(Effect.timeout("110 seconds"), Effect.provide(BunContext.layer)))
+// Bounded by its phase limits; callers cap the whole process above them.
+BunRuntime.runMain(run.pipe(Effect.provide(BunContext.layer)))

@@ -40,7 +40,10 @@ const run = (
     previous.length + chunk.length <= 1024 * 1024 ? Effect.succeed(previous + chunk)
       : Effect.fail(new CandidateAcceptanceFailed({ message: `${executable} exceeded its output limit` }))))
   const [code, stdout, stderr] = yield* Effect.all([child.exitCode, read(child.stdout), read(child.stderr)], { concurrency: "unbounded" })
-  if (code !== 0) return yield* new CandidateAcceptanceFailed({ message: `${executable} failed with exit ${code}: ${(stderr || stdout).trim()}` })
+  // Report both streams: a process may log to stderr while its failure is on stdout.
+  if (code !== 0) return yield* new CandidateAcceptanceFailed({
+    message: `${executable} failed with exit ${code}\n--- stdout ---\n${stdout.trim().slice(-16000)}\n--- stderr ---\n${stderr.trim().slice(-16000)}`,
+  })
   return stdout
 })).pipe(Effect.timeout("5 minutes"), Effect.provide(BunContext.layer)))
 
