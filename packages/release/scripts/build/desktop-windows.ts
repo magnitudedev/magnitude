@@ -138,7 +138,7 @@ export const buildWindowsDesktopInstaller = (options: {
   const inventory = yield* renderWindowsInstallationInventory({ version: options.version, revision: options.revision, files: files as [string, ...string[]] })
   yield* fs.writeFile(join(stage, "installation-files.txt"), Buffer.from(`\uFEFF${inventory}`, "utf16le"))
   const scriptPath = join(stage, "desktop.nsi")
-  const signed = (yield* windowsSigning) === "artifact-signing"
+  const signed = (yield* windowsSigning).mode === "artifact-signing"
   if (signed) yield* fs.copyFile(windowsSigningScript, join(stage, "sign.ps1"))
   yield* fs.writeFileString(scriptPath, script + (signed
     ? '\n!uninstfinalize \'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File sign.ps1 -Path "%1"\' = 0\n'

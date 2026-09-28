@@ -5,6 +5,12 @@ import { resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import { isBuiltin } from "node:module";
 import type { Plugin } from "vite";
+import { Option, Schema } from "effect";
+import {
+  DESKTOP_DISTRIBUTION_VARIABLE,
+  DesktopDistributionJson,
+  developmentDesktopDistribution,
+} from "../packages/release/src/desktop-distribution";
 
 if (process.versions.bun) {
   throw new Error("Build Electron with Node.js installed on PATH; Bun's built-in modules differ from Electron's.");
@@ -26,11 +32,11 @@ const bundledRuntime = (): Plugin => ({
 });
 
 const acceptanceConfig = process.env.MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG;
-const developerIdBuild = process.env.MAGNITUDE_APPLE_DISTRIBUTION === "developer-id";
-const appleTeam = developerIdBuild ? process.env.APPLE_TEAM_ID ?? "" : "";
-if (developerIdBuild && !/^[A-Z0-9]{10}$/.test(appleTeam)) {
-  throw new Error("Developer ID builds require a valid Apple Team ID.");
-}
+// Publisher identities are resolved by the release build for its host, never from signing variables.
+const encodedDistribution = process.env[DESKTOP_DISTRIBUTION_VARIABLE];
+const distribution = encodedDistribution === undefined
+  ? developmentDesktopDistribution
+  : Schema.decodeUnknownSync(DesktopDistributionJson)(encodedDistribution);
 const updateConfiguration = acceptanceConfig ? {
   ...JSON.parse(readFileSync(acceptanceConfig, "utf8")), acceptance: true,
 } : {
@@ -38,7 +44,7 @@ const updateConfiguration = acceptanceConfig ? {
   keyId: "magnitude-2026-01",
   publicKey: readFileSync(resolve(__dirname, "../packages/release/resources/distribution/magnitude-2026-01.pub.pem"), "utf8"),
   acceptance: false,
-  ...(process.env.MAGNITUDE_WINDOWS_PUBLISHER ? { windowsPublisher: process.env.MAGNITUDE_WINDOWS_PUBLISHER } : {}),
+  ...Option.match(distribution.windowsPublisher, { onNone: () => ({}), onSome: (windowsPublisher) => ({ windowsPublisher }) }),
 };
 
 export default defineConfig({
@@ -49,7 +55,7 @@ export default defineConfig({
       "process.env.WS_NO_UTF_8_VALIDATE": "true",
       __MAGNITUDE_UPDATE_CONFIGURATION__: JSON.stringify(updateConfiguration),
       __MAGNITUDE_UPDATE_ACCEPTANCE__: JSON.stringify(Boolean(acceptanceConfig)),
-      MAGNITUDE_APPLE_TEAM_ID: JSON.stringify(appleTeam),
+      MAGNITUDE_APPLE_TEAM_ID: JSON.stringify(Option.getOrElse(distribution.appleTeam, () => "")),
     },
     plugins: [bundledRuntime(), { name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }, {
       name: "installed-update-trust",

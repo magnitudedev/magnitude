@@ -12,7 +12,7 @@ describe("Windows distribution signing policy", () => {
     ))).resolves.toBeUndefined()
   })
   it("rejects a misspelled production mode instead of silently building unsigned", async () => {
-    await expect(Effect.runPromise(Effect.gen(function* () { return yield* windowsSigning }).pipe(
+    await expect(Effect.runPromise(windowsSigning.pipe(
       Effect.withConfigProvider(config([["MAGNITUDE_WINDOWS_DISTRIBUTION", "artifact-signng"]])),
     ))).rejects.toThrow()
   })

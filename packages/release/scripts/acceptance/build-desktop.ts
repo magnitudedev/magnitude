@@ -12,6 +12,9 @@ import { buildWindowsDesktopInstaller } from "../build/desktop-windows"
 import { ACN_EXECUTABLE_NAME } from "../../src/executables"
 import { ReleaseArtifactSchema } from "../../src/contracts"
 import { sha256File } from "../../src/macos-app"
+import { DESKTOP_DISTRIBUTION_VARIABLE, DesktopDistributionJson } from "../../src/desktop-distribution"
+import { currentHost } from "../../src/targets"
+import { resolveDesktopDistribution } from "../build/desktop-distribution"
 
 class AcceptanceBuildFailed extends Schema.TaggedError<AcceptanceBuildFailed>()("AcceptanceBuildFailed", { message: Schema.String }) {}
 const root = resolve(import.meta.dir, "../../../..")
@@ -35,8 +38,10 @@ const run = Effect.gen(function* () {
     keyId: "acceptance", publicKey: yield* fs.readFileString(join(root, "packages/release/resources/distribution/acceptance.pub.pem")),
     windowsPublisher: target.platform === "win32" ? Option.some("Magnitude Update Acceptance") : Option.none(),
   }))
+  const distribution = yield* resolveDesktopDistribution(currentHost()).pipe(Effect.flatMap(Schema.encode(DesktopDistributionJson)))
   const command = (args: readonly [string, ...string[]], cwd = root) => Command.make(...args).pipe(Command.workingDirectory(cwd),
-    Command.env({ MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG: configPath }), Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
+    Command.env({ MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG: configPath, [DESKTOP_DISTRIBUTION_VARIABLE]: distribution }),
+    Command.stdout("inherit"), Command.stderr("inherit"), Command.exitCode,
     Effect.flatMap(code => code === 0 ? Effect.void : new AcceptanceBuildFailed({ message: `${args[0]} exited ${code}` })))
   const packagePath = join(root, "packages/launcher/package.json")
   yield* Effect.acquireUseRelease(fs.readFileString(packagePath), original => Effect.gen(function* () {

@@ -3782,6 +3782,7 @@ dependencies = [
 name = "seismic-lang"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "num-bigint",
  "num-traits",
  "postcard",

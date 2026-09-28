@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+dunce = "=1.0.5"
 num-bigint = "=0.4.8"
 num-traits = "=0.2.19"
 postcard.workspace = true

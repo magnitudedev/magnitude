@@ -36,6 +36,7 @@ import {
   type ReleaseHost,
 } from "../../src/targets"
 import { buildAcnBinary } from "./acn"
+import { desktopBuildEnvironment } from "./desktop-distribution"
 import { buildCliBinary } from "./cli"
 import {
   buildArchive,
@@ -162,6 +163,8 @@ export const buildHostArtifacts = async (
   outputRoot: string,
 ): Promise<void> => {
   const host = hostById(hostId)
+  // Resolved before compiling so a missing or malformed publisher identity fails immediately.
+  const desktopEnvironment = await Effect.runPromise(desktopBuildEnvironment(host.id))
   const output = resolve(outputRoot)
   await rm(output, { recursive: true, force: true })
   await mkdir(output, { recursive: true, mode: 0o700 })
@@ -233,14 +236,14 @@ export const buildHostArtifacts = async (
       await runAppleBuild(appleCommand("/usr/bin/xcrun", "stapler", "validate", app))
     }
     acnSources = (await runAppleBuild(regularAppleFiles(app))).map((file) => ({ ...file, path: `Magnitude.app/${file.path}` }))
-    await run(["bun", "run", "build"], { cwd: resolve(PROJECT_ROOT, "desktop") })
+    await run(["bun", "run", "build"], { cwd: resolve(PROJECT_ROOT, "desktop"), env: desktopEnvironment })
     const packages = await runAppleBuild(buildDesktopApplication({ service: acn, cli, outputDirectory: resolve(output, ".desktop-build"), version, revision: ACN_COORDINATION_REVISION }))
     if (packages.length !== 1) throw new Error("Desktop packaging did not produce exactly one host application")
     const desktop = await runAppleBuild(buildDesktopDmg({ app: resolve(packages[0]!, "Magnitude.app"), output, host: Schema.decodeUnknownSync(Schema.Literal("darwin-arm64", "darwin-x64"))(host.id) }))
     desktopArtifacts.push(desktop.artifact, desktop.updateArtifact)
     notarizations.push(desktop.notarization)
   } else if (host.id.startsWith("linux-")) {
-    await run(["bun", "run", "build"], { cwd: resolve(PROJECT_ROOT, "desktop") })
+    await run(["bun", "run", "build"], { cwd: resolve(PROJECT_ROOT, "desktop"), env: desktopEnvironment })
     const installers = await Effect.runPromise(Effect.gen(function* () {
       const arch = host.id === "linux-arm64-gnu" ? "arm64" : "x64"
       const applications = yield* buildDesktopApplication({
@@ -259,7 +262,7 @@ export const buildHostArtifacts = async (
     }).pipe(Effect.provide(BunContext.layer)))
     desktopArtifacts.push(...installers)
   } else if (host.id === "windows-x64-msvc") {
-    await run(["bun", "run", "build"], { cwd: resolve(PROJECT_ROOT, "desktop") })
+    await run(["bun", "run", "build"], { cwd: resolve(PROJECT_ROOT, "desktop"), env: desktopEnvironment })
     const guard = resolve(output, ".desktop-build", "MagnitudeInstallGuard.dll")
     await run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
       resolve(PROJECT_ROOT, "packages/release/scripts/build/windows-installer.ps1"), "-Output", guard])

@@ -229,7 +229,9 @@ pub fn load(paths: &[PathBuf], mut prelude: SourceSet) -> Result<Loaded, LoadErr
     }
     for path in &files {
         prelude.push(SourceFile {
-            path: path.to_string_lossy().replace('\\', "/"),
+            // A source path is logical and `/`-separated, which cannot represent a Windows
+            // verbatim canonical path (`\\?\C:\...`); `C:/...` stays absolute.
+            path: dunce::simplified(path).to_string_lossy().replace('\\', "/"),
             text: std::fs::read_to_string(path)?,
         });
     }

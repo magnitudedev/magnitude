@@ -119,13 +119,6 @@ const runCargoBuild = (
   })).pipe(Effect.mapError((cause) =>
     cause instanceof InferenceBuildFailed ? cause : new InferenceBuildFailed({ message: `cargo build failed: ${String(cause)}` })))
 
-/**
- * Release rustflags are fixed so ambient configuration cannot raise the CPU baseline (no
- * `target-cpu`). Linux executables resolve owned libraries from `../runtime`.
- */
-export const releaseRustflags = (host: ReleaseHost): string =>
-  host.id.startsWith("linux-") ? "-Clink-arg=-Wl,-rpath,$ORIGIN/../runtime" : ""
-
 const readIdentity = (binary: string) =>
   Command.make(binary, "version", "--json").pipe(
     Command.env({ LD_LIBRARY_PATH: "", DYLD_LIBRARY_PATH: "" }),
@@ -173,7 +166,9 @@ export const buildInference = ({
       ? {
         ...releaseBuildEnvironment(host),
         CARGO_TARGET_DIR: targetDirectory,
-        CARGO_ENCODED_RUSTFLAGS: releaseRustflags(host),
+        // Empty so ambient configuration cannot raise the CPU baseline (no `target-cpu`). The
+        // server's build script owns the Linux `../runtime` rpath.
+        CARGO_ENCODED_RUSTFLAGS: "",
       }
       : {}, diagnostics)
     const executables = cargoExecutables(messages, ICN_EXECUTABLE_NAME)

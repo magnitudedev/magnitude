@@ -104,7 +104,8 @@ and exercises engine readiness and parent-loss shutdown before candidate assembl
 Production Windows packaging uses Artifact Signing with an explicit publisher identity. Owned code,
 the native CLI launcher, the embedded uninstaller, and the final installer are signed and timestamped before checksums are
 recorded. Publisher and signature validation fail the build; missing credentials cannot produce a
-production installer. Bundling preserves the signed CLI and service bytes from their archives.
+production installer. The same publisher identity is compiled into Desktop's update trust; a signed
+build without one fails before compilation. Bundling preserves the signed CLI and service bytes from their archives.
 Local unsigned builds carry no production trust claim.
 The independent consumer installs and uninstalls the accepted installer under a fresh user profile,
 verifies installed registration and CLI versions, compares bundled CLI/service bytes to their
@@ -144,6 +145,12 @@ the native-helper entitlement profile, without a JIT entitlement. The packaged u
 matches the build's Desktop configuration so foreground preparation uses the same publisher trust.
 Developer ID builds compile the Apple Team ID into both Desktop and the CLI; a missing or malformed
 identity fails the build. Installed runtime environment variables cannot replace that identity.
+
+The host build resolves Desktop's publisher identities once, before compiling, and hands them to the
+Desktop build as one explicit input: the Apple Team ID only on Apple hosts and the Windows publisher
+only on the Windows host. The Desktop build never reads signing configuration itself, so one
+platform's signing settings cannot affect another platform's build. A Desktop build without that
+input is a development build and carries no publisher identity.
 
 Apple must accept the CLI, inference payload, desktop, and app submissions. A rejected or incomplete
 submission fails the build and retains diagnostic logs. The app ticket is stapled and validated before
