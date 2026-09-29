@@ -1871,8 +1871,8 @@ mod tests {
     use std::io::Write;
 
     use magnitude_service_contracts::models::{
-        CatalogBaseId, CatalogIntelligence, CatalogVariantId, InstalledCatalogAttribution,
-        InstalledModelPackages, IntelligenceProvenance, ModelFile, ModelFileId, ModelFileRole,
+        CatalogBaseId, CatalogVariantId, InstalledCatalogAttribution,
+        InstalledModelPackages, ModelFile, ModelFileId, ModelFileRole,
         ModelPackageInstallationOrigin, ModelPackageProperties, ModelReleaseDate,
         ModelServingConfiguration, PackageValidation, RecommendableModel, ServableModelBundle,
         ServingProfile,
@@ -1896,14 +1896,7 @@ mod tests {
             parameterization: magnitude_service_contracts::models::ModelParameterization::Dense {
                 total_parameters: 8_000_000_000,
             },
-            intelligence: CatalogIntelligence {
-                score: 0.0,
-                provenance: IntelligenceProvenance::ArtificialAnalysisIntelligenceIndex {
-                    methodology_version: "test".to_owned(),
-                    as_of_date: "2026-01-01".to_owned(),
-                    url: "https://example.com/model".to_owned(),
-                },
-            },
+            intelligence: 0,
             support: magnitude_service_contracts::models::CatalogSupport::Supported,
             fidelity_rank: 0,
             quantization_aware: false,

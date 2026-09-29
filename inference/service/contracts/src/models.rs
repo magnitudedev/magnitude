@@ -1033,56 +1033,6 @@ pub enum ModelParameterization {
     },
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum IntelligenceEstimateConfidence {
-    High,
-    Moderate,
-    Low,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum IntelligenceTarget {
-    ArtificialAnalysisIntelligenceIndex,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
-pub enum IntelligenceProvenance {
-    #[serde(
-        rename = "artificialAnalysisIntelligenceIndex",
-        rename_all = "camelCase"
-    )]
-    ArtificialAnalysisIntelligenceIndex {
-        methodology_version: String,
-        as_of_date: String,
-        url: String,
-    },
-    #[serde(rename = "estimate", rename_all = "camelCase")]
-    Estimate {
-        #[cfg_attr(feature = "openapi", schema(value_type = String))]
-        target: IntelligenceTarget,
-        methodology_version: String,
-        as_of_date: String,
-        confidence: IntelligenceEstimateConfidence,
-        methodology: String,
-        #[cfg_attr(feature = "openapi", schema(min_items = 1))]
-        evidence_urls: Vec<String>,
-    },
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CatalogIntelligence {
-    pub score: f64,
-    pub provenance: IntelligenceProvenance,
-}
-
 /// What the release promises for a catalog model. It is independent of assessment, which says
 /// what one device can do with it.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1128,7 +1078,7 @@ pub struct RecommendableModel {
     pub release_date: ModelReleaseDate,
     pub license: String,
     pub parameterization: ModelParameterization,
-    pub intelligence: CatalogIntelligence,
+    pub intelligence: u32,
     pub support: CatalogSupport,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,
@@ -1180,7 +1130,7 @@ pub struct CatalogModel {
     pub license: String,
     pub source_urls: Vec<String>,
     pub parameterization: ModelParameterization,
-    pub intelligence: CatalogIntelligence,
+    pub intelligence: u32,
     pub support: CatalogSupport,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,

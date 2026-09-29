@@ -90,12 +90,12 @@ const discoveredFidelityLabel = (bits: Option.Option<number>): string =>
       value >= 8 ? "Very high" : value >= 5 ? "High" : value >= 4 ? "Medium" : "Reduced",
   })
 
-const memoryFootprintLabel = (assessment: ModelAssessment): string => {
+const memoryFitLabel = (assessment: ModelAssessment): string => {
   const use = memoryUseRatio(assessment)
-  if (use <= 0.2) return "Tiny"
-  if (use <= 0.4) return "Light"
-  if (use <= 0.6) return "Medium"
-  if (use <= 0.8) return "Heavy"
+  if (use <= 0.2) return "Spacious"
+  if (use <= 0.4) return "Roomy"
+  if (use <= 0.6) return "Comfortable"
+  if (use <= 0.8) return "Snug"
   return "Tight"
 }
 
@@ -151,12 +151,12 @@ export const localModelRadarAxes = (
   const axes: LocalModelRadarAxes = [
     {
       value: Option.map(catalog, ({ intelligence }) =>
-        clamp01(intelligence.score / 100)
+        clamp01(intelligence / 100)
       ),
       label: "INTELLIGENCE",
       detail: Option.match(catalog, {
         onNone: () => "Not assessed",
-        onSome: ({ intelligence }) => `${Math.round(intelligence.score)}%`,
+        onSome: ({ intelligence }) => `${intelligence}%`,
       }),
     },
     {
@@ -172,9 +172,9 @@ export const localModelRadarAxes = (
       detail: speculation,
     },
     {
-      value: Option.some(memoryUseRatio(assessment)),
-      label: "MEMORY",
-      detail: `${memoryFootprintLabel(assessment)} (${formatMemorySize(
+      value: Option.some(1 - memoryUseRatio(assessment)),
+      label: "FIT",
+      detail: `${memoryFitLabel(assessment)} (${formatMemorySize(
         assessment.memory.totalRequiredBytes
       )})`,
     },

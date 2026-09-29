@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest"
 import { Option, Schema } from "effect"
 import {
-  CatalogIntelligenceSchema,
   CatalogBaseIdSchema,
   CatalogVariantIdSchema,
   CatalogSupportSchema,
+  IntelligenceScoreSchema,
   LocalModelMemorySchema,
   LocalModelPreparationSchema,
   LocalModelSchema,
@@ -23,12 +23,7 @@ const catalogModel = {
   catalogData: {
     releaseDate: "2026-08-29",
     parameterization: { architecture: "dense", totalParameters: 1 },
-    intelligence: { score: 1, provenance: {
-      kind: "artificialAnalysisIntelligenceIndex",
-      methodologyVersion: "test",
-      asOfDate: "2026-08-29",
-      url: "https://example.com/model",
-    } },
+    intelligence: 1,
     support: { _tag: "Supported" },
     fidelityRank: 1,
     quantizationAware: false,
@@ -304,52 +299,13 @@ describe("ModelParameterizationSchema", () => {
   })
 })
 
-describe("CatalogIntelligenceSchema", () => {
-  it("preserves direct and estimated provenance as distinct variants", () => {
-    const direct = {
-      score: 20.4,
-      provenance: {
-        kind: "artificialAnalysisIntelligenceIndex",
-        methodologyVersion: "4.1.1",
-        asOfDate: "2026-08-26",
-        url: "https://artificialanalysis.ai/models/qwen3-5-4b",
-      },
+describe("IntelligenceScoreSchema", () => {
+  it("accepts whole percentages of the frontier and rejects fractions or values outside 0 to 100", () => {
+    for (const valid of [0, 59, 100]) {
+      expect(Schema.decodeUnknownSync(IntelligenceScoreSchema)(valid)).toBe(valid)
     }
-    const estimate = {
-      score: 7.3,
-      provenance: {
-        kind: "estimate",
-        target: "artificialAnalysisIntelligenceIndex",
-        methodologyVersion: "4.1.1",
-        asOfDate: "2026-08-26",
-        confidence: "moderate",
-        methodology: "Compared with the exact parent model.",
-        evidenceUrls: ["https://example.com/evidence"],
-      },
-    }
-    expect(Schema.decodeUnknownSync(CatalogIntelligenceSchema)(direct)).toEqual(direct)
-    expect(Schema.decodeUnknownSync(CatalogIntelligenceSchema)(estimate)).toEqual(estimate)
-  })
-
-  it("rejects malformed dates, non-HTTPS evidence, and empty estimate evidence", () => {
-    const provenance = {
-      kind: "estimate",
-      target: "artificialAnalysisIntelligenceIndex",
-      methodologyVersion: "4.1.1",
-      asOfDate: "2026-08-26",
-      confidence: "low",
-      methodology: "Peer comparison.",
-      evidenceUrls: ["https://example.com/evidence"],
-    }
-    for (const invalid of [
-      { ...provenance, asOfDate: "2026-02-29" },
-      { ...provenance, evidenceUrls: ["http://example.com/evidence"] },
-      { ...provenance, evidenceUrls: [] },
-    ]) {
-      expect(() => Schema.decodeUnknownSync(CatalogIntelligenceSchema)({
-        score: 1,
-        provenance: invalid,
-      })).toThrow()
+    for (const invalid of [-1, 101, 58.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => Schema.decodeUnknownSync(IntelligenceScoreSchema)(invalid)).toThrow()
     }
   })
 })

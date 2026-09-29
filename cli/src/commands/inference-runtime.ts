@@ -267,7 +267,7 @@ const renderRecommendation = (model: CatalogLocalModel, index: number): string =
     `${index + 1}. ${labeledModelName(model)}`,
     `   ID: ${model.modelId}`,
     `   ${speedLabel(model)} - ${modelMemory(model)} memory - ${modelContext(model)} context`,
-    `   Intelligence ${Math.round(model.catalogData.intelligence.score)}% - Fidelity ${radarDetail(model, "FIDELITY")} - Acceleration ${accelerationLabel(model)}`,
+    `   Intelligence ${model.catalogData.intelligence}% - Fidelity ${radarDetail(model, "FIDELITY")} - Acceleration ${accelerationLabel(model)}`,
     ...(capabilities.length > 0 ? [`   ${capabilities.join(", ")}`] : []),
   ].join("\n")
 }
@@ -370,8 +370,8 @@ const renderCatalogDetail = ({ model, models }: {
     ])]
     return ["Performance on this machine", renderFields([
       ["Speed", speedLabel(model)],
-      ["Memory", radarDetail(model, "MEMORY")],
-      ["Intelligence", `${Math.round(model.catalogData.intelligence.score)}%`],
+      ["Fit", radarDetail(model, "FIT")],
+      ["Intelligence", `${model.catalogData.intelligence}%`],
       ["Fidelity", radarDetail(model, "FIDELITY")],
       ["Acceleration", accelerationLabel(model)],
     ])]

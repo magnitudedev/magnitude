@@ -288,7 +288,7 @@ const catalogModel = (
     : undefined
   const rankingScores = assessment?._tag === "Assessed" && assessment.assessment._tag === "Fits"
     ? modelRankingScores({
-        intelligenceScore: source.intelligence.score,
+        intelligenceScore: source.intelligence,
         fidelityRank: source.fidelityRank,
         profile: ready?.profile ?? source.desired.profile,
         performance: assessment.assessment.performance,

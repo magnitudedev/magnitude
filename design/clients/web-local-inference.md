@@ -86,7 +86,7 @@ title bar, and other application chrome do not duplicate model identity, residen
 context information.
 
 CLI and web share the pure five-axis local-model comparison profile: intelligence, speed,
-speculation, memory efficiency, and accuracy. Each client owns its renderer, so terminal cells and
+speculation, fit, and accuracy. Each client owns its renderer, so terminal cells and
 browser SVG remain separate presentations of the same model evidence.
 
 Install, update, cancellation, failure dismissal, removal, and warm load use the canonical model

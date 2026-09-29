@@ -643,8 +643,8 @@ const compareCatalogModels = (
   }
   if (sort === "intelligence") {
     return (
-      (rightCatalog?.intelligence.score ?? -1) -
-        (leftCatalog?.intelligence.score ?? -1) || byName
+      (rightCatalog?.intelligence ?? -1) -
+        (leftCatalog?.intelligence ?? -1) || byName
     )
   }
   if (sort === "largest") {

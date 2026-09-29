@@ -7,8 +7,7 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use magnitude_service_contracts::models::{
-    CatalogBaseId, CatalogDiagnostic, CatalogIntelligence, CatalogSupport, CatalogVariantId,
-    IntelligenceProvenance, ModelFailure, ModelFileRole, ModelPackage, ModelPackageSource,
+    CatalogBaseId, CatalogDiagnostic, CatalogSupport, CatalogVariantId, ModelFailure, ModelFileRole, ModelPackage, ModelPackageSource,
     ModelParameterization, ModelReleaseDate, ModelServingConfiguration, PackageValidation,
     ParsedModelId,
     RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
@@ -43,7 +42,63 @@ const MAX_PLANNER_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CatalogSource {
+    artificial_analysis_frontier: ArtificialAnalysisFrontier,
     models: Vec<CatalogModel>,
+}
+
+/// The top Artificial Analysis Intelligence Index result. Catalog intelligence is each model's
+/// Artificial Analysis score as a percentage of it, so updating it rescales every model.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArtificialAnalysisFrontier {
+    model: String,
+    score: f64,
+    methodology_version: String,
+    as_of_date: String,
+    url: String,
+}
+
+impl ArtificialAnalysisFrontier {
+    /// Rounded half-up to a whole percentage.
+    fn intelligence(&self, artificial_analysis: &ArtificialAnalysisScore) -> u32 {
+        (artificial_analysis.score * 100.0 / self.score).round() as u32
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArtificialAnalysisScore {
+    score: f64,
+    provenance: ArtificialAnalysisProvenance,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ArtificialAnalysisTarget {
+    ArtificialAnalysisIntelligenceIndex,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum ArtificialAnalysisProvenance {
+    #[serde(
+        rename = "artificialAnalysisIntelligenceIndex",
+        rename_all = "camelCase"
+    )]
+    ArtificialAnalysisIntelligenceIndex {
+        methodology_version: String,
+        as_of_date: String,
+        url: String,
+    },
+    #[serde(rename = "estimate", rename_all = "camelCase")]
+    Estimate {
+        #[allow(dead_code)]
+        target: ArtificialAnalysisTarget,
+        methodology_version: String,
+        as_of_date: String,
+        methodology: String,
+        evidence_urls: Vec<String>,
+    },
 }
 
 #[derive(Clone, Deserialize)]
@@ -61,7 +116,7 @@ struct CatalogModel {
     #[serde(default)]
     speculative_decoding: Option<CatalogSpeculativeDecoding>,
     license: String,
-    intelligence: CatalogIntelligence,
+    artificial_analysis: ArtificialAnalysisScore,
     support: CatalogSupport,
 }
 
@@ -208,6 +263,11 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
             "catalog source must contain at least one model".to_owned(),
         ));
     }
+    if !valid_artificial_analysis_frontier(&source.artificial_analysis_frontier) {
+        return Err(InventoryError::Integrity(
+            "invalid Artificial Analysis frontier declaration".to_owned(),
+        ));
+    }
     let mut ids = BTreeSet::new();
     let mut presentations = BTreeSet::new();
     for model in &source.models {
@@ -270,7 +330,10 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                     }
                 })
             || model.license.is_empty()
-            || !valid_catalog_intelligence(&model.intelligence)
+            || !valid_artificial_analysis(
+                &model.artificial_analysis,
+                &source.artificial_analysis_frontier,
+            )
             || !ids.insert(model.id.as_str())
             || model.variants.iter().any(|variant| {
                 !presentations.insert((model.display_name.as_str(), variant.variant_label.as_str()))
@@ -330,28 +393,45 @@ fn valid_catalog_support(model: &CatalogModel, source: &CatalogSource) -> bool {
     }
 }
 
-fn valid_catalog_intelligence(intelligence: &CatalogIntelligence) -> bool {
-    if !intelligence.score.is_finite() || intelligence.score < 0.0 {
+fn valid_artificial_analysis_frontier(frontier: &ArtificialAnalysisFrontier) -> bool {
+    frontier.score.is_finite()
+        && frontier.score > 0.0
+        && valid_non_empty(&frontier.model)
+        && valid_non_empty(&frontier.methodology_version)
+        && ModelReleaseDate::new(frontier.as_of_date.clone()).is_ok()
+        && valid_https_url(&frontier.url)
+}
+
+/// A model's score shares the frontier's Intelligence Index version, because scores from different
+/// versions are not on one scale, and never exceeds the frontier.
+fn valid_artificial_analysis(
+    artificial_analysis: &ArtificialAnalysisScore,
+    frontier: &ArtificialAnalysisFrontier,
+) -> bool {
+    if !artificial_analysis.score.is_finite()
+        || artificial_analysis.score < 0.0
+        || artificial_analysis.score > frontier.score
+    {
         return false;
     }
-    match &intelligence.provenance {
-        IntelligenceProvenance::ArtificialAnalysisIntelligenceIndex {
+    match &artificial_analysis.provenance {
+        ArtificialAnalysisProvenance::ArtificialAnalysisIntelligenceIndex {
             methodology_version,
             as_of_date,
             url,
         } => {
-            valid_non_empty(methodology_version)
+            *methodology_version == frontier.methodology_version
                 && ModelReleaseDate::new(as_of_date.clone()).is_ok()
                 && valid_https_url(url)
         }
-        IntelligenceProvenance::Estimate {
+        ArtificialAnalysisProvenance::Estimate {
             methodology_version,
             as_of_date,
             methodology,
             evidence_urls,
             ..
         } => {
-            valid_non_empty(methodology_version)
+            *methodology_version == frontier.methodology_version
                 && ModelReleaseDate::new(as_of_date.clone()).is_ok()
                 && valid_non_empty(methodology)
                 && !evidence_urls.is_empty()
@@ -1223,6 +1303,7 @@ fn package_source_matches(
 
 fn recommendable_model(
     declaration: &CatalogModel,
+    frontier: &ArtificialAnalysisFrontier,
     variant: &CatalogVariant,
     target: ModelPackage,
     draft: Option<ModelPackage>,
@@ -1296,7 +1377,7 @@ fn recommendable_model(
         release_date: declaration.release_date.clone(),
         license: declaration.license.clone(),
         parameterization: declaration.parameterization.clone(),
-        intelligence: declaration.intelligence.clone(),
+        intelligence: frontier.intelligence(&declaration.artificial_analysis),
         support: declaration.support.clone(),
         fidelity_rank: variant.fidelity_rank,
         quantization_aware: variant.quantization_aware,
@@ -1333,6 +1414,7 @@ fn catalog_from_planner_inputs(
             })?;
             let model = recommendable_model(
                 declaration,
+                &source.artificial_analysis_frontier,
                 variant,
                 input.target.package.clone(),
                 input.draft.as_ref().map(|draft| draft.package.clone()),
@@ -1371,6 +1453,7 @@ impl ResolvingRecommendableCatalog {
     async fn resolve_model(
         &self,
         declaration: &CatalogModel,
+        frontier: &ArtificialAnalysisFrontier,
         variant: &CatalogVariant,
         snapshots: &BTreeMap<String, HuggingFaceRepositorySnapshot>,
     ) -> Result<
@@ -1473,6 +1556,7 @@ impl ResolvingRecommendableCatalog {
         };
         let model = recommendable_model(
             declaration,
+            frontier,
             variant,
             target.package.clone(),
             draft.as_ref().map(|draft| draft.package.clone()),
@@ -1721,10 +1805,11 @@ impl ResolvingRecommendableCatalog {
         }
         let resolved_snapshots = &resolved_snapshots;
         let snapshot_failures = &snapshot_failures;
+        let frontier = &source.artificial_analysis_frontier;
         let model_total = source.models.len();
         let mut model_completed = 0;
         let resolved =
-            stream::iter(source.models.into_iter().enumerate())
+            stream::iter(source.models.iter().cloned().enumerate())
                 .map(|(declaration_index, declaration)| async move {
                     let mut variants = Vec::with_capacity(declaration.variants.len());
                     for (variant_index, variant) in declaration.variants.iter().enumerate() {
@@ -1741,7 +1826,12 @@ impl ResolvingRecommendableCatalog {
                         let result =
                             match missing_repository {
                                 None => {
-                                    self.resolve_model(&declaration, variant, resolved_snapshots)
+                                    self.resolve_model(
+                                        &declaration,
+                                        frontier,
+                                        variant,
+                                        resolved_snapshots,
+                                    )
                                         .await
                                 }
                                 Some(repository) => Err(InventoryError::Io(
@@ -1995,6 +2085,56 @@ mod tests {
             .find(|model| model.id == "bonsai-8b-q1")
             .expect("deprecated model");
         assert!(!valid_catalog_support(deprecated, &source));
+    }
+
+    #[test]
+    fn intelligence_is_a_rounded_percentage_of_the_frontier() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let frontier = source.artificial_analysis_frontier;
+        let scored = |score: f64| ArtificialAnalysisScore {
+            score,
+            provenance: ArtificialAnalysisProvenance::ArtificialAnalysisIntelligenceIndex {
+                methodology_version: frontier.methodology_version.clone(),
+                as_of_date: "2026-09-29".to_owned(),
+                url: "https://artificialanalysis.ai/models/example".to_owned(),
+            },
+        };
+        assert_eq!(frontier.intelligence(&scored(frontier.score)), 100);
+        assert_eq!(frontier.intelligence(&scored(0.0)), 0);
+        let rescaled = ArtificialAnalysisFrontier {
+            score: 50.0,
+            ..frontier.clone()
+        };
+        assert_eq!(rescaled.intelligence(&scored(33.7)), 67);
+        assert_eq!(rescaled.intelligence(&scored(12.25)), 25);
+        assert_eq!(rescaled.intelligence(&scored(12.2)), 24);
+    }
+
+    #[test]
+    fn artificial_analysis_scores_share_the_frontier_version_and_never_exceed_it() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let frontier = &source.artificial_analysis_frontier;
+        assert!(valid_artificial_analysis_frontier(frontier));
+        for model in &source.models {
+            assert!(valid_artificial_analysis(&model.artificial_analysis, frontier));
+        }
+        let model = source.models[0].artificial_analysis.clone();
+        let above = ArtificialAnalysisScore {
+            score: frontier.score + 0.1,
+            ..model.clone()
+        };
+        assert!(!valid_artificial_analysis(&above, frontier));
+        let other_version = ArtificialAnalysisFrontier {
+            methodology_version: "4.1.1".to_owned(),
+            ..frontier.clone()
+        };
+        assert!(!valid_artificial_analysis(&model, &other_version));
+        for invalid in [0.0, -1.0, f64::NAN] {
+            assert!(!valid_artificial_analysis_frontier(&ArtificialAnalysisFrontier {
+                score: invalid,
+                ..frontier.clone()
+            }));
+        }
     }
 
     #[test]

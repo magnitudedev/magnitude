@@ -2052,23 +2052,6 @@
           }
         }
       },
-      "CatalogIntelligence": {
-        "type": "object",
-        "required": [
-          "score",
-          "provenance"
-        ],
-        "properties": {
-          "score": {
-            "type": "number",
-            "format": "double"
-          },
-          "provenance": {
-            "$ref": "#/components/schemas/IntelligenceProvenance"
-          }
-        },
-        "additionalProperties": false
-      },
       "CatalogModel": {
         "type": "object",
         "required": [
@@ -2119,7 +2102,9 @@
             "$ref": "#/components/schemas/ModelParameterization"
           },
           "intelligence": {
-            "$ref": "#/components/schemas/CatalogIntelligence"
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           },
           "support": {
             "$ref": "#/components/schemas/CatalogSupport"
@@ -4659,86 +4644,6 @@
           "model-assessments",
           "catalog-installations",
           "instances"
-        ]
-      },
-      "IntelligenceEstimateConfidence": {
-        "type": "string",
-        "enum": [
-          "high",
-          "moderate",
-          "low"
-        ]
-      },
-      "IntelligenceProvenance": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "methodologyVersion",
-              "asOfDate",
-              "url",
-              "kind"
-            ],
-            "properties": {
-              "methodologyVersion": {
-                "type": "string"
-              },
-              "asOfDate": {
-                "type": "string"
-              },
-              "url": {
-                "type": "string"
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "artificialAnalysisIntelligenceIndex"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "target",
-              "methodologyVersion",
-              "asOfDate",
-              "confidence",
-              "methodology",
-              "evidenceUrls",
-              "kind"
-            ],
-            "properties": {
-              "target": {
-                "type": "string"
-              },
-              "methodologyVersion": {
-                "type": "string"
-              },
-              "asOfDate": {
-                "type": "string"
-              },
-              "confidence": {
-                "$ref": "#/components/schemas/IntelligenceEstimateConfidence"
-              },
-              "methodology": {
-                "type": "string"
-              },
-              "evidenceUrls": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "minItems": 1
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "estimate"
-                ]
-              }
-            }
-          }
         ]
       },
       "JsonSchemaRequest": {

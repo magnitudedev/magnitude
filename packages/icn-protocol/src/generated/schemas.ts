@@ -249,20 +249,13 @@ export const CatalogInstallationsResponse = S.extend(
 export type CatalogInstallationsResponse = S.Schema.Type<typeof CatalogInstallationsResponse>
 export type CatalogInstallationsResponseEncoded = S.Schema.Encoded<typeof CatalogInstallationsResponse>
 
-export const CatalogIntelligence = S.Struct({
-  provenance: S.suspend((): S.Schema<IntelligenceProvenance, IntelligenceProvenanceEncoded> => IntelligenceProvenance),
-  score: S.Number,
-})
-export type CatalogIntelligence = S.Schema.Type<typeof CatalogIntelligence>
-export type CatalogIntelligenceEncoded = S.Schema.Encoded<typeof CatalogIntelligence>
-
 export const CatalogModel = S.Struct({
   description: S.String,
   desired: S.suspend((): S.Schema<ReadyModel, ReadyModelEncoded> => ReadyModel),
   displayName: S.String,
   fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   id: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
-  intelligence: S.suspend((): S.Schema<CatalogIntelligence, CatalogIntelligenceEncoded> => CatalogIntelligence),
+  intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   license: S.String,
   localState: S.suspend((): S.Schema<CatalogModelState, CatalogModelStateEncoded> => CatalogModelState),
   parameterization: S.suspend(
@@ -1331,39 +1324,6 @@ export const InferenceResourceTopic = S.Union(
 )
 export type InferenceResourceTopic = S.Schema.Type<typeof InferenceResourceTopic>
 export type InferenceResourceTopicEncoded = S.Schema.Encoded<typeof InferenceResourceTopic>
-
-export const IntelligenceEstimateConfidence = S.Union(S.Literal("high"), S.Literal("moderate"), S.Literal("low"))
-export type IntelligenceEstimateConfidence = S.Schema.Type<typeof IntelligenceEstimateConfidence>
-export type IntelligenceEstimateConfidenceEncoded = S.Schema.Encoded<typeof IntelligenceEstimateConfidence>
-
-export const IntelligenceProvenance = S.Union(
-  S.extend(
-    S.Struct({
-      asOfDate: S.String,
-      kind: S.Literal("artificialAnalysisIntelligenceIndex"),
-      methodologyVersion: S.String,
-      url: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      asOfDate: S.String,
-      confidence: S.suspend(
-        (): S.Schema<IntelligenceEstimateConfidence, IntelligenceEstimateConfidenceEncoded> =>
-          IntelligenceEstimateConfidence,
-      ),
-      evidenceUrls: S.Array(S.String).pipe(S.minItems(1)),
-      kind: S.Literal("estimate"),
-      methodology: S.String,
-      methodologyVersion: S.String,
-      target: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type IntelligenceProvenance = S.Schema.Type<typeof IntelligenceProvenance>
-export type IntelligenceProvenanceEncoded = S.Schema.Encoded<typeof IntelligenceProvenance>
 
 export const JsonSchemaRequest = S.Struct({
   name: S.String,

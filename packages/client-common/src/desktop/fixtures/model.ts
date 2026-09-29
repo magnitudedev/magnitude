@@ -1,5 +1,5 @@
 import { Option, Schema } from "effect"
-import { AssessmentEnvironmentIdSchema, CatalogIntelligenceSchema, CatalogFormModelIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelVariantLabelSchema, type LocalModel } from "@magnitudedev/sdk"
+import { AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelVariantLabelSchema, type LocalModel } from "@magnitudedev/sdk"
 export const providerModelId = CatalogFormModelIdSchema.make("setup-model:gguf:q4")
 export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readonly _tag: "Catalog" }> => {
   return {
@@ -16,15 +16,7 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
     catalogData: {
         releaseDate: ModelReleaseDateSchema.make("2026-01-01"),
         parameterization: { architecture: "dense", totalParameters: 1 },
-        intelligence: Schema.decodeUnknownSync(CatalogIntelligenceSchema)({
-          score: 1,
-          provenance: {
-            kind: "artificialAnalysisIntelligenceIndex",
-            methodologyVersion: "test",
-            asOfDate: "2026-01-01",
-            url: "https://example.com/model",
-          },
-        }),
+        intelligence: 1,
         support: { _tag: "Supported" },
         fidelityRank: 1,
         quantizationAware: false,

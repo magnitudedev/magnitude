@@ -1,4 +1,11 @@
 {
+  "artificialAnalysisFrontier": {
+    "model": "Claude Opus 5.5 (Adaptive Reasoning, Max Effort)",
+    "score": 57.6,
+    "methodologyVersion": "4.3.2",
+    "asOfDate": "2026-09-29",
+    "url": "https://artificialanalysis.ai/models/claude-opus-5-5"
+  },
   "models": [
     {
       "id": "qwen3.5-4b",
@@ -11,13 +18,17 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 20.4,
+      "artificialAnalysis": {
+        "score": 13.1,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
-          "url": "https://artificialanalysis.ai/models/qwen3-5-4b"
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/qwen3-5-4b"
+          ]
         }
       }
     },
@@ -32,12 +43,12 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 21.8,
+      "artificialAnalysis": {
+        "score": 11.2,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/qwen3-5-9b"
         }
       }
@@ -54,12 +65,12 @@
       "projector": { "path": "mmproj-BF16.gguf" },
       "speculativeDecoding": { "method": "dflash2", "draft": { "type": "file", "repository": "z-lab/Qwen3.8-27B-DFlash2-GGUF", "path": "Qwen3.8-27B-DFlash2-Q8_0.gguf" } },
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 52.0,
+      "artificialAnalysis": {
+        "score": 33.7,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/qwen3-8-27b"
         }
       }
@@ -75,12 +86,12 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "qwen-community-1.0",
-      "intelligence": {
-        "score": 56.0,
+      "artificialAnalysis": {
+        "score": 39.8,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-27",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/qwen3-8-flash-next"
         }
       }
@@ -104,12 +115,12 @@
         }
       },
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 32.1,
+      "artificialAnalysis": {
+        "score": 18.2,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/qwen3-6-35b-a3b"
         }
       }
@@ -126,12 +137,12 @@
       "projector": { "path": "mmproj-Muse-Glimmer-30B-Q8_0.gguf" },
       "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "path": "dflash-kquant.gguf" } },
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 35.1,
+      "artificialAnalysis": {
+        "score": 17.5,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/muse-glimmer"
         }
       }
@@ -147,13 +158,17 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 9.5,
+      "artificialAnalysis": {
+        "score": 7.8,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
-          "url": "https://artificialanalysis.ai/models/gemma-4-e2b"
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/gemma-4-e2b"
+          ]
         }
       }
     },
@@ -168,13 +183,17 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 12.2,
+      "artificialAnalysis": {
+        "score": 8.9,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
-          "url": "https://artificialanalysis.ai/models/gemma-4-e4b"
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/gemma-4-e4b"
+          ]
         }
       }
     },
@@ -196,13 +215,17 @@
         }
       },
       "license": "lfm1.0",
-      "intelligence": {
-        "score": 11.0,
+      "artificialAnalysis": {
+        "score": 8.4,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
-          "url": "https://artificialanalysis.ai/models/lfm2-5-2-6b"
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/lfm2-5-2-6b"
+          ]
         }
       }
     },
@@ -224,13 +247,17 @@
         }
       },
       "license": "lfm1.0",
-      "intelligence": {
-        "score": 8.1,
+      "artificialAnalysis": {
+        "score": 7.2,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
-          "url": "https://artificialanalysis.ai/models/lfm2-5-8b-a1b"
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/lfm2-5-8b-a1b"
+          ]
         }
       }
     },
@@ -244,7 +271,19 @@
       "repository": "openbmb/MiniCPM5-1B-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "license": "apache-2.0",
-      "intelligence": { "score": 9, "provenance": { "kind": "artificialAnalysisIntelligenceIndex", "methodologyVersion": "4.3.2", "asOfDate": "2026-09-27", "url": "https://artificialanalysis.ai/models/minicpm5-1b" } }
+      "artificialAnalysis": {
+        "score": 8.8,
+        "provenance": {
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/minicpm5-1b"
+          ]
+        }
+      }
     },
     {
       "id": "minicpm5-2b",
@@ -257,7 +296,15 @@
       "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "openbmb/MiniCPM5-2B-DSpark-GGUF", "path": "MiniCPM5-2.6B-DSpark.gguf" } },
       "license": "apache-2.0",
-      "intelligence": { "score": 12, "provenance": { "kind": "artificialAnalysisIntelligenceIndex", "methodologyVersion": "4.3.2", "asOfDate": "2026-09-27", "url": "https://artificialanalysis.ai/models/minicpm5-2b" } }
+      "artificialAnalysis": {
+        "score": 12.5,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "url": "https://artificialanalysis.ai/models/minicpm5-2b"
+        }
+      }
     },
     {
       "id": "bonsai-8b-q1",
@@ -274,14 +321,13 @@
       "repository": "prism-ml/Bonsai-8B-gguf",
       "variants": [{"variantId": "gguf:q1-qat", "format": "Q1_0", "variantLabel": "Q1 QAT", "fidelityRank": 20, "quantizationAware": true}],
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 7.3,
+      "artificialAnalysis": {
+        "score": 6.4,
         "provenance": {
           "kind": "estimate",
           "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
-          "confidence": "moderate",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "methodology": "Scaled the direct Qwen3 8B reasoning score by the geometric mean of Bonsai's published per-benchmark retention ratios against that exact parent.",
           "evidenceUrls": [
             "https://artificialanalysis.ai/models/qwen3-8b-instruct-reasoning",
@@ -301,13 +347,17 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 22.2,
+      "artificialAnalysis": {
+        "score": 14.2,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
-          "url": "https://artificialanalysis.ai/models/gemma-4-12b"
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/gemma-4-12b"
+          ]
         }
       }
     },
@@ -322,13 +372,17 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 26.1,
+      "artificialAnalysis": {
+        "score": 16.7,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
-          "url": "https://artificialanalysis.ai/models/gemma-4-26b-a4b"
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/gemma-4-26b-a4b"
+          ]
         }
       }
     },
@@ -343,13 +397,17 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 29.7,
+      "artificialAnalysis": {
+        "score": 19.0,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
-          "url": "https://artificialanalysis.ai/models/gemma-4-31b"
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/gemma-4-31b"
+          ]
         }
       }
     },
@@ -363,25 +421,17 @@
       "repository": "unsloth/Laguna-S-2.1-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "license": "openmdw-1.1",
-      "intelligence": {
-        "score": 45.9,
+      "artificialAnalysis": {
+        "score": 0.0,
         "provenance": {
           "kind": "estimate",
           "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
-          "confidence": "low",
-          "methodology": "Applied a local linear regression between published Terminal-Bench 2.1 results and direct Intelligence Index scores for an aligned seven-model Poolside comparison cohort; DeepSeek V4 Pro was excluded because effort and benchmark configurations could not be aligned.",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "methodology": "No Intelligence Index result or usable estimate; placeholder score for a disabled model.",
           "evidenceUrls": [
             "https://huggingface.co/poolside/Laguna-S-2.1",
-            "https://poolside.ai/blog/introducing-laguna-s-2-1",
-            "https://artificialanalysis.ai/models/hy3",
-            "https://artificialanalysis.ai/models/inkling",
-            "https://artificialanalysis.ai/models/nvidia-nemotron-3-ultra-550b-a55b",
-            "https://artificialanalysis.ai/models/kimi-k3",
-            "https://artificialanalysis.ai/models/qwen3-7-max",
-            "https://artificialanalysis.ai/models/muse-spark-1-1",
-            "https://artificialanalysis.ai/models/claude-fable-5"
+            "https://poolside.ai/blog/introducing-laguna-s-2-1"
           ]
         }
       }
@@ -397,12 +447,12 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
-      "intelligence": {
-        "score": 32.8,
+      "artificialAnalysis": {
+        "score": 15.6,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/qwen3-5-122b-a10b"
         }
       }
@@ -417,12 +467,12 @@
       "repository": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}, {"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "license": "nvidia-nemotron-open-model-license",
-      "intelligence": {
-        "score": 25.7,
+      "artificialAnalysis": {
+        "score": 12.8,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/nvidia-nemotron-3-super-120b-a12b"
         }
       }
@@ -445,12 +495,12 @@
         }
       },
       "license": "openmdw-1.1",
-      "intelligence": {
-        "score": 23.6,
+      "artificialAnalysis": {
+        "score": 12.9,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/nemotron-3-5-lightning"
         }
       }
@@ -466,12 +516,12 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "path": "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf" } },
       "license": "mit",
-      "intelligence": {
-        "score": 51.8,
+      "artificialAnalysis": {
+        "score": 34.3,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/deepseek-v4-flash"
         }
       }
@@ -486,12 +536,12 @@
       "repository": "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
       "variants": [{"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "license": "openmdw-1.1",
-      "intelligence": {
-        "score": 38.3,
+      "artificialAnalysis": {
+        "score": 22.9,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/nvidia-nemotron-3-ultra-550b-a55b"
         }
       }
@@ -507,12 +557,12 @@
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "speculativeDecoding": { "method": "mtp", "draft": { "type": "embedded" } },
       "license": "mit",
-      "intelligence": {
-        "score": 52.6,
+      "artificialAnalysis": {
+        "score": 33.7,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.1.1",
-          "asOfDate": "2026-08-26",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/glm-5-2"
         }
       }

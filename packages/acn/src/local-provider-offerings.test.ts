@@ -76,12 +76,7 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
       ? { catalogData: {
           releaseDate: "2026-08-29",
           parameterization: { architecture: "dense", totalParameters: 1 },
-          intelligence: { score: 1, provenance: {
-            kind: "artificialAnalysisIntelligenceIndex",
-            methodologyVersion: "test",
-            asOfDate: "2026-08-29",
-            url: "https://example.com/model",
-          } },
+          intelligence: 1,
           support: { _tag: "Supported" },
           fidelityRank: 1,
           quantizationAware: false,

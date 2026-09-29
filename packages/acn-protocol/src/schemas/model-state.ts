@@ -333,13 +333,6 @@ export const ModelParameterizationSchema = Schema.Union(
 )
 export type ModelParameterization = typeof ModelParameterizationSchema.Type
 
-const IntelligenceAsOfDateSchema = Schema.String.pipe(
-  Schema.filter(isRealIsoCalendarDate, {
-    message: () => "intelligence observation date must be a real YYYY-MM-DD calendar date",
-  }),
-  Schema.brand("IntelligenceAsOfDate"),
-)
-
 export const HttpsUrlSchema = Schema.String.pipe(
   Schema.filter((value) => {
     try {
@@ -351,30 +344,8 @@ export const HttpsUrlSchema = Schema.String.pipe(
   Schema.brand("HttpsUrl"),
 )
 
-export const IntelligenceProvenanceSchema = Schema.Union(
-  Schema.Struct({
-    kind: Schema.Literal("artificialAnalysisIntelligenceIndex"),
-    methodologyVersion: NonEmptyString,
-    asOfDate: IntelligenceAsOfDateSchema,
-    url: HttpsUrlSchema,
-  }),
-  Schema.Struct({
-    kind: Schema.Literal("estimate"),
-    target: Schema.Literal("artificialAnalysisIntelligenceIndex"),
-    methodologyVersion: NonEmptyString,
-    asOfDate: IntelligenceAsOfDateSchema,
-    confidence: Schema.Literal("high", "moderate", "low"),
-    methodology: NonEmptyString,
-    evidenceUrls: Schema.NonEmptyArray(HttpsUrlSchema),
-  }),
-)
-export type IntelligenceProvenance = typeof IntelligenceProvenanceSchema.Type
-
-export const CatalogIntelligenceSchema = Schema.Struct({
-  score: FiniteNonNegative,
-  provenance: IntelligenceProvenanceSchema,
-})
-export type CatalogIntelligence = typeof CatalogIntelligenceSchema.Type
+/** A model's intelligence as a whole percentage of the top Artificial Analysis Intelligence Index score. */
+export const IntelligenceScoreSchema = Schema.Int.pipe(Schema.between(0, 100))
 
 export const MemoryAssessmentSchema = Schema.Struct({
   memoryDomainId: LocalInferenceMemoryDomainIdSchema,
@@ -616,7 +587,7 @@ export type CatalogSupport = typeof CatalogSupportSchema.Type
 export const LocalModelCatalogDataSchema = Schema.Struct({
   releaseDate: ModelReleaseDateSchema,
   parameterization: ModelParameterizationSchema,
-  intelligence: CatalogIntelligenceSchema,
+  intelligence: IntelligenceScoreSchema,
   support: CatalogSupportSchema,
   fidelityRank: NonNegativeSafeInteger,
   quantizationAware: Schema.Boolean,

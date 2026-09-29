@@ -50,9 +50,9 @@ utility = intelligence ^ (0.9 * p)
         * fidelity     ^ 0.1
 ```
 
-Fidelity always contributes. Intelligence is model-level capability on the versioned Artificial
-Analysis Intelligence Index scale; fidelity is artifact-variant preservation and cannot supply or
-alter intelligence provenance. Memory is a hard filter and never a utility factor. A candidate is
+Fidelity always contributes. Intelligence is model-level capability as a percentage of the
+Artificial Analysis frontier score; fidelity is artifact-variant preservation and cannot supply or
+alter intelligence. Memory is a hard filter and never a utility factor. A candidate is
 eligible only when its assessed `memory.totalRequiredBytes` does not exceed the machine's normalized
 physical-memory capacity.
 

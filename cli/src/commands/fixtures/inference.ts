@@ -1,7 +1,6 @@
 import { Option, Schema } from "effect"
 import {
   AssessmentEnvironmentIdSchema,
-  CatalogIntelligenceSchema,
   CatalogFormModelIdSchema,
   HuggingFaceFormModelIdSchema,
   HttpsUrlSchema,
@@ -154,15 +153,7 @@ const makeCatalogOnlyModel = (
     catalogData: {
         releaseDate: "2026-01-01" as ModelReleaseDate,
         parameterization: { architecture: "dense", totalParameters: 8_000_000_000 },
-        intelligence: Schema.decodeUnknownSync(CatalogIntelligenceSchema)({
-          score: 75,
-          provenance: {
-            kind: "artificialAnalysisIntelligenceIndex",
-            methodologyVersion: "test",
-            asOfDate: "2026-01-01",
-            url: "https://example.com/model",
-          },
-        }),
+        intelligence: 75,
         support: { _tag: "Supported" },
         fidelityRank: 75,
         quantizationAware: false,

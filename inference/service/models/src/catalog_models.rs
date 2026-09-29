@@ -733,8 +733,8 @@ mod tests {
     use std::path::PathBuf;
 
     use magnitude_service_contracts::models::{
-        CatalogBaseId, CatalogIntelligence, CatalogPackageAffiliation, CatalogSupport,
-        CatalogVariantId, IntelligenceProvenance, ModelFile, ModelFileId, ModelFileRole, ModelPackage,
+        CatalogBaseId, CatalogPackageAffiliation, CatalogSupport,
+        CatalogVariantId, ModelFile, ModelFileId, ModelFileRole, ModelPackage,
         ModelPackageProperties, ModelPackageSource, ModelParameterization, ModelReleaseDate,
         PackageValidation, ResolvedModelInstallation, ServingProfile, SpeculativeDraftSource,
         SpeculativeMethod,
@@ -801,14 +801,7 @@ mod tests {
             parameterization: ModelParameterization::Dense {
                 total_parameters: 1_000_000,
             },
-            intelligence: CatalogIntelligence {
-                score: 1.0,
-                provenance: IntelligenceProvenance::ArtificialAnalysisIntelligenceIndex {
-                    methodology_version: "test".to_owned(),
-                    as_of_date: "2026-01-01".to_owned(),
-                    url: "https://example.com/model".to_owned(),
-                },
-            },
+            intelligence: 1,
             support: CatalogSupport::Supported,
             fidelity_rank: 1,
             quantization_aware: false,

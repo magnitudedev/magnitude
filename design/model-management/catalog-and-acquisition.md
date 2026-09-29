@@ -56,13 +56,22 @@ presentation; package coordinates and bundle structure remain private.
 A catalog declaration names no context length. The serving profile's context is the target's
 supported maximum context from its GGUF metadata, the context the engine resolves and serves;
 memory is elastic, so a long supported context no longer reserves memory up front.
-Every active model carries one model-level intelligence assessment with its own declared Artificial
-Analysis Intelligence Index methodology version. A direct assessment records the observation date
-and canonical Artificial Analysis model URL. When no direct result exists, an estimate is a
-structurally distinct value that records its target scale, methodology, confidence, observation
-date, and non-empty primary evidence URLs. Intelligence is shared by every artifact variant;
-variant-specific preservation remains represented only by fidelity rank. Catalog intelligence is
-reviewed immutable release data and is never refreshed from the network at runtime.
+Every active model carries one model-level Artificial Analysis score with its declared Artificial
+Analysis Intelligence Index methodology version. A direct score records the observation date and
+canonical Artificial Analysis model URL. When no direct result exists, or Artificial Analysis marks
+its own result as estimated, an estimate is a structurally distinct value that records its target
+scale, methodology, observation date, and non-empty primary evidence URLs. The catalog declares one
+Artificial Analysis frontier: the top Intelligence Index model, its score, methodology version,
+observation date, and URL. Every model score shares the frontier's methodology version, because
+scores from different versions are not on one scale, and none exceeds the frontier.
+
+A model's intelligence is its Artificial Analysis score as a percentage of the frontier score,
+rounded half-up to a whole number. Intelligence is the canonical score that clients display and
+ranking uses; Artificial Analysis scores and their provenance are catalog-internal and never leave
+the service. Updating the frontier rescales every model. Intelligence is shared by every artifact
+variant; variant-specific preservation remains represented only by fidelity rank. Catalog
+Artificial Analysis data is reviewed immutable release data and is never refreshed from the network
+at runtime.
 
 Reviewed model parameterization states whether the architecture is dense or
 mixture-of-experts, its positive total parameter count, and, only for mixture-of-experts, a
@@ -332,8 +341,11 @@ artifact mutations update the same materialized derivation.
 - Catalog configurations are not copied into durable model state.
 - Issued catalog configurations remain resolvable after deprecation.
 - Every catalog variant publishes the valid ISO calendar date inherited from its model declaration.
-- Every active catalog model publishes exactly one finite, non-negative intelligence assessment
-  with valid direct or estimated provenance and its own Intelligence Index methodology version.
+- Every active catalog model declares exactly one finite, non-negative Artificial Analysis score with
+  valid direct or estimated provenance, the frontier's methodology version, and a score no greater
+  than the frontier's.
+- Published intelligence is exactly the model's Artificial Analysis score as a percentage of the
+  frontier, rounded half-up to a whole number, in the range 0 to 100.
 - Model intelligence and artifact-variant fidelity remain separate catalog authorities.
 - Every catalog model declares one support level; a deprecation's required replacement is an exact
   configuration of a supported catalog model.
