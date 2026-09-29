@@ -2586,6 +2586,7 @@ export type ServingProfileEncoded = S.Schema.Encoded<typeof ServingProfile>
 export const SpeculativeMethod = S.Union(
   S.extend(S.TaggedStruct("Mtp", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(S.TaggedStruct("DFlash", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("DFlash2", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(S.TaggedStruct("DSpark", {}), S.Record({ key: S.String, value: JsonValue })),
 )
 export type SpeculativeMethod = S.Schema.Type<typeof SpeculativeMethod>

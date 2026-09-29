@@ -2256,7 +2256,7 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "Qualified end to end on at least one host per backend it claims.",
+            "description": "Intended to be available as a supported catalog model.",
             "required": [
               "level"
             ],
@@ -7573,6 +7573,20 @@
                 "type": "string",
                 "enum": [
                   "DFlash"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DFlash2"
                 ]
               }
             }

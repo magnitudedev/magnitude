@@ -707,6 +707,7 @@ pub enum ModelFileRole {
 pub enum SpeculativeMethod {
     Mtp,
     DFlash,
+    DFlash2,
     DSpark,
 }
 

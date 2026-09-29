@@ -52,6 +52,7 @@
       "repository": "unsloth/Qwen3.8-27B-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
+      "speculativeDecoding": { "method": "dflash2", "draft": { "type": "file", "repository": "z-lab/Qwen3.8-27B-DFlash2-GGUF", "path": "Qwen3.8-27B-DFlash2-Q8_0.gguf" } },
       "license": "apache-2.0",
       "intelligence": {
         "score": 52.0,

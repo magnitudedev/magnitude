@@ -298,6 +298,7 @@ pub(crate) fn engine_material(
             (SpeculativeDraftSource::Separate { .. }, method, Some(draft)) => {
                 let method = match method {
                     SpeculativeMethod::DFlash => ModelMethod::DFlash,
+                    SpeculativeMethod::DFlash2 => ModelMethod::DFlash2,
                     SpeculativeMethod::DSpark => ModelMethod::DSpark,
                     SpeculativeMethod::Mtp => {
                         return Err(InventoryError::InvalidRequest(
@@ -310,7 +311,7 @@ pub(crate) fn engine_material(
             }
             (SpeculativeDraftSource::Embedded, _, _) => {
                 return Err(InventoryError::InvalidRequest(
-                    "an embedded draft is an MTP head; DFlash and DSpark need a separate draft"
+                    "an embedded draft is an MTP head; DFlash, DFlash2 and DSpark need a separate draft"
                         .to_owned(),
                 ));
             }
@@ -800,6 +801,7 @@ mod tests {
     fn engine_material_carries_the_declared_draft_and_method() {
         for (method, expected) in [
             (SpeculativeMethod::DFlash, ModelMethod::DFlash),
+            (SpeculativeMethod::DFlash2, ModelMethod::DFlash2),
             (SpeculativeMethod::DSpark, ModelMethod::DSpark),
         ] {
             let material = engine_material(&speculative(true, method)).unwrap();
@@ -811,6 +813,7 @@ mod tests {
         assert_eq!((embedded.draft, embedded.method), (None, ModelMethod::Mtp));
         for (draft, method) in [
             (false, SpeculativeMethod::DFlash),
+            (false, SpeculativeMethod::DFlash2),
             (false, SpeculativeMethod::DSpark),
             (true, SpeculativeMethod::Mtp),
         ] {

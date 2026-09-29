@@ -105,6 +105,8 @@ enum CatalogSpeculativeMethod {
     Mtp,
     #[serde(rename = "dflash")]
     DFlash,
+    #[serde(rename = "dflash2")]
+    DFlash2,
     #[serde(rename = "dspark")]
     DSpark,
 }
@@ -114,6 +116,7 @@ impl From<CatalogSpeculativeMethod> for SpeculativeMethod {
         match method {
             CatalogSpeculativeMethod::Mtp => Self::Mtp,
             CatalogSpeculativeMethod::DFlash => Self::DFlash,
+            CatalogSpeculativeMethod::DFlash2 => Self::DFlash2,
             CatalogSpeculativeMethod::DSpark => Self::DSpark,
         }
     }
@@ -253,7 +256,9 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                     matches!(
                         (&speculative.method, &speculative.draft),
                         (
-                            CatalogSpeculativeMethod::DFlash | CatalogSpeculativeMethod::DSpark,
+                            CatalogSpeculativeMethod::DFlash
+                                | CatalogSpeculativeMethod::DFlash2
+                                | CatalogSpeculativeMethod::DSpark,
                             CatalogSpeculativeDraftSource::Embedded
                         )
                     ) || match &speculative.draft {

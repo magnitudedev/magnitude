@@ -745,6 +745,7 @@ export type LocalModelPresentation = typeof LocalModelPresentationSchema.Type
 export const SpeculativeMethodSchema = Schema.Union(
   Schema.TaggedStruct("Mtp", {}),
   Schema.TaggedStruct("DFlash", {}),
+  Schema.TaggedStruct("DFlash2", {}),
   Schema.TaggedStruct("DSpark", {}),
 )
 export type SpeculativeMethod = typeof SpeculativeMethodSchema.Type
