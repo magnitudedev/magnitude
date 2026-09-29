@@ -11,7 +11,9 @@ use magnitude_engine::error::{LoadError, UnloadCause};
 use magnitude_engine::options::ExecutionManifest;
 use magnitude_engine::worker::protocol::LoadProgress;
 use magnitude_engine::worker::transport::{FramedTransport, stdio_worker_transport};
-use magnitude_engine::worker::{EngineClient, WorkerConnection, WorkerExit, connect_worker, serve_worker};
+use magnitude_engine::worker::{
+    EngineClient, WorkerConnection, WorkerExit, connect_worker, prepare_worker, serve_worker,
+};
 
 use super::ResidencyWorker;
 use crate::worker_process::{BlockingChild, BlockingProcess, WorkerLauncher, WorkerRole};
@@ -23,7 +25,7 @@ const DIAGNOSTIC_TAIL_BYTES: usize = 16 * 1024;
 /// only whether the worker is gone; the code is diagnostic.
 pub fn worker_exit_code(exit: &WorkerExit) -> i32 {
     match exit {
-        WorkerExit::Shutdown | WorkerExit::HostLost { .. } => 0,
+        WorkerExit::Shutdown | WorkerExit::Prepared | WorkerExit::HostLost { .. } => 0,
         WorkerExit::Unloaded(UnloadCause::MemoryPressure) => 10,
         WorkerExit::Unloaded(_) => 11,
         WorkerExit::LoadFailed(_) => 12,
@@ -155,6 +157,18 @@ impl SpawnedWorker {
             }
             Err(error) => Err((self.worker, error)),
         }
+    }
+}
+
+impl SpawnedWorker {
+    /// Send `Hello` and `Prepare{manifest}` and wait until the worker has prepared the model's
+    /// programs, reporting its progress. Blocking; the worker exits once prepared.
+    pub fn prepare(
+        self,
+        manifest: ExecutionManifest,
+        progress: impl FnMut(LoadProgress),
+    ) -> Result<(), LoadError> {
+        prepare_worker(self.transport, manifest, progress)
     }
 }
 

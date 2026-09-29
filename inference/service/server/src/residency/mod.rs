@@ -5,6 +5,7 @@
 //! and releases workers and names the resident payload a lease hands out.
 
 pub mod controller;
+mod optimization;
 pub mod supervisor;
 pub mod worker;
 

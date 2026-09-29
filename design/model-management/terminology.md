@@ -45,7 +45,7 @@ alias, or bundle key at the ICN–ACN boundary.
 | Assessment Material | Compact immutable GGUF and bundle evidence sufficient for native assessment, including effective template inputs but no tensor payloads; ICN implementation only |
 | Inventory entry | One source-location/content observation; ICN implementation only |
 | Package validation | Structural statement that exact package files are valid and supported; never capability or hardware evidence |
-| Catalog installation operation | One model-addressed install/update synchronization occurrence; ICN |
+| Catalog installation operation | One model-addressed install/update synchronization occurrence, ending with the model's optimization for this computer; ICN |
 | Assessment | One recomputable result containing template-derived capabilities, template fingerprint, compatibility, memory, and performance evidence for exact model work; ICN owns computation and coordination |
 | Instance | One physical loaded occurrence identified by `ModelInstanceId`; ICN |
 | Local model product | ACN application projection combining catalog or discovery facts with assessment, acquisition, ranking, and residency |

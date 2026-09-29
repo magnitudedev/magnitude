@@ -1903,6 +1903,24 @@
           {
             "type": "object",
             "required": [
+              "progress",
+              "_tag"
+            ],
+            "properties": {
+              "progress": {
+                "$ref": "#/components/schemas/CatalogOptimizationProgress"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Optimizing"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "_tag"
             ],
             "properties": {
@@ -2236,6 +2254,41 @@
           }
         },
         "additionalProperties": false
+      },
+      "CatalogOptimizationProgress": {
+        "type": "object",
+        "description": "Kernel tuning after a verified download, in tuning work units. `Preparing` opens the device\nand counts the units (0 of 0); `device` is the device a load would select, once previewed.",
+        "required": [
+          "stage",
+          "completed",
+          "total"
+        ],
+        "properties": {
+          "stage": {
+            "$ref": "#/components/schemas/CatalogOptimizationStage"
+          },
+          "completed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "device": {
+            "$ref": "#/components/schemas/ModelLoadDevice"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CatalogOptimizationStage": {
+        "type": "string",
+        "enum": [
+          "preparing",
+          "tuning"
+        ]
       },
       "CatalogSupport": {
         "oneOf": [

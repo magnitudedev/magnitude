@@ -323,4 +323,40 @@ describe("catalog acquisition projection", () => {
 
     expect(catalogAcquisition(model, operation, { _tag: "Unloaded" })).toMatchObject({ _tag: "Installed" })
   })
+
+  it("projects post-download optimization as an installed model with its tuning progress", () => {
+    const installation = { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "Magnitude" }
+    const model = {
+      desired: { metadata: { storageBytes: 7 } },
+      localState: { _tag: "Installed", installation, updateState: { _tag: "Current" } },
+    } as unknown as CatalogModel
+    const operation = {
+      state: {
+        _tag: "Optimizing",
+        progress: { stage: "tuning", completed: 3, total: 12, device: Option.some({ id: "metal:0", backend: "metal" }) },
+      },
+    } as unknown as CatalogInstallationOperation
+
+    expect(catalogAcquisition(model, operation, { _tag: "Unloaded" })).toEqual({
+      _tag: "Optimizing",
+      installation,
+      residencyState: { _tag: "Unloaded" },
+      progress: { stage: "tuning", completed: 3, total: 12, device: Option.some({ deviceId: "metal:0", backend: "metal" }) },
+    })
+  })
+
+  it("keeps an optimizing download finishing until the catalog observes its installation", () => {
+    const model = {
+      desired: { metadata: { storageBytes: 7 } },
+      localState: { _tag: "NotInstalled" },
+    } as unknown as CatalogModel
+    const operation = {
+      state: { _tag: "Optimizing", progress: { stage: "preparing", completed: 0, total: 0, device: Option.none() } },
+    } as unknown as CatalogInstallationOperation
+
+    expect(catalogAcquisition(model, operation, { _tag: "Unloaded" })).toEqual({
+      _tag: "Installing",
+      progress: { stage: "publishing", completedBytes: 7, totalBytes: 7, bytesPerSecond: Option.none() },
+    })
+  })
 })

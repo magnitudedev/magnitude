@@ -187,6 +187,15 @@ While a model loads, its residency text names the stage in full (for example "Op
 <accelerator>…", "Loading weights…") and the bar below shows the load's measured fraction with its
 percentage to the bar's right; a requested load is preparing at zero, so nothing snaps back when it
 starts. A loaded model's residency text includes the memory it holds.
+A model's download card stays in place and becomes its optimization: "Preparing to optimize…"
+while preparing, then "Optimizing for <accelerator>…" (or "Optimizing…" when the previewed device
+is unknown) while tuning. The finished download's full bar pulses while preparing and then gives
+way to the tuning fraction without jumping backwards; the card describes the work as one-time setup
+for this device with its percentage and an estimated time remaining from the observed tuning rate,
+and its cancel action reads "Skip optimization". While the card is shown, load and remove are not
+offered beside it; skipping restores them, and an inference request still loads the model, which
+ends the optimization. Download selection, the Downloading filter and activity include optimizing
+models, whose activity label is `<model> · Optimizing`.
 
 Connection observations refresh after mutations and periodically while observed, so edits made by
 other tools become visible. Unrelated user fields do not invalidate a connection. Development profiles

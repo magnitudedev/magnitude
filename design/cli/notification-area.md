@@ -13,7 +13,9 @@ notification state or reset client-owned notifications.
 ## Sources and ownership
 
 A persistent notification is a pure projection of authoritative state. Download activity is
-derived from local-model acquisition state, and selected-model memory guidance is derived from the
+derived from local-model acquisition state: installing, updating, and optimizing models count as
+active installations, reported as `N models downloading`, or `N models optimizing` when none is
+downloading. Selected-model memory guidance is derived from the
 selected local model's current-headroom state. Selected-model `Requested` residency is likewise
 projected as activity, and `Failed` residency is projected as an error. None of these facts is
 copied into writable client state, started by a UI event, or cleared by a timer.
@@ -63,7 +65,7 @@ insufficient headroom.
 ## Conformance
 
 - The composer and model menu render the same resolved notification.
-- Model downloads have one derived count and no client-retained download state.
+- Model downloads and optimizations have one derived count and no client-retained download state.
 - Low-memory guidance has one derived condition and no selection-handler side channel.
 - Requested and failed residency are derived from the authoritative selected-slot state.
 - Only ephemeral client events enter writable notification state.

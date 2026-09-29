@@ -417,7 +417,9 @@ Each resident load creates one private `inference-worker` child running the engi
 opens its own device catalog, loads exactly one model on the device it is given, and owns the
 device, weights, state and scheduler until it exits. ICN keeps the model's chat semantics and
 reaches the worker only through the engine's versioned framed protocol with per-request output
-credit; both ends must be the same engine build. Worker kinds receive native-runtime authority
+credit; both ends must be the same engine build. A catalog installation's optimization runs the
+same inference worker with a prepare-only request that tunes into the kernel cache and exits
+without becoming an Instance. Worker kinds receive native-runtime authority
 from the same immutable worker-launch capability.
 
 ICN resolves the model once, device-free, and gives the worker the resulting execution manifest

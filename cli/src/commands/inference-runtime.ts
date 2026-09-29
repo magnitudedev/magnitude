@@ -7,6 +7,8 @@ import {
   formatLocalModelDisplayName,
   formatMemorySize,
   formatModelLoadPercentage,
+  formatModelOptimization,
+  modelOptimizationFraction,
   formatModelLoadStage,
   formatSpeculativeMethod,
   formatStorageSize,
@@ -463,6 +465,7 @@ const modelStatus = (model: CatalogLocalModel): string => {
     case "Updating": return `Updating ${percent(acquisition.progress.completedBytes, acquisition.progress.totalBytes)}`
     case "InstallFailed": return `Failed - ${modelDownloadFailureMessage(acquisition.failure)}`
     case "UpdateFailed": return `Failed - ${modelDownloadFailureMessage(acquisition.failure)}`
+    case "Optimizing": return formatModelOptimization(acquisition.progress)
     case "RemoveFailed": return `Failed - ${acquisition.failure.message}`
     case "NotInstalled": return "Not installed"
     case "UpdateAvailable": {
@@ -494,6 +497,13 @@ const installationFields = (model: CatalogLocalModel): readonly (readonly [strin
   if (state._tag === "Installing" || state._tag === "Updating") return [
     ["Installation", state._tag === "Installing" ? "Downloading" : "Updating"],
     ["Progress", `${percent(state.progress.completedBytes, state.progress.totalBytes)} - ${formatStorageSize(state.progress.completedBytes)} / ${formatStorageSize(state.progress.totalBytes)}`],
+  ]
+  if (state._tag === "Optimizing") return [
+    ["Installation", "Optimizing"],
+    ...Option.match(modelOptimizationFraction(state.progress), {
+      onNone: () => [],
+      onSome: (fraction) => [["Progress", formatModelLoadPercentage(fraction)]] as const,
+    }),
   ]
   if (state._tag === "InstallFailed" || state._tag === "UpdateFailed") return [
     ["Installation", "Failed"],

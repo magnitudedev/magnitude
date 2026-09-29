@@ -74,6 +74,9 @@ pub struct Admission {
 pub enum HostMessage {
     Hello { build: EngineBuild },
     Load { manifest: ExecutionManifest },
+    /// Prepare `manifest`'s programs on its device, tuning what the kernel
+    /// cache lacks, then exit without loading the model.
+    Prepare { manifest: ExecutionManifest },
     Admit(Admission),
     /// The host's consumer drained `batches` output batches.
     Credit { request_id: HostRequestId, batches: u32 },
@@ -159,6 +162,8 @@ pub enum WorkerMessage {
     Hello { build: EngineBuild },
     LoadProgress { progress: LoadProgress },
     Ready { ready: ReadyInfo },
+    /// A `Prepare` finished; the worker exits after this message.
+    Prepared,
     LoadFailed { error: LoadError },
     Admitted { request_id: HostRequestId },
     AdmissionRefused { request_id: HostRequestId, error: RequestError },

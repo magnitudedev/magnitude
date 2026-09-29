@@ -39,17 +39,17 @@ import {
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./copy-command"
 import { createRoot } from "react-dom/client"
-import { useId, useMemo, useState, type ReactNode } from "react"
+import { useId, useMemo, useRef, useState, type ReactNode } from "react"
 import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Exit, Layer, Option, Runtime, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { MagnitudeClient, ProviderModelIdSchema, localModelDeprecation, type ProviderModelId, type CatalogLocalModel, type LocalInferenceHardware, type ModelResidency } from "@magnitudedev/sdk"
+import { MagnitudeClient, ProviderModelIdSchema, localModelDeprecation, type ProviderModelId, type CatalogLocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
 import { ApplicationSnapshot, LoginStartupState, type NetworkAccessChange } from "@magnitudedev/sdk/desktop-host"
 import {
   DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, ModelTrayPresentation, DesktopConnectionsSnapshot, activeLocalModel,
   createAgentClient, AgentClientProvider, useAgentClient, makeFirstPartyConnection,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
-  describeModelLoadStage, formatModelLoadPercentage, formatModelMemory,
+  describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
   formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
   catalogModelReplacement,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
@@ -145,26 +145,96 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
     {content}
   </details>
 }
-function DownloadProgress({ acquisition, modelName, onCancel, pending = false }: { acquisition: CatalogLocalModel["acquisitionState"]; modelName: string; onCancel?: () => void; pending?: boolean }) {
-  if (acquisition._tag !== "Installing" && acquisition._tag !== "Updating") return null
-  const { progress } = acquisition
-  const downloading = progress.stage === "downloading"
-  const percent = progress.totalBytes > 0 ? progress.completedBytes / progress.totalBytes * 100 : null
-  const rate = downloading ? Option.getOrNull(progress.bytesPerSecond) : null
-  const eta = downloading && rate !== null && rate > 0 && progress.totalBytes > 0
-    ? `About ${Math.max(1, Math.ceil((progress.totalBytes - progress.completedBytes) / rate / 60))} min`
-    : downloading ? "Estimating…" : "—"
+/** A catalog model's download and the one-time optimization that follows it. */
+const acquiring = (acquisition: CatalogLocalModel["acquisitionState"]) =>
+  acquisition._tag === "Installing" || acquisition._tag === "Updating" || acquisition._tag === "Optimizing"
+const minutesRemaining = (seconds: number) => `About ${Math.max(1, Math.ceil(seconds / 60))} min`
+/** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
+function useTuningEstimate(progress: ModelOptimizationProgress | null): string {
+  const baseline = useRef<{ at: number; completed: number } | null>(null)
+  if (progress === null || progress.stage !== "tuning") {
+    baseline.current = null
+    return "—"
+  }
+  const now = Date.now()
+  if (baseline.current === null || progress.completed < baseline.current.completed) baseline.current = { at: now, completed: progress.completed }
+  const elapsed = (now - baseline.current.at) / 1000
+  const done = progress.completed - baseline.current.completed
+  return elapsed < 5 || done <= 0 ? "Estimating…" : minutesRemaining((progress.total - progress.completed) * elapsed / done)
+}
+/**
+ * One card from the first byte to the model being ready: once the download is verified it turns into
+ * the optimization in place. Every line keeps its place, and the finished download's bar fades into
+ * tuning progress rather than jumping back.
+ */
+function DownloadProgress({ acquisition, modelName, onCancel, pending = false, layout = "panel" }: { acquisition: CatalogLocalModel["acquisitionState"]; modelName: string; onCancel?: () => void; pending?: boolean; layout?: "panel" | "row" }) {
+  const hardware = useLocalInferenceHardware()
+  const optimization = acquisition._tag === "Optimizing" ? acquisition.progress : null
+  const tuningEstimate = useTuningEstimate(optimization)
+  if (acquisition._tag !== "Installing" && acquisition._tag !== "Updating" && acquisition._tag !== "Optimizing") return null
   const stages = { queued: "Queued", resolving: "Preparing download", checking_space: "Checking space", downloading: "Downloading", verifying: "Verifying download", publishing: "Finishing download" }
-  const bytes = `${formatStorageSize(progress.completedBytes)} / ${progress.totalBytes > 0 ? formatStorageSize(progress.totalBytes) : "Unknown total"}`
+  const bar = "absolute inset-y-0 left-0 rounded-md bg-blue-700 transition-[width,opacity] duration-500 ease-out dark:bg-blue-500"
+  let heading: string, title: ReactNode, detail: string, percent: number | null, downloadWidth: number, pulse: boolean, stat: { label: string; value: string }, remaining: string, cancelLabel: string
+  if (acquisition._tag === "Optimizing") {
+    const { stage, completed, total } = acquisition.progress
+    heading = describeModelOptimization(acquisition.progress, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())
+    title = <span className="min-w-0 flex-1 truncate">{heading}</span>
+    detail = "One-time setup for this device"
+    percent = stage === "tuning" && total > 0 ? Math.min(100, completed * 100 / total) : null
+    downloadWidth = 100
+    pulse = percent === null
+    stat = { label: "Model", value: modelName }
+    remaining = tuningEstimate
+    cancelLabel = "Skip optimization"
+  } else {
+    const { progress } = acquisition
+    const downloading = progress.stage === "downloading"
+    const rate = downloading ? Option.getOrNull(progress.bytesPerSecond) : null
+    heading = stages[progress.stage]
+    title = downloading ? <><span className="shrink-0">Downloading</span><span className="min-w-0 flex-1 truncate" title={modelName}>{modelName}</span></> : <span className="min-w-0 flex-1 truncate">{heading}</span>
+    detail = `${formatStorageSize(progress.completedBytes)} / ${progress.totalBytes > 0 ? formatStorageSize(progress.totalBytes) : "Unknown total"}`
+    percent = progress.totalBytes > 0 ? progress.completedBytes / progress.totalBytes * 100 : null
+    downloadWidth = percent ?? 100
+    pulse = percent === null
+    stat = { label: "Download speed", value: rate !== null ? formatTransferRate(rate) : "—" }
+    remaining = downloading && rate !== null && rate > 0 && progress.totalBytes > 0
+      ? minutesRemaining((progress.totalBytes - progress.completedBytes) / rate)
+      : downloading ? "Estimating…" : "—"
+    cancelLabel = "Cancel download"
+  }
+  const tuning = optimization !== null && percent !== null
+  const phase = acquisition._tag === "Optimizing" ? "optimizing" : "download"
+  const fade = "motion-safe:animate-[fade-in_400ms_ease-out]"
+  const spinner = <CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 text-blue-700 motion-safe:animate-spin dark:text-blue-400" />
+  const percentText = percent !== null ? `${Math.floor(percent)}%` : "—"
+  const cancelButton = (className: string, size?: "sm") => onCancel && <Button variant="ghost" size={size} className={`hover:bg-transparent hover:text-red-600 dark:hover:bg-transparent dark:hover:text-red-400 ${className}`} disabled={pending} onClick={onCancel}><XIcon />{cancelLabel}</Button>
+  const progressBar = <div role="progressbar" aria-label={optimization ? "Optimization progress" : "Download progress"} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent ?? undefined} aria-valuetext={detail} className="relative h-2 w-full overflow-hidden rounded-md bg-slate-100 dark:bg-slate-800">
+    <div className={`${bar} ${pulse ? "motion-safe:animate-pulse" : ""}`} style={{ width: `${downloadWidth}%`, opacity: tuning ? 0 : 1 }} />
+    <div className={bar} style={{ width: `${tuning ? percent : 0}%`, opacity: tuning ? 1 : 0 }} />
+  </div>
+  // A model row already names the model: one status line over the bar, one line of detail under it.
+  if (layout === "row") {
+    const facts = [optimization === null ? stat.value : null, remaining].filter(fact => fact !== null && fact !== "—").join(" · ")
+    return <div className="w-full min-w-0" aria-label="Model download">
+      <div className="flex h-7 items-center gap-2 text-sm">
+        {spinner}
+        <span key={phase} className={`min-w-0 flex-1 truncate font-medium ${fade}`}>{heading}</span>
+        <span className="shrink-0 tabular-nums text-slate-600 dark:text-slate-300">{percent !== null ? percentText : null}</span>
+        {cancelButton("-mr-2.5 ml-2", "sm")}
+      </div>
+      <div className="mt-2">{progressBar}</div>
+      <div className="mt-2 flex items-baseline justify-between gap-3 text-xs tabular-nums text-slate-500 dark:text-slate-400"><span className="min-w-0 truncate">{detail}</span><span className="shrink-0">{facts}</span></div>
+    </div>
+  }
   return <div className="w-full min-w-0" aria-label="Model download">
     <h3 className="mb-6 flex items-center gap-2 text-sm font-medium">
-      {downloading ? <><span className="shrink-0">Downloading</span><span className="min-w-0 flex-1 truncate" title={modelName}>{modelName}</span></> : <span className="min-w-0 flex-1 truncate">{stages[progress.stage]}</span>}
-      <CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 text-blue-700 motion-safe:animate-spin dark:text-blue-400" />
+      <span key={phase} className={`flex min-w-0 flex-1 items-center gap-2 ${fade}`}>{title}</span>
+      {spinner}
     </h3>
-    <Progress aria-label="Download progress" aria-valuetext={bytes} value={percent} trackClassName="h-2" indicatorClassName={`bg-blue-700 dark:bg-blue-500 ${percent === null ? "w-full motion-safe:animate-pulse" : ""}`} />
-    <div className="mt-3 flex items-baseline justify-between gap-3 text-sm tabular-nums text-slate-600 dark:text-slate-300"><span>{bytes}</span><span>{percent !== null ? `${Math.floor(percent)}%` : "—"}</span></div>
-    <dl className="mt-6 grid grid-cols-2 gap-4 text-sm"><div><dt className="text-xs text-slate-500 dark:text-slate-400">Download speed</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{rate !== null ? formatTransferRate(rate) : "—"}</dd></div><div className="text-right"><dt className="text-xs text-slate-500 dark:text-slate-400">Time remaining</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{eta}</dd></div></dl>
-    {onCancel && <div className="mt-7 flex justify-center"><Button variant="ghost" className="hover:bg-transparent hover:text-red-600 dark:hover:bg-transparent dark:hover:text-red-400" disabled={pending} onClick={onCancel}><XIcon />Cancel download</Button></div>}
+    {progressBar}
+    <div className="mt-3 flex items-baseline justify-between gap-3 text-sm tabular-nums text-slate-600 dark:text-slate-300"><span className="min-w-0 truncate">{detail}</span><span>{percentText}</span></div>
+    <dl className="mt-6 grid grid-cols-2 gap-4 text-sm"><div className="min-w-0"><dt className="text-xs text-slate-500 dark:text-slate-400">{stat.label}</dt><dd className="mt-1 truncate font-medium tabular-nums text-slate-800 dark:text-slate-200" title={stat.value}>{stat.value}</dd></div><div className="text-right"><dt className="text-xs text-slate-500 dark:text-slate-400">Time remaining</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{remaining}</dd></div></dl>
+    {onCancel && <div className="mt-7 flex justify-center">{cancelButton("")}</div>}
   </div>
 }
 /** One step from a deprecated model to its replacement: download it, or load it once downloaded. */
@@ -205,7 +275,7 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
   const installed = "residencyState" in acquisition
   const residency = installed ? acquisition.residencyState : undefined
   const canStop = residency !== undefined && ["Ready", "Loading", "Requested", "Stopping"].includes(residency._tag)
-  const transferring = acquisition._tag === "Installing" || acquisition._tag === "Updating"
+  const transferring = acquiring(acquisition)
   const fit = model.catalogData.support._tag === "Supported" ? fitNotice(model) : null
   const loadFailure = residency?._tag === "Failed" && !command.pendingOperations.includes("load") ? residency.failure : null
   const loadNotice = inlineLoadFailure ? loadFailure : null
@@ -215,13 +285,14 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
 
   return <TooltipProvider><div className="contents">
     <div className="flex flex-wrap items-center justify-end gap-2">{children}
-      {transferring ? <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /> : !installed ? downloadFailure ? null : <Button disabled={pending || model.catalogData.support._tag !== "Supported" || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
+      {transferring ? null : !installed ? downloadFailure ? null : <Button disabled={pending || model.catalogData.support._tag !== "Supported" || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
         {model.catalogData.support._tag === "Supported" && (onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : loadNotice ? null : <Button className="min-w-28" disabled={pending} onClick={requestLoad}><PlayIcon />Load model</Button>)}
         {!onConnectAgent && <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><TrashIcon /></Button>}
         {model.catalogData.support._tag === "Supported" && acquisition._tag === "UpdateAvailable" && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
       </>}
 
     </div>
+    {transferring && <div className="col-span-full mt-1"><DownloadProgress layout="row" modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /></div>}
     {fit !== null && !loadFailure && !downloadFailure && <ErrorNotice severity="info" title={fit} className="col-span-full mt-3" />}
     {model.catalogData.support._tag === "Disabled" && <ErrorNotice severity="warning" title="This model is unavailable" description="Choose another model from Catalog." className="col-span-full mt-3" />}
     {downloadFailure && <ErrorNotice {...downloadNotice(downloadFailure)} className="col-span-full mt-3" actions={<>
@@ -259,7 +330,7 @@ function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; a
   const [view, setView] = useState<"profile" | "details">("profile")
   const { cancel } = useLocalModelMutations()
   const command = useLocalModelCommandStatus(model.modelId)
-  const transferring = model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating"
+  const transferring = acquiring(model.acquisitionState)
   return <div className={`relative ${pageLayout.recommendationPane}`} aria-label="Selected model profile">
     <div className={transferring ? "invisible" : undefined} inert={transferring} aria-hidden={transferring}>
     <div className={pageLayout.recommendationToolbar}>
@@ -286,7 +357,7 @@ function Recommendations({ models, active, preference }: { models: readonly Cata
   const [selection, setSelection] = useState<{ preference: number; modelId: CatalogLocalModel["modelId"] | null }>({ preference, modelId: null })
   if (selection.preference !== preference) setSelection({ preference, modelId: null })
   const selectedId = selection.preference === preference ? selection.modelId : null
-  const downloads = models.filter(model => model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating")
+  const downloads = models.filter(model => acquiring(model.acquisitionState))
   const selectable = downloads.length > 0 ? downloads : models
   const selected = selectable.find(model => model.modelId === selectedId) ?? selectable[0]
   if (!selected) return null
@@ -355,7 +426,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     const matchesFilter = filter === "all"
       || filter === "fits" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
       || filter === "downloaded" && localModelIsInstalled(model)
-      || filter === "downloading" && (acquisition._tag === "Installing" || acquisition._tag === "Updating")
+      || filter === "downloading" && acquiring(acquisition)
     return matchesFilter && (lab === null || modelLab(model) === lab) && `${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.trim().toLowerCase())
   })
   if (sort !== "recommended") visible.sort((a, b) => {
@@ -487,11 +558,11 @@ function ModelStatus() {
 }
 function DownloadActivity() {
   const models = useLocalModels()
-  const active = Result.isSuccess(models) ? models.value.models.filter((model): model is CatalogLocalModel => model._tag === "Catalog" && (model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating" || model.acquisitionState._tag === "Removing")) : []
+  const active = Result.isSuccess(models) ? models.value.models.filter((model): model is CatalogLocalModel => model._tag === "Catalog" && (acquiring(model.acquisitionState) || model.acquisitionState._tag === "Removing")) : []
   if (Result.isInitial(models)) return null
   if (Result.isSuccess(models) && active.length === 0) return null
   return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-700">
-    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} /></li>)}</ul>}
+    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Optimizing" ? "Optimizing" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} /></li>)}</ul>}
   </div>
 }
 function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null }) {

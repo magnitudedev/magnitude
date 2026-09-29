@@ -2,6 +2,7 @@ import { Option } from "effect"
 import type * as InferenceSchema from "@magnitudedev/icn-protocol/schemas"
 import type {
   ModelInstanceAllocation,
+  ModelLoadDevice,
   ModelLoadPlan,
   ModelResidency,
 } from "@magnitudedev/acn-protocol"
@@ -20,15 +21,19 @@ export const projectInferenceAllocation = (
   })),
 })
 
+export const projectInferenceLoadDevice = (
+  device: InferenceSchema.ModelLoadDevice,
+): ModelLoadDevice => ({
+  deviceId: LocalInferenceDeviceIdSchema.make(device.id),
+  backend: device.backend,
+})
+
 export const projectInferenceLoadPlan = (
   plan: InferenceSchema.ModelLoadPlan,
 ): ModelLoadPlan => ({
   contextWindowTokens: plan.contextWindowTokens,
   requiredMemoryBytes: plan.requiredMemoryBytes,
-  device: {
-    deviceId: LocalInferenceDeviceIdSchema.make(plan.device.id),
-    backend: plan.device.backend,
-  },
+  device: projectInferenceLoadDevice(plan.device),
 })
 
 export const projectInferenceResidency = (

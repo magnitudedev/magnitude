@@ -22,7 +22,7 @@ import {
   type ModelResidency,
 } from "@magnitudedev/acn-protocol"
 import { IcnCatalogInstallations, IcnInstances, IcnModelAssessments } from "@magnitudedev/icn"
-import { projectInferenceResidency } from "@magnitudedev/acn-protocol"
+import { projectInferenceLoadDevice, projectInferenceResidency } from "@magnitudedev/acn-protocol"
 import type {
   CatalogInstallationOperation,
   CatalogModel,
@@ -187,6 +187,20 @@ export const catalogAcquisition = (
     return installed === undefined
       ? { _tag: "Installing", progress: transfer }
       : { _tag: "Updating", ...installed, progress: transfer }
+  }
+  if (operation?.state._tag === "Optimizing") {
+    const { stage, completed, total, device } = operation.state.progress
+    // The download is published; until the catalog observes the installation it reads as finishing.
+    const storageBytes = model.desired.metadata.storageBytes
+    return installed === undefined
+      ? { _tag: "Installing", progress: {
+          stage: "publishing", completedBytes: storageBytes, totalBytes: storageBytes, bytesPerSecond: Option.none(),
+        } }
+      : {
+          _tag: "Optimizing",
+          ...installed,
+          progress: { stage, completed, total, device: Option.map(device, projectInferenceLoadDevice) },
+        }
   }
   if (operation?.state._tag === "Failed" && !operation.state.acknowledged
     && !(model.localState._tag === "Installed" && model.localState.updateState._tag === "Current")) {

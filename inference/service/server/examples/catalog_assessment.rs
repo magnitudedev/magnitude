@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 use futures_util::future::BoxFuture;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogPackageRemover, ModelAssessment, ModelAssessmentDomainSnapshot,
-    ModelAssessmentEntryState, ModelAssessmentPoolState, ModelAssessments, ModelPackageId,
+    CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover, ModelAssessment,
+    ModelAssessmentDomainSnapshot, ModelAssessmentEntryState, ModelAssessmentPoolState,
+    ModelAssessments, ModelId, ModelPackageId,
 };
 use magnitude_service_models::{
     InventoryConfig, ManagedModelDownloads, ManagedModelStore, ModelDomainResolver,
@@ -34,9 +35,19 @@ use serde_json::json;
 
 const POLL: Duration = Duration::from_millis(20);
 
-struct NoRemoval;
+struct NoCatalogEffects;
 
-impl CatalogPackageRemover for NoRemoval {
+impl CatalogModelOptimizer for NoCatalogEffects {
+    fn optimize_catalog_model(
+        &self,
+        _model_id: ModelId,
+        _progress: Box<dyn Fn(CatalogOptimizationProgress) + Send + Sync>,
+    ) -> BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
+}
+
+impl CatalogPackageRemover for NoCatalogEffects {
     fn remove_catalog_packages(
         &self,
         _package_ids: Vec<ModelPackageId>,
@@ -102,7 +113,7 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
     let inventory = Arc::new(ManagedModelStore::open(config).await?);
     let resolver = ModelDomainResolver::new(inventory.clone(), release.catalog().clone());
     let downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()).await?);
-    let services = managed_model_services(resolver.clone(), downloads, Arc::new(NoRemoval))?;
+    let services = managed_model_services(resolver.clone(), downloads, Arc::new(NoCatalogEffects), Arc::new(NoCatalogEffects))?;
     let cache = inventory.derived_cache().clone();
     let assessor = Arc::new(ModelAssessor::new(
         inventory,

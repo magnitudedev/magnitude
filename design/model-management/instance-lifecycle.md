@@ -127,6 +127,21 @@ previewed device. The
 Ready allocation is the worker's allocation census, republished when it changes, at most once per
 second.
 
+A catalog installation's optimization (see
+[catalog and acquisition](./catalog-and-acquisition.md)) moves a new model's tuning ahead of its
+first load. It resolves the configuration through the same resolved-configuration cache, previews
+it to find the device a load would select (a model whose preview fails cannot load, so its
+optimization is skipped), shares the device with loads while excluding assessment measurement
+exactly as a load does, and runs an
+inference worker with a prepare-only request for exactly that device and the same kernel cache.
+Its worker reports the load's `preparing` and tuning progress, stores each tuned unit as it
+completes, and exits once prepared; it never creates an Instance, holds residency, or serves.
+There is at most one preparation job per servable bundle. A load of that bundle first stops the
+job and proves its worker retired, then spawns its own worker, which tunes only what is not yet
+stored. Other models may be resident and serving while a job runs. A job that fails (memory
+exhaustion beside a resident model, the tuning safety stop, worker loss) is logged and never
+reported as a model failure.
+
 Every release first asks the worker to shut down, which ends its open requests as
 `model_instance_stopped`. Graceful release (replacement, idle) allows two seconds and explicit Stop
 half a second before the worker is killed. Retirement is proven by the worker's exit status.
@@ -192,6 +207,8 @@ Instance ID.
 - A worker loads exactly the device its load previewed; readiness verifies the package identity
   and device against the host's resolution.
 - Host-only operations never lease or load a model.
+- A post-installation preparation never holds residency; a load of the same bundle stops it, and
+  its tuned units remain stored for that load.
 - Engine unload for memory pressure and the service's emergency kill both publish
   `memory_pressure` and gate new loads on five seconds of headroom above the planning reserve.
 - Client connection or presence state cannot change model residency.

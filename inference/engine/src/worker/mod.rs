@@ -15,7 +15,8 @@ pub mod transport;
 
 pub use binding::GenerationBinding;
 pub use client::{
-    connect_worker, EngineClient, EngineRequest, RequestEvent, RequestOptions, WorkerConnection,
+    connect_worker, prepare_worker, EngineClient, EngineRequest, RequestEvent, RequestOptions,
+    WorkerConnection,
 };
 
 use crate::census::{AllocationCensus, MemoryDomain};
@@ -50,6 +51,8 @@ const CONSTRAINT_CACHE: CacheLimits = CacheLimits {
 pub enum WorkerExit {
     /// The host asked it to shut down.
     Shutdown,
+    /// A `Prepare` finished; the host received `Prepared`.
+    Prepared,
     /// The model stopped serving (memory pressure or an execution failure).
     Unloaded(UnloadCause),
     /// Loading failed; the host received `LoadFailed`.
@@ -77,8 +80,8 @@ pub fn run_worker(manifest: ExecutionManifest, transport: impl WorkerTransport) 
     serve(manifest, receiver, Box::new(sender))
 }
 
-/// A worker process's entry: accept the host's `Hello` and `Load`, then run
-/// the worker on that manifest.
+/// A worker process's entry: accept the host's `Hello`, then either run the
+/// worker on a `Load`'s manifest or only prepare a `Prepare`'s.
 pub fn serve_worker(transport: impl WorkerTransport) -> WorkerExit {
     let (mut receiver, mut sender) = transport.split();
     let worker = EngineBuild::current();
@@ -101,7 +104,8 @@ pub fn serve_worker(transport: impl WorkerTransport) -> WorkerExit {
     }
     let manifest = match receiver.receive() {
         Ok(Some(HostMessage::Load { manifest })) => manifest,
-        Ok(Some(_)) => return WorkerExit::ProtocolViolation("expected Load".into()),
+        Ok(Some(HostMessage::Prepare { manifest })) => return prepare_only(manifest, sender),
+        Ok(Some(_)) => return WorkerExit::ProtocolViolation("expected Load or Prepare".into()),
         Ok(None) => return WorkerExit::HostLost { reason: None },
         Err(error) => {
             return WorkerExit::HostLost {
@@ -110,6 +114,58 @@ pub fn serve_worker(transport: impl WorkerTransport) -> WorkerExit {
         }
     };
     serve(manifest, receiver, Box::new(sender))
+}
+
+/// Prepare `manifest`'s programs on its device (tuning what the kernel cache
+/// lacks) and report the outcome. No graph sealing, resource allocation,
+/// weight import or warm-up.
+fn prepare_only(
+    manifest: ExecutionManifest,
+    sender: impl MessageSender<WorkerMessage>,
+) -> WorkerExit {
+    let outbound: Outbound = Arc::new(Mutex::new(Box::new(sender)));
+    let hello = WorkerMessage::Hello {
+        build: EngineBuild::current(),
+    };
+    if let Err(error) = outbound.lock().unwrap().send(hello) {
+        return WorkerExit::TransportFailed(error.to_string());
+    }
+    let progress_outbound = outbound.clone();
+    let prepared = Package::open_manifest(&manifest.package)
+        .map_err(|error| {
+            LoadError::Artifact(ArtifactError::from_artifacts(
+                error,
+                manifest.package.target.path(),
+            ))
+        })
+        .and_then(|package| {
+            let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
+            crate::execution::prepare(
+                &catalog,
+                &manifest,
+                &package,
+                Rc::new(move |progress| {
+                    let _ = progress_outbound
+                        .lock()
+                        .unwrap()
+                        .send(WorkerMessage::LoadProgress { progress });
+                }),
+            )
+        });
+    let (message, exit) = match prepared {
+        Ok(_) => (WorkerMessage::Prepared, WorkerExit::Prepared),
+        Err(error) => (
+            WorkerMessage::LoadFailed {
+                error: error.clone(),
+            },
+            WorkerExit::LoadFailed(error),
+        ),
+    };
+    let sent = outbound.lock().unwrap().send(message);
+    match sent {
+        Ok(()) => exit,
+        Err(error) => WorkerExit::TransportFailed(error.to_string()),
+    }
 }
 
 fn serve(

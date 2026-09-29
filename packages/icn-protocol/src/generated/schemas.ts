@@ -180,6 +180,14 @@ export const CatalogInstallationOperationState = S.Union(
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
+  S.extend(
+    S.TaggedStruct("Optimizing", {
+      progress: S.suspend(
+        (): S.Schema<CatalogOptimizationProgress, CatalogOptimizationProgressEncoded> => CatalogOptimizationProgress,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
   S.extend(S.TaggedStruct("Completed", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
     S.TaggedStruct("Failed", {
@@ -307,6 +315,22 @@ export const CatalogModelUpdate = S.Union(
 )
 export type CatalogModelUpdate = S.Schema.Type<typeof CatalogModelUpdate>
 export type CatalogModelUpdateEncoded = S.Schema.Encoded<typeof CatalogModelUpdate>
+
+export const CatalogOptimizationProgress = S.Struct({
+  completed: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  device: S.optionalWith(
+    S.suspend((): S.Schema<ModelLoadDevice, ModelLoadDeviceEncoded> => ModelLoadDevice),
+    { exact: true, as: "Option" },
+  ),
+  stage: S.suspend((): S.Schema<CatalogOptimizationStage, CatalogOptimizationStageEncoded> => CatalogOptimizationStage),
+  total: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type CatalogOptimizationProgress = S.Schema.Type<typeof CatalogOptimizationProgress>
+export type CatalogOptimizationProgressEncoded = S.Schema.Encoded<typeof CatalogOptimizationProgress>
+
+export const CatalogOptimizationStage = S.Union(S.Literal("preparing"), S.Literal("tuning"))
+export type CatalogOptimizationStage = S.Schema.Type<typeof CatalogOptimizationStage>
+export type CatalogOptimizationStageEncoded = S.Schema.Encoded<typeof CatalogOptimizationStage>
 
 export const CatalogSupport = S.Union(
   S.extend(

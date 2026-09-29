@@ -167,12 +167,13 @@ export const deriveModelDownloadNotificationState = (
   modelsState: LocalModelsState | null,
 ): NotificationState | null => {
   if (modelsState === null) return null
-  const count = modelsState.models.filter((model) => model._tag === "Catalog"
-    && (model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating")).length
+  const active = modelsState.models.flatMap((model) => model._tag === "Catalog" ? [model.acquisitionState._tag] : [])
+  const downloading = active.filter((tag) => tag === "Installing" || tag === "Updating").length
+  const count = downloading + active.filter((tag) => tag === "Optimizing").length
   if (count === 0) return null
   return persistentNotificationState(
     "local-model-download",
-    `${count} ${count === 1 ? "model" : "models"} downloading`,
+    `${count} ${count === 1 ? "model" : "models"} ${downloading > 0 ? "downloading" : "optimizing"}`,
     "activity",
     Option.some("openCatalog"),
   )

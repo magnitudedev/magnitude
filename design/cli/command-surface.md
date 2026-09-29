@@ -114,9 +114,10 @@ validate only model-ID syntax before delegating directly to their authoritative 
 
 `models status` lists curated catalog models when they are on the computer or have relevant
 acquisition/removal work. Addressed model commands accept catalog IDs only. One status field applies product priority:
-removal, transfer, failures, load/stop, ready, update availability, then unloaded. The addressed
-form reports installation, transfer progress, runtime, memory, context, and actionable failure
-details without historical or internal operation state.
+removal, transfer, failures, load/stop, ready, update availability, then unloaded. An optimizing
+model reports `Optimizing` with its percentage once tuning is measured. The addressed
+form reports installation, transfer or optimization progress, runtime, memory, context, and
+actionable failure details without historical or internal operation state.
 
 Load acknowledges admission and prints the focused status command; it never claims readiness from
 the load acknowledgement. Load and stop delegate directly to their authoritative mutations. Magnitude has one active local

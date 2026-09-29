@@ -12,14 +12,14 @@ use magnitude_artifacts::Package;
 use magnitude_batching::Demand;
 use magnitude_executor::{
     memory::{ClaimId, HoldingClass},
-    platform::{self, DomainRole, PlatformConfig, PlatformError},
-    AttestedPrograms, ClaimRefusal, ComponentLoader, DeviceHeap, ExecutorDomain, KernelCache,
+    platform::{self, DomainRole, OpenedPlatform, PlatformConfig, PlatformError},
+    AttestedPrograms, ExecutionPlanDraft, ClaimRefusal, ComponentLoader, DeviceHeap, ExecutorDomain, KernelCache,
     Operation, RequestId, ReservedResources, ResidencyStore, ResourceAllocator, ResourceCapacity,
     ResourceDomainId, ResourcePlan, ResourcePlanner, TokenId, TuningContext, TuningEvent,
     TuningObserver, TuningOrigin, WorkKind, DEFAULT_KERNEL_CACHE_BYTES,
 };
 use magnitude_family_contracts::{InputLayout, PreparedModelInput, TokenPlan};
-use seismic::{DeviceCatalog, DeviceMemory, DeviceSelector, MemoryPoolKind};
+use seismic::{BackendName, DeviceCatalog, DeviceMemory, DeviceSelector, MemoryPoolKind};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -53,12 +53,27 @@ pub fn build_native_domain(
     build(catalog, manifest, package, Rc::new(|_| {})).map(|built| (built.domain, built.plan))
 }
 
-pub(crate) fn build(
-    catalog: DeviceCatalog,
+/// A load's front half on its opened device: the selected device, the plan
+/// draft and the attested programs, tuned against the kernel cache.
+pub(crate) struct PreparedPrograms {
+    pub draft: ExecutionPlanDraft,
+    pub opened: OpenedPlatform,
+    pub programs: AttestedPrograms,
+    pub backend: BackendName,
+    pub pool: MemoryPoolKind,
+    pub capacity: ResourceCapacity,
+}
+
+/// Select and open the manifest's device, plan the model on it and prepare
+/// its programs, tuning whatever the kernel cache lacks. A load continues
+/// from here; the post-install prepare job ends here, so both produce and
+/// look up the same tuning keys.
+pub(crate) fn prepare(
+    catalog: &DeviceCatalog,
     manifest: &ExecutionManifest,
-    package: Arc<Package>,
+    package: &Package,
     progress: Rc<dyn Fn(LoadProgress)>,
-) -> Result<NativeDomain, LoadError> {
+) -> Result<PreparedPrograms, LoadError> {
     let mut phase_started = Instant::now();
     if package.manifest() != manifest.package {
         return Err(LoadError::Artifact(ArtifactError::Invalid {
@@ -71,7 +86,7 @@ pub(crate) fn build(
     // exact selector from the host is re-resolved here; a missing or
     // ambiguous match is refused, never substituted.
     let reserves = manifest.reserves;
-    let selected = platform::select_device(&catalog, manifest.path, manifest.device, &reserves)
+    let selected = platform::select_device(catalog, manifest.path, manifest.device, &reserves)
         .map_err(platform_error)?;
     let backend = selected.info.backend;
     let topology = catalog.topology();
@@ -84,7 +99,7 @@ pub(crate) fn build(
         }
         DeviceMemory::Unsupported { reason } => return Err(internal(reason.clone())),
     };
-    let capacity_bytes = ResourceCapacity {
+    let capacity = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes,
     };
     // The same derivation metadata-only assessment and preview plan through.
@@ -95,17 +110,6 @@ pub(crate) fn build(
             }
             error => internal(error.to_string()),
         })?;
-    let limits = draft.policy().limits();
-    let head_enabled = draft.policy().selection().head;
-    let state = ResourcePlanner::state_plan(
-        &manifest.definition,
-        draft.load(),
-        draft.policy().method(),
-        manifest.model.kv_codec,
-        limits,
-        capacity_bytes,
-    )
-    .map_err(internal)?;
     let kernel_cache = manifest
         .kernel_cache
         .clone()
@@ -114,7 +118,7 @@ pub(crate) fn build(
         .map_err(|error| internal(error.to_string()))?;
     report_load_phase("device selection and planning", &mut phase_started);
     let opened = platform::open_selected(
-        &catalog,
+        catalog,
         draft.device().selector(),
         PlatformConfig {
             path: manifest.path,
@@ -127,15 +131,13 @@ pub(crate) fn build(
     .map_err(platform_error)?;
     report_load_phase("device open", &mut phase_started);
     let preparing = Instant::now();
-    let mut programs = AttestedPrograms::prepare_draft(
+    let programs = AttestedPrograms::prepare_draft(
         &draft,
         opened.device(),
         TuningContext {
             definition: &manifest.definition,
-            weights: package.as_ref(),
-            observer: &TuningReport {
-                progress: progress.clone(),
-            },
+            weights: package,
+            observer: &TuningReport { progress },
             cache: kernel_cache.as_deref(),
         },
     )
@@ -168,7 +170,43 @@ pub(crate) fn build(
             .map(|tuned| tuned.time.validating_seconds)
             .sum::<f64>(),
     );
-    phase_started = Instant::now();
+    Ok(PreparedPrograms {
+        draft,
+        opened,
+        programs,
+        backend,
+        pool,
+        capacity,
+    })
+}
+
+pub(crate) fn build(
+    catalog: DeviceCatalog,
+    manifest: &ExecutionManifest,
+    package: Arc<Package>,
+    progress: Rc<dyn Fn(LoadProgress)>,
+) -> Result<NativeDomain, LoadError> {
+    let PreparedPrograms {
+        draft,
+        opened,
+        mut programs,
+        backend,
+        pool,
+        capacity,
+    } = prepare(&catalog, manifest, &package, progress.clone())?;
+    let reserves = manifest.reserves;
+    let limits = draft.policy().limits();
+    let head_enabled = draft.policy().selection().head;
+    let state = ResourcePlanner::state_plan(
+        &manifest.definition,
+        draft.load(),
+        draft.policy().method(),
+        manifest.model.kv_codec,
+        limits,
+        capacity,
+    )
+    .map_err(internal)?;
+    let mut phase_started = Instant::now();
     let target_graphs = programs
         .prepare_target_graphs(
             opened.device(),

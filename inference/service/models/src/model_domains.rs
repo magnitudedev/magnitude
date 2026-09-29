@@ -3,7 +3,8 @@ use std::sync::{Arc, Weak};
 use futures_util::stream::{BoxStream, StreamExt};
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogPackageRemover, ModelDomainInvalidation, RecommendableModelCatalog,
+    CatalogModelOptimizer, CatalogPackageRemover, ModelDomainInvalidation,
+    RecommendableModelCatalog,
 };
 
 use crate::ManagedModelDownloads;
@@ -51,8 +52,10 @@ pub fn managed_model_services(
     resolver: Arc<ModelDomainResolver>,
     downloads: Arc<ManagedModelDownloads>,
     remover: Arc<dyn CatalogPackageRemover>,
+    optimizer: Arc<dyn CatalogModelOptimizer>,
 ) -> Result<ManagedModelServices, InventoryError> {
-    let installations = ManagedCatalogInstallations::new(resolver.clone(), downloads, remover);
+    let installations =
+        ManagedCatalogInstallations::new(resolver.clone(), downloads, remover, optimizer);
     let discovered = ManagedDiscoveredModels::new(resolver.clone());
     let catalog = ManagedCatalogModels::new(resolver, installations.clone(), {
         let discovered = Arc::downgrade(&discovered);

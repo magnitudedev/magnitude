@@ -209,6 +209,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 model_variants,
                 model_downloads.clone(),
                 Arc::new(instances.clone()),
+                Arc::new(instances.clone()),
             )
             .context("failed to initialize model domains")?;
             let assessments = ManagedModelAssessments::start(

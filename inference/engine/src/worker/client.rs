@@ -176,6 +176,7 @@ impl State {
             WorkerMessage::Hello { .. }
             | WorkerMessage::LoadProgress { .. }
             | WorkerMessage::Ready { .. }
+            | WorkerMessage::Prepared
             | WorkerMessage::LoadFailed { .. } => {
                 return Err("load message after readiness".into())
             }
@@ -310,6 +311,47 @@ pub fn connect_worker(
         client: EngineClient { connection },
         ready,
     })
+}
+
+/// Ask a worker process to prepare `manifest`'s programs on its device and
+/// wait until it has, reporting its `LoadProgress` to `progress`. The worker
+/// exits once prepared; it never loads the model.
+pub fn prepare_worker(
+    transport: impl HostTransport,
+    manifest: ExecutionManifest,
+    mut progress: impl FnMut(LoadProgress),
+) -> Result<(), LoadError> {
+    let (mut receiver, mut sender) = transport.split();
+    let lost = |reason: String| LoadError::WorkerLost { reason };
+    let build = EngineBuild::current();
+    sender
+        .send(HostMessage::Hello {
+            build: build.clone(),
+        })
+        .and_then(|()| sender.send(HostMessage::Prepare { manifest }))
+        .map_err(|error| lost(error.to_string()))?;
+    let mut next = || match receiver.receive() {
+        Ok(Some(message)) => Ok(message),
+        Ok(None) => Err(lost("the worker ended before it was prepared".into())),
+        Err(error) => Err(lost(error.to_string())),
+    };
+    match next()? {
+        WorkerMessage::Hello { build: worker } if worker == build => {}
+        WorkerMessage::Hello { build: worker } => {
+            return Err(lost(format!(
+                "worker build {worker} differs from host build {build}"
+            )))
+        }
+        _ => return Err(lost("the worker did not greet the host".into())),
+    }
+    loop {
+        match next()? {
+            WorkerMessage::LoadProgress { progress: current } => progress(current),
+            WorkerMessage::Prepared => return Ok(()),
+            WorkerMessage::LoadFailed { error } => return Err(error),
+            _ => return Err(lost("unexpected message during preparation".into())),
+        }
+    }
 }
 
 impl EngineClient {

@@ -136,6 +136,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         resolver.clone(),
         downloads,
         Arc::new(main.instances.clone()),
+        Arc::new(main.instances.clone()),
     )?;
     // Local packages are catalog models when the catalog names them, discovered models otherwise;
     // either becomes ready once its validation completes.

@@ -22,7 +22,8 @@ use magnitude_engine::worker::EngineClient;
 use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation};
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_service_contracts::models::{
-    CatalogPackageRemover, InstalledModelPackages as _, ModelId, ModelInstance, ModelInstanceId,
+    CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
+    InstalledModelPackages as _, ModelId, ModelInstance, ModelInstanceId,
     ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan,
     ModelLoadStage, ModelPackageId, ModelServingConfiguration,
 };
@@ -33,6 +34,7 @@ use magnitude_service_models::{
 };
 use seismic::{DeviceCatalog, DeviceMemory};
 
+use super::optimization::{self, PreparationJobs};
 use super::supervisor::{HostMemoryObserver, MemorySupervisor};
 use super::worker::EngineWorker;
 use super::{
@@ -85,6 +87,7 @@ struct EngineResidency {
     environment: Arc<ResidencyEnvironment>,
     client: ResidencyClient<ResidentEngine>,
     supervisor: MemorySupervisor,
+    preparations: PreparationJobs,
     next_instance_id: Arc<AtomicU64>,
 }
 
@@ -94,6 +97,7 @@ pub struct ModelInstances {
     environment: Arc<ResidencyEnvironment>,
     residency: ResidencyClient<ResidentEngine>,
     supervisor: MemorySupervisor,
+    preparations: PreparationJobs,
 }
 
 impl ModelInstances {
@@ -107,10 +111,12 @@ impl ModelInstances {
             environment.reserves.for_domain(host_capacity),
             client.notifier(),
         );
+        let preparations = PreparationJobs::default();
         let driver = EngineResidency {
             environment: Arc::clone(&environment),
             client: client.clone(),
             supervisor: supervisor.clone(),
+            preparations: preparations.clone(),
             next_instance_id: Arc::new(AtomicU64::new(1)),
         };
         tokio::spawn(ModelResidency::new(driver).run(inbox));
@@ -118,6 +124,7 @@ impl ModelInstances {
             environment,
             residency: client,
             supervisor,
+            preparations,
         }
     }
 
@@ -257,6 +264,20 @@ impl magnitude_service_api::ModelInstanceController for ModelInstances {
     }
 }
 
+impl CatalogModelOptimizer for ModelInstances {
+    fn optimize_catalog_model(
+        &self,
+        model_id: ModelId,
+        progress: Box<dyn Fn(CatalogOptimizationProgress) + Send + Sync>,
+    ) -> BoxFuture<'static, ()> {
+        let environment = Arc::clone(&self.environment);
+        let preparations = self.preparations.clone();
+        Box::pin(async move {
+            optimization::optimize(&environment, &preparations, &model_id, Arc::from(progress)).await;
+        })
+    }
+}
+
 impl CatalogPackageRemover for ModelInstances {
     fn remove_catalog_packages(
         &self,
@@ -301,7 +322,7 @@ fn residency_target(
     }
 }
 
-async fn preview(
+pub(super) async fn preview(
     catalog: &Arc<DeviceCatalog>,
     resolved: &Arc<ResolvedConfiguration>,
 ) -> Result<LoadPreview, ModelOperationFailure> {
@@ -319,7 +340,7 @@ async fn preview(
         .map_err(preview_failure)
 }
 
-fn load_plan(preview: &LoadPreview) -> Result<ModelLoadPlan, ModelOperationFailure> {
+pub(super) fn load_plan(preview: &LoadPreview) -> Result<ModelLoadPlan, ModelOperationFailure> {
     Ok(ModelLoadPlan {
         context_window_tokens: context_window_tokens(preview.context_tokens)?,
         required_memory_bytes: preview.required_bytes,
@@ -505,6 +526,9 @@ impl EngineResidency {
         let plan = load_plan(&preview)?;
         self.progress(instance_id, ModelLoadStage::Preparing, Some(&plan));
 
+        // A load tunes whatever its post-install preparation has not stored yet.
+        self.preparations
+            .stop(&servable_model_bundle_key_for_bundle(&configuration.bundle));
         let device = environment.device_exclusion.residency().await;
         let spawned = EngineWorker::spawn(&environment.launcher, device).map_err(|error| {
             ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true)

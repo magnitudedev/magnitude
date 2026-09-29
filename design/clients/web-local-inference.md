@@ -24,7 +24,7 @@ while desktop preferences belong to its client host and canonical config. Onboar
 
 The unified `ModelCatalog` is ACN's read-only Magnitude product projection: each local row's
 `acquisitionState` carries the model's complete materialization lifecycle (disk truth, transfer
-progress, unacknowledged failure, update availability, and residency once installed) alongside
+and optimization progress, unacknowledged failure, update availability, and residency once installed) alongside
 assessment presentation, provider availability, ranking scores, and product warnings. Native ICN
 Models, Packages, Downloads, Instances, and Hardware remain authoritative beneath ACN and are not
 client-visible. `ModelSlotsState` owns durable selection, favorites, and recency, resolved

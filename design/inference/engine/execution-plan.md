@@ -57,8 +57,13 @@ the opened device's backend,
 and every native entry is prepared from that backend's declarations. Preparation reports every
 entry the program plan needs that lacks an implementation for the backend together, and every
 error names the path and the backend.
+A load and a prepare-only job share this one preparation (device selection, planning, opening the
+device and preparing programs with the kernel cache), so both produce and look up identical tuning
+keys; the prepare-only job ends there, while a load continues with state planning, graph sealing,
+resource allocation, weight import and warm-up.
 Native entries with declared tuning parameters are tuned on the opened device during this
-preparation, on the first load for each tuning key: each such entry registers a tuning case
+preparation, on the first preparation for each tuning key, whether by a load or by the prepare-only
+job that follows a catalog installation: each such entry registers a tuning case
 that supplies static values from model geometry, weighted tuning points over the shape classes that
 entry serves (every row class of its graph path, crossed with served history lengths for attention,
 including empty and short histories that exercise fresh-only and partially occupied groups;
@@ -117,14 +122,17 @@ reference, source, policy and device identities. Only matching evidence skips ca
 and timing; changed input contents require fresh qualification even in the same structural slot.
 Persisted numerical policies and search weights round-trip exactly; serialization must not
 change eligibility or invalidate an otherwise identical objective.
-Keys are content addresses for that structural and policy identity. Writes go through a
+Keys are content addresses for that structural and policy identity. Each unit's result is stored
+as soon as its search completes, so a preparation stopped before it finishes keeps the units it
+completed and a later preparation searches only the rest. Writes go through a
 temporary file renamed into place; an entry that cannot be read or parsed, or whose configuration
 the implementation does not admit, is a miss and is rewritten; opening the cache evicts the least
 recently used entries beyond its capacity. Stored results are local measurements; nothing is
 shipped. Tuning progress (the budget of the units searched so far over that of the units that
 search, reported when tuning begins and after each searched unit; nothing when every unit is
 stored), total tuning time and how many units were searched or stored are reported before
-readiness. The load also reports its target weight import in resident bytes; no tuning or
+readiness, or before a prepare-only job reports that it is prepared. The load also reports its
+target weight import in resident bytes; no tuning or
 preparation occurs after readiness. Two development
 measurement tools, enabled only by the forward bench and never by a served engine, change this:
 the executor's `pinned-tuning` build feature records the configuration chosen per entry (entry,

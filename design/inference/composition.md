@@ -34,7 +34,7 @@ Construction is one staged progression:
 
 ```text
 EngineConfiguration -> resolve -> ResolvedEngineConfiguration { host, manifest }
-                    -> preview (read-only planning)   or   load -> ReadyEngine
+                    -> preview (read-only planning)   or   prepare (tuning only)   or   load -> ReadyEngine
 ```
 
 - **Resolve** is device-free. It opens the package, recognizes its family, interprets the model
@@ -47,6 +47,11 @@ EngineConfiguration -> resolve -> ResolvedEngineConfiguration { host, manifest }
 - **Load** runs the same worker either in-process over a channel transport (engine CLI, tests) or
   in a worker process over framed standard streams (the service). The worker protocol and the
   worker code are identical in both cases.
+- **Prepare** runs the same worker, transport and build handshake through the preparation a load
+  begins with (opening the device and preparing programs, tuning whatever the kernel cache lacks),
+  reports preparation and tuning progress as a load does, and exits once prepared. Tuning imports
+  only the weights of the few layers its cases rotate over; a prepared worker never allocates
+  serving state, imports the whole model or serves.
 - **Readiness** binds host artifacts to the connected worker only when the worker loaded exactly
   the package the host resolved, with the same template fingerprint and input modalities; any
   mismatch is a typed failure, never a partial engine.

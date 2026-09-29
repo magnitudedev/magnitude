@@ -243,6 +243,28 @@ attempts. Packages already installed at admission contribute neither baseline pr
 Consequently a first installation measures the whole missing bundle, while an update measures only
 its actual artifact delta.
 
+An admitted installation ends by optimizing the model for this computer, so a new model's first
+load does not pay for kernel tuning. Once its download has verified and published the complete
+bundle, the occurrence enters `Optimizing` and runs one preparation of the model on the device a
+load would select (see [instance lifecycle](./instance-lifecycle.md)); it then ends `Completed`
+however that preparation ends. Optimization progress is its own measure: `preparing` while the
+device opens and tuning units are counted, then `tuning` with completed and total units, naming the
+previewed device once known. When every unit is already stored it ends straight from `preparing`.
+An installation whose admission downloads nothing does not optimize. `Optimizing` is active for
+duplicate-installation admission, and the occurrence's observation covers download and
+optimization changes alike.
+
+Optimization is an ahead-of-time cost move, never a gate on the model:
+
+- cancellation while optimizing stops the preparation and the occurrence still ends `Completed`;
+- a load of the same model stops the preparation and tunes only what is not yet stored;
+- removal while optimizing stops the preparation and then proceeds;
+- a failed preparation is logged and never becomes an installation failure; and
+- restart loses the process-local occurrence, and the next load tunes what is missing.
+
+An engine update that changes tuning keys leaves models to retune on their next load; installations
+are not re-optimized after an update.
+
 Expected failures distinguish insufficient disk space, interruption, unavailable source content,
 unavailable network, local storage failure, and corrupt content. Cancellation is a separate
 terminal result. Structured facts, including required and available byte counts, cross boundaries
@@ -313,7 +335,8 @@ guessing. Interrupted deletion is represented by the files that remain and may b
 idempotently. Conservative garbage collection may remove blobs proven unreferenced. Runtime
 ownership rejects or waits for removal of files used by a live model instance.
 
-Catalog removal is serialized with installation admission. An active installation is rejected.
+Catalog removal is serialized with installation admission. An installation that is still
+downloading is rejected; one that is optimizing is stopped and removal proceeds.
 Externally owned or shared dependencies are retained while a removable target and other exclusively
 owned material are removed; removal is retained as a whole only when a target itself is external or
 shared, because deleting it would either violate ownership or break another catalog model. Removing
@@ -360,6 +383,8 @@ artifact mutations update the same materialized derivation.
 - Inventory reconciliation never mutates managed artifacts.
 - One artifact failure cannot hide unrelated valid artifacts.
 - Download identities and terminal history do not survive ICN restart.
+- Optimization never changes an installation's outcome: cancellation, load, removal, failure, or
+  restart during it leaves the installed model intact and loadable.
 - Valid partial bytes may be reused only with matching integrity evidence.
 - Historical download completion never proves current presence.
 - Shared blobs are deleted only after current filesystem references prove them unreferenced.

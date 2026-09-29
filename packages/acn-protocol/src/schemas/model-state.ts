@@ -449,6 +449,16 @@ export const ModelTransferProgressSchema = Schema.Struct({
   { message: () => "model transfer progress cannot exceed its declared total" }))
 export type ModelTransferProgress = typeof ModelTransferProgressSchema.Type
 
+/** Kernel tuning after a download, in tuning work units; `preparing` counts them (0 of 0). */
+export const ModelOptimizationProgressSchema = Schema.Struct({
+  stage: Schema.Literal("preparing", "tuning"),
+  completed: NonNegativeSafeInteger,
+  total: NonNegativeSafeInteger,
+  device: Schema.optionalWith(ModelLoadDeviceSchema, { as: "Option", exact: true }),
+}).pipe(Schema.filter((progress) => progress.completed <= progress.total,
+  { message: () => "model optimization progress cannot exceed its declared total" }))
+export type ModelOptimizationProgress = typeof ModelOptimizationProgressSchema.Type
+
 export const ModelAcquisitionFailureSchema = Schema.Union(
   Schema.TaggedStruct("Interrupted", {}),
   Schema.TaggedStruct("InsufficientDiskSpace", {
@@ -490,6 +500,11 @@ export const LocalModelAcquisitionStateSchema = Schema.Union(
     ...InstalledModelFields,
     failure: ModelAcquisitionFailureSchema,
   }),
+  /** One-time kernel tuning after an install or update download; it ends Installed however it ends. */
+  Schema.TaggedStruct("Optimizing", {
+    ...InstalledModelFields,
+    progress: ModelOptimizationProgressSchema,
+  }),
   Schema.TaggedStruct("Removing", InstalledModelFields),
   Schema.TaggedStruct("RemoveFailed", {
     ...InstalledModelFields,
@@ -510,6 +525,7 @@ export const installedAcquisition = (
   || state._tag === "UpdateAvailable"
   || state._tag === "Updating"
   || state._tag === "UpdateFailed"
+  || state._tag === "Optimizing"
   || state._tag === "Removing"
   || state._tag === "RemoveFailed"
   ? state

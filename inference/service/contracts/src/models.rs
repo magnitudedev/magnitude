@@ -1212,6 +1212,40 @@ pub struct CatalogInstallationProgress {
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogOptimizationStage {
+    Preparing,
+    Tuning,
+}
+
+/// Kernel tuning after a verified download, in tuning work units. `Preparing` opens the device
+/// and counts the units (0 of 0); `device` is the device a load would select, once previewed.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogOptimizationProgress {
+    pub stage: CatalogOptimizationStage,
+    pub completed: u64,
+    pub total: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub device: Option<ModelLoadDevice>,
+}
+
+impl CatalogOptimizationProgress {
+    #[must_use]
+    pub const fn preparing(device: Option<ModelLoadDevice>) -> Self {
+        Self {
+            stage: CatalogOptimizationStage::Preparing,
+            completed: 0,
+            total: 0,
+            device,
+        }
+    }
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum CatalogInstallationOperationState {
@@ -1220,6 +1254,9 @@ pub enum CatalogInstallationOperationState {
     },
     Running {
         progress: CatalogInstallationProgress,
+    },
+    Optimizing {
+        progress: CatalogOptimizationProgress,
     },
     Completed,
     Failed {
@@ -1652,6 +1689,7 @@ pub struct ModelDomainInvalidation {
 }
 
 pub trait CatalogInstallations: Send + Sync + 'static {
+    fn watch_catalog_installations(&self) -> BoxStream<'static, CatalogInstallationsInvalidation>;
     fn list_catalog_installations(
         &self,
     ) -> BoxFuture<'_, Result<CatalogInstallationsResponse, InventoryError>>;
@@ -1663,6 +1701,22 @@ pub trait CatalogInstallations: Send + Sync + 'static {
         &self,
         id: &CatalogInstallationOperationId,
     ) -> BoxFuture<'_, Result<CatalogInstallationOperation, InventoryError>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogInstallationsInvalidation {
+    pub revision: u64,
+}
+
+/// Tunes a freshly installed catalog model's kernels for the device a load would select, so its
+/// first load does not. Reports progress until it finishes; dropping the future stops the job.
+/// A failure is the optimizer's to log: the model is installed either way.
+pub trait CatalogModelOptimizer: Send + Sync + 'static {
+    fn optimize_catalog_model(
+        &self,
+        model_id: ModelId,
+        progress: Box<dyn Fn(CatalogOptimizationProgress) + Send + Sync>,
+    ) -> BoxFuture<'static, ()>;
 }
 
 pub trait CatalogPackageRemover: Send + Sync + 'static {

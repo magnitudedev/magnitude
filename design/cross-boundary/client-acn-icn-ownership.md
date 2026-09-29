@@ -51,8 +51,8 @@ independently of command attribution.
 ACN owns the complete client-facing model contract:
 
 - `ModelCatalog`: the unified local and remote product view. A catalog local row carries one
-  `acquisitionState` union covering managed installation, update, transfer failure, removal, and
-  residency. A discovered local row instead carries observed discovery truth and no managed
+  `acquisitionState` union covering managed installation, update, post-installation optimization,
+  transfer failure, removal, and residency. A discovered local row instead carries observed discovery truth and no managed
   acquisition lifecycle. Every variant is a reachable product state; progress and failure payloads
   exist only under the states they belong to, and native occurrence identities never appear;
 - `ModelSlots`: durable selection resolved to truthful client-ready Slot states;

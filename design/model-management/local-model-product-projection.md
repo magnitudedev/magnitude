@@ -71,6 +71,13 @@ Catalog acquisition state is model-level: installation bytes, ownership, progres
 update availability, and residency appear only in variants where they are meaningful. A primary
 path exists only on a resolved installation; genuinely ambiguous installed target material is an
 unresolved installation and does not fabricate one.
+An installation's optimization projects as `Optimizing`, an installed-family state that carries
+residency and optimization progress (stage, completed and total units, and the device once known).
+Installing or Updating moves to `Optimizing` and then to `Installed`; cancellation, a load, or a
+failed optimization ends it in `Installed`, and removal moves it to `Removing`. If the operation
+reports `Optimizing` before the catalog observes the model as installed, ACN keeps projecting
+`Installing` at its publishing stage with full bytes, so the model never appears uninstalled in
+between. ACN's cancel command applies to an optimizing operation as it does to a download.
 Package lists and native occurrence IDs never enter the product. Installation and update failures
 retain their typed native variants, including required and available bytes for insufficient disk
 space; they are not flattened into diagnostic strings.

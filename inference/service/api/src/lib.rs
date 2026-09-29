@@ -708,10 +708,10 @@ async fn watch_inference_events(
         .model_controller
         .as_ref()
         .ok_or_else(|| ApiError::server("model control is not configured"))?;
-    let downloads = state
-        .model_downloads
+    let installations = state
+        .catalog_installations
         .as_ref()
-        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
+        .ok_or_else(|| ApiError::server("catalog installations are not configured"))?;
     let catalog = state
         .catalog_models
         .as_ref()
@@ -737,14 +737,13 @@ async fn watch_inference_events(
                 }),
             )
         });
-    let download_events = futures_util::StreamExt::flat_map(downloads.watch(), |event| {
-        futures_util::stream::once(async move {
-            InferenceResourceInvalidation {
-                topic: InferenceResourceTopic::CatalogInstallations,
-                revision: event.revision,
-            }
-        })
-    });
+    let installation_events = futures_util::StreamExt::map(
+        installations.watch_catalog_installations(),
+        |event| InferenceResourceInvalidation {
+            topic: InferenceResourceTopic::CatalogInstallations,
+            revision: event.revision,
+        },
+    );
     let catalog_events = futures_util::StreamExt::map(catalog.watch_catalog(), |event| {
         InferenceResourceInvalidation {
             topic: InferenceResourceTopic::Catalog,
@@ -777,7 +776,7 @@ async fn watch_inference_events(
     let events = futures_util::stream::select(
         futures_util::stream::select(
             futures_util::stream::select(
-                futures_util::stream::select(instance_events, download_events),
+                futures_util::stream::select(instance_events, installation_events),
                 catalog_events,
             ),
             discovery_events,
