@@ -85,13 +85,19 @@ impl PreparationGuard {
     }
 }
 
+/// A job ends with its worker: the blocking connection holds the worker too, so a stopped job
+/// (cancel, remove) must terminate it rather than wait for the last reference to drop.
 impl Drop for PreparationGuard {
     fn drop(&mut self) {
-        self.jobs
+        let job = self
+            .jobs
             .0
             .lock()
             .expect("preparation job lock")
             .remove(&self.key);
+        if let Some(worker) = job.and_then(|job| job.worker) {
+            worker.terminate("preparation_ended", "the installation's optimization ended");
+        }
     }
 }
 
