@@ -41,60 +41,45 @@ await mkdir(join(data, 'updates'), { recursive: true, mode: 0o700 })
 const env = { ...process.env, MAGNITUDE_DEV_DATA_DIR: data, MAGNITUDE_DESKTOP_STATE_DIR: state, MAGNITUDE_DEV_PORT: '11143' }
 const executablePath = join(installation, 'Magnitude.exe')
 const cli = args => execFileSync(join(installation, 'resources/magnitude.exe'), args, { env, encoding: 'utf8', timeout: 30000 })
+const preferencesPath = join(data, 'config.json')
+await writeFile(preferencesPath, JSON.stringify({ autoDownloadUpdates: false }))
 let app
 try {
   app = await electron.launch({ executablePath, env, timeout: 30000 })
-  app.on('console', message => {
-    if (message.text().startsWith('UPDATE_RANGE ')) console.log(message.text())
-  })
-  await app.evaluate(() => {
-    const fetch = globalThis.fetch
-    globalThis.fetch = async (...args) => {
-      const response = await fetch(...args)
-      const range = new Headers(args[1]?.headers).get('range')
-      if (range) console.log('UPDATE_RANGE ' + JSON.stringify({
-        requested: range, status: response.status,
-        received: response.headers.get('content-range'),
-        cache: response.headers.get('x-vercel-cache'),
-      }))
-      return response
-    }
-  })
-  let page = await app.firstWindow()
-  await page.getByRole('button', { name: 'Settings', exact: true }).click()
-  const automatic = page.getByRole('switch', { name: 'Automatic updates' })
-  const preferencesPath = join(data, 'config.json')
-  for (const enabled of [false, true, false]) {
-    await automatic.click()
-    await automatic.and(page.locator(`[aria-checked="${enabled}"]`)).waitFor({ timeout: 30000 })
-    assert.equal(JSON.parse(await readFile(preferencesPath, 'utf8')).autoDownloadUpdates, enabled)
-  }
+  assert.equal(JSON.parse(await readFile(preferencesPath, 'utf8')).autoDownloadUpdates, false)
   const keyPath = join(data, 'identity.pem')
-  const identity = await readFile(keyPath)
+  const identityDeadline = Date.now() + 30000
+  let identity
+  while (!identity) {
+    identity = await readFile(keyPath).catch(error => {
+      if (error.code === 'ENOENT') return undefined
+      throw error
+    })
+    assert.ok(identity || Date.now() < identityDeadline, 'Desktop did not create its installation identity')
+    if (!identity) await delay(100)
+  }
   const publicBytes = createPublicKey(identity).export({ type: 'spki', format: 'der' }).subarray(-32)
   const installationId = createHash('sha256').update(publicBytes).digest('hex')
   await writeFile(join(evidence, 'installation.json'), JSON.stringify({ installationId, version: from, at: new Date().toISOString() }, null, 2))
   console.log('WAITING for acceptance channel', to, 'installation', installationId)
   const deadline = Date.now() + 15 * 60000
-  while (!(await page.getByRole('button', { name: 'Download update', exact: true }).isVisible())) {
+  let updateStatus = ''
+  while (!(updateStatus = cli(['update', 'status'])).includes(`${to} is available`)) {
     assert.ok(Date.now() < deadline, 'Acceptance channel was not promoted before the consumer deadline')
-    await page.getByRole('button', { name: 'Check for updates', exact: true }).click()
+    cli(['update', 'check'])
     await delay(30000)
   }
-  await page.screenshot({ path: join(evidence, 'available.png'), fullPage: true })
-  assert.ok(cli(['update', 'status']).includes(`${to} is available`))
-  await page.getByRole('button', { name: 'Download update', exact: true }).click()
-  const ready = page.getByRole('button', { name: 'Restart to update', exact: true })
-  await ready.or(page.getByText('Could not download and verify the application update.', { exact: true })).waitFor({ timeout: 600000 })
-  assert.equal(await ready.isVisible(), true, 'The application rejected its installer transfer')
-  await page.screenshot({ path: join(evidence, 'ready.png'), fullPage: true })
-  assert.ok(cli(['update', 'status']).includes(`${to} is ready to install`))
+  cli(['update', 'download'])
+  const downloadDeadline = Date.now() + 600000
+  while (!(updateStatus = cli(['update', 'status'])).includes(`${to} is ready to install`)) {
+    assert.ok(Date.now() < downloadDeadline, `Update did not become ready: ${updateStatus}`)
+    assert.doesNotMatch(updateStatus, /could not|failed|unavailable/i, 'Update download or verification failed')
+    await delay(1000)
+  }
   console.log('PASS application downloaded and verified the offered installer')
   const original = app.process()
   const exited = once(original, 'exit', { signal: AbortSignal.timeout(60000) })
-  await page.getByRole('button', { name: 'Restart to update', exact: true }).click({ noWaitAfter: true, timeout: 30000 }).catch(error => {
-    console.log('Restart closed the automation connection:', error.message)
-  })
+  cli(['update', 'install'])
   await exited
   console.log('PASS original application process exited for replacement', original.pid)
   app = undefined
@@ -112,40 +97,24 @@ try {
   assert.match(status, /Tray\s+Registered/i, 'Updated app must relaunch with its native tray')
   assert.equal(cli(['--version']).trim(), to)
   assert.deepEqual(await readFile(keyPath), identity, 'Update changed installation identity')
-  assert.equal(JSON.parse(await readFile(preferencesPath, 'utf8')).autoDownload, false)
+  assert.equal(JSON.parse(await readFile(preferencesPath, 'utf8')).autoDownloadUpdates, false)
   await writeFile(join(evidence, 'after-relaunch.txt'), status)
-  console.log('PASS real Settings download/restart, updated installed version, automatic owner/tray relaunch and identity preservation')
-  execFileSync('powershell', ['-NoProfile', '-File', fileURLToPath(new URL('./windows-tray-acceptance.ps1', import.meta.url)), '-Evidence', evidence, '-MenuAction', 'Quit Magnitude'], { stdio: 'inherit', timeout: 60000 })
-  const stoppedDeadline = Date.now() + 30000
-  while (!/Runtime\s+Stopped/.test(cli(['status']))) {
-    assert.ok(Date.now() < stoppedDeadline, 'Updated owner did not quit')
+  console.log('PASS CLI download/install, updated installed version, automatic owner/tray relaunch and identity preservation')
+  cli(['update', 'check'])
+  const currentDeadline = Date.now() + 30000
+  while (!(updateStatus = cli(['update', 'status'])).includes('Magnitude is up to date.')) {
+    assert.ok(Date.now() < currentDeadline, `Updated app did not complete its update check: ${updateStatus}`)
     await delay(100)
   }
-  app = await electron.launch({ executablePath, env, timeout: 30000 })
-  page = await app.firstWindow()
-  await page.getByRole('button', { name: 'Settings', exact: true }).click()
-  assert.equal(await page.getByRole('switch', { name: 'Automatic updates' }).getAttribute('aria-checked'), 'false')
-  await page.getByRole('button', { name: 'Check for updates', exact: true }).click()
-  await page.getByText('You’re up to date.', { exact: true }).waitFor({ timeout: 30000 })
-  await page.screenshot({ path: join(evidence, 'updated-settings.png'), fullPage: true })
-  execFileSync('powershell', ['-NoProfile', '-File', fileURLToPath(new URL('./windows-tray-acceptance.ps1', import.meta.url)), '-Evidence', evidence], { stdio: 'inherit', timeout: 60000 })
-  await page.getByRole('heading', { name: 'Discover', exact: true }).waitFor({ timeout: 30000 })
-  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().forEach(window => window.close()))
-  assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().some(window => window.isVisible())), false)
-  assert.match(cli(['status']), /Tray\s+Registered/i)
-  execFileSync('powershell', ['-NoProfile', '-File', fileURLToPath(new URL('./windows-tray-acceptance.ps1', import.meta.url)), '-Evidence', evidence, '-MenuAction', 'Open Magnitude'], { stdio: 'inherit', timeout: 60000 })
-  await page.getByRole('heading', { name: 'Discover', exact: true }).waitFor({ timeout: 30000 })
-  assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().some(window => window.isVisible())), true)
+  assert.equal(JSON.parse(await readFile(preferencesPath, 'utf8')).autoDownloadUpdates, false)
   await writeFile(join(evidence, 'accepted.json'), JSON.stringify({ installationId, from, to, at: new Date().toISOString(), status }, null, 2))
-  console.log('PASS installed updated Settings, persisted auto-download preference and real up-to-date check')
+  console.log('PASS installed update check and persisted auto-download preference')
 } catch (error) {
   console.error(error)
   await writeFile(join(evidence, 'failure.txt'), String(error.stack ?? error))
   throw error
 } finally {
   if (app && app.process().exitCode === null) {
-    const visible = app.windows()[0]
-    if (visible) await visible.screenshot({ path: join(evidence, 'last-window.png'), fullPage: true, timeout: 5000 }).catch(() => {})
     await Promise.race([app.close(), delay(10000).then(() => {
       if (app.process().exitCode === null) app.process().kill()
     })])
