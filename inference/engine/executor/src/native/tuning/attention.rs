@@ -79,6 +79,10 @@ impl EntryTuning for AttentionProjectTuning {
     type Entry = attention_project::Entry;
     type Case = AttentionProjectCase;
 
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
@@ -188,6 +192,10 @@ impl AttentionOutputTuning {
 impl EntryTuning for AttentionOutputTuning {
     type Entry = attention_output::Entry;
     type Case = AttentionOutputCase;
+
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
 
     fn bindings(&self) -> String {
         format!("OW={},A={}", self.output.name(), self.activation.name())
@@ -602,6 +610,10 @@ macro_rules! mix_entry {
         impl EntryTuning for $tuning {
             type Entry = $module::Entry;
             type Case = AttentionMixCase<$history>;
+
+            fn launches(&self) -> usize {
+                self.0.scopes.len()
+            }
 
             fn bindings(&self) -> String {
                 self.0.bindings()

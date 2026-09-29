@@ -61,6 +61,10 @@ impl EntryTuning for RoutedSelectTuning {
     type Entry = routed_select::Entry;
     type Case = RoutedSelectCase;
 
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
@@ -227,6 +231,10 @@ impl EntryTuning for RoutedGateUpTuning {
     type Entry = routed_gate_up::Entry;
     type Case = RoutedExpandDecodeCase;
 
+    fn launches(&self) -> usize {
+        self.0.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         let b = self.0.binding;
         format!(
@@ -276,6 +284,10 @@ impl EntryTuning for RoutedGateUpTuning {
 impl EntryTuning for RoutedUpTuning {
     type Entry = routed_up::Entry;
     type Case = RoutedExpandDecodeCase;
+
+    fn launches(&self) -> usize {
+        self.0.scopes.len()
+    }
 
     fn bindings(&self) -> String {
         let b = self.0.binding;
@@ -332,6 +344,10 @@ pub(crate) struct RoutedDownCase {
 impl EntryTuning for RoutedDownTuning {
     type Entry = routed_down::Entry;
     type Case = RoutedDownCase;
+
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
 
     fn bindings(&self) -> String {
         let b = self.binding;
@@ -478,6 +494,10 @@ impl EntryTuning for RoutedGatedTilesTuning {
     type Entry = routed_experts::Entry;
     type Case = RoutedExpertTilesCase;
 
+    fn launches(&self) -> usize {
+        self.0.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         let b = self.0.binding;
         format!(
@@ -532,6 +552,10 @@ impl EntryTuning for RoutedUpTilesTuning {
     type Entry = routed_experts_up::Entry;
     type Case = RoutedExpertTilesCase;
 
+    fn launches(&self) -> usize {
+        self.0.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         let b = self.0.binding;
         format!(
@@ -581,6 +605,8 @@ impl EntryTuning for RoutedUpTilesTuning {
 /// base (grouped rows).
 pub(crate) struct RoutedScatterTuning {
     pub binding: GeneralRoutedBinding,
+    /// Layers prepared with this specialization.
+    pub layers: usize,
 }
 
 pub(crate) struct RoutedScatterCase {
@@ -593,6 +619,10 @@ pub(crate) struct RoutedScatterCase {
 impl EntryTuning for RoutedScatterTuning {
     type Entry = routed_scatter::Entry;
     type Case = RoutedScatterCase;
+
+    fn launches(&self) -> usize {
+        self.layers
+    }
 
     fn bindings(&self) -> String {
         format!(

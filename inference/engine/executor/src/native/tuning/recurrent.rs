@@ -112,6 +112,10 @@ impl EntryTuning for RecurrentProjectTuning {
     type Entry = gated_delta_project::Entry;
     type Case = RecurrentProjectCase;
 
+    fn launches(&self) -> usize {
+        self.shape.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         format!(
             "NW={},QW={},GW={},AW={},BW={},A={}",
@@ -212,6 +216,10 @@ impl RecurrentOutputTuning {
 impl EntryTuning for RecurrentOutputTuning {
     type Entry = gated_delta_output::Entry;
     type Case = RecurrentOutputCase;
+
+    fn launches(&self) -> usize {
+        self.shape.scopes.len()
+    }
 
     fn bindings(&self) -> String {
         format!(
@@ -425,6 +433,10 @@ macro_rules! state_entry {
         impl EntryTuning for $tuning {
             type Entry = $module::Entry;
             type Case = RecurrentStateCase;
+
+            fn launches(&self) -> usize {
+                self.0.shape.scopes.len()
+            }
 
             fn bindings(&self) -> String {
                 self.0.bindings()

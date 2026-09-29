@@ -101,6 +101,10 @@ impl EntryTuning for DenseExpandTuning {
     type Entry = dense_expand::Entry;
     type Case = DenseExpandCase;
 
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         format!(
             "NW={},GW={},UW={},A={}",
@@ -207,6 +211,10 @@ impl EntryTuning for DenseUpTuning {
     type Entry = dense_up::Entry;
     type Case = DenseUpCase;
 
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         format!(
             "NW={},UW={},A={}",
@@ -309,6 +317,10 @@ impl DenseOutputTuning {
 impl EntryTuning for DenseOutputTuning {
     type Entry = dense_output::Entry;
     type Case = DenseOutputCase;
+
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
 
     fn bindings(&self) -> String {
         format!("DW={},A={}", self.down.name(), self.activation.name())

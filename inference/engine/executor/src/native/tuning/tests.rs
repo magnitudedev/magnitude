@@ -111,7 +111,6 @@ fn screening_policy_is_part_of_the_tuning_cache_identity() {
         "A=bf16",
         &NativeSpecialization::new(),
         "same-implementation",
-        7,
         &points,
         &[],
     );
@@ -121,7 +120,6 @@ fn screening_policy_is_part_of_the_tuning_cache_identity() {
         "A=bf16",
         &NativeSpecialization::new(),
         "same-implementation",
-        7,
         &points,
         &cpu_projection_screening(&device, &points),
     );
@@ -147,11 +145,11 @@ fn metal_sample_policy_is_part_of_the_tuning_cache_identity() {
         "A=bf16",
         &NativeSpecialization::new(),
         "same-implementation",
-        7,
         &row_points(LIMITS),
         &[],
     );
-    assert!(key.contains("search 9"));
+    assert!(key.contains("search 12"));
+    assert!(key.contains("model budget 100"));
     assert!(key.contains("samples: 1"));
     assert!(key.contains("confirmation_samples: 5"));
     assert!(key.contains("confirmed: 3"));
@@ -225,26 +223,94 @@ fn rotations_take_distinct_layers_spread_over_depth() {
     assert_eq!(TuningInputs::rotation_scopes(&few, &rows(1)), few);
 }
 
+/// Units of `sizes` with equal shares of step time.
+fn equal(sizes: &[usize]) -> Vec<(usize, f64)> {
+    sizes.iter().map(|size| (*size, 1.0)).collect()
+}
+
 #[test]
-fn the_model_budget_is_shared_equally_and_small_spaces_return_their_rest() {
+fn equal_shares_split_the_model_budget_equally_and_small_spaces_return_their_rest() {
     // 100 over four units: the 6-configuration unit needs only 6; the other
     // three share 94 (32, 31, 31).
-    assert_eq!(allocate(100, &[1620, 6, 540, 108]), [32, 6, 31, 31]);
+    assert_eq!(allocate(100, &equal(&[1620, 6, 540, 108])), [32, 6, 31, 31]);
     // Every unit fits: each takes its size.
-    assert_eq!(allocate(100, &[3, 4, 5]), [3, 4, 5]);
+    assert_eq!(allocate(100, &equal(&[3, 4, 5])), [3, 4, 5]);
     // A budget below the unit count still evaluates every unit's defaults.
-    assert_eq!(allocate(2, &[10, 10, 10]), [1, 1, 1]);
+    assert_eq!(allocate(2, &equal(&[10, 10, 10])), [1, 1, 1]);
     // Redistribution cascades: after the 10 leaves, 45 each fits the 40.
-    assert_eq!(allocate(100, &[10, 40, 500]), [10, 40, 50]);
+    assert_eq!(allocate(100, &equal(&[10, 40, 500])), [10, 40, 50]);
+}
+
+#[test]
+fn the_model_budget_follows_shares_of_step_time() {
+    assert_eq!(
+        allocate(90, &[(1620, 0.6), (540, 0.3), (108, 0.1)]),
+        [54, 27, 9]
+    );
+    // A unit whose part covers its space leaves the rest to the others.
+    assert_eq!(allocate(100, &[(30, 0.9), (500, 0.1)]), [30, 70]);
+    // Largest remainders round, ties to the first: thirds of 100 take 34,
+    // 33, 33.
+    assert_eq!(
+        allocate(100, &[(500, 0.2), (500, 0.2), (500, 0.2)]),
+        [34, 33, 33]
+    );
 }
 
 #[test]
 fn spaces_up_to_the_complete_size_are_searched_completely_first() {
     // The 24s are complete although an equal share (100 / 5 = 20) would
     // cut them; the two large units share the remaining 44.
-    assert_eq!(allocate(100, &[24, 24, 8, 1620, 540]), [24, 24, 8, 22, 22]);
+    assert_eq!(
+        allocate(100, &equal(&[24, 24, 8, 1620, 540])),
+        [24, 24, 8, 22, 22]
+    );
     // When the small spaces do not all fit, every unit shares equally.
-    assert_eq!(allocate(40, &[24, 24, 8, 1620]), [11, 11, 8, 10]);
+    assert_eq!(allocate(40, &equal(&[24, 24, 8, 1620])), [11, 11, 8, 10]);
+}
+
+#[test]
+fn structural_form_starts_receive_measurements_within_the_model_budget() {
+    let mut budgets = [8, 1, 12, 3];
+    reserve_form_starts(&mut budgets, &[3, 2, 1, 1]);
+    assert_eq!(budgets.iter().sum::<usize>(), 24);
+    assert_eq!(budgets, [8, 2, 11, 3]);
+
+    // When every slot is already required for defaults, no unit can donate.
+    let mut exhausted = [1, 1];
+    reserve_form_starts(&mut exhausted, &[2, 2]);
+    assert_eq!(exhausted, [1, 1]);
+}
+
+#[test]
+fn a_unit_shares_each_row_class_by_its_time_there() {
+    let point = |rows: u64, context: Option<u64>| PointShape {
+        label: format!("m{rows}"),
+        weight: 0.0,
+        rows,
+        context,
+        class: context.map(|_| format!("m{rows}")),
+    };
+    // Attention at two history lengths of one row (a mean of 2 s), and a
+    // projection over one and sixteen rows.
+    let attention = [point(1, Some(256)), point(1, Some(4096))];
+    let projection = [point(1, None), point(16, None)];
+    let shares = step_shares(&[
+        UnitTime {
+            launches: 1,
+            shapes: &attention,
+            seconds: &[1.0, 3.0],
+        },
+        UnitTime {
+            launches: 2,
+            shapes: &projection,
+            seconds: &[1.0, 5.0],
+        },
+    ]);
+    // One row holds 0.4 of step time, split 2 : 2; sixteen rows hold 0.05,
+    // all the projection's.
+    assert!((shares[0] - 0.2).abs() < 1e-12, "{shares:?}");
+    assert!((shares[1] - 0.25).abs() < 1e-12, "{shares:?}");
 }
 
 fn metal() -> Option<Device> {
@@ -340,6 +406,10 @@ struct FakeArgs {
 impl EntryTuning for FakeCase {
     type Entry = dense_output::Entry;
     type Case = FakeArgs;
+
+    fn launches(&self) -> usize {
+        1
+    }
 
     fn bindings(&self) -> String {
         "fake".into()
@@ -491,7 +561,9 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         });
     let case = FakeCase::new(&implementation, &statics, "fake");
     let configurations = implementation.admissible(&statics).unwrap().len();
-    // A census counts the unit without tuning it.
+    // A census counts the unit without tuning it: its launch-scoped search
+    // measures every candidate and spends no share of the model budget.
+    assert!(implementation.launch_scoped());
     let mut census = Tuner::census(
         &device,
         context,
@@ -505,7 +577,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     );
     assert!(case.seen.borrow().is_empty() && recorder.0.borrow().is_empty());
     let budgets = census.budgets();
-    let budget = MODEL_BUDGET.min(configurations);
+    let budget = 1;
     assert_eq!(
         budgets.budgets.values().copied().collect::<Vec<_>>(),
         [budget]
@@ -721,6 +793,7 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
         TuningBudgets {
             budgets: [(key.clone(), 4)].into_iter().collect(),
             searching: [key].into_iter().collect(),
+            measurements: HashMap::new(),
         },
     );
     assert!(matches!(

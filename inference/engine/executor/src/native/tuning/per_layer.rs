@@ -38,6 +38,10 @@ impl EntryTuning for PerLayerGateTuning {
     type Entry = per_layer_gate::Entry;
     type Case = PerLayerGateCase;
 
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         format!(
             "GW={},A={}",

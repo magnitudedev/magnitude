@@ -44,6 +44,10 @@ impl EntryTuning for ShortConvProjectTuning {
     type Entry = short_conv_project::Entry;
     type Case = ShortConvProjectCase;
 
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
@@ -143,6 +147,10 @@ pub(crate) struct ShortConvOutputCase {
 impl EntryTuning for ShortConvOutputTuning {
     type Entry = attention_output::Entry;
     type Case = ShortConvOutputCase;
+
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
 
     fn bindings(&self) -> String {
         format!(

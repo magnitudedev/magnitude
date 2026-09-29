@@ -41,6 +41,10 @@ impl EntryTuning for ProjectRowsTuning {
     type Entry = project_rows::Entry;
     type Case = ProjectRowsCase;
 
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         format!(
             "A={},W={},Y={}",

@@ -172,6 +172,10 @@ impl EntryTuning for RoutedRouteTuning {
     type Entry = routed_route::Entry;
     type Case = RoutedRouteCase;
 
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         format!(
             "NW={},RW={},A={}",
@@ -249,6 +253,8 @@ impl EntryTuning for RoutedRouteTuning {
 /// routes. Its parameters are mappings.
 pub(crate) struct RoutedGroupTuning {
     pub shape: RoutedShape,
+    /// Layers prepared with this specialization.
+    pub layers: usize,
 }
 
 pub(crate) struct RoutedGroupCase {
@@ -262,6 +268,10 @@ pub(crate) struct RoutedGroupCase {
 impl EntryTuning for RoutedGroupTuning {
     type Entry = routed_group::Entry;
     type Case = RoutedGroupCase;
+
+    fn launches(&self) -> usize {
+        self.layers
+    }
 
     fn bindings(&self) -> String {
         "fixed".into()
@@ -350,6 +360,10 @@ impl RoutedExpandTuning {
 impl EntryTuning for RoutedExpandTuning {
     type Entry = routed_expand::Entry;
     type Case = RoutedExpandCase;
+
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
 
     fn bindings(&self) -> String {
         format!(
@@ -451,6 +465,10 @@ impl RoutedOutputTuning {
 impl EntryTuning for RoutedOutputTuning {
     type Entry = routed_output::Entry;
     type Case = RoutedOutputCase;
+
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
 
     fn bindings(&self) -> String {
         format!(
@@ -558,6 +576,10 @@ impl EntryTuning for RoutedExpertsTuning {
     type Entry = routed_experts::Entry;
     type Case = RoutedExpertsCase;
 
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         format!(
             "EGW={},EUW={},EDW={},A={}",
@@ -656,6 +678,10 @@ impl RoutedCombineTuning {
 impl EntryTuning for RoutedCombineTuning {
     type Entry = routed_combine::Entry;
     type Case = RoutedCombineCase;
+
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
 
     fn bindings(&self) -> String {
         format!(

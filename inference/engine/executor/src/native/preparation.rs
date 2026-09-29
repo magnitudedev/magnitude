@@ -1170,11 +1170,16 @@ impl<'a> Preparation<'a> {
             &mut self.tuner,
             &RoutedGroupTuning {
                 shape: routing_shape(&binding),
+                layers: scopes.len(),
             },
         )?;
-        let scatter = self
-            .spec
-            .tuned(&mut self.tuner, &RoutedScatterTuning { binding })?;
+        let scatter = self.spec.tuned(
+            &mut self.tuner,
+            &RoutedScatterTuning {
+                binding,
+                layers: scopes.len(),
+            },
+        )?;
         let shared = match (shape.shared, binding.shared) {
             (Some((_, expansion)), Some((gate, up, down))) => {
                 let expansion = match gate {
@@ -1306,9 +1311,13 @@ impl<'a> Preparation<'a> {
                 epsilon: self.epsilon,
             },
         )?;
-        let group = self
-            .spec
-            .tuned(&mut self.tuner, &RoutedGroupTuning { shape })?;
+        let group = self.spec.tuned(
+            &mut self.tuner,
+            &RoutedGroupTuning {
+                shape,
+                layers: scopes.len(),
+            },
+        )?;
         let expand = self.spec.tuned(
             &mut self.tuner,
             &RoutedExpandTuning {

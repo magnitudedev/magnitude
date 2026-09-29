@@ -101,8 +101,9 @@ pub const REPLAY_RUNS: usize = 1000;
 /// Replay the production search against every survey file in `directory`
 /// ([`REPLAY_RUNS`] runs each, §E2) and report, as Markdown: per entry
 /// instance, the chosen configuration's true cost relative to the true best
-/// at the budget the survey's load allocated and with the whole space as
-/// budget, for the production objective and the previous one; the
+/// at the budget the survey's load allocated, at twice and four times it and
+/// with the whole space as budget, for the production objective and the
+/// previous one, with the search settings of the survey's backend; the
 /// configurations needed for 95% of runs to reach 2% of the best (`n95`);
 /// and per point, the time of the overall best configuration against the
 /// best at that point alone (what a per-size launch could recover).
@@ -119,7 +120,6 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
             .is_some_and(|extension| extension == "json")
     });
     files.sort();
-    let settings = super::SEARCH_SETTINGS;
     let mut report = String::new();
     let percent = |value: f64| format!("{:.1}%", 100.0 * value);
     for path in files {
@@ -142,6 +142,13 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
         let recording =
             Recording::new(&result).map_err(|error| format!("{}: {error}", path.display()))?;
         let space = recording.space().len();
+        // The settings the recorded entry's search runs with (surveys use no
+        // screening points).
+        let settings = super::search_settings(
+            seismic::BackendName::parse(&result.backend)
+                .ok_or_else(|| format!("{}: unknown backend", path.display()))?,
+            false,
+        );
         writeln!(
             report,
             "### {} [{}] {}\n\n{} admissible, {} measured, budget {budget}; true best {:?}\n",
@@ -162,7 +169,12 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
             ("keyed (production)", Objective::Keyed),
             ("separate (previous)", Objective::Separate),
         ] {
-            for budget in [budget, space] {
+            let mut budgets = [1, 2, 4]
+                .map(|multiple| (multiple * budget).min(space))
+                .to_vec();
+            budgets.push(space);
+            budgets.dedup();
+            for budget in budgets {
                 let replayed = replay(&recording, budget, &settings, objective, REPLAY_RUNS);
                 let evaluated =
                     replayed.evaluated.iter().sum::<usize>() as f64 / REPLAY_RUNS as f64;

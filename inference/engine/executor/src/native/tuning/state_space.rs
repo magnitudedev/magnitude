@@ -65,6 +65,10 @@ impl EntryTuning for StateSpaceProjectTuning {
     type Entry = attention_project::Entry;
     type Case = StateSpaceProjectCase;
 
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
@@ -155,6 +159,10 @@ pub(crate) struct StateSpaceOutputCase {
 impl EntryTuning for StateSpaceOutputTuning {
     type Entry = attention_output::Entry;
     type Case = StateSpaceOutputCase;
+
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
 
     fn bindings(&self) -> String {
         format!(
@@ -331,6 +339,10 @@ macro_rules! state_entry {
         impl EntryTuning for $tuning {
             type Entry = $module::Entry;
             type Case = StateSpaceStateCase;
+
+            fn launches(&self) -> usize {
+                self.0.scopes.len()
+            }
 
             fn bindings(&self) -> String {
                 format!("A={}", self.0.activation.name())

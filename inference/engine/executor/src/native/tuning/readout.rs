@@ -48,6 +48,10 @@ impl EntryTuning for DraftRowsTuning {
     type Entry = draft_rows::Entry;
     type Case = DraftRowsCase;
 
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
     fn bindings(&self) -> String {
         format!(
             "EW={},EN={},HN={},CW={},A={}",
@@ -177,6 +181,10 @@ impl EntryTuning for HeadRowsTuning {
     type Entry = readout_head_rows::Entry;
     type Case = HeadRowsCase;
 
+    fn launches(&self) -> usize {
+        1
+    }
+
     fn bindings(&self) -> String {
         format!(
             "NW={},OW={},A={}",
@@ -265,6 +273,10 @@ impl SelectedRowsTuning {
 impl EntryTuning for SelectedRowsTuning {
     type Entry = readout_selected_rows::Entry;
     type Case = SelectedRowsCase;
+
+    fn launches(&self) -> usize {
+        1
+    }
 
     fn bindings(&self) -> String {
         format!(
@@ -359,6 +371,10 @@ impl EntryTuning for HeadLogitsTuning {
     type Entry = head_logits_rows::Entry;
     type Case = HeadLogitsCase;
 
+    fn launches(&self) -> usize {
+        1
+    }
+
     fn bindings(&self) -> String {
         format!("OW={},A={}", self.weight.name(), self.activation.name())
     }
@@ -434,6 +450,10 @@ pub(crate) struct ShapeRowsCase {
 impl EntryTuning for ShapeRowsTuning {
     type Entry = shape_rows::Entry;
     type Case = ShapeRowsCase;
+
+    fn launches(&self) -> usize {
+        1
+    }
 
     fn bindings(&self) -> String {
         "fixed".into()
@@ -516,6 +536,10 @@ pub(crate) struct SampleRowsCase {
 impl EntryTuning for SampleRowsTuning {
     type Entry = sample_rows::Entry;
     type Case = SampleRowsCase;
+
+    fn launches(&self) -> usize {
+        1
+    }
 
     fn bindings(&self) -> String {
         "fixed".into()

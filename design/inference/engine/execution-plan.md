@@ -74,13 +74,23 @@ in place (recurrent bank slabs, KV history, routing tables, selection outputs) i
 state: its written region is restored before each configuration's validation run, and real state
 is never bound. An entry that declares parameters without a case fails preparation; there are no
 engine-side default parameter values. An entry prepared again with identical element bindings and
-static values reuses the load's first tuning result. Entry-wide declarations still use a
-configuration budget: a census counts the model's tuning units (entry, element bindings, static
-values) and their admissible configurations, shares a per-model budget among them, and then finds
-which units have a stored result at their budget, so the load knows the budget it will search
-before any tuning. A
-launch-scoped declaration instead searches every candidate of each independent launch group;
-its boundary choices and group candidates do not spend that budget. A safety stop on the whole
+static values reuses the load's first tuning result. Entry-wide declarations
+use a configuration budget: a census counts the model's tuning units (entry,
+element bindings, static values), their admissible configurations and launches
+per step, finds which units have a stored result, and measures the defaults of
+each unit that will search (one configuration of the per-model budget each; a
+stored result supplies the defaults' times of a stored unit). Each row class's
+share of step time is split among the units serving it by launches times the
+defaults' mean time there. The per-model budget is shared by those step-time
+shares, so the load spends its search where the step spends its time. Spaces
+small enough to search completely still are when all of them fit. A unit with
+structural `form` values receives enough of the shared budget to measure its
+defaults and one admissible start per other value, redistributed from units
+with spare slots; if the model budget cannot cover every such start, defaults
+remain guaranteed. A launch-scoped declaration instead searches every
+candidate of each independent launch group; its boundary choices and group
+candidates do not spend that budget, and it takes no share. A safety stop on
+the whole
 preparation's tuning (a wall-clock limit for pathological machines) ends every search early with
 the best completed choice, leaving unfinished groups at their defaults; it is reported as a
 warning and its results are not stored.
@@ -92,8 +102,10 @@ is cached). It holds the program artifacts Seismic keeps (CUDA CUBINs, Vulkan SP
 the device's artifact store, one directory per toolchain namespace, and one tuning result per
 tuning key. The key is a digest over the device and toolchain identity (Metal OS
 build; CUDA driver and NVRTC release), the unit, the implementation digest (declaration and
-rendered source), and the search definition (search version, budget, settings, point labels and
-weights, screening points and folded weights, validation rule, sample time). A hit prepares the
+rendered source), and the search definition (search version, per-model budget, settings, point
+labels and weights, screening points and folded weights, validation rule, sample time); a unit's
+own budget follows the measured shares of the load that searched it and is not part of the key.
+A hit prepares the
 stored choice with no forming, measuring or validation for tuning; its key pins everything
 validation depended on. Keys are
 content addresses, so nothing is invalidated: changed inputs give new keys. Writes go through a
