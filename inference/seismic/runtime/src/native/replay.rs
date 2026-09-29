@@ -20,8 +20,7 @@
 //! configuration, margins relative to the whole cost.
 
 use super::search::{
-    self, Cost, Evaluator, ParameterValues, PointKey, SearchParameter, SearchSettings,
-    SearchSpace,
+    self, Cost, Evaluator, ParameterValues, PointKey, SearchParameter, SearchSettings, SearchSpace,
 };
 use super::tune::{Exclusion, Outcome, TuningResult};
 use std::collections::HashMap;
@@ -66,7 +65,7 @@ pub enum RecordingError {
     /// A measured configuration lacks samples at a point.
     Empty { point: String },
     /// The survey could not measure the defaults.
-    DefaultExcluded,
+    NoMeasuredCandidate,
 }
 
 impl std::fmt::Display for RecordingError {
@@ -79,7 +78,7 @@ impl std::fmt::Display for RecordingError {
             Self::Empty { point } => {
                 write!(f, "a surveyed configuration has no samples at `{point}`")
             }
-            Self::DefaultExcluded => f.write_str("the survey excluded the defaults"),
+            Self::NoMeasuredCandidate => f.write_str("the survey has no measured candidate"),
         }
     }
 }
@@ -151,9 +150,10 @@ impl Recording {
             .iter()
             .map(|point| point.label.clone())
             .collect();
-        let reference = points[space.default_index()]
-            .as_ref()
-            .ok_or(RecordingError::DefaultExcluded)?
+        let reference = points
+            .iter()
+            .find_map(Option::as_ref)
+            .ok_or(RecordingError::NoMeasuredCandidate)?
             .iter()
             .map(|point| point.time)
             .collect::<Vec<_>>();
@@ -382,13 +382,13 @@ impl Evaluator for Recorded<'_> {
                     );
                     return Err(Self::excluded());
                 };
-                if index == self.recording.space.default_index() {
+                if self.reference.is_none() {
                     self.reference = Some(self.reference_of(&medians));
                 }
                 let reference = self
                     .reference
                     .as_ref()
-                    .expect("the defaults are evaluated first");
+                    .expect("a passing candidate establishes the timing anchor");
                 let cost = self.cost(index, &medians, reference);
                 if self.cheapest.is_none_or(|(total, _)| cost.total() < total) {
                     self.cheapest = Some((cost.total(), index));
@@ -521,7 +521,7 @@ mod tests {
     use super::*;
     use crate::native::tune::{
         Configuration, ConfigurationRecord, DeclaredParameter, PointMeasurement, TuningMethod,
-        TuningTime, Validation,
+        TuningTime,
     };
 
     /// A survey of `A` (read by the first point) and `B` (read by the
@@ -577,7 +577,10 @@ mod tests {
                     class: None,
                 })
                 .collect(),
-            validation: Validation::BitExact,
+            validation: seismic_lang::precision::PrecisionPolicy::Exact,
+            numerical_evidence: Vec::new(),
+            reused: false,
+            implementation_identity: String::new(),
             parameters: vec![
                 DeclaredParameter {
                     name: "A".into(),

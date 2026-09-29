@@ -15,6 +15,27 @@ const LIMITS: TuningLimits = TuningLimits {
 };
 
 #[test]
+fn persisted_point_weights_preserve_cache_identity() {
+    // Real prefill weights: parsing these one ULP away caused every warm
+    // model load to retune otherwise identical, fully qualified entries.
+    for weight in [0.017857142857142853_f64, 0.026785714285714274] {
+        let point = seismic::PointRecord {
+            label: "prefill".into(),
+            weight,
+            class: Some("m16".into()),
+        };
+        let encoded = serde_json::to_vec(&point).unwrap();
+        let restored: seismic::PointRecord = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            restored.weight.to_bits(),
+            weight.to_bits(),
+            "{}",
+            String::from_utf8(encoded).unwrap()
+        );
+    }
+}
+
+#[test]
 fn stored_cpu_choice_accepts_device_owned_parameters() {
     let device = DeviceCatalog::discover()
         .unwrap()
@@ -148,7 +169,7 @@ fn metal_sample_policy_is_part_of_the_tuning_cache_identity() {
         &row_points(LIMITS),
         &[],
     );
-    assert!(key.contains("search 12"));
+    assert!(key.contains("search 14"));
     assert!(key.contains("model budget 100"));
     assert!(key.contains("samples: 1"));
     assert!(key.contains("confirmation_samples: 5"));
@@ -160,23 +181,25 @@ fn attention_points_cross_rows_with_served_contexts() {
     let points = attention_points(LIMITS);
     assert_eq!(
         points.len(),
-        TUNING_ROWS.len() * 3,
+        TUNING_ROWS.len() * 6,
         "64k exceeds the served context"
     );
     assert!(points.iter().all(|point| point.context.unwrap() <= 16384));
-    assert_eq!(points[0].label, "m1-c256");
+    assert_eq!(points[0].label, "m1-c0");
     // The history lengths of one row point form its class.
     assert_eq!(points[0].class.as_deref(), Some("m1"));
     assert_eq!(points[2].class.as_deref(), Some("m1"));
-    assert_eq!(points[3].class.as_deref(), Some("m2"));
+    assert_eq!(points[6].class.as_deref(), Some("m2"));
     assert!((points.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
     let short = attention_points(TuningLimits {
         max_rows: 1,
         max_projected_rows: 1,
         context_tokens: 128,
     });
-    assert_eq!(short.len(), 1);
-    assert_eq!(short[0].context, Some(128));
+    assert_eq!(
+        short.iter().map(|p| p.context.unwrap()).collect::<Vec<_>>(),
+        [0, 1, 32]
+    );
 }
 
 #[test]
@@ -218,7 +241,10 @@ fn rotations_take_distinct_layers_spread_over_depth() {
         TuningInputs::rotation_scopes(&scopes, &rows(4)),
         [0, 8, 16, 24].map(block)
     );
-    assert_eq!(TuningInputs::rotation_scopes(&scopes, &rows(32)), [block(0)]);
+    assert_eq!(
+        TuningInputs::rotation_scopes(&scopes, &rows(32)),
+        [block(0)]
+    );
     let few = [WeightScope::HeadBlock(0)];
     assert_eq!(TuningInputs::rotation_scopes(&few, &rows(1)), few);
 }
@@ -352,6 +378,7 @@ struct FakeCase {
     seen: RefCell<Vec<(String, f64, usize)>>,
     /// The implementation digest the case reports.
     digest: String,
+    scopes: Vec<WeightScope>,
     chosen: Configuration,
 }
 
@@ -370,6 +397,7 @@ impl FakeCase {
         Self {
             seen: RefCell::new(Vec::new()),
             digest: digest.into(),
+            scopes: Vec::new(),
             chosen: Configuration {
                 statics: chosen.statics().clone(),
                 params: chosen.params().clone(),
@@ -404,6 +432,12 @@ struct FakeArgs {
 }
 
 impl EntryTuning for FakeCase {
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
+    }
+    fn precision(&self) -> Result<PrecisionPolicy, TuneError> {
+        Ok(PrecisionPolicy::Exact)
+    }
     type Entry = dense_output::Entry;
     type Case = FakeArgs;
 
@@ -452,14 +486,22 @@ impl EntryTuning for FakeCase {
         _device: &Device,
         statics: &NativeSpecialization,
         points: Vec<TuningPoint<'_, Self::Entry>>,
-        validation: Validation,
+        validation: PrecisionPolicy,
         _strategy: Strategy,
+        reuse: Option<seismic::TuningReuse<'_>>,
     ) -> Result<TuningResult, TuneError> {
         self.seen.borrow_mut().extend(
             points
                 .iter()
                 .map(|point| (point.label.clone(), point.weight, point.rotation.len())),
         );
+        // This fake tests the engine's routing of cache records. Numerical
+        // identity checks are exercised by the native-runtime integration tests.
+        if let Some(seismic::TuningReuse::Completed(previous)) = reuse {
+            let mut result = previous.clone();
+            result.reused = true;
+            return Ok(result);
+        }
         let mut rejected = self.chosen.clone();
         rejected.launches[0].insert("ROWS".into(), 4);
         assert_eq!(&self.chosen.statics, statics.statics());
@@ -476,6 +518,9 @@ impl EntryTuning for FakeCase {
                 })
                 .collect(),
             validation,
+            numerical_evidence: Vec::new(),
+            reused: false,
+            implementation_identity: String::new(),
             parameters: Vec::new(),
             configurations: vec![
                 ConfigurationRecord {
@@ -557,7 +602,16 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
-            spec.with_static(name.clone(), if name == "DS" { 0 } else if name == "H" { 8 } else { 16 })
+            spec.with_static(
+                name.clone(),
+                if name == "DS" {
+                    0
+                } else if name == "H" {
+                    8
+                } else {
+                    16
+                },
+            )
         });
     let case = FakeCase::new(&implementation, &statics, "fake");
     let configurations = implementation.admissible(&statics).unwrap().len();
@@ -631,15 +685,18 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
             total: budget
         }
     );
-    assert_eq!((tuned.measured, tuned.excluded, tuned.defects), (1, 1, 1));
+    assert_eq!(
+        (tuned.measured, tuned.excluded, tuned.rejections),
+        (1, 1, 1)
+    );
     assert_eq!(tuner.tuned(), [tuned.clone()]);
 }
 
 /// Stored tuning results (tuning spec §C2): a miss tunes and stores the
-/// result; a hit prepares the stored choice without tuning; a change to any
+/// result; a hit offers the stored choice to runtime validation; a change to any
 /// of the key's material is a miss.
 #[test]
-fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
+fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     let Some(device) = metal() else {
         return;
     };
@@ -658,7 +715,16 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
-            spec.with_static(name.clone(), if name == "DS" { 0 } else if name == "H" { 8 } else { 16 })
+            spec.with_static(
+                name.clone(),
+                if name == "DS" {
+                    0
+                } else if name == "H" {
+                    8
+                } else {
+                    16
+                },
+            )
         });
     let limits = TuningLimits {
         max_rows: 64,
@@ -712,8 +778,8 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
     let (stored, started, planned) = load_once(&again, limits);
     assert_eq!(stored.origin, TuningOrigin::Stored);
     assert!(
-        !started && again.seen.borrow().is_empty(),
-        "a stored result is not tuned"
+        started && !again.seen.borrow().is_empty(),
+        "a stored result still passes through runtime evidence validation"
     );
     assert_eq!(
         planned, 0,
@@ -745,6 +811,29 @@ fn a_stored_tuning_result_is_used_without_tuning_and_a_changed_key_misses() {
         TuningOrigin::Searched
     );
     assert_eq!(stored_results(), 3);
+
+    // Equal geometry with different model weight groups must retain distinct
+    // cache slots. Alternating groups must reuse both, not overwrite one slot.
+    let scoped = |block| {
+        let mut case = FakeCase::new(&implementation, &statics, "implementation a");
+        case.scopes = vec![WeightScope::TargetSublayer(
+            magnitude_family_contracts::SublayerIndex { block, sublayer: 0 },
+        )];
+        case
+    };
+    for block in [0, 1] {
+        assert_eq!(
+            load_once(&scoped(block), limits).0.origin,
+            TuningOrigin::Searched
+        );
+    }
+    for block in [0, 1, 0] {
+        assert_eq!(
+            load_once(&scoped(block), limits).0.origin,
+            TuningOrigin::Stored
+        );
+    }
+    assert_eq!(stored_results(), 5);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -779,7 +868,12 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
             },
         )],
     };
-    let key = ("dense_output", case.bindings(), statics.statics().clone());
+    let key = (
+        "dense_output",
+        case.bindings(),
+        statics.statics().clone(),
+        case.weight_scopes().to_vec(),
+    );
     let mut tuner = Tuner::new(
         &device,
         TuningContext {
@@ -888,6 +982,6 @@ fn case_state_restores_its_written_rows() {
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
         .collect::<Vec<_>>();
-    assert_eq!(restored, [0.0, 0.0, 2.0, 3.0, 4.0, 5.0, 0.0, 0.0]);
+    assert_eq!(restored, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
     assert!(initializer(Vec::new()).is_none());
 }

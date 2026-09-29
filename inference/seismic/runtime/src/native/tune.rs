@@ -1,50 +1,27 @@
-//! Tuning of a native implementation over its declared domain, fast enough
-//! to run when programs are prepared.
-//!
-//! A [`Strategy::Search`] runs the budgeted local search of
-//! [`super::search`] over the admissible configurations: the live
-//! evaluator forms each batch of configurations concurrently, then measures
-//! each at the screening points, and re-measures the finalists over the full
-//! workload, alternating between them. Validation then walks the search's
-//! ranking and chooses the first configuration that agrees with the defaults. A
-//! [`Strategy::Survey`] (development) instead forms, measures and validates
-//! every admissible configuration, recording every sample, so searches can
-//! be replayed against it.
-//!
-//! The objective is [`Cost`]: per point, its weight (share of step time)
-//! times the configuration's time there relative to the defaults'. A point
-//! is measured once per [`PointKey`]: the launches doing work there and the
-//! parameters they read, as the declaration names them ([`Influence`]).
-//! Configurations that differ only in parameters no launch at a point reads
-//! share that point's measurement, so its noise cannot choose those
-//! parameters.
-//!
-//! Validation compares every tensor an entry writes, its results and its
-//! `&mut` parameters, against the all-defaults configuration: bit-exact when
-//! the arithmetic parameters agree with the defaults (a difference is a
-//! misclassified mapping parameter), else within the caller's tolerance.
-//! The defaults are the reference and always pass. The tuner never saves or
-//! restores state. A point whose entry has `&mut` parameters binds the same
-//! tensors for every configuration, so it must bring an initializer that
-//! restores them before each validation run; one without is rejected.
+//! Native tuning validates every candidate against the selected reference before
+//! repeated timing. The first initialized timed invocation supplies its outputs
+//! and writable state; host comparison remains outside the device interval.
+//! Ordinary, factored, survey and census paths use the same evidence. Timing
+//! normalization and reuse do not confer numerical eligibility.
 
 use super::plan::{self, PointShape};
 use super::search::{
-    self, Cost, Evaluator, ParameterValues, PointKey, SearchParameter, SearchSettings,
-    SearchSpace, SearchSpaceError, SearchStop,
+    self, Cost, Evaluator, ParameterValues, PointKey, SearchParameter, SearchSettings, SearchSpace,
+    SearchSpaceError, SearchStop,
 };
 use super::timing::{self, OutputPool, PointTiming};
+use super::validation::{self, PreparedPoint};
+pub use super::validation::{NumericalEvidence, NumericalMetrics};
 use super::{MeasureOptions, Measurement, NativePrepared};
 use crate::api::device::DeviceInner;
-use crate::api::kernel::{DecodedValue, EncodedArgs, PrepareError};
+use crate::api::kernel::{EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
-use seismic_compiler::prepared::{validate_invocation, ArgumentValue, InvocationContract};
+use seismic_compiler::prepared::{validate_invocation, InvocationContract};
 use seismic_lang::checked::{CheckedModule, NativeImplementation, NativeSpecialization};
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
-use seismic_lang::ids::{EntryId, RepresentationId};
-use seismic_lang::registry::{self, RepresentationKind};
-use seismic_lang::types::DType;
+use seismic_lang::ids::EntryId;
+use seismic_lang::precision::PrecisionPolicy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -68,29 +45,11 @@ pub struct TuningPoint<'a> {
     /// defaults' real time at each ([`Cost::relative`]). `None`: a class of
     /// its own.
     pub class: Option<String>,
-    /// Argument sets cycled through by measurement. The first is also the
-    /// validation input.
+    /// Argument sets cycled through by measurement and numerical validation.
     pub rotation: Vec<EncodedArgs>,
     /// Required when the entry has `&mut` parameters: called before every
-    /// configuration's validation run, it restores the tensors those
-    /// parameters bind in `rotation[0]`.
+    /// invocation, it restores all writable tensors in every rotation.
     pub initialize: Option<TuningInitializer<'a>>,
-}
-
-/// How configurations must agree with the all-defaults configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Validation {
-    BitExact,
-    /// Each dense floating-point result may differ from the reference by at
-    /// most `error` of the reference's norm: `‖actual − reference‖₂ ≤ error ·
-    /// ‖reference‖₂` over the whole tensor. Reduced-precision operands and
-    /// reassociated sums perturb every element by a share of the output's
-    /// scale, not of the element's own value, so near-zero elements carry
-    /// errors far above their own magnitude; the norm bound admits that and
-    /// still rejects a wrong result. Every other result is bit-exact.
-    Relative {
-        error: f64,
-    },
 }
 
 /// A configuration as recorded: its static values and parameter values.
@@ -144,13 +103,7 @@ pub enum Exclusion {
     Formation(String),
     /// The device rejected a call, for example a launch beyond its limits.
     Execution(String),
-    /// A mapping parameter changed result bits relative to the defaults,
-    /// which share its arithmetic parameters.
-    MisclassifiedParameter {
-        point: String,
-        reference: Configuration,
-    },
-    /// Results disagree with the all-defaults configuration.
+    /// Results or writable state disagree with the selected reference.
     Validation { point: String, detail: String },
     /// Measuring the configuration at a point failed.
     Measurement { point: String, detail: String },
@@ -179,9 +132,8 @@ pub enum Outcome {
         /// The finalists' re-measurement (empty for every other
         /// configuration).
         confirmed: Vec<PointMeasurement>,
-        /// Whether its outputs were compared with the defaults' (and
-        /// agreed). A search validates down its ranking only until one
-        /// configuration passes; a survey validates every configuration.
+        /// Whether the complete results and writable state passed the
+        /// precision policy against the selected reference on every required case.
         validated: bool,
     },
     Excluded(Exclusion),
@@ -229,6 +181,8 @@ pub enum TuningMethod {
 /// Where tuning time went.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TuningTime {
+    /// Case fingerprinting and reference preparation/execution.
+    pub reference_seconds: f64,
     pub forming_seconds: f64,
     pub measuring_seconds: f64,
     pub validating_seconds: f64,
@@ -251,7 +205,11 @@ pub struct TuningResult {
     pub backend: String,
     /// Points in the order given, with their weights and classes.
     pub points: Vec<PointRecord>,
-    pub validation: Validation,
+    pub validation: PrecisionPolicy,
+    pub numerical_evidence: Vec<NumericalEvidence>,
+    pub implementation_identity: String,
+    #[serde(skip)]
+    pub reused: bool,
     /// The parameters tuned, in declaration order.
     pub parameters: Vec<DeclaredParameter>,
     /// Every configuration reached, in the order reached.
@@ -263,17 +221,13 @@ pub struct TuningResult {
 }
 
 impl TuningResult {
-    /// Configurations excluded for authoring defects rather than device
-    /// limits.
-    pub fn defects(&self) -> impl Iterator<Item = &ConfigurationRecord> {
+    /// Configurations rejected during formation or numerical qualification.
+    /// Exceeding the caller's precision bound does not itself prove a kernel defect.
+    pub fn rejections(&self) -> impl Iterator<Item = &ConfigurationRecord> {
         self.configurations.iter().filter(|record| {
             matches!(
                 record.outcome,
-                Outcome::Excluded(
-                    Exclusion::Formation(_)
-                        | Exclusion::MisclassifiedParameter { .. }
-                        | Exclusion::Validation { .. }
-                )
+                Outcome::Excluded(Exclusion::Formation(_) | Exclusion::Validation { .. })
             )
         })
     }
@@ -285,6 +239,8 @@ pub enum TuneError {
     /// the static values are incomplete.
     Declaration(String),
     NoPoints,
+    Reference(String),
+    NoValidatedCandidate(Vec<Exclusion>),
     /// The declared parameters cannot be searched.
     Space(SearchSpaceError),
     /// A survey's domain override names an undeclared parameter or moves its
@@ -309,7 +265,8 @@ pub enum TuneError {
 impl std::fmt::Display for TuneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Declaration(message) | Self::Domain(message) => write!(f, "{message}"),
+            Self::Declaration(message) | Self::Domain(message) | Self::Reference(message) => write!(f, "{message}"),
+            Self::NoValidatedCandidate(failures) => write!(f, "no candidate passed numerical validation and measurement: {failures:?}"),
             Self::NoPoints => f.write_str("tuning needs at least one point"),
             Self::Space(error) => write!(f, "{error}"),
             Self::DefaultUnusable(exclusion) => {
@@ -375,6 +332,36 @@ pub struct SurveyPlan {
 pub enum Strategy {
     Search(SearchPlan),
     Survey(SurveyPlan),
+    /// Find the first passing configuration for startup budget allocation.
+    Census {
+        min_sample_seconds: f64,
+        deadline: Option<Instant>,
+    },
+}
+
+/// A completed matching search may be reused wholesale; a census seed only
+/// supplies matching numerical evidence and timing for continued exploration.
+#[derive(Clone, Copy)]
+pub enum TuningReuse<'a> {
+    Completed(&'a TuningResult),
+    Seed(&'a TuningResult),
+}
+impl<'a> TuningReuse<'a> {
+    pub fn result(self) -> &'a TuningResult {
+        match self {
+            Self::Completed(result) | Self::Seed(result) => result,
+        }
+    }
+}
+
+/// Numerical reference for empirical native tuning. Neither choice proves compiler applicability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TuningReference {
+    /// Independently execute the checked portable operation (development cases).
+    Portable,
+    /// Compare with the declaration's default native specialization.
+    /// Shared defects are invisible; model/kernel regressions remain necessary.
+    NativeDefault,
 }
 
 pub struct TuneRequest<'a> {
@@ -386,23 +373,11 @@ pub struct TuneRequest<'a> {
     pub statics: NativeSpecialization,
     pub cpu: Option<&'static CpuNativeKernels>,
     pub points: Vec<TuningPoint<'a>>,
-    pub validation: Validation,
+    pub validation: PrecisionPolicy,
     pub strategy: Strategy,
+    pub reuse: Option<TuningReuse<'a>>,
+    pub reference: TuningReference,
 }
-
-/// What one run wrote, read back at once: the in-place parameters are
-/// overwritten by the next configuration.
-#[derive(Clone)]
-enum Observed {
-    Tensor {
-        representation: RepresentationId,
-        bytes: Vec<u8>,
-    },
-    Scalar(ArgumentValue),
-}
-
-/// Every result, then every `&mut` parameter, of one run.
-type Outputs = Vec<Observed>;
 
 /// Forms configurations of one entry's implementation.
 struct Formation<'s> {
@@ -461,7 +436,7 @@ impl Formation<'_> {
 fn point_shapes(
     device: &Arc<DeviceInner>,
     logical: &LogicalEntry,
-    points: &[TuningPoint<'_>],
+    points: &[PreparedPoint<'_>],
 ) -> Result<Vec<PointShape>, TuneError> {
     let contract = InvocationContract::compile_entry(logical);
     points
@@ -588,7 +563,7 @@ fn measure_factored(
     boundary: &[plan::ParameterAddress],
     kernel: &Arc<NativePrepared>,
     specialization: &NativeSpecialization,
-    points: &[TuningPoint<'_>],
+    points: &[PreparedPoint<'_>],
     options: &MeasureOptions,
     affected_launches: Option<&[usize]>,
     baseline: Option<&[PointMeasurement]>,
@@ -605,6 +580,10 @@ fn measure_factored(
                 .map_err(|error| measurement_failure(points, point, error))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let mut placed = placed;
+    for (point, timing) in points.iter().zip(&mut placed) {
+        point.validate(timing, options.min_sample_seconds)?;
+    }
     let mut sampled = Vec::new();
     let mut indices = Vec::new();
     let mut reused = baseline
@@ -673,7 +652,7 @@ fn sample_slots(
     placed: &mut Vec<PointTiming>,
     slots: &mut Vec<Slot>,
     failures: &mut [Option<Exclusion>],
-    points: &[TuningPoint<'_>],
+    points: &[PreparedPoint<'_>],
     options: &MeasureOptions,
 ) {
     while let Err(failure) = timing::sample(placed, options) {
@@ -701,7 +680,7 @@ fn measure_factored_group(
     implementation: &NativeImplementation,
     boundary: &[plan::ParameterAddress],
     candidates: &[FactoredCandidate],
-    points: &[TuningPoint<'_>],
+    points: &[PreparedPoint<'_>],
     options: &MeasureOptions,
     affected_launches: &[usize],
     baseline: &[PointMeasurement],
@@ -722,7 +701,7 @@ fn measure_factored_group(
         let mut candidate_placed = Vec::new();
         let mut candidate_slots = Vec::new();
         for (point, workload) in points.iter().enumerate() {
-            let timing = match PointTiming::reusing_outputs(
+            let mut timing = match PointTiming::reusing_outputs(
                 &formed.kernel,
                 workload.rotation.clone(),
                 outputs.at(point),
@@ -733,6 +712,10 @@ fn measure_factored_group(
                     break;
                 }
             };
+            if let Err(error) = workload.validate(&mut timing, options.min_sample_seconds) {
+                failures[candidate] = Some(error);
+                break;
+            }
             let working = timing.working_launches();
             let affected = affected_launches.iter().any(|launch| {
                 working.contains(launch) || baseline[point].key.launches.contains(launch)
@@ -779,38 +762,7 @@ fn measure_factored_group(
         .collect()
 }
 
-fn next_confirmed_group_choice(
-    failure: &Exclusion,
-    measurements: &[PointMeasurement],
-    groups: &[plan::Group],
-    choices: &[usize],
-    confirmed: &[Vec<usize>],
-) -> Option<(usize, usize)> {
-    let point = match failure {
-        Exclusion::Validation { point, .. } | Exclusion::MisclassifiedParameter { point, .. } => {
-            point
-        }
-        _ => return None,
-    };
-    let active = &measurements
-        .iter()
-        .find(|measurement| &measurement.point == point)?
-        .key
-        .launches;
-    groups.iter().enumerate().find_map(|(group_index, group)| {
-        if !group.launches.iter().any(|launch| active.contains(launch)) {
-            return None;
-        }
-        let order = confirmed.get(group_index)?;
-        let next = order
-            .iter()
-            .position(|choice| *choice == choices[group_index])
-            .and_then(|position| order.get(position + 1))?;
-        Some((group_index, *next))
-    })
-}
-
-fn measurement_failure(points: &[TuningPoint<'_>], point: usize, error: CallError) -> Exclusion {
+fn measurement_failure(points: &[PreparedPoint<'_>], point: usize, error: CallError) -> Exclusion {
     Exclusion::Measurement {
         point: points[point].label.clone(),
         detail: error.to_string(),
@@ -865,19 +817,20 @@ impl Influence {
 }
 
 /// A configuration placed at every point, keyed.
-struct Placed {
-    timings: Vec<PointTiming>,
+struct Placed<'a> {
+    timings: Vec<PointTiming<'a>>,
     keys: Vec<PointKey>,
 }
 
 /// Place `kernel`'s calls at every point and key them.
-fn place(
+fn place<'a>(
     kernel: &Arc<NativePrepared>,
-    points: &[TuningPoint<'_>],
+    points: &[PreparedPoint<'a>],
     influence: &Influence,
     values: &ParameterValues,
     outputs: &mut OutputPool,
-) -> Result<Placed, Exclusion> {
+    minimum_seconds: f64,
+) -> Result<Placed<'a>, Exclusion> {
     let timings = points
         .iter()
         .enumerate()
@@ -886,6 +839,10 @@ fn place(
                 .map_err(|error| measurement_failure(points, index, error))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let mut timings = timings;
+    for (point, timing) in points.iter().zip(&mut timings) {
+        point.validate(timing, minimum_seconds)?;
+    }
     let keys = timings
         .iter()
         .map(|timing| influence.key(timing.working_launches(), values))
@@ -915,12 +872,18 @@ impl Measurer {
     fn measure(
         &mut self,
         kernel: &Arc<NativePrepared>,
-        points: &[TuningPoint<'_>],
+        points: &[PreparedPoint<'_>],
         values: &ParameterValues,
         options: &MeasureOptions,
     ) -> Result<Vec<PointMeasurement>, Exclusion> {
-        let Placed { timings, keys } =
-            place(kernel, points, &self.influence, values, &mut self.outputs)?;
+        let Placed { timings, keys } = place(
+            kernel,
+            points,
+            &self.influence,
+            values,
+            &mut self.outputs,
+            options.min_sample_seconds,
+        )?;
         let (fresh, mut timings): (Vec<usize>, Vec<PointTiming>) = timings
             .into_iter()
             .enumerate()
@@ -939,19 +902,6 @@ impl Measurer {
             .enumerate()
             .map(|(point, key)| self.measured[&(point, key)].clone())
             .collect())
-    }
-}
-
-/// Bring the device to its sustained clock after forming a batch left it
-/// idle ([`timing::warm`]), with the first formed configuration's first
-/// point. A configuration that cannot run here fails the same way when it
-/// is measured and is excluded there.
-fn warm(formed: &[Result<Arc<NativePrepared>, Exclusion>], points: &[TuningPoint<'_>]) {
-    let Some(kernel) = formed.iter().find_map(|kernel| kernel.as_ref().ok()) else {
-        return;
-    };
-    if let Ok(point) = PointTiming::new(kernel, points[0].rotation.clone()) {
-        let _ = timing::warm(&point);
     }
 }
 
@@ -991,7 +941,7 @@ struct Weighing {
 }
 
 impl Weighing {
-    fn of(points: &[TuningPoint<'_>]) -> Self {
+    fn of(points: &[PreparedPoint<'_>]) -> Self {
         Self {
             weights: points.iter().map(|point| point.weight).collect(),
             classes: search::classes(points.iter().map(|point| point.class.as_deref())),
@@ -1044,21 +994,27 @@ struct Live<'s, 'a> {
     formation: &'s Formation<'s>,
     space: &'s SearchSpace,
     statics: &'s NativeSpecialization,
-    points: &'s [TuningPoint<'a>],
-    screening_points: &'s [TuningPoint<'a>],
+    points: &'s [PreparedPoint<'a>],
+    screening_points: &'s [PreparedPoint<'a>],
     measurer: Measurer,
     search: MeasureOptions,
     confirmation: MeasureOptions,
     deadline: Option<Instant>,
     evaluated: HashMap<usize, Evaluated>,
+    anchor: Option<usize>,
+    seed: Option<&'s TuningResult>,
     time: TuningTime,
 }
 
 impl Live<'_, '_> {
-    /// The defaults' search measurement: the reference of every cost.
+    /// The first passing candidate supplies the timing normalization.
     fn reference(&self) -> Result<&[PointMeasurement], Exclusion> {
         self.evaluated
-            .get(&self.space.default_index())
+            .get(
+                &self
+                    .anchor
+                    .expect("a passing candidate establishes the timing anchor"),
+            )
             .map(|defaults| defaults.points.as_slice())
             .ok_or_else(|| Exclusion::Measurement {
                 point: String::new(),
@@ -1077,19 +1033,89 @@ impl Evaluator for Live<'_, '_> {
         let formed = self.formation.form_all(&specializations);
         let measuring = Instant::now();
         self.time.forming_seconds += (measuring - began).as_secs_f64();
-        warm(&formed, self.screening_points);
+
         let weighing = Weighing::of(self.screening_points);
         let costs = batch
             .iter()
             .zip(formed)
             .map(|(index, kernel)| {
+                if let Some(seed) = self.seed.filter(|seed| {
+                    self.points.iter().all(|point| {
+                        seed.numerical_evidence
+                            .iter()
+                            .any(|evidence| evidence.identity == point.identity())
+                    })
+                }) {
+                    let configuration = Configuration::of(&specialization(
+                        self.statics,
+                        &self.space.values(*index),
+                    ));
+                    if let Some(error) = seed.configurations.iter().find_map(|record| {
+                        if record.configuration != configuration {
+                            return None;
+                        }
+                        match &record.outcome {
+                            Outcome::Excluded(error) => Some(error.clone()),
+                            _ => None,
+                        }
+                    }) {
+                        return Err(error);
+                    }
+                }
                 let kernel = kernel?;
-                let points = self.measurer.measure(
-                    &kernel,
-                    self.screening_points,
-                    &self.space.values(*index),
-                    &self.search,
-                )?;
+                // Screening changes the timing objective, never numerical coverage.
+                for point in self.points.iter().filter(|point| {
+                    !self
+                        .screening_points
+                        .iter()
+                        .any(|screen| screen.label == point.label)
+                }) {
+                    let mut timing = PointTiming::new(&kernel, point.rotation.clone())
+                        .map_err(|e| Exclusion::Execution(e.to_string()))?;
+                    point.validate(&mut timing, self.search.min_sample_seconds)?;
+                }
+                let reused = self.seed.and_then(|seed| {
+                    if seed.overall
+                        != Configuration::of(&specialization(
+                            self.statics,
+                            &self.space.values(*index),
+                        ))
+                        || !self
+                            .points
+                            .iter()
+                            .all(|point| point.evidence(&kernel.artifact().0).is_some())
+                    {
+                        return None;
+                    }
+                    let measurements = seed.configurations.iter().find_map(|record| {
+                        if record.configuration != seed.overall {
+                            return None;
+                        }
+                        match &record.outcome {
+                            Outcome::Measured { points, .. } => Some(points),
+                            _ => None,
+                        }
+                    })?;
+                    self.screening_points
+                        .iter()
+                        .map(|point| {
+                            measurements
+                                .iter()
+                                .find(|measured| measured.point == point.label)
+                                .cloned()
+                        })
+                        .collect::<Option<Vec<_>>>()
+                });
+                let points = match reused {
+                    Some(points) => points,
+                    None => self.measurer.measure(
+                        &kernel,
+                        self.screening_points,
+                        &self.space.values(*index),
+                        &self.search,
+                    )?,
+                };
+                self.anchor.get_or_insert(*index);
                 self.evaluated.insert(
                     *index,
                     Evaluated {
@@ -1124,6 +1150,7 @@ impl Evaluator for Live<'_, '_> {
                     &self.measurer.influence,
                     &self.space.values(*index),
                     &mut self.measurer.outputs,
+                    self.confirmation.min_sample_seconds,
                 )?;
                 for (point, (timing, key)) in placed.into_iter().zip(&keys).enumerate() {
                     let id = (point, key.clone());
@@ -1176,14 +1203,19 @@ impl Evaluator for Live<'_, '_> {
             .collect::<Vec<_>>();
         self.time.measuring_seconds += began.elapsed().as_secs_f64();
         let weighing = Weighing::of(points);
-        // The finalists begin with the defaults, the reference.
-        let reference = confirmed[0].clone();
+        // Any successfully confirmed finalist can anchor timing normalization.
+        let reference = confirmed
+            .iter()
+            .find_map(|result| result.as_ref().ok())
+            .cloned();
         finalists
             .iter()
             .zip(confirmed)
             .map(|(index, measured)| {
                 let measured = measured?;
-                let reference = reference.as_ref().map_err(Clone::clone)?;
+                let reference = reference
+                    .as_ref()
+                    .expect("a measured finalist establishes the anchor");
                 let cost = weighing.cost(&measured, reference);
                 self.evaluated
                     .get_mut(index)
@@ -1197,79 +1229,6 @@ impl Evaluator for Live<'_, '_> {
     fn expired(&self) -> bool {
         self.deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
-    }
-}
-
-/// Validates configurations against the all-defaults configuration.
-struct Validator<'r, 'a> {
-    implementation: &'r NativeImplementation,
-    default: &'r NativeSpecialization,
-    default_kernel: &'r Arc<NativePrepared>,
-    reference: Vec<Outputs>,
-    mutable: &'r [usize],
-    validation: Validation,
-    points: &'r mut [TuningPoint<'a>],
-}
-
-impl Validator<'_, '_> {
-    /// Run `kernel` at every point and compare with the reference: bit-exact
-    /// when its arithmetic parameters equal the defaults', else within the
-    /// tolerance.
-    fn check(
-        &mut self,
-        kernel: &Arc<NativePrepared>,
-        candidate: &NativeSpecialization,
-    ) -> Result<Result<(), Exclusion>, TuneError> {
-        let exact = self
-            .points
-            .iter()
-            .map(|point| {
-                let args = vec![point.rotation[0].clone()];
-                let defaults = PointTiming::new(self.default_kernel, args.clone())
-                    .map_err(|error| Exclusion::Execution(error.to_string()))?
-                    .working_launches();
-                let current = PointTiming::new(kernel, args)
-                    .map_err(|error| Exclusion::Execution(error.to_string()))?
-                    .working_launches();
-                Ok(defaults == current
-                    && arithmetic_values(self.implementation, self.default, &defaults)
-                        == arithmetic_values(self.implementation, candidate, &current))
-            })
-            .collect::<Result<Vec<_>, Exclusion>>();
-        let exact = match exact {
-            Ok(exact) => exact,
-            Err(exclusion) => return Ok(Err(exclusion)),
-        };
-        let outputs = match run_points(kernel, self.points, self.mutable)? {
-            Err(exclusion) => return Ok(Err(exclusion)),
-            Ok(outputs) => outputs,
-        };
-        Ok(self
-            .points
-            .iter()
-            .zip(self.reference.iter().zip(&outputs))
-            .enumerate()
-            .find_map(|(index, (point, (expected, actual)))| {
-                let mode = if exact[index] {
-                    Validation::BitExact
-                } else {
-                    self.validation
-                };
-                compare(expected, actual, mode).err().map(|detail| {
-                    if exact[index] {
-                        Exclusion::MisclassifiedParameter {
-                            point: point.label.clone(),
-                            reference: Configuration::of(self.default),
-                        }
-                    } else {
-                        Exclusion::Validation {
-                            point: point.label.clone(),
-                            detail,
-                        }
-                    }
-                })
-            })
-            .map_or(Ok(()), Err))
     }
 }
 
@@ -1287,6 +1246,8 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
         points,
         validation,
         strategy,
+        reuse,
+        reference,
     } = request;
     let backend = super::backend_name(&device.kind);
     let entry_name = super::entry_name(module, entry);
@@ -1328,6 +1289,58 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
         .into_iter()
         .map(|(ordinal, _)| ordinal)
         .collect::<Vec<_>>();
+    let implementation_identity =
+        implementation_digest(device, module, entry, &bindings, &statics, cpu)?;
+    let reuse = reuse.filter(|reuse| {
+        let result = reuse.result();
+        result.validation == validation
+            && result.implementation_identity == implementation_identity
+            && result.tuning_identity == device.tuning_identity()
+            && result.entry == entry_name
+            && result.overall.statics == *statics.statics()
+            && implementation
+                .validate(&result.overall.specialization())
+                .is_ok()
+            && match (reuse, &strategy, &result.method) {
+                (TuningReuse::Seed(_), _, _) => true,
+                (
+                    _,
+                    Strategy::Search(plan),
+                    TuningMethod::Search {
+                        settings,
+                        screening,
+                        stop,
+                        ..
+                    },
+                ) => {
+                    plan.settings == *settings
+                        && plan.screening == *screening
+                        && *stop != SearchStop::Expired
+                }
+                (_, Strategy::Search(_), TuningMethod::Factored { complete: true, .. }) => true,
+                _ => false,
+            }
+    });
+    let reference_started = Instant::now();
+    let prepared = validation::prepare(
+        device,
+        module,
+        entry,
+        &bindings,
+        &logical,
+        &mutable,
+        points,
+        &validation,
+        reuse,
+        reference,
+        &default,
+        cpu,
+    )?;
+    let points = match prepared {
+        validation::Preparation::Reused(result) => return Ok(result),
+        validation::Preparation::Cases(points) => points,
+    };
+    let reference_seconds = reference_started.elapsed().as_secs_f64();
     if implementation.launch_scoped() {
         if !matches!(
             backend,
@@ -1343,7 +1356,7 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
                 "launch-scoped surveys require the factored search".into(),
             ));
         };
-        return tune_factored(FactoredRequest {
+        let mut result = tune_factored(FactoredRequest {
             device,
             module,
             entry,
@@ -1353,11 +1366,13 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
             cpu,
             points,
             validation,
+            implementation_identity,
             implementation: &implementation,
             default: &default,
-            mutable: &mutable,
             search: plan,
-        });
+        })?;
+        result.time.reference_seconds += reference_seconds;
+        return Ok(result);
     }
     let admissible = implementation
         .admissible(&statics)
@@ -1392,20 +1407,26 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
         formation: &formation,
         space: &space,
         statics: &statics,
-        default: &default,
-        mutable: &mutable,
-        validation,
+        seed: reuse.map(TuningReuse::result),
     };
-    let (configurations, overall, method, time) = match strategy {
+    let (configurations, overall, method, mut time) = match strategy {
         Strategy::Search(plan) => tuned.search(points, plan)?,
         Strategy::Survey(plan) => tuned.survey(points, plan)?,
+        Strategy::Census {
+            min_sample_seconds,
+            deadline,
+        } => tuned.census(points, min_sample_seconds, deadline)?,
     };
+    time.reference_seconds += reference_seconds;
     Ok(TuningResult {
         tuning_identity: device.tuning_identity(),
         entry: entry_name,
         backend: backend.as_str().to_owned(),
         points: configurations.points,
         validation,
+        reused: false,
+        numerical_evidence: configurations.evidence,
+        implementation_identity,
         parameters: implementation
             .params
             .iter()
@@ -1432,11 +1453,11 @@ struct FactoredRequest<'a, 'p> {
     bindings: &'a ElementBindings,
     statics: &'a NativeSpecialization,
     cpu: Option<&'static CpuNativeKernels>,
-    points: Vec<TuningPoint<'p>>,
-    validation: Validation,
+    points: Vec<PreparedPoint<'p>>,
+    validation: PrecisionPolicy,
+    implementation_identity: String,
     implementation: &'a NativeImplementation,
     default: &'a NativeSpecialization,
-    mutable: &'a [usize],
     search: SearchPlan,
 }
 
@@ -1449,11 +1470,11 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
         bindings,
         statics,
         cpu,
-        mut points,
+        points,
         validation,
+        implementation_identity,
         implementation,
         default,
-        mutable,
         search,
     } = request;
     let mut time = TuningTime::default();
@@ -1487,10 +1508,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
         )
         .map_err(|error| Exclusion::Formation(prepare_message(error)))
     };
-    let began = Instant::now();
-    let default_kernel = form(default).map_err(TuneError::DefaultUnusable)?;
-    time.forming_seconds += began.elapsed().as_secs_f64();
-    warm(&[Ok(default_kernel.clone())], &points);
+
     let measuring = MeasureOptions {
         samples: search.settings.samples,
         min_sample_seconds: search.min_sample_seconds,
@@ -1501,20 +1519,80 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
     };
     // Every configuration placed in this run writes its results here.
     let mut outputs = OutputPool::default();
+    let mut records = Vec::new();
+    let measure_seed = |specialization: &NativeSpecialization, outputs: &mut OutputPool| {
+        let kernel = form(specialization)?;
+        let measured = measure_factored(
+            implementation,
+            &partition.boundary,
+            &kernel,
+            specialization,
+            &points,
+            &measuring,
+            None,
+            None,
+            None,
+            outputs,
+        )?;
+        Ok::<_, Exclusion>((kernel, measured))
+    };
     let began = Instant::now();
-    let reference = measure_factored(
-        implementation,
-        &partition.boundary,
-        &default_kernel,
-        default,
-        &points,
-        &measuring,
-        None,
-        None,
-        None,
-        &mut outputs,
-    )
-    .map_err(TuneError::DefaultUnusable)?;
+    let mut seed = match measure_seed(default, &mut outputs) {
+        Ok((kernel, measured)) => Some((default.clone(), kernel, measured)),
+        Err(exclusion) => {
+            records.push(ConfigurationRecord {
+                configuration: Configuration::of(default),
+                outcome: Outcome::Excluded(exclusion),
+            });
+            None
+        }
+    };
+    // No group is an eligible baseline until the complete invocation passes.
+    // Enumerate alternative seeds lazily; never materialize the Cartesian product.
+    if seed.is_none() {
+        'seeds: for boundary in boundary_assignments(&partition, implementation) {
+            let mut choices = vec![0; partition.groups.len()];
+            loop {
+                if search
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    break 'seeds;
+                }
+                if let Ok(candidate) =
+                    partition.assemble(implementation, statics, &choices, &boundary)
+                {
+                    if candidate != *default {
+                        match measure_seed(&candidate, &mut outputs) {
+                            Ok((kernel, measured)) => {
+                                seed = Some((candidate, kernel, measured));
+                                break 'seeds;
+                            }
+                            Err(exclusion) => records.push(ConfigurationRecord {
+                                configuration: Configuration::of(&candidate),
+                                outcome: Outcome::Excluded(exclusion),
+                            }),
+                        }
+                    }
+                }
+                let mut advanced = false;
+                for group in (0..choices.len()).rev() {
+                    choices[group] += 1;
+                    if choices[group] < partition.groups[group].candidates.len() {
+                        advanced = true;
+                        break;
+                    }
+                    choices[group] = 0;
+                }
+                if !advanced {
+                    break;
+                }
+            }
+        }
+    }
+    let (seed, default_kernel, reference) =
+        seed.ok_or_else(|| TuneError::NoValidatedCandidate(excluded(&records)))?;
+    let default = &seed;
     time.measuring_seconds += began.elapsed().as_secs_f64();
     // A point with the same active launches and parameters runs the same work
     // under every boundary assignment. Reuse its sweep sample across those
@@ -1547,7 +1625,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
         .iter()
         .map(|address| address.value(default))
         .collect::<Vec<_>>();
-    let mut records = vec![ConfigurationRecord {
+    records.push(ConfigurationRecord {
         configuration: Configuration::of(default),
         outcome: Outcome::Measured {
             artifact: default_kernel.artifact().0.clone(),
@@ -1555,7 +1633,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
             confirmed: Vec::new(),
             validated: true,
         },
-    }];
+    });
     let mut boundaries = Vec::new();
     let mut complete = true;
     'boundaries: for boundary in boundary_assignments(&partition, implementation) {
@@ -1607,7 +1685,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                             artifact: kernel.artifact().0.clone(),
                             points: measured.clone(),
                             confirmed: Vec::new(),
-                            validated: false,
+                            validated: true,
                         },
                     });
                     measured
@@ -1689,7 +1767,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                                 artifact: candidate.kernel.artifact().0.clone(),
                                 points: measured,
                                 confirmed: Vec::new(),
-                                validated: false,
+                                validated: true,
                             },
                         });
                         ranking.push((candidate.index, cost));
@@ -1901,7 +1979,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                                     artifact: candidate.kernel.artifact().0.clone(),
                                     points: confirmed.clone(),
                                     confirmed,
-                                    validated: false,
+                                    validated: true,
                                 }
                             }
                         }
@@ -1937,7 +2015,6 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
             if selected == *default {
                 break;
             }
-            let mut retry = None;
             let began = Instant::now();
             let kernel = form(&selected);
             time.forming_seconds += began.elapsed().as_secs_f64();
@@ -1987,43 +2064,15 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                                     artifact: kernel.artifact().0.clone(),
                                     points: confirmed.clone(),
                                     confirmed,
-                                    validated: false,
+                                    validated: true,
                                 }
                             } else {
-                                let began = Instant::now();
-                                let expected = run_points(&default_kernel, &mut points, mutable)?
-                                    .map_err(TuneError::DefaultUnusable)?;
-                                let mut validator = Validator {
-                                    implementation,
-                                    default,
-                                    default_kernel: &default_kernel,
-                                    reference: expected,
-                                    mutable,
-                                    validation,
-                                    points: &mut points,
-                                };
-                                let verdict = validator.check(&kernel, &selected)?;
-                                time.validating_seconds += began.elapsed().as_secs_f64();
-                                match verdict {
-                                    Ok(()) => {
-                                        overall = selected.clone();
-                                        Outcome::Measured {
-                                            artifact: kernel.artifact().0.clone(),
-                                            points: confirmed.clone(),
-                                            confirmed,
-                                            validated: true,
-                                        }
-                                    }
-                                    Err(exclusion) => {
-                                        retry = next_confirmed_group_choice(
-                                            &exclusion,
-                                            &confirmed,
-                                            &partition.groups,
-                                            &best_choices,
-                                            &confirmed_choices,
-                                        );
-                                        Outcome::Excluded(exclusion)
-                                    }
+                                overall = selected.clone();
+                                Outcome::Measured {
+                                    artifact: kernel.artifact().0.clone(),
+                                    points: confirmed.clone(),
+                                    confirmed,
+                                    validated: true,
                                 }
                             }
                         }
@@ -2044,10 +2093,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                 complete = false;
                 break;
             }
-            let Some((group_index, next)) = retry else {
-                break;
-            };
-            best_choices[group_index] = next;
+            break;
         }
         if search
             .deadline
@@ -2091,6 +2137,8 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                 }),
         )
         .collect();
+    time.validating_seconds = points.iter().map(|p| p.validation_seconds()).sum::<f64>();
+    time.measuring_seconds = (time.measuring_seconds - time.validating_seconds).max(0.);
     Ok(TuningResult {
         tuning_identity: device.tuning_identity(),
         entry: super::entry_name(module, entry),
@@ -2104,6 +2152,9 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
             })
             .collect(),
         validation,
+        reused: false,
+        numerical_evidence: winner_evidence(&points, &records, &Configuration::of(&overall))?,
+        implementation_identity,
         parameters,
         configurations: records,
         overall: Configuration::of(&overall),
@@ -2243,6 +2294,7 @@ fn widen(
 struct Records {
     points: Vec<PointRecord>,
     records: Vec<ConfigurationRecord>,
+    evidence: Vec<NumericalEvidence>,
 }
 
 /// One entry's tuning, shared by both strategies.
@@ -2250,17 +2302,95 @@ struct Tuned<'s> {
     formation: &'s Formation<'s>,
     space: &'s SearchSpace,
     statics: &'s NativeSpecialization,
-    default: &'s NativeSpecialization,
-    mutable: &'s [usize],
-    validation: Validation,
+    seed: Option<&'s TuningResult>,
 }
 
 type Tuning = (Records, NativeSpecialization, TuningMethod, TuningTime);
 
 impl Tuned<'_> {
+    fn census(
+        &self,
+        points: Vec<PreparedPoint<'_>>,
+        min_sample_seconds: f64,
+        deadline: Option<Instant>,
+    ) -> Result<Tuning, TuneError> {
+        let mut measurer = Measurer::new(self.formation.implementation);
+        let options = MeasureOptions {
+            samples: 1,
+            min_sample_seconds,
+        };
+        let mut records = Vec::new();
+        let mut time = TuningTime::default();
+        let default = self.space.default_index();
+        for index in
+            std::iter::once(default).chain((0..self.space.len()).filter(|index| *index != default))
+        {
+            if index != default && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
+            let candidate = specialization(self.statics, &self.space.values(index));
+            let began = Instant::now();
+            let formed = self.formation.form_all(&[candidate.clone()]).remove(0);
+            time.forming_seconds += began.elapsed().as_secs_f64();
+            let began = Instant::now();
+            let outcome = match formed.and_then(|kernel| {
+                measurer
+                    .measure(&kernel, &points, candidate.params(), &options)
+                    .map(|measured| (kernel, measured))
+            }) {
+                Ok((kernel, measured)) => Outcome::Measured {
+                    artifact: kernel.artifact().0.clone(),
+                    points: measured,
+                    confirmed: Vec::new(),
+                    validated: true,
+                },
+                Err(error) => Outcome::Excluded(error),
+            };
+            time.measuring_seconds += began.elapsed().as_secs_f64();
+            let passed = matches!(outcome, Outcome::Measured { .. });
+            records.push(ConfigurationRecord {
+                configuration: Configuration::of(&candidate),
+                outcome,
+            });
+            if passed {
+                time.validating_seconds =
+                    points.iter().map(|p| p.validation_seconds()).sum::<f64>();
+                time.measuring_seconds = (time.measuring_seconds - time.validating_seconds).max(0.);
+                let budget = records.len();
+                return Ok((
+                    Records {
+                        points: labels(&points),
+                        evidence: winner_evidence(
+                            &points,
+                            &records,
+                            &Configuration::of(&candidate),
+                        )?,
+                        records,
+                    },
+                    candidate,
+                    TuningMethod::Search {
+                        budget,
+                        settings: SearchSettings {
+                            improvement: 0.01,
+                            restarts: 2,
+                            confirmed: 3,
+                            default_margin: 0.02,
+                            samples: 1,
+                            confirmation_samples: 3,
+                        },
+                        stop: SearchStop::Budget,
+                        screening: Vec::new(),
+                    },
+                    time,
+                ));
+            }
+        }
+        Err(TuneError::NoValidatedCandidate(excluded(&records)))
+    }
+
     fn search(
         &self,
-        mut points: Vec<TuningPoint<'_>>,
+        points: Vec<PreparedPoint<'_>>,
         plan: SearchPlan,
     ) -> Result<Tuning, TuneError> {
         let screening_points = if plan.screening.is_empty() {
@@ -2280,21 +2410,15 @@ impl Tuned<'_> {
                 }
                 seen[point.index] = true;
                 let source = &points[point.index];
-                selected.push(TuningPoint {
-                    label: source.label.clone(),
-                    weight: point.weight,
-                    class: source.class.clone(),
-                    rotation: source.rotation.clone(),
-                    initialize: None,
-                });
+                selected.push(source.reweighted(point.weight));
             }
             Some(selected)
         };
         let search_points = screening_points.as_deref().unwrap_or(&points);
-        let default_index = self.space.default_index();
         let start = plan
             .start
             .iter()
+            .chain(self.seed.map(|seed| &seed.overall.params))
             .filter_map(|values| self.space.index_of(values))
             .collect::<Vec<_>>();
         let mut live = Live {
@@ -2314,6 +2438,8 @@ impl Tuned<'_> {
             },
             deadline: plan.deadline,
             evaluated: HashMap::new(),
+            anchor: None,
+            seed: self.seed,
             time: TuningTime::default(),
         };
         let trace = search::search(self.space, &start, plan.budget, &plan.settings, &mut live);
@@ -2322,74 +2448,42 @@ impl Tuned<'_> {
             mut time,
             ..
         } = live;
-        let default_kernel = match trace
-            .evaluated
-            .iter()
-            .find(|(index, _)| *index == default_index)
-            .map(|(_, result)| result)
-        {
-            Some(Ok(_)) => evaluated[&default_index].kernel.clone(),
-            Some(Err(exclusion)) => return Err(TuneError::DefaultUnusable(exclusion.clone())),
-            None => unreachable!("the search evaluates the defaults"),
-        };
+        let chosen = *trace.ranking.first().ok_or_else(|| {
+            TuneError::NoValidatedCandidate(
+                trace
+                    .evaluated
+                    .iter()
+                    .chain(&trace.confirmed)
+                    .filter_map(|(_, outcome)| outcome.as_ref().err().cloned())
+                    .collect(),
+            )
+        })?;
+        time.validating_seconds = points.iter().map(|p| p.validation_seconds()).sum::<f64>();
+        time.measuring_seconds = (time.measuring_seconds - time.validating_seconds).max(0.);
 
-        // Validate down the ranking; the defaults are the reference and
-        // always pass.
-        let began = Instant::now();
-        let reference = run_points(&default_kernel, &mut points, self.mutable)?
-            .map_err(TuneError::DefaultUnusable)?;
-        let mut validator = Validator {
-            implementation: self.formation.implementation,
-            default: self.default,
-            default_kernel: &default_kernel,
-            reference,
-            mutable: self.mutable,
-            validation: self.validation,
-            points: &mut points,
-        };
-        let mut verdicts: HashMap<usize, Result<(), Exclusion>> = HashMap::new();
-        let mut chosen = default_index;
-        for &index in &trace.ranking {
-            let verdict = if index == default_index {
-                Ok(())
-            } else {
-                let candidate = specialization(self.statics, &self.space.values(index));
-                validator.check(&evaluated[&index].kernel, &candidate)?
-            };
-            let passed = verdict.is_ok();
-            verdicts.insert(index, verdict);
-            if passed {
-                chosen = index;
-                break;
-            }
-        }
-        time.validating_seconds += began.elapsed().as_secs_f64();
-
-        let records = trace
+        let records: Vec<_> = trace
             .evaluated
             .iter()
             .map(|(index, result)| {
                 let configuration =
                     Configuration::of(&specialization(self.statics, &self.space.values(*index)));
-                // A finalist that could not be confirmed is excluded; the
-                // defaults stay the fallback choice whatever their
-                // confirmation showed.
+                // Failed confirmation excludes a finalist, including the default.
                 let unconfirmed = trace
                     .confirmed
                     .iter()
-                    .find(|(finalist, _)| finalist == index && *index != default_index)
+                    .find(|(finalist, _)| finalist == index)
                     .and_then(|(_, confirmed)| confirmed.as_ref().err());
-                let outcome = match (result, unconfirmed, verdicts.get(index)) {
-                    (Err(exclusion), _, _)
-                    | (Ok(_), Some(exclusion), _)
-                    | (Ok(_), None, Some(Err(exclusion))) => Outcome::Excluded(exclusion.clone()),
-                    (Ok(_), None, verdict) => {
+                let outcome = match (result, unconfirmed) {
+                    (Err(exclusion), _) | (Ok(_), Some(exclusion)) => {
+                        Outcome::Excluded(exclusion.clone())
+                    }
+                    (Ok(_), None) => {
                         let measured = &evaluated[index];
                         Outcome::Measured {
                             artifact: measured.kernel.artifact().0.clone(),
                             points: measured.points.clone(),
                             confirmed: measured.confirmed.clone(),
-                            validated: verdict.is_some(),
+                            validated: true,
                         }
                     }
                 };
@@ -2402,6 +2496,11 @@ impl Tuned<'_> {
         Ok((
             Records {
                 points: labels(&points),
+                evidence: winner_evidence(
+                    &points,
+                    &records,
+                    &Configuration::of(&specialization(self.statics, &self.space.values(chosen))),
+                )?,
                 records,
             },
             specialization(self.statics, &self.space.values(chosen)),
@@ -2417,7 +2516,7 @@ impl Tuned<'_> {
 
     fn survey(
         &self,
-        mut points: Vec<TuningPoint<'_>>,
+        points: Vec<PreparedPoint<'_>>,
         plan: SurveyPlan,
     ) -> Result<Tuning, TuneError> {
         let options = MeasureOptions {
@@ -2425,18 +2524,6 @@ impl Tuned<'_> {
             min_sample_seconds: plan.min_sample_seconds,
         };
         let mut time = TuningTime::default();
-        let began = Instant::now();
-        let default_kernel = self
-            .formation
-            .form_all(std::slice::from_ref(self.default))
-            .pop()
-            .expect("one configuration was formed")
-            .map_err(TuneError::DefaultUnusable)?;
-        time.forming_seconds += began.elapsed().as_secs_f64();
-        let began = Instant::now();
-        let reference = run_points(&default_kernel, &mut points, self.mutable)?
-            .map_err(TuneError::DefaultUnusable)?;
-        time.validating_seconds += began.elapsed().as_secs_f64();
         let workers = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
@@ -2451,8 +2538,8 @@ impl Tuned<'_> {
             let began = Instant::now();
             let formed = self.formation.form_all(&specializations);
             time.forming_seconds += began.elapsed().as_secs_f64();
-            warm(&formed, &points);
-            for ((index, candidate), kernel) in batch.iter().zip(&specializations).zip(formed) {
+
+            for (index, kernel) in batch.iter().zip(formed) {
                 let began = Instant::now();
                 let measured = kernel.and_then(|kernel| {
                     measurer
@@ -2463,26 +2550,12 @@ impl Tuned<'_> {
                 let began = Instant::now();
                 let outcome = match measured {
                     Err(exclusion) => Outcome::Excluded(exclusion),
-                    Ok((kernel, measured)) => {
-                        let mut validator = Validator {
-                            implementation: self.formation.implementation,
-                            default: self.default,
-                            default_kernel: &default_kernel,
-                            reference: reference.clone(),
-                            mutable: self.mutable,
-                            validation: self.validation,
-                            points: &mut points,
-                        };
-                        match validator.check(&kernel, candidate)? {
-                            Err(exclusion) => Outcome::Excluded(exclusion),
-                            Ok(()) => Outcome::Measured {
-                                artifact: kernel.artifact().0.clone(),
-                                points: measured,
-                                confirmed: Vec::new(),
-                                validated: true,
-                            },
-                        }
-                    }
+                    Ok((kernel, measured)) => Outcome::Measured {
+                        artifact: kernel.artifact().0.clone(),
+                        points: measured,
+                        confirmed: Vec::new(),
+                        validated: true,
+                    },
                 };
                 time.validating_seconds += began.elapsed().as_secs_f64();
                 outcomes[*index] = Some(outcome);
@@ -2496,12 +2569,17 @@ impl Tuned<'_> {
             Outcome::Measured { points, .. } => Some(points.clone()),
             Outcome::Excluded(_) => None,
         };
-        let reference = match &outcomes[self.space.default_index()] {
-            Outcome::Measured { points, .. } => points.clone(),
-            Outcome::Excluded(exclusion) => {
-                return Err(TuneError::DefaultUnusable(exclusion.clone()))
-            }
-        };
+        let reference = outcomes.iter().find_map(measured).ok_or_else(|| {
+            TuneError::NoValidatedCandidate(
+                outcomes
+                    .iter()
+                    .filter_map(|outcome| match outcome {
+                        Outcome::Excluded(error) => Some(error.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        })?;
         let weighing = Weighing::of(&points);
         let chosen = (0..outcomes.len())
             .filter_map(|index| {
@@ -2510,8 +2588,10 @@ impl Tuned<'_> {
             })
             .min_by(|(_, left), (_, right)| left.total_cmp(right))
             .map(|(index, _)| index)
-            .expect("the defaults were measured");
-        let records = outcomes
+            .ok_or_else(|| TuneError::Reference("winner lacks numerical evidence".into()))?;
+        time.validating_seconds = points.iter().map(|p| p.validation_seconds()).sum::<f64>();
+        time.measuring_seconds = (time.measuring_seconds - time.validating_seconds).max(0.);
+        let records: Vec<_> = outcomes
             .into_iter()
             .enumerate()
             .map(|(index, outcome)| ConfigurationRecord {
@@ -2525,6 +2605,11 @@ impl Tuned<'_> {
         Ok((
             Records {
                 points: labels(&points),
+                evidence: winner_evidence(
+                    &points,
+                    &records,
+                    &Configuration::of(&specialization(self.statics, &self.space.values(chosen))),
+                )?,
                 records,
             },
             specialization(self.statics, &self.space.values(chosen)),
@@ -2536,7 +2621,44 @@ impl Tuned<'_> {
     }
 }
 
-fn labels(points: &[TuningPoint<'_>]) -> Vec<PointRecord> {
+fn excluded(records: &[ConfigurationRecord]) -> Vec<Exclusion> {
+    records
+        .iter()
+        .filter_map(|record| match &record.outcome {
+            Outcome::Excluded(error) => Some(error.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn winner_evidence(
+    points: &[PreparedPoint<'_>],
+    records: &[ConfigurationRecord],
+    winner: &Configuration,
+) -> Result<Vec<NumericalEvidence>, TuneError> {
+    let artifact = records
+        .iter()
+        .find_map(|record| {
+            if &record.configuration != winner {
+                return None;
+            }
+            match &record.outcome {
+                Outcome::Measured { artifact, .. } => Some(artifact),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| TuneError::Reference("winner lacks numerical evidence".into()))?;
+    points
+        .iter()
+        .map(|point| {
+            point
+                .evidence(artifact)
+                .ok_or_else(|| TuneError::Reference("winner lacks numerical evidence".into()))
+        })
+        .collect()
+}
+
+fn labels(points: &[PreparedPoint<'_>]) -> Vec<PointRecord> {
     points
         .iter()
         .map(|point| PointRecord {
@@ -2544,56 +2666,6 @@ fn labels(points: &[TuningPoint<'_>]) -> Vec<PointRecord> {
             weight: point.weight,
             class: point.class.clone(),
         })
-        .collect()
-}
-
-fn arithmetic_values(
-    implementation: &NativeImplementation,
-    specialization: &NativeSpecialization,
-    working: &[usize],
-) -> Vec<u64> {
-    implementation
-        .params
-        .iter()
-        .filter(|parameter| {
-            parameter.arithmetic && {
-                let owners = implementation
-                    .launches
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(ordinal, launch)| {
-                        launch
-                            .parameters()
-                            .contains(&parameter.name)
-                            .then_some(ordinal)
-                    })
-                    .collect::<Vec<_>>();
-                owners.is_empty() || owners.iter().any(|ordinal| working.contains(ordinal))
-            }
-        })
-        .map(|parameter| {
-            specialization
-                .param(&parameter.name)
-                .expect("admissible configurations value every parameter")
-        })
-        .chain(
-            implementation
-                .launches
-                .iter()
-                .enumerate()
-                .filter(|(ordinal, _)| working.contains(ordinal))
-                .flat_map(|(ordinal, launch)| {
-                    launch
-                        .params
-                        .iter()
-                        .filter(|parameter| parameter.arithmetic)
-                        .map(move |parameter| {
-                            specialization
-                                .launch_param(ordinal, &parameter.name)
-                                .expect("admissible configurations value every launch parameter")
-                        })
-                }),
-        )
         .collect()
 }
 
@@ -2608,7 +2680,7 @@ fn mutable_parameters(logical: &LogicalEntry) -> Vec<(usize, String)> {
             matches!(
                 parameter.kind,
                 ParameterKind::Tensor {
-                    access: TensorAccess::Mutable,
+                    access: TensorAccess::Mutable | TensorAccess::Owned,
                     ..
                 }
             )
@@ -2617,163 +2689,10 @@ fn mutable_parameters(logical: &LogicalEntry) -> Vec<(usize, String)> {
         .collect()
 }
 
-fn prepare_message(error: PrepareError) -> String {
+pub(super) fn prepare_message(error: PrepareError) -> String {
     match error {
         PrepareError::Source(error) => error.to_string(),
         PrepareError::Preparation(error) => error.to_string(),
-    }
-}
-
-/// Run every point's validation input once: initialize its in-place
-/// state, call, and read back the results and the `&mut` parameters. An
-/// initializer failure is the case's error; a call failure excludes the
-/// configuration.
-fn run_points(
-    kernel: &Arc<NativePrepared>,
-    points: &mut [TuningPoint<'_>],
-    mutable: &[usize],
-) -> Result<Result<Vec<Outputs>, Exclusion>, TuneError> {
-    let mut outputs = Vec::with_capacity(points.len());
-    for point in points {
-        if let Some(initialize) = &mut point.initialize {
-            initialize().map_err(|error| TuneError::Initialization {
-                point: point.label.clone(),
-                detail: error.to_string(),
-            })?;
-        }
-        let args = point.rotation[0].clone();
-        let observed = kernel
-            .call(args.clone())
-            .map_err(|error| Exclusion::Execution(error.to_string()))
-            .and_then(|results| {
-                let written = mutable.iter().map(|ordinal| {
-                    DecodedValue::Tensor(
-                        args.tensor(*ordinal)
-                            .expect("a mutable parameter is a tensor argument")
-                            .clone(),
-                    )
-                });
-                results
-                    .into_values()
-                    .into_iter()
-                    .chain(written)
-                    .map(observe)
-                    .collect::<Result<Outputs, _>>()
-            });
-        match observed {
-            Ok(observed) => outputs.push(observed),
-            Err(exclusion) => return Ok(Err(exclusion)),
-        }
-    }
-    Ok(Ok(outputs))
-}
-
-fn observe(value: DecodedValue) -> Result<Observed, Exclusion> {
-    match value {
-        DecodedValue::Tensor(tensor) => Ok(Observed::Tensor {
-            representation: tensor.representation(),
-            bytes: tensor
-                .read_to_host()
-                .map_err(|error| Exclusion::Execution(error.to_string()))?,
-        }),
-        DecodedValue::Scalar(value) => Ok(Observed::Scalar(value)),
-    }
-}
-
-fn compare(expected: &Outputs, actual: &Outputs, validation: Validation) -> Result<(), String> {
-    for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-        match (expected, actual) {
-            (
-                Observed::Tensor {
-                    representation,
-                    bytes: expected_bytes,
-                },
-                Observed::Tensor {
-                    bytes: actual_bytes,
-                    ..
-                },
-            ) => {
-                if expected_bytes == actual_bytes {
-                    continue;
-                }
-                let Validation::Relative { error } = validation else {
-                    return Err(format!("output {index} differs"));
-                };
-                let dtype = match &registry::representation_info(*representation).kind {
-                    RepresentationKind::Dense(dtype) => *dtype,
-                    _ => return Err(format!("packed output {index} differs")),
-                };
-                let decode = |bytes: &[u8], element: usize| -> f64 {
-                    match dtype {
-                        DType::F32 => f64::from(f32::from_le_bytes(
-                            bytes[element * 4..element * 4 + 4]
-                                .try_into()
-                                .expect("f32 element"),
-                        )),
-                        DType::F16 => f64::from(registry::f16_to_f32(u16::from_le_bytes(
-                            bytes[element * 2..element * 2 + 2]
-                                .try_into()
-                                .expect("f16 element"),
-                        ))),
-                        DType::BF16 => f64::from(f32::from_bits(
-                            u32::from(u16::from_le_bytes(
-                                bytes[element * 2..element * 2 + 2]
-                                    .try_into()
-                                    .expect("bf16 element"),
-                            )) << 16,
-                        )),
-                        _ => f64::NAN,
-                    }
-                };
-                if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
-                    return Err(format!("integer output {index} differs"));
-                }
-                let elements = expected_bytes.len() / dtype.bytes() as usize;
-                let (mut difference, mut norm) = (0.0f64, 0.0f64);
-                for element in 0..elements {
-                    let reference = decode(expected_bytes, element);
-                    let value = decode(actual_bytes, element);
-                    // Equal non-finite values (masked scores) agree; any
-                    // other non-finite value is a wrong result.
-                    if value == reference || (value.is_nan() && reference.is_nan()) {
-                        norm += if reference.is_finite() {
-                            reference * reference
-                        } else {
-                            0.0
-                        };
-                        continue;
-                    }
-                    if !(value.is_finite() && reference.is_finite()) {
-                        return Err(format!(
-                            "output {index} element {element}: {value} vs {reference}"
-                        ));
-                    }
-                    difference += (value - reference) * (value - reference);
-                    norm += reference * reference;
-                }
-                let (difference, norm) = (difference.sqrt(), norm.sqrt());
-                if difference > error * norm {
-                    return Err(format!(
-                        "output {index}: error norm {difference:.4e} exceeds {error} of the reference norm {norm:.4e} ({:.4})",
-                        difference / norm
-                    ));
-                }
-            }
-            (Observed::Scalar(expected), Observed::Scalar(actual)) => {
-                if !scalar_equal(expected, actual) {
-                    return Err(format!("scalar output {index} differs"));
-                }
-            }
-            _ => return Err(format!("output {index} changed kind")),
-        }
-    }
-    Ok(())
-}
-
-fn scalar_equal(expected: &ArgumentValue, actual: &ArgumentValue) -> bool {
-    match (expected, actual) {
-        (ArgumentValue::F32(left), ArgumentValue::F32(right)) => left.to_bits() == right.to_bits(),
-        (left, right) => left == right,
     }
 }
 
@@ -2836,31 +2755,6 @@ mod tests {
         assert_eq!(unstable(&[measured(88e-6, 2e-6)]), None);
         // Samples that spread widely at any point.
         assert!(unstable(&[measured(88e-6, 2e-6), measured(85e-6, 20e-6)]).is_some());
-    }
-
-    #[test]
-    fn launch_arithmetic_parameters_select_tolerant_validation() {
-        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    launch small when N <= 16:\n        params (code arithmetic ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N > 16:\n        threadgroups (ceil_div(N, 32), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
-        let module = check_source(SourceSet::new(vec![SourceFile {
-            path: "scale.seismic".into(),
-            text: text.into(),
-        }]))
-        .unwrap();
-        let implementation = module
-            .native_implementation(module.entries()[0].id, BackendName::Metal)
-            .unwrap();
-        let defaults = implementation
-            .default_specialization(&NativeSpecialization::new())
-            .unwrap();
-        let changed = defaults.clone().with_launch_param(0, "ROWS", 2);
-        assert_ne!(
-            arithmetic_values(implementation, &changed, &[0]),
-            arithmetic_values(implementation, &defaults, &[0])
-        );
-        assert_eq!(
-            arithmetic_values(implementation, &changed, &[1]),
-            arithmetic_values(implementation, &defaults, &[1])
-        );
     }
 
     #[test]
@@ -2946,75 +2840,6 @@ mod tests {
         assert_eq!(
             factored_key(implementation, &boundary, vec![1], &default),
             factored_key(implementation, &boundary, vec![1], &changed)
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn failed_point_advances_only_its_active_group() {
-        let groups = [
-            plan::Group {
-                launches: vec![0],
-                parameters: Vec::new(),
-                candidates: Vec::new(),
-            },
-            plan::Group {
-                launches: vec![1, 2],
-                parameters: Vec::new(),
-                candidates: Vec::new(),
-            },
-        ];
-        let confirmed = [vec![2, 1, 0], vec![3, 0]];
-        let failure = Exclusion::Validation {
-            point: "m1".into(),
-            detail: "wrong output".into(),
-        };
-        let mut measurement = measured(1.0, 0.0);
-        measurement.key.launches = vec![1, 2];
-        assert_eq!(
-            next_confirmed_group_choice(
-                &failure,
-                &[measurement.clone()],
-                &groups,
-                &[2, 3],
-                &confirmed
-            ),
-            Some((1, 0))
-        );
-        measurement.key.launches = vec![0];
-        assert_eq!(
-            next_confirmed_group_choice(
-                &failure,
-                &[measurement.clone()],
-                &groups,
-                &[2, 3],
-                &confirmed
-            ),
-            Some((0, 1))
-        );
-        measurement.key.launches = vec![1];
-        assert_eq!(
-            next_confirmed_group_choice(
-                &failure,
-                &[measurement.clone()],
-                &groups,
-                &[2, 0],
-                &confirmed
-            ),
-            None
-        );
-        assert_eq!(
-            next_confirmed_group_choice(
-                &Exclusion::Measurement {
-                    point: "m1".into(),
-                    detail: "noise".into()
-                },
-                &[measurement],
-                &groups,
-                &[2, 3],
-                &confirmed
-            ),
-            None
         );
     }
 }

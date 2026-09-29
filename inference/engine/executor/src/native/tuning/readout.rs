@@ -52,6 +52,10 @@ impl EntryTuning for DraftRowsTuning {
         self.scopes.len()
     }
 
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
+    }
+
     fn bindings(&self) -> String {
         format!(
             "EW={},EN={},HN={},CW={},A={}",
@@ -199,7 +203,10 @@ impl EntryTuning for HeadRowsTuning {
         Ok(vec![
             ("V", vocabulary),
             ("D", hidden),
-            ("WS", inputs.scale_extent(WeightScope::Target, WeightKind::Output)?),
+            (
+                "WS",
+                inputs.scale_extent(WeightScope::Target, WeightKind::Output)?,
+            ),
         ])
     }
 

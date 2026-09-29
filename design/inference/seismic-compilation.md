@@ -40,15 +40,14 @@ CheckedModule -> LogicalEntry -> InvocationContract
              -> Metal completion
 ```
 
-This route reuses the checked entry contract and public tensor runtime but constructs none of
+Native invocation reuses the checked entry contract and public tensor runtime but constructs none of
 `RefinedCandidateFamilies`, compiler kernel IR, `CandidateDomain`, `SelectionPolicy`, `ExecutableVariant`,
 `PreparedKernel`, or portable workflow artifacts. It has no solving, duration model, candidate
 selection, retry, or fallback. Its only search is tuning, fast enough to run at program
 preparation. Entry-wide declarations still use a budgeted local search of the author's declared parameter domain, minimizing one
 weighted device-measured cost (`Σ weight × median`) over the consumer's points. A consumer may
 name a cheaper screening subset with folded weights for candidate exploration. The default and
-screened finalists are then measured and ranked with the original points and weights; output
-validation also covers the original points. The result records the screening definition.
+screened finalists are then measured and ranked with the original points and weights. Every candidate must pass numerical validation on all original points before repeated timing, including points omitted from the screening objective. The result records the screening definition.
 Each parameter's values are ordered numerically; neighbours differ by one step in one parameter. The search
 evaluates the defaults, then, within the consumer's budget, one start per other value of each `form` parameter and any
 additional start configurations the consumer names. Each form start is the admissible configuration with that value nearest
@@ -74,18 +73,27 @@ covers a steady sample (2 ms), and a point whose sample is that long takes one s
 the requested count, because a sample's fixed jitter is then a small fraction of any ranking margin.
 Partition projects every admissible configuration's parameter values once and decides each point's
 active launches once per distinct value of what the launch conditions read. The consumer then prepares the chosen
-specialization explicitly. Validation walks the confirmed ranking until one configuration passes,
-so only the chosen configuration and any that beat it are validated: at each point, a configuration
-with the same active launches and the same arithmetic values read by them must be bit-identical
-(else its mapping parameters are misclassified); other points must agree within the consumer's
-tolerance, a bound on each dense
-result's error norm relative to the reference's norm (reduced-precision operands perturb every
-element by a share of the output's scale, not of its own value). Validation covers every tensor
-an entry writes, results and `&mut` parameters. The tuner never saves or restores state: a tuning
-point whose entry writes in place supplies an initializer that restores those tensors before each
-validation run, and a point without one is rejected. A configuration that fails to form, run,
-measure or validate is excluded with its typed reason; only the default configuration is required
-to run. The distinct public handle makes direct-only use structural.
+specialization explicitly. The first initialized timed execution also supplies numerical observations,
+consumed before any output storage is reused. Pooled result buffers start each observed
+execution from the same zeroed storage as a fresh call, so missing writes cannot inherit a
+preceding candidate's correct output. Reference execution, initialization, readback and
+comparison are outside the device timing interval. A cold execution remains calibration only;
+an already steady first sample is retained. A failing candidate is excluded immediately.
+The numerical reference is explicitly chosen by the caller: the required portable source
+construction under Exact with zero search, or the declaration default native specialization.
+There is no automatic fallback between references. Native-default agreement cannot detect
+shared implementation defects; neither kind of observation establishes compiler applicability. Native tuning applies the
+caller's bounded or exact policy to every result and writable input subject using the compiler's
+comparison rules. Discrete state stays exact. Mutable cases provide initialization for equivalent
+pristine reference and candidate invocations and valid timing repetitions.
+The default receives the same validation as every candidate. The first fully passing candidate
+establishes the timing anchor; if none passes, tuning returns a failure with the observed exclusions.
+A failed or unstable default cannot be selected as an implicit fallback. A startup census finds a
+passing seed and carries its numerical evidence and measurements into subsequent search.
+Complete cache reuse requires matching source, numerical policy, case contents and observation
+scope, native implementation, configuration and device identities. A timing reuse key alone never
+establishes numerical agreement. Old Boolean-only records cannot authorize selection.
+The distinct public handle makes direct-only use structural.
 Launch-scoped declarations use a factored search. The checked declaration gives each parameter
 its launch ownership, including explicit entry-parameter reads by kernels that are absent from
 launch geometry and activity conditions. Active launches, shared parameters and joint `where` restrictions
@@ -98,8 +106,8 @@ all its code variants and held for the whole run, so a candidate forms nothing a
 runtime geometry. A safety deadline leaves unmeasured groups at their defaults and prevents
 that incomplete result from being cached. An interrupted group's already formed candidates are
 measured and ranked; the tuner skips further group confirmation. The assembled choice is
-remeasured and validated against the defaults before it may replace them. The assembled
-candidate and the all-defaults reference are measured in shared sample rounds, so clock drift
+remeasured and validated as a complete invocation against the selected reference before selection. If the default fails, a passing seed must first be found; unmeasured group defaults cannot themselves authorize a result. The assembled
+candidate and the passing seed are measured in shared sample rounds, so clock drift
 affects both together.
 Native programs are formed uniformly. A caller renders a program: source text and the entries it
 needs, with any launch constants. Code variants of a launch are template instances of one source,

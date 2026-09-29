@@ -16,7 +16,7 @@
 //! ranked by those costs; a finalist the evaluator cannot confirm (its
 //! re-measurement failed or is not trustworthy) leaves the ranking, and the
 //! defaults rank first unless the leader beats them by `default_margin` or
-//! could not be confirmed themselves. Validation walks that ranking.
+//! could not be confirmed themselves. Only successful confirmations can rank.
 //!
 //! The objective ([`Cost`]) is per point: each tuning point contributes its
 //! weight (share of step time) times the configuration's time there relative
@@ -400,8 +400,7 @@ pub struct SearchTrace {
     pub evaluated: Vec<(usize, Result<Cost, Exclusion>)>,
     /// The finalists re-measured, with their confirmed costs.
     pub confirmed: Vec<(usize, Result<Cost, Exclusion>)>,
-    /// The order validation tries configurations in. It holds the defaults,
-    /// which always validate, so validation never runs past it.
+    /// Confirmed eligible configurations, cheapest first (subject to the default margin).
     pub ranking: Vec<usize>,
     pub stop: SearchStop,
 }
@@ -659,8 +658,14 @@ pub fn search(
         total(costs[left].as_ref()).total_cmp(&total(costs[right].as_ref()))
     });
     cheapest.truncate(settings.confirmed);
-    let finalists = std::iter::once(default).chain(cheapest).collect::<Vec<_>>();
-    let confirmed = if finalists.len() > 1 {
+    let finalists = costs
+        .get(&default)
+        .and_then(|cost| cost.as_ref())
+        .map(|_| default)
+        .into_iter()
+        .chain(cheapest)
+        .collect::<Vec<_>>();
+    let confirmed = if !finalists.is_empty() {
         let results = evaluator.confirm(&finalists);
         assert_eq!(
             results.len(),
@@ -695,9 +700,18 @@ pub fn search(
             }
             ranked
         }
-        // Nothing but the defaults was measured, or re-measuring the
-        // defaults failed: the defaults are the choice.
-        None => vec![default],
+        // A failed default cannot authorize selection of itself or another failure.
+        None => {
+            let mut ranked: Vec<_> = finalists
+                .iter()
+                .copied()
+                .filter(|index| confirmed_cost(*index).is_some())
+                .collect();
+            ranked.sort_by(|left, right| {
+                total(confirmed_cost(*left)).total_cmp(&total(confirmed_cost(*right)))
+            });
+            ranked
+        }
     };
     SearchTrace {
         evaluated,

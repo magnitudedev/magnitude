@@ -8,8 +8,8 @@
 //! before tuning), forming, measuring and validating what it reaches. With a
 //! [`KernelCache`], each result is stored under a key over everything it
 //! depends on (device and toolchain identity, unit, implementation digest,
-//! search definition); a later load with the same key prepares the stored
-//! choice without forming or measuring anything to tune. Nothing is shipped.
+//! search definition and model weight groups); a later load checks the stored
+//! evidence against actual initialized inputs before reusing its choice. Nothing is shipped.
 //! The engine supplies what only it knows, per entry, through an
 //! [`EntryTuning`] case:
 //!
@@ -22,11 +22,11 @@
 //! - control tables built as the batch builder builds them
 //!   ([`TuningInputs::batch`]);
 //! - scratch state, KV history and routing tables owned by each case. An
-//!   entry's `&mut` parameters bind [`CaseState`]s, whose written region is
-//!   restored before each configuration's validation run (Seismic's
+//!   entry's `&mut` parameters bind [`CaseState`]s, whose complete contents are
+//!   restored before each invocation (Seismic's
 //!   `TuningPoint::initialize`); real state is never bound.
 //!
-//! Every entry shares one validation rule, [`ARITHMETIC_TOLERANCE`].
+//! Each entry uses the compiler precision policy with explicit floating result/state limits.
 //!
 //! Adding an entry: implement [`EntryTuning`] for a case type in the module of
 //! its block family, and prepare the entry through `Specializer::tuned` at
@@ -34,9 +34,8 @@
 //! prepared through `Specializer::fixed` fails preparation with a typed error
 //! naming it.
 //!
-//! Entries prepared more than once with identical element bindings and static
-//! values (the MTP head's blocks share the target's shapes) are tuned once:
-//! the tuner reuses the first result.
+//! Entries sharing element bindings, static values and model weight groups can
+//! reuse matching numerical evidence; equal geometry alone never authorizes reuse.
 
 /// Implements [`EntryTuning::tune`] and [`EntryTuning::prepare`] through an
 /// entry module's generated `native_tune[_with]` and
@@ -44,16 +43,31 @@
 /// entry's element bindings built from it.
 macro_rules! generated_entry {
     ($module:ident, $this:ident => $elements:expr) => {
+        fn precision(&self) -> Result<seismic::PrecisionPolicy, seismic::TuneError> {
+            let $this = self;
+            super::precision::policy($module::native_numerical_subjects($elements)?)
+        }
+
         fn tune(
             &self,
             device: &seismic::Device,
             statics: &seismic::NativeSpecialization,
             points: Vec<seismic::TuningPoint<'_, Self::Entry>>,
-            validation: seismic::Validation,
+            validation: seismic::PrecisionPolicy,
             strategy: seismic::Strategy,
+            reuse: Option<seismic::TuningReuse<'_>>,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
             let $this = self;
-            $module::native_tune_with(device, $elements, statics, points, validation, strategy)
+            $module::native_tune_with(
+                device,
+                $elements,
+                statics,
+                points,
+                validation,
+                strategy,
+                reuse,
+                seismic::TuningReference::NativeDefault,
+            )
         }
 
         fn digest(
@@ -75,15 +89,28 @@ macro_rules! generated_entry {
         }
     };
     ($module:ident) => {
+        fn precision(&self) -> Result<seismic::PrecisionPolicy, seismic::TuneError> {
+            super::precision::policy($module::native_numerical_subjects()?)
+        }
+
         fn tune(
             &self,
             device: &seismic::Device,
             statics: &seismic::NativeSpecialization,
             points: Vec<seismic::TuningPoint<'_, Self::Entry>>,
-            validation: seismic::Validation,
+            validation: seismic::PrecisionPolicy,
             strategy: seismic::Strategy,
+            reuse: Option<seismic::TuningReuse<'_>>,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
-            $module::native_tune(device, statics, points, validation, strategy)
+            $module::native_tune(
+                device,
+                statics,
+                points,
+                validation,
+                strategy,
+                reuse,
+                seismic::TuningReference::NativeDefault,
+            )
         }
 
         fn digest(
@@ -107,10 +134,11 @@ macro_rules! generated_entry {
 pub(crate) mod attention;
 pub(crate) mod cases;
 pub(crate) mod general_routed;
+pub(crate) mod per_layer;
 #[cfg(feature = "pinned-tuning")]
 pub mod pinned;
-pub(crate) mod per_layer;
 pub(crate) mod post_norm;
+mod precision;
 pub(crate) mod readout;
 pub(crate) mod recurrent;
 pub(crate) mod routed;
@@ -129,9 +157,9 @@ use magnitude_batching::{Demand, PackedRowTables, Row, RowHistory, Slot};
 use magnitude_family_contracts::{ModelDefinition, Operator, WeightKind, WeightScope};
 use seismic::{
     Configuration, DType, Device, Element, NativeImplementation, NativeKernel,
-    NativeSpecialization, ParameterValues, ScreeningPoint, SearchPlan, SearchSettings, SearchStop,
-    Strategy, Tensor, TensorError, TuneError, TuningInitializer, TuningMethod, TuningPoint,
-    TuningResult, TuningTime, Validation,
+    NativeSpecialization, ParameterValues, PrecisionPolicy, ScreeningPoint, SearchPlan,
+    SearchSettings, SearchStop, Strategy, Tensor, TensorError, TuneError, TuningInitializer,
+    TuningMethod, TuningPoint, TuningResult, TuningTime,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
@@ -141,7 +169,9 @@ use std::time::{Duration, Instant};
 /// The row counts whose shares of step time weigh the objective (§5.3).
 pub const TUNING_ROWS: [u64; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
 /// History lengths of attention tuning points (§5.3).
-pub const TUNING_CONTEXTS: [u64; 4] = [256, 4096, 16384, 65536];
+// Empty and short histories expose fresh-only and partially occupied subgroup
+// paths that disappear in long-history averages (the Gemma G8 regression).
+pub const TUNING_CONTEXTS: [u64; 7] = [0, 1, 32, 256, 4096, 16384, 65536];
 /// Distinct layers a decode-row rotation cycles through where the model has
 /// them. Decode rows stream every weight once per call, so repeated calls
 /// must not find the weights cache resident. A prefill chunk reuses each
@@ -151,39 +181,6 @@ pub const ROTATION_LAYERS: usize = 4;
 /// The largest row count at which projections stream their weights (the K1
 /// GEMV bound); larger counts run tiled GEMMs.
 pub const STREAMING_ROWS: u64 = 8;
-
-/// The agreement tuning requires of every entry's configurations whose
-/// arithmetic parameters differ from the defaults': each dense result within
-/// 5% of the reference's norm (Seismic `Validation::Relative`); integer
-/// results exact. Configurations sharing the defaults' arithmetic parameters
-/// (every configuration of an entry with only mapping parameters) must be
-/// bit-exact.
-///
-/// This is a defect guard, not the precision gate. D4's end-to-end verdict
-/// (`forward_bench qualify`) is the gate, and the guard must never reject a
-/// configuration that would pass it. Error model, for a K-term projection
-/// `y = W x` whose activations are quantized to q8_1 (the most lossy
-/// arithmetic option any entry declares):
-///
-/// - q8_1 rounds each element of a 32-element block to a step of
-///   `max|x| / 127`; the error is uniform within half a step, rms
-///   `step / √12`. With `max/rms ≈ 2.4` for a Gaussian block (up to `√32 ≈
-///   5.7` when one outlier holds the block), the relative activation error
-///   is `2.4 / (127 · √12) ≈ 0.55%` (up to 1.3%).
-/// - Independent errors through `W` keep that relative size in `‖y‖`
-///   independently of K (the error norm and the output norm both grow as
-///   `√K`); bf16 output rounding adds `2⁻⁹ / √3 ≈ 0.11%`, f16 operands
-///   `≈ 0.03%`, reassociated f32 sums (split-K, chunked scans, partitioned
-///   softmax) far less.
-/// - llama.cpp CUDA runs every projection this way and passes D4 (mean KL
-///   0.0043 against the 0.010 bound). KL grows with the square of the
-///   per-layer error, so D4 admits per-layer errors up to about
-///   `√(0.010 / 0.0043) ≈ 1.5×` q8_1's, i.e. below ~2%.
-///
-/// A 5% bound is over twice the largest per-layer error D4 can admit, so any
-/// configuration it rejects would fail D4 too, while wrong results (a bad
-/// index, a missing term) miss by O(1) and are caught.
-pub const ARITHMETIC_TOLERANCE: Validation = Validation::Relative { error: 0.05 };
 
 /// Version of the search procedure: part of every stored tuning result's
 /// key. Bump it whenever the search could choose differently given the same
@@ -201,7 +198,10 @@ pub const ARITHMETIC_TOLERANCE: Validation = Validation::Relative { error: 0.05 
 ///    parameter's values seed a start of their own.
 /// 11: reserve enough of that budget to measure every admissible form start.
 /// 12: workload hints may replace a form's nearest-default first measurement.
-pub const SEARCH_VERSION: u32 = 12;
+/// 13: bounded first-execution validation, complete state resets, short-history
+///     coverage and 2 ms steady timing windows.
+/// 14: budget and cache units distinguish model weight groups.
+pub const SEARCH_VERSION: u32 = 14;
 /// Version of the CPU projection screening policy in keys that use it.
 const CPU_PROJECTION_SCREENING_VERSION: u32 = 3;
 /// Configurations one model's tuning may evaluate in all (`B_model`,
@@ -244,11 +244,14 @@ pub(crate) fn search_settings(backend: seismic::BackendName, screening: bool) ->
 }
 /// Minimum device time of one sample; device timestamps resolve
 /// microseconds.
-pub const MIN_SAMPLE_SECONDS: f64 = 0.0002;
+// A two-millisecond device window amortizes clock/submission variance after
+// pristine-state resets. The previous 200 us window rejected all finalists on
+// real Gemma loads (11–41% median deviation), despite numerical agreement.
+pub const MIN_SAMPLE_SECONDS: f64 = 0.002;
 /// The safety stop of one preparation's tuning: past it every search ends
 /// with the best found so far, and its result is not stored. It exists for
 /// pathological machines; budgets, not time, bound tuning otherwise.
-pub const SAFETY_STOP: Duration = Duration::from_secs(120);
+pub const SAFETY_STOP: Duration = Duration::from_secs(600);
 
 /// One workload an entry serves: its shape and its share of expected step
 /// time.
@@ -411,12 +414,11 @@ pub fn attention_points(limits: TuningLimits) -> Vec<PointShape> {
     with_contexts(limits, row_points(limits))
 }
 
-/// In-place state a case lends to an entry's `&mut` parameter: the tensor,
-/// the leading-axis rows the entry writes, and their initial contents, which
-/// are restored before each configuration's validation run.
+/// In-place state a case lends to an entry's `&mut` parameter. Its complete
+/// backing storage is restored before every reference or candidate invocation.
 pub(crate) struct CaseState {
     tensor: Tensor,
-    written: Tensor,
+    backing: Tensor,
     initial: Arc<[u8]>,
     _slab: Option<Arc<seismic::SlabTensor>>,
 }
@@ -430,20 +432,20 @@ impl CaseState {
     pub fn share(&self) -> Self {
         Self {
             tensor: self.tensor.clone(),
-            written: self.written.clone(),
+            backing: self.backing.clone(),
             initial: self.initial.clone(),
             _slab: self._slab.clone(),
         }
     }
 
     fn restorer(&self) -> impl FnMut() -> Result<(), TensorError> + 'static {
-        let mut written = self.written.clone();
+        let mut backing = self.backing.clone();
         let initial = self.initial.clone();
-        move || written.write_from_host(&initial)
+        move || backing.write_from_host(&initial)
     }
 }
 
-/// Restores every state of a point's validation argument set.
+/// Restores every writable state in every argument rotation of a point.
 fn initializer(states: Vec<&CaseState>) -> Option<TuningInitializer<'static>> {
     if states.is_empty() {
         return None;
@@ -461,6 +463,12 @@ fn initializer(states: Vec<&CaseState>) -> Option<TuningInitializer<'static>> {
 /// entry that declares tuning parameters.
 pub(crate) trait EntryTuning {
     type Entry: seismic::Entry;
+    fn precision(&self) -> Result<PrecisionPolicy, TuneError>;
+    /// Model weight groups defining this case, distinct from its kernel geometry.
+    /// This separates cache slots; runtime still fingerprints the actual input bytes.
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &[]
+    }
     /// One argument set: every tensor its arguments borrow, owned, including
     /// the [`CaseState`]s its `&mut` parameters bind.
     type Case;
@@ -508,8 +516,9 @@ pub(crate) trait EntryTuning {
         device: &Device,
         statics: &NativeSpecialization,
         points: Vec<TuningPoint<'_, Self::Entry>>,
-        validation: Validation,
+        validation: PrecisionPolicy,
         strategy: Strategy,
+        reuse: Option<seismic::TuningReuse<'_>>,
     ) -> Result<TuningResult, TuneError>;
     /// The entry's generated `native_digest[_with]`.
     fn digest(&self, device: &Device, statics: &NativeSpecialization) -> Result<String, TuneError>;
@@ -568,11 +577,11 @@ pub struct TunedEntry {
     /// measured when it was searched).
     pub measured: usize,
     pub excluded: usize,
-    /// Configurations excluded for authoring defects (formation failures,
-    /// misclassified parameters, validation failures).
-    pub defects: usize,
-    /// The first defect's configuration and reason, for the kernel's author.
-    pub first_defect: Option<String>,
+    /// Configurations rejected during formation or numerical qualification.
+    /// A numerical rejection is a policy result, not necessarily a kernel defect.
+    pub rejections: usize,
+    /// The first qualification rejection's configuration and reason.
+    pub first_rejection: Option<String>,
     /// Wall time of this unit at this load.
     pub seconds: f64,
     /// Where the search's time went; zero for a stored result.
@@ -614,17 +623,27 @@ impl Noise {
     /// `count` encoded values of `dtype` at the window `seed` places.
     fn window(&self, dtype: DType, count: usize, seed: u64) -> Result<Vec<u8>, String> {
         let (size, encode): (usize, fn(f32, &mut Vec<u8>)) = match dtype {
-            DType::F32 => (4, |value, bytes| bytes.extend_from_slice(&value.to_le_bytes())),
+            DType::F32 => (4, |value, bytes| {
+                bytes.extend_from_slice(&value.to_le_bytes())
+            }),
             DType::BF16 => (2, |value, bytes| {
                 bytes.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes())
             }),
-            DType::F16 => (2, |value, bytes| bytes.extend_from_slice(&f16_bits(value).to_le_bytes())),
-            other => return Err(format!("tuning activations support f32, bf16 and f16, not {other:?}")),
+            DType::F16 => (2, |value, bytes| {
+                bytes.extend_from_slice(&f16_bits(value).to_le_bytes())
+            }),
+            other => {
+                return Err(format!(
+                    "tuning activations support f32, bf16 and f16, not {other:?}"
+                ))
+            }
         };
         let mut pools = self.0.borrow_mut();
         let pool = pools.entry(dtype).or_default();
         // Twice the largest request, so windows at different seeds differ.
-        let wanted = count.checked_mul(2 * size).ok_or("tuning activation overflows")?;
+        let wanted = count
+            .checked_mul(2 * size)
+            .ok_or("tuning activation overflows")?;
         if pool.len() < wanted {
             let mut state = (pool.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
             pool.reserve(wanted - pool.len());
@@ -804,16 +823,18 @@ impl TuningInputs<'_, '_> {
     }
 
     /// `tensor` lent to a `&mut` parameter that writes leading-axis rows
-    /// `written`; their current contents are what every configuration's
-    /// validation run starts from.
+    /// `written`; every invocation starts from the complete tensor's current
+    /// contents, so out-of-region writes cannot pollute later observations.
     pub fn state(&self, tensor: Tensor, written: Range<u64>) -> Result<CaseState, String> {
-        let region = tensor
+        // Check the declared write region, but restore the complete observable state.
+        tensor
             .slice_leading(written.start, written.end)
             .map_err(|error| error.to_string())?;
+        let region = tensor.clone();
         let initial = region.read_to_host().map_err(|error| error.to_string())?;
         Ok(CaseState {
             tensor,
-            written: region,
+            backing: region,
             initial: initial.into(),
             _slab: None,
         })
@@ -854,12 +875,12 @@ impl TuningInputs<'_, '_> {
             .write_from_host(&bytes)
             .map_err(|error| error.to_string())?;
         let initial = slab
-            .region_rows(0, written.start, written.end - written.start)
+            .region_rows(0, 0, view)
             .map_err(|error| error.to_string())?;
         let tensor = slab.logical_region(0).map_err(|error| error.to_string())?;
         Ok(CaseState {
             tensor,
-            written: initial.clone(),
+            backing: initial.clone(),
             initial: initial
                 .read_to_host()
                 .map_err(|error| error.to_string())?
@@ -968,7 +989,12 @@ fn f16_bits(value: f32) -> u16 {
 
 /// An entry, its element bindings and its static values: what one tuning
 /// result applies to (a tuning unit).
-type TuningKey = (&'static str, String, BTreeMap<String, u64>);
+type TuningKey = (
+    &'static str,
+    String,
+    BTreeMap<String, u64>,
+    Vec<WeightScope>,
+);
 
 /// Split `total` configurations among tuning units, each given as its
 /// admissible configurations and its share of expected step time
@@ -1154,7 +1180,7 @@ struct CensusUnit {
     defaults: Option<(Vec<PointShape>, Vec<f64>)>,
     /// The census's measurement of the defaults: wall seconds and where
     /// they went.
-    measurement: Option<(f64, TuningTime)>,
+    measurement: Option<(f64, TuningResult)>,
 }
 
 /// The configurations each tuning unit of a model may evaluate, the units
@@ -1162,7 +1188,7 @@ struct CensusUnit {
 pub(crate) struct TuningBudgets {
     budgets: HashMap<TuningKey, usize>,
     searching: HashSet<TuningKey>,
-    measurements: HashMap<TuningKey, (f64, TuningTime)>,
+    measurements: HashMap<TuningKey, (f64, TuningResult)>,
 }
 
 /// A unit's slot in the kernel cache: the cache, the unit's key, and the
@@ -1177,12 +1203,9 @@ fn defaults_seconds(result: &TuningResult, defaults: &ParameterValues) -> Option
         .iter()
         .find(|record| record.configuration.params == *defaults)
         .and_then(|record| match &record.outcome {
-            seismic::Outcome::Measured { points, .. } => Some(
-                points
-                    .iter()
-                    .map(|point| point.median_seconds)
-                    .collect(),
-            ),
+            seismic::Outcome::Measured { points, .. } => {
+                Some(points.iter().map(|point| point.median_seconds).collect())
+            }
             seismic::Outcome::Excluded(_) => None,
         })
 }
@@ -1200,6 +1223,7 @@ pub(crate) struct Tuner<'a> {
     deadline: Instant,
     tuned: Vec<TunedEntry>,
     chosen: HashMap<TuningKey, NativeSpecialization>,
+    results: HashMap<TuningKey, TuningResult>,
     /// The latest choice for each parameter declaration of an entry, a start
     /// for the next unit with the same declaration.
     winners: HashMap<String, ParameterValues>,
@@ -1207,7 +1231,7 @@ pub(crate) struct Tuner<'a> {
     searching: HashSet<TuningKey>,
     /// The census's measurement of each unit it measured, reported as part
     /// of that unit's tuning.
-    measurements: HashMap<TuningKey, (f64, TuningTime)>,
+    measurements: HashMap<TuningKey, (f64, TuningResult)>,
     /// The budget of the units searched so far, of `searching_total`.
     searched: usize,
     searching_total: usize,
@@ -1261,7 +1285,7 @@ impl<'a> Tuner<'a> {
         weights: TuningWeights<'a>,
         allocation: Allocation,
         searching: HashSet<TuningKey>,
-        measurements: HashMap<TuningKey, (f64, TuningTime)>,
+        measurements: HashMap<TuningKey, (f64, TuningResult)>,
     ) -> Self {
         let searching_total = match &allocation {
             Allocation::Census(_) => 0,
@@ -1277,6 +1301,7 @@ impl<'a> Tuner<'a> {
             deadline: Instant::now() + SAFETY_STOP,
             tuned: Vec::new(),
             chosen: HashMap::new(),
+            results: HashMap::new(),
             winners: HashMap::new(),
             searching,
             measurements,
@@ -1311,10 +1336,11 @@ impl<'a> Tuner<'a> {
             })
             .collect::<Vec<_>>();
         let shares = step_shares(&budgeted.iter().map(|(_, time)| *time).collect::<Vec<_>>());
-        let measured = units
+        let measured: usize = units
             .iter()
-            .filter(|unit| unit.measurement.is_some())
-            .count();
+            .filter_map(|unit| unit.measurement.as_ref())
+            .map(|(_, result)| result.configurations.len())
+            .sum();
         let mut allocated = allocate(
             MODEL_BUDGET.saturating_sub(measured),
             &budgeted
@@ -1333,7 +1359,16 @@ impl<'a> Tuner<'a> {
         let mut budgets = budgeted
             .iter()
             .zip(allocated)
-            .map(|((unit, _), budget)| (unit.key.clone(), budget))
+            .map(|((unit, _), budget)| {
+                (
+                    unit.key.clone(),
+                    budget
+                        + unit
+                            .measurement
+                            .as_ref()
+                            .map_or(0, |(_, result)| result.configurations.len()),
+                )
+            })
             .collect::<HashMap<_, _>>();
         let mut searching = HashSet::new();
         let mut measurements = HashMap::new();
@@ -1378,7 +1413,12 @@ impl<'a> Tuner<'a> {
     ) -> Result<NativeSpecialization, CatalogFailure> {
         let entry = <T::Entry as seismic::Entry>::NAME;
         let bindings = case.bindings();
-        let key = (entry, bindings.clone(), statics.statics().clone());
+        let key = (
+            entry,
+            bindings.clone(),
+            statics.statics().clone(),
+            case.weight_scopes().to_vec(),
+        );
         let failure = |outcome: String| CatalogFailure::Tuning {
             entry,
             bindings: bindings.clone(),
@@ -1410,9 +1450,6 @@ impl<'a> Tuner<'a> {
                 .get(&key)
                 .ok_or_else(|| failure("the tuning census did not count this unit".into()))?,
         };
-        if let Some(chosen) = self.chosen.get(&key) {
-            return Ok(chosen.clone());
-        }
         #[cfg(feature = "pinned-tuning")]
         if let pinned::Pinned::Chosen(chosen) =
             pinned::lookup(&key, implementation).map_err(failure)?
@@ -1431,10 +1468,6 @@ impl<'a> Tuner<'a> {
         let stored = self
             .stored(case, statics, &shapes, &screening)
             .map_err(failure)?;
-        if let Some((_, _, Some(result))) = &stored {
-            let tuned = tuned_entry(entry, bindings, result, TuningOrigin::Stored, began);
-            return Ok(self.finish(key, declaration, tuned));
-        }
         self.context.observer.event(&TuningEvent::Started {
             entry,
             bindings: bindings.clone(),
@@ -1457,9 +1490,23 @@ impl<'a> Tuner<'a> {
                 screening,
             }),
         };
+        let previous = self
+            .results
+            .get(&key)
+            .cloned()
+            .or_else(|| stored.as_ref().and_then(|(_, _, result)| result.clone()));
+        let census = self
+            .measurements
+            .get(&key)
+            .map(|(_, result)| result.clone());
+        let reuse = previous
+            .as_ref()
+            .map(seismic::TuningReuse::Completed)
+            .or_else(|| census.as_ref().map(seismic::TuningReuse::Seed));
         let result = self
-            .run(case, statics, &shapes, strategy)
+            .run(case, statics, &shapes, strategy, reuse)
             .map_err(failure)?;
+        self.results.insert(key.clone(), result.clone());
         #[cfg(feature = "tuning-survey")]
         if surveyed {
             survey::record(&key, budget, &result).map_err(failure)?;
@@ -1475,16 +1522,23 @@ impl<'a> Tuner<'a> {
             }
         );
         // A search the safety stop ended is not the search its key names.
-        if let Some((cache, key, None)) = &stored {
+        if let Some((cache, key, _)) = &stored {
             if !stopped && !surveyed {
                 cache.store_tuning(key, &result);
             }
         }
-        let mut tuned = tuned_entry(entry, bindings, &result, TuningOrigin::Searched, began);
+        let origin = if result.reused {
+            TuningOrigin::Stored
+        } else {
+            TuningOrigin::Searched
+        };
+        let mut tuned = tuned_entry(entry, bindings, &result, origin, began);
         // The census's measurement of the defaults is part of the unit's
         // tuning.
-        if let Some((seconds, time)) = self.measurements.remove(&key) {
+        if let Some((seconds, census)) = self.measurements.remove(&key) {
+            let time = census.time;
             tuned.seconds += seconds;
+            tuned.time.reference_seconds += time.reference_seconds;
             tuned.time.forming_seconds += time.forming_seconds;
             tuned.time.measuring_seconds += time.measuring_seconds;
             tuned.time.validating_seconds += time.validating_seconds;
@@ -1559,7 +1613,7 @@ impl<'a> Tuner<'a> {
         {
             Some((_, _, Some(result))) => {
                 if !implementation.launch_scoped() {
-                    unit.defaults = defaults_seconds(&result, defaults.params())
+                    unit.defaults = defaults_seconds(&result, &result.overall.params)
                         .map(|seconds| (shapes, seconds));
                 }
             }
@@ -1572,20 +1626,17 @@ impl<'a> Tuner<'a> {
                             case,
                             statics,
                             &shapes,
-                            Strategy::Search(SearchPlan {
-                                budget: 1,
-                                settings: search_settings(self.device.backend(), false),
+                            Strategy::Census {
                                 min_sample_seconds: MIN_SAMPLE_SECONDS,
-                                start: Vec::new(),
                                 deadline: Some(self.deadline),
-                                screening: Vec::new(),
-                            }),
+                            },
+                            None,
                         )
                         .map_err(failure)?;
-                    let seconds = defaults_seconds(&result, defaults.params())
+                    let seconds = defaults_seconds(&result, &result.overall.params)
                         .ok_or_else(|| failure("the defaults were not measured".into()))?;
                     unit.defaults = Some((shapes, seconds));
-                    unit.measurement = Some((began.elapsed().as_secs_f64(), result.time));
+                    unit.measurement = Some((began.elapsed().as_secs_f64(), result));
                 }
             }
         }
@@ -1603,17 +1654,13 @@ impl<'a> Tuner<'a> {
         screening: &[ScreeningPoint],
     ) -> Result<Option<StoredSlot<'a>>, String> {
         let entry = <T::Entry as seismic::Entry>::NAME;
-        let Some(cache) = self
-            .context
-            .cache
-            .filter(|_| survey_plan(entry).is_none())
-        else {
+        let Some(cache) = self.context.cache.filter(|_| survey_plan(entry).is_none()) else {
             return Ok(None);
         };
         let digest = case
             .digest(self.device, statics)
             .map_err(|error| error.to_string())?;
-        let key = TuningCacheKey::of(&tuning_key_material(
+        let material = tuning_key_material(
             self.device,
             entry,
             &case.bindings(),
@@ -1621,6 +1668,12 @@ impl<'a> Tuner<'a> {
             &digest,
             shapes,
             screening,
+        );
+        let policy = case.precision().map_err(|error| error.to_string())?;
+        let key = TuningCacheKey::of(&format!(
+            "{material}\npolicy {:?}\nweight scopes {:?}",
+            seismic::precision::PolicyIdentity::of(&policy).0,
+            case.weight_scopes()
         ));
         let hit = cache
             .tuning(&key)
@@ -1636,6 +1689,7 @@ impl<'a> Tuner<'a> {
         statics: &NativeSpecialization,
         shapes: &[PointShape],
         strategy: Strategy,
+        reuse: Option<seismic::TuningReuse<'_>>,
     ) -> Result<TuningResult, String> {
         let mut shared = HashMap::new();
         let mut inputs = TuningInputs {
@@ -1652,7 +1706,7 @@ impl<'a> Tuner<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let initializers = rotations
             .iter()
-            .map(|cases| cases.first().and_then(|case| initializer(T::state(case))))
+            .map(|cases| initializer(cases.iter().flat_map(T::state).collect()))
             .collect::<Vec<_>>();
         let points = shapes
             .iter()
@@ -1667,7 +1721,14 @@ impl<'a> Tuner<'a> {
             })
             .collect();
         let result = case
-            .tune(self.device, statics, points, ARITHMETIC_TOLERANCE, strategy)
+            .tune(
+                self.device,
+                statics,
+                points,
+                case.precision().map_err(|e| e.to_string())?,
+                strategy,
+                reuse,
+            )
             .map_err(|error| error.to_string());
         drop(rotations);
         drop(shared);
@@ -1760,7 +1821,7 @@ fn tuning_key_material(
     format!(
         "device {}\nentry {entry}\nbindings {bindings}\nstatics {:?}\nimplementation {digest}\n\
          search {SEARCH_VERSION}\nmodel budget {MODEL_BUDGET}\nsettings {settings:?}\n\
-         points {points}{screening}\nvalidation {ARITHMETIC_TOLERANCE:?}\nmin sample {MIN_SAMPLE_SECONDS:?}",
+         points {points}{screening}\nvalidation bounded-per-subject-v1\nmin sample {MIN_SAMPLE_SECONDS:?}",
         device.tuning_identity(),
         statics.statics(),
     )
@@ -1796,13 +1857,15 @@ fn tuned_entry(
         search,
         measured,
         excluded: result.configurations.len() - measured,
-        defects: result.defects().count(),
-        first_defect: result.defects().find_map(|record| match &record.outcome {
-            seismic::Outcome::Excluded(exclusion) => {
-                Some(format!("{:?}: {exclusion:?}", record.configuration.params))
-            }
-            seismic::Outcome::Measured { .. } => None,
-        }),
+        rejections: result.rejections().count(),
+        first_rejection: result
+            .rejections()
+            .find_map(|record| match &record.outcome {
+                seismic::Outcome::Excluded(exclusion) => {
+                    Some(format!("{:?}: {exclusion:?}", record.configuration.params))
+                }
+                seismic::Outcome::Measured { .. } => None,
+            }),
         seconds: began.elapsed().as_secs_f64(),
         time,
     }

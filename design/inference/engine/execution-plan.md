@@ -60,24 +60,29 @@ error names the path and the backend.
 Native entries with declared tuning parameters are tuned on the opened device during this
 preparation, on the first load for each tuning key: each such entry registers a tuning case
 that supplies static values from model geometry, weighted tuning points over the shape classes that
-entry serves (every row class of its graph path, crossed with served history lengths for attention;
+entry serves (every row class of its graph path, crossed with served history lengths for attention,
+including empty and short histories that exercise fresh-only and partially occupied groups;
 projected-row classes for the readout, each retaining its own step-time share), rotations over real
 resident weights of distinct layers for weight-streaming decode rows,
-control tables packed by the batch builder. Every entry is validated with one engine-wide
-tolerance, a defect guard derived from an error model, not the precision gate: it admits every arithmetic option an
-entry declares (down to q8_1 activations) with margin, and is looser than anything the end-to-end
-precision gate could accept, so tuning never rejects a configuration the gate would pass; the gate
-itself is the end-to-end qualification. Because the tuner may choose any declared option, an entry
-declares only arithmetic options that pass the gate whichever one wins: on CPU the recurrent output
-projection and the recurrent projection's alpha and beta gates stay exact F32. Every tensor an entry writes
-in place (recurrent bank slabs, KV history, routing tables, selection outputs) is case-owned
-state: its written region is restored before each configuration's validation run, and real state
-is never bound. An entry that declares parameters without a case fails preparation; there are no
-engine-side default parameter values. An entry prepared again with identical element bindings and
-static values reuses the load's first tuning result. Entry-wide declarations
-use a configuration budget: a census counts the model's tuning units (entry,
-element bindings, static values), their admissible configurations and launches
-per step, finds which units have a stored result, and measures the defaults of
+control tables packed by the batch builder. Every tuned entry uses a bounded precision policy,
+with explicit floating result and writable-state subject limits shared with the compiler policy
+representation. Production tuning uses the declaration default native specialization as its
+reference. This checks candidate agreement with the baseline, not independent agreement with
+source semantics; kernel and model regressions must detect shared defects. Every candidate, including the
+default, must pass every case before continued performance sampling. The first suitable timed
+execution supplies its validation outputs. Integer, Boolean and packed-code state remains exact.
+Every tensor an entry writes in place is case-owned and restored to its pristine state; real
+serving state is never bound. Matching evidence from the startup census or a prior search can be
+reused, but timing equivalence alone is not numerical evidence. Whole-model numerical and raw
+output/parser regressions are development and release qualification, not another startup gate or
+a search over kernel combinations. Local bounded policies do not claim a mathematical bound on
+whole-model accumulated error.
+An entry that declares parameters without a case fails preparation; there are no
+engine-side default parameter values. An entry prepared again with identical element bindings,
+static values, weight groups and initialized inputs can reuse its earlier result. Entry-wide
+declarations use a configuration budget: a census counts the model's tuning units (entry,
+element bindings, static values and weight groups), their admissible configurations and launches
+per step, finds which units have a stored result, and finds and measures the first numerically passing seed of
 each unit that will search (one configuration of the per-model budget each; a
 stored result supplies the defaults' times of a stored unit). Each row class's
 share of step time is split among the units serving it by launches times the
@@ -92,7 +97,7 @@ candidate of each independent launch group; its boundary choices and group
 candidates do not spend that budget, and it takes no share. A safety stop on
 the whole
 preparation's tuning (a wall-clock limit for pathological machines) ends every search early with
-the best completed choice, leaving unfinished groups at their defaults; it is reported as a
+the best completed choice, retaining only a fully validated completed choice; it is reported as a
 warning and its results are not stored.
 On CPU, expensive projection cases screen candidates at a few representative rows with folded
 row shares. The default and shortlisted configurations are still confirmed, ranked and validated
@@ -101,14 +106,18 @@ The engine owns every cache, under a directory the host names (`--cache-dir`; wi
 is cached). It holds the program artifacts Seismic keeps (CUDA CUBINs, Vulkan SPIR-V), through
 the device's artifact store, one directory per toolchain namespace, and one tuning result per
 tuning key. The key is a digest over the device and toolchain identity (Metal OS
-build; CUDA driver and NVRTC release), the unit, the implementation digest (declaration and
+build; CUDA driver and NVRTC release), the unit including its model weight groups, the implementation digest (declaration and
 rendered source), and the search definition (search version, per-model budget, settings, point
 labels and weights, screening points and folded weights, validation rule, sample time); a unit's
 own budget follows the measured shares of the load that searched it and is not part of the key.
-A hit prepares the
-stored choice with no forming, measuring or validation for tuning; its key pins everything
-validation depended on. Keys are
-content addresses, so nothing is invalidated: changed inputs give new keys. Writes go through a
+Equal kernel geometry with different model weight groups has distinct budget and cache units,
+so one group's evidence cannot overwrite another's. A possible hit recomputes the requested
+initialized-input fingerprints and checks its winner's complete numerical evidence against the
+reference, source, policy and device identities. Only matching evidence skips candidate execution
+and timing; changed input contents require fresh qualification even in the same structural slot.
+Persisted numerical policies and search weights round-trip exactly; serialization must not
+change eligibility or invalidate an otherwise identical objective.
+Keys are content addresses for that structural and policy identity. Writes go through a
 temporary file renamed into place; an entry that cannot be read or parsed, or whose configuration
 the implementation does not admit, is a miss and is rewritten; opening the cache evicts the least
 recently used entries beyond its capacity. Stored results are local measurements; nothing is
@@ -338,7 +347,7 @@ generation transitions, or publication.
 ## Acceptance criteria
 
 - Every required entry corresponds to one ordered, attested callable slot.
-- Every selectable kernel configuration has passed the precision gate for each shape class it
+- Every selected tuned kernel configuration has matching bounded-policy evidence for each shape class it
   serves; at a fixed shape class, changing a peer row's inputs leaves a row's results
   bit-identical.
 - No independent kernel requirement set, semantic class set, or runtime handle query remains.

@@ -4,7 +4,9 @@
 //! `short_conv_rows` declares no parameters.
 
 use super::cases::projection_shape;
-use super::{cpu_projection_screening, row_points, EntryTuning, PointShape, TuningInputs, TuningLimits};
+use super::{
+    cpu_projection_screening, row_points, EntryTuning, PointShape, TuningInputs, TuningLimits,
+};
 use crate::ShortConvBinding;
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project};
@@ -46,6 +48,10 @@ impl EntryTuning for ShortConvProjectTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
+    }
+
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
     }
 
     fn bindings(&self) -> String {
@@ -152,6 +158,10 @@ impl EntryTuning for ShortConvOutputTuning {
         self.scopes.len()
     }
 
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
+    }
+
     fn bindings(&self) -> String {
         format!(
             "OW={},A={}",
@@ -165,7 +175,9 @@ impl EntryTuning for ShortConvOutputTuning {
         if projection_shape(inputs, &self.scopes, WeightKind::RecurrentOutput)?
             != (shape.hidden, shape.channels)
         {
-            return Err("the short convolution output projection disagrees with the binding".into());
+            return Err(
+                "the short convolution output projection disagrees with the binding".into(),
+            );
         }
         let [_, statics @ ..] = shape.output_dimensions(0);
         Ok(statics.to_vec())

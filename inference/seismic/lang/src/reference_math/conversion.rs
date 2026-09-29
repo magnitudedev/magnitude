@@ -1,6 +1,7 @@
 //! Host access to the scalar conversions and comparisons of the language.
 //!
-//! Every function evaluates the owning recipe or literal quantizer, so host code
+//! Conversions use the owning recipe or literal quantizer (memoized for finite
+//! payload domains), so host code
 //! (registries, runtime binding, comparison) never carries a second formula for
 //! narrow floating formats. Bits are the dtype's payload in the low bits of the word.
 use super::*;
@@ -20,9 +21,32 @@ pub fn quantize(dtype: DType, value: f64) -> u32 {
 
 /// The exact value of floating payload `bits`. Every NaN payload maps to NaN.
 pub fn exact_f64(dtype: DType, bits: u32) -> f64 {
-    assert!(dtype.is_float(), "exact value of a non-floating dtype");
-    // Widening to F32 is exact, and every F32 value is an F64 value.
-    f64::from(f32::from_bits(convert_bits(dtype, DType::F32, bits)))
+    use std::sync::OnceLock;
+    static F16_VALUES: OnceLock<Box<[f64]>> = OnceLock::new();
+    static BF16_VALUES: OnceLock<Box<[f64]>> = OnceLock::new();
+    // F32 -> F32 is bit-preserving; every finite F32 is exactly representable
+    // in F64. Narrow payloads have a small finite domain. Evaluate their owning
+    // cast recipe once per payload, rather than interpreting it per comparison.
+    let table = match dtype {
+        DType::F32 => return f64::from(f32::from_bits(bits)),
+        DType::F16 => &F16_VALUES,
+        DType::BF16 => &BF16_VALUES,
+        _ => panic!("exact value of a non-floating dtype"),
+    };
+    table.get_or_init(|| {
+        let recipe = scalar_recipe(ScalarOp::Cast(DType::F32), &[dtype]);
+        (0..=u16::MAX)
+            .map(|bits| {
+                let widened = evaluate(
+                    &recipe,
+                    &[ReferenceScalar::from_bits(dtype, u32::from(bits))],
+                )
+                .expect("casts have no failures")
+                .bits();
+                f64::from(f32::from_bits(widened))
+            })
+            .collect()
+    })[bits as u16 as usize]
 }
 
 /// The source comparison of two payloads of `dtype`.

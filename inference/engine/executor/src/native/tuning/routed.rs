@@ -163,7 +163,10 @@ impl RoutedRouteTuning {
             Operator::RoutedFfn(routed) => {
                 Ok(routed.router.normalization == RouteNormalization::Sum)
             }
-            other => Err(format!("a {} layer has no routed feed-forward", other.name())),
+            other => Err(format!(
+                "a {} layer has no routed feed-forward",
+                other.name()
+            )),
         }
     }
 }
@@ -174,6 +177,10 @@ impl EntryTuning for RoutedRouteTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
+    }
+
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
     }
 
     fn bindings(&self) -> String {
@@ -365,6 +372,10 @@ impl EntryTuning for RoutedExpandTuning {
         self.scopes.len()
     }
 
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
+    }
+
     fn bindings(&self) -> String {
         format!(
             "EGW={},EUW={},SGW={},SUW={},A={}",
@@ -468,6 +479,10 @@ impl EntryTuning for RoutedOutputTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
+    }
+
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
     }
 
     fn bindings(&self) -> String {
@@ -580,6 +595,10 @@ impl EntryTuning for RoutedExpertsTuning {
         self.scopes.len()
     }
 
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
+    }
+
     fn bindings(&self) -> String {
         format!(
             "EGW={},EUW={},EDW={},A={}",
@@ -681,6 +700,10 @@ impl EntryTuning for RoutedCombineTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
+    }
+
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
     }
 
     fn bindings(&self) -> String {

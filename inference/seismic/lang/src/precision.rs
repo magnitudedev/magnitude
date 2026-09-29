@@ -6,7 +6,8 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
 pub struct Limit(f64);
 impl Limit {
     pub const ZERO: Self = Self(0.0);
@@ -20,6 +21,17 @@ impl Limit {
     }
     pub fn get(self) -> f64 {
         self.0
+    }
+}
+impl TryFrom<f64> for Limit {
+    type Error = String;
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<Limit> for f64 {
+    fn from(value: Limit) -> Self {
+        value.get()
     }
 }
 impl PartialEq for Limit {
@@ -44,7 +56,8 @@ impl Hash for Limit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
 pub struct Finite(f64);
 impl Finite {
     pub fn new(value: f64) -> Result<Self, String> {
@@ -55,6 +68,17 @@ impl Finite {
     }
     pub fn get(self) -> f64 {
         self.0
+    }
+}
+impl TryFrom<f64> for Finite {
+    type Error = String;
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<Finite> for f64 {
+    fn from(value: Finite) -> Self {
+        value.get()
     }
 }
 impl PartialEq for Finite {
@@ -69,7 +93,7 @@ impl Hash for Finite {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Tolerance {
     pub absolute: Limit,
     pub relative: Limit,
@@ -93,7 +117,7 @@ impl Default for Tolerance {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SpecialPolicy {
     pub nan: bool,
     pub infinity: bool,
@@ -114,10 +138,22 @@ impl Default for SpecialPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "RangeEndpoints")]
 pub struct InputRange {
     pub minimum: Finite,
     pub maximum: Finite,
+}
+#[derive(serde::Deserialize)]
+struct RangeEndpoints {
+    minimum: Finite,
+    maximum: Finite,
+}
+impl TryFrom<RangeEndpoints> for InputRange {
+    type Error = String;
+    fn try_from(value: RangeEndpoints) -> Result<Self, Self::Error> {
+        Self::new(value.minimum.get(), value.maximum.get())
+    }
 }
 impl InputRange {
     pub fn new(minimum: f64, maximum: f64) -> Result<Self, String> {
@@ -137,7 +173,7 @@ impl InputRange {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum PrecisionPolicy {
     Exact,
     Bounded {
@@ -170,5 +206,46 @@ impl PrecisionPolicy {
             } => Some(outputs.get(output).copied().unwrap_or(*default)),
             Self::Unconstrained => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+    #[test]
+    fn policy_round_trip_preserves_all_limits_and_subjects() {
+        let mut policy = PrecisionPolicy::bounded(Tolerance {
+            absolute: Limit::new(1e-5).unwrap(),
+            relative: Limit::new(1e-4).unwrap(),
+            relative_floor: Limit::new(0.25).unwrap(),
+            ulps: Some(7),
+        });
+        if let PrecisionPolicy::Bounded {
+            outputs, inputs, ..
+        } = &mut policy
+        {
+            outputs.insert("i4".into(), Tolerance::EXACT);
+            inputs.insert("i0".into(), InputRange::new(-2., 4.).unwrap());
+        }
+        let bytes = postcard::to_allocvec(&policy).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<PrecisionPolicy>(&bytes).unwrap(),
+            policy
+        );
+    }
+    #[test]
+    fn decoding_rejects_invalid_limits_and_ranges() {
+        for value in [-1., f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let bytes = postcard::to_allocvec(&value).unwrap();
+            assert!(postcard::from_bytes::<Limit>(&bytes).is_err());
+        }
+        let invalid = InputRange {
+            minimum: Finite::new(2.).unwrap(),
+            maximum: Finite::new(1.).unwrap(),
+        };
+        assert!(
+            postcard::from_bytes::<InputRange>(&postcard::to_allocvec(&invalid).unwrap()).is_err()
+        );
+        assert_eq!(Limit::new(-0.).unwrap(), Limit::ZERO);
     }
 }

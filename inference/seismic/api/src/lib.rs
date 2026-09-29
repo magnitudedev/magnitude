@@ -23,7 +23,7 @@ pub use seismic_lang::checked::{
     NativeComparison, NativeCondition, NativeImplementation, NativeLaunch, NativeNatExpr,
     NativeParameter, NativeScratch, NativeSpecialization, NativeSpecializationError,
 };
-pub use seismic_lang::precision::PrecisionPolicy;
+pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 /// Numerical comparison helpers used by validation frontends.
 pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
@@ -39,9 +39,10 @@ pub use seismic_runtime::native::trace::{
     host_seconds, SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedSubmission,
 };
 pub use seismic_runtime::native::tune::{
-    Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, Outcome, PointMeasurement,
-    PointRecord, ScreeningPoint, SearchPlan, Strategy, SurveyPlan, TuneError, TuningInitializer,
-    TuningMethod, TuningResult, TuningTime, Validation,
+    Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, NumericalEvidence,
+    NumericalMetrics, Outcome, PointMeasurement, PointRecord, ScreeningPoint, SearchPlan, Strategy,
+    SurveyPlan, TuneError, TuningInitializer, TuningMethod, TuningReference, TuningResult,
+    TuningReuse, TuningTime,
 };
 pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
 
@@ -1095,8 +1096,8 @@ impl NativeTensorBatchCompletion {
     }
 }
 
-/// One workload for native tuning: argument sets cycled by measurement, the
-/// first also used for validation, and the point's share of the objective.
+/// One workload for native tuning: argument sets used for both measurement
+/// and numerical validation, and the point's share of the objective.
 pub struct TuningPoint<'a, E: Entry> {
     pub label: String,
     pub weight: f64,
@@ -1105,9 +1106,10 @@ pub struct TuningPoint<'a, E: Entry> {
     /// the defaults' real time at each. `None`: a class of its own.
     pub class: Option<String>,
     pub rotation: Vec<E::Args<'a>>,
-    /// Required when the entry has `&mut` parameters: restores the tensors
-    /// they bind in `rotation[0]` before each configuration's validation
-    /// run. The tuner never saves or restores state itself.
+    /// Required when the entry has `&mut` parameters: restores every writable
+    /// tensor in every rotation before each invocation. The caller owns the
+    /// pristine bytes; the tuner invokes this initializer before reference,
+    /// validation, warmup and timing executions.
     pub initialize: Option<TuningInitializer<'a>>,
 }
 
@@ -3150,14 +3152,59 @@ pub mod generated {
         )
     }
 
+    /// Floating result/state subjects of the checked entry, after element substitution.
+    pub fn native_numerical_subjects<E: Entry>(
+        elements: &[(&str, Element)],
+    ) -> Result<Vec<(String, DType)>, TuneError> {
+        use seismic_compiler::numerics::{input_subject, result_subject};
+        use seismic_lang::entry::{ParameterKind, ResultKind, TensorAccess};
+        use seismic_lang::registry::{representation_info, RepresentationKind};
+        let module = E::module().map_err(|e| TuneError::Declaration(e.to_string()))?;
+        let entry = E::resolve(module).map_err(|e| TuneError::Declaration(e.to_string()))?;
+        let logical = module
+            .logical_entry(entry.id(), &element_bindings(elements))
+            .map_err(|e| TuneError::Declaration(e.to_string()))?;
+        let dense = |representation| match representation_info(representation).kind {
+            RepresentationKind::Dense(dtype) => Some(dtype),
+            _ => None,
+        };
+        let mut subjects = Vec::new();
+        for result in logical.schema().results() {
+            let dtype = match result.kind {
+                ResultKind::Tensor { representation, .. } => dense(representation),
+                ResultKind::Scalar(dtype) => Some(dtype),
+                _ => None,
+            };
+            if let Some(dtype @ (DType::F32 | DType::F16 | DType::BF16)) = dtype {
+                subjects.push((result_subject(&result.path), dtype));
+            }
+        }
+        for (ordinal, parameter) in logical.schema().parameters().iter().enumerate() {
+            if let ParameterKind::Tensor {
+                representation,
+                access: TensorAccess::Mutable | TensorAccess::Owned,
+                ..
+            } = parameter.kind
+            {
+                if let Some(dtype @ (DType::F32 | DType::F16 | DType::BF16)) = dense(representation)
+                {
+                    subjects.push((input_subject(ordinal), dtype));
+                }
+            }
+        }
+        Ok(subjects)
+    }
+
     pub fn tune_native<E: Entry>(
         device: &Device,
         statics: &NativeSpecialization,
         elements: &[(&str, Element)],
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
         points: Vec<TuningPoint<'_, E>>,
-        validation: Validation,
+        validation: PrecisionPolicy,
         strategy: Strategy,
+        reuse: Option<TuningReuse<'_>>,
+        reference: TuningReference,
     ) -> Result<TuningResult, TuneError> {
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
         let entry =
@@ -3181,6 +3228,8 @@ pub mod generated {
                 .collect(),
             validation,
             strategy,
+            reuse,
+            reference,
         })
     }
 
@@ -3236,5 +3285,6 @@ pub mod dynamic;
 
 /// Numerical policy values shared by every host language.
 pub mod precision {
+    pub use seismic_compiler::numerics::PolicyIdentity;
     pub use seismic_lang::precision::*;
 }

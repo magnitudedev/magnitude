@@ -3,7 +3,9 @@
 //! product with the layer's slice of the per-layer inputs.
 
 use super::cases::projection_shape;
-use super::{cpu_projection_screening, row_points, EntryTuning, PointShape, TuningInputs, TuningLimits};
+use super::{
+    cpu_projection_screening, row_points, EntryTuning, PointShape, TuningInputs, TuningLimits,
+};
 use crate::PerLayerBinding;
 use magnitude_family_contracts::{Operator, WeightKind, WeightScope};
 use magnitude_kernels::per_layer_gate;
@@ -42,6 +44,10 @@ impl EntryTuning for PerLayerGateTuning {
         self.scopes.len()
     }
 
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
+    }
+
     fn bindings(&self) -> String {
         format!(
             "GW={},A={}",
@@ -56,7 +62,12 @@ impl EntryTuning for PerLayerGateTuning {
         {
             return Err("the per-layer gate disagrees with the binding".into());
         }
-        Ok(vec![("D", b.hidden), ("L", b.layers), ("P", b.width), ("GS", 0)])
+        Ok(vec![
+            ("D", b.hidden),
+            ("L", b.layers),
+            ("P", b.width),
+            ("GS", 0),
+        ])
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {

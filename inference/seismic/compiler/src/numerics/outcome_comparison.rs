@@ -285,7 +285,13 @@ pub fn compare_outcome(
         {
             continue;
         }
-        match tensor_difference(&tensor, &observed.tensor, policy, "value", allowance)? {
+        match tensor_difference(
+            &tensor,
+            &observed.tensor,
+            policy,
+            &super::input_subject(expected.ordinal()),
+            allowance,
+        )? {
             TensorComparison::Match => {}
             TensorComparison::Difference(index, message, metrics) => {
                 difference.get_or_insert_with(|| Difference {

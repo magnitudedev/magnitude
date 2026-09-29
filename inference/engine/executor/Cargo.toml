@@ -13,10 +13,13 @@ magnitude-kernels = { path = "../kernels" }
 magnitude-state = { path = "../state" }
 seismic.workspace = true
 serde.workspace = true
-serde_json = "=1.0.151"
+# Persisted precision policies and objective weights retain their exact f64 identity.
+serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }
 sha2 = "=0.11.0"
 
 [features]
+# Development-only bounded precision calibration; production uses fixed limits.
+tuning-precision-experiment = []
 # Development-only tuning pin for bit-exact measurement runs
 # (`native::tuning::pinned`). Enabled only through `magnitude-engine`'s
 # `pinned-tuning` feature by the `forward_bench` example; never by a served

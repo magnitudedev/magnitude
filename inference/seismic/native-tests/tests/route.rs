@@ -6,8 +6,8 @@
 use seismic::{
     Availability, BackendName, CallError, Device, DeviceCatalog, Element, Exclusion,
     InvocationError, MeasureOptions, NativeGraphFamily, NativeSpecialization, Outcome,
-    ScreeningPoint, SearchPlan, SearchSettings, SearchStop, Strategy, SurveyPlan, Tensor,
-    TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint, Validation,
+    PrecisionPolicy, ScreeningPoint, SearchPlan, SearchSettings, SearchStop, Strategy, SurveyPlan,
+    Tensor, TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint,
 };
 use seismic_native_tests::{accumulate, gated_sum, scale_rows, scoped_scale, split_sum};
 use std::time::{Duration, Instant};
@@ -167,8 +167,10 @@ fn metal_scoped_tuning_searches_launches_separately() {
         &device,
         &NativeSpecialization::new(),
         points,
-        Validation::BitExact,
+        PrecisionPolicy::Exact,
         search(2),
+        None,
+        seismic::TuningReference::Portable,
     )
     .expect("factored Metal tuning");
     assert!(matches!(
@@ -226,8 +228,10 @@ fn metal_scoped_tuning_expired_deadline_keeps_defaults_incomplete() {
         &device,
         &NativeSpecialization::new(),
         points,
-        Validation::BitExact,
+        PrecisionPolicy::Exact,
         Strategy::Search(plan),
+        None,
+        seismic::TuningReference::Portable,
     )
     .expect("expired factored search returns its usable defaults");
     assert!(matches!(
@@ -448,8 +452,10 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             &device,
             &statics(n),
             points(&inputs),
-            Validation::BitExact,
+            PrecisionPolicy::Exact,
             search(3),
+            None,
+            seismic::TuningReference::Portable,
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
         // The budget covers the whole domain: the search reaches every
@@ -519,12 +525,14 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             &device,
             &statics(n),
             points(&inputs),
-            Validation::BitExact,
+            PrecisionPolicy::Exact,
             Strategy::Survey(SurveyPlan {
                 samples: 5,
                 min_sample_seconds: 0.0002,
                 domains: Default::default(),
             }),
+            None,
+            seismic::TuningReference::Portable,
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
         assert_eq!(survey.configurations.len(), domain);
@@ -534,7 +542,9 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
                     points, validated, ..
                 } => {
                     assert!(validated);
-                    assert!(points.iter().all(|point| point.samples.len() == 5));
+                    assert!(points
+                        .iter()
+                        .all(|point| (1..=5).contains(&point.samples.len())));
                 }
                 Outcome::Excluded(exclusion) => {
                     panic!("{:?}: {exclusion:?}", device.backend())
@@ -581,8 +591,10 @@ fn screened_search_confirms_and_validates_the_full_workload() {
         &device,
         &statics(n),
         points,
-        Validation::BitExact,
+        PrecisionPolicy::Exact,
         Strategy::Search(plan),
+        None,
+        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert_eq!(result.points.len(), 2);
@@ -1086,8 +1098,10 @@ fn tuning_rejects_shared_mutable_state_without_an_initializer() {
             &device,
             &NativeSpecialization::new(),
             points,
-            Validation::BitExact,
+            PrecisionPolicy::Exact,
             search(2),
+            None,
+            seismic::TuningReference::Portable,
         ) {
             Err(TuneError::SharedMutableState { point, parameter }) => {
                 assert_eq!(point, "rows");
@@ -1125,25 +1139,24 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
             &device,
             &NativeSpecialization::new(),
             points,
-            Validation::BitExact,
+            PrecisionPolicy::Exact,
             search(2),
+            None,
+            seismic::TuningReference::Portable,
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-        // A BIAS 1 configuration is either validated, and then excluded as a
-        // misclassified parameter, or ranked below the chosen configuration
-        // and never validated; it is never chosen.
+        // Every candidate is checked before its repeated timing samples.
         for record in &result.configurations {
             match (record.configuration.params["BIAS"], &record.outcome) {
-                (0, Outcome::Measured { .. })
-                | (
-                    1,
+                (
+                    0,
                     Outcome::Measured {
-                        validated: false, ..
+                        validated: true, ..
                     },
                 ) => {}
-                (1, Outcome::Excluded(Exclusion::MisclassifiedParameter { point, reference })) => {
+                (1, Outcome::Excluded(Exclusion::Validation { point, detail })) => {
                     assert_eq!(point, "rows");
-                    assert_eq!(reference.params["BIAS"], 0);
+                    assert!(detail.contains("subject i0"));
                 }
                 (bias, outcome) => panic!("{:?}: BIAS {bias} gave {outcome:?}", device.backend()),
             }
@@ -1712,4 +1725,286 @@ fn a_failed_second_recommit_preserves_the_first_plane() {
         assert_eq!(device.memory_usage().charged, baseline);
         assert_eq!(read_f32(&first.slice_leading(0, 1).unwrap()), original);
     }
+}
+
+#[test]
+fn wrong_default_and_shared_defect_are_rejected_against_portable_source() {
+    use seismic_native_tests::wrong_default;
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let mut state = f32_tensor(&device, &[4], &[2.; 4]);
+    let x = f32_tensor(&device, &[4], &[1.; 4]);
+    let mut reset = state.clone();
+    let initial: Vec<_> = [2f32; 4]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let result = wrong_default::native_tune(
+        &device,
+        &NativeSpecialization::new(),
+        vec![TuningPoint {
+            label: "mutable".into(),
+            weight: 1.,
+            class: None,
+            rotation: vec![wrong_default::Args {
+                state: &mut state,
+                x: &x,
+            }],
+            initialize: Some(Box::new(move || reset.write_from_host(&initial))),
+        }],
+        PrecisionPolicy::Exact,
+        search(3),
+        None,
+        seismic::TuningReference::Portable,
+    )
+    .unwrap();
+    assert_eq!(result.overall.params["BIAS"], 0);
+    assert_eq!(result.numerical_evidence.len(), 1);
+    for record in result.configurations {
+        if record.configuration.params["BIAS"] != 0 {
+            assert!(matches!(
+                record.outcome,
+                Outcome::Excluded(Exclusion::Validation { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn factored_search_finds_a_complete_passing_seed_after_bad_defaults() {
+    use seismic_native_tests::scoped_wrong_default;
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let small = f32_tensor(&device, &[7], &[1.; 7]);
+    let large = f32_tensor(&device, &[35], &[1.; 35]);
+    let points = [&small, &large]
+        .into_iter()
+        .enumerate()
+        .map(|(i, x)| TuningPoint {
+            label: format!("p{i}"),
+            weight: 1.,
+            class: None,
+            rotation: vec![scoped_wrong_default::Args { x }],
+            initialize: None,
+        })
+        .collect();
+    let result = scoped_wrong_default::native_tune(
+        &device,
+        &NativeSpecialization::new(),
+        points,
+        PrecisionPolicy::Exact,
+        search(3),
+        None,
+        seismic::TuningReference::Portable,
+    )
+    .unwrap();
+    assert_eq!(result.overall.launches[0]["ROWS"], 2);
+    assert_eq!(result.overall.launches[1]["ROWS"], 8);
+    assert_eq!(result.numerical_evidence.len(), 2);
+}
+
+#[test]
+fn complete_evidence_reuses_only_matching_inputs_and_policy() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let x = f32_tensor(&device, &[4], &[1.; 4]);
+    let mut state = f32_tensor(&device, &[4], &[0.; 4]);
+    let count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut run = |initial: f32,
+                   policy: PrecisionPolicy,
+                   previous: Option<&seismic::TuningResult>,
+                   reference: seismic::TuningReference| {
+        let mut reset = state.clone();
+        let bytes: Vec<_> = [initial; 4]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let count = count.clone();
+        accumulate::native_tune(
+            &device,
+            &NativeSpecialization::new(),
+            vec![TuningPoint {
+                label: "state".into(),
+                weight: 1.,
+                class: None,
+                rotation: vec![accumulate::Args {
+                    state: &mut state,
+                    x: &x,
+                }],
+                initialize: Some(Box::new(move || {
+                    count.set(count.get() + 1);
+                    reset.write_from_host(&bytes)
+                })),
+            }],
+            policy,
+            search(2),
+            previous.map(seismic::TuningReuse::Completed),
+            reference,
+        )
+        .unwrap()
+    };
+    let first = run(
+        0.,
+        PrecisionPolicy::Exact,
+        None,
+        seismic::TuningReference::Portable,
+    );
+    count.set(0);
+    let reused = run(
+        0.,
+        PrecisionPolicy::Exact,
+        Some(&first),
+        seismic::TuningReference::Portable,
+    );
+    assert!(reused.reused);
+    assert_eq!(first.numerical_evidence, reused.numerical_evidence);
+    assert_eq!(first.overall, reused.overall);
+    assert_eq!(
+        count.get(),
+        1,
+        "a matching cache only initializes and fingerprints the input"
+    );
+    let changed = run(
+        2.,
+        PrecisionPolicy::Exact,
+        Some(&first),
+        seismic::TuningReference::Portable,
+    );
+    assert_ne!(
+        first.numerical_evidence[0].identity,
+        changed.numerical_evidence[0].identity
+    );
+    let bounded = run(
+        0.,
+        PrecisionPolicy::bounded(seismic::precision::Tolerance {
+            absolute: seismic::precision::Limit::new(0.001).unwrap(),
+            relative: seismic::precision::Limit::ZERO,
+            relative_floor: seismic::precision::Limit::ZERO,
+            ulps: None,
+        }),
+        Some(&first),
+        seismic::TuningReference::Portable,
+    );
+    assert_ne!(
+        first.numerical_evidence[0].identity,
+        bounded.numerical_evidence[0].identity
+    );
+    let native = run(
+        0.,
+        PrecisionPolicy::Exact,
+        Some(&first),
+        seismic::TuningReference::NativeDefault,
+    );
+    assert!(!native.reused);
+    assert_ne!(
+        native.numerical_evidence[0].identity,
+        first.numerical_evidence[0].identity
+    );
+    assert_eq!(
+        native.numerical_evidence[0].reference,
+        seismic::TuningReference::NativeDefault
+    );
+    let reused_native = run(
+        0.,
+        PrecisionPolicy::Exact,
+        Some(&native),
+        seismic::TuningReference::NativeDefault,
+    );
+    assert!(reused_native.reused);
+}
+
+#[test]
+fn rejected_candidates_stop_after_the_first_timed_invocation() {
+    use seismic_native_tests::wrong_default;
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let x = f32_tensor(&device, &[4], &[1.; 4]);
+    let mut state = f32_tensor(&device, &[4], &[2.; 4]);
+    let mut reset = state.clone();
+    let initial: Vec<_> = [2f32; 4]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captures = observed.clone();
+    let result = wrong_default::native_tune(
+        &device,
+        &NativeSpecialization::new(),
+        vec![TuningPoint {
+            label: "early".into(),
+            weight: 1.,
+            class: None,
+            rotation: vec![wrong_default::Args {
+                state: &mut state,
+                x: &x,
+            }],
+            initialize: Some(Box::new(move || {
+                captures.borrow_mut().push(read_f32(&reset)[0]);
+                reset.write_from_host(&initial)
+            })),
+        }],
+        PrecisionPolicy::Exact,
+        search(3),
+        None,
+        seismic::TuningReference::Portable,
+    )
+    .unwrap();
+    // Every subsequent initialization observes the preceding call before reset.
+    // The two faulty candidates produce 3.5 and 4.0; each may run only once.
+    let mut values = observed.borrow().clone();
+    values.push(read_f32(&state)[0]);
+    assert_eq!(values.iter().filter(|&&v| v == 3.5).count(), 1);
+    assert_eq!(values.iter().filter(|&&v| v == 4.0).count(), 1);
+    assert_eq!(result.overall.params["BIAS"], 0);
+}
+
+#[test]
+fn pooled_results_cannot_hide_a_candidates_missing_writes() {
+    use seismic_native_tests::omitted_write;
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let x = f32_tensor(&device, &[4], &[1., 2., 3., 4.]);
+    let result = omitted_write::native_tune(
+        &device,
+        &NativeSpecialization::new(),
+        vec![TuningPoint {
+            label: "missing-write".into(),
+            weight: 1.,
+            class: None,
+            rotation: vec![omitted_write::Args { x: &x }],
+            initialize: None,
+        }],
+        PrecisionPolicy::Exact,
+        search(2),
+        None,
+        seismic::TuningReference::NativeDefault,
+    )
+    .unwrap();
+    assert_eq!(
+        result.configurations[0].configuration.params["WRITE"], 1,
+        "the good candidate must populate pooled output before the missing-write candidate"
+    );
+    assert_eq!(result.overall.params["WRITE"], 1);
+    let omitted = result
+        .configurations
+        .iter()
+        .find(|r| r.configuration.params["WRITE"] == 0)
+        .unwrap();
+    assert!(
+        matches!(
+            omitted.outcome,
+            Outcome::Excluded(Exclusion::Validation { .. })
+        ),
+        "{omitted:?}"
+    );
 }

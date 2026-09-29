@@ -83,6 +83,10 @@ impl EntryTuning for AttentionProjectTuning {
         self.scopes.len()
     }
 
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
+    }
+
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
@@ -195,6 +199,10 @@ impl EntryTuning for AttentionOutputTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
+    }
+
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
     }
 
     fn bindings(&self) -> String {
@@ -388,7 +396,7 @@ impl AffineMixHistory {
         inputs.u32s(extents, &words)
     }
 
-    /// Pairs decoding codes 0..=levels onto [-1, 1]: scale 2 / levels, zero -1.
+    /// Vary each affine group so an incorrect coefficient stride cannot hide.
     fn coefficients(
         inputs: &TuningInputs<'_, '_>,
         extents: &[u64],
@@ -396,10 +404,15 @@ impl AffineMixHistory {
     ) -> Result<Tensor, String> {
         let count = usize::try_from(extents.iter().product::<u64>())
             .map_err(|_| "tuning coefficient plane exceeds usize")?;
-        let scale = super::f16_bits(2.0 / levels as f32);
-        let zero = super::f16_bits(-1.0);
         let bytes = (0..count / 2)
-            .flat_map(|_| [scale.to_le_bytes(), zero.to_le_bytes()])
+            .flat_map(|index| {
+                let magnitude = 0.25 + (index.wrapping_mul(17) % 127) as f32 / 64.0;
+                let offset = -0.75 + (index.wrapping_mul(43) % 97) as f32 / 96.0;
+                [
+                    super::f16_bits(magnitude / levels as f32).to_le_bytes(),
+                    super::f16_bits(offset).to_le_bytes(),
+                ]
+            })
             .flatten()
             .collect::<Vec<_>>();
         Tensor::from_host(inputs.device, Element::f16(), extents, &bytes)
@@ -613,6 +626,13 @@ macro_rules! mix_entry {
 
             fn launches(&self) -> usize {
                 self.0.scopes.len()
+            }
+
+
+            fn weight_scopes(&self) -> &[WeightScope] {
+
+                &self.0.scopes
+
             }
 
             fn bindings(&self) -> String {

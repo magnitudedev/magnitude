@@ -47,3 +47,41 @@ native scoped_scale for metal from "metal/scoped_scale.metal":
         params (WIDTH in [64, 128], code ROWS in [4, 8])
         threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
+
+# The first two native choices share a defect; only the last implements the source.
+fn wrong_default[N](state: &mut tensor[N] f32, x: &tensor[N] f32):
+    parallel for i in 0..N:
+        state[i] = state[i] + x[i]
+
+native wrong_default for metal from "metal/accumulate.metal":
+    params (BIAS in [1, 2, 0], WIDTH in [32])
+    launch accumulate:
+        threadgroups (ceil_div(N, WIDTH), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+
+fn scoped_wrong_default[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut output = tensor[N] f32
+    parallel for i in 0..N:
+        output[i] = x[i] * 2.0
+    return output
+
+native scoped_wrong_default for metal from "metal/scoped_faulty.metal":
+    launch scoped_scale_small when N <= 16:
+        params (WIDTH in [32, 64], code ROWS in [1, 2])
+        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+    launch scoped_scale_large when N > 16:
+        params (WIDTH in [64, 128], code ROWS in [4, 8])
+        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+
+# The second choice deliberately omits all result writes. Pooled results must
+# not preserve the preceding good candidate's output during validation.
+fn omitted_write[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return to_owned(x)
+
+native omitted_write for metal from "metal/omitted_write.metal":
+    params (WRITE in [1, 0])
+    launch omitted_write:
+        threadgroups (ceil_div(N, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)

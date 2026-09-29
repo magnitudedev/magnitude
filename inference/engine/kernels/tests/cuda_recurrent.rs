@@ -329,8 +329,15 @@ fn cuda_recurrent_scoped_tuning_completes() {
         gated_delta_chunk::Elements { A: Element::bf16() },
         &statics,
         points,
-        seismic::Validation::Relative { error: 0.05 },
+        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
+            absolute: seismic::precision::Limit::new(0.01).unwrap(),
+            relative: seismic::precision::Limit::new(0.05).unwrap(),
+            relative_floor: seismic::precision::Limit::ZERO,
+            ulps: None,
+        }),
         search(),
+        None,
+        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
@@ -341,7 +348,7 @@ fn cuda_recurrent_scoped_tuning_completes() {
             complete: true
         }
     ));
-    assert_eq!(result.defects().count(), 0);
+    assert_eq!(result.rejections().count(), 0);
     println!(
         "chunk CUDA choice {:?}, time {:?}",
         result.overall.launches, result.time

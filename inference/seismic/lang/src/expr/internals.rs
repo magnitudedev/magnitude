@@ -1271,7 +1271,7 @@ impl Arena {
                 operand: AnyExpr::Nat(n),
             } => Some(n),
             Node::Binary {
-                op: op @ (BinaryOp::Add | BinaryOp::Mul),
+                op: op @ (BinaryOp::Add | BinaryOp::Mul | BinaryOp::Div),
                 lhs: AnyExpr::Int(a),
                 rhs: AnyExpr::Int(b),
             } => {
@@ -1280,6 +1280,7 @@ impl Arena {
                 Some(match op {
                     BinaryOp::Add => self.nat_add(a, b),
                     BinaryOp::Mul => self.nat_mul(a, b),
+                    BinaryOp::Div => self.nat_div(a, b),
                     _ => unreachable!(),
                 })
             }

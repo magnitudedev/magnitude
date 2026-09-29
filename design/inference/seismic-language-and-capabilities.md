@@ -410,6 +410,6 @@ loops alike; leaf events retain the mutation ordering. Copies of views preserve
 the view's geometry and acquire independent storage. An index-map prefix is not
 an identity view of the entire backing tensor.
 
-Provably nonnegative signed additions and products of natural shape values
-canonicalize to the same natural arithmetic DAG. Potentially negative signed
+Provably nonnegative signed additions, products and divisions of natural shape values
+canonicalize to the same natural arithmetic DAG, preserving division-by-zero failure. Potentially negative signed
 expressions retain checked conversion and their original definedness conditions.

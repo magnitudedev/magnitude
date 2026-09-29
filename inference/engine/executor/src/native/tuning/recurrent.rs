@@ -116,6 +116,10 @@ impl EntryTuning for RecurrentProjectTuning {
         self.shape.scopes.len()
     }
 
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.shape.scopes
+    }
+
     fn bindings(&self) -> String {
         format!(
             "NW={},QW={},GW={},AW={},BW={},A={}",
@@ -219,6 +223,10 @@ impl EntryTuning for RecurrentOutputTuning {
 
     fn launches(&self) -> usize {
         self.shape.scopes.len()
+    }
+
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.shape.scopes
     }
 
     fn bindings(&self) -> String {
@@ -349,10 +357,9 @@ impl RecurrentState {
     /// Whether the model's q/k heads map to value heads in groups.
     fn grouped(&self, inputs: &TuningInputs<'_, '_>) -> Result<bool, String> {
         match inputs.operator(&self.shape.scopes)? {
-            Operator::GatedDelta(delta) => Ok(matches!(
-                delta.head_mapping,
-                RecurrentHeadMapping::Grouped
-            )),
+            Operator::GatedDelta(delta) => {
+                Ok(matches!(delta.head_mapping, RecurrentHeadMapping::Grouped))
+            }
             other => Err(format!("a {} layer has no recurrent mixer", other.name())),
         }
     }
@@ -436,6 +443,13 @@ macro_rules! state_entry {
 
             fn launches(&self) -> usize {
                 self.0.shape.scopes.len()
+            }
+
+
+            fn weight_scopes(&self) -> &[WeightScope] {
+
+                &self.0.shape.scopes
+
             }
 
             fn bindings(&self) -> String {

@@ -133,7 +133,7 @@ mod internals {
 
     pub(super) fn policy_identity(policy: &PrecisionPolicy) -> PolicyIdentity {
         let mut digest = Sha256::new();
-        digest.update(b"seismic-precision-policy-v2");
+        digest.update(b"seismic-precision-policy-v3");
         match policy {
             PrecisionPolicy::Exact => digest.update([0]),
             PrecisionPolicy::Unconstrained => digest.update([1]),
@@ -200,7 +200,7 @@ mod internals {
     }
 }
 mod comparison;
-pub use comparison::{compare_element, ElementComparison};
+pub use comparison::{compare_element, compare_element_bits, ElementComparison};
 mod outcome_comparison;
 pub use outcome_comparison::{
     compare_outcome, Comparison, ComparisonError, ComparisonSubject, Difference, ObservedInput,
@@ -214,25 +214,31 @@ mod demand;
 #[cfg(test)]
 mod demand_tests;
 
-/// Canonical public numerical subjects. Writable input state currently shares
-/// the owner's `value` policy; individual writable leaves are not separate names.
+/// Canonical result and writable-input subjects shared by compilation and native validation.
+pub fn result_subject(path: &[u32]) -> String {
+    internals::output_key(path)
+}
+pub fn input_subject(ordinal: usize) -> String {
+    format!("i{ordinal}")
+}
+
 pub fn subject_names(entry: &seismic_lang::checked::EntryInfo) -> Vec<String> {
     let mut names: std::collections::BTreeSet<_> = entry
         .results
         .iter()
         .map(|r| internals::output_key(&r.path))
         .collect();
-    if entry.parameters.iter().any(|p| {
-        matches!(
-            p.kind,
+    for (ordinal, parameter) in entry.parameters.iter().enumerate() {
+        if matches!(
+            parameter.kind,
             seismic_lang::checked::ParameterSummaryKind::Tensor {
                 access: seismic_lang::checked::TensorAccess::Mutable
                     | seismic_lang::checked::TensorAccess::Owned,
                 ..
             }
-        )
-    }) {
-        names.insert("value".into());
+        ) {
+            names.insert(input_subject(ordinal));
+        }
     }
     names.into_iter().collect()
 }

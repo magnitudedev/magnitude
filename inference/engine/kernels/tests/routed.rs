@@ -1085,7 +1085,9 @@ fn packed_weight(
 
 fn packed_router_matches_dense_decoding(representation: &str, backend: seismic::BackendName) {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
-    let Ok(device) = catalog.open_backend(backend) else { return };
+    let Ok(device) = catalog.open_backend(backend) else {
+        return;
+    };
     const HIDDEN: usize = 256;
     let (packed, decoded) = packed_weight(&device, representation, &[E as u64, HIDDEN as u64], 87);
     let dense = f32_tensor(&device, &[E as u64, HIDDEN as u64], &decoded);
@@ -1103,70 +1105,123 @@ fn packed_router_matches_dense_decoding(representation: &str, backend: seismic::
                     RW: router.element(),
                     A: seismic::Element::f32(),
                 },
-                &specialization_on(&device,
+                &specialization_on(
+                    &device,
                     &[("H", HIDDEN as u64), ("E", E as u64), ("K", K as u64)],
-                    &route_mapping(&device, 4, route_splits(&device)[0])),
-            ).unwrap();
+                    &route_mapping(&device, 4, route_splits(&device)[0]),
+                ),
+            )
+            .unwrap();
             let mut routes = i32_tensor(&device, &[rows as u64, K as u64], &vec![-7; rows * K]);
             let mut scores = f32_tensor(&device, &[rows as u64, K as u64], &vec![-7.0; rows * K]);
-            let outcome = kernel.call(routed_route::Args {
-                residual: &residual, norm: &norm, router, shared_router: &shared,
-                routes: &mut routes, scores: &mut scores, eps: 1e-6, normalize: 1,
-            }).unwrap();
+            let outcome = kernel
+                .call(routed_route::Args {
+                    residual: &residual,
+                    norm: &norm,
+                    router,
+                    shared_router: &shared,
+                    routes: &mut routes,
+                    scores: &mut scores,
+                    eps: 1e-6,
+                    normalize: 1,
+                })
+                .unwrap();
             (read_i32(&routes), read_f32(&scores), read_f32(&outcome.r1))
         };
         let expected = run(&dense);
         let actual = run(&packed);
         assert_eq!(actual.0, expected.0, "{representation} rows {rows} routes");
-        assert_near(&format!("{representation} rows {rows} scores"), &actual.1, &expected.1, 1e-4, 1e-4);
-        assert_near(&format!("{representation} rows {rows} gate"), &actual.2, &expected.2, 1e-4, 1e-4);
+        assert_near(
+            &format!("{representation} rows {rows} scores"),
+            &actual.1,
+            &expected.1,
+            1e-4,
+            1e-4,
+        );
+        assert_near(
+            &format!("{representation} rows {rows} gate"),
+            &actual.2,
+            &expected.2,
+            1e-4,
+            1e-4,
+        );
     }
 }
 
 #[test]
-fn metal_q8_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q8g32s", seismic::BackendName::Metal); }
+fn metal_q8_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q8g32s", seismic::BackendName::Metal);
+}
 
 #[test]
-fn metal_q6_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q6k", seismic::BackendName::Metal); }
+fn metal_q6_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q6k", seismic::BackendName::Metal);
+}
 
 #[test]
-fn metal_q4_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q4k", seismic::BackendName::Metal); }
+fn metal_q4_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q4k", seismic::BackendName::Metal);
+}
 
 #[test]
-fn metal_q5_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q5k", seismic::BackendName::Metal); }
+fn metal_q5_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q5k", seismic::BackendName::Metal);
+}
 
 #[test]
-fn metal_iq4_router_matches_dense_decoding() { packed_router_matches_dense_decoding("iq4g32", seismic::BackendName::Metal); }
+fn metal_iq4_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("iq4g32", seismic::BackendName::Metal);
+}
 
 #[test]
-fn cuda_q8_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q8g32s", seismic::BackendName::Cuda); }
+fn cuda_q8_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q8g32s", seismic::BackendName::Cuda);
+}
 
 #[test]
-fn cuda_q6_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q6k", seismic::BackendName::Cuda); }
+fn cuda_q6_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q6k", seismic::BackendName::Cuda);
+}
 
 #[test]
-fn cuda_q4_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q4k", seismic::BackendName::Cuda); }
+fn cuda_q4_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q4k", seismic::BackendName::Cuda);
+}
 
 #[test]
-fn cuda_q5_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q5k", seismic::BackendName::Cuda); }
+fn cuda_q5_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q5k", seismic::BackendName::Cuda);
+}
 
 #[test]
-fn cuda_iq4_router_matches_dense_decoding() { packed_router_matches_dense_decoding("iq4g32", seismic::BackendName::Cuda); }
+fn cuda_iq4_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("iq4g32", seismic::BackendName::Cuda);
+}
 
 #[test]
-fn vulkan_q8_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q8g32s", seismic::BackendName::Vulkan); }
+fn vulkan_q8_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q8g32s", seismic::BackendName::Vulkan);
+}
 
 #[test]
-fn vulkan_q6_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q6k", seismic::BackendName::Vulkan); }
+fn vulkan_q6_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q6k", seismic::BackendName::Vulkan);
+}
 
 #[test]
-fn vulkan_q4_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q4k", seismic::BackendName::Vulkan); }
+fn vulkan_q4_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q4k", seismic::BackendName::Vulkan);
+}
 
 #[test]
-fn vulkan_q5_router_matches_dense_decoding() { packed_router_matches_dense_decoding("q5k", seismic::BackendName::Vulkan); }
+fn vulkan_q5_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("q5k", seismic::BackendName::Vulkan);
+}
 
 #[test]
-fn vulkan_iq4_router_matches_dense_decoding() { packed_router_matches_dense_decoding("iq4g32", seismic::BackendName::Vulkan); }
+fn vulkan_iq4_router_matches_dense_decoding() {
+    packed_router_matches_dense_decoding("iq4g32", seismic::BackendName::Vulkan);
+}
 
 /// The planes of one packed weight: resident element, layout bytes and
 /// decoded values.
@@ -1341,9 +1396,12 @@ impl PackedBlock {
             Experts::Coded => {
                 packed_weight(device, ["q4g32s", "mxfp4g32", "q5g32"][which], shape, seed)
             }
-            Experts::Fp4 => {
-                packed_weight(device, ["nvfp4g16", "nvfp4g16", "q5g32s"][which], shape, seed)
-            }
+            Experts::Fp4 => packed_weight(
+                device,
+                ["nvfp4g16", "nvfp4g16", "q5g32s"][which],
+                shape,
+                seed,
+            ),
         };
         let (expert_gate, gate) = expert_weight(0, &[e, f, h], 41);
         let (expert_up, up) = expert_weight(1, &[e, f, h], 42);
@@ -1778,8 +1836,15 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
         },
         &statics,
         points,
-        seismic::Validation::Relative { error: 0.05 },
+        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
+            absolute: seismic::precision::Limit::new(0.01).unwrap(),
+            relative: seismic::precision::Limit::new(0.05).unwrap(),
+            relative_floor: seismic::precision::Limit::ZERO,
+            ulps: None,
+        }),
         search,
+        None,
+        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
@@ -1790,7 +1855,7 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
             complete: true
         }
     ));
-    assert_eq!(result.defects().count(), 0);
+    assert_eq!(result.rejections().count(), 0);
     println!(
         "routed_expand CUDA BF16: choice {:?}, method {:?}, time {:?}, records {}",
         result.overall.launches,
@@ -1878,8 +1943,15 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
         },
         &statics,
         points,
-        seismic::Validation::Relative { error: 0.05 },
+        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
+            absolute: seismic::precision::Limit::new(0.01).unwrap(),
+            relative: seismic::precision::Limit::new(0.05).unwrap(),
+            relative_floor: seismic::precision::Limit::ZERO,
+            ulps: None,
+        }),
         search,
+        None,
+        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
@@ -1890,7 +1962,7 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
             complete: true
         }
     ));
-    assert_eq!(result.defects().count(), 0);
+    assert_eq!(result.rejections().count(), 0);
     println!(
         "routed_output CUDA BF16: choice {:?}, method {:?}, time {:?}, records {}",
         result.overall.launches,
@@ -2885,7 +2957,12 @@ fn routed_kernel_timings() {
             measure.clone()
         }
     };
-    let validation = seismic::Validation::Relative { error: 0.05 };
+    let validation = seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
+        absolute: seismic::precision::Limit::new(0.01).unwrap(),
+        relative: seismic::precision::Limit::new(0.05).unwrap(),
+        relative_floor: seismic::precision::Limit::ZERO,
+        ulps: None,
+    });
     let statics = |pairs: &[(&str, u64)]| {
         pairs.iter().fold(
             seismic::NativeSpecialization::new(),
@@ -2949,8 +3026,10 @@ fn routed_kernel_timings() {
             },
             &statics(&[("H", h), ("E", e), ("K", k)]),
             points,
-            validation,
+            validation.clone(),
             measure.clone(),
+            None,
+            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
@@ -3011,8 +3090,10 @@ fn routed_kernel_timings() {
             },
             &decode_statics,
             points,
-            validation,
+            validation.clone(),
             decode_measure(),
+            None,
+            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
@@ -3050,8 +3131,10 @@ fn routed_kernel_timings() {
             },
             &decode_statics,
             points,
-            validation,
+            validation.clone(),
             decode_measure(),
+            None,
+            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
@@ -3124,8 +3207,10 @@ fn routed_kernel_timings() {
             },
             &statics(&[("H", h), ("F", f)]),
             points,
-            validation,
+            validation.clone(),
             measure.clone(),
+            None,
+            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
@@ -3167,6 +3252,8 @@ fn routed_kernel_timings() {
             points,
             validation,
             measure.clone(),
+            None,
+            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
@@ -3219,8 +3306,10 @@ fn routed_kernel_timings() {
             &device,
             &statics(&[("E", e), ("K", k)]),
             points,
-            seismic::Validation::BitExact,
+            seismic::PrecisionPolicy::Exact,
             measure,
+            None,
+            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );

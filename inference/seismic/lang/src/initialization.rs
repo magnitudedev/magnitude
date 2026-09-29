@@ -30,7 +30,7 @@ impl ParameterPath {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum Condition {
     Constant(bool),
     Parameter(ParameterPath),
@@ -43,7 +43,7 @@ pub(crate) enum Condition {
 }
 pub(crate) type Path = Vec<(Condition, bool)>;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct Bound {
     pub(crate) symbol: SymbolId,
     pub(crate) start: IntExpr,
@@ -53,7 +53,7 @@ pub(crate) struct Bound {
 /// Elements of one storage root. Images bind their coordinates jointly; the
 /// row-major forms are derived from the root's checked axes, never from
 /// matching byte sizes.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum Region {
     Empty,
     Full,
@@ -210,7 +210,10 @@ pub(crate) trait RegionOps {
             }
             Region::Guard(path, inner) => Region::guarded(path, self.normalize(*inner, facts)),
             Region::Linear(start, end) if self.le(facts, end, start) => Region::Empty,
-            Region::Union(parts) => {
+            Region::Union(mut parts) => {
+                // Remove repeated paths before recursively normalizing their
+                // identical regions; loop transfers can repeat many exits.
+                merge_complementary_guards(&mut parts);
                 let joined = parts.into_iter().fold(Region::Empty, |a, b| {
                     let b = self.normalize(b, facts);
                     a.union(b)
@@ -1793,12 +1796,6 @@ fn row_major(region: &Region) -> bool {
 /// Coverage normalization: `Guard(p ∧ c, R) ∪ Guard(p ∧ ¬c, R)` is
 /// `Guard(p, R)`, and a guarded copy of an unguarded member adds nothing.
 fn merge_complementary_guards(parts: &mut Vec<Region>) {
-    fn guard(region: &Region) -> (&[(Condition, bool)], &Region) {
-        match region {
-            Region::Guard(path, inner) => (path, inner),
-            other => (&[], other),
-        }
-    }
     fn complement(left: &[(Condition, bool)], right: &[(Condition, bool)]) -> Option<Path> {
         if left.len() != right.len() {
             return None;
@@ -1818,32 +1815,49 @@ fn merge_complementary_guards(parts: &mut Vec<Region>) {
         }
         None
     }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        'search: for i in 0..parts.len() {
-            for j in 0..parts.len() {
-                if i == j {
-                    continue;
-                }
-                let (left_path, left) = guard(&parts[i]);
-                let (right_path, right) = guard(&parts[j]);
-                if left != right {
-                    continue;
-                }
-                if left_path.is_empty() {
-                    parts.remove(j);
-                    changed = true;
-                    break 'search;
-                }
-                if let Some(path) = complement(left_path, right_path) {
-                    parts[i] = Region::guarded(path, left.clone());
-                    parts.remove(j);
-                    changed = true;
-                    break 'search;
+    // Only paths with identical underlying regions can merge. Index those
+    // regions once instead of comparing every pair after every merge.
+    let mut indices = HashMap::new();
+    let mut groups: Vec<(Region, Vec<Path>)> = Vec::new();
+    for part in std::mem::take(parts) {
+        let (path, region) = match part {
+            Region::Guard(path, inner) => (path, *inner),
+            region => (Vec::new(), region),
+        };
+        let index = *indices.entry(region.clone()).or_insert_with(|| {
+            groups.push((region, Vec::new()));
+            groups.len() - 1
+        });
+        if !groups[index].1.contains(&path) {
+            groups[index].1.push(path);
+        }
+    }
+    for (region, mut paths) in groups {
+        loop {
+            if paths.iter().any(Vec::is_empty) {
+                paths = vec![Vec::new()];
+                break;
+            }
+            let mut merged = false;
+            'search: for i in 0..paths.len() {
+                for j in i + 1..paths.len() {
+                    if let Some(path) = complement(&paths[i], &paths[j]) {
+                        paths[i] = path;
+                        paths.remove(j);
+                        merged = true;
+                        break 'search;
+                    }
                 }
             }
+            if !merged {
+                break;
+            }
         }
+        parts.extend(
+            paths
+                .into_iter()
+                .map(|path| Region::guarded(path, region.clone())),
+        );
     }
 }
 
@@ -2171,6 +2185,11 @@ impl<'a> InitializationContext<'a> {
         start: IntExpr,
         end: IntExpr,
     ) -> InitializationState {
+        // An unchanged initialization region needs no loop-binder expansion.
+        // This is common for captured inputs and preserves the empty-loop case.
+        if before.0 == iteration.0 {
+            return before.clone();
+        }
         let completed = Region::Bind(
             Bound {
                 symbol: binder,
@@ -2504,8 +2523,17 @@ impl InitializationContext<'_> {
                 let state = outputs[parameter]
                     .as_mut()
                     .expect("tensor input has initialization state");
-                state.0 = self.normalize(state.0.clone().union(region), &self.facts.clone());
+                state.0 = std::mem::replace(&mut state.0, Region::Empty).union(region);
             }
+        }
+        // All exits contribute a union under the same facts. Normalize once
+        // after collecting them, rather than repeatedly revisiting every
+        // preceding exit for each additional path.
+        for state in outputs.iter_mut().flatten() {
+            state.0 = self.normalize(
+                std::mem::replace(&mut state.0, Region::Empty),
+                &self.facts.clone(),
+            );
         }
         Ok(outputs)
     }
@@ -2609,6 +2637,41 @@ mod tests {
             Region::Bind(_, inner) | Region::Guard(_, inner) => 1 + size(inner),
             _ => 1,
         }
+    }
+
+    #[test]
+    fn complementary_guards_merge_only_identical_regions() {
+        let mut arena = ExprArena::new();
+        let a = Condition::Version(0, vec![]);
+        let b = Condition::Version(1, vec![]);
+        let regions = (0..64)
+            .map(|i| Region::Linear(arena.int(i), arena.int(i + 1)))
+            .collect::<Vec<_>>();
+        let mut parts = Vec::new();
+        // Interleave many distinct regions, including duplicate paths and
+        // reversed conjunction order. Each region is covered in all four worlds.
+        for left in [false, true] {
+            for right in [false, true] {
+                for region in &regions {
+                    let path = if left {
+                        vec![(a.clone(), left), (b.clone(), right)]
+                    } else {
+                        vec![(b.clone(), right), (a.clone(), left)]
+                    };
+                    parts.push(Region::guarded(path.clone(), region.clone()));
+                    parts.push(Region::guarded(path, region.clone()));
+                }
+            }
+        }
+        let distinct = Region::Linear(arena.int(100), arena.int(101));
+        parts.push(Region::guarded(vec![(a.clone(), true)], distinct.clone()));
+        merge_complementary_guards(&mut parts);
+        let mut expected = regions;
+        expected.push(Region::guarded(vec![(a, true)], distinct));
+        assert_eq!(parts, expected);
+        let once = parts.clone();
+        merge_complementary_guards(&mut parts);
+        assert_eq!(parts, once);
     }
 
     #[test]

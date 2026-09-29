@@ -3,7 +3,9 @@
 //! no tuning parameters.
 
 use super::cases::{projection_shape, scale_extent};
-use super::{cpu_projection_screening, row_points, EntryTuning, PointShape, TuningInputs, TuningLimits};
+use super::{
+    cpu_projection_screening, row_points, EntryTuning, PointShape, TuningInputs, TuningLimits,
+};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::project_rows;
 use seismic::{Device, Element, ScreeningPoint, Tensor};
@@ -43,6 +45,10 @@ impl EntryTuning for ProjectRowsTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
+    }
+
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
     }
 
     fn bindings(&self) -> String {

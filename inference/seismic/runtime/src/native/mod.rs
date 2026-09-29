@@ -17,8 +17,6 @@ mod batch;
 pub(crate) use batch::{NativeTensorBatch, NativeTensorBatchCompletion};
 #[cfg(test)]
 mod bundle_identity_tests;
-#[cfg(test)]
-mod vulkan_formation_tests;
 pub mod cpu;
 mod cuda;
 pub mod graph;
@@ -29,19 +27,21 @@ pub mod search;
 mod timing;
 pub mod trace;
 pub mod tune;
+mod validation;
 #[cfg(not(target_os = "macos"))]
 mod vulkan;
+#[cfg(test)]
+mod vulkan_formation_tests;
 
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{DecodedResults, DecodedValue, EncodedArgs, EncodedOutputs, PrepareError};
 use crate::api::tensor::TensorInner;
 use crate::api::{CallError, OutputError};
 use crate::backends::{CpuOpened, CudaOpened, OpenedKind};
-use crate::formation::{Formed, ProgramFormer};
-use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
 use crate::driver::{
     collect_native_access, typed_buffer, write_zeros, Allocation, DeviceCompletion,
 };
+use crate::formation::{Formed, ProgramFormer};
 use seismic_compiler::errors::{ExecutionError, InvocationError, PreparationError};
 use seismic_compiler::prepared::{
     validate_invocation, ArgumentValue, DeviceIdentity, InvocationContract,
@@ -56,6 +56,7 @@ use seismic_lang::expr::compiled::{CompiledNat, InvocationValues};
 use seismic_lang::expr::{SymbolId, SymbolValue};
 use seismic_lang::ids::{EntryId, RepresentationId};
 use seismic_lang::registry::BackendName;
+use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -577,7 +578,11 @@ impl NativePrepared {
                     backend.as_str()
                 ))
             })?;
-        let logical = Arc::new(module.entry(entry, &bindings).map_err(PrepareError::Source)?);
+        let logical = Arc::new(
+            module
+                .entry(entry, &bindings)
+                .map_err(PrepareError::Source)?,
+        );
         Self::prepare_implementation(
             device,
             module,
@@ -1331,7 +1336,12 @@ impl NativePrepared {
             words: shape.words,
             launches: shape.launches,
             access,
-            _slab_bindings: args.tensors().flatten().filter(|tensor| tensor.is_slabbed()).cloned().collect(),
+            _slab_bindings: args
+                .tensors()
+                .flatten()
+                .filter(|tensor| tensor.is_slabbed())
+                .cloned()
+                .collect(),
         })
     }
 
@@ -1362,14 +1372,26 @@ impl NativePrepared {
         }
         .submit(1)?
         .wait()?;
+        self.read_call_results(&calls[0])
+    }
+
+    fn reset_scalar_results(&self) -> Result<(), CallError> {
+        if self.scalar_bytes != 0 {
+            let _host = self.scalars.acquire(true);
+            write_zeros(self.scalars.storage(), self.scalar_bytes).map_err(CallError::Execution)?;
+        }
+        Ok(())
+    }
+
+    fn read_call_results(&self, call: &NativeBoundCall) -> Result<DecodedResults, CallError> {
+        let scalars = &self.scalars;
         let mut scalar_bytes = vec![0u8; self.scalar_words * 8];
         scalars
             .acquire(false)
             .read(scalars, 0, &mut scalar_bytes)
             .map_err(CallError::Execution)?;
-        let [call] = calls;
         let mut offset = 0usize;
-        let mut tensors = call.results.into_iter();
+        let mut tensors = call.results.iter().cloned();
         let mut decoded = Vec::with_capacity(self.results.len());
         for result in &self.results {
             match result {
@@ -1741,7 +1763,11 @@ fn encode(
                 for index in 0..list.count() {
                     buffers.clear();
                     let dispatch = list.dispatch(index, &mut buffers);
-                    let NativeRoute::Metal { launches: pipelines, .. } = &dispatch.kernel.route else {
+                    let NativeRoute::Metal {
+                        launches: pipelines,
+                        ..
+                    } = &dispatch.kernel.route
+                    else {
                         unreachable!("one device has one native route");
                     };
                     typed.clear();

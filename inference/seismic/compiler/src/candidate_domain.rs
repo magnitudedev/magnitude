@@ -984,10 +984,37 @@ pub(crate) mod internals {
         let structural = arena.partial(family.hard_constraints(), &fixed);
         let coverage = arena.all(&[semantic, structural]);
         if !arena.entails(target_domain, coverage) {
+            fn unproved(
+                arena: &ExprArena,
+                domain: BoolExpr,
+                requirement: BoolExpr,
+                out: &mut Vec<String>,
+            ) {
+                use seismic_lang::expr::{BinaryOp, NodeView};
+                if arena.entails(domain, requirement) {
+                    return;
+                }
+                if let NodeView::Binary {
+                    op: BinaryOp::And,
+                    lhs: AnyExpr::Bool(lhs),
+                    rhs: AnyExpr::Bool(rhs),
+                } = arena.view(requirement.into())
+                {
+                    unproved(arena, domain, lhs, out);
+                    unproved(arena, domain, rhs, out);
+                } else {
+                    out.push(crate::implementation::expression_detail(
+                        arena,
+                        requirement.into(),
+                        32,
+                    ));
+                }
+            }
+            let mut missing = Vec::new();
+            unproved(arena, target_domain, coverage, &mut missing);
             return Err(PreparationError::UniversalClosure(format!(
-                "entry {entry_name}: structural universal member is not total over TargetDomain (domain={}, required={})",
-                crate::implementation::expression_detail(arena, target_domain.into(), 12),
-                crate::implementation::expression_detail(arena, coverage.into(), 12),
+                "entry {entry_name}: structural universal member is not total over TargetDomain; unproved requirements: {}",
+                missing.join("; "),
             )));
         }
         Ok(())

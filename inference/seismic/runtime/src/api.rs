@@ -446,7 +446,10 @@ pub mod tensor {
     use seismic_lang::ids::RepresentationId;
     use seismic_lang::registry::representation_info;
     use std::io::Read;
-    use std::sync::{atomic::{AtomicUsize, Ordering}, Arc, Weak};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Weak,
+    };
 
     /// A non-owning observation of one physical tensor allocation. It keeps
     /// no storage alive and reads the same charge as the device ledger.
@@ -604,8 +607,10 @@ pub mod tensor {
                 .ok()
                 .and_then(|count| count.checked_mul(rows_per_slab))
                 .ok_or_else(|| TensorError::SlabLayout("logical slab extent overflows".into()))?;
-            if logical_rows == 0 || logical_rows > capacity_rows
-                || logical_rows <= capacity_rows - rows_per_slab {
+            if logical_rows == 0
+                || logical_rows > capacity_rows
+                || logical_rows <= capacity_rows - rows_per_slab
+            {
                 return Err(TensorError::SlabLayout(
                     "logical extent does not match slab capacity".into(),
                 ));
@@ -670,9 +675,9 @@ pub mod tensor {
                 });
             }
             let layout = layout::canonical(representation, extents)?;
-            let end = offset.checked_add(layout.byte_len).ok_or_else(|| {
-                TensorError::SlabLayout("region offset overflows".into())
-            })?;
+            let end = offset
+                .checked_add(layout.byte_len)
+                .ok_or_else(|| TensorError::SlabLayout("region offset overflows".into()))?;
             if self.byte_offset != 0
                 || self.reserved
                 || self.byte_len != self.allocation.bytes()
@@ -1051,16 +1056,16 @@ pub mod tensor {
                     )
                 })?;
                 let row_bytes = self.byte_len / self.extents[0];
-                let slab_bytes = usize::try_from(row_bytes * slabs.rows_per_slab).map_err(|_| {
-                    ExecutionError::AllocationFailed("slab exceeds host byte domain".into())
-                })?;
+                let slab_bytes =
+                    usize::try_from(row_bytes * slabs.rows_per_slab).map_err(|_| {
+                        ExecutionError::AllocationFailed("slab exceeds host byte domain".into())
+                    })?;
                 let mut bytes = vec![0u8; length];
                 for (index, region) in slabs.regions.iter().enumerate() {
                     if let Some(region) = region {
                         let start = index * slab_bytes;
                         let keep = slab_bytes.min(length - start);
-                        bytes[start..start + keep]
-                            .copy_from_slice(&region.read_to_host()?[..keep]);
+                        bytes[start..start + keep].copy_from_slice(&region.read_to_host()?[..keep]);
                     }
                 }
                 return Ok(bytes);
@@ -1110,10 +1115,11 @@ pub mod tensor {
                         "host write reaches a free slab".into(),
                     ));
                 }
-                let slab_bytes = usize::try_from(
-                    self.byte_len / self.extents[0] * slabs.rows_per_slab,
-                )
-                .map_err(|_| TensorError::SlabLayout("slab exceeds host byte domain".into()))?;
+                let slab_bytes =
+                    usize::try_from(self.byte_len / self.extents[0] * slabs.rows_per_slab)
+                        .map_err(|_| {
+                            TensorError::SlabLayout("slab exceeds host byte domain".into())
+                        })?;
                 for (index, region) in slabs.regions.iter().enumerate() {
                     let start = index * slab_bytes;
                     let keep = slab_bytes.min(bytes.len() - start);
@@ -1124,8 +1130,12 @@ pub mod tensor {
                         let rows = u64::try_from(keep)
                             .ok()
                             .and_then(|count| count.checked_div(self.byte_len / self.extents[0]))
-                            .ok_or_else(|| TensorError::SlabLayout("partial slab row count overflows".into()))?;
-                        region.slice_leading(0, rows)?.write_from_host(&bytes[start..start + keep])?;
+                            .ok_or_else(|| {
+                                TensorError::SlabLayout("partial slab row count overflows".into())
+                            })?;
+                        region
+                            .slice_leading(0, rows)?
+                            .write_from_host(&bytes[start..start + keep])?;
                     }
                 }
                 return Ok(());
@@ -1217,7 +1227,8 @@ pub mod tensor {
             &self.allocation
         }
         pub(crate) fn alias_identity(&self) -> u64 {
-            self.alias_identity.unwrap_or_else(|| self.allocation.identity())
+            self.alias_identity
+                .unwrap_or_else(|| self.allocation.identity())
         }
         #[doc(hidden)]
         pub fn shares_allocation(&self, other: &Self) -> bool {
@@ -1290,8 +1301,9 @@ pub mod tensor {
                         "slice crosses a slab boundary".into(),
                     ));
                 }
-                let slab_index = usize::try_from(start / slabs.rows_per_slab)
-                    .map_err(|_| TensorError::SlabLayout("slab index exceeds host domain".into()))?;
+                let slab_index = usize::try_from(start / slabs.rows_per_slab).map_err(|_| {
+                    TensorError::SlabLayout("slab index exceeds host domain".into())
+                })?;
                 let region = slabs.regions[slab_index]
                     .as_ref()
                     .ok_or_else(|| TensorError::SlabLayout("slice refers to a free slab".into()))?;
@@ -1332,7 +1344,11 @@ pub mod tensor {
                             .transpose()
                     })
                     .collect::<Result<Vec<_>, TensorError>>()?;
-                let lease = self.slab_lease.as_ref().expect("slab view has a binding lease").clone();
+                let lease = self
+                    .slab_lease
+                    .as_ref()
+                    .expect("slab view has a binding lease")
+                    .clone();
                 lease.fetch_add(1, Ordering::AcqRel);
                 return Ok(Self {
                     device: self.device.clone(),
@@ -1607,6 +1623,27 @@ pub mod kernel {
             Self {
                 arguments: Vec::new(),
             }
+        }
+        /// Preserve scalar arguments while replacing tensor bindings by ordinal.
+        pub(crate) fn map_tensors<E>(
+            &self,
+            mut map: impl FnMut(usize, &Arc<TensorInner>) -> Result<Arc<TensorInner>, E>,
+        ) -> Result<Self, E> {
+            Ok(Self {
+                arguments: self
+                    .arguments
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, argument)| match argument {
+                        EncodedArgument::Tensor(tensor) => {
+                            map(ordinal, tensor).map(EncodedArgument::Tensor)
+                        }
+                        EncodedArgument::Scalar(value) => {
+                            Ok(EncodedArgument::Scalar(value.clone()))
+                        }
+                    })
+                    .collect::<Result<_, _>>()?,
+            })
         }
         pub(crate) fn into_workflow(self) -> EncodedWorkflowArgs {
             let arguments = self

@@ -73,8 +73,9 @@ pub(super) fn record(key: &TuningKey, budget: usize, result: &TuningResult) -> R
     let survey = guard
         .as_ref()
         .expect("a survey result implies an installed survey");
-    let (entry, bindings, statics) = key;
-    let instance = crate::kernel_cache::TuningCacheKey::of(&format!("{bindings}{statics:?}"));
+    let (entry, bindings, statics, scopes) = key;
+    let instance =
+        crate::kernel_cache::TuningCacheKey::of(&format!("{bindings}{statics:?}{scopes:?}"));
     let path = survey
         .directory
         .join(format!("{entry}-{}.json", &instance.as_str()[..12]));

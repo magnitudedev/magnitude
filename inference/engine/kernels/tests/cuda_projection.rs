@@ -160,7 +160,13 @@ fn cuda_dense_expand_iq4_matches_host_model() {
 #[test]
 fn cuda_dense_expand_coded_matches_host_model() {
     dense_expand_cases(
-        &[Format::Q4_0, Format::Q5_0, Format::Q5_1, Format::Mxfp4, Format::Nvfp4],
+        &[
+            Format::Q4_0,
+            Format::Q5_0,
+            Format::Q5_1,
+            Format::Mxfp4,
+            Format::Nvfp4,
+        ],
         17,
     );
 }
@@ -361,15 +367,22 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
         },
         &statics,
         points,
-        seismic::Validation::Relative { error: 0.05 },
+        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
+            absolute: seismic::precision::Limit::new(0.01).unwrap(),
+            relative: seismic::precision::Limit::new(0.05).unwrap(),
+            relative_floor: seismic::precision::Limit::ZERO,
+            ulps: None,
+        }),
         search,
+        None,
+        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
         result.method,
         seismic::TuningMethod::Factored { complete: true, .. }
     ));
-    assert_eq!(result.defects().count(), 0);
+    assert_eq!(result.rejections().count(), 0);
     println!(
         "dense_expand CUDA BF16: choice {:?}, method {:?}, time {:?}, records {}",
         result.overall.launches,
@@ -450,15 +463,22 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
         },
         &statics,
         points,
-        seismic::Validation::Relative { error: 0.05 },
+        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
+            absolute: seismic::precision::Limit::new(0.01).unwrap(),
+            relative: seismic::precision::Limit::new(0.05).unwrap(),
+            relative_floor: seismic::precision::Limit::ZERO,
+            ulps: None,
+        }),
         search,
+        None,
+        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
         result.method,
         seismic::TuningMethod::Factored { complete: true, .. }
     ));
-    assert_eq!(result.defects().count(), 0);
+    assert_eq!(result.rejections().count(), 0);
     println!(
         "dense_output CUDA BF16: choice {:?}, method {:?}, time {:?}, records {}",
         result.overall.launches,
@@ -499,7 +519,8 @@ fn cuda_dense_weights_match_host_model() {
                     UW: bf16,
                     A: bf16,
                 },
-                &mapping.dense_expand_params(statics.clone().with_static("GS", 0).with_static("US", 0)),
+                &mapping
+                    .dense_expand_params(statics.clone().with_static("GS", 0).with_static("US", 0)),
             )
             .unwrap()
             .call(dense_expand::Args {

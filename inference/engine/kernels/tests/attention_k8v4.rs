@@ -401,7 +401,9 @@ fn k8v4_devices() -> Vec<Device> {
             "cpu" => BackendName::Cpu,
             other => panic!("unsupported SEISMIC_TEST_BACKEND={other}"),
         };
-        return vec![catalog.open_backend(backend).expect("selected backend opens")];
+        return vec![catalog
+            .open_backend(backend)
+            .expect("selected backend opens")];
     }
     [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
         .into_iter()
@@ -418,10 +420,15 @@ fn decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, 
         // The last configuration slices the query group as finely as the
         // group and the warps admit.
         BackendName::Cuda => {
-            let slices = [8u64, 4, 2, 1].into_iter().find(|s| group as u64 % s == 0).unwrap();
+            let slices = [8u64, 4, 2, 1]
+                .into_iter()
+                .find(|s| group as u64 % s == 0)
+                .unwrap();
             [(12, 4, 1), (24, 8, 1), (48, 4, 1), (48, 8, slices)]
                 .into_iter()
-                .map(|(parts, warps, slices)| vec![("PARTS", parts), ("WARPS", warps), ("SLICES", slices)])
+                .map(|(parts, warps, slices)| {
+                    vec![("PARTS", parts), ("WARPS", warps), ("SLICES", slices)]
+                })
                 .collect()
         }
         BackendName::Cpu => [8, 4, 16, 1]
@@ -431,13 +438,26 @@ fn decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, 
         // The last configuration slices the query group as finely as the
         // group and the simdgroups admit.
         BackendName::Metal => {
-            let slices = [8u64, 4, 2, 1].into_iter().find(|s| group as u64 % s == 0).unwrap();
-            [(32, 16, 4, 1), (64, 32, 8, 1), (256, 8, 8, 1), (32, 16, 8, slices)]
+            let slices = [8u64, 4, 2, 1]
                 .into_iter()
-                .map(|(span, parts, simds, slices)| {
-                    vec![("SPAN", span), ("PARTS", parts), ("SIMDS", simds), ("SLICES", slices)]
-                })
-                .collect()
+                .find(|s| group as u64 % s == 0)
+                .unwrap();
+            [
+                (32, 16, 4, 1),
+                (64, 32, 8, 1),
+                (256, 8, 8, 1),
+                (32, 16, 8, slices),
+            ]
+            .into_iter()
+            .map(|(span, parts, simds, slices)| {
+                vec![
+                    ("SPAN", span),
+                    ("PARTS", parts),
+                    ("SIMDS", simds),
+                    ("SLICES", slices),
+                ]
+            })
+            .collect()
         }
         // A slice count must divide the geometry's query group. The portable
         // comparison also uses a two-query group.
@@ -835,8 +855,18 @@ fn decode_reads_and_writes_across_affine_history_slabs() {
 #[test]
 fn decode_reads_spans_crossing_affine_history_slabs() {
     let rows = [
-        Row { spans: vec![(0, 200)], fresh: (0, 1), destination: 200, position: 200 },
-        Row { spans: vec![(7, 150), (170, 199)], fresh: (1, 2), destination: 201, position: 199 },
+        Row {
+            spans: vec![(0, 200)],
+            fresh: (0, 1),
+            destination: 200,
+            position: 200,
+        },
+        Row {
+            spans: vec![(7, 150), (170, 199)],
+            fresh: (1, 2),
+            destination: 201,
+            position: 199,
+        },
     ];
     let encoded = Encoded::new(Case::new(GROUPED, 224, 2, &rows, 79));
     let expected = encoded.expected();
@@ -923,7 +953,10 @@ fn prefill_reads_and_writes_across_affine_history_slabs() {
     let expected = encoded.expected();
     for device in k8v4_devices() {
         let backend = device.backend();
-        let config = prefill_configs(backend, GROUPED).into_iter().next().unwrap();
+        let config = prefill_configs(backend, GROUPED)
+            .into_iter()
+            .next()
+            .unwrap();
         let kernel = prefill_kernel(&device, GROUPED, &config);
         let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, true);
         let gated = kernel
@@ -1060,12 +1093,29 @@ fn sixteen_query_group_decode_and_prefill_at_4k_match_host_model() {
 /// whose declarations take them (the others refuse by `where`).
 #[test]
 fn wide_head_decode_and_prefill_match_host_model() {
-    let geometry = Geometry { kv: 2, g: 8, p: 64, s: 384 };
+    let geometry = Geometry {
+        kv: 2,
+        g: 8,
+        p: 64,
+        s: 384,
+    };
     for device in k8v4_devices() {
         let backend = device.backend();
         let context = 1024;
-        let decode = Encoded::new(Case::new(geometry, context + 128, 2, &decode_rows(context as i32 - 40), 5));
-        let prefill = Encoded::new(Case::new(geometry, context + 256, 2, &prefill_rows(40, context as i32), 7));
+        let decode = Encoded::new(Case::new(
+            geometry,
+            context + 128,
+            2,
+            &decode_rows(context as i32 - 40),
+            5,
+        ));
+        let prefill = Encoded::new(Case::new(
+            geometry,
+            context + 256,
+            2,
+            &prefill_rows(40, context as i32),
+            7,
+        ));
         for (encoded, configs, is_decode) in [
             (&decode, decode_configs(backend, geometry.g), true),
             (&prefill, prefill_configs(backend, geometry), false),
@@ -1073,7 +1123,10 @@ fn wide_head_decode_and_prefill_match_host_model() {
             let expected = encoded.expected();
             for config in configs {
                 let specialization = specialization_on(&device, geometry, &config);
-                let label = format!("{backend:?} wide {} {config:?}", if is_decode { "decode" } else { "prefill" });
+                let label = format!(
+                    "{backend:?} wide {} {config:?}",
+                    if is_decode { "decode" } else { "prefill" }
+                );
                 let mut bound = Bound::new(&device, encoded);
                 let result = if is_decode {
                     attention_decode_k8v4::native_for_device_with(
@@ -1081,14 +1134,24 @@ fn wide_head_decode_and_prefill_match_host_model() {
                         attention_decode_k8v4::Elements { A: Element::bf16() },
                         &specialization,
                     )
-                    .map(|kernel| kernel.call(args!(attention_decode_k8v4, bound, encoded.case)).unwrap().value)
+                    .map(|kernel| {
+                        kernel
+                            .call(args!(attention_decode_k8v4, bound, encoded.case))
+                            .unwrap()
+                            .value
+                    })
                 } else {
                     attention_prefill_k8v4::native_for_device_with(
                         &device,
                         attention_prefill_k8v4::Elements { A: Element::bf16() },
                         &specialization,
                     )
-                    .map(|kernel| kernel.call(args!(attention_prefill_k8v4, bound, encoded.case)).unwrap().value)
+                    .map(|kernel| {
+                        kernel
+                            .call(args!(attention_prefill_k8v4, bound, encoded.case))
+                            .unwrap()
+                            .value
+                    })
                 };
                 match result {
                     Ok(gated) => check(&label, encoded, &gated, &bound, &expected),
@@ -1252,23 +1315,41 @@ fn decode_timing() {
 
 /// MiniCPM5-2B's attention: 2 kv heads of 8 query heads, W = 128, full
 /// rotation.
-const MINICPM5: Geometry = Geometry { kv: 2, g: 8, p: 64, s: 0 };
+const MINICPM5: Geometry = Geometry {
+    kv: 2,
+    g: 8,
+    p: 64,
+    s: 0,
+};
 
 /// Gemma 4 31B's full-attention layers: 4 kv heads of 8 query heads,
 /// W = 512.
-const GEMMA31_FULL: Geometry = Geometry { kv: 4, g: 8, p: 64, s: 384 };
+const GEMMA31_FULL: Geometry = Geometry {
+    kv: 4,
+    g: 8,
+    p: 64,
+    s: 384,
+};
 
 /// The decode configurations a timing sweeps: the test configurations plus
 /// the larger partition counts long histories over few kv heads need.
 fn timing_decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, u64)>> {
     let mut configs = decode_configs(backend, group);
-    let slicings = [1u64, 2, 4, 8].into_iter().filter(|s| group as u64 % s == 0).collect::<Vec<_>>();
+    let slicings = [1u64, 2, 4, 8]
+        .into_iter()
+        .filter(|s| group as u64 % s == 0)
+        .collect::<Vec<_>>();
     match backend {
         BackendName::Metal | BackendName::Vulkan => {
             for parts in [64u64, 128] {
                 for simds in [4u64, 8] {
                     for &slices in slicings.iter().filter(|s| simds % **s == 0) {
-                        configs.push(vec![("SPAN", 32), ("PARTS", parts), ("SIMDS", simds), ("SLICES", slices)]);
+                        configs.push(vec![
+                            ("SPAN", 32),
+                            ("PARTS", parts),
+                            ("SIMDS", simds),
+                            ("SLICES", slices),
+                        ]);
                     }
                 }
             }
@@ -1293,12 +1374,18 @@ fn decode_timing_on(device: &Device) {
         match std::env::var("K8V4_DECODE_GEOMETRY").as_deref() {
             Ok("minicpm5") => (vec![MINICPM5], vec![256, 4096, 16384], true),
             Ok("gemma31") => (vec![GEMMA31_FULL], vec![4096, 16384], true),
-            _ => (vec![QWEN, QWEN35B, QWEN122B], vec![1, 256, 4096, 16384, 65536], false),
+            _ => (
+                vec![QWEN, QWEN35B, QWEN122B],
+                vec![1, 256, 4096, 16384, 65536],
+                false,
+            ),
         };
-    for (geometry, context) in geometries
-        .into_iter()
-        .flat_map(|geometry| contexts.clone().into_iter().map(move |context| (geometry, context)))
-    {
+    for (geometry, context) in geometries.into_iter().flat_map(|geometry| {
+        contexts
+            .clone()
+            .into_iter()
+            .map(move |context| (geometry, context))
+    }) {
         let rows = [Row {
             spans: vec![(0, context as i32 - 1)],
             fresh: (0, 1),
@@ -1307,7 +1394,11 @@ fn decode_timing_on(device: &Device) {
         }];
         let encoded = Encoded::new(Case::new(geometry, context + 64, 1, &rows, 3));
         let mut dense = DenseHistory::new(device, &encoded.case);
-        let configs = if sweep { timing_decode_configs(backend, geometry.g) } else { decode_configs(backend, geometry.g) };
+        let configs = if sweep {
+            timing_decode_configs(backend, geometry.g)
+        } else {
+            decode_configs(backend, geometry.g)
+        };
         for config in configs {
             // A sweep configuration the declaration's `where` refuses at this
             // geometry is skipped.
@@ -1341,12 +1432,7 @@ fn decode_timing_on(device: &Device) {
             .map(|dense_kernel| {
                 dense_kernel
                     .measure(
-                        vec![dense_args!(
-                            attention_decode,
-                            bound,
-                            dense,
-                            encoded.case
-                        )],
+                        vec![dense_args!(attention_decode, bound, dense, encoded.case)],
                         &TIMING,
                     )
                     .unwrap()
@@ -1430,7 +1516,13 @@ fn prefill_timing_on(device: &Device) {
             .map(|row| (history + row.fresh.1 - row.fresh.0) as f64)
             .sum::<f64>();
         let flop = pairs * (geometry.kv * geometry.g * geometry.w() * 4) as f64;
-        let encoded = Encoded::new(Case::new(geometry, history as usize + rows.len(), 1, &rows, 9));
+        let encoded = Encoded::new(Case::new(
+            geometry,
+            history as usize + rows.len(),
+            1,
+            &rows,
+            9,
+        ));
         let mut dense = DenseHistory::new(device, &encoded.case);
         for config in prefill_configs(backend, geometry) {
             let kernel = prefill_kernel(device, geometry, &config);
@@ -1450,12 +1542,7 @@ fn prefill_timing_on(device: &Device) {
             .unwrap();
             let dense_time = dense_kernel
                 .measure(
-                    vec![dense_args!(
-                        attention_prefill,
-                        bound,
-                        dense,
-                        encoded.case
-                    )],
+                    vec![dense_args!(attention_prefill, bound, dense, encoded.case)],
                     &TIMING,
                 )
                 .unwrap()
@@ -1471,4 +1558,368 @@ fn prefill_timing_on(device: &Device) {
             );
         }
     }
+}
+
+/// The incident's head geometry and four controlled configurations, using
+/// synthetic Qwen-style inputs. This checks geometry coverage; it does not
+/// reproduce or explain the historical Gemma output corruption.
+#[test]
+fn gemma_head_geometry_matches_synthetic_reference() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let geometry = Geometry {
+        kv: 2,
+        g: 8,
+        p: 256,
+        s: 0,
+    };
+    let rows = [Row {
+        spans: vec![(3, 137), (149, 251)],
+        fresh: (0, 1),
+        destination: 256,
+        position: 251,
+    }];
+    let encoded = Encoded::new(Case::new(geometry, 272, 2, &rows, 73));
+    let expected = encoded.expected();
+    for (simds, slices) in [(8, 4), (4, 1), (8, 1), (4, 4)] {
+        let configuration = [
+            ("PARTS", 16),
+            ("SPAN", 32),
+            ("SIMDS", simds),
+            ("SLICES", slices),
+        ];
+        let kernel = decode_kernel(&device, geometry, &configuration);
+        let mut bound = Bound::new(&device, &encoded);
+        let output = kernel
+            .call(args!(attention_decode_k8v4, bound, encoded.case))
+            .unwrap()
+            .value;
+        check(
+            &format!("Gemma G8 {configuration:?}"),
+            &encoded,
+            &output,
+            &bound,
+            &expected,
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual reference-preparation diagnostic: currently takes minutes in initialization-region construction"]
+fn gemma_g8_tuning_uses_portable_reference() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let geometry = Geometry {
+        kv: 2,
+        g: 8,
+        p: 256,
+        s: 0,
+    };
+    let rows = [Row {
+        spans: vec![(3, 17), (19, 25)],
+        fresh: (0, 1),
+        destination: 26,
+        position: 25,
+    }];
+    let encoded = Encoded::new(Case::new(geometry, 32, 2, &rows, 73));
+    let mut bound = Bound::new(&device, &encoded);
+    let mut pristine = [
+        &bound.key_codes,
+        &bound.key_coefficients,
+        &bound.value_codes,
+        &bound.value_coefficients,
+    ]
+    .into_iter()
+    .map(|tensor| (tensor.clone(), tensor.read_to_host().unwrap()))
+    .collect::<Vec<_>>();
+    let initialize: seismic::TuningInitializer<'_> = Box::new(move || {
+        for (tensor, bytes) in &mut pristine {
+            tensor.write_from_host(bytes)?;
+        }
+        Ok(())
+    });
+    let result = attention_decode_k8v4::native_tune_with(
+        &device,
+        attention_decode_k8v4::Elements { A: Element::bf16() },
+        &specialization_on(&device, geometry, &[]),
+        vec![seismic::TuningPoint {
+            label: "gemma-g8".into(),
+            weight: 1.,
+            class: None,
+            rotation: vec![args!(attention_decode_k8v4, bound, encoded.case)],
+            initialize: Some(initialize),
+        }],
+        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
+            absolute: seismic::precision::Limit::new(0.01).unwrap(),
+            relative: seismic::precision::Limit::new(0.01).unwrap(),
+            relative_floor: seismic::precision::Limit::ZERO,
+            ulps: None,
+        }),
+        seismic::Strategy::Search(seismic::SearchPlan {
+            budget: 2,
+            settings: seismic::SearchSettings {
+                improvement: 0.01,
+                restarts: 2,
+                confirmed: 3,
+                default_margin: 0.02,
+                samples: 1,
+                confirmation_samples: 3,
+            },
+            min_sample_seconds: 0.0002,
+            start: vec![[
+                ("PARTS".into(), 16),
+                ("SIMDS".into(), 8),
+                ("SLICES".into(), 4),
+                ("SPAN".into(), 32),
+            ]
+            .into()],
+            deadline: None,
+            screening: Vec::new(),
+        }),
+        None,
+        seismic::TuningReference::Portable,
+    );
+    eprintln!("Gemma portable-reference tuning: {result:?}");
+    assert!(result.is_ok());
+}
+
+/// Actual Gemma form from the incident cache: ungated, normalized values,
+/// BF16, KV2/G8/P256. Compare the incident choices on short and long history.
+#[test]
+#[ignore = "manual diagnostic: the historical Metal configuration is numerically defective without shader instrumentation"]
+fn gemma_form_decode_configurations_agree() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let geometry = Geometry {
+        kv: 2,
+        g: 8,
+        p: 256,
+        s: 0,
+    };
+    let mut failures = 0;
+    for history in [0, 1, 31, 32, 127, 256, 2048] {
+        let rows = [Row {
+            spans: vec![(0, history)],
+            fresh: (0, 1),
+            destination: history,
+            position: history,
+        }];
+        let encoded = Encoded::new(Case::new(geometry, history as usize + 1, 1, &rows, 73));
+        let mut baseline: Option<(Vec<f32>, Vec<Vec<u8>>)> = None;
+        for (simds, slices) in [(4, 1), (8, 4), (8, 1), (4, 4)] {
+            let mut bound = Bound::new(&device, &encoded);
+            let w = geometry.w();
+            let query: Vec<_> = encoded
+                .case
+                .query_gate
+                .chunks_exact(2 * w)
+                .flat_map(|head| head[..w].iter().copied())
+                .collect();
+            bound.query = bf16_tensor(&device, &[1, geometry.kv * geometry.g, w], &query);
+            bound.value_norm = f32_tensor(&device, &[1, w], &vec![1.; w]);
+            bound.components = i32_tensor(&device, &[geometry.p], &vec![0; geometry.p]);
+            let spec = specialization_on(
+                &device,
+                geometry,
+                &[
+                    ("PARTS", 16),
+                    ("SPAN", 32),
+                    ("SIMDS", simds),
+                    ("SLICES", slices),
+                ],
+            )
+            .with_static("I", 0)
+            .with_static("NV", 1);
+            let kernel = attention_decode_k8v4::native_for_device_with(
+                &device,
+                attention_decode_k8v4::Elements { A: Element::bf16() },
+                &spec,
+            )
+            .unwrap();
+            let out = kernel
+                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .unwrap()
+                .value;
+            let actual = bf16_values(&out);
+            eprintln!(
+                "Gemma history={history} SIMDS={simds} SLICES={slices}: first {:?}",
+                &actual[..4]
+            );
+            let state = [
+                &bound.key_codes,
+                &bound.key_coefficients,
+                &bound.value_codes,
+                &bound.value_coefficients,
+            ]
+            .into_iter()
+            .map(|t| t.read_to_host().unwrap())
+            .collect::<Vec<_>>();
+            if let Some((reference, expected_state)) = &baseline {
+                assert_eq!(
+                    &state, expected_state,
+                    "history {history} simds {simds} slices {slices}: writable state"
+                );
+                let mut worst = 0f32;
+                let mut required_scale = 0f32;
+                for (i, (&a, &r)) in actual.iter().zip(reference).enumerate() {
+                    worst = worst.max((a - r).abs());
+                    required_scale = required_scale.max((a - r).abs() / (0.01 + 0.01 * r.abs()));
+                    if !(a.is_finite() && (a - r).abs() <= 0.01 + 0.01 * r.abs()) {
+                        failures += 1;
+                        if i == 0 {
+                            eprintln!(
+                                "FAIL history {history} simds {simds} slices {slices}: {a} != {r}"
+                            );
+                        }
+                    }
+                }
+                eprintln!("Gemma history={history} SIMDS={simds} SLICES={slices}: max_abs={worst} required_scale={required_scale}");
+            } else {
+                baseline = Some((actual, state));
+            }
+        }
+    }
+    assert_eq!(failures, 0, "Gemma output elements outside bounded policy");
+}
+
+/// A single fresh key has a simple independent result: its normalized value,
+/// repeated for every query head. This catches the actual Gemma form defect
+/// without assuming the default native implementation is mathematically correct.
+#[test]
+fn gemma_tuner_rejects_corrupted_fresh_only_attention() {
+    for scale in [0.25, 1., 4.] {
+        gemma_fresh_only_with_scale(scale);
+    }
+}
+
+fn gemma_fresh_only_with_scale(scale: f64) {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let geometry = Geometry {
+        kv: 2,
+        g: 8,
+        p: 256,
+        s: 0,
+    };
+    let w = geometry.w();
+    let rows = [Row {
+        spans: vec![(0, 0)],
+        fresh: (0, 1),
+        destination: 0,
+        position: 0,
+    }];
+    let encoded = Encoded::new(Case::new(geometry, 1, 1, &rows, 73));
+    let mut bound = Bound::new(&device, &encoded);
+    let query: Vec<_> = encoded
+        .case
+        .query_gate
+        .chunks_exact(2 * w)
+        .flat_map(|head| head[..w].iter().copied())
+        .collect();
+    bound.query = bf16_tensor(&device, &[1, geometry.kv * geometry.g, w], &query);
+    bound.value_norm = f32_tensor(&device, &[1, w], &vec![1.; w]);
+    bound.components = i32_tensor(&device, &[geometry.p], &vec![0; geometry.p]);
+    let spec = specialization_on(&device, geometry, &[])
+        .with_static("I", 0)
+        .with_static("NV", 1);
+    let mut pristine = [
+        &bound.key_codes,
+        &bound.key_coefficients,
+        &bound.value_codes,
+        &bound.value_coefficients,
+    ]
+    .into_iter()
+    .map(|tensor| (tensor.clone(), tensor.read_to_host().unwrap()))
+    .collect::<Vec<_>>();
+    let result = attention_decode_k8v4::native_tune_with(
+        &device,
+        attention_decode_k8v4::Elements { A: Element::bf16() },
+        &spec,
+        vec![seismic::TuningPoint {
+            label: "gemma-fresh-only".into(),
+            weight: 1.,
+            class: None,
+            rotation: vec![args!(attention_decode_k8v4, bound, encoded.case)],
+            initialize: Some(Box::new(move || {
+                for (tensor, bytes) in &mut pristine {
+                    tensor.write_from_host(bytes)?;
+                }
+                Ok(())
+            })),
+        }],
+        seismic::PrecisionPolicy::bounded(seismic::Tolerance {
+            absolute: seismic::Limit::new(0.01 * scale).unwrap(),
+            relative: seismic::Limit::new(0.01 * scale).unwrap(),
+            relative_floor: seismic::Limit::ZERO,
+            ulps: None,
+        }),
+        seismic::Strategy::Survey(seismic::SurveyPlan {
+            samples: 2,
+            min_sample_seconds: 0.0002,
+            domains: [
+                ("PARTS", vec![16]),
+                ("SPAN", vec![32]),
+                ("SIMDS", vec![4, 8]),
+                ("SLICES", vec![1, 4]),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v))
+            .collect(),
+        }),
+        None,
+        seismic::TuningReference::NativeDefault,
+    )
+    .unwrap();
+    let mut expected = Vec::new();
+    for value in encoded.case.value.chunks_exact(w) {
+        let squares = value.iter().map(|v| v * v).sum::<f32>();
+        let inverse = 1. / (squares / w as f32 + encoded.case.epsilon).sqrt();
+        for _ in 0..geometry.g {
+            expected.extend(value.iter().map(|v| bf16(v * inverse)));
+        }
+    }
+    for record in &result.configurations {
+        if let seismic::Outcome::Measured { .. } = &record.outcome {
+            let kernel = attention_decode_k8v4::native_for_device_with(
+                &device,
+                attention_decode_k8v4::Elements { A: Element::bf16() },
+                &record.configuration.specialization(),
+            )
+            .unwrap();
+            let actual = bf16_values(
+                &kernel
+                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .unwrap()
+                    .value,
+            );
+            for (index, (&a, &r)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    a.is_finite() && (a - r).abs() <= 0.01 + 0.01 * r.abs(),
+                    "admitted {:?} element {index}: {a} vs independent {r}",
+                    record.configuration.params
+                );
+            }
+        }
+    }
+    let historical = result
+        .configurations
+        .iter()
+        .find(|r| r.configuration.params["SIMDS"] == 8 && r.configuration.params["SLICES"] == 4)
+        .unwrap();
+    eprintln!(
+        "Historical Gemma configuration at precision scale {scale}: {:?}",
+        historical.outcome
+    );
+    assert!(result
+        .configurations
+        .iter()
+        .any(|r| matches!(r.outcome, seismic::Outcome::Measured { .. })));
 }

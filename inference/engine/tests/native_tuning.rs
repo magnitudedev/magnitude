@@ -1,6 +1,6 @@
 //! Program preparation of pinned models on the host's accelerator: every
 //! parameterized entry is tuned on real resident weights of the model, each
-//! distinct case once, with no defect. This composes a model family with the
+//! distinct case once, selecting a numerically qualified candidate. This composes a model family with the
 //! executor, so it lives at the engine layer (the executor stays
 //! family-agnostic). The 4B covers the dense, attention, recurrent-state and
 //! selection cases; the 35B covers the routed ones (route, group, expand,
@@ -37,7 +37,7 @@ const PINNED_35B: [&str; 1] = [
 /// Prepare every program of the first existing file of `candidates` on the
 /// automatically selected accelerator `loads` times, with `cache` as the
 /// kernel cache, and return each load's tunings. Every entry of the first
-/// load must tune without defect.
+/// load must select a measured, numerically qualified candidate.
 fn prepare_every_entry(
     candidates: &[&str],
     cache: Option<Arc<KernelCache>>,
@@ -112,7 +112,7 @@ fn prepare_every_entry(
         let mut cases = HashSet::new();
         for tuned in programs.tuned() {
             eprintln!(
-                "{:.2} s {} [{}] {:?} {:?} ({} measured, {} excluded, {} defects)",
+                "{:.2} s {} [{}] {:?} {:?} ({} measured, {} excluded, {} qualification rejections)",
                 tuned.seconds,
                 tuned.entry,
                 tuned.bindings,
@@ -120,7 +120,7 @@ fn prepare_every_entry(
                 tuned.overall.params,
                 tuned.measured,
                 tuned.excluded,
-                tuned.defects
+                tuned.rejections
             );
             assert!(
                 cases.insert((tuned.entry, tuned.bindings.clone())),
@@ -141,17 +141,17 @@ fn prepare_every_entry(
         );
         tunings.push(programs.tuned().to_vec());
     }
-    let defective = tunings[0]
+    let unmeasured = tunings[0]
         .iter()
-        .filter(|tuned| tuned.measured == 0 || tuned.defects > 0)
+        .filter(|tuned| tuned.measured == 0)
         .map(|tuned| {
             format!(
                 "{} [{}]: {:?}",
-                tuned.entry, tuned.bindings, tuned.first_defect
+                tuned.entry, tuned.bindings, tuned.first_rejection
             )
         })
         .collect::<Vec<_>>();
-    assert!(defective.is_empty(), "{defective:#?}");
+    assert!(unmeasured.is_empty(), "{unmeasured:#?}");
     (backend, tunings)
 }
 

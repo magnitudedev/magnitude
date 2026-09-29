@@ -2141,6 +2141,38 @@ mod tests {
     }
 
     #[test]
+    fn nonnegative_signed_division_preserves_values_and_zero_divisor_failure() {
+        let mut arena = ExprArena::new();
+        let (_, ns) = arena.target_constant(SymbolSort::Nat);
+        let (_, ds) = arena.target_constant(SymbolSort::Nat);
+        let n = arena.nat_symbol(ns);
+        let d = arena.nat_symbol(ds);
+        let signed_n = arena.int_from_nat(n);
+        let signed_d = arena.int_from_nat(d);
+        let padding = arena.int(31);
+        let padded = arena.int_add(signed_n, padding);
+        let divided = arena.int_div(padded, signed_d);
+        let converted = arena.nat_from_int(divided);
+        let padding = arena.nat(31);
+        let padded = arena.nat_add(n, padding);
+        let expected = arena.nat_div(padded, d);
+        assert_eq!(converted, expected);
+        for numerator in [0u64, 1, 31, 32, 33, u32::MAX as u64] {
+            for divisor in [0u64, 1, 32] {
+                let mut assignment = Assignment::new();
+                assignment.bind(ns, SymbolValue::Nat(numerator.into()));
+                assignment.bind(ds, SymbolValue::Nat(divisor.into()));
+                let result = arena.eval_nat_u64(converted, &assignment);
+                if divisor == 0 {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap(), (numerator + 31) / divisor);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn product_bound_can_drop_only_proven_positive_factors() {
         let mut arena = ExprArena::new();
         let (_, ns) = arena.target_constant(SymbolSort::Nat);

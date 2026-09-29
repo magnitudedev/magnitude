@@ -10,7 +10,6 @@ use crate::options::ExecutionManifest;
 use crate::worker::protocol::LoadProgress;
 use magnitude_artifacts::Package;
 use magnitude_batching::Demand;
-use magnitude_family_contracts::{InputLayout, PreparedModelInput, TokenPlan};
 use magnitude_executor::{
     memory::{ClaimId, HoldingClass},
     platform::{self, DomainRole, PlatformConfig, PlatformError},
@@ -19,6 +18,7 @@ use magnitude_executor::{
     ResourceDomainId, ResourcePlan, ResourcePlanner, TokenId, TuningContext, TuningEvent,
     TuningObserver, TuningOrigin, WorkKind, DEFAULT_KERNEL_CACHE_BYTES,
 };
+use magnitude_family_contracts::{InputLayout, PreparedModelInput, TokenPlan};
 use seismic::{DeviceCatalog, DeviceMemory, DeviceSelector, MemoryPoolKind};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -583,14 +583,14 @@ impl TuningObserver for TuningReport {
                     (TuningOrigin::Searched, None) => "surveyed".to_owned(),
                 };
                 eprintln!(
-                    "magnitude-engine: tuned {} [{}] in {:.2} s ({origin}): {:?} ({} measured, {} excluded, {} defects)",
+                    "magnitude-engine: tuned {} [{}] in {:.2} s ({origin}): {:?} ({} measured, {} excluded, {} qualification rejections)",
                     tuned.entry,
                     tuned.bindings,
                     tuned.seconds,
                     tuned.overall.params,
                     tuned.measured,
                     tuned.excluded,
-                    tuned.defects
+                    tuned.rejections
                 );
                 if tuned.search.is_some_and(|(_, stop)| stop == seismic::SearchStop::Expired) {
                     eprintln!(
@@ -598,8 +598,8 @@ impl TuningObserver for TuningReport {
                         tuned.entry, tuned.bindings
                     );
                 }
-                if let Some(defect) = &tuned.first_defect {
-                    eprintln!("magnitude-engine:   first defect of {}: {defect}", tuned.entry);
+                if let Some(rejection) = &tuned.first_rejection {
+                    eprintln!("magnitude-engine:   first qualification rejection of {}: {rejection}", tuned.entry);
                 }
             }
         }

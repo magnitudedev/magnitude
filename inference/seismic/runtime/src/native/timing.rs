@@ -36,9 +36,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 /// One point's calls, placed once and submitted for every sample.
-pub(crate) struct PointTiming {
+pub(crate) struct PointTiming<'a> {
     kernel: Arc<NativePrepared>,
     calls: Vec<NativeBoundCall>,
+    arguments: Vec<EncodedArgs>,
+    pub(super) initialize: Option<super::validation::Initializer<'a>>,
     /// Passes over the rotation per sample; `None` until calibrated.
     repetitions: Option<usize>,
     /// Device time of one sample, as calibrated.
@@ -52,8 +54,8 @@ const STEADY_SAMPLE_SECONDS: f64 = 0.002;
 
 /// Result storage of each point's argument sets, shared by every placement at
 /// that point in one tuning run. Samples complete one at a time, so the
-/// configurations placed at a point can write the same results; none zeroes
-/// its own.
+/// configurations placed at a point can write the same results. Numerical
+/// observation clears that storage before each candidate's first invocation.
 #[derive(Default)]
 pub(crate) struct OutputPool(Vec<Vec<Vec<Arc<TensorInner>>>>);
 
@@ -69,20 +71,32 @@ impl OutputPool {
 
 /// A submitted sample of one point.
 pub(crate) struct PendingSample {
-    submission: NativeSubmission,
+    completion: SampleCompletion,
     calls: usize,
     /// Whether the kernel had completed a timed submission before this one.
     exercised: bool,
 }
 
+enum SampleCompletion {
+    Submitted(NativeSubmission),
+    Completed(f64),
+}
+
 impl PendingSample {
     /// Device seconds per call, once the sample completes.
     pub(crate) fn seconds(self) -> Result<f64, CallError> {
-        Ok(self.submission.device_seconds()? / self.calls as f64)
+        let calls = self.calls;
+        Ok(self.device_seconds()? / calls as f64)
+    }
+    fn device_seconds(self) -> Result<f64, CallError> {
+        match self.completion {
+            SampleCompletion::Submitted(submission) => submission.device_seconds(),
+            SampleCompletion::Completed(seconds) => Ok(seconds),
+        }
     }
 }
 
-impl PointTiming {
+impl<'a> PointTiming<'a> {
     /// Validate and place every call of `rotation`. Results of each argument
     /// set are allocated once and reused by every sample; scratch is the
     /// standalone arena.
@@ -111,6 +125,7 @@ impl PointTiming {
         if rotation.is_empty() {
             return Err(CallError::Workflow(crate::api::WorkflowError::Empty));
         }
+        let arguments = rotation.clone();
         let calls = {
             let mut standalone = kernel
                 .standalone
@@ -150,6 +165,8 @@ impl PointTiming {
         Ok(Self {
             kernel: kernel.clone(),
             calls,
+            arguments,
+            initialize: None,
             repetitions: None,
             sample_seconds: None,
             rotation_bytes: distinct.into_iter().map(|(_, bytes)| bytes).sum(),
@@ -187,17 +204,111 @@ impl PointTiming {
 
     /// Submit `passes` passes over the rotation as one unit of device work.
     fn submit_passes(&self, passes: usize) -> Result<PendingSample, CallError> {
-        let exercised = self.kernel.exercised.load(std::sync::atomic::Ordering::Acquire);
-        let submission = StandaloneCalls {
-            kernel: &self.kernel,
-            calls: &self.calls,
-        }
-        .submit(passes)?;
+        let exercised = self
+            .kernel
+            .exercised
+            .load(std::sync::atomic::Ordering::Acquire);
+        let completion = if self.initialize.is_some() || self.kernel.scalar_bytes != 0 {
+            // A mutable case is a sequence of separately initialized invocations. Host resets
+            // are outside each device interval; never compare or time progressively dirty state.
+            let mut seconds = 0.;
+            for _ in 0..passes {
+                for call in &self.calls {
+                    if let Some(initialize) = &self.initialize {
+                        initialize.borrow_mut()().map_err(|e| {
+                            CallError::Execution(
+                                seismic_compiler::errors::ExecutionError::SubmissionFailed(
+                                    e.to_string(),
+                                ),
+                            )
+                        })?;
+                    }
+                    self.kernel.reset_scalar_results()?;
+                    seconds += StandaloneCalls {
+                        kernel: &self.kernel,
+                        calls: std::slice::from_ref(call),
+                    }
+                    .submit(1)?
+                    .device_seconds()?;
+                }
+            }
+            SampleCompletion::Completed(seconds)
+        } else {
+            SampleCompletion::Submitted(
+                StandaloneCalls {
+                    kernel: &self.kernel,
+                    calls: &self.calls,
+                }
+                .submit(passes)?,
+            )
+        };
         Ok(PendingSample {
-            submission,
+            completion,
             calls: passes * self.calls.len(),
             exercised,
         })
+    }
+
+    pub(super) fn artifact(&self) -> &str {
+        &self.kernel.artifact().0
+    }
+
+    /// The calibration pass also supplies numerical observations, before any rotation or
+    /// subsequent candidate can overwrite the result/state buffers.
+    pub(super) fn observe_first(
+        &mut self,
+        minimum_seconds: f64,
+        mut observe: impl FnMut(
+            usize,
+            Vec<crate::api::kernel::DecodedValue>,
+            &EncodedArgs,
+        ) -> Result<(), super::tune::Exclusion>,
+    ) -> Result<(), super::tune::Exclusion> {
+        let exercised = self
+            .kernel
+            .exercised
+            .load(std::sync::atomic::Ordering::Acquire);
+        let mut seconds = 0.;
+        for (rotation, call) in self.calls.iter().enumerate() {
+            if let Some(initialize) = &self.initialize {
+                initialize.borrow_mut()()
+                    .map_err(|e| super::tune::Exclusion::Execution(e.to_string()))?;
+            }
+            // Match fresh-call zeroed result storage. A pooled output must not
+            // let a missing write inherit the preceding candidate's correct bytes.
+            // Initialization remains outside the submitted device interval.
+            for result in &call.results {
+                let bytes = usize::try_from(result.byte_len()).map_err(|_| {
+                    super::tune::Exclusion::Execution("result bytes exceed usize".into())
+                })?;
+                result
+                    .write_from_host(&vec![0; bytes])
+                    .map_err(|error| super::tune::Exclusion::Execution(error.to_string()))?;
+            }
+            self.kernel
+                .reset_scalar_results()
+                .map_err(|e| super::tune::Exclusion::Execution(e.to_string()))?;
+            let submission = StandaloneCalls {
+                kernel: &self.kernel,
+                calls: std::slice::from_ref(call),
+            }
+            .submit(1)
+            .map_err(|e| super::tune::Exclusion::Execution(e.to_string()))?;
+            seconds += submission
+                .device_seconds()
+                .map_err(|e| super::tune::Exclusion::Execution(e.to_string()))?;
+            let actual = self
+                .kernel
+                .read_call_results(call)
+                .map_err(|e| super::tune::Exclusion::Execution(e.to_string()))?;
+            observe(rotation, actual.into_values(), &self.arguments[rotation])?;
+        }
+        self.record(
+            seconds / self.calls.len() as f64,
+            exercised,
+            minimum_seconds,
+        );
+        Ok(())
     }
 
     /// Record a completed sample; the first calibrates and is not kept (it
@@ -268,7 +379,7 @@ const WARM_LIMIT_SECONDS: f64 = 0.5;
 /// [`WARM_CHUNK_SECONDS`] until two consecutive chunks take the same time
 /// per pass within [`WARM_AGREEMENT`], at most [`WARM_LIMIT_SECONDS`].
 pub(crate) fn warm(point: &PointTiming) -> Result<(), CallError> {
-    let pass = point.submit_passes(1)?.submission.device_seconds()?;
+    let pass = point.submit_passes(1)?.device_seconds()?;
     point
         .kernel
         .exercised
@@ -282,12 +393,11 @@ pub(crate) fn warm(point: &PointTiming) -> Result<(), CallError> {
     };
     let mut spent = point
         .submit_passes(passes(WARM_MIN_SECONDS))?
-        .submission
         .device_seconds()?;
     let chunk = passes(WARM_CHUNK_SECONDS);
     let mut previous = f64::INFINITY;
     while spent < WARM_LIMIT_SECONDS {
-        let seconds = point.submit_passes(chunk)?.submission.device_seconds()?;
+        let seconds = point.submit_passes(chunk)?.device_seconds()?;
         spent += seconds;
         if (seconds - previous).abs() <= WARM_AGREEMENT * previous {
             break;
@@ -336,7 +446,11 @@ pub(crate) fn sample(
     collect(points, &uncalibrated, options.min_sample_seconds)?;
     let missing = points
         .iter()
-        .map(|point| point.samples_needed(options.samples).saturating_sub(point.samples.len()))
+        .map(|point| {
+            point
+                .samples_needed(options.samples)
+                .saturating_sub(point.samples.len())
+        })
         .collect::<Vec<_>>();
     let rounds = missing.iter().copied().max().unwrap_or(0);
     let order = (0..rounds)

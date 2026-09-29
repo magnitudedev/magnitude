@@ -69,6 +69,10 @@ impl EntryTuning for StateSpaceProjectTuning {
         self.scopes.len()
     }
 
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
+    }
+
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
@@ -162,6 +166,10 @@ impl EntryTuning for StateSpaceOutputTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
+    }
+
+    fn weight_scopes(&self) -> &[WeightScope] {
+        &self.scopes
     }
 
     fn bindings(&self) -> String {
@@ -342,6 +350,13 @@ macro_rules! state_entry {
 
             fn launches(&self) -> usize {
                 self.0.scopes.len()
+            }
+
+
+            fn weight_scopes(&self) -> &[WeightScope] {
+
+                &self.0.scopes
+
             }
 
             fn bindings(&self) -> String {
