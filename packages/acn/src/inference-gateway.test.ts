@@ -10,6 +10,31 @@ import {
   proxyLocalAnthropicInferenceRequest,
 } from "./inference-gateway"
 
+const zstdRleFrame = (decodedLength: number) => {
+  const parts = [Buffer.from([
+    0x28, 0xb5, 0x2f, 0xfd,
+    0xa0,
+    decodedLength & 0xff,
+    (decodedLength >>> 8) & 0xff,
+    (decodedLength >>> 16) & 0xff,
+    (decodedLength >>> 24) & 0xff,
+  ])]
+  let remaining = decodedLength
+  while (remaining > 0) {
+    const blockSize = Math.min(128 * 1024, remaining)
+    const last = blockSize === remaining
+    const header = (blockSize << 3) | 0b10 | Number(last)
+    parts.push(Buffer.from([
+      header & 0xff,
+      (header >>> 8) & 0xff,
+      (header >>> 16) & 0xff,
+      0,
+    ]))
+    remaining -= blockSize
+  }
+  return Buffer.concat(parts)
+}
+
 const icn = {
   origin: new URL("http://127.0.0.1:9999"),
   clientOptions: {
@@ -459,6 +484,26 @@ describe("Codex inference gateway", () => {
 
     expect(forwarded?.headers.get("content-encoding")).toBeNull()
     expect(await forwarded?.text()).toBe('{"model":"canonical:model","input":[]}')
+  })
+
+  test("rejects zstd output above the routing body limit before forwarding", async () => {
+    const compressed = zstdRleFrame(MAX_CODEX_ROUTING_BODY_BYTES + 1)
+    let forwarded = false
+    const response = await proxyCodexInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/v1/proxies/codex/responses", {
+        method: "POST",
+        headers: { "content-encoding": "zstd" },
+        body: Uint8Array.from(compressed).buffer,
+      }),
+      icn,
+      async () => {
+        forwarded = true
+        return new Response("unexpected")
+      },
+    )
+
+    expect(response.status).toBe(413)
+    expect(forwarded).toBe(false)
   })
 
   test("rejects unsupported encodings and oversized routing bodies", async () => {
