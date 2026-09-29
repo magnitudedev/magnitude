@@ -7,6 +7,7 @@ applies_to:
   - packages/daemon-management/src/desktop-native/*-preferences.ts
   - desktop/native/**
   - desktop/scripts/build-native.ts
+  - desktop/scripts/dev.ts
   - packages/storage/src/types/config.ts
   - packages/sdk/src/desktop-host.ts
   - packages/client-common/src/desktop/**
@@ -225,6 +226,13 @@ differs, a persistent toast in the window's bottom-right corner on every page st
 is required, offers Restart Magnitude, which relaunches the application through the ordinary quit
 path, and shows a copyable platform-specific command that moves the previous store into the new
 folder. Magnitude never moves model files itself.
+
+When the renderer is served by the `electron-vite` dev server, Electron cannot relaunch itself:
+that server belongs to the parent process and exits with the application, so a self-relaunch would
+open an empty window. A development relaunch instead exits with a dedicated exit code that carries
+window visibility, and the desktop dev script supervises `electron-vite dev`, starting it again with
+a fresh renderer server whenever it sees that code. Any other exit ends the dev script with the
+same code.
 
 Network access is a General row with a switch, off by default, persisted as `network` in the same
 `config.json` that the service reads when it binds. Turning it on generates an API key once and

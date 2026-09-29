@@ -5,7 +5,7 @@
   "main": "out/main/main.js",
   "scripts": {
     "setup": "install-electron --no",
-    "dev": "bun run build:native && electron-vite dev",
+    "dev": "bun run build:native && bun scripts/dev.ts",
     "build": "bun run build:native && electron-vite build",
     "test": "bunx --bun vitest run",
     "build:native": "bun ../packages/daemon-management/scripts/build-native.ts && bun scripts/build-native.ts"

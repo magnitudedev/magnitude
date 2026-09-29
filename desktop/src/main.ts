@@ -21,6 +21,7 @@ import { makeHarnessConnectionService, resolveHarnessConnectionPaths, harnessExe
 import { HttpsUrlSchema } from "@magnitudedev/sdk"
 import { slate } from "@magnitudedev/client-common"
 import { DESKTOP_APP_ORIGIN, handleAppProtocol, resolveRendererDir } from "./app-protocol"
+import { developmentRelaunchExitCode, rendererServedByDevServer } from "./development-relaunch"
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, powerMonitor, shell, Tray } from "electron"
 import { join, resolve, dirname } from "node:path"
 import { homedir } from "node:os"
@@ -471,8 +472,12 @@ const program = Effect.scoped(Effect.gen(function* () {
 Effect.runPromiseExit(program).then(Exit.match({
   onSuccess: intent => {
     exiting = true
-    // `args` replaces the argument list, so keep the original ones (the app directory in development).
-    if (intent === "Relaunch") app.relaunch({ args: [...process.argv.slice(1).filter(argument => argument !== "--background"), ...(reopenAfterUpdate ? [] : ["--background"])] })
+    if (intent === "Relaunch") {
+      // The renderer dev server dies with this process; its supervising script performs the relaunch.
+      if (rendererServedByDevServer(process.env)) { app.exit(developmentRelaunchExitCode({ showWindow: reopenAfterUpdate })); return }
+      // `args` replaces the argument list, so keep the original ones (the app directory in development).
+      app.relaunch({ args: [...process.argv.slice(1).filter(argument => argument !== "--background"), ...(reopenAfterUpdate ? [] : ["--background"])] })
+    }
     if (intent === "InstallMacUpdate") {
       const install = Effect.scoped(Effect.gen(function* () {
         const stateDirectory = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: dataDir, override: Option.fromNullable(stateOverride) })
