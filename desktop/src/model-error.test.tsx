@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
 import { LowMemoryModelInstanceFailureSchema, LocalModelMutationFailed } from "@magnitudedev/sdk"
 import { Option, Schema } from "effect"
-import { ModelLoadNotice, downloadNotice, modelCommandNotice, modelRemovalNotice } from "./model-error"
+import { ModelLoadFailureIndicator, ModelLoadNotice, downloadNotice, modelCommandNotice, modelRemovalNotice } from "./model-error"
 import { ErrorNotice, NoticeAction } from "./error-notice"
 
 const memory = Schema.decodeUnknownSync(LowMemoryModelInstanceFailureSchema)({
@@ -21,6 +21,12 @@ describe("desktop failure presentation", () => {
     expect(html).toContain("Memory breakdown")
     expect(html).not.toMatch(/PRIVATE|bytes|32358673408|title=/)
     expect(html.match(/role="alert"/g)).toHaveLength(1)
+  })
+  it("marks a failed row with a labelled amber indicator instead of an alert", () => {
+    const html = renderToStaticMarkup(<ModelLoadFailureIndicator failure={memory} />)
+    expect(html).toContain('aria-label="Not enough memory to load this model"')
+    expect(html).toContain("text-amber-500")
+    expect(html).not.toMatch(/role="alert"|PRIVATE|bytes|32358673408/)
   })
   it("does not expose diagnostics from unknown load, download, or command failures", () => {
     const html = renderToStaticMarkup(<ModelLoadNotice failure={{ code: "worker_lost", message: "PRIVATE stack trace", retryable: true }} />)

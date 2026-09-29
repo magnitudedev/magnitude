@@ -2,6 +2,8 @@ import { Option } from "effect"
 import type { ModelAcquisitionFailure, ModelInstanceFailure, ModelFailure } from "@magnitudedev/sdk"
 import { formatMemorySize, formatStorageSize, type LocalModelCommandFailure } from "@magnitudedev/client-common"
 import { ErrorNotice, type NoticeContent } from "./error-notice"
+import { Tooltip, TooltipContent, TooltipTrigger } from "../../web/src/components/ui/tooltip"
+import { WarningCircleIcon } from "@phosphor-icons/react"
 import type { ReactNode } from "react"
 
 export const modelLoadNotice = (failure: ModelInstanceFailure): NoticeContent => {
@@ -12,17 +14,39 @@ export const modelLoadNotice = (failure: ModelInstanceFailure): NoticeContent =>
   return { title: "This model couldn’t start", description: "Try loading it again. If it still won’t start, choose another model." }
 }
 
+const isLowMemory = (failure: ModelInstanceFailure): failure is Extract<ModelInstanceFailure, { _tag: "LowMemory" }> =>
+  "_tag" in failure && failure._tag === "LowMemory"
+
+function MemoryBreakdown({ failure, className }: { failure: Extract<ModelInstanceFailure, { _tag: "LowMemory" }>; className?: string }) {
+  return <dl className={`grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1 tabular-nums ${className ?? ""}`}>
+    <dt>Needed for the model</dt><dd>{formatMemorySize(failure.requiredMemoryBytes, { rounding: "up" })}</dd>
+    <dt>Memory allowance for operating system</dt><dd>{formatMemorySize(failure.systemReserveBytes, { rounding: "up" })}</dd>
+    <dt>Available when loading was attempted</dt><dd>{formatMemorySize(failure.allocationHeadroomBytes)}</dd>
+  </dl>
+}
+
 export function ModelLoadNotice({ failure, actions }: { failure: ModelInstanceFailure; actions?: ReactNode }) {
   return <ErrorNotice {...modelLoadNotice(failure)} actions={actions}>
-    {"_tag" in failure && failure._tag === "LowMemory" && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
+    {isLowMemory(failure) && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
       <summary className="w-fit cursor-pointer rounded py-0.5 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500">Memory breakdown</summary>
-      <dl className="mt-2 grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1 tabular-nums">
-        <dt>Needed for the model</dt><dd>{formatMemorySize(failure.requiredMemoryBytes, { rounding: "up" })}</dd>
-        <dt>Memory allowance for operating system</dt><dd>{formatMemorySize(failure.systemReserveBytes, { rounding: "up" })}</dd>
-        <dt>Available when loading was attempted</dt><dd>{formatMemorySize(failure.allocationHeadroomBytes)}</dd>
-      </dl>
+      <MemoryBreakdown failure={failure} className="mt-2" />
     </details>}
   </ErrorNotice>
+}
+
+/** A compact amber marker for a row whose last load failed; hovering explains the failure without displacing the row's neighbours. */
+export function ModelLoadFailureIndicator({ failure }: { failure: ModelInstanceFailure }) {
+  const notice = modelLoadNotice(failure)
+  return <Tooltip>
+    <TooltipTrigger render={<span role="img" aria-label={notice.title} className="inline-flex shrink-0 text-amber-500 dark:text-amber-400" />}>
+      <WarningCircleIcon aria-hidden="true" weight="fill" className="size-4" />
+    </TooltipTrigger>
+    <TooltipContent side="top" sideOffset={6} className="max-w-sm flex-col items-start gap-1 border border-slate-300 bg-white px-3 py-2.5 text-left text-slate-900 shadow-md dark:border-slate-600 dark:bg-slate-750 dark:text-slate-100">
+      <span className="text-[12px] font-semibold leading-4">{notice.title}</span>
+      {notice.description && <span className="text-xs text-slate-600 dark:text-slate-400">{notice.description}</span>}
+      {isLowMemory(failure) && <MemoryBreakdown failure={failure} className="mt-1 text-xs text-slate-600 dark:text-slate-400" />}
+    </TooltipContent>
+  </Tooltip>
 }
 
 export const downloadNotice = (failure: ModelAcquisitionFailure): NoticeContent => {

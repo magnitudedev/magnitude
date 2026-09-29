@@ -1,5 +1,5 @@
 import { ErrorNotice, NoticeAction } from "./error-notice"
-import { ModelLoadNotice, modelRemovalNotice, downloadNotice, modelCommandNotice } from "./model-error"
+import { ModelLoadFailureIndicator, ModelLoadNotice, modelRemovalNotice, downloadNotice, modelCommandNotice } from "./model-error"
 import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
 import { RecommendationPreference } from "./model-preference-slider"
@@ -195,7 +195,8 @@ function DeprecatedModelControls({ model, replacement, children }: { model: Cata
     {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
   </div></TooltipProvider>
 }
-function ModelControls({ model, replacing, children, onConnectAgent }: { model: CatalogLocalModel; replacing?: string; children?: ReactNode; onConnectAgent?: () => void }) {
+/** `inlineLoadFailure` false leaves a failed load to the caller's own presentation and keeps the Load action available. */
+function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadFailure = true }: { model: CatalogLocalModel; replacing?: string; children?: ReactNode; onConnectAgent?: () => void; inlineLoadFailure?: boolean }) {
   const { install, load, stop, cancel, remove, dismissFailure: dismiss } = useLocalModelMutations()
   const command = useLocalModelCommandStatus(model.modelId)
   const stopping = useLocalModelStopStatus()
@@ -207,6 +208,7 @@ function ModelControls({ model, replacing, children, onConnectAgent }: { model: 
   const transferring = acquisition._tag === "Installing" || acquisition._tag === "Updating"
   const fit = model.catalogData.support._tag === "Supported" ? fitNotice(model) : null
   const loadFailure = residency?._tag === "Failed" && !command.pendingOperations.includes("load") ? residency.failure : null
+  const loadNotice = inlineLoadFailure ? loadFailure : null
   const downloadFailure = (acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && !command.pendingOperations.includes("install") ? acquisition.failure : null
   const canDownload = model.catalogData.support._tag === "Supported" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
   const requestLoad = () => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }
@@ -214,7 +216,7 @@ function ModelControls({ model, replacing, children, onConnectAgent }: { model: 
   return <TooltipProvider><div className="contents">
     <div className="flex flex-wrap items-center justify-end gap-2">{children}
       {transferring ? <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /> : !installed ? downloadFailure ? null : <Button disabled={pending || model.catalogData.support._tag !== "Supported" || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
-        {model.catalogData.support._tag === "Supported" && (onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : loadFailure ? null : <Button className="min-w-28" disabled={pending} onClick={requestLoad}><PlayIcon />Load model</Button>)}
+        {model.catalogData.support._tag === "Supported" && (onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : loadNotice ? null : <Button className="min-w-28" disabled={pending} onClick={requestLoad}><PlayIcon />Load model</Button>)}
         {!onConnectAgent && <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><TrashIcon /></Button>}
         {model.catalogData.support._tag === "Supported" && acquisition._tag === "UpdateAvailable" && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
       </>}
@@ -227,7 +229,7 @@ function ModelControls({ model, replacing, children, onConnectAgent }: { model: 
       <NoticeAction disabled={pending} onClick={() => dismiss(model.modelId)}>Dismiss</NoticeAction>
     </>} />}
     {acquisition._tag === "RemoveFailed" && <ErrorNotice {...modelRemovalNotice(acquisition.failure)} className="col-span-full mt-3" />}
-    {loadFailure && <div className="col-span-full mt-3"><ModelLoadNotice failure={loadFailure} actions={model.catalogData.support._tag === "Supported" && loadFailure.retryable && !onConnectAgent ? <NoticeAction disabled={pending} onClick={requestLoad}>Load again</NoticeAction> : undefined} /></div>}
+    {loadNotice && <div className="col-span-full mt-3"><ModelLoadNotice failure={loadNotice} actions={model.catalogData.support._tag === "Supported" && loadNotice.retryable && !onConnectAgent ? <NoticeAction disabled={pending} onClick={requestLoad}>Load again</NoticeAction> : undefined} /></div>}
     {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
   </div></TooltipProvider>
 }
@@ -265,7 +267,7 @@ function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; a
       <Button variant={view === "profile" ? "secondary" : "ghost"} aria-pressed={view === "profile"} onClick={() => setView("profile")}>Profile</Button>
       <Button variant={view === "details" ? "secondary" : "ghost"} aria-pressed={view === "details"} onClick={() => setView("details")}>Details</Button>
     </div>
-      {transferring ? <Button disabled><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <ModelControls model={model} onConnectAgent={() => connectAgent()} {...(Option.isSome(active) && active.value.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.value.model) } : {})} />}
+      {transferring ? <Button disabled><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <ModelControls model={model} inlineLoadFailure={false} onConnectAgent={() => connectAgent()} {...(Option.isSome(active) && active.value.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.value.model) } : {})} />}
     </div>
     <div className="grid min-h-72">
       <div className={`col-start-1 row-start-1 min-w-0 ${view === "profile" ? "" : "invisible"}`} aria-hidden={view !== "profile"}><ModelRadar model={model} /></div>
@@ -289,7 +291,7 @@ function Recommendations({ models, active, preference }: { models: readonly Cata
   const selected = selectable.find(model => model.modelId === selectedId) ?? selectable[0]
   if (!selected) return null
   return <section aria-label="Top recommendations" className="mb-8">
-    <div className={pageLayout.recommendations}>
+    <TooltipProvider><div className={pageLayout.recommendations}>
       <div className={pageLayout.recommendationList} aria-label="Recommended models">{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => setSelection({ preference, modelId: model.modelId })} className={`${pageLayout.recommendationRow} focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
         <span className="w-4 shrink-0 text-sm tabular-nums text-slate-500">{rank + 1}</span>
         <ModelLogo model={model} className="size-7" />
@@ -302,9 +304,10 @@ function Recommendations({ models, active, preference }: { models: readonly Cata
           >{model.presentation.displayName}{"\u00a0"}</span>
           <span className="shrink-0 whitespace-nowrap">({model.presentation.variantLabel})</span>
         </span>
+        {"residencyState" in model.acquisitionState && model.acquisitionState.residencyState._tag === "Failed" && <ModelLoadFailureIndicator failure={model.acquisitionState.residencyState.failure} />}
       </button>)}</div>
       <SelectedRecommendation model={selected} active={active} />
-    </div>
+    </div></TooltipProvider>
   </section>
 }
 function LabOption({ lab }: { lab: ModelLab | null }) {
