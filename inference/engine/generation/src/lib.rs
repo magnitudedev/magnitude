@@ -3,7 +3,6 @@
 mod acceptance;
 mod controls;
 mod dflash;
-pub mod grammar;
 mod method;
 mod mtp;
 mod plain;

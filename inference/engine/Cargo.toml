@@ -8,6 +8,7 @@ license.workspace = true
 magnitude-artifacts = { path = "artifacts" }
 magnitude-chat = { path = "chat" }
 magnitude-generation = { path = "generation" }
+magnitude-grammar = { path = "grammar" }
 magnitude-scheduler = { path = "scheduler" }
 magnitude-templates = { path = "templates" }
 magnitude-batching = { path = "batching" }

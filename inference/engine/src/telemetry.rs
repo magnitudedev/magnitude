@@ -67,6 +67,42 @@ pub fn tracer() -> global::BoxedTracer {
     global::tracer(SERVICE)
 }
 
+/// Record how a request's output constraint compiled: its size, lexical
+/// shape, and every place it had to degrade.
+pub fn span_grammar(report: &magnitude_grammar::CompileReport) {
+    let tracer = tracer();
+    let count = |key: &str, value: usize| key_u64(key, value as u64);
+    let mut span = tracer
+        .span_builder("compile grammar")
+        .with_kind(SpanKind::Internal)
+        .with_attributes(vec![
+            count("magnitude.grammar.gbnf_bytes", report.gbnf_bytes),
+            count("magnitude.grammar.lark_bytes", report.lark_bytes),
+            count("magnitude.grammar.symbols", report.symbols),
+            count("magnitude.grammar.earley_rules", report.earley_rules),
+            count("magnitude.grammar.terminals", report.terminals),
+            count("magnitude.grammar.lexemes", report.lexemes),
+            count("magnitude.grammar.scanners", report.scanners),
+            count("magnitude.grammar.unflattened", report.unflattened),
+            count("magnitude.grammar.hubs", report.hubs),
+            count(
+                "magnitude.grammar.character_lexemes",
+                report.character_lexemes,
+            ),
+            count(
+                "magnitude.grammar.certification_questions",
+                report.certification_questions,
+            ),
+            count(
+                "magnitude.grammar.exhausted_questions",
+                report.exhausted_questions,
+            ),
+            key_u64("magnitude.grammar.compile_us", report.compile_us),
+        ])
+        .start(&tracer);
+    span.end();
+}
+
 /// Record one imported weight (name, encoding, elements, wall time).
 pub fn span_import(weight: &str, encoding: &str, elements: u64, seconds: f64) {
     let tracer = tracer();

@@ -2,10 +2,11 @@
 //! function's schema: the constraint admits exactly the argument dictionaries
 //! the schema allows, in the template's key order.
 use magnitude_chat::{
-    BpeConfig, ByteBpeTokenizer, CacheLimits, ChatRequest, Normalization, PieceEncoding, PieceKind,
+    BpeConfig, ByteBpeTokenizer, ChatRequest, Normalization, PieceEncoding, PieceKind,
     PreparedChat, SpecialTokens, Split, SplitBehavior, TemplateBundle, TemplateSelection,
-    TemplateVariant, TokenId, ToolChoice, Vocabulary,
+    TemplateVariant, TokenId, ToolChoice,
 };
+use magnitude_grammar::{CacheLimits, Vocabulary};
 use serde_json::json;
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -96,7 +97,7 @@ fn gemma4_tool_constraint_admits_exactly_the_schema_arguments() {
     )
     .unwrap();
     let mut accepts = |arguments: &str| {
-        let state = vocabulary.bind(&plan).unwrap();
+        let state = vocabulary.bind(&plan.grammar, &plan.prefix).unwrap();
         let mut tokens = tokenizer
             .encode(
                 &format!("<|tool_call>call:forecast{arguments}<tool_call|>"),

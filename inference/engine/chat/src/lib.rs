@@ -3,7 +3,6 @@
 //! output parsing and the semantic output stream. Numerical execution and
 //! transport ownership are composed above this crate.
 pub mod artifacts;
-mod constraints;
 mod error;
 pub mod generation;
 pub mod output;
@@ -14,13 +13,12 @@ mod stream;
 mod templates;
 mod tokenizer;
 
-pub use constraints::{CacheLimits, ConstraintState, PreparedVocabulary, Vocabulary};
 pub use error::ChatError;
 pub use magnitude_generation::{
     DetailedUsage, EndOfGeneration, FinishReason, Options, OutputToken, Sampling, TokenId,
 };
 pub use magnitude_templates::{Event, PreparedDescription, PreparedRequest, TerminalCause};
-pub use preparation::{ConstraintPlan, PreparedChat, PreparedChatInput};
+pub use preparation::{ConstraintPlan, ConstraintSource, PreparedChat, PreparedChatInput};
 pub use reasoning::{ReasoningIntent, ResolvedReasoning};
 pub use request::{ChatInput, GenerationControls, GenerationRequest};
 pub use stream::{ChatStream, StopText, TokenChatStream};

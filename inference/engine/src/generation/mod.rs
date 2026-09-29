@@ -6,6 +6,6 @@
 //! its result.
 
 pub use magnitude_generation::{
-    grammar, Constraint, DetailedUsage, FinishReason, GenerationSeed, MethodChoice, Options,
+    Constraint, DetailedUsage, FinishReason, GenerationSeed, MethodChoice, Options,
     OutputToken, Sampling, Shaping, TokenId, Usage,
 };

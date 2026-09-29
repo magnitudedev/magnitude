@@ -424,6 +424,25 @@ impl ByteBpeTokenizer {
     }
 }
 
+impl magnitude_grammar::TokenTable for ByteBpeTokenizer {
+    fn len(&self) -> usize {
+        self.vocabulary()
+    }
+    /// Unused pieces, and byte-fallback pieces outside UTF-8, never spell
+    /// grammar text.
+    fn bytes(&self, token: TokenId) -> Option<&[u8]> {
+        let id = token.0 as usize;
+        let piece = self.pieces.get(id)?;
+        (self.kinds[id] != PieceKind::Unused && !piece.starts_with(&[0xff])).then_some(piece)
+    }
+    fn stop_tokens(&self) -> &BTreeSet<TokenId> {
+        &self.stop_tokens
+    }
+    fn encode(&self, text: &str) -> Result<Vec<TokenId>, String> {
+        ByteBpeTokenizer::encode(self, text, SpecialTokens::Recognize)
+    }
+}
+
 /// Replacement decoding matches V3: incomplete UTF-8 waits for subsequent token
 /// bytes; invalid sequences and an incomplete final suffix publish U+FFFD.
 pub struct TokenDecoder<'a> {

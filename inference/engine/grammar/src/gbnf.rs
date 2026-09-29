@@ -1,16 +1,15 @@
-//! Family-neutral GBNF conversion over parsed productions. Renaming never touches literal text;
-//! one-character classes remain Unicode scalar sets, including escaped controls.
-mod lexical;
-mod regular;
+//! GBNF syntax. Parsing checks the source before any lowering, so undefined
+//! rules and malformed escapes cannot be disguised by later transformations.
+//! One-character classes stay Unicode scalar sets, including escaped controls.
+use crate::GrammarError;
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_SOURCE: usize = 8 * 1024 * 1024;
 const MAX_NODES: usize = 100_000;
-const MAX_DEPTH: usize = 256;
-pub const CONVERTER_IDENTITY: &str = "magnitude-gbnf-rust-2-llguidance-1.8.0";
+pub(crate) const MAX_DEPTH: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Expr {
+pub(crate) enum Expr {
     Literal(String),
     Class {
         negated: bool,
@@ -22,55 +21,11 @@ enum Expr {
     Alternative(Vec<Expr>),
     Repeat(Box<Expr>, u32, Option<u32>),
 }
-type Rules = BTreeMap<String, Expr>;
 
-/// How a literal is rendered.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Literals {
-    /// As one piece of text.
-    Whole,
-    /// As one terminal per character.
-    Characters,
-}
+pub(crate) type Rules = BTreeMap<String, Expr>;
 
 impl Expr {
-    fn is_empty(&self) -> bool {
-        matches!(self, Self::Sequence(parts) if parts.is_empty())
-    }
-    fn size(&self) -> usize {
-        match self {
-            Self::Sequence(parts) | Self::Alternative(parts) => {
-                1 + parts.iter().map(Self::size).sum::<usize>()
-            }
-            Self::Repeat(part, _, _) => 1 + part.size(),
-            _ => 1,
-        }
-    }
-    /// The same language for regular-language analysis. References must
-    /// already be resolved.
-    fn regex(&self) -> derivre::RegexAst {
-        use derivre::RegexAst;
-        let class = |negated: bool, ranges: &[(char, char)]| {
-            let mut text = String::from(if negated { "[^" } else { "[" });
-            for (start, end) in ranges {
-                text.push_str(&format!("\\x{{{:x}}}-\\x{{{:x}}}", *start as u32, *end as u32));
-            }
-            text.push(']');
-            RegexAst::Regex(text)
-        };
-        match self {
-            Self::Literal(text) => RegexAst::Literal(text.clone()),
-            Self::Class { negated, ranges } => class(*negated, ranges),
-            Self::Any => class(false, &[('\0', char::MAX)]),
-            Self::Reference(name) => unreachable!("unresolved reference {name} in a lexeme"),
-            Self::Sequence(parts) => RegexAst::Concat(parts.iter().map(Self::regex).collect()),
-            Self::Alternative(parts) => RegexAst::Or(parts.iter().map(Self::regex).collect()),
-            Self::Repeat(part, min, max) => {
-                RegexAst::Repeat(Box::new(part.regex()), *min, max.unwrap_or(u32::MAX))
-            }
-        }
-    }
-    fn references(&self, names: &mut BTreeSet<String>) {
+    pub(crate) fn references(&self, names: &mut BTreeSet<String>) {
         match self {
             Self::Reference(name) => {
                 names.insert(name.clone());
@@ -81,121 +36,13 @@ impl Expr {
                 }
             }
             Self::Repeat(part, _, _) => part.references(names),
-            _ => {}
-        }
-    }
-    fn rename(&mut self, names: &BTreeMap<String, String>) {
-        match self {
-            Self::Reference(name) => *name = names[name].clone(),
-            Self::Sequence(parts) | Self::Alternative(parts) => {
-                for part in parts {
-                    part.rename(names);
-                }
-            }
-            Self::Repeat(part, _, _) => part.rename(names),
-            _ => {}
-        }
-    }
-    /// Lark for this expression inside one lexeme.
-    fn render(&self) -> String {
-        self.write(Literals::Whole)
-    }
-    /// Lark for this expression as grammar rules: every terminal lexes one
-    /// character, so no lexeme can be a proper prefix of another and greedy
-    /// lexing accepts exactly the rules' language.
-    fn render_characters(&self) -> String {
-        self.write(Literals::Characters)
-    }
-    fn write(&self, literals: Literals) -> String {
-        let render = |expr: &Self| expr.write(literals);
-        match self {
-            Self::Literal(text) if literals == Literals::Characters && text.chars().nth(1).is_some() => text
-                .chars()
-                .map(|c| serde_json::to_string(&c.to_string()).unwrap())
-                .collect::<Vec<_>>()
-                .join(" "),
-            Self::Literal(text) => serde_json::to_string(text).unwrap(),
-            Self::Class { negated, ranges } => format!(
-                "/[{}{}]/",
-                if *negated { "^" } else { "" },
-                ranges
-                    .iter()
-                    .map(|(a, b)| {
-                        if a == b {
-                            format!("\\x{{{:x}}}", *a as u32)
-                        } else {
-                            format!("\\x{{{:x}}}-\\x{{{:x}}}", *a as u32, *b as u32)
-                        }
-                    })
-                    .collect::<String>()
-            ),
-            Self::Any => "/[\\x{0}-\\x{10ffff}]/".into(),
-            Self::Reference(name) => name.clone(),
-            Self::Sequence(parts) => {
-                if parts.is_empty() {
-                    "\"\"".into()
-                } else {
-                    parts.iter().map(render).collect::<Vec<_>>().join(" ")
-                }
-            }
-            Self::Alternative(parts) => format!(
-                "({})",
-                parts.iter().map(render).collect::<Vec<_>>().join(" | ")
-            ),
-            Self::Repeat(part, min, max) => format!(
-                "({}){}",
-                render(part),
-                match (*min, *max) {
-                    (0, None) => "*".into(),
-                    (1, None) => "+".into(),
-                    (0, Some(1)) => "?".into(),
-                    (min, Some(max)) if min == max => format!("{{{min}}}"),
-                    (min, Some(max)) => format!("{{{min},{max}}}"),
-                    (min, None) => format!("{{{min},}}"),
-                }
-            ),
+            Self::Literal(_) | Self::Class { .. } | Self::Any => {}
         }
     }
 }
 
-/// Convert admitted GBNF to llguidance Lark. The source is parsed and checked
-/// before transformations, so undefined rules and malformed escapes cannot be
-/// disguised by renaming. No Python executable is used at runtime.
-///
-/// Regular stretches become lexemes when greedy lexing provably preserves the
-/// language (see `lexical`); otherwise every character is its own lexeme.
-pub fn to_lark(source: &str) -> Result<String, String> {
-    let mut rules = Parser::parse(source)?;
-    let names: BTreeMap<_, _> = rules
-        .keys()
-        .enumerate()
-        .map(|(index, name)| {
-            (
-                name.clone(),
-                if name == "root" {
-                    "root".into()
-                } else {
-                    format!("g{index}")
-                },
-            )
-        })
-        .collect();
-    rules = rules
-        .into_iter()
-        .map(|(name, mut expr)| {
-            expr.rename(&names);
-            (names[&name].clone(), expr)
-        })
-        .collect();
-    if let Some(lark) = lexical::compile(&rules, &regular::regular_rules(&rules)) {
-        return Ok(lark);
-    }
-    regular::orient(&mut rules);
-    let mut output = String::from("%llguidance {}\nstart: root\n");
-    for (name, expr) in rules {
-        output.push_str(&format!("{name}: {}\n", expr.render_characters()));
-    }
-    Ok(output)
+pub(crate) fn parse(source: &str) -> Result<Rules, GrammarError> {
+    Parser::parse(source).map_err(GrammarError::Syntax)
 }
 
 struct Parser<'a> {
@@ -203,6 +50,7 @@ struct Parser<'a> {
     at: usize,
     nodes: usize,
 }
+
 impl<'a> Parser<'a> {
     fn parse(source: &'a str) -> Result<Rules, String> {
         if source.is_empty() || source.len() > MAX_SOURCE {

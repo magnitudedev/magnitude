@@ -8,10 +8,11 @@
 use magnitude_artifacts::Package;
 use magnitude_chat::{
     artifacts::{gguf_byte_bpe, gguf_templates},
-    ByteBpeTokenizer, CacheLimits, ChatRequest, PreparedChat, SpecialTokens, TemplateBundle,
-    TemplateSelection, ToolChoice, Vocabulary,
+    ByteBpeTokenizer, ChatRequest, PreparedChat, SpecialTokens, TemplateBundle, TemplateSelection,
+    ToolChoice,
 };
 use magnitude_generation::Constraint;
+use magnitude_grammar::{CacheLimits, GrammarConstraint, Vocabulary};
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Instant};
 
@@ -52,10 +53,10 @@ fn allowed(mask: &[u32], token: u32) -> bool {
 /// stop token is never spelled as text inside the grammar's free text.
 fn ends_exactly_when_accepting(
     model: &Model,
-    state: &magnitude_chat::ConstraintState,
+    state: &GrammarConstraint,
     mask: &[u32],
 ) -> Result<(), String> {
-    let accepting = state.accepting()?;
+    let accepting = state.accepting().map_err(|e| e.to_string())?;
     for stop in model.tokenizer.stop_tokens() {
         if allowed(mask, stop.0) != accepting {
             return Err(format!(
@@ -83,14 +84,17 @@ fn walk(model: &mut Model, request: &ChatRequest, completion: &str) -> Result<()
         .constraint
         .as_ref()
         .ok_or("request prepared without a constraint")?;
-    // Without lexical compilation every byte of free text is a parser step,
-    // which exceeds the per-mask budget on a real vocabulary.
-    let lark = magnitude_generation::grammar::to_lark(&plan.gbnf)?;
-    if !lark.lines().any(|line| line.starts_with('L')) {
-        return Err("grammar was not lexically compiled".into());
+    // Template grammars compile with every lexeme at word level: a
+    // character-level lexeme makes each of its bytes a parser step.
+    let report = &prepared.constraint().unwrap().report;
+    if report.character_lexemes != 0 {
+        return Err(format!("grammar has character-level lexemes: {report:?}"));
     }
     let started = Instant::now();
-    let mut state = model.vocabulary.bind(plan)?;
+    let mut state = model
+        .vocabulary
+        .bind(&plan.grammar, &plan.prefix)
+        .map_err(|e| e.to_string())?;
     let bound = started.elapsed();
     let tokens = model
         .tokenizer
@@ -109,11 +113,11 @@ fn walk(model: &mut Model, request: &ChatRequest, completion: &str) -> Result<()
                 state.position()
             ));
         }
-        state = state.advance(&[*token])?;
+        state = state.advance(&[*token]).map_err(|e| e.to_string())?;
     }
     let mask = Constraint::mask(&state)?;
     ends_exactly_when_accepting(model, &state, &mask)?;
-    if !state.accepting()? {
+    if !state.accepting().map_err(|e| e.to_string())? {
         return Err("grammar does not accept the complete text".into());
     }
     eprintln!(
@@ -312,7 +316,14 @@ fn structured_output_and_tool_grammars_compute_masks_over_the_real_vocabulary() 
         tools(many, ToolChoice::Auto, true),
         format!(
             "{THINK}{}",
-            call("tool_7", &[("path", "a"), ("options", "{\"x\": {\"y\": [1]}}"), ("limit", "3")])
+            call(
+                "tool_7",
+                &[
+                    ("path", "a"),
+                    ("options", "{\"x\": {\"y\": [1]}}"),
+                    ("limit", "3")
+                ]
+            )
         ),
     ));
     let enums = tools(
@@ -340,7 +351,10 @@ fn structured_output_and_tool_grammars_compute_masks_over_the_real_vocabulary() 
         (
             "a value outside a numeric enum",
             enums.clone(),
-            format!("{THINK}{}", call("edit", &[("mode", "append"), ("count", "3")])),
+            format!(
+                "{THINK}{}",
+                call("edit", &[("mode", "append"), ("count", "3")])
+            ),
         ),
         (
             "content instead of a required call",

@@ -3,10 +3,11 @@
 //! a constraint that demands a call leaves the model no end but degenerate
 //! text. A required choice still demands one.
 use magnitude_chat::{
-    BpeConfig, ByteBpeTokenizer, CacheLimits, ChatRequest, Normalization, PieceEncoding, PieceKind,
+    BpeConfig, ByteBpeTokenizer, ChatRequest, Normalization, PieceEncoding, PieceKind,
     PreparedChat, SpecialTokens, Split, SplitBehavior, TemplateBundle, TemplateSelection,
-    TemplateVariant, TokenId, ToolChoice, Vocabulary,
+    TemplateVariant, TokenId, ToolChoice,
 };
+use magnitude_grammar::{CacheLimits, Vocabulary};
 use serde_json::json;
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -93,7 +94,7 @@ fn admits(source: &str, bos: &str, choice: ToolChoice, output: &str) -> bool {
         },
     )
     .unwrap();
-    let state = vocabulary.bind(&plan).unwrap();
+    let state = vocabulary.bind(&plan.grammar, &plan.prefix).unwrap();
     let mut tokens = tokenizer.encode(output, SpecialTokens::Recognize).unwrap();
     tokens.push(TokenId(256));
     state.advance(&tokens).is_ok()

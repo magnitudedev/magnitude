@@ -6,6 +6,7 @@
 //! dispatches them to the execution owner and forwards each request's
 //! publications while the host holds credit for them.
 
+use super::binding::GenerationBinding;
 use super::execution::UnloadNotice;
 use super::protocol::{
     Admission, DomainHeadroom, ExecutionTimings, HostMessage, HostRequestId, MemoryObservation,
@@ -16,7 +17,6 @@ use super::transport::{MessageReceiver, MessageSender, TransportError};
 use super::WorkerExit;
 use crate::census::{AllocationCensus, MemoryDomain};
 use crate::error::{RequestError, UnloadCause};
-use magnitude_chat::Vocabulary;
 use magnitude_executor::RequestId;
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_scheduler::{
@@ -124,7 +124,7 @@ struct Stream {
 /// What readiness fixed about the loaded model that the session needs.
 pub(crate) struct Loaded {
     pub execution: Worker,
-    pub vocabulary: Vocabulary,
+    pub binding: GenerationBinding,
     pub definition: ModelDefinition,
     pub compute_bytes: u64,
     /// Bytes of the model's host-resident tables held in host RAM.
@@ -356,8 +356,8 @@ impl Session {
         }
         let seed = self
             .loaded
-            .vocabulary
-            .prepare_generation(constraint.as_ref(), options, input.tokens(), input.layout())
+            .binding
+            .seed(constraint.as_ref(), options, input.tokens(), input.layout())
             .map_err(invalid)?;
         Ok((
             WorkerCommand::Admit(AdmitRequest {

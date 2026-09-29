@@ -6,12 +6,14 @@
 //! tests: a thread over a channel transport) and in a worker process (the
 //! service: framed messages over stdio).
 
+mod binding;
 mod client;
 mod execution;
 pub mod protocol;
 mod session;
 pub mod transport;
 
+pub use binding::GenerationBinding;
 pub use client::{
     connect_worker, EngineClient, EngineRequest, RequestEvent, RequestOptions, WorkerConnection,
 };
@@ -23,8 +25,9 @@ use execution::{ExecutionOwner, UnloadNotice};
 use magnitude_artifacts::Package;
 use magnitude_chat::{
     artifacts::{gguf_byte_bpe, gguf_templates},
-    ByteBpeTokenizer, CacheLimits, PreparedVocabulary, Vocabulary,
+    ByteBpeTokenizer,
 };
+use magnitude_grammar::CacheLimits;
 use magnitude_scheduler::{
     owner::Owner,
     worker::{Driven, SpawnError, Worker},
@@ -245,7 +248,7 @@ fn load(
             (ready, compute_bytes, host_table_bytes, domain),
         ))
     };
-    let host = move || -> Result<(Vocabulary, ChatIdentity), LoadError> {
+    let host = move || -> Result<(GenerationBinding, ChatIdentity), LoadError> {
         let unsupported = |reason: String| {
             LoadError::Unsupported(crate::error::UnsupportedModel::Representation { reason })
         };
@@ -270,15 +273,14 @@ fn load(
         );
         let projection = usize::try_from(definition.decoder.vocabulary)
             .map_err(|_| internal("model vocabulary exceeds the host domain"))?;
-        let vocabulary = PreparedVocabulary::new(tokenizer, projection)
-            .map_err(unsupported)?
-            .with_cache_limits(CONSTRAINT_CACHE);
-        Ok((vocabulary, chat))
+        let binding =
+            GenerationBinding::new(tokenizer, projection, CONSTRAINT_CACHE).map_err(unsupported)?;
+        Ok((binding, chat))
     };
     let (
         execution,
         (execution_ready, compute_bytes, host_table_bytes, domain),
-        (vocabulary, chat),
+        (binding, chat),
     ) =
         Worker::spawn_ready_with(factory, usize::MAX, host).map_err(|error| match error {
             SpawnError::Factory(error) | SpawnError::Host(error) => error,
@@ -301,7 +303,7 @@ fn load(
     Ok((
         Loaded {
             execution,
-            vocabulary,
+            binding,
             definition: session_definition,
             compute_bytes,
             host_table_bytes,

@@ -1,10 +1,11 @@
 use super::reasoning::{ReasoningIntent, ResolvedReasoning};
 use super::ChatError;
+use magnitude_grammar::{CompileCache, Compiled, GrammarError};
 use magnitude_templates::{PreparedRequest, Request as NativeRequest, SpecialTokens, Template};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +21,7 @@ pub struct TemplateBundle {
     default: String,
     special_tokens: SpecialTokens,
     profiles: Mutex<super::reasoning::ProfileCache>,
+    grammars: CompileCache,
 }
 #[derive(Default)]
 pub struct TemplateSelection<'a> {
@@ -157,7 +159,13 @@ impl TemplateBundle {
             default,
             special_tokens,
             profiles: Mutex::new(super::reasoning::ProfileCache::new(16, 1024 * 1024)),
+            grammars: CompileCache::new(16, 16 * 1024 * 1024),
         })
+    }
+    /// The compiled output constraint for a GBNF source, cached per model:
+    /// a conversation's turns repeat their template grammar.
+    pub fn compile_grammar(&self, gbnf: &str) -> Result<Arc<Compiled>, GrammarError> {
+        self.grammars.compile(gbnf)
     }
     pub fn select<'a>(
         &'a self,

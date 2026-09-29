@@ -375,8 +375,9 @@ fn token_stream_is_chunk_invariant_and_stops_before_semantic_parsing() {
 #[test]
 fn json_constrained_generation_starts_with_and_without_forced_runs() {
     use magnitude_artifacts::InputLayout;
-    use magnitude_chat::{CacheLimits, Options, Sampling, Vocabulary};
-    use magnitude_generation::{Plain, RequestId, RoundStart, Shaping, WorkKind};
+    use magnitude_chat::{Options, Sampling};
+    use magnitude_generation::{GenerationSeed, Plain, RequestId, RoundStart, Shaping, WorkKind};
+    use magnitude_grammar::{CacheLimits, Vocabulary};
     use std::sync::Arc;
 
     let tokenizer = Arc::new(tokenizer());
@@ -424,11 +425,17 @@ fn json_constrained_generation_starts_with_and_without_forced_runs() {
             end_of_generation: EndOfGeneration::Stop,
             reasoning_budget: None,
         };
-        let mut generation = vocabulary
-            .prepare_generation_for_input(prepared.input(), options, &tokens, &layout)
-            .unwrap()
-            .into_generation(Arc::new(Plain))
-            .unwrap();
+        let plan = prepared.input().constraint.as_ref().unwrap();
+        let constraint = vocabulary.bind(&plan.grammar, &plan.prefix).unwrap();
+        let mut generation = GenerationSeed::new(
+            tokens.clone(),
+            layout.clone(),
+            options,
+            Some(Box::new(constraint)),
+        )
+        .unwrap()
+        .into_generation(Arc::new(Plain))
+        .unwrap();
         assert_eq!(
             generation.start_round(RequestId(1), 64).unwrap(),
             RoundStart::Target

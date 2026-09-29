@@ -7,6 +7,7 @@ members = [
   "engine/artifacts",
   "engine/chat",
   "engine/generation",
+  "engine/grammar",
   "engine/scheduler",
   "engine/batching",
   "engine/families/contracts",

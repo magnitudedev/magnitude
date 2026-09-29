@@ -54,6 +54,9 @@ pub fn prepare(
         &request,
         &TemplateSelection::default(),
     )?;
+    if let Some(constraint) = chat.constraint() {
+        crate::telemetry::span_grammar(&constraint.report);
+    }
     let tokens = chat.input().tokens.clone();
     let input = match bound {
         InputBound::Served => host.prepare_input(tokens, &images),
@@ -93,10 +96,8 @@ pub fn apply_template(host: &HostArtifacts, input: &ChatInput) -> Result<Applied
         generation_prompt: description.generation_prefix.clone(),
         grammar: prepared
             .chat
-            .input()
-            .constraint
-            .as_ref()
-            .map_or_else(String::new, |plan| plan.gbnf.clone()),
+            .constraint()
+            .map_or_else(String::new, |source| source.gbnf.clone()),
         preserved_tokens: description.preserved_tokens.clone(),
         additional_stops: description.additional_stops.clone(),
         supports_thinking: description.supports_thinking,

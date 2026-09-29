@@ -2064,9 +2064,9 @@ dependencies = [
 name = "magnitude-chat"
 version = "0.1.0"
 dependencies = [
- "llguidance",
  "magnitude-artifacts",
  "magnitude-generation",
+ "magnitude-grammar",
  "magnitude-templates",
  "serde",
  "serde_json",
@@ -2092,6 +2092,7 @@ dependencies = [
  "magnitude-family-nemotron-h",
  "magnitude-family-qwen35",
  "magnitude-generation",
+ "magnitude-grammar",
  "magnitude-scheduler",
  "magnitude-state",
  "magnitude-templates",
@@ -2246,9 +2247,17 @@ dependencies = [
 name = "magnitude-generation"
 version = "0.1.0"
 dependencies = [
- "derivre",
  "magnitude-artifacts",
  "magnitude-executor",
+ "serde",
+]
+
+[[package]]
+name = "magnitude-grammar"
+version = "0.1.0"
+dependencies = [
+ "llguidance",
+ "magnitude-generation",
  "serde",
  "serde_json",
 ]
