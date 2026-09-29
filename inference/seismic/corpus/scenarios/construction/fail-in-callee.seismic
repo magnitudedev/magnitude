@@ -1,0 +1,9 @@
+# origin: C11:fail_in_callee
+# invoke: i32[1]=0 ; i32:0
+# expect: failed
+fn helper(a: i32) -> i32:
+    return 10 / a
+
+fn probe(dst: &mut tensor[1] i32, d: i32):
+    dst[0] = 3
+    dst[0] = helper(d)

@@ -1,0 +1,48 @@
+// copy_rows: rows[to[item], head, :] = rows[from[item], head, :] for dense state
+// planes of one element type; one invocation per copied element, over a
+// grid-stride loop (the grid is capped below the 65535-group floor). Rows
+// outside the plane (including -1) are skipped. Elements move as whole
+// words of their size, so every plane (integer planes included) is copied
+// bit for bit.
+#include <seismic/element.glsl>
+#include <seismic/slab.glsl>
+
+#if !defined(SEISMIC_ROWS_KIND_DENSE)
+#error "copy_rows supports dense state planes only"
+#endif
+
+void copy_rows() {
+    const uint64_t rows = SEISMIC_PTR(SEISMIC_BUFFER_ROWS);
+    const uint64_t from = SEISMIC_PTR(SEISMIC_BUFFER_FROM);
+    const uint64_t to = SEISMIC_PTR(SEISMIC_BUFFER_TO);
+    const uint64_t row_elements = SEISMIC_DIM_KV * SEISMIC_DIM_W;
+    const uint64_t count = SEISMIC_DIM_N * row_elements;
+    const uint slab_rows = uint(SEISMIC_PARAM_SLAB_ROWS);
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
+        const uint64_t item = index / row_elements;
+        const uint64_t head = (index % row_elements) / SEISMIC_DIM_W;
+        const uint64_t column = index % SEISMIC_DIM_W;
+        const int source_row = element_i32_index(from, item * SEISMIC_FROM_STRIDE_0);
+        const int destination_row = element_i32_index(to, item * SEISMIC_TO_STRIDE_0);
+        if (source_row < 0 || destination_row < 0 || uint64_t(source_row) >= SEISMIC_DIM_T
+            || uint64_t(destination_row) >= SEISMIC_DIM_T)
+            continue;
+        const uint64_t source = slab_row(rows, uint(source_row), slab_rows,
+                SEISMIC_ROWS_STRIDE_0 * SEISMIC_ROWS_PACKET_SIZE)
+            + (head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2) * SEISMIC_ROWS_PACKET_SIZE;
+        const uint64_t destination = slab_row(rows, uint(destination_row), slab_rows,
+                SEISMIC_ROWS_STRIDE_0 * SEISMIC_ROWS_PACKET_SIZE)
+            + (head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2) * SEISMIC_ROWS_PACKET_SIZE;
+#if SEISMIC_ROWS_PACKET_SIZE == 4
+        element_u32_put(destination, element_u32_at(source));
+#elif SEISMIC_ROWS_PACKET_SIZE == 2
+        element_u16_put(destination, element_u16_at(source));
+#elif SEISMIC_ROWS_PACKET_SIZE == 1
+        element_u8_put(destination, element_u8_at(source));
+#else
+        for (uint byte = 0u; byte < SEISMIC_ROWS_PACKET_SIZE; ++byte)
+            element_u8_put(destination + byte, element_u8_at(source + byte));
+#endif
+    }
+}

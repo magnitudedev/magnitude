@@ -1,0 +1,11 @@
+# origin: C11:if_scalar_join
+# cell: assign-local-scalar/join
+# cell: value-scalar/join
+# invoke: f32:-3
+fn probe(x: f32) -> f32:
+    let mut y = 0.0
+    if x > 0.0:
+        y = x
+    else:
+        y = -x
+    return y * 2.0

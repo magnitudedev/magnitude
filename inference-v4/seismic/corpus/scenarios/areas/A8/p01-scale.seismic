@@ -1,0 +1,11 @@
+# origin: A8:C4a-9
+# invoke: f32[3]=1,2,-3.5 ; f32:2.0 ; f32[3]=zero
+# expect: returned
+# pin: out = f32[3]=2,4,-7
+# invoke: f32[1037]=rand(1) ; f32:1.5 ; f32[1037]=zero
+# expect: returned
+fn probe[N](x: &tensor[N] f32, factor: f32, out: &mut tensor[N] f32):
+    # The minimal parallel elementwise launch: one reached kernel, formed with
+    # no native launch constraint after formation (A8 G-C4a-9 (b)).
+    parallel for i in 0..N:
+        out[i] = x[i] * factor

@@ -1,0 +1,5 @@
+# origin: C11:s_int_div
+# cell: scalar-op/sl
+# invoke: i32:7 ; i32:2
+fn probe(x: i32, y: i32) -> i32:
+    return x / y

@@ -73,7 +73,7 @@ export function ModelsSkeleton({ page }: { page: "discover" | "catalog" | "model
   if (page === "discover") return <><HardwarePending /><RecommendationPreference /><RecommendationsSkeleton /></>
   return <>
     <div className={pageLayout.modelHeader}><h1 className={pageLayout.pageTitle}>{page === "models" ? "My Models" : "Catalog"}</h1><Skeleton className="h-5 w-16" /></div>
-    <div className={pageLayout.catalogToolbar}><div className="flex flex-wrap items-center gap-2"><Skeleton className="h-8 w-32" /><Skeleton className="h-8 w-44" /></div><Skeleton className={`h-8 ${pageLayout.modelSearch}`} /></div>
+    <div className={pageLayout.catalogToolbar}><div className="flex flex-wrap items-center gap-2"><Skeleton className="h-8 w-32" /><Skeleton className="h-8 w-28" /><Skeleton className="h-8 w-44" /></div><Skeleton className={`h-8 ${pageLayout.modelSearch}`} /></div>
     <ModelCardsSkeleton library={page === "models"} />
   </>
 }

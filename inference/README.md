@@ -1,197 +1,50 @@
-# Magnitude ICN
+# Inference
 
-This workspace builds the Inference Control Node. `icn-contracts` defines transport- and
-backend-neutral contracts; `icn-models`, `icn-hardware`, and `icn-reasoning` own model lifecycle,
-fit assessment, and template reasoning inspection; `icn-engine` owns live inference; `icn-api`
-exports the HTTP/OpenAPI boundary; and `icn-server` is the composition root.
+This workspace contains Magnitude's Seismic-backed inference engine and service.
+The engine owns model interpretation, generation, scheduling, and state. Seismic
+owns numerical compilation, device resources, and execution on CPU, Metal,
+CUDA, and Vulkan. The service owns the public API, model inventory, assessment,
+residency, and worker supervision.
 
-The native dependency has two independently recorded revisions in `native-pin.toml`: the exact
-`llama-cpp-rs` commit and the llama.cpp gitlink embedded by that commit. The editable binding source
-is checked out at `native/llama-cpp-rs`; the inference workspace must consume its `llama-cpp-2`
-crate by relative path rather than resolving a second Cargo Git checkout. Run
-`bun icn:verify-native-pin` after changing either pin; the ICN-facing backend interface remains
-unchanged.
+Start with the [architecture overview](docs/overview.md), then the
+[engine](docs/engine/overview.md), [Seismic](docs/seismic/overview.md), and
+[distribution](docs/distribution.md) contracts. The frozen previous implementation
+is under `../old-inference/`; its behavior and independent V3 numerical fixtures
+remain preservation references.
 
-## Native submodule management
+## Layout
 
-The native source is nested and pinned:
+| Directory | Owner |
+| --- | --- |
+| `engine/` | Reusable engine, model families, scheduler, serving, and headless CLI |
+| `service/` | HTTP service, contracts, catalog, assessment, and worker lifecycle |
+| `seismic/` | Language, compiler, runtime, native libraries, and device backends |
+| `catalog/` | Model catalog and planner inputs |
+| `benchmarks/` | Session Bench and runtime adapters |
+| `validation/` | Independent numerical references and hardware qualification |
 
-```text
-magnitude
-└── inference/native/llama-cpp-rs       # our bindings fork
-    └── llama-cpp-sys-2/llama.cpp       # exact upstream llama.cpp revision
-```
+## Build and test
 
-We do **not** need utilityai or llama.cpp to accept our changes. Binding changes are committed and
-pushed to `magnitudedev/llama-cpp-rs`. Upstream PRs are optional.
-
-Magnitude stores only the exact bindings-fork commit, not changes made inside the submodule. The
-required order for a bindings change is therefore:
-
-1. Change and test `inference/native/llama-cpp-rs`.
-2. Commit and push that change to `magnitudedev/llama-cpp-rs`.
-3. Commit the updated `inference/native/llama-cpp-rs` pointer in Magnitude.
-
-Never point Magnitude at an unpushed bindings commit; other checkouts and CI could not fetch it.
-
-We normally do not modify llama.cpp. To upgrade it, update its nested commit pointer and commit that
-pointer in our bindings fork. Create a llama.cpp fork only if we actually need native patches.
-
-The bindings fork directly compiles its checked-in C/C++ wrapper sources, including the
-`wrapper_common_fit` surface, alongside the pinned llama.cpp checkout; it does not generate or
-apply a source overlay. [`parity/upstream/binding-surfaces.json`](parity/upstream/binding-surfaces.json)
-is the parity-owned audit inventory that maps relevant upstream, bridge, and safe Rust surfaces. It
-is not a fork build input; review it whenever either native pin or a parity-relevant safe surface
-changes.
-
-Initialize both submodules after cloning Magnitude:
-
-```sh
-git submodule update --init --recursive
-```
-
-## First five minutes
-
-Run these commands from the Magnitude repository root.
-
-Compile the development binary:
+From the repository root, build a development installation and smoke its binary,
+authenticated hardware endpoint, readiness handshake, and parent-loss exit:
 
 ```sh
 bun icn:build
+bun run inference/scripts/smoke.ts inference/target/development/installation.json
 ```
 
-The executable is now at `inference/target/debug/magnitude-inference`. Start it with the deterministic fake
-backend, which does not need a model file:
+From this directory, check the Rust workspace or run a focused crate test:
 
 ```sh
-bun icn:dev
+cargo check --workspace --all-targets
+cargo test -p magnitude-scheduler
 ```
 
-In another terminal, check health and make a streaming completion:
+The product's local release acquisition test is `bun test:release-bootstrap`
+from the repository root. `--cached` reuses a previously built local release and
+does not validate source changes made after that build.
 
-```sh
-curl -sS http://127.0.0.1:8080/health
-
-curl -N http://127.0.0.1:8080/v1/chat/completions \
-  -H 'content-type: application/json' \
-  --data '{
-    "model": "icn-fake",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "stream": true,
-    "stream_options": {"include_usage": true}
-  }'
-```
-
-The second command prints OpenAI-compatible `data:` frames followed by `data: [DONE]`. Stop the
-server with Ctrl-C.
-
-Set the top-level request field `"timings_per_token": true` to enable llama.cpp-compatible
-cumulative timing snapshots on streamed model updates. A sampled token can produce zero or several
-semantic deltas. The initial `{"role":"assistant","content":null}` delta belongs to the first
-sampled-token result: when that result also has parser deltas, only its last parser delta receives
-the snapshot; when it has none, the role delta receives it. Later results with no parser delta emit
-no SSE event, so the server never creates a timing-only event.
-
-The flag controls ordinary partial snapshots, but llama.cpp has one termination edge: a full stop
-word detected before a partial result is sent makes that result include timings even when the flag
-is false. EOS and length termination are detected after their partial-result timing decision and do
-not do so. The final timing summary is always present on the finish chunk or, when `include_usage`
-is enabled, the empty-choices usage chunk.
-
-To use a real GGUF model:
-
-```sh
-bun icn:serve -- \
-  --model /absolute/path/to/model.gguf \
-  --model-alias my-model \
-  --bind 127.0.0.1:8080
-```
-
-Use `my-model` in the same completion request. On Apple Silicon, the pinned bindings enable their
-macOS Metal backend. `--gpu-layers 0` forces CPU execution; the default attempts to offload all
-layers.
-
-## Build and verification commands
-
-Useful commands from the monorepo root:
-
-```sh
-bun icn:check                 # type-check the Rust workspace without linking a final binary
-bun icn:build                 # debug binary, fastest normal development build
-bun build:release            # build native release artifacts for this host
-bun icn:build:reference       # selected pinned tests, official tools, and native oracle
-bun icn:test                  # Rust API, SSE, backend, and workspace tests
-bun icn:parity:validate       # validate cases, fixtures, profiles, targets, and model registry
-bun icn:parity:list           # list primitive cases and implementation status
-bun icn:parity:test:ts        # test reference/model/provenance scripts
-bun icn:build:candidate -- --reference-manifest <path> # build the production ICN parity probe with provenance
-bun icn:generate
-bun icn:check-generated
-bun icn:verify-native-pin
-bun icn:doctor
-bun icn:version
-```
-
-`bun icn:build:reference -- --backend metal --target focused-tests --target oracle` builds only
-declared targets from the exact nested llama.cpp source used by the Rust bindings. Other target IDs
-include `llama-bench`, `llama-batched-bench`, `llama-perplexity`, `backend-ops`, and
-`quantize-perf`. The builder records source, configuration, artifact, and oracle digests; use
-`--dry-run` to inspect the resolved build without compiling. Every invocation reserves a fresh
-CMake tree, uses an allowlisted build environment, and records compile/link evidence for assertion
-and sanitizer status; an earlier CMake cache is never reused as parity evidence.
-
-## Inference testing philosophy
-
-Inference validation has three complementary categories:
-
-1. **Correctness parity** compares the smallest observable native and ICN operations: outputs,
-   effective configuration, and state transitions.
-2. **Performance parity** times those same isolated operations only after both sides prove they
-   performed equivalent work.
-3. **Composite inference benchmarking** sends controlled completion workloads to ICN and pinned
-   `llama-server` endpoints to measure the complete engine, including scheduling, concurrency,
-   prefix reuse, mixed prefill/decode work, latency, throughput, fairness, memory, and failures.
-
-The primitive suites make failures attributable; the composite benchmark establishes whether the
-complete engine is competitive. Composite fixtures define requests or deterministic agentic
-workflows together with prompt/output sizes, shared-prefix topology, arrival schedule, concurrency,
-and cold/warm state. Strict comparisons use identical model bytes, templates, settings, sampling,
-and token work; response or work divergence is a correctness result and invalidates timing. The
-same fixtures should support ICN-versus-llama.cpp comparison, ICN regression testing, and an opt-in
-public hardware benchmark exposed through the server and CLI.
-
-The versioned suite lives in [`benchmark/`](benchmark/), and the reusable library plus CLI is the
-`benchmark-runner` crate. It always exercises the configured HTTP endpoint, whether invoked from
-developer tooling or application code.
-
-## Primitive parity
-
-`parity/` contains neutral cases, fixtures, profiles, the content-addressed model registry, upstream
-target manifests, JSON evidence schemas, and the thin native C++ oracle. `icn-parity` validates and
-runs these assets without depending on the Rust bindings fork. It supports unchanged upstream
-tests, official upstream tools, and differential native-oracle/ICN-probe cases. Comparisons happen
-outside both producer processes and are exact, structural, tolerance-based, capability-based, or
-same-work performance ratios.
-
-Parity execution never uses a generated chat response or HTTP exchange as primitive evidence.
-The production `icn-probe` exposes the active paired operations through production-owned
-`icn-engine` code; descriptor status remains authoritative, with genuine artifact or production
-API gaps kept `planned` or `disabled`. The `diagnostic` profile is an uncontrolled, non-gating
-two-sided functional smoke. `native-diagnostic` separately runs the one-sided native C0/P0 checks
-without making a candidate-parity or controlled-performance claim. Generated run directories live
-under `results/parity/`.
-Downloaded parity models live under `target/parity-models/`. Both locations, all native/Rust build
-trees, and candidate artifacts are generated and ignored by the repository.
-
-`bun icn:generate` runs the Rust OpenAPI exporter and regenerates the complete ICN protocol under
-`packages/icn-protocol`: bootstrap records, HTTP schemas, HttpApi declarations, operation and
-streaming descriptors, generated client, and manifest. `bun icn:check-generated` performs the same
-derivation without writing and fails if any committed output is stale.
-
-The `inference/` directory is also a Bun workspace, so the equivalent short forms work:
-
-```sh
-bun run --cwd inference build
-bun run --cwd inference test
-bun run --cwd inference dev
-```
+The engine CLI is `magnitude-engine` (`engine/cli`); the production service
+binary is `magnitude-inference` (`service/server`). Platform support and
+qualification floors are in [compatibility](docs/compatibility.md). A passing
+local build does not establish qualification on every release host.

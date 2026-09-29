@@ -1,0 +1,10 @@
+# origin: C1:p28
+# invoke sl: f32[5]=seq ; i32:1 ; i32:3
+# pin: result = f32[5]=3,0,0,0,0
+# invoke sl: f32[5]=seq ; i32:3 ; i32:1
+# expect: failed
+fn sl[N](x: &tensor[N] f32, a: i32, b: i32) -> tensor[N] f32:
+    let mut out = zeros_like(x)
+    let v = x[a:b]
+    out[0] = reduce(v, 0, sum)
+    return out

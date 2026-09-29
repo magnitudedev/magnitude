@@ -1,0 +1,7 @@
+# cell: value-packed/arg
+# invoke: q4g64[4,64]=rand(171) ; f32[4]=zero
+fn code_sum(p: &tensor[64] q4g64) -> f32:
+    return p[0] + p[63]
+
+fn probe(w: &tensor[4, 64] q4g64, out: &mut tensor[4] f32):
+    out[0] = code_sum(w[2])

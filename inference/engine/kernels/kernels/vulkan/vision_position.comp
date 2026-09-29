@@ -1,0 +1,31 @@
+// vision_position: one invocation per value (grid-stride), the source plus
+// the four table corners scaled by their coefficients, summed in order.
+#include <seismic/element.glsl>
+
+#if defined(SEISMIC_TABLE_REPRESENTATION_BF16)
+#define TABLE_KIND ELEMENT_BF16
+#elif defined(SEISMIC_TABLE_REPRESENTATION_F16)
+#define TABLE_KIND ELEMENT_F16
+#elif defined(SEISMIC_TABLE_REPRESENTATION_F32)
+#define TABLE_KIND ELEMENT_F32
+#else
+#error "unsupported vision_position table representation"
+#endif
+
+void vision_position() {
+    const uint64_t columns = SEISMIC_DIM_H;
+    const uint64_t total = SEISMIC_DIM_M * columns;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < total; index += step) {
+        const uint64_t row = index / columns, column = index % columns;
+        float blended = 0.0;
+        [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+            const int corner = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_INDICES) + (row * 4ul + i) * 4ul);
+            blended += element_at(TABLE_KIND, SEISMIC_PTR(SEISMIC_BUFFER_TABLE),
+                uint64_t(corner) * SEISMIC_TABLE_STRIDE_0 + column)
+                * element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENTS) + (row * 4ul + i) * 4ul);
+        }
+        element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + (row * SEISMIC_RESULT_0_STRIDE_0 + column) * 4ul,
+            element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE) + (row * SEISMIC_SOURCE_STRIDE_0 + column) * 4ul) + blended);
+    }
+}

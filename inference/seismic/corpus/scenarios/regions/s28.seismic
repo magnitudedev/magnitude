@@ -1,0 +1,11 @@
+# origin: C14:s28
+# invoke: f32[4]=rand(50) ; bool:true
+# invoke: f32[4]=rand(50) ; bool:false
+fn helper(x: &tensor[4] f32, c: bool) -> f32:
+    let mut s = x[0]
+    if c:
+        s = x[1]
+    return s
+
+fn probe(x: &tensor[4] f32, c: bool) -> f32:
+    return helper(x, c) + 1.0

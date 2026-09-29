@@ -1,0 +1,7 @@
+# origin: X1:q5
+# rejected: "does not permit exclusive writes"
+fn probe[N](x: &tensor[N] f32, n: index[N]) -> f32:
+    let mut v = x[0:1]
+    for i in 0..n:
+        v = x[i:i+1]
+    return v[0]

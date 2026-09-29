@@ -1,0 +1,13 @@
+[package]
+name = "seismic-lang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dunce = "=1.0.5"
+num-bigint = "=0.4.8"
+num-traits = "=0.2.19"
+postcard.workspace = true
+serde.workspace = true
+sha2 = "=0.11.0"

@@ -1,0 +1,34 @@
+# Pointwise functions shared by the feed-forward and readout entries. Natives
+# evaluate the same expressions (`<backend>/lib/core/functions.*`).
+
+# Feed-forward activation by code:
+#   0  SiLU       a / (1 + exp(-a))
+#   1  GELU-tanh  a / (1 + exp(-2u)), u = √(2/π) (a + 0.044715 a³): the stable
+#                 form of 0.5 a (1 + tanh u), with no tanh primitive
+#   2  ReLU²      max(a, 0)²
+# The output dtype owns the publication.
+fn activate[M, N](x: &tensor[M, N] T, result: &mut tensor[M, N] U, function: i32):
+    parallel for rows in 0..M:
+        parallel for cols in 0..N:
+            let a = f32(x[rows, cols])
+            let mut value = a / (1.0 + exp(-a))
+            if function == 1:
+                let u = 0.7978845608028654 * (a + 0.044715 * (a * a * a))
+                value = a / (1.0 + exp(-2.0 * u))
+            if function == 2:
+                let r = max(a, 0.0)
+                value = r * r
+            result[rows, cols] = value
+
+# A weight's second-level scale (NVFP4 `.scale`) on F32 projections, then
+# published in U: result = x * scale[0] for a present port (S = 1), x
+# unscaled for an absent one (S = 0). Every entry that reads packed weights
+# takes one such port per weight (`<weight>_scale`, per tensor [S] or per
+# expert [S, E]), applied to the accumulator before any epilogue.
+fn scale_rows[M, N, S](x: &tensor[M, N] f32, scale: &tensor[S] f32, result: &mut tensor[M, N] U) where S >= 0 and S <= 1:
+    let mut factor = f32(1.0)
+    if S == 1:
+        factor = scale[0]
+    parallel for rows in 0..M:
+        parallel for cols in 0..N:
+            result[rows, cols] = x[rows, cols] * factor

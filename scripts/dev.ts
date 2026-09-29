@@ -1,6 +1,6 @@
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { buildLocalIcn } from "../inference/scripts/build-local"
+import { buildLocalInference } from "../inference/scripts/build-local"
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 
@@ -40,9 +40,9 @@ if (explicit) {
   icnPath = resolve(explicit)
   console.log(`[dev] Using ICN: ${icnPath}`)
 } else {
-  const built = await buildLocalIcn()
+  const built = await buildLocalInference()
   icnPath = built.installationPath
-  console.log(`[dev] Using ${built.backend} ICN: ${icnPath}`)
+  console.log(`[dev] Using ICN: ${icnPath}`)
 }
 
 const clientExit = await run(

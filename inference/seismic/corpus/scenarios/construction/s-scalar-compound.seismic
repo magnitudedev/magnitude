@@ -1,0 +1,9 @@
+# origin: C11:s_scalar_compound
+# cell: compound-local-scalar/sl
+# invoke: f32:1.5
+fn probe(x: f32) -> f32:
+    let mut y = x * 2.0
+    y += 1.0
+    y -= x
+    y *= 3.0
+    return y

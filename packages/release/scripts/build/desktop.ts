@@ -44,6 +44,7 @@ export const buildDesktopApplication = (options: {
   const license = join(resources, "Magnitude-LICENSE.txt")
   const command = join(resources, "magnitude-command")
   const extractor = join(resources, "magnitude-extract")
+  const trayStatus = join(resources, "tray-status.node")
   const launcher = join(resources, "magnitude-launcher.exe")
   const updateConfiguration = join(resources, "update-configuration.json")
   yield* fs.copyFile(join(root, "desktop/out/main/update-configuration.json"), updateConfiguration)
@@ -67,6 +68,7 @@ export const buildDesktopApplication = (options: {
   if (platform === "darwin") {
     yield* fs.copyFile(join(root, `packages/daemon-management/dist/native/${platform}-${arch}/magnitude-extract`), extractor)
     yield* fs.chmod(extractor, 0o755)
+    yield* fs.copyFile(join(root, `desktop/dist/native/${platform}-${arch}/tray-status.node`), trayStatus)
   }
   const electron = yield* fs.readFileString(join(root, "node_modules/electron/package.json")).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(PackageVersion))))
   return yield* Effect.tryPromise({ try: () => packager({
@@ -77,6 +79,6 @@ export const buildDesktopApplication = (options: {
     ...(platform === "darwin" ? { icon: join(root, "packages/release/resources/macos/Magnitude.icns"), extendInfo: { LSMinimumSystemVersion: MACOS_DEPLOYMENT_TARGET } } : {}),
     asar: true, prune: false, overwrite: true,
     extraResource: [service, cli, addon, tray, ...windowsTrayIcons, icon, license, updateTrust, updateConfiguration,
-      ...(platform === "win32" ? [launcher] : [command]), ...(platform === "darwin" ? [extractor] : [])],
+      ...(platform === "win32" ? [launcher] : [command]), ...(platform === "darwin" ? [extractor, trayStatus] : [])],
   }), catch: error => new DesktopBuildFailed({ message: `Could not assemble desktop: ${String(error)}` }) })
 })).pipe(Effect.mapError(error => error instanceof DesktopBuildFailed ? error : new DesktopBuildFailed({ message: String(error) })))

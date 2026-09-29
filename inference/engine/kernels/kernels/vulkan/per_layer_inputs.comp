@@ -1,0 +1,91 @@
+// per_layer_inputs: the per-layer input rows (PLE). Workgroup (chunk, row),
+// one invocation per chunk column: the scaled projection value, the chunk's
+// square sum, then
+//   (p * rms_inverse * norm + gathered * gathered_scale) * scale
+// with the gathered value decoded from its packet (rows16 or dense). The
+// Vulkan form of `metal/per_layer_inputs.metal`.
+#include <seismic/element.glsl>
+#include <seismic/packets.glsl>
+#include "lib/core/reduce.glsl"
+
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define INPUTS_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define INPUTS_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define INPUTS_NORM ELEMENT_BF16
+#else
+#error "per_layer_inputs requires a dense norm"
+#endif
+
+#if defined(SEISMIC_GATHERED_REPRESENTATION_Q4K)
+#define GATHERED_KIND PACKETS_Q4K
+#define GATHERED_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_GATHERED)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_Q5K)
+#define GATHERED_KIND PACKETS_Q5K
+#define GATHERED_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_GATHERED)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_Q6K)
+#define GATHERED_KIND PACKETS_Q6K
+#define GATHERED_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_GATHERED)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_Q8G32S)
+#define GATHERED_KIND PACKETS_Q8
+#define GATHERED_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_GATHERED)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_IQ4G32)
+#define GATHERED_KIND PACKETS_IQ4
+#define GATHERED_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATHERED)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_Q4G32S)
+#define GATHERED_KIND PACKETS_Q4G32S
+#define GATHERED_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATHERED)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_MXFP4G32)
+#define GATHERED_KIND PACKETS_MXFP4
+#define GATHERED_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATHERED)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_NVFP4G16)
+#define GATHERED_KIND PACKETS_NVFP4
+#define GATHERED_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATHERED)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_Q5G32S)
+#define GATHERED_KIND PACKETS_Q5G32S
+#define GATHERED_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_GATHERED)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_Q5G32)
+#define GATHERED_KIND PACKETS_Q5G32
+#define GATHERED_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_GATHERED)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_BF16)
+#define GATHERED_KIND PACKETS_BF16
+#define GATHERED_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATHERED, 2)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_F16)
+#define GATHERED_KIND PACKETS_F16
+#define GATHERED_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATHERED, 2)
+#elif defined(SEISMIC_GATHERED_REPRESENTATION_F32)
+#define GATHERED_KIND PACKETS_F32
+#define GATHERED_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATHERED, 4)
+#else
+#error "unsupported per_layer_inputs gathered representation"
+#endif
+#if defined(SEISMIC_GATHERED_KIND_PACKED) && !defined(SEISMIC_GATHERED_LAYOUT_ROWS16)
+#error "per_layer_inputs requires the rows16 layout for gathered"
+#endif
+
+// Shared: one partial per subgroup (reduce_group_sum at float 0).
+void per_layer_inputs() {
+    const uint chunk = uint(SEISMIC_DIM_P);
+    const uint width = uint(SEISMIC_DIM_L) * chunk;
+    const uint64_t row = gl_WorkGroupID.y;
+    const uint i = gl_LocalInvocationIndex;
+    const uint column = gl_WorkGroupID.x * chunk + i;
+    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const float gathered_scale = element_word_f32(SEISMIC_PARAM_GATHERED_SCALE);
+    const float projected_scale = element_word_f32(SEISMIC_PARAM_PROJECTED_SCALE);
+    const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
+    const float p = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_PROJECTED)
+        + (row * SEISMIC_PROJECTED_STRIDE_0 + uint64_t(column) * SEISMIC_PROJECTED_STRIDE_1) * 4ul) * projected_scale;
+    const float total = reduce_group_sum(p * p, 0u);
+    const float inverse = inversesqrt(seismic_div_rn(total, float(chunk)) + epsilon);
+    const packets_rows16 geometry = GATHERED_GEOMETRY;
+    const packets_packet packet = packets_load(GATHERED_KIND,
+        SEISMIC_PTR(SEISMIC_BUFFER_GATHERED) + row * geometry.stride, geometry, column / 32u, width);
+    const float token = packets_value_at(GATHERED_KIND, packet, column % 32u);
+    const float normalized = p * inverse * element_at(INPUTS_NORM, SEISMIC_PTR(SEISMIC_BUFFER_NORM),
+        uint64_t(i) * SEISMIC_NORM_STRIDE_0);
+    element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
+            + (row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
+        (normalized + token * gathered_scale) * scale);
+}

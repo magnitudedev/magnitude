@@ -1,7 +1,8 @@
 import * as Command from "@effect/platform/Command"
 import * as FileSystem from "@effect/platform/FileSystem"
-import { Config, Data, Effect, Schema, Stream } from "effect"
+import { Config, Data, Effect, Option, Schema, Stream } from "effect"
 import { resolve } from "node:path"
+import { AppleTeamId } from "../../src/desktop-distribution"
 
 export class AppleDistributionFailed extends Data.TaggedError("AppleDistributionFailed")<{
   readonly message: string
@@ -26,11 +27,11 @@ export const appleSigning = Effect.gen(function* () {
   const mode = yield* Config.literal("adhoc", "developer-id")("MAGNITUDE_APPLE_DISTRIBUTION").pipe(Config.withDefault("adhoc"))
   if (mode === "adhoc") return { mode, identity: "-", team: "" } as const
   const identity = yield* Config.nonEmptyString("APPLE_SIGNING_IDENTITY")
-  const team = yield* Config.string("APPLE_TEAM_ID")
-  if (!/^[A-Z0-9]{10}$/.test(team) || !identity.startsWith("Developer ID Application:")) {
+  const team = yield* Schema.decodeUnknown(AppleTeamId)(yield* Config.string("APPLE_TEAM_ID")).pipe(Effect.option)
+  if (Option.isNone(team) || !identity.startsWith("Developer ID Application:")) {
     return yield* new AppleDistributionFailed({ message: "Developer ID release requires a valid Team ID and Developer ID Application identity" })
   }
-  return { mode, identity, team } as const
+  return { mode, identity, team: team.value } as const
 })
 
 export const signAppleCode = (file: string, identifier: string, profile: "native" | "bun" | "library" = "native") => Effect.gen(function* () {

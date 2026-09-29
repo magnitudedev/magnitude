@@ -57,6 +57,17 @@ export const LocalInferenceMemoryDomainIdSchema = Schema.String.pipe(
 )
 export type LocalInferenceMemoryDomainId = typeof LocalInferenceMemoryDomainIdSchema.Type
 
+/** Stable identity of one inference execution device, including the host CPU. */
+export const LocalInferenceDeviceIdSchema = Schema.String.pipe(
+  Schema.minLength(1),
+  Schema.maxLength(512),
+  Schema.brand("LocalInferenceDeviceId"),
+)
+export type LocalInferenceDeviceId = typeof LocalInferenceDeviceIdSchema.Type
+
+export const LocalInferenceBackendSchema = Schema.Literal("cpu", "metal", "cuda", "vulkan")
+export type LocalInferenceBackend = typeof LocalInferenceBackendSchema.Type
+
 export const PercentageSchema = Schema.Number.pipe(Schema.int(), Schema.between(0, 100))
 export type Percentage = typeof PercentageSchema.Type
 
@@ -71,12 +82,11 @@ export const LowMemoryModelInstanceFailureSchema = Schema.TaggedStruct("LowMemor
   code: Schema.Literal("low_memory"),
   message: Schema.String,
   retryable: Schema.Boolean,
-  requiredSystemMemoryBytes: NonNegativeSafeInteger,
+  requiredMemoryBytes: NonNegativeSafeInteger,
   allocationHeadroomBytes: NonNegativeSafeInteger,
   systemReserveBytes: NonNegativeSafeInteger,
   loadBoundaryBytes: NonNegativeSafeInteger,
   minimumAdditionalAvailableBytes: PositiveSafeInteger,
-  parallelSequences: PositiveSafeInteger,
 })
 export type LowMemoryModelInstanceFailure =
   typeof LowMemoryModelInstanceFailureSchema.Type
@@ -102,18 +112,22 @@ export const formatModelDisplayName = (
   onSome: (label) => `${displayName} (${label})`,
 })
 
+export const ModelLoadDeviceSchema = Schema.Struct({
+  deviceId: LocalInferenceDeviceIdSchema,
+  backend: LocalInferenceBackendSchema,
+})
+export type ModelLoadDevice = typeof ModelLoadDeviceSchema.Type
+
 export const ModelLoadPlanSchema = Schema.Struct({
   contextWindowTokens: PositiveSafeInteger,
-  parallelSequences: PositiveSafeInteger,
-  physicalContextTokens: PositiveSafeInteger,
-  requiredSystemMemoryBytes: NonNegativeSafeInteger,
+  /** Startup peak claim in the selected device's allocation domain; excludes context growth. */
+  requiredMemoryBytes: NonNegativeSafeInteger,
+  device: ModelLoadDeviceSchema,
 })
 export type ModelLoadPlan = typeof ModelLoadPlanSchema.Type
 
 export const ModelInstanceAllocationSchema = Schema.Struct({
   contextWindowTokens: PositiveSafeInteger,
-  parallelSequences: PositiveSafeInteger,
-  physicalContextTokens: PositiveSafeInteger,
   memoryDomains: Schema.Array(Schema.Struct({
     memoryDomainId: LocalInferenceMemoryDomainIdSchema,
     modelBytes: NonNegativeSafeInteger,
@@ -426,15 +440,22 @@ export const ModelReleaseReasonSchema = Schema.Literal(
 )
 export type ModelReleaseReason = typeof ModelReleaseReasonSchema.Type
 
+export const ModelLoadStageSchema = Schema.Literal(
+  "queued",
+  "preparing",
+  "optimizing",
+  "loading_weights",
+  "finalizing",
+)
+export type ModelLoadStage = typeof ModelLoadStageSchema.Type
+
 export const ModelResidencySchema = Schema.Union(
   Schema.TaggedStruct("Unloaded", {}),
   Schema.TaggedStruct("Requested", {}),
   Schema.TaggedStruct("Loading", {
-    stage: Schema.Literal("queued", "resolving", "unloading", "loading", "verifying"),
-    progress: Schema.optionalWith(Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)), {
-      as: "Option",
-      exact: true,
-    }),
+    stage: ModelLoadStageSchema,
+    /** Completed fraction by measured work: tuning (when the load tunes) fills the first half. */
+    fraction: Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)),
     plannedAllocation: Schema.optionalWith(ModelLoadPlanSchema, { as: "Option", exact: true }),
   }),
   Schema.TaggedStruct("Ready", {
@@ -544,6 +565,8 @@ export const ProviderModelDisabledReasonSchema = Schema.Literal(
   "installation_unavailable",
   "incompatible_runtime",
   "invalid_configuration",
+  "catalog_disabled",
+  "deprecated",
 )
 export type ProviderModelDisabledReason = typeof ProviderModelDisabledReasonSchema.Type
 
@@ -571,10 +594,30 @@ export const ProviderModelCatalogEntrySchema = Schema.Struct({
   { message: () => "supported model slots must be unique" }))
 export type ProviderModelCatalogEntry = typeof ProviderModelCatalogEntrySchema.Type
 
+const CatalogDeprecationDateSchema = Schema.String.pipe(
+  Schema.filter(isRealIsoCalendarDate, {
+    message: () => "catalog deprecation date must be a real YYYY-MM-DD calendar date",
+  }),
+  Schema.brand("CatalogDeprecationDate"),
+)
+
+/** What the release promises for a catalog model, independent of this device's assessment. */
+export const CatalogSupportSchema = Schema.Union(
+  Schema.TaggedStruct("Supported", {}),
+  Schema.TaggedStruct("Disabled", { reason: NonEmptyString }),
+  Schema.TaggedStruct("Deprecated", {
+    since: CatalogDeprecationDateSchema,
+    replacement: CatalogFormModelIdSchema,
+    reason: NonEmptyString,
+  }),
+)
+export type CatalogSupport = typeof CatalogSupportSchema.Type
+
 export const LocalModelCatalogDataSchema = Schema.Struct({
   releaseDate: ModelReleaseDateSchema,
   parameterization: ModelParameterizationSchema,
   intelligence: CatalogIntelligenceSchema,
+  support: CatalogSupportSchema,
   fidelityRank: NonNegativeSafeInteger,
   quantizationAware: Schema.Boolean,
 })
@@ -702,6 +745,7 @@ export type LocalModelPresentation = typeof LocalModelPresentationSchema.Type
 export const SpeculativeMethodSchema = Schema.Union(
   Schema.TaggedStruct("Mtp", {}),
   Schema.TaggedStruct("DFlash", {}),
+  Schema.TaggedStruct("DFlash2", {}),
   Schema.TaggedStruct("DSpark", {}),
 )
 export type SpeculativeMethod = typeof SpeculativeMethodSchema.Type
@@ -1110,7 +1154,7 @@ export type ModelSlotsState = typeof ModelSlotsStateSchema.Type
 export const LocalInferenceAcceleratorSchema = Schema.Struct({
   acceleratorId: LocalInferenceAcceleratorIdSchema,
   name: Schema.String,
-  backend: Schema.String,
+  backend: LocalInferenceBackendSchema,
   memoryDomainId: LocalInferenceMemoryDomainIdSchema,
 })
 export const LocalInferenceMemoryDomainSchema = Schema.Struct({

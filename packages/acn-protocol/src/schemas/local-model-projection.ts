@@ -2,6 +2,7 @@ import { Option } from "effect"
 import type { ProviderModelId } from "@magnitudedev/ai/provider/model"
 import {
   installedAcquisition,
+  type CatalogSupport,
   type LocalModel,
   type LocalModelsState,
   type ModelCapabilities,
@@ -47,11 +48,25 @@ export const localModelCapabilities = (
     ? Option.some(serving.capabilities)
     : Option.none())
 
+export type CatalogDeprecation = Extract<CatalogSupport, { readonly _tag: "Deprecated" }>
+
+export const localModelIsAvailable = (model: LocalModel): boolean => model._tag !== "Catalog"
+  || model.catalogData.support._tag === "Supported"
+
+/** A deprecated catalog model is never recommended, installed, or loaded. */
+export const localModelDeprecation = (
+  model: LocalModel,
+): Option.Option<CatalogDeprecation> => model._tag === "Catalog"
+  && model.catalogData.support._tag === "Deprecated"
+  ? Option.some(model.catalogData.support)
+  : Option.none()
+
 export const localModelProviderModelId = (
   model: LocalModel,
 ): Option.Option<ProviderModelId> => {
   const serving = Option.getOrUndefined(localModelServingState(model))
   if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits") return Option.none()
+  if (!localModelIsAvailable(model)) return Option.none()
   if (model._tag === "Discovered") return Option.some(model.modelId)
   return installedAcquisition(model.acquisitionState) !== undefined
       && model.acquisitionState._tag !== "Removing"

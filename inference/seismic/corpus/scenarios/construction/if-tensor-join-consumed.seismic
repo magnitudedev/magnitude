@@ -1,0 +1,11 @@
+# origin: C11:if_tensor_join_consumed
+# cell: assign-local-tensor/join
+# cell: value-owned-tensor/join
+# invoke: f32[4]=1,2,3,4 ; f32[4]=5,6,7,8 ; bool:true
+fn probe(a: &tensor[4] f32, b: &tensor[4] f32, c: bool) -> tensor[4] f32:
+    let mut t = to_owned(a)
+    if c:
+        t = to_owned(b)
+    let u = t + 1.0
+    let w = u * t
+    return w

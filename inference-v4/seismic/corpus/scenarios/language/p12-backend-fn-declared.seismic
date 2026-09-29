@@ -1,0 +1,7 @@
+# origin: C1:p12
+# rejected: "written as"
+fn h[N](x: &tensor[N] f32) -> f32 for metal:
+    return x[0]
+
+fn f[N](x: &tensor[N] f32) -> f32:
+    return x[0]

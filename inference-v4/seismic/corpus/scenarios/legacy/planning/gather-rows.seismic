@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/planning.seismic:gather_rows
+# invoke gather_rows: f32[4,3]=seq ; i32[3]=3,0,2 ; f32[3,3]=zero
+# invoke gather_rows: f32[4,3]=seq ; i32[3]=3,4,2 ; f32[3,3]=zero
+# expect: failed
+fn gather_rows[N, E, W](table: &tensor[E, W] f32, routes: &tensor[N] i32, y: &mut tensor[N, W] f32):
+    parallel for i in 0..N:
+        y[i] = table[routes[i]]

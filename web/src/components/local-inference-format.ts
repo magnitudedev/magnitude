@@ -1,5 +1,10 @@
 import { Option } from "effect"
 import { localModelServingProfile, type LocalModel, type ModelSlot } from "@magnitudedev/sdk"
+import {
+  formatModelLoadPercentage,
+  formatModelLoadStage,
+  isMeasuredModelLoadStage,
+} from "@magnitudedev/client-common"
 
 export const formatBytes = (bytes: number): string => {
   if (bytes <= 0) return "0 B"
@@ -81,13 +86,9 @@ export const slotStatus = (
       return {
         label: "Loading",
         tone: "progress",
-        detail: `${slot.residency.stage}${Option.match(
-          slot.residency.progress,
-          {
-            onNone: () => "",
-            onSome: (progress) => ` · ${Math.round(progress * 100)}%`,
-          }
-        )}`,
+        detail: isMeasuredModelLoadStage(slot.residency.stage)
+          ? `${formatModelLoadStage(slot.residency.stage)} · ${formatModelLoadPercentage(slot.residency.fraction)}`
+          : formatModelLoadStage(slot.residency.stage),
       }
     case "Ready":
       return { label: "Ready", tone: "success", detail: null }

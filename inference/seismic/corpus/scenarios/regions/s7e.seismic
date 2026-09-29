@@ -1,0 +1,6 @@
+# origin: C14:s7e
+# rejected: "initialization"
+fn probe[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut s = tensor[N] f32
+    s[0] = x[0]
+    return s

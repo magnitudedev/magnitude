@@ -1,0 +1,7 @@
+# origin: C13:p04b
+# invoke: i32[4]=seq ; i32:1
+fn probe(input: &tensor[4] i32, flag: i32) -> tensor[4] i32:
+    let mut r = input * 3
+    if flag > 0:
+        r = input + input
+    return r

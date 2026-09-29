@@ -22,27 +22,38 @@ import { ReleaseManifestSchema, validateReleaseManifest } from "@magnitudedev/re
 class CandidateAcceptanceFailed extends Schema.TaggedError<CandidateAcceptanceFailed>()("CandidateAcceptanceFailed", { message: Schema.String }) {}
 
 const candidate = resolve(process.argv[2] ?? "release-candidate")
-// Script entry points use Promises; subprocess lifetime and output bounds remain Effect-owned.
+// Script entry points use Promises; subprocess lifetime remains Effect-owned.
 const run = (
   command: readonly string[],
   options: {
     readonly cwd?: string
     readonly env?: Readonly<Record<string, string | undefined>>
+    readonly timeout?: "5 minutes" | "25 minutes"
+    readonly output?: "inherit"
   } = {},
 ): Promise<string> => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const executable = command[0]
   if (!executable) return yield* new CandidateAcceptanceFailed({ message: "Empty acceptance command" })
   const environment = Object.fromEntries(Object.entries(options.env ?? {}).filter((entry): entry is [string, string] => entry[1] !== undefined))
-  const child = yield* Command.make(executable, ...command.slice(1)).pipe(
-    Command.workingDirectory(options.cwd ?? process.cwd()), Command.env(environment), Command.start,
+  const configured = Command.make(executable, ...command.slice(1)).pipe(
+    Command.workingDirectory(options.cwd ?? process.cwd()), Command.env(environment),
   )
-  const read = (stream: typeof child.stdout) => stream.pipe(Stream.decodeText(), Stream.runFoldEffect("", (previous, chunk) =>
-    previous.length + chunk.length <= 1024 * 1024 ? Effect.succeed(previous + chunk)
-      : Effect.fail(new CandidateAcceptanceFailed({ message: `${executable} exceeded its output limit` }))))
+  const child = yield* (options.output === "inherit"
+    ? configured.pipe(Command.stdout("inherit"), Command.stderr("inherit"), Command.start)
+    : configured.pipe(Command.start))
+  if (options.output === "inherit") {
+    const code = yield* child.exitCode
+    if (code !== 0) return yield* new CandidateAcceptanceFailed({ message: `${executable} failed with exit ${code}; see acceptance.log for complete output` })
+    return ""
+  }
+  const read = (stream: typeof child.stdout) => stream.pipe(Stream.decodeText(), Stream.runFold("", (previous, chunk) => previous + chunk))
   const [code, stdout, stderr] = yield* Effect.all([child.exitCode, read(child.stdout), read(child.stderr)], { concurrency: "unbounded" })
-  if (code !== 0) return yield* new CandidateAcceptanceFailed({ message: `${executable} failed with exit ${code}: ${(stderr || stdout).trim()}` })
+  // Report both streams: a process may log to stderr while its failure is on stdout.
+  if (code !== 0) return yield* new CandidateAcceptanceFailed({
+    message: `${executable} failed with exit ${code}\n--- stdout ---\n${stdout.trim()}\n--- stderr ---\n${stderr.trim()}`,
+  })
   return stdout
-})).pipe(Effect.timeout("5 minutes"), Effect.provide(BunContext.layer)))
+})).pipe(Effect.timeout(options.timeout ?? "5 minutes"), Effect.provide(BunContext.layer)))
 
 const manifest = await Effect.runPromise(Schema.decodeUnknown(Schema.parseJson(ReleaseManifestSchema))(
   await readFile(resolve(candidate, "magnitude-release.json"), "utf8"),
@@ -71,7 +82,13 @@ const server = Bun.serve({
   },
 })
 const baseUrl = `http://127.0.0.1:${server.port}`
+const diagnosticParent = process.env.MAGNITUDE_CANDIDATE_DIAGNOSTICS ?? tmpdir()
 const root = await mkdtemp(resolve(tmpdir(), "magnitude-candidate-"))
+const headlessRoot = await mkdtemp(process.platform === "win32" ? resolve(tmpdir(), "mag-candidate-headless-") : "/tmp/mag-candidate-headless-")
+const diagnosticRoot = await mkdtemp(resolve(diagnosticParent, "mag-candidate-headless-")).catch(async error => {
+  console.warn(`Could not retain candidate diagnostics under ${diagnosticParent}: ${String(error)}`)
+  return mkdtemp(resolve(tmpdir(), "mag-candidate-diagnostics-"))
+})
 const dataDir = resolve(root, "home-bootstrap", ".magnitude")
 let desktopApplication = "/usr/bin/magnitude-desktop"
 let cliExecutable = "/usr/bin/magnitude"
@@ -100,12 +117,11 @@ const acceptBootstrap = Effect.scoped(Effect.gen(function* () {
   if (Number(info.size) !== desktop.bytes || (yield* sha256File(image)) !== desktop.sha256) {
     return yield* new CandidateAcceptanceFailed({ message: "Desktop installer differs from the candidate manifest" })
   }
-  const base = yield* selectArtifact(manifest, "icn-base", host)
-  const installation = yield* installArtifact(baseUrl, manifest.version, base, resolve(dataDir, "inference"))
+  const inference = yield* selectArtifact(manifest, "icn-base", host)
+  const installation = yield* installArtifact(baseUrl, manifest.version, inference, resolve(dataDir, "inference"))
   const declaration = resolve(installation, "installation.json")
   yield* fs.writeFileString(declaration, yield* Schema.encode(Schema.parseJson(IcnInstallationDeclaration))({
-    schemaVersion: 1, backend: "cpu", nativeBuild: Option.getOrThrow(base.nativeBuild),
-    backendModuleAbi: Option.getOrThrow(base.backendModuleAbi),
+    schemaVersion: 1, nativeBuild: Option.getOrThrow(inference.nativeBuild),
   }))
   if (linux) {
     yield* validateLinuxDesktopInstaller({ file: image, format: "deb", arch: host === "linux-arm64-gnu" ? "arm64" : "x64",
@@ -152,13 +168,54 @@ const invoke = async (
   }
 }
 
+let accepted = false
 try {
   await Effect.runPromise(acceptBootstrap)
+  const headlessEnvironment = {
+    ...environment(resolve(headlessRoot, "home")),
+    MAGNITUDE_INSTALLED_ACCEPTANCE_OUTPUT: diagnosticRoot,
+    MAGNITUDE_INSTALLED_ACCEPTANCE_PROFILE: resolve(headlessRoot, "profile"),
+    MAGNITUDE_INSTALLED_ACCEPTANCE_RESULT: resolve(headlessRoot, "result.json"),
+    MAGNITUDE_INSTALLED_ACCEPTANCE_CLI: cliExecutable,
+    MAGNITUDE_INSTALLED_ACCEPTANCE_ADDON: process.platform === "darwin"
+      ? resolve(desktopApplication, "Contents/Resources/desktop-host.node")
+      : "/usr/lib/magnitude-desktop/resources/desktop-host.node",
+    MAGNITUDE_INSTALLED_ACCEPTANCE_VERSION: manifest.version,
+    MAGNITUDE_ICN_PATH: "",
+  }
+  await run([process.execPath, resolve(import.meta.dir, "../packages/release/scripts/acceptance/test-installed-headless.ts")], {
+    cwd: root,
+    env: headlessEnvironment,
+    timeout: "25 minutes",
+    output: "inherit",
+  })
+  await Effect.runPromise(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ engineAcquired: Schema.Literal(true), rankingReady: Schema.Literal(true) })))(
+    await readFile(resolve(headlessRoot, "result.json"), "utf8"),
+  ))
+  console.log("Installed desktop acquired ICN into an empty profile and reached headless readiness")
   await invoke([cliExecutable, "--version"], root, resolve(root, "home-cli"))
   server.stop(true)
+  await run([process.execPath, resolve(import.meta.dir, "../packages/release/scripts/acceptance/test-installed-headless.ts")], {
+    cwd: root,
+    env: { ...headlessEnvironment, MAGNITUDE_RELEASE_BASE_URL: "http://127.0.0.1:1", MAGNITUDE_INSTALLED_ACCEPTANCE_OFFLINE: "true" },
+    timeout: "25 minutes",
+    output: "inherit",
+  })
+  await Effect.runPromise(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ offlineCachedStart: Schema.Literal(true), rankingReady: Schema.Literal(true) })))(
+    await readFile(resolve(headlessRoot, "result.json"), "utf8"),
+  ))
   await invoke([cliExecutable, "--version"], root, resolve(root, "home-cli"))
-  console.log("Desktop-bundled CLI works with the candidate artifact endpoint stopped")
+  console.log("Installed service and bundled CLI work with the candidate artifact endpoint stopped")
+  accepted = true
 } finally {
   server.stop(true)
-  await rm(root, { recursive: true, force: true })
+  if (accepted) {
+    for (const path of [headlessRoot, root, diagnosticRoot]) {
+      await rm(path, { recursive: true, force: true }).catch(error => {
+        console.warn(`Could not remove candidate temporary directory ${path}: ${String(error)}`)
+      })
+    }
+  } else {
+    console.error(`Candidate diagnostics preserved at ${diagnosticRoot}; runtime state at ${headlessRoot} and ${root}`)
+  }
 }

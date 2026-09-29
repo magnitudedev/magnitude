@@ -1,0 +1,4 @@
+{
+    global: templates_*;
+    local: *;
+};

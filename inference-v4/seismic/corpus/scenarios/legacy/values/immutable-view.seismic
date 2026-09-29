@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/values.seismic:immutable_view
+# invoke immutable_view: f32[3,4]=seq ; f32[3]=zero
+fn immutable_view[M, N](x: &tensor[M, N] f32, y: &mut tensor[M] f32):
+    parallel for r in 0..M:
+        let row = x[r]
+        let tail = row[1:N]
+        y[r] = reduce(tail, 0, sum) + row[0]

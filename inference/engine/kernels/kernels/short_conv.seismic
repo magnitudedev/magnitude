@@ -1,0 +1,93 @@
+# Short convolution (LFM2 ShortConv) mixer: the gated causal depthwise
+# convolution between the segmented input projection and the output
+# projection.
+#
+# Projection column contract: `u (CH) | c (CH)` in F32, with u = B * X the
+# product of the input projection's B and X segments and c its C segment.
+# The product stays F32 into the convolution window, so it is not rounded
+# before the tap sum.
+#
+# State contract: each short-convolution layer owns one arena,
+# `window[S, C - 1 + T, CH] f32` (T >= 0, the planned speculative width).
+# A bank holds the C - 1 rows of u before its state, then the rows of u of up
+# to T rows past it; a version is (bank, j <= T): the bank advanced by its
+# first j tape rows, whose window is rows [j, j + C - 1). The window rows are
+# the whole tape: the layer has no other state. Slots, `stop` and the
+# successor publication follow the gated-delta contract (recurrent.seismic):
+# slot `b` reads version (`previous_bank[b]`, `previous_tape[b]`) and
+# publishes to bank `following_bank[b]` the C - 1 rows before its first
+# `stop[b]` rows' end, then the rows of the next t = min(T, rows - stop) rows
+# (window rows past C - 1 + t are not written). An entry never writes a
+# `previous_bank` row or bank 0, and successors are distinct.
+#
+# Output contract: `gated[M, CH] A` holds c * sum_tap w[ch, tap] u[row - (C -
+# 1) + tap] per row, summed tap-ascending in F32 with no bias and no
+# activation; rows outside every slot are zero. Every row is independent, so
+# decode, verify and prefill are one computation.
+
+fn short_conv_rows[M, B, S, CH, C, T](projection: &tensor[M, 2 * CH] f32,
+    convolution: &tensor[CH, C] f32,
+    segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
+    previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
+    window: &mut tensor[S, C - 1 + T, CH] f32,
+    slab_banks: u32) -> tensor[M, CH] A where T >= 0:
+    let mut gated = tensor[M, CH] A
+    for row in 0..M:
+        for channel in 0..CH:
+            gated[row, channel] = 0.0
+    for slot in 0..B:
+        let lo = segments[slot, 0]
+        let hi = segments[slot, 1]
+        let source = previous_bank[slot]
+        let taped = previous_tape[slot]
+        let target = following_bank[slot]
+        let publish = lo + stop[slot]
+        for row in 0..M:
+            if row >= lo and row < hi:
+                let local = row - lo
+                for channel in 0..CH:
+                    let mut sum = f32(0.0)
+                    for tap in 0..C:
+                        let mut value = f32(0.0)
+                        if local + tap < C - 1:
+                            value = window[source, taped + local + tap, channel]
+                        else:
+                            value = projection[lo + local + tap - (C - 1), channel]
+                        sum = fma(convolution[channel, tap], value, sum)
+                    gated[row, channel] = projection[row, CH + channel] * sum
+        for tap in 0..C - 1 + T:
+            if tap < C - 1 or publish + tap - (C - 1) < hi:
+                for channel in 0..CH:
+                    if stop[slot] + tap < C - 1:
+                        window[target, tap, channel] = window[source, taped + stop[slot] + tap, channel]
+                    else:
+                        window[target, tap, channel] = projection[publish + tap - (C - 1), channel]
+    return gated
+
+# Metal: a thread per (channel, row) for grid y < M; grid y = M + b
+# publishes slot b's successor window. The tap loop is the body's chain, so
+# the bits match on every backend and row class.
+native short_conv_rows for metal from "metal/short_conv_rows.metal":
+    launch short_conv_rows:
+        threadgroups (ceil_div(CH, 256), M + B, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CUDA and Vulkan: the Metal items, visited by a grid-stride loop over y
+# because both cap the y grid at 65535 groups.
+native short_conv_rows for cuda from "cuda/short_conv_rows.cu":
+    launch short_conv_rows:
+        threadgroups (ceil_div(CH, 256), min(M + B, 65535), 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native short_conv_rows for vulkan from "vulkan/short_conv_rows.comp":
+    launch short_conv_rows:
+        threadgroups (ceil_div(CH, 256), min(M + B, 65535), 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: work item r < M computes every channel of row r; work item M + b
+# publishes slot b's successor window. Shared: the row's tap sums.
+native short_conv_rows for cpu from "cpu/short_conv_rows.rs":
+    launch short_conv_rows:
+        threadgroups (M + B, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (CH * 4)

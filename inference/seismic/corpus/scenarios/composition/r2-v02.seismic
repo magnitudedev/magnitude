@@ -1,0 +1,6 @@
+# origin: X1:r2-v02
+# rejected: "cannot cross an owned boundary"
+fn probe(a: &mut tensor[4] f32) -> tensor[2] f32:
+    let v = a[0:2]
+    a[0] = 9.0
+    return v

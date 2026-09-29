@@ -1,0 +1,6 @@
+# origin: C13:p27f
+# invoke: i32[6]=seq
+fn probe(input: &tensor[6] i32) -> i32:
+    let mut r = tensor[4] i32
+    r[:] = ones_like(r)
+    return reduce(r, 0, sum) + 400

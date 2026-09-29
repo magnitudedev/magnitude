@@ -1,0 +1,4 @@
+# origin: test:validation:programs/scalar-semantics.seismic:tile_copy
+# invoke tile_copy: f32[4]=1,2,3,4
+fn tile_copy(x: &tensor[4] f32) -> tensor[4] f32:
+    return to_owned(x)

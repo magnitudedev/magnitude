@@ -1,0 +1,28 @@
+// state_space_step (decode, speculative verify and small row classes): the
+// row-sequential state-space rule with its preparation fused. The Vulkan form
+// of `cuda/state_space_step.cu` over `lib/recurrent/state_space.glsl`.
+//
+// One workgroup of four logical subgroups per (head, block of ROWS state
+// rows, slot); slots are a grid axis. Each subgroup owns ROWS / 4 state rows,
+// a lane N / 32 columns of each, held in registers for the whole slot. The
+// state is read from version (previous_bank, previous_tape)[slot] and
+// published to following_bank[slot] after the slot's first stop[slot] rows,
+// with the window and the tape of the rows after it. Grid z = B zeroes the
+// mixed rows no slot covers. ROWS never changes result bits, and
+// `state_space_chunk` gives its short slots the same bits.
+#include "lib/recurrent/state_space.glsl"
+
+void state_space_step() {
+    const uint head = gl_WorkGroupID.x;
+    const uint block_row0 = gl_WorkGroupID.y * SS_BLOCK_ROWS;
+    const uint row0 = block_row0 + SEISMIC_SUBGROUP * SS_LANE_ROWS;
+    if (uint64_t(gl_WorkGroupID.z) == SEISMIC_DIM_B) {
+        ss_zero_uncovered(head, row0);
+        return;
+    }
+    const versions_slot slot = versions_slot_of(gl_WorkGroupID.z);
+    float rows[SS_LANE_ROWS][SS_COLUMNS];
+    ss_load_version(slot, head, row0, rows);
+    ss_publish_window(slot, head, gl_WorkGroupID.y, gl_NumWorkGroups.y);
+    ss_advance_rows(slot, slot.lo, head, block_row0, row0, rows);
+}

@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./error-notice"
 import { HardwarePending } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
 import { Option } from "effect"
@@ -58,7 +59,8 @@ export function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
 function HardwareCard({ identity }: { identity: MachineIdentityObservation | null }) {
   const hardware = useLocalInferenceHardware()
   if (Result.isInitial(hardware)) return <HardwarePending />
-  if (!Result.isSuccess(hardware)) return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{Result.isFailure(hardware) ? "Hardware observation unavailable. Recommendations will return when it recovers." : "Getting to know your machine…"}</div>
+  if (Result.isFailure(hardware)) return <ErrorNotice title="Couldn’t read your hardware" description="Recommendations will return when hardware information is available." className="my-6" />
+  if (!Result.isSuccess(hardware)) return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{"Getting to know your machine…"}</div>
   return <HardwareSummary identity={identity} value={hardware.value} />
 }
 export function HardwareSummary({ identity, value }: { identity: MachineIdentityObservation | null; value: LocalInferenceHardware }) {

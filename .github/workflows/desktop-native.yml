@@ -11,11 +11,11 @@ on:
       - "packages/acn/src/**"
       - "packages/acn-protocol/src/desktop-control.ts"
       - "packages/release/scripts/build/acn.ts"
-      - "inference/crates/icn-utils/**"
-      - "inference/crates/icn-server/src/worker_process.rs"
-      - "inference/crates/icn-server/src/inference_worker.rs"
-      - "inference/crates/icn-server/src/main.rs"
-      - "inference/crates/icn-server/Cargo.toml"
+      - "inference/service/utils/**"
+      - "inference/service/server/src/worker_process.rs"
+      - "inference/service/server/src/residency/worker.rs"
+      - "inference/service/server/src/main.rs"
+      - "inference/service/server/Cargo.toml"
       - "inference/Cargo.lock"
       - "inference/rust-toolchain.toml"
       - "cli/**"
@@ -64,14 +64,14 @@ jobs:
       - name: Exercise isolated exchange, recovery and foreground continuation
         run: |
           cc -std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror -O2 \
-            -mmacosx-version-min=13.0 \
+            -mmacosx-version-min=15.0 \
             packages/daemon-management/native/test/mac-update-primitives.c \
             -o "$RUNNER_TEMP/mac-update-primitives"
           "$RUNNER_TEMP/mac-update-primitives"
       - name: Exercise private archive extraction and metadata preservation
         run: |
           cc -std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror -O2 \
-            -mmacosx-version-min=13.0 \
+            -mmacosx-version-min=15.0 \
             packages/daemon-management/native/mac-update-extract.c -larchive \
             -o "$RUNNER_TEMP/mac-update-extract"
           python3 packages/daemon-management/native/test/mac-update-extract.py "$RUNNER_TEMP/mac-update-extract"
@@ -240,8 +240,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -279,7 +277,7 @@ jobs:
 
       - name: Exercise Rust atomic child creation and descendant retirement
         working-directory: inference
-        run: cargo test --locked -p icn-utils windows_process::tests -- --test-threads=1
+        run: cargo test --locked -p magnitude-service-utils windows_process::tests -- --test-threads=1
       - name: Compile native x86 installer helper and verify configuration preservation
         shell: pwsh
         run: |

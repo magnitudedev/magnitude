@@ -1,0 +1,11 @@
+# origin: X1:r3-t07
+# cell: alloc-participant-extent/parallel
+# invoke: i32[3]=1,2,3 ; f32[3]=zero
+# pin: out = f32[3]=1,1,1
+fn probe[R](lens: &tensor[R] i32, out: &mut tensor[R] f32):
+    let n = lens[0]
+    if n >= 0:
+        parallel for r in 0..R:
+            let mut t = tensor[n] f32
+            t[:] = ones_like(t)
+            out[r] = reduce(t, 0, sum)

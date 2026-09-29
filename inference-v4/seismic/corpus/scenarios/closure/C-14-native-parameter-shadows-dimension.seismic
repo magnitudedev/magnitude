@@ -1,0 +1,13 @@
+# origin: native-route-performance NR1
+# rejected: "native parameter `N` shadows a dimension"
+fn probe[N](x: &tensor[N] f32, factor: f32, out: &mut tensor[N] f32):
+    # Launch expressions resolve a name as a dimension or a tuning
+    # parameter; one name cannot be both.
+    parallel for i in 0..N:
+        out[i] = x[i] * factor
+
+native probe for cpu from "probe.rs":
+    params (N in [1, 2])
+    launch probe:
+        threadgroups (N, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

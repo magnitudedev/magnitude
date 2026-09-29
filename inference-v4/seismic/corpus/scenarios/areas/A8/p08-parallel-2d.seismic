@@ -1,0 +1,15 @@
+# origin: A8:G-A8-new-6
+# invoke: i32[7]=seq ; i32[13]=seq ; i32[7,13]=zero
+# expect: returned
+# pin: o = i32[7,13]=0,1,2,3,4,5,6,7,8,9,10,11,12,1000,1001,1002,1003,1004,1005,1006,1007,1008,1009,1010,1011,1012,2000,2001,2002,2003,2004,2005,2006,2007,2008,2009,2010,2011,2012,3000,3001,3002,3003,3004,3005,3006,3007,3008,3009,3010,3011,3012,4000,4001,4002,4003,4004,4005,4006,4007,4008,4009,4010,4011,4012,5000,5001,5002,5003,5004,5005,5006,5007,5008,5009,5010,5011,5012,6000,6001,6002,6003,6004,6005,6006,6007,6008,6009,6010,6011,6012
+# invoke: i32[1]=seq ; i32[1]=seq ; i32[1,1]=zero
+# expect: returned
+# pin: o = i32[1,1]=0
+# invoke: i32[33]=seq ; i32[1025]=seq ; i32[33,1025]=zero
+# expect: returned
+fn probe[M, N](a: &tensor[M] i32, b: &tensor[N] i32, o: &mut tensor[M, N] i32):
+    # Two parallel axes linearized onto one launch dimension: every (row,
+    # column) pair is written exactly once, whatever the chunking of claims.
+    parallel for r in 0..M:
+        parallel for c in 0..N:
+            o[r, c] = a[r] * 1000 + b[c]

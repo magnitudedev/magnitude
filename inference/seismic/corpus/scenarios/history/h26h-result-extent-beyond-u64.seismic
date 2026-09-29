@@ -1,0 +1,12 @@
+# origin: H-26
+# invoke: f32[0,4]=zero
+# expect: returned
+# invoke: f32[2,3]=zero
+# expect: returned
+# pin: result = f32[2,9]=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+fn probe[M, N](x: &tensor[M, N] f32) -> tensor[M, N*N] f32 where M >= 0:
+    let mut t = tensor[M, N*N] f32
+    for i in 0..M:
+        for j in 0..N*N:
+            t[i, j] = 0.0
+    return t

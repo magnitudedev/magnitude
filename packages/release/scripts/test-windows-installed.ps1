@@ -54,10 +54,11 @@ try {
   $engine = Join-Path $scratch 'bin\magnitude-inference.exe'
   if (!(Test-Path -LiteralPath $engine -PathType Leaf)) { throw 'Missing accepted inference executable.' }
   AssertSignature $engine
-  foreach ($directory in @('runtime', 'backends')) {
-    foreach ($library in Get-ChildItem -LiteralPath (Join-Path $scratch $directory) -Filter '*.dll' -File) {
-      AssertSignature $library.FullName -AllowMicrosoftRuntime
-    }
+  foreach ($library in Get-ChildItem -LiteralPath (Join-Path $scratch 'runtime') -Filter '*.dll' -File) {
+    # NVIDIA publishes the NVRTC redistributable without Authenticode signatures; the build
+    # verifies its pinned archive digest and ships the libraries unmodified.
+    if ($library.Name -match '^nvrtc(-builtins)?64_\d+(_0)?\.dll$') { continue }
+    AssertSignature $library.FullName -AllowMicrosoftRuntime
   }
   foreach ($pair in @(@('magnitude-cli.exe', 'magnitude.exe'), @('magnitude-service.exe', 'magnitude-service.exe'))) {
     $accepted = (Get-FileHash -LiteralPath (Join-Path $scratch "bin\$($pair[0])") -Algorithm SHA256).Hash

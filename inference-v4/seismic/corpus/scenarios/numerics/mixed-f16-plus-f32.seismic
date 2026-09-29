@@ -1,0 +1,5 @@
+# origin: C12:G-C12-3
+# invoke: f16:1.5 ; f32:2.25
+# pin: result = f32[]=3.75
+fn probe(a: f16, b: f32) -> f32:
+    return a + b

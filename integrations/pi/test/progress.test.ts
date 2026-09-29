@@ -68,7 +68,7 @@ describe("scoped progress lifecycle", () => {
       .toBe("● Model worked for 1s · 0.5s TTFT")
   })
   it("formats the approved live phases and clamps inconsistent counters", () => {
-    expect(formatLiveProgress({ modelName: "Model", startedAt: 0, progress: { phase: "model_loading", fraction: 0.47 } }, 2300)).toBe("Loading Model into memory · 47% · 2s")
+    expect(formatLiveProgress({ modelName: "Model", startedAt: 0, progress: { phase: "model_loading", stage: "loading_weights", fraction: 0.47 } }, 2300)).toBe("Loading Model into memory · 47% · 2s")
     expect(formatLiveProgress({ modelName: "Model", startedAt: 0, progress: { phase: "preparing" } }, 2300)).toBeUndefined()
     expect(formatLiveProgress({ modelName: "Model", startedAt: 0, progress: { phase: "prefill", completed_tokens: 14020, total_tokens: 14300, cached_tokens: 13200 } }, 400)).toBe("Prefilling prompt · 820 / 1.1k tokens · 13.2k cached · 0s")
     expect(formatLiveProgress({ modelName: "Model", startedAt: 0, progress: { phase: "prefill", completed_tokens: 9000, total_tokens: 1000, cached_tokens: 2000 } }, 0)).toBe("Prefilling prompt · 0 / 0 tokens · 1k cached · 0s")

@@ -8,7 +8,7 @@
     "dev": "bun run build:native && electron-vite dev",
     "build": "bun run build:native && electron-vite build",
     "test": "bunx --bun vitest run",
-    "build:native": "bun ../packages/daemon-management/scripts/build-native.ts"
+    "build:native": "bun ../packages/daemon-management/scripts/build-native.ts && bun scripts/build-native.ts"
   },
   "dependencies": {
     "@effect/platform": "^0.96.1",
@@ -32,6 +32,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^43.7.0",
     "electron-vite": "^5.0.0",
+    "node-api-headers": "1.9.0",
     "playwright": "^1.62.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.7.0",

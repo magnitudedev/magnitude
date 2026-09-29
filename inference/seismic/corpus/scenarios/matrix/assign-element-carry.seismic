@@ -1,0 +1,5 @@
+# cell: assign-element/carry
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32):
+    for i in 0..4:
+        out[0] = out[0] + x[i, 0]

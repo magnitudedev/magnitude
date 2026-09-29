@@ -1,0 +1,8 @@
+# cell: call-explicit-dims/parallel
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero
+fn row_sum[V](r: &tensor[V] f32) -> f32:
+    return reduce(r, 0, sum)
+
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32) where W >= 8:
+    parallel for i in 0..4:
+        out[i] = row_sum[V = W](x[i])

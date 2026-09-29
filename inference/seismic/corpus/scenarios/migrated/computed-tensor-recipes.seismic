@@ -1,0 +1,10 @@
+# origin: test:seismic-runtime:runtime/src/feedback/payload_tests.rs:computed_tensor_recipes
+# invoke fused: bf16[1]=0x3fc0 ; bf16[1]=0x3f81 ; bf16[1]=0xb280
+# pin: result = bf16[1]=0x3fc1
+# invoke maximum: f32[4]=0x80000000,0,0xff800001,0x7fc00001 ; f32[4]=0,0x80000000,1,0xffc00002
+# pin: result = f32[4]=0,0,1,0x7fc00000
+fn fused(a: &tensor[1] bf16, b: &tensor[1] bf16, c: &tensor[1] bf16) -> tensor[1] bf16:
+    return fma(a, b, c)
+
+fn maximum(a: &tensor[4] f32, b: &tensor[4] f32) -> tensor[4] f32:
+    return max(a, b)

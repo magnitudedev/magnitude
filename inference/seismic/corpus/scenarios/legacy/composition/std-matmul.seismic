@@ -1,0 +1,9 @@
+# std: yes
+# origin: test:validation:corpus/composition.seismic:std_matmul
+# invoke std_matmul: f32[3,8]=rand(89) ; f32[5,8]=rand(90)
+fn std_matmul[M, N, K](a: &tensor[M, K] f32, b: &tensor[N, K] f32) -> tensor[M, N] f32:
+    let mut seed = tensor[M, N] f32
+    for i in 0..M:
+        for j in 0..N:
+            seed[i, j] = 0.0
+    return matmul(a, b, seed)

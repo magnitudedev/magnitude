@@ -1,0 +1,5 @@
+# origin: C1:p13
+# rejected: "i32("
+fn s[N](x: &tensor[N] f32) -> bool:
+    let m = x > 2.0
+    return reduce(m, 0, sum)

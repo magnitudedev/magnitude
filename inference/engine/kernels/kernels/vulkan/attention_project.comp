@@ -1,0 +1,322 @@
+// attention_project: RMS prologue over the F32 residual, then one
+// segmented projection query | key | value into three results (a segment of
+// zero rows has no tiles). The
+// Vulkan form of `metal/attention_project.metal` over
+// `lib/projection/projection.glsl`.
+#include "lib/core/activation.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define PROJECT_ACT ELEMENT_ACT
+#else
+#error "attention_project requires a bf16 or f16 activation"
+#endif
+#if defined(SEISMIC_INPUT_NORM_REPRESENTATION_F32)
+#define PROJECT_NORM ELEMENT_F32
+#elif defined(SEISMIC_INPUT_NORM_REPRESENTATION_F16)
+#define PROJECT_NORM ELEMENT_F16
+#elif defined(SEISMIC_INPUT_NORM_REPRESENTATION_BF16)
+#define PROJECT_NORM ELEMENT_BF16
+#else
+#error "attention_project requires a dense input_norm"
+#endif
+
+#if defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_Q4K)
+#define QUERY_KIND PACKETS_Q4K
+#define QUERY_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_QUERY_WEIGHT)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_Q5K)
+#define QUERY_KIND PACKETS_Q5K
+#define QUERY_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_QUERY_WEIGHT)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_Q6K)
+#define QUERY_KIND PACKETS_Q6K
+#define QUERY_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_QUERY_WEIGHT)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_Q8G32S)
+#define QUERY_KIND PACKETS_Q8
+#define QUERY_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_QUERY_WEIGHT)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_IQ4G32)
+#define QUERY_KIND PACKETS_IQ4
+#define QUERY_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_QUERY_WEIGHT)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_Q4G32S)
+#define QUERY_KIND PACKETS_Q4G32S
+#define QUERY_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_QUERY_WEIGHT)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_MXFP4G32)
+#define QUERY_KIND PACKETS_MXFP4
+#define QUERY_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_QUERY_WEIGHT)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_NVFP4G16)
+#define QUERY_KIND PACKETS_NVFP4
+#define QUERY_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_QUERY_WEIGHT)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_Q5G32S)
+#define QUERY_KIND PACKETS_Q5G32S
+#define QUERY_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_QUERY_WEIGHT)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_Q5G32)
+#define QUERY_KIND PACKETS_Q5G32
+#define QUERY_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_QUERY_WEIGHT)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_BF16)
+#define QUERY_KIND PACKETS_BF16
+#define QUERY_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_QUERY_WEIGHT, 2)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_F16)
+#define QUERY_KIND PACKETS_F16
+#define QUERY_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_QUERY_WEIGHT, 2)
+#elif defined(SEISMIC_QUERY_WEIGHT_REPRESENTATION_F32)
+#define QUERY_KIND PACKETS_F32
+#define QUERY_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_QUERY_WEIGHT, 4)
+#else
+#error "unsupported attention_project query_weight representation"
+#endif
+#if defined(SEISMIC_QUERY_WEIGHT_KIND_PACKED) && !defined(SEISMIC_QUERY_WEIGHT_LAYOUT_ROWS16)
+#error "attention_project requires the rows16 layout for query_weight"
+#endif
+
+#if defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q4K)
+#define GATE_KIND PACKETS_Q4K
+#define GATE_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q5K)
+#define GATE_KIND PACKETS_Q5K
+#define GATE_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q6K)
+#define GATE_KIND PACKETS_Q6K
+#define GATE_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q8G32S)
+#define GATE_KIND PACKETS_Q8
+#define GATE_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_IQ4G32)
+#define GATE_KIND PACKETS_IQ4
+#define GATE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q4G32S)
+#define GATE_KIND PACKETS_Q4G32S
+#define GATE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_MXFP4G32)
+#define GATE_KIND PACKETS_MXFP4
+#define GATE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_NVFP4G16)
+#define GATE_KIND PACKETS_NVFP4
+#define GATE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q5G32S)
+#define GATE_KIND PACKETS_Q5G32S
+#define GATE_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_Q5G32)
+#define GATE_KIND PACKETS_Q5G32
+#define GATE_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_GATE_WEIGHT)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_BF16)
+#define GATE_KIND PACKETS_BF16
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 2)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_F16)
+#define GATE_KIND PACKETS_F16
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 2)
+#elif defined(SEISMIC_GATE_WEIGHT_REPRESENTATION_F32)
+#define GATE_KIND PACKETS_F32
+#define GATE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_GATE_WEIGHT, 4)
+#else
+#error "unsupported attention_project gate_weight representation"
+#endif
+#if defined(SEISMIC_GATE_WEIGHT_KIND_PACKED) && !defined(SEISMIC_GATE_WEIGHT_LAYOUT_ROWS16)
+#error "attention_project requires the rows16 layout for gate_weight"
+#endif
+
+#if defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_Q4K)
+#define KEY_KIND PACKETS_Q4K
+#define KEY_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_KEY_WEIGHT)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_Q5K)
+#define KEY_KIND PACKETS_Q5K
+#define KEY_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_KEY_WEIGHT)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_Q6K)
+#define KEY_KIND PACKETS_Q6K
+#define KEY_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_KEY_WEIGHT)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_Q8G32S)
+#define KEY_KIND PACKETS_Q8
+#define KEY_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_KEY_WEIGHT)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_IQ4G32)
+#define KEY_KIND PACKETS_IQ4
+#define KEY_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_KEY_WEIGHT)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_Q4G32S)
+#define KEY_KIND PACKETS_Q4G32S
+#define KEY_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_KEY_WEIGHT)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_MXFP4G32)
+#define KEY_KIND PACKETS_MXFP4
+#define KEY_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_KEY_WEIGHT)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_NVFP4G16)
+#define KEY_KIND PACKETS_NVFP4
+#define KEY_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_KEY_WEIGHT)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_Q5G32S)
+#define KEY_KIND PACKETS_Q5G32S
+#define KEY_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_KEY_WEIGHT)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_Q5G32)
+#define KEY_KIND PACKETS_Q5G32
+#define KEY_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_KEY_WEIGHT)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_BF16)
+#define KEY_KIND PACKETS_BF16
+#define KEY_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_KEY_WEIGHT, 2)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_F16)
+#define KEY_KIND PACKETS_F16
+#define KEY_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_KEY_WEIGHT, 2)
+#elif defined(SEISMIC_KEY_WEIGHT_REPRESENTATION_F32)
+#define KEY_KIND PACKETS_F32
+#define KEY_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_KEY_WEIGHT, 4)
+#else
+#error "unsupported attention_project key_weight representation"
+#endif
+#if defined(SEISMIC_KEY_WEIGHT_KIND_PACKED) && !defined(SEISMIC_KEY_WEIGHT_LAYOUT_ROWS16)
+#error "attention_project requires the rows16 layout for key_weight"
+#endif
+
+#if defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_Q4K)
+#define VALUE_KIND PACKETS_Q4K
+#define VALUE_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_VALUE_WEIGHT)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_Q5K)
+#define VALUE_KIND PACKETS_Q5K
+#define VALUE_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_VALUE_WEIGHT)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_Q6K)
+#define VALUE_KIND PACKETS_Q6K
+#define VALUE_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_VALUE_WEIGHT)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_Q8G32S)
+#define VALUE_KIND PACKETS_Q8
+#define VALUE_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_VALUE_WEIGHT)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_IQ4G32)
+#define VALUE_KIND PACKETS_IQ4
+#define VALUE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_VALUE_WEIGHT)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_Q4G32S)
+#define VALUE_KIND PACKETS_Q4G32S
+#define VALUE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_VALUE_WEIGHT)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_MXFP4G32)
+#define VALUE_KIND PACKETS_MXFP4
+#define VALUE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_VALUE_WEIGHT)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_NVFP4G16)
+#define VALUE_KIND PACKETS_NVFP4
+#define VALUE_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_VALUE_WEIGHT)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_Q5G32S)
+#define VALUE_KIND PACKETS_Q5G32S
+#define VALUE_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_VALUE_WEIGHT)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_Q5G32)
+#define VALUE_KIND PACKETS_Q5G32
+#define VALUE_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_VALUE_WEIGHT)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_BF16)
+#define VALUE_KIND PACKETS_BF16
+#define VALUE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_VALUE_WEIGHT, 2)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_F16)
+#define VALUE_KIND PACKETS_F16
+#define VALUE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_VALUE_WEIGHT, 2)
+#elif defined(SEISMIC_VALUE_WEIGHT_REPRESENTATION_F32)
+#define VALUE_KIND PACKETS_F32
+#define VALUE_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_VALUE_WEIGHT, 4)
+#else
+#error "unsupported attention_project value_weight representation"
+#endif
+#if defined(SEISMIC_VALUE_WEIGHT_KIND_PACKED) && !defined(SEISMIC_VALUE_WEIGHT_LAYOUT_ROWS16)
+#error "attention_project requires the rows16 layout for value_weight"
+#endif
+
+#define PROJECTION_GEMM_KINDS ((1 << QUERY_KIND) | (1 << GATE_KIND) | (1 << KEY_KIND) | (1 << VALUE_KIND))
+#include "lib/projection/projection.glsl"
+
+#define PROJECT_K uint(SEISMIC_DIM_D)
+#define PROJECT_QUERY_ROWS uint(SEISMIC_DIM_Q)
+#define PROJECT_GATE_ROWS uint(SEISMIC_DIM_GR)
+#define PROJECT_KEY_ROWS uint(SEISMIC_DIM_K)
+#define PROJECT_VALUE_ROWS uint(SEISMIC_DIM_V)
+
+projection_prologue attention_project_input() {
+    return projection_rms(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0,
+        SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM), SEISMIC_INPUT_NORM_STRIDE_0, PROJECT_NORM,
+        element_word_f32(SEISMIC_PARAM_EPSILON), PROJECT_K, 0ul);
+}
+
+projection_weights attention_project_query() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_WEIGHT), QUERY_GEOMETRY, PROJECT_K, 0ul);
+}
+projection_weights attention_project_gate() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY, PROJECT_K, 0ul);
+}
+projection_weights attention_project_key() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_KEY_WEIGHT), KEY_GEOMETRY, PROJECT_K, 0ul);
+}
+projection_weights attention_project_value() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT), VALUE_GEOMETRY, PROJECT_K, 0ul);
+}
+
+projection_epilogue attention_project_query_out() {
+    return projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1, 0ul);
+}
+projection_epilogue attention_project_gate_out() {
+    return projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER), SEISMIC_RESULT_1_STRIDE_0,
+        SEISMIC_RESULT_1_STRIDE_1, 0ul);
+}
+projection_epilogue attention_project_key_out() {
+    return projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER), SEISMIC_RESULT_2_STRIDE_0,
+        SEISMIC_RESULT_2_STRIDE_1, 0ul);
+}
+projection_epilogue attention_project_value_out() {
+    return projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_3_BUFFER), SEISMIC_RESULT_3_STRIDE_0,
+        SEISMIC_RESULT_3_STRIDE_1, 0ul);
+}
+
+void attention_project_gemv() {
+    const uint per = projection_gemv_rows(SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES);
+    const uint rows = uint(SEISMIC_DIM_M), tile = gl_WorkGroupID.x;
+    const uint t0 = (PROJECT_QUERY_ROWS + per - 1u) / per, t1 = (PROJECT_GATE_ROWS + per - 1u) / per;
+    const uint t2 = (PROJECT_KEY_ROWS + per - 1u) / per;
+    const projection_prologue x = attention_project_input();
+    if (tile < t0) {
+        const projection_weights w = attention_project_query();
+        projection_gemv(QUERY_KIND, QUERY_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED,
+            x, attention_project_query_out(), w, w, rows, PROJECT_QUERY_ROWS, PROJECT_K, tile);
+    } else if (tile < t0 + t1) {
+        const projection_weights w = attention_project_gate();
+        projection_gemv(GATE_KIND, GATE_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED,
+            x, attention_project_gate_out(), w, w, rows, PROJECT_GATE_ROWS, PROJECT_K, tile - t0);
+    } else if (tile < t0 + t1 + t2) {
+        const projection_weights w = attention_project_key();
+        projection_gemv(KEY_KIND, KEY_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED,
+            x, attention_project_key_out(), w, w, rows, PROJECT_KEY_ROWS, PROJECT_K, tile - t0 - t1);
+    } else {
+        const projection_weights w = attention_project_value();
+        projection_gemv(VALUE_KIND, VALUE_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED,
+            x, attention_project_value_out(), w, w, rows, PROJECT_VALUE_ROWS, PROJECT_K, tile - t0 - t1 - t2);
+    }
+}
+
+void attention_project_stage() {
+    projection_stage(attention_project_input(), gl_WorkGroupID.x,
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED), PROJECT_K);
+}
+
+// Workgroup column n belongs to the segment whose tiles hold it; the GEMM
+// body runs once with that segment's kind, weights and result.
+void attention_project_gemm() {
+    const uint tn = SEISMIC_TUNE_TILE_N;
+    const projection_prologue x = projection_plain(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        uint64_t(PROJECT_K), 1ul, PROJECT_K, 0ul);
+    const uint m = uint(SEISMIC_DIM_M), n = gl_WorkGroupID.x;
+    const uint t0 = (PROJECT_QUERY_ROWS + tn - 1u) / tn, t1 = (PROJECT_GATE_ROWS + tn - 1u) / tn;
+    const uint t2 = (PROJECT_KEY_ROWS + tn - 1u) / tn;
+    int kind;
+    projection_weights w;
+    projection_epilogue out_;
+    uint rows, tile;
+    if (n < t0) {
+        kind = QUERY_KIND;
+        w = attention_project_query();
+        out_ = attention_project_query_out();
+        rows = PROJECT_QUERY_ROWS;
+        tile = n;
+    } else if (n < t0 + t1) {
+        kind = GATE_KIND;
+        w = attention_project_gate();
+        out_ = attention_project_gate_out();
+        rows = PROJECT_GATE_ROWS;
+        tile = n - t0;
+    } else if (n < t0 + t1 + t2) {
+        kind = KEY_KIND;
+        w = attention_project_key();
+        out_ = attention_project_key_out();
+        rows = PROJECT_KEY_ROWS;
+        tile = n - t0 - t1;
+    } else {
+        kind = VALUE_KIND;
+        w = attention_project_value();
+        out_ = attention_project_value_out();
+        rows = PROJECT_VALUE_ROWS;
+        tile = n - t0 - t1 - t2;
+    }
+    projection_gemm(kind, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, out_, w,
+        m, rows, PROJECT_K, gl_WorkGroupID.y, tile, 0xffffffffu);
+}

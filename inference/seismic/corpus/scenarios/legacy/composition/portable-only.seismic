@@ -1,0 +1,5 @@
+# origin: test:validation:corpus/composition.seismic:portable_only
+# invoke portable_only: f32[9]=rand(96) ; f32[9]=zero
+fn portable_only[N](x: &tensor[N] f32, y: &mut tensor[N] f32):
+    parallel for i in 0..N:
+        y[i] = sqrt(abs(x[i]))

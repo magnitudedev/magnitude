@@ -1,0 +1,8 @@
+# origin: test:validation:corpus/values.seismic:owned_one_init
+# invoke owned_one_init: f32[2,3]=seq
+fn owned_one_init[M, N](x: &tensor[M, N] f32) -> tensor[M, N] f32:
+    let mut scaled = ones_like(x)
+    for i in 0..M:
+        for j in 0..N:
+            scaled[i, j] = scaled[i, j] * x[i, j]
+    return scaled

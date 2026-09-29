@@ -1,0 +1,13 @@
+uint d = thread_position_in_grid.x;
+if (d >= WIDTH) return;
+uint item = thread_position_in_grid.y;
+int token = int(tok[item]);
+uint row = uint(token < 0 ? token + VOCAB : token);
+const device uint* weights = weight + size_t(row) * (WIDTH * BITS / 32);
+uint bit = d * BITS;
+uint wi = bit >> 5, shift = bit & 31;
+uint value = weights[wi] >> shift;
+if (shift + BITS > 32) value |= weights[wi + 1] << (32 - shift);
+uint quantized = value & ((1u << BITS) - 1);
+uint group = row * (WIDTH / GROUP) + d / GROUP;
+out[size_t(item) * WIDTH + d] = T(metal::fma(float(scales[group]), float(quantized), float(biases[group])));

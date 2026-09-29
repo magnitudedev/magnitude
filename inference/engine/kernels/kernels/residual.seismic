@@ -1,0 +1,158 @@
+# Residual row ops: the sublayer tails whose norm spans a whole output row,
+# which a column-tiled projection epilogue cannot form. A projection stores
+# its sublayer output in F32 (from the accumulator, unrounded); the row op
+# normalizes it and adds it to the F32 residual stream. Every value stays F32:
+# nothing here publishes in the activation type.
+#
+# `scale` multiplies the whole updated stream (a layer output scale, folded
+# into the last row op of a layer; 1.0 elsewhere).
+
+# A sandwich-norm tail: result = (residual + rms(projected) * norm) * scale,
+# over the `out_rows` rows of the residual (`dense_output` convention: a block
+# that advances every row binds the identity).
+fn post_norm_residual[M, O, D](residual: &tensor[M, D] f32,
+    projected: &tensor[O, D] f32, norm: &tensor[D] NW, out_rows: &tensor[O] i32,
+    epsilon: f32, scale: f32) -> tensor[O, D] f32:
+    let mut result = tensor[O, D] f32
+    parallel for row in 0..O:
+        let p = projected[row]
+        let inverse = rsqrt(sum_any_order(p * p) / f32(D) + epsilon)
+        parallel for col in 0..D:
+            result[row, col] = (residual[out_rows[row], col] + projected[row, col] * inverse * f32(norm[col])) * scale
+    return result
+
+# One threadgroup per output row: the square sum, then the update.
+native post_norm_residual for metal from "metal/post_norm_residual.metal":
+    launch post_norm_residual:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native post_norm_residual for cuda from "cuda/post_norm_residual.cu":
+    launch post_norm_residual:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native post_norm_residual for vulkan from "vulkan/post_norm_residual.comp":
+    launch post_norm_residual:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+
+# CPU: one work item per output row, the norm decoded into its shared bytes.
+native post_norm_residual for cpu from "cpu/post_norm_residual.rs":
+    launch post_norm_residual:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (D * 4)
+
+
+# The tail of a feed-forward with a dense branch beside the routed experts:
+# each branch output is normalized with its own norm, their sum normalized
+# again, then added to the residual:
+#   f = rms(dense) * dense_norm + rms(routed) * routed_norm
+#   result = (residual + rms(f) * norm) * scale
+fn moe_tail[M, D](residual: &tensor[M, D] f32, dense: &tensor[M, D] f32,
+    routed: &tensor[M, D] f32, dense_norm: &tensor[D] NW,
+    routed_norm: &tensor[D] NW, norm: &tensor[D] NW, epsilon: f32,
+    scale: f32) -> tensor[M, D] f32:
+    let mut combined = tensor[M, D] f32
+    let mut result = tensor[M, D] f32
+    parallel for row in 0..M:
+        let d = dense[row]
+        let r = routed[row]
+        let dense_inverse = rsqrt(sum_any_order(d * d) / f32(D) + epsilon)
+        let routed_inverse = rsqrt(sum_any_order(r * r) / f32(D) + epsilon)
+        parallel for col in 0..D:
+            let from_dense = dense[row, col] * dense_inverse * f32(dense_norm[col])
+            let from_routed = routed[row, col] * routed_inverse * f32(routed_norm[col])
+            combined[row, col] = from_dense + from_routed
+    parallel for row in 0..M:
+        let f = combined[row]
+        let inverse = rsqrt(sum_any_order(f * f) / f32(D) + epsilon)
+        parallel for col in 0..D:
+            result[row, col] = (residual[row, col] + combined[row, col] * inverse * f32(norm[col])) * scale
+    return result
+
+# One threadgroup per row, which forms the combined row again (the same
+# operations, so the same bits) in the pass that publishes it instead of
+# holding it in threadgroup memory.
+native moe_tail for metal from "metal/moe_tail.metal":
+    launch moe_tail:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native moe_tail for cuda from "cuda/moe_tail.cu":
+    launch moe_tail:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native moe_tail for vulkan from "vulkan/moe_tail.comp":
+    launch moe_tail:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+
+# CPU: one work item per row; the combined row and the three decoded norms in
+# its shared bytes.
+native moe_tail for cpu from "cpu/moe_tail.rs":
+    launch moe_tail:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (D * 16)
+
+
+# Per-layer inputs (PLE): each row's L chunks of P columns combine the row's
+# model projection (`projected`, the F32 output of the D -> L * P projection)
+# and its gathered token rows (`gathered`, the rows of the host-resident table
+# uploaded for the batch, in the table's representation):
+#   p = projected[chunk] * projected_scale
+#   result[chunk] = (rms(p) * norm + gathered[chunk] * gathered_scale) * scale
+# with one norm shared by every chunk.
+fn per_layer_inputs[M, L, P](gathered: &tensor[M, L * P] TW,
+    projected: &tensor[M, L * P] f32, norm: &tensor[P] NW, epsilon: f32,
+    gathered_scale: f32, projected_scale: f32, scale: f32) -> tensor[M, L * P] f32:
+    let mut result = tensor[M, L * P] f32
+    parallel for row in 0..M:
+        parallel for layer in 0..L:
+            let p = projected[row, layer * P : layer * P + P] * projected_scale
+            let inverse = rsqrt(sum_any_order(p * p) / f32(P) + epsilon)
+            parallel for i in 0..P:
+                let column = layer * P + i
+                let normalized = projected[row, column] * projected_scale * inverse * f32(norm[i])
+                let token = f32(gathered[row, column]) * gathered_scale
+                result[row, column] = (normalized + token) * scale
+    return result
+
+# Metal and Vulkan: threadgroup (chunk, row), one thread per chunk column (P
+# is static), the gathered value decoded from its rows16 or dense packet.
+native per_layer_inputs for metal from "metal/per_layer_inputs.metal":
+    static (L, P)
+    where P % 32 == 0 and P <= 1024
+    launch per_layer_inputs:
+        threadgroups (L, M, 1)
+        threads_per_threadgroup (P, 1, 1)
+
+# CUDA: as Metal, the chunk's gathered values first decoded into shared
+# memory (mma16 lane chunks of 64-column k-blocks).
+native per_layer_inputs for cuda from "cuda/per_layer_inputs.cu":
+    static (L, P)
+    where P % 64 == 0 and P <= 1024
+    launch per_layer_inputs:
+        threadgroups (L, M, 1)
+        threads_per_threadgroup (P, 1, 1)
+
+native per_layer_inputs for vulkan from "vulkan/per_layer_inputs.comp":
+    static (L, P)
+    where P % 32 == 0 and P <= 1024
+    launch per_layer_inputs:
+        threadgroups (L, M, 1)
+        threads_per_threadgroup (P, 1, 1)
+        shared_bytes (128)
+
+# CPU: one work item per row; its decoded gathered row, the norm and the
+# scaled chunk in its shared bytes.
+native per_layer_inputs for cpu from "cpu/per_layer_inputs.rs":
+    launch per_layer_inputs:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((L + 2) * P * 4)

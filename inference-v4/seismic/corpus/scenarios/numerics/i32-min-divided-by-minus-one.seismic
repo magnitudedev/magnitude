@@ -1,0 +1,5 @@
+# origin: C12:recipe-table
+# invoke: i32:-2147483648 ; i32:-1
+# expect: failed
+fn probe(a: i32, b: i32) -> i32:
+    return a / b

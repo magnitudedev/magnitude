@@ -1,0 +1,9 @@
+# origin: C11:if_write_in_arm
+# cell: assign-element/if-arm
+# invoke: f32[4]=0,0,0,0 ; f32:2
+fn probe(dst: &mut tensor[4] f32, x: f32):
+    if x > 0.0:
+        dst[0] = x
+    else:
+        dst[1] = x
+    dst[2] = dst[0] + dst[1]

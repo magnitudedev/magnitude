@@ -1,5 +1,24 @@
 # @magnitudedev/cli
 
+## 0.2.0-alpha.0
+
+### Minor Changes
+
+- [`f0cd67e`](https://github.com/magnitudedev/magnitude/commit/f0cd67ed900fe76022273081490be0939908df70) Thanks [@anerli](https://github.com/anerli)! - Replace the llama.cpp-based inference engine with Magnitude's own engine which automatically optimizes itself for any hardware and has efficient kernels for several open-weight model families.
+
+### Patch Changes
+
+- [`07c39a1`](https://github.com/magnitudedev/magnitude/commit/07c39a14870d8691d7762a3601b913b140ba3319) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Add `magnitude serve` to run inference without a desktop window on macOS, Windows, and Linux. Opening Desktop takes over from the foreground server and reports why it stopped.
+
+  - Replace the `magnitude service` commands with `magnitude serve` and `magnitude status`. Model, catalog, hardware, and connection commands require an existing Desktop or server instead of starting one automatically. Startup errors identify which application must be stopped.
+  - Share application updates between Desktop and the CLI. A running server can prepare updates without being interrupted; prepared updates install at the next startup. The `magnitude update` commands support checking, downloading, inspecting, installing, and discarding updates while Desktop is closed. Failed installations require an explicit retry.
+  - Fix Windows update preparation when the update folder has inherited permissions, and improve update recovery and command continuation. Existing affected releases still require a manual installer to receive the fix.
+  - Add shell and PowerShell installation scripts for the complete application, including its CLI.
+  - Improve `magnitude app open` during Desktop takeover. On Windows, clicking the tray icon opens Desktop, and sharper tray icons adapt to the system's light or dark theme.
+  - Add a remote server guide and update network access, CLI, and installation documentation.
+
+- [`fd37123`](https://github.com/magnitudedev/magnitude/commit/fd37123a374ee4931a0f2bb28e6b3cb091a6d601) - Gate remote callers in the /rpc and inference route handlers instead of the middleware, so case, slash, and percent-encoded path variants can no longer skip the API key check.
+
 ## 0.1.5
 
 ### Patch Changes

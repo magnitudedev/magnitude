@@ -1,0 +1,7 @@
+# origin: X1:P24
+# invoke: q4g64[2,128]=rand(30) ; f32[2]=zero
+# invoke: q4g64[2,128]=bits(30) ; f32[2]=zero
+fn probe[R](w: &tensor[R, 128] q4g64, out: &mut tensor[R] f32):
+    parallel for r in 0..R:
+        let v = w[r, 64:128]
+        out[r] = f32(v[3])

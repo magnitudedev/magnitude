@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/planning.seismic:sequential_temporaries
+# invoke sequential_temporaries: f32[5]=seq
+fn sequential_temporaries[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let first = to_owned(x * 2.0)
+    let second = to_owned(first + 1.0)
+    let third = to_owned(second * second)
+    return third

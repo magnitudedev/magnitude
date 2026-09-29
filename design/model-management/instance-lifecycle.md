@@ -1,8 +1,10 @@
 ---
 applies_to:
-  - inference/crates/icn-contracts/**
-  - inference/crates/icn-api/**
-  - inference/crates/icn-server/**
+  - inference/service/api/**
+  - inference/service/server/src/residency/**
+  - inference/service/server/src/configurations.rs
+  - inference/service/server/src/serving.rs
+  - inference/service/contracts/**
   - packages/icn/src/instances/**
   - packages/icn/src/provider/**
   - packages/acn/src/model-*.ts
@@ -28,6 +30,25 @@ that physical occurrence; it is never persisted as harness or Slot model selecti
 
 The canonical model ID, such as `gemma-4-26b-a4b-it-qat:gguf:q4`, is the only callable model
 identity. ICN does not mint aliases or wrapper identities.
+
+## Load plan and allocation
+
+A read-only load plan, also carried by a Loading Instance and a Stopping Instance that never
+became resident, states the serving context window (the engine's supported maximum), the device
+the load would use (its device identity and backend), and the required memory: the load's startup
+peak claim in that device's allocation domain, system RAM or dedicated VRAM. Required memory
+excludes future context growth, which the engine claims as history grows.
+
+A Ready allocation states the serving context window and, per memory domain, the engine heap's
+observed model, context, compute, and auxiliary bytes at the last observation. Memory is elastic,
+so this is standing, not a fixed reservation. No plan or allocation carries fixed sequence slots
+or a physical context size.
+
+A low-memory load failure reports the required memory, the limiting domain's allocation headroom
+and planning reserve, the load boundary (required memory plus that reserve), and the minimum
+additional available memory the load needs. The limiting domain is the one whose claim the
+engine refused: the device's allocation domain, or system RAM when a dedicated device's staged
+upload did not fit.
 
 ## Lifecycle
 
@@ -76,6 +97,47 @@ An unproven release remains Stopping with its worker owned: Stop and queued dema
 failure, new loads and package removal are rejected, and a later exact-instance Stop retries that
 same worker. Native exit evidence persists after reaping; absence of a live PID is not used as proof.
 
+## Loading on the engine worker
+
+A resident model runs in one `inference-worker` process of the service executable; the service
+owns its spawn, its framed transport, crash handling and the proof of its retirement. The host
+process keeps the model's chat semantics.
+
+A load resolves the model's installed material through the service's single resolved-configuration
+cache, which host-only operations (counting, template application, properties) share, so no second
+tokenizer, template or properties path exists and those operations never lease or load. The load
+then waits while memory admission is closed (stage `queued`), previews itself on the service's
+device catalog (the same engine preview the load-plan endpoint returns), and has the worker load
+exactly the previewed device with the service's kernel cache and reserve policy.
+
+`Loading` carries a `stage` and a `fraction`, both measured from the worker's work and never from
+time. The stages are `queued`, `preparing` (resolution, planning, opening the device, preparing
+programs), `optimizing` (kernel tuning), `loading_weights` and `finalizing` (state allocation,
+warm-up, readiness verification). Before tuning begins the worker counts its tuning units and
+finds each one's stored result, so a load enters `optimizing` only when it will search, and knows
+this before any tuning or weight import starts. Tuning progress is the configuration budget of
+the searched units over that of every unit that searches; weight progress is resident bytes
+imported over the target's. A load that tunes fills the fraction's first half with tuning and the
+second with weights; one that does not fills it with weights. The fraction is monotonic, stays at
+zero until measured work starts, and holds through `finalizing`; only `Ready` means the load is
+complete. Progress is published in bounded steps rather than per unit or weight. Readiness is verified before the Instance is
+Ready: the worker must report the package identity the host resolved, the chat-template
+fingerprint and input modalities it read from its own opened package equal to the host's, and the
+previewed device. The
+Ready allocation is the worker's allocation census, republished when it changes, at most once per
+second.
+
+Every release first asks the worker to shut down, which ends its open requests as
+`model_instance_stopped`. Graceful release (replacement, idle) allows two seconds and explicit Stop
+half a second before the worker is killed. Retirement is proven by the worker's exit status.
+
+Memory pressure has two sources with one outcome. The engine unloads itself when other programs
+keep headroom at or below its planning reserve, and the service kills the worker on the first
+system-RAM sample at or below the emergency reserve. Either releases the Instance as
+`memory_pressure` and closes load admission until system-RAM headroom has stayed above the planning
+reserve for five seconds; a failed sample restarts that wait. Nothing reloads automatically. Worker
+exit, a lost device, and one continuous second of failed memory observation fail the Instance.
+
 ## Inference acquisition
 
 Chat Completions, Responses, and explicit Instance admission use one residency coordinator.
@@ -84,7 +146,8 @@ and atomically acquire a request lease before invoking the backend. There is no 
 slot load request, or caller-supplied instance identity.
 
 When `Magnitude-Include-Progress: true` is present, streaming endpoints begin their SSE response
-before acquisition and publish meaningful model-loading progress on the same response stream.
+before acquisition and publish model-loading progress on the same response stream: the Instance's
+`stage` and `fraction` under the same names and values as the Instance status.
 Ordinary consumers wait through acquisition and inference admission before opening a successful
 stream. They receive only the standard inference stream.
 
@@ -126,4 +189,9 @@ Instance ID.
   replacement.
 - Ready-instance explicit Stop interrupts active semantic output as `ModelInstanceStopped`.
 - Graceful replacement and idle release drain active inference leases.
+- A worker loads exactly the device its load previewed; readiness verifies the package identity
+  and device against the host's resolution.
+- Host-only operations never lease or load a model.
+- Engine unload for memory pressure and the service's emergency kill both publish
+  `memory_pressure` and gate new loads on five seconds of headroom above the planning reserve.
 - Client connection or presence state cannot change model residency.

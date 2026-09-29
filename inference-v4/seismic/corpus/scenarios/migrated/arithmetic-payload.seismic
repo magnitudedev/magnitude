@@ -1,0 +1,15 @@
+# origin: test:seismic-runtime:runtime/src/feedback/payload_tests.rs:arithmetic_payloads
+# invoke fused: bf16:0x3fc0 ; bf16:0x3f81 ; bf16:0xb280
+# pin: result = bf16[]=0x3fc1
+# invoke remainder: f32:7 ; f32:4
+# pin: result = f32[]=3
+# invoke absolute: f16:0xfc01
+# pin: result = f16[]=0x7c01
+fn fused(a: bf16, b: bf16, c: bf16) -> bf16:
+    return fma(a, b, c)
+
+fn remainder(a: f32, b: f32) -> f32:
+    return a % b
+
+fn absolute(a: f16) -> f16:
+    return abs(a)

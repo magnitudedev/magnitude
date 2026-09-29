@@ -1,0 +1,11 @@
+# origin: test:seismic-compiler:compiler/src/portable/import_tests.rs:nested_effect_only_calls_keep_distinct_executable_imports
+# invoke: f32[1]=zero ; f32[1]=zero
+fn write(dst: &mut tensor[1] f32, value: f32):
+    dst[0] = value
+
+fn forward(dst: &mut tensor[1] f32, value: f32):
+    write(dst, value)
+
+fn probe(left: &mut tensor[1] f32, right: &mut tensor[1] f32):
+    forward(left, 3.0)
+    forward(right, 7.0)

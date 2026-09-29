@@ -3,37 +3,57 @@ import { Atom, Registry, Result, useAtomSet, useAtomValue } from "@effect-atom/a
 import { Cause, Context, Effect, Layer, Option, Schema } from "effect"
 import { Mutation, QueryClient } from "@magnitudedev/effect-query"
 import { Models } from "../operations"
-import { type CatalogFormModelId, type ModelId } from "@magnitudedev/sdk"
+import { LocalModelMutationFailed, type LocalModel, type CatalogFormModelId, type ModelId } from "@magnitudedev/sdk"
 import { useAgentClient } from "../state/agent-client-context"
 import { ClientEffectQuery } from "../state/client-effect-query"
 import { localModelsFromCatalog } from "../model-catalog/projection"
 
+export type LocalModelCommand = "install" | "cancel" | "dismiss" | "remove" | "load"
+export interface LocalModelCommandFailure {
+  readonly operation: LocalModelCommand
+  readonly rejection: Option.Option<LocalModelMutationFailed>
+}
 interface ModelCommandObservation {
   readonly modelId: ModelId
+  readonly operation: LocalModelCommand
   readonly pending: boolean
-  readonly failure: Option.Option<string>
+  readonly failure: Option.Option<LocalModelCommandFailure>
 }
-const messageSchema = Schema.Struct({ message: Schema.NonEmptyString })
-export const localModelFailureMessage = (cause: Cause.Cause<unknown>, fallback = "The model command could not finish. Check Status and try again."): string => {
-  const failure = Cause.failureOption(cause)
-  if (Option.isSome(failure) && Schema.is(messageSchema)(failure.value)) return failure.value.message
-  return fallback
-}
+export const localModelCommandFailure = (operation: LocalModelCommand, cause: Cause.Cause<unknown>): LocalModelCommandFailure => ({
+  operation,
+  rejection: Option.filter(Cause.failureOption(cause), Schema.is(LocalModelMutationFailed)),
+})
 export interface LocalModelStopStatus {
   readonly pending: boolean
   readonly failure: Option.Option<string>
 }
 export interface LocalModelCommandStatus {
   readonly pending: boolean
-  readonly failures: ReadonlyArray<string>
+  readonly pendingOperations: ReadonlyArray<LocalModelCommand>
+  readonly failures: ReadonlyArray<LocalModelCommandFailure>
 }
-/** Select each command's latest invocation for this exact model, inside the domain owner. */
-export const localModelCommandStatus = (modelId: ModelId, commands: ReadonlyArray<ReadonlyArray<ModelCommandObservation>>): LocalModelCommandStatus => {
+/** Select exact model/command outcomes; a domain failure is displayed from its richer resource state. */
+export const localModelCommandStatus = (modelId: ModelId, commands: ReadonlyArray<ReadonlyArray<ModelCommandObservation>>, model: Option.Option<LocalModel>): LocalModelCommandStatus => {
   const latest = commands.flatMap(history => {
     const observation = history.findLast(value => value.modelId === modelId)
     return observation ? [observation] : []
   })
-  return { pending: latest.some(value => value.pending), failures: latest.flatMap(value => Option.toArray(value.failure)) }
+  const superseded = (feedback: LocalModelCommandFailure): boolean => {
+    if (Option.isNone(model)) return false
+    const row = model.value
+    const acquisition = row._tag === "Catalog" ? row.acquisitionState : undefined
+    const residency = acquisition && "residencyState" in acquisition ? acquisition.residencyState
+      : row._tag === "Discovered" && row.state._tag === "Ready" ? row.state.residencyState : undefined
+    // Observed readiness fulfills a prior load request, regardless of who completed the load.
+    if (feedback.operation === "load" && residency?._tag === "Ready") return true
+    if (Option.isNone(feedback.rejection)) return false
+    if (feedback.operation === "load" && residency?._tag === "Failed") return feedback.rejection.value.code === residency.failure.code
+    if (feedback.operation === "remove" && acquisition?._tag === "RemoveFailed") return feedback.rejection.value.code === acquisition.failure.code
+    return false
+  }
+  const pendingOperations = latest.filter(value => value.pending).map(value => value.operation)
+  return { pending: pendingOperations.length > 0, pendingOperations,
+    failures: latest.flatMap(value => value.pending ? [] : Option.toArray(value.failure)).filter(failure => !superseded(failure)) }
 }
 
 const makeLocalModels = Effect.gen(function* () {
@@ -49,7 +69,7 @@ const makeLocalModels = Effect.gen(function* () {
   const stop = effectQuery.Models.StopActiveLocalModel
   const stopStatus = Atom.make((get): LocalModelStopStatus => {
     const result = get(stop)
-    return { pending: result.waiting, failure: Result.isFailure(result) ? Option.some(localModelFailureMessage(result.cause)) : Option.none() }
+    return { pending: result.waiting, failure: Result.isFailure(result) && !result.waiting ? Option.some("The model may still be running. Try stopping it again.") : Option.none() }
   })
   const state = Atom.make((get) => Result.map(get(query).result, localModelsFromCatalog))
   const catalog = Atom.make((get) => Result.map(
@@ -59,15 +79,21 @@ const makeLocalModels = Effect.gen(function* () {
       models: models.models.filter((model) => model._tag === "Catalog"),
     }),
   ))
+  const observeCommand = (mutation: typeof Models.LoadLocalModel | typeof Models.RemoveLocalModel | typeof Models.SyncLocalModel | typeof Models.CancelLocalModelSync | typeof Models.AcknowledgeLocalModelSyncFailure, operation: LocalModelCommand) =>
+    Mutation.state({ filters: { mutation }, select: ({ input, result }): ModelCommandObservation => ({
+      modelId: input.modelId, operation, pending: result.waiting,
+      failure: Result.isFailure(result) && !result.waiting ? Option.some(localModelCommandFailure(operation, result.cause)) : Option.none(),
+    }) })
   const commandObservations = yield* Effect.all([
-    Models.SyncLocalModel, Models.CancelLocalModelSync, Models.AcknowledgeLocalModelSyncFailure,
-    Models.RemoveLocalModel, Models.LoadLocalModel,
-  ].map(mutation => Mutation.state({ filters: { mutation }, select: ({ input, result }): ModelCommandObservation => ({
-    modelId: input.modelId, pending: result.waiting,
-    failure: Result.isFailure(result) && !result.waiting ? Option.some(localModelFailureMessage(result.cause)) : Option.none(),
-  }) })))
-  const commandStatus = Atom.family((modelId: ModelId) => Atom.make(get =>
-    localModelCommandStatus(modelId, commandObservations.map(observation => get(observation)))))
+    observeCommand(Models.SyncLocalModel, "install"), observeCommand(Models.CancelLocalModelSync, "cancel"),
+    observeCommand(Models.AcknowledgeLocalModelSyncFailure, "dismiss"), observeCommand(Models.RemoveLocalModel, "remove"),
+    observeCommand(Models.LoadLocalModel, "load"),
+  ])
+  const commandStatus = Atom.family((modelId: ModelId) => Atom.make(get => {
+    const observed = get(state)
+    const model = Result.isSuccess(observed) ? Option.fromNullable(observed.value.models.find(value => value.modelId === modelId)) : Option.none<LocalModel>()
+    return localModelCommandStatus(modelId, commandObservations.map(observation => get(observation)), model)
+  }))
   const provideRegistry = Effect.provideService(Registry.AtomRegistry, registry)
 
   return {
@@ -131,5 +157,5 @@ export function useLocalModelCommandStatus(modelId: ModelId): LocalModelCommandS
   const service = useMemo(() => client.runtime.atom(LocalModels), [client])
   const status = useMemo(() => Atom.make(get => Result.map(get(service), models => get(models.commandStatus(modelId)))), [service, modelId])
   const result = useAtomValue(status)
-  return Result.isSuccess(result) ? result.value : { pending: false, failures: [] }
+  return Result.isSuccess(result) ? result.value : { pending: false, pendingOperations: [], failures: [] }
 }

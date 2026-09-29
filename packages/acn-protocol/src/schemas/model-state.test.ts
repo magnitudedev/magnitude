@@ -4,6 +4,7 @@ import {
   CatalogIntelligenceSchema,
   CatalogBaseIdSchema,
   CatalogVariantIdSchema,
+  CatalogSupportSchema,
   LocalModelMemorySchema,
   LocalModelPreparationSchema,
   LocalModelSchema,
@@ -28,6 +29,7 @@ const catalogModel = {
       asOfDate: "2026-08-29",
       url: "https://example.com/model",
     } },
+    support: { _tag: "Supported" },
     fidelityRank: 1,
     quantizationAware: false,
   },
@@ -38,6 +40,18 @@ const catalogModel = {
     failure: { code: "unavailable", message: "Unavailable", retryable: true },
   },
 } as const
+
+describe("CatalogSupportSchema", () => {
+  it("requires a disabled reason and a deprecated replacement", () => {
+    expect(() => Schema.decodeUnknownSync(CatalogSupportSchema)({ _tag: "Disabled", reason: "" })).toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogSupportSchema)({
+      _tag: "Deprecated", since: "2026-09-27", reason: "superseded",
+    })).toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogSupportSchema)({
+      _tag: "Deprecated", since: "2026-09-27", reason: "superseded", replacement: "model:gguf:q4",
+    })).not.toThrow()
+  })
+})
 
 describe("ModelIdSchema", () => {
   it("accepts canonical catalog and Hugging Face callable identities", () => {

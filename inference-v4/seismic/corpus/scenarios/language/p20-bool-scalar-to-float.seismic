@@ -1,0 +1,7 @@
+# origin: C1:p20
+# invoke s: bool:true
+# pin: result = f32[]=1
+# invoke s: bool:false
+# pin: result = f32[]=0
+fn s(a: bool) -> f32:
+    return f32(a)

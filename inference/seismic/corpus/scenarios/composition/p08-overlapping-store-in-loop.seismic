@@ -1,0 +1,10 @@
+# origin: X1:P08 X1:q2d
+# invoke: f32[4]=1,2,3,4 ; index:2
+# pin: out = f32[4]=9,4,3,4
+# invoke: f32[4]=1,2,3,4 ; index:0
+# pin: out = f32[4]=9,2,3,4
+fn probe(out: &mut tensor[4] f32, n: index[3]):
+    let mut v = out[0:2]
+    for i in 0..n:
+        v = out[i+1:i+3]
+    v[0] = 9.0

@@ -20,8 +20,6 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
@@ -32,15 +30,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Install Linux build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y build-essential
       - run: npm install --global "npm@${NPM_VERSION}"
       - run: bun install --frozen-lockfile
-      - name: Test Linux CPU MTP memory-domain accounting
-        run: >-
-          cargo test
-          --manifest-path inference/Cargo.toml
-          -p icn-hardware
-          mtp_
       - run: bun run icn:catalog:build-bundle
       - name: Build the Linux x64 CPU release host
         run: >-

@@ -1,0 +1,29 @@
+[package]
+name = "magnitude-service-api"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "export-openapi"
+path = "src/bin/export-openapi.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum = { workspace = true, features = ["ws"] }
+base64.workspace = true
+futures-util.workspace = true
+magnitude-service-contracts = { workspace = true, features = ["openapi"] }
+magnitude-serving = { path = "../../engine/serving" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+utoipa.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true, features = ["util"] }

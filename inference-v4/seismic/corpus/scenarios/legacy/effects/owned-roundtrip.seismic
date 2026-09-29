@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/effects.seismic:owned_roundtrip
+# invoke owned_roundtrip: f32[4]=1,2,3,4
+fn owned_roundtrip[N](x: tensor[N] f32) -> tensor[N] f32:
+    let mut y = x
+    for i in 0..N:
+        y[i] = y[i] + 1.0
+    return y

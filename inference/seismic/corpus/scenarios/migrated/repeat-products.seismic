@@ -1,0 +1,34 @@
+# origin: test:seismic-runtime:runtime/src/feedback/binding_tests.rs:cpu_repeat_transports_actual_tensor_views_and_fresh_instances
+# invoke zero: f32[2,2]=1,2,3,4
+# pin: result = f32[]=2
+# invoke strided: f32[2,2]=1,2,3,4
+# pin: result = f32[]=3
+# invoke fresh: f32[2,2]=1,2,3,4
+# pin: result = f32[]=16
+# invoke fresh_partial: f32[2,2]=1,2,3,4
+# pin: result = f32[]=5
+fn zero(x: &tensor[2,2] f32) -> f32:
+    let mut y = to_owned(x)
+    for i in 0..0:
+        y = y.T
+    return y[0,1]
+
+fn strided(x: &tensor[2,2] f32) -> f32:
+    let mut y = to_owned(x)
+    for i in 0..3:
+        y = y.T
+    return y[0,1]
+
+fn fresh(x: &tensor[2,2] f32) -> f32:
+    let mut y = to_owned(x)
+    for i in 0..3:
+        y = y + y
+    return y[0,1]
+
+fn fresh_partial(x: &tensor[2,2] f32) -> f32:
+    let mut y = to_owned(x)
+    for i in 0..3:
+        let mut next = tensor[2,2] f32
+        next[0,1] = y[0,1] + 1.0
+        y = next
+    return y[0,1]

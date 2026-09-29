@@ -1,0 +1,111 @@
+// qwen_vision_merger: layer norm of each of the M * G F32 patch rows (width
+// H), then the up GEMM over G concatenated rows (+ bias, erf GELU) and the
+// down GEMM to the decoder width D (+ bias), published in F32. The Vulkan form of
+// `metal/qwen_vision_merger.metal` (bodies in lib/vision/vision.glsl and the
+// projection library).
+#include "lib/core/activation.glsl"
+#include "lib/vision/vision.glsl"
+
+#if !defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#error "qwen_vision_merger requires a bf16 or f16 activation"
+#endif
+
+#if defined(SEISMIC_UP_WEIGHT_REPRESENTATION_BF16)
+#define UP_KIND PACKETS_BF16
+#define UP_BYTES 2
+#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_F16)
+#define UP_KIND PACKETS_F16
+#define UP_BYTES 2
+#elif defined(SEISMIC_UP_WEIGHT_REPRESENTATION_F32)
+#define UP_KIND PACKETS_F32
+#define UP_BYTES 4
+#else
+#error "unsupported qwen_vision_merger up_weight representation"
+#endif
+
+#if defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_BF16)
+#define DOWN_KIND PACKETS_BF16
+#define DOWN_BYTES 2
+#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_F16)
+#define DOWN_KIND PACKETS_F16
+#define DOWN_BYTES 2
+#elif defined(SEISMIC_DOWN_WEIGHT_REPRESENTATION_F32)
+#define DOWN_KIND PACKETS_F32
+#define DOWN_BYTES 4
+#else
+#error "unsupported qwen_vision_merger down_weight representation"
+#endif
+
+#if defined(SEISMIC_UP_BIAS_REPRESENTATION_BF16)
+#define UP_BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_UP_BIAS_REPRESENTATION_F16)
+#define UP_BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_UP_BIAS_REPRESENTATION_F32)
+#define UP_BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_merger up_bias representation"
+#endif
+
+#if defined(SEISMIC_DOWN_BIAS_REPRESENTATION_BF16)
+#define DOWN_BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_DOWN_BIAS_REPRESENTATION_F16)
+#define DOWN_BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_DOWN_BIAS_REPRESENTATION_F32)
+#define DOWN_BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_merger down_bias representation"
+#endif
+
+#if defined(SEISMIC_NORM_WEIGHT_REPRESENTATION_BF16)
+#define NORM_WEIGHT_KIND ELEMENT_BF16
+#elif defined(SEISMIC_NORM_WEIGHT_REPRESENTATION_F16)
+#define NORM_WEIGHT_KIND ELEMENT_F16
+#elif defined(SEISMIC_NORM_WEIGHT_REPRESENTATION_F32)
+#define NORM_WEIGHT_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_merger norm_weight representation"
+#endif
+
+#if defined(SEISMIC_NORM_BIAS_REPRESENTATION_BF16)
+#define NORM_BIAS_KIND ELEMENT_BF16
+#elif defined(SEISMIC_NORM_BIAS_REPRESENTATION_F16)
+#define NORM_BIAS_KIND ELEMENT_F16
+#elif defined(SEISMIC_NORM_BIAS_REPRESENTATION_F32)
+#define NORM_BIAS_KIND ELEMENT_F32
+#else
+#error "unsupported qwen_vision_merger norm_bias representation"
+#endif
+
+#define MERGER_H uint(SEISMIC_DIM_H)
+#define MERGER_WIDTH uint(SEISMIC_DIM_G * SEISMIC_DIM_H)
+#define MERGER_M uint(SEISMIC_DIM_M)
+
+// Workgroup per patch row.
+void qwen_vision_merger_norm() {
+    const uint64_t row = uint64_t(gl_WorkGroupID.x) * MERGER_H;
+    vision_layer_norm(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + row * 4ul,
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED) + row * 2ul,
+        SEISMIC_PTR(SEISMIC_BUFFER_NORM_WEIGHT), NORM_WEIGHT_KIND, SEISMIC_PTR(SEISMIC_BUFFER_NORM_BIAS),
+        NORM_BIAS_KIND, MERGER_H, element_word_f32(SEISMIC_PARAM_EPSILON));
+}
+
+void qwen_vision_merger_up() {
+    const projection_prologue in_ = projection_plain(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
+        uint64_t(MERGER_WIDTH), 1ul, MERGER_WIDTH, 0ul);
+    const vision_epilogue out_ = vision_bias(VISION_BIAS_GELU_ERF, ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ACTIVATED), uint64_t(MERGER_WIDTH), SEISMIC_PTR(SEISMIC_BUFFER_UP_BIAS),
+        UP_BIAS_KIND);
+    const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT), SEISMIC_UP_WEIGHT_STRIDE_0,
+        UP_BYTES, MERGER_WIDTH);
+    vision_gemm(UP_KIND, in_, out_, w, MERGER_M, MERGER_WIDTH, MERGER_WIDTH, gl_WorkGroupID.y, gl_WorkGroupID.x);
+}
+
+void qwen_vision_merger_down() {
+    const projection_prologue in_ = projection_plain(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ACTIVATED),
+        uint64_t(MERGER_WIDTH), 1ul, MERGER_WIDTH, 0ul);
+    const vision_epilogue out_ = vision_bias_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_PTR(SEISMIC_BUFFER_DOWN_BIAS), DOWN_BIAS_KIND, 0ul, 0ul);
+    const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT), SEISMIC_DOWN_WEIGHT_STRIDE_0,
+        DOWN_BYTES, MERGER_WIDTH);
+    vision_gemm(DOWN_KIND, in_, out_, w, MERGER_M, uint(SEISMIC_DIM_D), MERGER_WIDTH, gl_WorkGroupID.y,
+        gl_WorkGroupID.x);
+}

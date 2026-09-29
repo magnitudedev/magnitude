@@ -1,0 +1,5 @@
+# origin: test:validation:corpus/planning.seismic:bounded_domain
+# invoke bounded_domain: f32[5]=seq ; f32[5]=zero
+fn bounded_domain[N](x: &tensor[N] f32, y: &mut tensor[N] f32) where N >= 1:
+    parallel for i in 0..N:
+        y[i] = x[i] / f32(N)

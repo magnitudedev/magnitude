@@ -1,0 +1,6 @@
+# origin: C1:p19
+# invoke s: f32:2.75
+# pin: result = i32[]=2
+# invoke s: f32:-2.75
+fn s(a: f32) -> i32:
+    return i32(a)

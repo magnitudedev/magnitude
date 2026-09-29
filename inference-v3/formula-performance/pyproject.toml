@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "magnitude-formula-performance"
+version = "0.1.0"
+description = "Formula performance mathematics and evidence, independent of execution"
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2.13,<3"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/formula_performance"]

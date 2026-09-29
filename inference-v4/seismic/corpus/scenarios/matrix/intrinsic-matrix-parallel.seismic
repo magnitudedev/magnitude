@@ -1,0 +1,22 @@
+# cell: intrinsic-matrix/parallel
+# backends: metal
+# undecided: reassociated
+# invoke: f32[2,8,8]=rand(174) ; f32[8,8]=rand(175) ; f32[2,8,8]=zero
+fn mm[M, N, K](a: &tensor[M, K] f32, b: &tensor[N, K] f32, into: tensor[M, N] f32) -> tensor[M, N] f32:
+    let mut out = into
+    for i in 0..M:
+        for j in 0..N:
+            let mut s = out[i, j]
+            for k in 0..K:
+                s = fma(a[i, k], b[j, k], s)
+            out[i, j] = s
+    return out
+
+lower mm[M, N, K](a: &tensor[M, K] f32, b: &tensor[N, K] f32, into: tensor[M, N] f32) -> tensor[M, N] f32
+    for metal requires metal.matrix:
+    return metal.matrix.matmul_add(a, b.T, into)
+
+fn probe(a: &tensor[2, 8, 8] f32, b: &tensor[8, 8] f32, out: &mut tensor[2, 8, 8] f32):
+    parallel for g in 0..2:
+        let seed = zeros_like(b)
+        out[g] = mm(a[g], b, seed)

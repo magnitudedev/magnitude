@@ -1,0 +1,4 @@
+# origin: C11:s_bitand_index
+# invoke: index:7
+fn probe(i: index[100]) -> i32:
+    return i32(i) & 3

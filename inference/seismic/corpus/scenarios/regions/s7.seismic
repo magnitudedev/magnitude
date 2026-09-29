@@ -1,0 +1,14 @@
+# origin: C14:s7
+# invoke: f32[5]=rand(50) ; bool:true
+# invoke: f32[5]=rand(50) ; bool:false
+fn helper[N](x: &tensor[N] f32) -> tensor[N] f32:
+    let mut s = tensor[N] f32
+    for i in 0..N:
+        s[i] = x[i] * 3.0
+    return s
+
+fn probe[N](x: &tensor[N] f32, c: bool) -> tensor[N] f32:
+    let mut t = x + x
+    if c:
+        t = helper(x)
+    return t

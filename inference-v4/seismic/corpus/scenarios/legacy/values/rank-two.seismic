@@ -1,0 +1,6 @@
+# origin: test:validation:corpus/values.seismic:rank_two
+# invoke rank_two: f32[2,3]=seq ; f32[2,3]=zero
+fn rank_two[A, B](x: &tensor[A, B] f32, y: &mut tensor[A, B] f32) where A >= 0 and B >= 0:
+    parallel for a in 0..A:
+        parallel for b in 0..B:
+            y[a, b] = x[a, b] + 1.0

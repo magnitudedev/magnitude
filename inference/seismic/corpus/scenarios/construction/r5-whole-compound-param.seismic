@@ -1,0 +1,4 @@
+# origin: C11:r5_whole_compound_param
+# rejected: "scalar element place"
+fn probe(dst: &mut tensor[4] f32, src: &tensor[4] f32):
+    dst[:] += src

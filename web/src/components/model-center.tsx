@@ -2,6 +2,7 @@ import { useMemo, useState, type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Progress } from "@/components/ui/progress"
+import { ActionTooltip } from "@/components/ui/tooltip"
 import {
   Select,
   SelectContent,
@@ -44,7 +45,11 @@ import {
   XIcon,
 } from "@phosphor-icons/react"
 import {
+  catalogModelReplacement,
+  catalogSupportLabel,
   deriveHardwareMemoryView,
+  describeCatalogDeprecation,
+  formatLocalInferenceBackend,
   formatLocalModelDisplayName,
   localModelRadarAxes,
   localModelIsInstalled,
@@ -65,6 +70,7 @@ import {
   acquisitionFailure,
   acquisitionProgress,
   installedAcquisition,
+  localModelDeprecation,
   type LocalModel,
 } from "@magnitudedev/sdk"
 import type { SettingsTab } from "../state/web-atoms"
@@ -378,10 +384,73 @@ function InstalledModelMenu({
   )
 }
 
+function SupportLabel({ model }: { readonly model: LocalModel }): ReactNode {
+  if (model._tag !== "Catalog") return null
+  const support = model.catalogData.support
+  return Option.match(catalogSupportLabel(support), {
+    onNone: () => null,
+    onSome: (label) => (
+      <ActionTooltip
+        label={support._tag === "Supported" ? label : support.reason}
+        trigger={<span
+        className={`ml-2 inline-block cursor-default rounded border px-1.5 align-middle font-sans text-[10px] font-medium tracking-normal ${
+          support._tag === "Deprecated"
+            ? "border-red-300 text-red-600 dark:border-red-700 dark:text-red-500"
+            : "border-orange-300 text-orange-700 dark:border-orange-700 dark:text-orange-500"
+        }`}
+      >
+        {label}
+      </span>}
+      />
+    ),
+  })
+}
+
+/**
+ * An installed deprecated model never loads. It names its replacement and downloads it in one step;
+ * choosing the active model stays in the composer.
+ */
+function DeprecationNotice({
+  model,
+  catalog,
+}: {
+  readonly model: LocalModel
+  readonly catalog: readonly LocalModel[]
+}): ReactNode {
+  const actions = useLocalModelActions()
+  return Option.match(localModelDeprecation(model), {
+    onNone: () => null,
+    onSome: (deprecation) => {
+      const replacement = catalogModelReplacement(catalog, deprecation)
+      const target = Option.getOrNull(replacement)
+      const targetFits = target !== null && target.servingState._tag === "Assessed"
+        && target.servingState.assessment._tag === "Fits"
+      return (
+        <div className="col-span-full flex flex-wrap items-center gap-3 text-[11px] text-red-600 dark:text-red-500">
+          <span>{describeCatalogDeprecation(deprecation, replacement)}</span>
+          {target !== null && !localModelIsInstalled(target) && (
+            <Button
+              variant="outline"
+              size="sm"
+              type="button"
+              disabled={!targetFits || modelTransfer(target) !== null}
+              onClick={() => actions.install(target.modelId)}
+            >
+              Switch to {formatLocalModelDisplayName(target)}
+            </Button>
+          )}
+        </div>
+      )
+    },
+  })
+}
+
 function InstalledLibrary({
   models,
+  catalog,
 }: {
   readonly models: readonly LocalModel[]
+  readonly catalog: readonly LocalModel[]
 }): ReactNode {
   const [query, setQuery] = useState("")
   const normalizedQuery = query.trim().toLowerCase()
@@ -454,6 +523,7 @@ function InstalledLibrary({
                 <div className="flex min-w-0 flex-col gap-[3px]">
                   <strong className="break-words text-[13px] font-semibold text-slate-900 dark:text-slate-200">
                     {displayName}
+                    <SupportLabel model={model} />
                   </strong>
                   <span className="overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-slate-500">
                     {model.presentation.description}
@@ -478,6 +548,7 @@ function InstalledLibrary({
                   </div>
                 </dl>
                 <InstalledModelMenu model={model} />
+                <DeprecationNotice model={model} catalog={catalog} />
               </article>
             )
           })}
@@ -511,7 +582,7 @@ function ModelsView(): ReactNode {
         />
       ) : null}
       {models && !inventoryLoading ? (
-        <InstalledLibrary models={installed} />
+        <InstalledLibrary models={installed} catalog={models.models} />
       ) : null}
     </div>
   )
@@ -537,11 +608,12 @@ const catalogSortLabels: Readonly<Record<CatalogSort, string>> = {
 const catalogData = (model: LocalModel) =>
   model._tag === "Catalog" ? model.catalogData : null
 
+// A deprecated model is listed only where installed; disabled models explain their unavailability.
 const isCatalogVisible = (model: LocalModel): boolean =>
-  Option.match(localModelServingState(model), {
+  model._tag === "Catalog" && model.catalogData.support._tag !== "Deprecated" && (model.catalogData.support._tag === "Disabled" || Option.match(localModelServingState(model), {
     onNone: () => true,
     onSome: (serving) => serving._tag !== "Assessed" || serving.assessment._tag === "Fits",
-  })
+  }))
 
 const matchesCatalogFilter = (
   model: CatalogLocalModel,
@@ -619,6 +691,7 @@ function CatalogCandidate({
         ) : null}
         <strong className="text-[13px] font-semibold leading-[1.4] text-slate-900 [overflow-wrap:anywhere] dark:text-slate-100">
           {formatLocalModelDisplayName(model)}
+          <SupportLabel model={model} />
         </strong>
       </span>
     </Button>
@@ -655,7 +728,7 @@ function CatalogInspector({
           variant="default"
           size="default"
           type="button"
-          disabled={starting}
+          disabled={starting || model.catalogData.support._tag !== "Supported"}
           onClick={() => modelActions.install(configurationId)}
         >
           {model.acquisitionState._tag === "InstallFailed" ? (
@@ -675,7 +748,7 @@ function CatalogInspector({
             variant="default"
             size="default"
             type="button"
-            disabled={starting}
+            disabled={starting || model.catalogData.support._tag !== "Supported"}
             onClick={() => modelActions.install(configurationId)}
           >
             <ArrowsClockwiseIcon size={14} />
@@ -701,6 +774,7 @@ function CatalogInspector({
           <div className="min-w-0 max-w-[720px]">
             <h2 className="font-heading text-[24px] leading-[1.2] tracking-[-.025em] text-slate-900 [overflow-wrap:anywhere] dark:text-slate-100">
               {formatLocalModelDisplayName(model)}
+              <SupportLabel model={model} />
             </h2>
             <p className="mt-2 text-[13px] leading-5 text-slate-600 dark:text-slate-400">
               {model.presentation.description}
@@ -1036,7 +1110,7 @@ function HardwareView(): ReactNode {
                     <div>
                       <dt>Required memory</dt>
                       <dd>
-                        {formatBytes(preview.value.requiredSystemMemoryBytes)}
+                        {formatBytes(preview.value.requiredMemoryBytes)}
                       </dd>
                     </div>
                     <div>
@@ -1046,8 +1120,8 @@ function HardwareView(): ReactNode {
                       </dd>
                     </div>
                     <div>
-                      <dt>Parallel</dt>
-                      <dd>{preview.value.parallelSequences}</dd>
+                      <dt>Device</dt>
+                      <dd>{formatLocalInferenceBackend(preview.value.device.backend)}</dd>
                     </div>
                   </dl>
                 )}
@@ -1195,7 +1269,7 @@ function HardwareView(): ReactNode {
                     <CpuIcon size={17} aria-hidden="true" />
                     <div>
                       <strong>{accelerator.name}</strong>
-                      <span>{accelerator.backend}</span>
+                      <span>{formatLocalInferenceBackend(accelerator.backend)}</span>
                     </div>
                     <span>Local inference</span>
                   </article>

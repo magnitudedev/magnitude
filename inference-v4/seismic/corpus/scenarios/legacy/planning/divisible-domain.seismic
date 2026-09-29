@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/planning.seismic:divisible_domain
+# invoke divisible_domain: f32[16]=seq ; f32[16]=zero
+# invoke divisible_domain: f32[12]=seq ; f32[12]=zero
+# expect: invalid-invocation
+fn divisible_domain[N](x: &tensor[N] f32, y: &mut tensor[N] f32) where N % 8 == 0:
+    parallel for i in 0..N:
+        y[i] = x[i] + f32(i)

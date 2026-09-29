@@ -30,7 +30,7 @@ const scriptInvocation = (path: string): RegExp =>
     "i",
   )
 
-const icnExecutable = executable(`(?:${ICN_EXECUTABLE_NAME}|icn-server)`)
+const icnExecutable = executable(ICN_EXECUTABLE_NAME)
 const acnExecutable = executable(ACN_EXECUTABLE_NAME)
 const cliExecutable = executable("magnitude-cli")
 const acnSource = scriptInvocation("packages/acn/src/binary\\.ts")
@@ -42,8 +42,8 @@ export const classifyMagnitudeProcess = (
 ): MagnitudeProcessKind | undefined => {
   if (
     icnExecutable.test(command) ||
-    /(?:^|\s)(?:icn:dev|icn:serve)(?:\s|$)/i.test(command) ||
-    /(?:^|\s)-p\s+icn-server(?:\s|$)/i.test(command)
+    /(?:^|\s)icn:serve(?:\s|$)/i.test(command) ||
+    /(?:^|\s)-p\s+magnitude-service-server(?:\s|$)/i.test(command)
   ) return "ICN"
 
   if (acnExecutable.test(command) || (acnSource.test(command) && /(?:^|\s)serve(?:\s|$)/.test(command))) {

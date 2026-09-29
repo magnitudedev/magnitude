@@ -1,0 +1,7 @@
+# origin: C14:s7f
+# invoke: f32[4]=rand(50)
+fn probe(x: &tensor[4] f32) -> tensor[4] f32:
+    let mut s = tensor[4] f32
+    for i in 0..4:
+        s[i] = x[i]
+    return s

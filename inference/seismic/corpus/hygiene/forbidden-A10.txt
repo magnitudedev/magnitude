@@ -1,0 +1,23 @@
+# Identifiers deleted by A10 lanes (design A10 §2.11). One identifier per line;
+# `tests/hygiene.rs` fails on any word-boundary match in the scanned `.rs` files.
+
+# L10-5: typed construction surface and dead physical vocabulary (C3-10, C16-9)
+KernelBuilder
+TypedIntrinsic
+IntrinsicSink
+remap_views
+specialize_for_native
+SpecializationError
+ChoiceBuilder
+ChooseOption
+CooperativeGrid
+
+# D2 and L10-11: estimator, envelopes and the post-D2 expression-core residue
+seismic_estimator
+WorkloadEnvelope
+CapacityClass
+PlanningExpr
+DurationExpr
+compile_duration
+compile_decision_bool
+constant_predicate

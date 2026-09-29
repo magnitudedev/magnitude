@@ -1,0 +1,17 @@
+// vision_clamp: one invocation per element (grid-stride), A(clamp(x,
+// minimum, maximum)).
+#include "lib/core/activation.glsl"
+
+void vision_clamp() {
+    const uint64_t columns = SEISMIC_DIM_N;
+    const uint64_t total = SEISMIC_DIM_M * columns;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    const float minimum = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_MINIMUM));
+    const float maximum = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_MAXIMUM));
+    for (uint64_t index = gl_GlobalInvocationID.x; index < total; index += step) {
+        const uint64_t row = index / columns, column = index % columns;
+        const float value = element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_X), row * SEISMIC_X_STRIDE_0 + column);
+        element_put(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row * SEISMIC_RESULT_0_STRIDE_0 + column,
+            min(max(value, minimum), maximum));
+    }
+}

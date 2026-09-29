@@ -1,0 +1,5 @@
+# cell: loop-parallel/sl
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32) where W >= 8:
+    parallel for j in 0..8:
+        y[0, j] = x[0, j] * 2.0

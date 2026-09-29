@@ -1,0 +1,8 @@
+# origin: test:seismic-runtime:runtime/src/feedback/packed_tests.rs:packed_reads
+# invoke: iq4g32[256]=rand(140)
+# invoke: iq4g32[256]=bits(141)
+fn probe[N](x: &tensor[N] iq4g32) -> tensor[N] f32:
+    let mut result = tensor[N] f32
+    parallel for i in 0..N:
+        result[i] = f32(x[i])
+    return result

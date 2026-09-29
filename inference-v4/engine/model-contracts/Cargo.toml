@@ -1,0 +1,9 @@
+[package]
+name = "magnitude-model-contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "../artifacts" }
+serde.workspace = true

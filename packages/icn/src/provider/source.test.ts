@@ -279,7 +279,7 @@ describe("ICN local provider", () => {
       created: 1,
       model: modelId,
       choices: [],
-      progress: { phase: "model_loading", fraction: 0.25 },
+      progress: { phase: "model_loading", stage: "loading_weights", fraction: 0.25 },
     }
     const http = HttpClient.make((request) => Effect.succeed(HttpClientResponse.fromWeb(
       request,
@@ -302,7 +302,7 @@ describe("ICN local provider", () => {
 
     expect(first).toEqual(Option.some({
       _tag: "preparation_update",
-      preparation: { phase: "model_loading", fraction: 0.25 },
+      preparation: { phase: "model_loading", stage: "loading_weights", fraction: 0.25 },
       requestId: "request-1",
     }))
   })

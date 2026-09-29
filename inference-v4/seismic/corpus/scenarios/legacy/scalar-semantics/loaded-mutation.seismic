@@ -1,0 +1,12 @@
+# origin: test:validation:programs/scalar-semantics.seismic:loaded_mutation
+# invoke loaded_mutation: f32[65]=seq ; f32[1]=zero
+fn loaded_mutation(x: &tensor[65] f32, result: tensor[1] f32) -> tensor[1] f32:
+    let mut snapshot = to_owned(x)
+    let mut output = result
+    for i in 0..65:
+        snapshot[i] = 0.0
+    let mut total = f32(0.0)
+    for i in 0..65:
+        total = total + snapshot[i]
+    output[0] = total
+    return output

@@ -1,0 +1,12 @@
+# origin: test:validation:corpus/effects.seismic:aliased_reads
+# invoke aliased_reads: f32[4]=1,2,3,4
+fn shared_pair[N](a: &tensor[N] f32, b: &tensor[N] f32) -> f32:
+    let mut total = f32(0.0)
+    for i in 0..N:
+        total = total + a[i] * b[i]
+    return total
+
+fn aliased_reads[N](x: &tensor[N] f32) -> f32:
+    let front = x[:]
+    let back = x[:]
+    return shared_pair(front, back) + shared_pair(x, x)

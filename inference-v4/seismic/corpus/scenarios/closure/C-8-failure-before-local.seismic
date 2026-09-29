@@ -1,0 +1,22 @@
+# origin: X1:R6-X1-5
+# policies: exact unconstrained
+# invoke: f32[4]=2.0,3.5,-4.0,0x3f800001 ; i32[4]=zero ; i32:12 ; index:8
+# expect: returned
+# pin: out = i32[4]=14,8,0,14
+# invoke: f32[4]=2.0,0.5,-4.0,1.0 ; i32[4]=zero ; i32:12 ; index:8
+# expect: failed
+# invoke: f32[4]=2.0,0x00000001,-4.0,1.0 ; i32[4]=zero ; i32:12 ; index:8
+# expect: failed
+fn probe[N](x: &tensor[N] f32, out: &mut tensor[N] i32, m: i32, n: index[64]):
+    # C-8: I-91's program after D12, with discrete outputs. The float -> i32
+    # cast feeds a checked divisor and the float compare decides whether the
+    # visit reaches its launch-scratch local; both are demanded, so both are
+    # Exact under every policy, and a visit whose divisor is 0 fails before
+    # its allocation. The reservation is the envelope (4 * 63 bytes per
+    # participant), independent of x.
+    parallel for i in 0..N:
+        let k = m / i32(x[i])
+        if x[i] * 3.0 > 1.0:
+            let mut t = tensor[n / (i + 1)] i32
+            t[:] = ones_like(t)
+            out[i] = reduce(t, 0, sum) + k

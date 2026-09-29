@@ -1,0 +1,14 @@
+# origin: test:seismic-runtime:runtime/src/feedback/failure_tests.rs:cpu_reached_private_allocation_skips_backing_after_source_failure
+# invoke main: i32[1]=zero ; i32:0
+# expect: failed
+# pin: out = i32[1]=7
+# invoke main: i32[1]=zero ; i32:1
+# expect: returned
+fn main(out: &mut tensor[1] i32, divisor: i32):
+    let mut first = tensor[1] i32
+    first[0] = 7
+    out[0] = first[0]
+    let quotient = 1 / divisor
+    let mut later = tensor[65536] i32
+    later[0] = quotient
+    out[0] = later[0]

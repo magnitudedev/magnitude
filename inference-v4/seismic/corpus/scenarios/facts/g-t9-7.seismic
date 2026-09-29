@@ -1,0 +1,9 @@
+# origin: C26:G-T9-7
+# invoke: bool:true
+# invoke window: f32[8]=seq ; u32:3
+# invoke window: f32[8]=seq ; u32:7
+fn probe(c: bool) -> bool:
+    return ~c
+
+fn window(x: &tensor[8] f32, a: u32) -> f32:
+    return reduce(x[a:a+2], 0, sum)

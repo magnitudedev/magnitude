@@ -46,7 +46,7 @@ jobs:
           run-id: ${{ inputs.artifact_run }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: ${{ runner.temp }}/magnitude-windows-update-acceptance
-      - name: Exercise real downloads, Settings, native replacement and tray interaction
+      - name: Exercise hosted download, native replacement and owner relaunch
         shell: pwsh
         run: ./packages/release/scripts/acceptance/test-windows-hosted-update.ps1
       - uses: actions/upload-artifact@v4

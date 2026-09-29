@@ -77,7 +77,7 @@ export interface ModelFamily {
 }
 
 export const ProviderModelDisabledReasonSchema = Schema.Literal(
-  "insufficient_resources", "provider_unavailable", "model_unavailable", "installation_unavailable", "incompatible_runtime", "invalid_configuration",
+  "insufficient_resources", "provider_unavailable", "model_unavailable", "installation_unavailable", "incompatible_runtime", "invalid_configuration", "catalog_disabled", "deprecated",
 )
 export type ProviderModelDisabledReason = Schema.Schema.Type<typeof ProviderModelDisabledReasonSchema>
 export const ProviderModelAvailabilitySchema = Schema.Union(

@@ -1,0 +1,4 @@
+# origin: C11:r2_decode_tensor
+# invoke: q4g64[128]=zero
+fn probe(w: &tensor[128] q4g64) -> tensor[128] f32:
+    return f32(w)

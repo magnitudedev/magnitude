@@ -1,0 +1,12 @@
+# origin: X1:r2-n01b
+# invoke: i32[4]=zero ; i32:9 ; i32:0
+# expect: failed
+# pin: out = i32[4]=7,0,0,0
+# invoke: i32[4]=zero ; i32:9 ; i32:2
+# expect: returned
+# pin: result = i32[]=4
+fn probe(out: &mut tensor[4] i32, n: i32, k: i32) -> i32:
+    out[0] = 7
+    let q = n / k
+    out[1] = q
+    return q

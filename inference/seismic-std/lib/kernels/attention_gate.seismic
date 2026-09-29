@@ -1,0 +1,6 @@
+# Attention output gate: y = attended * sigmoid(gate), flattened over heads.
+fn attention_gate[H, W](attended: &tensor[1, H, W] bf16, gate: &tensor[1, H * W] bf16, y: &mut tensor[1, H * W] bf16):
+    parallel for heads in 0..H:
+        let a = f32(attended[0, heads])
+        let g = f32(gate[0, heads * W : (heads + 1) * W])
+        y[0, heads * W : (heads + 1) * W] = a / (1.0 + exp(-g))

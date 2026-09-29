@@ -3,6 +3,7 @@ import { Effect } from "effect"
 import { resolve } from "node:path"
 import { ACN_EXECUTABLE_NAME } from "../../src/executables"
 import { MACOS_APP_NAME, MACOS_BUNDLE_ID } from "../../src/macos-app"
+import { MACOS_DEPLOYMENT_TARGET } from "../../src/targets"
 import { appleCommand, signAppleCode } from "./signing"
 
 const resources = resolve(import.meta.dir, "../../resources/macos")
@@ -19,7 +20,7 @@ const plist = (version: string, revision: number) => `<?xml version="1.0" encodi
 <key>CFBundleShortVersionString</key><string>${version.split("-")[0]}</string>
 <key>CFBundleVersion</key><string>${revision}</string>
 <key>MagnitudeReleaseVersion</key><string>${version}</string>
-<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>LSMinimumSystemVersion</key><string>${MACOS_DEPLOYMENT_TARGET}</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

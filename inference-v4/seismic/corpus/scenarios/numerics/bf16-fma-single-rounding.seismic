@@ -1,0 +1,5 @@
+# origin: C12:C4a-5
+# invoke: bf16:0x3fc0 ; bf16:0x3f81 ; bf16:0xb280
+# pin: result = bf16[]=0x3fc1
+fn probe(a: bf16, b: bf16, c: bf16) -> bf16:
+    return fma(a, b, c)

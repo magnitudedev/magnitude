@@ -1,0 +1,13 @@
+[package]
+name = "magnitude-service-catalog-tool"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+magnitude-service-contracts.workspace = true
+magnitude-service-models.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

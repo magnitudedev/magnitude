@@ -30,8 +30,6 @@ const instances = (revision: number): ModelInstancesSnapshot => ({
       _tag: "Ready",
       allocation: {
         contextWindowTokens: 8_192,
-        parallelSequences: 1,
-        physicalContextTokens: 8_192,
         memoryDomains: [],
       },
     },

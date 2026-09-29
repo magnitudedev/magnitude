@@ -1,0 +1,10 @@
+# origin: test:validation:programs/scalar-semantics.seismic:loop_carried
+# invoke loop_carried: f32[1]=zero
+fn loop_carried(result: tensor[1] f32) -> tensor[1] f32:
+    let mut output = result
+    let mut value = f32(1.0)
+    for step in 0..3:
+        let next = value + 1.0
+        output[0] = value + next
+        value = next
+    return output

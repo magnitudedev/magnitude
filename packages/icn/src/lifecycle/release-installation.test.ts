@@ -1,26 +1,32 @@
-import { describe, expect, it } from "vitest"
-import { BackendEligibilityReport } from "@magnitudedev/icn-protocol"
-import { Schema } from "effect"
-import { finalOutputRecord } from "./release-installation.js"
+import { afterEach, expect, it } from "vitest"
+import { BunContext } from "@effect/platform-bun"
+import { Effect } from "effect"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { dirname, join } from "node:path"
+import { hostById, inferenceNvrtcPaths, inferenceRequiredPaths } from "@magnitudedev/release"
+import { isCompleteArtifact } from "./release-installation"
 
-describe("release ICN command output", () => {
-  it("decodes the final backend eligibility record after native driver chatter", () => {
-    const output = [
-      " dllPath = /usr/lib/wsl/drivers/iigd_dch.inf_amd64/libigdgmm_w.so.12",
-      " IsWddmLinux = 1, dllWslName = /usr/lib/wsl/drivers/iigd_dch.inf_amd64/libigdgmm_w.so.12 flags = 2",
-      '{"schemaVersion":1,"cuda":{"state":"usable","driverApi":13010,"architectures":["89"],"driverLibrary":"/usr/lib/wsl/lib/libcuda.so.1"},"vulkan":{"state":"usable","loaderApi":4206867},"metal":{"state":"absent","diagnostic":"Metal requires Apple Silicon"}}',
-      "",
-    ].join("\n")
+let directory: string | undefined
 
-    const report = Schema.decodeUnknownSync(
-      Schema.parseJson(BackendEligibilityReport),
-    )(finalOutputRecord(output))
+afterEach(async () => {
+  if (directory) await rm(directory, { recursive: true, force: true })
+  directory = undefined
+})
 
-    expect(report.schemaVersion).toBe(1)
-    expect(report.cuda).toMatchObject({
-      state: "usable",
-      driverApi: 13010,
-      architectures: ["89"],
-    })
-  })
+it("requires every bundled NVRTC file before reusing a cached Linux installation", async () => {
+  directory = await mkdtemp(join(tmpdir(), "magnitude-inference-installation-"))
+  const host = hostById("linux-x64-gnu")
+  const paths = inferenceRequiredPaths(host)
+  for (const relative of paths) {
+    const file = join(directory, relative)
+    await mkdir(dirname(file), { recursive: true })
+    await writeFile(file, "present")
+  }
+  const complete = () => Effect.runPromise(
+    isCompleteArtifact(directory!, host.id).pipe(Effect.provide(BunContext.layer)),
+  )
+  expect(await complete()).toBe(true)
+  await rm(join(directory, inferenceNvrtcPaths(host)[0]!))
+  expect(await complete()).toBe(false)
 })

@@ -1,0 +1,11 @@
+# origin: C18:G-T1-4
+# invoke: f32[32]=rand(160) ; f32[32]=zero
+fn probe(x: &tensor[32] f32, out: &mut tensor[32] f32):
+    let m = reduce(x, 0, max)
+    parallel for i in 0..32:
+        out[i] = m
+
+lower probe(x: &tensor[32] f32, out: &mut tensor[32] f32)
+    for metal requires metal.subgroup:
+    parallel for i in 0..32:
+        out[i] = metal.subgroup.simd_max(x[i])

@@ -1,0 +1,4 @@
+# origin: C13:p03l
+# invoke: i32[0]=seq
+fn probe[N](x: &tensor[N] i32) -> i32 where N + 1 > 0:
+    return i32(N) + 100

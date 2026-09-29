@@ -1,0 +1,5 @@
+# origin: C25:G-C25-3
+# invoke p: f16:1.5 ; f32:2.25
+# pin: result = f32[]=3.75
+fn p(a: f16, b: f32) -> f32:
+    return a + b

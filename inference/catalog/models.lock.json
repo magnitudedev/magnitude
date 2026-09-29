@@ -16,6 +16,11 @@
     "target": "dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0",
     "speculativeDraft": "7ba04ee5ff05a4baf2681fe5ddda6d736581ccdf"
   },
+  "minicpm5-1b": { "target": "3d55fac80935ae6456986ad2384b5cbcc4d6c948" },
+  "minicpm5-2b": {
+    "target": "2079a22f3beaa4e306449978533478fe0522f4b3",
+    "speculativeDraft": "a261d2b4abc9c9ebfbad2af8a817a09802fc4ca3"
+  },
   "muse-glimmer-30b": { "target": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5", "speculativeDraft": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5" },
   "nemotron-3-super-120b-a12b": { "target": "036038fb30334a2d56a146c6f0d4871ab5edccbb" },
   "nemotron-3-ultra-550b-a55b": { "target": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6" },
@@ -30,6 +35,6 @@
     "target": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
     "speculativeDraft": "0e8061d252dbac5a1b4abe506bf2b7613d438f87"
   },
-  "qwen3.8-27b": { "target": "27af057ecb382ddfea5d12837360a8980560e3ed" },
+  "qwen3.8-27b": { "target": "27af057ecb382ddfea5d12837360a8980560e3ed", "speculativeDraft": "2d9571f8ce46e151f61c6499c99dee6079e1d610" },
   "qwen3.8-flash-next": { "target": "83cadfda58d30be06c110518208d1bb918b33f10" }
 }

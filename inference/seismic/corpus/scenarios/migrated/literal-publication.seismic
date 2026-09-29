@@ -1,0 +1,12 @@
+# origin: test:seismic-runtime:runtime/src/feedback/literal_tests.rs:literal_publications
+# invoke:
+# pin: result.0 = f16[]=0x3c01
+# pin: result.1 = bf16[]=0x3f81
+# pin: result.2 = f32[]=0x5a000001
+# pin: result.3 = f32[]=0x5f800000
+# pin: result.4 = f16[]=0x8000
+# pin: result.5 = bf16[]=0x8000
+# pin: result.6 = f32[]=0x80000000
+# pin: result.7 = f16[]=0xfc00
+fn probe() -> (f16, bf16, f32, f32, f16, bf16, f32, f16):
+    return (1.0004882812500002, 1.0039062500000002, 9007199791611905, 18446744073709551615, -0.0, -0.0, -0.0, -inf)

@@ -25,6 +25,7 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
             url: "https://example.com/model",
           },
         }),
+        support: { _tag: "Supported" },
         fidelityRank: 1,
         quantizationAware: false,
     },

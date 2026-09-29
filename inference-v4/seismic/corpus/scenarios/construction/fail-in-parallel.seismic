@@ -1,0 +1,6 @@
+# origin: C11:fail_in_parallel
+# invoke: i32[4]=0,0,0,0 ; i32[4]=1,2,0,3
+# expect: failed
+fn probe[N](dst: &mut tensor[N] i32, d: &tensor[N] i32):
+    parallel for k in 0..N:
+        dst[k] = 12 / d[k]

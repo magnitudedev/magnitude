@@ -1,0 +1,4 @@
+# origin: test:validation:corpus/effects.seismic:slice_assign_complete
+# invoke slice_assign_complete: f32[2,3]=seq ; f32[2,3]=zero
+fn slice_assign_complete[M, N](x: &tensor[M, N] f32, y: &mut tensor[M, N] f32):
+    y[:] = x * 2.0

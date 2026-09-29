@@ -1,0 +1,15 @@
+# origin: X1:r2-w02
+# invoke: f32[4]=1,2,3,4 ; index:3 ; bool:true
+# pin: result = f32[]=3
+# invoke: f32[4]=1,2,3,4 ; index:0 ; bool:true
+# pin: result = f32[]=0
+# invoke: f32[4]=1,2,3,4 ; index:3 ; bool:false
+# pin: result = f32[]=0
+fn step(x: &tensor[4] f32, s: f32) -> f32:
+    return x[0] * s + 1.0
+fn probe(x: &tensor[4] f32, n: index[8], c: bool) -> f32:
+    let mut s = 0.0
+    for i in 0..n:
+        if c:
+            s = step(x, s)
+    return s

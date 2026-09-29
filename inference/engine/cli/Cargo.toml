@@ -1,0 +1,22 @@
+[package]
+name = "magnitude-engine-cli"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+
+# The low-level `magnitude-engine` binary: one explicit local model, loaded
+# in-process, served through the engine's protocol library.
+[[bin]]
+name = "magnitude-engine"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+futures-util.workspace = true
+magnitude-engine = { path = ".." }
+magnitude-executor = { path = "../executor" }
+magnitude-serving = { path = "../serving" }
+magnitude-state = { path = "../state" }
+seismic.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }

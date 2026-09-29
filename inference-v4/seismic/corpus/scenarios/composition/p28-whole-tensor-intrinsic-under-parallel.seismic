@@ -1,0 +1,14 @@
+# origin: X1:P28
+# rejected: "Placement"
+fn mm[M, N, K](a: &tensor[M, K] f32, b: &tensor[N, K] f32, c: &mut tensor[M, N] f32):
+    for i in 0..M:
+        for j in 0..N:
+            let mut acc = 0.0
+            for k in 0..K:
+                acc = acc + a[i, k] * b[j, k]
+            c[i, j] = acc
+
+lower mm[M, N, K](a: &tensor[M, K] f32, b: &tensor[N, K] f32, c: &mut tensor[M, N] f32)
+    for metal requires metal.matrix:
+    parallel for i in 0..1:
+        c[:] = metal.matrix.matmul_add(a, b.T, zeros_like(c))

@@ -1,0 +1,7 @@
+# origin: C13:p29
+# invoke: i32[2,10]=seq ; i32[2,6]=seq
+fn steps[NK, GV](qkv: &tensor[2, 2 * NK + NK * GV] i32, beta: &tensor[2, NK * GV] i32) -> i32:
+    return i32(NK) * 10 + i32(GV)
+
+fn probe[NK, GV](qkv: &tensor[2, 2 * NK + NK * GV] i32, beta: &tensor[2, NK * GV] i32) -> i32:
+    return steps(qkv, beta)

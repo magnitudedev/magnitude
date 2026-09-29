@@ -1,0 +1,14 @@
+# origin: H-16
+# invoke: f32[5]=rand(8)
+fn helper[N](x: &tensor[N] f32) -> f32:
+    return reduce(x, 0, sum)
+
+fn total[N](x: &tensor[N] f32) -> f32:
+    return helper(x)
+
+fn total[N](x: &tensor[N] f32) -> f32:
+    let twice = helper(x) + helper(x)
+    return twice * 0.5
+
+fn probe[N](x: &tensor[N] f32) -> f32:
+    return total(x) + helper(x)

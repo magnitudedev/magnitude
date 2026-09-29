@@ -1,0 +1,11 @@
+# The final norm folded into the readout: one activation row, RMS-normalized on the fly,
+# against the packed readout matrix, kept in f32 for sampling.
+fn norm_logits[N, K](x: &tensor[1, K] bf16, nw: &tensor[1, K] bf16, w: &tensor[N, K] q4g64, eps: f32, result: &mut tensor[1, N] f32):
+    parallel for cols in 0..N:
+        let mut acc = f32(0.0)
+        let xf = f32(x[0])
+        let ss = reduce(xf * xf, 0, sum)
+        for k in 0..K:
+            let a = f32(x[0, k]) * f32(nw[0, k])
+            acc = fma(a, f32(w[cols, k]), acc)
+        result[0, cols] = acc * rsqrt(ss / f32(K) + eps)

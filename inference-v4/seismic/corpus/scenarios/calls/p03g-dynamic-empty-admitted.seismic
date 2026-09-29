@@ -1,0 +1,9 @@
+# origin: C13:p03g
+# invoke: i32[8]=seq ; i32[2]=3,3
+fn seed[N](x: &tensor[N] i32) -> i32 where N >= 0:
+    return i32(N) + 100
+
+fn probe(input: &tensor[8] i32, bounds: &tensor[2] i32) -> i32:
+    let lo = bounds[0]
+    let hi = bounds[1]
+    return seed(input[lo:hi])

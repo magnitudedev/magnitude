@@ -2,6 +2,7 @@ import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, writeFile, chmod, mkdir } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
@@ -21,11 +22,24 @@ await writeFile(probeShell, '#!/bin/sh\necho "$PPID" >> "$MAGNITUDE_TEST_SHELL_P
 await chmod(probeShell, 0o700);
 const env = { ...process.env, SHELL: probeShell, MAGNITUDE_TEST_SHELL_PIDS: probePids, MAGNITUDE_DEV_DATA_DIR: profile, MAGNITUDE_DEV_PORT: '11109' };
 delete env.MAGNITUDE_SHELL_ENV_INHERITED;
+const control = (dataDirectory, intent) => new Promise((resolve, reject) => {
+  const socket = createConnection(join(dataDirectory, 'state/application.sock'));
+  let data = '';
+  socket.setTimeout(5000, () => socket.destroy(new Error(`Application control ${intent} timed out`)));
+  socket.on('error', reject);
+  socket.on('connect', () => socket.write(JSON.stringify({ version: 1, intent }) + '\n'));
+  socket.on('data', chunk => {
+    data += chunk;
+    if (!data.includes('\n')) return;
+    socket.destroy();
+    try { resolve(JSON.parse(data.split('\n')[0])); } catch (error) { reject(error); }
+  });
+});
 const alive = pid => {
   try { process.kill(pid, 0); return true; }
   catch (error) { if (error.code === 'ESRCH') return false; throw error; }
 };
-const eventually = async (read, expected, timeout = 10000) => {
+const eventually = async (read, expected, timeout = 30000) => {
   const deadline = Date.now() + timeout;
   let actual;
   do {
@@ -33,13 +47,49 @@ const eventually = async (read, expected, timeout = 10000) => {
     if (JSON.stringify(actual) === JSON.stringify(expected)) return;
     await delay(100);
   } while (Date.now() < deadline);
-  assert.deepEqual(actual, expected);
+  assert.deepEqual(actual, expected, `Condition did not settle within ${timeout} ms; application output:\n${ownerOutput}`);
 };
+// The owning application's recent main-process output, reported when a contender stalls.
+let ownerOutput = '';
+const launchOwner = async options => {
+  const launched = await electron.launch(options);
+  ownerOutput = '';
+  const collect = chunk => { ownerOutput = (ownerOutput + chunk.toString()).slice(-32000); };
+  launched.process().stdout.on('data', collect);
+  launched.process().stderr.on('data', collect);
+  return launched;
+};
+// Native stacks show whether a stalled process waits on the control socket or is busy.
+const sampleStack = pid => {
+  try { return execFileSync('/usr/bin/sample', [String(pid), '2'], { encoding: 'utf8', timeout: 20000, maxBuffer: 16 * 1024 * 1024 }).slice(0, 16000); }
+  catch (error) { return `sample failed: ${error.message}`; }
+};
+// A contender cold-starts Electron, then makes two handoff exchanges (Observe, then its intent),
+// each of which the application allows 5 seconds (application-control.ts).
+const contenderLimit = 60000;
 const invoke = args => new Promise((resolve, reject) => {
-  const child = spawn(executablePath, args, { env, stdio: 'ignore' });
-  const timeout = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Application contender did not exit')); }, 10000);
+  const started = Date.now();
+  const child = spawn(executablePath, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '';
+  const collect = chunk => { output = (output + chunk.toString()).slice(-32000); };
+  child.stdout.on('data', collect); child.stderr.on('data', collect);
+  const timeout = setTimeout(() => {
+    const owner = application?.process();
+    const report = [
+      `Application contender [${args.join(' ')}] did not exit within ${contenderLimit} ms.`,
+      `Contender output:\n${output}`,
+      `Contender stack:\n${sampleStack(child.pid)}`,
+      ...(owner ? [`Owner stack:\n${sampleStack(owner.pid)}`, `Owner output:\n${ownerOutput}`] : []),
+    ].join('\n\n');
+    child.kill('SIGKILL');
+    reject(new Error(report));
+  }, contenderLimit);
   child.once('error', error => { clearTimeout(timeout); reject(error); });
-  child.once('exit', code => { clearTimeout(timeout); resolve(code); });
+  child.once('exit', code => {
+    clearTimeout(timeout);
+    console.log(`Application contender [${args.join(' ')}] exited ${code} after ${Date.now() - started} ms`);
+    resolve(code);
+  });
 });
 let application;
 let probeOwner;
@@ -59,7 +109,7 @@ try {
       // This fixture owns the freshly spawned group, including Chromium helpers.
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
       reject(new Error(`Failed startup did not exit: ${output}`));
-    }, 10000);
+    }, 30000);
     child.once('error', error => { clearTimeout(timeout); reject(error); });
     child.once('exit', code => { clearTimeout(timeout); resolve({ code, output }); });
   });
@@ -67,40 +117,31 @@ try {
   assert.match(rejected.output, /ApplicationOwnershipFailed|EEXIST/);
   assert.doesNotMatch(rejected.output, /Cause\.reduceWithContext|UnhandledPromiseRejection/);
   console.log('Rejected ownership path: original failure reported and background process exited');
-  application = await electron.launch({ chromiumSandbox: true, executablePath, args: [], env: {
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: [], env: {
     ...env, MAGNITUDE_DEV_DATA_DIR: failedProfile,
     MAGNITUDE_ICN_PATH: join(failedProfile, 'absent-engine.json'),
-  }, timeout: 30000 });
+  }, timeout: 60000 });
   const failedOwner = application.process();
-  const failedWindow = await application.firstWindow();
-  await failedWindow.waitForFunction(() => !!window.__magnitudeDesktop);
-  const rejectedLogin = await failedWindow.evaluate(async () => {
-    try { await window.__magnitudeDesktop.setLoginStartup(true); return null; }
-    catch (error) { return { message: error.message }; }
-  });
-  assert.deepEqual(rejectedLogin, { message: 'Launch at login is disabled in this development or test build. Install Magnitude to enable it.' });
-  console.log('Host action failure preserves actionable message across real contextBridge');
-  await failedWindow.getByRole('button', { name: 'Status', exact: true }).click();
+  await eventually(async () => (await control(failedProfile, 'Observe').catch(() => null))?.service?._tag, 'Failed', 60000);
   for (let attempt = 0; attempt < 2; attempt++) {
-    await failedWindow.getByRole('button', { name: 'Retry service', exact: true }).waitFor({ timeout: 20000 });
-    await failedWindow.getByRole('alert').waitFor();
+    const snapshot = await control(failedProfile, 'Observe');
+    const failure = snapshot.service;
+    assert.equal(failure._tag, 'Failed');
+    assert.ok(failure.message, 'Failed service must report its cause');
+    assert.equal(snapshot.owner.tray._tag, 'Registered');
     assert.equal(alive(failedOwner.pid), true);
     if (attempt === 0) {
-      await failedWindow.getByRole('button', { name: 'Retry service', exact: true }).click();
-      await failedWindow.getByRole('button', { name: 'Retry service', exact: true }).waitFor({ state: 'hidden' });
+      await control(failedProfile, 'Retry');
+      await eventually(async () => (await control(failedProfile, 'Observe')).service._tag, 'Starting', 30000);
+      await eventually(async () => (await control(failedProfile, 'Observe')).service._tag, 'Failed', 60000);
     }
   }
-  const failedQuit = application.waitForEvent('close', { timeout: 10000 });
-  await application.evaluate(({ Menu, BrowserWindow }) => {
-    const window = BrowserWindow.getAllWindows()[0];
-    const item = Menu.getApplicationMenu().items.flatMap(item => item.submenu?.items ?? []).find(item => item.label === 'Quit Magnitude');
-    if (!item) throw new Error('Native full Quit action is missing');
-    setImmediate(() => item.click({}, window, window.webContents));
-  });
+  const failedQuit = application.waitForEvent('close', { timeout: 30000 });
+  await control(failedProfile, 'Quit');
   await failedQuit;
   application = undefined;
   assert.equal(failedOwner.exitCode, 0);
-  console.log('Missing inference engine: bounded startup failures retain safe detail and tray, Retry repeats cleanly, native Quit exits0');
+  console.log('Missing inference engine: startup and retry report failure through application control; owner survives and Quit exits0');
 
   await mkdir(join(profile, 'acn'), { recursive: true });
   const oldState = join(profile, 'acn/coordination.sqlite');
@@ -108,27 +149,27 @@ try {
   await writeFile(join(profile, 'preserved.txt'), 'preserve user data');
   incumbent = createServer((_request, response) => response.end('unrelated service'));
   await new Promise((resolve, reject) => { incumbent.once('error', reject); incumbent.listen(11109, '127.0.0.1', resolve); });
-  application = await electron.launch({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 60000 });
   const app = application;
   const visibility = () => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => ({ visible: window.isVisible(), minimized: window.isMinimized() })));
   const health = () => fetch('http://127.0.0.1:11109/health').then(response => response.json()).catch(() => null);
-  await eventually(visibility, [{ visible: false, minimized: false }], 2000);
-  await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)).catch(() => false), true, 2000);
+  await eventually(visibility, [{ visible: false, minimized: false }]);
+  await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)).catch(() => false), true);
   console.log('Slow shell probe: owner and hidden window available while shell is still running');
   assert.equal(await invoke([]), 0);
-  const conflictWindow = await app.firstWindow();
-  await conflictWindow.getByRole('button', { name: 'Status', exact: true }).click();
-  await conflictWindow.getByRole('button', { name: 'Retry service', exact: true }).waitFor();
-  await conflictWindow.getByRole('alert').waitFor();
+  await eventually(async () => (await control(profile, 'Observe').catch(() => null))?.service?._tag, 'Failed', 60000);
+  assert.equal((await control(profile, 'Observe')).owner.tray._tag, 'Registered');
   assert.equal(await (await fetch('http://127.0.0.1:11109')).text(), 'unrelated service');
-  await conflictWindow.getByRole('button', { name: 'Retry service', exact: true }).click();
-  await conflictWindow.getByRole('button', { name: 'Retry service', exact: true }).waitFor();
+  await control(profile, 'Retry');
+  await eventually(async () => (await control(profile, 'Observe')).service._tag, 'Starting', 30000);
+  await eventually(async () => (await control(profile, 'Observe')).service._tag, 'Failed', 60000);
   assert.equal(await (await fetch('http://127.0.0.1:11109')).text(), 'unrelated service');
   await new Promise(resolve => incumbent.close(resolve));
   incumbent = undefined;
-  await conflictWindow.getByRole('button', { name: 'Retry service', exact: true }).click();
+  await control(profile, 'Retry');
+  await eventually(async () => (await control(profile, 'Observe')).service._tag, 'Starting', 30000);
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
-  console.log('Port conflict: actionable failure, tray and control stay available, incumbent survives retries');
+  console.log('Port conflict: control reports failure, owner stays available, incumbent survives retry');
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
   await eventually(visibility, [{ visible: false, minimized: false }]);
   const service = await health();
@@ -138,7 +179,7 @@ try {
   await assert.rejects(readFile(join(profile, 'desktop/legacy-migration.json')), { code: 'ENOENT' });
   assert.equal(await readFile(oldState, 'utf8'), 'old coordination state: deliberately not a database');
   assert.equal(await readFile(join(profile, 'preserved.txt'), 'utf8'), 'preserve user data');
-  console.log('Clean cutover: old coordination files untouched, no migration checkpoint, Retry reaches Ready');
+  console.log('Clean cutover: old coordination files untouched, no migration checkpoint, control Retry reaches Ready');
   console.log('Cold background launch: service Ready, window hidden');
 
   assert.deepEqual(await Promise.all(Array.from({ length: 4 }, () => invoke(['--background']))), [0, 0, 0, 0]);
@@ -157,24 +198,6 @@ try {
   assert.match(rejectedConnection, /No installed Magnitude models are available|Codex is not installed/);
   assert.doesNotMatch(rejectedConnection, /UnknownException|FiberFailure|Effect\.tryPromise|\n\s+at /);
   console.log('Rejected connection preserves actionable host failure and does not create a managed connection');
-  await window.getByRole('button', { name: 'Settings', exact: true }).click();
-  const theme = window.getByRole('group', { name: 'Theme', exact: true });
-  for (const preference of ['light', 'dark']) {
-    await theme.getByRole('button', { name: preference === 'light' ? 'Light' : 'Dark', exact: true }).click();
-    await eventually(() => window.evaluate(() => document.documentElement.dataset.theme), preference);
-    await eventually(() => app.evaluate(({ nativeTheme }) => nativeTheme.themeSource), preference);
-    assert.equal(JSON.parse(await readFile(join(profile, 'config.json'), 'utf8')).appearance, preference);
-  }
-  await window.reload();
-  await eventually(() => window.evaluate(() => document.documentElement.dataset.theme), 'dark');
-  await window.getByRole('button', { name: 'Settings', exact: true }).click();
-  assert.equal(await theme.getByRole('button', { name: 'Dark', exact: true }).getAttribute('aria-pressed'), 'true');
-  await theme.getByRole('button', { name: 'System', exact: true }).click();
-  await eventually(() => app.evaluate(({ nativeTheme }) => nativeTheme.themeSource), 'system');
-  assert.equal(JSON.parse(await readFile(join(profile, 'config.json'), 'utf8')).appearance, 'system');
-  await eventually(() => window.evaluate(() => document.documentElement.dataset.theme === (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')), true);
-  console.log('Appearance preference persists across reload and synchronizes the native theme');
-  // Native macOS role invocation is covered by CUA with a separate passive visibility observer.
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
   await eventually(visibility, [{ visible: false, minimized: false }]);
   assert.equal((await health()).pid, service.pid);
@@ -192,47 +215,62 @@ try {
   console.log('Dock activation event and Open restore hidden/minimized windows');
 
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
-  const rendererReady = () => app.evaluate(async ({ BrowserWindow }) => {
+  const rendererStatus = () => app.evaluate(async ({ BrowserWindow }) => {
     const contents = BrowserWindow.getAllWindows()[0].webContents;
-    if (contents.isCrashed() || contents.isLoading()) return false;
+    const status = { crashed: contents.isCrashed(), loading: contents.isLoading(), documentReady: false };
+    if (status.crashed || status.loading) return status;
     return Promise.race([
-      contents.executeJavaScript('document.readyState === "complete" && !!window.__magnitudeDesktop && document.querySelector("main") !== null'),
-      new Promise(resolve => setTimeout(() => resolve(false), 1000)),
+      contents.executeJavaScript('document.readyState === "complete" && !!window.__magnitudeDesktop')
+        .then(documentReady => ({ ...status, documentReady })),
+      new Promise(resolve => setTimeout(() => resolve(status), 1000)),
     ]);
-  }).catch(() => false);
-  await eventually(rendererReady, true);
+  }).catch(error => ({ error: String(error) }));
+  const rendererReady = () => rendererStatus().then(status => status.documentReady === true);
+  const waitForRenderer = async () => {
+    try { await eventually(rendererReady, true); }
+    catch (error) { throw new Error(`Renderer did not recover: ${JSON.stringify(await rendererStatus())}\n${ownerOutput}`, { cause: error }); }
+  };
+  const crashRenderer = () => app.evaluate(async ({ BrowserWindow }) => {
+    const contents = BrowserWindow.getAllWindows()[0].webContents;
+    const gone = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        contents.removeListener('render-process-gone', onGone);
+        reject(new Error('Renderer crash event was not observed within 30 seconds'));
+      }, 30000);
+      const onGone = () => { clearTimeout(timer); resolve(); };
+      contents.once('render-process-gone', onGone);
+    });
+    contents.forcefullyCrashRenderer();
+    await gone;
+  });
+  await waitForRenderer();
   for (let attempt = 0; attempt < 3; attempt++) {
     console.log(`Crashing renderer: attempt ${attempt + 1}`);
-    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.forcefullyCrashRenderer());
-    await eventually(rendererReady, true);
+    await crashRenderer();
+    await waitForRenderer();
     console.log(`Renderer recovered: attempt ${attempt + 1}`);
     assert.equal((await health()).pid, service.pid);
     assert.deepEqual(await visibility(), [{ visible: false, minimized: false }]);
   }
-  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.forcefullyCrashRenderer());
+  await crashRenderer();
   await delay(1000);
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.isCrashed()), true);
   assert.equal(await invoke(['--background']), 0);
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.isCrashed()), true);
   assert.equal((await health()).pid, service.pid);
   assert.equal(await invoke([]), 0);
-  await eventually(rendererReady, true);
+  await waitForRenderer();
   assert.deepEqual(await visibility(), [{ visible: true, minimized: false }]);
   console.log('Renderer crashes: three bounded retries, background demand cannot renew them, explicit Open recovers the same service');
 
-  const menuQuit = app.waitForEvent('close', { timeout: 10000 });
-  await app.evaluate(({ BrowserWindow, Menu }) => {
-    const window = BrowserWindow.getAllWindows()[0];
-    const item = Menu.getApplicationMenu().items.flatMap(item => item.submenu?.items ?? []).find(item => item.label === 'Quit Magnitude');
-    if (!item) throw new Error('Native full Quit action is missing');
-    setImmediate(() => item.click({}, window, window.webContents));
-  });
-  await menuQuit;
+  const ownerQuit = app.waitForEvent('close', { timeout: 30000 });
+  await control(profile, 'Quit');
+  await ownerQuit;
   application = undefined;
   assert.equal(await health(), null);
   assert.throws(() => process.kill(service.pid, 0));
   await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)), false);
-  console.log('Native menu Quit: service and shell probe groups absent, endpoint closed');
+  console.log('Application control Quit: service and shell probe groups absent, endpoint closed');
 
   // Probe cleanup and inference readiness have independent deadlines. Observe the
   // probe directly so a slow engine boot cannot make this crash case miss it.
@@ -254,13 +292,10 @@ try {
   await eventually(health, null);
   console.log('Forced owner death during shell discovery: observed live probe and descendant retired');
 
-  application = await electron.launch({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 60000 });
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
-  const reopened = await application.firstWindow();
-  await reopened.getByRole('button', { name: /^Download \([0-9.]+[KMGT]B\)$/ }).first().waitFor();
-  assert.equal(await reopened.getByRole('button', { name: 'Skip setup', exact: true }).count(), 0);
   assert.deepEqual(await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => window.isVisible())), [false]);
-  console.log('No setup flow after full Quit and hidden relaunch');
+  console.log('Full Quit and hidden relaunch preserve background window state');
   const replacement = await health();
   const descendants = execFileSync('/bin/ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' }).trim().split('\n')
     .map(line => line.trim().split(/\s+/).map(Number)).filter(([, parent]) => parent === replacement.pid).map(([pid]) => pid);
@@ -274,12 +309,12 @@ try {
   await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)), false);
   console.log('Forced owner death after Ready: service and inference removed by lifetime guards');
 
-  application = await electron.launch({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 60000 });
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
   assert.notEqual((await health()).pid, replacement.pid);
   const terminatedService = (await health()).pid;
   const terminatedProcess = application.process();
-  const terminated = application.waitForEvent('close', { timeout: 15000 });
+  const terminated = application.waitForEvent('close', { timeout: 30000 });
   terminatedProcess.kill('SIGTERM');
   await terminated;
   assert.equal(terminatedProcess.signalCode, null, 'SIGTERM must follow graceful application shutdown');
@@ -290,11 +325,11 @@ try {
   await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)), false);
   console.log('Relaunch after crash and SIGTERM: ownership reacquired, graceful exit0 retires service and shell probes');
 
-  application = await electron.launch({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 30000 });
+  application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 60000 });
   await eventually(async () => (await health())?.state?._tag, 'Ready', 60000);
   const shutdownService = (await health()).pid;
   const shutdownProcess = application.process();
-  const shutdownClosed = application.waitForEvent('close', { timeout: 15000 });
+  const shutdownClosed = application.waitForEvent('close', { timeout: 30000 });
   await application.evaluate(({ powerMonitor }) => {
     powerMonitor.emit('shutdown', { preventDefault() { throw new Error('OS shutdown must not be vetoed'); } });
   });

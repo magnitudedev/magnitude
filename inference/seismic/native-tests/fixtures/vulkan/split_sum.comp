@@ -1,0 +1,38 @@
+// Each part is summed in element order by lane 0 after WIDTH-wide staging
+// through the group-memory region.
+void split_partial() {
+    seismic_f32 x = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_X));
+    seismic_f32 partials = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS));
+    const uint64_t n = SEISMIC_DIM_N;
+    const uint64_t per = (n + SEISMIC_TUNE_PARTS - 1) / SEISMIC_TUNE_PARTS;
+    const uint64_t part = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint64_t begin = min(part * per, n);
+    const uint64_t end = min(begin + per, n);
+    float total = 0.0;
+    for (uint64_t base = begin; base < end; base += SEISMIC_TUNE_WIDTH) {
+        const uint64_t index = base + lane;
+        seismic_shared_f32[lane] = index < end ? x[uint(index * SEISMIC_X_STRIDE_0)].v : 0.0;
+        barrier();
+        if (lane == 0u) {
+            const uint64_t count = min(uint64_t(SEISMIC_TUNE_WIDTH), end - base);
+            for (uint j = 0u; j < count; ++j) {
+                total += seismic_shared_f32[j];
+            }
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        partials[uint(part)].v = total;
+    }
+}
+
+void split_merge() {
+    seismic_f32 partials = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS));
+    seismic_f32 result = seismic_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    float total = 0.0;
+    for (uint part = 0u; part < SEISMIC_TUNE_PARTS; ++part) {
+        total += partials[part].v;
+    }
+    result[0].v = total;
+}

@@ -1,16 +1,13 @@
 ---
 applies_to:
-  - inference/crates/icn-reasoning/**
-  - inference/crates/icn-contracts/**
-  - inference/crates/icn-models/**
-  - inference/crates/icn-api/**
-  - inference/crates/icn-engine/**
+  - inference/engine/chat/src/reasoning.rs
+  - inference/engine/chat/src/templates.rs
+  - inference/engine/chat/tests/reasoning.rs
+  - inference/engine/templates/**
+  - inference/engine/src/chat/**
+  - inference/service/contracts/**
+  - inference/service/api/**
   - inference/catalog/**
-  - inference/native/llama-cpp-rs/llama-cpp-2/src/common_chat.rs
-  - inference/native/llama-cpp-rs/llama-cpp-sys-2/wrapper_common_chat.cpp
-  - inference/native/llama-cpp-rs/llama-cpp-sys-2/wrapper_common_chat.h
-  - inference/native/llama-cpp-rs/llama-cpp-sys-2/llama.cpp/common/chat.cpp
-  - inference/native/llama-cpp-rs/llama-cpp-sys-2/llama.cpp/common/chat.h
 ---
 
 # ICN reasoning detection
@@ -64,8 +61,9 @@ behaviors. Their semantics come from their control domain, not solely from rende
 Some templates expose a meaningful named state outside this scale. MiniMax M3's adaptive mode is
 the important current example. Such a state remains `adaptive`; it is not mislabeled as medium.
 
-The normalized default is the behavior produced by pinned llama.cpp. Its common-chat input exposes
-`enable_thinking` as a boolean whose default is enabled, so a caller that does not choose an effort
+The normalized default is the behavior produced by the engine's owned template renderer, a pinned
+extraction of llama.cpp's common-chat renderer. Its input exposes `enable_thinking` as a boolean
+whose default is enabled, so a caller that does not choose an effort
 uses the enabled side of a supported toggle. ICN does not maintain a second parser for a template's
 authored Jinja fallback.
 
@@ -79,7 +77,7 @@ and test requirements, not runtime dispatch keys.
 
 Qwen 3.5 and Qwen 3.6 use `enable_thinking`. Qwen 3.8 combines that toggle with a closed symbolic
 effort domain. Kimi K2.5 and Kimi K2.6 use a similar boolean named `thinking`. Gemma 4 also uses
-`enable_thinking`; all are rendered through the pinned common-chat input contract.
+`enable_thinking`; all are rendered through the owned renderer's common-chat input contract.
 
 | Example | Native behavior | Normalized options | Normalized default |
 | --- | --- | --- | --- |
@@ -182,12 +180,11 @@ change the normalized effort list in this implementation.
 
 ## Detection architecture
 
-As the template phase of model assessment, detection consumes Assessment Material. The planning
-worker opens its compact primary GGUF once through llama.cpp in no-allocation mode and constructs
-common-chat templates from that model. The same native model handle is then used to construct every
-requested no-allocation context graph. This makes llama.cpp authoritative for metadata, vocabulary,
-template selection, BOS/EOS behavior, rendering, and planning without loading tensor weights or
-creating an inference context. ICN does not copy those inputs into a parallel metadata schema.
+Detection is part of the engine's chat implementation and runs host-side over the engine's host
+artifacts of a package: its GGUF metadata, vocabulary and template variants, read without weight
+payloads. The engine's owned template renderer is authoritative for template selection, BOS/EOS
+behavior and rendering. Detection never leases a worker, loads a model, or creates an inference
+context, and the service does not copy its inputs into a parallel metadata schema.
 
 The process has two distinct responsibilities:
 
@@ -258,12 +255,12 @@ behavior. A Qwen-named GGUF carrying a modified fixed-thinking template is class
 thinking. Runtime behavior is never selected from filename substrings.
 
 Changing the effective template, template-selection inputs, inspector version, semantic-policy
-version, or pinned llama.cpp behavior invalidates the cached result.
+version, or template renderer identity invalidates the cached result.
 
 Reasoning evidence is published and cached only inside the flat model-assessment result alongside
 the template fingerprint and profile evidence. The detector owns no worker, deadline, cache,
 inventory field, or filesystem layout. Local inventory and download never invoke it. Release-catalog
-generation binds Assessment Material to the same inspector, semantic-policy, and pinned-native
+generation binds Assessment Material to the same inspector, semantic-policy, and template renderer
 identities used at runtime and proves full-artifact/material parity. Changing any of those identities
 invalidates the combined assessment cache and requires catalog regeneration before release
 validation can pass.
@@ -333,11 +330,11 @@ advertise a disabling option.
 
 ## Acceptance criteria
 
-- Qwen 3.5/3.6 boolean controls normalize to `none` and `high` with the pinned common-chat default.
+- Qwen 3.5/3.6 boolean controls normalize to `none` and `high` with the renderer's common-chat default.
 - Qwen 3.8 normalizes to `none`, `low`, `medium`, and `xhigh`, with `xhigh` as the detected default.
 - Kimi K2.5/K2.6 nonstandard booleans normalize to `none` and `high`.
 - Kimi K2.7 Code and MiniMax M2 fixed reasoning normalize to `high` only.
-- Gemma 4 normalizes to `none` and `high` with the pinned common-chat default.
+- Gemma 4 normalizes to `none` and `high` with the renderer's common-chat default.
 - GLM-5.2 preserves distinct `none`, `high`, and `max` options.
 - DeepSeek V3/V4 modes map to the correct normalized options and private mode recipes.
 - MiniMax M3 preserves `adaptive` rather than relabeling it as an effort.

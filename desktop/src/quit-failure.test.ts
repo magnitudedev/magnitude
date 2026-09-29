@@ -7,12 +7,13 @@ describe("failed application cleanup", () => {
     const forceQuit = vi.fn()
     const showDialog = vi.fn(async () => ({ response, checkboxChecked: false }))
     const retry = await Effect.runPromise(resolveQuitFailure("The service did not stop", { showDialog, forceQuit }))
+    expect(JSON.stringify(showDialog.mock.calls)).not.toContain("The service did not stop")
     expect(retry).toBe(response === 1)
     expect(forceQuit).toHaveBeenCalledTimes(response === 2 ? 1 : 0)
     expect(showDialog).toHaveBeenCalledWith(expect.objectContaining({
       cancelId: 0,
       defaultId: 1,
-      detail: expect.stringContaining("without confirming that all background processes stopped"),
+      detail: expect.stringContaining("some background processes may still be running"),
     }))
   })
 

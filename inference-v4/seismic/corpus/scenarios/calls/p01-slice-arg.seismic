@@ -1,0 +1,8 @@
+# origin: C13:p01
+# cell: value-view/arg
+# invoke: i32[8]=seq
+fn seed[N](x: &tensor[N] i32) -> i32:
+    return reduce(x, 0, sum)
+
+fn probe(input: &tensor[8] i32) -> i32:
+    return seed(input[2:5])

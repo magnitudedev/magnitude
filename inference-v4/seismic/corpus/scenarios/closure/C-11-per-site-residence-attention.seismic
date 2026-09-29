@@ -1,0 +1,104 @@
+# origin: X4:R6-X4-1 X4:R5-X4-1
+# invoke: f32[2,1,4,256]=rand(1) ; f32[3,1,256]=rand(2) ; f32[3,1,256]=rand(3) ; f32[2,1,256]=rand(4) ; f32[2,1,256]=rand(5) ; i32[2,1,2]=0,3,0,3 ; f32[2,1,4,256]=zero ; f32:0.0625
+# expect: returned
+# invoke: f32[2,1,8,256]=rand(1) ; f32[3,1,256]=rand(2) ; f32[3,1,256]=rand(3) ; f32[2,1,256]=rand(4) ; f32[2,1,256]=rand(5) ; i32[2,1,2]=0,3,0,3 ; f32[2,1,8,256]=zero ; f32:0.0625
+# expect: returned
+# invoke: f32[1,2,4,256]=rand(6) ; f32[70,2,256]=rand(7) ; f32[70,2,256]=rand(8) ; f32[1,2,256]=rand(9) ; f32[1,2,256]=rand(10) ; i32[1,2,2]=0,40,50,70 ; f32[1,2,4,256]=zero ; f32:0.0625
+# expect: returned
+# invoke: f32[2,1,2,2]=1,0,0,1,1,1,0,0 ; f32[1,1,2]=1,0 ; f32[1,1,2]=2,4 ; f32[2,1,2]=0,1 ; f32[2,1,2]=6,8 ; i32[2,1,2]=0,1,0,1 ; f32[2,1,2,2]=zero ; f32:1.0
+# expect: returned
+fn attention_absorb[G, W](qt: &tensor[G, W] A, key: &tensor[W] A, value: &tensor[W] A,
+                          m: &mut tensor[G] f32, l: &mut tensor[G] f32, acc: &mut tensor[G, W] f32, scale: f32):
+    for i in 0..G:
+        let score = reduce(f32(qt[i]) * f32(key), 0, sum) * scale
+        let top = max(m[i], score)
+        let keep = exp(m[i] - top)
+        let weight = exp(score - top)
+        l[i] = fma(l[i], keep, weight)
+        for j in 0..W:
+            acc[i, j] = fma(acc[i, j], keep, weight * f32(value[j]))
+        m[i] = top
+
+# Attention for M fresh rows appended after a resident history, partitioned over history.
+# Partition `part` (of 64) absorbs, in ascending order, the history keys part, part + 64, ...
+# inside the row's visible windows, then the fresh keys part, part + 64, ... up to the row itself.
+# The 64 partition states merge in ascending partition order. A window selects the history keys
+# in [0, T) that it contains.
+fn attention_append_partitioned[M, T, G, KV, W, R](q: &tensor[M, KV, G, W] A,
+    k: &tensor[T, KV, W] A, v: &tensor[T, KV, W] A,
+    fresh_key: &tensor[M, KV, W] A, fresh_value: &tensor[M, KV, W] A,
+    visible: &tensor[M, R, 2] i32, result: &mut tensor[M, KV, G, W] A, scale: f32):
+    let mut pm = tensor[M, KV, 64, G] f32
+    let mut pl = tensor[M, KV, 64, G] f32
+    let mut pacc = tensor[M, KV, 64, G, W] f32
+    let mut pn = tensor[M, KV, 64] i32
+    parallel for rows in 0..M:
+        parallel for kv_heads in 0..KV:
+            parallel for part in 0..64:
+                let qt = q[rows, kv_heads]
+                let mut m = tensor[G] f32
+                let mut l = tensor[G] f32
+                let mut acc = tensor[G, W] f32
+                for i in 0..G:
+                    m[i] = -inf
+                    l[i] = 0.0
+                    for j in 0..W:
+                        acc[i, j] = 0.0
+                let mut absorbed = i32(0)
+                for t in 0..(T + 63) / 64:
+                    if t * 64 + part < T:
+                        for span in 0..R:
+                            if i32(t * 64 + part) >= visible[rows, span, 0] and i32(t * 64 + part) < visible[rows, span, 1]:
+                                attention_absorb(qt, k[t * 64 + part, kv_heads], v[t * 64 + part, kv_heads], m, l, acc, scale)
+                                absorbed = absorbed + 1
+                for t in 0..(M + 63) / 64:
+                    if t * 64 + part < M:
+                        if t * 64 + part < rows + 1:
+                            attention_absorb(qt, fresh_key[t * 64 + part, kv_heads], fresh_value[t * 64 + part, kv_heads], m, l, acc, scale)
+                            absorbed = absorbed + 1
+                pm[rows, kv_heads, part] = m
+                pl[rows, kv_heads, part] = l
+                pacc[rows, kv_heads, part] = acc
+                pn[rows, kv_heads, part] = absorbed
+    parallel for rows in 0..M:
+        parallel for kv_heads in 0..KV:
+            let mut m = tensor[G] f32
+            let mut l = tensor[G] f32
+            let mut acc = tensor[G, W] f32
+            for i in 0..G:
+                m[i] = -inf
+                l[i] = 0.0
+                for j in 0..W:
+                    acc[i, j] = 0.0
+            for part in 0..64:
+                if pn[rows, kv_heads, part] > 0:
+                    for i in 0..G:
+                        let top = max(m[i], pm[rows, kv_heads, part, i])
+                        let keep = exp(m[i] - top)
+                        let weight = exp(pm[rows, kv_heads, part, i] - top)
+                        l[i] = fma(l[i], keep, pl[rows, kv_heads, part, i] * weight)
+                        for j in 0..W:
+                            acc[i, j] = fma(acc[i, j], keep, pacc[rows, kv_heads, part, i, j] * weight)
+                        m[i] = top
+            let mut y = tensor[G, W] f32
+            for i in 0..G:
+                for j in 0..W:
+                    y[i, j] = acc[i, j] / l[i]
+            result[rows, kv_heads] = y
+
+fn probe[M, T, G, KV, W, R](q: &tensor[M, KV, G, W] f32,
+    k: &tensor[T, KV, W] f32, v: &tensor[T, KV, W] f32,
+    fresh_key: &tensor[M, KV, W] f32, fresh_value: &tensor[M, KV, W] f32,
+    visible: &tensor[M, R, 2] i32, result: &mut tensor[M, KV, G, W] f32, scale: f32):
+    attention_append_partitioned(q, k, v, fresh_key, fresh_value, visible, result, scale)
+
+# C-11 (IF I-93): residence is decided per promotable cohort site, never per list entry.
+# The two nests of `attention_append_partitioned` (verbatim, `engine/lib/attention.seismic`)
+# are two promotable barrier-stepped cohort sites of one entry whose workgroup-local bytes
+# over the Invocation envelope are W_part = 4G(W+2) and W_merge = 8G(W+1). On Metal
+# (max_workgroup_bytes 32768, threshold 3*32768/16 = 6144 B):
+#   invocation 1 (4B shape, G=4, W=256): W_part = 4128 promoted, W_merge = 8224 unpromoted;
+#   invocation 2 (35B shape, G=8, W=256): 8256 and 16448, both unpromoted;
+#   invocation 3 (decode, M=1, two KV heads, T=70 > 64 partitions, two windows): as 1;
+#   invocation 4 (G=2, W=2): 32 and 48 B, both promoted (pinned values).
+# Every invocation's outcome is the interpreter's, whichever twin each site runs.

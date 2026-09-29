@@ -1,0 +1,5 @@
+# std: yes
+# origin: test:validation:corpus/composition.seismic:std_linear
+# invoke std_linear: f32[2,8]=rand(85) ; f32[4,8]=rand(86) ; f32[2,4]=zero
+fn std_linear[M, N, K](x: &tensor[M, K] f32, weight: &tensor[N, K] f32, y: &mut tensor[M, N] f32):
+    linear(x, weight, y)

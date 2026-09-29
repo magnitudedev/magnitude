@@ -1,0 +1,98 @@
+# origin: test:seismic-runtime:runtime/src/feedback/payload_tests.rs:payloads
+# invoke scalar: bf16:0x7f81 ; bf16:0x8001 ; bool:false ; range:0..0
+# pin: result = bf16[]=0x7f81
+# invoke scalar: bf16:0xffa3 ; bf16:0x1 ; bool:false ; range:0..0
+# pin: result = bf16[]=0xffa3
+# invoke scalar: bf16:0x7fc1 ; bf16:0x8000 ; bool:false ; range:0..0
+# pin: result = bf16[]=0x7fc1
+# invoke scalar: bf16:0xffe3 ; bf16:0x0 ; bool:false ; range:0..0
+# pin: result = bf16[]=0xffe3
+# invoke scalar: bf16:0x0 ; bf16:0xffe3 ; bool:false ; range:0..0
+# pin: result = bf16[]=0x0
+# invoke scalar: bf16:0x8000 ; bf16:0x7fc1 ; bool:false ; range:0..0
+# pin: result = bf16[]=0x8000
+# invoke scalar: bf16:0x1 ; bf16:0xffa3 ; bool:false ; range:0..0
+# pin: result = bf16[]=0x1
+# invoke scalar: bf16:0x8001 ; bf16:0x7f81 ; bool:false ; range:0..0
+# pin: result = bf16[]=0x8001
+# invoke tensor: bf16[8]=0x7f81,0xffa3,0x7fc1,0xffe3,0x0,0x8000,0x1,0x8001 ; bf16[8]=0x8001,0x1,0x8000,0x0,0xffe3,0x7fc1,0xffa3,0x7f81 ; bool:false ; range:0..0
+# pin: result.0 = bf16[8]=0x7f81,0xffa3,0x7fc1,0xffe3,0x0,0x8000,0x1,0x8001
+# pin: result.1 = bf16[]=0x7f81
+# invoke scalar: bf16:0x7f81 ; bf16:0x8001 ; bool:true ; range:0..0
+# pin: result = bf16[]=0x8001
+# invoke scalar: bf16:0xffa3 ; bf16:0x1 ; bool:true ; range:0..0
+# pin: result = bf16[]=0x1
+# invoke scalar: bf16:0x7fc1 ; bf16:0x8000 ; bool:true ; range:0..0
+# pin: result = bf16[]=0x8000
+# invoke scalar: bf16:0xffe3 ; bf16:0x0 ; bool:true ; range:0..0
+# pin: result = bf16[]=0x0
+# invoke scalar: bf16:0x0 ; bf16:0xffe3 ; bool:true ; range:0..0
+# pin: result = bf16[]=0xffe3
+# invoke scalar: bf16:0x8000 ; bf16:0x7fc1 ; bool:true ; range:0..0
+# pin: result = bf16[]=0x7fc1
+# invoke scalar: bf16:0x1 ; bf16:0xffa3 ; bool:true ; range:0..0
+# pin: result = bf16[]=0xffa3
+# invoke scalar: bf16:0x8001 ; bf16:0x7f81 ; bool:true ; range:0..0
+# pin: result = bf16[]=0x7f81
+# invoke tensor: bf16[8]=0x7f81,0xffa3,0x7fc1,0xffe3,0x0,0x8000,0x1,0x8001 ; bf16[8]=0x8001,0x1,0x8000,0x0,0xffe3,0x7fc1,0xffa3,0x7f81 ; bool:true ; range:0..0
+# pin: result.0 = bf16[8]=0x8001,0x1,0x8000,0x0,0xffe3,0x7fc1,0xffa3,0x7f81
+# pin: result.1 = bf16[]=0x8001
+# invoke scalar: bf16:0x7f81 ; bf16:0x8001 ; bool:false ; range:0..2
+# pin: result = bf16[]=0x7f81
+# invoke scalar: bf16:0xffa3 ; bf16:0x1 ; bool:false ; range:0..2
+# pin: result = bf16[]=0xffa3
+# invoke scalar: bf16:0x7fc1 ; bf16:0x8000 ; bool:false ; range:0..2
+# pin: result = bf16[]=0x7fc1
+# invoke scalar: bf16:0xffe3 ; bf16:0x0 ; bool:false ; range:0..2
+# pin: result = bf16[]=0xffe3
+# invoke scalar: bf16:0x0 ; bf16:0xffe3 ; bool:false ; range:0..2
+# pin: result = bf16[]=0x0
+# invoke scalar: bf16:0x8000 ; bf16:0x7fc1 ; bool:false ; range:0..2
+# pin: result = bf16[]=0x8000
+# invoke scalar: bf16:0x1 ; bf16:0xffa3 ; bool:false ; range:0..2
+# pin: result = bf16[]=0x1
+# invoke scalar: bf16:0x8001 ; bf16:0x7f81 ; bool:false ; range:0..2
+# pin: result = bf16[]=0x8001
+# invoke tensor: bf16[8]=0x7f81,0xffa3,0x7fc1,0xffe3,0x0,0x8000,0x1,0x8001 ; bf16[8]=0x8001,0x1,0x8000,0x0,0xffe3,0x7fc1,0xffa3,0x7f81 ; bool:false ; range:0..2
+# pin: result.0 = bf16[8]=0x7f81,0xffa3,0x7fc1,0xffe3,0x0,0x8000,0x1,0x8001
+# pin: result.1 = bf16[]=0x7f81
+# invoke scalar: bf16:0x7f81 ; bf16:0x8001 ; bool:true ; range:0..2
+# pin: result = bf16[]=0x8001
+# invoke scalar: bf16:0xffa3 ; bf16:0x1 ; bool:true ; range:0..2
+# pin: result = bf16[]=0x1
+# invoke scalar: bf16:0x7fc1 ; bf16:0x8000 ; bool:true ; range:0..2
+# pin: result = bf16[]=0x8000
+# invoke scalar: bf16:0xffe3 ; bf16:0x0 ; bool:true ; range:0..2
+# pin: result = bf16[]=0x0
+# invoke scalar: bf16:0x0 ; bf16:0xffe3 ; bool:true ; range:0..2
+# pin: result = bf16[]=0xffe3
+# invoke scalar: bf16:0x8000 ; bf16:0x7fc1 ; bool:true ; range:0..2
+# pin: result = bf16[]=0x7fc1
+# invoke scalar: bf16:0x1 ; bf16:0xffa3 ; bool:true ; range:0..2
+# pin: result = bf16[]=0xffa3
+# invoke scalar: bf16:0x8001 ; bf16:0x7f81 ; bool:true ; range:0..2
+# pin: result = bf16[]=0x7f81
+# invoke tensor: bf16[8]=0x7f81,0xffa3,0x7fc1,0xffe3,0x0,0x8000,0x1,0x8001 ; bf16[8]=0x8001,0x1,0x8000,0x0,0xffe3,0x7fc1,0xffa3,0x7f81 ; bool:true ; range:0..2
+# pin: result.0 = bf16[8]=0x8001,0x1,0x8000,0x0,0xffe3,0x7fc1,0xffa3,0x7f81
+# pin: result.1 = bf16[]=0x8001
+fn identity(value: bf16) -> bf16:
+    return value
+
+fn scalar(value: bf16, alternate: bf16, choose: bool, times: range[3]) -> bf16:
+    let mut result = identity(value)
+    if choose:
+        result = identity(alternate)
+    for iteration in times:
+        result = identity(result)
+    return result
+
+fn tensor(x: &tensor[8] bf16, y: &tensor[8] bf16, choose: bool, times: range[3]) -> (tensor[8] bf16, bf16):
+    let mut result = zeros_like(x)
+    parallel for i in 0..8:
+        let mut value = identity(x[i])
+        if choose:
+            value = identity(y[i])
+        for iteration in times:
+            value = identity(value)
+        result[i] = value
+    return (result, identity(result[0]))

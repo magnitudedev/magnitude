@@ -1,0 +1,5 @@
+# origin: H-35
+# invoke: f32[2]=seq ; f32[2]=zero
+fn probe[N](x: &tensor[N] f32, y: &mut tensor[N] f32):
+    for i in 0..N:
+        y[i] = x[i] + 1.0

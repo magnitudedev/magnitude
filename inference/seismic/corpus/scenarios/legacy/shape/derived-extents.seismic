@@ -1,0 +1,7 @@
+# origin: test:validation:corpus/shape.seismic:derived_extents
+# invoke derived_extents: f32[7]=seq ; f32[2]=zero ; f32[3]=zero
+fn derived_extents[P, S](x: &tensor[2 * P + S] f32, pairs: &mut tensor[P] f32, tail: &mut tensor[S] f32):
+    parallel for i in 0..P:
+        pairs[i] = x[i] + x[i + P]
+    parallel for i in 0..S:
+        tail[i] = x[2 * P + i]

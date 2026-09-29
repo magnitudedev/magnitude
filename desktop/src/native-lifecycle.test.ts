@@ -16,5 +16,5 @@ describe.skipIf(!process.env.MAGNITUDE_TEST_DESKTOP_EXECUTABLE || process.platfo
       child.once("exit", code => resolve({ code, output }))
     })
     expect(result.code, result.output).toBe(0)
-  }, 120_000)
+  }, 8 * 60_000)
 })

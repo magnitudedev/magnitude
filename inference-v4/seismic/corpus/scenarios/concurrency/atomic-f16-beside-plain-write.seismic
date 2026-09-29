@@ -1,0 +1,7 @@
+# origin: C17:atomic_neighbor_plain_write_f16
+# invoke: f16[4]=1,2,3,4 ; f16[8]=zero
+# pin: out = f16[8]=10,0,0,0,1,2,3,4
+fn probe(x: &tensor[4] f16, out: &mut tensor[8] f16):
+    parallel for i in 0..4:
+        atomic(add, out[0], x[i])
+        out[i + 4] = x[i]

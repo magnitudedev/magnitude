@@ -1,9 +1,5 @@
 import { appendFile } from "node:fs/promises"
-import { backendPacks, releaseHosts } from "../src/targets"
-
-const selectedPacks = process.argv.includes("--windows-backends-only")
-  ? backendPacks.filter(pack => pack.host === "windows-x64-msvc")
-  : backendPacks
+import { releaseHosts } from "../src/targets"
 
 const matrices = {
   hosts: {
@@ -11,15 +7,6 @@ const matrices = {
       id: host.id,
       runner: host.runner,
       rustTarget: host.rustTarget,
-    })),
-  },
-  backends: {
-    include: selectedPacks.map((pack) => ({
-      id: pack.id,
-      host: pack.host,
-      backend: pack.backend,
-      runner: pack.runner,
-      toolkit: "cuda" in pack ? pack.cuda.toolkitVersion : "",
     })),
   },
   appleHosts: {
@@ -40,7 +27,6 @@ const matrices = {
 const output = process.env.GITHUB_OUTPUT
 if (output) {
   await appendFile(output, `hosts=${JSON.stringify(matrices.hosts)}\n`)
-  await appendFile(output, `backends=${JSON.stringify(matrices.backends)}\n`)
   await appendFile(output, `appleHosts=${JSON.stringify(matrices.appleHosts)}\n`)
   await appendFile(output, `linuxHosts=${JSON.stringify(matrices.linuxHosts)}\n`)
 } else {

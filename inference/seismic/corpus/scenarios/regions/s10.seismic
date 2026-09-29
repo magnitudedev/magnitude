@@ -1,0 +1,7 @@
+# origin: C14:s10
+# invoke: f32[5]=zero
+fn probe[N](x: &mut tensor[N] f32) -> f32:
+    let a = x + x
+    parallel for i in 0..N:
+        x[i] = 0.0
+    return reduce(a, 0, sum)

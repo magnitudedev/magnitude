@@ -1,0 +1,35 @@
+// Decode expansion of up-only experts (M <= 8): workgroup row y = choice
+// (m, k), a K1 GEMV over the feature tile `x` of expert routes[m, k]'s up
+// rows with the Activated epilogue A(act(A(up))). The Vulkan form of
+// `metal/routed_up.metal`; lane groups are whole subgroups.
+#include "lib/core/activation.glsl"
+#include "lib/routed/routed.glsl"
+#include "lib/routed/expert_up.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define ROUTED_ACT ELEMENT_ACT
+#else
+#error "routed_up requires a bf16 or f16 activation"
+#endif
+
+void routed_up() {
+    const uint rows_per_tile = SEISMIC_SUBGROUPS * SEISMIC_TUNE_ROWS;
+    const uint tile = gl_WorkGroupID.x;
+    if (uint64_t(tile) * rows_per_tile >= SEISMIC_DIM_F)
+        return;
+    const uint hidden = uint(SEISMIC_DIM_H);
+    const uint64_t m = gl_WorkGroupID.y / SEISMIC_DIM_K, k = gl_WorkGroupID.y % SEISMIC_DIM_K;
+    const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
+        + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
+    const projection_prologue x = projection_plain(ROUTED_ACT,
+        SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED) + m * SEISMIC_NORMALIZED_STRIDE_0 * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
+        SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
+    const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), EU_GEOMETRY,
+        routed_expert_row(expert, SEISMIC_DIM_F), hidden);
+    const projection_epilogue out_ = projection_activated(ROUTED_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
+            + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
+        0ul, SEISMIC_RESULT_0_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION),
+        element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE) + expert * SEISMIC_UP_SCALE_STRIDE_0 * 4ul), 1.0);
+    projection_gemv_bounded(EU_KIND, EU_KIND, false, SEISMIC_TUNE_ROWS, 32u, 1u, PROJECTION_NORM_NONE, x, out_, up,
+        up, 1u, uint(SEISMIC_DIM_F), hidden, tile);
+}

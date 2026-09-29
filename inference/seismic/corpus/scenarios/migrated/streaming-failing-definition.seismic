@@ -1,0 +1,8 @@
+# origin: test:seismic-compiler:compiler/src/portable/streaming.rs:potentially_failing_tensor_definition_does_not_move_into_a_consumer
+# invoke: i32[4]=1,2,3,4
+# expect: returned
+# invoke: i32[4]=1,0,3,4
+# expect: failed
+fn probe[N](x: &tensor[N] i32) -> i32:
+    let a = x / x
+    return reduce(a, 0, sum)

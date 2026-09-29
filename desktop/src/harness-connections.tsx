@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./error-notice"
 import { pageLayout } from "./page-layout"
 import type { DesktopHarnessConnection, HarnessId } from "@magnitudedev/client-common"
 import { Brand } from "effect"
@@ -50,9 +51,8 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
             <div><h3 className="text-lg font-semibold">{row.name}</h3>
               <p className={`mt-1 flex items-center gap-2 text-sm ${installed && row.inspection._tag === "Connected" ? "text-green-600 dark:text-green-400" : needsAttention ? "text-orange-600 dark:text-orange-400" : "text-slate-500"}`}>
                 {installed && <span aria-hidden="true" className={`size-2 shrink-0 rounded-full ${row.inspection._tag === "Connected" ? "bg-green-600 dark:bg-green-400" : needsAttention ? "bg-orange-500" : "bg-slate-400"}`} />}
-                {!installed ? "Not installed" : row.inspection._tag === "Connected" ? "Connected" : row.inspection._tag === "Unavailable" ? "Could not verify connection" : needsAttention ? "Connection needs repair" : "Not connected"}
+                {!installed ? "Not installed" : row.inspection._tag === "Connected" ? "Connected" : row.inspection._tag === "Unavailable" ? "Status unavailable" : needsAttention ? "Connection needs repair" : "Not connected"}
               </p>
-              {installed && row.inspection._tag === "Unavailable" && <p className="mt-1 text-xs text-slate-500">{row.inspection.reason}</p>}
             </div>
           </div>
           <div className="ml-auto flex shrink-0 flex-wrap items-center justify-end gap-3">
@@ -63,6 +63,7 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
               : <a href={installationDocs[Brand.unbranded(row.id)]} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm text-slate-500 hover:underline">Install {row.name}<ArrowUpRightIcon aria-hidden="true" className="size-4" /></a>}
           </div>
         </div>
+              {installed && row.inspection._tag === "Unavailable" && <ErrorNotice title="Couldn’t verify this connection" description="The agent’s configuration could not be read or validated. Check it before reconnecting." className="mt-2" />}
         {installed && row.inspection._tag === "Connected" && <div className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750"><HarnessCommand harness={row.id} name={row.name} models={models} defaultModel={defaultModel} platform={platform} /><div className="relative mt-3 text-xs"><details className="group"><summary className="w-fit cursor-pointer list-none hover:text-slate-700 dark:hover:text-slate-300 [&::-webkit-details-marker]:hidden"><span aria-hidden="true" className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>Configuration files</summary><ul className="mt-2 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono text-xs">{file}</li>)}</ul></details>{models.length > 0 && <span className="absolute right-0 top-0 max-w-[calc(100%-9rem)] truncate text-right text-slate-500">Run this in {platform === "win32" ? "PowerShell" : "your terminal"} from your project folder.</span>}</div></div>}
 
       </article>})}</div>

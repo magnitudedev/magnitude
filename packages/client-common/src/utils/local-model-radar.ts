@@ -53,9 +53,10 @@ const speculationValue = (model: LocalModel): number => {
     onNone: () => 0,
     onSome: (method) => {
       switch (method._tag) {
-        case "Mtp": return 1 / 3
-        case "DFlash": return 2 / 3
-        case "DSpark": return 1
+        case "Mtp": return 1 / 4
+        case "DFlash": return 2 / 4
+        case "DSpark": return 3 / 4
+        case "DFlash2": return 1
       }
     },
   })

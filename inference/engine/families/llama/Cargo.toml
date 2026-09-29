@@ -1,0 +1,13 @@
+[package]
+name = "magnitude-family-llama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "../../artifacts" }
+magnitude-family-common = { path = "../common" }
+magnitude-family-contracts = { path = "../contracts" }
+
+[dev-dependencies]
+magnitude-family-common = { path = "../common", features = ["catalog-headers"] }

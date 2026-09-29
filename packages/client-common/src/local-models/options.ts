@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import { parseModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
+import { localModelIsAvailable, parseModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
 import type {
   LocalInferenceHardware,
   LocalModel,
@@ -89,7 +89,7 @@ export const rankedLocalModelOptions = (
 ): readonly LocalModelOption[] => {
   const rankedCatalog = options
     .flatMap((option): readonly { readonly option: LocalModelOption; readonly utility: number }[] => {
-      if (option.model._tag !== "Catalog") return []
+      if (option.model._tag !== "Catalog" || !localModelIsAvailable(option.model)) return []
       const serving = option.model.servingState
       if (serving._tag !== "Assessed"
         || serving.assessment._tag !== "Fits"
@@ -146,6 +146,7 @@ export const localModelOptions = (
   const representedModelIds = new Set(installed.map(({ model }) => model.modelId))
   const downloadable = models.models.flatMap((model): readonly LocalModelOption[] => {
     if (model._tag !== "Catalog"
+      || !localModelIsAvailable(model)
       || representedModelIds.has(model.modelId)
       || model.servingState._tag !== "Assessed"
       || model.servingState.assessment._tag !== "Fits"

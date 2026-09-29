@@ -1,0 +1,6 @@
+# origin: test:validation:corpus/shape.seismic:shared_dimensions
+# invoke shared_dimensions: f32[2,3]=seq ; f32[3,2]=seq ; f32[2,3]=zero
+fn shared_dimensions[M, N](x: &tensor[M, N] f32, y: &tensor[N, M] f32, z: &mut tensor[M, N] f32):
+    parallel for i in 0..M:
+        parallel for j in 0..N:
+            z[i, j] = x[i, j] + y[j, i]

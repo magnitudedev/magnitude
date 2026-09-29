@@ -1,0 +1,123 @@
+--- a/common/peg-parser.h
++++ b/common/peg-parser.h
+@@ -114,6 +114,12 @@
+     size_t size() const { return nodes_.size(); }
+ 
+     void clear() { nodes_.clear(); }
++    void truncate(size_t count) { nodes_.resize(count); }
++    void rebase(std::string_view input) {
++        for (auto & node : nodes_) {
++            node.text = input.substr(node.start, node.end - node.start);
++        }
++    }
+ 
+     void visit(common_peg_ast_id id, const common_peg_ast_visitor & visitor) const;
+     void visit(const common_peg_parse_result & result, const common_peg_ast_visitor & visitor) const;
+@@ -180,7 +186,38 @@
+     // named rule nodes. Never suppress those nodes without an explicit opt-in.
+     bool tags_only = false;
+     size_t boundary_reads = 0;
+-    struct scan_progress { size_t position; int count; };
++    struct scan_progress {
++        size_t position;
++        int count;
++        std::vector<common_peg_ast_id> nodes;
++    };
++    // Stable nodes are immutable. The tail above this watermark is provisional
++    // and discarded before the next append. Bounds limit retained cache storage;
++    // exhausting a cache changes cost, never accepted language or output.
++    static constexpr size_t max_retained_nodes = 262144;
++    size_t retained_nodes = 0;
++    const char * input_storage = nullptr;
++    std::map<std::pair<common_peg_parser_id, size_t>, common_peg_parse_result> completed;
++
++    bool retain_nodes() {
++        if (ast.size() > max_retained_nodes) { return false; }
++        retained_nodes = ast.size();
++        return true;
++    }
++    void begin_parse() {
++        if (!append_only) { return; }
++        if (ast.size() < retained_nodes) {
++            // Explicitly clearing the caller-owned AST resets its dependent caches.
++            retained_nodes = 0;
++            completed.clear();
++            scans.clear();
++        }
++        ast.truncate(retained_nodes);
++        if (input_storage != input.data()) { ast.rebase(input); }
++        input_storage = input.data();
++        boundary_reads = 0;
++        parse_depth = 0;
++    }
+     std::map<std::pair<common_peg_parser_id, size_t>, scan_progress> scans;
+     scan_progress * scan(common_peg_parser_id parser, size_t start) {
+         if (!append_only) { return nullptr; }
+--- a/common/peg-parser.cpp
++++ b/common/peg-parser.cpp
+@@ -374,7 +374,7 @@
+         auto pos = progress ? progress->position : start_pos;
+         int match_count = progress ? progress->count : 0;
+         bool stable = true;
+-        std::vector<common_peg_ast_id> nodes;
++        std::vector<common_peg_ast_id> nodes = progress ? progress->nodes : std::vector<common_peg_ast_id>{};
+ 
+         // Try to match up to max_count times (or unlimited if max_count is -1)
+         while (p.max_count == -1 || match_count < p.max_count) {
+@@ -388,7 +388,7 @@
+ 
+             const auto boundary_reads = ctx.boundary_reads;
+             auto result = arena.parse(p.child, ctx, pos);
+-            stable &= result.nodes.empty() && ctx.boundary_reads == boundary_reads;
++            stable &= ctx.boundary_reads == boundary_reads;
+ 
+             if (ctx.is_debug()) {
+                 fprintf(stderr, "%sREPEAT iter %d: %s at %zu->%zu, nodes=%zu\n", debug_indent().c_str(), match_count,
+@@ -411,9 +411,16 @@
+ 
+                 pos = result.end;
+                 match_count++;
+-                // Only omit iterations with no observable AST and no EOF-dependent
+-                // decision. Provisional choices must be reevaluated after append.
+-                if (stable && progress) { *progress = {pos, match_count}; }
++                // Retain complete iterations, including their AST. Any observation
++                // of the unfinished boundary (even in a failed alternative) makes
++                // this and all subsequent iterations provisional.
++                if (stable && progress && ctx.retain_nodes()) {
++                    progress->position = pos;
++                    progress->count = match_count;
++                    progress->nodes.insert(progress->nodes.end(), result.nodes.begin(), result.nodes.end());
++                } else if (stable && progress) {
++                    stable = false;
++                }
+                 continue;
+             }
+ 
+@@ -824,14 +831,26 @@
+     if (root_ == COMMON_PEG_INVALID_PARSER_ID) {
+         throw std::runtime_error("No root parser set");
+     }
++    ctx.begin_parse();
+     return parse(root_, ctx, start);
+ }
+ 
+ common_peg_parse_result common_peg_arena::parse(common_peg_parser_id id, common_peg_parse_context & ctx, size_t start) const {
+     // Execute parser
+     const auto & parser = parsers_.at(id);
++    const auto key = std::make_pair(id, start);
++    const bool memoize = ctx.append_only && std::holds_alternative<common_peg_rule_parser>(parser);
++    if (memoize) {
++        if (auto found = ctx.completed.find(key); found != ctx.completed.end()) { return found->second; }
++    }
++    const auto boundary_reads = ctx.boundary_reads;
+     parser_executor exec(*this, ctx, start, id);
+-    return std::visit(exec, parser);
++    auto result = std::visit(exec, parser);
++    if (memoize && result.success() && result.end > start &&
++        ctx.boundary_reads == boundary_reads && ctx.completed.size() < 65536 && ctx.retain_nodes()) {
++        ctx.completed.emplace(key, result);
++    }
++    return result;
+ }
+ 
+ common_peg_parser_id common_peg_arena::resolve_ref(common_peg_parser_id id) {

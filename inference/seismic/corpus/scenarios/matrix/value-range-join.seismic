@@ -1,0 +1,11 @@
+# cell: value-range/join
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; range:2..6 ; range:0..3 ; bool:true
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; range:2..6 ; range:0..3 ; bool:false
+fn probe(x: &tensor[4, 8] f32, out: &mut tensor[4] f32, r: range[8], t: range[8], c: bool):
+    let mut chosen = r
+    if c:
+        chosen = t
+    let mut s = 0.0
+    for j in chosen:
+        s = s + x[0, j]
+    out[0] = s

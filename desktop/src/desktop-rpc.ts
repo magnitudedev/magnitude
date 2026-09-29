@@ -1,11 +1,10 @@
 import { Rpc, RpcGroup, type RpcClient, type RpcClientError } from "@effect/rpc"
 import { atMostOnce, replaySafe } from "@magnitudedev/sdk"
-import { AppearancePreference, ApplicationSnapshot, LoginStartupState, ApplicationMemoryObservation, MachineIdentityObservation, ModelStorageSettings, NetworkAccessSettings, NetworkAccessChange } from "@magnitudedev/sdk/desktop-host"
-import { DesktopApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, DesktopUpdateState, HarnessIdSchema } from "@magnitudedev/client-common"
+import { AppearancePreference, ApplicationSnapshot, LoginStartupState, ApplicationMemoryObservation, MachineIdentityObservation, ModelStorageSettings, NetworkAccessSettings, NetworkAccessChange, DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
+import { DesktopApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, HarnessIdSchema, DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common/desktop/contracts"
 import { Schema } from "effect"
 
-export { DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common"
-import { DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common"
+export { DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common/desktop/contracts"
 export class HostError extends Schema.TaggedError<HostError>()("HostError", { message: Schema.String }) {}
 const Unit = Schema.Struct({})
 export const InferenceHostRpcs = RpcGroup.make(
@@ -52,7 +51,7 @@ export interface DesktopApi {
   readonly platform: string
   readonly observe: (value: (snapshot: typeof ApplicationSnapshot.Encoded) => void, error: (message: string) => void) => () => void
   readonly actions: (value: (action: typeof ApplicationAction.Type) => void) => () => void
-  readonly presentModel: (value: typeof ModelTrayPresentation.Type) => Promise<void>
+  readonly presentModel: (value: typeof ModelTrayPresentation.Encoded) => Promise<void>
   readonly getAppearance: () => Promise<AppearancePreference>
   readonly setAppearance: (preference: AppearancePreference) => Promise<void>
   readonly getModelStorage: () => Promise<ModelStorageSettings>

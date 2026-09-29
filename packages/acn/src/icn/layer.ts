@@ -1,10 +1,12 @@
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups";
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native";
+import { FileSystem } from "@effect/platform";
+import { ModelAssessmentsSnapshot } from "@magnitudedev/icn-protocol/schemas";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { nativeWindowsJobOwnerLayer, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native";
 import { WindowsIcnChildSpawner } from "./windows-child";
-import { Duration, Effect, Layer, Option, Ref } from "effect";
+import { Duration, Effect, Layer, Option, Ref, Schema } from "effect";
 import { MagnitudeStorage, resolveModelStoreLocation } from "@magnitudedev/storage";
 import {
   type AcnInstallationPlan,
@@ -15,6 +17,7 @@ import {
   IcnBinaryResolutionConfig,
   IcnLifecycleConfig,
   IcnProcess,
+  IcnModelAssessments,
   makeIcnCatalog,
   makeIcnCatalogInstallations,
   makeIcnDiscovery,
@@ -33,25 +36,42 @@ import { resolveHuggingFaceCacheRoots } from "./hugging-face-cache";
 import { AcnServiceLifecycle } from "../service-lifecycle";
 
 const artifactProgress = (
-  artifact: "Base" | "Accelerator",
   event: Extract<ArtifactInstallationEvent, { readonly _tag: "Downloading" }>,
   plan: AcnInstallationPlan
-): AcnStartupProgress => {
-  const completedBeforeArtifact =
-    artifact === "Accelerator"
-      ? plan.inferenceEngineBytes - event.progress.totalBytes
-      : 0;
-  return {
-    completed: Math.min(
-      plan.inferenceEngineBytes,
-      completedBeforeArtifact + event.progress.acceptedBytes
-    ),
-    totalBytes: plan.inferenceEngineBytes,
-    unit: "Bytes",
-    attempt: Option.some(event.progress.attempt),
-  };
-};
+): AcnStartupProgress => ({
+  completed: Math.min(plan.inferenceEngineBytes, event.progress.acceptedBytes),
+  totalBytes: plan.inferenceEngineBytes,
+  unit: "Bytes",
+  attempt: Option.some(event.progress.attempt),
+});
 const defaultDataDir = () => join(homedir(), ".magnitude");
+const AcceptanceAssessmentDiagnostics = Schema.Struct({
+  assessments: ModelAssessmentsSnapshot,
+  inferenceDiagnosticTail: Schema.String,
+});
+
+const acceptanceAssessmentDiagnostics = Layer.scopedDiscard(Effect.gen(function* () {
+  const path = process.env.MAGNITUDE_ACCEPTANCE_ASSESSMENT_DIAGNOSTICS;
+  if (!path) return;
+  const fs = yield* FileSystem.FileSystem;
+  const assessments = yield* IcnModelAssessments;
+  const icnProcess = yield* IcnProcess;
+  yield* Effect.gen(function* () {
+    for (;;) {
+      yield* Effect.gen(function* () {
+        const snapshot = (yield* assessments.get).state;
+        const inferenceDiagnosticTail = yield* icnProcess.diagnosticTail;
+        const report = yield* Schema.encode(Schema.parseJson(AcceptanceAssessmentDiagnostics))({
+          assessments: snapshot,
+          inferenceDiagnosticTail,
+        });
+        yield* fs.writeFileString(`${path}.pending`, report);
+        yield* fs.rename(`${path}.pending`, path);
+      }).pipe(Effect.catchAll(() => Effect.void));
+      yield* Effect.sleep("5 seconds");
+    }
+  }).pipe(Effect.forkScoped);
+}));
 
 const binarySource = (dataDir: string) => {
   const explicit = process.env.MAGNITUDE_ICN_PATH?.trim();
@@ -208,11 +228,7 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
                     plan: current.plan.value,
                   },
                   Option.some(
-                    artifactProgress(
-                      event.artifact,
-                      event.event,
-                      current.plan.value
-                    )
+                    artifactProgress(event.event, current.plan.value)
                   )
                 );
               }
@@ -257,6 +273,9 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
   const withCatalog = Layer.provideMerge(makeIcnCatalog(), withHardware);
   const withModels = Layer.provideMerge(makeIcnDiscovery(), withCatalog);
   const withAssessments = Layer.provideMerge(makeIcnModelAssessments(), withModels);
-  const withInstallations = Layer.provideMerge(makeIcnCatalogInstallations(), withAssessments);
+  const withDiagnostics = globalThis.process.env.MAGNITUDE_ACCEPTANCE_ASSESSMENT_DIAGNOSTICS
+    ? Layer.provideMerge(acceptanceAssessmentDiagnostics, withAssessments)
+    : withAssessments;
+  const withInstallations = Layer.provideMerge(makeIcnCatalogInstallations(), withDiagnostics);
   return Layer.provideMerge(IcnInstancesLive, withInstallations);
 };

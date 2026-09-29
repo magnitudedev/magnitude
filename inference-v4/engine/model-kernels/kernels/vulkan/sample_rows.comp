@@ -1,0 +1,141 @@
+// sample_rows: two-launch partition/merge selection. The Vulkan form of
+// `cuda/sample_rows.cu`.
+//   sample_rows_partition (PARTS x M workgroups): each workgroup scans its
+//     contiguous vocabulary slice, applies the mask of a constrained row and
+//     the Philox4x32-10 Gumbel draw (counter = token, draws[3..5]; key =
+//     draws[1..2]) and keeps its winner (score bits, token, nonfinite flag),
+//     ties to the lower token.
+//   sample_rows_merge (M invocations): merges the partitions in ascending
+//     order, preserving the winning score bits, and publishes (token, status):
+//     0 success, 1 empty, 2 nonfinite source.
+// The token counter is the vocabulary coordinate, so partitioning never
+// changes a draw and the result is independent of PARTS and WIDTH.
+#include <seismic/element.glsl>
+
+#define SAMPLE_NO_TOKEN 0xffffffffu
+#define SAMPLE_INF uintBitsToFloat(0x7f800000u)
+
+float sample_gumbel_score(float value, uint token, uint64_t draw, uint64_t stride) {
+    if (element_u32_at(draw) != 1u)
+        return value;
+    uint c0 = token, c1 = element_u32_at(draw + 3ul * stride * 4ul), c2 = element_u32_at(draw + 4ul * stride * 4ul),
+         c3 = element_u32_at(draw + 5ul * stride * 4ul);
+    uint k0 = element_u32_at(draw + stride * 4ul), k1 = element_u32_at(draw + 2ul * stride * 4ul);
+    [[unroll]] for (int round = 0; round < 10; ++round) {
+        uint hi0, lo0, hi1, lo1;
+        umulExtended(3528531795u, c0, hi0, lo0);
+        umulExtended(3449720151u, c2, hi1, lo1);
+        const uint next0 = hi1 ^ c1 ^ k0;
+        const uint next2 = hi0 ^ c3 ^ k1;
+        c0 = next0;
+        c1 = lo1;
+        c2 = next2;
+        c3 = lo0;
+        k0 += 2654435769u;
+        k1 += 3144134277u;
+    }
+    const float draw_uniform = (float(c0 >> 9) + 0.5) * 0.00000011920928955078125;
+    return value - log(-log(draw_uniform));
+}
+
+// A candidate (score, token) replaces the best when it has a higher score, or
+// an equal score at a lower token.
+bool sample_better(float score, uint token, float best_score, uint best_token) {
+    return token != SAMPLE_NO_TOKEN
+        && (best_token == SAMPLE_NO_TOKEN || score > best_score || (score == best_score && token < best_token));
+}
+
+// The subgroup's best (score, token) and the union of its nonfinite flags;
+// every lane receives them.
+void sample_subgroup_best(inout float score, inout uint token, inout uint bad) {
+    [[unroll]] for (uint offset = 16u; offset > 0u; offset >>= 1) {
+        const float other_score = subgroupShuffleXor(score, offset);
+        const uint other_token = subgroupShuffleXor(token, offset);
+        const uint other_bad = subgroupShuffleXor(bad, offset);
+        if (sample_better(other_score, other_token, score, token)) {
+            score = other_score;
+            token = other_token;
+        }
+        bad |= other_bad;
+    }
+}
+
+// Shared (u32 words): per subgroup (score bits, token, bad).
+void sample_rows_partition() {
+    const uint64_t logits = SEISMIC_PTR(SEISMIC_BUFFER_LOGITS);
+    const uint64_t mask = SEISMIC_PTR(SEISMIC_BUFFER_MASK);
+    const uint64_t draws = SEISMIC_PTR(SEISMIC_BUFFER_DRAWS);
+    const uint64_t partials = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS);
+    const uint64_t row = gl_WorkGroupID.y;
+    const uint part = gl_WorkGroupID.x;
+    const uint vocabulary = uint(SEISMIC_DIM_V);
+    const uint span = (vocabulary + SEISMIC_TUNE_PARTS - 1u) / SEISMIC_TUNE_PARTS;
+    const uint begin = min(part * span, vocabulary);
+    const uint end = min(begin + span, vocabulary);
+    const uint64_t line = logits + row * SEISMIC_LOGITS_STRIDE_0 * 4ul;
+    const uint64_t bits = mask + row * SEISMIC_MASK_STRIDE_0 * 4ul;
+    const uint64_t draw = draws + row * SEISMIC_DRAWS_STRIDE_0 * 4ul;
+    // An unconstrained row admits every token; its mask row is never read.
+    const bool masked = element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_CONSTRAINED), row * SEISMIC_CONSTRAINED_STRIDE_0) != 0;
+    float score = -SAMPLE_INF;
+    uint token = SAMPLE_NO_TOKEN;
+    uint bad = 0u;
+    for (uint t = begin + gl_LocalInvocationIndex; t < end; t += gl_WorkGroupSize.x) {
+        const float value = element_f32_at(line + uint64_t(t) * SEISMIC_LOGITS_STRIDE_1 * 4ul);
+        bad |= (isnan(value) || value == SAMPLE_INF) ? 1u : 0u;
+        if (!(value > -SAMPLE_INF && value < SAMPLE_INF))
+            continue;
+        if (masked && ((element_u32_at(bits + uint64_t(t / 32u) * SEISMIC_MASK_STRIDE_1 * 4ul) >> (t % 32u)) & 1u) == 0u)
+            continue;
+        const float candidate = sample_gumbel_score(value, t, draw, SEISMIC_DRAWS_STRIDE_1);
+        if (sample_better(candidate, t, score, token)) {
+            score = candidate;
+            token = t;
+        }
+    }
+    sample_subgroup_best(score, token, bad);
+    if (SEISMIC_LANE == 0u) {
+        seismic_shared_u32[3u * SEISMIC_SUBGROUP] = floatBitsToUint(score);
+        seismic_shared_u32[3u * SEISMIC_SUBGROUP + 1u] = token;
+        seismic_shared_u32[3u * SEISMIC_SUBGROUP + 2u] = bad;
+    }
+    barrier();
+    if (SEISMIC_SUBGROUP == 0u) {
+        const uint lane = SEISMIC_LANE;
+        const bool present = lane < SEISMIC_SUBGROUPS;
+        score = present ? uintBitsToFloat(seismic_shared_u32[3u * lane]) : -SAMPLE_INF;
+        token = present ? seismic_shared_u32[3u * lane + 1u] : SAMPLE_NO_TOKEN;
+        bad = present ? seismic_shared_u32[3u * lane + 2u] : 0u;
+        sample_subgroup_best(score, token, bad);
+        if (lane == 0u) {
+            const uint64_t slot = partials + (row * SEISMIC_TUNE_PARTS + part) * 12ul;
+            element_u32_put(slot, floatBitsToUint(score));
+            element_u32_put(slot + 4ul, token);
+            element_u32_put(slot + 8ul, bad);
+        }
+    }
+}
+
+void sample_rows_merge() {
+    const uint64_t partials = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_BUFFER_RESULT);
+    const uint64_t row = gl_GlobalInvocationID.x;
+    if (row >= SEISMIC_DIM_M)
+        return;
+    uint best_bits = 0u;
+    uint best_token = SAMPLE_NO_TOKEN;
+    uint bad = 0u;
+    for (uint part = 0u; part < SEISMIC_TUNE_PARTS; ++part) {
+        const uint64_t slot = partials + (row * SEISMIC_TUNE_PARTS + part) * 12ul;
+        bad |= element_u32_at(slot + 8ul);
+        const uint bits = element_u32_at(slot);
+        const uint token = element_u32_at(slot + 4ul);
+        if (sample_better(uintBitsToFloat(bits), token, uintBitsToFloat(best_bits), best_token)) {
+            best_bits = bits;
+            best_token = token;
+        }
+    }
+    const int status = bad != 0u ? 2 : (best_token == SAMPLE_NO_TOKEN ? 1 : 0);
+    element_i32_put(result + row * SEISMIC_RESULT_STRIDE_0 * 4ul, status == 0 ? int(best_token) : -1);
+    element_i32_put(result + (row * SEISMIC_RESULT_STRIDE_0 + SEISMIC_RESULT_STRIDE_1) * 4ul, status);
+}

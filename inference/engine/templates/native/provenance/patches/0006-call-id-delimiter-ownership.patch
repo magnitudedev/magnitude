@@ -1,0 +1,24 @@
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -246,7 +246,11 @@
+                                                     const common_peg_parser & call_id_section, bool have_call_id,
+                                                     const common_peg_parser & args,
+                                                     std::optional<common_peg_parser> atomic_peek) const {
+-    auto              open           = p.tool_open(function.name_prefix + p.tool_name(p.literal(name)) + function.name_suffix);
++    // The function probe omits IDs. Its apparent suffix can therefore be the
++    // delimiter already owned by the subsequently discovered call-ID section.
++    const auto name_suffix = have_call_id && function.name_suffix == call_id.suffix
++        ? std::string() : function.name_suffix;
++    auto              open           = p.tool_open(function.name_prefix + p.tool_name(p.literal(name)) + name_suffix);
+     bool              matched_atomic = false;
+     common_peg_parser func_parser    = p.eps();
+ 
+@@ -254,7 +258,7 @@
+         open = open + p.space() + p.literal(function.args_separator);
+     }
+ 
+-    if (!function.name_suffix.empty()) {
++    if (!name_suffix.empty()) {
+         func_parser    = open + call_id_section + p.space() + args;
+         matched_atomic = true;
+     } else if (have_call_id) {

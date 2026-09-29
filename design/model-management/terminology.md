@@ -1,7 +1,7 @@
 ---
 applies_to:
-  - inference/crates/icn-contracts/src/**
-  - inference/crates/icn-models/**
+  - inference/service/contracts/src/**
+  - inference/service/models/**
   - packages/icn/src/**
   - packages/sdk/src/inference*
   - packages/acn/src/local-model-**

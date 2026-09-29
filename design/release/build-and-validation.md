@@ -5,7 +5,7 @@ applies_to:
   - packages/release/scripts/**
   - packages/release/src/targets.ts
   - scripts/accept-release-candidate.ts
-  - inference/scripts/compile.ts
+  - inference/scripts/**
   - .github/workflows/integrations.yml
   - .github/workflows/desktop-native.yml
   - scripts/*integrations.ts
@@ -24,8 +24,11 @@ archives, not only on intermediate build outputs.
 - Every job builds one pinned source commit and one Changesets-owned version.
 - Version-dependent source is generated in each clean checkout before release code is loaded.
 - Planner inputs are generated once and shared by every host build.
-- Toolchains, backend features, CUDA targets, and shader compiler versions are explicit release
-  inputs. Ambient runner packages must not enable optional native features.
+- Toolchains and each host's NVRTC redistributable pin (version, URL, SHA-256) are explicit release
+  inputs. The build downloads and verifies the pinned archive and stages its two libraries and
+  license notice; builders need no CUDA toolkit or Vulkan SDK. Every backend of a host is compiled
+  into its one inference executable. Release compiler flags are fixed, so ambient configuration
+  cannot select a CPU model or enable optional native features.
 - Compiler-result caches may reuse objects matched by compiler inputs; clean release output,
   final linking, packaging, signing, and independent artifact acceptance remain mandatory.
 - The workspace and CI use the same pinned Bun runtime. Runtime changes require native
@@ -58,17 +61,10 @@ archives, not only on intermediate build outputs.
 
 ## Linux build baseline
 
-Every Linux host, CPU base, CUDA pack, and Vulkan pack builds on its architecture's Ubuntu 22.04
-runner. CUDA 11.8 and CUDA 12.9 use the same userspace baseline.
+Every Linux host builds on its architecture's Ubuntu 22.04 runner.
 
 Build-tool download caches are keyed by Ubuntu version, architecture, and the resolved APT package
 plan. APT still resolves and installs dependencies normally; a cache hit never skips installation.
-These archives are separate from CUDA downloads and survive CUDA's package-cache cleanup.
-
-Ubuntu 22.04's Vulkan headers are older than the Vulkan API types used by the pinned llama.cpp.
-Vulkan jobs therefore construct a build-only SDK prefix from Vulkan-Headers 1.4.313 and shaderc
-`v2023.8` `glslc`, while linking against Jammy's system Vulkan loader. The headers and shader
-compiler are not included in the release and do not become customer dependencies.
 
 Linux desktop packaging runs its installer tooling under Node and validates the final package,
 compressing the DEB once with zstd level 9 after finalizing its payload,
@@ -87,52 +83,52 @@ release target; an installer extension or matching checksum alone is insufficien
 
 ## Windows build baseline
 
-Windows CPU and accelerator artifacts target x64 MSVC. CMake receives that target explicitly, including when the
-build tools run under x64 emulation on Windows ARM; the build machine's processor must not select
-ARM backend variants for an x64 artifact. Desktop, service, and installer builds share the native
-host toolchain discovery. The Node import library is verified against the selected Node release's
-checksums and remains a build-only input.
+Windows artifacts target x64 MSVC, including when the build tools run under x64 emulation on
+Windows ARM; the build machine's processor must not select ARM code for an x64 artifact. Desktop,
+service, and installer builds share the native host toolchain discovery. The Node import library
+is verified against the selected Node release's checksums and remains a build-only input.
 
-The engine package includes the Microsoft C++ runtime DLLs required by its native import graph.
+The inference artifact includes the Microsoft C++ runtime DLLs required by its native import graph.
 Build validation resolves imports only against the owned payload, the selected toolchain's x64 CRT
 redistributable, and Windows system libraries/API sets. An ambient developer PATH or installed VC
 redistributable cannot satisfy a missing package dependency. Redistributable DLL imports are checked
-recursively; the resulting files use the existing installation-owned runtime directory.
-Backend builds initialize the same native compiler environment as host builds and use Ninja.
-CUDA pack dependencies are resolved from explicitly selected toolkit DLLs; Vulkan and CUDA driver
-libraries are capability-owned only for their respective accelerator compositions. Magnitude-built
-backend DLLs are signed before archiving; vendor runtime DLLs retain their vendor signatures.
-A manually dispatched Windows-backend-only check builds the same accelerator archives without
-publishing or claiming full candidate acceptance. GPU execution validation composes the final base
-and accelerator pack on a driver-equipped Windows host without development toolkits, verifies GPU
-allocations and owned module paths, and exercises generation, streaming, cancellation, concurrent
-admission, model reload, and worker cleanup.
+recursively, including NVRTC's; the resulting files use the installation-owned runtime directory.
+Driver libraries are loaded at runtime and are never imports. The Magnitude-built executable is
+signed before archiving; Microsoft CRT DLLs retain Microsoft's signatures, and NVRTC DLLs are
+shipped unmodified as NVIDIA publishes them. GPU execution validation runs the final artifact on a
+driver-equipped Windows host without development toolkits, verifies GPU allocations, that NVRTC
+loads from the installation's runtime directory, and exercises generation, streaming,
+cancellation, concurrent admission, model reload, and worker cleanup.
 An independent Windows consumer extracts and runs the final archives, checks their metadata,
 and exercises engine readiness and parent-loss shutdown before candidate assembly can pass.
 Production Windows packaging uses Artifact Signing with an explicit publisher identity. Owned code,
 the native CLI launcher, the embedded uninstaller, and the final installer are signed and timestamped before checksums are
 recorded. Publisher and signature validation fail the build; missing credentials cannot produce a
-production installer. Bundling preserves the signed CLI and service bytes from their archives.
+production installer. The same publisher identity is compiled into Desktop's update trust; a signed
+build without one fails before compilation. Bundling preserves the signed CLI and service bytes from their archives.
 Local unsigned builds carry no production trust claim.
 The independent consumer installs and uninstalls the accepted installer under a fresh user profile,
 verifies installed registration and CLI versions, compares bundled CLI/service bytes to their
 accepted archives, and requires publisher signatures for production inputs.
-The consumer also verifies the inference executable and every shipped engine/runtime DLL; engine
-code must carry Magnitude's timestamped signature, while Microsoft CRT files retain Microsoft's signature.
+The consumer also verifies the inference executable and every shipped runtime DLL; the inference
+executable must carry Magnitude's timestamped signature, Microsoft CRT files retain Microsoft's
+signature, and NVRTC is exempt because NVIDIA does not sign it.
 Signing credentials belong to the protected Windows signing environment; ordinary pull-request validation is unsigned.
 
 ## Apple build baseline
 
-Apple arm64 and Apple x64 target macOS 13.0. The release configuration passes that floor through
-both `MACOSX_DEPLOYMENT_TARGET` and `CMAKE_OSX_DEPLOYMENT_TARGET`, ensuring that Rust, Cargo build
-scripts, cc, CMake, Clang, and the linker share one minimum-version contract. The selected SDK may be
-newer than macOS 13: newer operating-system APIs must remain weak-linked and availability-guarded,
-while Metal kernels and GPU features continue to specialize for the actual runtime device.
+Apple arm64 and Apple x64 target macOS 15.0, the floor set by the inference platform contract. The
+release configuration passes that floor through both `MACOSX_DEPLOYMENT_TARGET` and
+`CMAKE_OSX_DEPLOYMENT_TARGET`, ensuring that Rust, Cargo build scripts, cc, CMake, Clang, and the
+linker share one minimum-version contract, and declares it as the minimum system version of the
+application bundle and the desktop. The selected SDK may be newer than macOS 15: newer
+operating-system APIs must remain weak-linked and availability-guarded, while Metal kernels and GPU
+features continue to specialize for the actual runtime device.
 
 The runner image is only a build environment. Changing or advancing that image must not change the
 deployment target recorded in release artifacts. Before packaging, the Apple build validates every
 executable and native library with Apple's `vtool`, selecting the expected release architecture and
-rejecting a missing deployment declaration or a minimum newer than 13.0.
+rejecting a missing deployment declaration or a minimum newer than 15.0.
 
 ## Apple signing and notarization
 
@@ -150,13 +146,20 @@ matches the build's Desktop configuration so foreground preparation uses the sam
 Developer ID builds compile the Apple Team ID into both Desktop and the CLI; a missing or malformed
 identity fails the build. Installed runtime environment variables cannot replace that identity.
 
-Apple must accept the CLI, inference payload, desktop, app, and backend submissions. A rejected or incomplete
+The host build resolves Desktop's publisher identities once, before compiling, and hands them to the
+Desktop build as one explicit input: the Apple Team ID only on Apple hosts and the Windows publisher
+only on the Windows host. The Desktop build never reads signing configuration itself, so one
+platform's signing settings cannot affect another platform's build. A Desktop build without that
+input is a development build and carries no publisher identity.
+
+Apple must accept the CLI, inference payload, desktop, and app submissions. A rejected or incomplete
 submission fails the build and retains diagnostic logs. The app ticket is stapled and validated before
 final archiving and checksums. Private receipts bind publisher, commit, submissions, and final native
 archive digests. Independent Apple consumer jobs execute the downloaded host archives and verify
 signatures and the stapled app. Real login/permission UI acceptance remains a signed macOS test.
 Desktop consumer acceptance mounts the final DMG read-only, verifies its sealed bundle and matched
-service version, and executes lifecycle tests against the extracted release ICN base. It covers
+service version, copies the byte-identical app to a writable installation location, and executes
+lifecycle tests against the extracted release ICN base. It covers
 hidden and concurrent startup, close-to-tray, renderer recovery, full Quit, and owner-crash cleanup.
 Installer packaging and acceptance allow bounded retries when macOS reports a busy mounted image;
 they retain the attached device identity because an unsuccessful eject may already have removed
@@ -172,8 +175,8 @@ the separate renderer acceptance fixtures and do not gate a native release.
 
 ## Archive validation
 
-Assembly validates every host base and every legal base-plus-backend composition. For Linux, every
-ELF file is inspected with `readelf`; release inputs are never executed through `ldd`.
+Assembly validates every host's inference artifact. For Linux, every ELF file, including NVRTC, is
+inspected with `readelf`; release inputs are never executed through `ldd`.
 
 Assembly rejects:
 
@@ -184,14 +187,24 @@ Apple compatibility is validated on the Apple build host, using Apple's own Mach
 the exact files subsequently passed to the deterministic archive builder. Assembly does not
 reimplement Mach-O parsing.
 
-Archive layout, artifact size and digest, native-build identity, backend ABI, planner-input equality,
-and backend compatibility metadata are also validated before the manifest is emitted.
+Archive layout, artifact size and digest, native-build identity and planner-input equality are also
+validated before the manifest is emitted. An inference artifact contains only `bin/`, `runtime/`
+and `catalog/`, and on Linux and Windows its `runtime/` holds both NVRTC libraries and NVIDIA's
+license notice. The Linux inference executable's only loader path is `$ORIGIN/../runtime`.
 
 ## Execution gates
 
-Each host build extracts and executes its CLI, ACN, and ICN-base archives. It verifies versions,
-embedded ripgrep, ICN identity, backend eligibility, readiness, authenticated health, and managed
-shutdown with inherited Unix library search paths cleared.
+Each host build extracts and executes its CLI, ACN, and inference archives. It verifies versions,
+embedded ripgrep, the inference identity against the declared native build, readiness, health,
+authenticated hardware, and managed shutdown with inherited Unix library search paths cleared.
+The same installation smoke runs, without GitHub, against the local development installation and
+a locally built release. Local release bootstrap serves that release to an empty profile, installs
+its inference artifact through the production acquisition path, and verifies identity, readiness,
+authenticated hardware, and managed shutdown. On macOS the same local release also launches the
+installed desktop's bundled CLI from an empty profile, observes headless service readiness and
+CLI queries and complete local-model assessment after its own engine acquisition, then restarts the
+same installation with the artifact endpoint unavailable and verifies readiness, recommendations,
+queries, and graceful shutdown again.
 Managed inference starts as its own process-group leader. Parent-channel loss acceptance requires
 the watchdog to terminate that group, including workers; it does not expect a graceful zero exit.
 
@@ -213,11 +226,14 @@ the default restrictions on other operations. Acceptance never disables Chromium
 
 The complete candidate gate runs the installed desktop’s bundled CLI and service, acquires ICN from an empty data root, reaches ACN/ICN
 readiness and local-model ranking readiness, shuts down the exact owned processes, and proves
-the bundled CLI works when the artifact endpoint is unavailable.
+the bundled CLI and service start from cached artifacts when the artifact endpoint is unavailable.
 On Linux this gate runs in a disposable Ubuntu consumer, explicitly installs the candidate DEB,
 and passes the acquired candidate ICN installation to the installed desktop lifecycle test. It must
 observe a Ready service; an intentionally missing engine only certifies failure handling and cannot
 satisfy candidate bootstrap acceptance. Engine readiness does not imply model-serving acceptance.
+Candidate acceptance preserves complete process output and raw measurement-worker diagnostics on
+failure. The publish and build gates retain these as downloadable artifacts alongside the final
+assessment snapshot and last observed catalog status.
 
 A manual macOS Intel CPU consumer downloads a selected run's final host archive, verifies its
 digest and native identity, installs a selected shipped catalog model through the canonical
@@ -228,6 +244,10 @@ hardware, retaining results and server diagnostics without publishing or replaci
 
 Pull requests run the complete build and acceptance graph without publishing. A manually dispatched
 Linux x64 dry run exercises the CPU-only production path but cannot authorize publication.
+For local diagnosis, a final Linux inference archive can run from an isolated profile in a
+disposable Ubuntu container. The run verifies artifact integrity, records raw assessment state
+transitions and the complete service log, and needs no publication. Architecture emulation may
+change measurement timing; native-host acceptance remains authoritative for performance bounds.
 
 ## Publication gate
 

@@ -1,0 +1,11 @@
+# origin: C11:call_in_loop
+# cell: call-portable/ordered
+# invoke: f32[4]=1,2,3,4
+fn helper(a: f32, b: f32) -> f32:
+    return a + b
+
+fn probe[N](x: &tensor[N] f32) -> f32:
+    let mut s = 0.0
+    for k in 0..N:
+        s = helper(s, x[k])
+    return s

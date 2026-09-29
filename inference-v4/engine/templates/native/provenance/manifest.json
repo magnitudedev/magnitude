@@ -1,0 +1,650 @@
+{
+  "repository": "https://github.com/ggml-org/llama.cpp",
+  "revision": "930e2fa5995789efbf249a8bf61325bb626e417b",
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    },
+    {
+      "path": "common/chat-auto-parser-generator.cpp",
+      "sha256": "9f76ec58eb8e7aa8d2c40df1be0a75ba2e90a0486fc347f6a00e73b4457d1df4"
+    },
+    {
+      "path": "common/chat-auto-parser-helpers.cpp",
+      "sha256": "6cd3a7719a87964f54372c20ab1a98350d4b6dfbe65f09fc6cffe6ac3a6be93a"
+    },
+    {
+      "path": "common/chat-auto-parser-helpers.h",
+      "sha256": "a2866e5411ab5c23171db7214fa9aa60171b52ed4737bd37ce66f828d8683998"
+    },
+    {
+      "path": "common/chat-auto-parser.h",
+      "sha256": "c774fcc02980529671793e110118ecfccb1e3c48eac52c852ce354922f599b52"
+    },
+    {
+      "path": "common/chat-diff-analyzer.cpp",
+      "sha256": "5acb9907c78a66685e4f43327e9f700db3325fefb8991c1212d713a412469297"
+    },
+    {
+      "path": "common/chat-peg-parser.cpp",
+      "sha256": "a069958a4967609f67a3feea22a37dd3a8d712687eb37c56d75ea078aac540e3"
+    },
+    {
+      "path": "common/chat-peg-parser.h",
+      "sha256": "9a9eeef7f7eb190f8191d2bd12cf6beebece29e307714e01c405eaa87c8da918"
+    },
+    {
+      "path": "common/chat.cpp",
+      "sha256": "a226aa0cbf844490cd480bb805c458df16af8771b1ecb53a8fe608e3b2e60d3c"
+    },
+    {
+      "path": "common/chat.h",
+      "sha256": "12b3f8a287698b1b5f3f4e020e52162f5026b06596b55946fa865a4a0b3c4abc"
+    },
+    {
+      "path": "common/common.cpp",
+      "sha256": "e6eccdf376a80a3f534fc71ad7775fcac52eb6089367f1592ce1d293b147db66"
+    },
+    {
+      "path": "common/jinja/README.md",
+      "sha256": "0915e0a15eaa7d492ea50c651a186b494bd081125e11b041bab3131f2fc09240"
+    },
+    {
+      "path": "common/jinja/caps.cpp",
+      "sha256": "4ad7e2bdcdf55eb33c7d8549d7cc76d15d8ccbba33e0f57cff713e14b8e01174"
+    },
+    {
+      "path": "common/jinja/caps.h",
+      "sha256": "50b2c243067d236480dbf7fcaafa30a7a5b70d770b0671d6b4168f122548b75a"
+    },
+    {
+      "path": "common/jinja/lexer.cpp",
+      "sha256": "3d6774bc2dac477e10ddbee69eff403df36f5925c8512ccf8a249bde5c26dbd7"
+    },
+    {
+      "path": "common/jinja/lexer.h",
+      "sha256": "93aecd72cc952fab08f657aa2a70e9f58421672b19d3179f8bdf555e683a1cc7"
+    },
+    {
+      "path": "common/jinja/parser.cpp",
+      "sha256": "284c3dcc92cfcbdb3391f4b251bdc2bd5191899973bf665e9351aca3b795c724"
+    },
+    {
+      "path": "common/jinja/parser.h",
+      "sha256": "6225eb759da910f3dd7753aed71c6938131cfa04c609d744e6f1390396422316"
+    },
+    {
+      "path": "common/jinja/runtime.cpp",
+      "sha256": "a51c57dce6838341d0d88d27b6e12078275ccd0cc394aab7f658cb1398778700"
+    },
+    {
+      "path": "common/jinja/runtime.h",
+      "sha256": "89c8efc60ad287f49089fbcf7f028d1b88b32d41a2e859f1b68af5a574816a3f"
+    },
+    {
+      "path": "common/jinja/string.cpp",
+      "sha256": "6b1b13dea3f94c4d542c15250f793abd638839733fd96a9da6704bfdab662e86"
+    },
+    {
+      "path": "common/jinja/string.h",
+      "sha256": "d32ad2a319398b8dbc1cc43b39dd10ab2eb0ce2eae9d0eaf3c2162777dd615dc"
+    },
+    {
+      "path": "common/jinja/utils.h",
+      "sha256": "61ae8bc57a7a551bdfb294a23a0ef8b5ba8e3cf4d695389f0f0797e2d7689781"
+    },
+    {
+      "path": "common/jinja/value.cpp",
+      "sha256": "cf2f6f137c3eadb0a61a88a7ca7fd0be161f6df38a5b661b3e89e1006dca48bd"
+    },
+    {
+      "path": "common/jinja/value.h",
+      "sha256": "19dc9611c0d342d7728bceb5843224d41840df9a7a758fbe1de3589958ace7ea"
+    },
+    {
+      "path": "common/json-schema-to-grammar.cpp",
+      "sha256": "4bd38802809f63810eaedc70bd94898331c093f7c6cbc520e6c89b5aaea72c09"
+    },
+    {
+      "path": "common/json-schema-to-grammar.h",
+      "sha256": "7dc12dd8b3513b97293f22c2f87f0918e476fac3ba8895e8cb9671110401ea07"
+    },
+    {
+      "path": "common/json-schema.cpp",
+      "sha256": "68ba2adbb6e0578c0d89e99cc9a9a7aa9c0b554b555bcd3908da71789045509d"
+    },
+    {
+      "path": "common/json-schema.h",
+      "sha256": "57933a181ec0e84cbba1abea7fd898dc03e452d7de1a35795b787cee679d02af"
+    },
+    {
+      "path": "common/json.cpp",
+      "sha256": "d8c556445cef8e7c93b0857f6ca7ae7ebd8295f169403ac66641b72f6b0598f2"
+    },
+    {
+      "path": "common/json.h",
+      "sha256": "1b8a34c15ec62f2f13ae5809b723962b4d075a1a28af6902d9b64de6e607ee72"
+    },
+    {
+      "path": "common/parsers/cohere2moe.cpp",
+      "sha256": "ac10ca473a4e12b3b4ebb10dc12bc5ff08869c7b683afc2baf1c3eef03abdc76"
+    },
+    {
+      "path": "common/parsers/deepseek.cpp",
+      "sha256": "de672787357c35ad109ec41e0b6a6f3e82684ad00aa05158545474e1c3ee6017"
+    },
+    {
+      "path": "common/parsers/functionary-v3-2.cpp",
+      "sha256": "d90603cc2e5eceff355dfb37137778dec8161dce7e853378c198513eb9899e3f"
+    },
+    {
+      "path": "common/parsers/gemma4.cpp",
+      "sha256": "a877293a6a6da97ffeb646f4b3b64006f06f5cc3069eeecc445522fad60ac720"
+    },
+    {
+      "path": "common/parsers/gigachat-v3.cpp",
+      "sha256": "ae130d5c26a0cbcc439fe473ed618729f71f16fc392aa33d6b05b53e44d55ec2"
+    },
+    {
+      "path": "common/parsers/gpt-oss.cpp",
+      "sha256": "232b1feeb8b800bb22d7b8da7e171427a36bd53f8279d8a31f143314616bb68f"
+    },
+    {
+      "path": "common/parsers/kimi-k2.cpp",
+      "sha256": "497f63f1788e413c369c7b04ce0df153e7bdae6a0ced1234f6862574b1513292"
+    },
+    {
+      "path": "common/parsers/kimi-k3.cpp",
+      "sha256": "52ba090b5c5dcc8f406a7a2de024a8d66180b6482ec2b200258ef585bd7ad5ca"
+    },
+    {
+      "path": "common/parsers/lfm2.cpp",
+      "sha256": "31346c9c3f0fefd87aec5cc978bc1686b8761b0d295da82cb4114ae394c3ce9a"
+    },
+    {
+      "path": "common/parsers/minicpm5.cpp",
+      "sha256": "2bfc737b9b99961835338261a2c7c3e3e7b05969652ef4b269dab77155261900"
+    },
+    {
+      "path": "common/parsers/minimax-m3.cpp",
+      "sha256": "572b13e22782145e40e94cd78625729228c8fd0be3399fb9892477b074b32538"
+    },
+    {
+      "path": "common/parsers/ministral3.cpp",
+      "sha256": "b9e4b6e38abd7da35ea3181e8a8d8ddaa405a30f1194a751f7f37b80594823df"
+    },
+    {
+      "path": "common/parsers/muse-glimmer.cpp",
+      "sha256": "643fd42d1c797aa42cb2ee7c2111bf5fe71fb0ae5b275826aa2a3ab82466bad2"
+    },
+    {
+      "path": "common/parsers/parsers.cpp",
+      "sha256": "87593a29686ee0f8b64d1baee19c182aef63ea42c379d926688fb2da4f07e14a"
+    },
+    {
+      "path": "common/parsers/parsers.h",
+      "sha256": "dc457e1602374d9f3d39ced8a335e229b9d027c45ee41f39d728236b7870d5dc"
+    },
+    {
+      "path": "common/parsers/qwen3-coder.cpp",
+      "sha256": "d3d64cd8446c1b9a7f269993c91dbbb27c60ef4993e364cbb918f50a816a36db"
+    },
+    {
+      "path": "common/peg-parser.cpp",
+      "sha256": "594680aeee74b5b35ae7193075ec78e9fdff526061eb05d17e1d823f9b51f7c7"
+    },
+    {
+      "path": "common/peg-parser.h",
+      "sha256": "af0b4a67c4756c57c54ae3aab41bf6d88616f145792a0ddfbbe61448013ca603"
+    },
+    {
+      "path": "common/subproc.cpp",
+      "sha256": "5a9e0d0e4ca4441cac5ac57af1622ff4a6dcdd598dcecd0f28079d95dca81ffa"
+    },
+    {
+      "path": "common/subproc.h",
+      "sha256": "ac5f9d21b53d11c4763f5fb1ff8c7c8b516ab680d178c6ee39004f561e3c028f"
+    },
+    {
+      "path": "common/trie.cpp",
+      "sha256": "807cac6c6296ca294397360fbfdd5f19a65fb7c50a587c8b56094261eec5acb2"
+    },
+    {
+      "path": "common/trie.h",
+      "sha256": "391806c154f074d63e208f5a79d4d19df07592a645d860bb2c845525afda898e"
+    },
+    {
+      "path": "common/unicode.cpp",
+      "sha256": "a07137a4fe6a657acf0d4b16ee5fa4ba388f7e9c8d3c98993410b28720b69b6d"
+    },
+    {
+      "path": "common/unicode.h",
+      "sha256": "b88c29194f028c27988c05a64bd72948ff55081dc1b07e5ff9c3bb72601c62b5"
+    },
+    {
+      "path": "models/templates/Apertus-8B-Instruct.jinja",
+      "sha256": "dea688e9f24a339a0d2504f6840852adbcedb082373172a0b82ca2c55996768d"
+    },
+    {
+      "path": "models/templates/Apriel-1.6-15b-Thinker-fixed.jinja",
+      "sha256": "2f5ce4b3c1e0ab30fc5f204a151aba5ee584615b0aa641afc2d58bcccfe33bdb"
+    },
+    {
+      "path": "models/templates/Bielik-11B-v3.0-Instruct.jinja",
+      "sha256": "a30b8c4531dda19196f35fb95ab84110dd8357acbd75eea3776c5543a70db5a9"
+    },
+    {
+      "path": "models/templates/ByteDance-Seed-OSS.jinja",
+      "sha256": "3f9e0dc4adeb8032287d0129dc75b6298fee8698a52ab41e863dbc89929330d3"
+    },
+    {
+      "path": "models/templates/Cohere2MoE.jinja",
+      "sha256": "d8366efb9f07c571da620ce6a924594fc52c80273a0fbb46a38b643972df95fd"
+    },
+    {
+      "path": "models/templates/CohereForAI-c4ai-command-r-plus-tool_use.jinja",
+      "sha256": "bf9e9ee8c0f2297c6ff60af5fab357d7b34bc4375884ed16ab6aa90597d7eb7d"
+    },
+    {
+      "path": "models/templates/CohereForAI-c4ai-command-r7b-12-2024-tool_use.jinja",
+      "sha256": "cc60b553279347d83df761f5dc55b4b2fb66bc1fa9a33e219911c13c11552fac"
+    },
+    {
+      "path": "models/templates/GLM-4.6.jinja",
+      "sha256": "8804f445c761b9f259e3c1126a579d481a22ca09b2a3d32bcc4eb91bc36e0301"
+    },
+    {
+      "path": "models/templates/GLM-4.7-Flash.jinja",
+      "sha256": "d63ad536c3c81880043e22ec7fd08db42b4d8fb7c89c7138bc562bfa25281375"
+    },
+    {
+      "path": "models/templates/GigaChat3-10B-A1.8B.jinja",
+      "sha256": "bbbf2de800b645dfe032b1d85e1d6479d78fd82d38d4af0d8d5bb2dacacd20d6"
+    },
+    {
+      "path": "models/templates/GigaChat3.1-10B-A1.8B.jinja",
+      "sha256": "304f0d64aa3ba30ee85c281befdeb0e5b32aed232b06dee1752310daa1208a4b"
+    },
+    {
+      "path": "models/templates/HuggingFaceTB-SmolLM3-3B.jinja",
+      "sha256": "19eacf64569032f07644ea92c8e2a87af06ee7008147557302c31e474912ca97"
+    },
+    {
+      "path": "models/templates/Kimi-K2-Instruct.jinja",
+      "sha256": "1d396d5b128cdb9b2a4ef73434fa08d31c75604a11daa77bcb4b622d32dddd41"
+    },
+    {
+      "path": "models/templates/Kimi-K2-Thinking.jinja",
+      "sha256": "2f6c593d50682612ccc3229f043ecd1bdeb5a32fdfe86ca2158203a61d885817"
+    },
+    {
+      "path": "models/templates/Kimi-K3.jinja",
+      "sha256": "4578103bf225f58d5b7ceb613ccc2ac8fe82b6707b7289211b3d4825e87806b3"
+    },
+    {
+      "path": "models/templates/LFM2-8B-A1B.jinja",
+      "sha256": "2294f49b51a0b9a1b0194add3f124237b5bd986599f43180eec49bba4de01365"
+    },
+    {
+      "path": "models/templates/LFM2.5-8B-A1B.jinja",
+      "sha256": "6d65c8804847ad74eea912dd7eca3dc1cf7a457b53a77f47d841a14121910963"
+    },
+    {
+      "path": "models/templates/LFM2.5-Instruct.jinja",
+      "sha256": "f05bf4b967dc993bdc7a2fe6e43759ee218eb0eb340d68b063e1c4f8ad148176"
+    },
+    {
+      "path": "models/templates/MiMo-VL.jinja",
+      "sha256": "10490379c20af484107413cc5fd93f6e587d0cb4364a183a89ab68849406b80d"
+    },
+    {
+      "path": "models/templates/MiniMax-M1.jinja",
+      "sha256": "e1790d8fbe1c587e6fc385e2a712363f86faf52ae1fb1fcbfc5ded3eb1fae70a"
+    },
+    {
+      "path": "models/templates/MiniMax-M2.jinja",
+      "sha256": "967ff7e387676f4b4340585da0585416532f1e6c5ee3f1ede64b2c21ef7ea001"
+    },
+    {
+      "path": "models/templates/MiniMax-M3.jinja",
+      "sha256": "11421244f67553498e5c8112dae02802025bcc4305ec45ad380af95c96f9fe64"
+    },
+    {
+      "path": "models/templates/Mistral-Small-3.2-24B-Instruct-2506.jinja",
+      "sha256": "5b8f31f11198696548d544dbe424a3c1ef244d00a475f4e1bffb351fda085608"
+    },
+    {
+      "path": "models/templates/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.jinja",
+      "sha256": "ab7813c3abdd9cb655905a410728b26c7884eca45ddfab8d9f931553485a7862"
+    },
+    {
+      "path": "models/templates/NVIDIA-Nemotron-Nano-v2.jinja",
+      "sha256": "52ae8e50fa083e63a0a5726eeffc85502089b82064aceb1bddf0366f7317b3f8"
+    },
+    {
+      "path": "models/templates/NousResearch-Hermes-2-Pro-Llama-3-8B-tool_use.jinja",
+      "sha256": "7ce09d55d3690e06c70b5c07228cc7e8c99c43a23cdc027762be4011efcdea6c"
+    },
+    {
+      "path": "models/templates/NousResearch-Hermes-3-Llama-3.1-8B-tool_use.jinja",
+      "sha256": "7ce09d55d3690e06c70b5c07228cc7e8c99c43a23cdc027762be4011efcdea6c"
+    },
+    {
+      "path": "models/templates/Qwen-QwQ-32B.jinja",
+      "sha256": "5ed15374ce53e19a7798710736a2c9fe41c79f7385e8421a2080d6575a80ef1b"
+    },
+    {
+      "path": "models/templates/Qwen-Qwen2.5-7B-Instruct.jinja",
+      "sha256": "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"
+    },
+    {
+      "path": "models/templates/Qwen-Qwen3-0.6B.jinja",
+      "sha256": "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5"
+    },
+    {
+      "path": "models/templates/Qwen3-Coder.jinja",
+      "sha256": "d287fb2edf144207f868ae1b282755dc19db2a3f1c5b3a3d57e9e5abffa98392"
+    },
+    {
+      "path": "models/templates/Qwen3.5-4B.jinja",
+      "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+    },
+    {
+      "path": "models/templates/README.md",
+      "sha256": "b52f146416b95dc31bfecbf7c65702385a1f9b5f435d1545a9d14611263b8ec9"
+    },
+    {
+      "path": "models/templates/Reka-Edge.jinja",
+      "sha256": "546b04dba74993efae8f9da3ba08e29f437f5ac3f4e40b5cb9a4de5901a841df"
+    },
+    {
+      "path": "models/templates/Spark2.5.jinja",
+      "sha256": "afea0f7114d5d35b20ad9f44f7dd0782791412b8fcfc1b49e31f27c2da09e9cb"
+    },
+    {
+      "path": "models/templates/StepFun3.5-Flash.jinja",
+      "sha256": "b18b99dff7261214c43e0402cba9f573e3240be6f9bb7ccaa54bb8df97e49dca"
+    },
+    {
+      "path": "models/templates/deepseek-ai-DeepSeek-R1-Distill-Llama-8B.jinja",
+      "sha256": "dd2675619a64a449cdcdd2b93e605a0a50764cee41e344f244752bc93643936c"
+    },
+    {
+      "path": "models/templates/deepseek-ai-DeepSeek-R1-Distill-Qwen-32B.jinja",
+      "sha256": "bbe594884b44d740667ee65a70bc8d333a565eab3d63ea59f291ea73ada84ba6"
+    },
+    {
+      "path": "models/templates/deepseek-ai-DeepSeek-V3.1.jinja",
+      "sha256": "d9f5f351b276cf9e81d009db08830db7d38e94927aecd09a7beb43e2aafee94e"
+    },
+    {
+      "path": "models/templates/deepseek-ai-DeepSeek-V3.2.jinja",
+      "sha256": "8e5a13fcc4bdd4d943311fc59064b805770fdeddfccbd7f1c252cc16e8acaf3d"
+    },
+    {
+      "path": "models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja",
+      "sha256": "aec3d906bce80d43a9e6e89922c04e8e752c05f71f10040ba3f61b746ebacd6d"
+    },
+    {
+      "path": "models/templates/deepseek-ai-DeepSeek-V4.jinja",
+      "sha256": "7bd4fbdf0c06cd7398ddb6913de6e4a5839b9d06569e74e5b2ec246b375ca9c9"
+    },
+    {
+      "path": "models/templates/fireworks-ai-llama-3-firefunction-v2.jinja",
+      "sha256": "fcb749f5c5d6bbc4240db4e86af5dfcefe9c7e85355235d0f304ab4319ba6b51"
+    },
+    {
+      "path": "models/templates/google-gemma-2-2b-it.jinja",
+      "sha256": "ecd6ae513fe103f0eb62e8ab5bfa8d0fe45c1074fa398b089c93a7e70c15cfd6"
+    },
+    {
+      "path": "models/templates/google-gemma-4-31B-it-interleaved.jinja",
+      "sha256": "65f93a25708c952457106a30e185ba7beffddd726121c8d7e3f3e08b23c16c67"
+    },
+    {
+      "path": "models/templates/google-gemma-4-31B-it.jinja",
+      "sha256": "85a08664d16d8f3be4416c92427b3ac10df1024ac566cc0b4bc3bab409393f98"
+    },
+    {
+      "path": "models/templates/ibm-granite-granite-3.3-2B-Instruct.jinja",
+      "sha256": "3c71df5f659987462c882bf9e295b597dc19902467a7312ea382c5896681bc02"
+    },
+    {
+      "path": "models/templates/ibm-granite-granite-4.0.jinja",
+      "sha256": "9524df67b77a7b25a2dfee898f75b316a157eb9d855b51e32aeac79d7c8a83ce"
+    },
+    {
+      "path": "models/templates/ibm-granite-granite-4.1.jinja",
+      "sha256": "fed2756d2d24e127b951dcf139d0b03ab7db8ef23a456128ebc9c2db4901d476"
+    },
+    {
+      "path": "models/templates/llama-cpp-deepseek-r1.jinja",
+      "sha256": "0d11fd8d7cf3f212733d73dfe09ead89a14a18816661dc30ea1fb3147428fba1"
+    },
+    {
+      "path": "models/templates/llama-cpp-rwkv-world.jinja",
+      "sha256": "e70723034f0928096207d99b2ec4678950361f290f5341c017d957f88b196935"
+    },
+    {
+      "path": "models/templates/meetkai-functionary-medium-v3.1.jinja",
+      "sha256": "2fc9dbfaea552f864b4b8cdf9d17401e9a49cbda199498531f137eb0ec5ae1d8"
+    },
+    {
+      "path": "models/templates/meetkai-functionary-medium-v3.2.jinja",
+      "sha256": "5c7c96c27cfecf3418411d1ebd0d11d691ab6bd2155bb38dacc62250fe47c3c8"
+    },
+    {
+      "path": "models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja",
+      "sha256": "e10ca381b1ccc5cf9db52e371f3b6651576caee0a630b452e2816b2d404d4b65"
+    },
+    {
+      "path": "models/templates/meta-llama-Llama-3.2-3B-Instruct.jinja",
+      "sha256": "5816fce10444e03c2e9ee1ef8a4a1ea61ae7e69e438613f3b17b69d0426223a4"
+    },
+    {
+      "path": "models/templates/meta-llama-Llama-3.3-70B-Instruct.jinja",
+      "sha256": "e10ca381b1ccc5cf9db52e371f3b6651576caee0a630b452e2816b2d404d4b65"
+    },
+    {
+      "path": "models/templates/microsoft-Phi-3.5-mini-instruct.jinja",
+      "sha256": "78d976a442bcde2f0be15aafbb8e3050e1104f86732266f68403251b89982a90"
+    },
+    {
+      "path": "models/templates/mistralai-Ministral-3-14B-Reasoning-2512.jinja",
+      "sha256": "39f03c383413f531fd302c06c7e982ad98c83f0657a8339ae25478ccb81fdcda"
+    },
+    {
+      "path": "models/templates/mistralai-Mistral-Nemo-Instruct-2407.jinja",
+      "sha256": "e4676cb56dffea7782fd3e2b577cfaf1e123537e6ef49b3ec7caa6c095c62272"
+    },
+    {
+      "path": "models/templates/moonshotai-Kimi-K2.jinja",
+      "sha256": "9fcc72b7c248a72020c81f70bb652f3094d18a750c93ca35dfcb3cf5fe23ff53"
+    },
+    {
+      "path": "models/templates/muse-glimmer.jinja",
+      "sha256": "cfc67e5f349f37690dfd31ed1f18bc4442a9dd32fe39a648f993cb4eb3cae678"
+    },
+    {
+      "path": "models/templates/openai-gpt-oss-120b.jinja",
+      "sha256": "a4c9919cbbd4acdd51ccffe22da049264b1b73e59055fa58811a99efbd7c8146"
+    },
+    {
+      "path": "models/templates/openbmb-MiniCPM5-1B.jinja",
+      "sha256": "7451a05cf1e28a79d97d7c0bc951028c0b1915119bf9046acd06a0e3d931f47c"
+    },
+    {
+      "path": "models/templates/poolside-Laguna-S-2.1.jinja",
+      "sha256": "444819b8ad4612870827ac05b9147fe9e3344d3850cae8c2790898fc514099ff"
+    },
+    {
+      "path": "models/templates/poolside-Laguna-XS-2.1.jinja",
+      "sha256": "5f1bf14725b6a0e662678e7ca66d7b347bbaa436b09db038472045aba37da2f2"
+    },
+    {
+      "path": "models/templates/poolside-Laguna-XS.2.jinja",
+      "sha256": "cefcef90515772c003776b3d7db3c088f4e0ee89f8470679b95cf83210dc9e06"
+    },
+    {
+      "path": "models/templates/tencent-Hy3.jinja",
+      "sha256": "84437b9746423f042920c15289ac84d4eba7a50a11ebc05e8b414c460f814873"
+    },
+    {
+      "path": "models/templates/unsloth-Apriel-1.5.jinja",
+      "sha256": "fae87682d3551b1cd3191fc92c5372c230e6e90115a98f049e35218cf4e13d8f"
+    },
+    {
+      "path": "models/templates/unsloth-mistral-Devstral-Small-2507.jinja",
+      "sha256": "039a4710e2aabaa79e85a233fa3daa4fbc030a4a8dc218cb7f34fb0c4b8c13b1"
+    },
+    {
+      "path": "models/templates/upstage-Solar-Open-100B.jinja",
+      "sha256": "4618a1ec1a3442b9723d661d72bb1776d1bf8ebd7281a3bf3edd8bfd80e5ad4e"
+    },
+    {
+      "path": "tests/peg-parser/simple-tokenize.cpp",
+      "sha256": "9afe0a1e48e57a5b38965a214d805905238ec81126e28e741a2f37bbdcca17e2"
+    },
+    {
+      "path": "tests/peg-parser/simple-tokenize.h",
+      "sha256": "4b95a0a4bf6162fd0e60c13c29a3cd81289d22a7d59ccd0a6d4c4aaed3ebb7d4"
+    },
+    {
+      "path": "tests/peg-parser/test-basic.cpp",
+      "sha256": "24c5c31c65b2f5fc88919a4b5d06506ae644f8f0460c14c0134cd5439c5a7694"
+    },
+    {
+      "path": "tests/peg-parser/test-gbnf-generation.cpp",
+      "sha256": "d14973bb98faaa87d1e17af30b76d413e2ac6541ab800c20eb55d48c8fa1952a"
+    },
+    {
+      "path": "tests/peg-parser/test-json-parser.cpp",
+      "sha256": "2731298bf7f28047852e4f420243fc533bdb1408611257f47a5fff2adacb36fc"
+    },
+    {
+      "path": "tests/peg-parser/test-json-serialization.cpp",
+      "sha256": "276f50faa0f1f50da7d5289b3e13110c26cf9120ff23bbdb4a6a8c12c384a028"
+    },
+    {
+      "path": "tests/peg-parser/test-python-dict-parser.cpp",
+      "sha256": "ab6b20f141fed193bc93e810608c1b6800415d14ff832ad3ff84671594d18d4f"
+    },
+    {
+      "path": "tests/peg-parser/test-unicode.cpp",
+      "sha256": "5eda6c6457af1ff1a62081dadac597d7706bb656e9941bb828de6421d9c563cf"
+    },
+    {
+      "path": "tests/peg-parser/tests.h",
+      "sha256": "8788590edb516c2e46a3d63bcfbce6c8ed7f6c0235c9e0988df46574fcc15292"
+    },
+    {
+      "path": "tests/snapshots/deepseek-v3.1.schema",
+      "sha256": "15ddeb983cc8041eb2c12effd5a4a0b702649b2557dcdb27011abc148e638594"
+    },
+    {
+      "path": "tests/snapshots/gemma-3-4b-it.schema",
+      "sha256": "c1c380e2d0399238373232ae8c9a3672cf7c1e1e17077ad141a3dcdb0634d5ac"
+    },
+    {
+      "path": "tests/snapshots/glm-4.6v.schema",
+      "sha256": "a15600c575cd715c01e2c2b20259e2b7f02a836e4155b7f105e84173865ca7ca"
+    },
+    {
+      "path": "tests/snapshots/gpt-oss-120b.schema",
+      "sha256": "fda9db4e0b84ee3453a9b1b5b3c0b8480280f598dbea560fde0ef35f876e7109"
+    },
+    {
+      "path": "tests/snapshots/meta-llama-3.1-70b-instruct.schema",
+      "sha256": "b82548268a1281e244a57f0d358cfcc315a3da74b3b937a8729adbd8995146ac"
+    },
+    {
+      "path": "tests/snapshots/nvidia-nemotron-3-nano-30b-a3b.schema",
+      "sha256": "725ff2e1851450d547bc8a7ad105e129c6a62292dbc1c7cc1b6c2208422e9903"
+    },
+    {
+      "path": "tests/snapshots/qwen3-0.6b.schema",
+      "sha256": "7059f53787894768403915aadeb7f80083a4b019e79d84b920a7c2fd4ac32edc"
+    },
+    {
+      "path": "tests/snapshots/qwen3-14b.schema",
+      "sha256": "10532e520522603b571a238989da0ae424c05c02f9c669fc760bce1556986a69"
+    },
+    {
+      "path": "tests/snapshots/qwen3-coder-next.schema",
+      "sha256": "32835949c8562ad546e7128bde983a7b8814868d5ef2e4646b7f73e0b4b5449b"
+    },
+    {
+      "path": "tests/snapshots/qwen3.5-397b-a17b.schema",
+      "sha256": "217f7e343c4d83046f321189582adc390c75288851e96c5d1c6144a54e465aa1"
+    },
+    {
+      "path": "tests/snapshots/qwen3.6-27b.schema",
+      "sha256": "2e690a5e47f6d052a6f6c4dc0cee2873bfb871e25fcdd80c4929d86fcfe8aa8c"
+    },
+    {
+      "path": "tests/snapshots/step-3.5-flash.schema",
+      "sha256": "79958024f1acbb92d81ef3fcbff79f466aa03414cc1babc15f979479f3715524"
+    },
+    {
+      "path": "tests/test-chat-analysis.cpp",
+      "sha256": "d895ae1736845640b8dab486c68189726821abfbbfc0ca96f98cd419633ad1a1"
+    },
+    {
+      "path": "tests/test-chat-auto-parser.cpp",
+      "sha256": "d69af3154f3ed738e47a74280bcd63d2e90cd60b05dff7f5f1f7a5b26c59478c"
+    },
+    {
+      "path": "tests/test-chat-peg-parser.cpp",
+      "sha256": "6a246d427dc6d0594b47ff2e409e98b9a7b5f380851751774c161b437534456f"
+    },
+    {
+      "path": "tests/test-chat-template.cpp",
+      "sha256": "7a790605222858ca5d5a2de94de27115d693e2c293638c392b7726a44ad3451f"
+    },
+    {
+      "path": "tests/test-chat.cpp",
+      "sha256": "2f165193e862433d706cf0b052ca927fcddf64033277d1c5ac15001b4093a2cc"
+    },
+    {
+      "path": "tests/test-jinja.cpp",
+      "sha256": "72026cc518213a04403eb4eb4fe5dcf0e00ba5500938a50f4b2e5976846a759b"
+    },
+    {
+      "path": "tests/test-json-schema-to-grammar.cpp",
+      "sha256": "0c3a9c7700fa95b2a4a32660e2fb8f55f0b7b44c755c7077160ec19000e3610d"
+    },
+    {
+      "path": "tests/test-json-schema.cpp",
+      "sha256": "3e86801971b688d62dc23a68f8aa9bb6c197aa47d9701f3885d2885c5d634079"
+    },
+    {
+      "path": "tests/test-peg-parser.cpp",
+      "sha256": "52ebb967feae3aec877a1d3cb1c509b2598a9c799e60401a82253a5d4844038b"
+    },
+    {
+      "path": "tests/testing.h",
+      "sha256": "348604ea7f55fdcb5e91b8f476c5653e778e19c796602b803929b35ed19e0629"
+    },
+    {
+      "path": "vendor/nlohmann/CMakeLists.txt",
+      "sha256": "1b8d383ce777413f3659548cd51b48af094b39134622ed08bbc474c406b621ce"
+    },
+    {
+      "path": "vendor/nlohmann/json.hpp",
+      "sha256": "aaf127c04cb31c406e5b04a63f1ae89369fccde6d8fa7cdda1ed4f32dfc5de63"
+    },
+    {
+      "path": "vendor/nlohmann/json_fwd.hpp",
+      "sha256": "fb6aa70cbece087f37ab4685c182b287c53be54f785f981b9db9d30d2d028b37"
+    },
+    {
+      "path": "vendor/sheredom/CMakeLists.txt",
+      "sha256": "a3fa72186159c3fe9760756f58563e4c7d653e5dc9f188be3e1ca254174ca34c"
+    },
+    {
+      "path": "vendor/sheredom/subprocess.h",
+      "sha256": "ddec448cb93c2a5096f914a5b796f707dcf0a9e91591ca13000d210200160cb1"
+    }
+  ]
+}

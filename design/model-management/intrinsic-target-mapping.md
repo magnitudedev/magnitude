@@ -1,9 +1,9 @@
 ---
 applies_to:
   - inference/catalog/**
-  - inference/crates/icn-catalog/**
-  - inference/crates/icn-models/**
-  - inference/crates/icn-contracts/src/models.rs
+  - inference/service/catalog-tool/**
+  - inference/service/models/**
+  - inference/service/contracts/src/models.rs
 ---
 
 # Intrinsic catalog target mapping

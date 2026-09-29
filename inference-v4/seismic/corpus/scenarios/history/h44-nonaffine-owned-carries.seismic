@@ -1,0 +1,20 @@
+# origin: H-44 X1:P32 test:seismic-runtime:runtime/src/feedback/binding_tests.rs:cpu_nonaffine_owned_carries_relocate_initialized_storage
+# invoke carried: f32[2,3]=1,2,3,4,5,6
+# pin: result = f32[2,3]=1,17,4,3,2,6
+# invoke partial: f32[2,3]=1,2,3,4,5,6
+# pin: result = f32[1]=1
+fn carried(x: &tensor[2,3] f32) -> tensor[2,3] f32:
+    let mut y = to_owned(x)
+    for i in 0..2:
+        y = reshape(y.T, (2,3))
+    y[0,1] = 17.0
+    return y
+
+fn partial(x: &tensor[2,3] f32) -> tensor[1] f32:
+    let mut y = tensor[2,3] f32
+    y[0,0] = x[0,0]
+    for i in 0..2:
+        y = reshape(y.T, (2,3))
+    let mut result = tensor[1] f32
+    result[0] = y[0,0]
+    return result

@@ -1,0 +1,20 @@
+# Rust/CMake outputs, including standalone validation crates.
+/target/
+**/target/
+
+# Local compiler/runtime cache.
+.seismic-cache/
+
+# Generated validation fixtures, reports, measurements, and environments.
+validation/**/results/
+validation/**/venv/
+validation/**/.venv/
+validation/**/*.json
+validation/**/*.jsonl
+validation/**/*.ndjson
+validation/**/__pycache__/
+
+# Solver lab output.
+solver/lab/results/
+solver/lab/evidence/
+solver/lab/**/__pycache__/

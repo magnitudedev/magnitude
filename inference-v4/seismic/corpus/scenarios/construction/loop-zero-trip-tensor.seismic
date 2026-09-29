@@ -1,0 +1,9 @@
+# origin: C11:loop_zero_trip_tensor
+# cell: assign-local-tensor/zero-trip
+# cell: value-owned-tensor/zero-trip
+# invoke: f32[4]=1,2,3,4 ; index:0
+fn probe(x: &tensor[4] f32, n: index[8]) -> tensor[4] f32:
+    let mut t = to_owned(x)
+    for k in 0..n:
+        t = t + 1.0
+    return t

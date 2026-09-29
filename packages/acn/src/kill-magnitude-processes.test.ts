@@ -11,8 +11,8 @@ import {
 describe("classifyMagnitudeProcess", () => {
   it.each([
     [`/tmp/bin/${ICN_EXECUTABLE_NAME} serve --port 1234`, "ICN"],
-    ["target/debug/icn-server serve --fake", "ICN"],
-    ["cargo run -p icn-server -- serve --fake", "ICN"],
+    [`inference/target/debug/${ICN_EXECUTABLE_NAME} serve --installation installation.json`, "ICN"],
+    ["cargo run -p magnitude-service-server -- serve --installation installation.json", "ICN"],
     ["bun run icn:serve", "ICN"],
     [`/Users/me/.magnitude/bin/${ACN_EXECUTABLE_NAME} serve --parent-bound`, "ACN"],
     ["bun run packages/acn/src/binary.ts serve --debug", "ACN"],
@@ -26,7 +26,7 @@ describe("classifyMagnitudeProcess", () => {
   it.each([
     "bun run scripts/kill-all.ts",
     "bun run packages/acn/src/binary.ts kill-all",
-    "code /repo/inference/crates/icn-server/src/main.rs",
+    "code /repo/inference/service/server/src/main.rs",
     "rg magnitude-cli packages",
     "npm run dev",
   ])("does not classify unrelated command %s", (command) => {

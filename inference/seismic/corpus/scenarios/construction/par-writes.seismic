@@ -1,0 +1,6 @@
+# origin: C11:par_writes
+# cell: assign-element/parallel
+# invoke: f32[4]=1,2,3,4 ; f32[4]=0,0,0,0
+fn probe[N](x: &tensor[N] f32, dst: &mut tensor[N] f32):
+    parallel for k in 0..N:
+        dst[k] = x[k] * 2.0

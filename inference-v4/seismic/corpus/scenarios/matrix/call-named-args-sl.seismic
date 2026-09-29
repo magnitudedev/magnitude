@@ -1,0 +1,7 @@
+# cell: call-named-args/sl
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero
+fn scaled[V](r: &tensor[V] f32, s: f32) -> f32:
+    return r[0] * s
+
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32) where W >= 8:
+    out[0] = scaled(r=x[0], s=2.0)

@@ -1,0 +1,18 @@
+# origin: X1:r6-w01
+# invoke: f32[4]=zero ; index:12
+# expect: returned
+# pin: out = f32[4]=3,4,6,12
+# invoke: f32[1]=zero ; index:4095
+# expect: returned
+# pin: out = f32[1]=4095
+# invoke: f32[0]=zero ; index:7
+# expect: returned
+fn probe[N](out: &mut tensor[N] f32, n: index[4096]):
+    # Every visit's local is sized by the binder (`n / (N - i)`), so the
+    # sequential demand grows with `i`; the ordered outcome is independent of
+    # visit order (L25) and the reservation is the static bound (D12).
+    for i in 0..N:
+        let q = n / (N - i)
+        let mut t = tensor[q] f32
+        t[:] = ones_like(t)
+        out[i] = reduce(t, 0, sum)

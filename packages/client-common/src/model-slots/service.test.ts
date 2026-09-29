@@ -77,7 +77,7 @@ describe("model-slot mutation synchronization", () => {
         residency: {
           _tag: "Loading",
           stage: "queued",
-          progress: Option.none(),
+          fraction: 0,
           plannedAllocation: Option.none(),
         },
         actions: ["Stop"],

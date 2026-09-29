@@ -1,0 +1,9 @@
+# origin: H-15
+# general-launches-at-most: 1
+# invoke: u32[1000]=rand(7) ; u32[1000]=zero
+fn probe[N](x: &tensor[N] u32, y: &mut tensor[N] u32):
+    for i in 0..N:
+        if x[i] > u32(0):
+            y[i] = x[i] + u32(1)
+        else:
+            y[i] = u32(0)

@@ -9,6 +9,7 @@ import {
   ProviderModelIdSchema,
   ReasoningEffortSchema,
   type DisplayRootStatus,
+  type ModelLoadStage,
   type ModelResidency,
 } from "@magnitudedev/sdk"
 import { InlineWorkActivity } from "./inline-work-activity"
@@ -42,12 +43,12 @@ const requestedModel = new ModelSlotConfiguredLocal({
   actions: ["Stop"],
 })
 
-const loadingModel = (progress: Option.Option<number>) => new ModelSlotConfiguredLocal({
+const loadingModel = (stage: ModelLoadStage, fraction: number) => new ModelSlotConfiguredLocal({
   ...requestedModel,
   residency: {
     _tag: "Loading",
-    stage: "loading",
-    progress,
+    stage,
+    fraction,
     plannedAllocation: Option.none(),
   } satisfies ModelResidency,
 })
@@ -67,10 +68,10 @@ describe("InlineWorkActivity", () => {
     expect(html).toContain('role="status"')
   })
 
-  it("renders indeterminate loading without fabricating zero percent", () => {
+  it("renders a stage without measured progress without fabricating zero percent", () => {
     const html = render({
       rootStatus: working({ _tag: "WaitingForModel", turnStartedAt: Date.now() }),
-      modelLoadActivity: loadingModel(Option.none()),
+      modelLoadActivity: loadingModel("preparing", 0),
       modelName: "Qwen Test",
     })
     expect(html).toContain("Loading Qwen Test")
@@ -82,12 +83,12 @@ describe("InlineWorkActivity", () => {
   it("renders each authoritative progress sample", () => {
     const zero = render({
       rootStatus: working({ _tag: "WaitingForModel", turnStartedAt: Date.now() }),
-      modelLoadActivity: loadingModel(Option.some(0)),
+      modelLoadActivity: loadingModel("loading_weights", 0),
       modelName: "Qwen Test",
     })
     const advanced = render({
       rootStatus: working({ _tag: "WaitingForModel", turnStartedAt: Date.now() }),
-      modelLoadActivity: loadingModel(Option.some(0.47)),
+      modelLoadActivity: loadingModel("loading_weights", 0.47),
       modelName: "Qwen Test",
     })
     expect(zero).toContain("0%")
@@ -102,7 +103,7 @@ describe("InlineWorkActivity", () => {
         _tag: "Worked",
         lastProductiveMs: 5_000,
       },
-      modelLoadActivity: loadingModel(Option.some(0)),
+      modelLoadActivity: loadingModel("loading_weights", 0),
       modelName: "Qwen Test",
     })
     expect(html).toBe("")

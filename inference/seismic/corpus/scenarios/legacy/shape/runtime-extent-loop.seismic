@@ -1,0 +1,11 @@
+# origin: test:validation:corpus/shape.seismic:runtime_extent_loop
+# invoke runtime_extent_loop: f32[6]=seq ; i32[2]=1,5
+# invoke runtime_extent_loop: f32[6]=seq ; i32[2]=3,3
+fn runtime_extent_loop[N](x: &tensor[N] f32, bounds: &tensor[2] i32) -> f32:
+    let lo = bounds[0]
+    let hi = bounds[1]
+    let window = x[lo:hi]
+    let mut total = f32(0.0)
+    for i in 0..extent(window, 0):
+        total = total + window[i] * f32(i)
+    return total

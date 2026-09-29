@@ -83,7 +83,9 @@ CLI protocol, CLI service starter, or separately published integration-contract 
 
 ## Catalog and recommendation behavior
 
-`catalog status` reports authoritative assessment completion and progress counts. It does not infer
+`catalog status` reports authoritative assessment completion and progress counts when targets are
+available. When assessment is incomplete and no targets have been reported, it says so without
+inferring a preparation phase or failure reason from the empty count. It does not infer
 completion from catalog rows or recommendation availability and does not wait for assessment to
 finish. Arbitrary-model discovery is outside the catalog-only product and is not presented.
 

@@ -1,0 +1,11 @@
+# Bias is applied to the FP32 accumulator before output publication. A separate
+# compact linear result followed by add would introduce an extra rounding.
+fn linear_bias[M, N, K](x: &tensor[M, K] T, weight: &tensor[N, K] U,
+    bias: &tensor[N] B, result: &mut tensor[M, N] V):
+    parallel for rows in 0..M:
+        parallel for cols in 0..N:
+            let mut acc = f32(0.0)
+            for k in 0..K:
+                acc = fma(f32(x[rows, k]), f32(weight[cols, k]), acc)
+            acc = acc + f32(bias[cols])
+            result[rows, cols] = acc

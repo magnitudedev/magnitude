@@ -1,0 +1,21 @@
+# origin: A8:C4a-1 A8:G-T11-1
+# backends: metal
+# undecided: reassociated
+# invoke lane_sum: f32[2,32]=seq ; f32[2,32]=zero
+# expect: returned
+# pin: out = f32[2,32]=496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,496,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520,1520
+# invoke lane_sum: f32[5,32]=rand(11) ; f32[5,32]=zero
+# expect: returned
+fn lane_sum[G](x: &tensor[G, 32] f32, out: &mut tensor[G, 32] f32):
+    # Every element receives the sum of its 32-element group. On Metal the
+    # lowering is one `simd_sum` per 32-lane subgroup (`SubgroupFold`), whose
+    # width is the device's `subgroup_width`, checked against the pipeline.
+    parallel for g in 0..G:
+        parallel for l in 0..32:
+            out[g, l] = reduce(x[g], 0, sum, unordered=true)
+
+lower lane_sum[G](x: &tensor[G, 32] f32, out: &mut tensor[G, 32] f32)
+    for metal requires metal.subgroup:
+    parallel for g in 0..G:
+        parallel for l in 0..32:
+            out[g, l] = metal.subgroup.simd_sum(x[g, l])

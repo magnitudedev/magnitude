@@ -1,0 +1,11 @@
+# cell: call-effect-only/after-failure
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; i32:2
+# expect: returned
+# invoke: f32[4,8]=rand(170) ; f32[4]=zero ; f32[4,8]=zero ; i32:0
+# expect: failed
+fn fill_row[V](dst: &mut tensor[V] f32, src: &tensor[V] f32):
+    dst[:] = src * 2.0
+
+fn probe[W](x: &tensor[4, W] f32, out: &mut tensor[4] f32, y: &mut tensor[4, W] f32, d: i32) where W >= 8:
+    let q = 10 / d
+    fill_row(y[0], x[0])

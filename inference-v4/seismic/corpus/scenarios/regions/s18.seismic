@@ -1,0 +1,7 @@
+# origin: C14:s18
+# rejected: "`v` has type"
+fn probe[N](x: &tensor[N] f32) -> f32:
+    let mut v = x[0:1]
+    for i in 1..N:
+        v = x[0:i + 1]
+    return reduce(v, 0, sum)

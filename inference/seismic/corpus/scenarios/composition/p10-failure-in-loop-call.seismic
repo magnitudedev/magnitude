@@ -1,0 +1,12 @@
+# origin: X1:P10
+# invoke: i32[4]=zero ; i32[4]=1,2,3,4
+# expect: failed
+# pin: out = i32[4]=-5,-10,0,0
+# invoke: i32[4]=zero ; i32[4]=4,5,8,13
+# expect: returned
+# pin: out = i32[4]=10,5,2,1
+fn step(out: &mut tensor[4] i32, i: index[4], d: i32):
+    out[i] = 10 / d
+fn probe(out: &mut tensor[4] i32, ds: &tensor[4] i32):
+    for i in 0..4:
+        step(out, i, ds[i] - 3)

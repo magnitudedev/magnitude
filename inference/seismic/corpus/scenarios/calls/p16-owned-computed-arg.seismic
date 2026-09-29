@@ -1,0 +1,9 @@
+# origin: C13:p16
+# rejected: "cannot cross an owned boundary"
+fn own[N](x: tensor[N] i32) -> i32:
+    let mut y = x
+    y[0] = 100
+    return reduce(y, 0, sum)
+
+fn probe(input: &tensor[4] i32) -> i32:
+    return own(input * 2) + own(input)

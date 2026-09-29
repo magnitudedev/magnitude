@@ -216,7 +216,7 @@ describe("shared local-model command hooks", () => {
         actions.stop()
         await Effect.runPromise(Effect.sleep("20 millis"))
       })
-      for (const id of [0, 1]) expect(statuses.get(id)).toEqual({ pending: false, failure: Option.some("Cleanup is incomplete. Try Stop again.") })
+      for (const id of [0, 1]) expect(statuses.get(id)).toEqual({ pending: false, failure: Option.some("The model may still be running. Try stopping it again.") })
     } finally {
       if (renderer) await act(async () => renderer.unmount())
       registry.dispose()

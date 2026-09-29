@@ -25,24 +25,23 @@ artifacts. The release graph is product configuration, not a plugin system.
 | Desktop | supported graphical hosts | Electron application with its matched service and native ownership addon and, on Unix, transient command helper; macOS uses an explicit DMG installation |
 | ACN | Apple hosts | signed, notarized, stapled `Magnitude.app` whose main executable is `magnitude-service` with embedded ripgrep, plus metadata and icon |
 | ACN | other hosts | one `bin/magnitude-service` executable with embedded ripgrep |
-| ICN base | every host | one `bin/magnitude-inference` executable, planner inputs, common runtime libraries, and CPU modules |
-| ICN backend pack | compatible hosts | one Metal, CUDA, or Vulkan module family and its redistributable runtime libraries |
+| Inference | every host | one complete installation layout: `bin/magnitude-inference` with every backend of the host compiled in, `runtime/` (NVRTC on Linux and Windows; the Microsoft CRT on Windows), and `catalog/` planner inputs |
 
 Release hosts are Apple arm64, Apple x64, Linux GNU arm64, Linux GNU x64, and Windows x64 MSVC.
-Windows ships a CPU base, CUDA 12.9 and Vulkan packs, and a per-user desktop installer.
-Each backend pack names exactly one required ICN base and must have the same
-native-build identity and backend-module ABI as that base.
+Windows also ships a per-user desktop installer.
 
-Apple arm64 publishes Metal; Apple x64 is CPU-only. Linux arm64 and x64 publish Vulkan plus CUDA 11.8 and CUDA 12.9.
-CUDA device-image and driver compatibility is defined by
-[CUDA compatibility](../inference/cuda-compatibility.md).
+Each host has exactly one inference artifact and there are no backend packs. Apple arm64 includes
+Metal and CPU; Apple x64 is CPU-only; Linux and Windows include CUDA, Vulkan and CPU. NVRTC 12.9 is
+the only CUDA payload, adding about 40–45 MB compressed to every Linux and Windows artifact.
+Backend floors are defined by [the inference platform contract](../../inference/docs/compatibility.md);
+the device a service uses is chosen at runtime by Seismic discovery, never by artifact selection.
 
 ## Release identity
 
 The release manifest identifies one version, source commit, ACN coordination revision, and the
 complete native artifact graph. Each artifact record contains its host, kind, filename, byte size,
-SHA-256, and the compatibility facts required for runtime selection. ICN records also contain their
-native-build identity and backend-module ABI.
+and SHA-256. Inference records also contain their native-build identity: the engine build, which a
+declared installation and its executable must match.
 
 The manifest does not describe build provenance or duplicate platform policy. Platform support is
 a property of the release target and is enforced while building and accepting the candidate.
@@ -121,8 +120,8 @@ A conforming release satisfies all of the following:
 
 - Every published artifact is present exactly once and matches its manifest size and SHA-256.
 - Every executable and library depends only on artifact-owned files, its host platform contract,
-  and the capability dependencies of the selected backend.
-- A backend pack composes with exactly its required base and cannot alter the base platform floor.
+  and capability dependencies loaded at runtime.
+- Each host's inference artifact is one complete installation with every backend of that host.
 - Final artifacts pass build-host-independent validation before publication.
 - GitHub assets are public and verified before hosted update metadata promotes them. No npm packages are published.
 

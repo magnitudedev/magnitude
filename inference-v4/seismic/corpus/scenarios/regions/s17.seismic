@@ -1,0 +1,6 @@
+# origin: C14:s17
+# rejected: "tensor borrow is live"
+fn probe(x: &mut tensor[4] f32) -> f32:
+    let v = x[0:2]
+    x[0] = 5.0
+    return reduce(v, 0, sum)

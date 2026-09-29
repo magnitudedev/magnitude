@@ -1,0 +1,19 @@
+# origin: X1:w12
+# cell: call-portable/parallel
+# invoke: f32[2,4]=1,2,3,4,5,6,7,8 ; f32[2]=-1,-1 ; index:10
+# expect: returned
+# pin: y = f32[2,4]=100,2,3,4,100,6,7,8
+# pin: out = f32[2]=10,10
+fn peek[C](v: &tensor[C] f32) -> f32 where C >= 1:
+    return v[0]
+
+fn probe[R, C](y: &mut tensor[R, C] f32, out: &mut tensor[R] f32, n: index[1000000000000]) where C >= 1:
+    # C-5: the reaching condition of `t` reads `y`'s class through a kernel-inlined
+    # callee after the visit wrote it. F1 (e) is deleted (C-5): one Nest, `t`
+    # reserved at its static envelope (D12); the callee reads the visit's write.
+    parallel for r in 0..R:
+        y[r, 0] = 100.0
+        if peek(y[r, :]) > 50.0:
+            let mut t = tensor[n] f32
+            t[:] = ones_like(t)
+            out[r] = reduce(t, 0, sum)

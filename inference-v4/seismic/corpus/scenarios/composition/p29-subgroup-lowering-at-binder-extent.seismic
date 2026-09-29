@@ -1,0 +1,15 @@
+# origin: X1:P29
+# invoke: f32[64]=rand(32) ; f32[64]=zero ; index:40
+# invoke: f32[64]=rand(32) ; f32[64]=zero ; index:63
+fn lane_total[N](x: &tensor[N] f32, out: &mut tensor[N] f32):
+    parallel for i in 0..N:
+        out[i] = x[i]
+
+lower lane_total[N](x: &tensor[N] f32, out: &mut tensor[N] f32)
+    for metal requires metal.subgroup:
+    parallel for i in 0..N:
+        out[i] = metal.subgroup.simd_sum(x[i])
+
+fn probe[T](x: &tensor[T] f32, out: &mut tensor[T] f32, n: index[T]):
+    for t in 0..n:
+        lane_total(x[0:t + 1], out[0:t + 1])

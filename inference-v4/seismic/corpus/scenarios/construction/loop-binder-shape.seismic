@@ -1,0 +1,7 @@
+# origin: C11:loop_binder_shape
+# invoke: f32[4]=1,2,3,4
+fn probe(x: &tensor[4] f32) -> f32:
+    let mut s = 0.0
+    for k in 1..4:
+        s = s + reduce(x[0:k], 0, sum)
+    return s

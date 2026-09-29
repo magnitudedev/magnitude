@@ -1,0 +1,10 @@
+# origin: H-43 test:seismic-compiler:compiler/src/evaluation_session.rs:complete_helper_products_do_not_allocate_an_intermediate_tensor
+# invoke: f32[4]=seq
+fn twice[N](x: &tensor[N] f32) -> tensor[N] f32:
+    return x + x
+
+fn total[N](x: &tensor[N] f32) -> f32:
+    return reduce(x, 0, sum)
+
+fn probe(x: &tensor[4] f32) -> f32:
+    return total(twice(x))
