@@ -1,12 +1,7 @@
-// Decode output (M <= 8): workgroup (x, m) owns output channels of tile x for
-// row m. The Vulkan form of `metal/routed_output.metal`. It runs the K1
-// GEMV sums of each choice's down projection in slot order, weighting each
-// published (A-rounded) projection by its score, then the shared expert's
-// down projection, and publishes
-//     residual + selected + round_A(shared) * coefficient.
-// Every lane of a lane group (a whole subgroup) receives each channel's
-// total, so the running selection lives in every lane's registers and one
-// lane stores the channel.
+// Decode output (M <= 8): each (row, choice) runs its down projection in a
+// separate workgroup. Choice K is the shared expert. The projection launch
+// publishes A-rounded values to scratch; the next launch weights the expert
+// choices in slot order and adds the shared expert and residual.
 #include "lib/core/activation.glsl"
 #include "lib/routed/routed.glsl"
 
@@ -110,50 +105,61 @@
 
 #define OUTPUT_R SEISMIC_TUNE_ROWS
 
-void routed_output() {
+void routed_output_project() {
     const uint tile = gl_WorkGroupID.x;
-    const uint64_t m = gl_WorkGroupID.y;
+    const uint64_t m = gl_WorkGroupID.y / (SEISMIC_DIM_K + 1ul);
+    const uint64_t choice = gl_WorkGroupID.y % (SEISMIC_DIM_K + 1ul);
     const uint hidden = uint(SEISMIC_DIM_H);
     const uint first = projection_gemv_first_row(OUTPUT_R, 32u, tile);
     const uint bytes = ELEMENT_BYTES(ROUTED_ACT);
-    float selected[PROJECTION_GEMV_MAX_R];
-    [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r)
-        selected[r] = 0.0;
     float totals[PROJECTION_GEMV_SUMS], unused[PROJECTION_GEMV_SUMS];
-
-    for (uint64_t k = 0ul; k < SEISMIC_DIM_K; ++k) {
+    if (choice < SEISMIC_DIM_K) {
         const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
-            + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
+            + (m * SEISMIC_ROUTES_STRIDE_0 + choice * SEISMIC_ROUTES_STRIDE_1) * 4ul));
         const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_PRODUCT)
-                + (m * SEISMIC_EXPERT_PRODUCT_STRIDE_0 + k * SEISMIC_EXPERT_PRODUCT_STRIDE_1) * uint64_t(bytes),
+                + (m * SEISMIC_EXPERT_PRODUCT_STRIDE_0 + choice * SEISMIC_EXPERT_PRODUCT_STRIDE_1) * uint64_t(bytes),
             0ul, SEISMIC_EXPERT_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F), 0ul);
         const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), ED_GEOMETRY,
             routed_expert_row(expert, SEISMIC_DIM_H), uint(SEISMIC_DIM_F));
         projection_gemv_sums(ED_KIND, ED_KIND, false, OUTPUT_R, 32u, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,
             hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
-        const float score = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)
-            + (m * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1) * 4ul);
-        [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r)
-            if (r < OUTPUT_R)
-                selected[r] = seismic_fma_rn(score, element_round(ROUTED_ACT, totals[r * PROJECTION_GEMV_MAX_M]), selected[r]);
+    } else {
+        const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SHARED_PRODUCT)
+                + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * uint64_t(bytes),
+            0ul, SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S), 0ul);
+        const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN), SD_GEOMETRY, 0ul,
+            uint(SEISMIC_DIM_S));
+        projection_gemv_sums(SD_KIND, SD_KIND, false, OUTPUT_R, 32u, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,
+            hidden, uint(SEISMIC_DIM_S), tile, totals, unused);
     }
-
-    const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SHARED_PRODUCT)
-            + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * uint64_t(bytes),
-        0ul, SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S), 0ul);
-    const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN), SD_GEOMETRY, 0ul,
-        uint(SEISMIC_DIM_S));
-    projection_gemv_sums(SD_KIND, SD_KIND, false, OUTPUT_R, 32u, 1u, PROJECTION_NORM_NONE, x, down, down, 1u, hidden,
-        uint(SEISMIC_DIM_S), tile, totals, unused);
-    const float coefficient = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT) + m * SEISMIC_COEFFICIENT_STRIDE_0 * 4ul);
     [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
         const uint n = first + r;
-        if (r < OUTPUT_R && n < hidden && SEISMIC_LANE == r) {
-            const float residual = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)
-                + (m * SEISMIC_RESIDUAL_STRIDE_0 + uint64_t(n) * SEISMIC_RESIDUAL_STRIDE_1) * 4ul);
-            element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
-                    + (m * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(n) * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
-                residual + selected[r] + element_round(ROUTED_ACT, totals[r * PROJECTION_GEMV_MAX_M]) * coefficient);
-        }
+        if (r < OUTPUT_R && n < hidden && SEISMIC_LANE == r)
+            element_put(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PROJECTED),
+                (m * (SEISMIC_DIM_K + 1ul) + choice) * SEISMIC_DIM_H + uint64_t(n),
+                totals[r * PROJECTION_GEMV_MAX_M]);
     }
+}
+
+void routed_output_combine() {
+    const uint64_t m = gl_WorkGroupID.y;
+    const uint64_t n = uint64_t(gl_WorkGroupID.x) * 256ul + gl_LocalInvocationIndex;
+    if (n >= SEISMIC_DIM_H)
+        return;
+    float selected = 0.0;
+    for (uint64_t choice = 0ul; choice < SEISMIC_DIM_K; ++choice) {
+        const float score = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)
+            + (m * SEISMIC_SCORES_STRIDE_0 + choice * SEISMIC_SCORES_STRIDE_1) * 4ul);
+        const float projected = element_at(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PROJECTED),
+            (m * (SEISMIC_DIM_K + 1ul) + choice) * SEISMIC_DIM_H + n);
+        selected = seismic_fma_rn(score, projected, selected);
+    }
+    const float projected_shared = element_at(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PROJECTED),
+        (m * (SEISMIC_DIM_K + 1ul) + SEISMIC_DIM_K) * SEISMIC_DIM_H + n);
+    const float coefficient = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT) + m * SEISMIC_COEFFICIENT_STRIDE_0 * 4ul);
+    const float residual = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)
+        + (m * SEISMIC_RESIDUAL_STRIDE_0 + n * SEISMIC_RESIDUAL_STRIDE_1) * 4ul);
+    element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
+            + (m * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
+        residual + selected + projected_shared * coefficient);
 }

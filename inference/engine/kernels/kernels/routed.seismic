@@ -261,14 +261,20 @@ native routed_output for cuda from "cuda/routed_output.cu":
         threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M, 1)
         threads_per_threadgroup (128, 1, 1)
 
-# Vulkan: the Metal form; decode lane groups are whole subgroups.
+# Vulkan: project the expert choices and shared expert in separate workgroups,
+# then combine their A-rounded outputs in choice order. Decode lane groups
+# are whole subgroups.
 native routed_output for vulkan from "vulkan/routed_output.comp":
     static (H, K, F, S)
     params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
-    launch routed_output:
-        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M, 1)
+    scratch projected bytes (M * (K + 1) * H * 2)
+    launch routed_output_project:
+        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M * (K + 1), 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + min(ceil_div(max(F, S), 32), 288) * 72)
+    launch routed_output_combine:
+        threadgroups (ceil_div(H, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 # CPU: the products staged once as F32; work item (x, m) owns ROWS output
 # channels of row m and carries their running sum across the choices.
