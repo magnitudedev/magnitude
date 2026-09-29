@@ -159,6 +159,9 @@ impl Printer {
             if param.arithmetic {
                 p.out.push_str("arithmetic ");
             }
+            if param.form {
+                p.out.push_str("form ");
+            }
             let values = param
                 .values
                 .iter()

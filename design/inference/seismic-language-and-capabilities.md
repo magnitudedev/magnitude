@@ -220,7 +220,10 @@ static calls, or compiler planning.
 A native declaration has entry parameters shared by launches and parameters scoped to one launch.
 Launches may reuse parameter names; a launch's condition and geometry see only its own parameters,
 entry parameters, and dimensions. Scratch sees entry parameters and dimensions. A parameter marked
-`code` changes its launch's generated code; other parameters are supplied at launch time. For a
+`code` changes its launch's generated code; other parameters are supplied at launch time. A
+parameter marked `form` selects among structurally different algorithms (a vector and a matrix
+form of one entry): the best values of the other parameters in one form say nothing about
+another's, so tuning searches each form from a start of its own. For a
 launch-scoped Metal implementation, non-code entry parameters and then non-code parameters of
 each launch occupy trailing ABI argument words in declaration order. A launch source sees its
 own local names as `SEISMIC_RUNTIME_<NAME>` at those offsets; it may instead read a device built-in

@@ -403,11 +403,12 @@ impl Parser {
         }
     }
 
-    /// `[code] [arithmetic] NAME in [V, ..]`
+    /// `[code] [arithmetic] [form] NAME in [V, ..]`
     fn native_param(&mut self) -> PResult<NativeParamDecl> {
         let begin = self.span();
         let mut code = false;
         let mut arithmetic = false;
+        let mut form = false;
         loop {
             if self.at_word("code") && !code {
                 self.bump();
@@ -415,6 +416,9 @@ impl Parser {
             } else if self.at_word("arithmetic") && !arithmetic {
                 self.bump();
                 arithmetic = true;
+            } else if self.at_word("form") && !form {
+                self.bump();
+                form = true;
             } else {
                 break;
             }
@@ -437,6 +441,7 @@ impl Parser {
             name,
             code,
             arithmetic,
+            form,
             values,
             span: begin.to(self.prev_span()),
         })
@@ -1258,7 +1263,7 @@ mod tests {
     #[test]
     fn specialized_native_declarations_round_trip() {
         let file = round_trip(
-            "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic PARTS in [1, 2, 4], WIDTH in [64, 128])\n    where PARTS * WIDTH <= N and WIDTH >= 64\n    scratch partials bytes (PARTS * N * 4)\n    launch scale_partial:\n        threadgroups (ceil_div(N, WIDTH), PARTS, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (max(WIDTH * 4, 256))\n    launch scale_merge:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (min(N, 256), 1, 1)\n",
+            "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic form PARTS in [1, 2, 4], WIDTH in [64, 128])\n    where PARTS * WIDTH <= N and WIDTH >= 64\n    scratch partials bytes (PARTS * N * 4)\n    launch scale_partial:\n        threadgroups (ceil_div(N, WIDTH), PARTS, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (max(WIDTH * 4, 256))\n    launch scale_merge:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (min(N, 256), 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
@@ -1266,6 +1271,7 @@ mod tests {
         assert_eq!(native.statics.len(), 1);
         assert_eq!(native.params.len(), 2);
         assert!(native.params[0].arithmetic);
+        assert!(native.params[0].form);
         assert!(matches!(
             native
                 .constraint
@@ -1284,7 +1290,7 @@ mod tests {
     #[test]
     fn launch_parameters_round_trip_with_reused_names() {
         let file = round_trip(
-            "native project for metal from \"project.metal\":\n    params (BATCH_FROM in [5, 3])\n    launch gemv when O < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8], code arithmetic ROWS in [1, 2])\n        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when O >= BATCH_FROM:\n        params (SIMDGROUPS in [8, 4])\n        threadgroups (ceil_div(H, SIMDGROUPS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n",
+            "native project for metal from \"project.metal\":\n    params (BATCH_FROM in [5, 3])\n    launch gemv when O < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8], code arithmetic form ROWS in [1, 2])\n        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when O >= BATCH_FROM:\n        params (SIMDGROUPS in [8, 4])\n        threadgroups (ceil_div(H, SIMDGROUPS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
@@ -1292,6 +1298,7 @@ mod tests {
         assert_eq!(native.launches[0].params[0].name.name, "SIMDGROUPS");
         assert!(native.launches[0].params[1].code);
         assert!(native.launches[0].params[1].arithmetic);
+        assert!(native.launches[0].params[1].form);
         assert_eq!(native.launches[1].params[0].name.name, "SIMDGROUPS");
     }
 

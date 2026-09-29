@@ -694,6 +694,10 @@ pub struct NativeParameter {
     /// The parameter changes the arithmetic order of a row's result. Other
     /// parameters must produce bit-identical results across their values.
     pub arithmetic: bool,
+    /// Its values select structurally different algorithms (for example a
+    /// vector or a matrix form), whose best settings of the other parameters
+    /// are unrelated: tuning searches each form from a start of its own.
+    pub form: bool,
     pub values: Vec<u64>,
     pub role: NativeParameterRole,
 }
@@ -752,6 +756,7 @@ impl NativeParameter {
                 name: format!("cpu.workers.{launch}"),
                 code: false,
                 arithmetic: false,
+                form: false,
                 values: counts.clone(),
                 role: NativeParameterRole::Workers {
                     launch: launch as u32,
@@ -761,6 +766,7 @@ impl NativeParameter {
                 name: "cpu.tier".to_owned(),
                 code: false,
                 arithmetic: false,
+                form: false,
                 values: tiers,
                 role: NativeParameterRole::Tier,
             }))

@@ -191,6 +191,8 @@ pub struct NativeParamDecl {
     pub code: bool,
     /// The parameter changes the arithmetic order of a row's result.
     pub arithmetic: bool,
+    /// The parameter's values select structurally different algorithms.
+    pub form: bool,
     pub values: Vec<u64>,
     pub span: Span,
 }

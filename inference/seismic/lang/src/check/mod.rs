@@ -1074,6 +1074,7 @@ fn check_native(
             name: name.clone(),
             code: param.code,
             arithmetic: param.arithmetic,
+            form: param.form,
             values,
             role: crate::checked::NativeParameterRole::Declared,
         });
@@ -1313,6 +1314,7 @@ fn check_native(
                 name: name.clone(),
                 code: param.code,
                 arithmetic: param.arithmetic,
+                form: param.form,
                 values,
                 role: crate::checked::NativeParameterRole::Declared,
             });

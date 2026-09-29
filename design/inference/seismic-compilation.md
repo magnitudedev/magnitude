@@ -50,10 +50,14 @@ name a cheaper screening subset with folded weights for candidate exploration. T
 screened finalists are then measured and ranked with the original points and weights; output
 validation also covers the original points. The result records the screening definition.
 Each parameter's values are ordered numerically; neighbours differ by one step in one parameter. The search
-evaluates the defaults (and any start configurations the consumer names), then repeatedly forms
-every unvisited neighbour of the current configuration as one parallel batch, measures each, and
-moves to the best while it improves by more than ε; at a local minimum it restarts from the
-unvisited configuration farthest from everything visited. It stops when the consumer's budget (a
+evaluates the defaults, then, within the consumer's budget, one start per other value of each `form` parameter and any
+additional start configurations the consumer names. Each form start is the admissible configuration with that value nearest
+the defaults, unless the consumer supplies an admissible start for that form value; the hint then uses that form's first
+measurement slot. From the cheapest start of each form, cheapest form first, it repeatedly forms every
+unvisited neighbour of the current configuration as one parallel batch, measures each, and moves
+to the best while it improves by more than ε; a form's own defaults can be far from its best, and
+a single descent from the entry's defaults rarely crosses into another form. Then, at each local
+minimum, it restarts from the unvisited configuration farthest from everything visited. It stops when the consumer's budget (a
 configuration count, never a wall-clock limit) is spent, the space is exhausted, R consecutive
 restarts found nothing better, or the consumer's safety deadline passes. Configurations the
 device cannot form or run cost +∞ and consume budget. The K cheapest configurations and the

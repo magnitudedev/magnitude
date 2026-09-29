@@ -1550,6 +1550,7 @@ mod metadata_scratch_tests {
             name: "tile".into(),
             code: false,
             arithmetic: false,
+            form: false,
             values: vec![1, 4],
             role: NativeParameterRole::Declared,
         };

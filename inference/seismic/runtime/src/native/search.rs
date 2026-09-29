@@ -2,9 +2,12 @@
 //! space, as a pure function of what an [`Evaluator`] reports.
 //!
 //! The search walks the grid of admissible configurations: each parameter's
-//! values in numeric order, neighbors one step apart in one parameter. From
-//! the best starting configuration it moves to the best neighbor while that
-//! improves the cost by more than `improvement`; at a local minimum it
+//! values in numeric order, neighbors one step apart in one parameter. It
+//! starts from the defaults, one configuration per other value of each form
+//! parameter (the admissible configuration with that value nearest the
+//! defaults) and the consumer's hints. From the cheapest start of each form,
+//! cheapest form first, it moves to the best neighbor while that improves
+//! the cost by more than `improvement`; then, at each local minimum, it
 //! restarts from the unvisited configuration farthest from everything
 //! visited. It stops when the budget is spent, every configuration was
 //! visited, `restarts` consecutive restarts failed to improve the best cost,
@@ -160,12 +163,26 @@ pub struct SearchSettings {
     pub confirmation_samples: usize,
 }
 
+/// One declared parameter.
+#[derive(Clone, Debug)]
+pub struct SearchParameter {
+    pub name: String,
+    /// Its values in declaration order; the first is the default.
+    pub values: Vec<u64>,
+    /// Its values select structurally different forms of the implementation
+    /// (declared `form`), each searched from a start of its own: one form's
+    /// defaults tell nothing of another's.
+    pub form: bool,
+}
+
 /// A declared parameter space and its admissible configurations.
 #[derive(Clone, Debug)]
 pub struct SearchSpace {
     /// Parameter names in declaration order, each with its values in numeric
     /// order.
     parameters: Vec<(String, Vec<u64>)>,
+    /// Positions of the form parameters.
+    forms: Vec<usize>,
     /// Admissible configurations, as a value index per parameter.
     configurations: Vec<Vec<u32>>,
     /// Each admissible configuration's index.
@@ -203,22 +220,24 @@ impl std::fmt::Display for SearchSpaceError {
 impl std::error::Error for SearchSpaceError {}
 
 impl SearchSpace {
-    /// `declared` lists each parameter's values in declaration order (the
-    /// first is its default); `admissible` lists the configurations the
-    /// declaration's `where` admits.
+    /// `declared` lists the parameters in declaration order; `admissible`
+    /// lists the configurations the declaration's `where` admits.
     pub fn new(
-        declared: &[(String, Vec<u64>)],
+        declared: &[SearchParameter],
         admissible: &[ParameterValues],
     ) -> Result<Self, SearchSpaceError> {
         let parameters = declared
             .iter()
-            .map(|(name, values)| {
-                let mut sorted = values.clone();
+            .map(|parameter| {
+                let mut sorted = parameter.values.clone();
                 sorted.sort_unstable();
                 sorted.dedup();
-                (name.clone(), sorted)
+                (parameter.name.clone(), sorted)
             })
             .collect::<Vec<_>>();
+        let forms = (0..declared.len())
+            .filter(|position| declared[*position].form)
+            .collect();
         let coordinates = |values: &ParameterValues| -> Result<Vec<u32>, SearchSpaceError> {
             if values.len() != parameters.len() {
                 return Err(SearchSpaceError::Undeclared(values.clone()));
@@ -240,7 +259,7 @@ impl SearchSpace {
             .collect::<Result<Vec<_>, _>>()?;
         let defaults = declared
             .iter()
-            .map(|(name, values)| (name.clone(), values[0]))
+            .map(|parameter| (parameter.name.clone(), parameter.values[0]))
             .collect::<ParameterValues>();
         let positions = configurations
             .iter()
@@ -252,6 +271,7 @@ impl SearchSpace {
             .ok_or(SearchSpaceError::DefaultInadmissible)?;
         Ok(Self {
             parameters,
+            forms,
             configurations,
             positions,
             default,
@@ -302,6 +322,45 @@ impl SearchSpace {
             .zip(&self.configurations[right])
             .map(|(left, right)| left.abs_diff(*right))
             .sum()
+    }
+
+    /// The form of configuration `index`: its form parameters' values.
+    fn form(&self, index: usize) -> Vec<u32> {
+        self.forms
+            .iter()
+            .map(|position| self.configurations[index][*position])
+            .collect()
+    }
+
+    /// One start per other value of each form parameter: the admissible
+    /// configuration with that value nearest the defaults (ties go to the
+    /// lowest index). A value no configuration admits has none.
+    pub fn form_starts(&self) -> Vec<usize> {
+        self.form_starts_with(&[])
+    }
+
+    /// Prefer an admissible consumer hint for a form value when one exists.
+    /// This lets a workload choose where to begin within a structural form
+    /// without spending an extra measurement beyond that form's first start.
+    fn form_starts_with(&self, hints: &[usize]) -> Vec<usize> {
+        let defaults = &self.configurations[self.default];
+        let mut starts = Vec::new();
+        for &position in &self.forms {
+            for value in 0..self.parameters[position].1.len() as u32 {
+                if value == defaults[position] {
+                    continue;
+                }
+                let hinted = hints.iter().copied().find(|index| {
+                    *index < self.len() && self.configurations[*index][position] == value
+                });
+                starts.extend(hinted.or_else(|| {
+                    (0..self.len())
+                        .filter(|index| self.configurations[*index][position] == value)
+                        .min_by_key(|index| self.distance(*index, self.default))
+                }));
+            }
+        }
+        starts
     }
 }
 
@@ -497,9 +556,10 @@ impl<E: Evaluator> State<'_, E> {
     }
 }
 
-/// Search `space` from the defaults and the `start` configurations (for
-/// example the winner of the same declaration at other element bindings),
-/// evaluating at most `budget` configurations (at least the defaults).
+/// Search `space` from the defaults, its form starts and the `start`
+/// configurations. A hint for a structural form replaces that form's usual
+/// nearest-default start, so it uses the same measurement slot. Evaluate at
+/// most `budget` configurations (at least the defaults).
 pub fn search(
     space: &SearchSpace,
     start: &[usize],
@@ -518,6 +578,7 @@ pub fn search(
     };
     let default = space.default;
     let starts = std::iter::once(default)
+        .chain(space.form_starts_with(start))
         .chain(start.iter().copied().filter(|index| *index < space.len()))
         .collect::<Vec<_>>();
     // The defaults are the validation reference: evaluated even past the
@@ -533,7 +594,22 @@ pub fn search(
     } else {
         state.evaluate(&starts);
     }
-    let current = state.cheapest(starts).expect("the defaults were evaluated");
+    // The cheapest measured start of each form, cheapest form first.
+    let mut descents: Vec<usize> = Vec::new();
+    for index in starts
+        .iter()
+        .copied()
+        .filter(|index| state.visited(*index) && state.cost(*index).is_some())
+    {
+        match descents
+            .iter_mut()
+            .find(|other| space.form(**other) == space.form(index))
+        {
+            Some(other) => *other = state.cheapest([*other, index]).expect("both evaluated"),
+            None => descents.push(index),
+        }
+    }
+    descents.sort_by(|left, right| total(state.cost(*left)).total_cmp(&total(state.cost(*right))));
     // A budget covering the whole space measures all of it: the walk could
     // converge on a local minimum while budget is left.
     if state.stop.is_none() && state.budget == space.len() {
@@ -542,7 +618,10 @@ pub fn search(
             .collect::<Vec<_>>();
         state.evaluate(&rest);
     }
-    if state.stop.is_none() {
+    for current in descents {
+        if state.stop.is_some() {
+            break;
+        }
         state.descend(current, settings.improvement);
     }
     let mut failed_restarts = 0;
@@ -633,23 +712,38 @@ mod tests {
     use super::*;
 
     fn space(declared: &[(&str, &[u64])]) -> SearchSpace {
+        forms_space(declared, &[], |_| true)
+    }
+
+    /// The configurations of `declared` that `admits`, with `forms` declared
+    /// form parameters.
+    fn forms_space(
+        declared: &[(&str, &[u64])],
+        forms: &[&str],
+        admits: impl Fn(&ParameterValues) -> bool,
+    ) -> SearchSpace {
         let declared = declared
             .iter()
-            .map(|(name, values)| (name.to_string(), values.to_vec()))
+            .map(|(name, values)| SearchParameter {
+                name: name.to_string(),
+                values: values.to_vec(),
+                form: forms.contains(name),
+            })
             .collect::<Vec<_>>();
         let mut admissible = vec![ParameterValues::new()];
-        for (name, values) in &declared {
+        for parameter in &declared {
             admissible = admissible
                 .into_iter()
                 .flat_map(|base| {
-                    values.iter().map(move |value| {
+                    parameter.values.iter().map(move |value| {
                         let mut next = base.clone();
-                        next.insert(name.clone(), *value);
+                        next.insert(parameter.name.clone(), *value);
                         next
                     })
                 })
                 .collect();
         }
+        admissible.retain(|values| admits(values));
         SearchSpace::new(&declared, &admissible).unwrap()
     }
 
@@ -913,6 +1007,85 @@ mod tests {
         };
         let trace = search(&space, &[hint], 2, &settings(), &mut evaluator);
         assert_eq!(evaluator.evaluations, vec![space.default_index(), hint]);
+        assert_eq!(trace.ranking[0], hint);
+    }
+
+    #[test]
+    fn each_form_is_searched_from_a_start_of_its_own() {
+        // The matrix form (M 1) needs K ≥ 2, so the defaults have no M
+        // neighbor. Its nearest start costs more than the defaults, but
+        // tuned along A it beats every vector configuration.
+        let space = forms_space(
+            &[
+                ("A", &[1, 2, 3, 4, 5, 6, 7, 8]),
+                ("K", &[1, 2, 3, 4]),
+                ("M", &[0, 1]),
+            ],
+            &["M"],
+            |values| values["M"] == 0 || values["K"] >= 2,
+        );
+        let start = space
+            .index_of(
+                &[("A", 1), ("K", 2), ("M", 1)]
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value))
+                    .collect(),
+            )
+            .unwrap();
+        assert_eq!(space.form_starts(), vec![start]);
+        let mut evaluator = Exact {
+            space: &space,
+            cost: |values: &ParameterValues| match values["M"] {
+                0 => 1.0 + 0.01 * (values["A"] + values["K"]) as f64,
+                _ => 0.9 + 0.1 * (8 - values["A"]) as f64 + 0.01 * values["K"] as f64,
+            },
+            evaluations: Vec::new(),
+        };
+        let trace = search(&space, &[], 30, &settings(), &mut evaluator);
+        assert_eq!(evaluator.evaluations[..2], [space.default_index(), start]);
+        let chosen = space.values(trace.ranking[0]);
+        assert_eq!((chosen["M"], chosen["A"]), (1, 8), "{chosen:?}");
+    }
+
+    #[test]
+    fn hinted_form_start_uses_its_first_measurement() {
+        let space = forms_space(
+            &[
+                ("PARTS", &[16, 32, 64, 128]),
+                ("MATRIX", &[0, 1]),
+                ("KEYWISE", &[0, 1]),
+            ],
+            &["MATRIX", "KEYWISE"],
+            |values| values["MATRIX"] == 0 || values["KEYWISE"] == 0,
+        );
+        let hint = space
+            .index_of(
+                &[
+                    ("PARTS".to_owned(), 128),
+                    ("MATRIX".to_owned(), 0),
+                    ("KEYWISE".to_owned(), 1),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+        let matrix = space.form_starts()[0];
+        let mut evaluator = Exact {
+            space: &space,
+            cost: |values: &ParameterValues| {
+                if values["KEYWISE"] == 1 && values["PARTS"] == 128 {
+                    0.5
+                } else {
+                    1.0
+                }
+            },
+            evaluations: Vec::new(),
+        };
+        let trace = search(&space, &[hint], 3, &settings(), &mut evaluator);
+        assert_eq!(
+            evaluator.evaluations,
+            vec![space.default_index(), matrix, hint]
+        );
         assert_eq!(trace.ranking[0], hint);
     }
 }

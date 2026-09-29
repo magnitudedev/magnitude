@@ -30,8 +30,8 @@
 
 use super::plan::{self, PointShape};
 use super::search::{
-    self, Cost, Evaluator, ParameterValues, PointKey, SearchSettings, SearchSpace,
-    SearchSpaceError, SearchStop,
+    self, Cost, Evaluator, ParameterValues, PointKey, SearchParameter, SearchSettings,
+    SearchSpace, SearchSpaceError, SearchStop,
 };
 use super::timing::{self, OutputPool, PointTiming};
 use super::{MeasureOptions, Measurement, NativePrepared};
@@ -201,6 +201,7 @@ pub struct DeclaredParameter {
     #[serde(default)]
     pub launch: Option<usize>,
     pub arithmetic: bool,
+    pub form: bool,
     pub values: Vec<u64>,
 }
 
@@ -338,8 +339,9 @@ pub struct SearchPlan {
     pub settings: SearchSettings,
     /// Minimum device time of one sample; sets repetitions per sample.
     pub min_sample_seconds: f64,
-    /// Configurations evaluated with the defaults at the start (winners of
-    /// the same declaration elsewhere); inadmissible ones are skipped.
+    /// Consumer hints for the search. An admissible hint matching a structural
+    /// form becomes that form's first measurement; other hints follow the
+    /// form starts. Inadmissible hints are skipped.
     pub start: Vec<ParameterValues>,
     /// The safety stop: past it, the search ends with the best found.
     pub deadline: Option<Instant>,
@@ -1363,7 +1365,11 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
     let declared = implementation
         .params
         .iter()
-        .map(|parameter| (parameter.name.clone(), parameter.values.clone()))
+        .map(|parameter| SearchParameter {
+            name: parameter.name.clone(),
+            values: parameter.values.clone(),
+            form: parameter.form,
+        })
         .collect::<Vec<_>>();
     let space = SearchSpace::new(
         &declared,
@@ -1407,6 +1413,7 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
                 name: parameter.name.clone(),
                 launch: None,
                 arithmetic: parameter.arithmetic,
+                form: parameter.form,
                 values: parameter.values.clone(),
             })
             .collect(),
@@ -2062,6 +2069,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
             name: parameter.name.clone(),
             launch: None,
             arithmetic: parameter.arithmetic,
+            form: parameter.form,
             values: parameter.values.clone(),
         })
         .chain(
@@ -2077,6 +2085,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                             name: parameter.name.clone(),
                             launch: Some(ordinal),
                             arithmetic: parameter.arithmetic,
+                            form: parameter.form,
                             values: parameter.values.clone(),
                         })
                 }),

@@ -20,7 +20,8 @@
 //! configuration, margins relative to the whole cost.
 
 use super::search::{
-    self, Cost, Evaluator, ParameterValues, PointKey, SearchSettings, SearchSpace,
+    self, Cost, Evaluator, ParameterValues, PointKey, SearchParameter, SearchSettings,
+    SearchSpace,
 };
 use super::tune::{Exclusion, Outcome, TuningResult};
 use std::collections::HashMap;
@@ -100,7 +101,11 @@ impl Recording {
         let declared = result
             .parameters
             .iter()
-            .map(|parameter| (parameter.name.clone(), parameter.values.clone()))
+            .map(|parameter| SearchParameter {
+                name: parameter.name.clone(),
+                values: parameter.values.clone(),
+                form: parameter.form,
+            })
             .collect::<Vec<_>>();
         let admissible = result
             .configurations
@@ -578,12 +583,14 @@ mod tests {
                     name: "A".into(),
                     launch: None,
                     arithmetic: false,
+                    form: false,
                     values: vec![1, 2, 3, 4],
                 },
                 DeclaredParameter {
                     name: "B".into(),
                     launch: None,
                     arithmetic: false,
+                    form: false,
                     values: vec![1, 2],
                 },
             ],
