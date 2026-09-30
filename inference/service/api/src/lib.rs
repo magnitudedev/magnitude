@@ -1559,13 +1559,14 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
 }
 
 fn preserve_typed_request_client_contract(document: &mut OpenApiDocument) {
-    const TYPED_REQUEST_SCHEMAS: [&str; 24] = [
+    const TYPED_REQUEST_SCHEMAS: [&str; 25] = [
         "AllowedToolRequest",
         "AllowedToolsChoiceRequest",
         "AllowedToolsRequest",
         "ChatCompletionRequest",
         "ChatToolCallRequest",
         "ChatToolRequest",
+        "CountTokensRequest",
         "FunctionDefinitionRequest",
         "FunctionNameRequest",
         "FunctionToolChoiceRequest",

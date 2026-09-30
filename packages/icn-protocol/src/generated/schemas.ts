@@ -763,6 +763,33 @@ export const ContentIdentity = S.Union(
 export type ContentIdentity = S.Schema.Type<typeof ContentIdentity>
 export type ContentIdentityEncoded = S.Schema.Encoded<typeof ContentIdentity>
 
+export const CountTokensRequest = S.Struct({
+  messages: S.Array(S.suspend((): S.Schema<Message, MessageEncoded> => Message)),
+  model: S.String,
+  output_config: S.optionalWith(
+    S.Union(
+      S.Null,
+      S.suspend((): S.Schema<OutputConfig, OutputConfigEncoded> => OutputConfig),
+    ),
+    { exact: true, as: "Option" },
+  ),
+  system: S.optionalWith(
+    S.suspend((): S.Schema<SystemPrompt, SystemPromptEncoded> => SystemPrompt),
+    { exact: true, as: "Option" },
+  ),
+  thinking: S.optionalWith(
+    S.suspend((): S.Schema<Thinking, ThinkingEncoded> => Thinking),
+    { exact: true, as: "Option" },
+  ),
+  tool_choice: S.optionalWith(
+    S.suspend((): S.Schema<AnthropicToolChoice, AnthropicToolChoiceEncoded> => AnthropicToolChoice),
+    { exact: true, as: "Option" },
+  ),
+  tools: S.optionalWith(S.Array(S.suspend((): S.Schema<Tool, ToolEncoded> => Tool)), { exact: true, as: "Option" }),
+})
+export type CountTokensRequest = S.Schema.Type<typeof CountTokensRequest>
+export type CountTokensRequestEncoded = S.Schema.Encoded<typeof CountTokensRequest>
+
 export const CountTokensResponse = S.extend(
   S.Struct({
     input_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),

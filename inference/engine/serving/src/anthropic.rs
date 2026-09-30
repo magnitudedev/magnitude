@@ -10,7 +10,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use magnitude_chat::output::{Completion, Output, OutputEvent, Termination};
+use magnitude_chat::output::{Completion, Output, OutputEvent, Termination, TokenUsage};
 use magnitude_chat::request::{
     AssistantTurn, Conversation, Entry, GenerationControls, OutputFormat, PromptCache, ToolCall,
     ToolDefinition, ToolExchange, ToolResultPart, Tools, UserPart,
@@ -52,6 +52,24 @@ pub struct MessagesRequest {
     #[schema(nullable = false)]
     pub thinking: Option<Thinking>,
     pub metadata: Option<Value>,
+    pub output_config: Option<OutputConfig>,
+}
+
+/// `count_tokens` takes only what renders the prompt; generation controls
+/// such as `max_tokens` belong to Messages alone.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CountTokensRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub system: Option<SystemPrompt>,
+    #[serde(default)]
+    pub tools: Vec<Tool>,
+    #[schema(nullable = false)]
+    pub tool_choice: Option<AnthropicToolChoice>,
+    #[schema(nullable = false)]
+    pub thinking: Option<Thinking>,
     pub output_config: Option<OutputConfig>,
 }
 
@@ -227,13 +245,25 @@ fn invalid(error: magnitude_chat::ChatError) -> ApiError {
     ApiError::invalid(error.to_string())
 }
 
+/// The model input a request renders, shared by Messages and `count_tokens`
+/// so counting renders exactly as generation does.
+struct AdaptedInput {
+    model: String,
+    input: ChatInput,
+    reasoning_budget: Option<NonZeroU32>,
+}
+
 pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
-    if request.model.is_empty() {
-        return Err(ApiError::invalid("model is required"));
-    }
-    if request.messages.is_empty() {
-        return Err(ApiError::invalid("messages must not be empty"));
-    }
+    // A Messages request's prompt is exactly the `count_tokens` request.
+    let adapted = adapt_input(CountTokensRequest {
+        model: request.model,
+        messages: request.messages,
+        system: request.system,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
+        thinking: request.thinking,
+        output_config: request.output_config,
+    })?;
     let max_tokens = NonZeroU32::new(request.max_tokens)
         .ok_or_else(|| ApiError::invalid("max_tokens must be greater than zero"))?;
     if request.top_k.is_some() {
@@ -247,6 +277,37 @@ pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
         .is_some_and(|value| !value.is_object())
     {
         return Err(ApiError::invalid("metadata must be an object"));
+    }
+    for stop in &request.stop_sequences {
+        crate::chat::require_non_empty(stop, "stop sequence")?;
+    }
+    let sampling = crate::responses::sampling(
+        request.temperature.unwrap_or(1.0),
+        request.top_p.unwrap_or(1.0),
+    )?;
+    Ok(AdaptedRequest {
+        model: adapted.model,
+        request: GenerationRequest {
+            input: adapted.input,
+            controls: GenerationControls {
+                max_output_tokens: Some(max_tokens),
+                sampling,
+                stops: request.stop_sequences,
+                end_of_generation: EndOfGeneration::Stop,
+                reasoning_budget: adapted.reasoning_budget,
+                prompt_cache: PromptCache::Allowed,
+            },
+        },
+        stream: request.stream,
+    })
+}
+
+fn adapt_input(request: CountTokensRequest) -> Result<AdaptedInput, ApiError> {
+    if request.model.is_empty() {
+        return Err(ApiError::invalid("model is required"));
+    }
+    if request.messages.is_empty() {
+        return Err(ApiError::invalid("messages must not be empty"));
     }
     let conversation = context(request.system, request.messages)?;
     let definitions = request
@@ -305,33 +366,16 @@ pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
         (Some(Thinking::Enabled { .. }), None) => ReasoningIntent::Enabled,
         (Some(Thinking::Adaptive) | None, None) => ReasoningIntent::ModelDefault,
     };
-    for stop in &request.stop_sequences {
-        crate::chat::require_non_empty(stop, "stop sequence")?;
-    }
-    let sampling = crate::responses::sampling(
-        request.temperature.unwrap_or(1.0),
-        request.top_p.unwrap_or(1.0),
-    )?;
-    Ok(AdaptedRequest {
+    Ok(AdaptedInput {
         model: request.model,
-        request: GenerationRequest {
-            input: ChatInput {
-                conversation,
-                tools,
-                reasoning,
-                output: OutputFormat::Text,
-                template_arguments: Map::new(),
-            },
-            controls: GenerationControls {
-                max_output_tokens: Some(max_tokens),
-                sampling,
-                stops: request.stop_sequences,
-                end_of_generation: EndOfGeneration::Stop,
-                reasoning_budget: budget,
-                prompt_cache: PromptCache::Allowed,
-            },
+        input: ChatInput {
+            conversation,
+            tools,
+            reasoning,
+            output: OutputFormat::Text,
+            template_arguments: Map::new(),
         },
-        stream: request.stream,
+        reasoning_budget: budget,
     })
 }
 
@@ -700,6 +744,23 @@ pub struct UsageResponse {
     pub output_tokens: u64,
 }
 
+/// Anthropic reports prompt tokens as disjoint parts whose sum is the prompt:
+/// `input_tokens` excludes the prefix restored from cache, which is
+/// `cache_read_input_tokens`. Engine usage counts the whole prompt as input.
+impl From<TokenUsage> for UsageResponse {
+    fn from(usage: TokenUsage) -> Self {
+        Self {
+            input_tokens: usage
+                .input_tokens
+                .checked_sub(usage.cached_input_tokens)
+                .expect("cached input tokens are a prefix of the prompt"),
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: usage.cached_input_tokens,
+            output_tokens: usage.output_tokens,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CountTokensResponse {
     pub input_tokens: u64,
@@ -735,12 +796,7 @@ pub fn message(id: &str, model: &str, output: &Output, completion: &Completion) 
         content,
         stop_reason,
         stop_sequence: stop_sequence.map(str::to_owned),
-        usage: UsageResponse {
-            input_tokens: completion.usage.input_tokens,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: completion.usage.cached_input_tokens,
-            output_tokens: completion.usage.output_tokens,
-        },
+        usage: completion.usage.into(),
     }
 }
 
@@ -772,7 +828,7 @@ enum StreamEvent {
     },
     MessageDelta {
         delta: MessageDelta,
-        usage: OutputUsage,
+        usage: UsageResponse,
     },
     MessageStop,
     Error {
@@ -821,11 +877,6 @@ struct MessageDelta {
 }
 
 #[derive(Debug, Serialize)]
-struct OutputUsage {
-    output_tokens: u64,
-}
-
-#[derive(Debug, Serialize)]
 struct StreamError {
     r#type: &'static str,
     message: String,
@@ -868,12 +919,14 @@ impl StreamProjector {
                     content: Vec::new(),
                     stop_reason: None,
                     stop_sequence: None,
-                    usage: UsageResponse {
+                    // Provisional: the prefix-cache hit is decided only when
+                    // the request becomes resident, after admission, so the
+                    // whole prompt counts as input until message_delta.
+                    usage: TokenUsage {
                         input_tokens,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0,
-                        output_tokens: 0,
-                    },
+                        ..TokenUsage::default()
+                    }
+                    .into(),
                 },
             },
         )
@@ -990,9 +1043,9 @@ impl StreamProjector {
                     stop_reason,
                     stop_sequence: stop_sequence.map(str::to_owned),
                 },
-                usage: OutputUsage {
-                    output_tokens: completion.usage.output_tokens,
-                },
+                // Cumulative and authoritative: supersedes message_start's
+                // provisional input numbers.
+                usage: completion.usage.into(),
             },
         )
         .await?;
@@ -1101,7 +1154,7 @@ fn anthropic_error_response(request_id: String, error: ApiError) -> Response {
     path = "/anthropic/v1/messages/count_tokens",
     operation_id = "countAnthropicMessageTokens",
     tag = "anthropic",
-    request_body = MessagesRequest,
+    request_body = CountTokensRequest,
     responses(
         (status = 200, description = "Anthropic-compatible input token count", body = CountTokensResponse),
         (status = 400, description = "Invalid Anthropic request", body = ErrorEnvelope),
@@ -1114,19 +1167,19 @@ fn anthropic_error_response(request_id: String, error: ApiError) -> Response {
 pub async fn anthropic_count_tokens(
     State(state): State<Serving>,
     headers: HeaderMap,
-    payload: Result<Json<MessagesRequest>, JsonRejection>,
+    payload: Result<Json<CountTokensRequest>, JsonRejection>,
 ) -> Response {
     let request_id = state.next_id("req_icn_");
     let result = async {
         validate_anthropic_version(&headers)?;
         let Json(request) = payload.map_err(|error| ApiError::invalid(error.body_text()))?;
-        let adapted = adapt(request)?;
+        let adapted = adapt_input(request)?;
         let host = state
             .models
             .host(&adapted.model)
             .await
             .map_err(ApiError::from)?;
-        let input = adapted.request.input;
+        let input = adapted.input;
         let count = tokio::task::spawn_blocking(move || host.count(&input))
             .await
             .map_err(|error| ApiError::server(format!("token-count task failed: {error}")))?

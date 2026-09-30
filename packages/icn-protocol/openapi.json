@@ -100,7 +100,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/MessagesRequest"
+                "$ref": "#/components/schemas/CountTokensRequest"
               }
             }
           },
@@ -3267,6 +3267,51 @@
             }
           }
         ]
+      },
+      "CountTokensRequest": {
+        "type": "object",
+        "description": "`count_tokens` takes only what renders the prompt; generation controls\nsuch as `max_tokens` belong to Messages alone.",
+        "required": [
+          "model",
+          "messages"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            }
+          },
+          "system": {
+            "$ref": "#/components/schemas/SystemPrompt"
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tool"
+            }
+          },
+          "tool_choice": {
+            "$ref": "#/components/schemas/AnthropicToolChoice"
+          },
+          "thinking": {
+            "$ref": "#/components/schemas/Thinking"
+          },
+          "output_config": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OutputConfig"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
       },
       "CountTokensResponse": {
         "type": "object",

@@ -42,6 +42,8 @@ struct Script {
     failure: Option<ServingError>,
     /// Holds the stream open after output until the consumer goes away.
     hang: bool,
+    /// Leading prompt tokens the completion reports as restored from cache.
+    cached_input_tokens: u64,
 }
 
 impl Script {
@@ -60,6 +62,7 @@ impl Script {
             output,
             failure: None,
             hang: false,
+            cached_input_tokens: 0,
         }
     }
 
@@ -71,14 +74,17 @@ impl Script {
     }
 }
 
-fn completion(output: &[(OutputEvent, Option<TimingSnapshot>)]) -> Completion {
+fn completion(
+    output: &[(OutputEvent, Option<TimingSnapshot>)],
+    cached_input_tokens: u64,
+) -> Completion {
     let tools = output
         .iter()
         .any(|(event, _)| matches!(event, OutputEvent::ToolCallFinished { .. }));
     Completion {
         usage: TokenUsage {
             input_tokens: 11,
-            cached_input_tokens: 0,
+            cached_input_tokens,
             output_tokens: 7,
             reasoning_output_tokens: 1,
         },
@@ -190,7 +196,10 @@ impl ModelInvocation for ScriptedInvocation {
             }
             send(match script.failure {
                 Some(error) => GenerationEvent::Failed(error),
-                None => GenerationEvent::Completed(completion(&script.output)),
+                None => GenerationEvent::Completed(completion(
+                    &script.output,
+                    script.cached_input_tokens,
+                )),
             })
             .await;
         });
@@ -1988,7 +1997,8 @@ async fn anthropic_count_tokens_is_host_only() {
         app(source),
         "/anthropic/v1/messages/count_tokens",
         ANTHROPIC,
-        json!({ "model": "test-model", "max_tokens": 32, "messages": [{ "role": "user", "content": "hi" }] }),
+        // The endpoint takes no generation controls: no `max_tokens`.
+        json!({ "model": "test-model", "messages": [{ "role": "user", "content": "hi" }] }),
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK);
@@ -2035,6 +2045,56 @@ async fn anthropic_stream_follows_message_and_content_block_lifecycle() {
     assert!(body.contains("\"signature_delta\""));
     assert!(body.contains("\"input_json_delta\""));
     assert!(body.contains("\"stop_reason\":\"tool_use\""));
+}
+
+fn cache_hit() -> Scripted {
+    Scripted::new(Script {
+        cached_input_tokens: 8,
+        ..Script::text("hello")
+    })
+}
+
+/// Anthropic prompt usage parts are disjoint: 11 prompt tokens with an
+/// 8-token cache hit are 3 uncached input plus 8 cache reads.
+fn cache_hit_usage() -> Value {
+    json!({
+        "input_tokens": 3,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 8,
+        "output_tokens": 7
+    })
+}
+
+#[tokio::test]
+async fn anthropic_message_usage_counts_cache_reads_once() {
+    let reply = send(
+        app(cache_hit()),
+        "/anthropic/v1/messages",
+        ANTHROPIC,
+        json!({ "model": "test-model", "max_tokens": 32, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let body = serde_json::from_str::<Value>(&reply.body).unwrap();
+    assert_eq!(body["usage"], cache_hit_usage());
+}
+
+#[tokio::test]
+async fn anthropic_stream_message_delta_carries_cumulative_usage() {
+    let reply = send(
+        app(cache_hit()),
+        "/anthropic/v1/messages",
+        ANTHROPIC,
+        json!({ "model": "test-model", "max_tokens": 32, "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let events = stream_json(&reply.body);
+    let message_delta = events
+        .iter()
+        .find(|event| event["type"] == "message_delta")
+        .unwrap();
+    assert_eq!(message_delta["usage"], cache_hit_usage());
 }
 
 #[tokio::test]

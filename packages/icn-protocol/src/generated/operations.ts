@@ -147,7 +147,9 @@ export const countAnthropicMessageTokensOperation = {
       mediaType: "application/json",
     },
   ],
-  payload: S.suspend((): S.Schema<Schemas.MessagesRequest, Schemas.MessagesRequestEncoded> => Schemas.MessagesRequest),
+  payload: S.suspend(
+    (): S.Schema<Schemas.CountTokensRequest, Schemas.CountTokensRequestEncoded> => Schemas.CountTokensRequest,
+  ),
   payloadMediaType: "application/json",
   payloadRequired: true,
 } as const

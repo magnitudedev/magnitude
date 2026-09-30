@@ -79,7 +79,9 @@ export const countAnthropicMessageTokens = HttpApiEndpoint.post(
   "/anthropic/v1/messages/count_tokens",
 )
   .setPayload(
-    S.suspend((): S.Schema<Schemas.MessagesRequest, Schemas.MessagesRequestEncoded> => Schemas.MessagesRequest),
+    S.suspend(
+      (): S.Schema<Schemas.CountTokensRequest, Schemas.CountTokensRequestEncoded> => Schemas.CountTokensRequest,
+    ),
   )
   .addSuccess(
     S.suspend(
