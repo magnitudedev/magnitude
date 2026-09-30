@@ -1,5 +1,37 @@
 # @magnitudedev/cli
 
+## 0.2.0
+
+### Minor Changes
+
+- [`f0cd67e`](https://github.com/magnitudedev/magnitude/commit/f0cd67ed900fe76022273081490be0939908df70) Thanks [@anerli](https://github.com/anerli)! - Replace the llama.cpp-based inference engine with Magnitude's own engine which automatically optimizes itself for any hardware and has efficient kernels for several open-weight model families.
+
+### Patch Changes
+
+- [`9b929cf`](https://github.com/magnitudedev/magnitude/commit/9b929cfef434742e0f43043dfbf212f7801d5ba5) Thanks [@anerli](https://github.com/anerli)! - - Fix models that load and run, such as Gemma 4 26B-A4B and Qwen3.6 35B-A3B on Apple Silicon, being reported as unable to run on this computer.
+
+  - A model is reported as unsupported only when Magnitude cannot actually run it. A gap in the device's speed measurements now shows "Speed estimate unavailable" instead of hiding the model.
+
+- [`482e6ab`](https://github.com/magnitudedev/magnitude/commit/482e6abbb94f4081c19e223fef09263ac559df14) Thanks [@anerli](https://github.com/anerli)! - - Make DFlash, DSpark, and DFlash2 speculative decoding faster than plain decoding on Apple Silicon (Qwen3.6-35B-A3B at 65k tokens: 10.7% faster, previously 7% slower) and faster on NVIDIA (38.8% over plain, previously 28.7%), with better draft acceptance at long context.
+
+  - Fix speculative drafts whose layers are all sliding-window (such as Muse-Glimmer's DFlash) failing to load.
+  - Reduce the time to first token added by speculative decoding from about 2.6% to 0.6% of prompt processing on NVIDIA and from about 1.5% to 0.7% on Apple Silicon.
+  - Speed up long-context decoding and speculative verification by reading each attention head group's history once, on Apple Silicon, NVIDIA, and Vulkan GPUs.
+  - Speed up mixture-of-experts decoding on Apple Silicon and prompt processing on NVIDIA.
+
+- [`07c39a1`](https://github.com/magnitudedev/magnitude/commit/07c39a14870d8691d7762a3601b913b140ba3319) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Add `magnitude serve` to run inference without a desktop window on macOS, Windows, and Linux. Opening Desktop takes over from the foreground server and reports why it stopped.
+
+  - Replace the `magnitude service` commands with `magnitude serve` and `magnitude status`. Model, catalog, hardware, and connection commands require an existing Desktop or server instead of starting one automatically. Startup errors identify which application must be stopped.
+  - Share application updates between Desktop and the CLI. A running server can prepare updates without being interrupted; prepared updates install at the next startup. The `magnitude update` commands support checking, downloading, inspecting, installing, and discarding updates while Desktop is closed. Failed installations require an explicit retry.
+  - Fix Windows update preparation when the update folder has inherited permissions, and improve update recovery and command continuation. Existing affected releases still require a manual installer to receive the fix.
+  - Add shell and PowerShell installation scripts for the complete application, including its CLI.
+  - Improve `magnitude app open` during Desktop takeover. On Windows, clicking the tray icon opens Desktop, and sharper tray icons adapt to the system's light or dark theme.
+  - Add a remote server guide and update network access, CLI, and installation documentation.
+
+- [`f29bcb2`](https://github.com/magnitudedev/magnitude/commit/f29bcb218cc60d6cf01c930a54cd6e735ba4ba7f) Thanks [@anerli](https://github.com/anerli)! - - Fix long prompts failing partway through with "target graph class ... was not sealed" and the model server going down, as with Qwen3.8-27B on a 64k-token prompt on Apple Silicon. Attention history now stays within the bound its kernels were prepared for on every model, however requests interleave, fork or are reclaimed.
+
+- [#125](https://github.com/magnitudedev/magnitude/pull/125) [`fd37123`](https://github.com/magnitudedev/magnitude/commit/fd37123a374ee4931a0f2bb28e6b3cb091a6d601) Thanks [@Nitish-1303](https://github.com/Nitish-1303)! - Gate remote callers in the /rpc and inference route handlers instead of the middleware, so case, slash, and percent-encoded path variants can no longer skip the API key check.
+
 ## 0.2.0-alpha.2
 
 ### Patch Changes
