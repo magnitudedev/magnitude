@@ -231,7 +231,7 @@ impl<'d> DraftGeometry<'d> {
             .collect::<Result<Vec<_>, String>>()?;
         let segments = u64::try_from(
             state
-                .max_visible_spans()?
+                .span_limit()
                 .checked_next_power_of_two()
                 .ok_or("draft segment class overflows")?,
         )

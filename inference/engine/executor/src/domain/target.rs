@@ -112,7 +112,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let batch = crate::batching::ValidatedHeadBatch::from_block_slots(
             &[slot],
             self.definition.decoder.vocabulary as usize,
-            self.execution.policy().limits().max_launch_rows,
+            self.head_class_limits()?,
         )
         .map_err(|error| self.fatal_invariant(error.to_string()))?;
         // Entry rows every window drops before the first draft skip the
@@ -223,8 +223,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 tokens.len(),
             ));
         }
-        let limits = self.execution.policy().limits();
-        let class = crate::LaunchClass::covering(rows, segments, demand, limits.max_launch_rows)
+        let class_limits = self.target_class_limits();
+        let class = crate::LaunchClass::covering(rows, segments, demand, class_limits)
             .map_err(|error| error.to_string())?;
         let mut metadata = Vec::with_capacity(operations.len());
         for operation in operations {
@@ -262,7 +262,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let batch = match ValidatedTargetBatch::covering(
             &slots,
             self.definition.decoder.vocabulary as usize,
-            limits.max_launch_rows,
+            class_limits,
             segments,
         ) {
             Ok(batch) if batch.class() == class => batch,
@@ -821,11 +821,14 @@ pub(super) fn row_histories(
 /// store with Shared reads (`shared_read_history`) the ranges of the rows
 /// the advance appends, at most one per slab they touch.
 pub(super) fn reserved_segments(store: &StateStore, spans: usize, rows: usize) -> usize {
+    // A Shared reader also sees the rows its source appends in the advance:
+    // the rest of the source's last page, then whole pages (see
+    // `magnitude_state::history_geometry`).
     spans
         + store
             .shared_source_domains()
             .into_iter()
-            .map(|domain| rows.div_ceil(store.history_slab_rows(domain)) + 1)
+            .map(|domain| rows.div_ceil(store.history_page_rows(domain)) + 1)
             .max()
             .unwrap_or(0)
 }

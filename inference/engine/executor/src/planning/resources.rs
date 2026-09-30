@@ -246,7 +246,8 @@ pub struct HistoryStorePlan {
     pub rows: usize,
     pub row_bytes: u64,
     pub slab_rows: u32,
-    pub span_bound: usize,
+    pub page_rows: u32,
+    pub span_limit: usize,
 }
 
 /// The history an attention layer binds: its stored domain, and the
@@ -266,7 +267,8 @@ impl HistoryStorePlan {
             row_bytes: self.row_bytes,
             bytes: self.row_bytes * self.rows as u64,
             slab_rows: self.slab_rows as usize,
-            span_bound: self.span_bound,
+            page_rows: self.page_rows as usize,
+            span_limit: self.span_limit,
         }
     }
 
@@ -286,36 +288,16 @@ impl HistoryStorePlan {
 }
 
 impl StateStorePlan {
-    /// The largest span bound of the store's domains: the batching and
-    /// kernel span limit (1 without history).
-    pub fn max_visible_spans(&self) -> Result<usize, String> {
-        // A Shared layer reads its source domain's accepted rows and, as
-        // history, the rows its source appends in the advance: at most one
-        // range per slab they touch.
-        let shared = self
-            .history
+    /// The most spans any history of the store presents to one launch (a
+    /// Shared reader included, see `magnitude_state::history_geometry`): the
+    /// span class bound graphs are sealed to and launches are checked
+    /// against (1 without history).
+    pub fn span_limit(&self) -> usize {
+        self.domains
             .iter()
-            .filter_map(|plan| match &plan.layout {
-                HistoryDomainLayout::Shared { source, .. } => Some(*source),
-                _ => None,
-            })
-            .map(|source| {
-                let store = self
-                    .layer_history(source)
-                    .ok_or_else(|| format!("shared history source {source:?} has no domain"))?
-                    .store;
-                let slab_rows =
-                    usize::try_from(store.slab_rows).map_err(|_| "slab rows exceed the host")?;
-                Ok(store.span_bound + self.max_advance.div_ceil(slab_rows) + 1)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(self
-            .domains
-            .iter()
-            .map(|domain| domain.span_bound)
-            .chain(shared)
+            .map(|domain| domain.span_limit)
             .max()
-            .unwrap_or(1))
+            .unwrap_or(1)
     }
 
     /// The history `layer` binds, resolving a Shared layer to its source.
@@ -424,7 +406,12 @@ impl StateStorePlan {
                 )
                 .map_err(|_| "window rows exceed u64")?,
             };
-            let slabs = rows.max(1).div_ceil(u64::from(domain.slab_rows));
+            // Whole pages: a history's first page may be partial once a
+            // window releases the rows before it, its last page always may.
+            let page = u64::from(domain.page_rows);
+            let front = u64::from(matches!(domain.kind, HistoryDomainKind::Window { .. }));
+            let pages = rows.max(1).div_ceil(page) + front;
+            let slabs = (pages * page).div_ceil(u64::from(domain.slab_rows));
             layout
                 .slab_bytes
                 .checked_mul(slabs)
@@ -1019,12 +1006,23 @@ fn state_store_plan(
     recurrent_components: Vec<ComponentSpec>,
     bank_capacity: BankCapacity,
 ) -> Result<StateStorePlan, String> {
-    let history = history
-        .into_iter()
+    let layouts = history;
+    // The rows the store reserves for each stored domain (whole pages), which
+    // graphs are sealed over.
+    let history = layouts
+        .iter()
         .map(|layout| {
+            let logical_rows = match layout {
+                HistoryDomainLayout::Shared { .. } => 0,
+                _ => layout
+                    .geometry(&layouts, rows.context, rows.max_advance)
+                    .map_err(|error| error.to_string())?
+                    .reserved_rows(rows.rows(layout)?)
+                    .ok_or("history rows overflow whole pages")?,
+            };
             Ok(HistoryDomainPlan {
-                logical_rows: rows.rows(&layout)?,
-                layout,
+                logical_rows,
+                layout: layout.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1032,19 +1030,21 @@ fn state_store_plan(
         .iter()
         .filter(|plan| !matches!(plan.layout, HistoryDomainLayout::Shared { .. }))
         .map(|plan| {
-            let kind = plan.layout.kind();
             let row_bytes = plan.layout.row_bytes().map_err(|error| error.to_string())?;
-            let slab_rows = magnitude_state::history_rows_per_slab(row_bytes)?;
-            let row_limit = kind
-                .row_limit(rows.context, rows.max_advance)
+            let geometry = plan
+                .layout
+                .geometry(&layouts, rows.context, rows.max_advance)
                 .map_err(|error| error.to_string())?;
             Ok(HistoryStorePlan {
-                kind,
+                kind: plan.layout.kind(),
                 components: plan.layout.components().to_vec(),
                 rows: plan.logical_rows,
                 row_bytes,
-                slab_rows: u32::try_from(slab_rows).map_err(|_| "history slab rows exceed u32")?,
-                span_bound: magnitude_state::max_visible_spans(row_limit, slab_rows)?,
+                slab_rows: u32::try_from(geometry.slab_rows)
+                    .map_err(|_| "history slab rows exceed u32")?,
+                page_rows: u32::try_from(geometry.page_rows)
+                    .map_err(|_| "history page rows exceed u32")?,
+                span_limit: geometry.span_limit,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1158,7 +1158,7 @@ mod slab_plan_tests {
 
 /// History bytes per token of context: the rows of every Token domain.
 /// Window domains hold a bounded number of rows whatever the context (see
-/// `HistoryDomainLayout::steady_footprint`).
+/// `StateStorePlan::history_bytes_at_depth`).
 pub(super) fn history_row_bytes(domains: &[HistoryDomainLayout]) -> Result<u64, String> {
     domains
         .iter()

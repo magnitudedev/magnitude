@@ -2,7 +2,7 @@
 
 use super::{
     append_ranges, install_commit, ranges_from, BankHandle, Claims, Codec, ComponentDescriptor,
-    Error, HistoryDomainId, KvCodec, LayerRef, PlaneBuffer, PlaneCopy, SequenceState, StateStore,
+    Error, HistoryDomainId, KvCodec, LayerRef, PlaneBuffer, SequenceState, StateStore, StoreCopy,
     Transaction, VectorKind,
 };
 use seismic::Tensor;
@@ -59,35 +59,17 @@ pub struct OwnedStateAdvance {
     _transaction: Transaction,
 }
 
-/// Preparation keeps ownership of the source sequence in every outcome.
-/// Deferral is a capacity result, not a partially reserved transaction.
-pub enum OwnedCompactionPreparation {
-    NotNeeded(SequenceState),
-    Ready(OwnedCompaction),
-    Deferred {
-        state: SequenceState,
-        segments: usize,
-        visible_rows: usize,
-    },
-}
-
-/// Tentative history copy of one domain with a reserved contiguous
-/// destination. Its source extents remain accepted until the state program
-/// completes and commits it.
-pub struct OwnedCompaction {
+/// Tentative copy of one domain's partial last page into a free page, for a
+/// history that cannot grow in place because another history (a sibling
+/// fork) continued that page. Its source rows remain accepted until the
+/// copy ([`OwnedTailRelocation::copy`], run like any store copy) completes
+/// and the relocation commits.
+pub struct OwnedTailRelocation {
     state: SequenceState,
     domain: HistoryDomainId,
     destination: Claims,
-    copies: Vec<PlaneCopy>,
-    history: Vec<PlaneBuffer>,
+    copy: StoreCopy,
     _transaction: Transaction,
-}
-
-/// Physical copy bindings pinned by the owned compaction until completion.
-#[derive(Clone, Copy)]
-pub struct OwnedCompactionBindings<'a> {
-    pub history: &'a [PlaneBuffer],
-    pub copies: &'a [PlaneCopy],
 }
 
 /// One semantic vector conversion. A codec can use several physical planes;
@@ -429,96 +411,74 @@ fn conversion_steps(
     steps
 }
 
-impl OwnedCompaction {
-    /// Join the longest suffix of a domain's history runs (at least two)
-    /// holding at most `max_rows` rows into one contiguous run: the recent
-    /// small runs decode leaves, moved with one bounded copy. Histories below
-    /// the domain's span bound need nothing.
+impl OwnedTailRelocation {
+    /// Reserve a free page for a blocked last page of `domain` (see
+    /// [`SequenceState::blocked_tails`]) and plan the copy of that page's
+    /// rows of this history to its start. The caller has provisioned one
+    /// free page (see [`SequenceState::relocation_demands`]); without one
+    /// this is a capacity error and the state is unchanged.
     pub fn prepare(
         state: SequenceState,
         domain: HistoryDomainId,
-        max_rows: usize,
-    ) -> Result<OwnedCompactionPreparation, (SequenceState, Error)> {
-        let ranges = state.history_ranges(domain);
-        if ranges.len() < state.store.span_bound(domain) {
-            return Ok(OwnedCompactionPreparation::NotNeeded(state));
-        }
-        let visible_rows = ranges.iter().map(|(_, count)| count).sum::<usize>();
-        let mut moved = 0;
-        let mut suffix = 0;
-        for (_, count) in ranges.iter().rev() {
-            if moved + count > max_rows {
-                break;
-            }
-            moved += count;
-            suffix += 1;
-        }
-        let destination = (suffix >= 2)
-            .then(|| state.store.reserve_contiguous(domain, moved))
-            .flatten();
-        let Some(destination) = destination else {
-            return Ok(OwnedCompactionPreparation::Deferred {
+    ) -> Result<Self, (SequenceState, Error)> {
+        if !state.blocked_tails().contains(&domain) {
+            return Err((
                 state,
-                segments: ranges.len(),
-                visible_rows,
-            });
+                Error::Request("only a blocked last page is relocated".into()),
+            ));
+        }
+        let ranges = state.history_ranges(domain);
+        let &(last, count) = ranges.last().expect("a blocked history has rows");
+        let end = last + count;
+        let page_rows = state.store.history_page_rows(domain);
+        // A page is filled in place from its first row, so the history's
+        // rows of its last page are one run.
+        let first = last.max((end - 1) / page_rows * page_rows);
+        let moved = end - first;
+        let Some(destination) = state.store.reserve_page(domain, moved) else {
+            let required = page_rows as u64 * state.store.history_row_bytes(domain);
+            return Err((
+                state,
+                Error::Capacity {
+                    required,
+                    available_bytes: 0,
+                },
+            ));
         };
-        let history = match state.store.history_planes() {
-            Ok(history) => history,
-            Err(error) => return Err((state, error)),
-        };
-        let from = ranges[ranges.len() - suffix..]
-            .iter()
-            .flat_map(|(start, count)| *start..*start + *count)
-            .collect::<Vec<_>>();
         let to = destination
             .ranges()
             .into_iter()
             .flat_map(|(start, count)| start..start + count)
             .collect::<Vec<_>>();
-        let copies = history
-            .iter()
-            .filter(|plane| plane.domain == domain)
-            .map(|plane| PlaneCopy {
-                plane_index: plane.plane_index,
-                from: from.clone(),
-                to: to.clone(),
-            })
-            .collect();
+        let copy = match state
+            .store
+            .history_row_copy(domain, (first..end).collect(), to)
+        {
+            Ok(copy) => copy,
+            Err(error) => return Err((state, error)),
+        };
         let mut transaction = state.store.begin_transaction();
         transaction.track(&state.claims, &state.bank);
         transaction.track_history(domain, &destination);
-        Ok(OwnedCompactionPreparation::Ready(Self {
+        Ok(Self {
             state,
             domain,
             destination,
-            copies,
-            history,
+            copy,
             _transaction: transaction,
-        }))
+        })
     }
 
-    pub fn belongs_to(&self, store: &Rc<StateStore>) -> bool {
-        self.state.belongs_to(store)
-    }
-    /// The domain whose rows this compaction moves.
+    /// The domain whose rows this relocation moves.
     pub fn domain(&self) -> HistoryDomainId {
         self.domain
     }
-    pub fn rows(&self) -> usize {
-        self.destination.rows()
-    }
-    pub fn copies(&self) -> &[PlaneCopy] {
-        &self.copies
-    }
-    pub fn bindings(&self) -> OwnedCompactionBindings<'_> {
-        OwnedCompactionBindings {
-            history: &self.history,
-            copies: &self.copies,
-        }
+    /// The row copy to run before [`OwnedTailRelocation::commit`].
+    pub fn copy(&self) -> &StoreCopy {
+        &self.copy
     }
 
-    /// Called only after the owning state submission has physically finished.
+    /// Called only after the copy has physically finished.
     pub fn commit(self) -> SequenceState {
         let Self {
             mut state,
@@ -810,14 +770,6 @@ impl OwnedSuccessorAdvance {
     ) -> Result<Self, Error> {
         if count == 0 || count > store.context_capacity.saturating_sub(predecessor.end) {
             return Err(Error::from("successor advance exceeds context capacity"));
-        }
-        if store
-            .history_domains()
-            .any(|domain| predecessor.ranges[domain.0].len() >= store.span_bound(domain))
-        {
-            return Err(Error::from(
-                "successor advance would exceed the segment limit",
-            ));
         }
         let claims = store.reserve(Some(predecessor.claims), count)?;
         let following = store.successor_bank()?;

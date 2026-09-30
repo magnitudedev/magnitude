@@ -45,6 +45,16 @@ pub fn row_classes(limit: usize) -> Vec<usize> {
     classes
 }
 
+/// The launches a runtime prepared graphs for: at most `rows` rows, and at
+/// most `segments` history spans per row (the state store's span limit). No
+/// [`LaunchClass`] beyond either is constructed, so every class names a
+/// sealed graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassLimits {
+    pub rows: usize,
+    pub segments: usize,
+}
+
 /// Physical preparation class shared by native and planned execution paths.
 ///
 /// The native path uses this as launch shape and qualification data; planned
@@ -84,18 +94,18 @@ impl fmt::Display for ClassError {
 impl std::error::Error for ClassError {}
 
 impl LaunchClass {
-    /// Round actual launch requirements onto the fixed ladders: rows onto
-    /// [`row_class`], segments onto powers of two.
+    /// Round actual launch requirements within `limits` onto the fixed
+    /// ladders: rows onto [`row_class`], segments onto powers of two.
     pub fn covering(
         actual_rows: usize,
         actual_segments: usize,
         demand: Demand,
-        row_limit: usize,
+        limits: ClassLimits,
     ) -> Result<Self, ClassError> {
         if actual_rows == 0 {
             return Err(ClassError::EmptyRows);
         }
-        let limit = row_limit.min(MAX_CLASS_ROWS);
+        let limit = limits.rows.min(MAX_CLASS_ROWS);
         let rows = row_class(actual_rows)
             .filter(|_| actual_rows <= limit)
             .ok_or(ClassError::RowsTooLarge {
@@ -103,13 +113,13 @@ impl LaunchClass {
                 limit,
             })?;
         let actual_segments = actual_segments.max(1);
-        let segments =
-            actual_segments
-                .checked_next_power_of_two()
-                .ok_or(ClassError::SegmentsTooLarge {
-                    segments: actual_segments,
-                    limit: usize::MAX,
-                })?;
+        if actual_segments > limits.segments {
+            return Err(ClassError::SegmentsTooLarge {
+                segments: actual_segments,
+                limit: limits.segments,
+            });
+        }
+        let segments = actual_segments.next_power_of_two();
         Ok(Self {
             rows,
             segments,
@@ -146,9 +156,13 @@ impl fmt::Display for LaunchClass {
 mod tests {
     use super::*;
 
+    fn limits(rows: usize) -> ClassLimits {
+        ClassLimits { rows, segments: 63 }
+    }
+
     #[test]
     fn rounds_to_the_fixed_class_ladders() {
-        let class = LaunchClass::covering(17, 3, Demand::SELECT, 256).unwrap();
+        let class = LaunchClass::covering(17, 3, Demand::SELECT, limits(256)).unwrap();
         assert_eq!(class.rows(), 32);
         assert_eq!(class.segments(), 4);
         assert_eq!(class.to_string(), "m32-r4-d4");
@@ -157,7 +171,7 @@ mod tests {
     #[test]
     fn prefill_rows_round_to_multiples_of_64() {
         let class = |rows| {
-            LaunchClass::covering(rows, 1, Demand::NONE, 512)
+            LaunchClass::covering(rows, 1, Demand::NONE, limits(512))
                 .unwrap()
                 .rows()
         };
@@ -194,17 +208,32 @@ mod tests {
     #[test]
     fn enforces_runtime_and_protocol_caps() {
         assert_eq!(
-            LaunchClass::covering(129, 1, Demand::NONE, 128),
+            LaunchClass::covering(129, 1, Demand::NONE, limits(128)),
             Err(ClassError::RowsTooLarge {
                 rows: 129,
                 limit: 128
             })
         );
         assert_eq!(
-            LaunchClass::covering(1, 17, Demand::NONE, 512)
+            LaunchClass::covering(1, 17, Demand::NONE, limits(512))
                 .unwrap()
                 .segments(),
             32
+        );
+        // The segment limit is the exact span limit, not its sealed class:
+        // a launch never names a class whose graph was not sealed.
+        assert_eq!(
+            LaunchClass::covering(1, 63, Demand::NONE, limits(512))
+                .unwrap()
+                .segments(),
+            64
+        );
+        assert_eq!(
+            LaunchClass::covering(1, 64, Demand::NONE, limits(512)),
+            Err(ClassError::SegmentsTooLarge {
+                segments: 64,
+                limit: 63
+            })
         );
     }
 }

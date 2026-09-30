@@ -2,11 +2,10 @@
 
 use crate::{InvariantError, NativeGraphWorkspaceLease, ResourceDomainId};
 use magnitude_batching::{StateBatchKind, ValidatedStateBatch};
-use magnitude_state::{OwnedCodecAdvance, OwnedCompaction, StateStore, StoreCopy};
+use magnitude_state::{OwnedCodecAdvance, StateStore, StoreCopy};
 use std::rc::Rc;
 
 pub enum StateWork {
-    Copy(OwnedCompaction),
     StoreCopy(StoreCopy),
     CodecConversion(OwnedCodecAdvance),
 }
@@ -46,16 +45,6 @@ impl StateLaunchInputs {
             ));
         }
         match (&self.work, self.batch.kind()) {
-            (StateWork::Copy(work), StateBatchKind::Copy) => {
-                if !work.belongs_to(source_store)
-                    || work.rows() != self.batch.actual_rows()
-                    || self.batch.copies() != Some(work.copies())
-                {
-                    return Err(invalid(
-                        "copy controls differ from the owned compaction".into(),
-                    ));
-                }
-            }
             (StateWork::StoreCopy(work), StateBatchKind::Copy) => {
                 if !work.belongs_to(source_store)
                     || work.rows() != self.batch.actual_rows()

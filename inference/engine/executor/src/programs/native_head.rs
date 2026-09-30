@@ -96,11 +96,11 @@ pub(crate) fn head_graph_classes(
     limits: ResourceLimits,
     history_rows: u64,
     slab_rows: u32,
-    context_rows: usize,
+    span_limit: usize,
     proposals: usize,
 ) -> Result<Vec<HeadGraphClass>, String> {
     let segments = u64::try_from(
-        magnitude_state::max_visible_spans(context_rows, slab_rows as usize)?
+        span_limit
             .checked_next_power_of_two()
             .ok_or("head segment class overflows")?,
     )
@@ -998,6 +998,17 @@ impl PreparedHeadGraphs {
 }
 
 impl BoundHeadGraphs {
+    /// The span class every head graph was sealed with (the head store's
+    /// span limit, see [`head_graph_classes`]).
+    fn segments(&self) -> Result<u64, SubmitError> {
+        self.prepared
+            .classes
+            .keys()
+            .next()
+            .map(|class| class.segments)
+            .ok_or_else(|| invalid("head graph family has no classes"))
+    }
+
     fn constant_bytes(&self) -> Result<u64, &'static str> {
         self.constants.iter().try_fold(0u64, |bytes, tensor| {
             bytes
@@ -1169,17 +1180,7 @@ impl NativeHeadProgram {
             slots: slots as u64,
             history_rows,
             slab_rows,
-            segments: u64::try_from(
-                magnitude_state::max_visible_spans(
-                    usize::try_from(self.geometry.context_limit)
-                        .map_err(|_| invalid("head context limit exceeds host domain"))?,
-                    slab_rows as usize,
-                )
-                .map_err(invalid)?
-                .checked_next_power_of_two()
-                .ok_or_else(|| invalid("head segment class overflows"))?,
-            )
-            .map_err(|_| invalid("head segment class exceeds u64"))?,
+            segments: self.graphs.segments()?,
             steps: steps as u64,
             shaped,
         };

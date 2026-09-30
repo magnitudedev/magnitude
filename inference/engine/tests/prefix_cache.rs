@@ -408,6 +408,7 @@ fn forward(
         demand: Demand::LOGITS,
         select: Vec::new(),
         committed: rows,
+        prime: None,
     };
     let groups = service_domain::group(domain, vec![operation]);
     let [group] = groups.as_slice() else {

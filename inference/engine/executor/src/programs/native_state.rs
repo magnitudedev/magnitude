@@ -110,28 +110,14 @@ impl NativeStateProgram {
         state_graph_workspace: &mut NativeGraphWorkspaceLease,
     ) -> Result<(), SubmitError> {
         match work {
-            StateWork::Copy(_) | StateWork::StoreCopy(_) => {
-                let (planes, copies) = match work {
-                    StateWork::Copy(advance) => {
-                        let binding = advance.bindings();
-                        (
-                            binding
-                                .history
-                                .iter()
-                                .map(|plane| (&plane.buffer, plane.slab_rows))
-                                .collect::<Vec<_>>(),
-                            binding.copies,
-                        )
-                    }
-                    StateWork::StoreCopy(copy) => (
-                        copy.planes()
-                            .iter()
-                            .map(|plane| (plane, copy.slab_rows()))
-                            .collect::<Vec<_>>(),
-                        copy.copies(),
-                    ),
-                    StateWork::CodecConversion(_) => unreachable!(),
-                };
+            StateWork::StoreCopy(copy) => {
+                let (planes, copies) = (
+                    copy.planes()
+                        .iter()
+                        .map(|plane| (plane, copy.slab_rows()))
+                        .collect::<Vec<_>>(),
+                    copy.copies(),
+                );
                 if copies.is_empty() {
                     return Err(invalid("empty copy mapping"));
                 }

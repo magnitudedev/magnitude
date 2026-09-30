@@ -321,8 +321,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.orphan_lookahead()?;
         }
         for operation in operations {
-            if let Operation::Forward { request, .. } = operation {
-                self.compact_target(*request)?;
+            if let Operation::Forward { request, .. } | Operation::Head { request, .. } = operation
+            {
+                self.relocate_tails(*request)?;
             }
         }
         let mut target = Vec::new();
@@ -522,100 +523,65 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(self.memory.borrow_mut().check(required, staged)?)
     }
 
-    /// Repack the target history of a request at a domain's visible segment
-    /// limit into one contiguous run with the bit-exact state copy program,
-    /// so its next launch cannot exceed the limit. Rare by construction
-    /// (placement keeps histories in few runs), so the copy completes before
-    /// the state publishes the new run and the launch proceeds. Each domain
-    /// at its limit is repacked by its own copy.
-    pub(super) fn compact_target(&mut self, request: RequestId) -> Result<(), DomainError> {
-        let Some(state) = self.target.get(&request) else {
-            return Ok(());
-        };
-        if state.compaction_needed().is_none() || !self.family.state_is_bound() {
+    /// Before a request's next launch reserves rows, relocate the partial
+    /// last page of each of its target and head histories that a sibling
+    /// fork continued (`magnitude_state::OwnedTailRelocation`), so every
+    /// history keeps growing within its span limit. A relocation copies
+    /// less than one page into one free page; without memory for that page
+    /// the request fails with a capacity error before any launch.
+    pub(super) fn relocate_tails(&mut self, request: RequestId) -> Result<(), DomainError> {
+        if !self.family.state_is_bound() {
             return Ok(());
         }
-        let demands = state.compaction_demands();
-        self.grant_state_growth(self.target_store.clone(), &demands, 0)?;
+        self.relocate_store_tails(request, false)?;
+        self.relocate_store_tails(request, true)
+    }
+
+    fn relocate_store_tails(&mut self, request: RequestId, head: bool) -> Result<(), DomainError> {
+        let store = if head {
+            match self.head_store.clone() {
+                Some(store) => store,
+                None => return Ok(()),
+            }
+        } else {
+            self.target_store.clone()
+        };
+        let Some(state) = self.lane_states(head).get(&request) else {
+            return Ok(());
+        };
+        let demands = state.relocation_demands();
+        if demands.is_empty() {
+            return Ok(());
+        }
+        self.grant_state_growth(store.clone(), &demands, 0)?;
         for demand in demands {
-            self.compact_target_domain(request, demand.domain)?;
+            let state = self
+                .lane_states(head)
+                .remove(&request)
+                .expect("state checked above");
+            let relocation = match OwnedTailRelocation::prepare(state, demand.domain) {
+                Ok(relocation) => relocation,
+                Err((state, error)) => {
+                    self.lane_states(head).insert(request, state);
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = self.submit_store_copy(&store, relocation.copy()) {
+                self.lane_states(head).insert(request, relocation.abort());
+                return Err(error);
+            }
+            self.lane_states(head).insert(request, relocation.commit());
         }
         Ok(())
     }
 
-    fn compact_target_domain(
-        &mut self,
-        request: RequestId,
-        domain: magnitude_state::HistoryDomainId,
-    ) -> Result<(), DomainError> {
-        let state = self.target.remove(&request).expect("state checked above");
-        // One copy launch of at most the largest prepared copy class.
-        let max_rows = self.execution.policy().limits().max_launch_rows;
-        let compaction = match OwnedCompaction::prepare(state, domain, max_rows) {
-            Ok(OwnedCompactionPreparation::Ready(compaction)) => compaction,
-            Ok(
-                OwnedCompactionPreparation::NotNeeded(state)
-                | OwnedCompactionPreparation::Deferred { state, .. },
-            ) => {
-                self.target.insert(request, state);
-                return Ok(());
-            }
-            Err((state, error)) => {
-                self.target.insert(request, state);
-                return Err(error.into());
-            }
-        };
-        let workspace = match self.resources.state_graph().acquire_workspace() {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                self.target.insert(request, compaction.abort());
-                return Err(DomainError::Capacity(error));
-            }
-        };
-        let Some(class_rows) = crate::batching::row_class(compaction.rows()) else {
-            self.target.insert(request, compaction.abort());
-            return Err(self.fatal_invariant("a copy within the batch bound has no row class"));
-        };
-        let batch = match crate::batching::ValidatedStateBatch::copy(
-            compaction.copies().to_vec(),
-            self.target_store.history_capacity(compaction.domain()),
-            class_rows,
-        ) {
-            Ok(batch) => batch,
-            Err(error) => {
-                self.target.insert(request, compaction.abort());
-                return Err(DomainError::invariant(error.to_string()));
-            }
-        };
-        let inputs = StateLaunchInputs::new(batch, StateWork::Copy(compaction), workspace);
-        let launch =
-            match ValidatedStateLaunch::new(inputs, &self.target_store, None, self.domain.id()) {
-                Ok(launch) => launch,
-                Err((_, error)) => return Err(self.fatal_invariant(error.to_string())),
-            };
-        let submission = match self.family.submit_state(launch) {
-            Ok(submission) => submission,
-            Err((error, _)) => {
-                let failure = DomainError::from(error);
-                self.fatal = Some(failure.clone());
-                return Err(failure);
-            }
-        };
-        let completed = match submission.finish() {
-            Ok(completed) => completed,
-            Err(error) => {
-                let failure = DomainError::Device(error);
-                self.fatal = Some(failure.clone());
-                return Err(failure);
-            }
-        };
-        let (core, _) = completed.into_parts();
-        let (_, work) = core.into_parts();
-        let StateWork::Copy(compaction) = work else {
-            return Err(self.fatal_invariant("state copy returned another maintenance kind"));
-        };
-        self.target.insert(request, compaction.commit());
-        Ok(())
+    /// The accepted states of the head or target lane.
+    fn lane_states(&mut self, head: bool) -> &mut BTreeMap<RequestId, SequenceState> {
+        if head {
+            &mut self.head
+        } else {
+            &mut self.target
+        }
     }
 
     /// Commit the successor banks a newly opened request needs.
@@ -665,7 +631,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         store: Rc<StateStore>,
         policy: ShrinkPolicy,
     ) -> Result<u64, DomainError> {
-        let released = store.shrink_with(policy, |_, copy| self.submit_store_copy(&store, copy));
+        let released = store.shrink_with(policy, |_, copy| self.submit_store_copy(&store, &copy));
         self.sync_static_holding().map_err(DomainError::Input)?;
         released
     }
@@ -673,7 +639,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     fn submit_store_copy(
         &mut self,
         store: &Rc<StateStore>,
-        copy: StoreCopy,
+        copy: &StoreCopy,
     ) -> Result<(), DomainError> {
         let max_rows = self.execution.policy().limits().max_launch_rows;
         for start in (0..copy.rows()).step_by(max_rows) {

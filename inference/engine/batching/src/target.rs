@@ -1,6 +1,6 @@
 //! Opaque, device-independent target row semantics.
 
-use crate::{HistoryTables, LaunchClass, PackError, PackedRowTables, Slot};
+use crate::{ClassLimits, HistoryTables, LaunchClass, PackError, PackedRowTables, Slot};
 use std::sync::Arc;
 
 /// The packed controls and their row mapping are validated together once.
@@ -14,10 +14,10 @@ impl ValidatedTargetBatch {
     pub fn from_slots(
         slots: &[Slot],
         vocabulary_size: usize,
-        row_limit: usize,
+        limits: ClassLimits,
     ) -> Result<Self, PackError> {
         Ok(Self {
-            packed: PackedRowTables::pack(slots, vocabulary_size, row_limit)?,
+            packed: PackedRowTables::pack(slots, vocabulary_size, limits)?,
         })
     }
 
@@ -26,11 +26,11 @@ impl ValidatedTargetBatch {
     pub fn covering(
         slots: &[Slot],
         vocabulary_size: usize,
-        row_limit: usize,
+        limits: ClassLimits,
         segments: usize,
     ) -> Result<Self, PackError> {
         Ok(Self {
-            packed: PackedRowTables::pack_covering(slots, vocabulary_size, row_limit, segments)?,
+            packed: PackedRowTables::pack_covering(slots, vocabulary_size, limits, segments)?,
         })
     }
 
@@ -203,7 +203,10 @@ mod tests {
                 }],
             }],
             16,
-            8,
+            ClassLimits {
+                rows: 8,
+                segments: 63,
+            },
         )
         .unwrap();
         assert_eq!(batch.actual_rows(), 1);

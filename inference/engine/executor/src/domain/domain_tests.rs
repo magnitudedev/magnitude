@@ -431,6 +431,47 @@ fn ready_target_can_abort_then_reconcile() {
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
 }
 
+/// A history's next rows in its partly used last page need no free page: a
+/// store whose every page is referenced still reserves them.
+#[test]
+fn in_place_rows_reserve_without_a_free_page() {
+    let Some(mut domain) = fixture(None) else {
+        return;
+    };
+    let request = RequestId(10);
+    open(&mut domain, request);
+    let accept = |domain: &mut ExecutorDomain<TestFamily>, position| {
+        let flight = submit_reserved_target(domain, vec![forward(request, position)]).unwrap();
+        let pending = domain.finish_target(flight).unwrap().pop().unwrap();
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .unwrap();
+    };
+    accept(&mut domain, 0);
+    // Hold every other page of the backed slabs with one-row histories.
+    let store = domain.target_store.clone();
+    let mut held = Vec::new();
+    while store
+        .history_domains()
+        .any(|history| store.free_rows(history) != 0)
+    {
+        let advance = OwnedStateAdvance::begin(store.create().unwrap(), 1)
+            .ok()
+            .unwrap();
+        let OwnedAdvanceResolution::Committed(filler) = advance.commit_all().ok().unwrap() else {
+            panic!("a one-row advance commits");
+        };
+        held.push(filler);
+    }
+    for position in 1..4 {
+        accept(&mut domain, position);
+    }
+    assert!(store
+        .history_domains()
+        .all(|history| store.free_rows(history) == 0));
+    assert_eq!(domain.resume_state(request).unwrap().target.position(), 4);
+}
+
 #[test]
 fn pending_target_request_cancellation_aborts_without_poisoning_then_device_failure_is_fatal() {
     let control = PendingControl::default();

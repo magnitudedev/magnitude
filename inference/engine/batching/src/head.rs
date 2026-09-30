@@ -8,7 +8,8 @@
 //! output feature on the device.
 
 use crate::{
-    Demand, LaunchClass, PackError, Row, Select, Slot, TargetBatchUpload, ValidatedTargetBatch,
+    ClassLimits, Demand, LaunchClass, PackError, Row, Select, Slot, TargetBatchUpload,
+    ValidatedTargetBatch,
 };
 
 /// One request's head rows.
@@ -61,7 +62,7 @@ impl ValidatedHeadBatch {
     pub fn from_slots(
         slots: &[HeadSlot],
         vocabulary_size: usize,
-        row_limit: usize,
+        limits: ClassLimits,
     ) -> Result<Self, PackError> {
         let steps = slots.first().map_or(0, |slot| slot.proposals.len());
         for (index, slot) in slots.iter().enumerate() {
@@ -96,7 +97,7 @@ impl ValidatedHeadBatch {
                 Ok(entry)
             })
             .collect::<Result<Vec<_>, PackError>>()?;
-        let entry = ValidatedTargetBatch::from_slots(&entry, vocabulary_size, row_limit)?;
+        let entry = ValidatedTargetBatch::from_slots(&entry, vocabulary_size, limits)?;
         let chain = (1..steps)
             .map(|step| {
                 let rows = slots
@@ -115,7 +116,7 @@ impl ValidatedHeadBatch {
                         }
                     })
                     .collect::<Vec<_>>();
-                ValidatedTargetBatch::from_slots(&rows, vocabulary_size, row_limit)
+                ValidatedTargetBatch::from_slots(&rows, vocabulary_size, limits)
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -131,7 +132,7 @@ impl ValidatedHeadBatch {
     pub fn from_block_slots(
         slots: &[BlockSlot],
         vocabulary_size: usize,
-        row_limit: usize,
+        limits: ClassLimits,
     ) -> Result<Self, PackError> {
         let width = slots.first().map_or(0, |slot| slot.block.len());
         let proposals = |slot: &BlockSlot| slot.block.iter().filter(|row| row.select.is_some()).count();
@@ -164,7 +165,7 @@ impl ValidatedHeadBatch {
             }
         }
         let entry = slots.iter().map(|slot| slot.entry.clone()).collect::<Vec<_>>();
-        let entry = ValidatedTargetBatch::from_slots(&entry, vocabulary_size, row_limit)?;
+        let entry = ValidatedTargetBatch::from_slots(&entry, vocabulary_size, limits)?;
         let chain = if width == 0 {
             Vec::new()
         } else {
@@ -190,7 +191,11 @@ impl ValidatedHeadBatch {
                     stop,
                 })
                 .collect::<Vec<_>>();
-            vec![ValidatedTargetBatch::from_slots(&rows, vocabulary_size, row_limit)?]
+            vec![ValidatedTargetBatch::from_slots(
+                &rows,
+                vocabulary_size,
+                limits,
+            )?]
         };
         Ok(Self {
             entry,
@@ -269,6 +274,11 @@ mod tests {
     use super::*;
     use crate::{Draw, DrawKind, RowHistory, Shaping};
 
+    const LIMITS: ClassLimits = ClassLimits {
+        rows: 64,
+        segments: 63,
+    };
+
     fn row(token: i32, destination: i32, select: Option<Select>) -> Row {
         Row {
             token,
@@ -317,7 +327,8 @@ mod tests {
     #[test]
     fn a_block_batch_drafts_every_proposal_in_one_pass() {
         let batch =
-            ValidatedHeadBatch::from_block_slots(&[slot(2, 3, 4), slot(4, 1, 4)], 16, 64).unwrap();
+            ValidatedHeadBatch::from_block_slots(&[slot(2, 3, 4), slot(4, 1, 4)], 16, LIMITS)
+                .unwrap();
         assert_eq!(batch.passes(), HeadPasses::Block);
         assert_eq!((batch.actual_slots(), batch.actual_rows(), batch.steps()), (2, 4, 4));
         let block = batch.chain().collect::<Vec<_>>();
@@ -335,12 +346,12 @@ mod tests {
     fn an_empty_block_only_injects() {
         // A block without proposals has no rows at all.
         assert!(matches!(
-            ValidatedHeadBatch::from_block_slots(&[slot(2, 3, 0)], 16, 64),
+            ValidatedHeadBatch::from_block_slots(&[slot(2, 3, 0)], 16, LIMITS),
             Err(PackError::HeadSteps { slot: 0 })
         ));
         let mut empty = slot(2, 3, 0);
         empty.block.clear();
-        let batch = ValidatedHeadBatch::from_block_slots(&[empty], 16, 64).unwrap();
+        let batch = ValidatedHeadBatch::from_block_slots(&[empty], 16, LIMITS).unwrap();
         assert_eq!((batch.steps(), batch.chain().count()), (0, 0));
     }
 
@@ -349,11 +360,11 @@ mod tests {
         let mut appending = slot(2, 3, 2);
         appending.block[1].histories[0].destination = 9;
         assert!(matches!(
-            ValidatedHeadBatch::from_block_slots(&[appending], 16, 64),
+            ValidatedHeadBatch::from_block_slots(&[appending], 16, LIMITS),
             Err(PackError::InvalidDestination { .. })
         ));
         assert!(matches!(
-            ValidatedHeadBatch::from_block_slots(&[slot(2, 3, 2), slot(4, 1, 3)], 16, 64),
+            ValidatedHeadBatch::from_block_slots(&[slot(2, 3, 2), slot(4, 1, 3)], 16, LIMITS),
             Err(PackError::HeadSteps { slot: 1 })
         ));
     }

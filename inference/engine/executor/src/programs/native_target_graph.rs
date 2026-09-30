@@ -355,7 +355,7 @@ impl PreparedTargetGraphs {
         let max_segments = u64::try_from(
             state
                 .target_state()
-                .max_visible_spans()?
+                .span_limit()
                 .checked_next_power_of_two()
                 .ok_or("target segment class overflows")?,
         )
@@ -1384,7 +1384,7 @@ fn certify_target_family(
     let max_segments = u64::try_from(
         state
             .target_state()
-            .max_visible_spans()?
+            .span_limit()
             .checked_next_power_of_two()
             .ok_or("target segment class overflows")?,
     )
@@ -1596,11 +1596,7 @@ mod resource_template_tests {
                 )
                 .unwrap();
                 let geometry = &definition.decoder;
-                let max_segments = state
-                    .target_state()
-                    .max_visible_spans()
-                    .unwrap()
-                    .next_power_of_two() as u64;
+                let max_segments = state.target_state().span_limit().next_power_of_two() as u64;
                 let weight = embedding_weight(&load).unwrap();
                 let elements = [("EW", weight.resident), ("A", activation(geometry))];
                 let fits =

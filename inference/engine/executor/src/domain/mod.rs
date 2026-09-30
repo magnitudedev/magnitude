@@ -20,8 +20,8 @@ use crate::{
 };
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{
-    Holder, InFlightState, OwnedAdvanceResolution, OwnedCompaction, OwnedCompactionPreparation,
-    OwnedStateAdvance, SequenceState, StateCheckpoint, StateStore, TentativeAdvance,
+    Holder, InFlightState, OwnedAdvanceResolution, OwnedStateAdvance, OwnedTailRelocation,
+    RowDemand, SequenceState, StateCheckpoint, StateStore, TentativeAdvance,
 };
 use seismic::Tensor;
 mod draft;
@@ -190,6 +190,28 @@ impl From<magnitude_state::Error> for DomainError {
     }
 }
 
+/// Whether `store`'s free pages hold `demands` without growth: in every
+/// stored domain, the page-rounded rows the advances append beyond their last
+/// pages.
+fn holds(store: &StateStore, demands: &[RowDemand]) -> Result<(), CapacityError> {
+    for domain in store.history_domains() {
+        let required = demands
+            .iter()
+            .filter(|demand| demand.domain == domain)
+            .map(|demand| demand.rows)
+            .sum::<usize>();
+        let available = store.free_rows(domain);
+        if available < required {
+            return Err(CapacityError {
+                resource: ResourceKind::StateRows,
+                required: required as u64,
+                available: available as u64,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// One request's immutable numerical result and its still-owned physical
 /// transaction. Cloning the view never clones the transaction.
 pub struct PendingOperationOutcome {
@@ -234,11 +256,13 @@ pub enum ReservationLane {
 pub struct DomainRequirements {
     lane: ReservationLane,
     pool: PoolClass,
-    state_rows: usize,
+    /// Each advance's page demand in its store (see
+    /// `SequenceState::demands`): rows a history appends in place need none.
+    state_demand: Vec<RowDemand>,
     successor_banks: usize,
-    /// Head rows (and one successor bank each) of the drafter entries the
-    /// target group's prompt chunks prime.
-    priming_rows: usize,
+    /// Head page demand (and one successor bank each) of the drafter entries
+    /// the target group's prompt chunks prime.
+    priming_demand: Vec<RowDemand>,
     priming_banks: usize,
     /// The operations claim the queued lookahead step: nothing is reserved.
     claim: bool,
@@ -250,9 +274,6 @@ impl DomainRequirements {
     }
     pub fn pool(&self) -> PoolClass {
         self.pool
-    }
-    pub fn state_rows(&self) -> usize {
-        self.state_rows
     }
     pub fn successor_banks(&self) -> usize {
         self.successor_banks
@@ -436,6 +457,28 @@ impl ExecutorDomain<NativeFamily> {
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
+    /// The target launches graphs were sealed for: the launch row bound and
+    /// the target store's span limit.
+    fn target_class_limits(&self) -> crate::batching::ClassLimits {
+        crate::batching::ClassLimits {
+            rows: self.execution.policy().limits().max_launch_rows,
+            segments: self.target_store.max_span_limit(),
+        }
+    }
+
+    /// The head (drafter) launches graphs were sealed for: the launch row
+    /// bound and the head store's span limit.
+    fn head_class_limits(&self) -> Result<crate::batching::ClassLimits, DomainError> {
+        let store = self
+            .head_store
+            .as_ref()
+            .ok_or_else(|| DomainError::invariant("a head launch without a head store"))?;
+        Ok(crate::batching::ClassLimits {
+            rows: self.execution.policy().limits().max_launch_rows,
+            segments: store.max_span_limit(),
+        })
+    }
+
     /// Return every byte that remains resident as part of the model's static
     /// footprint.  This is the single accounting path used both when the
     /// holding is first registered and whenever lazy state/program binding
@@ -589,9 +632,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(DomainRequirements {
                 lane: ReservationLane::Target,
                 pool: PoolClass::Target(class),
-                state_rows: 0,
+                state_demand: Vec::new(),
                 successor_banks: 0,
-                priming_rows: 0,
+                priming_demand: Vec::new(),
                 priming_banks: 0,
                 claim: true,
             });
@@ -616,8 +659,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 "reservation crosses numerical lanes",
             ));
         }
-        let limits = self.execution.policy().limits();
-        let mut priming_rows = 0usize;
+        let mut priming_demand = Vec::new();
         let mut priming_banks = 0usize;
         for operation in operations {
             if let Operation::Forward {
@@ -639,13 +681,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         "drafter entry position differs from accepted drafter state".into(),
                     ));
                 }
-                priming_rows += prime.tokens.len();
+                priming_demand.extend(state.demands(prime.tokens.len()));
                 priming_banks += 1;
             }
         }
-        let (pool, state_rows, successor_banks) = match lane {
+        let (pool, state_demand, successor_banks) = match lane {
             ReservationLane::Target | ReservationLane::Head => {
                 let mut rows = 0usize;
+                let mut state_demand = Vec::new();
                 let mut segments = 1usize;
                 let mut demand = crate::batching::Demand::NONE;
                 let mut seen = BTreeSet::new();
@@ -675,6 +718,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             "reservation position differs from accepted state".into(),
                         ));
                     }
+                    state_demand.extend(state.demands(operation.row_count()));
                     // Speculative target rows are recorded on the recurrent
                     // tape, which holds the planned draft rows.
                     if lane == ReservationLane::Target
@@ -719,16 +763,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         state.span_count()
                     });
                 }
-                let class =
-                    crate::LaunchClass::covering(rows, segments, demand, limits.max_launch_rows)
-                        .map_err(|error| error.to_string())?;
+                let class_limits = if lane == ReservationLane::Target {
+                    self.target_class_limits()
+                } else {
+                    self.head_class_limits()?
+                };
+                let class = crate::LaunchClass::covering(rows, segments, demand, class_limits)
+                    .map_err(|error| error.to_string())?;
                 (
                     if lane == ReservationLane::Target {
                         PoolClass::Target(class)
                     } else {
                         PoolClass::Head(class)
                     },
-                    rows,
+                    state_demand,
                     operations.len(),
                 )
             }
@@ -755,7 +803,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     PoolClass::Vision {
                         patch_rows: image.patches(),
                     },
-                    0,
+                    Vec::new(),
                     0,
                 )
             }
@@ -763,9 +811,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(DomainRequirements {
             lane,
             pool,
-            state_rows,
+            state_demand,
             successor_banks,
-            priming_rows,
+            priming_demand,
             priming_banks,
             claim: false,
         })
@@ -855,16 +903,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             )?;
             let store = self.head_store.as_ref().ok_or(CapacityError {
                 resource: ResourceKind::StateRows,
-                required: requirements.priming_rows as u64,
+                required: requirements
+                    .priming_demand
+                    .iter()
+                    .map(|demand| demand.rows as u64)
+                    .sum(),
                 available: 0,
             })?;
-            if store.available_rows() < requirements.priming_rows {
-                return Err(CapacityError {
-                    resource: ResourceKind::StateRows,
-                    required: requirements.priming_rows as u64,
-                    available: store.available_rows() as u64,
-                });
-            }
+            holds(store, &requirements.priming_demand)?;
             if store.available_banks() < requirements.priming_banks {
                 return Err(CapacityError {
                     resource: ResourceKind::RecurrentBanks,
@@ -878,16 +924,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         } else {
             Some(&self.target_store)
         };
-        if requirements.state_rows != 0 {
+        if requirements.lane != ReservationLane::Vision {
             let store = store.expect("head requirements require a head store");
-            let rows = store.available_rows();
-            if rows < requirements.state_rows {
-                return Err(CapacityError {
-                    resource: ResourceKind::StateRows,
-                    required: requirements.state_rows as u64,
-                    available: rows as u64,
-                });
-            }
+            holds(store, &requirements.state_demand)?;
             let banks = store.available_banks();
             if banks < requirements.successor_banks {
                 return Err(CapacityError {

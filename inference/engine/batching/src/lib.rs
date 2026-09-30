@@ -9,7 +9,7 @@ mod target;
 mod vision;
 
 pub use classes::{
-    row_class, row_classes, ClassError, LaunchClass, MAX_CLASS_ROWS,
+    row_class, row_classes, ClassError, ClassLimits, LaunchClass, MAX_CLASS_ROWS,
     PREFILL_ROW_QUANTUM, SMALL_CLASS_ROWS,
 };
 pub use demand::Demand;

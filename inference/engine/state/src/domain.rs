@@ -1,12 +1,10 @@
 //! History domains. A history domain is a set of attention layers whose
 //! history shares one row numbering: a row is one token's history in the
 //! domain's layers. A store holds one history slab tensor per stored domain,
-//! with its own components, rows per slab, span bound, free space and per-row
-//! references.
+//! with its own components, placement geometry (pages, slabs and span limit),
+//! free space and per-row references.
 
-use crate::{
-    history_rows_per_slab, max_visible_spans, ComponentDescriptor, Error, LayerRef, LayoutError,
-};
+use crate::{history_geometry, ComponentDescriptor, Error, HistoryGeometry, LayerRef, LayoutError};
 use std::collections::BTreeSet;
 
 /// A stored history domain of one store: its index among the store's stored
@@ -130,49 +128,44 @@ impl HistoryDomainLayout {
         })
     }
 
-    /// The slab-rounded steady footprint of `live` histories and
-    /// `checkpoints` checkpoints at position `context`, for assessment. A
-    /// live history holds its row limit (for Window(n), `n` plus one advance
-    /// whatever the context); a checkpoint holds its checkpoint rows. Rows a
-    /// checkpoint shares with a live history are counted for both, so the
-    /// footprint is an upper bound. Rows of distinct histories share slabs,
-    /// so rounding applies to the domain total. Shared domains hold nothing.
-    pub fn steady_footprint(
+    /// The placement geometry of this stored domain among a store's
+    /// `domains` (see [`history_geometry`]): its histories hold at most its
+    /// row limit, and Shared layers reading it also see one advance's
+    /// appended rows.
+    pub fn geometry(
         &self,
+        domains: &[HistoryDomainLayout],
         context: usize,
         max_advance: usize,
-        live: u64,
-        checkpoints: u64,
-    ) -> Result<HistoryFootprint, Error> {
-        let kind = self.kind();
-        if let HistoryDomainKind::Shared { .. } = kind {
-            return Ok(HistoryFootprint::default());
-        }
-        let overflow = || Error::Layout(LayoutError::ArithmeticOverflow("history footprint"));
-        let live_rows =
-            u64::try_from(kind.row_limit(context, max_advance)?).map_err(|_| overflow())?;
-        let checkpoint_rows =
-            u64::try_from(kind.checkpoint_rows(context)?).map_err(|_| overflow())?;
-        let rows = live
-            .checked_mul(live_rows)
-            .and_then(|live| checkpoints.checked_mul(checkpoint_rows)?.checked_add(live))
-            .ok_or_else(overflow)?;
-        let rows_per_slab = history_rows_per_slab(self.row_bytes()?).map_err(Error::Request)?;
-        Ok(HistoryFootprint {
-            rows_per_slab,
-            rows,
-            slabs: rows.div_ceil(rows_per_slab as u64),
-        })
+    ) -> Result<HistoryGeometry, Error> {
+        history_geometry(
+            self.row_bytes()?,
+            self.kind().row_limit(context, max_advance)?,
+            shared_appended_rows(self.components(), domains, max_advance),
+        )
+        .map_err(Error::Request)
     }
 }
 
-/// A domain's steady history in rows and whole slabs. The planner prices
-/// the slabs with the Seismic slab layout of the domain's regions.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct HistoryFootprint {
-    pub rows_per_slab: usize,
-    pub rows: u64,
-    pub slabs: u64,
+/// The appended rows Shared readers of a stored domain with `components`
+/// see within one advance: `max_advance` when any Shared layout of `domains`
+/// reads one of its layers, else none.
+fn shared_appended_rows(
+    components: &[ComponentDescriptor],
+    domains: &[HistoryDomainLayout],
+    max_advance: usize,
+) -> usize {
+    let read = domains.iter().any(|domain| match domain {
+        HistoryDomainLayout::Shared { source, .. } => components
+            .iter()
+            .any(|component| component.layer == *source),
+        _ => false,
+    });
+    if read {
+        max_advance
+    } else {
+        0
+    }
 }
 
 /// One domain of a store: its layout and the row addresses reserved for
@@ -189,9 +182,8 @@ pub(crate) struct StoredDomain {
     pub kind: HistoryDomainKind,
     pub components: Vec<ComponentDescriptor>,
     pub row_bytes: u64,
-    pub slab_rows: usize,
+    pub geometry: HistoryGeometry,
     pub logical_rows: usize,
-    pub span_bound: usize,
 }
 
 /// Where a layer's history lives: the stored domain and the layer whose
@@ -214,6 +206,10 @@ pub(crate) fn validate_domains(
     let mut stored = Vec::new();
     let mut layers = BTreeSet::new();
     let mut shared = Vec::new();
+    let layouts = plans
+        .iter()
+        .map(|plan| plan.layout.clone())
+        .collect::<Vec<_>>();
     for plan in plans {
         let kind = plan.layout.kind();
         match plan.layout {
@@ -255,25 +251,28 @@ pub(crate) fn validate_domains(
                     for plane in component.planes() {
                         let bytes = u64::try_from(plane.row_bytes)
                             .map_err(|_| LayoutError::ArithmeticOverflow("plane row bytes"))?;
-                        bytes
-                            .checked_mul(plan.logical_rows as u64)
-                            .ok_or(LayoutError::ArithmeticOverflow("history plane capacity"))?;
                         row_bytes = row_bytes
                             .checked_add(bytes)
                             .ok_or(LayoutError::ArithmeticOverflow("history row bytes"))?;
                     }
                 }
-                row_bytes
-                    .checked_mul(plan.logical_rows as u64)
+                let geometry = history_geometry(
+                    row_bytes,
+                    row_limit,
+                    shared_appended_rows(&components, &layouts, max_advance),
+                )
+                .map_err(Error::Request)?;
+                // Every plane's capacity is at most the domain's total.
+                let logical_rows = geometry
+                    .reserved_rows(plan.logical_rows)
+                    .filter(|&rows| row_bytes.checked_mul(rows as u64).is_some())
                     .ok_or(LayoutError::ArithmeticOverflow("total history capacity"))?;
-                let slab_rows = history_rows_per_slab(row_bytes).map_err(Error::Request)?;
                 stored.push(StoredDomain {
                     kind,
                     components,
                     row_bytes,
-                    slab_rows,
-                    logical_rows: plan.logical_rows,
-                    span_bound: max_visible_spans(row_limit, slab_rows).map_err(Error::Request)?,
+                    geometry,
+                    logical_rows,
                 });
             }
         }

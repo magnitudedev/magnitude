@@ -356,12 +356,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ));
             slots.push(slot);
         }
-        let limits = self.execution.policy().limits();
+        let class_limits = self.target_class_limits();
         let vocabulary = self.definition.decoder.vocabulary as usize;
         let batch = if selected_tokens {
-            ValidatedTargetBatch::from_slots(&slots, vocabulary, limits.max_launch_rows)
+            ValidatedTargetBatch::from_slots(&slots, vocabulary, class_limits)
         } else {
-            ValidatedTargetBatch::covering(&slots, vocabulary, limits.max_launch_rows, segments)
+            ValidatedTargetBatch::covering(&slots, vocabulary, class_limits, segments)
         }
         .map_err(|error| DomainError::Input(error.to_string()))?;
         let tokens = match selected {

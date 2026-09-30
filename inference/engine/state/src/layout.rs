@@ -9,15 +9,75 @@ use seismic::DType;
 
 pub const SLAB_BYTE_TARGET: u64 = 64 * 1024 * 1024;
 pub const SLAB_ROW_TILE: usize = 256;
+/// The most spans any history of a domain can present to one launch, so the
+/// largest span class a store seals is 64.
+pub const MAX_HISTORY_SPANS: usize = 63;
 
-/// Rows in one history slab. A large row still gets one complete tile.
-pub fn history_rows_per_slab(row_bytes: u64) -> Result<usize, String> {
+/// How one stored history domain places rows (see [`history_geometry`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryGeometry {
+    /// Rows of one page: the unit a history takes beyond its own tail page.
+    pub page_rows: usize,
+    /// Rows of one slab: a whole number of pages.
+    pub slab_rows: usize,
+    /// The most spans a history of the domain presents to a launch.
+    pub span_limit: usize,
+}
+
+impl HistoryGeometry {
+    /// The rows a domain reserves for `rows` requested: whole pages, so every
+    /// page is complete and a history's page demand is exactly what its
+    /// claims take.
+    pub fn reserved_rows(&self, rows: usize) -> Option<usize> {
+        rows.checked_next_multiple_of(self.page_rows)
+    }
+}
+
+/// The placement geometry of a stored history domain whose histories hold at
+/// most `row_limit` rows. `appended_rows` is the most rows one advance
+/// appends that Shared readers of the domain see as history (0 without
+/// readers).
+///
+/// A history takes rows only in place after its end within its last page, or
+/// as whole free pages, so every page it references is complete except its
+/// first and last. It therefore presents at most `ceil(row_limit / page) + 1`
+/// spans, plus `ceil(appended_rows / page) + 1` for rows a Shared reader sees
+/// appended within an advance. Pages are the smallest multiple of
+/// [`SLAB_ROW_TILE`] keeping that at most [`MAX_HISTORY_SPANS`]; a slab holds
+/// as many whole pages as fit [`SLAB_BYTE_TARGET`], and at least one.
+pub fn history_geometry(
+    row_bytes: u64,
+    row_limit: usize,
+    appended_rows: usize,
+) -> Result<HistoryGeometry, String> {
     if row_bytes == 0 {
         return Err("history row must have storage".into());
     }
-    let rows = (SLAB_BYTE_TARGET / row_bytes) / SLAB_ROW_TILE as u64 * SLAB_ROW_TILE as u64;
-    usize::try_from(rows.max(SLAB_ROW_TILE as u64))
-        .map_err(|_| "history slab row count exceeds host domain".into())
+    let span_limit = |page_rows: usize| {
+        let appended = if appended_rows == 0 {
+            0
+        } else {
+            appended_rows.div_ceil(page_rows) + 1
+        };
+        row_limit.div_ceil(page_rows) + 1 + appended
+    };
+    // No page below this many tiles meets the limit (each span holds at most
+    // a page), so the search starts there and settles within a few tiles.
+    let mut tiles = ((row_limit + appended_rows) / (MAX_HISTORY_SPANS * SLAB_ROW_TILE)).max(1);
+    while span_limit(tiles * SLAB_ROW_TILE) > MAX_HISTORY_SPANS {
+        tiles += 1;
+    }
+    let page_rows = tiles * SLAB_ROW_TILE;
+    let slab_pages = usize::try_from(SLAB_BYTE_TARGET / row_bytes / page_rows as u64)
+        .map_err(|_| "history slab row count exceeds host domain")?
+        .max(1);
+    Ok(HistoryGeometry {
+        page_rows,
+        slab_rows: slab_pages
+            .checked_mul(page_rows)
+            .ok_or("history slab row count exceeds host domain")?,
+        span_limit: span_limit(page_rows),
+    })
 }
 
 /// Banks in one recurrent slab. A bank larger than the byte target still
@@ -28,17 +88,6 @@ pub fn banks_per_slab(bank_bytes: u64) -> Result<usize, String> {
     }
     usize::try_from((SLAB_BYTE_TARGET / bank_bytes).max(1))
         .map_err(|_| "recurrent slab bank count exceeds host domain".into())
-}
-
-/// Maximum history spans a loaded model admits before compaction.
-pub fn max_visible_spans(context_limit: usize, rows_per_slab: usize) -> Result<usize, String> {
-    if rows_per_slab == 0 {
-        return Err("history slab must contain rows".into());
-    }
-    context_limit
-        .div_ceil(rows_per_slab)
-        .checked_add(16)
-        .ok_or_else(|| "history span bound overflows".into())
 }
 
 /// Device-free state allocation plan derived from the family-neutral model
@@ -342,11 +391,46 @@ mod tests {
     };
 
     #[test]
-    fn slab_shape_uses_byte_target_and_row_tile() {
-        assert_eq!(history_rows_per_slab(18_432).unwrap(), 3_584);
-        assert_eq!(history_rows_per_slab(SLAB_BYTE_TARGET).unwrap(), 256);
+    fn history_geometry_is_the_smallest_page_within_the_span_limit() {
+        // Qwen3.8-27B (16 K8/V4 layers x 4 heads) at 65,792 rows: the
+        // incident geometry.
+        let qwen38 = history_geometry(28_672, 65_792, 0).unwrap();
+        assert_eq!(qwen38.page_rows, 1_280);
+        assert_eq!(qwen38.span_limit, 53);
+        assert_eq!(qwen38.slab_rows % qwen38.page_rows, 0);
+        assert!(qwen38.slab_rows as u64 * 28_672 <= SLAB_BYTE_TARGET);
+        // Qwen3.6-35B (10 layers x 2 heads).
+        let qwen36 = history_geometry(8_960, 65_792, 0).unwrap();
+        assert_eq!((qwen36.page_rows, qwen36.slab_rows), (1_280, 6_400));
+        // A short window keeps one-tile pages; a row above the byte target
+        // still gets a slab of one page.
+        let window = history_geometry(SLAB_BYTE_TARGET, 1_024 + 512, 0).unwrap();
+        assert_eq!((window.page_rows, window.slab_rows), (256, 256));
+        // Shared readers see an advance's appended rows too.
+        let shared = history_geometry(18_432, 262_144, 1_024).unwrap();
+        assert!(shared.span_limit <= MAX_HISTORY_SPANS);
+        for (row_limit, appended) in [(1, 0), (65_792, 0), (262_144, 512), (1 << 20, 1_024)] {
+            let geometry = history_geometry(4_096, row_limit, appended).unwrap();
+            assert!(geometry.span_limit <= MAX_HISTORY_SPANS);
+            if geometry.page_rows > SLAB_ROW_TILE {
+                let smaller = history_geometry_span_limit(
+                    geometry.page_rows - SLAB_ROW_TILE,
+                    row_limit,
+                    appended,
+                );
+                assert!(smaller > MAX_HISTORY_SPANS, "{row_limit} {appended}");
+            }
+        }
         assert_eq!(banks_per_slab(52 * 1024 * 1024).unwrap(), 1);
-        assert_eq!(max_visible_spans(262_144, 3_584).unwrap(), 90);
+    }
+
+    fn history_geometry_span_limit(page_rows: usize, row_limit: usize, appended: usize) -> usize {
+        let appended = if appended == 0 {
+            0
+        } else {
+            appended.div_ceil(page_rows) + 1
+        };
+        row_limit.div_ceil(page_rows) + 1 + appended
     }
 
     fn weight(shape: &[u64]) -> WeightDescriptor {

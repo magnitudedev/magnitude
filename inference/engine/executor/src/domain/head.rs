@@ -109,7 +109,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             DraftForm::Chained | DraftForm::Block => steps,
         };
         let vocabulary = self.definition.decoder.vocabulary as usize;
-        let row_limit = self.execution.policy().limits().max_launch_rows;
+        let class_limits = self.head_class_limits()?;
         let batch = match form {
             DraftForm::Chained => operations
                 .iter()
@@ -117,8 +117,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .map(|(operation, advance)| self.head_slot(operation, advance, steps))
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|slots| {
-                    crate::batching::ValidatedHeadBatch::from_slots(&slots, vocabulary, row_limit)
-                        .map_err(|error| error.to_string())
+                    crate::batching::ValidatedHeadBatch::from_slots(
+                        &slots,
+                        vocabulary,
+                        class_limits,
+                    )
+                    .map_err(|error| error.to_string())
                 }),
             DraftForm::Block => operations
                 .iter()
@@ -127,7 +131,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|slots| {
                     crate::batching::ValidatedHeadBatch::from_block_slots(
-                        &slots, vocabulary, row_limit,
+                        &slots,
+                        vocabulary,
+                        class_limits,
                     )
                     .map_err(|error| error.to_string())
                 }),

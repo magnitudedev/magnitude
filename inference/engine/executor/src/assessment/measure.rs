@@ -1866,7 +1866,9 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         self.begin()?;
         let history_bytes = depth * row_bytes;
         self.session.history_rotation(affine, heads, history_bytes);
-        let slab_rows = magnitude_state::history_rows_per_slab(row_bytes).map_err(failed)? as u64;
+        let slab_rows = magnitude_state::history_geometry(row_bytes, depth as usize, 0)
+            .map_err(failed)?
+            .slab_rows as u64;
         let regions = planes
             .iter()
             .map(|(element, per_head, _)| SlabRegion {

@@ -10,13 +10,12 @@ pub mod placement;
 
 pub use advance::{
     CodecConversionStep, OwnedAdvanceBindings, OwnedAdvanceResolution, OwnedCodecAdvance,
-    OwnedCodecBindings, OwnedCompaction, OwnedCompactionBindings, OwnedCompactionPreparation,
-    OwnedStateAdvance, OwnedSuccessorAdvance, TentativeAdvance,
+    OwnedCodecBindings, OwnedStateAdvance, OwnedSuccessorAdvance, OwnedTailRelocation,
+    TentativeAdvance,
 };
 pub use bank::{recurrent_bank_bytes, BankComponent};
 pub use domain::{
-    HistoryDomainId, HistoryDomainKind, HistoryDomainLayout, HistoryDomainPlan, HistoryFootprint,
-    HistorySource,
+    HistoryDomainId, HistoryDomainKind, HistoryDomainLayout, HistoryDomainPlan, HistorySource,
 };
 
 pub use codec::{
@@ -24,8 +23,8 @@ pub use codec::{
     PlaneDescriptor, PlaneName, VectorKind, AFFINE_GROUP,
 };
 pub use layout::{
-    banks_per_slab, history_rows_per_slab, max_visible_spans, ModelStateLayout, SLAB_BYTE_TARGET,
-    SLAB_ROW_TILE,
+    banks_per_slab, history_geometry, HistoryGeometry, ModelStateLayout, MAX_HISTORY_SPANS,
+    SLAB_BYTE_TARGET, SLAB_ROW_TILE,
 };
 
 use placement::{Generation, LogicalId, Placement, PlacementError};
@@ -175,13 +174,21 @@ pub struct PlaneBuffer {
 /// History rows of one store: address-ordered, coalesced free holes, and the
 /// referenced rows as address-ordered runs with a reference count.
 ///
-/// Placement keeps every sequence's history in few segments however requests
-/// interleave: a sequence grows in place into the hole that begins at its
-/// history end, and a sequence that cannot grow in place (a fresh sequence, a
-/// fork whose sibling took the rows, or a neighbour boundary) starts at the
-/// middle of the largest hole, leaving the rows before it as growth room for
-/// the history that ends there. Only a hole at row 0 has no such history and
-/// is filled from its start.
+/// Rows are placed in pages of `page_rows`, a whole number per slab and per
+/// domain capacity, so every page is complete. A history takes rows
+/// only in place after its end within its last page, or as whole free pages
+/// (pages without a referenced row), so every page it references is
+/// complete except its first and last, and its spans stay within its
+/// domain's span limit however requests interleave, fork or are reclaimed
+/// (see [`history_geometry`]). The rows after a history's end in its last
+/// page are never given to another history: its page holds a referenced
+/// row. A history whose last page is partial but whose next row another
+/// history took (a sibling fork) relocates that page's rows before it grows
+/// ([`OwnedTailRelocation`]). A history takes the free page that begins at
+/// its end when there is one; otherwise, as a fresh history does, the middle
+/// page of the largest run of free pages, leaving the pages before it for
+/// the history that ends there (a run at row 0 has none and is taken from
+/// its start).
 ///
 /// A row is referenced once by every history ([`Claims`]) covering it, so a
 /// prefix is shared by any number of sequences and checkpoints at row
@@ -191,6 +198,7 @@ pub struct PlaneBuffer {
 #[derive(Clone)]
 struct Arena {
     slab_rows: usize,
+    page_rows: usize,
     backed: BTreeSet<usize>,
     free: Vec<(usize, usize)>,
     runs: BTreeMap<usize, Run>,
@@ -206,12 +214,14 @@ struct Run {
 }
 
 impl Arena {
-    fn new(rows: usize, slab_rows: usize) -> Self {
-        assert!(slab_rows > 0);
+    /// An arena whose first `rows` (whole pages) are backed.
+    fn new(rows: usize, slab_rows: usize, page_rows: usize) -> Self {
+        assert!(page_rows > 0 && slab_rows % page_rows == 0 && rows % page_rows == 0);
         let mut free = Vec::new();
         append_ranges(&mut free, [(0, rows)], slab_rows);
         Self {
             slab_rows,
+            page_rows,
             backed: (0..rows.div_ceil(slab_rows)).collect(),
             free,
             runs: BTreeMap::new(),
@@ -236,91 +246,88 @@ impl Arena {
         id
     }
 
-    fn available(&self) -> usize {
-        self.free.iter().map(|(_, count)| count).sum()
+    /// One past the last row of the page holding `row`.
+    fn page_end(&self, row: usize) -> usize {
+        row / self.page_rows * self.page_rows + self.page_rows
     }
 
-    /// Empty one backed slab into free rows in other backed slabs. The
-    /// placement is planned on a clone by the caller and published only
-    /// after all row copies succeed.
-    #[cfg(test)]
-    fn compact_slab(&mut self, rows: usize, slab: usize) -> Option<Vec<(usize, usize, usize)>> {
-        if !self.backed.contains(&slab) {
-            return None;
-        }
-        let start = slab * self.slab_rows;
-        let end = (start + self.slab_rows).min(rows);
-        let mut spans = self
-            .runs
-            .range(start..end)
-            .map(|(&row, run)| (row, run.count))
-            .collect::<Vec<_>>();
-        let mut holes = self
-            .free
-            .iter()
-            .copied()
-            .filter(|&(row, _)| row < start || row >= end)
-            .collect::<Vec<_>>();
-        let occupied = spans.iter().map(|(_, count)| count).sum::<usize>();
-        if occupied == 0 || holes.iter().map(|(_, count)| count).sum::<usize>() < occupied {
-            return None;
-        }
-        spans.sort_unstable_by_key(|&(row, count)| (std::cmp::Reverse(count), row));
-        let mut placed = BTreeMap::new();
-        for (span, count) in spans {
-            let fitting = holes
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, size))| *size >= count)
-                .min_by_key(|(_, &(row, size))| (size, row))
-                .map(|(index, _)| index);
-            let (mut row, mut remaining) = (span, count);
-            while remaining > 0 {
-                let hole = fitting.unwrap_or_else(|| {
-                    (0..holes.len())
-                        .max_by_key(|&index| (holes[index].1, std::cmp::Reverse(holes[index].0)))
-                        .expect("other slabs have enough free rows")
-                });
-                let (to, size) = holes[hole];
-                let taken = size.min(remaining);
-                placed.insert(row, (taken, to));
-                holes[hole] = (to + taken, size - taken);
-                if holes[hole].1 == 0 {
-                    holes.remove(hole);
-                }
-                row += taken;
-                remaining -= taken;
+    /// The start of every free page, in address order: pages without a
+    /// referenced row. A page lies within one slab, so within one hole.
+    fn free_pages(&self) -> Vec<usize> {
+        let mut pages = Vec::new();
+        for &(start, count) in &self.free {
+            let end = start + count;
+            let mut page = start.next_multiple_of(self.page_rows);
+            while page < end && self.page_end(page) <= end {
+                pages.push(page);
+                page += self.page_rows;
             }
         }
-        Some(self.remap(rows, placed))
+        pages
     }
 
-    #[cfg(test)]
-    fn least_occupied_slab_compaction(
-        &self,
-        rows: usize,
-    ) -> Option<(usize, Self, Vec<(usize, usize, usize)>)> {
-        let mut candidates = self
-            .backed
+    /// Rows a fresh history can take: the rows of every free page.
+    fn available(&self) -> usize {
+        self.free_pages().len() * self.page_rows
+    }
+
+    /// Rows a history ending at `end` can take in place: the free rows that
+    /// begin at its end, up to the end of its last page.
+    fn in_place(&self, end: Option<usize>) -> usize {
+        let Some(end) = end.filter(|end| end % self.page_rows != 0) else {
+            return 0;
+        };
+        self.free
             .iter()
-            .filter_map(|&index| {
-                let start = index * self.slab_rows;
-                let end = (start + self.slab_rows).min(rows);
-                let occupied = self
-                    .runs
-                    .range(start..end)
-                    .map(|(_, run)| run.count)
-                    .sum::<usize>();
-                (occupied > 0).then_some((occupied, std::cmp::Reverse(index), index))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_unstable();
-        candidates.into_iter().find_map(|(_, _, index)| {
-            let mut planned = self.clone();
-            planned
-                .compact_slab(rows, index)
-                .map(|moves| (index, planned, moves))
+            .find(|(start, _)| *start == end)
+            .map_or(0, |&(start, count)| count.min(self.page_end(start) - start))
+    }
+
+    /// Whether a history ending at `end` must relocate its last page before
+    /// it grows: the page has rows after its end, but another history took
+    /// the next one.
+    fn tail_blocked(&self, end: Option<usize>) -> bool {
+        end.is_some_and(|end| {
+            end % self.page_rows != 0
+                && end < self.page_end(end - 1)
+                && self.in_place(Some(end)) == 0
         })
+    }
+
+    /// Rows a history ending at `end` can take (see [`Arena::claim`]).
+    fn claimable(&self, end: Option<usize>) -> usize {
+        self.in_place(end) + self.available()
+    }
+
+    /// The free page a history ending at `end` takes next, given the free
+    /// pages (see the placement rule above).
+    fn next_page(&self, end: Option<usize>, pages: &[usize]) -> usize {
+        if let Some(end) = end {
+            if pages.binary_search(&end).is_ok() {
+                return end;
+            }
+        }
+        let mut largest: Option<(usize, usize)> = None;
+        let mut first = 0;
+        while first < pages.len() {
+            let mut next = first + 1;
+            while next < pages.len()
+                && pages[next] == pages[next - 1] + self.page_rows
+                && pages[next] / self.slab_rows == pages[first] / self.slab_rows
+            {
+                next += 1;
+            }
+            if largest.is_none_or(|(_, count)| next - first > count) {
+                largest = Some((first, next - first));
+            }
+            first = next;
+        }
+        let (first, count) = largest.expect("claimed rows never exceed the available rows");
+        if pages[first] == 0 {
+            pages[first]
+        } else {
+            pages[first + (count - 1) / 2]
+        }
     }
 
     /// Plan every row move for one shrink against the published placement.
@@ -332,47 +339,30 @@ impl Arena {
         keep: &BTreeSet<usize>,
     ) -> (Self, Vec<(usize, usize, usize)>) {
         let mut planned = self.clone();
-        let mut spans = self
-            .runs
-            .iter()
-            .filter(|(row, _)| !keep.contains(&(*row / self.slab_rows)))
-            .map(|(&row, run)| (row, run.count))
-            .collect::<Vec<_>>();
-        let mut holes = self
-            .free
-            .iter()
-            .copied()
-            .filter(|(row, _)| keep.contains(&(row / self.slab_rows)))
-            .collect::<Vec<_>>();
-        debug_assert!(
-            holes.iter().map(|(_, count)| count).sum::<usize>()
-                >= spans.iter().map(|(_, count)| count).sum::<usize>()
-        );
-        spans.sort_unstable_by_key(|&(row, count)| (std::cmp::Reverse(count), row));
+        // Whole occupied pages move to free pages of kept slabs at the same
+        // offsets, so every history keeps its page structure (and its span
+        // limit), including the free rows after a history's end.
+        let mut destinations = self
+            .free_pages()
+            .into_iter()
+            .filter(|page| keep.contains(&(page / self.slab_rows)));
+        let mut moved_pages = BTreeMap::new();
         let mut placed = BTreeMap::new();
-        for (span, count) in spans {
-            let fitting = holes
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, size))| *size >= count)
-                .min_by_key(|(_, &(row, size))| (size, row))
-                .map(|(index, _)| index);
-            let (mut row, mut remaining) = (span, count);
-            while remaining > 0 {
-                let hole = fitting.unwrap_or_else(|| {
-                    (0..holes.len())
-                        .max_by_key(|&index| (holes[index].1, std::cmp::Reverse(holes[index].0)))
-                        .expect("kept slabs have room for every moved row")
+        for (&start, run) in &self.runs {
+            if keep.contains(&(start / self.slab_rows)) {
+                continue;
+            }
+            let (mut row, end) = (start, start + run.count);
+            while row < end {
+                let page = row / self.page_rows * self.page_rows;
+                let to = *moved_pages.entry(page).or_insert_with(|| {
+                    destinations
+                        .next()
+                        .expect("kept slabs have a free page for every moved page")
                 });
-                let (to, size) = holes[hole];
-                let taken = size.min(remaining);
-                placed.insert(row, (taken, to));
-                holes[hole] = (to + taken, size - taken);
-                if holes[hole].1 == 0 {
-                    holes.remove(hole);
-                }
-                row += taken;
-                remaining -= taken;
+                let piece = end.min(self.page_end(row)) - row;
+                placed.insert(row, (piece, to + row - page));
+                row += piece;
             }
         }
         let moves = if placed.is_empty() {
@@ -486,27 +476,31 @@ impl Arena {
         moves
     }
 
-    /// Claim `count` rows, in logical order, for a sequence whose history ends
-    /// at row `after`. The caller has checked `count <= self.available()`.
+    /// Claim `count` rows, in logical order, for a history whose end is row
+    /// `after`: in place after its end within its last page, then whole free
+    /// pages. The caller has checked that its tail is not blocked and that
+    /// `count <= self.claimable(after)`.
     fn claim(&mut self, after: Option<usize>, count: usize) -> Vec<(usize, usize)> {
+        debug_assert!(!self.tail_blocked(after));
         let mut claimed = Vec::new();
         let mut remaining = count;
-        if let Some(end) = after {
-            if let Some(hole) = self.free.iter().position(|(start, _)| *start == end) {
-                let taken = self.free[hole].1.min(remaining);
-                claimed.push(self.take(hole, 0, taken));
-                remaining -= taken;
-            }
-        }
+        let mut end = after;
         while remaining > 0 {
-            let hole = (0..self.free.len())
-                .max_by_key(|&hole| (self.free[hole].1, std::cmp::Reverse(self.free[hole].0)))
-                .expect("claimed rows never exceed the available rows");
-            let (start, size) = self.free[hole];
-            let taken = size.min(remaining);
-            let offset = if start == 0 { 0 } else { (size - taken) / 2 };
-            claimed.push(self.take(hole, offset, taken));
-            remaining -= taken;
+            let in_place = self.in_place(end);
+            let (start, taken) = if in_place > 0 {
+                (end.expect("in-place rows follow a history end"), in_place)
+            } else {
+                (self.next_page(end, &self.free_pages()), self.page_rows)
+            };
+            let hole = self
+                .free
+                .iter()
+                .position(|&(hole, size)| hole <= start && start < hole + size)
+                .expect("the rows taken are free");
+            let piece = self.take(hole, start - self.free[hole].0, taken.min(remaining));
+            claimed.push(piece);
+            end = Some(piece.0 + piece.1);
+            remaining -= piece.1;
         }
         claimed
     }
@@ -527,12 +521,6 @@ impl Arena {
         assert!(self.runs.range(start..end).next().is_none());
         assert!(self.backed.remove(&slab));
         self.free.retain(|&(row, _)| row < start || row >= end);
-    }
-
-    /// Claim the first hole of at least `count` rows from its start.
-    fn claim_contiguous(&mut self, count: usize) -> Option<usize> {
-        let hole = self.free.iter().position(|(_, size)| *size >= count)?;
-        Some(self.take(hole, 0, count).0)
     }
 
     /// Remove `count` rows at `offset` within hole `hole`, keeping the free
@@ -931,7 +919,7 @@ pub struct StateAllocationTrace {
 }
 
 /// One stored history domain as allocated: `capacity` reserved rows of
-/// `row_bytes`, `slab_rows` per slab and its span bound.
+/// `row_bytes`, its slab and page rows, and its span limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryDomainTrace {
     pub kind: HistoryDomainKind,
@@ -939,7 +927,8 @@ pub struct HistoryDomainTrace {
     pub row_bytes: u64,
     pub bytes: u64,
     pub slab_rows: usize,
-    pub span_bound: usize,
+    pub page_rows: usize,
+    pub span_limit: usize,
 }
 
 /// The permanently pristine bank every new sequence starts from. It is never
@@ -1196,42 +1185,45 @@ impl Drop for Transaction {
         }
     }
 }
-/// One stored history domain of a store: its layout, rows per slab, span
-/// bound and the arena of its rows (free space and per-row references).
+/// One stored history domain of a store: its layout, placement geometry and
+/// the arena of its rows (free space and per-row references).
 struct HistoryDomain {
     kind: HistoryDomainKind,
     components: Vec<ComponentDescriptor>,
     row_bytes: u64,
     slab_rows: usize,
+    page_rows: usize,
     /// Row addresses reserved for the domain and sealed into graphs.
     capacity: usize,
-    span_bound: usize,
+    span_limit: usize,
     arena: Rc<RefCell<Arena>>,
 }
 
 impl HistoryDomain {
-    /// Whole slabs to add, lowest unbacked indices first, so that `rows`
-    /// more rows are free.
+    /// Whole slabs to add, lowest unbacked indices first, so that the free
+    /// pages hold a demand of `rows` page-rounded rows (see
+    /// [`StateStore::page_demand`]).
     fn growth_slabs(&self, rows: usize) -> Result<usize, Error> {
         if rows == 0 {
             return Ok(0);
         }
         let arena = self.arena.borrow();
-        let available = arena.available();
-        let shortage = rows.saturating_sub(available);
+        let pages = rows.div_ceil(self.page_rows);
+        let free = arena.free_pages().len();
+        let shortage = pages.saturating_sub(free);
         let mut additional_slabs = 0;
-        let mut added_rows = 0;
+        let mut added_pages = 0;
         for slab in 0..self.capacity.div_ceil(self.slab_rows) {
-            if !arena.backed.contains(&slab) && added_rows < shortage {
+            if !arena.backed.contains(&slab) && added_pages < shortage {
                 let start = slab * self.slab_rows;
-                added_rows += (start + self.slab_rows).min(self.capacity) - start;
+                added_pages += ((start + self.slab_rows).min(self.capacity) - start) / self.page_rows;
                 additional_slabs += 1;
             }
         }
-        if added_rows < shortage {
+        if added_pages < shortage {
             return Err(Error::Capacity {
                 required: rows as u64 * self.row_bytes,
-                available_bytes: (added_rows + available) as u64 * self.row_bytes,
+                available_bytes: ((added_pages + free) * self.page_rows) as u64 * self.row_bytes,
             });
         }
         Ok(additional_slabs)
@@ -1254,46 +1246,54 @@ impl HistoryDomain {
 
     /// Plan one shrink of this domain against its published arena: the
     /// slabs kept (idle: every occupied slab and one spare; reclaim: the
-    /// most occupied slabs that hold every referenced row), the row moves
-    /// out of the others, and the arena to publish once they are copied.
+    /// most occupied slabs whose free whole pages hold every occupied page
+    /// of the others), the page moves out of the others, and the arena to
+    /// publish once they are copied.
     fn shrink_plan(&self, policy: ShrinkPolicy, rows: usize) -> ShrinkPlan {
         let arena = self.arena.borrow();
+        let occupied_pages = arena
+            .runs
+            .iter()
+            .flat_map(|(&start, run)| {
+                (start / self.page_rows..=(start + run.count - 1) / self.page_rows)
+                    .map(|page| page * self.page_rows)
+            })
+            .collect::<BTreeSet<_>>();
+        let free_pages = arena.free_pages();
+        // (slab, occupied pages, free whole pages)
         let mut slabs = arena
             .backed
             .iter()
             .map(|&index| {
-                let start = index * self.slab_rows;
-                let end = (start + self.slab_rows).min(self.capacity);
-                let occupied = arena
-                    .runs
-                    .range(start..end)
-                    .map(|(_, run)| run.count)
-                    .sum::<usize>();
-                (index, end - start, occupied)
+                let in_slab = |page: &&usize| **page / self.slab_rows == index;
+                let free = free_pages.iter().filter(in_slab).count();
+                (index, occupied_pages.iter().filter(in_slab).count(), free)
             })
             .collect::<Vec<_>>();
-        slabs.sort_unstable_by_key(|&(index, _, occupied)| (std::cmp::Reverse(occupied), index));
+        slabs.sort_unstable_by_key(|&(index, occupied, _)| (std::cmp::Reverse(occupied), index));
         let mut keep = BTreeSet::new();
         match policy {
             ShrinkPolicy::Idle => {
                 keep.extend(
                     slabs
                         .iter()
-                        .filter(|(_, _, occupied)| *occupied > 0)
+                        .filter(|(_, occupied, _)| *occupied > 0)
                         .map(|(index, _, _)| *index),
                 );
-                if let Some(&(index, _, _)) = slabs.iter().find(|(_, _, occupied)| *occupied == 0) {
+                if let Some(&(index, _, _)) = slabs.iter().find(|(_, occupied, _)| *occupied == 0) {
                     keep.insert(index);
                 }
             }
             ShrinkPolicy::Reclaim => {
-                let mut capacity = 0;
-                for &(index, rows, _) in &slabs {
-                    if capacity >= arena.referenced {
+                let mut moved = occupied_pages.len();
+                let mut room = 0;
+                for &(index, occupied, free) in &slabs {
+                    if room >= moved {
                         break;
                     }
                     keep.insert(index);
-                    capacity += rows;
+                    moved -= occupied;
+                    room += free;
                 }
             }
         }
@@ -1454,9 +1454,10 @@ impl StateStore {
         let mut history = Vec::with_capacity(stored.len());
         let mut domains = Vec::with_capacity(stored.len());
         for domain in stored {
+            let geometry = domain.geometry;
             let mut slabs = SlabTensor::new(
                 &device,
-                domain.slab_rows as u64,
+                geometry.slab_rows as u64,
                 domain.logical_rows as u64,
                 domain
                     .components
@@ -1469,16 +1470,21 @@ impl StateStore {
                     .collect(),
             )?;
             slabs.add_slab()?;
-            let rows = domain.slab_rows.min(domain.logical_rows);
+            let rows = geometry.slab_rows.min(domain.logical_rows);
             history.push(HistorySlabs { slabs, rows });
             domains.push(HistoryDomain {
                 kind: domain.kind,
                 components: domain.components,
                 row_bytes: domain.row_bytes,
-                slab_rows: domain.slab_rows,
+                slab_rows: geometry.slab_rows,
+                page_rows: geometry.page_rows,
                 capacity: domain.logical_rows,
-                span_bound: domain.span_bound,
-                arena: Rc::new(RefCell::new(Arena::new(rows, domain.slab_rows))),
+                span_limit: geometry.span_limit,
+                arena: Rc::new(RefCell::new(Arena::new(
+                    rows,
+                    geometry.slab_rows,
+                    geometry.page_rows,
+                ))),
             });
         }
         Ok(Rc::new(Self {
@@ -1812,10 +1818,23 @@ impl StateStore {
     pub fn history_slab_rows(&self, domain: HistoryDomainId) -> usize {
         self.domains[domain.0].slab_rows
     }
-    /// The most spans a history of the domain may reach before compaction:
-    /// `ceil(row limit / rows per slab) + 16`.
-    pub fn span_bound(&self, domain: HistoryDomainId) -> usize {
-        self.domains[domain.0].span_bound
+    pub fn history_page_rows(&self, domain: HistoryDomainId) -> usize {
+        self.domains[domain.0].page_rows
+    }
+    /// The most spans a history of the domain (or a Shared reader of it)
+    /// presents to one launch; placement guarantees it (see
+    /// [`history_geometry`]).
+    pub fn span_limit(&self, domain: HistoryDomainId) -> usize {
+        self.domains[domain.0].span_limit
+    }
+    /// The most spans any history of the store presents to one launch: the
+    /// span class bound graphs are sealed to (1 without history).
+    pub fn max_span_limit(&self) -> usize {
+        self.domains
+            .iter()
+            .map(|domain| domain.span_limit)
+            .max()
+            .unwrap_or(1)
     }
     pub fn bank_slab_banks(&self) -> usize {
         self.bank_slab_banks
@@ -1841,7 +1860,8 @@ impl StateStore {
                     // Validated not to overflow at construction.
                     bytes: domain.row_bytes * domain.capacity as u64,
                     slab_rows: domain.slab_rows,
-                    span_bound: domain.span_bound,
+                    page_rows: domain.page_rows,
+                    span_limit: domain.span_limit,
                 })
                 .collect(),
             bank_capacity: self.bank_capacity,
@@ -2286,6 +2306,17 @@ impl StateStore {
         StoreCopy::new(self.clone(), slabs, from, to)
     }
 
+    /// A copy of rows `from` to rows `to` in one history domain's slabs.
+    fn history_row_copy(
+        self: &Rc<Self>,
+        domain: HistoryDomainId,
+        from: Vec<usize>,
+        to: Vec<usize>,
+    ) -> Result<StoreCopy, Error> {
+        let backing = self.backing.borrow();
+        StoreCopy::new(self.clone(), &backing.history[domain.0].slabs, from, to)
+    }
+
     fn bank_copy_plan(
         self: &Rc<Self>,
         slabs: &SlabTensor,
@@ -2476,17 +2507,11 @@ impl StateStore {
     pub fn available_banks(&self) -> usize {
         self.banks.available()
     }
-    /// Free backed rows of one domain.
+    /// Rows of the free backed pages of one domain: what advances beyond
+    /// their histories' last pages can take without growth (see
+    /// [`SequenceState::demands`]).
     pub fn free_rows(&self, domain: HistoryDomainId) -> usize {
         self.domains[domain.0].arena.borrow().available()
-    }
-    /// Rows every stored domain can provide without growth: an advance of
-    /// `n` rows needs `n` free rows in each. Unbounded without history.
-    pub fn available_rows(&self) -> usize {
-        self.history_domains()
-            .map(|domain| self.free_rows(domain))
-            .min()
-            .unwrap_or(usize::MAX)
     }
     /// Drop the store's arena allocations when no sequence/checkpoint owns them.
     /// External completion/buffer pins may still retain physical storage.
@@ -2510,7 +2535,8 @@ impl StateStore {
                 }
                 history.rows = domain.backed_extent(&history.slabs);
             }
-            *domain.arena.borrow_mut() = Arena::new(0, domain.slab_rows);
+            *domain.arena.borrow_mut() =
+                Arena::new(0, domain.slab_rows, domain.page_rows);
         }
         drop(backing);
         usize::try_from(before.saturating_sub(self.device.memory_usage().charged))
@@ -2549,6 +2575,17 @@ impl StateStore {
         self.reserve_rows(histories, &vec![count; self.domains.len()])
     }
 
+    /// The free-page rows a history of `domain` ending at `end` needs to take
+    /// `count` more rows: whatever its last page cannot hold in place,
+    /// rounded up to whole pages.
+    fn page_demand(&self, domain: HistoryDomainId, end: Option<usize>, count: usize) -> usize {
+        let domain = &self.domains[domain.0];
+        count
+            .saturating_sub(domain.arena.borrow().in_place(end))
+            .div_ceil(domain.page_rows)
+            * domain.page_rows
+    }
+
     /// Reserve `counts[domain]` rows in every stored domain (see
     /// [`StateStore::reserve`]).
     fn reserve_rows(
@@ -2556,30 +2593,42 @@ impl StateStore {
         histories: Option<&[Claims]>,
         counts: &[usize],
     ) -> Result<Vec<Claims>, Error> {
+        let ends = (0..self.domains.len())
+            .map(|index| histories.and_then(|histories| histories[index].end()))
+            .collect::<Vec<_>>();
         if self
             .domains
             .iter()
-            .zip(counts)
-            .any(|(domain, &count)| domain.arena.borrow().available() < count)
+            .zip(&ends)
+            .any(|(domain, &end)| domain.arena.borrow().tail_blocked(end))
         {
-            self.provision(
-                &self
-                    .history_domains()
-                    .zip(counts)
-                    .map(|(domain, &rows)| RowDemand { domain, rows })
-                    .collect::<Vec<_>>(),
-                0,
-            )?;
+            return Err(Error::Request(
+                "a history whose last page another history continued must relocate it before it grows"
+                    .into(),
+            ));
+        }
+        let demands = self
+            .history_domains()
+            .zip(&ends)
+            .zip(counts)
+            .map(|((domain, &end), &count)| RowDemand {
+                domain,
+                rows: self.page_demand(domain, end, count),
+            })
+            .collect::<Vec<_>>();
+        if self.domains.iter().zip(&demands).any(|(domain, demand)| {
+            domain.arena.borrow().free_pages().len() < demand.rows.div_ceil(domain.page_rows)
+        }) {
+            self.provision(&demands, 0)?;
         }
         let mut reserved = Vec::with_capacity(self.domains.len());
-        for (index, (domain, &count)) in self.domains.iter().zip(counts).enumerate() {
-            let after = histories.and_then(|histories| histories[index].end());
+        for ((domain, &count), &after) in self.domains.iter().zip(counts).zip(&ends) {
             let mut arena = domain.arena.borrow_mut();
-            let available_rows = arena.available();
-            if available_rows < count {
+            let claimable = arena.claimable(after);
+            if claimable < count {
                 return Err(Error::Capacity {
                     required: count as u64 * domain.row_bytes,
-                    available_bytes: available_rows as u64 * domain.row_bytes,
+                    available_bytes: claimable as u64 * domain.row_bytes,
                 });
             }
             let ranges = arena.claim(after, count);
@@ -2602,13 +2651,16 @@ impl StateStore {
         self.transactions.begin()
     }
 
-    fn reserve_contiguous(&self, domain: HistoryDomainId, count: usize) -> Option<Claims> {
-        if count == 0 {
+    /// The first `rows` rows (at most a page) of a free page, as a fresh
+    /// history takes them: the destination of a relocated last page. `None`
+    /// without a free page.
+    fn reserve_page(&self, domain: HistoryDomainId, rows: usize) -> Option<Claims> {
+        let arena = &self.domains[domain.0].arena;
+        if rows == 0 || rows > self.domains[domain.0].page_rows || arena.borrow().available() == 0 {
             return None;
         }
-        let arena = &self.domains[domain.0].arena;
-        let start = arena.borrow_mut().claim_contiguous(count)?;
-        Some(Claims::new(arena, vec![(start, count)]))
+        let ranges = arena.borrow_mut().claim(None, rows);
+        Some(Claims::new(arena, ranges))
     }
 }
 
@@ -2706,13 +2758,18 @@ impl SequenceState {
         self.expected_end = self.expected_end.max(position);
         Ok(())
     }
-    /// This sequence's demand for appending `rows`: `rows` in every stored
-    /// domain, for provisioning a launch's backing before its advances
-    /// begin.
+    /// This sequence's demand for appending `rows`: in every stored domain,
+    /// the whole free pages beyond what its last page holds in place, for
+    /// provisioning a launch's backing before its advances begin.
     pub fn demands(&self, rows: usize) -> Vec<RowDemand> {
         self.store
             .history_domains()
-            .map(|domain| RowDemand { domain, rows })
+            .map(|domain| RowDemand {
+                domain,
+                rows: self
+                    .store
+                    .page_demand(domain, self.claims[domain.0].end(), rows),
+            })
             .collect()
     }
     /// The rows this history references in one domain, in logical order:
@@ -2771,24 +2828,29 @@ impl SequenceState {
         }
     }
 
-    /// The first domain whose history is at its span bound: the next
-    /// advance could start one more span, so that history is repacked
-    /// before its next launch.
-    pub fn compaction_needed(&self) -> Option<HistoryDomainId> {
+    /// The domains whose partial last page this history must relocate
+    /// before it grows, because another history (a sibling fork) continued
+    /// that page ([`OwnedTailRelocation`]).
+    pub fn blocked_tails(&self) -> Vec<HistoryDomainId> {
         self.store
             .history_domains()
-            .find(|&domain| self.history_ranges(domain).len() >= self.store.span_bound(domain))
+            .filter(|&domain| {
+                self.store.domains[domain.0]
+                    .arena
+                    .borrow()
+                    .tail_blocked(self.claims[domain.0].end())
+            })
+            .collect()
     }
 
-    /// The growth each domain needing compaction may claim for its
-    /// destination: its whole history.
-    pub fn compaction_demands(&self) -> Vec<RowDemand> {
-        self.store
-            .history_domains()
-            .filter(|&domain| self.history_ranges(domain).len() >= self.store.span_bound(domain))
+    /// The growth relocating [`SequenceState::blocked_tails`] needs: one
+    /// free page per domain.
+    pub fn relocation_demands(&self) -> Vec<RowDemand> {
+        self.blocked_tails()
+            .into_iter()
             .map(|domain| RowDemand {
                 domain,
-                rows: self.claims[domain.0].rows(),
+                rows: self.store.history_page_rows(domain),
             })
             .collect()
     }
@@ -3123,13 +3185,15 @@ mod tests {
         claims
     }
 
+    /// A backed arena of one slab that is one page.
     fn arena(rows: usize) -> Rc<RefCell<Arena>> {
-        Rc::new(RefCell::new(Arena::new(rows, rows.max(1))))
+        let rows = rows.max(1);
+        Rc::new(RefCell::new(Arena::new(rows, rows, rows)))
     }
 
     #[test]
     fn history_spans_and_free_holes_stop_at_slab_boundaries() {
-        let arena = Rc::new(RefCell::new(Arena::new(0, 4)));
+        let arena = Rc::new(RefCell::new(Arena::new(0, 4, 4)));
         for index in 0..3 {
             arena.borrow_mut().back_slab(index, 12);
         }
@@ -3145,6 +3209,25 @@ mod tests {
             .all(|(start, count)| start / 4 == (start + count - 1) / 4));
         drop(claims);
         assert_eq!(arena.borrow().free, vec![(0, 4), (4, 4), (8, 4)]);
+    }
+
+    #[test]
+    fn growth_across_a_slab_boundary_stays_in_place() {
+        let arena = Rc::new(RefCell::new(Arena::new(0, 8, 8)));
+        for index in 0..4 {
+            arena.borrow_mut().back_slab(index, 32);
+        }
+        // Chunked growth of one sequence: every chunk continues at the
+        // history end, including a chunk that fills one slab's last rows and
+        // spills into the next.
+        let mut history = Vec::new();
+        let mut end = None;
+        for _ in 0..5 {
+            let ranges = arena.borrow_mut().claim(end, 6);
+            end = ranges.last().map(|(start, count)| start + count);
+            append_ranges(&mut history, ranges, 8);
+        }
+        assert_eq!(history, vec![(0, 8), (8, 8), (16, 8), (24, 6)]);
     }
 
     #[test]
@@ -3338,24 +3421,26 @@ mod tests {
         assert!(device.memory_usage().charged < before);
     }
 
+    /// Reclaim moves whole occupied pages to free pages of kept slabs at the
+    /// same offsets, so a history keeps its page structure.
     #[test]
-    fn reclaim_selects_the_least_occupied_history_slab() {
-        let arena = Rc::new(RefCell::new(Arena::new(0, 4)));
+    fn reclaim_moves_whole_pages_at_their_offsets() {
+        let arena = Rc::new(RefCell::new(Arena::new(0, 4, 2)));
         for index in 0..3 {
             arena.borrow_mut().back_slab(index, 12);
         }
         let _full = claim_rows(&arena, 0, 4);
-        let sparse = claim_rows(&arena, 4, 1);
-        let _high = claim_rows(&arena, 8, 3);
-        let (index, compacted, moves) = arena
+        // Row 5: the second row of page [4, 6).
+        let sparse = claim_rows(&arena, 5, 1);
+        let _high = claim_rows(&arena, 8, 2);
+        let (planned, moves) = arena
             .borrow()
-            .least_occupied_slab_compaction(12)
-            .expect("one row fits in the high slab");
-        assert_eq!(index, 1);
-        assert_eq!(moves, vec![(4, 11, 1)]);
-        assert_eq!(compacted.referenced, 8);
-        assert_eq!(compacted.runs.range(4..8).count(), 0);
-        assert_eq!(sparse.ranges(), vec![(4, 1)]);
+            .compact_into_slabs(12, &BTreeSet::from([0, 2]));
+        // Page [4, 6) moves to the free page [10, 12) at the same offset.
+        assert_eq!(moves, vec![(5, 11, 1)]);
+        assert_eq!(planned.referenced, 7);
+        assert!(!planned.backed.contains(&1));
+        assert_eq!(planned.entries[&sparse.id].ranges, vec![(11, 1)]);
     }
 
     #[test]
@@ -3378,9 +3463,12 @@ mod tests {
         .unwrap();
         store.add_history_slabs(TOKEN, 2).unwrap();
         let rows = store.history_slab_rows(TOKEN);
+        let page = store.history_page_rows(TOKEN);
         let _low = claim_rows(&store.arena(), 0, rows);
         let sparse = claim_rows(&store.arena(), rows, 1);
-        let _high = claim_rows(&store.arena(), 2 * rows, rows - 1);
+        // The high slab's last page is free: the sparse page moves there.
+        let _high = claim_rows(&store.arena(), 2 * rows, rows - page);
+        let moved = 3 * rows - page;
         let value = vec![43u8; 4096 * 4];
         store
             .history_slabs()
@@ -3396,7 +3484,7 @@ mod tests {
         assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), slab_bytes);
         device.set_memory_limit(None);
         assert_eq!(store.compactions().history_rows, 1);
-        assert_eq!(sparse.ranges(), vec![(3 * rows - 1, 1)]);
+        assert_eq!(sparse.ranges(), vec![(moved, 1)]);
         assert!(store
             .history_slabs()
             .slab(1)
@@ -3404,7 +3492,7 @@ mod tests {
         assert_eq!(
             store
                 .history_slabs()
-                .region_rows(0, (3 * rows - 1) as u64, 1)
+                .region_rows(0, moved as u64, 1)
                 .unwrap()
                 .read_to_host()
                 .unwrap(),
@@ -3432,9 +3520,11 @@ mod tests {
         .unwrap();
         store.add_history_slabs(TOKEN, 2).unwrap();
         let rows = store.history_slab_rows(TOKEN);
+        let page = store.history_page_rows(TOKEN);
         let _low = claim_rows(&store.arena(), 0, rows);
         let sparse = claim_rows(&store.arena(), rows, 1);
-        let _high = claim_rows(&store.arena(), 2 * rows, rows - 1);
+        // One whole page of the high slab stays free for the sparse page.
+        let _high = claim_rows(&store.arena(), 2 * rows, rows - page);
         let before_charge = device.memory_usage().charged;
         let before_ranges = sparse.ranges();
         let before_stats = store.compactions();
@@ -3554,27 +3644,41 @@ mod tests {
     }
 
     #[test]
-    fn arena_grows_histories_in_place_and_starts_new_ones_mid_hole() {
-        let mut arena = Arena::new(100, 100);
+    fn arena_grows_histories_in_place_and_takes_whole_pages() {
+        // One slab of ten 10-row pages.
+        let mut arena = Arena::new(100, 100, 10);
         // Row 0 has no preceding history: fill from its start.
         assert_eq!(arena.claim(None, 10), [(0, 10)]);
-        // A new history leaves the rows after [0, 10) as that history's room.
+        // A new history takes the middle page of the free pages, leaving the
+        // pages after [0, 10) as that history's room.
         assert_eq!(arena.claim(None, 10), [(50, 10)]);
         assert_eq!(arena.free, [(10, 40), (60, 40)]);
-        // Both grow in place, one row at a time, whatever the interleaving.
+        // Both grow into the page at their end, then in place, one row at a
+        // time, whatever the interleaving.
         for step in 0..5 {
             assert_eq!(arena.claim(Some(10 + step), 1), [(10 + step, 1)]);
             assert_eq!(arena.claim(Some(60 + step), 1), [(60 + step, 1)]);
         }
-        // A third history starts mid-way through the largest hole (ties go to
-        // the lower address); a history without room in place follows it.
+        // Rows after a history's end in its page are never another's: a
+        // third history takes the middle page of the largest free run (ties
+        // go to the lower address).
+        assert_eq!(arena.available(), 60);
         assert_eq!(arena.claim(None, 5), [(30, 5)]);
-        assert_eq!(arena.claim(Some(35), 20), [(35, 15), (80, 5)]);
+        // A history fills its page in place, then takes the page at its end,
+        // then (that page taken) the middle page of the largest free run.
+        assert_eq!(arena.claimable(Some(35)), 5 + 50);
+        assert_eq!(arena.claim(Some(35), 20), [(35, 5), (40, 10), (80, 5)]);
         assert_eq!(arena.free, [(15, 15), (65, 15), (85, 15)]);
-        // A request larger than every hole takes whole holes, largest first.
-        assert_eq!(arena.claim(Some(3), 40), [(15, 15), (65, 15), (87, 10)]);
-        assert_eq!(arena.free, [(85, 2), (97, 3)]);
-        assert_eq!(arena.available(), 5);
+        // Only whole free pages serve a fresh history: pages 20, 70 and 90.
+        assert_eq!(arena.available(), 30);
+        assert_eq!(arena.claim(None, 25), [(20, 10), (70, 10), (90, 5)]);
+        assert_eq!(arena.free, [(15, 5), (65, 5), (85, 5), (95, 5)]);
+        assert_eq!(arena.available(), 0);
+        assert_eq!(arena.claimable(Some(95)), 5);
+        // A history whose next row another took must relocate its last page.
+        assert!(arena.tail_blocked(Some(12)));
+        assert!(!arena.tail_blocked(Some(15)));
+        assert!(!arena.tail_blocked(Some(20)));
     }
 
     #[test]
@@ -3598,9 +3702,10 @@ mod tests {
         )
         .unwrap();
         assert!(store.history_allocated());
-        assert_eq!(committed_extent(&store).0, 8);
+        // Eight rows requested reserve one whole 256-row page.
+        assert_eq!(committed_extent(&store).0, 256);
         assert_eq!(store.history_row_bytes(TOKEN), 32);
-        assert_eq!(store.allocation_trace().unwrap().history[0].bytes, 256);
+        assert_eq!(store.allocation_trace().unwrap().history[0].bytes, 32 * 256);
 
         store
             .provision(
@@ -3624,7 +3729,7 @@ mod tests {
                 && plane.name == PlaneName::Dense
                 && plane.row_bytes == 16
                 && plane.base_row == 0
-                && plane.buffer.extents() == [8, 1, 4]
+                && plane.buffer.extents() == [256, 1, 4]
         }));
 
         let second = store.history_planes().unwrap();
@@ -3843,8 +3948,8 @@ mod tests {
         };
         let store = token_store(
             device.clone(),
-            64,
-            256,
+            1024,
+            1024,
             vec![dense_component(1)],
             vec![ComponentSpec {
                 shape: vec![1],
@@ -3867,21 +3972,25 @@ mod tests {
             };
             state
         };
-        // The system prompt is one prefill run.
-        let prompt = commit(store.create().unwrap(), 24);
+        // The system prompt is one prefill run of one whole page, so branches
+        // share it and each continues in a page of its own (a branch from a
+        // partial page first relocates it; see the relocation tests).
+        let page = store.history_page_rows(TOKEN);
+        assert_eq!(page, 256);
+        let prompt = commit(store.create().unwrap(), page);
         let system = prompt.checkpoint();
-        assert_eq!(system.history_ranges(TOKEN), [(0, 24)]);
+        assert_eq!(system.history_ranges(TOKEN), [(0, page)]);
         // Request A continues the path; requests B and C branch at the prompt.
         let a = commit(prompt, 8);
         let b = commit(system.fork(), 6);
         let c = commit(system.fork(), 3);
         let a_turn = a.checkpoint();
-        assert_eq!(a.history_ranges(TOKEN), [(0, 32)]);
+        assert_eq!(a.history_ranges(TOKEN), [(0, page + 8)]);
         for branch in [&b, &c] {
-            assert_eq!(branch.history_ranges(TOKEN)[0], (0, 24));
+            assert_eq!(branch.history_ranges(TOKEN)[0], (0, page));
             assert_eq!(branch.history_ranges(TOKEN).len(), 2);
         }
-        assert_eq!(store.occupied_rows(TOKEN), 24 + 8 + 6 + 3);
+        assert_eq!(store.occupied_rows(TOKEN), page + 8 + 6 + 3);
         let census = store
             .holding_census(
                 &[Holder::State(&a), Holder::State(&b), Holder::State(&c)],
@@ -3890,7 +3999,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(census.retained, bank);
-        assert_eq!(census.live, (24 + 8 + 6 + 3) * row + 3 * bank);
+        assert_eq!(census.live, (page as u64 + 8 + 6 + 3) * row + 3 * bank);
         assert_eq!(census.total(), store.committed_bytes());
         assert_eq!(census.total(), device.memory_usage().charged);
         let submitted = store
@@ -3900,7 +4009,7 @@ mod tests {
                 &[Holder::State(&a)],
             )
             .unwrap();
-        assert_eq!(submitted.in_flight, 32 * row + bank);
+        assert_eq!(submitted.in_flight, (page as u64 + 8) * row + bank);
         assert_eq!(submitted.live, (6 + 3) * row + 2 * bank);
         assert_eq!(submitted.retained, bank);
         assert_eq!(submitted.total(), store.committed_bytes());
@@ -3937,7 +4046,7 @@ mod tests {
         drop((b, c));
         assert_eq!(
             store.exclusive_bytes(&retained).unwrap(),
-            32 * row + 2 * bank
+            (page as u64 + 8) * row + 2 * bank
         );
         // Repeated holders count once.
         let repeated = [
@@ -3947,66 +4056,39 @@ mod tests {
         ];
         assert_eq!(
             store.exclusive_bytes(&repeated).unwrap(),
-            32 * row + 2 * bank
+            (page as u64 + 8) * row + 2 * bank
         );
         drop((system, a_turn));
         assert_eq!(store.occupied_rows(TOKEN), 0);
     }
 
-    /// A history without room in place is relaid out, not split: the
-    /// backing is full (no growth), yet the history continues in one run and
-    /// an interior prefix commits without repair.
+    /// A history that fills its page continues in the page at its end; a
+    /// speculative advance across that boundary commits a prefix without
+    /// repair, and the rejected page is free again.
     #[test]
-    fn full_backing_continues_a_history_in_another_span() {
+    fn growth_continues_into_the_next_page_and_rolls_back_whole_pages() {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
-            device,
-            8,
-            8,
-            vec![dense_component(1)],
-            vec![],
-            BankCapacity {
-                active: 3,
-                in_flight: 3,
-                retained: 0,
-            },
-        )
-        .unwrap();
-        let states = (0..3)
-            .map(|_| {
-                let advance = OwnedStateAdvance::begin(store.create().unwrap(), 2)
-                    .ok()
-                    .unwrap();
-                let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap()
-                else {
-                    panic!("full prefix must commit");
-                };
-                state
-            })
-            .collect::<Vec<_>>();
-        let mut states = states.into_iter();
-        let first = states.next().unwrap();
-        let middle = states.next().unwrap();
-        let last = states.next().unwrap();
-        // Placement: first [0, 2), middle mid-hole at [4, 6), last [2, 4).
+        let store = paged_store(device);
+        let first = advance_all(store.create().unwrap(), 254);
+        // A second history takes the middle page of the free pages.
+        let middle = advance_all(store.create().unwrap(), 2);
+        assert_eq!(first.history_ranges(TOKEN), [(0, 254)]);
+        assert_eq!(middle.history_ranges(TOKEN), [(512, 2)]);
         let checkpoint = first.checkpoint();
-        drop(last);
-        assert_eq!(middle.history_ranges(TOKEN), [(4, 2)]);
-        // Two free rows follow `first`, so its third new row uses another span.
+        // Two rows fit in place; the third takes the page at the end.
         let advance = OwnedStateAdvance::begin(first, 3).ok().unwrap();
-        assert_eq!(committed_extent(&store).0, 8);
-        assert_eq!(advance.bindings().destinations[0], [2, 3, 6]);
-        assert_eq!(middle.history_ranges(TOKEN), [(4, 2)]);
+        assert_eq!(advance.bindings().destinations[0], [254, 255, 256]);
         let OwnedAdvanceResolution::Committed(first) = advance.commit(2).ok().unwrap() else {
             panic!("attention prefix must commit without repair");
         };
-        assert_eq!(first.position(), 4);
-        assert_eq!(first.history_ranges(TOKEN), [(0, 4)]);
-        assert_eq!(checkpoint.position(), 2);
-        assert_eq!(checkpoint.fork().history_ranges(TOKEN), [(0, 2)]);
-        assert_eq!(store.occupied_rows(TOKEN), 6);
+        assert_eq!(first.position(), 256);
+        assert_eq!(first.history_ranges(TOKEN), [(0, 256)]);
+        assert_eq!(checkpoint.fork().history_ranges(TOKEN), [(0, 254)]);
+        assert_eq!(store.occupied_rows(TOKEN), 256 + 2);
+        // The rejected row's page is whole and free again.
+        assert_eq!(store.free_rows(TOKEN), 512);
         assert_eq!(middle.position(), 2);
     }
 
@@ -4077,10 +4159,11 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
+        // Three branches, each in a page of its own.
         let store = token_store(
             device,
             16,
-            16,
+            3 * 256,
             vec![dense_component(1)],
             vec![
                 ComponentSpec {
@@ -4212,192 +4295,23 @@ mod tests {
         assert_eq!(store.available_banks(), 2);
     }
 
-    /// A sequence whose 17 visible rows are the even rows 0..34, with every
-    /// row outside `free` and the sequence held by filler claims.
-    fn fragmented(store: &Rc<StateStore>, free: &[(usize, usize)]) -> (SequenceState, Vec<Claims>) {
-        let rows = store.history_capacity(TOKEN);
-        store
-            .provision(&[RowDemand { domain: TOKEN, rows }], 0)
-            .unwrap();
-        assert_eq!(committed_extent(&store).0, rows);
-        let mut state = store.create().unwrap();
-        let even = (0..17).map(|row| (row * 2, 1)).collect::<Vec<_>>();
-        state.claims[0].append(history(&store.arena(), &even));
-        state.position = 17;
-        let held = |row: usize| {
-            (row < 34 && row % 2 == 0)
-                || free
-                    .iter()
-                    .any(|(start, count)| *start <= row && row < start + count)
-        };
-        let fillers = (0..store.history_capacity(TOKEN))
-            .filter(|row| !held(*row))
-            .map(|row| claim_rows(&store.arena(), row, 1))
-            .collect();
-        assert_eq!(store.available_rows(), free.iter().map(|(_, n)| n).sum());
-        (state, fillers)
-    }
-
-    #[test]
-    fn compaction_is_bit_exact_and_publishes_only_after_success() {
-        let Some(device) = cpu_device() else {
-            return;
-        };
+    /// A store of 1,024 rows (four 256-row pages) of one dense row for a
+    /// 1,024-row context, every page backed.
+    fn paged_store(device: Rc<Device>) -> Rc<StateStore> {
         let store = token_store(
             device,
-            64,
-            64,
-            vec![dense_component(1)],
-            vec![],
-            BankCapacity {
-                active: 1,
-                in_flight: 1,
-                retained: 0,
-            },
-        )
-        .unwrap();
-        let (state, _fillers) = fragmented(&store, &[(40, 17)]);
-
-        let planes = store.history_planes().unwrap();
-        for plane in &planes {
-            let mut bytes = vec![0u8; plane.buffer.byte_len() as usize];
-            for row in 0..64 {
-                let start = row * plane.row_bytes;
-                bytes[start..start + plane.row_bytes].fill(row as u8);
-            }
-            let mut buffer = plane.buffer.clone();
-            buffer.write_from_host(&bytes).unwrap();
-        }
-
-        assert!(state.compaction_needed().is_some());
-        let old_ranges = state.history_ranges(TOKEN);
-        let OwnedCompactionPreparation::Ready(failed) =
-            OwnedCompaction::prepare(state, TOKEN, 64).ok().unwrap()
-        else {
-            panic!("contiguous destination must prepare compaction")
-        };
-        // A failed copy submission aborts its owned destination.
-        let state = failed.abort();
-        assert_eq!(state.history_ranges(TOKEN), old_ranges);
-
-        let OwnedCompactionPreparation::Ready(compaction) =
-            OwnedCompaction::prepare(state, TOKEN, 64).ok().unwrap()
-        else {
-            panic!("released destination must be reusable")
-        };
-        assert_eq!(compaction.copies().len(), 2);
-        for copy in compaction.copies() {
-            assert_eq!(copy.from, (0..17).map(|row| row * 2).collect::<Vec<_>>());
-            assert_eq!(copy.to, (40..57).collect::<Vec<_>>());
-        }
-        let bindings = compaction.bindings();
-        for copy in bindings.copies {
-            let plane = &bindings.history[copy.plane_index];
-            let mut bytes = plane.buffer.read_to_host().unwrap();
-            for (&from, &to) in copy.from.iter().zip(&copy.to) {
-                let source = bytes[from * plane.row_bytes..(from + 1) * plane.row_bytes].to_vec();
-                bytes[to * plane.row_bytes..(to + 1) * plane.row_bytes].copy_from_slice(&source);
-            }
-            let mut buffer = plane.buffer.clone();
-            buffer.write_from_host(&bytes).unwrap();
-        }
-        let state = compaction.commit();
-        assert_eq!(state.history_ranges(TOKEN), [(40, 17)]);
-        assert!(!state.compaction_needed().is_some());
-        for plane in store.history_planes().unwrap() {
-            let bytes = plane.buffer.read_to_host().unwrap();
-            for (logical, row) in (40..57).enumerate() {
-                assert_eq!(
-                    &bytes[row * plane.row_bytes..(row + 1) * plane.row_bytes],
-                    vec![(logical * 2) as u8; plane.row_bytes]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn compaction_defers_when_no_contiguous_run_is_free() {
-        let Some(device) = cpu_device() else {
-            return;
-        };
-        let store = token_store(
-            device,
-            64,
-            64,
-            vec![dense_component(1)],
-            vec![],
-            BankCapacity {
-                active: 1,
-                in_flight: 1,
-                retained: 0,
-            },
-        )
-        .unwrap();
-        let (state, _fillers) = fragmented(&store, &[(40, 8), (50, 9)]);
-        assert!(state.compaction_needed().is_some());
-        let OwnedCompactionPreparation::Deferred {
-            state,
-            segments,
-            visible_rows,
-        } = OwnedCompaction::prepare(state, TOKEN, 64).ok().unwrap()
-        else {
-            panic!("fragmented capacity must defer compaction");
-        };
-        assert_eq!((segments, visible_rows), (17, 17));
-        assert_eq!(state.history_ranges(TOKEN).len(), 17);
-    }
-
-    #[test]
-    fn fragmented_history_uses_free_committed_rows_without_growth_claim() {
-        let Some(device) = cpu_device() else {
-            return;
-        };
-        let store = token_store(
-            device.clone(),
-            64,
-            64,
-            vec![dense_component(1)],
-            vec![],
-            BankCapacity {
-                active: 1,
-                in_flight: 1,
-                retained: 0,
-            },
-        )
-        .unwrap();
-        let (state, _fillers) = fragmented(&store, &[(40, 8), (50, 9)]);
-        let demand = state.demands(9);
-        let claim = store.growth_claim(&demand, 0).unwrap();
-        assert_eq!(claim.minimum_bytes, 0);
-        let charged = device.memory_usage().charged;
-        device.set_memory_limit(Some(charged + claim.minimum_bytes));
-        store
-            .provision_with_growth(&demand, 0, GrowthChoice::Minimum)
-            .unwrap();
-        assert!(OwnedStateAdvance::begin(state, 9).is_ok());
-    }
-
-    /// Repacking restores adjacency with one bounded copy: a long shared
-    /// prefix stays in place and only the recent decode runs move, joining
-    /// into one run; a checkpoint on the prefix keeps seeing the same rows.
-    #[test]
-    fn repacking_joins_the_recent_runs_and_keeps_a_shared_prefix_in_place() {
-        let Some(device) = cpu_device() else {
-            return;
-        };
-        let store = token_store(
-            device,
-            512,
+            1024,
             1024,
             vec![dense_component(1)],
             vec![],
             BankCapacity {
-                active: 1,
-                in_flight: 1,
+                active: 3,
+                in_flight: 3,
                 retained: 1,
             },
         )
         .unwrap();
+        assert_eq!(store.history_page_rows(TOKEN), 256);
         store
             .provision(
                 &[RowDemand {
@@ -4407,39 +4321,396 @@ mod tests {
                 0,
             )
             .unwrap();
-        // A 200-row prefix (retained by a checkpoint), then 16 one-row runs
-        // separated by rows other histories hold.
-        let mut state = store.create().unwrap();
-        state.claims[0].append(claim_rows(&store.arena(), 0, 200));
-        state.position = 200;
-        let prefix = state.checkpoint();
-        let mut fillers = Vec::new();
-        for run in 0..16 {
-            let row = 300 + 2 * run;
-            fillers.push(claim_rows(&store.arena(), row + 1, 1));
-            state.claims[0].append(claim_rows(&store.arena(), row, 1));
-            state.position += 1;
-        }
-        assert_eq!(state.history_ranges(TOKEN).len(), store.span_bound(TOKEN));
-        assert!(state.compaction_needed().is_some());
-        let OwnedCompactionPreparation::Ready(compaction) =
-            OwnedCompaction::prepare(state, TOKEN, 64).ok().unwrap()
-        else {
-            panic!("the recent runs fit one bounded copy")
+        store
+    }
+
+    fn advance_all(state: SequenceState, rows: usize) -> SequenceState {
+        let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
+        let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap() else {
+            panic!("an attention advance commits");
         };
-        assert_eq!(compaction.rows(), 16);
-        let copy = &compaction.copies()[0];
+        state
+    }
+
+    /// Two forks of one checkpoint on a partial page: the first continues
+    /// that page in place; the second must relocate the page before it
+    /// grows. The relocation copies exactly the page's rows, publishes only
+    /// after its copy, and an aborted relocation leaves the state unchanged.
+    #[test]
+    fn relocation_is_bit_exact_and_publishes_only_after_success() {
+        let Some(device) = cpu_device() else {
+            return;
+        };
+        let store = paged_store(device);
+        let state = advance_all(store.create().unwrap(), 10);
+        let prefix = state.history_ranges(TOKEN);
+        assert_eq!(prefix.len(), 1);
+        let (page, _) = prefix[0];
+        // Tag every row of the store with its row number.
+        for plane in store.history_planes().unwrap() {
+            let mut bytes = vec![0u8; plane.buffer.byte_len() as usize];
+            for row in 0..1024 {
+                let start = row * plane.row_bytes;
+                bytes[start..start + plane.row_bytes].fill(row as u8);
+            }
+            plane.buffer.clone().write_from_host(&bytes).unwrap();
+        }
+        let checkpoint = state.checkpoint();
+        drop(state);
+        let first = advance_all(checkpoint.fork(), 3);
+        assert_eq!(first.history_ranges(TOKEN), [(page, 13)]);
+        let second = checkpoint.fork();
+        assert_eq!(second.blocked_tails(), [TOKEN]);
         assert_eq!(
-            copy.from,
-            (0..16).map(|run| 300 + 2 * run).collect::<Vec<_>>()
+            second.relocation_demands(),
+            [RowDemand {
+                domain: TOKEN,
+                rows: 256,
+            }]
         );
-        // The first free run that fits is the one right after the prefix.
-        assert_eq!(copy.to, (200..216).collect::<Vec<_>>());
-        let state = compaction.commit();
-        assert_eq!(state.history_ranges(TOKEN), [(0, 216)]);
-        assert_eq!(prefix.history_ranges(TOKEN), [(0, 200)]);
-        // The moved runs' rows are free again; the prefix is held once.
-        assert_eq!(store.occupied_rows(TOKEN), 200 + 16 + fillers.len());
+        // Growth without relocation is refused, not placed in another span.
+        let Err((second, _)) = OwnedStateAdvance::begin(second, 1) else {
+            panic!("a blocked tail grows only after relocation");
+        };
+        let failed = OwnedTailRelocation::prepare(second, TOKEN).ok().unwrap();
+        let second = failed.abort();
+        assert_eq!(second.history_ranges(TOKEN), [(page, 10)]);
+        let relocation = OwnedTailRelocation::prepare(second, TOKEN).ok().unwrap();
+        let copy = relocation.copy();
+        assert_eq!(copy.rows(), 10);
+        let destination = copy.copies()[0].to[0];
+        assert_eq!(destination % 256, 0);
+        for copy in copy.copies() {
+            assert_eq!(copy.from, (page..page + 10).collect::<Vec<_>>());
+            assert_eq!(copy.to, (destination..destination + 10).collect::<Vec<_>>());
+        }
+        // Run the copy on the host, then publish.
+        for plane in store.history_planes().unwrap() {
+            let mut bytes = plane.buffer.read_to_host().unwrap();
+            for offset in 0..10 {
+                let (from, to) = (page + offset, destination + offset);
+                let source = bytes[from * plane.row_bytes..(from + 1) * plane.row_bytes].to_vec();
+                bytes[to * plane.row_bytes..(to + 1) * plane.row_bytes].copy_from_slice(&source);
+            }
+            plane.buffer.clone().write_from_host(&bytes).unwrap();
+        }
+        let second = relocation.commit();
+        assert_eq!(second.history_ranges(TOKEN), [(destination, 10)]);
+        assert!(second.blocked_tails().is_empty());
+        for plane in store.history_planes().unwrap() {
+            let bytes = plane.buffer.read_to_host().unwrap();
+            for offset in 0..10 {
+                let row = destination + offset;
+                assert_eq!(
+                    &bytes[row * plane.row_bytes..(row + 1) * plane.row_bytes],
+                    vec![(page + offset) as u8; plane.row_bytes]
+                );
+            }
+        }
+        // It now grows in place; the first fork and the checkpoint keep theirs.
+        let second = advance_all(second, 3);
+        assert_eq!(second.history_ranges(TOKEN), [(destination, 13)]);
+        assert_eq!(first.history_ranges(TOKEN), [(page, 13)]);
+        assert_eq!(checkpoint.history_ranges(TOKEN), [(page, 10)]);
+    }
+
+    /// Without a free page a relocation is a capacity error before any row
+    /// moves, and the sequence is returned unchanged.
+    #[test]
+    fn relocation_without_a_free_page_is_a_capacity_error() {
+        let Some(device) = cpu_device() else {
+            return;
+        };
+        let store = paged_store(device);
+        let checkpoint = advance_all(store.create().unwrap(), 10).checkpoint();
+        let first = advance_all(checkpoint.fork(), 1);
+        // Every other page is taken.
+        let _pages = (0..3)
+            .map(|_| advance_all(store.create().unwrap(), 256))
+            .collect::<Vec<_>>();
+        assert_eq!(store.free_rows(TOKEN), 0);
+        let second = checkpoint.fork();
+        let Err((second, error)) = OwnedTailRelocation::prepare(second, TOKEN) else {
+            panic!("no free page holds the relocated rows");
+        };
+        assert!(matches!(error, Error::Capacity { .. }));
+        assert_eq!(
+            second.history_ranges(TOKEN),
+            checkpoint.history_ranges(TOKEN)
+        );
+        assert_eq!(first.history_ranges(TOKEN).len(), 1);
+    }
+
+    /// Growth demand is what the last page cannot hold in place, rounded up
+    /// to whole pages; rows inside another history's page never count.
+    #[test]
+    fn page_demand_counts_in_place_rows_then_whole_pages() {
+        let Some(device) = cpu_device() else {
+            return;
+        };
+        let store = paged_store(device);
+        let state = advance_all(store.create().unwrap(), 10);
+        let rows = |demands: Vec<RowDemand>| demands[0].rows;
+        assert_eq!(rows(state.demands(246)), 0);
+        assert_eq!(rows(state.demands(247)), 256);
+        assert_eq!(rows(state.demands(246 + 513)), 768);
+        assert_eq!(rows(store.create().unwrap().demands(1)), 256);
+        // Three whole pages remain free for a fresh history.
+        assert_eq!(store.free_rows(TOKEN), 768);
+    }
+
+    /// Fill `arena` as one history's chunked prompt, backing the lowest
+    /// unbacked slab whenever it runs short, as provisioning does.
+    /// Back the lowest unbacked slabs of an arena of `capacity` rows until
+    /// a history ending at `end` can take `rows` more.
+    fn back_for(arena: &Rc<RefCell<Arena>>, capacity: usize, end: Option<usize>, rows: usize) {
+        let mut inner = arena.borrow_mut();
+        while inner.claimable(end) < rows {
+            let Some(slab) =
+                (0..capacity.div_ceil(inner.slab_rows)).find(|slab| !inner.backed.contains(slab))
+            else {
+                return;
+            };
+            inner.back_slab(slab, capacity);
+        }
+    }
+
+    /// The incident: Qwen3.8-27B (28,672-byte K8/V4 rows) at a 65,792-row
+    /// context, a 65,536-token prompt in 512-row chunks. The committed
+    /// allocator split every chunk that crossed a slab and reached 98-109
+    /// spans against 64 sealed; paging holds one span per slab it touches.
+    /// Four concurrent 16,384-token prompts sharing the row budget (84
+    /// spans before) stay within the limit too.
+    #[test]
+    fn long_prompts_stay_within_the_span_limit_at_the_incident_geometry() {
+        let geometry = history_geometry(28_672, 65_792, 0).unwrap();
+        assert!(geometry.span_limit <= MAX_HISTORY_SPANS);
+        for concurrent in [1usize, 2, 4, 8] {
+            let capacity = (65_792 * concurrent).next_multiple_of(geometry.page_rows);
+            let arena = Rc::new(RefCell::new(Arena::new(
+                0,
+                geometry.slab_rows,
+                geometry.page_rows,
+            )));
+            let prompt = 65_536 / concurrent;
+            let mut histories = (0..concurrent)
+                .map(|_| Claims::new(&arena, vec![]))
+                .collect::<Vec<_>>();
+            let mut written = 0;
+            while written < prompt {
+                // The scheduler shares one 512-row budget across requests.
+                let rows = (512 / concurrent).min(prompt - written);
+                for history in &mut histories {
+                    let end = history.end();
+                    back_for(&arena, capacity, end, rows);
+                    let ranges = arena.borrow_mut().claim(end, rows);
+                    history.append(Claims::new(&arena, ranges));
+                    let spans = history.ranges().len();
+                    assert!(
+                        spans <= geometry.span_limit,
+                        "{concurrent} prompts: {spans} spans at {written} rows"
+                    );
+                }
+                written += rows;
+            }
+            let peak = histories
+                .iter()
+                .map(|history| history.ranges().len())
+                .max()
+                .unwrap();
+            eprintln!(
+                "incident geometry, {concurrent} concurrent prompt(s) of {prompt}: {peak} spans \
+                 (limit {}, page {} rows, slab {} rows)",
+                geometry.span_limit, geometry.page_rows, geometry.slab_rows
+            );
+            if concurrent == 1 {
+                // One span per slab touched.
+                assert_eq!(peak, prompt.div_ceil(geometry.slab_rows));
+            }
+        }
+    }
+
+    /// Randomized placement over a sweep of geometries (rows of 256 B to
+    /// 1 MiB; row limits of 2,048 to 1,048,576 rows, with and without rows a
+    /// Shared reader sees appended): up to eight live histories grow in
+    /// chunks of up to a sixteenth of the row limit, advance speculatively
+    /// and roll back a random suffix, fork from checkpoints with both
+    /// branches continuing (relocating a blocked last page), release a
+    /// window's front rows, finish, and are reclaimed (the sparsest slab
+    /// emptied into free pages of the others). After every operation every
+    /// history presents at most `ceil(rows / page) + 1` spans, within its
+    /// domain's span limit; and whenever the free pages hold a growth's page
+    /// demand (the admission check), the claim succeeds without growth.
+    #[test]
+    fn every_placement_path_stays_within_the_span_limit() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut random = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound.max(1) as u64) as usize
+        };
+        for row_bytes in [256u64, 1_024, 8_960, 28_672, 131_072, 1 << 20] {
+            for (row_limit, appended) in [
+                (2_048, 0),
+                (65_792, 0),
+                (65_792, 512),
+                (262_144, 0),
+                (1_048_576, 1_024),
+            ] {
+                let geometry = history_geometry(row_bytes, row_limit, appended).unwrap();
+                assert!(geometry.span_limit <= MAX_HISTORY_SPANS);
+                let page = geometry.page_rows;
+                let slab = geometry.slab_rows;
+                let capacity = (row_limit * 4).next_multiple_of(page);
+                let arena = Rc::new(RefCell::new(Arena::new(0, slab, page)));
+                let mut live: Vec<(Claims, usize)> = Vec::new();
+                let mut checkpoints: Vec<Claims> = Vec::new();
+                for _ in 0..1_500 {
+                    match random(12) {
+                        // Admit a history (or fork one from a checkpoint).
+                        0 | 1 if live.len() < 8 => {
+                            if !checkpoints.is_empty() && random(2) == 0 {
+                                let checkpoint = &checkpoints[random(checkpoints.len())];
+                                let rows = checkpoint.rows();
+                                live.push((checkpoint.clone(), rows));
+                            } else {
+                                live.push((Claims::new(&arena, vec![]), 0));
+                            }
+                        }
+                        // Finish a history.
+                        2 if !live.is_empty() => {
+                            live.swap_remove(random(live.len()));
+                        }
+                        // Keep a checkpoint of a history.
+                        3 if !live.is_empty() && checkpoints.len() < 6 => {
+                            let index = random(live.len());
+                            checkpoints.push(live[index].0.clone());
+                        }
+                        4 if !checkpoints.is_empty() => {
+                            checkpoints.swap_remove(random(checkpoints.len()));
+                        }
+                        // Release a window's front rows.
+                        5 if !live.is_empty() => {
+                            let index = random(live.len());
+                            let (history, _) = &mut live[index];
+                            let rows = history.rows();
+                            if rows > 1 {
+                                history.drop_front(random(rows));
+                            }
+                        }
+                        // Reclaim: empty the sparsest backed slab into free
+                        // pages of the others when they hold its pages.
+                        6 => {
+                            let planned = {
+                                let inner = arena.borrow();
+                                let occupied = |index: usize| {
+                                    inner
+                                        .runs
+                                        .iter()
+                                        .flat_map(|(&start, run)| {
+                                            start / page..=(start + run.count - 1) / page
+                                        })
+                                        .filter(|&page_index| page_index * page / slab == index)
+                                        .collect::<BTreeSet<_>>()
+                                        .len()
+                                };
+                                inner
+                                    .backed
+                                    .iter()
+                                    .copied()
+                                    .min_by_key(|&index| (occupied(index), index))
+                                    .and_then(|victim| {
+                                        let keep = inner
+                                            .backed
+                                            .iter()
+                                            .copied()
+                                            .filter(|&index| index != victim)
+                                            .collect::<BTreeSet<_>>();
+                                        let room = inner
+                                            .free_pages()
+                                            .into_iter()
+                                            .filter(|free| keep.contains(&(free / slab)))
+                                            .count();
+                                        (room >= occupied(victim))
+                                            .then(|| inner.compact_into_slabs(capacity, &keep).0)
+                                    })
+                            };
+                            if let Some(planned) = planned {
+                                *arena.borrow_mut() = planned;
+                            }
+                        }
+                        // Grow, possibly speculatively with a rolled-back
+                        // suffix.
+                        _ if !live.is_empty() => {
+                            let index = random(live.len());
+                            let (history, position) = &mut live[index];
+                            let rows = (1 + random(row_limit / 16)).min(row_limit - *position);
+                            if rows == 0 {
+                                continue;
+                            }
+                            if arena.borrow().tail_blocked(history.end()) {
+                                // Relocate the last page (the copy itself is
+                                // the executor's): its rows move to a fresh
+                                // page's start.
+                                let end = history.end().unwrap();
+                                let first = history
+                                    .ranges()
+                                    .last()
+                                    .unwrap()
+                                    .0
+                                    .max((end - 1) / page * page);
+                                back_for(&arena, capacity, None, end - first);
+                                if arena.borrow().available() == 0 {
+                                    continue;
+                                }
+                                let moved = arena.borrow_mut().claim(None, end - first);
+                                let kept = history.rows() - (end - first);
+                                drop(history.split_off(kept));
+                                history.append(Claims::new(&arena, moved));
+                            }
+                            let end = history.end();
+                            // Admission: free pages holding the page demand
+                            // guarantee the claim.
+                            {
+                                let inner = arena.borrow();
+                                let demand = rows
+                                    .saturating_sub(inner.in_place(end))
+                                    .div_ceil(page)
+                                    * page;
+                                if inner.available() >= demand {
+                                    assert!(inner.claimable(end) >= rows);
+                                }
+                            }
+                            back_for(&arena, capacity, end, rows);
+                            if arena.borrow().claimable(end) < rows {
+                                continue;
+                            }
+                            let ranges = arena.borrow_mut().claim(end, rows);
+                            let mut tentative = Claims::new(&arena, ranges);
+                            let accepted = if random(3) == 0 {
+                                1 + random(rows)
+                            } else {
+                                rows
+                            };
+                            drop(tentative.split_off(accepted));
+                            history.append(tentative);
+                            *position += accepted;
+                        }
+                        _ => {}
+                    }
+                    for (history, _) in &live {
+                        let (spans, rows) = (history.ranges().len(), history.rows());
+                        assert!(
+                            spans <= rows.div_ceil(page) + 1 && spans <= geometry.span_limit,
+                            "{spans} spans for {rows} rows (row bytes {row_bytes}, page {page}, \
+                             limit {})",
+                            geometry.span_limit
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Lock-step serving of `active` requests for `steps` steps: chunked
@@ -4628,6 +4899,8 @@ mod tests {
         store.shrink(ShrinkPolicy::Idle).unwrap();
         Interleaved {
             segments: max_segments,
+            span_limit: store.span_limit(TOKEN),
+            reserved: store.allocation_trace().unwrap().history[0].capacity,
             decode_steps: max_decode_steps,
             peak_committed,
             released_to: committed_extent(&store).0,
@@ -4961,10 +5234,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let expected = |rows: usize| (0..rows).map(|row| tag(row).to_vec()).collect::<Vec<_>>();
-        // A large request fills the low rows; a prompt and two branches sit
-        // above it.
+        // A large request fills the low rows; a one-page prompt and two
+        // branches (each continuing in a page of its own) sit above it.
+        assert_eq!(store.history_page_rows(TOKEN), 256);
         let large = commit(store.create().unwrap(), 3000);
-        let prompt = commit(store.create().unwrap(), 100);
+        let prompt = commit(store.create().unwrap(), 256);
         let system = prompt.checkpoint();
         let long = commit(prompt, 50);
         let short = commit(system.fork(), 20);
@@ -4975,7 +5249,7 @@ mod tests {
         drop(large);
         let before = (committed_extent(&store).0, device.memory_usage().charged);
         let occupied = store.occupied_rows(TOKEN);
-        assert_eq!(occupied, 100 + 50 + 20);
+        assert_eq!(occupied, 256 + 50 + 20);
         // Reclaim copies only into space held by the store and succeeds when
         // the device refuses all new allocations.
         device.set_memory_limit(Some(before.1));
@@ -4985,16 +5259,16 @@ mod tests {
         assert!(committed_extent(&store).0 <= before.0);
         assert!(device.memory_usage().charged < before.1);
         assert_eq!(store.compactions(), Compactions::default());
-        assert_eq!(read(long.history_ranges(TOKEN)), expected(150));
+        assert_eq!(read(long.history_ranges(TOKEN)), expected(306));
         assert_eq!(store.compactions().count, 0);
         assert!(device.memory_usage().charged < before.1);
         assert_eq!(store.occupied_rows(TOKEN), occupied);
         assert_eq!(long.history_ranges(TOKEN), long_ranges);
         assert_eq!(system.history_ranges(TOKEN), system_ranges);
         assert_eq!(short.history_ranges(TOKEN), short_ranges);
-        assert_eq!(read(long.history_ranges(TOKEN)), expected(150));
-        assert_eq!(read(short.history_ranges(TOKEN)), expected(120));
-        assert_eq!(read(system.history_ranges(TOKEN)), expected(100));
+        assert_eq!(read(long.history_ranges(TOKEN)), expected(306));
+        assert_eq!(read(short.history_ranges(TOKEN)), expected(276));
+        assert_eq!(read(system.history_ranges(TOKEN)), expected(256));
         let demand = [RowDemand {
             domain: TOKEN,
             rows: store.history_slab_rows(TOKEN),
@@ -5440,9 +5714,10 @@ mod tests {
         store.add_history_slabs(TOKEN, 2).unwrap();
         store.add_bank_slabs(2).unwrap();
         let rows = store.history_slab_rows(TOKEN);
+        let page = store.history_page_rows(TOKEN);
         let _low = claim_rows(&store.arena(), 0, rows);
         let sparse = claim_rows(&store.arena(), rows, 1);
-        let _high = claim_rows(&store.arena(), 2 * rows, rows - 1);
+        let _high = claim_rows(&store.arena(), 2 * rows, rows - page);
         let history_value = vec![41u8; 4096 * 4];
         store
             .history_slabs()
@@ -5536,6 +5811,9 @@ mod tests {
 
     struct Interleaved {
         segments: usize,
+        span_limit: usize,
+        /// The store's reserved rows (whole pages).
+        reserved: usize,
         decode_steps: usize,
         peak_committed: usize,
         released_to: usize,
@@ -5543,10 +5821,10 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_decode_respects_span_bound_with_slab_backing() {
+    fn interleaved_decode_respects_span_limit_with_slab_backing() {
         // Reservations of 8 to 17 contexts, down to exactly one context per
-        // request. Histories may continue in another span when their slab
-        // has no adjacent free rows.
+        // request. Histories continue in another page when theirs is full,
+        // and never exceed the store's span limit.
         for (active, contexts, steps) in [
             (8, 16, 800),
             (4, 5, 3000),
@@ -5555,7 +5833,8 @@ mod tests {
             (16, 17, 3000),
         ] {
             let run = serve_interleaved(active, contexts, steps);
-            let reserved = contexts * 512 + 64;
+            let reserved = run.reserved;
+            assert_eq!(reserved, (contexts * 512 + 64).next_multiple_of(256));
             eprintln!(
                 "interleaved active={active} contexts={contexts}: segments={} \
                  written={} peak_committed={} of {reserved}",
@@ -5567,9 +5846,10 @@ mod tests {
                 run.decode_steps
             );
             assert!(
-                run.segments <= 17,
-                "{active} requests in {contexts} contexts reached {} segments",
-                run.segments
+                run.segments <= run.span_limit,
+                "{active} requests in {contexts} contexts reached {} segments of {}",
+                run.segments,
+                run.span_limit
             );
             // A small logical reservation fits within one physical slab.
             assert!(

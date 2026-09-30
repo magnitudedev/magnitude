@@ -321,7 +321,7 @@ impl AttestedPrograms {
                 limits,
                 history_rows,
                 history.slab_rows,
-                state.context_rows,
+                state.span_limit(),
                 proposals,
             )?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Head(Rc::new(

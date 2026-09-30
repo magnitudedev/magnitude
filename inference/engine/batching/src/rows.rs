@@ -1,4 +1,4 @@
-use crate::{ClassError, Demand, LaunchClass};
+use crate::{ClassError, ClassLimits, Demand, LaunchClass};
 use std::{fmt, sync::Arc};
 
 pub const HISTORY_WIDTH: usize = 64;
@@ -361,9 +361,9 @@ impl PackedRowTables {
     pub fn pack(
         slots: &[Slot],
         vocabulary_size: usize,
-        row_limit: usize,
+        limits: ClassLimits,
     ) -> Result<Self, PackError> {
-        Self::pack_covering(slots, vocabulary_size, row_limit, 1)
+        Self::pack_covering(slots, vocabulary_size, limits, 1)
     }
 
     /// Pack into a launch class covering at least `segments` history ranges
@@ -372,7 +372,7 @@ impl PackedRowTables {
     pub fn pack_covering(
         slots: &[Slot],
         vocabulary_size: usize,
-        row_limit: usize,
+        limits: ClassLimits,
         segments: usize,
     ) -> Result<Self, PackError> {
         if vocabulary_size == 0 {
@@ -481,7 +481,7 @@ impl PackedRowTables {
                 index += 1;
             }
         }
-        let class = LaunchClass::covering(actual_rows, max_segments, union, row_limit)?;
+        let class = LaunchClass::covering(actual_rows, max_segments, union, limits)?;
         let m = class.rows();
         let r = class.segments();
         let m_i32 = i32::try_from(m).map_err(|_| PackError::IntegerOverflow("class rows"))?;
@@ -655,6 +655,11 @@ fn as_i32(value: usize, field: &'static str) -> Result<i32, PackError> {
 mod tests {
     use super::*;
 
+    const LIMITS: ClassLimits = ClassLimits {
+        rows: 512,
+        segments: 63,
+    };
+
     fn row(token: i32, demand: Demand) -> Row {
         Row {
             token,
@@ -714,7 +719,7 @@ mod tests {
                 stop: 2,
             },
         ];
-        let packed = PackedRowTables::pack(&slots, 33, 512).unwrap();
+        let packed = PackedRowTables::pack(&slots, 33, LIMITS).unwrap();
         assert_eq!((packed.actual_rows, packed.class.rows()), (6, 8));
         assert_eq!((packed.actual_slots, packed.slots), (3, 4));
         assert_eq!(
@@ -774,7 +779,7 @@ mod tests {
             following_bank: 1,
             stop: 3,
         }];
-        let packed = PackedRowTables::pack(&slots, 33, 512).unwrap();
+        let packed = PackedRowTables::pack(&slots, 33, LIMITS).unwrap();
         assert_eq!(packed.histories.len(), 2);
         assert_eq!(&packed.histories[0].fresh[..3], &[[0, 1], [0, 2], [0, 3]]);
         assert_eq!(&packed.histories[1].fresh[..3], &[[0, 1], [0, 2], [1, 3]]);
@@ -783,13 +788,13 @@ mod tests {
         let mut mismatched = slots.clone();
         mismatched[0].rows[1].histories.pop();
         assert!(matches!(
-            PackedRowTables::pack(&mismatched, 33, 512),
+            PackedRowTables::pack(&mismatched, 33, LIMITS),
             Err(PackError::HistoryDomains { row: 1, .. })
         ));
         let mut early = slots.clone();
         early[0].rows[1].histories[1].fresh_start = 2;
         assert!(matches!(
-            PackedRowTables::pack(&early, 33, 512),
+            PackedRowTables::pack(&early, 33, LIMITS),
             Err(PackError::InvalidFreshSpan { row: 1, .. })
         ));
         // A media span's rows read every fresh row of the span; a span end
@@ -798,11 +803,11 @@ mod tests {
         for row in &mut media[0].rows {
             row.histories[0].bidirectional_end = Some(3);
         }
-        let packed = PackedRowTables::pack(&media, 33, 512).unwrap();
+        let packed = PackedRowTables::pack(&media, 33, LIMITS).unwrap();
         assert_eq!(&packed.histories[0].fresh[..3], &[[0, 3], [0, 3], [0, 3]]);
         media[0].rows[0].histories[0].bidirectional_end = Some(4);
         assert!(matches!(
-            PackedRowTables::pack(&media, 33, 512),
+            PackedRowTables::pack(&media, 33, LIMITS),
             Err(PackError::InvalidFreshSpan { row: 0, .. })
         ));
     }
@@ -827,7 +832,7 @@ mod tests {
                 stop: 1,
             }],
             33,
-            512,
+            LIMITS,
         )
         .unwrap();
         assert_eq!(packed.out_rows, vec![1, 2, 3]);
@@ -845,7 +850,7 @@ mod tests {
     #[test]
     fn invalid_shapes_and_ranges_are_rejected() {
         assert!(matches!(
-            PackedRowTables::pack(&[], 32, 512),
+            PackedRowTables::pack(&[], 32, LIMITS),
             Err(PackError::Class(ClassError::EmptyRows))
         ));
         assert!(matches!(
@@ -858,7 +863,7 @@ mod tests {
                     stop: 1,
                 }],
                 32,
-                512
+                LIMITS
             ),
             Err(PackError::EmptySlot { .. })
         ));
@@ -874,7 +879,7 @@ mod tests {
                     stop: 1,
                 }],
                 32,
-                512
+                LIMITS
             ),
             Err(PackError::SelectMismatch { .. })
         ));
@@ -889,7 +894,7 @@ mod tests {
                     stop: 1,
                 }],
                 32,
-                512
+                LIMITS
             ),
             Err(PackError::InvalidMaskWidth { .. })
         ));
@@ -907,7 +912,7 @@ mod tests {
                         stop: 1,
                     }],
                     32,
-                    512
+                    LIMITS
                 ),
                 Err(PackError::OverlappingVisibleRanges { .. })
             ));
@@ -927,7 +932,7 @@ mod tests {
                 stop: 1,
             }],
             32,
-            512,
+            LIMITS,
         )
         .unwrap();
         assert_eq!(packed.class.segments(), 4);
@@ -952,7 +957,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>(),
                 32,
-                512,
+                LIMITS,
             )
         };
         assert!(pack(&[(0, 3), (0, 4)]).is_ok());
@@ -981,7 +986,7 @@ mod tests {
                     stop,
                 }],
                 32,
-                512,
+                LIMITS,
             )
         };
         assert!(pack(3, 1).is_ok());

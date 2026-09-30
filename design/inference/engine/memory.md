@@ -157,6 +157,9 @@ kill is independent fault containment; it chooses nothing to release.
   history or banks.
 - Reclaim releases empty slabs and compacts referenced rows and banks into free space in held slabs
   without a new claim, including on Metal, Vulkan, CPU and CUDA.
+- No history presents more spans to a launch than its domain's span limit, for any sequence of
+  growth, interleaving, forks, window release, rollback and Reclaim; graphs are sealed to that limit
+  and a launch beyond it is rejected before submission, never discovered by a graph lookup.
 - Startup, lazy component and state-growth allocations all claim from the one device heap.
 
 ## Physical state placement
@@ -170,24 +173,42 @@ layers read a source layer's regions). A history slab contains fixed-offset regi
 component of its domain; a bank slab contains complete recurrent banks, whose bytes follow from
 their components (convolution windows, gated delta and F32 state-space states, and their tapes).
 Row numbers identify a slab of their domain and an offset within it. Every history span lies within
-one slab. Free space is tracked within each slab, and a freed slab index may be reused. A Window(n)
-history releases its references on rows before `n` behind its accepted position after each
-advance; those rows are ordinary free space, and a slab left empty is released by the rules below.
+one slab. Rows are placed in pages: a domain's page is the smallest multiple of 256 rows for which
+its span limit below is at most 63; a slab holds a whole number of pages, and a domain reserves a
+whole number of pages, so every page is complete and a growth's demand in whole pages is exactly
+what admission checks, provisioning backs and the claim takes. A history takes rows
+only in place after its end within its last page, or as whole free pages (pages without a
+referenced row), preferring the page that begins at its end; a fresh history takes the middle page
+of the largest run of free pages. Every page a history references is therefore complete except its
+first and last, so a history of `r` rows presents at most `ceil(r / page) + 1` spans, and a Shared
+reader also sees at most `ceil(advance / page) + 1` spans of rows appended within one advance. The
+domain's span limit is that bound at its row limit. It is exact, guaranteed for every placement
+path (growth, interleaved requests, forks, window release, rollback and Reclaim), and it is the
+limit graphs are sealed to and every launch is checked against: a launch class beyond it is
+never constructed. The rows after a history's end in its last page are never given to another
+history. A history whose last page is partial but whose next row a sibling fork took copies that
+page's rows (fewer than a page) into a free page before it grows; that relocation needs one free
+page, and without memory for it the request fails before any launch. A history's slack is under
+one page per domain. Free space is tracked within each slab, and a freed slab index may be reused.
+A Window(n) history releases its references on rows before `n` behind its accepted position after
+each advance; those rows are free again, a page is reused once none of its rows is referenced, and
+a slab left empty is released by the rules below.
 Callers retain logical identities and published placement snapshots, never mutable physical bank
 indices.
 
 Assessment charges history per domain at slab granularity: a Token domain by the rows of the
 assessed context, and a Window(n) domain by its steady footprint of `n` plus one advance per live
-history and `n` per checkpoint, independent of the context, rounded up to whole slabs of the
-domain.
+history and `n` per checkpoint, independent of the context, each rounded up to whole pages (plus
+one page for a window's partially released first page) and then to whole slabs of the domain.
 
-Compaction is the single mechanism for moving referenced rows or claimed banks. It plans
-destinations in free space of slabs already held, submits all copies, waits for completion, then
-publishes the placement with a new generation. Until publication, the source is authoritative;
-failure leaves accepted values, placement and charge unchanged. Compaction merges a history's spans
-before its next launch if fragmentation would exceed its per-model span bound. In Reclaim it empties
-the least occupied slabs so they can be freed. Empty slabs are released at once in Reclaim and,
-at idle, beyond one free slab per store. No compaction requires a memory claim.
+Compaction is the single mechanism for moving referenced rows or claimed banks between slabs. It
+plans destinations in free space of slabs already held, submits all copies, waits for completion,
+then publishes the placement with a new generation. Until publication, the source is
+authoritative; failure leaves accepted values, placement and charge unchanged. In Reclaim it
+empties the least occupied slabs so they can be freed, moving whole occupied pages to free pages at
+the same offsets, so every history keeps its page structure and its span limit. Empty slabs are
+released at once in Reclaim and, at idle, beyond one free slab per store. No compaction requires a
+memory claim.
 
 The memory heap is the sole authority for claims, bands, holding classes and
 release decisions. Seismic is the sole byte and allocation-charge authority.

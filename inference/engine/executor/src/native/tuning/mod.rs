@@ -153,7 +153,7 @@ pub use weights::{TuningWeightSource, ZeroTuningWeights};
 
 use super::CatalogFailure;
 use crate::kernel_cache::{KernelCache, TuningCacheKey};
-use magnitude_batching::{Demand, PackedRowTables, Row, RowHistory, Slot};
+use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
 use magnitude_family_contracts::{ModelDefinition, Operator, WeightKind, WeightScope};
 use seismic::{
     Configuration, DType, Device, Element, NativeImplementation, NativeKernel,
@@ -1009,7 +1009,9 @@ impl TuningInputs<'_, '_> {
             .collect::<Vec<_>>();
         let vocabulary = usize::try_from(self.definition.decoder.vocabulary)
             .map_err(|_| "vocabulary exceeds usize")?;
-        PackedRowTables::pack(&packed, vocabulary, rows).map_err(|error| error.to_string())
+        // Each row sees at most one history span.
+        let limits = ClassLimits { rows, segments: 1 };
+        PackedRowTables::pack(&packed, vocabulary, limits).map_err(|error| error.to_string())
     }
 }
 

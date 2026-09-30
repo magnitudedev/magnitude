@@ -207,7 +207,7 @@ impl AssessmentGraphResourceBounds {
                         limits,
                         history_rows,
                         history.slab_rows,
-                        head_state.context_rows,
+                        head_state.span_limit(),
                         method.draft_rows(),
                     )?,
                 )?;
@@ -895,7 +895,7 @@ mod tests {
             limits,
             head_history.rows as u64,
             head_history.slab_rows,
-            head_state.context_rows,
+            head_state.span_limit(),
             method.draft_rows(),
         )
         .unwrap();
@@ -1040,7 +1040,7 @@ mod tests {
                 limits,
                 head_history.rows as u64,
                 head_history.slab_rows,
-                head_state.context_rows,
+                head_state.span_limit(),
                 method.draft_rows(),
             )
             .unwrap(),
