@@ -207,7 +207,7 @@ pub struct MemoryPoolInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum LedgerKey {
     Host,
-    /// CUDA and Vulkan expose the same physical GPU UUID on shared devices.
+    /// Stable physical UUID shared by CUDA and Vulkan views of a GPU.
     PhysicalGpu([u8; 16]),
     /// A device whose backing is not normalized accounts privately.
     Unestablished(DeviceSelector),

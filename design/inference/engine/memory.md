@@ -24,7 +24,8 @@ no caller supplies a memory budget or retention percentage.
 
 CUDA and Vulkan views with the same physical GPU UUID share one device-local memory domain and
 charge ledger. They remain separate execution devices, but hardware inventory counts their
-capacity once and presents both backends under that GPU. Distinct UUIDs retain distinct domains.
+capacity once and presents both backends under that GPU, regardless of model name, device count,
+or enumeration order. Distinct UUIDs retain distinct domains even when their names match.
 
 ## Who guarantees what
 
