@@ -280,17 +280,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // A group claiming the queued lookahead needs no rows of its own. The
         // step it queues next is optional and is queued only into space
         // already bound: growing now would change bindings under the claimed
-        // step. Any other target group orphans the lookahead; a head or
-        // encoder group runs beside it unless it changes bindings.
+        // step. Any other group resolves the lookahead first: its tentative
+        // rows would otherwise read as another history's in every layout
+        // question below (blocked tails, in-place rows, growth).
         if self.claim_slots(bindings, operations).is_some() {
             return Ok(());
         }
-        if operations
-            .iter()
-            .any(|operation| matches!(operation, Operation::Forward { .. }))
-        {
-            self.orphan_lookahead(bindings)?;
-        }
+        self.orphan_lookahead(bindings)?;
         for operation in operations {
             if let Operation::Forward { request, .. } | Operation::Head { request, .. } = operation
             {
@@ -408,20 +404,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         demands: &[RowDemand],
         banks: usize,
     ) -> Result<(), DomainError> {
-        let grows = |bindings: &mut StateBindings<F>| -> Result<bool, DomainError> {
-            let claim = bindings.store(head)?.growth_claim(demands, banks)?;
-            Ok(claim.minimum_bytes != 0 || claim.preferred_bytes != 0)
-        };
         // No backing changes when neither plan adds a slab. Reservation
         // observes memory again before launching the selected group.
-        if !grows(bindings)? {
+        let claim = bindings.store(head)?.growth_claim(demands, banks)?;
+        if claim.minimum_bytes == 0 && claim.preferred_bytes == 0 {
             return Ok(());
-        }
-        if bindings.lookahead.is_some() {
-            self.orphan_lookahead(bindings)?;
-            if !grows(bindings)? {
-                return Ok(());
-            }
         }
         let store = bindings.store(head)?;
         for choice in [GrowthChoice::Preferred, GrowthChoice::Minimum] {
@@ -540,6 +527,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         } else {
             self.target_store.clone()
         };
+        // `provision` resolved the lookahead: only another history can block.
         let Some(state) = self.lane_states(head).get(&request) else {
             return Ok(());
         };
@@ -547,7 +535,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if demands.is_empty() {
             return Ok(());
         }
-        self.orphan_lookahead(bindings)?;
         self.grant_state_growth(bindings, head, &demands, 0)?;
         for demand in demands {
             let state = self
@@ -582,6 +569,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Commit the successor banks a newly opened request needs. Free banks
     /// change no bindings and leave a queued lookahead running.
     pub fn provision_open(&mut self, bindings: &mut StateBindings<F>) -> Result<(), DomainError> {
+        self.orphan_lookahead(bindings)?;
         let requirements = self.open_requirements();
         self.grant_state_growth(bindings, false, &[], requirements.target_banks())?;
         if self.head_store.is_some() {

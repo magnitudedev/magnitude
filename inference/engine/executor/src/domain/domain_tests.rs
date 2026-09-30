@@ -522,8 +522,8 @@ fn ready_target_can_abort_then_reconcile() {
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
 }
 
-/// Growth changes bindings: with a lookahead queued, growing a store first
-/// orphans it, then commits the slab.
+/// Growth changes bindings: every entry that can grow resolves a queued
+/// lookahead first, then commits the slab.
 #[test]
 fn growth_orphans_a_queued_lookahead_then_grows() {
     let Some((mut domain, mut bindings)) = fixture_with(None, true, true) else {
@@ -539,34 +539,52 @@ fn growth_orphans_a_queued_lookahead_then_grows() {
         domain: history,
         rows: head.free_rows(history) + 1,
     }];
+    domain.provision_open(&mut bindings).unwrap();
+    assert!(bindings.lookahead.is_none(), "the growing entry orphaned the lookahead");
     domain
         .grant_state_growth(&mut bindings, true, &demand, 0)
         .unwrap();
-    assert!(bindings.lookahead.is_none(), "growth orphaned the lookahead");
     assert!(head.committed_rows(history) > committed);
     // The orphaned step changed no accepted state.
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
 }
 
-/// Opening a request into free banks changes no bindings: the queued
-/// lookahead keeps running and is still claimed by its continuation.
+/// A queued lookahead reserves the rows after its request's history, so that
+/// history's last page reads as blocked by another. Drafter work for the same
+/// request, which does not claim the lookahead, must resolve it before any
+/// layout question: it provisions without relocating, and the lookahead is
+/// gone. (Regression: relocation planned against the lookahead's rows, then
+/// orphaned it and failed with "only a blocked last page is relocated".)
 #[test]
-fn opening_into_a_free_bank_leaves_the_lookahead_running() {
-    let Some((mut domain, mut bindings)) = fixture_with(None, true, false) else {
+fn drafter_work_resolves_its_requests_lookahead_before_provisioning() {
+    let Some((mut domain, mut bindings)) = fixture_with(None, true, true) else {
         return;
     };
     let request = RequestId(61);
     open(&mut domain, &mut bindings, request);
     let mut bindings = queue_lookahead(&mut domain, bindings, request);
-    assert!(domain.target_store.available_banks() >= 1);
-    open(&mut domain, &mut bindings, RequestId(62));
-    assert!(bindings.lookahead.is_some(), "opening kept the lookahead");
-    let next = vec![prefill(request, 1)];
-    let reservation = domain.reserve(&mut bindings, &next).unwrap();
-    assert!(matches!(
-        reservation.into_resources(),
-        ReservedResources::Target(TargetGraphReservation::Claim(_))
-    ));
+    assert!(
+        !domain.target[&request].blocked_tails().is_empty(),
+        "the lookahead's rows read as another history's"
+    );
+    let draft = Operation::Head {
+        request,
+        phase: crate::HeadPhase::Generation,
+        tokens: vec![crate::TokenId(1)],
+        conditioning: crate::FeatureRows::new(vec![0u8; 4].into(), 1).unwrap(),
+        position: 1,
+        proposals: Vec::new(),
+        form: crate::DraftForm::Chained,
+    };
+    // The fixture has no drafter weights, so provisioning ends at loading the
+    // head component: after the lookahead and every relocation are resolved.
+    match domain.provision(&mut bindings, &[draft]) {
+        Ok(()) => {}
+        Err(DomainError::Input(detail)) if detail == "head component is disabled" => {}
+        Err(error) => panic!("provisioning drafter work failed: {error}"),
+    }
+    assert!(bindings.lookahead.is_none(), "drafter work resolved the lookahead");
+    assert!(domain.target[&request].blocked_tails().is_empty());
 }
 
 /// A history's next rows in its partly used last page need no free page: a

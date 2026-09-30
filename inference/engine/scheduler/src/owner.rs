@@ -26,7 +26,7 @@ use super::{
     worker::Wakes,
 };
 use magnitude_executor::{
-    DomainError, DomainRequirements, HeadPhase, InvariantError, MemoryChargeReconciliation,
+    DomainError, HeadPhase, InvariantError, MemoryChargeReconciliation,
     NativeFamily,
     OpenRequirements, Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
     ProgramFamily, RequestId, ResourceKind, ResourcePlan, StateBindings, SubmitError,
@@ -1981,45 +1981,32 @@ impl<F: ProgramFamily> Service<F> {
         round: &Round,
         group_: OperationGroup,
     ) -> Result<Provisioned, RequestError> {
-        let mut current = match self.domain.provision(bindings, group_.operations()) {
-            Ok(()) => Ok(()),
-            Err(error @ (DomainError::Capacity(_) | DomainError::Blind(_) | DomainError::Reclaim)) => {
-                Err(error)
-            }
-            Err(error) => return Err(classify_domain_error(error)),
-        };
-        let requirement =
-            requirements(&self.domain, bindings, &group_).map_err(classify_domain_error)?;
-        current = current.and_then(|()| {
-            self.domain
-                .can_reserve(&requirement)
-                .map_err(DomainError::from)
-        });
         let short = |current: &Result<(), DomainError>| matches!(current, Err(DomainError::Capacity(_)));
         let mut group_ = group_;
+        let mut current = self.fits(bindings, &group_);
         if short(&current) {
             self.domain
                 .shrink_state(bindings, ShrinkPolicy::Reclaim)
                 .map_err(classify_domain_error)?;
-            current = self.fits(bindings, group_.operations(), &requirement);
+            current = self.fits(bindings, &group_);
         }
         if short(&current) {
             self.domain
                 .reclaim_idle(bindings)
                 .map_err(invariant("idle state release"))?;
-            current = self.fits(bindings, group_.operations(), &requirement);
+            current = self.fits(bindings, &group_);
         }
         while short(&current) && self.prefix_cache.evict_one() {
             self.domain
                 .shrink_state(bindings, ShrinkPolicy::Reclaim)
                 .map_err(classify_domain_error)?;
-            current = self.fits(bindings, group_.operations(), &requirement);
+            current = self.fits(bindings, &group_);
         }
         if short(&current) {
             self.domain
                 .release_idle_optional_components(bindings)
                 .map_err(invariant("optional component release"))?;
-            current = self.fits(bindings, group_.operations(), &requirement);
+            current = self.fits(bindings, &group_);
         }
         if short(&current) {
             group_ = match group_.split_last() {
@@ -2031,7 +2018,7 @@ impl<F: ProgramFamily> Service<F> {
                 self.domain
                     .shrink_state(bindings, ShrinkPolicy::Reclaim)
                     .map_err(classify_domain_error)?;
-                current = self.fits(bindings, group_.operations(), &requirement);
+                current = self.fits(bindings, &group_);
             }
         }
         match current {
@@ -2047,16 +2034,14 @@ impl<F: ProgramFamily> Service<F> {
         }
     }
 
-    /// Whether `operations` fit after a release: provision, then reserve.
-    fn fits(
-        &mut self,
-        bindings: &mut StateBindings<F>,
-        operations: &[Operation],
-        requirement: &DomainRequirements,
-    ) -> Result<(), DomainError> {
-        self.domain.provision(bindings, operations)?;
+    /// Whether the group fits now: provision it, then check the reservation
+    /// its requirement, derived from the layout it was just provisioned
+    /// into, would take.
+    fn fits(&mut self, bindings: &mut StateBindings<F>, group_: &OperationGroup) -> Result<(), DomainError> {
+        self.domain.provision(bindings, group_.operations())?;
+        let requirement = requirements(&self.domain, bindings, group_)?;
         self.domain
-            .can_reserve(requirement)
+            .can_reserve(&requirement)
             .map_err(DomainError::from)
     }
 

@@ -227,6 +227,7 @@ fn concurrent_cohort_memory_growth_and_idle_release() {
     assert_eq!(baseline.unattributed, 0);
     eprintln!("cohort baseline: {baseline:?}");
 
+    let mut spare = None;
     for count in [1, 4, 16] {
         let mut streams = (0..count)
             .map(|seed| {
@@ -273,7 +274,15 @@ fn concurrent_cohort_memory_growth_and_idle_release() {
         if count == 16 {
             assert!(peak.charged > baseline.charged);
         }
-        assert_eq!(idle.charged, baseline.charged);
+        // Idle release keeps occupied slabs plus one empty spare per store.
+        // Once growth has left that spare, idle charge stays there: it never
+        // accumulates across cohorts.
+        assert!(idle.charged >= baseline.charged);
+        match spare {
+            Some(settled) => assert_eq!(idle.charged, settled),
+            None if idle.charged != baseline.charged => spare = Some(idle.charged),
+            None => {}
+        }
     }
 }
 

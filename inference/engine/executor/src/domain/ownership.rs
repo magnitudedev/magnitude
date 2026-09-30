@@ -59,6 +59,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         request: RequestId,
         from: Option<&ResumeState>,
     ) -> Result<Vec<Operation>, DomainError> {
+        self.orphan_lookahead(bindings)?;
         let installed = self
             .input
             .get(&request)
@@ -267,10 +268,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Release every slab of a store no sequence or checkpoint owns. That
     /// changes bindings, so a queued lookahead is orphaned first.
     pub fn reclaim_idle(&mut self, bindings: &mut StateBindings<F>) -> Result<u64, String> {
-        if self.target_store.idle() || self.head_store.as_ref().is_some_and(|store| store.idle()) {
-            self.orphan_lookahead(bindings)
-                .map_err(|error| error.to_string())?;
-        }
+        self.orphan_lookahead(bindings)
+            .map_err(|error| error.to_string())?;
         let mut bytes = u64::try_from(
             bindings
                 .target

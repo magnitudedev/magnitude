@@ -104,10 +104,11 @@ dropping claims) do not. Submitting a group moves the binding right into its fli
 completion returns it, so no binding changes while a flight is in the air; releases that need a
 binding change run at completion. The lookahead, the step queued behind the last flight with its
 drafter priming, is the only work that holds state between flights and lives in the binding
-right. An operation that actually changes bindings first resolves it: a matching submission claims
-it and anything else orphans it. Opening a request into free rows and banks changes no bindings
-and leaves the lookahead running. Growth has no blocked outcome: it succeeds or returns a memory
-deficit.
+right. Its tentative rows are indistinguishable from another history's in every layout question
+(a blocked last page, rows in place, growth), so it lives only until the next operation that
+uses the binding right: a matching submission claims it, and every other such operation orphans
+it on entry, before asking any layout question. Growth has no blocked outcome: it succeeds or
+returns a memory deficit.
 
 An interior accepted prefix with recurrent state requires numerical repair before the successor
 can be published or checkpointed. State compaction, copying, and codec conversion follow the same
@@ -154,6 +155,6 @@ Commit publishes the destination position and history only after the state progr
 - An accepted/resident checkpoint is created only after reconciliation.
 - Exactly one binding right exists; every binding change holds it, and no binding change is
   possible while a flight holds it.
-- A binding change with a queued lookahead claims or orphans it first; opening a request into free
-  rows and banks leaves the lookahead running.
+- Every operation using the binding right, other than the submission that claims a queued
+  lookahead, orphans it on entry; no layout question is answered while it is queued.
 - Growth succeeds or returns a memory deficit; it never silently does nothing.
