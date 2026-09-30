@@ -1,5 +1,18 @@
 # @magnitudedev/cli
 
+## 0.2.2
+
+### Patch Changes
+
+- [`1588451`](https://github.com/magnitudedev/magnitude/commit/1588451a88f979a70c1f6385599d50de029064f7) Thanks [@anerli](https://github.com/anerli)! - - Fix the app getting stuck on "Assessing models" on some hardware: model speed is now estimated from the device's memory bandwidth instead of running kernels on the GPU, which could hang or fail.
+
+- [`3940408`](https://github.com/magnitudedev/magnitude/commit/394040878bd6cf10bf5a9addd9a3791d8eb2ef9f) Thanks [@anerli](https://github.com/anerli)! - - Fix Codex hanging after its first tool call over the Responses WebSocket: follow-up requests now continue from the previous response's output, and request errors end the request instead of leaving it waiting.
+  - Fix requests that repeat the same image, in one message or across turns, failing with a 400. A repeated image is now encoded once.
+  - Fix tool call IDs repeating across turns (every turn's first call was `call_0`), which made Claude Code drop tool calls and loop.
+  - Fix Anthropic token usage counting cached tokens twice in responses and reporting none when streaming, and `count_tokens` requiring `max_tokens`.
+  - Fix large system prompts being re-read in full when only the last message changes: later requests now resume from the cached prompt.
+  - Fix tools with free-form object parameters failing on Gemma 4 with "Too many items" (breaking Claude Code and Oh My Pi), Cline failing mid-task with "Output parser would retract a published tool call", and forced tool calls (`tool_choice` "required", "any" or a named tool) repeating until the token limit.
+
 ## 0.2.1
 
 ### Patch Changes
