@@ -167,6 +167,12 @@ impl ApiError {
         self
     }
 
+    #[must_use]
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.body.code = code.to_owned();
+        self
+    }
+
     pub fn response(self) -> Response {
         let mut response = (self.status, Json(ErrorResponse { error: self.body })).into_response();
         let request_id = format!(

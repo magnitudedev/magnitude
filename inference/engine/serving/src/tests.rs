@@ -1889,6 +1889,74 @@ async fn responses_streams_reasoning_and_function_call_items() {
     assert_eq!(sequence, (0..sequence.len() as u64).collect::<Vec<_>>());
 }
 
+async fn start_response(script: Script) -> responses::ResponseStream {
+    let request = serde_json::from_value(json!({ "model": "test-model", "input": "hi", "stream": true }))
+        .expect("request must decode");
+    responses::start_response_stream(
+        Serving::new(Arc::new(Scripted::new(script))),
+        &axum::http::HeaderMap::new(),
+        request,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{}", error.body.message))
+}
+
+/// Items conclude in `output_index` order even when a message follows a tool
+/// call, and the concluded output is exactly the response's `output`.
+#[tokio::test]
+async fn responses_conclude_items_in_output_order() {
+    let mut stream = start_response(Script::output(vec![
+        OutputEvent::ToolCallStarted {
+            index: 0,
+            id: "call-1".into(),
+            name: "lookup".into(),
+        },
+        OutputEvent::ToolInputDelta {
+            index: 0,
+            fragment: "{}".into(),
+        },
+        OutputEvent::ToolCallFinished { index: 0 },
+        OutputEvent::TextDelta("after".into()),
+    ]))
+    .await;
+    let mut done = Vec::new();
+    let mut output = Value::Null;
+    while let Some(event) = stream.events.recv().await {
+        match event["type"].as_str().unwrap() {
+            "response.output_item.done" => {
+                done.push((event["output_index"].clone(), event["item"].clone()));
+            }
+            "response.completed" => output = event["response"]["output"].clone(),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        done.iter().map(|(index, _)| index.clone()).collect::<Vec<_>>(),
+        [json!(0), json!(1)]
+    );
+    assert_eq!(
+        Value::Array(done.into_iter().map(|(_, item)| item).collect()),
+        output
+    );
+    assert_eq!(output[0]["type"], "function_call");
+    assert_eq!(Value::Array(stream.concluded.await.unwrap()), output);
+}
+
+#[tokio::test]
+async fn a_failed_response_concludes_nothing() {
+    let mut script = Script::text("partial");
+    script.failure = Some(ServingError::Request(RequestError::DeviceLost {
+        reason: "scripted failure".into(),
+    }));
+    let mut stream = start_response(script).await;
+    let mut last = Value::Null;
+    while let Some(event) = stream.events.recv().await {
+        last = event;
+    }
+    assert_eq!(last["type"], "response.failed");
+    assert!(stream.concluded.await.is_err());
+}
+
 #[tokio::test]
 async fn anthropic_messages_echoes_the_gateway_alias_without_leaking_it_to_inference() {
     let source = Scripted::new(Script::text("hello"));

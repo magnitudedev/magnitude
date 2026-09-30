@@ -97,9 +97,18 @@ unsupported model is a non-retryable conflict, and device loss is a retryable
 server error. A failure of an admitted request is an engine failure, never a
 client error.
 
-The Responses WebSocket keeps per-connection logical history: a request marked
-not to generate is recorded without generation, and a later request naming it
-as its predecessor appends its input to that history.
+The Responses WebSocket keeps per-connection logical history in memory only:
+the most recent concluded (completed or incomplete) response, as its full input
+followed by its output items in `output` order. A request marked not to generate
+is validated as its generation would be and recorded without generation. A
+later request naming that response as its predecessor continues from it and
+appends its own input; naming any other is `previous_response_not_found`, and a
+continuation that fails evicts the predecessor it named. Output items conclude
+in `output_index` order, so the order a client observes them is the order of
+`output`. A request that fails before it becomes a response is answered with an
+`error` event carrying the HTTP status it would have had and the standard error
+object, so the client ends the request rather than waiting for a terminal
+response event.
 
 Qualification covers immutable input history, automatic/required/named/allowed/disabled
 tools, reasoning resolution and budgets, grammar and schema enforcement,

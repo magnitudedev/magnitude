@@ -1,8 +1,8 @@
 //! OpenAI Responses over HTTP (JSON and SSE) and WebSocket. The WebSocket
-//! keeps per-connection logical request history: `generate: false` warms a
-//! request without generating, and `previous_response_id` appends new input to
-//! that history.
-use std::collections::{BTreeMap, HashMap};
+//! keeps per-connection logical history: `generate: false` warms a request
+//! without generating, and `previous_response_id` continues from the most
+//! recent concluded response's input and output with new input.
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use magnitude_chat::schema::JsonSchema;
 use magnitude_chat::{ChatInput, EndOfGeneration, GenerationRequest, ReasoningIntent, ToolChoice};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use utoipa::openapi::Ref;
 use utoipa::openapi::schema::AnyOfBuilder;
@@ -361,6 +361,7 @@ pub(crate) struct StreamProjector {
     reasoning: String,
     tool_calls: BTreeMap<usize, ToolProjection>,
     projection: ResponseProjection,
+    concluded: Option<oneshot::Sender<Vec<Value>>>,
 }
 
 /// The stream consumer is gone; the generation is dropped (cancelled).
@@ -374,6 +375,7 @@ impl StreamProjector {
         sender: mpsc::Sender<Value>,
         sequence: Arc<AtomicU64>,
         projection: ResponseProjection,
+        concluded: oneshot::Sender<Vec<Value>>,
     ) -> Self {
         let message_id = format!("msg_{}", &id[5..]);
         Self {
@@ -390,6 +392,7 @@ impl StreamProjector {
             reasoning: String::new(),
             tool_calls: BTreeMap::new(),
             projection,
+            concluded: Some(concluded),
         }
     }
 
@@ -544,8 +547,10 @@ impl StreamProjector {
         Ok(())
     }
 
-    async fn finish(&self, completion: &Completion) -> Result<(), Disconnected> {
-        let mut indexed = Vec::new();
+    /// Close every output item in `output_index` order, so the order a client
+    /// observes items concluding is the order of the response's `output`.
+    async fn finish(&mut self, completion: &Completion) -> Result<(), Disconnected> {
+        let mut closing: Vec<(usize, Vec<(&'static str, Value)>, Value)> = Vec::new();
         if let Some(index) = self.reasoning_output_index {
             let item_id = self.reasoning_id();
             let item = serde_json::to_value(reasoning_item(
@@ -554,19 +559,13 @@ impl StreamProjector {
                 Some(self.reasoning.clone()),
             ))
             .expect("output item is serializable");
-            self.send(
+            let events = vec![(
                 "response.reasoning_summary_text.done",
                 serde_json::json!({
                     "item_id": item_id, "output_index": index, "summary_index": 0, "text": self.reasoning,
                 }),
-            )
-            .await?;
-            self.send(
-                "response.output_item.done",
-                serde_json::json!({ "output_index": index, "item": item }),
-            )
-            .await?;
-            indexed.push((index, item));
+            )];
+            closing.push((index, events, item));
         }
         if let Some(index) = self.message_output_index {
             let item = serde_json::to_value(message_item(
@@ -575,28 +574,22 @@ impl StreamProjector {
                 Some(self.text.clone()),
             ))
             .expect("output item is serializable");
-            let content = item["content"].clone();
-            self.send(
-                "response.output_text.done",
-                serde_json::json!({
-                    "item_id": self.message_id, "output_index": index, "content_index": 0, "text": self.text,
-                }),
-            )
-            .await?;
-            self.send(
-                "response.content_part.done",
-                serde_json::json!({
-                    "item_id": self.message_id, "output_index": index, "content_index": 0,
-                    "part": content[0],
-                }),
-            )
-            .await?;
-            self.send(
-                "response.output_item.done",
-                serde_json::json!({ "output_index": index, "item": item }),
-            )
-            .await?;
-            indexed.push((index, item));
+            let events = vec![
+                (
+                    "response.output_text.done",
+                    serde_json::json!({
+                        "item_id": self.message_id, "output_index": index, "content_index": 0, "text": self.text,
+                    }),
+                ),
+                (
+                    "response.content_part.done",
+                    serde_json::json!({
+                        "item_id": self.message_id, "output_index": index, "content_index": 0,
+                        "part": item["content"][0],
+                    }),
+                ),
+            ];
+            closing.push((index, events, item));
         }
         for (output_index, item_id, call_id, name, arguments) in self.tool_calls.values() {
             let item = serde_json::to_value(function_call_item(
@@ -607,22 +600,28 @@ impl StreamProjector {
                 arguments.clone(),
             ))
             .expect("output item is serializable");
-            self.send(
+            let events = vec![(
                 "response.function_call_arguments.done",
                 serde_json::json!({
                     "item_id": item_id, "output_index": output_index, "arguments": arguments,
                 }),
-            )
-            .await?;
+            )];
+            closing.push((*output_index, events, item));
+        }
+        closing.sort_by_key(|(index, _, _)| *index);
+        let mut items = Vec::with_capacity(closing.len());
+        for (index, events, item) in closing {
+            for (event_type, value) in events {
+                self.send(event_type, value).await?;
+            }
             self.send(
                 "response.output_item.done",
-                serde_json::json!({ "output_index": output_index, "item": item }),
+                serde_json::json!({ "output_index": index, "item": item }),
             )
             .await?;
-            indexed.push((*output_index, item));
+            items.push(item);
         }
-        indexed.sort_by_key(|(index, _)| *index);
-        let output = Value::Array(indexed.into_iter().map(|(_, item)| item).collect());
+        let output = Value::Array(items.clone());
         let incomplete = completion.termination == Termination::OutputLimit;
         let mut completed = self.base(
             if incomplete { "incomplete" } else { "completed" },
@@ -640,7 +639,11 @@ impl StreamProjector {
             },
             serde_json::json!({ "response": completed }),
         )
-        .await
+        .await?;
+        if let Some(concluded) = self.concluded.take() {
+            let _ = concluded.send(items);
+        }
+        Ok(())
     }
 
     async fn fail(&self, error: &ApiErrorBody) {
@@ -1500,8 +1503,9 @@ pub async fn responses(
 ) -> Result<Response, ApiError> {
     let Json(request) = payload.map_err(|error| ApiError::invalid(error.body_text()))?;
     if request.stream {
-        let (request_id, receiver) = start_response_stream(state, &headers, request).await?;
-        let receiver = ReceiverStream::new(receiver).map(|value| {
+        let stream = start_response_stream(state, &headers, request).await?;
+        let request_id = stream.id;
+        let receiver = ReceiverStream::new(stream.events).map(|value| {
             let event_type = value
                 .get("type")
                 .and_then(Value::as_str)
@@ -1537,19 +1541,29 @@ pub async fn responses(
     Ok(with_request_id(response, &id))
 }
 
+/// A started streamed response.
+pub(crate) struct ResponseStream {
+    pub(crate) id: String,
+    pub(crate) events: mpsc::Receiver<Value>,
+    /// The response's output items, in `output` order, once it completes or
+    /// is incomplete; closed without a value when it fails or is abandoned.
+    pub(crate) concluded: oneshot::Receiver<Vec<Value>>,
+}
+
 /// Start a streamed response. Without progress, the stream opens only after
 /// the model is bound and the request admitted, so those failures keep their
 /// HTTP status; with progress it opens at once and reports them in-stream.
-async fn start_response_stream(
+pub(crate) async fn start_response_stream(
     state: Serving,
     headers: &HeaderMap,
     request: ResponseCreateRequest,
-) -> Result<(String, mpsc::Receiver<Value>), ApiError> {
+) -> Result<ResponseStream, ApiError> {
     let adapted = adapt(request)?;
     let id = state.next_id("resp_icn_");
     let created_at = unix_timestamp();
     let include_progress = include_progress(headers);
-    let (sender, receiver) = mpsc::channel::<Value>(32);
+    let (sender, events) = mpsc::channel::<Value>(32);
+    let (concluded_sender, concluded) = oneshot::channel();
     let sequence = Arc::new(AtomicU64::new(0));
     let projector = StreamProjector::new(
         id.clone(),
@@ -1558,7 +1572,13 @@ async fn start_response_stream(
         sender.clone(),
         sequence.clone(),
         adapted.projection,
+        concluded_sender,
     );
+    let response = ResponseStream {
+        id: id.clone(),
+        events,
+        concluded,
+    };
     if include_progress {
         let progress_id = id.clone();
         let progress: LoadProgress = Arc::new(move |load| {
@@ -1580,7 +1600,7 @@ async fn start_response_stream(
                 Err(error) => projector.fail(&ApiError::from(error).body).await,
             }
         });
-        return Ok((id, receiver));
+        return Ok(response);
     }
     let invocation = state
         .models
@@ -1596,7 +1616,7 @@ async fn start_response_stream(
             project(stream, before, projector, false).await;
         }
     });
-    Ok((id, receiver))
+    Ok(response)
 }
 
 async fn project(
@@ -1660,62 +1680,115 @@ async fn send_websocket_value(socket: &mut WebSocket, value: Value) -> bool {
         .is_ok()
 }
 
-pub(crate) fn websocket_error_event(error: &ApiErrorBody, sequence_number: u64) -> Value {
+/// A request-level failure on the WebSocket: the request never became a
+/// response, so it is framed like the HTTP error it would have been — its
+/// status and the standard error object — rather than as an in-stream event.
+/// Clients end the request on it; without `status` they keep waiting.
+pub(crate) fn websocket_error_event(error: &ApiError, sequence_number: u64) -> Value {
     serde_json::json!({
         "type": "error",
-        "code": error.code,
-        "message": error.message,
-        "param": error.param,
+        "status": error.status.as_u16(),
+        "error": error.body,
         "sequence_number": sequence_number,
     })
 }
 
 async fn send_websocket_error(
     socket: &mut WebSocket,
-    error: &ApiErrorBody,
+    error: &ApiError,
     sequence: &AtomicU64,
 ) -> bool {
     let sequence_number = sequence.fetch_add(1, Ordering::Relaxed);
     send_websocket_value(socket, websocket_error_event(error, sequence_number)).await
 }
 
-/// Resolve one WebSocket message into its full logical request against the
-/// connection's history. `generate: false` requests are recorded, not run.
-pub(crate) fn websocket_logical_request(
-    mut request: Value,
-    history: &HashMap<String, Value>,
-) -> Result<(Value, bool), String> {
-    let object = request
-        .as_object_mut()
-        .ok_or_else(|| "WebSocket message must be a JSON object".to_owned())?;
-    if object.get("type").and_then(Value::as_str) != Some("response.create") {
-        return Err("WebSocket message type must be response.create".to_owned());
+/// One WebSocket message resolved against the connection's history.
+pub(crate) struct LogicalRequest {
+    /// The full request: `previous_response_id` resolved into `input`.
+    pub(crate) request: Value,
+    /// The full input items, which this response's history entry extends.
+    pub(crate) input: Vec<Value>,
+    /// The predecessor this request continues, evicted if it fails.
+    pub(crate) previous: Option<String>,
+    /// `generate: false` requests are recorded, not run.
+    pub(crate) generate: bool,
+}
+
+/// A connection's logical history: the most recent concluded response, as the
+/// full input a follow-up naming it extends — the response's own logical input
+/// followed by its output items, as the Responses API defines
+/// `previous_response_id`. Nothing is persisted (`store: false`), so any other
+/// predecessor is `previous_response_not_found`, and a continuation that fails
+/// evicts the predecessor it named.
+#[derive(Default)]
+pub(crate) struct WebsocketHistory {
+    latest: Option<(String, Vec<Value>)>,
+}
+
+impl WebsocketHistory {
+    pub(crate) fn resolve(&self, mut request: Value) -> Result<LogicalRequest, ApiError> {
+        let object = request
+            .as_object_mut()
+            .ok_or_else(|| ApiError::invalid("WebSocket message must be a JSON object"))?;
+        if object.get("type").and_then(Value::as_str) != Some("response.create") {
+            return Err(ApiError::invalid(
+                "WebSocket message type must be response.create",
+            ));
+        }
+        let generate = object.remove("generate").and_then(|value| value.as_bool()) != Some(false);
+        object.remove("type");
+        let (previous, mut input) = match object.remove("previous_response_id") {
+            None | Some(Value::Null) => (None, Vec::new()),
+            Some(Value::String(previous_id)) => match &self.latest {
+                Some((id, input)) if *id == previous_id => (Some(previous_id), input.clone()),
+                _ => return Err(previous_response_not_found(&previous_id)),
+            },
+            Some(_) => {
+                return Err(ApiError::invalid("previous_response_id must be a string")
+                    .with_param("previous_response_id"));
+            }
+        };
+        input.extend(match object.remove("input") {
+            Some(Value::Array(items)) => items,
+            // The shorthand text input is one user message.
+            Some(Value::String(text)) => {
+                vec![serde_json::json!({ "role": "user", "content": text })]
+            }
+            _ => {
+                return Err(
+                    ApiError::invalid("input must be a string or an array of items")
+                        .with_param("input"),
+                );
+            }
+        });
+        object.insert("input".to_owned(), Value::Array(input.clone()));
+        object.insert("stream".to_owned(), Value::Bool(true));
+        Ok(LogicalRequest {
+            request,
+            input,
+            previous,
+            generate,
+        })
     }
-    let generate = object.remove("generate").and_then(|value| value.as_bool()) != Some(false);
-    object.remove("type");
-    if let Some(previous_id) = object
-        .get("previous_response_id")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-    {
-        let previous = history
-            .get(&previous_id)
-            .ok_or_else(|| format!("Unknown previous_response_id: {previous_id}"))?;
-        let previous_input = previous
-            .get("input")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "Previous WebSocket request input was not an array".to_owned())?;
-        let incremental_input = object
-            .get("input")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "Incremental WebSocket request input must be an array".to_owned())?;
-        let mut input = previous_input.clone();
-        input.extend(incremental_input.iter().cloned());
-        object.insert("input".to_owned(), Value::Array(input));
-        object.remove("previous_response_id");
+
+    /// Record a concluded response: its logical input, then its output items.
+    pub(crate) fn record(&mut self, id: String, mut input: Vec<Value>, output: Vec<Value>) {
+        input.extend(output);
+        self.latest = Some((id, input));
     }
-    object.insert("stream".to_owned(), Value::Bool(true));
-    Ok((request, generate))
+
+    /// A continuation of `previous` failed: that state is no longer reusable.
+    pub(crate) fn evict(&mut self, previous: Option<&str>) {
+        if previous.is_some() && self.latest.as_ref().map(|(id, _)| id.as_str()) == previous {
+            self.latest = None;
+        }
+    }
+}
+
+fn previous_response_not_found(id: &str) -> ApiError {
+    ApiError::invalid(format!("Previous response with id '{id}' not found."))
+        .with_param("previous_response_id")
+        .with_code("previous_response_not_found")
 }
 
 fn warmup_events(id: &str) -> [Value; 2] {
@@ -1744,7 +1817,7 @@ fn warmup_events(id: &str) -> [Value; 2] {
 }
 
 async fn serve_responses_websocket(mut socket: WebSocket, state: Serving, headers: HeaderMap) {
-    let mut history = HashMap::<String, Value>::new();
+    let mut history = WebsocketHistory::default();
     while let Some(message) = socket.next().await {
         let sequence = AtomicU64::new(0);
         let request = match message {
@@ -1763,58 +1836,65 @@ async fn serve_responses_websocket(mut socket: WebSocket, state: Serving, header
             Ok(request) => request,
             Err(error) => {
                 let error = ApiError::invalid(format!("Invalid JSON: {error}"));
-                if !send_websocket_error(&mut socket, &error.body, &sequence).await {
+                if !send_websocket_error(&mut socket, &error, &sequence).await {
                     return;
                 }
                 continue;
             }
         };
-        let (logical, generate) = match websocket_logical_request(request, &history) {
-            Ok(request) => request,
+        let logical = match history.resolve(request) {
+            Ok(logical) => logical,
             Err(error) => {
-                let error = ApiError::invalid(error);
-                if !send_websocket_error(&mut socket, &error.body, &sequence).await {
+                if !send_websocket_error(&mut socket, &error, &sequence).await {
                     return;
                 }
                 continue;
             }
         };
-        if !generate {
+        let request = serde_json::from_value::<ResponseCreateRequest>(logical.request)
+            .map_err(|error| ApiError::invalid(error.to_string()));
+        let previous = logical.previous.as_deref();
+        if !logical.generate {
+            // A warmup is refused exactly as its generation would be.
+            if let Err(error) = request.and_then(adapt) {
+                history.evict(previous);
+                if !send_websocket_error(&mut socket, &error, &sequence).await {
+                    return;
+                }
+                continue;
+            }
             let id = state.next_id("resp_icn_");
             for event in warmup_events(&id) {
                 if !send_websocket_value(&mut socket, event).await {
                     return;
                 }
             }
-            history.insert(id, logical);
+            history.record(id, logical.input, Vec::new());
             continue;
         }
-        let request = match serde_json::from_value::<ResponseCreateRequest>(logical.clone()) {
-            Ok(request) => request,
-            Err(error) => {
-                let error = ApiError::invalid(error.to_string());
-                if !send_websocket_error(&mut socket, &error.body, &sequence).await {
-                    return;
-                }
-                continue;
-            }
+        let started = match request {
+            Ok(request) => start_response_stream(state.clone(), &headers, request).await,
+            Err(error) => Err(error),
         };
-        let (id, mut receiver) = match start_response_stream(state.clone(), &headers, request).await
-        {
+        let mut stream = match started {
             Ok(stream) => stream,
             Err(error) => {
-                if !send_websocket_error(&mut socket, &error.body, &sequence).await {
+                history.evict(previous);
+                if !send_websocket_error(&mut socket, &error, &sequence).await {
                     return;
                 }
                 continue;
             }
         };
-        while let Some(event) = receiver.recv().await {
+        while let Some(event) = stream.events.recv().await {
             if !send_websocket_value(&mut socket, event).await {
                 return;
             }
         }
-        history.insert(id, logical);
+        match stream.concluded.await {
+            Ok(output) => history.record(stream.id, logical.input, output),
+            Err(_) => history.evict(previous),
+        }
     }
 }
 
@@ -1822,8 +1902,16 @@ async fn serve_responses_websocket(mut socket: WebSocket, state: Serving, header
 mod websocket_tests {
     use super::*;
 
+    fn tool() -> Value {
+        serde_json::json!({
+            "type": "function",
+            "name": "shell",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+        })
+    }
+
     #[test]
-    fn errors_use_the_standard_top_level_event_shape() {
+    fn request_errors_carry_status_and_the_standard_error_object() {
         let error = ApiError::from(ServingError::Chat(
             magnitude_chat::ChatError::ContextLengthExceeded {
                 prompt_tokens: 33,
@@ -1832,61 +1920,183 @@ mod websocket_tests {
         ))
         .with_param("input");
         assert_eq!(
-            websocket_error_event(&error.body, 7),
+            websocket_error_event(&error, 7),
             serde_json::json!({
                 "type": "error",
-                "code": "context_length_exceeded",
-                "message": "prompt is too long: 33 tokens leave no generation capacity in a 32-token context",
-                "param": "input",
+                "status": 400,
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": "prompt is too long: 33 tokens leave no generation capacity in a 32-token context",
+                    "param": "input",
+                },
                 "sequence_number": 7,
             })
         );
     }
 
     #[test]
-    fn warmup_is_retained_for_incremental_generation() {
-        let warmup = serde_json::json!({
-            "type": "response.create",
-            "model": "local-model",
-            "input": [{"role": "user", "content": "hello"}],
-            "generate": false,
-        });
-        let (warmup, generate) = websocket_logical_request(warmup, &HashMap::new()).unwrap();
-        assert!(!generate);
-        let history = HashMap::from([("warm-1".to_owned(), warmup)]);
+    fn unknown_predecessor_is_previous_response_not_found() {
         let request = serde_json::json!({
             "type": "response.create",
             "model": "local-model",
             "input": [],
-            "previous_response_id": "warm-1",
+            "previous_response_id": "resp-missing",
         });
-        let (logical, generate) = websocket_logical_request(request, &history).unwrap();
-        assert!(generate);
-        assert!(logical.get("previous_response_id").is_none());
-        assert_eq!(logical["input"].as_array().unwrap().len(), 1);
-        assert_eq!(logical["stream"], Value::Bool(true));
+        let Err(error) = WebsocketHistory::default().resolve(request) else {
+            panic!("an unknown predecessor must be refused");
+        };
+        assert_eq!(error.status.as_u16(), 400);
+        assert_eq!(error.body.code, "previous_response_not_found");
+        assert_eq!(error.body.param.as_deref(), Some("previous_response_id"));
     }
 
     #[test]
-    fn incremental_items_append_to_the_previous_logical_request() {
-        let history = HashMap::from([(
-            "resp-1".to_owned(),
-            serde_json::json!({
+    fn warmup_is_retained_for_incremental_generation() {
+        let mut history = WebsocketHistory::default();
+        let warmup = history
+            .resolve(serde_json::json!({
+                "type": "response.create",
                 "model": "local-model",
                 "input": [{"role": "user", "content": "hello"}],
-                "stream": true,
-            }),
-        )]);
-        let request = serde_json::json!({
+                "generate": false,
+            }))
+            .unwrap();
+        assert!(!warmup.generate);
+        history.record("warm-1".to_owned(), warmup.input, Vec::new());
+        let logical = history
+            .resolve(serde_json::json!({
+                "type": "response.create",
+                "model": "local-model",
+                "input": [],
+                "previous_response_id": "warm-1",
+            }))
+            .unwrap();
+        assert!(logical.generate);
+        assert!(logical.request.get("previous_response_id").is_none());
+        assert_eq!(logical.input.len(), 1);
+        assert_eq!(logical.request["input"].as_array().unwrap().len(), 1);
+        assert_eq!(logical.request["stream"], Value::Bool(true));
+    }
+
+    fn continuation(previous: &str) -> Value {
+        serde_json::json!({
             "type": "response.create",
             "model": "local-model",
-            "input": [
-                {"type": "message", "role": "assistant", "content": []},
-                {"type": "function_call_output", "call_id": "call-1", "output": "ok"}
-            ],
-            "previous_response_id": "resp-1",
-        });
-        let (logical, _) = websocket_logical_request(request, &history).unwrap();
-        assert_eq!(logical["input"].as_array().unwrap().len(), 3);
+            "input": [{"role": "user", "content": "next"}],
+            "previous_response_id": previous,
+        })
+    }
+
+    #[test]
+    fn only_the_most_recent_response_is_a_predecessor() {
+        let mut history = WebsocketHistory::default();
+        let hello = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        history.record("resp-1".to_owned(), hello.clone(), Vec::new());
+        history.record("resp-2".to_owned(), hello, Vec::new());
+        let Err(error) = history.resolve(continuation("resp-1")) else {
+            panic!("a superseded response is not retained");
+        };
+        assert_eq!(error.body.code, "previous_response_not_found");
+        let logical = history.resolve(continuation("resp-2")).unwrap();
+        assert_eq!(logical.previous.as_deref(), Some("resp-2"));
+        assert_eq!(logical.input.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_continuation_evicts_its_predecessor() {
+        let mut history = WebsocketHistory::default();
+        let hello = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        history.record("resp-1".to_owned(), hello, Vec::new());
+        history.evict(None);
+        history.evict(Some("resp-0"));
+        assert!(history.resolve(continuation("resp-1")).is_ok());
+        history.evict(Some("resp-1"));
+        let Err(error) = history.resolve(continuation("resp-1")) else {
+            panic!("a failed continuation's predecessor is evicted");
+        };
+        assert_eq!(error.body.code, "previous_response_not_found");
+    }
+
+    #[test]
+    fn text_input_is_one_user_message_in_history() {
+        let logical = WebsocketHistory::default()
+            .resolve(serde_json::json!({
+                "type": "response.create",
+                "model": "local-model",
+                "input": "hello",
+            }))
+            .unwrap();
+        assert_eq!(
+            logical.input,
+            vec![serde_json::json!({"role": "user", "content": "hello"})]
+        );
+    }
+
+    /// A client continuing after a tool call sends only the tool result: the
+    /// call itself was the predecessor's output, which history must carry.
+    #[test]
+    fn tool_result_follows_the_predecessors_emitted_call() {
+        let mut history = WebsocketHistory::default();
+        let first = history
+            .resolve(serde_json::json!({
+                "type": "response.create",
+                "model": "local-model",
+                "tools": [tool()],
+                "input": [{"role": "user", "content": "list files"}],
+            }))
+            .unwrap();
+        let output = [
+            serde_json::to_value(reasoning_item(
+                "rs_1".into(),
+                "completed",
+                Some("run ls".into()),
+            )),
+            serde_json::to_value(function_call_item(
+                "fc_call-1".into(),
+                "completed",
+                "call-1".into(),
+                "shell".into(),
+                r#"{"command":"ls"}"#.into(),
+            )),
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        history.record("resp-1".to_owned(), first.input, output);
+
+        let follow_up = history
+            .resolve(serde_json::json!({
+                "type": "response.create",
+                "model": "local-model",
+                "tools": [tool()],
+                "input": [{"type": "function_call_output", "call_id": "call-1", "output": "a.txt"}],
+                "previous_response_id": "resp-1",
+            }))
+            .unwrap();
+        let types = follow_up
+            .input
+            .iter()
+            .map(|item| item.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            [
+                None,
+                Some("reasoning"),
+                Some("function_call"),
+                Some("function_call_output")
+            ]
+        );
+        let request = serde_json::from_value::<ResponseCreateRequest>(follow_up.request).unwrap();
+        let adapted = adapt(request).unwrap_or_else(|error| panic!("{}", error.body.message));
+        let entries = adapted.request.input.conversation.entries();
+        assert_eq!(entries.len(), 2);
+        let Entry::Assistant(turn) = &entries[1] else {
+            panic!("the tool exchange is an assistant turn");
+        };
+        assert_eq!(turn.reasoning.as_deref(), Some("run ls"));
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].call.id, "call-1");
     }
 }
