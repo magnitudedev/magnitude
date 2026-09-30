@@ -1,9 +1,9 @@
 ---
 title: Introduction
-description: "Run the best open models for your machine"
+description: "Run open models as fast as your hardware allows"
 ---
 
-Magnitude is the open source inference engine for the hardware you already own. It profiles your machine, recommends the best open models for it, and tunes them for your exact hardware. One click connects your favorite agent (Pi, OpenCode, Hermes, etc.). Works on Apple Silicon, NVIDIA, AMD, or nothing but a CPU.
+Magnitude is an open source inference engine for agents that optimizes itself for your exact hardware. It compiles and tunes its kernels on your device, so open models run up to 2x faster than llama.cpp. One click connects the agent you already use (Pi, OpenCode, Hermes, Codex, and more). Works on Apple Silicon, NVIDIA, AMD, or nothing but a CPU.
 
 <video
   controls
@@ -19,11 +19,10 @@ Magnitude is the open source inference engine for the hardware you already own. 
 
 ## Why Magnitude?
 
-- **Knows your machine:** profiles your hardware and estimates tok/s before you download
-- **Recommends the best models:** ranked by speed, accuracy, intelligence, and memory
-- **Tuned end to end:** speculative decoding and more, all set for your hardware
-- **Works with your agent:** one click to connect Pi, OpenCode, Hermes, and more
-- **Free to run:** no token costs, API keys, or rate limits
-- **Fully private and offline:** models, prompts, and files stay on your machine
-- **Models on demand:** loaded on request, unloaded when idle or memory fills
-- **Open source:** Apache 2.0, yours to modify
+- **Up to 2x faster than llama.cpp:** 92% faster decode on Metal, 19% on CUDA
+- **Tuned on your device:** kernels are tuned on your hardware before a model runs
+- **Built for the best models:** hand-optimized kernels for popular open-weight families
+- **Memory that flexes:** 27% less memory per agent, freed when agents stop
+- **Fast concurrent sessions:** sessions share prefix caches to prevent slowdown
+- **Works with your agent:** one click to connect Pi, OpenCode, Hermes, Codex, and more
+- **Free, private, open source:** no token costs, nothing leaves your machine, Apache 2.0

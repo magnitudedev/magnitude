@@ -5,35 +5,31 @@ description: "Common questions about running Magnitude."
 
 ## What is Magnitude?
 
-An open source inference engine optimized for consumer hardware. The desktop app profiles your machine, recommends the best models for it, then downloads, tunes, and runs them. One click connects the agent you already use.
+An open source inference engine that optimizes itself for your hardware. It ships as a desktop app that runs open models and connects them to the agent you already use.
 
-## How does it know what my machine can run?
+## How is it faster than llama.cpp, Ollama, or LM Studio?
 
-Magnitude profiles your hardware and estimates tok/s for every model in the catalog before you download anything. It ranks them by speed, accuracy, intelligence, and memory so you can pick.
-
-## How is this different from Ollama or LM Studio?
-
-They run whatever model you pick. Magnitude helps you pick. It estimates how every model and quant will perform on your machine before you download, then tunes the one you choose for your exact hardware, from context size to speculative decoding.
+They ship kernels precompiled for broad classes of hardware. Magnitude compiles and tunes its kernels on your actual device before a model runs, so they fit your exact chip. [See the benchmarks against llama.cpp.](https://magnitude.dev/#benchmark)
 
 ## What hardware do I need?
 
-There's no fixed minimum. Magnitude profiles your machine and recommends what runs well on it. More memory lets you run larger models.
+Any Apple Silicon, NVIDIA, or AMD GPU, or nothing but a CPU. There is no fixed minimum. Smaller machines run smaller models, and more memory lets you run larger ones.
 
-## What systems does Magnitude support?
+## What operating systems does it support?
 
-The desktop app is native on macOS, Linux, and Windows. It runs on Apple Silicon, NVIDIA and AMD GPUs, and CPU-only machines, including unified-memory boxes like DGX Spark and Strix Halo.
+macOS, Linux, and Windows.
 
-## Which harnesses work with it?
+## Which models does it support?
 
-Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. Pick a model and connect your harness in one click.
+See the full list at [magnitude.dev/models](https://magnitude.dev/models). We write optimized kernels for the most popular open-weight families, which is how we beat generalist engines.
 
-## Do I need to manage it after setup?
+## Which agents work with it?
 
-No. It runs in the background, loads models when your agent needs them, and unloads them when idle or memory gets tight.
+One click connects Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, and Cline. Anything else works through the OpenAI-compatible API.
 
 ## Is it private?
 
-Yes. Prompts, files, and models stay on your machine. Once a model is downloaded, no internet connection is needed.
+Yes. Prompts, files, and models stay on your machine. No internet needed once a model is downloaded.
 
 ## Can I use Magnitude from another computer, a container, or WSL?
 
