@@ -73,20 +73,16 @@ impl<F: ProgramFamily> ExecutionOwner<F> {
         })
     }
 
-    /// A fresh reading of every domain the device uses, then the heap's
-    /// standing as that reading left it. Fails only when an observation
-    /// fails.
+    /// A fresh reading of every domain the device uses, then Seismic's
+    /// charge classified by every holder the owner keeps. Fails when an
+    /// observation fails or the charge does not reconcile.
     fn observe(owner: &Owner<F>) -> Result<WorkerReply, String> {
-        owner.inspect_domain(|domain: &ExecutorDomain<F>| {
-            let readings = domain.refresh_memory().map_err(|error| error.to_string())?;
-            let heap = domain.memory();
-            Ok(WorkerReply::Observed {
-                readings,
-                standing: heap
-                    .standing()
-                    .map_err(|error| format!("memory standing is unavailable: {error:?}"))?,
-                holdings: heap.holdings().collect(),
-            })
+        let readings = owner.inspect_domain(|domain: &ExecutorDomain<F>| {
+            domain.refresh_memory().map_err(|error| error.to_string())
+        })?;
+        Ok(WorkerReply::Observed {
+            readings,
+            reconciliation: owner.reconcile_memory_charge()?,
         })
     }
 }

@@ -7,9 +7,8 @@
 
 use crate::publication::PublicationReceiver;
 use crate::owner::{AdmissionError, Status};
-use magnitude_executor::memory::{Holding, MemoryStanding};
 use magnitude_executor::platform::DomainReading;
-use magnitude_executor::RequestId;
+use magnitude_executor::{MemoryChargeReconciliation, RequestId};
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::GenerationSeed;
 
@@ -51,8 +50,8 @@ pub enum WorkerReply {
     /// `None` when the request is not live.
     Status(Option<RequestSnapshot>),
     Observed {
-        standing: MemoryStanding,
-        holdings: Vec<Holding>,
+        /// Seismic's charge classified by every holder the owner keeps.
+        reconciliation: MemoryChargeReconciliation,
         /// A fresh reading of every memory domain the device uses.
         readings: Vec<DomainReading>,
     },

@@ -126,7 +126,6 @@ pub(crate) struct Loaded {
     pub execution: Worker,
     pub binding: GenerationBinding,
     pub definition: ModelDefinition,
-    pub compute_bytes: u64,
     /// Bytes of the model's host-resident tables held in host RAM.
     pub host_table_bytes: u64,
     pub domain: MemoryDomain,
@@ -435,13 +434,10 @@ impl Session {
             self.observations.swap_remove(index);
             match reply {
                 Ok(WorkerReply::Observed {
-                    standing,
-                    holdings,
+                    reconciliation,
                     readings,
                 }) => match AllocationCensus::classify(
-                    &standing,
-                    holdings,
-                    self.loaded.compute_bytes,
+                    &reconciliation,
                     self.loaded.host_table_bytes,
                     self.loaded.domain,
                 ) {

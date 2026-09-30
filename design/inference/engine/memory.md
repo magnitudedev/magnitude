@@ -92,6 +92,12 @@ Every charged byte belongs to exactly one release class:
 | In flight | Storage held by submitted work until completion |
 | Model | Target weights, sealed resources and the pristine recurrent seed |
 
+The engine's allocation census reports the charge from its reconciliation against every holder
+(requests, cached prefixes and submitted work), each byte once: context is surplus, retained, live
+and in-flight state and request media; compute is the committed graph pools and prepared programs,
+plus any charge not attributed to a holder; auxiliary is optional component weights; model is
+target weights, bound constants and the pristine recurrent seed.
+
 ## Bands
 
 The heap observes every domain it uses on every claim and every 100 ms while loaded. Headroom is

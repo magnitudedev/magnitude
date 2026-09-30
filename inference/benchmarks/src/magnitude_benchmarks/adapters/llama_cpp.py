@@ -1,3 +1,4 @@
+import re
 import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -8,8 +9,30 @@ from ..session_bench.models import file_hash
 from .base import Adapter, command
 
 
+# llama.cpp logs each per-sequence memory buffer as it allocates it (at
+# verbosity 4): the attention KV cache and, for hybrid models, the recurrent
+# state. Their sizes are what one slot of the configured context holds.
+STATE_BUFFER = re.compile(r"\b(KV|RS) buffer size = +([0-9.]+) MiB")
+
+
 class LlamaCpp(Adapter):
     extensions = {"cache_prompt": False}
+
+    async def memory_observation(self, engine):
+        kv = recurrent = 0.0
+        for kind, mib in STATE_BUFFER.findall(engine.log.read_text(errors="replace")):
+            if kind == "KV":
+                kv += float(mib)
+            else:
+                recurrent += float(mib)
+        if kv == 0 and recurrent == 0:
+            return None
+        return {
+            "state": {
+                "kv_bytes": round(kv * 1024 * 1024),
+                "recurrent_bytes": round(recurrent * 1024 * 1024),
+            }
+        }
 
     async def prepare(self):
         executable = (
@@ -87,6 +110,8 @@ class LlamaCpp(Adapter):
             "0",
             "--offline",
             "--no-context-shift",
+            "--log-verbosity",
+            "4",
         ]
 
     def ready_path(self):

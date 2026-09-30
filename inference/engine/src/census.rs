@@ -3,7 +3,7 @@
 //! the service publishes. Because memory is elastic these are the standing at
 //! the observation, not a fixed reservation.
 
-use magnitude_executor::memory::{Holding, HoldingClass, MemoryStanding};
+use magnitude_executor::MemoryChargeReconciliation;
 use seismic::{DeviceSelector, MemoryPoolKind};
 use serde::{Deserialize, Serialize};
 
@@ -19,11 +19,15 @@ pub enum MemoryDomain {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainAllocation {
     pub domain: MemoryDomain,
-    /// Model class: target weights, sealed resources and the state seed.
+    /// Model class: target weights, bound constants, the pristine recurrent
+    /// seed and host-resident tables.
     pub model_bytes: u64,
-    /// Live, retained, surplus and in-flight state.
+    /// Per-conversation state: attention history and recurrent banks that
+    /// are live, retained for reuse, in flight or committed headroom, and
+    /// request media.
     pub context_bytes: u64,
-    /// Prepared program workspace and graph pools.
+    /// Prepared programs and graph pools, as committed, and any charge the
+    /// reconciliation has not attributed to a holder.
     pub compute_bytes: u64,
     /// Optional components (MTP head, vision), resident or dormant.
     pub auxiliary_bytes: u64,
@@ -55,39 +59,52 @@ impl MemoryDomain {
 
 impl AllocationCensus {
     /// Classify the device allocation domain's current Seismic charge from
-    /// the heap's standing and holdings. Compute bytes are the plan's graph
-    /// pools, which are fixed at startup; the model class is the remainder
-    /// of the charge, so every charged byte is reported exactly once. The
-    /// model's host-resident tables are model bytes of host RAM.
+    /// its reconciliation against every holder, so every charged byte is
+    /// reported exactly once. Storage the reconciliation has not attributed
+    /// to a holder is reported with the compute class. The model's
+    /// host-resident tables are model bytes of host RAM.
     pub(crate) fn classify(
-        standing: &MemoryStanding,
-        holdings: impl IntoIterator<Item = Holding>,
-        compute_bytes: u64,
+        charge: &MemoryChargeReconciliation,
         host_table_bytes: u64,
         domain: MemoryDomain,
     ) -> Result<Self, String> {
-        let mut context_bytes = 0u64;
-        let mut auxiliary_bytes = 0u64;
-        for holding in holdings {
-            let total = match holding.class {
-                HoldingClass::Live
-                | HoldingClass::Retained
-                | HoldingClass::Surplus
-                | HoldingClass::InFlight => &mut context_bytes,
-                HoldingClass::Dormant => &mut auxiliary_bytes,
-                HoldingClass::Model => continue,
-            };
-            *total = total
-                .checked_add(holding.bytes)
-                .ok_or("census byte count overflow")?;
-        }
-        let model_bytes = standing
-            .observation
-            .charged_bytes
-            .checked_sub(context_bytes)
-            .and_then(|bytes| bytes.checked_sub(auxiliary_bytes))
-            .and_then(|bytes| bytes.checked_sub(compute_bytes))
-            .ok_or("classified memory exceeds the domain's charge")?;
+        let overflow = || "census byte count overflow".to_owned();
+        let state = |census: magnitude_state::StateHoldingCensus| {
+            [census.live, census.retained, census.surplus, census.in_flight]
+                .into_iter()
+                .try_fold(0u64, u64::checked_add)
+        };
+        let head_state = match charge.head_state {
+            Some(census) => state(census).ok_or_else(overflow)?,
+            None => 0,
+        };
+        let context_bytes = [
+            state(charge.target_state).ok_or_else(overflow)?,
+            head_state,
+            charge.owned_media,
+            charge.external_pins,
+        ]
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(overflow)?;
+        let compute_bytes = [
+            charge.graph_pools,
+            charge.prepared_programs,
+            charge.unattributed,
+        ]
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(overflow)?;
+        let auxiliary_bytes = charge.optional_weights;
+        let model_bytes = [
+            charge.target_weights,
+            charge.bound_constants,
+            charge.target_state.model_seed,
+            charge.head_state.map_or(0, |census| census.model_seed),
+        ]
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(overflow)?;
         let allocation = DomainAllocation {
             domain,
             model_bytes,

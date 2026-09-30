@@ -11,9 +11,9 @@ import { activeLocalModel, formatMemorySize, useLocalModels } from "@magnitudede
 export function MemoryFigures({ allocation }: { readonly allocation: Option.Option<ModelInstanceAllocation> | null }) {
   const domains = allocation === null ? [] : Option.match(allocation, { onNone: () => [], onSome: value => value.memoryDomains })
   const segments = [
-    { label: "Model weights", bytes: domains.reduce((sum, domain) => sum + domain.modelBytes, 0), color: "bg-blue-600 dark:bg-blue-400" },
+    { label: "Model weights", bytes: domains.reduce((sum, domain) => sum + domain.modelBytes + domain.auxiliaryBytes, 0), color: "bg-blue-600 dark:bg-blue-400" },
     { label: "KV cache", bytes: domains.reduce((sum, domain) => sum + domain.contextBytes, 0), color: "bg-blue-300 dark:bg-blue-700" },
-    { label: "Overhead", bytes: domains.reduce((sum, domain) => sum + domain.computeBytes + domain.auxiliaryBytes, 0), color: "bg-slate-600 dark:bg-slate-300" },
+    { label: "Overhead", bytes: domains.reduce((sum, domain) => sum + domain.computeBytes, 0), color: "bg-slate-600 dark:bg-slate-300" },
   ]
   const total = segments.reduce((sum, segment) => sum + segment.bytes, 0)
   return <>
