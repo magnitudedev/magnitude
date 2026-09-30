@@ -21,6 +21,7 @@ use magnitude_chat::request::{
     AssistantTurn, Conversation, Entry, GenerationControls, OutputFormat, PromptCache,
     SamplingControls, ToolCall, ToolDefinition, ToolExchange, ToolResultPart, Tools, UserPart,
 };
+use magnitude_chat::schema::JsonSchema;
 use magnitude_chat::{ChatInput, EndOfGeneration, GenerationRequest, ReasoningIntent, ToolChoice};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -1050,7 +1051,7 @@ pub fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseRequest, A
             ResponseTool::Function(function) => definitions.push(ToolDefinition {
                 name: function.name,
                 description: function.description,
-                parameters: function.parameters,
+                parameters: JsonSchema::new(function.parameters).map_err(invalid)?,
             }),
             // Opaque declarations are projection-only. The one guard: a
             // function-typed declaration that failed strict parsing must stay
@@ -1087,14 +1088,10 @@ pub fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseRequest, A
     let output = match request.text.map(|value| value.format) {
         None | Some(ResponseTextFormat::Text) => OutputFormat::Text,
         Some(ResponseTextFormat::JsonObject) => OutputFormat::JsonObject,
-        Some(ResponseTextFormat::JsonSchema {
+        // Output is constrained best effort whether or not it is strict.
+        Some(ResponseTextFormat::JsonSchema { name, schema, .. }) => OutputFormat::JsonSchema {
             name,
-            schema,
-            strict,
-        }) => OutputFormat::JsonSchema {
-            name,
-            schema,
-            strict,
+            schema: JsonSchema::new(schema).map_err(invalid)?,
         },
     };
     let max_output_tokens = request

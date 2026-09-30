@@ -76,6 +76,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
                 foreach_parameter(function, [&](const common_chat_schema_property & prop, const common_chat_schema_document_ptr & doc) {
                     auto value_parser = p.eps();
                     if (prop.schema->may_be_string()) {
+                        templates_raw_string_argument(name, *prop.schema);
                         value_parser = string_value;
                     } else {
                         value_parser = p.tool_arg_json_value(

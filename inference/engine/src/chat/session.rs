@@ -10,15 +10,18 @@ use crate::worker::{
     EngineClient, RequestEvent, RequestOptions,
 };
 use magnitude_chat::{
+    conformance::OutputSchemas,
     generation::{generation_options, ModelLimits},
     output::{
         Completion, GenerationTimings, OutputEvent, Progress, Termination, TimingSnapshot,
         TokenUsage,
     },
     request::PromptCache,
-    ChatError, Event, FinishReason, GenerationRequest, SpecialTokens, TokenChatStream,
+    ChatError, Event, FinishReason, GenerationRequest, SpecialTokens, TerminalCause,
+    TokenChatStream,
 };
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -184,7 +187,7 @@ async fn run(
         generated: 0,
         parser: Duration::ZERO,
     };
-    let mut semantics = Semantics::default();
+    let mut semantics = Semantics::new(OutputSchemas::new(&request.input, &chat));
     let mut prefill_reported = None;
     loop {
         let event = if clock.first_output.is_none() {
@@ -244,8 +247,8 @@ async fn run(
                     let parsing = Instant::now();
                     let parsed = parser.feed(token);
                     clock.parser += parsing.elapsed();
-                    match parsed {
-                        Ok(parsed) => produced.extend(semantics.translate(parsed)),
+                    match parsed.and_then(|parsed| semantics.translate(parsed)) {
+                        Ok(parsed) => produced.extend(parsed),
                         Err(error) => {
                             return fail_internal(events, error).await;
                         }
@@ -347,8 +350,8 @@ async fn finish(
         let parsing = Instant::now();
         let parsed = parser.finish(finish);
         clock.parser += parsing.elapsed();
-        match parsed {
-            Ok(parsed) => produced.extend(semantics.translate(parsed)),
+        match parsed.and_then(|parsed| semantics.translate(parsed)) {
+            Ok(parsed) => produced.extend(parsed),
             Err(error) => return fail_internal(events, error).await,
         }
     }
@@ -434,44 +437,89 @@ impl Clock {
     }
 }
 
-/// Maps native parser events onto the semantic output stream.
-#[derive(Default)]
+/// Maps native parser events onto the semantic output stream, and checks each
+/// completed value against its schema. Values are published as generated;
+/// violations are reported.
 struct Semantics {
     tool_calls: usize,
     reasoning: String,
+    schemas: OutputSchemas,
+    /// Open tool calls: name and arguments so far.
+    calls: BTreeMap<u32, (String, String)>,
+    /// Content, when it is JSON output with a schema.
+    content: String,
 }
 
 impl Semantics {
-    fn translate(&mut self, events: Vec<Event>) -> Vec<OutputEvent> {
-        events
-            .into_iter()
-            .filter_map(|event| match event {
-                Event::Content { text } if !text.is_empty() => Some(OutputEvent::TextDelta(text)),
+    fn new(schemas: OutputSchemas) -> Self {
+        Self {
+            tool_calls: 0,
+            reasoning: String::new(),
+            schemas,
+            calls: BTreeMap::new(),
+            content: String::new(),
+        }
+    }
+
+    fn translate(&mut self, events: Vec<Event>) -> Result<Vec<OutputEvent>, String> {
+        let mut output = Vec::new();
+        for event in events {
+            match event {
+                Event::Content { text } if !text.is_empty() => {
+                    if self.schemas.constrains_output() {
+                        self.content.push_str(&text);
+                    }
+                    output.push(OutputEvent::TextDelta(text));
+                }
                 Event::Reasoning { text } if !text.is_empty() => {
                     self.reasoning.push_str(&text);
-                    Some(OutputEvent::ReasoningDelta(text))
+                    output.push(OutputEvent::ReasoningDelta(text));
                 }
-                Event::Content { .. } | Event::Reasoning { .. } => None,
+                Event::Content { .. } | Event::Reasoning { .. } => {}
                 Event::ToolStart { index, name, id } => {
                     self.tool_calls += 1;
-                    Some(OutputEvent::ToolCallStarted {
+                    self.calls.insert(index, (name.clone(), String::new()));
+                    output.push(OutputEvent::ToolCallStarted {
                         index: index as usize,
                         id,
                         name,
-                    })
+                    });
                 }
                 Event::ToolArguments { index, text } if !text.is_empty() => {
-                    Some(OutputEvent::ToolInputDelta {
+                    let (_, arguments) = self
+                        .calls
+                        .get_mut(&index)
+                        .ok_or("tool arguments precede their call")?;
+                    arguments.push_str(&text);
+                    output.push(OutputEvent::ToolInputDelta {
                         index: index as usize,
                         fragment: text,
-                    })
+                    });
                 }
-                Event::ToolArguments { .. } => None,
-                Event::ToolComplete { index } => Some(OutputEvent::ToolCallFinished {
-                    index: index as usize,
-                }),
-                Event::Finish { .. } => None,
-            })
-            .collect()
+                Event::ToolArguments { .. } => {}
+                Event::ToolComplete { index } => {
+                    let (name, arguments) = self
+                        .calls
+                        .remove(&index)
+                        .ok_or("a tool call completed before it started")?;
+                    crate::telemetry::span_nonconforming_output(
+                        &format!("tool {name}"),
+                        &self.schemas.tool_call(&name, &arguments),
+                    );
+                    output.push(OutputEvent::ToolCallFinished {
+                        index: index as usize,
+                    });
+                }
+                Event::Finish { cause } => {
+                    // Output that stopped early is incomplete, not nonconforming.
+                    if cause == TerminalCause::Natural {
+                        if let Some(conformance) = self.schemas.output(&self.content) {
+                            crate::telemetry::span_nonconforming_output("output", &conformance);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(output)
     }
 }

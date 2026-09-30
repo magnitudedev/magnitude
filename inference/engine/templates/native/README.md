@@ -15,6 +15,10 @@ The series has no patch 0009: it once defaulted `additionalProperties` to allowe
 list `properties`, and was withdrawn to keep the upstream converter semantics the previous service
 enforced (an object listing properties is closed unless the schema explicitly allows more).
 
+Patch 0019 makes schema lowering total: every valid JSON Schema lowers, and keywords a grammar
+cannot enforce are loosened and recorded instead of rejected. It supersedes the rejections patches
+0008 and 0010 introduced. It also restricts string grammars to valid JSON string text.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

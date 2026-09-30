@@ -7,7 +7,6 @@ use std::{
 const SOURCES: &[&str] = &[
     "native/src/abi.cpp",
     "native/src/output-stream.cpp",
-    "native/src/schema-validation.cpp",
     "native/src/templates-support.cpp",
     "native/source/common/chat-auto-parser-generator.cpp",
     "native/source/common/chat-auto-parser-helpers.cpp",

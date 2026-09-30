@@ -1,7 +1,10 @@
 //! Each in-scope family's own chat template (the catalog GGUF's
 //! `tokenizer.chat_template`) renders a tool request, and its parser recovers
 //! reasoning and tool calls from output written in the model's format.
-use magnitude_templates::{Event, Request, SpecialTokens, Template, TerminalCause};
+use magnitude_templates::{
+    Event, Relaxation, RelaxationReason, RelaxationSubject, Request, SpecialTokens, Template,
+    TerminalCause,
+};
 use serde_json::{json, Value};
 
 const GEMMA4: &str = include_str!("assets/gemma-4-12B-it.jinja");
@@ -222,15 +225,48 @@ fn gemma4_arguments_follow_the_function_schema() {
             "{output} parsed as {parsed:?}"
         );
     }
-    // Constraints the dictionary grammar cannot enforce are rejected.
-    for parameters in [
-        json!({"type":"object","properties":{"city":{"type":"string","pattern":"^[A-Z]"}}}),
-        json!({"type":"object","properties":{"days":{"type":"integer","minimum":1}}}),
-        json!({"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":true}),
+    assert!(prepared.description().relaxations.is_empty());
+    // Constraints the dictionary syntax cannot carry are loosened and recorded.
+    for (parameters, path, keyword, reason) in [
+        (
+            json!({"type":"object","properties":{"city":{"type":"string","pattern":"^[A-Z]"}}}),
+            "#/properties/city",
+            "pattern",
+            RelaxationReason::Unenforced,
+        ),
+        (
+            json!({"type":"object","properties":{"days":{"type":"integer","minimum":1}}}),
+            "#/properties/days",
+            "minimum",
+            RelaxationReason::Unenforced,
+        ),
+        (
+            json!({"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":true}),
+            "#",
+            "additionalProperties",
+            RelaxationReason::Unenforced,
+        ),
+        (
+            json!({"type":"object","properties":{"a":{"enum":["x", "x<|\"|>y"]}}}),
+            "#/properties/a",
+            "enum",
+            RelaxationReason::Unrepresentable,
+        ),
     ] {
         request.tools =
             vec![json!({"type":"function","function":{"name":"f","parameters":parameters}})];
-        assert!(template.prepare(&request).is_err(), "{parameters}");
+        let prepared = template.prepare(&request).unwrap();
+        assert!(!prepared.description().grammar.is_empty());
+        assert_eq!(
+            prepared.description().relaxations,
+            vec![Relaxation {
+                subject: RelaxationSubject::Tool { name: "f".into() },
+                path: path.into(),
+                keyword: keyword.into(),
+                reason,
+            }],
+            "{parameters}"
+        );
     }
 }
 

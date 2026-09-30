@@ -2,7 +2,7 @@
 //! Messages all adapt into these values; rendering them is the one path by
 //! which a conversation becomes template input, so counting, template
 //! application and generation see identical prompts.
-use super::{ChatError, ChatRequest, ReasoningIntent, ToolChoice};
+use super::{schema::JsonSchema, ChatError, ChatRequest, ReasoningIntent, ToolChoice};
 use serde_json::{json, Map, Value};
 use std::{collections::BTreeSet, num::NonZeroU32, sync::Arc};
 
@@ -88,7 +88,7 @@ impl Conversation {
 pub struct ToolDefinition {
     pub name: String,
     pub description: Option<String>,
-    pub parameters: Map<String, Value>,
+    pub parameters: JsonSchema,
 }
 
 /// Offered tools and how the model may use them. Names are unique and every
@@ -176,10 +176,11 @@ impl Tools {
 pub enum OutputFormat {
     Text,
     JsonObject,
+    /// Output constrained by a schema, best effort: exactly where the grammar
+    /// can express the schema, loosened and reported where it cannot.
     JsonSchema {
         name: String,
-        schema: Map<String, Value>,
-        strict: bool,
+        schema: JsonSchema,
     },
     /// A caller-supplied GBNF grammar.
     Grammar(String),
@@ -276,7 +277,8 @@ impl ChatInput {
             .definitions()
             .iter()
             .map(|tool| {
-                let mut function = json!({"name": tool.name, "parameters": tool.parameters});
+                let mut function =
+                    json!({"name": tool.name, "parameters": tool.parameters.source()});
                 if let Some(description) = &tool.description {
                     function["description"] = json!(description);
                 }
@@ -293,7 +295,7 @@ impl ChatInput {
             // schema as no output format, so the object shape is explicit.
             OutputFormat::JsonObject => request.json_schema = Some(json!({"type": "object"})),
             OutputFormat::JsonSchema { schema, .. } => {
-                request.json_schema = Some(Value::Object(schema.clone()))
+                request.json_schema = Some(Value::Object(schema.source().clone()))
             }
             OutputFormat::Grammar(grammar) => request.grammar = Some(grammar.clone()),
         }

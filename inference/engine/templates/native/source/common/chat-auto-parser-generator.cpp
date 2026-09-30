@@ -381,7 +381,9 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         std::vector<common_peg_parser> required_parsers;
         std::vector<common_peg_parser> optional_parsers;
         foreach_parameter(func, [&](const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
-            templates_require_unconstrained_raw_string(*param.schema);
+            if (param.schema->may_be_string()) {
+                templates_raw_string_argument(name, *param.schema);
+            }
             auto arg =
                 p.tool_arg(p.tool_arg_open(arguments.name_prefix + p.tool_arg_name(p.literal(param.name)) +
                                            arguments.name_suffix) +

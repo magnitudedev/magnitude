@@ -17,6 +17,7 @@ use magnitude_chat::request::{
     AssistantTurn, Conversation, Entry, GenerationControls, OutputFormat, PromptCache,
     SamplingControls, ToolCall, ToolDefinition, ToolExchange, ToolResultPart, Tools, UserPart,
 };
+use magnitude_chat::schema::JsonSchema;
 use magnitude_chat::{
     ChatInput, EndOfGeneration, GenerationRequest, ReasoningIntent, ToolChoice,
     reasoning::normalize_effort,
@@ -1315,7 +1316,8 @@ fn tools(requests: Vec<ChatToolRequest>) -> Result<(Vec<ToolDefinition>, BTreeSe
             Ok(ToolDefinition {
                 name: function.name,
                 description: function.description,
-                parameters,
+                parameters: JsonSchema::new(parameters)
+                    .map_err(|error| ApiError::invalid(error.to_string()))?,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1459,10 +1461,11 @@ fn response_format(request: Option<ResponseFormatRequest>) -> Result<OutputForma
                     "response_format JSON Schema must be a JSON object",
                 ));
             };
+            // Output is constrained best effort whether or not it is strict.
             Ok(OutputFormat::JsonSchema {
                 name: json_schema.name,
-                schema,
-                strict: json_schema.strict,
+                schema: JsonSchema::new(schema)
+                    .map_err(|error| ApiError::invalid(error.to_string()))?,
             })
         }
     }

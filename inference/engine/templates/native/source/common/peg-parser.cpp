@@ -1761,8 +1761,10 @@ void common_peg_arena::build_grammar(const common_grammar_builder & builder, boo
                 }
                 return result + "{" + std::to_string(p.min_count) + "," + std::to_string(p.max_count) + "}";
             } else if constexpr (std::is_same_v<T, common_peg_string_parser>) {
+                // Raw control characters and lone surrogates are not string text.
                 const std::string delim(1, p.delimiter);
-                return R"(( [^)" + delim + R"(\\] | "\\" ( [)" + delim + R"(\\/ bfnrt] | "u" [0-9a-fA-F]{4} ) )*)";
+                return R"(( [^)" + delim + R"(\\\x00-\x1F] | "\\" ( [)" + delim + R"(\\/bfnrt] | )" +
+                       GBNF_JSON_UNICODE_ESCAPE + R"( ) )*)";
             } else if constexpr (std::is_same_v<T, common_peg_until_parser>) {
                 if (p.delimiters.empty()) {
                     return ".*";

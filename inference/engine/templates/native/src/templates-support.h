@@ -1,5 +1,7 @@
 #pragma once
 
+#include "json-schema.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <ctime>
@@ -60,9 +62,24 @@ inline bool string_ends_with(std::string_view s, std::string_view suffix) {
     return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
 }
 
-struct common_chat_schema;
-void templates_require_unconstrained_raw_string(const common_chat_schema & schema);
+namespace templates_native {
+// A schema keyword a tool's argument syntax cannot enforce, recorded by the
+// family that builds the grammar. Drained by the ABI at operation boundaries.
+struct tool_relaxation {
+    std::string                   tool;
+    common_chat_schema_relaxation relaxation;
+};
+extern thread_local std::vector<tool_relaxation> relaxations;
+void relax(const std::string & tool, const common_chat_schema & node, const std::string & keyword,
+           common_chat_schema_relaxation::reason_kind reason);
+}
+
+// Raw argument text is any string without the closing delimiter. Records the
+// string constraints of the schema that raw text leaves unenforced.
+void templates_raw_string_argument(const std::string & tool, const common_chat_schema & schema);
 // The strings a tagged raw argument value may be: nullopt when any text is
 // allowed, otherwise exactly these values (none when the schema admits no
-// string). Throws for string constraints raw text cannot enforce.
-std::optional<std::vector<std::string>> templates_raw_string_values(const common_chat_schema & schema);
+// string). Values containing `delimiter` cannot be written and are left out.
+// Records every constraint raw text leaves unenforced.
+std::optional<std::vector<std::string>> templates_raw_string_values(const std::string & tool, const common_chat_schema & schema,
+                                                                    const std::string & delimiter);

@@ -15,6 +15,7 @@ use magnitude_chat::request::{
     AssistantTurn, Conversation, Entry, GenerationControls, OutputFormat, PromptCache, ToolCall,
     ToolDefinition, ToolExchange, ToolResultPart, Tools, UserPart,
 };
+use magnitude_chat::schema::JsonSchema;
 use magnitude_chat::{ChatInput, EndOfGeneration, GenerationRequest, ReasoningIntent, ToolChoice};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -251,12 +252,14 @@ pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
     let definitions = request
         .tools
         .into_iter()
-        .map(|tool| ToolDefinition {
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.input_schema,
+        .map(|tool| {
+            Ok(ToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                parameters: JsonSchema::new(tool.input_schema).map_err(invalid)?,
+            })
         })
-        .collect();
+        .collect::<Result<_, ApiError>>()?;
     let (choice, parallel) = match request.tool_choice {
         None => (ToolChoice::Auto, true),
         Some(AnthropicToolChoice::Auto {

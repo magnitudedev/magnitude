@@ -4,12 +4,13 @@
 #include "json-schema-to-grammar.h"
 #include "templates-log.h"
 #include "output-stream.h"
-#include "schema-validation.h"
 
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 
 namespace {
@@ -22,10 +23,21 @@ struct template_state {
     common_chat_templates_ptr compiled;
     json special_tokens;
 };
+// A schema keyword the prepared constraint does not enforce, for a tool's
+// arguments (named) or for the JSON output (unnamed).
+struct subject_relaxation {
+    std::optional<std::string>    tool;
+    common_chat_schema_relaxation relaxation;
+
+    bool operator<(const subject_relaxation & other) const {
+        return std::tie(tool, relaxation) < std::tie(other.tool, other.relaxation);
+    }
+};
 struct prepared_state {
     common_chat_params parameters;
     common_chat_parser_params parser;
     std::vector<std::string> diagnostics;
+    std::set<subject_relaxation> relaxations;
 };
 std::mutex mutex;
 uint64_t next_handle = 1;
@@ -56,6 +68,7 @@ int32_t guarded(templates_buffer * error, F && function) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex);
         templates_native::diagnostics.clear();
+        templates_native::relaxations.clear();
         try {
             function();
             return TEMPLATES_OK;
@@ -210,12 +223,18 @@ int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_
         request.messages = common_chat_msgs_parse_oaicompat(data.at("messages"));
         if (request.messages.empty()) { throw std::invalid_argument("Request requires messages"); }
         request.tool_choice = common_chat_tool_choice_parse_oaicompat(data.value("tool_choice", std::string("auto")));
+        // Schemas are valid JSON Schemas (the host admits only those) and
+        // always lower; lowering records what the constraint does not enforce.
+        std::set<subject_relaxation> relaxations;
+        auto lower = [&](const std::optional<std::string> & tool, const json & schema) {
+            for (auto & relaxation : common_chat_schema_from_json(schema).relaxations) {
+                relaxations.insert({ tool, std::move(relaxation) });
+            }
+        };
         if (request.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && data.contains("tools")) {
             for (const auto & tool : data.at("tools")) {
                 const auto & function = tool.at("function");
-                if (function.contains("parameters")) {
-                    templates_native::validate_schema(function.at("parameters"));
-                }
+                lower(function.at("name").get<std::string>(), common_chat_tool_parameters(function));
             }
             request.tools = common_chat_tools_parse_oaicompat(data.at("tools"));
         }
@@ -243,7 +262,7 @@ int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_
         }
         if (data.contains("json_schema")) {
             if (!request.tools.empty()) { throw std::invalid_argument("Combining tools with JSON output is unsupported"); }
-            templates_native::validate_schema(data.at("json_schema"));
+            lower(std::nullopt, data.at("json_schema"));
             request.json_schema = data.at("json_schema").dump();
         }
         auto prepared = std::make_shared<prepared_state>();
@@ -258,6 +277,10 @@ int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_
         prepared->parser.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
         if (!prepared->parameters.parser.empty()) { prepared->parser.parser.load(prepared->parameters.parser); }
         prepared->diagnostics = templates_native::diagnostics;
+        for (auto & recorded : templates_native::relaxations) {
+            relaxations.insert({ recorded.tool, std::move(recorded.relaxation) });
+        }
+        prepared->relaxations = std::move(relaxations);
         auto id = allocate_handle();
         requests.emplace(id, std::move(prepared));
         *output = id;
@@ -274,6 +297,12 @@ int32_t templates_request_describe(uint64_t handle, templates_buffer * output, t
         for (const auto & trigger : params.grammar_triggers) {
             triggers.push_back(json({{"type", static_cast<int>(trigger.type)}, {"value", trigger.value}, {"token", trigger.token}}));
         }
+        json relaxations = json::array();
+        for (const auto & [tool, relaxation] : state.relaxations) {
+            json subject = tool ? json({{"kind", "tool"}, {"name", *tool}}) : json({{"kind", "output"}});
+            relaxations.push_back(json({{"subject", subject}, {"path", relaxation.path}, {"keyword", relaxation.keyword},
+                {"reason", common_chat_schema_relaxation::reason_name(relaxation.reason)}}));
+        }
         *output = owned(json({{"version", 1}, {"prompt", params.prompt},
             {"generation_prefix", params.generation_prompt}, {"parser", params.parser},
             {"format", common_chat_format_name(params.format)},
@@ -282,7 +311,8 @@ int32_t templates_request_describe(uint64_t handle, templates_buffer * output, t
             {"grammar_lazy", params.grammar_lazy}, {"grammar_triggers", triggers},
             {"preserved_tokens", params.preserved_tokens}, {"additional_stops", params.additional_stops},
             {"supports_thinking", params.supports_thinking}, {"thinking_start", params.thinking_start_tag},
-            {"thinking_ends", params.thinking_end_tags}, {"diagnostics", state.diagnostics}}).dump());
+            {"thinking_ends", params.thinking_end_tags}, {"diagnostics", state.diagnostics},
+            {"relaxations", relaxations}}).dump());
     });
 }
 

@@ -111,15 +111,12 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                     auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param.name)) + ">\n");
 
                     auto types = param.schema->value_types();
-                    // Raw text is enforceable when strings are unconstrained
-                    // or drawn from listed values (enum, const).
-                    auto raw_values = templates_raw_string_values(*param.schema);
+                    // Raw text enforces strings drawn from listed values
+                    // (enum, const); other string constraints are recorded.
+                    auto raw_values = templates_raw_string_values(name, *param.schema, "\n</parameter>\n");
                     auto raw_value  = p.choice();
                     if (raw_values) {
                         for (const auto & value : *raw_values) {
-                            if (value.find("\n</parameter>\n") != std::string::npos) {
-                                throw std::invalid_argument("Unsupported JSON schema: a raw string value contains the argument delimiter");
-                            }
                             // Each value carries the close, so an ordered choice
                             // never commits to a value that prefixes another.
                             raw_value |= p.tool_arg_string_value(p.literal(value)) + arg_close;
@@ -140,7 +137,12 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                         arg_value = arg_string;
                     } else {
                         // The string alternative accepts any text, so the grammar only keeps the raw string
-                        // rule. The parser still tries the JSON alternatives first to type the value.
+                        // rule. The parser still tries the JSON alternatives first to type the value,
+                        // so structured and numeric values follow only their JSON type.
+                        if (types.has(common_chat_schema::TYPE_OBJECT) || types.has(common_chat_schema::TYPE_ARRAY) ||
+                            types.has(common_chat_schema::TYPE_NUMBER) || types.has(common_chat_schema::TYPE_INTEGER)) {
+                            templates_native::relax(name, *param.schema, "type", common_chat_schema_relaxation::REASON_UNENFORCED);
+                        }
                         auto json_value = p.choice();
                         if (types.has(common_chat_schema::TYPE_OBJECT)) {
                             json_value |= p.json_object();
