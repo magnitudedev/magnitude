@@ -43,16 +43,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         )
     }
     /// Release bound optional components after the owner has drained all
-    /// requests. The measured ledger delta is the only released-byte credit;
+    /// requests; a queued lookahead, which drafts with them, is orphaned
+    /// first. The measured ledger delta is the only released-byte credit;
     /// shared target tensors remain cached by the head loader.
-    pub fn release_idle_optional_components(&mut self) -> Result<u64, String> {
-        if !self.target.is_empty()
-            || !self.head.is_empty()
-            || !self.input.is_empty()
-            || self.lookahead.is_some()
-        {
+    pub fn release_idle_optional_components(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+    ) -> Result<u64, String> {
+        if !self.target.is_empty() || !self.head.is_empty() || !self.input.is_empty() {
             return Ok(0);
         }
+        self.orphan_lookahead(bindings)
+            .map_err(|error| error.to_string())?;
         let before = self.domain.device().memory_usage().charged;
         self.family.unbind_optional();
         if let Some(loader) = &self.head_loader {
@@ -264,66 +266,35 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// and successor banks its operations will claim, placed so histories
     /// keep growing in place. A refused minimum grant returns a byte deficit.
     /// Histories at the segment limit are repacked first.
-    pub fn provision(&mut self, operations: &[Operation]) -> Result<(), DomainError> {
+    pub fn provision(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+        operations: &[Operation],
+    ) -> Result<(), DomainError> {
         fn primed(operation: &Operation) -> Option<&Priming> {
             match operation {
                 Operation::Forward { prime, .. } => prime.as_ref(),
                 _ => None,
             }
         }
-        // A group claiming the queued lookahead needs no rows of its own, only
-        // room for the step it queues next (its rows follow the claimed
-        // step's). Growth adds slabs and never moves the rows the in-flight
-        // step writes. Any other target group first waits for the lookahead
-        // and releases it; a head or encoder group touches no target state
-        // and runs beside it.
-        if self.claim_slots(operations).is_some() {
-            let mut target = Vec::new();
-            let mut banks = 0usize;
-            let mut head = Vec::new();
-            let mut head_banks = 0usize;
-            for operation in operations {
-                let request = operation.request();
-                if let (Some((next, false)), Some(state)) =
-                    (self.successor_of(operation), self.target.get(&request))
-                {
-                    target.extend(state.demands(next.row_count()));
-                    banks += 1;
-                    if let (Operation::Forward { prime: Some(prime), .. }, Some(state)) =
-                        (&next, self.head.get(&request))
-                    {
-                        head.extend(state.demands(prime.tokens.len()));
-                        head_banks += 1;
-                    }
-                }
-            }
-            // The queued step is optional: without room, the next step
-            // runs unpipelined and provisions as usual.
-            let optional = |grant: Result<(), DomainError>| match grant {
-                Ok(())
-                | Err(DomainError::Capacity(_) | DomainError::Blind(_) | DomainError::Reclaim) => {
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            };
-            if banks != 0 {
-                optional(self.grant_state_growth(self.target_store.clone(), &target, banks))?;
-            }
-            if let (true, Some(store)) = (head_banks != 0, self.head_store.clone()) {
-                optional(self.grant_state_growth(store, &head, head_banks))?;
-            }
+        // A group claiming the queued lookahead needs no rows of its own. The
+        // step it queues next is optional and is queued only into space
+        // already bound: growing now would change bindings under the claimed
+        // step. Any other target group orphans the lookahead; a head or
+        // encoder group runs beside it unless it changes bindings.
+        if self.claim_slots(bindings, operations).is_some() {
             return Ok(());
         }
         if operations
             .iter()
             .any(|operation| matches!(operation, Operation::Forward { .. }))
         {
-            self.orphan_lookahead()?;
+            self.orphan_lookahead(bindings)?;
         }
         for operation in operations {
             if let Operation::Forward { request, .. } | Operation::Head { request, .. } = operation
             {
-                self.relocate_tails(*request)?;
+                self.relocate_tails(bindings, *request)?;
             }
         }
         let mut target = Vec::new();
@@ -369,12 +340,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         // Stores without history domains still grow banks.
         if target_banks != 0 {
-            self.grant_state_growth(self.target_store.clone(), &target, target_banks)?;
+            self.grant_state_growth(bindings, false, &target, target_banks)?;
         }
-        if head_banks != 0 {
-            if let Some(store) = self.head_store.clone() {
-                self.grant_state_growth(store, &head, head_banks)?;
-            }
+        if head_banks != 0 && self.head_store.is_some() {
+            self.grant_state_growth(bindings, true, &head, head_banks)?;
         }
         // The import itself runs under a claim at reservation; admit its peak
         // here so a deficit reaches the owner's release order first.
@@ -427,22 +396,36 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.sync_static_holding().map_err(DomainError::Input)
     }
 
-    /// Grant elastic state growth from a fresh domain observation. Seismic's
-    /// charge ledger remains authoritative: its limit enforces the grant on
-    /// each added slab allocation.
-    fn grant_state_growth(
+    /// Grant elastic state growth of the target or `head` store from a fresh
+    /// domain observation. Growth changes bindings, so a queued lookahead is
+    /// orphaned first; its release may itself free what the growth needed.
+    /// Seismic's charge ledger remains authoritative: its limit enforces the
+    /// grant on each added slab allocation.
+    pub(super) fn grant_state_growth(
         &mut self,
-        store: Rc<StateStore>,
+        bindings: &mut StateBindings<F>,
+        head: bool,
         demands: &[RowDemand],
         banks: usize,
     ) -> Result<(), DomainError> {
-        for choice in [GrowthChoice::Preferred, GrowthChoice::Minimum] {
-            let claim = store.growth_claim(demands, banks)?;
-            // No backing changes when neither plan adds a slab. Reservation
-            // observes memory again before launching the selected group.
-            if claim.minimum_bytes == 0 && claim.preferred_bytes == 0 {
+        let grows = |bindings: &mut StateBindings<F>| -> Result<bool, DomainError> {
+            let claim = bindings.store(head)?.growth_claim(demands, banks)?;
+            Ok(claim.minimum_bytes != 0 || claim.preferred_bytes != 0)
+        };
+        // No backing changes when neither plan adds a slab. Reservation
+        // observes memory again before launching the selected group.
+        if !grows(bindings)? {
+            return Ok(());
+        }
+        if bindings.lookahead.is_some() {
+            self.orphan_lookahead(bindings)?;
+            if !grows(bindings)? {
                 return Ok(());
             }
+        }
+        let store = bindings.store(head)?;
+        for choice in [GrowthChoice::Preferred, GrowthChoice::Minimum] {
+            let claim = store.growth_claim(demands, banks)?;
             let required = match choice {
                 GrowthChoice::Preferred => claim.preferred_bytes,
                 GrowthChoice::Minimum => claim.minimum_bytes,
@@ -529,15 +512,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// history keeps growing within its span limit. A relocation copies
     /// less than one page into one free page; without memory for that page
     /// the request fails with a capacity error before any launch.
-    pub(super) fn relocate_tails(&mut self, request: RequestId) -> Result<(), DomainError> {
+    /// Moving rows changes bindings: a queued lookahead is orphaned before
+    /// the first relocation.
+    pub(super) fn relocate_tails(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+        request: RequestId,
+    ) -> Result<(), DomainError> {
         if !self.family.state_is_bound() {
             return Ok(());
         }
-        self.relocate_store_tails(request, false)?;
-        self.relocate_store_tails(request, true)
+        self.relocate_store_tails(bindings, request, false)?;
+        self.relocate_store_tails(bindings, request, true)
     }
 
-    fn relocate_store_tails(&mut self, request: RequestId, head: bool) -> Result<(), DomainError> {
+    fn relocate_store_tails(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+        request: RequestId,
+        head: bool,
+    ) -> Result<(), DomainError> {
         let store = if head {
             match self.head_store.clone() {
                 Some(store) => store,
@@ -553,7 +547,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if demands.is_empty() {
             return Ok(());
         }
-        self.grant_state_growth(store.clone(), &demands, 0)?;
+        self.orphan_lookahead(bindings)?;
+        self.grant_state_growth(bindings, head, &demands, 0)?;
         for demand in demands {
             let state = self
                 .lane_states(head)
@@ -584,12 +579,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// Commit the successor banks a newly opened request needs.
-    pub fn provision_open(&mut self) -> Result<(), DomainError> {
+    /// Commit the successor banks a newly opened request needs. Free banks
+    /// change no bindings and leave a queued lookahead running.
+    pub fn provision_open(&mut self, bindings: &mut StateBindings<F>) -> Result<(), DomainError> {
         let requirements = self.open_requirements();
-        self.grant_state_growth(self.target_store.clone(), &[], requirements.target_banks())?;
-        if let Some(store) = self.head_store.clone() {
-            self.grant_state_growth(store, &[], requirements.head_banks())?;
+        self.grant_state_growth(bindings, false, &[], requirements.target_banks())?;
+        if self.head_store.is_some() {
+            self.grant_state_growth(bindings, true, &[], requirements.head_banks())?;
         }
         self.sync_static_holding().map_err(DomainError::Input)?;
         Ok(())
@@ -597,14 +593,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Release empty state slabs at idle, keeping one spare per store. In
     /// Reclaim, also compact sparse occupied slabs into already held space.
-    /// Returns the physical bytes released.
-    /// A queued lookahead is released first: it holds a state transaction,
-    /// under which nothing shrinks.
-    pub fn shrink_state(&mut self, policy: ShrinkPolicy) -> Result<u64, DomainError> {
-        self.orphan_lookahead()?;
-        let mut released = self.shrink_store(self.target_store.clone(), policy)?;
-        if let Some(store) = self.head_store.clone() {
-            released += self.shrink_store(store, policy)?;
+    /// Returns the physical bytes released. A queued lookahead is orphaned
+    /// first: its launch binding pins slab placement.
+    pub fn shrink_state(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+        policy: ShrinkPolicy,
+    ) -> Result<u64, DomainError> {
+        self.orphan_lookahead(bindings)?;
+        let mut released = self.shrink_store(bindings, false, policy)?;
+        if self.head_store.is_some() {
+            released += self.shrink_store(bindings, true, policy)?;
         }
         Ok(released + self.release_idle_outputs()?)
     }
@@ -628,10 +627,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Synchronize the static holding after Seismic reports the released bytes.
     fn shrink_store(
         &mut self,
-        store: Rc<StateStore>,
+        bindings: &mut StateBindings<F>,
+        head: bool,
         policy: ShrinkPolicy,
     ) -> Result<u64, DomainError> {
-        let released = store.shrink_with(policy, |_, copy| self.submit_store_copy(&store, &copy));
+        let bindings = bindings.store(head)?;
+        let store = Rc::clone(bindings);
+        let released =
+            bindings.shrink_with(policy, |_, copy| self.submit_store_copy(&store, &copy));
         self.sync_static_holding().map_err(DomainError::Input)?;
         released
     }
@@ -651,7 +654,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .acquire_workspace()
                 .map_err(DomainError::Capacity)?;
             let class_rows = crate::batching::row_class(chunk.rows())
-                .ok_or_else(|| self.fatal_invariant("store copy has no prepared row class"))?;
+                .ok_or_else(|| DomainError::invariant("store copy has no prepared row class"))?;
             let batch = crate::batching::ValidatedStateBatch::copy(
                 chunk.copies().to_vec(),
                 chunk.row_capacity(),
@@ -660,17 +663,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .map_err(|error| DomainError::invariant(error.to_string()))?;
             let inputs = StateLaunchInputs::new(batch, StateWork::StoreCopy(chunk), workspace);
             let launch = ValidatedStateLaunch::new(inputs, store, None, self.domain.id())
-                .map_err(|(_, error)| self.fatal_invariant(error.to_string()))?;
-            let submission = self.family.submit_state(launch).map_err(|(error, _)| {
-                let failure = DomainError::from(error);
-                self.fatal = Some(failure.clone());
-                failure
-            })?;
-            submission.finish().map_err(|error| {
-                let failure = DomainError::Device(error);
-                self.fatal = Some(failure.clone());
-                failure
-            })?;
+                .map_err(|(_, error)| DomainError::invariant(error.to_string()))?;
+            let submission = self
+                .family
+                .submit_state(launch)
+                .map_err(|(error, _)| DomainError::from(error))?;
+            submission.finish().map_err(DomainError::Device)?;
         }
         Ok(())
     }

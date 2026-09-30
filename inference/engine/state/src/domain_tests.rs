@@ -41,7 +41,7 @@ fn windowed_store(
     max_advance: usize,
     window_rows: usize,
     width: usize,
-) -> Rc<StateStore> {
+) -> StoreBindings {
     StateStore::new(
         device,
         context,
@@ -65,6 +65,7 @@ fn windowed_store(
         banks(),
     )
     .unwrap()
+    .1
 }
 
 fn commit(state: SequenceState, rows: usize) -> SequenceState {
@@ -277,14 +278,15 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
     const WINDOW_ROWS: usize = 8;
     // 2 planes of 32768 F32 values: 256 KiB rows, 256 rows per slab.
     let width = 32768;
-    let store = windowed_store(device.clone(), 4096, WINDOW_ROWS, 4, 512, width);
+    let mut bindings = windowed_store(device.clone(), 4096, WINDOW_ROWS, 4, 512, width);
+    let store = Rc::clone(&bindings);
     let slab_rows = store.history_slab_rows(WINDOW);
     assert_eq!(slab_rows, SLAB_ROW_TILE);
     // Eight rows plus a four-row advance fit one page: at most two spans.
     assert_eq!(store.history_page_rows(WINDOW), SLAB_ROW_TILE);
     assert_eq!(store.span_limit(WINDOW), 2);
     // Back both slabs, so the window runs from slab 0 straight into slab 1.
-    store
+    bindings
         .provision(
             &[RowDemand {
                 domain: WINDOW,
@@ -315,8 +317,8 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
             .unwrap();
         u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize
     };
-    let step = |state: SequenceState, rows: usize| {
-        store.provision(&state.demands(rows), 0).unwrap();
+    let step = |bindings: &mut StoreBindings, state: SequenceState, rows: usize| {
+        bindings.provision(&state.demands(rows), 0).unwrap();
         let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
         let buffer = advance.bindings().history
             [advance.bindings().history.iter().position(|p| p.domain == WINDOW).unwrap()]
@@ -348,11 +350,11 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
     let mut state = store.create().unwrap();
     let mut crossed = false;
     for _ in 0..700 {
-        state = step(state, 1);
+        state = step(&mut bindings, state, 1);
         check(&state);
         crossed |= state.history_ranges(WINDOW).len() > 1;
         // Idle release keeps one spare slab and never copies.
-        store
+        bindings
             .shrink_with(ShrinkPolicy::Idle, |_, _| -> Result<(), Error> {
                 panic!("idle release never copies")
             })
@@ -364,7 +366,7 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
     // Reclaim frees whichever slab the window does not occupy; the next
     // growth adds the lowest unbacked index again.
     let before = device.memory_usage().charged;
-    let released = store.shrink(ShrinkPolicy::Reclaim).unwrap();
+    let released = bindings.shrink(ShrinkPolicy::Reclaim).unwrap();
     let occupied_slabs = state
         .history_ranges(WINDOW)
         .iter()
@@ -378,7 +380,7 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
     }
     check(&state);
     for _ in 0..600 {
-        state = step(state, 3);
+        state = step(&mut bindings, state, 3);
         check(&state);
     }
     assert!(store.domains[WINDOW.0].arena.borrow().backed.len() <= 2);
@@ -389,7 +391,7 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
 fn freed_window_slab_index_is_reused_by_growth() {
     let Some(device) = cpu_device() else { return };
     let width = 32768;
-    let store = windowed_store(device.clone(), 4096, 8, 4, 1024, width);
+    let mut store = windowed_store(device.clone(), 4096, 8, 4, 1024, width);
     let slab_rows = store.history_slab_rows(WINDOW);
     let arena = store.domains[WINDOW.0].arena.clone();
     // The window starts at row 0 and decodes through slab 0 (one page)
@@ -435,7 +437,7 @@ fn freed_window_slab_index_is_reused_by_growth() {
 #[test]
 fn relocation_moves_one_domain() {
     let Some(device) = cpu_device() else { return };
-    let store = windowed_store(device, 1024, 64, 1, 1024, 1);
+    let mut store = windowed_store(device, 1024, 64, 1, 1024, 1);
     store
         .provision(
             &[
@@ -477,7 +479,7 @@ fn relocation_moves_one_domain() {
 #[test]
 fn shrink_and_census_cover_every_domain() {
     let Some(device) = cpu_device() else { return };
-    let store = windowed_store(device.clone(), 8192, 16, 4, 8192, 4096);
+    let mut store = windowed_store(device.clone(), 8192, 16, 4, 8192, 4096);
     let window_slab = store.history_slab_rows(WINDOW);
     // Three window slabs: the growth claim is the two added.
     let demand = [RowDemand {
@@ -604,7 +606,8 @@ fn shared_layers_bind_their_source_regions() {
         vec![],
         banks(),
     )
-    .unwrap();
+    .unwrap()
+    .0;
     assert_eq!(store.history_domains().count(), 1);
     assert_eq!(store.sole_history_domain().unwrap(), TOKEN);
     assert_eq!(
@@ -646,7 +649,8 @@ fn a_single_token_domain_is_the_one_domain_store() {
         vec![],
         banks(),
     )
-    .unwrap();
+    .unwrap()
+    .0;
     let geometry = history_geometry(row_bytes, 20_000, 0).unwrap();
     let slab_rows = geometry.slab_rows;
     assert_eq!(store.history_row_bytes(TOKEN), row_bytes);

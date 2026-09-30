@@ -23,11 +23,9 @@ pub struct AdmitRequest {
 pub enum WorkerCommand {
     Admit(AdmitRequest),
     Stop { request: RequestId },
-    Cancel { request: RequestId },
     Status { request: RequestId },
     /// The memory heap's classified holdings and standing.
     Observe,
-    Close,
 }
 
 /// A live request's scheduling status and progress.

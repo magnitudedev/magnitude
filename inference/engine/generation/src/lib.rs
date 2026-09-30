@@ -157,13 +157,6 @@ pub enum FinishReason {
     Cancelled,
     Failed,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WaitReason {
-    Completion,
-    Output,
-    Finished,
-    Residency,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CausalProgress {
@@ -182,9 +175,31 @@ pub struct OutputToken {
     pub token: TokenId,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// The outcome of starting the next round. Method (drafter) work starts no
+/// target round, so the generation comes back with it; callers start again
+/// after reconciling that work.
 pub enum RoundStart {
-    Target,
+    Target(StartedRound),
+    Method(Generation, Vec<Operation>),
+}
+
+/// The next target round of a resident generation, fixed before the method
+/// proposes. `Generation::start_round` builds its round from this plan and
+/// `Generation::publication_bound` bounds the round's publication from it, so
+/// the two cannot disagree about the round's inputs.
+enum RoundPlan {
+    /// Replay of numerical rows through `end` held before eviction.
+    Replay { end: usize },
+    /// The prompt chunk ending at `end`.
+    Prefill { end: usize },
+    /// A constrained run accepted without selection.
+    Forced(Vec<TokenId>),
+    /// A decode or verification of at most `limit` proposals.
+    Propose { limit: usize },
+}
+
+enum NextRound {
+    Target(RoundState),
     Method(Vec<Operation>),
 }
 
@@ -198,8 +213,8 @@ pub struct ReconcileDecision {
 }
 
 /// Every fallible logical change is performed against private state before
-/// physical reconciliation. Dropping this value leaves the live generation
-/// untouched, including its suspended round and method state.
+/// physical reconciliation. Dropping this value leaves the started round
+/// untouched, including its generation's method state.
 pub struct PreparedGenerationTransition {
     request: RequestId,
     expected_resident_position: usize,
@@ -265,7 +280,15 @@ pub struct Generation {
     method: Box<dyn MethodState>,
     cached_tokens: usize,
     draft_stats: DraftStats,
-    round: Option<RoundState>,
+}
+
+/// A target round in progress. It owns its generation from start until the
+/// round's reconciled transition commits, or until eviction, cancellation or
+/// failure discards the round. Operations that require no round in progress
+/// exist only on `Generation`.
+pub struct StartedRound {
+    generation: Generation,
+    round: RoundState,
 }
 
 impl Generation {
@@ -327,7 +350,6 @@ impl Generation {
             method,
             cached_tokens: 0,
             draft_stats: DraftStats::default(),
-            round: None,
         })
     }
     pub fn prompt(&self) -> &[TokenId] {
@@ -377,8 +399,8 @@ impl Generation {
     }
     /// Export owned method state for prefix retention.
     pub fn method_checkpoint(&self) -> Result<MethodCheckpoint, String> {
-        if self.round.is_some() || !self.resident {
-            return Err("method checkpoint requires reconciled resident state".into());
+        if !self.resident {
+            return Err("method checkpoint requires resident state".into());
         }
         self.method.checkpoint().map_err(|error| error.to_string())
     }
@@ -406,9 +428,6 @@ impl Generation {
     pub fn output_len(&self) -> usize {
         self.output.len()
     }
-    pub fn awaiting_completion(&self) -> bool {
-        self.round.is_some()
-    }
     pub fn constraint_position(&self) -> Option<usize> {
         self.constraint.as_ref().map(|c| c.position())
     }
@@ -424,75 +443,132 @@ impl Generation {
     pub fn is_resident(&self) -> bool {
         self.resident
     }
-    pub fn wait_reason(&self) -> Option<WaitReason> {
-        if self.round.is_some() {
-            Some(WaitReason::Completion)
-        } else if self.finish.is_some() {
-            Some(WaitReason::Finished)
-        } else if self.output.len() >= self.options.output_capacity {
-            Some(WaitReason::Output)
-        } else if !self.resident {
-            Some(WaitReason::Residency)
-        } else {
-            None
+    /// Start the next target round, which then owns this generation. Method
+    /// work is returned as ordinary executor operations with the generation;
+    /// callers start again after reconciling it. A refused start returns the
+    /// generation with its error.
+    pub fn start_round(
+        mut self,
+        request: RequestId,
+        allowance: usize,
+    ) -> Result<RoundStart, (Self, String)> {
+        match self.next_round(request, allowance) {
+            Ok(NextRound::Target(round)) => Ok(RoundStart::Target(StartedRound {
+                generation: self,
+                round,
+            })),
+            Ok(NextRound::Method(operations)) => Ok(RoundStart::Method(self, operations)),
+            Err(error) => Err((self, error)),
         }
     }
 
-    /// Build and suspend the next target round. Method work is returned as
-    /// ordinary executor operations; callers retry after reconciling it.
-    pub fn start_round(
-        &mut self,
-        request: RequestId,
-        allowance: usize,
-    ) -> Result<RoundStart, String> {
+    /// The most tokens the round `start_round(_, allowance)` would publish,
+    /// computed without starting it, so publication permits can be reserved
+    /// first. It is computed from the same plan `start_round` builds the round
+    /// from, and is at least that round's `round_publication_bound()`:
+    ///
+    /// - replay publishes nothing;
+    /// - a prompt chunk publishes one token when it ends the prompt (forced or
+    ///   selected), otherwise none;
+    /// - a forced run publishes exactly its forced tokens;
+    /// - a decode or verification publishes at most `limit + 1` tokens, where
+    ///   `limit` is the proposal width from the allowance, remaining
+    ///   `max_tokens`, output credit, context limit and method proposals. The
+    ///   method may propose fewer, or return drafter work that starts no
+    ///   target round and publishes nothing.
+    ///
+    /// It fails exactly when `start_round` would refuse before proposing.
+    pub fn publication_bound(&self, allowance: usize) -> Result<usize, String> {
+        Ok(match self.plan_round(allowance)? {
+            RoundPlan::Replay { .. } => 0,
+            RoundPlan::Prefill { end } => usize::from(end == self.prompt.len()),
+            RoundPlan::Forced(tokens) => tokens.len(),
+            RoundPlan::Propose { limit } => limit + 1,
+        })
+    }
+
+    fn plan_round(&self, allowance: usize) -> Result<RoundPlan, String> {
         if allowance == 0 {
             return Err("service allowance must be positive".into());
         }
-        if let Some(reason) = self.wait_reason() {
-            return Err(format!("generation cannot start a round while {reason:?}"));
+        if self.finish.is_some() {
+            return Err("a finished generation cannot start a round".into());
+        }
+        if !self.resident {
+            return Err("a non-resident generation cannot start a round".into());
+        }
+        if self.output.len() >= self.options.output_capacity {
+            return Err("generation output is full".into());
         }
         let position = self.resident_position;
-        let requirements = self.method_factory.requires();
-        let round = if position < self.reconciliation_target {
+        if position < self.reconciliation_target {
             let end = self
                 .layout
                 .chunk_end(position, self.reconciliation_target, allowance)?;
-            let tokens = self
-                .prompt
-                .iter()
-                .chain(&self.generated)
-                .skip(position)
-                .take(end - position)
-                .copied()
-                .collect();
-            RoundState::progress(WorkKind::Replay, tokens, Vec::new(), None, None, requirements)?
-        } else if position < self.prompt.len() {
-            self.prefill_round(position, allowance, self.method.priming_position())?
-        } else {
-            if self.generated.is_empty()
-                || position != self.prompt.len() + self.generated.len() - 1
-                || position >= self.options.context_limit
-            {
-                return Err("generation history and numerical continuation disagree".into());
+            return Ok(RoundPlan::Replay { end });
+        }
+        if position < self.prompt.len() {
+            let end = self
+                .layout
+                .chunk_end(position, self.prompt.len(), allowance)?;
+            return Ok(RoundPlan::Prefill { end });
+        }
+        if self.generated.is_empty()
+            || position != self.prompt.len() + self.generated.len() - 1
+            || position >= self.options.context_limit
+        {
+            return Err("generation history and numerical continuation disagree".into());
+        }
+        let remaining = self.options.max_tokens - self.generated.len();
+        let credit = self.options.output_capacity - self.output.len();
+        let forced = self.forced_tokens(
+            allowance
+                .min(self.options.context_limit - position)
+                .min(remaining)
+                .min(credit),
+        )?;
+        if !forced.is_empty() {
+            return Ok(RoundPlan::Forced(forced));
+        }
+        let limit = RoundState::proposal_limit(
+            allowance.min(self.options.context_limit - position),
+            remaining,
+            credit,
+            self.options.method == MethodChoice::Plain,
+        )
+        .min(self.options.method.proposals());
+        Ok(RoundPlan::Propose { limit })
+    }
+
+    fn next_round(&mut self, request: RequestId, allowance: usize) -> Result<NextRound, String> {
+        let requirements = self.method_factory.requires();
+        let round = match self.plan_round(allowance)? {
+            RoundPlan::Replay { end } => {
+                let position = self.resident_position;
+                let tokens = self
+                    .prompt
+                    .iter()
+                    .chain(&self.generated)
+                    .skip(position)
+                    .take(end - position)
+                    .copied()
+                    .collect();
+                RoundState::progress(
+                    WorkKind::Replay,
+                    tokens,
+                    Vec::new(),
+                    None,
+                    None,
+                    requirements,
+                )?
             }
-            let remaining = self.options.max_tokens - self.generated.len();
-            let credit = self.options.output_capacity - self.output.len();
-            let forced = self.forced_tokens(
-                allowance
-                    .min(self.options.context_limit - position)
-                    .min(remaining)
-                    .min(credit),
-            )?;
-            if !forced.is_empty() {
+            RoundPlan::Prefill { end } => {
+                self.prefill_round(self.resident_position, end, self.method.priming_position())?
+            }
+            RoundPlan::Forced(forced) => {
                 RoundState::forced(*self.generated.last().unwrap(), forced, requirements)?
-            } else {
-                let limit = RoundState::proposal_limit(
-                    allowance.min(self.options.context_limit - position),
-                    remaining,
-                    credit,
-                    self.options.method == MethodChoice::Plain,
-                )
-                .min(self.options.method.proposals());
+            }
+            RoundPlan::Propose { limit } => {
                 let selects = self.proposal_selects(limit)?;
                 let proposal = match self.method.propose(request, &selects) {
                     Propose::Tokens(tokens) => tokens,
@@ -501,7 +577,7 @@ impl Generation {
                     }
                     Propose::Pending(operations) => {
                         self.validate_method_operations(request, &operations)?;
-                        return Ok(RoundStart::Method(operations));
+                        return Ok(NextRound::Method(operations));
                     }
                 };
                 if proposal.len() > limit
@@ -532,23 +608,19 @@ impl Generation {
                 )?
             }
         };
-        self.round = Some(round);
-        Ok(RoundStart::Target)
+        Ok(NextRound::Target(round))
     }
 
-    /// The prompt chunk from `position`, at most `allowance` rows; the chunk
-    /// ending the prompt selects (or forces) the first generated token. A
-    /// drafter entering chunks on the device at `drafter` enters, behind the
-    /// chunk, each following prompt token with the chunk row before it.
+    /// The prompt chunk from `position` to `end`; the chunk ending the prompt
+    /// selects (or forces) the first generated token. A drafter entering
+    /// chunks on the device at `drafter` enters, behind the chunk, each
+    /// following prompt token with the chunk row before it.
     fn prefill_round(
         &self,
         position: usize,
-        allowance: usize,
+        end: usize,
         drafter: Option<usize>,
     ) -> Result<RoundState, String> {
-        let end = self
-            .layout
-            .chunk_end(position, self.prompt.len(), allowance)?;
         let requirements = self.method_factory.requires();
         let prime = drafter
             .filter(|_| requirements.head && requirements.prefill_demand.contains(Demand::FEATURES))
@@ -584,18 +656,13 @@ impl Generation {
         RoundState::progress(WorkKind::Prefill, tokens, forced, select, prime, requirements)
     }
 
-    /// The prompt chunk of at most `allowance` rows that follows the
-    /// suspended round once it commits, when that is known now: the round is
-    /// a prompt chunk that selects nothing, and the prompt is plain text (a
-    /// conditioned span's rows need its encoding).
-    pub fn planned_prefill(
+    /// See `StartedRound::planned_prefill`.
+    fn planned_prefill(
         &self,
+        forward: &RoundForward,
         request: RequestId,
         allowance: usize,
     ) -> Result<Option<Operation>, String> {
-        let Some(forward) = self.round.as_ref().map(RoundState::forward) else {
-            return Ok(None);
-        };
         if forward.kind != WorkKind::Prefill
             || !forward.selects.is_empty()
             || forward.committed != forward.tokens.len()
@@ -613,7 +680,10 @@ impl Generation {
             .prime
             .as_ref()
             .map(|prime| prime.position + prime.tokens.len());
-        self.prefill_round(position, allowance, drafter)?
+        let end = self
+            .layout
+            .chunk_end(position, self.prompt.len(), allowance)?;
+        self.prefill_round(position, end, drafter)?
             .forward()
             .clone()
             .into_operation(request, position, None)
@@ -660,19 +730,31 @@ impl Generation {
     /// itself. This fact is independent of why a checkpoint is requested.
     pub fn pending_reconciliation(&self) -> Option<PendingReconciliation> {
         let progress = self.causal_progress();
-        (self.resident
-            && self.round.is_none()
-            && progress.resident_position < progress.accepted_position)
-            .then_some(PendingReconciliation {
+        (self.resident && progress.resident_position < progress.accepted_position).then_some(
+            PendingReconciliation {
                 start: progress.resident_position,
                 end: progress.accepted_position,
-            })
+            },
+        )
     }
 
     /// Advance accepted successors without selecting or publishing another
     /// token. Callers use this before any operation requiring exact numerical
-    /// state, including but not limited to retention.
-    pub fn start_reconciliation(&mut self, allowance: usize) -> Result<(), String> {
+    /// state, including but not limited to retention. A refused start returns
+    /// the generation unchanged with its error.
+    pub fn start_reconciliation(self, allowance: usize) -> Result<StartedRound, (Self, String)> {
+        match self.reconciliation_round(allowance) {
+            Ok((target, round)) => {
+                let mut generation = self;
+                generation.reconciliation_target = target;
+                Ok(StartedRound { generation, round })
+            }
+            Err(error) => Err((self, error)),
+        }
+    }
+
+    /// The reconciliation round and the numerical boundary it advances toward.
+    fn reconciliation_round(&self, allowance: usize) -> Result<(usize, RoundState), String> {
         let pending = self
             .pending_reconciliation()
             .ok_or("generation has no pending causal reconciliation")?;
@@ -690,7 +772,6 @@ impl Generation {
             .take(end - pending.start)
             .copied()
             .collect();
-        self.reconciliation_target = pending.end;
         let round = RoundState::progress(
             WorkKind::Replay,
             tokens,
@@ -699,8 +780,7 @@ impl Generation {
             None,
             self.method_factory.requires(),
         )?;
-        self.round = Some(round);
-        Ok(())
+        Ok((pending.end, round))
     }
 
     fn forced_tokens(&self, limit: usize) -> Result<Vec<TokenId>, String> {
@@ -743,14 +823,6 @@ impl Generation {
         Ok(tokens)
     }
 
-    pub fn round_forward(&self) -> Option<&RoundForward> {
-        self.round.as_ref().map(RoundState::forward)
-    }
-
-    pub fn round_publication_bound(&self) -> Option<usize> {
-        self.round.as_ref().map(RoundState::publication_bound)
-    }
-
     /// Consume a method operation's outcome against private method state.
     /// The decision commits a head transaction's entry rows.
     pub fn prepare_method_transition(
@@ -758,9 +830,6 @@ impl Generation {
         operation: &Operation,
         outcome: &magnitude_executor::Outcome,
     ) -> Result<PreparedMethodTransition, String> {
-        if self.round.is_some() {
-            return Err("method work cannot reconcile while a target round is suspended".into());
-        }
         let Operation::Head {
             request, tokens, ..
         } = operation
@@ -792,8 +861,7 @@ impl Generation {
 
     pub fn commit_method_transition(&mut self, transition: PreparedMethodTransition) {
         assert!(
-            self.round.is_none()
-                && self.resident_position == transition.expected_resident_position
+            self.resident_position == transition.expected_resident_position
                 && self.generated.len() == transition.expected_generated_len
                 && self.finish == transition.expected_finish,
             "generation changed between method preparation and physical reconciliation"
@@ -801,19 +869,15 @@ impl Generation {
         self.method = transition.method;
     }
 
-    /// Prepare acceptance, grammar, method effects, counters, and publication
-    /// against private state. The live round remains suspended until the
-    /// executor has reconciled the returned decision.
-    pub fn prepare_round_transition(
+    /// See `StartedRound::prepare_round_transition`.
+    fn prepare_round_transition(
         &self,
+        round: &RoundState,
         request: RequestId,
         samples: &[TokenId],
         features: Option<FeatureRef>,
         reader: &mut dyn FeatureReader,
     ) -> Result<PreparedGenerationTransition, String> {
-        let Some(round) = self.round.as_ref() else {
-            return Err("generation has no target round awaiting selections".into());
-        };
         let causal_reconciliation = self.finish.is_some()
             && round.forward().kind == WorkKind::Replay
             && round.forward().selects.is_empty();
@@ -968,20 +1032,21 @@ impl Generation {
         })
     }
 
-    /// Apply a fully checked transition after physical state reconciliation.
-    /// Any mismatch here is an executor/generation ordering bug.
-    pub fn commit_transition(&mut self, transition: PreparedGenerationTransition) -> MethodEffects {
+    /// See `StartedRound::commit`.
+    fn commit_transition(
+        &mut self,
+        forward: &RoundForward,
+        transition: PreparedGenerationTransition,
+    ) -> MethodEffects {
         assert!(
-            self.round.is_some()
-                && self.resident_position == transition.expected_resident_position
+            self.resident_position == transition.expected_resident_position
                 && self.generated.len() == transition.expected_generated_len
                 && self.finish == transition.expected_finish
                 && self.output.len() == transition.expected_output_len
                 && self.published == transition.expected_published
-                && self.round_forward() == Some(&transition.expected_forward),
+                && forward == &transition.expected_forward,
             "generation changed between preparation and physical reconciliation"
         );
-        self.round = None;
         self.method = transition.method;
         if let Some(constraint) = transition.constraint {
             self.constraint = Some(constraint);
@@ -1013,13 +1078,11 @@ impl Generation {
 
     /// Accepted output remains owned by the caller until drained or discarded.
     pub fn cancel(&mut self) {
-        self.round = None;
         if self.finish.is_none() {
             self.finish = Some(FinishReason::Cancelled);
         }
     }
     pub fn fail(&mut self) {
-        self.round = None;
         if self.finish.is_none() {
             self.finish = Some(FinishReason::Failed);
         }
@@ -1037,7 +1100,6 @@ impl Generation {
         // been fed through the model; replaying that token here would advance
         // past the point from which the next decode must start.
         self.reconciliation_target = self.resident_position;
-        self.round = None;
         self.method.evict();
         self.resident = false;
         Ok(())
@@ -1081,6 +1143,81 @@ impl Generation {
         self.resident_position = position;
         self.resident = true;
         Ok(())
+    }
+}
+
+impl StartedRound {
+    /// The generation as it was when the round started.
+    pub fn generation(&self) -> &Generation {
+        &self.generation
+    }
+
+    pub fn round_forward(&self) -> &RoundForward {
+        self.round.forward()
+    }
+
+    pub fn round_publication_bound(&self) -> usize {
+        self.round.publication_bound()
+    }
+
+    /// The prompt chunk of at most `allowance` rows that follows this round
+    /// once it commits, when that is known now: the round is a prompt chunk
+    /// that selects nothing, and the prompt is plain text (a conditioned
+    /// span's rows need its encoding).
+    pub fn planned_prefill(
+        &self,
+        request: RequestId,
+        allowance: usize,
+    ) -> Result<Option<Operation>, String> {
+        self.generation
+            .planned_prefill(self.round.forward(), request, allowance)
+    }
+
+    /// Prepare acceptance, grammar, method effects, counters, and publication
+    /// against private state. The round stays started until the executor has
+    /// reconciled the returned decision.
+    pub fn prepare_round_transition(
+        &self,
+        request: RequestId,
+        samples: &[TokenId],
+        features: Option<FeatureRef>,
+        reader: &mut dyn FeatureReader,
+    ) -> Result<PreparedGenerationTransition, String> {
+        self.generation
+            .prepare_round_transition(&self.round, request, samples, features, reader)
+    }
+
+    /// Apply a fully checked transition after physical state reconciliation,
+    /// ending the round. Any mismatch here is an executor/generation ordering
+    /// bug.
+    pub fn commit(self, transition: PreparedGenerationTransition) -> (Generation, MethodEffects) {
+        let Self {
+            mut generation,
+            round,
+        } = self;
+        let effects = generation.commit_transition(round.forward(), transition);
+        (generation, effects)
+    }
+
+    /// Discard the round after the execution owner releases numerical state.
+    /// See `Generation::evicted`.
+    pub fn evicted(self) -> Result<Generation, String> {
+        let mut generation = self.generation;
+        generation.evicted()?;
+        Ok(generation)
+    }
+
+    /// Discard the round without committing or publishing it.
+    pub fn cancel(self) -> Generation {
+        let mut generation = self.generation;
+        generation.cancel();
+        generation
+    }
+
+    pub fn fail(self) -> Generation {
+        let mut generation = self.generation;
+        generation.fail();
+        generation
     }
 }
 

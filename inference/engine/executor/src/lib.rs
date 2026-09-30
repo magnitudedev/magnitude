@@ -37,7 +37,7 @@ pub use domain::{
     ClaimRefusal, DeviceHeap, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
     HeadFlight, MemoryChargeReconciliation, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, ProgramFamily, ReservedResources, ResumeState,
-    TargetFlight, TargetHostTiming, VisionFlight,
+    StateBindings, SubmitFailure, TargetFlight, TargetHostTiming, VisionFlight,
 };
 pub use error::{CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError};
 pub use execution_path::ExecutionPath;

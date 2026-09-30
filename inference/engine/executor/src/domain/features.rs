@@ -5,7 +5,6 @@ use std::time::Instant;
 
 impl<F: ProgramFamily> FeatureReader for ExecutorDomain<F> {
     fn read(&mut self, span: &FeatureSpan) -> Result<FeatureRows, String> {
-        self.healthy().map_err(|error| error.to_string())?;
         let started = Instant::now();
         let source = self
             .domain

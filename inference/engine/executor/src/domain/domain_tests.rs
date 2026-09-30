@@ -33,7 +33,46 @@ fn tiny_manifest(definition: &ModelDefinition) -> PackageManifest {
     crate::planning::tests::fixture_manifest(definition)
 }
 
-fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>> {
+type Fixture = (ExecutorDomain<TestFamily>, StateBindings<TestFamily>);
+
+fn fixture(control: Option<PendingControl>) -> Option<Fixture> {
+    fixture_with(control, false, false)
+}
+
+/// A spare head store of 4096-wide F32 rows: 2048 rows per slab, 8192 rows,
+/// one slab backed. It grows independently of the target model.
+fn spare_head_store(device: Rc<seismic::Device>) -> StoreBindings {
+    use magnitude_state::{
+        BankCapacity, CodecSpec, ComponentDescriptor, HistoryDomainLayout, HistoryDomainPlan,
+        LayerRef,
+    };
+    StateStore::new(
+        device,
+        8192,
+        8192,
+        vec![HistoryDomainPlan {
+            layout: HistoryDomainLayout::Token {
+                components: vec![ComponentDescriptor::new(
+                    LayerRef::Target(0),
+                    CodecSpec::dense(seismic::DType::F32, 4096, 4096),
+                    1,
+                )
+                .unwrap()],
+            },
+            logical_rows: 8192,
+        }],
+        vec![],
+        BankCapacity {
+            active: 4,
+            in_flight: 4,
+            retained: 0,
+        },
+    )
+    .unwrap()
+    .1
+}
+
+fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) -> Option<Fixture> {
     let catalog = seismic::DeviceCatalog::discover().ok()?;
     let reserves = platform::MemoryReserves::standard();
     let selected = platform::select_device(
@@ -55,7 +94,7 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         max_launch_slots: 2,
         max_projected_rows: 2,
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
-        lookahead: false,
+        lookahead,
     };
     let capacity_bytes = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
@@ -146,13 +185,14 @@ fn fixture(control: Option<PendingControl>) -> Option<ExecutorDomain<TestFamily>
         .target_state()
         .allocate(device.clone())
         .unwrap();
+    let head = head.then(|| spare_head_store(device.clone()));
     Some(ExecutorDomain::with_family(
         execution,
         definition,
         resources,
         DeviceHeap::open(catalog, reserves, device).unwrap(),
         store,
-        None,
+        head,
         None,
         None,
         TestFamily { control, programs },
@@ -174,11 +214,15 @@ fn forward(request: RequestId, position: usize) -> Operation {
 }
 
 /// Make `request` resident on fresh state with no prompt rows.
-fn open<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, request: RequestId) {
+fn open<F: ProgramFamily>(
+    domain: &mut ExecutorDomain<F>,
+    bindings: &mut StateBindings<F>,
+    request: RequestId,
+) {
     domain
         .install_input(request, PreparedModelInput::continuation_only())
         .unwrap();
-    assert!(domain.open_state(request, None).unwrap().is_empty());
+    assert!(domain.open_state(bindings, request, None).unwrap().is_empty());
 }
 
 #[derive(Default)]
@@ -399,55 +443,152 @@ impl ProgramFamily for TestFamily {
     }
 }
 
+/// Reserve and submit one target group; the flight takes the bindings.
 fn submit_reserved_target<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
+    mut bindings: StateBindings<F>,
     operations: Vec<Operation>,
-) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
-    let resources = domain.reserve(&operations)?.into_resources();
+) -> TargetFlight<F> {
+    let resources = domain
+        .reserve(&mut bindings, &operations)
+        .unwrap()
+        .into_resources();
     let ReservedResources::Target(reservation) = resources else {
         panic!("target operation produced another reservation lane")
     };
-    domain.submit_target(&operations, reservation)
+    domain
+        .submit_target(bindings, &operations, reservation)
+        .unwrap_or_else(|failure| panic!("target submission failed: {}", failure.error()))
+}
+
+/// Finish a target flight with one outcome.
+fn finish_one<F: ProgramFamily>(
+    domain: &mut ExecutorDomain<F>,
+    flight: TargetFlight<F>,
+) -> (PendingOperationOutcome, StateBindings<F>) {
+    let (mut pending, bindings) = domain.finish_target(flight).unwrap();
+    (pending.pop().unwrap(), bindings)
+}
+
+fn prefill(request: RequestId, position: usize) -> Operation {
+    Operation::Forward {
+        request,
+        kind: WorkKind::Prefill,
+        tokens: vec![crate::TokenId(1)],
+        position,
+        conditioning: None,
+        demand: crate::batching::Demand::NONE,
+        select: Vec::new(),
+        committed: 1,
+        prime: None,
+    }
+}
+
+/// Submit and reconcile a prefill chunk at 0 whose planned next chunk is
+/// queued behind it: the returned bindings hold that lookahead.
+fn queue_lookahead(
+    domain: &mut ExecutorDomain<TestFamily>,
+    bindings: StateBindings<TestFamily>,
+    request: RequestId,
+) -> StateBindings<TestFamily> {
+    domain.plan_successors(vec![prefill(request, 1)]);
+    let flight = submit_reserved_target(domain, bindings, vec![prefill(request, 0)]);
+    let (pending, bindings) = finish_one(domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    assert!(bindings.lookahead.is_some(), "the next chunk is queued");
+    bindings
 }
 
 #[test]
 fn ready_target_can_abort_then_reconcile() {
-    let Some(mut domain) = fixture(None) else {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
         return;
     };
     let request = RequestId(1);
-    open(&mut domain, request);
-    let mut flight = submit_reserved_target(&mut domain, vec![forward(request, 0)]).unwrap();
+    open(&mut domain, &mut bindings, request);
+    let mut flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
     assert!(flight.completion().is_complete());
     assert!(domain.resume_state(request).is_err());
-    let pending = domain.finish_target(flight).unwrap().pop().unwrap();
+    let (pending, bindings) = finish_one(&mut domain, flight);
     domain.abort(pending).unwrap();
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 0);
-    let flight = submit_reserved_target(&mut domain, vec![forward(request, 0)]).unwrap();
-    let pending = domain.finish_target(flight).unwrap().pop().unwrap();
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
+    let (pending, _) = finish_one(&mut domain, flight);
     assert!(domain
         .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
         .is_ok());
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
 }
 
+/// Growth changes bindings: with a lookahead queued, growing a store first
+/// orphans it, then commits the slab.
+#[test]
+fn growth_orphans_a_queued_lookahead_then_grows() {
+    let Some((mut domain, mut bindings)) = fixture_with(None, true, true) else {
+        return;
+    };
+    let request = RequestId(60);
+    open(&mut domain, &mut bindings, request);
+    let mut bindings = queue_lookahead(&mut domain, bindings, request);
+    let head = domain.head_store.clone().unwrap();
+    let history = head.sole_history_domain().unwrap();
+    let committed = head.committed_rows(history);
+    let demand = [RowDemand {
+        domain: history,
+        rows: head.free_rows(history) + 1,
+    }];
+    domain
+        .grant_state_growth(&mut bindings, true, &demand, 0)
+        .unwrap();
+    assert!(bindings.lookahead.is_none(), "growth orphaned the lookahead");
+    assert!(head.committed_rows(history) > committed);
+    // The orphaned step changed no accepted state.
+    assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
+}
+
+/// Opening a request into free banks changes no bindings: the queued
+/// lookahead keeps running and is still claimed by its continuation.
+#[test]
+fn opening_into_a_free_bank_leaves_the_lookahead_running() {
+    let Some((mut domain, mut bindings)) = fixture_with(None, true, false) else {
+        return;
+    };
+    let request = RequestId(61);
+    open(&mut domain, &mut bindings, request);
+    let mut bindings = queue_lookahead(&mut domain, bindings, request);
+    assert!(domain.target_store.available_banks() >= 1);
+    open(&mut domain, &mut bindings, RequestId(62));
+    assert!(bindings.lookahead.is_some(), "opening kept the lookahead");
+    let next = vec![prefill(request, 1)];
+    let reservation = domain.reserve(&mut bindings, &next).unwrap();
+    assert!(matches!(
+        reservation.into_resources(),
+        ReservedResources::Target(TargetGraphReservation::Claim(_))
+    ));
+}
+
 /// A history's next rows in its partly used last page need no free page: a
 /// store whose every page is referenced still reserves them.
 #[test]
 fn in_place_rows_reserve_without_a_free_page() {
-    let Some(mut domain) = fixture(None) else {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
         return;
     };
     let request = RequestId(10);
-    open(&mut domain, request);
-    let accept = |domain: &mut ExecutorDomain<TestFamily>, position| {
-        let flight = submit_reserved_target(domain, vec![forward(request, position)]).unwrap();
-        let pending = domain.finish_target(flight).unwrap().pop().unwrap();
+    open(&mut domain, &mut bindings, request);
+    let accept = |domain: &mut ExecutorDomain<TestFamily>,
+                  bindings: StateBindings<TestFamily>,
+                  position| {
+        let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
+        let (pending, bindings) = finish_one(domain, flight);
         domain
             .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
             .unwrap();
+        bindings
     };
-    accept(&mut domain, 0);
+    let mut bindings = accept(&mut domain, bindings, 0);
     // Hold every other page of the backed slabs with one-row histories.
     let store = domain.target_store.clone();
     let mut held = Vec::new();
@@ -464,7 +605,7 @@ fn in_place_rows_reserve_without_a_free_page() {
         held.push(filler);
     }
     for position in 1..4 {
-        accept(&mut domain, position);
+        bindings = accept(&mut domain, bindings, position);
     }
     assert!(store
         .history_domains()
@@ -472,15 +613,17 @@ fn in_place_rows_reserve_without_a_free_page() {
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 4);
 }
 
+/// A cancelled completed request aborts and the bindings return; a device
+/// failure is returned as an error that consumes them.
 #[test]
-fn pending_target_request_cancellation_aborts_without_poisoning_then_device_failure_is_fatal() {
+fn pending_target_request_cancellation_aborts_then_device_failure_consumes_the_bindings() {
     let control = PendingControl::default();
-    let Some(mut domain) = fixture(Some(control.clone())) else {
+    let Some((mut domain, mut bindings)) = fixture(Some(control.clone())) else {
         return;
     };
     let request = RequestId(2);
-    open(&mut domain, request);
-    let mut flight = submit_reserved_target(&mut domain, vec![forward(request, 0)]).unwrap();
+    open(&mut domain, &mut bindings, request);
+    let mut flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
     assert!(!flight.completion().is_complete());
     assert!(domain.resume_state(request).is_err());
     let woke = Arc::new(AtomicBool::new(false));
@@ -491,49 +634,50 @@ fn pending_target_request_cancellation_aborts_without_poisoning_then_device_fail
     assert!(!woke.load(Ordering::SeqCst));
     control.resolve(Ok(()));
     assert!(woke.load(Ordering::SeqCst));
-    let pending = domain.finish_target(flight).unwrap().pop().unwrap();
+    let (pending, _bindings) = finish_one(&mut domain, flight);
     domain.abort(pending).unwrap();
-    assert!(domain.fatal_error().is_none());
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 0);
     let failed = PendingControl::default();
-    let Some(mut failed_domain) = fixture(Some(failed.clone())) else {
+    let Some((mut failed_domain, mut bindings)) = fixture(Some(failed.clone())) else {
         return;
     };
     let failed_request = RequestId(3);
-    open(&mut failed_domain, failed_request);
+    open(&mut failed_domain, &mut bindings, failed_request);
     let flight =
-        submit_reserved_target(&mut failed_domain, vec![forward(failed_request, 0)]).unwrap();
+        submit_reserved_target(&mut failed_domain, bindings, vec![forward(failed_request, 0)]);
     failed.resolve(Err(crate::DeviceError::Execution(
         "injected target failure".into(),
     )));
-    assert!(failed_domain.finish_target(flight).is_err());
-    assert!(failed_domain.fatal_error().is_some());
+    assert!(matches!(
+        failed_domain.finish_target(flight),
+        Err(DomainError::Device(_))
+    ));
     assert!(failed_domain.resume_state(failed_request).is_err());
 }
 
 #[test]
 fn pending_target_state_is_classified_as_in_flight() {
     let control = PendingControl::default();
-    let Some(mut domain) = fixture(Some(control.clone())) else {
+    let Some((mut domain, mut bindings)) = fixture(Some(control.clone())) else {
         return;
     };
     let request = RequestId(9);
-    open(&mut domain, request);
+    open(&mut domain, &mut bindings, request);
     let before = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(before.unattributed, 0, "{before:?}");
-    let flight = submit_reserved_target(&mut domain, vec![forward(request, 0)]).unwrap();
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
     let pending = domain.reconcile_memory_charge(&[]).unwrap();
     assert!(pending.target_state.in_flight > before.target_state.in_flight);
     assert_eq!(pending.unattributed, 0);
     control.resolve(Ok(()));
-    for outcome in domain.finish_target(flight).unwrap() {
+    for outcome in domain.finish_target(flight).unwrap().0 {
         domain.abort(outcome).unwrap();
     }
 }
 
 #[test]
 fn fresh_memory_observation_reconciles_released_state_backing() {
-    let Some(mut domain) = fixture(None) else {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
         return;
     };
     let static_bytes = domain.static_holding_bytes().unwrap();
@@ -548,7 +692,9 @@ fn fresh_memory_observation_reconciles_released_state_backing() {
     domain.refresh_memory().unwrap();
     let before = domain.memory().standing().unwrap();
     assert_eq!(before.unattributed_bytes, 0);
-    let released = domain.shrink_state(ShrinkPolicy::Reclaim).unwrap();
+    let released = domain
+        .shrink_state(&mut bindings, ShrinkPolicy::Reclaim)
+        .unwrap();
     assert!(released > 0);
     domain.refresh_memory().unwrap();
     let after = domain.memory().standing().unwrap();
@@ -556,13 +702,15 @@ fn fresh_memory_observation_reconciles_released_state_backing() {
     assert_eq!(after.unattributed_bytes, 0);
 }
 
+/// A failed head or vision flight returns its device error, and its
+/// bindings go with it.
 #[test]
-fn pending_head_and_vision_device_failures_poison_the_domain_owner() {
+fn pending_head_and_vision_device_failures_consume_the_bindings() {
     let failure = |lane: &'static str| {
         crate::DeviceError::Execution(format!("failed pending {lane} submission"))
     };
 
-    let Some(mut head_domain) = fixture(None) else {
+    let Some((mut head_domain, bindings)) = fixture(None) else {
         return;
     };
     let head_control = PendingControl::default();
@@ -572,6 +720,7 @@ fn pending_head_and_vision_device_failures_poison_the_domain_owner() {
         submission: PendingFailureSubmission::<CompletedHeadWork>::new(head_control.clone()),
         started: Instant::now(),
         launch_trace: None,
+        bindings,
     };
     assert!(!head.completion().is_complete());
     head_control.resolve(Err(failure("head")));
@@ -579,12 +728,8 @@ fn pending_head_and_vision_device_failures_poison_the_domain_owner() {
         head_domain.finish_head(head),
         Err(DomainError::Device(_))
     ));
-    assert!(matches!(
-        head_domain.fatal_error(),
-        Some(DomainError::Device(_))
-    ));
 
-    let Some(mut vision_domain) = fixture(None) else {
+    let Some((mut vision_domain, bindings)) = fixture(None) else {
         return;
     };
     let vision_control = PendingControl::default();
@@ -593,6 +738,7 @@ fn pending_head_and_vision_device_failures_poison_the_domain_owner() {
         image: ImageRef::new(vision_domain.resource_identity().clone(), 1).unwrap(),
         submission: PendingFailureSubmission::<CompletedVisionWork>::new(vision_control.clone()),
         started: Instant::now(),
+        bindings,
     };
     assert!(!vision.completion().is_complete());
     vision_control.resolve(Err(failure("vision")));
@@ -600,19 +746,15 @@ fn pending_head_and_vision_device_failures_poison_the_domain_owner() {
         vision_domain.finish_vision(vision),
         Err(DomainError::Device(_))
     ));
-    assert!(matches!(
-        vision_domain.fatal_error(),
-        Some(DomainError::Device(_))
-    ));
 }
 
 #[test]
-fn completed_head_and_vision_request_cancellation_restores_or_drops_without_poisoning() {
-    let Some(mut domain) = fixture(None) else {
+fn completed_head_and_vision_request_cancellation_restores_or_drops() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
         return;
     };
     let request = RequestId(50);
-    open(&mut domain, request);
+    open(&mut domain, &mut bindings, request);
 
     // A head advance is independent from the accepted target lane. The target
     // state remaining resident must not be mistaken for a conflicting owner.
@@ -633,7 +775,6 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops_without_pois
             image: None,
         })
         .unwrap();
-    assert!(domain.fatal_error().is_none());
     assert_eq!(domain.target.get(&request).unwrap().position(), 0);
     assert_eq!(domain.head.remove(&request).unwrap().position(), 0);
 
@@ -661,6 +802,5 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops_without_pois
             image: Some(image),
         })
         .unwrap();
-    assert!(domain.fatal_error().is_none());
     assert_eq!(domain.target.get(&request).unwrap().position(), 0);
 }

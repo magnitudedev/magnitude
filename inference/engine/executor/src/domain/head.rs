@@ -16,26 +16,33 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Submit one batch of head transactions. Each commits its entry rows to
     /// head state when it completes; its chained proposal rows are scratch.
+    /// The flight holds `bindings` until `finish_head` returns them.
     pub fn submit_head(
         &mut self,
+        bindings: StateBindings<F>,
         operations: &[Operation],
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
         advances: Vec<OwnedStateAdvance>,
-    ) -> Result<HeadFlight<F::HeadSubmission>, DomainError> {
-        self.healthy()?;
+    ) -> Result<HeadFlight<F>, SubmitFailure<F>> {
+        if operations.is_empty() && advances.is_empty() {
+            return Err(SubmitFailure::Refused(
+                "head group is empty".into(),
+                bindings,
+            ));
+        }
+        // Reservation checked the group and moved its states into the
+        // advances: a mismatch now is a broken domain invariant.
+        let broken =
+            |detail: String| SubmitFailure::Failed(DomainError::invariant(detail));
         let store = self
             .head_store
-            .as_ref()
-            .ok_or("head state is disabled")?
-            .clone();
-        if operations.is_empty() {
-            return Err("head group is empty".into());
-        }
+            .clone()
+            .ok_or_else(|| broken("head advances without a head store".into()))?;
         if operations.len() != advances.len() {
-            return Err(
-                self.fatal_invariant("head reservation advance count differs from operations")
-            );
+            return Err(broken(
+                "head reservation advance count differs from operations".into(),
+            ));
         }
         let advances = advances
             .into_iter()
@@ -44,7 +51,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut seen = BTreeSet::new();
         let mut steps = 0usize;
         for (operation, advance) in operations.iter().zip(&advances) {
-            operation.validate().map_err(|error| error.to_string())?;
+            operation
+                .validate()
+                .map_err(|error| broken(error.to_string()))?;
             let Operation::Head {
                 request,
                 position,
@@ -52,13 +61,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 ..
             } = operation
             else {
-                return Err("head group contains another operation kind".into());
+                return Err(broken("head group contains another operation kind".into()));
             };
             if !seen.insert(*request) {
-                return Err("head request is repeated".into());
+                return Err(broken("head request is repeated".into()));
             }
             if advance.position() != *position || advance.rows() != operation.row_count() {
-                return Err("head position or rows differ from accepted state".into());
+                return Err(broken(
+                    "head position or rows differ from accepted state".into(),
+                ));
             }
             steps = steps.max(proposals.len());
         }
@@ -100,7 +111,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             |operation| !matches!(operation, Operation::Head { form: other, .. } if *other == form),
         ) {
             self.restore_head_advances(&metadata, advances);
-            return Err("head group mixes draft forms".into());
+            return Err(SubmitFailure::Refused(
+                "head group mixes draft forms".into(),
+                bindings,
+            ));
         }
         // A drafting block drafts the load's proposals; a request takes its
         // leading ones.
@@ -109,7 +123,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             DraftForm::Chained | DraftForm::Block => steps,
         };
         let vocabulary = self.definition.decoder.vocabulary as usize;
-        let class_limits = self.head_class_limits()?;
+        let class_limits = self.head_class_limits().map_err(SubmitFailure::Failed)?;
         let batch = match form {
             DraftForm::Chained => operations
                 .iter()
@@ -142,7 +156,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Ok(batch) => batch,
             Err(error) => {
                 self.restore_head_advances(&metadata, advances);
-                return Err(error.to_string().into());
+                return Err(SubmitFailure::Refused(error.into(), bindings));
             }
         };
         let conditioning = HeadConditioning::Rows(
@@ -187,9 +201,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Err((inputs, error)) => {
                 let (_, advances, _, _, _) = inputs.into_parts();
                 self.restore_head_advances(&metadata, advances);
-                let failure = DomainError::Invariant(error);
-                self.fatal = Some(failure.clone());
-                return Err(failure);
+                return Err(SubmitFailure::Failed(DomainError::Invariant(error)));
             }
         };
         // A single proposing flight supplies kernel attribution without
@@ -227,9 +239,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let (core, _, _) = launch.into_submission_parts();
                 let (_, advances, _) = core.into_parts();
                 self.restore_head_advances(&metadata, advances);
-                let failure = DomainError::from(error);
-                self.fatal = Some(failure.clone());
-                return Err(failure);
+                return Err(SubmitFailure::Failed(error.into()));
             }
         };
         Ok(HeadFlight {
@@ -238,6 +248,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             submission,
             started,
             launch_trace,
+            bindings,
         })
     }
 
@@ -378,24 +389,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Complete a head batch: read every drafted selection once, then hold
-    /// each transaction for its owner's reconciliation.
+    /// each transaction for its owner's reconciliation. Returns the bindings
+    /// the flight held; an error consumes them, as the domain cannot
+    /// continue.
     pub fn finish_head(
         &mut self,
-        flight: HeadFlight<F::HeadSubmission>,
-    ) -> Result<Vec<PendingOperationOutcome>, DomainError> {
-        let result = self.finish_head_inner(flight);
-        if let Err(error) = &result {
-            self.fatal = Some(error.clone());
-        }
-        result
-    }
-
-    fn finish_head_inner(
-        &mut self,
-        flight: HeadFlight<F::HeadSubmission>,
-    ) -> Result<Vec<PendingOperationOutcome>, DomainError> {
-        let completed = flight.submission.finish().map_err(DomainError::Device)?;
-        if let Some(trace) = &flight.launch_trace {
+        flight: HeadFlight<F>,
+    ) -> Result<(Vec<PendingOperationOutcome>, StateBindings<F>), DomainError> {
+        let HeadFlight {
+            requests,
+            steps,
+            submission,
+            started,
+            launch_trace,
+            bindings,
+        } = flight;
+        let completed = submission.finish().map_err(DomainError::Device)?;
+        if let Some(trace) = &launch_trace {
             let submissions = trace
                 .collect()
                 .map_err(|error| DomainError::Input(error.to_string()))?;
@@ -431,17 +441,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 eprintln!("  {entry}: {ms:.3} ms across {launches} launches");
             }
         }
-        let duration = flight.started.elapsed();
+        let duration = started.elapsed();
         if std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some() {
             eprintln!(
                 "flight head duration_ms={:.3} requests={:?}",
                 duration.as_secs_f64() * 1000.0,
-                flight.requests
+                requests
             );
         }
         let (core, selections) = completed.into_parts();
         let slots = core.batch().actual_slots();
-        if slots != flight.requests.len() {
+        if slots != requests.len() {
             return Err(DomainError::invariant(
                 "head slot count differs from request count",
             ));
@@ -455,16 +465,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             None => Vec::new(),
         };
-        let slot_class = selected.len().checked_div(flight.steps).unwrap_or(0);
-        if flight.steps != 0 && (slot_class < slots || selected.len() != flight.steps * slot_class)
-        {
+        let slot_class = selected.len().checked_div(steps).unwrap_or(0);
+        if steps != 0 && (slot_class < slots || selected.len() != steps * slot_class) {
             return Err(DomainError::invariant(
                 "head selections differ from the batch's steps and slots",
             ));
         }
         let passes = core.batch().passes();
         if std::env::var_os("MAGNITUDE_TRACE_DRAFT").is_some() {
-            for (slot, (request, _, proposals)) in flight.requests.iter().enumerate() {
+            for (slot, (request, _, proposals)) in requests.iter().enumerate() {
                 eprintln!(
                     "draft proposals request={request:?} {:?}",
                     (0..*proposals)
@@ -486,8 +495,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(flight
-            .requests
+        let pending = requests
             .into_iter()
             .zip(advances)
             .enumerate()
@@ -508,7 +516,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     image: None,
                 },
             )
-            .collect())
+            .collect();
+        Ok((pending, bindings))
     }
 }
 

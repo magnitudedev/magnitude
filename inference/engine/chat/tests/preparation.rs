@@ -427,7 +427,7 @@ fn json_constrained_generation_starts_with_and_without_forced_runs() {
         };
         let plan = prepared.input().constraint.as_ref().unwrap();
         let constraint = vocabulary.bind(&plan.grammar, &plan.prefix).unwrap();
-        let mut generation = GenerationSeed::new(
+        let generation = GenerationSeed::new(
             tokens.clone(),
             layout.clone(),
             options,
@@ -436,11 +436,10 @@ fn json_constrained_generation_starts_with_and_without_forced_runs() {
         .unwrap()
         .into_generation(Arc::new(Plain))
         .unwrap();
-        assert_eq!(
-            generation.start_round(RequestId(1), 64).unwrap(),
-            RoundStart::Target
-        );
-        let forward = generation.round_forward().unwrap();
+        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 64) else {
+            panic!("a fresh plain generation starts a target round");
+        };
+        let forward = round.round_forward();
         assert_eq!(forward.kind, WorkKind::Prefill);
         assert_eq!(forward.tokens, tokens);
         // The schema admits leading whitespace, so no token is forced: the

@@ -20,13 +20,13 @@ can always record one final outcome after the last accepted data event, even whi
 full. The receiver observes all queued data before the terminal. Recording a terminal closes the
 stream to further output; a second terminal is an invariant violation.
 
-A full data ring makes the request ineligible for scheduling until space returns. The first drain
+A full data ring makes the request ineligible to start a round until space returns. The first drain
 from full to non-full coalesces output credit and wakes the worker on a reserved path independent of
 ordinary command capacity. The worker clears that credit while processing it so another full-to-
 non-full transition cannot be lost. A processed credit makes the request schedulable only if the
 ring is still non-full and the receiver is still open. Receiver cancellation likewise wakes the
-worker through a reserved path. Closing either endpoint deterministically closes the request;
-worker teardown records terminal failure for a receiver that remains open.
+worker through a reserved path. A closed receiver never grants credit: it cancels its request.
+Worker teardown records terminal failure for a receiver that remains open.
 
 When the host is another process, the worker forwards the stream under host credit: the host
 grants one output batch per batch its consumer drains, and the worker drains the queue only while
@@ -34,10 +34,11 @@ it holds credit, so a slow consumer backs up to the queue's bound. The terminal 
 the stream's data in the same order; a connection that ends before a request's terminal outcome
 is a worker failure for that request.
 
-A failure the execution owner cannot isolate stops it with one classified error: every live request
-terminates with it, every later admission is refused with it, and the worker unloads with its cause.
-A device failure therefore reaches the host as device loss on all three paths, never as an engine
-invariant.
+Every execution stop (close, persistent Reclaim, or a failure the execution owner cannot isolate)
+reaches every live request with its cause: each terminates with it, every pending control and later
+admission is refused with it, and the worker unloads with it. A failure stops execution with one
+classified error, so a device failure reaches the host as device loss on every path, never as an
+engine invariant.
 
 A live request's status reports its prompt size, the leading prompt tokens restored from a
 retained prefix rather than computed, its resident position and its output count, so prefill
@@ -46,9 +47,11 @@ progress distinguishes reused from computed input.
 Shared queue state contains only device-free publication data, endpoint state, and wake state. Live
 generation, state transactions, device resources, and submissions remain confined to the worker.
 Host receiver progress does not require periodic polling commands or sleeps.
-Before submitting numerical work, the owner reserves output slots for every token the suspended
-generation round may accept, including tokens forced by a constraint or emitted while prefill
-advances without a selection row. Accepted output always has a matching publication permit.
+Before a generation round starts, the owner reserves output slots for every token the round may
+accept, including tokens forced by a constraint or emitted while prefill advances without a
+selection row. A request without that credit waits without starting the round, alone, until a
+publication wake; permits unused at reconciliation stay with the request. Credit therefore never
+runs out midway through a round, and accepted output always has a matching publication permit.
 
 Terminal success carries measured physical prompt and predicted durations accumulated by the
 execution owner at completed program boundaries. The host response converts these durations to
@@ -65,7 +68,10 @@ timing phase.
 - Forced and prefill-emitted tokens publish without exhausting unreserved output slots.
 - Success and failure follow all accepted output in the same stream, including when the ring is full.
 - Output credit and cancellation wakes remain observable when the ordinary worker mailbox is full.
-- Output-blocked requests do not receive new numerical service until credit is processed.
+- A request without credit for its next round does not start it until credit is processed; its
+  peers keep running.
+- A closed receiver cancels its request.
+- Every execution stop terminates each live request and fails each pending control with its cause.
 - Dropping the worker sender gives an open receiver one terminal failure.
 - Every terminal path releases request-owned resources after physical work and state reconciliation.
 - Terminal timing fields represent measured execution and remain consistent in streaming and complete responses.

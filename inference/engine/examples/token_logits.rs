@@ -20,13 +20,10 @@ use magnitude_engine::{
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     Demand, DomainError, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision,
-    RequestId, TokenId, WorkKind,
+    RequestId, ReservedResources, StateBindings, TokenId, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
-use magnitude_scheduler::{
-    domain::{self as service_domain, DomainFlight},
-    ServiceLimits,
-};
+use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
 use std::io::Write;
 use std::path::PathBuf;
@@ -94,15 +91,17 @@ fn text(error: DomainError) -> String {
 }
 
 /// One forward of `tokens` at `position`, the logits of every row that
-/// returns them (a prefill returns its last row's) appended to `logits`.
+/// returns them (a prefill returns its last row's) appended to `logits`. The
+/// flight carries the bindings and returns them.
 fn forward(
     domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
     request: RequestId,
     kind: WorkKind,
     tokens: Vec<TokenId>,
     position: usize,
     logits: &mut Vec<f32>,
-) -> Result<(), String> {
+) -> Result<StateBindings, String> {
     let rows = tokens.len();
     let operation = Operation::Forward {
         request,
@@ -115,16 +114,19 @@ fn forward(
         committed: rows,
         prime: None,
     };
-    let groups = service_domain::group(domain, vec![operation]);
-    let [group] = groups.as_slice() else {
-        return Err("one forward forms one group".into());
-    };
-    let DomainFlight::Target(flight) =
-        service_domain::submit_group(domain, group).map_err(|error| error.to_string())?
+    let operations = [operation];
+    let ReservedResources::Target(reservation) = domain
+        .reserve(&mut bindings, &operations)
+        .map_err(text)?
+        .into_resources()
     else {
         return Err("a forward runs on the target lane".into());
     };
-    for pending in domain.finish_target(flight).map_err(text)? {
+    let flight = domain
+        .submit_target(bindings, &operations, reservation)
+        .map_err(|failure| failure.error().to_string())?;
+    let (pending, bindings) = domain.finish_target(flight).map_err(text)?;
+    for pending in pending {
         let Outcome::Forward { rows: results } = pending.outcome().clone() else {
             return Err("a forward returns forward rows".into());
         };
@@ -144,7 +146,7 @@ fn forward(
             )
             .map_err(text)?;
     }
-    Ok(())
+    Ok(bindings)
 }
 
 fn main() -> Result<(), String> {
@@ -176,15 +178,18 @@ fn main() -> Result<(), String> {
     .resolve()
     .map_err(|error| error.to_string())?;
     let package = resolved.host.shared_package();
-    let (mut domain, _) =
+    let (mut domain, mut bindings, _) =
         build_native_domain(&resolved.manifest, package).map_err(|error| error.to_string())?;
     let request = RequestId(1);
     domain.install_input(request, PreparedModelInput::continuation_only())?;
-    domain.open_state(request, None).map_err(text)?;
+    domain
+        .open_state(&mut bindings, request, None)
+        .map_err(text)?;
     let mut logits = Vec::new();
     let (prefill, decode) = options.tokens.split_at(options.prefill);
-    forward(
+    bindings = forward(
         &mut domain,
+        bindings,
         request,
         WorkKind::Prefill,
         prefill.to_vec(),
@@ -192,8 +197,9 @@ fn main() -> Result<(), String> {
         &mut logits,
     )?;
     for (offset, token) in decode.iter().enumerate() {
-        forward(
+        bindings = forward(
             &mut domain,
+            bindings,
             request,
             WorkKind::Decode,
             vec![*token],

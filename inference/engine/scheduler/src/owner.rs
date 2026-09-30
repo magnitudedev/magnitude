@@ -1,32 +1,43 @@
 //! Serialized ownership of logical generation and one executor resource domain.
+//!
+//! The owner is the one schedule. Admission is logical: it records a request
+//! and replies. Residency, rounds, reclamation and eviction all happen in
+//! [`Owner::run`], between flights, where the owner holds the
+//! [`StateBindings`] that every binding change requires. The pipeline waits
+//! only on its own flight; a request that cannot proceed waits alone, in
+//! exactly one [`State`].
 use super::{
     domain::{
-        DomainFlight, ExecutorDomain, OperationGroup, ResumeState, group, requirements,
-        submit_group,
+        DomainFlight, ExecutorDomain, FlightOutcomes, OperationGroup, ResumeState, finish, group,
+        requirements, submit_group,
     },
     policy::{
         AvailabilityEpoch, Operation as ScheduledOperation, Phase, Scheduler, Selection,
         ServiceLimits, Victim, order_victims,
     },
     prefix_cache::{MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache, PrefixCacheCapacity, PrefixPath},
+    protocol::{RequestSnapshot, WorkerReply},
     publication::{
-        CapacityResource, ModelUnloadCause, PhysicalTimings, PublicationPermit, PublicationSender,
-        PublicationWake, PublicationWakeKind, PublishError, RequestError, ServiceCapacityError,
+        CapacityResource, ModelUnloadCause, PhysicalTimings, PublicationPermit, PublicationQueue,
+        PublicationReceiver, PublicationSender, PublicationWake, PublicationWakeKind, PublishError,
+        RequestError, ServiceCapacityError,
     },
     round_driver::{RoundError, lower_round, reconcile_forward},
+    worker::Wakes,
 };
 use magnitude_executor::{
     DomainError, DomainRequirements, HeadPhase, InvariantError, MemoryChargeReconciliation,
-    NativeFamily, OpenRequirements, Operation, Outcome, PhysicalDecision, ProgramFamily, RequestId,
-    ResourceKind, ResourcePlan, SubmitError, WorkKind, platform::DomainRole,
+    NativeFamily,
+    OpenRequirements, Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
+    ProgramFamily, RequestId, ResourceKind, ResourcePlan, StateBindings, SubmitError,
+    SubmitFailure, WorkKind, platform::DomainRole,
 };
 use magnitude_family_contracts::PreparedModelInput;
-use magnitude_generation::{
-    DetailedUsage, FinishReason, Generation, OutputToken, RoundStart, WaitReason,
-};
+use magnitude_generation::{FinishReason, Generation, OutputToken, RoundStart, StartedRound};
 use magnitude_state::ShrinkPolicy;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
     time::Duration,
 };
 
@@ -42,12 +53,12 @@ struct BranchPlan {
 /// deepest point a request with the same prompt can resume from (it must
 /// compute the row it samples from). None when that is not an exact input
 /// boundary, too short to be a hit, or already retained.
-fn prompt_boundary(record: &Record) -> Option<usize> {
-    let boundary = record.generation.prompt().len().checked_sub(1)?;
+fn prompt_boundary(record: &Record, generation: &Generation) -> Option<usize> {
+    let boundary = generation.prompt().len().checked_sub(1)?;
     (record.prefix_cache
         && !record.prefill_retained
         && boundary >= MIN_PREFIX_HIT
-        && record.generation.layout().boundary(boundary))
+        && generation.layout().boundary(boundary))
     .then_some(boundary)
 }
 
@@ -58,19 +69,33 @@ fn prefilling_toward(generation: &Generation, position: usize) -> bool {
         && generation.resident_position() < position
 }
 
+/// Whether a finished request still owes the prefix cache its reconciliation
+/// round: numerical state trails its accepted path.
+fn owes_reconciliation(record: &Record, generation: &Generation) -> bool {
+    record.prefix_cache
+        && !record.terminal_retained
+        && matches!(
+            generation.finish_reason(),
+            Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context)
+        )
+        && generation.pending_reconciliation().is_some()
+}
+
+fn ended(generation: &Generation) -> bool {
+    matches!(
+        generation.finish_reason(),
+        Some(FinishReason::Cancelled | FinishReason::Failed)
+    )
+}
+
+/// What stays with a request wherever its state is.
 struct Record {
-    generation: Generation,
-    /// Image encodes the request must complete before its next round, from
-    /// its latest residency.
-    encodes: VecDeque<Operation>,
     waiting_since: u64,
     service_ns: u64,
     physical_timings: PhysicalTimings,
     error: Option<RequestError>,
-    capacity: Option<(AvailabilityEpoch, u64, u64)>,
     preemption_debt: u32,
     protected_until: Option<usize>,
-    retire_on_completion: bool,
     /// Whether the request resumes from and contributes to the prefix cache.
     prefix_cache: bool,
     /// The cached prefix the request's residency forked, protected while
@@ -82,15 +107,11 @@ struct Record {
     /// diverges from a path the engine holds. Prefill stops there so the
     /// cache can retain a state every later divergent request resumes from.
     branch: Option<usize>,
-    /// A prompt position a live peer is prefilling toward and will retain:
-    /// this request stays non-resident until that prefix is cached (or no
-    /// peer computes it any more), so the prefix is computed once.
-    awaited_prefix: Option<usize>,
+    /// The host's stream; `None` once the host released the request.
     publication: Option<PublicationSender>,
     publication_batch_limit: usize,
     pending_publication: Option<Vec<OutputToken>>,
     publication_permits: VecDeque<PublicationPermit>,
-    publication_blocked: bool,
 }
 
 impl Record {
@@ -102,6 +123,168 @@ impl Record {
         };
         *bucket = bucket.saturating_add(nanos);
     }
+
+    /// Drop everything the host would still receive.
+    fn release_publication(&mut self) {
+        self.pending_publication = None;
+        self.publication_permits.clear();
+        self.publication.take();
+    }
+}
+
+/// Lowered operations a request submits before anything new. Never empty.
+struct Work(Vec<Operation>);
+
+impl Work {
+    fn new(operations: Vec<Operation>) -> Option<Self> {
+        (!operations.is_empty()).then_some(Self(operations))
+    }
+}
+
+/// Why residency or provisioning was refused, after every release was tried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    Capacity {
+        at: AvailabilityEpoch,
+        resource: ResourceKind,
+        required: u64,
+        available: u64,
+    },
+    /// Blind or Reclaim.
+    Memory,
+}
+
+enum Stage {
+    /// Not resident; a live peer is computing the prefix through this
+    /// position, and this request will resume from it.
+    AwaitingPrefix { through: usize },
+    /// Not resident. Selection makes it resident.
+    NonResident(Option<Wait>),
+    /// Resident; selection starts a round. A finished request waits here for
+    /// its output to drain, or for its reconciliation round.
+    Ready,
+    /// Resident; its host must drain output before the next round's
+    /// publication permits fit.
+    AwaitingCredit,
+    /// Resident with work outside a target round to submit first: image
+    /// encodes after residency, or method (drafter) operations.
+    Pending(Work, Option<Wait>),
+}
+
+/// A request outside the pipeline.
+enum State {
+    /// No round started.
+    Between(Generation, Stage),
+    /// A started target round whose next operation couldn't be provisioned.
+    /// It is submitted unchanged when selected.
+    Parked(StartedRound, Work, Option<Wait>),
+}
+
+impl State {
+    fn generation(&self) -> &Generation {
+        match self {
+            Self::Between(generation, _) => generation,
+            Self::Parked(round, ..) => round.generation(),
+        }
+    }
+
+    fn wait(&self) -> Option<Wait> {
+        match self {
+            Self::Between(_, Stage::NonResident(wait) | Stage::Pending(_, wait))
+            | Self::Parked(_, _, wait) => *wait,
+            Self::Between(_, _) => None,
+        }
+    }
+
+    /// Terminate the request's generation, discarding any started round.
+    fn terminate(self, cancel: bool) -> Generation {
+        let generation = match self {
+            Self::Between(generation, _) => generation,
+            Self::Parked(round, ..) => round.cancel(),
+        };
+        let mut generation = generation;
+        if cancel {
+            generation.cancel();
+        } else {
+            generation.fail();
+        }
+        generation
+    }
+}
+
+struct Request {
+    record: Record,
+    state: State,
+}
+
+/// A request whose work is in the current round.
+enum Membership {
+    /// Encodes or drafter work: no target round started.
+    Generation(Generation),
+    Started(StartedRound),
+}
+
+impl Membership {
+    fn generation(&self) -> &Generation {
+        match self {
+            Self::Generation(generation) => generation,
+            Self::Started(round) => round.generation(),
+        }
+    }
+
+    fn terminate(self, cancel: bool) -> Generation {
+        let mut generation = match self {
+            Self::Generation(generation) => generation,
+            Self::Started(round) => round.cancel(),
+        };
+        if cancel {
+            generation.cancel();
+        } else {
+            generation.fail();
+        }
+        generation
+    }
+}
+
+struct Member {
+    record: Record,
+    state: Membership,
+}
+
+/// A request selection can take, moved out of the map while a round forms.
+enum Candidate {
+    NonResident(Generation),
+    Ready(Generation),
+    Pending(Generation, Work),
+    Parked(StartedRound, Work),
+}
+
+impl Candidate {
+    fn generation(&self) -> &Generation {
+        match self {
+            Self::NonResident(generation) | Self::Ready(generation) | Self::Pending(generation, _) => {
+                generation
+            }
+            Self::Parked(round, _) => round.generation(),
+        }
+    }
+
+    fn into_state(self) -> State {
+        match self {
+            Self::NonResident(generation) => State::Between(generation, Stage::NonResident(None)),
+            Self::Ready(generation) => State::Between(generation, Stage::Ready),
+            Self::Pending(generation, work) => State::Between(generation, Stage::Pending(work, None)),
+            Self::Parked(round, work) => State::Parked(round, work, None),
+        }
+    }
+}
+
+/// How starting a selected request ended.
+enum Start {
+    /// Its work joins the round.
+    Joined(Member, Vec<Operation>),
+    /// It waits, or ended, outside the round.
+    Returned(Request),
 }
 
 fn classify_domain_error(error: DomainError) -> RequestError {
@@ -130,6 +313,21 @@ fn classify_domain_error(error: DomainError) -> RequestError {
     }
 }
 
+/// Whether a domain error stops execution rather than one request.
+fn is_fatal(error: &DomainError) -> bool {
+    matches!(
+        error,
+        DomainError::Device(_)
+            | DomainError::Invariant(_)
+            | DomainError::State(_)
+            | DomainError::Submit(SubmitError::Device(_) | SubmitError::Invariant(_))
+    )
+}
+
+fn invariant(context: &'static str) -> impl FnOnce(String) -> RequestError {
+    move |detail| RequestError::Invariant(InvariantError { context, detail })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Runnable,
@@ -152,9 +350,8 @@ pub enum AdmissionError {
     ModelUnloaded {
         cause: ModelUnloadCause,
     },
-    /// The request cannot open: the typed failure it would otherwise have
-    /// reported (invalid input, capacity after the release order, device
-    /// failure, or a failed engine invariant).
+    /// The request cannot be admitted: the typed failure it would otherwise
+    /// have reported (invalid input or a failed engine invariant).
     Refused(RequestError),
 }
 
@@ -197,18 +394,25 @@ impl From<DomainError> for AdmissionError {
     }
 }
 
+/// What one [`Owner::run`] left behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Step {
-    Submitted,
-    Reconciled,
-    Waiting,
-    Idle,
-    Progress,
+pub struct Ran {
+    /// When the owner must run again without an event: its next memory
+    /// observation.
+    pub due: u64,
+    /// Whether a group is on the device.
+    pub in_flight: bool,
+    /// Memory escalation decided to unload the model. Every request has been
+    /// terminated with memory pressure; the caller drains the flight.
+    pub unload: bool,
 }
 
 /// How long Reclaim may persist after releases are exhausted, and how long
 /// observations may fail continuously, before the model unloads.
 const MEMORY_ESCALATION_NS: u64 = 1_000_000_000;
+
+/// How often the owner observes memory without another reason to run.
+const OBSERVATION_INTERVAL_NS: u64 = 100_000_000;
 
 /// One probe of every domain the loaded model uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,14 +439,10 @@ enum MemoryCondition {
     Blind {
         since: u64,
     },
-    Unloading,
 }
 
 impl MemoryCondition {
     fn observe(self, observation: MemoryObservation, now: u64) -> Self {
-        if self == Self::Unloading {
-            return self;
-        }
         match observation {
             MemoryObservation::Normal => Self::Normal,
             MemoryObservation::Reclaim => match self {
@@ -257,7 +457,7 @@ impl MemoryCondition {
                 }
                 Self::Blind { since } => Self::Blind { since },
                 Self::Reclaim { since } => Self::Reclaim { since },
-                _ => Self::Blind { since: now },
+                Self::Normal => Self::Blind { since: now },
             },
         }
     }
@@ -279,34 +479,33 @@ struct ActiveGroup<F: ProgramFamily> {
     flight: DomainFlight<F>,
     operations: Vec<Operation>,
     prefix_uses: Vec<u64>,
-    publication_permits: BTreeMap<RequestId, Vec<PublicationPermit>>,
 }
 
-struct Batch<F: ProgramFamily> {
+struct Round {
     selection: Selection,
     started: u64,
-    queued: VecDeque<OperationGroup>,
-    active: Option<ActiveGroup<F>>,
-    blocked: Option<AvailabilityEpoch>,
+    /// The requests whose work is in this round, moved out of the map.
+    members: BTreeMap<RequestId, Member>,
+    /// Groups not yet submitted, in order; reconciliation appends follow-ups.
+    groups: VecDeque<OperationGroup>,
 }
 
-pub struct Owner<F: ProgramFamily = NativeFamily> {
-    domain: ExecutorDomain<F>,
-    scheduler: Scheduler,
-    records: BTreeMap<RequestId, Record>,
-    batch: Option<Batch<F>>,
-    epoch: AvailabilityEpoch,
-    next_id: u64,
-    now: u64,
-    /// The classified failure that stopped the owner; every live request
-    /// terminated with it and every later admission is refused with it.
-    fatal: Option<RequestError>,
-    prefix_cache: PrefixCache<ResumeState>,
-    reclaim_release_pending: bool,
-    memory_condition: MemoryCondition,
-    /// Per domain role, the least memory a capacity-blocked request still
-    /// needs from that domain's ceiling after every release was exhausted.
-    memory_deficits: Vec<MemoryDeficit>,
+enum Pipeline<F: ProgramFamily> {
+    /// Between flights: the right to change store bindings is here.
+    Idle(StateBindings<F>),
+    /// One group on the device. Its flight holds the bindings until
+    /// completion returns them.
+    InFlight(Round, ActiveGroup<F>),
+}
+
+/// How provisioning a group ended.
+enum Provisioned {
+    /// The group fits: submit it.
+    Fits(OperationGroup),
+    /// Capacity fits the leading operations: submit them first.
+    Split(OperationGroup, OperationGroup),
+    /// It cannot proceed now; its requests wait.
+    Short(OperationGroup, Wait),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,165 +514,668 @@ struct MemoryDeficit {
     required: u64,
 }
 
+/// Everything the owner holds except its pipeline.
+struct Service<F: ProgramFamily> {
+    domain: ExecutorDomain<F>,
+    scheduler: Scheduler,
+    /// Requests outside the pipeline.
+    requests: BTreeMap<RequestId, Request>,
+    epoch: AvailabilityEpoch,
+    next_id: u64,
+    now: u64,
+    prefix_cache: PrefixCache<ResumeState>,
+    memory_condition: MemoryCondition,
+    /// Per domain role, the least memory a capacity-blocked request still
+    /// needs from that domain's ceiling after every release was exhausted.
+    memory_deficits: Vec<MemoryDeficit>,
+    /// Reclaim was observed while a flight held the bindings; its releases
+    /// run once they return.
+    release_owed: bool,
+    next_observation: u64,
+    wakes: Arc<dyn Wakes>,
+}
+
+pub struct Owner<F: ProgramFamily = NativeFamily> {
+    service: Service<F>,
+    pipeline: Pipeline<F>,
+}
+
 impl<F: ProgramFamily> Owner<F> {
-    pub fn new(domain: ExecutorDomain<F>, limits: ServiceLimits) -> Result<Self, String> {
-        Self::with_prefix_cache_capacity(domain, limits, PrefixCacheCapacity::disabled())
+    pub fn new(
+        domain: ExecutorDomain<F>,
+        bindings: StateBindings<F>,
+        limits: ServiceLimits,
+        wakes: Arc<dyn Wakes>,
+    ) -> Result<Self, String> {
+        Self::with_prefix_cache_capacity(
+            domain,
+            bindings,
+            limits,
+            PrefixCacheCapacity::disabled(),
+            wakes,
+        )
     }
 
     pub fn with_prefix_cache_capacity(
         domain: ExecutorDomain<F>,
+        bindings: StateBindings<F>,
         limits: ServiceLimits,
         capacity: PrefixCacheCapacity,
+        wakes: Arc<dyn Wakes>,
     ) -> Result<Self, String> {
         Ok(Self {
-            domain,
-            scheduler: Scheduler::new(limits)?,
-            records: BTreeMap::new(),
-            batch: None,
-            epoch: AvailabilityEpoch::default(),
-            next_id: 1,
-            now: 0,
-            fatal: None,
-            prefix_cache: PrefixCache::new(capacity),
-            reclaim_release_pending: false,
-            memory_condition: MemoryCondition::Normal,
-            memory_deficits: Vec::new(),
+            service: Service {
+                domain,
+                scheduler: Scheduler::new(limits)?,
+                requests: BTreeMap::new(),
+                epoch: AvailabilityEpoch::default(),
+                next_id: 1,
+                now: 0,
+                prefix_cache: PrefixCache::new(capacity),
+                memory_condition: MemoryCondition::Normal,
+                memory_deficits: Vec::new(),
+                release_owed: false,
+                next_observation: 0,
+                wakes,
+            },
+            pipeline: Pipeline::Idle(bindings),
         })
     }
 
     pub fn with_resource_plan(
         domain: ExecutorDomain<F>,
+        bindings: StateBindings<F>,
         limits: ServiceLimits,
         plan: &ResourcePlan,
+        wakes: Arc<dyn Wakes>,
     ) -> Result<Self, String> {
         Self::with_prefix_cache_capacity(
             domain,
+            bindings,
             limits,
             PrefixCacheCapacity::from_resource_plan(plan),
+            wakes,
         )
     }
 
-    /// Bind the sole host-visible stream before the worker next advances this
-    /// request. The queue is created after admission so its reserved wake can
-    /// carry the assigned request identity.
-    pub fn attach_publication(
+    /// Logical admission: record the request and hand the host its stream.
+    /// It opens no state and grows nothing; it becomes resident when a round
+    /// selects it.
+    pub fn admit(
         &mut self,
-        request: RequestId,
-        sender: PublicationSender,
-        token_batch_limit: usize,
-    ) -> Result<(), String> {
-        if token_batch_limit == 0 {
-            return Err("publication token batch limit must be positive".into());
-        }
-        let record = self.records.get_mut(&request).ok_or("unknown request")?;
-        if record.publication.is_some() || record.publication_batch_limit != 0 {
-            return Err("request already has a publication stream".into());
-        }
-        record.publication = Some(sender);
-        record.publication_batch_limit = token_batch_limit;
-        Ok(())
+        generation: Generation,
+        input: PreparedModelInput,
+        prefix_cache: bool,
+        output_capacity: usize,
+        now: u64,
+    ) -> Result<(RequestId, PublicationReceiver), AdmissionError> {
+        let members = match &mut self.pipeline {
+            Pipeline::InFlight(round, _) => Some(&mut round.members),
+            Pipeline::Idle(_) => None,
+        };
+        self.service
+            .admit(generation, input, prefix_cache, output_capacity, now, members)
     }
 
-    /// Consume only a reserved wake for this request's exact queue. A stale
-    /// credit cannot make a full request schedulable; receiver closure cancels
-    /// through the existing physical-completion-aware release path.
-    pub fn publication_wake(
-        &mut self,
-        request: RequestId,
-        wake: PublicationWake,
-    ) -> Result<(), String> {
-        let (credit, cancelled) = {
-            let Some(record) = self.records.get_mut(&request) else {
-                return Ok(());
-            };
-            let Some(sender) = record.publication.as_mut() else {
-                return Ok(());
-            };
-            match wake.kind() {
-                PublicationWakeKind::OutputCredit => {
-                    let credit = sender.process_output_credit(wake);
-                    if credit {
-                        record.publication_blocked = false;
-                    }
-                    (credit, false)
+    /// Stop a live request through its ordered stream. Work in flight still
+    /// reconciles before the request retires.
+    pub fn stop(&mut self, request: RequestId) {
+        self.terminate_request(request, false);
+    }
+
+    /// Release a request the host abandoned: no terminal outcome reaches it.
+    pub fn cancel(&mut self, request: RequestId) {
+        self.terminate_request(request, true);
+    }
+
+    fn terminate_request(&mut self, id: RequestId, release: bool) {
+        if let Pipeline::InFlight(round, _) = &mut self.pipeline {
+            if let Some(Member { mut record, state }) = round.members.remove(&id) {
+                // Work in flight reconciles as aborted; queued work is dropped.
+                let mut generation = state.terminate(true);
+                generation.discard_output();
+                if release {
+                    record.release_publication();
+                } else {
+                    record.pending_publication = None;
+                    record.publication_permits.clear();
                 }
-                PublicationWakeKind::Cancelled => (false, sender.process_cancelled(wake)),
+                round.members.insert(
+                    id,
+                    Member {
+                        record,
+                        state: Membership::Generation(generation),
+                    },
+                );
+                return;
             }
-        };
-        if credit {
-            self.epoch.advance()?;
         }
-        if cancelled {
-            self.release(request)?;
+        self.service.terminate_request(id, release);
+    }
+
+    pub fn snapshot(&self, request: RequestId) -> Option<RequestSnapshot> {
+        if let Pipeline::InFlight(round, _) = &self.pipeline {
+            if let Some(member) = round.members.get(&request) {
+                return Some(snapshot(
+                    member.state.generation(),
+                    match member.state.generation().finish_reason() {
+                        Some(finish) if ended(member.state.generation()) => {
+                            Status::Terminal(finish)
+                        }
+                        _ => Status::AwaitingCompletion,
+                    },
+                ));
+            }
         }
-        Ok(())
+        let request = self.service.requests.get(&request)?;
+        Some(snapshot(
+            request.state.generation(),
+            self.service.status(request),
+        ))
+    }
+
+    /// A fresh reading of every memory domain, then Seismic's charge
+    /// classified by every holder the owner keeps.
+    pub fn observe(&self) -> Result<WorkerReply, String> {
+        Ok(WorkerReply::Observed {
+            readings: self
+                .service
+                .domain
+                .refresh_memory()
+                .map_err(|error| error.to_string())?,
+            reconciliation: self.reconcile_memory_charge()?,
+        })
+    }
+
+    /// Seismic's charge reconciled against every state holder the owner
+    /// keeps: resident requests and cached prefixes; submitted work is
+    /// counted through its stores' claims.
+    pub fn reconcile_memory_charge(&self) -> Result<MemoryChargeReconciliation, String> {
+        let cached = self.service.prefix_cache.states().collect::<Vec<_>>();
+        self.service.domain.reconcile_memory_charge(&cached)
+    }
+
+    pub fn completed_service_ns(&self) -> u128 {
+        self.service.scheduler.completed_service_ns()
+    }
+
+    pub fn cached_prefixes(&self) -> usize {
+        self.service.prefix_cache.len()
     }
 
     pub fn inspect_domain<R>(
         &self,
         inspect: impl FnOnce(&ExecutorDomain<F>) -> Result<R, String>,
     ) -> Result<R, String> {
-        inspect(&self.domain)
+        inspect(&self.service.domain)
     }
 
-    fn time(&mut self, now: u64) -> Result<(), String> {
+    /// Consume a reserved wake for this request's exact queue. Output credit
+    /// lets a request waiting on it start its next round; receiver closure
+    /// releases the request.
+    pub fn publication_wake(&mut self, request: RequestId, wake: PublicationWake) {
+        let cancelled = match wake.kind() {
+            PublicationWakeKind::OutputCredit => {
+                self.service.output_credit(request, wake, &mut self.pipeline);
+                false
+            }
+            PublicationWakeKind::Cancelled => self
+                .service
+                .publication_sender(request, &mut self.pipeline)
+                .is_some_and(|sender| sender.process_cancelled(wake)),
+        };
+        if cancelled {
+            self.cancel(request);
+        }
+    }
+
+    /// Terminate every live request with `error`: the lifecycle is draining.
+    pub fn terminate_all(&mut self, error: RequestError) {
+        let members = match &mut self.pipeline {
+            Pipeline::InFlight(round, _) => Some(&mut round.members),
+            Pipeline::Idle(_) => None,
+        };
+        self.service.terminalize_all(error, members);
+    }
+
+    /// Run every transition that is possible now. An error is fatal: every
+    /// request has been terminated with it and execution must stop.
+    pub fn run(self, now: u64) -> Result<(Self, Ran), RequestError> {
+        let Owner {
+            mut service,
+            pipeline,
+        } = self;
+        match service.drive(pipeline, now) {
+            Ok((pipeline, ran)) => Ok((Owner { service, pipeline }, ran)),
+            Err((mut members, error)) => {
+                // Members are dropped with the owner; terminating them first
+                // delivers their outcome.
+                service.terminalize_all(error.clone(), members.as_mut());
+                Err(error)
+            }
+        }
+    }
+}
+
+fn snapshot(generation: &Generation, status: Status) -> RequestSnapshot {
+    let usage = generation.detailed_usage();
+    RequestSnapshot {
+        status,
+        prompt_tokens: usage.prompt_tokens,
+        cached_tokens: usage.cached_tokens,
+        resident_position: generation.resident_position(),
+        output_tokens: generation.output_len(),
+    }
+}
+
+type Fatal = (Option<BTreeMap<RequestId, Member>>, RequestError);
+
+impl<F: ProgramFamily> Service<F> {
+    fn time(&mut self, now: u64) -> Result<(), RequestError> {
         if now < self.now {
-            return Err("service clock moved backwards".into());
+            return Err(invariant("service clock")("service clock moved backwards".into()));
         }
         self.now = now;
         Ok(())
     }
 
-    /// Observe every domain the model uses. In Reclaim, release in order
-    /// until the band is Normal; unload once Reclaim persists for the
-    /// escalation interval after releases are exhausted, or once
-    /// observations have failed for that interval. Releases and unload never
-    /// run under a flight: they wait for its completion.
-    fn observe_periodic_memory(&mut self, now: u64) -> Result<(), String> {
-        self.time(now)?;
-        if self.memory_condition == MemoryCondition::Unloading {
-            return Ok(());
+    fn admit(
+        &mut self,
+        generation: Generation,
+        input: PreparedModelInput,
+        prefix_cache: bool,
+        output_capacity: usize,
+        now: u64,
+        members: Option<&mut BTreeMap<RequestId, Member>>,
+    ) -> Result<(RequestId, PublicationReceiver), AdmissionError> {
+        self.time(now).map_err(AdmissionError::Refused)?;
+        if matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
+            return Err(AdmissionError::MemoryReclaim);
         }
-        let observation = Self::memory_observation(self.domain.probe_memory())?;
-        self.enter_memory_condition(self.memory_condition.observe(observation, now))?;
-        if !matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
-            self.reclaim_release_pending = false;
-            if observation == MemoryObservation::Normal {
-                self.reopen_memory_deficits()?;
-            }
-            return Ok(());
+        if generation.is_resident() || generation.usage().completion_tokens != 0 {
+            return Err(AdmissionError::invariant("admission")(
+                "only a fresh generation can be admitted".into(),
+            ));
         }
-        if self
-            .batch
-            .as_ref()
-            .is_some_and(|batch| batch.active.is_some())
-        {
-            self.reclaim_release_pending = true;
-            return Ok(());
-        }
-        // Releases are measured against a fresh reading; a Blind escalation
-        // has none, so it goes straight to the unload decision.
-        if observation == MemoryObservation::Reclaim && self.release_for_reclaim()? {
-            self.memory_condition = self.memory_condition.released(now);
-            let after = Self::memory_observation(self.domain.probe_memory())?;
-            self.enter_memory_condition(self.memory_condition.observe(after, now))?;
-        }
-        if self.memory_condition.should_unload(now) {
-            self.begin_memory_unload();
-        }
-        Ok(())
+        self.domain.probe_memory().map_err(AdmissionError::from)?;
+        let id = RequestId(self.next_id);
+        self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
+            AdmissionError::invariant("service identity")("identity exhausted".into())
+        })?;
+        let wakes = self.wakes.clone();
+        let (sender, receiver) = PublicationQueue::bounded(output_capacity, move |wake| {
+            wakes.publication(id, wake);
+        })
+        .map_err(|error| AdmissionError::invariant("publication")(error.to_owned()))?;
+        self.domain
+            .install_input(id, input)
+            .map_err(|error| AdmissionError::Refused(RequestError::Input(error)))?;
+        let plan = if prefix_cache {
+            self.plan_branches(PrefixPath::of(&generation), generation.resume_bound(), members)
+        } else {
+            BranchPlan::default()
+        };
+        let stage = match plan.awaited {
+            Some(through) => Stage::AwaitingPrefix { through },
+            None => Stage::NonResident(None),
+        };
+        self.requests.insert(
+            id,
+            Request {
+                record: Record {
+                    waiting_since: now,
+                    service_ns: 0,
+                    physical_timings: PhysicalTimings::default(),
+                    error: None,
+                    preemption_debt: 0,
+                    protected_until: None,
+                    prefix_cache,
+                    prefix_source: None,
+                    prefill_retained: false,
+                    terminal_retained: false,
+                    branch: plan.branch,
+                    publication: Some(sender),
+                    publication_batch_limit: output_capacity,
+                    pending_publication: None,
+                    publication_permits: VecDeque::new(),
+                },
+                state: State::Between(generation, stage),
+            },
+        );
+        Ok((id, receiver))
     }
 
-    /// Enter `next`. Memory returning to Normal is an availability change:
-    /// every request waiting on memory retries.
-    fn enter_memory_condition(&mut self, next: MemoryCondition) -> Result<(), String> {
+    /// Branch points for a new request's `path`: the deepest position where
+    /// it diverges from a cached path or a live request's prompt. A live
+    /// request that has not yet prefilled to its divergence from this one
+    /// stops there too, so the shared prefix is cached by whichever request
+    /// reaches it first and every later request resumes at it instead of
+    /// recomputing.
+    fn plan_branches(
+        &mut self,
+        path: PrefixPath,
+        bound: usize,
+        members: Option<&mut BTreeMap<RequestId, Member>>,
+    ) -> BranchPlan {
+        let worthwhile = |point: usize, from: usize, prompt: usize| {
+            point >= MIN_PREFIX_HIT && point >= from + MIN_BRANCH_GAIN && point < prompt
+        };
+        let resumed = self.prefix_cache.deepest(path, bound);
+        let cached = self.prefix_cache.shared_boundary(path);
+        let mut deepest = cached;
+        // The deepest shared prefix a live peer is still prefilling toward
+        // and will cache at its branch point.
+        let mut in_flight = 0;
+        let live = self
+            .requests
+            .values_mut()
+            .map(|request| (&mut request.record, request.state.generation()))
+            .chain(
+                members
+                    .into_iter()
+                    .flat_map(|members| members.values_mut())
+                    .map(|member| (&mut member.record, member.state.generation())),
+            )
+            .filter(|(record, _)| record.prefix_cache);
+        for (record, generation) in live {
+            let shared = path.shared_with_prompt_of(PrefixPath::of(generation));
+            deepest = deepest.max(shared);
+            if record.branch.is_none()
+                && worthwhile(
+                    shared,
+                    generation.resident_position(),
+                    generation.prompt().len(),
+                )
+            {
+                record.branch = Some(shared);
+            }
+            if record.branch == Some(shared) && prefilling_toward(generation, shared) {
+                in_flight = in_flight.max(shared);
+            }
+        }
+        if !worthwhile(deepest, resumed, path.len()) {
+            return BranchPlan::default();
+        }
+        if in_flight == deepest && deepest > cached {
+            // A peer computes this prefix now: wait for it to be cached.
+            return BranchPlan {
+                branch: None,
+                awaited: Some(deepest),
+            };
+        }
+        BranchPlan {
+            branch: Some(deepest),
+            awaited: None,
+        }
+    }
+
+    /// Whether a live request other than `except` is still prefilling toward
+    /// a planned branch point at `position`.
+    fn prefix_pending(&self, position: usize, except: RequestId) -> bool {
+        self.requests.iter().any(|(&id, request)| {
+            id != except
+                && request.record.prefix_cache
+                && request.record.branch == Some(position)
+                && prefilling_toward(request.state.generation(), position)
+        })
+    }
+
+    fn status(&self, request: &Request) -> Status {
+        let generation = request.state.generation();
+        if let Some(finish) = generation.finish_reason() {
+            if !owes_reconciliation(&request.record, generation) {
+                return Status::Terminal(finish);
+            }
+        }
+        match request.state.wait() {
+            Some(Wait::Capacity {
+                required,
+                available,
+                ..
+            }) => {
+                return Status::CapacityBlocked {
+                    required,
+                    available,
+                };
+            }
+            Some(Wait::Memory) => return Status::Preempted,
+            None => {}
+        }
+        match &request.state {
+            State::Between(_, Stage::AwaitingCredit) => Status::OutputBlocked,
+            State::Between(_, Stage::NonResident(_)) if request.record.preemption_debt > 0 => {
+                Status::Preempted
+            }
+            _ => Status::Runnable,
+        }
+    }
+
+    fn publication_sender<'a>(
+        &'a mut self,
+        request: RequestId,
+        pipeline: &'a mut Pipeline<F>,
+    ) -> Option<&'a mut PublicationSender> {
+        if let Pipeline::InFlight(round, _) = pipeline {
+            if let Some(member) = round.members.get_mut(&request) {
+                return member.record.publication.as_mut();
+            }
+        }
+        self.requests
+            .get_mut(&request)
+            .and_then(|request| request.record.publication.as_mut())
+    }
+
+    /// A credit wake sends a request waiting on credit back to selection,
+    /// whatever the ring holds now: its next reservation either fits or,
+    /// refused, re-arms the queue's next wake.
+    fn output_credit(&mut self, id: RequestId, wake: PublicationWake, pipeline: &mut Pipeline<F>) {
+        if let Some(sender) = self.publication_sender(id, pipeline) {
+            sender.process_output_credit(wake);
+        }
+        if let Some(request) = self.requests.get_mut(&id) {
+            if let State::Between(_, stage @ Stage::AwaitingCredit) = &mut request.state {
+                *stage = Stage::Ready;
+            }
+        }
+    }
+
+    /// Terminate a request outside the pipeline, and retire it once nothing
+    /// remains for its host.
+    fn terminate_request(&mut self, id: RequestId, release: bool) {
+        let Some(Request { mut record, state }) = self.requests.remove(&id) else {
+            return;
+        };
+        let mut generation = state.terminate(true);
+        generation.discard_output();
+        if release {
+            record.release_publication();
+        } else {
+            record.pending_publication = None;
+            record.publication_permits.clear();
+        }
+        self.requests.insert(
+            id,
+            Request {
+                record,
+                state: State::Between(generation, Stage::Ready),
+            },
+        );
+        self.epoch.advance();
+    }
+
+    /// Terminate every live request with `error`, delivering each host its
+    /// outcome now.
+    fn terminalize_all(
+        &mut self,
+        error: RequestError,
+        members: Option<&mut BTreeMap<RequestId, Member>>,
+    ) {
+        let terminate = |record: &mut Record, generation: &mut Generation| {
+            if generation.finish_reason().is_none() {
+                generation.fail();
+                record.error.get_or_insert_with(|| error.clone());
+            }
+            // Only output already accepted by the queue precedes a terminal
+            // outcome. Unpublished generation output is not promoted by a
+            // second, unbounded failure delivery channel.
+            if let Some(sender) = record.publication.take() {
+                generation.discard_output();
+                record.pending_publication = None;
+                record.publication_permits.clear();
+                match generation.finish_reason() {
+                    Some(FinishReason::Failed) | None => {
+                        sender.fail(record.error.clone().unwrap_or_else(|| error.clone()));
+                    }
+                    Some(finish) => sender.complete(
+                        finish,
+                        generation.detailed_usage(),
+                        generation.method_identity().to_owned(),
+                        record.physical_timings,
+                    ),
+                }
+            }
+        };
+        let ids = self.requests.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            let Request { mut record, state } = self.requests.remove(&id).expect("listed request");
+            let mut generation = match state {
+                State::Between(generation, _) => generation,
+                State::Parked(round, ..) => round.fail(),
+            };
+            terminate(&mut record, &mut generation);
+            self.requests.insert(
+                id,
+                Request {
+                    record,
+                    state: State::Between(generation, Stage::Ready),
+                },
+            );
+        }
+        if let Some(members) = members {
+            let ids = members.keys().copied().collect::<Vec<_>>();
+            for id in ids {
+                let Member { mut record, state } = members.remove(&id).expect("listed member");
+                let mut generation = match state {
+                    Membership::Generation(generation) => generation,
+                    Membership::Started(round) => round.fail(),
+                };
+                terminate(&mut record, &mut generation);
+                members.insert(
+                    id,
+                    Member {
+                        record,
+                        state: Membership::Generation(generation),
+                    },
+                );
+            }
+        }
+    }
+
+    fn fail_generation(record: &mut Record, generation: &mut Generation, error: RequestError) {
+        // Accepted output still precedes the terminal failure on this
+        // request's stream. Its reserved permits must survive until that
+        // output has drained.
+        if generation.finish_reason().is_none() {
+            generation.fail();
+        }
+        record.error = Some(error);
+    }
+
+    fn drive(&mut self, mut pipeline: Pipeline<F>, now: u64) -> Result<(Pipeline<F>, Ran), Fatal> {
+        self.time(now).map_err(|error| (None, error))?;
+        let mut unload = false;
+        loop {
+            pipeline = match pipeline {
+                Pipeline::InFlight(round, mut active) => {
+                    if !active.flight.completion().is_complete() {
+                        unload |= self.observe(None).map_err(|error| (None, error))?;
+                        return Ok((
+                            Pipeline::InFlight(round, active),
+                            self.ran(true, unload),
+                        ));
+                    }
+                    let (round, bindings) = self.reconcile(round, active)?;
+                    self.advance(round, bindings)?
+                }
+                Pipeline::Idle(mut bindings) => {
+                    unload |= self
+                        .observe(Some(&mut bindings))
+                        .map_err(|error| (None, error))?;
+                    self.publish_ready().map_err(|error| (None, error))?;
+                    match self.select(&mut bindings)? {
+                        Selected::Round(round) => self.advance(round, bindings)?,
+                        Selected::Retry => Pipeline::Idle(bindings),
+                        Selected::Empty => {
+                            if self.fail_capacity_waiters() {
+                                Pipeline::Idle(bindings)
+                            } else {
+                                return Ok((Pipeline::Idle(bindings), self.ran(false, unload)));
+                            }
+                        }
+                    }
+                }
+            };
+        }
+    }
+
+    fn ran(&self, in_flight: bool, unload: bool) -> Ran {
+        Ran {
+            due: self.next_observation,
+            in_flight,
+            unload,
+        }
+    }
+
+    /// Observe memory when due. Reclaim releases need the bindings; while a
+    /// flight holds them they are owed until it completes. Returns whether
+    /// memory escalation decided to unload, after terminating every request.
+    fn observe(&mut self, bindings: Option<&mut StateBindings<F>>) -> Result<bool, RequestError> {
+        let memory = |error: String| invariant("memory observation")(error);
+        if self.now >= self.next_observation {
+            self.next_observation = self.now.saturating_add(OBSERVATION_INTERVAL_NS);
+            let observation = memory_observation(self.domain.probe_memory()).map_err(memory)?;
+            self.enter_memory_condition(self.memory_condition.observe(observation, self.now));
+            if !matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
+                self.release_owed = false;
+                if observation == MemoryObservation::Normal {
+                    self.reopen_memory_deficits().map_err(memory)?;
+                }
+            } else if observation == MemoryObservation::Reclaim {
+                // Releases are measured against a fresh reading; a Blind
+                // escalation has none, so it goes straight to the unload
+                // decision.
+                self.release_owed = true;
+            }
+        }
+        if let (true, Some(bindings)) = (self.release_owed, bindings) {
+            self.release_owed = false;
+            if self.release_for_reclaim(bindings)? {
+                self.memory_condition = self.memory_condition.released(self.now);
+                let after = memory_observation(self.domain.probe_memory()).map_err(memory)?;
+                self.enter_memory_condition(self.memory_condition.observe(after, self.now));
+            }
+        }
+        if self.memory_condition.should_unload(self.now) {
+            self.terminalize_all(
+                RequestError::ModelUnloaded {
+                    cause: ModelUnloadCause::MemoryPressure,
+                },
+                None,
+            );
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Enter `next`. Memory returning to Normal is an availability change,
+    /// and it ends every memory wait.
+    fn enter_memory_condition(&mut self, next: MemoryCondition) {
         let recovered =
             self.memory_condition != MemoryCondition::Normal && next == MemoryCondition::Normal;
         self.memory_condition = next;
         if recovered {
-            self.epoch.advance()?;
+            self.epoch.advance();
         }
-        Ok(())
     }
 
     /// A request blocked on a memory deficit waits for an availability
@@ -497,14 +1199,19 @@ impl<F: ProgramFamily> Owner<F> {
             })
         });
         if self.memory_deficits.len() != before {
-            self.epoch.advance()?;
+            self.epoch.advance();
         }
         Ok(())
     }
 
     /// Record that blocked work needs `required` bytes from `role`'s domain,
     /// keeping the least requirement per role so the earliest retry is kept.
-    fn record_memory_deficit(&mut self, role: DomainRole, required: u64) {
+    fn record_memory_deficit(&mut self, resource: ResourceKind, required: u64) {
+        let role = match resource {
+            ResourceKind::DeviceMemory => DomainRole::Allocation,
+            ResourceKind::HostStaging => DomainRole::Staging,
+            _ => return,
+        };
         match self
             .memory_deficits
             .iter_mut()
@@ -515,67 +1222,24 @@ impl<F: ProgramFamily> Owner<F> {
         }
     }
 
-    /// Block `requests` on a capacity deficit until availability changes,
-    /// when a live request outside `excluded` can still finish, drain or
-    /// release; a memory deficit also reopens once another process frees the
-    /// memory. With nothing that could change, fail them with the typed
-    /// deficit. Returns whether they are blocked.
-    fn block_on_capacity(
-        &mut self,
-        requests: &[RequestId],
-        excluded: &[RequestId],
-        resource: ResourceKind,
-        required: u64,
-        available: u64,
-    ) -> Result<bool, String> {
-        let can_change = self.records.iter().any(|(id, record)| {
-            !excluded.contains(id)
-                && (record.generation.finish_reason().is_some()
-                    || record.generation.output_len() > 0
-                    || record.capacity.is_none())
-        });
-        if !can_change {
-            for &request in requests {
-                self.fail_request(
-                    request,
-                    RequestError::Capacity(ServiceCapacityError {
-                        resource: CapacityResource::Execution(resource),
-                        required,
-                        available,
-                    }),
-                );
-            }
-            self.epoch.advance()?;
-            return Ok(false);
-        }
-        for request in requests {
-            if let Some(record) = self.records.get_mut(request) {
-                record.capacity = Some((self.epoch, required, available));
-            }
-        }
-        match resource {
-            ResourceKind::DeviceMemory => {
-                self.record_memory_deficit(DomainRole::Allocation, required)
-            }
-            ResourceKind::HostStaging => self.record_memory_deficit(DomainRole::Staging, required),
-            _ => {}
-        }
-        Ok(true)
-    }
-
-    fn memory_observation(result: Result<(), DomainError>) -> Result<MemoryObservation, String> {
-        match result {
-            Ok(()) => Ok(MemoryObservation::Normal),
-            Err(DomainError::Reclaim) => Ok(MemoryObservation::Reclaim),
-            Err(DomainError::Blind(_)) => Ok(MemoryObservation::Blind),
-            Err(error) => Err(error.to_string()),
+    /// The wait for a capacity deficit, recorded at the current epoch: after
+    /// every release has been tried.
+    fn capacity_wait(&mut self, resource: ResourceKind, required: u64, available: u64) -> Wait {
+        self.record_memory_deficit(resource, required);
+        Wait::Capacity {
+            at: self.epoch,
+            resource,
+            required,
+            available,
         }
     }
 
     /// Whether a fresh reading is still in the Reclaim band. A failed reading
     /// cannot measure a release, so it stops releasing.
-    fn reclaim_needed(&mut self) -> Result<bool, String> {
-        Ok(Self::memory_observation(self.domain.probe_memory())? == MemoryObservation::Reclaim)
+    fn reclaim_needed(&mut self) -> Result<bool, RequestError> {
+        Ok(memory_observation(self.domain.probe_memory())
+            .map_err(invariant("memory observation"))?
+            == MemoryObservation::Reclaim)
     }
 
     /// Release in the Reclaim order until every domain is back above its
@@ -584,157 +1248,462 @@ impl<F: ProgramFamily> Owner<F> {
     /// each eligible victim once. Preempted requests replay only after the
     /// band is Normal again, so no victim is chosen twice. Returns whether
     /// anything was released.
-    fn release_for_reclaim(&mut self) -> Result<bool, String> {
-        let mut released = self.release_surplus()?;
+    fn release_for_reclaim(&mut self, bindings: &mut StateBindings<F>) -> Result<bool, RequestError> {
+        let mut released = self.release_surplus(bindings)?;
         while self.reclaim_needed()? {
             if !self.prefix_cache.evict_one() {
                 break;
             }
             // Eviction drops claims, but committed rows and banks remain
             // charged until the stores shrink.
-            self.release_surplus()?;
+            self.release_surplus(bindings)?;
             released = true;
         }
         if self.reclaim_needed()? {
-            released |= self.domain.release_idle_optional_components()? != 0;
+            released |= self
+                .domain
+                .release_idle_optional_components(bindings)
+                .map_err(invariant("optional component release"))?
+                != 0;
         }
         while self.reclaim_needed()? {
             if !self.evict_victims(&[], false)? {
                 break;
             }
-            self.release_surplus()?;
+            self.release_surplus(bindings)?;
             released = true;
         }
         // Preemption can leave the optional components dormant.
         if self.reclaim_needed()? {
-            released |= self.domain.release_idle_optional_components()? != 0;
+            released |= self
+                .domain
+                .release_idle_optional_components(bindings)
+                .map_err(invariant("optional component release"))?
+                != 0;
         }
-        self.epoch.advance()?;
+        if released {
+            self.epoch.advance();
+        }
         Ok(released)
     }
 
     /// Release state backing beyond what the stores need, including idle
     /// state. Returns whether any bytes were released.
-    fn release_surplus(&mut self) -> Result<bool, String> {
+    fn release_surplus(&mut self, bindings: &mut StateBindings<F>) -> Result<bool, RequestError> {
         let shrunk = self
             .domain
-            .shrink_state(ShrinkPolicy::Reclaim)
-            .map_err(|error| error.to_string())?;
-        let idle = self.domain.reclaim_idle()?;
+            .shrink_state(bindings, ShrinkPolicy::Reclaim)
+            .map_err(classify_domain_error)?;
+        let idle = self
+            .domain
+            .reclaim_idle(bindings)
+            .map_err(invariant("idle state release"))?;
         Ok(shrunk != 0 || idle != 0)
     }
 
-    fn release_deferred_reclaim(&mut self) -> Result<(), String> {
-        if !self.reclaim_release_pending {
-            return Ok(());
+    /// When nothing can move the epoch (no flight: this runs in `Idle`, no
+    /// request waits on its host or on memory, and memory is Normal), every
+    /// capacity wait ends in its typed error. Returns whether any did.
+    fn fail_capacity_waiters(&mut self) -> bool {
+        if self.memory_condition != MemoryCondition::Normal {
+            return false;
         }
-        self.reclaim_release_pending = false;
-        self.observe_periodic_memory(self.now)
+        let independent = self.requests.values().any(|request| {
+            request.state.generation().finish_reason().is_some()
+                || matches!(request.state, State::Between(_, Stage::AwaitingCredit))
+                || request.state.wait() == Some(Wait::Memory)
+        });
+        if independent {
+            return false;
+        }
+        let waiting = self
+            .requests
+            .iter()
+            .filter_map(|(&id, request)| match request.state.wait() {
+                Some(Wait::Capacity {
+                    resource,
+                    required,
+                    available,
+                    ..
+                }) => Some((id, resource, required, available)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if waiting.is_empty() {
+            return false;
+        }
+        for (id, resource, required, available) in waiting {
+            let Request { mut record, state } = self.requests.remove(&id).expect("waiting request");
+            let mut generation = state.terminate(false);
+            Self::fail_generation(
+                &mut record,
+                &mut generation,
+                RequestError::Capacity(ServiceCapacityError {
+                    resource: CapacityResource::Execution(resource),
+                    required,
+                    available,
+                }),
+            );
+            self.requests.insert(
+                id,
+                Request {
+                    record,
+                    state: State::Between(generation, Stage::Ready),
+                },
+            );
+        }
+        self.epoch.advance();
+        true
     }
 
-    /// Admit a fresh generation with its prepared input. Unless it waits for
-    /// a live peer to compute a shared prefix, it becomes resident now, from
-    /// the deepest cached prefix of its path when `prefix_cache` allows.
-    pub fn admit(
-        &mut self,
-        generation: Generation,
-        input: PreparedModelInput,
-        prefix_cache: bool,
-        now: u64,
-    ) -> Result<RequestId, AdmissionError> {
-        self.time(now)
-            .map_err(AdmissionError::invariant("service clock"))?;
-        if self.memory_condition == MemoryCondition::Unloading {
-            return Err(AdmissionError::ModelUnloaded {
-                cause: ModelUnloadCause::MemoryPressure,
-            });
-        }
-        if matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
-            return Err(AdmissionError::MemoryReclaim);
-        }
-        if let Some(error) = &self.fatal {
-            return Err(AdmissionError::Refused(error.clone()));
-        }
-        if generation.is_resident() || generation.usage().completion_tokens != 0 {
-            return Err(AdmissionError::invariant("admission")(
-                "only a fresh generation can be admitted".into(),
-            ));
-        }
-        // A Blind refusal must leave accepted peers and their numerical
-        // holdings intact.
-        self.domain.probe_memory().map_err(AdmissionError::from)?;
-        let id = RequestId(self.next_id);
-        self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
-            AdmissionError::invariant("service identity")("identity exhausted".into())
-        })?;
-        self.domain
-            .install_input(id, input)
-            .map_err(|error| AdmissionError::Refused(RequestError::Input(error)))?;
-        let plan = if prefix_cache {
-            self.plan_branches(PrefixPath::of(&generation), generation.resume_bound())
-        } else {
-            BranchPlan::default()
+    /// End the waits that have ended, then take the requests selection can
+    /// start out of the map.
+    fn candidates(&mut self) -> BTreeMap<RequestId, (Record, Candidate)> {
+        let memory_normal = self.memory_condition == MemoryCondition::Normal;
+        let epoch = self.epoch;
+        let ended_wait = |wait: Option<Wait>| match wait {
+            Some(Wait::Capacity { at, .. }) => epoch.changed_since(at),
+            Some(Wait::Memory) => memory_normal,
+            None => true,
         };
-        self.records.insert(
-            id,
-            Record {
-                generation,
-                encodes: VecDeque::new(),
-                waiting_since: now,
-                service_ns: 0,
-                physical_timings: PhysicalTimings::default(),
-                error: None,
-                capacity: None,
-                preemption_debt: 0,
-                protected_until: None,
-                retire_on_completion: false,
-                prefix_cache,
-                prefix_source: None,
-                prefill_retained: false,
-                terminal_retained: false,
-                branch: plan.branch,
-                awaited_prefix: plan.awaited,
-                publication: None,
-                publication_batch_limit: 0,
-                pending_publication: None,
-                publication_permits: VecDeque::new(),
-                publication_blocked: false,
-            },
-        );
-        if plan.awaited.is_none() {
-            if let Err(error) = self.make_resident(id) {
-                self.records.remove(&id);
-                if let Err(rollback) = self.domain.close(id) {
-                    let fatal = format!("admission failed ({error}); rollback failed ({rollback})");
-                    self.fail_all(fatal.clone());
-                    return Err(AdmissionError::invariant("admission rollback")(fatal));
+        let awaiting = self
+            .requests
+            .iter()
+            .filter_map(|(&id, request)| match request.state {
+                State::Between(_, Stage::AwaitingPrefix { through }) => Some((id, through)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (id, through) in awaiting {
+            let generation = self.requests[&id].state.generation();
+            let cached = self
+                .prefix_cache
+                .deepest(PrefixPath::of(generation), generation.resume_bound())
+                >= through;
+            if cached || !self.prefix_pending(through, id) {
+                if let State::Between(_, stage) = &mut self.requests.get_mut(&id).unwrap().state {
+                    *stage = Stage::NonResident(None);
                 }
-                return Err(error);
             }
         }
-        self.epoch
-            .advance()
-            .map_err(AdmissionError::invariant("availability epoch"))?;
-        Ok(id)
+        let selectable = self
+            .requests
+            .iter()
+            .filter(|(_, request)| match &request.state {
+                State::Between(generation, Stage::Ready) => {
+                    generation.finish_reason().is_none()
+                        || owes_reconciliation(&request.record, generation)
+                }
+                State::Between(_, Stage::NonResident(wait)) => memory_normal && ended_wait(*wait),
+                State::Between(_, Stage::Pending(_, wait)) | State::Parked(_, _, wait) => {
+                    ended_wait(*wait)
+                }
+                State::Between(_, Stage::AwaitingPrefix { .. } | Stage::AwaitingCredit) => false,
+            })
+            .map(|(&id, _)| id)
+            .collect::<Vec<_>>();
+        selectable
+            .into_iter()
+            .map(|id| {
+                let Request { record, state } = self.requests.remove(&id).expect("selectable");
+                let candidate = match state {
+                    State::Between(generation, Stage::Ready) => Candidate::Ready(generation),
+                    State::Between(generation, Stage::NonResident(_)) => {
+                        Candidate::NonResident(generation)
+                    }
+                    State::Between(generation, Stage::Pending(work, _)) => {
+                        Candidate::Pending(generation, work)
+                    }
+                    State::Parked(round, work, _) => Candidate::Parked(round, work),
+                    State::Between(_, Stage::AwaitingPrefix { .. } | Stage::AwaitingCredit) => {
+                        unreachable!("filtered above")
+                    }
+                };
+                (id, (record, candidate))
+            })
+            .collect()
+    }
+
+    fn select(&mut self, bindings: &mut StateBindings<F>) -> Result<Selected, Fatal> {
+        let mut candidates = self.candidates();
+        let operations = candidates
+            .iter()
+            .map(|(&id, (record, candidate))| {
+                let generation = candidate.generation();
+                let reconciliation = owes_reconciliation(record, generation);
+                let prefill = !reconciliation
+                    && (!generation.is_resident()
+                        || generation.resident_position() < generation.usage().prompt_tokens);
+                ScheduledOperation {
+                    identity: id,
+                    phase: if prefill { Phase::Prefill } else { Phase::Decode },
+                    active: record.service_ns > 0,
+                    resident: generation.is_resident(),
+                    waiting_since_ns: record.waiting_since,
+                    service_ns: record.service_ns,
+                    preemption_debt: record.preemption_debt,
+                }
+            })
+            .collect::<Vec<_>>();
+        let selection = self
+            .scheduler
+            .select(&operations, self.now)
+            .map_err(|error| (None, invariant("scheduler")(error)))?;
+        let Some(mut selection) = selection else {
+            // Idle (no request is live, not merely none schedulable now):
+            // release state backing well beyond what the stores need.
+            let live = self.requests.values().any(|request| {
+                request.state.generation().is_resident()
+                    && request.state.generation().finish_reason().is_none()
+            });
+            if !live {
+                self.domain
+                    .shrink_state(bindings, ShrinkPolicy::Idle)
+                    .map_err(|error| (None, classify_domain_error(error)))?;
+            }
+            self.return_candidates(candidates);
+            return Ok(Selected::Empty);
+        };
+        // Requests take rows from one phase-wide token budget in selection
+        // order. Additional ready requests wait for the next round.
+        let mut remaining_rows = match selection.phase() {
+            Phase::Prefill => self.scheduler.limits().prefill_tokens,
+            Phase::Decode => self.scheduler.limits().decode_tokens,
+        };
+        let mut attempted = 0;
+        let mut members = BTreeMap::new();
+        let mut operations = Vec::new();
+        for &id in selection.requests() {
+            if remaining_rows == 0 {
+                break;
+            }
+            // Share the remaining rows across requests still eligible in this
+            // round. A lone request can use the whole budget, while peers get
+            // compatible chunks instead of the first request consuming it.
+            let allowance = remaining_rows.div_ceil(selection.requests().len() - attempted);
+            attempted += 1;
+            let (record, candidate) = candidates.remove(&id).expect("selected candidate");
+            match self.start(id, record, candidate, allowance, bindings)? {
+                Start::Joined(member, mut next) => {
+                    let rows = next
+                        .iter()
+                        .filter(|operation| {
+                            matches!(operation, Operation::Forward { .. } | Operation::Head { .. })
+                        })
+                        .map(Operation::row_count)
+                        .sum::<usize>();
+                    remaining_rows = remaining_rows.saturating_sub(rows);
+                    operations.append(&mut next);
+                    members.insert(id, member);
+                }
+                Start::Returned(request) => {
+                    self.requests.insert(id, request);
+                }
+            }
+        }
+        self.return_candidates(candidates);
+        selection
+            .truncate(attempted)
+            .map_err(|error| (None, invariant("scheduler")(error)))?;
+        if operations.is_empty() {
+            self.scheduler.completed(selection, 0);
+            return Ok(Selected::Retry);
+        }
+        Ok(Selected::Round(Round {
+            selection,
+            started: self.now,
+            members,
+            groups: group(&self.domain, operations).into_iter().collect(),
+        }))
+    }
+
+    fn return_candidates(&mut self, candidates: BTreeMap<RequestId, (Record, Candidate)>) {
+        for (id, (record, candidate)) in candidates {
+            self.requests.insert(
+                id,
+                Request {
+                    record,
+                    state: candidate.into_state(),
+                },
+            );
+        }
+    }
+
+    /// Start a selected request: its pending work, residency, or a round.
+    fn start(
+        &mut self,
+        id: RequestId,
+        mut record: Record,
+        candidate: Candidate,
+        allowance: usize,
+        bindings: &mut StateBindings<F>,
+    ) -> Result<Start, Fatal> {
+        let generation = match candidate {
+            Candidate::Parked(round, work) => {
+                return Ok(Start::Joined(
+                    Member {
+                        record,
+                        state: Membership::Started(round),
+                    },
+                    work.0,
+                ));
+            }
+            Candidate::Pending(generation, work) => {
+                return Ok(Start::Joined(
+                    Member {
+                        record,
+                        state: Membership::Generation(generation),
+                    },
+                    work.0,
+                ));
+            }
+            Candidate::Ready(generation) => generation,
+            Candidate::NonResident(generation) => {
+                match self.make_resident(id, &mut record, generation, bindings)? {
+                    Residency::Resident(generation, encodes) => match Work::new(encodes) {
+                        Some(work) => {
+                            return Ok(Start::Joined(
+                                Member {
+                                    record,
+                                    state: Membership::Generation(generation),
+                                },
+                                work.0,
+                            ));
+                        }
+                        None => generation,
+                    },
+                    Residency::Waiting(generation, wait) => {
+                        return Ok(Start::Returned(Request {
+                            record,
+                            state: State::Between(generation, Stage::NonResident(Some(wait))),
+                        }));
+                    }
+                }
+            }
+        };
+        self.start_round(id, record, generation, allowance)
+            .map_err(|error| (None, error))
+    }
+
+    fn start_round(
+        &mut self,
+        id: RequestId,
+        mut record: Record,
+        generation: Generation,
+        allowance: usize,
+    ) -> Result<Start, RequestError> {
+        let fail = |mut record: Record, mut generation: Generation, detail: String| {
+            Self::fail_generation(
+                &mut record,
+                &mut generation,
+                invariant("generation round start")(detail),
+            );
+            Start::Returned(Request {
+                record,
+                state: State::Between(generation, Stage::Ready),
+            })
+        };
+        if owes_reconciliation(&record, &generation) {
+            return Ok(match generation.start_reconciliation(allowance) {
+                Ok(round) => match lower_round(&round, id, round.generation().resident_position(), None) {
+                    Ok(operation) => Start::Joined(
+                        Member {
+                            record,
+                            state: Membership::Started(round),
+                        },
+                        vec![operation],
+                    ),
+                    Err(detail) => fail(record, round.fail(), detail),
+                },
+                Err((generation, detail)) => fail(record, generation, detail),
+            });
+        }
+        // A prefill chunk ends exactly at a planned branch point, and at the
+        // prompt's retained boundary one row before its end.
+        let resident = generation.resident_position();
+        let allowance = [record.branch, prompt_boundary(&record, &generation)]
+            .into_iter()
+            .flatten()
+            .filter(|&stop| stop > resident)
+            .min()
+            .map_or(allowance, |stop| allowance.min(stop - resident));
+        let bound = match generation.publication_bound(allowance) {
+            Ok(bound) => bound,
+            Err(detail) => return Ok(fail(record, generation, detail)),
+        };
+        if bound != 0 {
+            if let Some(sender) = &record.publication {
+                let slots = bound.div_ceil(record.publication_batch_limit);
+                match sender.reserve_outputs(slots) {
+                    Ok(permits) => record.publication_permits.extend(permits),
+                    Err(PublishError::Full) => {
+                        return Ok(Start::Returned(Request {
+                            record,
+                            state: State::Between(generation, Stage::AwaitingCredit),
+                        }));
+                    }
+                    Err(PublishError::ReceiverClosed) => {
+                        let mut generation = generation;
+                        generation.cancel();
+                        generation.discard_output();
+                        record.release_publication();
+                        self.epoch.advance();
+                        return Ok(Start::Returned(Request {
+                            record,
+                            state: State::Between(generation, Stage::Ready),
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(match generation.start_round(id, allowance) {
+            Ok(RoundStart::Target(round)) => {
+                match lower_round(&round, id, round.generation().resident_position(), None) {
+                    Ok(operation) => Start::Joined(
+                        Member {
+                            record,
+                            state: Membership::Started(round),
+                        },
+                        vec![operation],
+                    ),
+                    Err(detail) => fail(record, round.fail(), detail),
+                }
+            }
+            Ok(RoundStart::Method(generation, operations)) => {
+                if operations.iter().any(|operation| operation.request() != id) {
+                    fail(
+                        record,
+                        generation,
+                        "method returned an operation for another request".into(),
+                    )
+                } else {
+                    Start::Joined(
+                        Member {
+                            record,
+                            state: Membership::Generation(generation),
+                        },
+                        operations,
+                    )
+                }
+            }
+            Err((generation, detail)) => fail(record, generation, detail),
+        })
     }
 
     /// The single transition that makes a request resident: from the deepest
     /// cached prefix of its path below its resume bound, or from fresh state.
-    /// Admission, a waiting request whose prefix is ready, and an evicted
-    /// request all come through here.
-    fn make_resident(&mut self, id: RequestId) -> Result<(), AdmissionError> {
-        let invariant = |detail: String| AdmissionError::invariant("residency")(detail);
-        let record = self
-            .records
-            .get(&id)
-            .ok_or_else(|| invariant("unknown request".into()))?;
+    fn make_resident(
+        &mut self,
+        id: RequestId,
+        record: &mut Record,
+        mut generation: Generation,
+        bindings: &mut StateBindings<F>,
+    ) -> Result<Residency, Fatal> {
+        let fatal = |error: RequestError| (None, error);
         let hit = if record.prefix_cache {
             self.prefix_cache
-                .lookup(
-                    PrefixPath::of(&record.generation),
-                    record.generation.resume_bound(),
-                )
-                .map_err(AdmissionError::invariant("prefix cache"))?
+                .lookup(PrefixPath::of(&generation), generation.resume_bound())
+                .map_err(|error| fatal(invariant("prefix cache")(error)))?
         } else {
             None
         };
@@ -743,878 +1712,225 @@ impl<F: ProgramFamily> Owner<F> {
                 let cached = self
                     .prefix_cache
                     .entry(hit)
-                    .map_err(AdmissionError::invariant("prefix cache"))?;
-                self.domain.open_state(id, Some(cached.state()))
+                    .map_err(|error| fatal(invariant("prefix cache")(error)))?;
+                self.domain.open_state(bindings, id, Some(cached.state()))
             }
-            None => {
-                self.ensure_open_capacity()?;
-                self.domain.open_state(id, None)
-            }
+            None => self
+                .ensure_open_capacity(bindings)
+                .and_then(|()| self.domain.open_state(bindings, id, None)),
         };
         let encodes = match opened {
             Ok(encodes) => encodes,
+            Err(DomainError::Capacity(error)) => {
+                let wait = self.capacity_wait(error.resource, error.required, error.available);
+                return Ok(Residency::Waiting(generation, wait));
+            }
+            Err(DomainError::Reclaim | DomainError::Blind(_)) => {
+                return Ok(Residency::Waiting(generation, Wait::Memory));
+            }
+            Err(error) if is_fatal(&error) => return Err(fatal(classify_domain_error(error))),
             Err(error) => {
-                if let Some(fatal) = self.domain.fatal_error().cloned() {
-                    self.fail_domain_error(fatal);
-                }
-                return Err(AdmissionError::from(error));
+                Self::fail_generation(record, &mut generation, classify_domain_error(error));
+                return Ok(Residency::Resident(generation, Vec::new()));
             }
         };
-        let record = self.records.get_mut(&id).expect("known request");
         let resumed = match hit {
-            Some(hit) => self.prefix_cache.entry(hit).and_then(|cached| {
-                record
-                    .generation
-                    .resume_at(Some((hit.position(), cached.method())))
-            }),
-            None => record.generation.resume_at(None),
+            Some(hit) => self
+                .prefix_cache
+                .entry(hit)
+                .and_then(|cached| generation.resume_at(Some((hit.position(), cached.method())))),
+            None => generation.resume_at(None),
         };
         if let Err(error) = resumed {
-            return Err(match self.domain.release_state(&[id]) {
-                Ok(_) => invariant(error),
-                Err(rollback) => {
-                    let fatal = format!("{error}; executor rollback failed ({rollback})");
-                    self.fail_all(fatal.clone());
-                    invariant(fatal)
+            return match self.domain.release_state(&[id]) {
+                Ok(_) => {
+                    Self::fail_generation(record, &mut generation, invariant("residency")(error));
+                    Ok(Residency::Resident(generation, Vec::new()))
                 }
-            });
-        }
-        record.encodes.extend(encodes);
-        record.prefix_source = hit.map(|hit| hit.id());
-        Ok(())
-    }
-
-    /// Branch points for a new request's `path`: the deepest position where
-    /// it diverges from a cached path or a live request's prompt. A live
-    /// request that has not yet prefilled to its divergence from this one
-    /// stops there too, so the shared prefix is cached by whichever request
-    /// reaches it first and every later request resumes at it instead of
-    /// recomputing.
-    fn plan_branches(&mut self, path: PrefixPath, bound: usize) -> BranchPlan {
-        let worthwhile = |point: usize, from: usize, prompt: usize| {
-            point >= MIN_PREFIX_HIT && point >= from + MIN_BRANCH_GAIN && point < prompt
-        };
-        let resumed = self.prefix_cache.deepest(path, bound);
-        let cached = self.prefix_cache.shared_boundary(path);
-        let mut deepest = cached;
-        // The deepest shared prefix a live peer is still prefilling toward
-        // and will cache at its branch point.
-        let mut in_flight = 0;
-        for record in self
-            .records
-            .values_mut()
-            .filter(|record| record.prefix_cache)
-        {
-            let live = PrefixPath::of(&record.generation);
-            let shared = path.shared_with_prompt_of(live);
-            deepest = deepest.max(shared);
-            if record.branch.is_none()
-                && worthwhile(
-                    shared,
-                    record.generation.resident_position(),
-                    record.generation.prompt().len(),
-                )
-            {
-                record.branch = Some(shared);
-            }
-            if record.branch == Some(shared) && prefilling_toward(&record.generation, shared) {
-                in_flight = in_flight.max(shared);
-            }
-        }
-        if !worthwhile(deepest, resumed, path.len()) {
-            return BranchPlan::default();
-        }
-        if in_flight == deepest && deepest > cached {
-            // A peer computes this prefix now: wait for it to be cached.
-            return BranchPlan {
-                branch: None,
-                awaited: Some(deepest),
+                Err(rollback) => Err(fatal(invariant("residency")(format!(
+                    "{error}; executor rollback failed ({rollback})"
+                )))),
             };
         }
-        BranchPlan {
-            branch: Some(deepest),
-            awaited: None,
-        }
+        record.prefix_source = hit.map(|hit| hit.id());
+        Ok(Residency::Resident(generation, encodes))
     }
 
-    /// Whether a live request other than `except` is still prefilling toward
-    /// a planned branch point at `position`.
-    fn prefix_pending(&self, position: usize, except: RequestId) -> bool {
-        self.records.iter().any(|(&id, record)| {
-            id != except
-                && record.prefix_cache
-                && record.branch == Some(position)
-                && prefilling_toward(&record.generation, position)
-        })
-    }
-
-    /// A waiting request stops waiting once the prefix it awaits is cached,
-    /// or once no peer computes it any more. It then becomes resident
-    /// through the ordinary residency path, from the deepest cached prefix.
-    fn release_awaited(&mut self) -> Result<(), String> {
-        let waiting = self
-            .records
-            .iter()
-            .filter_map(|(&id, record)| record.awaited_prefix.map(|position| (id, position)))
-            .collect::<Vec<_>>();
-        let mut released = false;
-        for (id, awaited) in waiting {
-            let generation = &self.records[&id].generation;
-            let cached = self
-                .prefix_cache
-                .deepest(PrefixPath::of(generation), generation.resume_bound())
-                >= awaited;
-            if cached || !self.prefix_pending(awaited, id) {
-                self.records
-                    .get_mut(&id)
-                    .expect("waiting request")
-                    .awaited_prefix = None;
-                released = true;
-            }
-        }
-        if released {
-            self.epoch.advance()?;
-        }
-        Ok(())
-    }
-
-    fn ensure_open_capacity(&mut self) -> Result<(), AdmissionError> {
+    fn ensure_open_capacity(&mut self, bindings: &mut StateBindings<F>) -> Result<(), DomainError> {
+        let release = |context: &'static str| {
+            move |detail: String| DomainError::Invariant(InvariantError { context, detail })
+        };
         let requirements = self.domain.open_requirements();
-        let mut current = self.open_capacity(requirements);
+        let mut current = self.open_capacity(bindings, requirements);
+        if !matches!(current, Err(DomainError::Capacity(_))) {
+            return current;
+        }
+        self.domain.shrink_state(bindings, ShrinkPolicy::Reclaim)?;
+        current = self.open_capacity(bindings, requirements);
         if matches!(current, Err(DomainError::Capacity(_))) {
             self.domain
-                .shrink_state(ShrinkPolicy::Reclaim)
-                .map_err(AdmissionError::from)?;
-            current = self.open_capacity(requirements);
-            if matches!(current, Err(DomainError::Capacity(_))) {
-                self.domain
-                    .reclaim_idle()
-                    .map_err(AdmissionError::invariant("idle state release"))?;
-                current = self.open_capacity(requirements);
-            }
-            while matches!(current, Err(DomainError::Capacity(_))) {
-                if !self.prefix_cache.evict_one() {
-                    break;
-                }
-                self.domain
-                    .shrink_state(ShrinkPolicy::Reclaim)
-                    .map_err(AdmissionError::from)?;
-                current = self.open_capacity(requirements);
-            }
-            if matches!(current, Err(DomainError::Capacity(_))) {
-                self.domain
-                    .release_idle_optional_components()
-                    .map_err(AdmissionError::invariant("optional component release"))?;
-                current = self.open_capacity(requirements);
-            }
-            while matches!(current, Err(DomainError::Capacity(_))) {
-                if !self
-                    .evict_victims(&[], true)
-                    .map_err(AdmissionError::invariant("preemption"))?
-                {
-                    break;
-                }
-                self.domain
-                    .shrink_state(ShrinkPolicy::Reclaim)
-                    .map_err(AdmissionError::from)?;
-                current = self.open_capacity(requirements);
-            }
+                .reclaim_idle(bindings)
+                .map_err(release("idle state release"))?;
+            current = self.open_capacity(bindings, requirements);
         }
-        current.map_err(AdmissionError::from)
+        while matches!(current, Err(DomainError::Capacity(_))) {
+            if !self.prefix_cache.evict_one() {
+                break;
+            }
+            self.domain.shrink_state(bindings, ShrinkPolicy::Reclaim)?;
+            current = self.open_capacity(bindings, requirements);
+        }
+        if matches!(current, Err(DomainError::Capacity(_))) {
+            self.domain
+                .release_idle_optional_components(bindings)
+                .map_err(release("optional component release"))?;
+            current = self.open_capacity(bindings, requirements);
+        }
+        while matches!(current, Err(DomainError::Capacity(_))) {
+            if !self
+                .evict_victims(&[], true)
+                .map_err(|error| release("preemption")(error.to_string()))?
+            {
+                break;
+            }
+            self.domain.shrink_state(bindings, ShrinkPolicy::Reclaim)?;
+            current = self.open_capacity(bindings, requirements);
+        }
+        current
     }
 
-    fn open_capacity(&mut self, requirements: OpenRequirements) -> Result<(), DomainError> {
-        self.domain.provision_open()?;
+    fn open_capacity(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+        requirements: OpenRequirements,
+    ) -> Result<(), DomainError> {
+        self.domain.provision_open(bindings)?;
         self.domain
             .can_open(requirements)
             .map_err(DomainError::from)
     }
 
-    pub fn error(&self, id: RequestId) -> Option<&RequestError> {
-        self.records
-            .get(&id)
-            .and_then(|record| record.error.as_ref())
-    }
-    pub fn output_len(&self, id: RequestId) -> Result<usize, String> {
-        Ok(self
-            .records
-            .get(&id)
-            .ok_or("unknown request")?
-            .generation
-            .output_len())
-    }
-    pub fn usage(&self, id: RequestId) -> Result<DetailedUsage, String> {
-        Ok(self
-            .records
-            .get(&id)
-            .ok_or("unknown request")?
-            .generation
-            .detailed_usage())
-    }
-    pub fn resident_position(&self, id: RequestId) -> Result<usize, String> {
-        Ok(self
-            .records
-            .get(&id)
-            .ok_or("unknown request")?
-            .generation
-            .resident_position())
-    }
-    pub fn method_identity(&self, id: RequestId) -> Result<&str, String> {
-        Ok(self
-            .records
-            .get(&id)
-            .ok_or("unknown request")?
-            .generation
-            .method_identity())
-    }
-    pub fn fatal_error(&self) -> Option<&RequestError> {
-        self.fatal.as_ref()
-    }
-    pub fn completed_service_ns(&self) -> u128 {
-        self.scheduler.completed_service_ns()
-    }
-    pub fn cached_prefixes(&self) -> usize {
-        self.prefix_cache.len()
-    }
-
-    /// Seismic's charge reconciled against every state holder the owner
-    /// keeps: resident requests and cached prefixes; submitted work is
-    /// counted through its stores' transactions.
-    pub fn reconcile_memory_charge(&self) -> Result<MemoryChargeReconciliation, String> {
-        let cached = self.prefix_cache.states().collect::<Vec<_>>();
-        self.domain.reconcile_memory_charge(&cached)
-    }
-
-    pub fn status(&self, id: RequestId) -> Result<Status, String> {
-        let record = self.records.get(&id).ok_or("unknown request")?;
-        if record.generation.awaiting_completion() || self.batch_contains(id) {
-            return Ok(Status::AwaitingCompletion);
-        }
-        if let Some(reason) = record.generation.finish_reason() {
-            return Ok(Status::Terminal(reason));
-        }
-        if record.publication_blocked {
-            return Ok(Status::OutputBlocked);
-        }
-        if let Some((epoch, required, available)) = record.capacity {
-            if !self.epoch.changed_since(epoch) {
-                return Ok(Status::CapacityBlocked {
-                    required,
-                    available,
+    /// Submit the round's next groups until one is on the device or the
+    /// round is exhausted.
+    fn advance(&mut self, mut round: Round, mut bindings: StateBindings<F>) -> Result<Pipeline<F>, Fatal> {
+        loop {
+            let Some(group_) = round.groups.pop_front() else {
+                self.finish_round(round)
+                    .map_err(|error| (None, error))?;
+                return Ok(Pipeline::Idle(bindings));
+            };
+            // Work of a request that ended while the round ran is dropped.
+            let live = group_
+                .operations()
+                .iter()
+                .all(|operation| {
+                    round
+                        .members
+                        .get(&operation.request())
+                        .is_some_and(|member| !ended(member.state.generation()))
                 });
+            if !live {
+                let live = group_
+                    .into_operations()
+                    .into_iter()
+                    .filter(|operation| {
+                        round
+                            .members
+                            .get(&operation.request())
+                            .is_some_and(|member| !ended(member.state.generation()))
+                    })
+                    .collect::<Vec<_>>();
+                for group_ in group(&self.domain, live).into_iter().rev() {
+                    round.groups.push_front(group_);
+                }
+                continue;
             }
-        }
-        Ok(match record.generation.wait_reason() {
-            None => Status::Runnable,
-            // Waiting for a peer to compute a shared prefix is not preemption.
-            Some(WaitReason::Residency) if record.awaited_prefix.is_some() => Status::Runnable,
-            Some(WaitReason::Output) => Status::OutputBlocked,
-            Some(WaitReason::Residency) => Status::Preempted,
-            Some(WaitReason::Completion) => Status::AwaitingCompletion,
-            Some(WaitReason::Finished) => {
-                Status::Terminal(record.generation.finish_reason().unwrap())
-            }
-        })
-    }
-
-    pub fn take(&mut self, id: RequestId, count: usize) -> Result<Vec<OutputToken>, String> {
-        let output = self
-            .records
-            .get_mut(&id)
-            .ok_or("unknown request")?
-            .generation
-            .take(count)?;
-        if !output.is_empty() {
-            self.epoch.advance()?;
-        }
-        Ok(output)
-    }
-
-    pub fn cancel(&mut self, id: RequestId, discard_output: bool) -> Result<(), String> {
-        let record = self.records.get_mut(&id).ok_or("unknown request")?;
-        let changed = record.generation.finish_reason().is_none()
-            || (discard_output && record.generation.output_len() > 0);
-        record.generation.cancel();
-        if discard_output {
-            record.generation.discard_output();
-        }
-        if changed {
-            self.epoch.advance()?;
-        }
-        Ok(())
-    }
-
-    pub fn retire(&mut self, id: RequestId) -> Result<(), String> {
-        if self.batch_contains(id) {
-            return Err("retirement must wait for shared batch reconciliation".into());
-        }
-        let record = self.records.get(&id).ok_or("unknown request")?;
-        if record.generation.awaiting_completion()
-            || record.generation.finish_reason().is_none()
-            || record.generation.output_len() != 0
-            || record.pending_publication.is_some()
-            || record.publication.is_some()
-        {
-            return Err("retirement requires terminal reconciled work and drained output".into());
-        }
-        self.retain_terminal(id)?;
-        if let Err(error) = self.domain.close(id) {
-            if let Some(fatal) = self.domain.fatal_error().cloned() {
-                self.fail_domain_error(fatal);
-            }
-            return Err(error);
-        }
-        self.records.remove(&id);
-        self.epoch.advance()
-    }
-
-    pub fn release(&mut self, id: RequestId) -> Result<(), String> {
-        if !self.records.contains_key(&id) {
-            return Ok(());
-        }
-        self.cancel(id, true)?;
-        if let Some(record) = self.records.get_mut(&id) {
-            record.pending_publication = None;
-            record.publication_permits.clear();
-            // Release owns abandonment, including an admission reply that was
-            // dropped before the host received its endpoint. An open receiver
-            // observes WorkerClosed; a closed receiver needs no terminal.
-            record.publication.take();
-        }
-        if self.batch_contains(id) {
-            self.records.get_mut(&id).unwrap().retire_on_completion = true;
-            Ok(())
-        } else {
-            self.retire(id)
-        }
-    }
-
-    /// Stop a live host request through the same ordered stream. In-flight
-    /// numerical work still reconciles before its owner is retired.
-    pub fn stop(&mut self, id: RequestId) -> Result<(), String> {
-        self.cancel(id, true)?;
-        let record = self.records.get_mut(&id).ok_or("unknown request")?;
-        record.pending_publication = None;
-        record.publication_permits.clear();
-        self.publish_ready().map(|_| ())
-    }
-
-    fn publish_ready(&mut self) -> Result<bool, String> {
-        let ids = self.records.keys().copied().collect::<Vec<_>>();
-        let mut progressed = false;
-        for id in ids {
-            let in_batch = self.batch_contains(id);
-            let mut receiver_closed = false;
-            let mut drained = false;
-            let mut terminal = false;
-            {
-                let record = self
-                    .records
-                    .get_mut(&id)
-                    .expect("known publication request");
-                let Some(sender) = record.publication.as_mut() else {
+            let planned = match self.planned_prefill(&round, group_.operations()) {
+                Ok(planned) => planned,
+                Err(error) => return Err((Some(round.members), error)),
+            };
+            self.domain.plan_successors(planned);
+            let group_ = match self.provision(&mut bindings, &round, group_) {
+                Ok(Provisioned::Fits(group_)) => group_,
+                Ok(Provisioned::Split(leading, trailing)) => {
+                    round.groups.push_front(trailing);
+                    round.groups.push_front(leading);
                     continue;
-                };
-                if !sender.receiver_open() {
-                    receiver_closed = true;
-                } else {
-                    if !record.publication_blocked {
-                        loop {
-                            let tokens = match record.pending_publication.take() {
-                                Some(tokens) => tokens,
-                                None if record.generation.output_len() > 0 => {
-                                    drained = true;
-                                    record.generation.take(record.publication_batch_limit)?
-                                }
-                                None => break,
-                            };
-                            let Some(permit) = record.publication_permits.pop_front() else {
-                                return Err(
-                                    "accepted output has no reserved publication permit".into()
-                                );
-                            };
-                            match sender.output_with_permit(tokens, permit) {
-                                Ok(()) => {
-                                    progressed = true;
-                                }
-                                Err((PublishError::Full, _)) => {
-                                    unreachable!("a publication permit owns an exact output slot")
-                                }
-                                Err((PublishError::ReceiverClosed, _)) => {
-                                    receiver_closed = true;
-                                    break;
+                }
+                Ok(Provisioned::Short(group_, wait)) => {
+                    self.park(&mut round, group_, wait);
+                    continue;
+                }
+                Err(error) => return Err((Some(round.members), error)),
+            };
+            match submit_group(&mut self.domain, bindings, &group_, self.wakes.completion()) {
+                Ok(flight) => {
+                    let mut prefix_uses = Vec::new();
+                    let requests = group_
+                        .operations()
+                        .iter()
+                        .map(Operation::request)
+                        .collect::<BTreeSet<_>>();
+                    for request in requests {
+                        let source = round
+                            .members
+                            .get(&request)
+                            .and_then(|member| member.record.prefix_source);
+                        if let Some(source) = source {
+                            match self.prefix_cache.begin_submitted_if_cached(source) {
+                                Ok(true) => prefix_uses.push(source),
+                                Ok(false) => {}
+                                Err(error) => {
+                                    return Err((Some(round.members), invariant("prefix cache")(error)));
                                 }
                             }
                         }
-                        if record.pending_publication.is_none()
-                            && record.generation.output_len() == 0
-                        {
-                            record.publication_permits.clear();
+                    }
+                    return Ok(Pipeline::InFlight(
+                        round,
+                        ActiveGroup {
+                            flight,
+                            operations: group_.into_operations(),
+                            prefix_uses,
+                        },
+                    ));
+                }
+                Err(SubmitFailure::Refused(error, returned)) => {
+                    bindings = returned;
+                    match error {
+                        DomainError::Blind(_) | DomainError::Reclaim => {
+                            self.park(&mut round, group_, Wait::Memory);
                         }
+                        DomainError::Input(error) => {
+                            let requests = group_
+                                .operations()
+                                .iter()
+                                .map(Operation::request)
+                                .collect::<BTreeSet<_>>();
+                            for request in requests {
+                                Self::fail_member(
+                                    &mut round,
+                                    request,
+                                    RequestError::Input(error.clone()),
+                                );
+                            }
+                            self.epoch.advance();
+                        }
+                        other => return Err((Some(round.members), classify_domain_error(other))),
                     }
-                    let needs_reconciliation = record.prefix_cache
-                        && record.generation.pending_reconciliation().is_some()
-                        && matches!(
-                            record.generation.finish_reason(),
-                            Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context)
-                        );
-                    terminal = !receiver_closed
-                        && record.pending_publication.is_none()
-                        && record.generation.output_len() == 0
-                        && record.generation.finish_reason().is_some()
-                        && !record.generation.awaiting_completion()
-                        && !in_batch
-                        && !needs_reconciliation;
                 }
-            }
-            if drained {
-                self.epoch.advance()?;
-            }
-            if receiver_closed {
-                self.release(id)?;
-                progressed = true;
-                continue;
-            }
-            if terminal {
-                self.retain_terminal(id)?;
-                let record = self
-                    .records
-                    .get_mut(&id)
-                    .ok_or("unknown terminal request")?;
-                let sender = record
-                    .publication
-                    .take()
-                    .expect("terminal publication sender");
-                match record
-                    .generation
-                    .finish_reason()
-                    .expect("terminal generation")
-                {
-                    FinishReason::Failed => {
-                        sender.fail(record.error.clone().unwrap_or_else(|| {
-                            RequestError::Invariant(InvariantError {
-                                context: "service request",
-                                detail: "failed without a classified cause".into(),
-                            })
-                        }))
-                    }
-                    finish => sender.complete(
-                        finish,
-                        record.generation.detailed_usage(),
-                        record.generation.method_identity().to_owned(),
-                        record.physical_timings,
-                    ),
-                }
-                self.retire(id)?;
-                progressed = true;
-            }
-        }
-        Ok(progressed)
-    }
-
-    fn batch_contains(&self, request: RequestId) -> bool {
-        self.batch
-            .as_ref()
-            .is_some_and(|batch| batch.selection.requests().contains(&request))
-    }
-
-    fn fail_all(&mut self, error: String) {
-        self.fail_all_classified(RequestError::Invariant(InvariantError {
-            context: "service worker",
-            detail: error,
-        }));
-    }
-
-    fn fail_domain_error(&mut self, error: DomainError) {
-        self.fail_all_classified(classify_domain_error(error));
-    }
-
-    fn fail_domain_outcome(&mut self, request: RequestId, error: DomainError) {
-        match error {
-            DomainError::Device(_)
-            | DomainError::Invariant(_)
-            | DomainError::Submit(SubmitError::Device(_) | SubmitError::Invariant(_)) => {
-                self.fail_domain_error(error);
-            }
-            other => self.fail_request(request, classify_domain_error(other)),
-        }
-    }
-
-    fn fail_all_classified(&mut self, error: RequestError) {
-        if self.fatal.is_none() {
-            self.fatal = Some(error.clone());
-            self.terminalize_all(error);
-        }
-    }
-
-    fn begin_memory_unload(&mut self) {
-        if self.memory_condition == MemoryCondition::Unloading {
-            return;
-        }
-        self.memory_condition = MemoryCondition::Unloading;
-        self.terminalize_all(RequestError::ModelUnloaded {
-            cause: ModelUnloadCause::MemoryPressure,
-        });
-    }
-
-    pub fn memory_unload_ready(&mut self) -> bool {
-        self.memory_condition == MemoryCondition::Unloading
-            && self.batch.as_mut().is_none_or(|batch| {
-                batch
-                    .active
-                    .as_mut()
-                    .is_none_or(|active| active.flight.completion().is_complete())
-            })
-    }
-
-    pub fn memory_unloading(&self) -> bool {
-        self.memory_condition == MemoryCondition::Unloading
-    }
-
-    fn terminalize_all(&mut self, error: RequestError) {
-        for record in self.records.values_mut() {
-            if record.generation.finish_reason().is_none()
-                || record.generation.awaiting_completion()
-            {
-                record.generation.fail();
-                record.error.get_or_insert_with(|| error.clone());
-            }
-        }
-        for record in self.records.values_mut() {
-            // Only output already accepted by the queue precedes a terminal
-            // outcome. Unpublished generation output is not promoted by
-            // a second, unbounded failure delivery channel.
-            if let Some(sender) = record.publication.take() {
-                record.generation.discard_output();
-                record.pending_publication = None;
-                record.publication_permits.clear();
-                match record.generation.finish_reason() {
-                    Some(FinishReason::Failed) | None => {
-                        sender.fail(record.error.clone().unwrap_or_else(|| error.clone()));
-                    }
-                    Some(finish) => sender.complete(
-                        finish,
-                        record.generation.detailed_usage(),
-                        record.generation.method_identity().to_owned(),
-                        record.physical_timings,
-                    ),
+                Err(SubmitFailure::Failed(error)) => {
+                    return Err((Some(round.members), classify_domain_error(error)));
                 }
             }
         }
-    }
-
-    fn fail_request(&mut self, id: RequestId, error: RequestError) {
-        if let Some(record) = self.records.get_mut(&id) {
-            // Accepted output still precedes the terminal failure on this
-            // request's stream. Its reserved permits must survive until that
-            // output has drained.
-            record.generation.fail();
-            record.error = Some(error);
-            record.capacity = None;
-        }
-    }
-
-    pub fn step(&mut self, now: u64) -> Result<Step, String> {
-        self.time(now)?;
-        if let Some(error) = self.domain.fatal_error().cloned() {
-            self.fail_domain_error(error);
-            return Ok(Step::Idle);
-        }
-        let before = self.publish_ready()?;
-        let mut step = self.step_inner(now)?;
-        if step == Step::Reconciled {
-            // Submit the next round before publishing the reconciled batch's
-            // tokens, so publication overlaps device execution. The round
-            // never depends on publication; it reads only reconciled state.
-            step = self.step_inner(now)?;
-        }
-        let after = self.publish_ready()?;
-        if (before || after) && matches!(step, Step::Idle | Step::Waiting) {
-            Ok(Step::Progress)
-        } else {
-            Ok(step)
-        }
-    }
-
-    fn step_inner(&mut self, now: u64) -> Result<Step, String> {
-        if self.memory_condition == MemoryCondition::Unloading {
-            return Ok(Step::Idle);
-        }
-        if self.batch.is_some() {
-            return self.drive_batch(now);
-        }
-        if self.fatal.is_some() {
-            return Ok(Step::Idle);
-        }
-        self.release_awaited()?;
-        let mut candidates = Vec::new();
-        for (&id, record) in &mut self.records {
-            if record.awaited_prefix.is_some() {
-                continue;
-            }
-            // Becoming resident is growth: it waits for memory to be Normal,
-            // whose return advances the epoch.
-            if !record.generation.is_resident() && self.memory_condition != MemoryCondition::Normal
-            {
-                continue;
-            }
-            if record
-                .capacity
-                .is_some_and(|(epoch, _, _)| !self.epoch.changed_since(epoch))
-            {
-                continue;
-            }
-            record.capacity = None;
-            let reconciliation = record.prefix_cache
-                && !record.terminal_retained
-                && matches!(
-                    record.generation.finish_reason(),
-                    Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context)
-                )
-                && record.generation.pending_reconciliation().is_some();
-            if record.generation.awaiting_completion()
-                || record.publication_blocked
-                || (!reconciliation
-                    && (record.generation.finish_reason().is_some()
-                        || matches!(record.generation.wait_reason(), Some(WaitReason::Output))))
-            {
-                continue;
-            }
-            let prefill = !reconciliation
-                && (!record.generation.is_resident()
-                    || record.generation.resident_position()
-                        < record.generation.usage().prompt_tokens);
-            candidates.push(ScheduledOperation {
-                identity: id,
-                phase: if prefill {
-                    Phase::Prefill
-                } else {
-                    Phase::Decode
-                },
-                active: record.service_ns > 0,
-                resident: record.generation.is_resident(),
-                waiting_since_ns: record.waiting_since,
-                service_ns: record.service_ns,
-                preemption_debt: record.preemption_debt,
-            });
-        }
-        let Some(mut selection) = self.scheduler.select(&candidates, now)? else {
-            // Idle (no request is live, not merely none schedulable now):
-            // release state backing well beyond what the stores need.
-            let live = self.records.values().any(|record| {
-                record.generation.is_resident() && record.generation.finish_reason().is_none()
-            });
-            if !live {
-                if let Err(error) = self.domain.shrink_state(ShrinkPolicy::Idle) {
-                    self.fail_domain_error(error);
-                }
-            }
-            return Ok(Step::Idle);
-        };
-        // Requests take rows from one phase-wide token budget in selection
-        // order. Additional ready requests wait for the next round.
-        let mut remaining_rows = match selection.phase() {
-            Phase::Prefill => self.scheduler.limits().prefill_tokens,
-            Phase::Decode => self.scheduler.limits().decode_tokens,
-        };
-        let mut started = 0;
-        let mut operations = Vec::new();
-        for &request in selection.requests() {
-            if remaining_rows == 0 {
-                break;
-            }
-            // Share the remaining rows across requests still eligible in this
-            // round. A lone request can use the whole budget, while peers get
-            // compatible chunks instead of the first request consuming it.
-            let waiting = selection.requests().len() - started;
-            let allowance = remaining_rows.div_ceil(waiting);
-            started += 1;
-            match self.start_request(request, allowance) {
-                Ok(mut next) => {
-                    let rows = next
-                        .iter()
-                        .filter(|operation| {
-                            matches!(
-                                operation,
-                                Operation::Forward { .. } | Operation::Head { .. }
-                            )
-                        })
-                        .map(Operation::row_count)
-                        .sum::<usize>();
-                    remaining_rows = remaining_rows.saturating_sub(rows);
-                    operations.append(&mut next);
-                }
-                Err(detail) => {
-                    // The request was admitted; failing to start its next
-                    // round is an engine failure, not a client error.
-                    self.fail_request(
-                        request,
-                        RequestError::Invariant(InvariantError {
-                            context: "generation round start",
-                            detail,
-                        }),
-                    );
-                    self.epoch.advance()?;
-                }
-            }
-        }
-        selection.truncate(started)?;
-        if operations.is_empty() {
-            self.scheduler.completed(selection, 0);
-            return Ok(Step::Progress);
-        }
-        let groups = group(&self.domain, operations);
-        self.batch = Some(Batch {
-            selection,
-            started: now,
-            queued: groups.into_iter().collect(),
-            active: None,
-            blocked: None,
-        });
-        self.drive_batch(now)
-    }
-
-    /// Make a non-resident request (evicted, or done waiting for a peer's
-    /// prefix) resident. Returns false when it cannot be now: short of
-    /// capacity it is blocked (or failed) like any capacity-blocked work; in
-    /// Reclaim or without a memory reading, the owner records that reading
-    /// and residency waits until memory is Normal again.
-    fn restore(&mut self, request: RequestId) -> Result<bool, String> {
-        let observation = match self.make_resident(request) {
-            Ok(()) => return Ok(true),
-            Err(AdmissionError::Refused(RequestError::Capacity(ServiceCapacityError {
-                resource: CapacityResource::Execution(resource),
-                required,
-                available,
-            }))) => {
-                self.block_on_capacity(&[request], &[request], resource, required, available)?;
-                return Ok(false);
-            }
-            Err(AdmissionError::MemoryReclaim) => MemoryObservation::Reclaim,
-            Err(AdmissionError::MemoryObservationUnavailable(_)) => MemoryObservation::Blind,
-            Err(error) => return Err(error.to_string()),
-        };
-        self.enter_memory_condition(self.memory_condition.observe(observation, self.now))?;
-        Ok(false)
-    }
-
-    fn start_request(
-        &mut self,
-        request: RequestId,
-        allowance: usize,
-    ) -> Result<Vec<Operation>, String> {
-        let needs_open = !self
-            .records
-            .get(&request)
-            .ok_or("unknown request")?
-            .generation
-            .is_resident();
-        if needs_open && !self.restore(request)? {
-            return Ok(Vec::new());
-        }
-        let record = self.records.get_mut(&request).expect("known request");
-        if !record.encodes.is_empty() {
-            return Ok(record.encodes.drain(..).collect());
-        }
-        if matches!(
-            record.generation.finish_reason(),
-            Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context)
-        ) && record.generation.pending_reconciliation().is_some()
-        {
-            record.generation.start_reconciliation(allowance)?;
-            return Ok(vec![lower_round(
-                &record.generation,
-                request,
-                record.generation.resident_position(),
-                None,
-            )?]);
-        }
-        // A prefill chunk ends exactly at a planned branch point, and at the
-        // prompt's retained boundary one row before its end.
-        let resident = record.generation.resident_position();
-        let stop = [record.branch, prompt_boundary(record)]
-            .into_iter()
-            .flatten()
-            .filter(|&stop| stop > resident)
-            .min();
-        let allowance = match stop {
-            Some(stop) => allowance.min(stop - resident),
-            None => allowance,
-        };
-        match record.generation.start_round(request, allowance)? {
-            RoundStart::Target => Ok(vec![lower_round(
-                &record.generation,
-                request,
-                record.generation.resident_position(),
-                None,
-            )?]),
-            RoundStart::Method(operations) => {
-                if operations
-                    .iter()
-                    .any(|operation| operation.request() != request)
-                {
-                    return Err("method returned an operation for another request".into());
-                }
-                Ok(operations)
-            }
-        }
-    }
-
-    fn drive_batch(&mut self, now: u64) -> Result<Step, String> {
-        if self
-            .batch
-            .as_ref()
-            .and_then(|batch| batch.blocked)
-            .is_some_and(|blocked| !self.epoch.changed_since(blocked))
-        {
-            return Ok(Step::Waiting);
-        }
-        if let Some(batch) = &mut self.batch {
-            batch.blocked = None;
-        }
-        let complete = self
-            .batch
-            .as_mut()
-            .and_then(|batch| batch.active.as_mut())
-            .is_some_and(|active| active.flight.completion().is_complete());
-        if self
-            .batch
-            .as_ref()
-            .is_some_and(|batch| batch.active.is_some())
-            && !complete
-        {
-            return Ok(Step::Waiting);
-        }
-        if complete {
-            self.reconcile_active()?;
-            self.release_deferred_reclaim()?;
-            if self.memory_condition == MemoryCondition::Unloading {
-                return Ok(Step::Idle);
-            }
-        }
-        if self
-            .batch
-            .as_ref()
-            .is_some_and(|batch| batch.active.is_none() && !batch.queued.is_empty())
-        {
-            return self.submit_next();
-        }
-        if self
-            .batch
-            .as_ref()
-            .is_some_and(|batch| batch.active.is_none() && batch.queued.is_empty())
-        {
-            self.finish_batch(now)?;
-            return Ok(Step::Reconciled);
-        }
-        Ok(Step::Waiting)
     }
 
     /// The prompt chunk a lone prefill group's request submits next, when it
     /// is known now, so the domain queues it behind this group. A chunk
     /// ending at a planned branch or retention point is followed by that
     /// retention, not planned past.
-    fn planned_prefill(&self, operations: &[Operation]) -> Result<Vec<Operation>, String> {
+    fn planned_prefill(&self, round: &Round, operations: &[Operation]) -> Result<Vec<Operation>, RequestError> {
         let [Operation::Forward {
             request,
             kind: WorkKind::Prefill,
@@ -1625,14 +1941,15 @@ impl<F: ProgramFamily> Owner<F> {
         else {
             return Ok(Vec::new());
         };
-        let Some(record) = self.records.get(request) else {
+        let Some(Member {
+            record,
+            state: Membership::Started(started),
+        }) = round.members.get(request)
+        else {
             return Ok(Vec::new());
         };
-        if !record.encodes.is_empty() {
-            return Ok(Vec::new());
-        }
         let end = position + tokens.len();
-        let stops = [record.branch, prompt_boundary(record)]
+        let stops = [record.branch, prompt_boundary(record, started.generation())]
             .into_iter()
             .flatten()
             .filter(|&stop| stop > *position)
@@ -1644,535 +1961,284 @@ impl<F: ProgramFamily> Owner<F> {
             .iter()
             .map(|stop| stop - end)
             .fold(self.scheduler.limits().prefill_tokens.max(1), usize::min);
-        Ok(record
-            .generation
-            .planned_prefill(*request, allowance)?
+        Ok(started
+            .planned_prefill(*request, allowance)
+            .map_err(invariant("planned prefill"))?
             .into_iter()
             .collect())
     }
 
-    fn submit_next(&mut self) -> Result<Step, String> {
-        let mut queued = self.batch.as_mut().unwrap().queued.pop_front().unwrap();
-        let ended = queued
-            .operations()
-            .iter()
-            .map(Operation::request)
-            .filter(|request| {
-                self.records.get(request).is_none_or(|record| {
-                    matches!(
-                        record.generation.finish_reason(),
-                        Some(FinishReason::Cancelled | FinishReason::Failed)
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        if !ended.is_empty() {
-            let live = queued
-                .into_operations()
-                .into_iter()
-                .filter(|operation| !ended.contains(&operation.request()))
-                .collect::<Vec<_>>();
-            if !live.is_empty() {
-                let mut groups = group(&self.domain, live);
-                if groups.len() != 1 {
-                    return Err("filtered operation group changed its numerical lane".into());
-                }
-                self.batch
-                    .as_mut()
-                    .unwrap()
-                    .queued
-                    .push_front(groups.pop().unwrap());
-            }
-            self.epoch.advance()?;
-            return Ok(Step::Progress);
-        }
-        let planned = self.planned_prefill(queued.operations())?;
-        self.domain.plan_successors(planned);
-        let first_provision = match self.domain.provision(queued.operations()) {
+    /// Provision a group's state and check its reservation. A requirement
+    /// and a growth claim are one capacity question: recheck both after each
+    /// release. Selection is provisional until every exact requirement is
+    /// available: a deficit first releases state backing beyond what the
+    /// stores need, then least-recently-used retention until the
+    /// requirement fits, then idle residency, then the group's trailing
+    /// operations, then eligible live victims outside the round.
+    fn provision(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+        round: &Round,
+        group_: OperationGroup,
+    ) -> Result<Provisioned, RequestError> {
+        let mut current = match self.domain.provision(bindings, group_.operations()) {
             Ok(()) => Ok(()),
-            Err(
-                error @ (DomainError::Capacity(_) | DomainError::Blind(_) | DomainError::Reclaim),
-            ) => Err(error),
-            Err(error) => {
-                self.fail_domain_error(error);
-                return Ok(Step::Progress);
+            Err(error @ (DomainError::Capacity(_) | DomainError::Blind(_) | DomainError::Reclaim)) => {
+                Err(error)
             }
+            Err(error) => return Err(classify_domain_error(error)),
         };
-        let requirement = match requirements(&self.domain, &queued) {
-            Ok(requirement) => requirement,
-            Err(error) => {
-                self.fail_domain_error(error);
-                return Ok(Step::Progress);
-            }
-        };
-        // A growth claim and the structural reservation are one capacity
-        // question. Recheck both after each release: free device bytes do not
-        // become committed state rows until provisioning succeeds.
-        let mut current = first_provision.and_then(|_| {
+        let requirement =
+            requirements(&self.domain, bindings, &group_).map_err(classify_domain_error)?;
+        current = current.and_then(|()| {
             self.domain
                 .can_reserve(&requirement)
                 .map_err(DomainError::from)
         });
-        if matches!(&current, Err(DomainError::Capacity(_))) {
-            // Selection is provisional until every exact requirement is
-            // available. A demand deficit first releases state backing beyond
-            // what the stores need (another store may hold the device memory
-            // this one needs to grow into); policy then releases
-            // least-recently-used retention only until the requirement fits,
-            // then idle residency, then eligible live victims. No launch or
-            // state transaction exists while these scheduling decisions run.
-            match self.domain.shrink_state(ShrinkPolicy::Reclaim) {
-                Ok(_) => current = self.provisioned_capacity(queued.operations(), &requirement),
-                Err(error) => {
-                    self.fail_domain_error(error);
-                    return Ok(Step::Progress);
-                }
-            }
-            if matches!(&current, Err(DomainError::Capacity(_))) {
-                self.domain.reclaim_idle()?;
-                current = self.provisioned_capacity(queued.operations(), &requirement);
-            }
-            while matches!(&current, Err(DomainError::Capacity(_))) {
-                if !self.prefix_cache.evict_one() {
-                    break;
-                }
-                if let Err(error) = self.domain.shrink_state(ShrinkPolicy::Reclaim) {
-                    self.fail_domain_error(error);
-                    return Ok(Step::Progress);
-                }
-                current = self.provisioned_capacity(queued.operations(), &requirement);
-            }
-            if matches!(&current, Err(DomainError::Capacity(_))) {
-                self.domain.release_idle_optional_components()?;
-                current = self.provisioned_capacity(queued.operations(), &requirement);
-            }
-            if matches!(&current, Err(DomainError::Capacity(_))) {
-                queued = match queued.split_last() {
-                    Ok((leading, trailing)) => {
-                        let batch = self.batch.as_mut().unwrap();
-                        batch.queued.push_front(trailing);
-                        batch.queued.push_front(leading);
-                        return Ok(Step::Progress);
-                    }
-                    Err(queued) => queued,
-                };
-            }
-            let selected = self.batch.as_ref().unwrap().selection.requests().to_vec();
-            while matches!(&current, Err(DomainError::Capacity(_))) {
-                if !self.evict_victims(&selected, false)? {
-                    break;
-                }
-                if let Err(error) = self.domain.shrink_state(ShrinkPolicy::Reclaim) {
-                    self.fail_domain_error(error);
-                    return Ok(Step::Progress);
-                }
-                current = self.provisioned_capacity(queued.operations(), &requirement);
-            }
+        let short = |current: &Result<(), DomainError>| matches!(current, Err(DomainError::Capacity(_)));
+        let mut group_ = group_;
+        if short(&current) {
+            self.domain
+                .shrink_state(bindings, ShrinkPolicy::Reclaim)
+                .map_err(classify_domain_error)?;
+            current = self.fits(bindings, group_.operations(), &requirement);
         }
-        if matches!(&current, Err(DomainError::Reclaim)) {
-            // Growth pauses in the Reclaim band. Keep the group, then run
-            // the Reclaim releases now rather than at the next periodic
-            // observation; no flight is active here.
-            self.requeue_group(queued);
-            self.observe_periodic_memory(self.now)?;
-            return Ok(Step::Waiting);
+        if short(&current) {
+            self.domain
+                .reclaim_idle(bindings)
+                .map_err(invariant("idle state release"))?;
+            current = self.fits(bindings, group_.operations(), &requirement);
+        }
+        while short(&current) && self.prefix_cache.evict_one() {
+            self.domain
+                .shrink_state(bindings, ShrinkPolicy::Reclaim)
+                .map_err(classify_domain_error)?;
+            current = self.fits(bindings, group_.operations(), &requirement);
+        }
+        if short(&current) {
+            self.domain
+                .release_idle_optional_components(bindings)
+                .map_err(invariant("optional component release"))?;
+            current = self.fits(bindings, group_.operations(), &requirement);
+        }
+        if short(&current) {
+            group_ = match group_.split_last() {
+                Ok((leading, trailing)) => return Ok(Provisioned::Split(leading, trailing)),
+                Err(whole) => whole,
+            };
+            let selected = round.members.keys().copied().collect::<Vec<_>>();
+            while short(&current) && self.evict_victims(&selected, false)? {
+                self.domain
+                    .shrink_state(bindings, ShrinkPolicy::Reclaim)
+                    .map_err(classify_domain_error)?;
+                current = self.fits(bindings, group_.operations(), &requirement);
+            }
         }
         match current {
-            Ok(()) => {}
-            Err(DomainError::Blind(_)) => {
-                // Keep the accepted batch intact. A missing observation
-                // revokes the allocation grant but says nothing about which
-                // existing holdings could satisfy this request.
-                self.requeue_group(queued);
-                return Ok(Step::Waiting);
+            Ok(()) => Ok(Provisioned::Fits(group_)),
+            Err(DomainError::Blind(_) | DomainError::Reclaim) => {
+                Ok(Provisioned::Short(group_, Wait::Memory))
             }
             Err(DomainError::Capacity(deficit)) => {
-                return self.capacity_unavailable(
-                    queued,
-                    deficit.resource,
-                    deficit.required,
-                    deficit.available,
-                );
+                let wait = self.capacity_wait(deficit.resource, deficit.required, deficit.available);
+                Ok(Provisioned::Short(group_, wait))
             }
-            Err(DomainError::Reclaim) => unreachable!("reclaim handled above"),
-            Err(error) => {
-                self.fail_domain_error(error);
-                return Ok(Step::Progress);
-            }
-        }
-        let Some(publication_permits) = self.reserve_group_publications(queued.operations())?
-        else {
-            let batch = self.batch.as_mut().unwrap();
-            batch.queued.push_front(queued);
-            batch.blocked = Some(self.epoch);
-            return Ok(Step::Waiting);
-        };
-        let submitted = submit_group(&mut self.domain, &queued);
-        match submitted {
-            Ok(flight) => {
-                let operations = queued.into_operations();
-                let mut prefix_uses = Vec::new();
-                for request in operations
-                    .iter()
-                    .map(Operation::request)
-                    .collect::<std::collections::BTreeSet<_>>()
-                {
-                    if let Some(source) = self
-                        .records
-                        .get(&request)
-                        .and_then(|record| record.prefix_source)
-                    {
-                        if self.prefix_cache.begin_submitted_if_cached(source)? {
-                            prefix_uses.push(source);
-                        }
-                    }
-                }
-                self.batch.as_mut().unwrap().active = Some(ActiveGroup {
-                    flight,
-                    operations,
-                    prefix_uses,
-                    publication_permits,
-                });
-                Ok(Step::Submitted)
-            }
-            Err(DomainError::Capacity(error)) => {
-                self.fail_all_classified(RequestError::Invariant(InvariantError {
-                    context: "reserved service submission",
-                    detail: format!("capacity changed after reservation: {error}"),
-                }));
-                Ok(Step::Progress)
-            }
-            Err(DomainError::Blind(_)) => {
-                // The domain can re-observe during reserve after the owner's
-                // preflight. No work was submitted. Give unused publication
-                // permits back, then rebuild groups in case provisioning
-                // changed the domain's grouping state.
-                drop(publication_permits);
-                self.requeue_group(queued);
-                Ok(Step::Waiting)
-            }
-            Err(DomainError::Reclaim) => {
-                drop(publication_permits);
-                self.requeue_group(queued);
-                Ok(Step::Waiting)
-            }
-            Err(DomainError::Input(error)) => {
-                for request in queued
-                    .operations()
-                    .iter()
-                    .map(Operation::request)
-                    .collect::<std::collections::BTreeSet<_>>()
-                {
-                    self.fail_request(request, RequestError::Input(error.clone()));
-                }
-                self.epoch.advance()?;
-                Ok(Step::Progress)
-            }
-            Err(DomainError::State(error)) => {
-                self.fail_all_classified(RequestError::State(error));
-                self.batch = None;
-                self.epoch.advance()?;
-                Ok(Step::Progress)
-            }
-            Err(DomainError::Submit(SubmitError::Device(error)))
-            | Err(DomainError::Device(error)) => {
-                self.fail_all_classified(RequestError::Device(error));
-                self.batch = None;
-                self.epoch.advance()?;
-                Ok(Step::Progress)
-            }
-            Err(DomainError::Submit(SubmitError::Invariant(error)))
-            | Err(DomainError::Invariant(error)) => {
-                self.fail_all_classified(RequestError::Invariant(error));
-                self.batch = None;
-                self.epoch.advance()?;
-                Ok(Step::Progress)
-            }
+            Err(error) => Err(classify_domain_error(error)),
         }
     }
 
-    fn requeue_group(&mut self, queued: OperationGroup) {
-        let regrouped = group(&self.domain, queued.into_operations());
-        let batch = self.batch.as_mut().expect("queued group has a batch");
-        for group in regrouped.into_iter().rev() {
-            batch.queued.push_front(group);
-        }
-    }
-
-    fn reserve_group_publications(
+    /// Whether `operations` fit after a release: provision, then reserve.
+    fn fits(
         &mut self,
-        operations: &[Operation],
-    ) -> Result<Option<BTreeMap<RequestId, Vec<PublicationPermit>>>, String> {
-        let mut tokens = BTreeMap::<RequestId, usize>::new();
-        for operation in operations {
-            let count = match operation {
-                Operation::Forward { .. } => self
-                    .records
-                    .get(&operation.request())
-                    .ok_or("unknown publication request")?
-                    .generation
-                    .round_publication_bound()
-                    .ok_or("forward has no suspended generation round")?,
-                Operation::Head { .. } | Operation::Encode { .. } => 0,
-            };
-            if count != 0 {
-                *tokens.entry(operation.request()).or_default() += count;
-            }
-        }
-        let mut reserved = BTreeMap::new();
-        for (request, tokens) in tokens {
-            let record = self
-                .records
-                .get_mut(&request)
-                .ok_or("unknown publication request")?;
-            let Some(sender) = record.publication.as_ref() else {
-                continue;
-            };
-            let batch = record.publication_batch_limit;
-            if batch == 0 {
-                return Err("publication stream has no token batch limit".into());
-            }
-            let slots = tokens.div_ceil(batch);
-            match sender.reserve_outputs(slots) {
-                Ok(permits) => {
-                    reserved.insert(request, permits);
-                }
-                Err(PublishError::Full | PublishError::ReceiverClosed) => {
-                    record.publication_blocked = true;
-                    return Ok(None);
-                }
-            }
-        }
-        Ok(Some(reserved))
-    }
-
-    fn provisioned_capacity(
-        &mut self,
+        bindings: &mut StateBindings<F>,
         operations: &[Operation],
         requirement: &DomainRequirements,
     ) -> Result<(), DomainError> {
-        self.domain.provision(operations)?;
+        self.domain.provision(bindings, operations)?;
         self.domain
             .can_reserve(requirement)
             .map_err(DomainError::from)
     }
 
-    fn capacity_unavailable(
-        &mut self,
-        queued: OperationGroup,
-        resource: ResourceKind,
-        required: u64,
-        available: u64,
-    ) -> Result<Step, String> {
-        let operations = queued.operations();
-        if std::env::var_os("MAGNITUDE_TRACE_TARGET").is_some() {
-            eprintln!(
-                "target admission deficit {:?} required={} available={} operations={} rows={:?}",
-                resource,
-                required,
-                available,
-                operations.len(),
-                operations
-                    .iter()
-                    .map(Operation::row_count)
-                    .collect::<Vec<_>>()
-            );
-        }
-        let requests = operations
+    /// Move a group that cannot proceed out of the round: each of its
+    /// requests takes all of its remaining work with it and waits alone.
+    fn park(&mut self, round: &mut Round, group_: OperationGroup, wait: Wait) {
+        let requests = group_
+            .operations()
             .iter()
             .map(Operation::request)
-            .collect::<Vec<_>>();
-        let selected = self.batch.as_ref().unwrap().selection.requests().to_vec();
-        if self.block_on_capacity(&requests, &selected, resource, required, available)? {
-            let batch = self.batch.as_mut().unwrap();
-            batch.queued.push_front(queued);
-            batch.blocked = Some(self.epoch);
-            Ok(Step::Waiting)
-        } else {
-            Ok(Step::Progress)
+            .collect::<BTreeSet<_>>();
+        let mut operations = group_.into_operations();
+        let groups = std::mem::take(&mut round.groups);
+        let mut kept = Vec::new();
+        for queued in groups {
+            let (theirs, others): (Vec<_>, Vec<_>) = queued
+                .into_operations()
+                .into_iter()
+                .partition(|operation| requests.contains(&operation.request()));
+            operations.extend(theirs);
+            kept.extend(others);
+        }
+        round.groups = group(&self.domain, kept).into_iter().collect();
+        for request in requests {
+            let Some(Member { record, state }) = round.members.remove(&request) else {
+                continue;
+            };
+            let theirs = operations
+                .iter()
+                .filter(|operation| operation.request() == request)
+                .cloned()
+                .collect::<Vec<_>>();
+            let work = Work::new(theirs).expect("a parked request has work in the group");
+            let state = match state {
+                Membership::Started(started) => State::Parked(started, work, Some(wait)),
+                Membership::Generation(generation) => {
+                    State::Between(generation, Stage::Pending(work, Some(wait)))
+                }
+            };
+            self.requests.insert(request, Request { record, state });
         }
     }
 
-    fn abort_pending(
+    /// Reconcile the completed group and take back the bindings.
+    fn reconcile(&mut self, mut round: Round, active: ActiveGroup<F>) -> Result<(Round, StateBindings<F>), Fatal> {
+        let ActiveGroup {
+            flight,
+            operations,
+            prefix_uses,
+        } = active;
+        for source in prefix_uses {
+            if let Err(error) = self.prefix_cache.end_submitted(source) {
+                return Err((Some(round.members), invariant("prefix cache")(error)));
+            }
+        }
+        let (outcomes, mut bindings) = match finish(&mut self.domain, flight) {
+            Ok(finished) => finished,
+            Err(error) => return Err((Some(round.members), classify_domain_error(error))),
+        };
+        let reconciled = match outcomes {
+            FlightOutcomes::Target(pending) => self.reconcile_target(&mut round, pending, &operations),
+            FlightOutcomes::Head(pending) => self.reconcile_method(&mut round, pending, &operations),
+            FlightOutcomes::Vision(item) => self.reconcile_vision(&mut round, item, &operations),
+        };
+        if let Err(error) = reconciled {
+            return Err((Some(round.members), error));
+        }
+        self.epoch.advance();
+        if let Err(error) = self.observe(Some(&mut bindings)) {
+            return Err((Some(round.members), error));
+        }
+        self.publish_members(&mut round);
+        Ok((round, bindings))
+    }
+
+    fn reconcile_target(
         &mut self,
-        pending: magnitude_executor::PendingOperationOutcome,
-    ) -> Result<(), String> {
-        match self.domain.abort(pending) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let detail = error.to_string();
-                self.fail_domain_error(error);
-                Err(detail)
-            }
-        }
-    }
-
-    fn reconcile_active(&mut self) -> Result<(), String> {
-        let active = self.batch.as_mut().unwrap().active.take().unwrap();
-        for source in active.prefix_uses {
-            self.prefix_cache.end_submitted(source)?;
-        }
-        for (request, permits) in active.publication_permits {
-            if let Some(record) = self.records.get_mut(&request) {
-                record.publication_permits.extend(permits);
-            }
-        }
-        match active.flight {
-            DomainFlight::Head(flight) => {
-                let pending = match self.domain.finish_head(flight) {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        self.fail_domain_error(error);
-                        return Ok(());
-                    }
-                };
-                self.reconcile_method_outcomes(pending, &active.operations)?;
-            }
-            DomainFlight::Vision(flight) => {
-                let item = match self.domain.finish_vision(flight) {
-                    Ok(item) => item,
-                    Err(error) => {
-                        self.fail_domain_error(error);
-                        return Ok(());
-                    }
-                };
-                let request = item.request();
-                let valid = matches!(active.operations.as_slice(),
-                    [Operation::Encode { request: expected, .. }] if *expected == request)
-                    && matches!(item.outcome(), Outcome::Encode { .. });
-                if !valid || !self.records.contains_key(&request) {
-                    self.abort_pending(item)?;
-                    self.fail_all("vision outcome differs from submitted request".into());
-                    return Ok(());
-                }
-                let record = self.records.get_mut(&request).unwrap();
-                record.add_physical_duration(item.kind(), item.physical_duration());
-                if matches!(
-                    record.generation.finish_reason(),
-                    Some(FinishReason::Cancelled | FinishReason::Failed)
-                ) {
-                    self.abort_pending(item)?;
-                } else if let Err(error) = self
-                    .domain
-                    .reconcile(item, PhysicalDecision { accepted_rows: 0 })
-                {
-                    self.fail_domain_outcome(request, error);
-                }
-            }
-            DomainFlight::Target(flight) => {
-                let pending = match self.domain.finish_target(flight) {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        self.fail_domain_error(error);
-                        return Ok(());
-                    }
-                };
-                let expected = active
-                    .operations
-                    .iter()
-                    .map(|operation| (operation.request(), operation))
-                    .collect::<BTreeMap<_, _>>();
-                let actual = pending
-                    .iter()
-                    .map(|item| item.request())
-                    .collect::<std::collections::BTreeSet<_>>();
-                if pending.len() != active.operations.len()
-                    || actual.len() != pending.len()
-                    || actual != expected.keys().copied().collect()
-                {
-                    for item in pending {
-                        self.abort_pending(item)?;
-                    }
-                    self.fail_all(
-                        "executor outcomes do not match submitted request identities".into(),
-                    );
-                    return Ok(());
-                }
-                let mut followups = Vec::new();
-                for item in pending {
-                    let request = item.request();
-                    let kind = item.kind();
-                    let duration = item.physical_duration();
-                    let operation = expected[&request];
-                    let Some(record) = self.records.get_mut(&request) else {
-                        self.abort_pending(item)?;
-                        continue;
-                    };
-                    record.add_physical_duration(kind, duration);
-                    if matches!(
-                        record.generation.finish_reason(),
-                        Some(FinishReason::Cancelled | FinishReason::Failed)
-                    ) {
-                        self.abort_pending(item)?;
-                        continue;
-                    }
-                    if !matches!(operation, Operation::Forward { .. }) {
-                        self.abort_pending(item)?;
-                        self.fail_request(
-                            request,
-                            RequestError::Invariant(InvariantError {
-                                context: "service target flight",
-                                detail: "target flight contains a non-forward operation".into(),
-                            }),
-                        );
-                        continue;
-                    }
-                    match reconcile_forward(&mut record.generation, &mut self.domain, request, item)
-                    {
-                        Ok(effects) => {
-                            followups.extend(effects.operations);
-                        }
-                        Err(RoundError::Logical(detail)) => self.fail_request(
-                            request,
-                            RequestError::Invariant(InvariantError {
-                                context: "generation round",
-                                detail,
-                            }),
-                        ),
-                        Err(RoundError::Physical(error)) => {
-                            self.fail_domain_outcome(request, error)
-                        }
-                    }
-                }
-                if !followups.is_empty() {
-                    self.queue_operations(followups);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn reconcile_method_outcomes(
-        &mut self,
-        pending: Vec<magnitude_executor::PendingOperationOutcome>,
+        round: &mut Round,
+        pending: Vec<PendingOperationOutcome>,
         operations: &[Operation],
-    ) -> Result<(), String> {
+    ) -> Result<(), RequestError> {
         let expected = operations
             .iter()
             .map(|operation| (operation.request(), operation))
             .collect::<BTreeMap<_, _>>();
         let actual = pending
             .iter()
-            .map(|item| item.request())
-            .collect::<std::collections::BTreeSet<_>>();
+            .map(PendingOperationOutcome::request)
+            .collect::<BTreeSet<_>>();
         if pending.len() != operations.len()
             || actual.len() != pending.len()
             || actual != expected.keys().copied().collect()
         {
-            for item in pending {
-                self.abort_pending(item)?;
+            return Err(invariant("service target flight")(
+                "executor outcomes do not match submitted request identities".into(),
+            ));
+        }
+        let mut followups = Vec::new();
+        for item in pending {
+            let request = item.request();
+            if !matches!(expected[&request], Operation::Forward { .. }) {
+                return Err(invariant("service target flight")(
+                    "target flight contains a non-forward operation".into(),
+                ));
             }
-            self.fail_all("method outcomes do not match submitted requests".into());
-            return Ok(());
+            let Some(Member { mut record, state }) = round.members.remove(&request) else {
+                self.domain.abort(item).map_err(classify_domain_error)?;
+                continue;
+            };
+            record.add_physical_duration(item.kind(), item.physical_duration());
+            let state = match state {
+                Membership::Started(started) if !ended(started.generation()) => {
+                    match reconcile_forward(started, &mut self.domain, request, item) {
+                        Ok((generation, effects)) => {
+                            followups.extend(effects.operations);
+                            Membership::Generation(generation)
+                        }
+                        Err((mut generation, RoundError::Logical(detail))) => {
+                            Self::fail_generation(
+                                &mut record,
+                                &mut generation,
+                                invariant("generation round")(detail),
+                            );
+                            Membership::Generation(generation)
+                        }
+                        Err((_, RoundError::Physical(error))) if is_fatal(&error) => {
+                            return Err(classify_domain_error(error));
+                        }
+                        Err((mut generation, RoundError::Physical(error))) => {
+                            Self::fail_generation(
+                                &mut record,
+                                &mut generation,
+                                classify_domain_error(error),
+                            );
+                            Membership::Generation(generation)
+                        }
+                    }
+                }
+                state => {
+                    self.domain.abort(item).map_err(classify_domain_error)?;
+                    state
+                }
+            };
+            round.members.insert(request, Member { record, state });
+        }
+        if !followups.is_empty() {
+            round
+                .groups
+                .extend(group(&self.domain, followups));
+        }
+        Ok(())
+    }
+
+    fn reconcile_method(
+        &mut self,
+        round: &mut Round,
+        pending: Vec<PendingOperationOutcome>,
+        operations: &[Operation],
+    ) -> Result<(), RequestError> {
+        let expected = operations
+            .iter()
+            .map(|operation| (operation.request(), operation))
+            .collect::<BTreeMap<_, _>>();
+        let actual = pending
+            .iter()
+            .map(PendingOperationOutcome::request)
+            .collect::<BTreeSet<_>>();
+        if pending.len() != operations.len()
+            || actual.len() != pending.len()
+            || actual != expected.keys().copied().collect()
+        {
+            return Err(invariant("service method flight")(
+                "method outcomes do not match submitted requests".into(),
+            ));
         }
         for item in pending {
             let request = item.request();
-            let duration = item.physical_duration();
             let operation = expected[&request];
             let correct = matches!(operation, Operation::Head { .. })
                 && matches!(item.outcome(), Outcome::Head { .. });
-            let Some(record) = self.records.get_mut(&request) else {
-                self.abort_pending(item)?;
+            let Some(member) = round.members.get_mut(&request) else {
+                self.domain.abort(item).map_err(classify_domain_error)?;
                 continue;
             };
             let kind = match operation {
@@ -2182,38 +2248,35 @@ impl<F: ProgramFamily> Owner<F> {
                 } => WorkKind::Prefill,
                 _ => item.kind(),
             };
-            record.add_physical_duration(kind, duration);
-            if matches!(
-                record.generation.finish_reason(),
-                Some(FinishReason::Cancelled | FinishReason::Failed)
-            ) {
-                self.abort_pending(item)?;
+            member.record.add_physical_duration(kind, item.physical_duration());
+            let Membership::Generation(generation) = &mut member.state else {
+                return Err(invariant("service method flight")(
+                    "drafter work reached a request with a started target round".into(),
+                ));
+            };
+            if ended(generation) {
+                self.domain.abort(item).map_err(classify_domain_error)?;
                 continue;
             }
             if !correct {
-                self.abort_pending(item)?;
-                self.fail_request(
-                    request,
-                    RequestError::Invariant(InvariantError {
-                        context: "service method flight",
-                        detail: "method outcome differs from submitted operation".into(),
-                    }),
+                self.domain.abort(item).map_err(classify_domain_error)?;
+                Self::fail_generation(
+                    &mut member.record,
+                    generation,
+                    invariant("service method flight")(
+                        "method outcome differs from submitted operation".into(),
+                    ),
                 );
                 continue;
             }
-            let transition = match record
-                .generation
-                .prepare_method_transition(operation, item.outcome())
-            {
+            let transition = match generation.prepare_method_transition(operation, item.outcome()) {
                 Ok(transition) => transition,
                 Err(detail) => {
-                    self.abort_pending(item)?;
-                    self.fail_request(
-                        request,
-                        RequestError::Invariant(InvariantError {
-                            context: "generation method transition",
-                            detail,
-                        }),
+                    self.domain.abort(item).map_err(classify_domain_error)?;
+                    Self::fail_generation(
+                        &mut member.record,
+                        generation,
+                        invariant("generation method transition")(detail),
                     );
                     continue;
                 }
@@ -2224,160 +2287,380 @@ impl<F: ProgramFamily> Owner<F> {
                     accepted_rows: transition.decision().accepted_rows,
                 },
             ) {
-                Ok(_) => record.generation.commit_method_transition(transition),
-                Err(error) => self.fail_domain_outcome(request, error),
+                Ok(()) => generation.commit_method_transition(transition),
+                Err(error) if is_fatal(&error) => return Err(classify_domain_error(error)),
+                Err(error) => Self::fail_generation(
+                    &mut member.record,
+                    generation,
+                    classify_domain_error(error),
+                ),
             }
         }
         Ok(())
     }
 
-    fn queue_operations(&mut self, operations: Vec<Operation>) {
-        let groups = group(&self.domain, operations);
-        self.batch.as_mut().unwrap().queued.extend(groups);
+    fn reconcile_vision(
+        &mut self,
+        round: &mut Round,
+        item: PendingOperationOutcome,
+        operations: &[Operation],
+    ) -> Result<(), RequestError> {
+        let request = item.request();
+        let valid = matches!(operations,
+            [Operation::Encode { request: expected, .. }] if *expected == request)
+            && matches!(item.outcome(), Outcome::Encode { .. });
+        if !valid {
+            return Err(invariant("service vision flight")(
+                "vision outcome differs from submitted request".into(),
+            ));
+        }
+        let Some(member) = round.members.get_mut(&request) else {
+            return self.domain.abort(item).map_err(classify_domain_error);
+        };
+        member
+            .record
+            .add_physical_duration(item.kind(), item.physical_duration());
+        if ended(member.state.generation()) {
+            return self.domain.abort(item).map_err(classify_domain_error);
+        }
+        match self.domain.reconcile(item, PhysicalDecision { accepted_rows: 0 }) {
+            Ok(()) => Ok(()),
+            Err(error) if is_fatal(&error) => Err(classify_domain_error(error)),
+            Err(error) => {
+                Self::fail_member(round, request, classify_domain_error(error));
+                Ok(())
+            }
+        }
     }
 
-    fn finish_batch(&mut self, now: u64) -> Result<(), String> {
-        let batch = self.batch.take().unwrap();
-        let elapsed = now.saturating_sub(batch.started);
-        let count = batch.selection.requests().len() as u64;
+    /// Fail a round member with `error`; its started round, if any, ends.
+    fn fail_member(round: &mut Round, request: RequestId, error: RequestError) {
+        if let Some(Member { mut record, state }) = round.members.remove(&request) {
+            let mut generation = state.terminate(false);
+            Self::fail_generation(&mut record, &mut generation, error);
+            round.members.insert(
+                request,
+                Member {
+                    record,
+                    state: Membership::Generation(generation),
+                },
+            );
+        }
+    }
+
+    /// The round is exhausted: charge its service and return its members.
+    fn finish_round(&mut self, round: Round) -> Result<(), RequestError> {
+        let Round {
+            selection,
+            started,
+            members,
+            ..
+        } = round;
+        let elapsed = self.now.saturating_sub(started);
+        let count = selection.requests().len() as u64;
         let base = elapsed / count;
         let remainder = elapsed % count;
-        for (index, request) in batch.selection.requests().iter().enumerate() {
-            if let Some(record) = self.records.get_mut(request) {
-                let share = base + u64::from((index as u64) < remainder);
-                record.service_ns = record.service_ns.saturating_add(share);
-                record.waiting_since = now;
-                if record
-                    .protected_until
-                    .is_some_and(|boundary| record.generation.resident_position() > boundary)
-                {
-                    record.protected_until = None;
-                }
+        let mut members = members;
+        for (index, request) in selection.requests().iter().enumerate() {
+            let share = base + u64::from((index as u64) < remainder);
+            let (record, generation) = match members.get_mut(request) {
+                Some(member) => (&mut member.record, member.state.generation()),
+                None => match self.requests.get_mut(request) {
+                    Some(request) => (&mut request.record, request.state.generation()),
+                    None => continue,
+                },
+            };
+            record.service_ns = record.service_ns.saturating_add(share);
+            record.waiting_since = self.now;
+            if record
+                .protected_until
+                .is_some_and(|boundary| generation.resident_position() > boundary)
+            {
+                record.protected_until = None;
             }
         }
-        let completed_requests = batch.selection.requests().to_vec();
-        self.scheduler.completed(batch.selection, elapsed);
-        for request in completed_requests {
-            self.retain_branch_point(request)?;
-            self.retain_prefill_boundary(request)?;
-            self.retain_terminal(request)?;
+        self.scheduler.completed(selection, elapsed);
+        let ids = members.keys().copied().collect::<Vec<_>>();
+        for (id, Member { mut record, state }) in members {
+            let generation = match state {
+                Membership::Generation(generation) => generation,
+                // Every submitted target operation reconciled and every
+                // unsubmitted one parked or ended, so a started round left
+                // here lost its work: it fails.
+                Membership::Started(started) => {
+                    let mut generation = started.fail();
+                    Self::fail_generation(
+                        &mut record,
+                        &mut generation,
+                        invariant("service round")(
+                            "a started round ended without its operation".into(),
+                        ),
+                    );
+                    generation
+                }
+            };
+            let stage = if generation.is_resident() {
+                Stage::Ready
+            } else {
+                Stage::NonResident(None)
+            };
+            self.requests.insert(
+                id,
+                Request {
+                    record,
+                    state: State::Between(generation, stage),
+                },
+            );
         }
-        self.epoch.advance()?;
-        let released = self
-            .records
-            .iter()
-            .filter_map(|(&id, record)| record.retire_on_completion.then_some(id))
-            .collect::<Vec<_>>();
-        for id in released {
-            self.retire(id)?;
+        for id in ids {
+            self.retain_branch_point(id)?;
+            self.retain_prefill_boundary(id)?;
+            self.retain_terminal(id)?;
         }
-        Ok(())
+        self.publish_ready()
+    }
+
+    /// A request outside the pipeline between rounds: its record and
+    /// generation.
+    fn between(&self, id: RequestId) -> Option<(&Record, &Generation)> {
+        match self.requests.get(&id) {
+            Some(Request {
+                record,
+                state: State::Between(generation, _),
+            }) => Some((record, generation)),
+            _ => None,
+        }
     }
 
     /// Retain the request's reconciled state at its planned branch point: the
     /// recurrent bank and method state there, sharing every history row
     /// before it with the request itself.
-    fn retain_branch_point(&mut self, request: RequestId) -> Result<(), String> {
-        let Some(record) = self.records.get_mut(&request) else {
+    fn retain_branch_point(&mut self, id: RequestId) -> Result<(), RequestError> {
+        let Some((record, generation)) = self.between(id) else {
             return Ok(());
         };
         let Some(branch) = record.branch else {
             return Ok(());
         };
-        let resident = record.generation.resident_position();
-        if record.generation.finish_reason().is_some()
-            || !record.generation.is_resident()
-            || resident > branch
-        {
-            record.branch = None;
+        let resident = generation.resident_position();
+        if generation.finish_reason().is_some() || !generation.is_resident() || resident > branch {
+            self.requests.get_mut(&id).unwrap().record.branch = None;
             return Ok(());
         }
-        if resident < branch || record.generation.awaiting_completion() {
+        if resident < branch {
             return Ok(());
         }
-        record.branch = None;
-        self.cache_prefix(request, branch)
+        self.requests.get_mut(&id).unwrap().record.branch = None;
+        self.cache_prefix(id, branch)
     }
 
     /// Cache the request's reconciled state as the prefix of its path ending
     /// at `position`, where it is resident.
-    fn cache_prefix(&mut self, request: RequestId, position: usize) -> Result<(), String> {
-        let state = self.domain.resume_state(request)?;
+    fn cache_prefix(&mut self, id: RequestId, position: usize) -> Result<(), RequestError> {
+        let state = self
+            .domain
+            .resume_state(id)
+            .map_err(invariant("prefix retention"))?;
         if state.position() != position {
-            return Err("cached prefix state differs from its path position".into());
+            return Err(invariant("prefix retention")(
+                "cached prefix state differs from its path position".into(),
+            ));
         }
-        let generation = &self
-            .records
-            .get(&request)
-            .ok_or("unknown request")?
-            .generation;
-        let method = generation.method_checkpoint()?;
-        if self
-            .prefix_cache
-            .retain(PrefixPath::of(generation), position, state, method)?
-        {
-            self.epoch.advance()?;
-        }
+        let Some(Request {
+            state: State::Between(generation, _),
+            ..
+        }) = self.requests.get(&id)
+        else {
+            return Ok(());
+        };
+        let method = generation
+            .method_checkpoint()
+            .map_err(invariant("prefix retention"))?;
+        self.prefix_cache
+            .retain(PrefixPath::of(generation), position, state, method)
+            .map_err(invariant("prefix retention"))?;
         Ok(())
     }
 
     /// Retain the request's prompt one row before its end (see
     /// [`prompt_boundary`]): the deepest point a request with the same prompt
     /// can resume from, since it must compute the row it samples from.
-    fn retain_prefill_boundary(&mut self, request: RequestId) -> Result<(), String> {
-        let Some(record) = self.records.get(&request) else {
+    fn retain_prefill_boundary(&mut self, id: RequestId) -> Result<(), RequestError> {
+        let Some((record, generation)) = self.between(id) else {
             return Ok(());
         };
-        let Some(boundary) = prompt_boundary(record) else {
+        let Some(boundary) = prompt_boundary(record, generation) else {
             return Ok(());
         };
-        if record.prefill_retained
-            || matches!(
-                record.generation.finish_reason(),
-                Some(FinishReason::Cancelled | FinishReason::Failed)
-            )
-            || record.generation.resident_position() != boundary
-            || record.generation.awaiting_completion()
-            || !record.generation.is_resident()
+        if ended(generation)
+            || generation.resident_position() != boundary
+            || !generation.is_resident()
         {
             return Ok(());
         }
-        self.cache_prefix(request, boundary)?;
-        self.records
-            .get_mut(&request)
-            .expect("known request")
-            .prefill_retained = true;
+        self.cache_prefix(id, boundary)?;
+        self.requests.get_mut(&id).unwrap().record.prefill_retained = true;
         Ok(())
     }
 
     /// Cache a finished request's whole path, prompt and reply: the next turn
     /// of a conversation extends it.
-    fn retain_terminal(&mut self, request: RequestId) -> Result<(), String> {
-        let record = self.records.get(&request).ok_or("unknown request")?;
+    fn retain_terminal(&mut self, id: RequestId) -> Result<(), RequestError> {
+        let Some((record, generation)) = self.between(id) else {
+            return Ok(());
+        };
         if record.terminal_retained
             || !record.prefix_cache
-            || !record.generation.is_resident()
+            || !generation.is_resident()
             || !matches!(
-                record.generation.finish_reason(),
+                generation.finish_reason(),
                 Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context)
             )
         {
             return Ok(());
         }
-        let end = PrefixPath::of(&record.generation).len();
-        if record.generation.resident_position() != end {
-            if record.generation.pending_reconciliation().is_some() {
+        let end = PrefixPath::of(generation).len();
+        if generation.resident_position() != end {
+            if generation.pending_reconciliation().is_some() {
                 return Ok(());
             }
-            return Err(
+            return Err(invariant("prefix retention")(
                 "terminal numerical state is not reconciled at the accepted boundary".into(),
-            );
+            ));
         }
-        self.cache_prefix(request, end)?;
-        self.records
-            .get_mut(&request)
-            .expect("known request")
-            .terminal_retained = true;
+        self.cache_prefix(id, end)?;
+        self.requests.get_mut(&id).unwrap().record.terminal_retained = true;
+        Ok(())
+    }
+
+    /// Drain round members' accepted output into their reserved permits, so
+    /// publication overlaps the next submission.
+    fn publish_members(&mut self, round: &mut Round) {
+        let mut closed = Vec::new();
+        for (&id, member) in round.members.iter_mut() {
+            if let Member {
+                record,
+                state: Membership::Generation(generation),
+            } = member
+            {
+                if Self::drain(record, generation) {
+                    closed.push(id);
+                }
+            }
+        }
+        // A closed receiver releases its request.
+        for id in closed {
+            if let Some(Member { mut record, state }) = round.members.remove(&id) {
+                let mut generation = state.terminate(true);
+                generation.discard_output();
+                record.release_publication();
+                round.members.insert(
+                    id,
+                    Member {
+                        record,
+                        state: Membership::Generation(generation),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Drain accepted output into reserved permits. Returns whether the
+    /// receiver has closed.
+    fn drain(record: &mut Record, generation: &mut Generation) -> bool {
+        let Some(sender) = record.publication.as_mut() else {
+            return false;
+        };
+        if !sender.receiver_open() {
+            return true;
+        }
+        loop {
+            let tokens = match record.pending_publication.take() {
+                Some(tokens) => tokens,
+                None if generation.output_len() > 0 => {
+                    match generation.take(record.publication_batch_limit) {
+                        Ok(tokens) => tokens,
+                        Err(_) => break,
+                    }
+                }
+                None => break,
+            };
+            let Some(permit) = record.publication_permits.pop_front() else {
+                // Output beyond the reserved bound waits for the next round's
+                // reservation.
+                record.pending_publication = Some(tokens);
+                break;
+            };
+            match sender.output_with_permit(tokens, permit) {
+                Ok(()) => {}
+                Err((PublishError::Full, _)) => {
+                    unreachable!("a publication permit owns an exact output slot")
+                }
+                Err((PublishError::ReceiverClosed, _)) => return true,
+            }
+        }
+        if record.pending_publication.is_none() && generation.output_len() == 0 {
+            record.publication_permits.clear();
+        }
+        false
+    }
+
+    /// Publish every request outside the pipeline, and retire the ones with
+    /// nothing left for their host.
+    fn publish_ready(&mut self) -> Result<(), RequestError> {
+        let ids = self.requests.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            let request = self.requests.get_mut(&id).expect("listed request");
+            let State::Between(generation, _) = &mut request.state else {
+                continue;
+            };
+            if Self::drain(&mut request.record, generation) {
+                self.terminate_request(id, true);
+            }
+            let request = &self.requests[&id];
+            let State::Between(generation, _) = &request.state else {
+                continue;
+            };
+            let record = &request.record;
+            let finished = generation.finish_reason().is_some()
+                && record.pending_publication.is_none()
+                && generation.output_len() == 0
+                && !owes_reconciliation(record, generation);
+            if !finished {
+                continue;
+            }
+            self.retain_terminal(id)?;
+            let request = self.requests.get_mut(&id).expect("listed request");
+            let State::Between(generation, _) = &request.state else {
+                continue;
+            };
+            let record = &mut request.record;
+            if let Some(sender) = record.publication.take() {
+                match generation.finish_reason().expect("terminal generation") {
+                    FinishReason::Failed => sender.fail(record.error.clone().unwrap_or_else(|| {
+                        RequestError::Invariant(InvariantError {
+                            context: "service request",
+                            detail: "failed without a classified cause".into(),
+                        })
+                    })),
+                    finish => sender.complete(
+                        finish,
+                        generation.detailed_usage(),
+                        generation.method_identity().to_owned(),
+                        record.physical_timings,
+                    ),
+                }
+            }
+            self.retire(id)?;
+        }
+        Ok(())
+    }
+
+    /// Close a terminal request's executor state and forget it.
+    fn retire(&mut self, id: RequestId) -> Result<(), RequestError> {
+        self.domain.close(id).map_err(invariant("request retirement"))?;
+        self.requests.remove(&id);
+        self.epoch.advance();
         Ok(())
     }
 
@@ -2385,30 +2668,34 @@ impl<F: ProgramFamily> Owner<F> {
         &mut self,
         selected: &[RequestId],
         release_resident_slot: bool,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, RequestError> {
         let mut victims = Vec::new();
-        for (&id, record) in &self.records {
+        for (&id, request) in &self.requests {
+            let State::Between(generation, stage @ (Stage::Ready | Stage::AwaitingCredit)) =
+                &request.state
+            else {
+                continue;
+            };
             if selected.contains(&id)
-                || !record.generation.is_resident()
-                || record.generation.awaiting_completion()
-                || record.generation.finish_reason().is_some()
-                || !record.encodes.is_empty()
-                || self.batch_contains(id)
-                || record.protected_until.is_some()
+                || !generation.is_resident()
+                || generation.finish_reason().is_some()
+                || request.record.protected_until.is_some()
             {
                 continue;
             }
-            let executor_bytes = self.domain.reclaimable(&[id])?;
+            let executor_bytes = self
+                .domain
+                .reclaimable(&[id])
+                .map_err(invariant("preemption"))?;
             victims.push(Victim {
                 identity: id,
-                output_blocked: record.publication_blocked
-                    || matches!(record.generation.wait_reason(), Some(WaitReason::Output)),
-                preemption_debt: record.preemption_debt,
+                output_blocked: matches!(stage, Stage::AwaitingCredit),
+                preemption_debt: request.record.preemption_debt,
                 exclusive_bytes: executor_bytes
-                    .checked_add(record.generation.method_reclaimable())
-                    .ok_or("request reclaim byte count overflow")?,
-                replay_tokens: record.generation.accepted_position() as u64,
-                service_ns: record.service_ns,
+                    .checked_add(generation.method_reclaimable())
+                    .ok_or_else(|| invariant("preemption")("request reclaim byte count overflow".into()))?,
+                replay_tokens: generation.accepted_position() as u64,
+                service_ns: request.record.service_ns,
             });
         }
         order_victims(&mut victims);
@@ -2417,143 +2704,64 @@ impl<F: ProgramFamily> Owner<F> {
             set.push(victim.identity);
             let method_bytes = set.iter().try_fold(0u64, |total, request| {
                 total
-                    .checked_add(
-                        self.records
-                            .get(request)
-                            .ok_or("unknown eviction request")?
-                            .generation
-                            .method_reclaimable(),
-                    )
-                    .ok_or_else(|| "method reclaim byte count overflow".to_owned())
+                    .checked_add(self.requests[request].state.generation().method_reclaimable())
+                    .ok_or_else(|| invariant("preemption")("method reclaim byte count overflow".into()))
             })?;
-            if !release_resident_slot && self.domain.reclaimable(&set)? == 0 && method_bytes == 0 {
+            let reclaimable = self
+                .domain
+                .reclaimable(&set)
+                .map_err(invariant("preemption"))?;
+            if !release_resident_slot && reclaimable == 0 && method_bytes == 0 {
                 continue;
             }
-            let executor_released = match self.domain.release_state(&set) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    if let Some(fatal) = self.domain.fatal_error().cloned() {
-                        self.fail_domain_error(fatal);
-                    }
-                    return Err(error);
-                }
-            };
-            if !release_resident_slot && executor_released == 0 && method_bytes == 0 {
+            let released = self
+                .domain
+                .release_state(&set)
+                .map_err(invariant("preemption"))?;
+            if !release_resident_slot && released == 0 && method_bytes == 0 {
                 continue;
             }
             for id in set {
-                let record = self.records.get_mut(&id).unwrap();
-                record.protected_until = Some(record.generation.accepted_position());
-                record.generation.evicted()?;
+                let Request { mut record, state } = self.requests.remove(&id).expect("victim");
+                let State::Between(mut generation, _) = state else {
+                    unreachable!("victims are between rounds")
+                };
+                record.protected_until = Some(generation.accepted_position());
                 record.preemption_debt = record.preemption_debt.saturating_add(1);
-                record.capacity = None;
+                generation.evicted().map_err(invariant("preemption"))?;
+                self.requests.insert(
+                    id,
+                    Request {
+                        record,
+                        state: State::Between(generation, Stage::NonResident(None)),
+                    },
+                );
             }
-            self.epoch.advance()?;
+            self.epoch.advance();
             return Ok(true);
         }
         Ok(false)
     }
 }
 
-impl<F: ProgramFamily> super::worker::Driven for Owner<F> {
-    fn admission_ready(&self) -> bool {
-        self.domain.open_growth_unblocked()
-    }
+enum Selected {
+    Round(Round),
+    /// Selection started no work but changed some request's state.
+    Retry,
+    Empty,
+}
 
-    fn settle_completion(&mut self, now: u64) -> Result<(), String> {
-        self.time(now)?;
-        let complete = self
-            .batch
-            .as_mut()
-            .and_then(|batch| batch.active.as_mut())
-            .is_some_and(|active| active.flight.completion().is_complete());
-        if !complete {
-            return Err("completion notification preceded executor completion".into());
-        }
-        self.reconcile_active()?;
-        self.release_deferred_reclaim()?;
-        if self.memory_condition != MemoryCondition::Unloading
-            && self
-                .batch
-                .as_ref()
-                .is_some_and(|batch| batch.queued.is_empty())
-        {
-            self.finish_batch(now)?;
-        }
-        Ok(())
-    }
+enum Residency {
+    Resident(Generation, Vec<Operation>),
+    Waiting(Generation, Wait),
+}
 
-    fn periodic(&mut self, now: u64) -> Result<(), String> {
-        self.observe_periodic_memory(now)
-    }
-
-    fn publication_wake(
-        &mut self,
-        request: RequestId,
-        wake: PublicationWake,
-        _now: u64,
-    ) -> Result<(), String> {
-        Owner::publication_wake(self, request, wake)
-    }
-
-    fn failure(&self) -> Option<&RequestError> {
-        self.fatal_error()
-    }
-
-    fn advance(
-        &mut self,
-        now: u64,
-        wake: super::worker::CompletionWake,
-    ) -> Result<super::worker::Drive, String> {
-        use super::worker::Drive;
-        match self.step(now)? {
-            Step::Submitted => {
-                self.batch
-                    .as_mut()
-                    .and_then(|batch| batch.active.as_mut())
-                    .expect("submitted domain flight")
-                    .flight
-                    .completion()
-                    .notify(wake);
-                Ok(Drive::AwaitingCompletion)
-            }
-            Step::Reconciled | Step::Progress => Ok(Drive::Progress),
-            Step::Idle => Ok(Drive::Idle),
-            Step::Waiting
-                if self
-                    .batch
-                    .as_ref()
-                    .is_none_or(|batch| batch.active.is_none()) =>
-            {
-                Ok(Drive::Idle)
-            }
-            Step::Waiting => Err("completion notification preceded executor completion".into()),
-        }
-    }
-
-    fn failed(&mut self, error: &str) {
-        self.fail_all(error.into());
-    }
-
-    fn shutdown(&mut self) -> Result<bool, String> {
-        let ids = self.records.keys().copied().collect::<Vec<_>>();
-        for &id in &ids {
-            self.cancel(id, true)?;
-        }
-        if self
-            .batch
-            .as_ref()
-            .is_some_and(|batch| batch.active.is_some())
-        {
-            return Ok(false);
-        }
-        self.batch = None;
-        for id in ids {
-            self.domain.close(id)?;
-            self.records.remove(&id);
-        }
-        self.prefix_cache.evict_all();
-        Ok(true)
+fn memory_observation(result: Result<(), DomainError>) -> Result<MemoryObservation, String> {
+    match result {
+        Ok(()) => Ok(MemoryObservation::Normal),
+        Err(DomainError::Reclaim) => Ok(MemoryObservation::Reclaim),
+        Err(DomainError::Blind(_)) => Ok(MemoryObservation::Blind),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -2612,20 +2820,5 @@ mod memory_condition_tests {
         assert_eq!(normal.released(11), MemoryCondition::Normal);
         let renewed = normal.observe(MemoryObservation::Reclaim, 11);
         assert_eq!(renewed, MemoryCondition::Reclaim { since: 11 });
-    }
-
-    #[test]
-    fn unloading_is_terminal() {
-        for observation in [
-            MemoryObservation::Normal,
-            MemoryObservation::Reclaim,
-            MemoryObservation::Blind,
-        ] {
-            assert_eq!(
-                MemoryCondition::Unloading.observe(observation, 1),
-                MemoryCondition::Unloading
-            );
-        }
-        assert!(!MemoryCondition::Unloading.should_unload(u64::MAX));
     }
 }

@@ -1,8 +1,13 @@
 //! Thread-confined execution behind one closed, device-free protocol.
+//!
+//! The worker is an event pump: it applies every command and event to the
+//! execution owner as it arrives, lets the owner run every transition that is
+//! possible, then sleeps until the next arrival or the owner's next due time.
+//! It makes no scheduling, storage, or lifecycle decision of its own.
 
 use crate::{
     protocol::{WorkerCommand, WorkerReply},
-    publication::{PublicationWake, RequestError},
+    publication::PublicationWake,
 };
 pub use magnitude_executor::CompletionWake;
 use magnitude_executor::RequestId;
@@ -17,142 +22,200 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub enum Drive {
-    Idle,
-    Progress,
-    AwaitingCompletion,
+/// Everything the owner applies other than a command.
+pub enum Event {
+    /// The in-flight group finished on the device.
+    Completion,
+    Publication(RequestId, PublicationWake),
+    /// A request whose admission reply was dropped, or whose host cancelled it.
+    Cancel(RequestId),
+    /// The worker is closing: terminate every request, let the flight finish, stop.
+    Close,
 }
 
 /// Worker-local execution domain. Implementations and all values they own stay
 /// on this thread; only the closed command/reply vocabulary crosses it.
 pub trait Driven {
-    fn install_wake_handle(&mut self, _wakes: WorkerWakeHandle) {}
-    fn admission_ready(&self) -> bool { true }
-    fn command(&mut self, _command: WorkerCommand, _now: u64) -> Result<WorkerReply, String> {
-        Err("execution domain does not implement the worker protocol".into())
-    }
-    fn publication_wake(
-        &mut self,
-        _request: RequestId,
-        _wake: PublicationWake,
-        _now: u64,
-    ) -> Result<(), String> {
-        Err("execution domain does not implement publication wakes".into())
-    }
-    fn advance(&mut self, now: u64, wake: CompletionWake) -> Result<Drive, String>;
-    /// Reconcile a completed flight and release its storage bindings before
-    /// queued admissions can grow the store. Submission resumes via advance.
-    fn settle_completion(&mut self, _now: u64) -> Result<(), String> {
-        Ok(())
-    }
-    /// Runs on the worker thread even while a submitted flight is outstanding.
-    /// The owner must not release storage held by that flight here.
-    fn periodic(&mut self, _now: u64) -> Result<(), String> {
-        Ok(())
-    }
-    fn failed(&mut self, error: &str);
-    /// The classified failure that stopped the domain, if any.
-    fn failure(&self) -> Option<&RequestError>;
-    fn shutdown(&mut self) -> Result<bool, String>;
+    /// Why execution stopped. Every later call fails with it.
+    type Stopped;
+    /// Executes immediately. No command is deferred or refused for "not now".
+    fn command(&mut self, command: WorkerCommand, now: u64) -> Result<WorkerReply, String>;
+    fn event(&mut self, event: Event, now: u64);
+    /// Run every transition that is possible now. Returns the worker-clock
+    /// time at which the owner must run again without an event (its next
+    /// memory observation), or why execution stopped.
+    fn run(&mut self, now: u64) -> Result<u64, Self::Stopped>;
 }
 
-struct ReplyState {
+/// The execution owner panicked: execution stopped without a cause of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Panicked;
+
+/// Why a dispatched command has no reply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallError<C> {
+    /// The owner refused the command.
+    Refused(String),
+    /// Execution stopped before or while the command ran.
+    Stopped(C),
+}
+
+/// Why a command could not be dispatched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DispatchError<C> {
+    Stopped(C),
+    /// Every control slot holds an unconsumed call.
+    Full,
+}
+
+struct ReplyState<C> {
     abandoned: bool,
-    result: Option<Result<WorkerReply, String>>,
+    result: Option<Result<WorkerReply, CallError<C>>>,
     waker: Option<Waker>,
 }
-struct Reply {
-    state: Mutex<ReplyState>,
+struct Reply<C> {
+    state: Mutex<ReplyState<C>>,
     changed: Condvar,
 }
-struct Envelope {
+struct Envelope<C> {
     command: WorkerCommand,
-    reply: Arc<Reply>,
+    reply: Arc<Reply<C>>,
 }
-struct Inbox {
-    controls: VecDeque<Envelope>,
-    cleanup: VecDeque<WorkerCommand>,
-    publications: VecDeque<(RequestId, PublicationWake)>,
-    completion: Option<u64>,
-    stop: bool,
-    closed: Option<String>,
-    terminated: bool,
+enum Item<C> {
+    Control(Envelope<C>),
+    Event(Event),
+}
+struct Inbox<C> {
+    /// Commands and events in arrival order.
+    items: VecDeque<Item<C>>,
+    stopped: Option<C>,
+    /// The session's waker, woken when execution stops.
+    stop_watcher: Option<Waker>,
+    /// Dispatched calls not yet consumed or abandoned.
     outstanding: usize,
 }
-struct Mailbox {
-    state: Mutex<Inbox>,
+struct Mailbox<C> {
+    state: Mutex<Inbox<C>>,
     changed: Condvar,
     capacity: usize,
 }
 
-/// Reserved publication wake capability. It never consumes ordinary command
-/// capacity and carries no caller-controlled numerical behavior.
-#[derive(Clone)]
-pub struct WorkerWakeHandle {
-    mailbox: Arc<Mailbox>,
-}
-
-impl WorkerWakeHandle {
-    pub fn publication(&self, request: RequestId, wake: PublicationWake) {
-        let mut state = self.mailbox.state.lock().unwrap();
-        if state.terminated {
+impl<C: Clone> Mailbox<C> {
+    fn push(&self, event: Event) {
+        let mut state = self.state.lock().unwrap();
+        if state.stopped.is_some() {
             return;
         }
-        state.publications.push_back((request, wake));
-        self.mailbox.changed.notify_one();
+        state.items.push_back(Item::Event(event));
+        self.changed.notify_one();
     }
-}
-
-impl Mailbox {
     fn release(&self) {
         self.state.lock().unwrap().outstanding -= 1;
     }
-    fn close(&self, error: &str) {
-        let pending = {
+    /// Deliver one reply. Returns the request to cancel when the caller had
+    /// abandoned an admission that the owner accepted.
+    fn deliver(&self, reply: &Reply<C>, result: Result<WorkerReply, CallError<C>>) -> Option<RequestId> {
+        let mut state = reply.state.lock().unwrap();
+        if !state.abandoned {
+            state.result = Some(result);
+            let waker = state.waker.take();
+            drop(state);
+            reply.changed.notify_one();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+            return None;
+        }
+        drop(state);
+        self.release();
+        match result {
+            Ok(WorkerReply::Admitted { request, .. }) => Some(request),
+            _ => None,
+        }
+    }
+    /// Stop accepting work and fail every pending command with `cause`.
+    fn stop(&self, cause: C) {
+        let (pending, watcher) = {
             let mut state = self.state.lock().unwrap();
-            state.closed.get_or_insert_with(|| error.into());
-            state.stop = true;
-            std::mem::take(&mut state.controls)
+            state.stopped = Some(cause.clone());
+            (std::mem::take(&mut state.items), state.stop_watcher.take())
         };
-        self.changed.notify_one();
-        for envelope in pending {
-            if deliver(&envelope.reply, Err(error.into())) {
-                self.release();
+        if let Some(watcher) = watcher {
+            watcher.wake();
+        }
+        for item in pending {
+            if let Item::Control(envelope) = item {
+                self.deliver(&envelope.reply, Err(CallError::Stopped(cause.clone())));
             }
         }
     }
-    fn cleanup(&self, command: WorkerCommand) {
-        let mut state = self.state.lock().unwrap();
-        if state.terminated {
-            return;
+}
+
+/// The wakes an execution owner raises: a submitted flight's completion and a
+/// request's publication activity.
+pub trait Wakes: Send + Sync {
+    fn completion(&self) -> CompletionWake;
+    fn publication(&self, request: RequestId, wake: PublicationWake);
+}
+
+impl<C: Clone + Send + 'static> Wakes for WorkerWakeHandle<C> {
+    fn completion(&self) -> CompletionWake {
+        WorkerWakeHandle::completion(self)
+    }
+    fn publication(&self, request: RequestId, wake: PublicationWake) {
+        WorkerWakeHandle::publication(self, request, wake)
+    }
+}
+
+/// Reserved wake capability of the owner. It never consumes command capacity
+/// and carries no caller-controlled behavior.
+pub struct WorkerWakeHandle<C> {
+    mailbox: Arc<Mailbox<C>>,
+}
+
+impl<C> Clone for WorkerWakeHandle<C> {
+    fn clone(&self) -> Self {
+        Self {
+            mailbox: self.mailbox.clone(),
         }
-        state.cleanup.push_back(command);
-        self.changed.notify_one();
+    }
+}
+
+impl<C: Clone + Send + 'static> WorkerWakeHandle<C> {
+    pub fn publication(&self, request: RequestId, wake: PublicationWake) {
+        self.mailbox.push(Event::Publication(request, wake));
+    }
+    /// The wake a submitted flight fires on completion.
+    pub fn completion(&self) -> CompletionWake {
+        let mailbox = self.mailbox.clone();
+        CompletionWake::new(move || mailbox.push(Event::Completion))
     }
 }
 
 /// One response to one closed worker command.
-pub struct Call {
-    reply: Arc<Reply>,
-    mailbox: Arc<Mailbox>,
+pub struct Call<C: Clone> {
+    reply: Arc<Reply<C>>,
+    mailbox: Arc<Mailbox<C>>,
     consumed: bool,
 }
-impl Call {
-    pub fn wait(mut self) -> Result<WorkerReply, String> {
+impl<C: Clone> Call<C> {
+    pub fn wait(mut self) -> Result<WorkerReply, CallError<C>> {
         let result = {
             let mut state = self.reply.state.lock().unwrap();
-            while state.result.is_none() {
+            loop {
+                if let Some(result) = state.result.take() {
+                    break result;
+                }
                 state = self.reply.changed.wait(state).unwrap();
             }
-            state.result.take().unwrap()
         };
         self.consumed = true;
         self.mailbox.release();
         result
     }
 }
-impl Future for Call {
-    type Output = Result<WorkerReply, String>;
+impl<C: Clone> Future for Call<C> {
+    type Output = Result<WorkerReply, CallError<C>>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         assert!(!this.consumed, "worker reply polled after consumption");
@@ -176,7 +239,7 @@ impl Future for Call {
         }
     }
 }
-impl Drop for Call {
+impl<C: Clone> Drop for Call<C> {
     fn drop(&mut self) {
         if self.consumed {
             return;
@@ -189,31 +252,11 @@ impl Drop for Call {
         };
         if let Some(result) = completed {
             if let Ok(WorkerReply::Admitted { request, .. }) = result {
-                self.mailbox.cleanup(WorkerCommand::Cancel { request });
+                self.mailbox.push(Event::Cancel(request));
             }
             self.mailbox.release();
         }
     }
-}
-
-fn deliver(reply: &Reply, result: Result<WorkerReply, String>) -> bool {
-    let (abandoned, waker) = {
-        let mut state = reply.state.lock().unwrap();
-        let abandoned = state.abandoned;
-        if !abandoned {
-            state.result = Some(result);
-        } else if let Ok(WorkerReply::Admitted { request, receiver }) = result {
-            // Preserve the only reply that owns a worker resource so the
-            // execution thread can immediately cancel it.
-            state.result = Some(Ok(WorkerReply::Admitted { request, receiver }));
-        }
-        (abandoned, state.waker.take())
-    };
-    reply.changed.notify_one();
-    if let Some(waker) = waker {
-        waker.wake();
-    }
-    abandoned
 }
 
 /// Why an execution owner could not be started.
@@ -241,23 +284,26 @@ impl<E: std::fmt::Display> std::fmt::Display for SpawnError<E> {
     }
 }
 
-pub struct Worker {
-    mailbox: Arc<Mailbox>,
+/// The execution owner a factory builds on the worker thread.
+pub type Owner<C> = Box<dyn Driven<Stopped = C>>;
+
+pub struct Worker<C: Clone + Send + 'static> {
+    mailbox: Arc<Mailbox<C>>,
     thread: Option<JoinHandle<()>>,
 }
-impl Worker {
+impl<C: Clone + Send + From<Panicked> + 'static> Worker<C> {
     pub fn spawn(
-        factory: impl FnOnce() -> Result<Box<dyn Driven>, String> + Send + 'static,
+        factory: impl FnOnce(WorkerWakeHandle<C>) -> Result<Owner<C>, String> + Send + 'static,
         capacity: usize,
     ) -> Result<Self, String> {
-        Self::spawn_ready(move || factory().map(|owner| (owner, ())), capacity)
+        Self::spawn_ready(move |wakes| factory(wakes).map(|owner| (owner, ())), capacity)
             .map(|(worker, ())| worker)
     }
 
     /// Start a thread-confined numerical owner and return device-free readiness
     /// evidence only after construction has completed on that worker.
     pub fn spawn_ready<R: Send + 'static>(
-        factory: impl FnOnce() -> Result<(Box<dyn Driven>, R), String> + Send + 'static,
+        factory: impl FnOnce(WorkerWakeHandle<C>) -> Result<(Owner<C>, R), String> + Send + 'static,
         capacity: usize,
     ) -> Result<(Self, R), String> {
         let (worker, ready, ()) = Self::spawn_ready_with(factory, capacity, || Ok(()))
@@ -268,7 +314,7 @@ impl Worker {
     /// Construct host artifacts on the caller while the execution thread
     /// builds its domain, then wait for both sides before publishing readiness.
     pub fn spawn_ready_with<R: Send + 'static, H, E: Send + 'static>(
-        factory: impl FnOnce() -> Result<(Box<dyn Driven>, R), E> + Send + 'static,
+        factory: impl FnOnce(WorkerWakeHandle<C>) -> Result<(Owner<C>, R), E> + Send + 'static,
         capacity: usize,
         host: impl FnOnce() -> Result<H, E>,
     ) -> Result<(Self, R, H), SpawnError<E>> {
@@ -277,13 +323,9 @@ impl Worker {
         }
         let mailbox = Arc::new(Mailbox {
             state: Mutex::new(Inbox {
-                controls: VecDeque::new(),
-                cleanup: VecDeque::new(),
-                publications: VecDeque::new(),
-                completion: None,
-                stop: false,
-                closed: None,
-                terminated: false,
+                items: VecDeque::new(),
+                stopped: None,
+                stop_watcher: None,
                 outstanding: 0,
             }),
             changed: Condvar::new(),
@@ -294,28 +336,20 @@ impl Worker {
         let thread = thread::Builder::new()
             .name("magnitude-execution".into())
             .spawn(move || {
-                let made = catch_unwind(AssertUnwindSafe(factory))
+                let wakes = WorkerWakeHandle {
+                    mailbox: queue.clone(),
+                };
+                let made = catch_unwind(AssertUnwindSafe(|| factory(wakes)))
                     .map_err(|_| SpawnError::Panicked)
                     .and_then(|made| made.map_err(SpawnError::Factory));
                 match made {
                     Ok((mut owner, readiness)) => {
-                        owner.install_wake_handle(WorkerWakeHandle {
-                            mailbox: queue.clone(),
-                        });
                         let _ = ready.send(Ok(readiness));
-                        let result = catch_unwind(AssertUnwindSafe(|| run(owner.as_mut(), &queue)));
-                        if result.is_err() {
-                            owner.failed("execution owner panicked");
-                        }
-                        queue.state.lock().unwrap().terminated = true;
-                        queue.close(&owner.failure().map_or_else(
-                            || "execution worker stopped".to_owned(),
-                            ToString::to_string,
-                        ));
+                        let cause = catch_unwind(AssertUnwindSafe(|| run(owner.as_mut(), &queue)))
+                            .unwrap_or_else(|_| C::from(Panicked));
+                        queue.stop(cause);
                     }
                     Err(error) => {
-                        queue.state.lock().unwrap().terminated = true;
-                        queue.close("execution construction failed");
                         let _ = ready.send(Err(error));
                     }
                 }
@@ -329,43 +363,54 @@ impl Worker {
         let readiness = receive.recv().map_err(|_| SpawnError::Panicked)??;
         Ok((worker, readiness, host))
     }
-    pub fn client(&self) -> Client {
+    pub fn client(&self) -> Client<C> {
         Client {
             mailbox: self.mailbox.clone(),
         }
     }
+    /// Terminate every request, let the flight finish, and join the thread.
     pub fn close(&mut self) {
         if let Some(thread) = self.thread.take() {
-            match self.client().dispatch(WorkerCommand::Close) {
-                Ok(call) => {
-                    let _ = call.wait();
-                }
-                Err(_) => self.mailbox.close("execution worker stopped"),
-            }
+            self.mailbox.push(Event::Close);
             let _ = thread.join();
         }
     }
 }
-impl Drop for Worker {
+impl<C: Clone + Send + 'static> Drop for Worker<C> {
     fn drop(&mut self) {
-        self.close();
+        if let Some(thread) = self.thread.take() {
+            self.mailbox.push(Event::Close);
+            let _ = thread.join();
+        }
     }
 }
 
 /// Cloneable, concrete command capability.
-#[derive(Clone)]
-pub struct Client {
-    mailbox: Arc<Mailbox>,
+pub struct Client<C> {
+    mailbox: Arc<Mailbox<C>>,
 }
-impl Client {
-    pub fn is_closed(&self) -> bool {
-        self.mailbox.state.lock().unwrap().closed.is_some()
+impl<C> Clone for Client<C> {
+    fn clone(&self) -> Self {
+        Self {
+            mailbox: self.mailbox.clone(),
+        }
     }
-    /// Why the execution owner stopped accepting commands, once it has.
-    pub fn closed_reason(&self) -> Option<String> {
-        self.mailbox.state.lock().unwrap().closed.clone()
+}
+impl<C: Clone + Send + 'static> Client<C> {
+    /// Why execution stopped, once it has.
+    pub fn stopped(&self) -> Option<C> {
+        self.mailbox.state.lock().unwrap().stopped.clone()
     }
-    pub fn dispatch(&self, command: WorkerCommand) -> Result<Call, String> {
+    /// Why execution stopped; otherwise `waker` replaces the watcher woken
+    /// once it does.
+    pub fn poll_stopped(&self, waker: &Waker) -> Option<C> {
+        let mut state = self.mailbox.state.lock().unwrap();
+        if state.stopped.is_none() {
+            state.stop_watcher = Some(waker.clone());
+        }
+        state.stopped.clone()
+    }
+    pub fn dispatch(&self, command: WorkerCommand) -> Result<Call<C>, DispatchError<C>> {
         let reply = Arc::new(Reply {
             state: Mutex::new(ReplyState {
                 abandoned: false,
@@ -375,17 +420,17 @@ impl Client {
             changed: Condvar::new(),
         });
         let mut state = self.mailbox.state.lock().unwrap();
-        if let Some(error) = &state.closed {
-            return Err(error.clone());
+        if let Some(cause) = &state.stopped {
+            return Err(DispatchError::Stopped(cause.clone()));
         }
         if state.outstanding >= self.mailbox.capacity {
-            return Err("execution control queue is full".into());
+            return Err(DispatchError::Full);
         }
         state.outstanding += 1;
-        state.controls.push_back(Envelope {
+        state.items.push_back(Item::Control(Envelope {
             command,
             reply: reply.clone(),
-        });
+        }));
         self.mailbox.changed.notify_one();
         Ok(Call {
             reply,
@@ -394,235 +439,50 @@ impl Client {
         })
     }
     /// Reserved lifecycle path; it cannot carry arbitrary caller behavior.
-    pub fn cancel(&self, request: magnitude_executor::RequestId) {
-        self.mailbox.cleanup(WorkerCommand::Cancel { request });
+    pub fn cancel(&self, request: RequestId) {
+        self.mailbox.push(Event::Cancel(request));
     }
 }
 
-fn run(owner: &mut dyn Driven, mailbox: &Arc<Mailbox>) {
-    enum Event {
-        Completion(u64),
-        Publication(RequestId, PublicationWake),
-        Stop,
-        Cleanup(WorkerCommand),
-        Control(Envelope),
-        Tick,
-    }
+fn run<C: Clone>(owner: &mut dyn Driven<Stopped = C>, mailbox: &Mailbox<C>) -> C {
     let start = Instant::now();
-    let now = || start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-    let mut waiting = None;
-    let mut admissions_to_drain = 0;
-    let mut serial = 0u64;
-    let mut drive = true;
-    let mut stopping = false;
-    let observation_interval = Duration::from_millis(100);
-    let mut next_observation = Instant::now() + observation_interval;
+    let now = || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     loop {
-        if !stopping {
-            if let Some(error) = owner.failure().map(ToString::to_string) {
-                mailbox.close(&error);
-                stopping = true;
-            }
-        }
-        if stopping {
-            match owner.shutdown() {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => {
-                    owner.failed(&error);
-                    break;
+        let items = std::mem::take(&mut mailbox.state.lock().unwrap().items);
+        for item in items {
+            match item {
+                Item::Event(event) => owner.event(event, now()),
+                Item::Control(envelope) => {
+                    let result = owner
+                        .command(envelope.command, now())
+                        .map_err(CallError::Refused);
+                    if let Some(request) = mailbox.deliver(&envelope.reply, result) {
+                        owner.event(Event::Cancel(request), now());
+                    }
                 }
             }
         }
-        if !stopping && Instant::now() >= next_observation {
-            if let Err(error) = owner.periodic(now()) {
-                owner.failed(&error);
-                mailbox.close(&error);
-                stopping = true;
-                continue;
-            }
-            next_observation = Instant::now() + observation_interval;
-        }
-        let event = {
-            let mut state = mailbox.state.lock().unwrap();
-            loop {
-                if let Some(id) = state.completion.take() {
-                    break Some(Event::Completion(id));
-                }
-                if let Some((request, wake)) = state.publications.pop_front() {
-                    break Some(Event::Publication(request, wake));
-                }
-                if let Some(command) = state.cleanup.pop_front() {
-                    break Some(Event::Cleanup(command));
-                }
-                if state.stop {
-                    state.stop = false;
-                    break Some(Event::Stop);
-                }
-                // An advance may hold a state transaction before it submits
-                // a flight. Let normal drive reach its completion wait before
-                // opening another request; the transaction can then release
-                // its slab binding before queued admissions run. Lifecycle
-                // and status commands remain available throughout.
-                let control = if waiting.is_some()
-                    || !owner.admission_ready()
-                    || (drive && admissions_to_drain == 0)
-                {
-                    state.controls.iter().position(|envelope| {
-                        !matches!(envelope.command, WorkerCommand::Admit(_))
-                    })
-                } else {
-                    (!state.controls.is_empty()).then_some(0)
-                };
-                if let Some(envelope) = control.and_then(|index| state.controls.remove(index)) {
-                    break Some(Event::Control(envelope));
-                }
-                if drive && waiting.is_none() {
-                    break None;
-                }
-                let (next, elapsed) = mailbox
-                    .changed
-                    .wait_timeout(
-                        state,
-                        next_observation.saturating_duration_since(Instant::now()),
-                    )
-                    .unwrap();
-                state = next;
-                if elapsed.timed_out() {
-                    break Some(Event::Tick);
-                }
-            }
+        let due = match owner.run(now()) {
+            Ok(due) => due,
+            Err(cause) => return cause,
         };
-        match event {
-            Some(Event::Stop) => {
-                stopping = true;
-                continue;
+        let mut state = mailbox.state.lock().unwrap();
+        while state.items.is_empty() {
+            let remaining = due.saturating_sub(now());
+            if remaining == 0 {
+                break;
             }
-            Some(Event::Tick) => {
-                // A blind memory observation needs a fresh claim attempt even
-                // when no command or completion arrives to move the epoch.
-                drive = waiting.is_none();
-            }
-            Some(Event::Completion(id)) => {
-                if waiting != Some(id) {
-                    owner.failed("completion identity differs from outstanding work");
-                    mailbox.close("completion identity differs from outstanding work");
-                    stopping = true;
-                    continue;
-                }
-                waiting = None;
-                if let Err(error) = owner.settle_completion(now()) {
-                    owner.failed(&error);
-                    mailbox.close(&error);
-                    stopping = true;
-                    continue;
-                }
-                admissions_to_drain = mailbox
-                    .state
-                    .lock()
-                    .unwrap()
-                    .controls
-                    .iter()
-                    .filter(|envelope| matches!(envelope.command, WorkerCommand::Admit(_)))
-                    .count();
-                drive = true;
-            }
-            Some(Event::Publication(request, wake)) => {
-                if let Err(error) = owner.publication_wake(request, wake, now()) {
-                    owner.failed(&error);
-                    mailbox.close(&error);
-                    stopping = true;
-                }
-                drive = true;
-            }
-            Some(Event::Cleanup(command)) => {
-                if let Err(error) = owner.command(command, now()) {
-                    owner.failed(&error);
-                    mailbox.close(&error);
-                    stopping = true;
-                }
-                drive = true;
-            }
-            Some(Event::Control(envelope)) => {
-                if matches!(envelope.command, WorkerCommand::Admit(_)) {
-                    admissions_to_drain = admissions_to_drain.saturating_sub(1);
-                }
-                let close_requested = matches!(envelope.command, WorkerCommand::Close);
-                let result = match envelope.command {
-                    WorkerCommand::Close => Ok(WorkerReply::Acknowledged),
-                    command => {
-                        match catch_unwind(AssertUnwindSafe(|| owner.command(command, now()))) {
-                            Ok(result) => result,
-                            Err(_) => {
-                                let error = "execution command panicked".to_string();
-                                owner.failed(&error);
-                                mailbox.close(&error);
-                                stopping = true;
-                                Err(error)
-                            }
-                        }
-                    }
-                };
-                let abandoned = deliver(&envelope.reply, result);
-                if abandoned {
-                    let admitted = {
-                        let mut state = envelope.reply.state.lock().unwrap();
-                        match state.result.take() {
-                            Some(Ok(WorkerReply::Admitted { request, .. })) => Some(request),
-                            _ => None,
-                        }
-                    };
-                    if let Some(request) = admitted {
-                        let _ = owner.command(WorkerCommand::Cancel { request }, now());
-                    }
-                    mailbox.release();
-                }
-                if close_requested {
-                    mailbox.close("execution worker stopped");
-                    stopping = true;
-                }
-                drive = true;
-            }
-            None => {}
-        }
-        if waiting.is_some() {
-            continue;
-        }
-        if drive && admissions_to_drain == 0 {
-            serial = match serial.checked_add(1) {
-                Some(id) => id,
-                None => {
-                    owner.failed("completion identity exhausted");
-                    break;
-                }
-            };
-            let id = serial;
-            let queue = mailbox.clone();
-            let wake = CompletionWake::new(move || {
-                let mut state = queue.state.lock().unwrap();
-                state.completion = Some(id);
-                queue.changed.notify_one();
-            });
-            match owner.advance(now(), wake) {
-                Ok(Drive::Idle) => drive = false,
-                Ok(Drive::Progress) => drive = true,
-                Ok(Drive::AwaitingCompletion) => {
-                    waiting = Some(id);
-                    drive = false;
-                }
-                Err(error) => {
-                    owner.failed(&error);
-                    mailbox.close(&error);
-                    stopping = true;
-                    drive = false;
-                }
-            }
+            state = mailbox
+                .changed
+                .wait_timeout(state, Duration::from_nanos(remaining))
+                .unwrap()
+                .0;
         }
     }
 }
 
 #[cfg(test)]
-mod overlap_tests {
+mod tests {
     use super::*;
     use magnitude_family_contracts::TokenPlan;
     use magnitude_generation::{
@@ -631,7 +491,15 @@ mod overlap_tests {
     };
     use std::collections::BTreeSet;
     use std::sync::mpsc;
-    use std::time::Duration;
+
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    const NEVER: u64 = u64::MAX;
+
+    impl From<Panicked> for String {
+        fn from(_: Panicked) -> Self {
+            "execution owner panicked".into()
+        }
+    }
 
     fn admit_request() -> WorkerCommand {
         let tokens = vec![TokenId(1), TokenId(2)];
@@ -673,38 +541,80 @@ mod overlap_tests {
         })
     }
 
-    struct Idle;
+    /// Reports every call; stops once closed.
+    struct Recorder {
+        calls: mpsc::Sender<&'static str>,
+        due: u64,
+        closed: bool,
+    }
+    impl Driven for Recorder {
+        type Stopped = String;
+        fn command(&mut self, command: WorkerCommand, _: u64) -> Result<WorkerReply, String> {
+            self.calls.send("command").unwrap();
+            Ok(match command {
+                WorkerCommand::Status { .. } => WorkerReply::Status(None),
+                _ => WorkerReply::Acknowledged,
+            })
+        }
+        fn event(&mut self, event: Event, _: u64) {
+            self.calls
+                .send(match event {
+                    Event::Completion => "completion",
+                    Event::Publication(..) => "publication",
+                    Event::Cancel(_) => "cancel",
+                    Event::Close => {
+                        self.closed = true;
+                        "close"
+                    }
+                })
+                .unwrap();
+        }
+        fn run(&mut self, now: u64) -> Result<u64, String> {
+            self.calls.send("run").unwrap();
+            if self.closed {
+                return Err("closed".into());
+            }
+            Ok(self.due.saturating_add(now))
+        }
+    }
 
-    impl Driven for Idle {
-        fn advance(&mut self, _: u64, _: CompletionWake) -> Result<Drive, String> {
-            Ok(Drive::Idle)
-        }
-        fn failed(&mut self, _: &str) {}
-        fn failure(&self) -> Option<&RequestError> {
-            None
-        }
-        fn shutdown(&mut self) -> Result<bool, String> {
-            Ok(true)
-        }
+    fn recorder(due: u64) -> (Worker<String>, mpsc::Receiver<&'static str>) {
+        let (calls, observed) = mpsc::channel();
+        let worker = Worker::spawn(
+            move |_| {
+                Ok(Box::new(Recorder {
+                    calls,
+                    due,
+                    closed: false,
+                }) as Owner<String>)
+            },
+            4,
+        )
+        .unwrap();
+        (worker, observed)
     }
 
     #[test]
     fn host_construction_runs_before_worker_readiness() {
         let (started, observe_start) = mpsc::sync_channel(1);
         let (finish, allow_finish) = mpsc::sync_channel(1);
-        let (mut worker, ready, host) = Worker::spawn_ready_with::<_, _, String>(
-            move || {
+        let (calls, _observed) = mpsc::channel();
+        let (mut worker, ready, host) = Worker::<String>::spawn_ready_with::<_, _, String>(
+            move |_| {
                 started.send(()).unwrap();
-                allow_finish
-                    .recv_timeout(Duration::from_secs(2))
-                    .map_err(|error| error.to_string())?;
-                Ok((Box::new(Idle) as Box<dyn Driven>, 7))
+                allow_finish.recv_timeout(TIMEOUT).map_err(|error| error.to_string())?;
+                Ok((
+                    Box::new(Recorder {
+                        calls,
+                        due: NEVER,
+                        closed: false,
+                    }) as Owner<String>,
+                    7,
+                ))
             },
             1,
             move || {
-                observe_start
-                    .recv_timeout(Duration::from_secs(2))
-                    .map_err(|error| error.to_string())?;
+                observe_start.recv_timeout(TIMEOUT).map_err(|error| error.to_string())?;
                 finish.send(()).unwrap();
                 Ok(9)
             },
@@ -715,205 +625,184 @@ mod overlap_tests {
     }
 
     #[test]
-    fn idle_owner_gets_periodic_retry_without_a_command() {
-        struct Retry {
-            attempts: usize,
-            retried: mpsc::SyncSender<()>,
+    fn an_idle_owner_runs_once_and_the_worker_sleeps() {
+        let (mut worker, observed) = recorder(NEVER);
+        assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "run");
+        assert!(observed.recv_timeout(Duration::from_millis(200)).is_err());
+        worker.close();
+    }
+
+    #[test]
+    fn the_owner_runs_again_when_its_observation_is_due() {
+        let (mut worker, observed) = recorder(Duration::from_millis(5).as_nanos() as u64);
+        for _ in 0..3 {
+            assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "run");
         }
-        impl Driven for Retry {
-            fn advance(&mut self, _: u64, _: CompletionWake) -> Result<Drive, String> {
-                self.attempts += 1;
-                if self.attempts == 2 {
-                    self.retried.send(()).unwrap();
+        worker.close();
+    }
+
+    /// The incident's worker half: commands never wait on the owner's state.
+    /// An admission dispatched while a flight is in the air is applied at once,
+    /// and the flight's completion arrives as an event.
+    #[test]
+    fn commands_and_completion_are_applied_while_a_flight_is_in_the_air() {
+        struct InFlight {
+            wakes: WorkerWakeHandle<String>,
+            flight: mpsc::Sender<CompletionWake>,
+            calls: mpsc::Sender<&'static str>,
+            submitted: bool,
+            closed: bool,
+        }
+        impl Driven for InFlight {
+            type Stopped = String;
+            fn command(&mut self, command: WorkerCommand, _: u64) -> Result<WorkerReply, String> {
+                Ok(match command {
+                    WorkerCommand::Admit(_) => {
+                        self.calls.send("admit").unwrap();
+                        WorkerReply::Acknowledged
+                    }
+                    _ => WorkerReply::Status(None),
+                })
+            }
+            fn event(&mut self, event: Event, _: u64) {
+                match event {
+                    Event::Completion => self.calls.send("completion").unwrap(),
+                    Event::Close => self.closed = true,
+                    _ => {}
                 }
-                Ok(Drive::Idle)
             }
-            fn failed(&mut self, _: &str) {}
-            fn failure(&self) -> Option<&RequestError> {
-                None
-            }
-            fn shutdown(&mut self) -> Result<bool, String> {
-                Ok(true)
+            fn run(&mut self, _: u64) -> Result<u64, String> {
+                if self.closed {
+                    return Err("closed".into());
+                }
+                if !self.submitted {
+                    self.submitted = true;
+                    self.flight.send(self.wakes.completion()).unwrap();
+                }
+                Ok(NEVER)
             }
         }
-        let (retried, observed) = mpsc::sync_channel(1);
+        let (flight, flights) = mpsc::channel();
+        let (calls, observed) = mpsc::channel();
         let mut worker = Worker::spawn(
-            move || {
-                Ok(Box::new(Retry {
-                    attempts: 0,
-                    retried,
-                }))
+            move |wakes| {
+                Ok(Box::new(InFlight {
+                    wakes,
+                    flight,
+                    calls,
+                    submitted: false,
+                    closed: false,
+                }) as Owner<String>)
+            },
+            2,
+        )
+        .unwrap();
+        let completion = flights.recv_timeout(TIMEOUT).unwrap();
+        let client = worker.client();
+        assert!(matches!(
+            client.dispatch(admit_request()).unwrap().wait(),
+            Ok(WorkerReply::Acknowledged)
+        ));
+        assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "admit");
+        completion.complete();
+        assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "completion");
+        worker.close();
+    }
+
+    #[test]
+    fn a_stopped_owner_fails_pending_and_later_commands_with_its_cause() {
+        struct Stopping;
+        impl Driven for Stopping {
+            type Stopped = String;
+            fn command(&mut self, _: WorkerCommand, _: u64) -> Result<WorkerReply, String> {
+                Ok(WorkerReply::Acknowledged)
+            }
+            fn event(&mut self, _: Event, _: u64) {}
+            fn run(&mut self, _: u64) -> Result<u64, String> {
+                Err("device lost".into())
+            }
+        }
+        let mut worker =
+            Worker::spawn(|_| Ok(Box::new(Stopping) as Owner<String>), 1).unwrap();
+        let client = worker.client();
+        let deadline = Instant::now() + TIMEOUT;
+        while client.stopped().is_none() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(client.stopped(), Some("device lost".into()));
+        assert!(matches!(
+            client.dispatch(WorkerCommand::Observe),
+            Err(DispatchError::Stopped(cause)) if cause == "device lost"
+        ));
+        worker.close();
+    }
+
+    #[test]
+    fn an_abandoned_admission_is_cancelled_on_the_worker() {
+        struct Admitting {
+            cancelled: mpsc::Sender<RequestId>,
+            closed: bool,
+        }
+        impl Driven for Admitting {
+            type Stopped = String;
+            fn command(&mut self, _: WorkerCommand, _: u64) -> Result<WorkerReply, String> {
+                let (_, receiver) =
+                    crate::publication::PublicationQueue::bounded(1, |_| {})?;
+                Ok(WorkerReply::Admitted {
+                    request: RequestId(3),
+                    receiver,
+                })
+            }
+            fn event(&mut self, event: Event, _: u64) {
+                match event {
+                    Event::Cancel(request) => self.cancelled.send(request).unwrap(),
+                    Event::Close => self.closed = true,
+                    _ => {}
+                }
+            }
+            fn run(&mut self, _: u64) -> Result<u64, String> {
+                if self.closed {
+                    return Err("closed".into());
+                }
+                Ok(NEVER)
+            }
+        }
+        let (cancelled, observed) = mpsc::channel();
+        let mut worker = Worker::spawn(
+            move |_| {
+                Ok(Box::new(Admitting {
+                    cancelled,
+                    closed: false,
+                }) as Owner<String>)
             },
             1,
         )
         .unwrap();
-        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(worker.client().dispatch(admit_request()).unwrap());
+        assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), RequestId(3));
         worker.close();
     }
 
     #[test]
-    fn observes_periodically_while_a_submission_is_outstanding() {
-        struct InFlight {
-            observed: mpsc::Sender<()>,
-        }
-        impl Driven for InFlight {
-            fn advance(&mut self, _: u64, _: CompletionWake) -> Result<Drive, String> {
-                Ok(Drive::AwaitingCompletion)
-            }
-            fn periodic(&mut self, _: u64) -> Result<(), String> {
-                self.observed.send(()).unwrap();
-                Ok(())
-            }
-            fn failed(&mut self, _: &str) {}
-            fn failure(&self) -> Option<&RequestError> {
-                None
-            }
-            fn shutdown(&mut self) -> Result<bool, String> {
-                Ok(true)
-            }
-        }
-        let (observed, receiver) = mpsc::channel();
-        let mut worker = Worker::spawn(move || Ok(Box::new(InFlight { observed })), 1).unwrap();
-        receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-        worker.close();
-    }
-
-    #[test]
-    fn admission_waits_for_a_submitted_flight_while_status_remains_available() {
-        struct InFlight {
-            wake: mpsc::Sender<CompletionWake>,
-            admitted: mpsc::Sender<()>,
-            submitted: bool,
-            settled: bool,
-            admissions: usize,
-        }
-        impl Driven for InFlight {
-            fn command(&mut self, command: WorkerCommand, _: u64) -> Result<WorkerReply, String> {
-                match command {
-                    WorkerCommand::Admit(_) => {
-                        assert!(self.settled);
-                        self.admissions += 1;
-                        self.admitted.send(()).unwrap();
-                        Ok(WorkerReply::Acknowledged)
-                    }
-                    WorkerCommand::Status { .. } => Ok(WorkerReply::Status(None)),
-                    _ => Ok(WorkerReply::Acknowledged),
-                }
-            }
-            fn advance(&mut self, _: u64, wake: CompletionWake) -> Result<Drive, String> {
-                if self.submitted {
-                    assert_eq!(self.admissions, 2);
-                    Ok(Drive::Idle)
-                } else {
-                    self.submitted = true;
-                    self.wake.send(wake).unwrap();
-                    Ok(Drive::AwaitingCompletion)
-                }
-            }
-            fn settle_completion(&mut self, _: u64) -> Result<(), String> {
-                self.settled = true;
-                Ok(())
-            }
-            fn failed(&mut self, _: &str) {}
-            fn failure(&self) -> Option<&RequestError> { None }
-            fn shutdown(&mut self) -> Result<bool, String> { Ok(true) }
-        }
-        let (wake_sender, wake_receiver) = mpsc::channel();
-        let (admitted_sender, admitted_receiver) = mpsc::channel();
-        let mut worker = Worker::spawn(
-            move || Ok(Box::new(InFlight {
-                wake: wake_sender,
-                admitted: admitted_sender,
-                submitted: false,
-                settled: false,
-                admissions: 0,
-            })),
-            3,
-        ).unwrap();
-        let wake = wake_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    fn events_bypass_a_saturated_control_queue() {
+        let (mut worker, observed) = recorder(NEVER);
+        assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "run");
         let client = worker.client();
-        let admission = client.dispatch(admit_request()).unwrap();
-        let second_admission = client.dispatch(admit_request()).unwrap();
-        let status = client.dispatch(WorkerCommand::Status { request: RequestId(1) }).unwrap();
-        assert!(matches!(status.wait().unwrap(), WorkerReply::Status(None)));
-        assert!(admitted_receiver.try_recv().is_err());
-        wake.complete();
-        assert!(matches!(admission.wait().unwrap(), WorkerReply::Acknowledged));
-        assert!(matches!(second_admission.wait().unwrap(), WorkerReply::Acknowledged));
-        admitted_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-        admitted_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-        worker.close();
-    }
-
-    #[test]
-    fn admission_waits_while_advance_prepares_a_submission() {
-        struct Preparing {
-            entered: mpsc::Sender<()>,
-            resume: mpsc::Receiver<()>,
-            wake: mpsc::Sender<CompletionWake>,
-            admitted: mpsc::Sender<()>,
-            stage: usize,
-            admissions: usize,
-            settled: bool,
+        let held = client.dispatch(WorkerCommand::Observe).unwrap();
+        let _held_too = client.dispatch(WorkerCommand::Observe).unwrap();
+        let _third = client.dispatch(WorkerCommand::Observe).unwrap();
+        let _fourth = client.dispatch(WorkerCommand::Observe).unwrap();
+        assert!(matches!(
+            client.dispatch(WorkerCommand::Observe),
+            Err(DispatchError::Full)
+        ));
+        client.cancel(RequestId(1));
+        let mut seen = Vec::new();
+        while !seen.contains(&"cancel") {
+            seen.push(observed.recv_timeout(TIMEOUT).unwrap());
         }
-        impl Driven for Preparing {
-            fn command(&mut self, command: WorkerCommand, _: u64) -> Result<WorkerReply, String> {
-                if matches!(command, WorkerCommand::Admit(_)) {
-                    if self.admissions > 0 {
-                        assert!(self.settled, "peer admitted during an active state transaction");
-                    }
-                    self.admissions += 1;
-                    self.admitted.send(()).unwrap();
-                }
-                Ok(WorkerReply::Acknowledged)
-            }
-            fn advance(&mut self, _: u64, wake: CompletionWake) -> Result<Drive, String> {
-                match self.stage {
-                    0 => { self.stage = 1; Ok(Drive::Idle) }
-                    1 => {
-                        self.stage = 2;
-                        self.entered.send(()).unwrap();
-                        self.resume.recv().unwrap();
-                        Ok(Drive::Progress)
-                    }
-                    2 => {
-                        self.stage = 3;
-                        self.wake.send(wake).unwrap();
-                        Ok(Drive::AwaitingCompletion)
-                    }
-                    _ => Ok(Drive::Idle),
-                }
-            }
-            fn settle_completion(&mut self, _: u64) -> Result<(), String> {
-                self.settled = true;
-                Ok(())
-            }
-            fn failed(&mut self, _: &str) {}
-            fn failure(&self) -> Option<&RequestError> { None }
-            fn shutdown(&mut self) -> Result<bool, String> { Ok(true) }
-        }
-        let (entered, entering) = mpsc::channel();
-        let (resume, resumed) = mpsc::channel();
-        let (wake, waking) = mpsc::channel();
-        let (admitted, admissions) = mpsc::channel();
-        let mut worker = Worker::spawn(
-            move || Ok(Box::new(Preparing {
-                entered, resume: resumed, wake, admitted,
-                stage: 0, admissions: 0, settled: false,
-            })),
-            2,
-        ).unwrap();
-        let client = worker.client();
-        assert!(matches!(client.dispatch(admit_request()).unwrap().wait().unwrap(), WorkerReply::Acknowledged));
-        entering.recv_timeout(Duration::from_secs(2)).unwrap();
-        let peer = client.dispatch(admit_request()).unwrap();
-        resume.send(()).unwrap();
-        let completion = waking.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(admissions.recv_timeout(Duration::from_secs(2)).is_ok());
-        assert!(admissions.try_recv().is_err());
-        completion.complete();
-        assert!(matches!(peer.wait().unwrap(), WorkerReply::Acknowledged));
-        admissions.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(held);
         worker.close();
     }
 }

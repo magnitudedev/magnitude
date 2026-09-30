@@ -22,7 +22,7 @@ pub use client::{
 use crate::census::{AllocationCensus, MemoryDomain};
 use crate::error::{ArtifactError, LoadError, UnloadCause};
 use crate::options::{ExecutionManifest, InputModalities, ReadyInfo, ResourcePlanSummary};
-use execution::{ExecutionOwner, UnloadNotice};
+use execution::ExecutionOwner;
 use magnitude_artifacts::Package;
 use magnitude_chat::{
     artifacts::{gguf_byte_bpe, gguf_templates},
@@ -31,7 +31,7 @@ use magnitude_chat::{
 use magnitude_grammar::CacheLimits;
 use magnitude_scheduler::{
     owner::Owner,
-    worker::{Driven, SpawnError, Worker},
+    worker::{Driven, SpawnError, Wakes, Worker, WorkerWakeHandle},
 };
 use protocol::{EngineBuild, HostMessage, WorkerMessage};
 use seismic::DeviceCatalog;
@@ -183,7 +183,7 @@ fn serve(
     let signal = Arc::new(Signal::default());
     // Host messages that arrive during the load wait in the session inbox.
     let _reader = session::spawn_reader(receiver, signal.clone());
-    match load(manifest, &outbound, &signal) {
+    match load(manifest, &outbound) {
         Ok((loaded, ready)) => {
             if let Err(error) = outbound.lock().unwrap().send(WorkerMessage::Ready { ready }) {
                 return WorkerExit::TransportFailed(error.to_string());
@@ -221,7 +221,6 @@ struct ChatIdentity {
 fn load(
     manifest: ExecutionManifest,
     outbound: &Outbound,
-    signal: &Arc<Signal>,
 ) -> Result<(Loaded, ReadyInfo), LoadError> {
     let package = Arc::new(Package::open_manifest(&manifest.package).map_err(|error| {
         LoadError::Artifact(ArtifactError::from_artifacts(
@@ -234,9 +233,6 @@ fn load(
         .method
         .factory(&manifest.package.identity.to_string())
         .map_err(internal)?;
-    let notice = Arc::new(UnloadNotice::default());
-    let wake = signal.clone();
-    notice.install_wake(move || wake.notify());
     let definition = manifest.definition.clone();
     let session_definition = manifest.definition.clone();
     let manifest_identity = manifest.package.identity;
@@ -245,10 +241,12 @@ fn load(
     let ready_path = manifest.path;
     let host_package = package.clone();
     let progress_outbound = outbound.clone();
-    let owner_notice = notice.clone();
     // Readiness, the host-table bytes and the allocation domain.
     type Built = (ExecutionReady, u64, MemoryDomain);
-    let factory = move || -> Result<(Box<dyn Driven>, Built), LoadError> {
+    let factory = move |wakes: WorkerWakeHandle<UnloadCause>| -> Result<
+        (Box<dyn Driven<Stopped = UnloadCause>>, Built),
+        LoadError,
+    > {
         let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
         let built = crate::execution::build(
             catalog,
@@ -269,8 +267,14 @@ fn load(
         let host_table_bytes = built.domain.host_table_bytes();
         let domain = MemoryDomain::of(built.device, built.pool);
         let resources = ResourcePlanSummary::from_plan(&built.plan).map_err(internal)?;
-        let owner = Owner::with_resource_plan(built.domain, manifest.service.clone(), &built.plan)
-            .map_err(internal)?;
+        let owner = Owner::with_resource_plan(
+            built.domain,
+            built.bindings,
+            manifest.service.clone(),
+            &built.plan,
+            Arc::new(wakes) as Arc<dyn Wakes>,
+        )
+        .map_err(internal)?;
         let census = owner
             .reconcile_memory_charge()
             .and_then(|charge| AllocationCensus::classify(&charge, host_table_bytes, domain))
@@ -282,12 +286,7 @@ fn load(
             census,
         };
         Ok((
-            Box::new(ExecutionOwner {
-                owner: Some(owner),
-                method,
-                wakes: None,
-                notice: owner_notice,
-            }) as Box<dyn Driven>,
+            Box::new(ExecutionOwner::new(owner, method)) as Box<dyn Driven<Stopped = UnloadCause>>,
             (ready, host_table_bytes, domain),
         ))
     };
@@ -350,7 +349,6 @@ fn load(
             definition: session_definition,
             host_table_bytes,
             domain,
-            notice,
         },
         ready,
     ))

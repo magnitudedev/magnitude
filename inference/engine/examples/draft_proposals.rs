@@ -20,13 +20,11 @@ use magnitude_engine::{
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     Demand, DomainError, DraftForm, ExecutionPath, FeatureReader, FeatureSpan, Operation, Outcome,
-    PhysicalDecision, RequestId, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
+    PhysicalDecision, RequestId, ReservedResources, Sampling, SelectSpec, Shaping, TokenId,
+    WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
-use magnitude_scheduler::{
-    domain::{self as service_domain, DomainFlight},
-    ServiceLimits,
-};
+use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
 use std::path::PathBuf;
 
@@ -142,11 +140,14 @@ fn main() -> Result<(), String> {
         options.cache.clone(),
         MemoryReserves::standard(),
     )?;
-    let (mut domain, _) = build_native_domain(&manifest, std::sync::Arc::new(package))
-        .map_err(|error| error.to_string())?;
+    let (mut domain, mut bindings, _) =
+        build_native_domain(&manifest, std::sync::Arc::new(package))
+            .map_err(|error| error.to_string())?;
     let request = RequestId(1);
     domain.install_input(request, PreparedModelInput::continuation_only())?;
-    domain.open_state(request, None).map_err(text)?;
+    domain
+        .open_state(&mut bindings, request, None)
+        .map_err(text)?;
 
     // The target runs the committed tokens; every row's features condition
     // the draft.
@@ -161,17 +162,21 @@ fn main() -> Result<(), String> {
         committed,
         prime: None,
     };
-    let groups = service_domain::group(&domain, vec![prefill]);
-    let [group] = groups.as_slice() else {
-        return Err("one prefill forms one group".into());
-    };
-    let DomainFlight::Target(flight) =
-        service_domain::submit_group(&mut domain, group).map_err(|error| error.to_string())?
+    // Each flight carries the bindings and returns them.
+    let operations = [prefill];
+    let ReservedResources::Target(reservation) = domain
+        .reserve(&mut bindings, &operations)
+        .map_err(text)?
+        .into_resources()
     else {
         return Err("a prefill runs on the target lane".into());
     };
+    let flight = domain
+        .submit_target(bindings, &operations, reservation)
+        .map_err(|failure| failure.error().to_string())?;
+    let (pending, mut bindings) = domain.finish_target(flight).map_err(text)?;
     let mut features = None;
-    for pending in domain.finish_target(flight).map_err(text)? {
+    for pending in pending {
         let Outcome::Forward { rows } = pending.outcome().clone() else {
             return Err("a prefill returns forward rows".into());
         };
@@ -202,16 +207,19 @@ fn main() -> Result<(), String> {
             .collect(),
         form: DraftForm::Block,
     };
-    let groups = service_domain::group(&domain, vec![head]);
-    let [group] = groups.as_slice() else {
-        return Err("one draft transaction forms one group".into());
-    };
-    let DomainFlight::Head(flight) =
-        service_domain::submit_group(&mut domain, group).map_err(|error| error.to_string())?
+    let operations = [head];
+    let ReservedResources::Head(workspace, output, advances) = domain
+        .reserve(&mut bindings, &operations)
+        .map_err(text)?
+        .into_resources()
     else {
         return Err("a draft transaction runs on the head lane".into());
     };
-    for pending in domain.finish_head(flight).map_err(text)? {
+    let flight = domain
+        .submit_head(bindings, &operations, workspace, output, advances)
+        .map_err(|failure| failure.error().to_string())?;
+    let (pending, _) = domain.finish_head(flight).map_err(text)?;
+    for pending in pending {
         let Outcome::Head { proposals } = pending.outcome().clone() else {
             return Err("a draft transaction returns proposals".into());
         };

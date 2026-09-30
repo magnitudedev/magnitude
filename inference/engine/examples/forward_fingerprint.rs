@@ -20,13 +20,11 @@ use magnitude_engine::{
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     Demand, DomainError, ExecutionPath, ExecutorDomain, FeatureRows, Operation, Outcome,
-    PhysicalDecision, RequestId, RowResult, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
+    PhysicalDecision, RequestId, ReservedResources, RowResult, Sampling, SelectSpec, Shaping,
+    StateBindings, TokenId, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
-use magnitude_scheduler::{
-    domain::{self as service_domain, DomainFlight},
-    ServiceLimits,
-};
+use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -114,22 +112,26 @@ impl Fingerprint {
             .collect()
     }
 
-    fn open(&mut self, id: u64) -> Result<Sequence, String> {
+    fn open(&mut self, bindings: &mut StateBindings, id: u64) -> Result<Sequence, String> {
         let request = RequestId(id);
         self.domain
             .install_input(request, PreparedModelInput::continuation_only())?;
-        self.domain.open_state(request, None).map_err(text)?;
+        self.domain
+            .open_state(bindings, request, None)
+            .map_err(text)?;
         Ok(Sequence {
             request,
             position: 0,
         })
     }
 
-    /// One target group of forwards; every row commits and is accepted.
+    /// One target group of forwards; every row commits and is accepted. The
+    /// flight carries the bindings and returns them.
     fn step(
         &mut self,
+        mut bindings: StateBindings,
         forwards: Vec<(&mut Sequence, WorkKind, Vec<TokenId>, Demand)>,
-    ) -> Result<Vec<Vec<RowResult>>, String> {
+    ) -> Result<(Vec<Vec<RowResult>>, StateBindings), String> {
         let mut operations = Vec::new();
         let mut sequences = Vec::new();
         for (sequence, kind, tokens, demand) in forwards {
@@ -152,16 +154,19 @@ impl Fingerprint {
             });
             sequences.push((sequence, rows));
         }
-        let groups = service_domain::group(&self.domain, operations);
-        let [group] = groups.as_slice() else {
-            return Err("a fingerprint step must form one group".into());
-        };
-        let DomainFlight::Target(flight) = service_domain::submit_group(&mut self.domain, group)
-            .map_err(|error| error.to_string())?
+        let ReservedResources::Target(reservation) = self
+            .domain
+            .reserve(&mut bindings, &operations)
+            .map_err(text)?
+            .into_resources()
         else {
             return Err("a forward runs on the target lane".into());
         };
-        let pending = self.domain.finish_target(flight).map_err(text)?;
+        let flight = self
+            .domain
+            .submit_target(bindings, &operations, reservation)
+            .map_err(|failure| failure.error().to_string())?;
+        let (pending, bindings) = self.domain.finish_target(flight).map_err(text)?;
         let mut results = Vec::new();
         for (pending, (sequence, rows)) in pending.into_iter().zip(sequences) {
             let Outcome::Forward { rows: outcome } = pending.outcome().clone() else {
@@ -178,12 +183,17 @@ impl Fingerprint {
             sequence.position += rows;
             results.push(outcome);
         }
-        Ok(results)
+        Ok((results, bindings))
     }
 
     /// A draft-head transaction: one committed entry row, then a greedy
     /// proposal chain.
-    fn head(&mut self, sequence: &Sequence, token: TokenId) -> Result<Vec<TokenId>, String> {
+    fn head(
+        &mut self,
+        mut bindings: StateBindings,
+        sequence: &Sequence,
+        token: TokenId,
+    ) -> Result<(Vec<TokenId>, StateBindings), String> {
         // A fixed bf16 conditioning row with values in [-1, 1).
         let row = (0..self.hidden)
             .flat_map(|index| {
@@ -202,17 +212,22 @@ impl Fingerprint {
                 .collect(),
             form: magnitude_executor::DraftForm::Chained,
         };
-        let groups = service_domain::group(&self.domain, vec![operation]);
-        let [group] = groups.as_slice() else {
-            return Err("one head operation forms one group".into());
-        };
-        let DomainFlight::Head(flight) = service_domain::submit_group(&mut self.domain, group)
-            .map_err(|error| error.to_string())?
+        let operations = [operation];
+        let ReservedResources::Head(workspace, output, advances) = self
+            .domain
+            .reserve(&mut bindings, &operations)
+            .map_err(text)?
+            .into_resources()
         else {
             return Err("a head operation runs on the head lane".into());
         };
+        let flight = self
+            .domain
+            .submit_head(bindings, &operations, workspace, output, advances)
+            .map_err(|failure| failure.error().to_string())?;
+        let (pending, bindings) = self.domain.finish_head(flight).map_err(text)?;
         let mut proposals = Vec::new();
-        for pending in self.domain.finish_head(flight).map_err(text)? {
+        for pending in pending {
             let Outcome::Head { proposals: chain } = pending.outcome().clone() else {
                 return Err("a head operation returns proposals".into());
             };
@@ -221,7 +236,7 @@ impl Fingerprint {
                 .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
                 .map_err(text)?;
         }
-        Ok(proposals)
+        Ok((proposals, bindings))
     }
 }
 
@@ -284,7 +299,7 @@ fn main() -> Result<(), String> {
     let vocabulary = usize::try_from(decoder.vocabulary).map_err(|_| "vocabulary exceeds host")?;
     let hidden = usize::try_from(decoder.hidden).map_err(|_| "hidden exceeds host")?;
     let package = resolved.host.shared_package();
-    let (domain, _) =
+    let (domain, mut bindings, _) =
         build_native_domain(&resolved.manifest, package).map_err(|error| error.to_string())?;
     let mut run = Fingerprint {
         domain,
@@ -292,23 +307,28 @@ fn main() -> Result<(), String> {
         hidden,
     };
 
-    let mut first = run.open(1)?;
+    let mut first = run.open(&mut bindings, 1)?;
     let prompt = run.forced(0, PROMPT);
     let mut hasher = Sha256::new();
     let mut tokens = Vec::new();
-    for rows in run.step(vec![(
-        &mut first,
-        WorkKind::Prefill,
-        prompt,
-        Demand::LOGITS,
-    )])? {
+    let (results, next_bindings) = run.step(
+        bindings,
+        vec![(&mut first, WorkKind::Prefill, prompt, Demand::LOGITS)],
+    )?;
+    bindings = next_bindings;
+    for rows in results {
         digest(&rows, &mut hasher, &mut tokens)?;
     }
     println!("prefill rows={PROMPT} logits={}", hex(hasher));
 
     let replay = run.forced(first.position, REPLAY);
     let mut hasher = Sha256::new();
-    for rows in run.step(vec![(&mut first, WorkKind::Replay, replay, Demand::LOGITS)])? {
+    let (results, next_bindings) = run.step(
+        bindings,
+        vec![(&mut first, WorkKind::Replay, replay, Demand::LOGITS)],
+    )?;
+    bindings = next_bindings;
+    for rows in results {
         digest(&rows, &mut hasher, &mut tokens)?;
     }
     println!("replay rows={REPLAY} logits={}", hex(hasher));
@@ -317,12 +337,16 @@ fn main() -> Result<(), String> {
     let mut greedy_tokens = Vec::new();
     let mut next = run.forced(first.position, 1)[0];
     for _ in 0..options.steps {
-        let results = run.step(vec![(
-            &mut first,
-            WorkKind::Decode,
-            vec![next],
-            Demand::SELECT | Demand::LOGITS,
-        )])?;
+        let (results, next_bindings) = run.step(
+            bindings,
+            vec![(
+                &mut first,
+                WorkKind::Decode,
+                vec![next],
+                Demand::SELECT | Demand::LOGITS,
+            )],
+        )?;
+        bindings = next_bindings;
         for rows in results {
             digest(&rows, &mut hasher, &mut greedy_tokens)?;
         }
@@ -334,27 +358,36 @@ fn main() -> Result<(), String> {
         hex(hasher)
     );
 
-    let mut second = run.open(2)?;
+    let mut second = run.open(&mut bindings, 2)?;
     let prompt = run.forced(1000, PROMPT + 13);
-    run.step(vec![(&mut second, WorkKind::Prefill, prompt, Demand::NONE)])?;
+    bindings = run
+        .step(
+            bindings,
+            vec![(&mut second, WorkKind::Prefill, prompt, Demand::NONE)],
+        )?
+        .1;
     let mut hasher = Sha256::new();
     let mut pair_tokens = Vec::new();
     let mut heads = [next, run.forced(second.position, 1)[0]];
     for _ in 0..8 {
-        let results = run.step(vec![
-            (
-                &mut first,
-                WorkKind::Decode,
-                vec![heads[0]],
-                Demand::SELECT | Demand::LOGITS,
-            ),
-            (
-                &mut second,
-                WorkKind::Decode,
-                vec![heads[1]],
-                Demand::SELECT | Demand::LOGITS,
-            ),
-        ])?;
+        let (results, next_bindings) = run.step(
+            bindings,
+            vec![
+                (
+                    &mut first,
+                    WorkKind::Decode,
+                    vec![heads[0]],
+                    Demand::SELECT | Demand::LOGITS,
+                ),
+                (
+                    &mut second,
+                    WorkKind::Decode,
+                    vec![heads[1]],
+                    Demand::SELECT | Demand::LOGITS,
+                ),
+            ],
+        )?;
+        bindings = next_bindings;
         for (lane, rows) in results.iter().enumerate() {
             let mut selected = Vec::new();
             digest(rows, &mut hasher, &mut selected)?;
@@ -369,10 +402,12 @@ fn main() -> Result<(), String> {
 
     if options.head {
         let mut proposals = Vec::new();
-        let mut sequence = run.open(3)?;
+        let mut sequence = run.open(&mut bindings, 3)?;
         for round in 0..6 {
             let token = run.forced(sequence.position + round * 7, 1)[0];
-            proposals.extend(run.head(&sequence, token)?.into_iter().map(|token| token.0));
+            let (chain, next_bindings) = run.head(bindings, &sequence, token)?;
+            bindings = next_bindings;
+            proposals.extend(chain.into_iter().map(|token| token.0));
             sequence.position += 1;
         }
         println!("head rounds=6 proposals={proposals:?}");

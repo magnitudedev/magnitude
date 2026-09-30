@@ -18,21 +18,24 @@ use magnitude_engine::{
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
-    TokenId, WorkKind,
+    ReservedResources, StateBindings, TokenId, WorkKind,
 };
 use magnitude_family_contracts::{PreparedModelInput, TokenPlan};
 use magnitude_generation::{
     EndOfGeneration, Generation, InputLayout, MethodChoice, Options, Sampling, Shaping,
 };
 use magnitude_scheduler::{
-    domain::{self as service_domain, DomainFlight},
-    owner::{Owner, Status, Step},
+    owner::Owner,
     prefix_cache::{PrefixCacheCapacity, MIN_PREFIX_HIT},
     ServiceLimits,
 };
 use magnitude_state::KvCodec;
+use owner_host::Host;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::time::Duration;
+
+mod owner_host;
 
 const CONTEXT: usize = 4096;
 
@@ -78,19 +81,22 @@ fn limits() -> ServiceLimits {
 
 /// A plain owner caching up to 64 prefixes (none are evicted by count in
 /// these tests), with its vocabulary and tokenizer.
-fn owner() -> (Owner, usize, std::sync::Arc<ByteBpeTokenizer>) {
+fn owner() -> (Host, usize, std::sync::Arc<ByteBpeTokenizer>) {
     let resolved = resolved(false);
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let tokenizer = resolved.host.shared_tokenizer();
-    let (domain, _) = build_native_domain(&resolved.manifest, resolved.host.shared_package())
-        .unwrap();
-    let owner = Owner::with_prefix_cache_capacity(
-        domain,
-        limits(),
-        PrefixCacheCapacity { max_entries: 64 },
-    )
-    .unwrap();
-    (owner, vocabulary, tokenizer)
+    let (domain, bindings, _) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+    let host = Host::new(|wakes| {
+        Owner::with_prefix_cache_capacity(
+            domain,
+            bindings,
+            limits(),
+            PrefixCacheCapacity { max_entries: 64 },
+            wakes,
+        )
+    });
+    (host, vocabulary, tokenizer)
 }
 
 /// Deterministic English text of about `len` tokens; distinct seeds give
@@ -155,24 +161,6 @@ fn text_input(prompt: &[TokenId]) -> PreparedModelInput {
     .unwrap()
 }
 
-struct Clock(u64);
-
-impl Clock {
-    fn tick(&mut self) -> u64 {
-        self.0 += 10_000_000;
-        self.0
-    }
-}
-
-fn step(owner: &mut Owner, clock: &mut Clock) {
-    if matches!(
-        owner.step(clock.tick()).unwrap(),
-        Step::Waiting | Step::Idle
-    ) {
-        std::thread::sleep(std::time::Duration::from_micros(200));
-    }
-}
-
 /// One admitted request of a sequence and what it produced.
 struct Turn {
     prompt: Vec<TokenId>,
@@ -180,64 +168,41 @@ struct Turn {
     cached: usize,
 }
 
-/// Admit `prompts` together with the prefix cache, run them all to their end
-/// and retire them, so each retains its terminal prefix. Admitting several at
-/// once lets later ones wait for an earlier one's shared prefix.
-fn run(
-    owner: &mut Owner,
-    clock: &mut Clock,
-    vocabulary: usize,
-    prompts: &[Vec<TokenId>],
-    max_tokens: usize,
-) -> Vec<Turn> {
-    let requests = prompts
+/// Admit `prompts` together with the prefix cache and run them all to their
+/// end. A request completes on its stream only once its terminal prefix is
+/// retained (after any reconciliation round the prefix cache needs), and the
+/// owner retires it then. Admitting several at once lets later ones wait for
+/// an earlier one's shared prefix.
+fn run(host: &mut Host, vocabulary: usize, prompts: &[Vec<TokenId>], max_tokens: usize) -> Vec<Turn> {
+    let mut streams = prompts
         .iter()
         .map(|prompt| {
-            owner
-                .admit(
-                    greedy(prompt, vocabulary, max_tokens),
-                    text_input(prompt),
-                    true,
-                    clock.tick(),
-                )
-                .unwrap()
+            host.admit(
+                greedy(prompt, vocabulary, max_tokens),
+                text_input(prompt),
+                true,
+                max_tokens,
+            )
+            .unwrap()
         })
         .collect::<Vec<_>>();
-    let mut outputs = vec![Vec::new(); requests.len()];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        assert!(std::time::Instant::now() < deadline, "requests stalled");
-        step(owner, clock);
-        let mut done = true;
-        for (request, output) in requests.iter().zip(&mut outputs) {
-            output.extend(
-                owner
-                    .take(*request, usize::MAX)
-                    .unwrap()
-                    .into_iter()
-                    .map(|token| token.token),
-            );
-            assert!(owner.error(*request).is_none(), "{:?}", owner.error(*request));
-            done &= matches!(owner.status(*request).unwrap(), Status::Terminal(_))
-                && owner.resident_position(*request).unwrap()
-                    == prompts[requests.iter().position(|id| id == request).unwrap()].len()
-                        + output.len();
-        }
-        if done {
-            break;
-        }
-    }
-    requests
+    host.drive(
+        &mut streams.iter_mut().collect::<Vec<_>>(),
+        Duration::from_secs(120),
+    );
+    streams
         .into_iter()
         .zip(prompts)
-        .zip(outputs)
-        .map(|((request, prompt), output)| {
-            let cached = owner.usage(request).unwrap().cached_tokens;
-            owner.retire(request).unwrap();
+        .map(|(stream, prompt)| {
+            assert_eq!(stream.output.len(), max_tokens);
+            assert!(
+                host.snapshot(stream.id).is_none(),
+                "a completed request is retired"
+            );
             Turn {
                 prompt: prompt.clone(),
-                output,
-                cached,
+                cached: stream.usage().cached_tokens,
+                output: stream.output,
             }
         })
         .collect()
@@ -253,12 +218,11 @@ fn path(turn: &Turn) -> Vec<TokenId> {
 #[test]
 #[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
 fn conversation_turns_resume_at_the_previous_reply() {
-    let (mut owner, vocabulary, tokenizer) = owner();
-    let mut clock = Clock(0);
+    let (mut host, vocabulary, tokenizer) = owner();
     let mut prompt = text(&tokenizer, 1, 200);
     let mut previous: Option<usize> = None;
     for turn in 0..4 {
-        let [done] = run(&mut owner, &mut clock, vocabulary, &[prompt.clone()], 12)
+        let [done] = run(&mut host, vocabulary, &[prompt.clone()], 12)
             .try_into()
             .ok()
             .unwrap();
@@ -272,7 +236,7 @@ fn conversation_turns_resume_at_the_previous_reply() {
         prompt = path(&done);
         prompt.extend(text(&tokenizer, 100 + turn, 40));
     }
-    assert_eq!(owner.reconcile_memory_charge().unwrap().unattributed, 0);
+    assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
 }
 
 /// A template that rewrites the previous reply (dropping reasoning, say)
@@ -281,17 +245,16 @@ fn conversation_turns_resume_at_the_previous_reply() {
 #[test]
 #[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
 fn a_rewritten_reply_resumes_at_the_previous_prompt() {
-    let (mut owner, vocabulary, tokenizer) = owner();
-    let mut clock = Clock(0);
+    let (mut host, vocabulary, tokenizer) = owner();
     let first = text(&tokenizer, 2, 200);
-    let [done] = run(&mut owner, &mut clock, vocabulary, &[first.clone()], 12)
+    let [done] = run(&mut host, vocabulary, &[first.clone()], 12)
         .try_into()
         .ok()
         .unwrap();
     let mut rewritten = first.clone();
     rewritten.extend(text(&tokenizer, 3, 60));
     assert_ne!(rewritten[first.len()], done.output[0]);
-    let [next] = run(&mut owner, &mut clock, vocabulary, &[rewritten], 12)
+    let [next] = run(&mut host, vocabulary, &[rewritten], 12)
         .try_into()
         .ok()
         .unwrap();
@@ -319,8 +282,7 @@ impl Lcg {
 #[test]
 #[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
 fn arbitrary_request_sequences_resume_from_their_deepest_cached_prefix() {
-    let (mut owner, vocabulary, tokenizer) = owner();
-    let mut clock = Clock(0);
+    let (mut host, vocabulary, tokenizer) = owner();
     let seed = std::env::var("PREFIX_CACHE_SEED")
         .ok()
         .and_then(|seed| seed.parse().ok())
@@ -351,7 +313,7 @@ fn arbitrary_request_sequences_resume_from_their_deepest_cached_prefix() {
                 prompt
             })
             .collect::<Vec<_>>();
-        let turns = run(&mut owner, &mut clock, vocabulary, &prompts, 8);
+        let turns = run(&mut host, vocabulary, &prompts, 8);
         for turn in &turns {
             let guaranteed = finished
                 .iter()
@@ -373,31 +335,45 @@ fn arbitrary_request_sequences_resume_from_their_deepest_cached_prefix() {
             assert!(turn.cached < turn.prompt.len());
         }
         finished.extend(turns);
-        assert_eq!(owner.reconcile_memory_charge().unwrap().unattributed, 0);
+        assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
     }
 }
 
-/// Run the encodes a residency returned and install their features.
-fn encode(domain: &mut ExecutorDomain, operations: Vec<Operation>) {
-    for group in service_domain::group(domain, operations) {
-        let DomainFlight::Vision(flight) = service_domain::submit_group(domain, &group).unwrap()
+/// Run the encodes a residency returned and install their features. Each
+/// flight carries the bindings and returns them.
+fn encode(
+    domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
+    operations: Vec<Operation>,
+) -> StateBindings {
+    for operation in operations {
+        let ReservedResources::Vision(workspace, output) = domain
+            .reserve(&mut bindings, std::slice::from_ref(&operation))
+            .unwrap()
+            .into_resources()
         else {
             panic!("an encode runs on the vision lane")
         };
-        let pending = domain.finish_vision(flight).unwrap();
+        let flight = domain
+            .submit_vision(bindings, &operation, workspace, output)
+            .unwrap_or_else(|failure| panic!("{}", failure.error()));
+        let (pending, next) = domain.finish_vision(flight).unwrap();
+        bindings = next;
         domain
             .reconcile(pending, PhysicalDecision { accepted_rows: 0 })
             .unwrap();
     }
+    bindings
 }
 
 /// Forward the input rows `range` and return the last row's logits.
 fn forward(
     domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
     request: RequestId,
     input: &PreparedModelInput,
     range: std::ops::Range<usize>,
-) -> Vec<f32> {
+) -> (Vec<f32>, StateBindings) {
     let rows = range.len();
     let operation = Operation::Forward {
         request,
@@ -410,15 +386,20 @@ fn forward(
         committed: rows,
         prime: None,
     };
-    let groups = service_domain::group(domain, vec![operation]);
-    let [group] = groups.as_slice() else {
-        panic!("one forward forms one group")
-    };
-    let DomainFlight::Target(flight) = service_domain::submit_group(domain, group).unwrap() else {
+    let operations = [operation];
+    let ReservedResources::Target(reservation) = domain
+        .reserve(&mut bindings, &operations)
+        .unwrap()
+        .into_resources()
+    else {
         panic!("a forward runs on the target lane")
     };
+    let flight = domain
+        .submit_target(bindings, &operations, reservation)
+        .unwrap_or_else(|failure| panic!("{}", failure.error()));
+    let (pending, bindings) = domain.finish_target(flight).unwrap();
     let mut logits = Vec::new();
-    for pending in domain.finish_target(flight).unwrap() {
+    for pending in pending {
         let Outcome::Forward { rows: results } = pending.outcome().clone() else {
             panic!("a forward returns forward rows")
         };
@@ -430,7 +411,7 @@ fn forward(
             .unwrap();
     }
     assert!(!logits.is_empty());
-    logits
+    (logits, bindings)
 }
 
 fn bits(values: &[f32]) -> Vec<u32> {
@@ -475,43 +456,48 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     let split = span.end + 2;
     let end = input.tokens().len();
     assert!(split < end && split <= 512, "image span {}..{} of {end}", span.start, span.end);
-    let (mut domain, _) = build_native_domain(&resolved.manifest, host.shared_package()).unwrap();
+    let (mut domain, mut bindings, _) =
+        build_native_domain(&resolved.manifest, host.shared_package()).unwrap();
 
     // Uninterrupted: encode, the image chunk, then the rest.
     let reference = RequestId(1);
     domain.install_input(reference, input.clone()).unwrap();
-    let encodes = domain.open_state(reference, None).unwrap();
+    let encodes = domain.open_state(&mut bindings, reference, None).unwrap();
     assert_eq!(encodes.len(), 1);
-    encode(&mut domain, encodes);
+    bindings = encode(&mut domain, bindings, encodes);
     let encoded = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(encoded.unattributed, 0, "{encoded:?}");
-    forward(&mut domain, reference, &input, 0..split);
+    bindings = forward(&mut domain, bindings, reference, &input, 0..split).1;
     let after_image = domain.resume_state(reference).unwrap();
-    let expected = forward(&mut domain, reference, &input, split..end);
+    let (expected, next) = forward(&mut domain, bindings, reference, &input, split..end);
+    bindings = next;
     domain.close(reference).unwrap();
 
     // Evicted after the image: its state and features go, its input stays.
     // Becoming resident again re-encodes the image for the replay.
     let evicted = RequestId(2);
     domain.install_input(evicted, input.clone()).unwrap();
-    let encodes = domain.open_state(evicted, None).unwrap();
-    encode(&mut domain, encodes);
-    forward(&mut domain, evicted, &input, 0..split);
+    let encodes = domain.open_state(&mut bindings, evicted, None).unwrap();
+    bindings = encode(&mut domain, bindings, encodes);
+    bindings = forward(&mut domain, bindings, evicted, &input, 0..split).1;
     domain.release_state(&[evicted]).unwrap();
-    let encodes = domain.open_state(evicted, None).unwrap();
+    let encodes = domain.open_state(&mut bindings, evicted, None).unwrap();
     assert_eq!(encodes.len(), 1, "replay re-encodes the released image");
-    encode(&mut domain, encodes);
-    forward(&mut domain, evicted, &input, 0..split);
-    let replayed = forward(&mut domain, evicted, &input, split..end);
+    bindings = encode(&mut domain, bindings, encodes);
+    bindings = forward(&mut domain, bindings, evicted, &input, 0..split).1;
+    let (replayed, next) = forward(&mut domain, bindings, evicted, &input, split..end);
+    bindings = next;
     assert_eq!(bits(&replayed), bits(&expected), "replay keeps the image conditioning");
     domain.close(evicted).unwrap();
 
     // Resumed from the cached state past the image: nothing to encode.
     let resumed = RequestId(3);
     domain.install_input(resumed, input.clone()).unwrap();
-    let encodes = domain.open_state(resumed, Some(&after_image)).unwrap();
+    let encodes = domain
+        .open_state(&mut bindings, resumed, Some(&after_image))
+        .unwrap();
     assert!(encodes.is_empty(), "an image before the resume position is not re-encoded");
-    let continued = forward(&mut domain, resumed, &input, split..end);
+    let (continued, _) = forward(&mut domain, bindings, resumed, &input, split..end);
     assert_eq!(bits(&continued), bits(&expected));
     domain.close(resumed).unwrap();
 

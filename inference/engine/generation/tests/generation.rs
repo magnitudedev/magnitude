@@ -6,8 +6,8 @@ use magnitude_generation::{
     BoundaryRule, Constraint, DFlash, Demand, EndOfGeneration, FinishReason, Generation,
     InputLayout, InputSpan, Method, MethodCheckpoint, MethodCheckpointError, MethodChoice,
     MethodEffects, MethodRequirements, MethodState, Mtp, Options, Propose, ReasoningBudget,
-    RequestId, RoundStart, Sampling, SelectSpec, Shaping, TokenId, Verification, WaitReason,
-    WorkKind,
+    RequestId, RoundForward, RoundStart, Sampling, SelectSpec, Shaping, StartedRound, TokenId,
+    Verification, WorkKind,
 };
 use std::{
     cell::RefCell,
@@ -99,32 +99,55 @@ fn generation(constraint: Option<Box<dyn Constraint>>) -> Generation {
     )
 }
 
-fn start(generation: &mut Generation, allowance: usize) -> magnitude_generation::RoundForward {
-    assert_eq!(
-        generation.start_round(RequestId(1), allowance).unwrap(),
-        RoundStart::Target
-    );
-    generation.round_forward().unwrap().clone()
+/// Start a target round, checking it against the bound computed before it
+/// started.
+fn start(generation: Generation, allowance: usize) -> StartedRound {
+    let bound = generation.publication_bound(allowance).unwrap();
+    match generation.start_round(RequestId(1), allowance) {
+        Ok(RoundStart::Target(round)) => {
+            assert!(round.round_publication_bound() <= bound);
+            round
+        }
+        Ok(RoundStart::Method(..)) => panic!("expected a target round"),
+        Err((_, error)) => panic!("{error}"),
+    }
+}
+
+/// Start a round that returns method (drafter) work.
+fn draft(generation: Generation, allowance: usize) -> (Generation, Vec<Operation>) {
+    match generation.start_round(RequestId(1), allowance) {
+        Ok(RoundStart::Method(generation, operations)) => (generation, operations),
+        Ok(RoundStart::Target(_)) => panic!("expected method work"),
+        Err((_, error)) => panic!("{error}"),
+    }
 }
 
 fn resolve(
-    generation: &mut Generation,
+    round: StartedRound,
     samples: &[u32],
     features: Option<FeatureRef>,
-) -> Vec<Operation> {
+) -> (Generation, Vec<Operation>) {
     let samples = samples.iter().copied().map(TokenId).collect::<Vec<_>>();
-    let transition = generation
+    let transition = round
         .prepare_round_transition(RequestId(1), &samples, features, &mut Rows)
         .unwrap();
-    generation.commit_transition(transition).operations
+    let (generation, effects) = round.commit(transition);
+    (generation, effects.operations)
 }
 
-fn prefill(generation: &mut Generation, selected: u32) {
-    let round = start(generation, generation.prompt().len());
-    assert_eq!(round.kind, WorkKind::Prefill);
-    assert_eq!(round.tokens, [TokenId(1), TokenId(2)]);
-    assert_eq!(round.selects.len(), 1);
-    assert!(resolve(generation, &[selected], None).is_empty());
+fn forward(round: &StartedRound) -> RoundForward {
+    round.round_forward().clone()
+}
+
+fn prefill(generation: Generation, selected: u32) -> Generation {
+    let allowance = generation.prompt().len();
+    let round = start(generation, allowance);
+    assert_eq!(round.round_forward().kind, WorkKind::Prefill);
+    assert_eq!(round.round_forward().tokens, [TokenId(1), TokenId(2)]);
+    assert_eq!(round.round_forward().selects.len(), 1);
+    let (generation, effects) = resolve(round, &[selected], None);
+    assert!(effects.is_empty());
+    generation
 }
 
 #[derive(Clone)]
@@ -169,40 +192,39 @@ impl Constraint for Grammar {
 
 #[test]
 fn prefill_chunks_and_decode_share_the_round_protocol() {
-    let mut generation = generation(None);
-    let first = start(&mut generation, 1);
-    assert_eq!(first.kind, WorkKind::Prefill);
-    assert!(first.selects.is_empty());
-    resolve(&mut generation, &[], None);
+    let first = start(generation(None), 1);
+    assert_eq!(first.round_forward().kind, WorkKind::Prefill);
+    assert!(first.round_forward().selects.is_empty());
+    let (generation, _) = resolve(first, &[], None);
     assert_eq!(generation.resident_position(), 1);
     assert!(generation.generated().is_empty());
 
-    let final_prefill = start(&mut generation, 1);
-    assert_eq!(final_prefill.selects.len(), 1);
-    resolve(&mut generation, &[10], None);
-    let decode = start(&mut generation, 4);
-    assert_eq!(decode.kind, WorkKind::Decode);
-    assert_eq!(decode.tokens, [TokenId(10)]);
-    resolve(&mut generation, &[11], None);
+    let final_prefill = start(generation, 1);
+    assert_eq!(final_prefill.round_forward().selects.len(), 1);
+    let (generation, _) = resolve(final_prefill, &[10], None);
+    let decode = start(generation, 4);
+    assert_eq!(decode.round_forward().kind, WorkKind::Decode);
+    assert_eq!(decode.round_forward().tokens, [TokenId(10)]);
+    let (generation, _) = resolve(decode, &[11], None);
     assert_eq!(generation.generated(), [TokenId(10), TokenId(11)]);
 }
 
 #[test]
 fn forced_prefill_and_decode_are_committed_rounds_without_selection() {
-    let mut generation = generation(Some(Box::new(Grammar {
+    let generation = generation(Some(Box::new(Grammar {
         accepted: vec![],
         forced: vec![TokenId(10), TokenId(11), TokenId(12)],
         reject: None,
     })));
-    let prefill = start(&mut generation, 2);
-    assert!(prefill.selects.is_empty());
-    resolve(&mut generation, &[], None);
+    let prefill = start(generation, 2);
+    assert!(prefill.round_forward().selects.is_empty());
+    let (mut generation, _) = resolve(prefill, &[], None);
     generation.take(4).unwrap();
-    let forced = start(&mut generation, 4);
-    assert_eq!(forced.kind, WorkKind::Decode);
-    assert!(forced.selects.is_empty());
-    assert_eq!(forced.tokens, [TokenId(10), TokenId(11)]);
-    resolve(&mut generation, &[], None);
+    let forced = start(generation, 4);
+    assert_eq!(forced.round_forward().kind, WorkKind::Decode);
+    assert!(forced.round_forward().selects.is_empty());
+    assert_eq!(forced.round_forward().tokens, [TokenId(10), TokenId(11)]);
+    let (generation, _) = resolve(forced, &[], None);
     assert_eq!(
         generation.generated(),
         [TokenId(10), TokenId(11), TokenId(12)]
@@ -211,110 +233,165 @@ fn forced_prefill_and_decode_are_committed_rounds_without_selection() {
 
 #[test]
 fn forced_runs_include_the_first_stop_and_never_commit_rows_past_it() {
-    let mut generation = generation(Some(Box::new(Grammar {
+    let generation = generation(Some(Box::new(Grammar {
         accepted: vec![],
         forced: vec![TokenId(10), TokenId(99), TokenId(12)],
         reject: None,
     })));
-    start(&mut generation, 2);
-    resolve(&mut generation, &[], None);
+    let (mut generation, _) = resolve(start(generation, 2), &[], None);
     generation.take(4).unwrap();
 
-    let forced = start(&mut generation, 4);
-    assert_eq!(forced.tokens, [TokenId(10)]);
-    assert_eq!(forced.committed, 1);
-    resolve(&mut generation, &[], None);
+    let forced = start(generation, 4);
+    assert_eq!(forced.round_forward().tokens, [TokenId(10)]);
+    assert_eq!(forced.round_forward().committed, 1);
+    let (generation, _) = resolve(forced, &[], None);
     assert_eq!(generation.generated(), [TokenId(10), TokenId(99)]);
     assert_eq!(generation.finish_reason(), Some(FinishReason::Stop));
     assert_eq!(generation.resident_position(), 3);
 }
 
 #[test]
-fn output_credit_stop_and_wait_reasons_are_round_native() {
-    let mut generation = generation(None);
-    prefill(&mut generation, 10);
+fn output_credit_and_stop_refuse_the_next_round() {
+    let mut generation = prefill(generation(None), 10);
     for token in [11, 12, 13] {
-        start(&mut generation, 1);
-        resolve(&mut generation, &[token], None);
+        (generation, _) = resolve(start(generation, 1), &[token], None);
     }
-    assert_eq!(generation.wait_reason(), Some(WaitReason::Output));
-    assert!(generation.start_round(RequestId(1), 1).is_err());
+    // Full output refuses a round, and the refusal returns the generation.
+    assert!(generation.publication_bound(1).is_err());
+    let Err((mut generation, _)) = generation.start_round(RequestId(1), 1) else {
+        panic!("full output refuses a round")
+    };
     assert_eq!(generation.take(4).unwrap().len(), 4);
-    start(&mut generation, 1);
-    resolve(&mut generation, &[99], None);
+    let (generation, _) = resolve(start(generation, 1), &[99], None);
     assert_eq!(generation.finish_reason(), Some(FinishReason::Stop));
-    assert_eq!(generation.wait_reason(), Some(WaitReason::Finished));
+    assert!(generation.publication_bound(1).is_err());
+    assert!(generation.start_round(RequestId(1), 1).is_err());
 }
 
 #[test]
 fn prepared_transition_does_not_change_live_generation_until_commit() {
-    let mut generation = generation(Some(Box::new(Grammar {
+    let generation = generation(Some(Box::new(Grammar {
         accepted: vec![],
         forced: vec![],
         reject: Some(TokenId(12)),
     })));
-    start(&mut generation, 2);
-    assert!(generation
+    let round = start(generation, 2);
+    assert!(round
         .prepare_round_transition(RequestId(1), &[TokenId(12)], None, &mut Rows)
         .is_err());
-    assert_eq!(generation.finish_reason(), None);
-    assert_eq!(generation.resident_position(), 0);
-    assert!(generation.awaiting_completion());
+    assert_eq!(round.generation().finish_reason(), None);
+    assert_eq!(round.generation().resident_position(), 0);
 
-    let prepared = generation
+    let prepared = round
         .prepare_round_transition(RequestId(1), &[TokenId(10)], None, &mut Rows)
         .unwrap();
     assert_eq!(prepared.decision().accepted_rows, 2);
     drop(prepared);
-    assert_eq!(generation.resident_position(), 0);
-    assert!(generation.generated().is_empty());
-    assert!(generation.awaiting_completion());
+    assert_eq!(round.generation().resident_position(), 0);
+    assert!(round.generation().generated().is_empty());
 
-    let prepared = generation
+    let prepared = round
         .prepare_round_transition(RequestId(1), &[TokenId(10)], None, &mut Rows)
         .unwrap();
-    let effects = generation.commit_transition(prepared);
+    let (generation, effects) = round.commit(prepared);
     assert!(effects.operations.is_empty());
     assert_eq!(generation.generated(), [TokenId(10)]);
     assert_eq!(generation.resident_position(), 2);
-    assert!(!generation.awaiting_completion());
+}
+
+/// A started round round-trips: start, prepare and commit return the
+/// generation, which starts the next round from the committed state.
+#[test]
+fn a_started_round_commits_back_into_its_generation() {
+    let round = start(generation(None), 2);
+    assert_eq!(round.generation().resident_position(), 0);
+    let prepared = round
+        .prepare_round_transition(RequestId(1), &[TokenId(10)], None, &mut Rows)
+        .unwrap();
+    let (generation, effects) = round.commit(prepared);
+    assert!(effects.operations.is_empty());
+    assert_eq!(generation.resident_position(), 2);
+    assert_eq!(generation.accepted_position(), 3);
+    assert_eq!(generation.generated(), [TokenId(10)]);
+    assert_eq!(generation.output_len(), 1);
+    assert!(generation.method_checkpoint().is_ok());
+    let decode = start(generation, 1);
+    assert_eq!(decode.round_forward().kind, WorkKind::Decode);
+    assert_eq!(decode.round_forward().tokens, [TokenId(10)]);
 }
 
 #[test]
 fn cancellation_reconciles_the_round_without_committing_or_publishing_it() {
-    let mut generation = generation(None);
-    start(&mut generation, 2);
-    generation.cancel();
-    assert!(!generation.awaiting_completion());
+    let generation = start(generation(None), 2).cancel();
     assert_eq!(generation.resident_position(), 0);
     assert!(generation.generated().is_empty());
     assert_eq!(generation.finish_reason(), Some(FinishReason::Cancelled));
+    assert!(generation.start_round(RequestId(1), 1).is_err());
+}
+
+#[test]
+fn failure_discards_the_round_and_finishes_failed() {
+    let generation = start(prefill(generation(None), 10), 1).fail();
+    assert_eq!(generation.resident_position(), 2);
+    assert_eq!(generation.generated(), [TokenId(10)]);
+    assert_eq!(generation.finish_reason(), Some(FinishReason::Failed));
 }
 
 #[test]
 fn eviction_discards_suspended_work_and_replays_through_rounds() {
-    let mut generation = generation(None);
-    prefill(&mut generation, 10);
+    let mut generation = prefill(generation(None), 10);
     generation.take(4).unwrap();
-    start(&mut generation, 1);
-    generation.evicted().unwrap();
-    assert_eq!(generation.wait_reason(), Some(WaitReason::Residency));
+    let generation = start(generation, 1).evicted().unwrap();
+    assert!(!generation.is_resident());
+    let Err((mut generation, _)) = generation.start_round(RequestId(1), 1) else {
+        panic!("a non-resident generation starts no round")
+    };
     generation.resume_at(None).unwrap();
     for _ in 0..2 {
-        let replay = start(&mut generation, 1);
-        assert_eq!(replay.kind, WorkKind::Replay);
-        resolve(&mut generation, &[], None);
+        let replay = start(generation, 1);
+        assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+        (generation, _) = resolve(replay, &[], None);
     }
     assert_eq!(generation.resident_position(), 2);
     assert_eq!(generation.generated(), [TokenId(10)]);
-    let decode = start(&mut generation, 1);
-    assert_eq!(decode.kind, WorkKind::Decode);
+    let decode = start(generation, 1);
+    assert_eq!(decode.round_forward().kind, WorkKind::Decode);
+}
+
+/// Evicting a started round rewinds exactly as evicting its generation
+/// between rounds: to the numerical prefix held before the round, keeping
+/// accepted history and output.
+#[test]
+fn evicting_a_started_round_rewinds_to_its_numerical_prefix() {
+    let between = {
+        let mut generation = prefill(generation(None), 10);
+        generation.evicted().unwrap();
+        generation
+    };
+    let started = start(prefill(generation(None), 10), 1).evicted().unwrap();
+    for generation in [&between, &started] {
+        assert!(!generation.is_resident());
+        assert_eq!(generation.resident_position(), 2);
+        assert_eq!(generation.accepted_position(), 3);
+        assert_eq!(generation.resume_bound(), 3);
+        assert_eq!(generation.generated(), [TokenId(10)]);
+        assert_eq!(generation.output_len(), 1);
+        assert_eq!(generation.finish_reason(), None);
+    }
+    let mut generation = started;
+    generation.resume_at(None).unwrap();
+    // Replay stops at the two consumed prompt rows; the accepted successor
+    // remains the next decode's input.
+    let replay = start(generation, 4);
+    assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+    assert_eq!(replay.round_forward().tokens, [TokenId(1), TokenId(2)]);
+    let (generation, _) = resolve(replay, &[], None);
+    assert_eq!(forward(&start(generation, 1)).tokens, [TokenId(10)]);
 }
 
 #[test]
 fn eviction_resumes_from_a_retained_prefix_and_replays_the_rest() {
-    let mut generation = generation(None);
-    prefill(&mut generation, 10);
+    let mut generation = prefill(generation(None), 10);
     let checkpoint = generation.method_checkpoint().unwrap();
     generation.evicted().unwrap();
     // Accepted input includes the sampled successor, while the numerical
@@ -326,14 +403,14 @@ fn eviction_resumes_from_a_retained_prefix_and_replays_the_rest() {
     assert!(generation.resume_at(Some((1, &checkpoint))).is_err());
     assert_eq!(generation.resident_position(), 1);
     assert_eq!(generation.detailed_usage().cached_tokens, 0);
-    let replay = start(&mut generation, 4);
-    assert_eq!(replay.kind, WorkKind::Replay);
-    assert_eq!(replay.tokens, [TokenId(2)]);
-    resolve(&mut generation, &[], None);
+    let replay = start(generation, 4);
+    assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+    assert_eq!(replay.round_forward().tokens, [TokenId(2)]);
+    let (generation, _) = resolve(replay, &[], None);
     assert_eq!(generation.resident_position(), 2);
     assert_eq!(generation.generated(), [TokenId(10)]);
-    let decode = start(&mut generation, 1);
-    assert_eq!(decode.kind, WorkKind::Decode);
+    let decode = start(generation, 1);
+    assert_eq!(decode.round_forward().kind, WorkKind::Decode);
 }
 
 /// An admitted MTP generation that is not yet resident.
@@ -396,11 +473,9 @@ fn reconcile_head(generation: &mut Generation, operation: &Operation, proposals:
 
 #[test]
 fn prefill_chunks_enter_target_conditioned_pairs_and_keep_the_anchor() {
-    let request = RequestId(1);
-    let mut generation = mtp_generation(&[1, 2, 3], 2);
+    let generation = mtp_generation(&[1, 2, 3], 2);
     // First chunk: rows 1, 2. Its pairs are (2, f5.0); f5.1 waits for 3.
-    start(&mut generation, 2);
-    let effects = resolve(&mut generation, &[], Some(feature(5)));
+    let (mut generation, effects) = resolve(start(generation, 2), &[], Some(feature(5)));
     let [head] = effects.as_slice() else {
         panic!("a non-final chunk enters its complete pairs")
     };
@@ -420,8 +495,7 @@ fn prefill_chunks_enter_target_conditioned_pairs_and_keep_the_anchor() {
     reconcile_head(&mut generation, head, &[]);
     // Final chunk: row 3 selects 10. Pairs (3, f5.1) are entered; the anchor
     // (10, f6.0) waits for the first draft.
-    start(&mut generation, 1);
-    let effects = resolve(&mut generation, &[10], Some(feature(6)));
+    let (mut generation, effects) = resolve(start(generation, 1), &[10], Some(feature(6)));
     let [head] = effects.as_slice() else {
         panic!("the final chunk enters all but the anchor")
     };
@@ -439,9 +513,7 @@ fn prefill_chunks_enter_target_conditioned_pairs_and_keep_the_anchor() {
     );
     reconcile_head(&mut generation, head, &[]);
     generation.take(4).unwrap();
-    let RoundStart::Method(draft) = generation.start_round(request, 4).unwrap() else {
-        panic!("decode drafts first")
-    };
+    let (_, draft) = draft(generation, 4);
     let (tokens, rows, position, proposals) = head_parts(&draft[0]);
     assert_eq!(
         (tokens, rows, position),
@@ -457,26 +529,29 @@ fn prefill_chunks_enter_target_conditioned_pairs_and_keep_the_anchor() {
     );
 }
 
-#[test]
-fn verification_accepts_the_matching_prefix_and_re_enters_accepted_rows() {
-    let request = RequestId(1);
-    let mut generation = mtp_generation(&[1, 2], 3);
-    start(&mut generation, 2);
-    let effects = resolve(&mut generation, &[10], Some(feature(1)));
+/// An MTP generation after its prefill, with its first draft started.
+fn mtp_drafting(proposals: u8) -> (Generation, Operation) {
+    let generation = mtp_generation(&[1, 2], proposals);
+    let (mut generation, effects) = resolve(start(generation, 2), &[10], Some(feature(1)));
     reconcile_head(&mut generation, &effects[0], &[]);
     generation.take(4).unwrap();
-    let RoundStart::Method(draft) = generation.start_round(request, 4).unwrap() else {
-        panic!("decode drafts first")
-    };
-    reconcile_head(&mut generation, &draft[0], &[(11, 0), (12, 0), (13, 0)]);
-    let verify = start(&mut generation, 4);
-    assert_eq!(verify.kind, WorkKind::Verify);
+    let (generation, mut draft) = draft(generation, 4);
+    (generation, draft.remove(0))
+}
+
+#[test]
+fn verification_accepts_the_matching_prefix_and_re_enters_accepted_rows() {
+    let (mut generation, first) = mtp_drafting(3);
+    reconcile_head(&mut generation, &first, &[(11, 0), (12, 0), (13, 0)]);
+    let verify = start(generation, 4);
+    assert_eq!(verify.round_forward().kind, WorkKind::Verify);
     assert_eq!(
-        verify.tokens,
+        verify.round_forward().tokens,
         [TokenId(10), TokenId(11), TokenId(12), TokenId(13)]
     );
     // The target agrees on 11 and 12 and samples 20 after them.
-    assert!(resolve(&mut generation, &[11, 12, 20, 30], Some(feature(2))).is_empty());
+    let (mut generation, effects) = resolve(verify, &[11, 12, 20, 30], Some(feature(2)));
+    assert!(effects.is_empty());
     assert_eq!(
         generation.generated(),
         [TokenId(10), TokenId(11), TokenId(12), TokenId(20)]
@@ -487,10 +562,8 @@ fn verification_accepts_the_matching_prefix_and_re_enters_accepted_rows() {
     generation.take(4).unwrap();
     // The next draft enters every accepted row with its target feature and
     // anchors on the bonus token: (11, f2.0), (12, f2.1), (20, f2.2).
-    let RoundStart::Method(draft) = generation.start_round(request, 4).unwrap() else {
-        panic!("decode drafts again")
-    };
-    let (tokens, rows, position, _) = head_parts(&draft[0]);
+    let (_, next) = draft(generation, 4);
+    let (tokens, rows, position, _) = head_parts(&next[0]);
     assert_eq!(tokens, [TokenId(11), TokenId(12), TokenId(20)]);
     assert_eq!(rows, [(2, 0), (2, 1), (2, 2)]);
     assert_eq!(position, 2);
@@ -498,36 +571,25 @@ fn verification_accepts_the_matching_prefix_and_re_enters_accepted_rows() {
 
 #[test]
 fn proposals_stop_at_a_failed_selection_or_a_stop_token() {
-    let request = RequestId(1);
-    let mut generation = mtp_generation(&[1, 2], 3);
-    start(&mut generation, 2);
-    let effects = resolve(&mut generation, &[10], Some(feature(1)));
-    reconcile_head(&mut generation, &effects[0], &[]);
-    generation.take(4).unwrap();
-    let RoundStart::Method(draft) = generation.start_round(request, 4).unwrap() else {
-        panic!("decode drafts first")
-    };
-    reconcile_head(&mut generation, &draft[0], &[(11, 0), (99, 0), (13, 0)]);
-    assert_eq!(start(&mut generation, 4).tokens, [TokenId(10), TokenId(11)]);
+    let (mut generation, first) = mtp_drafting(3);
+    reconcile_head(&mut generation, &first, &[(11, 0), (99, 0), (13, 0)]);
+    assert_eq!(
+        start(generation, 4).round_forward().tokens,
+        [TokenId(10), TokenId(11)]
+    );
 
-    let mut failed = mtp_generation(&[1, 2], 3);
-    start(&mut failed, 2);
-    let effects = resolve(&mut failed, &[10], Some(feature(1)));
-    reconcile_head(&mut failed, &effects[0], &[]);
-    failed.take(4).unwrap();
-    let RoundStart::Method(draft) = failed.start_round(request, 4).unwrap() else {
-        panic!("decode drafts first")
-    };
-    reconcile_head(&mut failed, &draft[0], &[(11, 0), (0, 1), (13, 0)]);
-    assert_eq!(start(&mut failed, 4).tokens, [TokenId(10), TokenId(11)]);
+    let (mut failed, first) = mtp_drafting(3);
+    reconcile_head(&mut failed, &first, &[(11, 0), (0, 1), (13, 0)]);
+    assert_eq!(
+        start(failed, 4).round_forward().tokens,
+        [TokenId(10), TokenId(11)]
+    );
 }
 
 #[test]
 fn checkpoints_carry_host_rows_and_restore_at_their_target_boundary() {
-    let request = RequestId(1);
-    let mut source = mtp_generation(&[1, 2], 2);
-    start(&mut source, 2);
-    let effects = resolve(&mut source, &[10], Some(feature(3)));
+    let source = mtp_generation(&[1, 2], 2);
+    let (mut source, effects) = resolve(start(source, 2), &[10], Some(feature(3)));
     // A checkpoint needs reconciled method work.
     assert!(source.method_checkpoint().is_err());
     reconcile_head(&mut source, &effects[0], &[]);
@@ -542,7 +604,6 @@ fn checkpoints_carry_host_rows_and_restore_at_their_target_boundary() {
     assert!(fresh.resume_at(Some((1, &checkpoint))).is_err());
     fresh.resume_at(Some((2, &checkpoint))).unwrap();
     assert_eq!(fresh.resident_position(), 2);
-    let _ = request;
 }
 
 #[test]
@@ -648,10 +709,8 @@ fn every_prefill_chunk_primes_the_method_with_its_selected_successor() {
     .unwrap();
     generation.resume_at(None).unwrap();
 
-    start(&mut generation, 1);
-    resolve(&mut generation, &[], Some(feature(1)));
-    start(&mut generation, 1);
-    resolve(&mut generation, &[10], Some(feature(2)));
+    let (generation, _) = resolve(start(generation, 1), &[], Some(feature(1)));
+    resolve(start(generation, 1), &[10], Some(feature(2)));
     assert_eq!(
         *calls.lock().unwrap(),
         vec![
@@ -674,7 +733,7 @@ fn retained_prefix_restores_position_into_a_fresh_extended_prompt() {
             reject: None,
         }) as Box<dyn Constraint>
     };
-    let mut source = resident(
+    let source = resident(
         Generation::new(
             prompt.clone(),
             InputLayout::new(prompt.len(), vec![]).unwrap(),
@@ -683,8 +742,9 @@ fn retained_prefix_restores_position_into_a_fresh_extended_prompt() {
         )
         .unwrap(),
     );
-    assert_eq!(start(&mut source, prompt.len()).tokens, prompt);
-    resolve(&mut source, &[70], None);
+    let round = start(source, prompt.len());
+    assert_eq!(round.round_forward().tokens, prompt);
+    let (source, _) = resolve(round, &[70], None);
     assert_eq!(source.resident_position(), 64);
     assert_eq!(source.generated(), [TokenId(70)]);
     assert_eq!(source.constraint_position(), Some(1));
@@ -751,24 +811,27 @@ fn staged_causal_reconciliation_advances_after_finished_prefill() {
     )
     .unwrap();
     generation.resume_at(None).unwrap();
-    start(&mut generation, 64);
-    let transition = generation
+    let round = start(generation, 64);
+    let transition = round
         .prepare_round_transition(RequestId(1), &[TokenId(70)], None, &mut Rows)
         .unwrap();
     assert_eq!(transition.decision().accepted_rows, 64);
-    generation.commit_transition(transition);
+    let (generation, _) = round.commit(transition);
     assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
     assert_eq!(generation.pending_reconciliation().unwrap().end, 65);
-    generation.start_reconciliation(1).unwrap();
-    let reconciliation = generation.round_forward().unwrap();
-    assert_eq!(reconciliation.kind, WorkKind::Replay);
-    assert_eq!(reconciliation.tokens, [TokenId(70)]);
-    assert!(reconciliation.selects.is_empty());
-    let transition = generation
+    let Ok(reconciliation) = generation.start_reconciliation(1) else {
+        panic!("pending reconciliation starts")
+    };
+    let forward = reconciliation.round_forward();
+    assert_eq!(forward.kind, WorkKind::Replay);
+    assert_eq!(forward.tokens, [TokenId(70)]);
+    assert!(forward.selects.is_empty());
+    assert_eq!(reconciliation.round_publication_bound(), 0);
+    let transition = reconciliation
         .prepare_round_transition(RequestId(1), &[], None, &mut Rows)
         .unwrap();
     assert_eq!(transition.decision().accepted_rows, 1);
-    generation.commit_transition(transition);
+    let (generation, _) = reconciliation.commit(transition);
     assert_eq!(generation.resident_position(), 65);
     assert!(generation.pending_reconciliation().is_none());
     assert_eq!(generation.generated(), [TokenId(70)]);
@@ -787,14 +850,14 @@ fn ignored_end_of_generation_masks_stop_tokens_from_every_selection() {
     )
     .unwrap();
     generation.resume_at(None).unwrap();
-    let round = start(&mut generation, 2);
-    let mask = round.selects[0]
+    let round = start(generation, 2);
+    let mask = round.round_forward().selects[0]
         .mask
         .clone()
         .expect("suppression masks selection");
     assert_eq!(mask[99 / 32] & (1 << (99 % 32)), 0);
     assert_ne!(mask[98 / 32] & (1 << (98 % 32)), 0);
-    assert!(generation
+    assert!(round
         .prepare_round_transition(RequestId(1), &[TokenId(99)], None, &mut Rows)
         .is_err());
 }
@@ -816,7 +879,7 @@ fn spent_reasoning_budget_selects_only_the_end_tag() {
     )
     .unwrap();
     generation.resume_at(None).unwrap();
-    prefill(&mut generation, 5);
+    let generation = prefill(generation, 5);
     assert_eq!(
         generation.selection_mask().unwrap().unwrap()[0],
         1 << 11,
@@ -845,15 +908,11 @@ fn dflash_generation(prompt: &[u32], proposals: u8) -> Generation {
 /// A separate draft's generation after its prefill: the prefill's entry
 /// transaction reconciled and the first block draft started.
 fn dflash_drafting(proposals: u8) -> (Generation, Operation) {
-    let request = RequestId(1);
-    let mut generation = dflash_generation(&[1, 2], proposals);
-    start(&mut generation, 2);
-    let effects = resolve(&mut generation, &[10], Some(feature(1)));
+    let generation = dflash_generation(&[1, 2], proposals);
+    let (mut generation, effects) = resolve(start(generation, 2), &[10], Some(feature(1)));
     reconcile_head(&mut generation, &effects[0], &[]);
     generation.take(4).unwrap();
-    let RoundStart::Method(draft) = generation.start_round(request, 4).unwrap() else {
-        panic!("decode drafts first")
-    };
+    let (generation, draft) = draft(generation, 4);
     let [draft] = <[Operation; 1]>::try_from(draft).unwrap();
     let Operation::Head { form, phase, .. } = &draft else {
         panic!("a draft is a head transaction")
@@ -869,7 +928,6 @@ fn dflash_drafting(proposals: u8) -> (Generation, Operation) {
 /// before anchoring on the bonus token.
 #[test]
 fn dflash_verification_publishes_the_accepted_prefix_and_re_enters_it() {
-    let request = RequestId(1);
     for (samples, accepted, entered) in [
         // Zero: the target rejects 11 and samples 21.
         (vec![21, 30, 31, 32], 0, vec![21]),
@@ -878,15 +936,16 @@ fn dflash_verification_publishes_the_accepted_prefix_and_re_enters_it() {
         // Full: every proposal agrees; 40 is the bonus token.
         (vec![11, 12, 13, 40], 3, vec![11, 12, 13, 40]),
     ] {
-        let (mut generation, draft) = dflash_drafting(3);
-        reconcile_head(&mut generation, &draft, &[(11, 0), (12, 0), (13, 0)]);
-        let verify = start(&mut generation, 4);
-        assert_eq!(verify.kind, WorkKind::Verify);
+        let (mut generation, first) = dflash_drafting(3);
+        reconcile_head(&mut generation, &first, &[(11, 0), (12, 0), (13, 0)]);
+        let verify = start(generation, 4);
+        assert_eq!(verify.round_forward().kind, WorkKind::Verify);
         assert_eq!(
-            verify.tokens,
+            verify.round_forward().tokens,
             [TokenId(10), TokenId(11), TokenId(12), TokenId(13)]
         );
-        assert!(resolve(&mut generation, &samples, Some(feature(2))).is_empty());
+        let (mut generation, effects) = resolve(verify, &samples, Some(feature(2)));
+        assert!(effects.is_empty());
         let mut generated = vec![TokenId(10)];
         generated.extend(entered.iter().copied().map(TokenId));
         assert_eq!(generation.generated(), generated, "{accepted} accepted");
@@ -894,9 +953,7 @@ fn dflash_verification_publishes_the_accepted_prefix_and_re_enters_it() {
         assert_eq!(generation.detailed_usage().draft_n, 3);
         assert_eq!(generation.detailed_usage().draft_n_accepted, accepted);
         generation.take(8).unwrap();
-        let RoundStart::Method(next) = generation.start_round(request, 4).unwrap() else {
-            panic!("decode drafts again")
-        };
+        let (_, next) = draft(generation, 4);
         let (tokens, rows, position, _) = head_parts(&next[0]);
         assert_eq!(
             tokens,
@@ -915,9 +972,8 @@ fn dflash_verification_publishes_the_accepted_prefix_and_re_enters_it() {
 /// restores another method's state.
 #[test]
 fn dflash_checkpoints_wait_for_reconciled_drafts_and_keep_their_kind() {
-    let mut source = dflash_generation(&[1, 2], 2);
-    start(&mut source, 2);
-    let effects = resolve(&mut source, &[10], Some(feature(3)));
+    let source = dflash_generation(&[1, 2], 2);
+    let (mut source, effects) = resolve(start(source, 2), &[10], Some(feature(3)));
     assert!(source.method_checkpoint().is_err());
     reconcile_head(&mut source, &effects[0], &[]);
     let checkpoint = source.method_checkpoint().unwrap();
@@ -943,4 +999,66 @@ fn dflash_cancellation_discards_the_in_flight_draft() {
     assert_eq!(generation.finish_reason(), Some(FinishReason::Cancelled));
     assert_eq!(generation.generated(), [TokenId(10)]);
     assert_eq!(generation.detailed_usage().draft_n, 0);
+}
+
+/// The bound computed before a round starts covers the started round's bound:
+/// exactly for replay, prompt chunks and forced runs, and as the proposal
+/// width for decode and verification, whose method may propose fewer.
+#[test]
+fn publication_bound_before_start_covers_the_started_round() {
+    fn bounds(generation: Generation, allowance: usize) -> (usize, usize, Generation) {
+        let before = generation.publication_bound(allowance).unwrap();
+        let round = start(generation, allowance);
+        let started = round.round_publication_bound();
+        let samples = vec![10; round.round_forward().selects.len()];
+        let (generation, _) = resolve(round, &samples, None);
+        (before, started, generation)
+    }
+
+    // Plain: a prompt chunk that does not end the prompt, the chunk that
+    // selects the first token, then a decode.
+    let (before, started, generation) = bounds(generation(None), 1);
+    assert_eq!((before, started), (0, 0));
+    let (before, started, mut generation) = bounds(generation, 1);
+    assert_eq!((before, started), (1, 1));
+    generation.take(4).unwrap();
+    let (before, started, mut generation) = bounds(generation, 4);
+    assert_eq!((before, started), (1, 1));
+
+    // Replay after eviction publishes nothing.
+    generation.evicted().unwrap();
+    generation.resume_at(None).unwrap();
+    let (before, started, _) = bounds(generation, 4);
+    assert_eq!((before, started), (0, 0));
+
+    // Forced: the first token is forced by the final prompt chunk, the rest
+    // by one forced run.
+    let forced = generation_with(Grammar {
+        accepted: vec![],
+        forced: vec![TokenId(10), TokenId(11), TokenId(12)],
+        reject: None,
+    });
+    let (before, started, mut forced) = bounds(forced, 2);
+    assert_eq!((before, started), (1, 1));
+    forced.take(4).unwrap();
+    let (before, started, _) = bounds(forced, 4);
+    assert_eq!((before, started), (2, 2));
+
+    // Speculative: drafter work starts no target round; the verification of
+    // a full proposal publishes at most its width, and a proposal cut at a
+    // stop token publishes less.
+    for (proposals, width) in [
+        (vec![(11, 0), (12, 0), (13, 0)], 4),
+        (vec![(11, 0), (99, 0), (13, 0)], 2),
+    ] {
+        let (mut generation, first) = mtp_drafting(3);
+        reconcile_head(&mut generation, &first, &proposals);
+        let before = generation.publication_bound(4).unwrap();
+        let round = start(generation, 4);
+        assert_eq!((before, round.round_publication_bound()), (4, width));
+    }
+}
+
+fn generation_with(grammar: Grammar) -> Generation {
+    generation(Some(Box::new(grammar)))
 }

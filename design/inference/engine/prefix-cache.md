@@ -45,8 +45,9 @@ path it holds and are not part of an entry's identity.
   the deepest cached prefix of the request's path below its resume bound, fork its state (or
   create fresh state), adopt cached features for straddling spans, encode every span that ends
   after the position and still lacks features, and set the generation's position.
-- **Admission**, a **request waiting for a peer's prefix**, and an **evicted request** all become
-  resident through that one transition. They differ only in when it runs.
+- A **newly admitted request**, a **request waiting for a peer's prefix**, and an **evicted
+  request** all become resident through that one transition, when rounds are formed. They differ
+  only in when it runs.
 - **Eviction** releases numerical state and encoded features; the input stays, so replay is
   conditioned exactly as the first pass.
 - **Resume bound**: a resumed request still computes the row it next samples from, so only
@@ -64,11 +65,12 @@ shared prefix or stops computing it; the prefix is computed once.
 1. A hit exists only for an entry whose path is a prefix of the queried path at an exact
    boundary.
 2. Making a request resident from a hit cannot fail for input reasons. A shortfall of capacity
-   blocks the request exactly like capacity-blocked work: it waits for the next availability
-   change while something can still free capacity, and otherwise fails with the typed capacity
-   error. In Reclaim, or without a memory reading, residency waits until memory is Normal again,
-   and that return is itself an availability change. Any other failure is an engine invariant
-   failure, never a request error.
+   gives the request a capacity wait at the current availability epoch, ended when the epoch
+   advances. When, between flights, memory is Normal and no request awaits host credit or memory
+   or has finished with state still to release, nothing can advance the epoch: every capacity
+   wait then fails with its typed capacity error ([scheduler](scheduler.md)). In Reclaim, or
+   without a memory reading, residency waits until memory is Normal again. Any other failure is
+   an engine invariant failure, never a request error.
 3. A request with installed input keeps it until it closes; every row the executor lowers has its
    input. There is no fallback for missing input.
 4. A resume state references features only for spans that straddle its position.

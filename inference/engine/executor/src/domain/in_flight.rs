@@ -1,32 +1,35 @@
-//! Owned numerical submissions and completed selection decoding.
+//! Owned numerical submissions and completed selection decoding. Every flight
+//! holds the domain's [`StateBindings`] until its finish returns them.
 
 use super::*;
 
-pub struct VisionFlight<S: ProgramSubmission<CompletedWork = crate::CompletedVisionWork> = <NativeFamily as ProgramFamily>::VisionSubmission> {
+pub struct VisionFlight<F: ProgramFamily = NativeFamily> {
     pub(super) request: RequestId,
     pub(super) image: ImageRef,
-    pub(super) submission: S,
+    pub(super) submission: F::VisionSubmission,
     pub(super) started: Instant,
+    pub(super) bindings: StateBindings<F>,
 }
 
-impl<S: ProgramSubmission<CompletedWork = crate::CompletedVisionWork>> VisionFlight<S> {
+impl<F: ProgramFamily> VisionFlight<F> {
     pub fn completion(&mut self) -> &mut dyn Completion {
         self.submission.completion()
     }
 }
 
-pub struct HeadFlight<S: ProgramSubmission<CompletedWork = crate::CompletedHeadWork> = <NativeFamily as ProgramFamily>::HeadSubmission> {
+pub struct HeadFlight<F: ProgramFamily = NativeFamily> {
     /// Per slot: request, entry rows, proposals.
     pub(super) requests: Vec<(RequestId, usize, usize)>,
     /// Selections per slot in the submitted graph.
     pub(super) steps: usize,
-    pub(super) submission: S,
+    pub(super) submission: F::HeadSubmission,
     pub(super) started: Instant,
     /// Optional one-flight launch attribution for diagnosing a proposing head.
     pub(super) launch_trace: Option<seismic::SubmissionTrace>,
+    pub(super) bindings: StateBindings<F>,
 }
 
-impl<S: ProgramSubmission<CompletedWork = crate::CompletedHeadWork>> HeadFlight<S> {
+impl<F: ProgramFamily> HeadFlight<F> {
     pub fn completion(&mut self) -> &mut dyn Completion {
         self.submission.completion()
     }
@@ -44,10 +47,9 @@ pub(super) struct PrimingFlight<H> {
     pub(super) continuation: Option<Option<InFlightState>>,
 }
 
-pub struct TargetFlight<
-    S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork> = <NativeFamily as ProgramFamily>::TargetSubmission,
-    H: ProgramSubmission<CompletedWork = crate::CompletedHeadWork> = <NativeFamily as ProgramFamily>::HeadSubmission,
-> {
+/// One submitted target step: a group's flight, or the lookahead queued
+/// behind one.
+pub(super) struct TargetWork<F: ProgramFamily> {
     pub(super) requests: Vec<(
         RequestId,
         usize,
@@ -55,9 +57,9 @@ pub struct TargetFlight<
         WorkKind,
         usize,
     )>,
-    pub(super) submission: S,
-    /// The drafter entry of the flight's prompt chunk, when it primes one.
-    pub(super) priming: Option<PrimingFlight<H>>,
+    pub(super) submission: F::TargetSubmission,
+    /// The drafter entry of the step's prompt chunk, when it primes one.
+    pub(super) priming: Option<PrimingFlight<F::HeadSubmission>>,
     /// Optional attribution for one prefill flight selected by diagnostics.
     pub(super) launch_trace: Option<seismic::SubmissionTrace>,
     pub(super) started: Instant,
@@ -68,21 +70,23 @@ pub struct TargetFlight<
     pub(super) runnable: Instant,
     /// When the domain last read a selection before this step was submitted.
     pub(super) previous_selection: Option<Instant>,
-    /// Identifies the flight a lookahead continues.
+    /// Identifies the step a lookahead continues.
     pub(super) id: u64,
     /// For a claimed lookahead, per slot: the accepted state its successor
     /// advance attaches to at finish, or `None` for a slot nobody claimed
-    /// (its rows are discarded). `None` for an ordinary flight.
+    /// (its rows are discarded). `None` for an ordinary step.
     pub(super) continuation: Option<Vec<Option<InFlightState>>>,
 }
 
-impl<
-        S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork>,
-        H: ProgramSubmission<CompletedWork = crate::CompletedHeadWork>,
-    > TargetFlight<S, H>
-{
+pub struct TargetFlight<F: ProgramFamily = NativeFamily> {
+    pub(super) work: TargetWork<F>,
+    /// Carries the lookahead queued behind `work`.
+    pub(super) bindings: StateBindings<F>,
+}
+
+impl<F: ProgramFamily> TargetFlight<F> {
     pub fn completion(&mut self) -> &mut dyn Completion {
-        self.submission.completion()
+        self.work.submission.completion()
     }
 }
 

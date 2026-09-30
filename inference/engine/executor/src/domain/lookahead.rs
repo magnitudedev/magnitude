@@ -8,24 +8,23 @@
 //! runs N+1 without waiting for the host to observe N and submit the next
 //! step.
 //!
-//! The owner never sees the lookahead. When the operations it next submits
-//! equal the prediction (token included, known once N finished) and the
-//! accepted states are the ones the successors follow, the group claims the
-//! queued step: nothing is reserved or launched, and its flight is returned.
-//! Anything else orphans it: the domain waits for it and drops it, so its
-//! rows, banks and leases return before the other group reserves. Every
-//! device write of a lookahead goes to rows and banks its own successors
-//! own, so an orphan never changes accepted state.
+//! The lookahead lives in the domain's `StateBindings`: it is the only work
+//! that holds bindings between flights. The owner carries it there but never
+//! sees it. When the operations it next submits equal the prediction (token
+//! included, known once N finished) and the accepted states are the ones the
+//! successors follow, the group claims the queued step: nothing is reserved
+//! or launched, and its flight is returned. Any other target group, and any
+//! binding change, orphans it: the domain waits for it and drops it, so its
+//! rows, banks and leases return first. Every device write of a lookahead
+//! goes to rows and banks its own successors own, so an orphan never changes
+//! accepted state.
 
 use super::*;
 use crate::programs::{SubmittedHead, SubmittedTarget};
 use magnitude_state::TentativeAdvance;
 
-pub(super) struct Lookahead<
-    S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork>,
-    H: ProgramSubmission<CompletedWork = crate::CompletedHeadWork>,
-> {
-    flight: TargetFlight<S, H>,
+pub(super) struct Lookahead<F: ProgramFamily> {
+    flight: TargetWork<F>,
     /// The flight whose selections are this one's tokens.
     predecessor: u64,
     /// Per slot, the operation that claims it (a decode continuation with a
@@ -135,8 +134,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// The lookahead slot each operation claims, in operation order, when
     /// the group is exactly the queued continuation of accepted states.
-    pub(super) fn claim_slots(&self, operations: &[Operation]) -> Option<Vec<usize>> {
-        let lookahead = self.lookahead.as_ref()?;
+    pub(super) fn claim_slots(
+        &self,
+        bindings: &StateBindings<F>,
+        operations: &[Operation],
+    ) -> Option<Vec<usize>> {
+        let lookahead = bindings.lookahead.as_ref()?;
         let selected = lookahead.selected.as_ref()?;
         let advances = lookahead.flight.submission.launch().advances();
         let mut slots = Vec::with_capacity(operations.len());
@@ -179,9 +182,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The launch class a claimable group occupies.
-    pub(super) fn claim_class(&self, operations: &[Operation]) -> Option<crate::LaunchClass> {
-        self.claim_slots(operations)?;
-        let lookahead = self.lookahead.as_ref()?;
+    pub(super) fn claim_class(
+        &self,
+        bindings: &StateBindings<F>,
+        operations: &[Operation],
+    ) -> Option<crate::LaunchClass> {
+        self.claim_slots(bindings, operations)?;
+        let lookahead = bindings.lookahead.as_ref()?;
         Some(lookahead.flight.submission.launch().batch().class())
     }
 
@@ -190,15 +197,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// attaches to at finish; unclaimed slots are discarded then.
     pub(super) fn claim_lookahead(
         &mut self,
+        bindings: &mut StateBindings<F>,
         operations: &[Operation],
         slots: Vec<usize>,
-    ) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
-        self.healthy()?;
-        if self.claim_slots(operations).as_ref() != Some(&slots) {
-            return Err(self.fatal_invariant("claimed lookahead changed after reservation"));
+    ) -> Result<TargetWork<F>, DomainError> {
+        if self.claim_slots(bindings, operations).as_ref() != Some(&slots) {
+            return Err(DomainError::invariant(
+                "claimed lookahead changed after reservation",
+            ));
         }
-        let Some(Lookahead { mut flight, .. }) = self.lookahead.take() else {
-            return Err(self.fatal_invariant("claimed lookahead is absent"));
+        let Some(Lookahead { mut flight, .. }) = bindings.lookahead.take() else {
+            return Err(DomainError::invariant("claimed lookahead is absent"));
         };
         let mut sources = (0..flight.requests.len()).map(|_| None).collect::<Vec<_>>();
         // `claim_slots` found every claimed request's accepted state.
@@ -222,29 +231,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(flight)
     }
 
-    /// Record the selections of a finished flight for the lookahead it feeds.
-    /// The predecessor finished at `completed`: the queued step's selections
-    /// are known, and the device runs it from then on.
-    pub(super) fn predecessor_selected(
-        &mut self,
-        flight: u64,
-        selected: &[Selected],
-        completed: Instant,
-    ) {
-        if let Some(lookahead) = self
-            .lookahead
-            .as_mut()
-            .filter(|lookahead| lookahead.predecessor == flight)
-        {
-            lookahead.selected = Some(selected.to_vec());
-            lookahead.flight.runnable = completed;
-        }
-    }
-
     /// Wait for a queued step nobody will claim and drop it: its successors
     /// release their rows and banks, its leases return to their pools.
-    pub(super) fn orphan_lookahead(&mut self) -> Result<(), DomainError> {
-        let Some(lookahead) = self.lookahead.take() else {
+    pub(super) fn orphan_lookahead(
+        &self,
+        bindings: &mut StateBindings<F>,
+    ) -> Result<(), DomainError> {
+        let Some(lookahead) = bindings.lookahead.take() else {
             return Ok(());
         };
         if self.trace_lookahead {
@@ -262,11 +255,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .map(|priming| priming.submission.finish().map(drop));
         match (lookahead.flight.submission.finish().map(drop), priming) {
             (Ok(()), None | Some(Ok(()))) => Ok(()),
-            (Err(error), _) | (_, Some(Err(error))) => {
-                let failure = DomainError::Device(error);
-                self.fatal = Some(failure.clone());
-                Err(failure)
-            }
+            (Err(error), _) | (_, Some(Err(error))) => Err(DomainError::Device(error)),
         }
     }
 
@@ -277,7 +266,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// anything. Otherwise the next step is submitted by the owner as usual.
     pub(super) fn queue_lookahead(
         &mut self,
-        flight: &TargetFlight<F::TargetSubmission, F::HeadSubmission>,
+        bindings: &mut StateBindings<F>,
+        flight: &TargetWork<F>,
         operations: &[Operation],
     ) -> Result<(), DomainError> {
         let successors = operations
@@ -288,8 +278,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if !self.execution.policy().limits().lookahead {
             return Ok(());
         }
-        if self.lookahead.is_some() {
-            return Err(self.fatal_invariant("a lookahead was queued over another"));
+        if bindings.lookahead.is_some() {
+            return Err(DomainError::invariant("a lookahead was queued over another"));
         }
         // Tokens are the flight's selection rows, one per slot in slot
         // order, so the continuation keeps every slot in the same order.
@@ -427,11 +417,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.definition.decoder.hidden as usize,
         ) {
             Ok(launch) => launch,
-            Err((_, error)) => {
-                let failure = DomainError::Invariant(error);
-                self.fatal = Some(failure.clone());
-                return Err(failure);
-            }
+            Err((_, error)) => return Err(DomainError::Invariant(error)),
         };
         // A planned prompt chunk's drafter entry follows the in-flight entry
         // of the chunk before it, with its own draft launch leases.
@@ -480,14 +466,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             _ => None,
         };
         let started = Instant::now();
-        let submission = match self.family.submit_target(launch) {
-            Ok(submission) => submission,
-            Err((error, _)) => {
-                let failure = DomainError::from(error);
-                self.fatal = Some(failure.clone());
-                return Err(failure);
-            }
-        };
+        let submission = self
+            .family
+            .submit_target(launch)
+            .map_err(|(error, _)| DomainError::from(error))?;
         let requests = predicted
             .iter()
             .map(|operation| {
@@ -511,7 +493,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 predicted.iter().map(Operation::row_count).sum::<usize>()
             );
         }
-        let mut queued = TargetFlight {
+        let mut queued = TargetWork {
             launch_trace: None,
             requests,
             submission,
@@ -532,7 +514,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 output,
             )?;
         }
-        self.lookahead = Some(Lookahead {
+        bindings.lookahead = Some(Lookahead {
             flight: queued,
             predecessor: flight.id,
             predicted,
@@ -540,5 +522,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             selected: None,
         });
         Ok(())
+    }
+}
+
+impl<F: ProgramFamily> StateBindings<F> {
+    /// Record the selections of a finished flight for the lookahead it feeds.
+    /// The predecessor finished at `completed`: the queued step's selections
+    /// are known, and the device runs it from then on.
+    pub(super) fn predecessor_selected(
+        &mut self,
+        flight: u64,
+        selected: &[Selected],
+        completed: Instant,
+    ) {
+        if let Some(lookahead) = self
+            .lookahead
+            .as_mut()
+            .filter(|lookahead| lookahead.predecessor == flight)
+        {
+            lookahead.selected = Some(selected.to_vec());
+            lookahead.flight.runnable = completed;
+        }
     }
 }

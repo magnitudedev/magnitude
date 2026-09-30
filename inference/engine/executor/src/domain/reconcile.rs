@@ -11,7 +11,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         mut pending: PendingOperationOutcome,
         decision: PhysicalDecision,
     ) -> Result<(), DomainError> {
-        self.healthy()?;
         if matches!(pending.outcome, Outcome::Head { .. }) {
             // A head commits exactly its entry rows; its chained proposal
             // rows never become visible.
@@ -22,13 +21,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let advance = pending
                 .advance
                 .take()
-                .ok_or_else(|| self.fatal_invariant("head outcome has no owned advance"))?;
+                .ok_or_else(|| DomainError::invariant("head outcome has no owned advance"))?;
             let (OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) =
                 advance
                     .commit(decision.accepted_rows)
                     .map_err(|(state, error)| {
                         self.head.insert(pending.request, state);
-                        self.fatal_state(error)
+                        DomainError::from(error)
                     })?;
             self.head.insert(pending.request, state);
             return Ok(());
@@ -40,13 +39,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             if let (Outcome::Encode { features }, Some(image)) = (&pending.outcome, &pending.image)
             {
                 let Some(input) = self.input.get(&pending.request) else {
-                    return Err(self.fatal_invariant("vision outcome has no admitted input"));
+                    return Err(DomainError::invariant("vision outcome has no admitted input"));
                 };
                 let Some(existing) = input.images.values().find(|slot| &slot.image == image) else {
-                    return Err(self.fatal_invariant("encoded image is absent from admitted input"));
+                    return Err(DomainError::invariant(
+                        "encoded image is absent from admitted input",
+                    ));
                 };
                 if existing.features.is_some() {
-                    return Err(self.fatal_invariant("encoded image feature is already installed"));
+                    return Err(DomainError::invariant(
+                        "encoded image feature is already installed",
+                    ));
                 }
                 let input = self
                     .input
@@ -71,10 +74,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.target.contains_key(&request)
             || (pending.primed.is_some() && self.head.contains_key(&request))
         {
-            return Err(self.fatal_invariant("request already has another physical state owner"));
+            return Err(DomainError::invariant(
+                "request already has another physical state owner",
+            ));
         }
         let Some(advance) = pending.advance.take() else {
-            return Err(self.fatal_invariant("target outcome has no owned target advance"));
+            return Err(DomainError::invariant(
+                "target outcome has no owned target advance",
+            ));
         };
         // A prompt chunk commits whole, and its drafter entry with it.
         if let Some(primed) = pending.primed.take() {
@@ -89,7 +96,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 Err((state, error)) => {
                     self.head.insert(request, state);
                     self.target.insert(request, advance.abort());
-                    return Err(self.fatal_state(error));
+                    return Err(error.into());
                 }
             }
         }
@@ -102,7 +109,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             Err((state, error)) => {
                 self.target.insert(request, state);
-                Err(self.fatal_state(error))
+                Err(error.into())
             }
         }
     }
@@ -119,7 +126,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Outcome::Encode { .. } => false,
         };
         if conflicting_owner {
-            return Err(self.fatal_invariant("request already has another physical state owner"));
+            return Err(DomainError::invariant(
+                "request already has another physical state owner",
+            ));
         }
         if let Some(primed) = pending.primed {
             self.head.insert(pending.request, primed.abort());
@@ -133,9 +142,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     self.target.insert(pending.request, advance.abort());
                 }
                 Outcome::Encode { .. } => {
-                    return Err(
-                        self.fatal_invariant("stateless outcome unexpectedly owns sequence state")
-                    );
+                    return Err(DomainError::invariant(
+                        "stateless outcome unexpectedly owns sequence state",
+                    ));
                 }
             }
         }

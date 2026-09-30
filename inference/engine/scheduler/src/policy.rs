@@ -185,17 +185,13 @@ pub fn order_victims(victims: &mut [Victim]) {
     });
 }
 
-/// Reconsider queued admission only after an event that can change resource
-/// availability. This gates scheduling wakeups without retrying a submission.
+/// Counts the events that free capacity. A request short of capacity retries
+/// only after it moves.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AvailabilityEpoch(u64);
 impl AvailabilityEpoch {
-    pub fn advance(&mut self) -> Result<(), String> {
-        self.0 = self
-            .0
-            .checked_add(1)
-            .ok_or("availability epoch exhausted")?;
-        Ok(())
+    pub fn advance(&mut self) {
+        self.0 = self.0.wrapping_add(1);
     }
     pub fn changed_since(self, blocked: Self) -> bool {
         self != blocked

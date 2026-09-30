@@ -1,4 +1,4 @@
-use magnitude_generation::{Generation, MethodEffects, PreparedGenerationTransition, RoundForward};
+use magnitude_generation::{Generation, MethodEffects, PreparedGenerationTransition, StartedRound};
 use magnitude_executor::{
     ConditioningRef, DomainError, ExecutorDomain, FeatureRef, Operation, Outcome,
     PendingOperationOutcome, PhysicalDecision, ProgramFamily, RequestId, RowResult,
@@ -27,57 +27,54 @@ impl std::fmt::Debug for RoundError {
 impl std::error::Error for RoundError {}
 
 pub fn lower_round(
-    generation: &Generation,
+    round: &StartedRound,
     request: RequestId,
     numerical_position: usize,
     conditioning: Option<ConditioningRef>,
 ) -> Result<Operation, String> {
-    generation
+    round
         .round_forward()
-        .ok_or_else(|| "generation has no suspended target round".to_owned())?
         .clone()
         .into_operation(request, numerical_position, conditioning)
 }
 
+/// Reconcile a started round's physical outcome. Success commits the round
+/// back into its generation; a failure aborts the outcome and fails the
+/// round, returning the failed generation with the cause.
 pub fn reconcile_forward<F: ProgramFamily>(
-    generation: &mut Generation,
+    round: StartedRound,
     domain: &mut ExecutorDomain<F>,
     request: RequestId,
     pending: PendingOperationOutcome,
-) -> Result<MethodEffects, RoundError> {
-    let staged = stage_forward(generation, domain, request, &pending);
-    let transition = match staged {
+) -> Result<(Generation, MethodEffects), (Generation, RoundError)> {
+    let transition = match stage_forward(&round, domain, request, &pending) {
         Ok(transition) => transition,
         Err(error) => {
-            domain.abort(pending).map_err(RoundError::Physical)?;
-            return Err(RoundError::Logical(error));
+            let error = match domain.abort(pending) {
+                Ok(()) => RoundError::Logical(error),
+                Err(physical) => RoundError::Physical(physical),
+            };
+            return Err((round.fail(), error));
         }
     };
     let accepted_rows = transition.decision().accepted_rows;
-    domain
-        .reconcile(pending, PhysicalDecision { accepted_rows })
-        .map_err(RoundError::Physical)?;
-    Ok(generation.commit_transition(transition))
+    if let Err(error) = domain.reconcile(pending, PhysicalDecision { accepted_rows }) {
+        return Err((round.fail(), RoundError::Physical(error)));
+    }
+    Ok(round.commit(transition))
 }
 
 fn stage_forward<F: ProgramFamily>(
-    generation: &Generation,
+    round: &StartedRound,
     domain: &mut ExecutorDomain<F>,
     request: RequestId,
     pending: &PendingOperationOutcome,
 ) -> Result<PreparedGenerationTransition, String> {
-    let expected_rows = generation
-        .round_forward()
-        .map(|forward| forward.tokens.len())
-        .ok_or("generation has no suspended target round")?;
-    let forward = generation
-        .round_forward()
-        .ok_or("generation has no suspended target round")?;
-    let features_required = generation.round_forward().is_some_and(|forward| {
-        forward
-            .demand
-            .contains(magnitude_executor::Demand::FEATURES)
-    });
+    let forward = round.round_forward();
+    let expected_rows = forward.tokens.len();
+    let features_required = forward
+        .demand
+        .contains(magnitude_executor::Demand::FEATURES);
     let Outcome::Forward { rows } = pending.outcome() else {
         return Err("target round returned a non-forward outcome".into());
     };
@@ -119,7 +116,7 @@ fn stage_forward<F: ProgramFamily>(
         );
     }
     let features = common_features(&rows, features_required)?;
-    generation.prepare_round_transition(request, &samples, features, domain)
+    round.prepare_round_transition(request, &samples, features, domain)
 }
 
 /// A forward may attach one aggregate `[rows, D]` lease to exactly one row, or
@@ -144,8 +141,4 @@ fn common_features(rows: &[RowResult], required: bool) -> Result<Option<FeatureR
         return Err("forward rows returned an ambiguous feature-lease layout".into());
     }
     Ok(Some(first))
-}
-
-pub fn round_forward(generation: &Generation) -> Option<&RoundForward> {
-    generation.round_forward()
 }

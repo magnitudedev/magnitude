@@ -107,18 +107,18 @@ or available memory and commit, CUDA free bytes, or Vulkan budget less usage.
 | Headroom | Band | Engine behavior |
 |---|---|---|
 | Above the planning reserve | Normal | Claims are granted if headroom stays above the planning reserve |
-| At or below the planning reserve | Reclaim | Only other programs cause this. Pause admission and growth, release, and unload if it persists |
+| At or below the planning reserve | Reclaim | Only other programs cause this. Refuse admission, hold residency and growth in memory waits, release, and unload if it persists |
 | At or below the emergency reserve | (still Reclaim) | The hosting service kills the worker on its first observation |
 
 Process limits are the visible ones. Inside a container the container's own cgroup limit is
 visible while cgroups above it may be hidden; hidden ancestors bound nothing beyond host headroom,
 so a contained process plans and claims against its own limit and host headroom.
 
-An unavailable required observation is Blind: growth stops
+An unavailable required observation is Blind: residency and growth wait on memory
 immediately, and a continuous second of Blind is treated as Reclaim. If Reclaim persists for one
 second after releases are exhausted and in-flight work completes, the engine unloads the model. An
-admission attempted during Blind returns the typed `MemoryObservationUnavailable` result; during
-Reclaim it is refused as memory pressure. Already accepted work retains its state while the engine
+admission attempted during Blind is refused at once with the typed `MemoryObservationUnavailable`
+result; during Reclaim it is refused at once as memory pressure. Already accepted work retains its state while the engine
 retries its observation. The engine reads no OS pressure signal.
 
 ## Release order
@@ -131,15 +131,18 @@ The request owner applies the same order to every deficit and stops when that de
 4. For a demand deficit, reduce the pending batch by removing its last request and then
    reducing its token allowance.
 5. For demand or Reclaim, preempt live requests while preserving accepted tokens for replay.
-6. For demand, wait for a completion, publication, cancellation or peer release to advance the
-   resource epoch.
-7. For unresolved demand, fail only the affected operation with `InsufficientMemory { required,
-   available }`; never unload the model for one oversized claim.
+6. For demand, park the affected work on its request, which waits alone until capacity is freed
+   and the availability epoch advances; the pipeline and other requests continue.
+7. For demand nothing can free any more ([scheduler capacity rule](scheduler.md)), fail only the
+   waiting requests with their typed capacity error `{ resource, required, available }`; never
+   unload the model for one oversized claim.
 8. For persistent Reclaim, unload the model and finish open and new requests with
    `ModelUnloaded { cause: MemoryPressure }`.
 
 Reclaim uses steps 1–3, 5 and 8 and stops as soon as headroom is back above the planning
 reserve; each victim is preempted once, and in-flight work retains its storage until physical
+completion. A release that changes slab bindings needs the binding right
+([state transactions](state-transactions.md)), so during a flight it runs at that flight's
 completion. Removed index entries do not count as released bytes until Seismic's charge actually
 falls. After unloading, the engine does not reload itself.
 

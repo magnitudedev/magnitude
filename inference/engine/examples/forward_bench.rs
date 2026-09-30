@@ -56,13 +56,10 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     Demand, DomainError, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision,
-    RequestId, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
+    RequestId, ReservedResources, Sampling, SelectSpec, Shaping, StateBindings, TokenId, WorkKind,
 };
 use magnitude_family_contracts::{Decoder, PreparedModelInput};
-use magnitude_scheduler::{
-    domain::{self as service_domain, DomainFlight},
-    ServiceLimits,
-};
+use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
 use seismic::{host_seconds, SubmissionTrace, TraceDetail, TracedSubmission};
 use serde_json::{json, Value};
@@ -527,7 +524,8 @@ impl Options {
 }
 
 /// The executor domain opened for one engine configuration, plus the forced
-/// token stream and request identities.
+/// token stream and request identities. The domain's `StateBindings` travel
+/// beside it: each step's flight carries them and returns them.
 pub(crate) struct Bench {
     domain: ExecutorDomain,
     device: seismic::Device,
@@ -570,7 +568,7 @@ impl Bench {
         kv_codec: KvCodec,
         device: magnitude_executor::platform::DeviceRequest,
         lookahead: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, StateBindings), String> {
         let resolved = EngineConfiguration {
             package: PackageOptions {
                 target: model.to_path_buf(),
@@ -601,10 +599,10 @@ impl Bench {
             .map_err(|_| "vocabulary exceeds host domain")?;
         let geometry = resolved.manifest.definition.decoder.clone();
         let package = resolved.host.shared_package();
-        let (domain, _) =
+        let (domain, bindings, _) =
             build_native_domain(&resolved.manifest, package).map_err(|error| error.to_string())?;
         let device = domain.resources().device().clone();
-        Ok(Self {
+        let bench = Self {
             domain,
             device,
             vocabulary,
@@ -612,20 +610,24 @@ impl Bench {
             next_request: 1,
             lookahead,
             feedback: false,
-        })
+        };
+        Ok((bench, bindings))
     }
 
     pub(crate) fn device(&self) -> &seismic::Device {
         &self.device
     }
 
-    pub(crate) fn open_sequence(&mut self) -> Result<Sequence, String> {
+    pub(crate) fn open_sequence(
+        &mut self,
+        bindings: &mut StateBindings,
+    ) -> Result<Sequence, String> {
         let request = RequestId(self.next_request);
         self.next_request += 1;
         self.domain
             .install_input(request, PreparedModelInput::continuation_only())?;
         self.domain
-            .open_state(request, None)
+            .open_state(bindings, request, None)
             .map_err(|error| error.to_string())?;
         Ok(Sequence {
             request,
@@ -702,27 +704,31 @@ impl Bench {
     }
 
     /// Submit one group of forwards, wait, commit every row and advance the
-    /// sequences. Returns the step's timings (from `trace`, when present) and
-    /// the outcomes in operation order.
+    /// sequences. Returns the step's timings (from `trace`, when present),
+    /// the outcomes in operation order, and the bindings the flight returned.
     pub(crate) fn step(
         &mut self,
+        mut bindings: StateBindings,
         operations: Vec<Operation>,
         sequences: &mut [&mut Sequence],
         trace: Option<&SubmissionTrace>,
-    ) -> Result<(Step, Vec<Outcome>), String> {
+    ) -> Result<(Step, Vec<Outcome>, StateBindings), String> {
         let text = |error: DomainError| error.to_string();
         let start = host_seconds();
-        let groups = service_domain::group(&self.domain, operations);
-        let [group] = groups.as_slice() else {
-            return Err("a bench step must form exactly one target group".into());
-        };
-        let DomainFlight::Target(flight) =
-            service_domain::submit_group(&mut self.domain, group).map_err(text)?
+        let ReservedResources::Target(reservation) = self
+            .domain
+            .reserve(&mut bindings, &operations)
+            .map_err(text)?
+            .into_resources()
         else {
             return Err("a bench step must run on the target lane".into());
         };
+        let flight = self
+            .domain
+            .submit_target(bindings, &operations, reservation)
+            .map_err(|failure| failure.error().to_string())?;
         let submitted = host_seconds();
-        let pending = self.domain.finish_target(flight).map_err(text)?;
+        let (pending, bindings) = self.domain.finish_target(flight).map_err(text)?;
         let finished = host_seconds();
         if pending.len() != sequences.len() {
             return Err("step outcomes differ from its sequences".into());
@@ -764,16 +770,18 @@ impl Bench {
                 submissions,
             },
             outcomes,
+            bindings,
         ))
     }
 
     /// Accept `rows` tokens of history in prefill chunks without readout.
     pub(crate) fn history(
         &mut self,
+        mut bindings: StateBindings,
         sequence: &mut Sequence,
         rows: usize,
         trace: Option<&SubmissionTrace>,
-    ) -> Result<(), String> {
+    ) -> Result<StateBindings, String> {
         let target = sequence.position + rows;
         let started = host_seconds();
         let mut next_progress = sequence.position + 16 * PREFILL_ROWS;
@@ -781,7 +789,7 @@ impl Bench {
             let chunk = (target - sequence.position).min(PREFILL_ROWS);
             let tokens = self.forced(sequence.position, chunk);
             let operation = Self::forward(sequence, WorkKind::Prefill, tokens, Demand::NONE);
-            self.step(vec![operation], &mut [sequence], trace)?;
+            bindings = self.step(bindings, vec![operation], &mut [sequence], trace)?.2;
             if rows >= 32 * PREFILL_ROWS && sequence.position >= next_progress {
                 eprintln!(
                     "history {} / {} rows in {:.1}s",
@@ -792,7 +800,7 @@ impl Bench {
                 next_progress += 16 * PREFILL_ROWS;
             }
         }
-        Ok(())
+        Ok(bindings)
     }
 }
 
@@ -947,12 +955,13 @@ fn attribution(submissions: &[TracedSubmission], steps: usize, until: f64) -> Va
 /// production trace, then attribute `attribution_steps` more.
 fn measure(
     bench: &mut Bench,
+    mut bindings: StateBindings,
     sequences: &mut [Sequence],
     warm: usize,
     measured: usize,
     attribution_steps: usize,
     make: &dyn Fn(&Bench, &[Sequence]) -> Vec<Operation>,
-) -> Result<Value, String> {
+) -> Result<(Value, StateBindings), String> {
     let traced = |bench: &Bench, detail| {
         bench
             .device()
@@ -960,22 +969,23 @@ fn measure(
             .map_err(|error| error.to_string())
     };
     let run = |bench: &mut Bench,
+               bindings: StateBindings,
                sequences: &mut [Sequence],
                trace: &SubmissionTrace|
-     -> Result<Step, String> {
+     -> Result<(Step, StateBindings), String> {
         let operations = make(bench, sequences);
         let mut refs = sequences.iter_mut().collect::<Vec<_>>();
         // Under lookahead the trace is collected once per window: a per-step
         // collect would wait for the step queued behind this one.
         let per_step = (!bench.lookahead).then_some(trace);
         bench
-            .step(operations, &mut refs, per_step)
-            .map(|(step, _)| step)
+            .step(bindings, operations, &mut refs, per_step)
+            .map(|(step, _, bindings)| (step, bindings))
     };
     let collect = |trace: &SubmissionTrace| trace.collect().map_err(|error| error.to_string());
     let trace = traced(bench, TraceDetail::Submissions)?;
     for _ in 0..warm {
-        run(bench, sequences, &trace)?;
+        bindings = run(bench, bindings, sequences, &trace)?.1;
     }
     // Under lookahead a step's submissions are traced during the previous
     // step, so steps are summarized by host time only and device time over
@@ -989,7 +999,8 @@ fn measure(
     // lookahead when decode feeds them back.
     let mut selected = Vec::with_capacity(measured);
     for _ in 0..measured {
-        let step = run(bench, sequences, &trace)?;
+        let (step, next) = run(bench, bindings, sequences, &trace)?;
+        bindings = next;
         selected.push(
             sequences
                 .iter()
@@ -1011,7 +1022,8 @@ fn measure(
     let mut attributed = Vec::new();
     let mut attributed_end = f64::NEG_INFINITY;
     for _ in 0..attribution_steps {
-        let step = run(bench, sequences, &trace)?;
+        let (step, next) = run(bench, bindings, sequences, &trace)?;
+        bindings = next;
         attributed_end = step.end;
         attributed.extend(step.submissions);
     }
@@ -1021,7 +1033,7 @@ fn measure(
         .iter()
         .map(|summary| summary["wall_ms"].as_f64().expect("wall"))
         .collect::<Vec<_>>();
-    Ok(json!({
+    let result = json!({
         "warm_steps": warm,
         "lookahead": bench.lookahead,
         "median_ms": median(&mut wall),
@@ -1030,7 +1042,8 @@ fn measure(
         "selected": selected,
         "steps": summaries,
         "attribution": attribution(&attributed, attribution_steps, attributed_end),
-    }))
+    });
+    Ok((result, bindings))
 }
 
 /// Device time over a window of consecutive steps: busy is the union of the
@@ -1071,18 +1084,20 @@ fn decode_operations(bench: &Bench, sequences: &[Sequence]) -> Vec<Operation> {
 
 fn decode_cell(
     bench: &mut Bench,
+    mut bindings: StateBindings,
     options: &Options,
     context: usize,
     count: usize,
-) -> Result<Value, String> {
+) -> Result<(Value, StateBindings), String> {
     let mut sequences = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut sequence = bench.open_sequence()?;
-        bench.history(&mut sequence, context, None)?;
+        let mut sequence = bench.open_sequence(&mut bindings)?;
+        bindings = bench.history(bindings, &mut sequence, context, None)?;
         sequences.push(sequence);
     }
-    let mut result = measure(
+    let (mut result, bindings) = measure(
         bench,
+        bindings,
         &mut sequences,
         options.warm,
         options.steps,
@@ -1096,7 +1111,7 @@ fn decode_cell(
     for sequence in sequences {
         bench.close(sequence)?;
     }
-    Ok(result)
+    Ok((result, bindings))
 }
 
 /// Single-launch prefill chunks: one cold, three warm (timed), one attributed.
@@ -1104,11 +1119,16 @@ const PREFILL_CHUNKS: usize = 5;
 
 /// Time a whole prompt through the same bounded prefill launches the service
 /// uses. The existing single-launch cell below retains its per-launch trace.
-fn prefill_prompt_cell(bench: &mut Bench, options: &Options, rows: usize) -> Result<Value, String> {
+fn prefill_prompt_cell(
+    bench: &mut Bench,
+    mut bindings: StateBindings,
+    options: &Options,
+    rows: usize,
+) -> Result<(Value, StateBindings), String> {
     let mut samples = Vec::with_capacity(options.prefill_samples);
     for _ in 0..options.prefill_samples {
-        let mut sequence = bench.open_sequence()?;
-        bench.history(&mut sequence, options.prefill_history, None)?;
+        let mut sequence = bench.open_sequence(&mut bindings)?;
+        bindings = bench.history(bindings, &mut sequence, options.prefill_history, None)?;
         let start = host_seconds();
         let mut remaining = rows;
         while remaining > 0 {
@@ -1124,7 +1144,9 @@ fn prefill_prompt_cell(bench: &mut Bench, options: &Options, rows: usize) -> Res
                 bench.forced(sequence.position, chunk),
                 demand,
             );
-            bench.step(vec![operation], &mut [&mut sequence], None)?;
+            bindings = bench
+                .step(bindings, vec![operation], &mut [&mut sequence], None)?
+                .2;
             remaining -= chunk;
         }
         let elapsed_ms = (host_seconds() - start) * MS;
@@ -1133,7 +1155,7 @@ fn prefill_prompt_cell(bench: &mut Bench, options: &Options, rows: usize) -> Res
     }
     let mut warm = samples[1..].to_vec();
     let median_ms = median(&mut warm);
-    Ok(json!({
+    let result = json!({
         "rows": rows,
         "history": options.prefill_history,
         "chunks": rows.div_ceil(PREFILL_ROWS),
@@ -1142,31 +1164,38 @@ fn prefill_prompt_cell(bench: &mut Bench, options: &Options, rows: usize) -> Res
         "tokens_per_second": rows as f64 / (median_ms / MS),
         "cold_ms": samples[0],
         "samples_ms": &samples[1..],
-    }))
+    });
+    Ok((result, bindings))
 }
 
 /// Without history, every chunk is a fresh sequence at position 0. With
 /// `--prefill-history H`, one sequence first accepts H tokens of history and
 /// the chunks follow each other on it, so chunk `i` starts at H + i * rows.
-fn prefill_cell(bench: &mut Bench, options: &Options, rows: usize) -> Result<Value, String> {
+fn prefill_cell(
+    bench: &mut Bench,
+    mut bindings: StateBindings,
+    options: &Options,
+    rows: usize,
+) -> Result<(Value, StateBindings), String> {
     if rows > PREFILL_ROWS {
-        return prefill_prompt_cell(bench, options, rows);
+        return prefill_prompt_cell(bench, bindings, options, rows);
     }
     let history = options.prefill_history;
     let mut shared = if history == 0 {
         None
     } else {
-        let mut sequence = bench.open_sequence()?;
-        bench.history(&mut sequence, history, None)?;
+        let mut sequence = bench.open_sequence(&mut bindings)?;
+        bindings = bench.history(bindings, &mut sequence, history, None)?;
         Some(sequence)
     };
     let chunk = |bench: &mut Bench,
+                 mut bindings: StateBindings,
                  shared: &mut Option<Sequence>,
                  trace: &SubmissionTrace|
-     -> Result<Step, String> {
+     -> Result<(Step, StateBindings), String> {
         let mut fresh = match shared {
             Some(_) => None,
-            None => Some(bench.open_sequence()?),
+            None => Some(bench.open_sequence(&mut bindings)?),
         };
         let sequence = shared.as_mut().or(fresh.as_mut()).expect("a sequence");
         let operation = Bench::forward(
@@ -1175,27 +1204,32 @@ fn prefill_cell(bench: &mut Bench, options: &Options, rows: usize) -> Result<Val
             bench.forced(sequence.position, rows),
             Demand::SELECT,
         );
-        let (step, _) = bench.step(vec![operation], &mut [sequence], Some(trace))?;
+        let (step, _, bindings) =
+            bench.step(bindings, vec![operation], &mut [sequence], Some(trace))?;
         if let Some(sequence) = fresh {
             bench.close(sequence)?;
         }
-        Ok(step)
+        Ok((step, bindings))
     };
     let trace = bench
         .device()
         .trace_submissions(TraceDetail::Submissions)
         .map_err(|error| error.to_string())?;
-    let cold = step_summary(&chunk(bench, &mut shared, &trace)?, None)?;
+    let (step, next) = chunk(bench, bindings, &mut shared, &trace)?;
+    bindings = next;
+    let cold = step_summary(&step, None)?;
     let mut summaries = Vec::new();
     for _ in 1..PREFILL_CHUNKS - 1 {
-        summaries.push(step_summary(&chunk(bench, &mut shared, &trace)?, None)?);
+        let (step, next) = chunk(bench, bindings, &mut shared, &trace)?;
+        bindings = next;
+        summaries.push(step_summary(&step, None)?);
     }
     drop(trace);
     let trace = bench
         .device()
         .trace_submissions(TraceDetail::Launches)
         .map_err(|error| error.to_string())?;
-    let attributed = chunk(bench, &mut shared, &trace)?;
+    let (attributed, bindings) = chunk(bench, bindings, &mut shared, &trace)?;
     drop(trace);
     if let Some(sequence) = shared {
         bench.close(sequence)?;
@@ -1204,7 +1238,7 @@ fn prefill_cell(bench: &mut Bench, options: &Options, rows: usize) -> Result<Val
         .iter()
         .map(|summary| summary["wall_ms"].as_f64().expect("wall"))
         .collect::<Vec<_>>();
-    Ok(json!({
+    let result = json!({
         "rows": rows,
         "history": history,
         "median_ms": median(&mut wall),
@@ -1212,7 +1246,8 @@ fn prefill_cell(bench: &mut Bench, options: &Options, rows: usize) -> Result<Val
         "median": medians(&summaries),
         "steps": summaries,
         "attribution": attribution(&attributed.submissions, 1, attributed.end),
-    }))
+    });
+    Ok((result, bindings))
 }
 
 fn host() -> String {
@@ -1253,7 +1288,7 @@ fn bench(options: &Options) -> Result<(), String> {
         1
     };
     let loaded = host_seconds();
-    let mut bench = Bench::open(
+    let (mut bench, mut bindings) = Bench::open(
         &options.model,
         options.path,
         context_tokens,
@@ -1294,7 +1329,8 @@ fn bench(options: &Options) -> Result<(), String> {
     if decode {
         for &context in &options.contexts {
             eprintln!("decode context={context}");
-            let cell = decode_cell(&mut bench, options, context, 1)?;
+            let (cell, next) = decode_cell(&mut bench, bindings, options, context, 1)?;
+            bindings = next;
             eprintln!(
                 "  median {:.3} ms",
                 cell["median_ms"].as_f64().unwrap_or(f64::NAN)
@@ -1306,7 +1342,8 @@ fn bench(options: &Options) -> Result<(), String> {
     if prefill {
         for &rows in &options.prefills {
             eprintln!("prefill rows={rows}");
-            let cell = prefill_cell(&mut bench, options, rows)?;
+            let (cell, next) = prefill_cell(&mut bench, bindings, options, rows)?;
+            bindings = next;
             eprintln!(
                 "  median {:.3} ms",
                 cell["median_ms"].as_f64().unwrap_or(f64::NAN)
@@ -1319,7 +1356,8 @@ fn bench(options: &Options) -> Result<(), String> {
         for &context in &options.contexts {
             for &count in &options.sequences {
                 eprintln!("concurrent sequences={count} context={context}");
-                let cell = decode_cell(&mut bench, options, context, count)?;
+                let (cell, next) = decode_cell(&mut bench, bindings, options, context, count)?;
+                bindings = next;
                 eprintln!(
                     "  {:.1} tok/s",
                     cell["aggregate_tokens_per_second"]
@@ -1338,7 +1376,8 @@ fn bench(options: &Options) -> Result<(), String> {
         for &context in &options.contexts {
             for &width in &options.widths {
                 eprintln!("verify width={width} context={context}");
-                let cell = verify_cell(&mut bench, options, context, width)?;
+                let (cell, next) = verify_cell(&mut bench, bindings, options, context, width)?;
+                bindings = next;
                 eprintln!(
                     "  median {:.3} ms",
                     cell["median_ms"].as_f64().unwrap_or(f64::NAN)
@@ -1355,12 +1394,13 @@ fn bench(options: &Options) -> Result<(), String> {
 /// MTP verification shape); every row is accepted.
 fn verify_cell(
     bench: &mut Bench,
+    mut bindings: StateBindings,
     options: &Options,
     context: usize,
     width: usize,
-) -> Result<Value, String> {
-    let mut sequence = bench.open_sequence()?;
-    bench.history(&mut sequence, context, None)?;
+) -> Result<(Value, StateBindings), String> {
+    let mut sequence = bench.open_sequence(&mut bindings)?;
+    let bindings = bench.history(bindings, &mut sequence, context, None)?;
     let make = |bench: &Bench, sequences: &[Sequence]| {
         sequences
             .iter()
@@ -1388,8 +1428,9 @@ fn verify_cell(
             .collect()
     };
     let mut sequences = [sequence];
-    let mut result = measure(
+    let (mut result, bindings) = measure(
         bench,
+        bindings,
         &mut sequences,
         options.warm,
         options.steps,
@@ -1400,14 +1441,17 @@ fn verify_cell(
     result["width"] = json!(width);
     let [sequence] = sequences;
     bench.close(sequence)?;
-    Ok(result)
+    Ok((result, bindings))
 }
 
 /// D4 precision runner (Q1): V4 logits against a llama.cpp
 /// `--kl-divergence-base` file, with llama.cpp's own KL and same-top
 /// definitions (`validation/precision/README.md` documents the file).
 mod qualify {
-    use super::{host, Bench, Decoder, Demand, Operation, Options, Outcome, Sequence, WorkKind};
+    use super::{
+        host, Bench, Decoder, Demand, Operation, Options, Outcome, Sequence, StateBindings,
+        WorkKind,
+    };
     use magnitude_executor::TokenId;
     use magnitude_family_contracts::Operator;
     use serde_json::{json, Value};
@@ -1886,7 +1930,7 @@ mod qualify {
             .flat_map(|(category, &count)| (0..count).map(move |chunk| Work { category, chunk }))
             .collect();
         let batch = options.batch.min(work.len());
-        let mut bench = Bench::open(
+        let (mut bench, mut bindings) = Bench::open(
             &options.model,
             options.path,
             n_ctx,
@@ -1920,7 +1964,10 @@ mod qualify {
         });
         let mut scores = Vec::with_capacity(work.len());
         for (index, items) in work.chunks(batch).enumerate() {
-            scores.extend(score(&mut bench, &mut bases, items, options.verify_width)?);
+            let (scored, next) =
+                score(&mut bench, bindings, &mut bases, items, options.verify_width)?;
+            bindings = next;
+            scores.extend(scored);
             eprintln!(
                 "scored {} of {} chunks (batch {index})",
                 scores.len(),
@@ -2018,10 +2065,11 @@ mod qualify {
     /// several sequences into each step up to PREFILL_ROWS rows.
     fn prefill(
         bench: &mut Bench,
+        mut bindings: StateBindings,
         sequences: &mut [Sequence],
         tokens: &[Vec<TokenId>],
         first: usize,
-    ) -> Result<(), String> {
+    ) -> Result<StateBindings, String> {
         while sequences.iter().any(|sequence| sequence.position < first) {
             let mut budget = super::PREFILL_ROWS;
             let mut operations = Vec::new();
@@ -2041,9 +2089,9 @@ mod qualify {
                 ));
                 advancing.push(sequence);
             }
-            bench.step(operations, &mut advancing, None)?;
+            bindings = bench.step(bindings, operations, &mut advancing, None)?.2;
         }
-        Ok(())
+        Ok(bindings)
     }
 
     /// Scores `items` together: every chunk's history is prefilled on its own
@@ -2051,18 +2099,19 @@ mod qualify {
     /// and each step's rows are compared against the reference in parallel.
     fn score(
         bench: &mut Bench,
+        mut bindings: StateBindings,
         bases: &mut [(&str, BaseFile)],
         items: &[Work],
         width: usize,
-    ) -> Result<Vec<ChunkScore>, String> {
+    ) -> Result<(Vec<ChunkScore>, StateBindings), String> {
         let (first, evaluated) = (bases[0].1.first(), bases[0].1.evaluated());
         let mut sequences = Vec::with_capacity(items.len());
         let mut tokens = Vec::with_capacity(items.len());
         for item in items {
             tokens.push(bases[item.category].1.chunk_tokens(item.chunk)?);
-            sequences.push(bench.open_sequence()?);
+            sequences.push(bench.open_sequence(&mut bindings)?);
         }
-        prefill(bench, &mut sequences, &tokens, first)?;
+        bindings = prefill(bench, bindings, &mut sequences, &tokens, first)?;
         let mut scores: Vec<ChunkScore> = items
             .iter()
             .map(|_| ChunkScore {
@@ -2082,7 +2131,8 @@ mod qualify {
                 })
                 .collect();
             let mut advancing: Vec<&mut Sequence> = sequences.iter_mut().collect();
-            let (_, outcomes) = bench.step(operations, &mut advancing, None)?;
+            let (_, outcomes, next) = bench.step(bindings, operations, &mut advancing, None)?;
+            bindings = next;
             // (item, scored row, reference log-probabilities, V4 logits)
             let mut pairs = Vec::with_capacity(items.len() * group);
             for (index, outcome) in outcomes.iter().enumerate() {
@@ -2134,6 +2184,6 @@ mod qualify {
         for sequence in sequences {
             bench.close(sequence)?;
         }
-        Ok(scores)
+        Ok((scores, bindings))
     }
 }

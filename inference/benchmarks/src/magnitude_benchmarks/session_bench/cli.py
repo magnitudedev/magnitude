@@ -6,6 +6,7 @@ import json
 import signal
 import sys
 from pathlib import Path
+from typing import get_args
 
 from ..fixtures import bfcl as corpus
 from ..fixtures import prose as prose_source
@@ -15,6 +16,7 @@ from . import models
 from .options import (
     DEFAULT_ENGINE_OPTIONS,
     EngineOptions,
+    KvCacheType,
     LlamaOptions,
     NativeOptions,
     Watchdog,
@@ -114,6 +116,8 @@ def parser() -> argparse.ArgumentParser:
     llama.add_argument("--llama-draft-method", choices=("dflash", "dspark"), default="dflash")
     llama.add_argument("--llama-draft-proposals", type=int, default=3)
     llama.add_argument("--llama-gpu-layers", type=int, default=99)
+    llama.add_argument("--llama-cache-type-k", choices=get_args(KvCacheType), default="f16")
+    llama.add_argument("--llama-cache-type-v", choices=get_args(KvCacheType), default="f16")
     watchdog = execute.add_argument_group("watchdog")
     watchdog.add_argument(
         "--stall-seconds",
@@ -279,6 +283,8 @@ def main(argv=None) -> int:
                     draft_method=args.llama_draft_method,
                     draft_proposals=args.llama_draft_proposals,
                     gpu_layers=args.llama_gpu_layers,
+                    cache_type_k=args.llama_cache_type_k,
+                    cache_type_v=args.llama_cache_type_v,
                 ),
                 watchdog=Watchdog(
                     stall_seconds=args.stall_seconds, request_seconds=args.request_seconds

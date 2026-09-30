@@ -25,20 +25,29 @@ pub struct TargetHostTiming {
 impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Submit one target group with state advances already reserved, or
     /// claim the queued lookahead step it equals. A continuable group queues
-    /// its own lookahead behind it.
+    /// its own lookahead behind it, in the bindings the flight holds until
+    /// `finish_target` returns them.
     pub fn submit_target(
         &mut self,
+        mut bindings: StateBindings<F>,
         operations: &[Operation],
         reservation: TargetGraphReservation,
-    ) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
-        let flight = match reservation {
-            TargetGraphReservation::Claim(slots) => self.claim_lookahead(operations, slots)?,
+    ) -> Result<TargetFlight<F>, SubmitFailure<F>> {
+        let work = match reservation {
+            TargetGraphReservation::Claim(slots) => self
+                .claim_lookahead(&mut bindings, operations, slots)
+                .map_err(SubmitFailure::Failed)?,
             TargetGraphReservation::Launch(reservation) => {
-                self.launch_target(operations, reservation)?
+                match self.launch_target(operations, reservation) {
+                    Ok(work) => work,
+                    Err(failure) => return Err(failure.with(bindings)),
+                }
             }
         };
-        self.queue_lookahead(&flight, operations)?;
-        Ok(flight)
+        // The step is on the device: any failure from here drops it.
+        self.queue_lookahead(&mut bindings, &work, operations)
+            .map_err(SubmitFailure::Failed)?;
+        Ok(TargetFlight { work, bindings })
     }
 
     /// Launch the group's target step, then a primed prompt chunk's drafter
@@ -47,15 +56,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         &mut self,
         operations: &[Operation],
         mut reservation: TargetLaunchReservation,
-    ) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
+    ) -> Result<TargetWork<F>, Unsubmitted> {
         let priming = reservation.priming.take();
-        let flight = match self.launch_target_graph(operations, reservation) {
-            Ok(flight) => flight,
-            Err(error) => {
+        let work = match self.launch_target_graph(operations, reservation) {
+            Ok(work) => work,
+            Err(failure) => {
                 if let (Some(priming), [operation]) = (priming, operations) {
                     self.head.insert(operation.request(), priming.advance.abort());
                 }
-                return Err(error);
+                return Err(failure);
             }
         };
         let Some(PrimingReservation {
@@ -64,7 +73,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             graph_output,
         }) = priming
         else {
-            return Ok(flight);
+            return Ok(work);
         };
         let [Operation::Forward {
             request,
@@ -72,49 +81,53 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ..
         }] = operations
         else {
-            return Err(self.fatal_invariant("a drafter entry was reserved for an unprimed group"));
+            return Err(Unsubmitted::Failed(DomainError::invariant(
+                "a drafter entry was reserved for an unprimed group",
+            )));
         };
         self.launch_priming(
-            flight,
+            work,
             *request,
             prime,
             TentativeAdvance::Accepted(advance),
             graph_workspace,
             graph_output,
         )
+        .map_err(Unsubmitted::Failed)
     }
 
-    /// Draft `prime` behind `flight` (whose lone slot is its prompt chunk),
-    /// conditioned by the flight's feature output on the device.
+    /// Draft `prime` behind `work` (whose lone slot is its prompt chunk),
+    /// conditioned by the step's feature output on the device. `work` is on
+    /// the device, so every error is fatal.
     pub(super) fn launch_priming(
         &mut self,
-        mut flight: TargetFlight<F::TargetSubmission, F::HeadSubmission>,
+        mut work: TargetWork<F>,
         request: RequestId,
         prime: &Priming,
         advance: TentativeAdvance,
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
-    ) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
-        let features = flight
+    ) -> Result<TargetWork<F>, DomainError> {
+        let features = work
             .submission
             .output()
             .readout
             .as_ref()
             .map(|readout| readout.features.clone())
-            .ok_or_else(|| self.fatal_invariant("a primed prompt chunk publishes no features"))?;
+            .ok_or_else(|| DomainError::invariant("a primed prompt chunk publishes no features"))?;
         let store = self
             .head_store
             .clone()
-            .ok_or_else(|| self.fatal_invariant("a drafter entry without a drafter store"))?;
+            .ok_or_else(|| DomainError::invariant("a drafter entry without a drafter store"))?;
         let slot = self
             .block_slot(&prime.tokens, prime.position, &[], &advance, 0)
-            .map_err(|error| self.fatal_invariant(error))?;
+            .map_err(DomainError::invariant)?;
         let batch = crate::batching::ValidatedHeadBatch::from_block_slots(
             &[slot],
             self.definition.decoder.vocabulary as usize,
             self.head_class_limits()?,
         )
-        .map_err(|error| self.fatal_invariant(error.to_string()))?;
+        .map_err(|error| DomainError::invariant(error.to_string()))?;
         // Entry rows every window drops before the first draft skip the
         // windowed layers (see `submit_head`).
         let windowed = super::head::skippable_window(&store).is_none_or(|window| {
@@ -135,33 +148,25 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.head_conditioning_bytes(),
         ) {
             Ok(launch) => launch,
-            Err((_, error)) => {
-                let failure = DomainError::Invariant(error);
-                self.fatal = Some(failure.clone());
-                return Err(failure);
-            }
+            Err((_, error)) => return Err(DomainError::Invariant(error)),
         };
-        let submission = match self.family.submit_head(launch) {
-            Ok(submission) => submission,
-            Err((error, _)) => {
-                let failure = DomainError::from(error);
-                self.fatal = Some(failure.clone());
-                return Err(failure);
-            }
-        };
-        flight.priming = Some(PrimingFlight {
+        let submission = self
+            .family
+            .submit_head(launch)
+            .map_err(|(error, _)| DomainError::from(error))?;
+        work.priming = Some(PrimingFlight {
             request,
             submission,
             continuation: None,
         });
-        Ok(flight)
+        Ok(work)
     }
 
     fn launch_target_graph(
         &mut self,
         operations: &[Operation],
         reservation: TargetLaunchReservation,
-    ) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
+    ) -> Result<TargetWork<F>, Unsubmitted> {
         let TargetLaunchReservation {
             advances,
             graph_workspace,
@@ -174,21 +179,25 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .into_iter()
             .map(TentativeAdvance::Accepted)
             .collect::<Vec<_>>();
-        self.healthy()?;
+        // Reservation checked the group and moved its states into the
+        // advances: a mismatch now is a broken domain invariant.
+        let broken = |detail: String| Unsubmitted::Failed(DomainError::invariant(detail));
+        if operations.len() != advances.len() {
+            return Err(broken(
+                "target reservation advance count differs from operations".into(),
+            ));
+        }
         if operations.is_empty() {
-            return Err("target group is empty".into());
+            return Err(Unsubmitted::Refused("target group is empty".into()));
         }
         let mut seen = BTreeSet::new();
         let mut rows = 0usize;
         let mut demand = crate::batching::Demand::NONE;
         let mut segments = 1usize;
-        if operations.len() != advances.len() {
-            return Err(
-                self.fatal_invariant("target reservation advance count differs from operations")
-            );
-        }
         for (operation, advance) in operations.iter().zip(&advances) {
-            operation.validate().map_err(|error| error.to_string())?;
+            operation
+                .validate()
+                .map_err(|error| broken(error.to_string()))?;
             let Operation::Forward {
                 request,
                 position,
@@ -198,24 +207,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 ..
             } = operation
             else {
-                return Err("target group contains another operation kind".into());
+                return Err(broken("target group contains another operation kind".into()));
             };
             if !seen.insert(*request) {
-                return Err("target group repeats a request".into());
+                return Err(broken("target group repeats a request".into()));
             }
             if advance.position() != *position || advance.rows() != tokens.len() {
-                return Err("target position differs from accepted state".into());
+                return Err(broken("target position differs from accepted state".into()));
             }
             if conditioning.as_ref().is_some_and(|lease| {
                 lease.domain() != self.domain.id() || lease.allocation().rows() != tokens.len()
             }) {
-                return Err(
+                return Err(broken(
                     "target conditioning differs from physical rows or resource domain".into(),
-                );
+                ));
             }
             rows = rows
                 .checked_add(tokens.len())
-                .ok_or("target row count overflow")?;
+                .ok_or_else(|| broken("target row count overflow".into()))?;
             demand |= *next;
             segments = segments.max(reserved_segments(
                 &self.target_store,
@@ -225,7 +234,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let class_limits = self.target_class_limits();
         let class = crate::LaunchClass::covering(rows, segments, demand, class_limits)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| broken(error.to_string()))?;
         let mut metadata = Vec::with_capacity(operations.len());
         for operation in operations {
             let request = operation.request();
@@ -255,7 +264,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.restore_advances(metadata, advances);
-                return Err(error.into());
+                return Err(Unsubmitted::Refused(error.into()));
             }
         };
         let (slots, conditioning_slices): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
@@ -268,11 +277,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Ok(batch) if batch.class() == class => batch,
             Ok(_) => {
                 self.restore_advances(metadata, advances);
-                return Err(self.fatal_invariant("target packed class changed after reservation"));
+                return Err(broken(
+                    "target packed class changed after reservation".into(),
+                ));
             }
             Err(error) => {
                 self.restore_advances(metadata, advances);
-                return Err(error.to_string().into());
+                return Err(Unsubmitted::Refused(error.to_string().into()));
             }
         };
         let conditioning = metadata
@@ -300,9 +311,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Err((inputs, error)) => {
                 let (_, advances, _, _) = inputs.into_parts();
                 self.restore_advances(metadata, advances);
-                let failure = DomainError::Invariant(error);
-                self.fatal = Some(failure.clone());
-                return Err(failure);
+                return Err(Unsubmitted::Failed(DomainError::Invariant(error)));
             }
         };
         let trace_position = std::env::var("MAGNITUDE_TRACE_TARGET_PREFILL_MIN_POSITION")
@@ -357,12 +366,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let (core, _) = launch.into_submission_parts();
                 let (_, advances, _, _) = core.into_parts();
                 self.restore_advances(metadata, advances);
-                let failure = DomainError::from(error);
-                self.fatal = Some(failure.clone());
-                return Err(failure);
+                return Err(Unsubmitted::Failed(error.into()));
             }
         };
-        Ok(TargetFlight {
+        Ok(TargetWork {
             requests: metadata,
             submission,
             priming: None,
@@ -377,21 +384,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Completion exposes immutable outcomes while every owned advance stays
     /// suspended. The caller can stage grammar and method changes from these
-    /// views before choosing physical prefixes.
+    /// views before choosing physical prefixes. Returns the bindings the
+    /// flight held, with the lookahead it queued; an error consumes them, as
+    /// the domain cannot continue.
     pub fn finish_target(
         &mut self,
-        flight: TargetFlight<F::TargetSubmission, F::HeadSubmission>,
-    ) -> Result<Vec<PendingOperationOutcome>, DomainError> {
-        let result = self.finish_target_inner(flight);
-        if let Err(error) = &result {
-            self.fatal = Some(error.clone());
-        }
-        result
+        flight: TargetFlight<F>,
+    ) -> Result<(Vec<PendingOperationOutcome>, StateBindings<F>), DomainError> {
+        let TargetFlight { work, mut bindings } = flight;
+        let pending = self.finish_target_work(&mut bindings, work)?;
+        Ok((pending, bindings))
     }
 
-    fn finish_target_inner(
+    fn finish_target_work(
         &mut self,
-        flight: TargetFlight<F::TargetSubmission, F::HeadSubmission>,
+        bindings: &mut StateBindings<F>,
+        flight: TargetWork<F>,
     ) -> Result<Vec<PendingOperationOutcome>, DomainError> {
         let completed = match flight.submission.finish() {
             Ok(completed) => completed,
@@ -497,7 +505,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.selection_read = Some(Instant::now());
             decode_selected(&bytes)?
         };
-        self.predecessor_selected(flight.id, &selected, finish_started);
+        bindings.predecessor_selected(flight.id, &selected, finish_started);
         let mut physical = vec![RowResult::default(); batch.actual_rows()];
         for (projected_index, &output_index) in output
             .as_ref()

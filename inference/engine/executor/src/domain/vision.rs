@@ -5,13 +5,42 @@ use super::*;
 impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Vision launches are one prepared image each. The physical feature
     /// remains a proposal until `reconcile` installs it in admitted input.
+    /// The flight holds `bindings` until `finish_vision` returns them.
     pub fn submit_vision(
         &mut self,
+        bindings: StateBindings<F>,
         operation: &Operation,
         workspace: NativeGraphWorkspaceLease,
         output: NativeGraphOutputLease,
-    ) -> Result<VisionFlight<F::VisionSubmission>, DomainError> {
-        self.healthy()?;
+    ) -> Result<VisionFlight<F>, SubmitFailure<F>> {
+        let (request, image, batch) = match self.vision_batch(operation) {
+            Ok(checked) => checked,
+            Err(error) => return Err(SubmitFailure::Refused(error, bindings)),
+        };
+        let launch = ValidatedVisionLaunch::new(
+            VisionLaunchInputs::new(batch, workspace, output),
+            self.domain.id(),
+        )
+        .map_err(|(_, error)| SubmitFailure::Failed(DomainError::Invariant(error)))?;
+        let started = Instant::now();
+        let submission = self
+            .family
+            .submit_vision(launch)
+            .map_err(|(error, _)| SubmitFailure::Failed(error.into()))?;
+        Ok(VisionFlight {
+            request,
+            image,
+            submission,
+            started,
+            bindings,
+        })
+    }
+
+    /// The one image `operation` encodes, checked against admitted input.
+    fn vision_batch(
+        &self,
+        operation: &Operation,
+    ) -> Result<(RequestId, ImageRef, crate::batching::ValidatedVisionBatch), DomainError> {
         let Operation::Encode { request, image } = operation else {
             return Err("vision submission requires one Encode operation".into());
         };
@@ -37,49 +66,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             patch_rows,
         )
         .map_err(|error| error.to_string())?;
-        let launch = ValidatedVisionLaunch::new(
-            VisionLaunchInputs::new(batch, workspace, output),
-            self.domain.id(),
-        )
-        .map_err(|(_, error)| {
-            let failure = DomainError::Invariant(error);
-            self.fatal = Some(failure.clone());
-            failure
-        })?;
-        let started = Instant::now();
-        let submission = match self.family.submit_vision(launch) {
-            Ok(submission) => submission,
-            Err((error, _launch)) => {
-                let failure = DomainError::from(error);
-                self.fatal = Some(failure.clone());
-                return Err(failure);
-            }
-        };
-        Ok(VisionFlight {
-            request: *request,
-            image: image.clone(),
-            submission,
-            started,
-        })
+        Ok((*request, image.clone(), batch))
     }
 
+    /// Complete an encode and return the bindings its flight held. An error
+    /// consumes them: the domain cannot continue.
     pub fn finish_vision(
         &mut self,
-        flight: VisionFlight<F::VisionSubmission>,
-    ) -> Result<PendingOperationOutcome, DomainError> {
-        let result = self.finish_vision_inner(flight);
-        if let Err(error) = &result {
-            self.fatal = Some(error.clone());
-        }
-        result
-    }
-
-    fn finish_vision_inner(
-        &mut self,
-        flight: VisionFlight<F::VisionSubmission>,
-    ) -> Result<PendingOperationOutcome, DomainError> {
-        let completed = flight.submission.finish().map_err(DomainError::Device)?;
-        let duration = flight.started.elapsed();
+        flight: VisionFlight<F>,
+    ) -> Result<(PendingOperationOutcome, StateBindings<F>), DomainError> {
+        let VisionFlight {
+            request,
+            image,
+            submission,
+            started,
+            bindings,
+        } = flight;
+        let completed = submission.finish().map_err(DomainError::Device)?;
+        let duration = started.elapsed();
         let (core, output) = completed.into_parts();
         let patch_rows = core.batch().patch_rows();
         let merge = usize::try_from(
@@ -103,8 +107,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .domain
             .publish_graph_features(view)
             .map_err(|error| DomainError::invariant(error.to_string()))?;
-        Ok(PendingOperationOutcome {
-            request: flight.request,
+        let pending = PendingOperationOutcome {
+            request,
             outcome: Outcome::Encode { features },
             advance: None,
             primed: None,
@@ -112,7 +116,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: duration,
-            image: Some(flight.image),
-        })
+            image: Some(image),
+        };
+        Ok((pending, bindings))
     }
 }

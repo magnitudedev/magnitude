@@ -2,6 +2,7 @@
 applies_to:
   - inference/engine/scheduler/**
   - inference/engine/batching/**
+  - inference/engine/src/worker/execution.rs
 ---
 
 # Scheduler
@@ -14,25 +15,84 @@ generations responsive while new prompts make progress.
 
 ```mermaid
 flowchart LR
-    Q[Waiting requests] -->|FIFO admission when memory permits| P[Unfinished prompts]
+    Q[Admitted requests] -->|FIFO residency when capacity permits| P[Unfinished prompts]
     P -->|Bounded compatible prompt chunks| P
     P -->|Prompt ready| D[Ready generations]
     D -->|One step per selected request in a decode round| D
     D -->|Complete| F[Retain reusable prefix / release state]
 ```
 
-Admission reserves room for state growth and execution, not just existing KV.
-While an advance prepares or submits a flight that holds state storage, new
-admissions wait for its physical completion and reconciliation. Admissions
-already queued at that completion are handled before another flight is submitted,
-so bank capacity can grow without waiting for an active generation to finish.
-Status and lifecycle commands remain
+Residency reserves room for state growth and execution, not just existing KV.
+Admission is logical and immediate. A request becomes resident when rounds are
+formed, between flights, so capacity can grow without waiting for an active
+generation to finish. Work that cannot be provisioned is parked on its request,
+which waits alone; the pipeline waits only on its flight. A round starts only
+with publication credit. Status and lifecycle commands remain
 available during the flight.
 Prefix reuse reduces remaining prompt work; reclaimable cached state can make
 room for active requests. The [prefix cache](prefix-cache.md) defines what is
 cached, when a request resumes from it, and how residency is regained. Output-blocked requests are ineligible until ready
 again. Cancellation removes future work, with resource release after in-flight
 execution completes.
+
+## Execution thread
+
+One thread owns execution. Each piece has one job:
+
+| Piece | Owns | Does not own |
+|---|---|---|
+| Worker | Thread confinement, mailbox, replies, sleeping | Any scheduling, storage or lifecycle decision |
+| Execution lifecycle | Serving, Draining or Stopped, and the typed stop cause | What runs |
+| Owner | The one schedule: request states, rounds, the pipeline | Physical holds |
+| Executor and state stores | The binding right, flights, the lookahead, slabs, rows, banks ([state transactions](state-transactions.md)) | When requests become resident |
+
+**The worker is an event pump.** Its events are a flight's completion, a publication wake, and a
+request's cancellation (by its host, or by a dropped admission reply). It applies events and
+controls in arrival order, runs every possible owner transition, then sleeps until the next event
+or the next memory observation. A control executes at once; nothing is deferred or refused for
+"not now". A completion exists only for a flight in the air. There is no periodic re-drive.
+
+**Lifecycle.** Close and memory escalation (persistent Reclaim) move Serving to Draining: every
+live request terminates with the cause, the pipeline finishes its flight, and execution stops once
+the pipeline is Idle. A device or engine fault stops at once with its classified error; a panic in
+the owner stops with an internal cause. The stop cause closes the mailbox, fails every pending
+control, and is the one stop signal the host reads.
+
+**Pipeline.** Idle, between flights and holding the binding right; or InFlight, one group on the
+device whose flight holds the binding right until completion returns it. In Idle the owner selects
+a round and submits its groups in order. Completion reconciles the group, queues its follow-up
+operations in the round and continues it; an exhausted round returns to Idle. The pipeline waits
+on nothing but its flight: one request's shortage or one slow consumer never stops the others.
+
+**Request states.** A request has one state in one place: the owner's table, or the current round
+while its work is in it; in Idle every request is in the table. Outside a round a request awaits a
+peer's prefix, is non-resident, ready, awaiting credit, pending (image encodes or drafter work to
+submit before a round), or parked (a started round whose next operation couldn't be provisioned,
+submitted unchanged when selected). Non-resident, pending and parked work may carry a wait:
+capacity at an availability epoch, or memory. A started round is a value that owns its generation.
+
+| State | Ended by |
+|---|---|
+| In the pipeline's round | Its flight's completion |
+| Awaiting credit | A publication wake |
+| Memory wait | An observation that returns Normal |
+| Capacity wait | The availability epoch advancing |
+| Awaiting a prefix | Its peer caching the prefix, or no longer computing it |
+
+Provisioning a group first applies the [release order](memory.md#release-order). If the group
+still doesn't fit, each of its requests leaves the round with its operations, parked or pending,
+with a capacity wait at the current epoch, or a memory wait in Blind or Reclaim.
+
+**The availability epoch advances exactly when capacity is freed:** a reconciled completion, a
+request ending or being evicted, a release or shrink, memory returning to Normal, or memory freed
+elsewhere covering a recorded deficit. Rounds finishing, admissions and prefix releases free
+nothing and don't advance it.
+
+**Capacity rule.** In Idle, when memory is Normal and no request awaits host credit or memory or
+has finished with state still to release, nothing can advance the epoch. Every capacity wait then
+ends in its typed capacity error. That also ends any prefix wait on those requests, and the waiter
+proceeds on its own. Every chain of waits therefore ends in a flight, the host, a memory
+observation, or a typed outcome.
 
 ## Choosing what runs next
 
@@ -165,3 +225,17 @@ Qualify all four combinations of single/multiple sessions and plain/speculative
 composition, plus transitions between session counts. Each must preserve the
 efficient execution behavior specified in the
 [performance contract](speculative-generation.md#performance-contract).
+
+## Acceptance criteria
+
+- A request admitted while a flight or its lookahead holds state is admitted immediately and
+  becomes resident in a later round, with no worker spin.
+- With no events, the worker runs the owner once per memory observation interval.
+- A request short of capacity parks only its own work; peers keep running, and the parked work is
+  submitted unchanged once capacity is freed.
+- When every live request is short, each takes its typed capacity error; a request awaiting a
+  short peer's prefix proceeds on its own.
+- A slow consumer stops only its own request, before it starts a round.
+- Memory waits in Blind or Reclaim end on the return to Normal.
+- Close or memory escalation during a flight lets the flight finish, then stops; every live
+  request and pending control receives the stop cause.

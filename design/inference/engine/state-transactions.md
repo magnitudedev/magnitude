@@ -93,12 +93,27 @@ indices, and stores the resulting logical state in one owned
 `PreparedGenerationTransition`. The executor receives only its `ReconcileDecision`. Applying
 the transition after physical reconciliation has no recoverable errors. A cancelled or failed
 physical reconciliation drops the staged method and grammar without changing the live request.
+A started round is a value that owns its generation until its reconciled transition commits;
+eviction and cancellation consume it and return the rewound or terminal generation.
+
+**Binding right.** Each store has exactly one right to change its slab bindings: adding slabs,
+moving rows and banks, and releasing slabs. The executor holds the stores' rights together with
+the lookahead as one binding right (`StateBindings`). Growth, provisioning, residency, shrink,
+compaction and tail relocation require it; row and bank claims (advances, checkpoints, forks, and
+dropping claims) do not. Submitting a group moves the binding right into its flight and physical
+completion returns it, so no binding changes while a flight is in the air; releases that need a
+binding change run at completion. The lookahead, the step queued behind the last flight with its
+drafter priming, is the only work that holds state between flights and lives in the binding
+right. An operation that actually changes bindings first resolves it: a matching submission claims
+it and anything else orphans it. Opening a request into free rows and banks changes no bindings
+and leaves the lookahead running. Growth has no blocked outcome: it succeeds or returns a memory
+deficit.
 
 An interior accepted prefix with recurrent state requires numerical repair before the successor
 can be published or checkpointed. State compaction, copying, and codec conversion follow the same
-submit, complete, finish, reconcile lifecycle. Compaction runs only while the store has no
-transaction, moves rows and banks into free space of slabs already held after submitted writes
-complete, and publishes the rewritten histories and bank placement only after every copy succeeds.
+submit, complete, finish, reconcile lifecycle. Compaction requires the binding right, so it runs
+only between flights after the lookahead is resolved. It moves rows and banks into free space of
+slabs already held after submitted writes complete, and publishes the rewritten histories and bank placement only after every copy succeeds.
 It merges a domain's spans before that domain's span bound is exceeded and empties the least
 occupied slabs of every domain under pressure. Accepted state keeps its logical identity throughout. Cancellation, submission failure,
 device failure and teardown release reservations through ownership.
@@ -137,3 +152,8 @@ Commit publishes the destination position and history only after the state progr
 - Full, partial, and zero acceptance reconcile each transaction exactly once.
 - A recurrent interior prefix is not visible until its repair work completes.
 - An accepted/resident checkpoint is created only after reconciliation.
+- Exactly one binding right exists; every binding change holds it, and no binding change is
+  possible while a flight holds it.
+- A binding change with a queued lookahead claims or orphans it first; opening a request into free
+  rows and banks leaves the lookahead running.
+- Growth succeeds or returns a memory deficit; it never silently does nothing.

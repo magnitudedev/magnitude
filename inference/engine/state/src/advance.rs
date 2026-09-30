@@ -744,7 +744,7 @@ struct Predecessor<'a> {
 /// writes only its own rows and bank; its source state is the predecessor's
 /// committed state, joined by [`OwnedSuccessorAdvance::attach`] once the
 /// predecessor committed every row. Dropping it releases its rows and bank.
-/// It holds a transaction, so slab placement cannot change under it.
+/// Its captured bindings pin slab placement until it drops.
 pub struct OwnedSuccessorAdvance {
     store: Rc<StateStore>,
     position: usize,
@@ -995,7 +995,7 @@ mod tests {
     use super::*;
     use crate::{
         BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, HistoryDomainLayout,
-        HistoryDomainPlan, LayerRef, StateStore,
+        HistoryDomainPlan, LayerRef, StateStore, StoreBindings,
     };
     use seismic::{BackendName, DType, Device, DeviceCatalog};
 
@@ -1009,7 +1009,7 @@ mod tests {
         components: Vec<ComponentDescriptor>,
         specs: Vec<ComponentSpec>,
         banks: BankCapacity,
-    ) -> Result<Rc<StateStore>, Error> {
+    ) -> Result<StoreBindings, Error> {
         StateStore::new(
             device,
             context,
@@ -1021,6 +1021,7 @@ mod tests {
             specs,
             banks,
         )
+        .map(|(_, bindings)| bindings)
     }
 
     #[test]
@@ -1271,7 +1272,7 @@ mod tests {
         assert_eq!(destination_store.occupied_rows(TOKEN), 2);
     }
 
-    fn recurrent_store(context: usize, in_flight: usize) -> Option<Rc<StateStore>> {
+    fn recurrent_store(context: usize, in_flight: usize) -> Option<StoreBindings> {
         let device = DeviceCatalog::discover()
             .ok()
             .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())?;
@@ -1380,7 +1381,7 @@ mod tests {
     /// publishes when every row is accepted, and attaches only to it.
     #[test]
     fn successors_follow_the_tape_version_of_a_speculative_advance() {
-        let Some(store) = recurrent_store(8, 3) else {
+        let Some(mut store) = recurrent_store(8, 3) else {
             return;
         };
         let first = OwnedStateAdvance::begin_speculative(store.create().unwrap(), 3, 1)

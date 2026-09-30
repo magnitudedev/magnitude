@@ -56,6 +56,10 @@ class NativeOptions(Record):
         return args
 
 
+# llama.cpp KV cache element types.
+KvCacheType = Literal["f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"]
+
+
 class LlamaOptions(Record):
     """Upstream llama-server selection recorded with each benchmark run."""
 
@@ -64,6 +68,8 @@ class LlamaOptions(Record):
     draft_method: Literal["dflash", "dspark"] = "dflash"
     draft_proposals: int = Field(default=3, gt=0)
     gpu_layers: int = Field(default=99, ge=0)
+    cache_type_k: KvCacheType = "f16"
+    cache_type_v: KvCacheType = "f16"
 
     def arguments(self) -> list[str]:
         args = []
@@ -74,6 +80,8 @@ class LlamaOptions(Record):
             args += ["--llama-draft-method", self.draft_method]
             args += ["--llama-draft-proposals", str(self.draft_proposals)]
         args += ["--llama-gpu-layers", str(self.gpu_layers)]
+        args += ["--llama-cache-type-k", self.cache_type_k]
+        args += ["--llama-cache-type-v", self.cache_type_v]
         return args
 
 

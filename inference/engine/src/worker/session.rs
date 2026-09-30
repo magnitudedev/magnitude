@@ -7,7 +7,6 @@
 //! publications while the host holds credit for them.
 
 use super::binding::GenerationBinding;
-use super::execution::UnloadNotice;
 use super::protocol::{
     Admission, DomainHeadroom, ExecutionTimings, HostMessage, HostRequestId, MemoryObservation,
     RequestProgress, RequestState, RetentionPolicy, WorkerMessage,
@@ -23,7 +22,7 @@ use magnitude_scheduler::{
     owner::Status,
     protocol::{AdmitRequest, RequestSnapshot, WorkerCommand, WorkerReply},
     publication::{Publication, PublicationReceiver},
-    worker::{Call, Client, Worker},
+    worker::{Call, CallError, Client, DispatchError, Worker},
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -41,7 +40,7 @@ enum Inbound {
 }
 
 /// The session's single wake source: inbound messages, execution replies,
-/// publication readiness and unload notices all land here.
+/// publication readiness and the execution stopping all land here.
 #[derive(Default)]
 pub(crate) struct Signal {
     state: Mutex<SignalState>,
@@ -60,7 +59,7 @@ impl Signal {
         self.changed.notify_one();
     }
 
-    pub fn notify(&self) {
+    fn notify(&self) {
         self.state.lock().unwrap().woken = true;
         self.changed.notify_one();
     }
@@ -109,7 +108,7 @@ pub(crate) fn spawn_reader(
 
 struct PendingAdmission {
     id: HostRequestId,
-    call: Call,
+    call: Call<UnloadCause>,
     output_capacity: usize,
     stop: bool,
     cancelled: bool,
@@ -123,13 +122,12 @@ struct Stream {
 
 /// What readiness fixed about the loaded model that the session needs.
 pub(crate) struct Loaded {
-    pub execution: Worker,
+    pub execution: Worker<UnloadCause>,
     pub binding: GenerationBinding,
     pub definition: ModelDefinition,
     /// Bytes of the model's host-resident tables held in host RAM.
     pub host_table_bytes: u64,
     pub domain: MemoryDomain,
-    pub notice: Arc<UnloadNotice>,
 }
 
 pub(crate) struct Session {
@@ -137,12 +135,12 @@ pub(crate) struct Session {
     signal: Arc<Signal>,
     waker: Waker,
     loaded: Loaded,
-    client: Client,
+    client: Client<UnloadCause>,
     admissions: Vec<PendingAdmission>,
     streams: BTreeMap<HostRequestId, Stream>,
-    stops: Vec<Call>,
-    statuses: Vec<(HostRequestId, Call)>,
-    observations: Vec<Call>,
+    stops: Vec<Call<UnloadCause>>,
+    statuses: Vec<(HostRequestId, Call<UnloadCause>)>,
+    observations: Vec<Call<UnloadCause>>,
     /// The model stopped serving; the session ends once every open request
     /// has delivered its terminal outcome.
     unloading: Option<UnloadCause>,
@@ -157,6 +155,9 @@ impl Session {
     pub fn new(outbound: Outbound, signal: Arc<Signal>, loaded: Loaded) -> Self {
         let waker = Waker::from(signal.clone());
         let client = loaded.execution.client();
+        // Watch for execution stopping from the start: the session sleeps
+        // until a signal arrives.
+        let unloading = client.poll_stopped(&waker);
         Self {
             outbound,
             signal,
@@ -168,7 +169,7 @@ impl Session {
             stops: Vec::new(),
             statuses: Vec::new(),
             observations: Vec::new(),
-            unloading: None,
+            unloading,
         }
     }
 
@@ -213,16 +214,11 @@ impl Session {
         exit
     }
 
-    fn dispatch(&self, command: WorkerCommand) -> Result<Call, String> {
+    fn dispatch(
+        &self,
+        command: WorkerCommand,
+    ) -> Result<Call<UnloadCause>, DispatchError<UnloadCause>> {
         self.client.dispatch(command)
-    }
-
-    /// The cause a failed execution command reports.
-    fn unload_cause(&self, reason: String) -> UnloadCause {
-        self.loaded
-            .notice
-            .cause()
-            .unwrap_or(UnloadCause::Internal { reason })
     }
 
     fn handle(&mut self, message: HostMessage) -> Result<Flow, TransportError> {
@@ -253,7 +249,7 @@ impl Session {
                         request: stream.request,
                     }) {
                         Ok(call) => self.stops.push(call),
-                        Err(reason) => self.fail_stream(request_id, reason)?,
+                        Err(error) => self.fail_stream(request_id, error)?,
                     }
                 }
             }
@@ -309,11 +305,9 @@ impl Session {
                     stop: false,
                     cancelled: false,
                 }),
-                Err(reason) => self.send(WorkerMessage::AdmissionRefused {
+                Err(error) => self.send(WorkerMessage::AdmissionRefused {
                     request_id: id,
-                    error: RequestError::ModelUnloaded {
-                        cause: self.unload_cause(reason),
-                    },
+                    error: undispatched(error),
                 })?,
             },
             Err(error) => self.send(WorkerMessage::AdmissionRefused {
@@ -372,29 +366,31 @@ impl Session {
         ))
     }
 
-    fn fail_stream(&mut self, id: HostRequestId, reason: String) -> Result<(), TransportError> {
+    fn fail_stream(
+        &mut self,
+        id: HostRequestId,
+        error: DispatchError<UnloadCause>,
+    ) -> Result<(), TransportError> {
         if self.streams.remove(&id).is_some() {
-            let cause = self.unload_cause(reason);
             self.send(WorkerMessage::Failed {
                 request_id: id,
-                error: RequestError::ModelUnloaded { cause },
+                error: undispatched(error),
             })?;
         }
         Ok(())
     }
 
-    fn poll_call(waker: &Waker, call: &mut Call) -> Poll<Result<WorkerReply, String>> {
+    fn poll_call(
+        waker: &Waker,
+        call: &mut Call<UnloadCause>,
+    ) -> Poll<Result<WorkerReply, CallError<UnloadCause>>> {
         Pin::new(call).poll(&mut Context::from_waker(waker))
     }
 
     /// Advance every pending reply and every stream holding credit.
     fn progress(&mut self) -> Result<Flow, TransportError> {
         if self.unloading.is_none() {
-            if let Some(cause) = self.loaded.notice.cause() {
-                self.unloading = Some(cause);
-            } else if let Some(reason) = self.client.closed_reason() {
-                self.unloading = Some(UnloadCause::Internal { reason });
-            }
+            self.unloading = self.client.poll_stopped(&self.waker);
         }
         let waker = self.waker.clone();
         let mut index = 0;
@@ -462,10 +458,16 @@ impl Session {
                         })))
                     }
                 },
-                // Nothing is resident: the unload notice ends the session.
-                Ok(_) => {}
-                Err(reason) => self.send(WorkerMessage::Observed {
+                Ok(_) => self.send(WorkerMessage::Observed {
+                    observation: Err(RequestError::internal(
+                        "execution owner returned an invalid observation reply",
+                    )),
+                })?,
+                Err(CallError::Refused(reason)) => self.send(WorkerMessage::Observed {
                     observation: Err(RequestError::MemoryObservationUnavailable { reason }),
+                })?,
+                Err(CallError::Stopped(cause)) => self.send(WorkerMessage::Observed {
+                    observation: Err(RequestError::ModelUnloaded { cause }),
                 })?,
             }
         }
@@ -485,7 +487,7 @@ impl Session {
     fn admitted(
         &mut self,
         pending: PendingAdmission,
-        reply: Result<WorkerReply, String>,
+        reply: Result<WorkerReply, CallError<UnloadCause>>,
     ) -> Result<(), TransportError> {
         let refused = |error| WorkerMessage::AdmissionRefused {
             request_id: pending.id,
@@ -511,7 +513,7 @@ impl Session {
                 if pending.stop {
                     match self.dispatch(WorkerCommand::Stop { request }) {
                         Ok(call) => self.stops.push(call),
-                        Err(reason) => self.fail_stream(pending.id, reason)?,
+                        Err(error) => self.fail_stream(pending.id, error)?,
                     }
                 }
                 Ok(())
@@ -520,8 +522,8 @@ impl Session {
             Ok(_) => self.send(refused(RequestError::internal(
                 "execution owner returned an invalid admission reply",
             ))),
-            Err(reason) => {
-                let cause = self.unload_cause(reason);
+            Err(CallError::Refused(reason)) => self.send(refused(RequestError::internal(reason))),
+            Err(CallError::Stopped(cause)) => {
                 self.send(refused(RequestError::ModelUnloaded { cause }))
             }
         }
@@ -593,6 +595,14 @@ impl Session {
             outbound.send(message)?;
         }
         Ok(())
+    }
+}
+
+/// Why a command the session could not dispatch fails its request.
+fn undispatched(error: DispatchError<UnloadCause>) -> RequestError {
+    match error {
+        DispatchError::Stopped(cause) => RequestError::ModelUnloaded { cause },
+        DispatchError::Full => RequestError::Overloaded,
     }
 }
 

@@ -23,12 +23,9 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
-    ExecutionPath, Outcome, RequestId,
+    ExecutionPath, Outcome, RequestId, ReservedResources,
 };
-use magnitude_scheduler::{
-    domain::{self as service_domain, DomainFlight},
-    ServiceLimits,
-};
+use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
 use seismic::BackendName;
 use sha2::{Digest, Sha256};
@@ -145,26 +142,31 @@ fn main() -> Result<(), String> {
     }
 
     let started = Instant::now();
-    let (mut domain, _) = build_native_domain(&resolved.manifest, host.shared_package())
-        .map_err(|error| error.to_string())?;
+    let (mut domain, mut bindings, _) =
+        build_native_domain(&resolved.manifest, host.shared_package())
+            .map_err(|error| error.to_string())?;
     println!("backend={:?} load={:.1}s", domain.execution_backend(), started.elapsed().as_secs_f64());
 
     let request = RequestId(1);
     domain.install_input(request, input)?;
     let operations = domain
-        .open_state(request, None)
+        .open_state(&mut bindings, request, None)
         .map_err(|error| error.to_string())?;
-    let groups = service_domain::group(&domain, operations);
-    let [group] = groups.as_slice() else {
-        return Err("one image forms one encode group".into());
+    let [operation] = operations.as_slice() else {
+        return Err("one image forms one encode".into());
     };
     let started = Instant::now();
-    let DomainFlight::Vision(flight) =
-        service_domain::submit_group(&mut domain, group).map_err(|error| error.to_string())?
+    let ReservedResources::Vision(workspace, output) = domain
+        .reserve(&mut bindings, &operations)
+        .map_err(|error| error.to_string())?
+        .into_resources()
     else {
         return Err("an encode runs on the vision lane".into());
     };
-    let pending = domain
+    let flight = domain
+        .submit_vision(bindings, operation, workspace, output)
+        .map_err(|failure| failure.error().to_string())?;
+    let (pending, _) = domain
         .finish_vision(flight)
         .map_err(|error| error.to_string())?;
     let encode = started.elapsed().as_secs_f64();

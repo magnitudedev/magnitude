@@ -1109,13 +1109,11 @@ struct HistorySlabs {
 /// arena.
 type HistoryKey = (usize, u64);
 
-/// Counts transactions that captured this store's tensors and write them
-/// later (advances, compactions, conversions). The backing may be
-/// changed only while none exists; a captured binding has a fixed slab
-/// placement for its submission.
+/// The history and bank claims that transactions (advances, relocations,
+/// conversions) hold on this store's rows and banks: shared ownership, not a
+/// right to change slab bindings ([`StoreBindings`]).
 #[derive(Default)]
 struct TransactionClaims {
-    active: usize,
     histories: BTreeMap<HistoryKey, usize>,
     banks: BTreeMap<LogicalId, usize>,
 }
@@ -1131,15 +1129,11 @@ struct Transaction {
 
 impl Transactions {
     fn begin(&self) -> Transaction {
-        self.0.borrow_mut().active += 1;
         Transaction {
             claims: self.0.clone(),
             histories: Vec::new(),
             banks: Vec::new(),
         }
-    }
-    fn idle(&self) -> bool {
-        self.0.borrow().active == 0
     }
 }
 
@@ -1165,7 +1159,6 @@ impl Transaction {
 impl Drop for Transaction {
     fn drop(&mut self) {
         let mut tracked = self.claims.borrow_mut();
-        tracked.active -= 1;
         for id in &self.histories {
             let count = tracked
                 .histories
@@ -1316,7 +1309,7 @@ struct ShrinkPlan {
 ///
 /// Each domain's reserved rows and the bank capacity are reservations
 /// sealed into graphs. Backing slabs are added as demand grows and released
-/// when empty ([`StateStore::provision`], [`StateStore::shrink_with`]).
+/// when empty, only through the store's [`StoreBindings`].
 pub struct StateStore {
     device: Rc<Device>,
     context_capacity: usize,
@@ -1342,7 +1335,7 @@ pub struct StateStore {
     compactions: Cell<Compactions>,
 }
 
-/// How [`StateStore::shrink_with`] releases slab backing. Idle releases empty
+/// How [`StoreBindings::shrink_with`] releases slab backing. Idle releases empty
 /// slabs beyond one spare per store. Reclaim also compacts occupied slabs and
 /// releases every slab it can empty.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1367,6 +1360,62 @@ pub struct Compactions {
 pub struct RowDemand {
     pub domain: HistoryDomainId,
     pub rows: usize,
+}
+
+/// The one right to change a store's slab bindings: adding slabs, moving
+/// rows and banks, and releasing slabs. [`StateStore::new`] hands out exactly
+/// one; it is never cloned. Row and bank claims (advances, relocations,
+/// checkpoints) need no binding right.
+pub struct StoreBindings {
+    store: Rc<StateStore>,
+}
+
+impl std::ops::Deref for StoreBindings {
+    type Target = Rc<StateStore>;
+    fn deref(&self) -> &Rc<StateStore> {
+        &self.store
+    }
+}
+
+impl StoreBindings {
+    /// Add backing slabs so the free rows hold `demands` and `banks` banks
+    /// are free. A refused allocation returns a capacity error without
+    /// publishing tentative backing or changing accepted state.
+    pub fn provision(&mut self, demands: &[RowDemand], banks: usize) -> Result<(), Error> {
+        self.store
+            .provision_with_growth(demands, banks, GrowthChoice::Preferred)
+    }
+
+    pub fn provision_with_growth(
+        &mut self,
+        demands: &[RowDemand],
+        banks: usize,
+        choice: GrowthChoice,
+    ) -> Result<(), Error> {
+        self.store.provision_with_growth(demands, banks, choice)
+    }
+
+    /// Release empty history and bank slabs, retaining one spare of each at
+    /// idle. Reclaim first moves referenced rows and claimed banks from
+    /// sparse slabs into free slots of the retained ones through `copy`.
+    /// Returns the physical bytes released, measured by the device ledger.
+    pub fn shrink_with<E, F>(&mut self, policy: ShrinkPolicy, copy: F) -> Result<u64, E>
+    where
+        E: From<Error>,
+        F: FnMut(&SlabTensor, StoreCopy) -> Result<(), E>,
+    {
+        self.store.shrink_with(policy, copy)
+    }
+
+    /// Drop every slab once no sequence or checkpoint owns the store.
+    pub fn release_idle(&mut self) -> Result<usize, Error> {
+        self.store.release_idle()
+    }
+
+    #[cfg(test)]
+    fn shrink(&mut self, policy: ShrinkPolicy) -> Result<u64, Error> {
+        self.store.shrink_on_host(policy)
+    }
 }
 
 /// Additional Seismic charge for fixed slab additions during state growth.
@@ -1403,7 +1452,8 @@ impl StateStore {
     /// A store of the given history domains and recurrent bank components.
     /// Every domain's reserved rows cover its row limit: the context for
     /// Token, `n` plus one advance of at most `max_advance` rows for
-    /// Window(n). Each stored domain starts with one backed slab.
+    /// Window(n). Each stored domain starts with one backed slab. The store's
+    /// one [`StoreBindings`] comes with it.
     pub fn new(
         device: Rc<Device>,
         context_capacity: usize,
@@ -1411,7 +1461,7 @@ impl StateStore {
         domains: Vec<HistoryDomainPlan>,
         component_specs: Vec<ComponentSpec>,
         bank_capacity: BankCapacity,
-    ) -> Result<Rc<Self>, Error> {
+    ) -> Result<(Rc<Self>, StoreBindings), Error> {
         if context_capacity == 0 {
             return Err(Error::Request(
                 "history capacity must fit a positive sequence context".into(),
@@ -1487,7 +1537,7 @@ impl StateStore {
                 ))),
             });
         }
-        Ok(Rc::new(Self {
+        let store = Rc::new(Self {
             device,
             context_capacity,
             domains,
@@ -1510,7 +1560,11 @@ impl StateStore {
             sequences: Cell::new(0),
             transactions: Transactions(Rc::new(RefCell::new(TransactionClaims::default()))),
             compactions: Cell::new(Compactions::default()),
-        }))
+        });
+        Ok((
+            store.clone(),
+            StoreBindings { store },
+        ))
     }
     pub fn component_specs(&self) -> &[ComponentSpec] {
         &self.component_specs
@@ -1878,19 +1932,6 @@ impl StateStore {
             .any(|history| history.rows != 0)
     }
 
-    /// Slab bindings cannot change while an accepted advance holds them.
-    pub fn growth_unblocked(&self) -> bool {
-        self.transactions.idle()
-    }
-
-    /// Add backing slabs for a launch before any transaction begins.
-    /// A refused allocation returns a capacity
-    /// error without publishing tentative backing or changing accepted state.
-    /// Nothing changes while a transaction holds this store's tensors.
-    pub fn provision(&self, demands: &[RowDemand], banks: usize) -> Result<(), Error> {
-        self.provision_with_growth(demands, banks, GrowthChoice::Preferred)
-    }
-
     /// A read-only claim for the slabs a launch must add. Minimum and
     /// preferred are equal while growth follows exact slab demand.
     pub fn growth_claim(
@@ -1910,9 +1951,6 @@ impl StateStore {
         banks: usize,
         choice: GrowthChoice,
     ) -> Result<u64, Error> {
-        if !self.transactions.idle() {
-            return Ok(0);
-        }
         let plans = self.history_growth_plans(demands, choice)?;
         let backing = self.backing.borrow();
         let bank_slabs = self.bank_growth_slabs(banks)?;
@@ -1938,15 +1976,12 @@ impl StateStore {
             .ok_or_else(|| Error::Request("state slab claim overflows".into()))
     }
 
-    pub fn provision_with_growth(
+    fn provision_with_growth(
         &self,
         demands: &[RowDemand],
         banks: usize,
         choice: GrowthChoice,
     ) -> Result<(), Error> {
-        if !self.transactions.idle() {
-            return Ok(());
-        }
         let bank_slabs = self.bank_growth_slabs(banks)?;
         let plans = self.history_growth_plans(demands, choice)?;
         // Growth of every domain and the banks is one fallible operation.
@@ -2062,16 +2097,12 @@ impl StateStore {
     /// idle. Reclaim also moves referenced rows and claimed banks from sparse
     /// slabs into free slots of the retained slabs before releasing them.
     /// Returns the physical bytes released, measured by the device ledger:
-    /// an earlier backing a caller still views stays charged. Nothing changes
-    /// while a transaction exists.
-    pub fn shrink_with<E, F>(self: &Rc<Self>, policy: ShrinkPolicy, mut copy: F) -> Result<u64, E>
+    /// an earlier backing a caller still views stays charged.
+    fn shrink_with<E, F>(self: &Rc<Self>, policy: ShrinkPolicy, mut copy: F) -> Result<u64, E>
     where
         E: From<Error>,
         F: FnMut(&SlabTensor, StoreCopy) -> Result<(), E>,
     {
-        if !self.transactions.idle() {
-            return Ok(0);
-        }
         let before = self.device.memory_usage().charged;
         let backing = self.backing.borrow();
         // Each stored domain plans against its own published arena.
@@ -2272,7 +2303,7 @@ impl StateStore {
     }
 
     #[cfg(test)]
-    fn shrink(self: &Rc<Self>, policy: ShrinkPolicy) -> Result<u64, Error> {
+    fn shrink_on_host(self: &Rc<Self>, policy: ShrinkPolicy) -> Result<u64, Error> {
         self.shrink_with(policy, |slabs, plan| {
             for copy in plan.copies() {
                 for (&from, &to) in copy.from.iter().zip(&copy.to) {
@@ -2515,8 +2546,8 @@ impl StateStore {
     }
     /// Drop the store's arena allocations when no sequence/checkpoint owns them.
     /// External completion/buffer pins may still retain physical storage.
-    pub fn release_idle(&self) -> Result<usize, Error> {
-        if !self.idle() || !self.transactions.idle() {
+    fn release_idle(&self) -> Result<usize, Error> {
+        if !self.idle() {
             return Ok(0);
         }
         let before = self.device.memory_usage().charged;
@@ -2569,8 +2600,7 @@ impl StateStore {
     /// Reserve `count` rows in every stored domain, in logical order, each
     /// following that domain's `histories` claim (none for rows of a new
     /// history; see [`Arena`] for placement). One domain's refusal releases
-    /// the rows already reserved in the others. Provisioning may add slabs,
-    /// so each history's end is read when claiming.
+    /// the rows already reserved in the others. Reserving never adds slabs.
     fn reserve(&self, histories: Option<&[Claims]>, count: usize) -> Result<Vec<Claims>, Error> {
         self.reserve_rows(histories, &vec![count; self.domains.len()])
     }
@@ -2607,20 +2637,6 @@ impl StateStore {
                     .into(),
             ));
         }
-        let demands = self
-            .history_domains()
-            .zip(&ends)
-            .zip(counts)
-            .map(|((domain, &end), &count)| RowDemand {
-                domain,
-                rows: self.page_demand(domain, end, count),
-            })
-            .collect::<Vec<_>>();
-        if self.domains.iter().zip(&demands).any(|(domain, demand)| {
-            domain.arena.borrow().free_pages().len() < demand.rows.div_ceil(domain.page_rows)
-        }) {
-            self.provision(&demands, 0)?;
-        }
         let mut reserved = Vec::with_capacity(self.domains.len());
         for ((domain, &count), &after) in self.domains.iter().zip(counts).zip(&ends) {
             let mut arena = domain.arena.borrow_mut();
@@ -2638,12 +2654,9 @@ impl StateStore {
         Ok(reserved)
     }
 
-    /// A free successor bank, committing more banks first when none is free
-    /// and no transaction holds this store's tensors.
+    /// A free successor bank. Claims never grow the store: its binding
+    /// right's owner provisions banks first.
     fn successor_bank(&self) -> Result<BankHandle, Error> {
-        if self.banks.available() == 0 {
-            self.provision(&[], 1)?;
-        }
         self.banks.acquire()
     }
 
@@ -3073,7 +3086,7 @@ mod tests {
         components: Vec<ComponentDescriptor>,
         specs: Vec<ComponentSpec>,
         banks: BankCapacity,
-    ) -> Result<Rc<StateStore>, Error> {
+    ) -> Result<StoreBindings, Error> {
         let domains = if components.is_empty() {
             vec![]
         } else {
@@ -3082,7 +3095,7 @@ mod tests {
                 logical_rows: rows,
             }]
         };
-        StateStore::new(device, context, context, domains, specs, banks)
+        StateStore::new(device, context, context, domains, specs, banks).map(|(_, bindings)| bindings)
     }
 
     impl StateStore {
@@ -3235,7 +3248,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             8192,
             8192,
@@ -3296,7 +3309,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             8192,
             8192,
@@ -3363,7 +3376,7 @@ mod tests {
     }
 
     fn reclaim_compacts_partial_final_history_and_bank_slabs_on(device: Rc<Device>) {
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             5000,
             5000,
@@ -3448,7 +3461,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             8192,
             8192,
@@ -3505,7 +3518,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             8192,
             8192,
@@ -3549,7 +3562,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             4096,
             4096,
@@ -3688,7 +3701,7 @@ mod tests {
             // under a noisy test host. Never substitute an accelerator here.
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device,
             4,
             8,
@@ -4160,7 +4173,7 @@ mod tests {
             return;
         };
         // Three branches, each in a page of its own.
-        let store = token_store(
+        let mut store = token_store(
             device,
             16,
             3 * 256,
@@ -4298,7 +4311,7 @@ mod tests {
     /// A store of 1,024 rows (four 256-row pages) of one dense row for a
     /// 1,024-row context, every page backed.
     fn paged_store(device: Rc<Device>) -> Rc<StateStore> {
-        let store = token_store(
+        let mut store = token_store(
             device,
             1024,
             1024,
@@ -4321,7 +4334,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        store
+        Rc::clone(&store)
     }
 
     fn advance_all(state: SequenceState, rows: usize) -> SequenceState {
@@ -4724,7 +4737,7 @@ mod tests {
         const CONTEXT: usize = 512;
         const BATCH_ROWS: usize = 64;
         let device = cpu_device().expect("the CPU backend is available");
-        let store = token_store(
+        let mut bindings = token_store(
             device,
             CONTEXT,
             contexts * CONTEXT + BATCH_ROWS,
@@ -4737,6 +4750,7 @@ mod tests {
             },
         )
         .unwrap();
+        let store = Rc::clone(&bindings);
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
         let mut random = |bound: usize| {
             seed ^= seed << 13;
@@ -4818,7 +4832,7 @@ mod tests {
                     rows: *rows,
                 })
                 .collect::<Vec<_>>();
-            store.provision(&demands, 0).unwrap();
+            bindings.provision(&demands, 0).unwrap();
             peak_committed = peak_committed.max(committed_extent(&store).0);
             let mut advances = Vec::with_capacity(active);
             for (index, request, rows) in planned {
@@ -4872,7 +4886,7 @@ mod tests {
                 }
             }
             // Worst case for thrash: the engine idles between every batch.
-            store.shrink(ShrinkPolicy::Idle).unwrap();
+            bindings.shrink(ShrinkPolicy::Idle).unwrap();
             let mut ranges = slots
                 .iter()
                 .flatten()
@@ -4896,7 +4910,7 @@ mod tests {
             verify(request);
         }
         drop(slots);
-        store.shrink(ShrinkPolicy::Idle).unwrap();
+        bindings.shrink(ShrinkPolicy::Idle).unwrap();
         Interleaved {
             segments: max_segments,
             span_limit: store.span_limit(TOKEN),
@@ -4910,13 +4924,13 @@ mod tests {
 
     /// The backing commits rows and banks with demand, keeps every row's
     /// contents across growth, and returns bytes to the device ledger when
-    /// a slab is unreferenced; placement is fixed during a transaction.
+    /// a slab is unreferenced; a launch's captured binding pins placement.
     #[test]
     fn backing_grows_and_shrinks_and_returns_device_memory() {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             16384,
             16384,
@@ -4944,16 +4958,18 @@ mod tests {
             .unwrap();
         let rows = committed_extent(&store).0;
         assert_eq!(rows, store.history_slab_rows(TOKEN));
-        // Growth is refused while a transaction holds the tensors.
-        store
-            .provision(
+        // A launch's captured binding pins slab placement: growth fails
+        // rather than doing nothing, and the backing is unchanged.
+        assert!(matches!(
+            store.provision(
                 &[RowDemand {
                     domain: TOKEN,
                     rows: 5000,
                 }],
                 8,
-            )
-            .unwrap();
+            ),
+            Err(Error::Tensor(seismic::TensorError::SlabLayout(_)))
+        ));
         assert_eq!(committed_extent(&store).0, rows);
         let written = (0..1000u32)
             .flat_map(|row| (row as f32).to_le_bytes().repeat(4096))
@@ -4969,7 +4985,7 @@ mod tests {
         };
         let grown = charged();
         assert_eq!(grown, base);
-        // Without transactions, growth commits more rows and banks and keeps
+        // Without a captured binding, growth commits more rows and banks and keeps
         // the accepted rows' contents.
         let demand = state.demands(10000);
         let claim = store.growth_claim(&demand, 8).unwrap();
@@ -5072,7 +5088,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             8192,
             8192,
@@ -5141,7 +5157,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut bindings = token_store(
             device,
             4096,
             4 * 4096,
@@ -5157,14 +5173,15 @@ mod tests {
             },
         )
         .unwrap();
-        let step = |state: SequenceState, rows: usize| {
-            store.provision(&state.demands(rows), 1).unwrap();
+        let store = Rc::clone(&bindings);
+        let mut step = |state: SequenceState, rows: usize| {
+            bindings.provision(&state.demands(rows), 1).unwrap();
             let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
             let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap()
             else {
                 panic!("full prefix must commit");
             };
-            store.shrink(ShrinkPolicy::Idle).unwrap();
+            bindings.shrink(ShrinkPolicy::Idle).unwrap();
             state
         };
         let mut state = step(store.create().unwrap(), 500);
@@ -5188,7 +5205,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut bindings = token_store(
             device.clone(),
             4096,
             8192,
@@ -5201,8 +5218,10 @@ mod tests {
             },
         )
         .unwrap();
+        let store = Rc::clone(&bindings);
         let tag = |row: usize| (row as f32).to_le_bytes();
-        let commit = |state: SequenceState, rows: usize| {
+        let mut commit = |state: SequenceState, rows: usize| {
+            bindings.provision(&state.demands(rows), 0).unwrap();
             let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
             let plane = &advance.bindings().history[0].buffer;
             for (offset, &row) in advance.bindings().destinations[0].iter().enumerate() {
@@ -5253,7 +5272,7 @@ mod tests {
         // Reclaim copies only into space held by the store and succeeds when
         // the device refuses all new allocations.
         device.set_memory_limit(Some(before.1));
-        let released = store.shrink(ShrinkPolicy::Reclaim).unwrap();
+        let released = bindings.shrink(ShrinkPolicy::Reclaim).unwrap();
         device.set_memory_limit(None);
         assert!(released > 0);
         assert!(committed_extent(&store).0 <= before.0);
@@ -5279,7 +5298,7 @@ mod tests {
             .slab_bytes();
         assert_eq!(claim.minimum_bytes, slab_bytes);
         assert_eq!(claim.preferred_bytes, slab_bytes);
-        store.provision(&demand, 0).unwrap();
+        bindings.provision(&demand, 0).unwrap();
         assert!(store
             .history_slabs()
             .slab(0)
@@ -5299,7 +5318,7 @@ mod tests {
                 continue;
             };
             let device = Rc::new(device);
-            let store = token_store(
+            let mut store = token_store(
                 device.clone(),
                 8192,
                 8192,
@@ -5359,7 +5378,7 @@ mod tests {
                 continue;
             };
             let device = Rc::new(device);
-            let store = token_store(
+            let mut bindings = token_store(
                 device.clone(),
                 64,
                 256,
@@ -5381,6 +5400,7 @@ mod tests {
                 },
             )
             .unwrap();
+            let store = Rc::clone(&bindings);
             store.add_bank_slabs(2).unwrap();
             let mut claims = (0..9)
                 .map(|_| Some(store.banks.acquire().unwrap()))
@@ -5425,7 +5445,7 @@ mod tests {
             let generation = store.bank_placement_generation();
             // Compaction and release use only already held storage.
             device.set_memory_limit(Some(charged));
-            let released = store.shrink(ShrinkPolicy::Reclaim).unwrap();
+            let released = bindings.shrink(ShrinkPolicy::Reclaim).unwrap();
             device.set_memory_limit(None);
             assert!(released > 0);
             assert_eq!(committed_extent(&store).1, 4);
@@ -5434,7 +5454,7 @@ mod tests {
             assert!(store.bank_placement_generation() > generation);
             assert_eq!(store.compactions().banks, 2);
             holds(after);
-            assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 0);
+            assert_eq!(bindings.shrink(ShrinkPolicy::Reclaim).unwrap(), 0);
             assert_eq!(store.compactions().count, 1);
             assert_eq!(placed(), after);
             holds(after);
@@ -5447,7 +5467,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             64,
             64,
@@ -5518,7 +5538,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             64,
             64,
@@ -5577,7 +5597,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             64,
             64,
@@ -5643,7 +5663,7 @@ mod tests {
         let Some(device) = cpu_device() else {
             return;
         };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             64,
             64,
@@ -5695,7 +5715,7 @@ mod tests {
     #[test]
     fn later_copy_failure_preserves_both_placements_values_and_charge() {
         let Some(device) = cpu_device() else { return };
-        let store = token_store(
+        let mut store = token_store(
             device.clone(),
             8192,
             8192,

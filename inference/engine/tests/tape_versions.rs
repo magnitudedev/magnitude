@@ -16,13 +16,10 @@ use magnitude_engine::{
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
-    RowResult, TokenId, WorkKind,
+    ReservedResources, RowResult, StateBindings, TokenId, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
-use magnitude_scheduler::{
-    domain::{self as service_domain, DomainFlight},
-    ServiceLimits,
-};
+use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
 use std::path::PathBuf;
 
@@ -31,7 +28,7 @@ use std::path::PathBuf;
 const PROPOSALS: u8 = 4;
 const PROMPT: usize = 40;
 
-fn open_domain() -> Option<(ExecutorDomain, usize)> {
+fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
     let model = PathBuf::from(std::env::var_os("MAGNITUDE_TEST_MTP_GGUF")?);
     let resolved = EngineConfiguration {
         package: PackageOptions {
@@ -61,8 +58,8 @@ fn open_domain() -> Option<(ExecutorDomain, usize)> {
     .unwrap();
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let package = resolved.host.shared_package();
-    let (domain, _) = build_native_domain(&resolved.manifest, package).unwrap();
-    Some((domain, vocabulary))
+    let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
+    Some((domain, bindings, vocabulary))
 }
 
 /// A fixed spread over ordinary vocabulary rows.
@@ -79,16 +76,18 @@ struct Sequence {
 }
 
 /// Run one forward of `tokens` whose first `committed` rows always commit,
-/// accept `accepted` rows, and return its row results.
+/// accept `accepted` rows, and return its row results. The flight carries
+/// the bindings and returns them.
 fn advance(
     domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
     sequence: &mut Sequence,
     kind: WorkKind,
     tokens: Vec<TokenId>,
     demand: Demand,
     committed: usize,
     accepted: usize,
-) -> Vec<RowResult> {
+) -> (Vec<RowResult>, StateBindings) {
     let operation = Operation::Forward {
         request: sequence.request,
         kind,
@@ -100,14 +99,19 @@ fn advance(
         committed,
         prime: None,
     };
-    let groups = service_domain::group(domain, vec![operation]);
-    let [group] = groups.as_slice() else {
-        panic!("one forward forms one group");
-    };
-    let DomainFlight::Target(flight) = service_domain::submit_group(domain, group).unwrap() else {
+    let operations = [operation];
+    let ReservedResources::Target(reservation) = domain
+        .reserve(&mut bindings, &operations)
+        .unwrap()
+        .into_resources()
+    else {
         panic!("a forward runs on the target lane");
     };
-    let pending = domain.finish_target(flight).unwrap().pop().unwrap();
+    let flight = domain
+        .submit_target(bindings, &operations, reservation)
+        .unwrap_or_else(|failure| panic!("{}", failure.error()));
+    let (mut pending, bindings) = domain.finish_target(flight).unwrap();
+    let pending = pending.pop().unwrap();
     let Outcome::Forward { rows } = pending.outcome().clone() else {
         panic!("a forward returns forward rows");
     };
@@ -120,28 +124,32 @@ fn advance(
         )
         .unwrap();
     sequence.position += accepted;
-    rows
+    (rows, bindings)
 }
 
 /// Decode `steps` forced rows and return each step's logits.
 fn continuation(
     domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
     sequence: &mut Sequence,
     vocabulary: usize,
     steps: usize,
-) -> Vec<Vec<u32>> {
-    (0..steps)
-        .map(|_| {
-            let token = tokens(vocabulary, sequence.position, 1);
-            let rows = advance(
-                domain,
-                sequence,
-                WorkKind::Decode,
-                token,
-                Demand::LOGITS,
-                1,
-                1,
-            );
+) -> (Vec<Vec<u32>>, StateBindings) {
+    let mut logits = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        let token = tokens(vocabulary, sequence.position, 1);
+        let (rows, next) = advance(
+            domain,
+            bindings,
+            sequence,
+            WorkKind::Decode,
+            token,
+            Demand::LOGITS,
+            1,
+            1,
+        );
+        bindings = next;
+        logits.push(
             rows[0]
                 .logits
                 .as_ref()
@@ -150,9 +158,10 @@ fn continuation(
                 .unwrap()
                 .into_iter()
                 .map(f32::to_bits)
-                .collect()
-        })
-        .collect()
+                .collect(),
+        );
+    }
+    (logits, bindings)
 }
 
 /// Verify a speculative round of the anchor plus `PROPOSALS` rows. `taped`
@@ -160,73 +169,79 @@ fn continuation(
 /// its state exactly at the accepted prefix. Both accept `accepted` rows.
 fn round(
     domain: &mut ExecutorDomain,
+    bindings: StateBindings,
     sequence: &mut Sequence,
     vocabulary: usize,
     taped: bool,
     accepted: usize,
-) {
+) -> StateBindings {
     let rows = 1 + usize::from(PROPOSALS);
     let committed = if taped { 1 } else { accepted };
     let tokens = tokens(vocabulary, sequence.position, rows);
     advance(
         domain,
+        bindings,
         sequence,
         WorkKind::Replay,
         tokens,
         Demand::NONE,
         committed,
         accepted,
-    );
+    )
+    .1
 }
 
 #[test]
 #[ignore = "requires a GPU and MAGNITUDE_TEST_MTP_GGUF"]
 fn tape_versions_continue_exactly_like_runs_that_stopped_there() {
-    let Some((mut domain, vocabulary)) = open_domain() else {
+    let Some((mut domain, mut bindings, vocabulary)) = open_domain() else {
         panic!("set MAGNITUDE_TEST_MTP_GGUF to an MTP GGUF of a recurrent model");
     };
-    let mut open = |id| {
+    let mut open = |bindings: &mut StateBindings, id| {
         let request = RequestId(id);
         domain
             .install_input(request, PreparedModelInput::continuation_only())
             .unwrap();
-        domain.open_state(request, None).unwrap();
+        domain.open_state(bindings, request, None).unwrap();
         Sequence {
             request,
             position: 0,
         }
     };
-    let (mut taped, mut stopped) = (open(1), open(2));
+    let (mut taped, mut stopped) = (open(&mut bindings, 1), open(&mut bindings, 2));
     for sequence in [&mut taped, &mut stopped] {
         let prompt = tokens(vocabulary, 0, PROMPT);
-        advance(
+        bindings = advance(
             &mut domain,
+            bindings,
             sequence,
             WorkKind::Prefill,
             prompt,
             Demand::NONE,
             PROMPT,
             PROMPT,
-        );
+        )
+        .1;
     }
     // Rounds accepting every count the tape can hold, including a version
     // read by the next round (a round directly after a round).
     for (accepted, steps) in [(3, 2), (2, 0), (5, 1), (1, 2)] {
-        round(&mut domain, &mut taped, vocabulary, true, accepted);
-        round(&mut domain, &mut stopped, vocabulary, false, accepted);
+        bindings = round(&mut domain, bindings, &mut taped, vocabulary, true, accepted);
+        bindings = round(&mut domain, bindings, &mut stopped, vocabulary, false, accepted);
         assert_eq!(taped.position, stopped.position);
-        let expected = continuation(&mut domain, &mut stopped, vocabulary, steps);
-        let actual = continuation(&mut domain, &mut taped, vocabulary, steps);
+        let (expected, next) = continuation(&mut domain, bindings, &mut stopped, vocabulary, steps);
+        let (actual, next) = continuation(&mut domain, next, &mut taped, vocabulary, steps);
+        bindings = next;
         assert!(
             expected == actual,
             "continuation after a {accepted}-row prefix differs from the stopped run"
         );
     }
     // A last continuation straight after a round.
-    round(&mut domain, &mut taped, vocabulary, true, 4);
-    round(&mut domain, &mut stopped, vocabulary, false, 4);
-    let expected = continuation(&mut domain, &mut stopped, vocabulary, 3);
-    let actual = continuation(&mut domain, &mut taped, vocabulary, 3);
+    bindings = round(&mut domain, bindings, &mut taped, vocabulary, true, 4);
+    bindings = round(&mut domain, bindings, &mut stopped, vocabulary, false, 4);
+    let (expected, bindings) = continuation(&mut domain, bindings, &mut stopped, vocabulary, 3);
+    let (actual, _) = continuation(&mut domain, bindings, &mut taped, vocabulary, 3);
     assert!(
         expected == actual,
         "continuation after a 4-row prefix differs"

@@ -1,7 +1,7 @@
 use magnitude_state::{
     BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, HistoryDomainId,
     HistoryDomainLayout, HistoryDomainPlan, Holder, LayerRef, OwnedAdvanceResolution,
-    OwnedStateAdvance, SequenceState, StateStore,
+    OwnedStateAdvance, SequenceState, StateStore, StoreBindings,
 };
 
 /// The one history domain of these stores.
@@ -44,7 +44,7 @@ fn history_component(width: usize, dtype: DType) -> ComponentDescriptor {
     )
     .unwrap()
 }
-fn store(history: bool, values: bool) -> Rc<StateStore> {
+fn store(history: bool, values: bool) -> StoreBindings {
     StateStore::new(
         Rc::new(device()),
         16,
@@ -74,6 +74,7 @@ fn store(history: bool, values: bool) -> Rc<StateStore> {
         },
     )
     .unwrap()
+    .1
 }
 fn accept(store: &StateStore, state: SequenceState, count: usize) -> SequenceState {
     let advance = OwnedStateAdvance::begin(state, count).ok().unwrap();
@@ -263,7 +264,7 @@ fn adjacent_claims_merge_but_checkpoint_boundaries_do_not_grow() {
 #[ignore = "requires a Metal device"]
 fn idle_arena_release_and_value_only_or_history_only_sequences() {
     for (history, values) in [(true, false), (false, true), (true, true)] {
-        let store = store(history, values);
+        let mut store = store(history, values);
         let mut parent = store.create().unwrap();
         // A store starts with one backed history slab per history domain.
         assert_eq!(store.history_planes().unwrap().is_empty(), !history);
@@ -289,8 +290,11 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
         drop(old);
         store.release_idle().unwrap();
         assert!(store.history_planes().unwrap().is_empty());
-        // An idle store returns its committed history.
-        parent = accept(&store, store.create().unwrap(), 4);
+        // An idle store returns its committed history. Advances never grow
+        // the store: the binding right provisions first.
+        parent = store.create().unwrap();
+        store.provision(&parent.demands(4), 1).unwrap();
+        parent = accept(&store, parent, 4);
         drop(parent);
         // Its one history slab, the full slab byte target.
         assert_eq!(
@@ -368,14 +372,15 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
             retained: 0,
         },
     )
-    .unwrap();
+    .unwrap()
+    .0;
     assert!(other.exclusive_bytes(&[Holder::State(&fork)]).is_err());
 }
 
 #[test]
 #[ignore = "requires a Metal device"]
 fn owned_advances_reconcile_independently_after_shared_completion() {
-    let store = store(true, true);
+    let mut store = store(true, true);
     let first = store.create().unwrap();
     let second = store.create().unwrap();
     let first_advance = OwnedStateAdvance::begin(first, 2).ok().unwrap();

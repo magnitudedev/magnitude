@@ -25,17 +25,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// An admission that needs another bank slab waits for the transaction
-    /// currently holding that store's binding to complete.
-    pub fn open_growth_unblocked(&self) -> bool {
-        let requirements = self.open_requirements();
-        (self.target_store.available_banks() >= requirements.target_banks()
-            || self.target_store.growth_unblocked())
-            && self.head_store.as_ref().is_none_or(|store| {
-                store.available_banks() >= requirements.head_banks() || store.growth_unblocked()
-            })
-    }
-
     pub fn can_open(&self, requirements: OpenRequirements) -> Result<(), CapacityError> {
         let target = self.target_store.available_banks();
         if target < requirements.target_banks {
@@ -61,13 +50,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Make a request with installed input resident: fresh state at zero, or
     /// `from`'s state at its position. Features `from` holds for spans of
     /// this input straddling that position are adopted; every span ending
-    /// after it that still lacks features is returned as an encode.
+    /// after it that still lacks features is returned as an encode. Opening
+    /// into free banks changes no bindings; growing one orphans a queued
+    /// lookahead first.
     pub fn open_state(
         &mut self,
+        bindings: &mut StateBindings<F>,
         request: RequestId,
         from: Option<&ResumeState>,
     ) -> Result<Vec<Operation>, DomainError> {
-        self.healthy()?;
         let installed = self
             .input
             .get(&request)
@@ -81,7 +72,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let (target, head) = match from {
             Some(from) => self.fork_resume_state(from)?,
-            None => self.fresh_state()?,
+            None => self.fresh_state(bindings)?,
         };
         let position = target.position();
         self.target.insert(request, target);
@@ -112,8 +103,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(encodes)
     }
 
-    fn fresh_state(&mut self) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
-        self.provision_open()?;
+    fn fresh_state(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+    ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
+        self.provision_open(bindings)?;
         let requirements = self.open_requirements();
         self.can_open(requirements).map_err(DomainError::Capacity)?;
         let target = self.target_store.create().map_err(|error| {
@@ -270,14 +264,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(bytes)
     }
 
-    pub fn reclaim_idle(&mut self) -> Result<u64, String> {
+    /// Release every slab of a store no sequence or checkpoint owns. That
+    /// changes bindings, so a queued lookahead is orphaned first.
+    pub fn reclaim_idle(&mut self, bindings: &mut StateBindings<F>) -> Result<u64, String> {
+        if self.target_store.idle() || self.head_store.as_ref().is_some_and(|store| store.idle()) {
+            self.orphan_lookahead(bindings)
+                .map_err(|error| error.to_string())?;
+        }
         let mut bytes = u64::try_from(
-            self.target_store
+            bindings
+                .target
                 .release_idle()
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|_| "target idle bytes exceed u64")?;
-        if let Some(store) = &self.head_store {
+        if let Some(store) = &mut bindings.head {
             bytes = bytes
                 .checked_add(
                     u64::try_from(store.release_idle().map_err(|error| error.to_string())?)

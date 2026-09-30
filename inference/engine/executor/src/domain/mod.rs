@@ -21,7 +21,7 @@ use crate::{
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{
     Holder, InFlightState, OwnedAdvanceResolution, OwnedStateAdvance, OwnedTailRelocation,
-    RowDemand, SequenceState, StateCheckpoint, StateStore, TentativeAdvance,
+    RowDemand, SequenceState, StateCheckpoint, StateStore, StoreBindings, TentativeAdvance,
 };
 use seismic::Tensor;
 mod draft;
@@ -43,7 +43,7 @@ mod domain_tests;
 
 pub use family::{NativeFamily, ProgramFamily};
 pub use heap::{ClaimRefusal, DeviceHeap};
-use in_flight::{decode_selected, PrimingFlight};
+use in_flight::{decode_selected, PrimingFlight, TargetWork};
 pub use in_flight::{HeadFlight, TargetFlight, VisionFlight};
 pub use ownership::OpenRequirements;
 pub use state::MemoryChargeReconciliation;
@@ -186,6 +186,66 @@ impl From<magnitude_state::Error> for DomainError {
                 available: 0,
             }),
             other => Self::State(other),
+        }
+    }
+}
+
+/// The right to change the stores' slab bindings: growth, residency, shrink,
+/// compaction, tail relocation and idle release. The domain hands out exactly
+/// one with itself; it is never cloned. Submitting a group moves it into the
+/// flight and finishing the flight returns it, so no binding changes while
+/// work is on the device.
+pub struct StateBindings<F: ProgramFamily = NativeFamily> {
+    target: StoreBindings,
+    head: Option<StoreBindings>,
+    /// The step queued behind the last flight, with its drafter priming. It
+    /// is the only work that holds bindings between flights, so it lives
+    /// here and is resolved before bindings change.
+    lookahead: Option<lookahead::Lookahead<F>>,
+}
+
+impl<F: ProgramFamily> StateBindings<F> {
+    /// The binding right of the target store, or of the head store.
+    fn store(&mut self, head: bool) -> Result<&mut StoreBindings, DomainError> {
+        if head {
+            self.head
+                .as_mut()
+                .ok_or_else(|| DomainError::invariant("head state growth without a head store"))
+        } else {
+            Ok(&mut self.target)
+        }
+    }
+}
+
+/// A group that did not become a flight.
+pub enum SubmitFailure<F: ProgramFamily = NativeFamily> {
+    /// Refused before anything reached the device; accepted state is
+    /// unchanged and the bindings return.
+    Refused(DomainError, StateBindings<F>),
+    /// The device or a domain invariant failed. The bindings are gone, so no
+    /// binding can change again.
+    Failed(DomainError),
+}
+
+impl<F: ProgramFamily> SubmitFailure<F> {
+    pub fn error(&self) -> &DomainError {
+        match self {
+            Self::Refused(error, _) | Self::Failed(error) => error,
+        }
+    }
+}
+
+/// Why a submission produced no flight, before the bindings are attached.
+enum Unsubmitted {
+    Refused(DomainError),
+    Failed(DomainError),
+}
+
+impl Unsubmitted {
+    fn with<F: ProgramFamily>(self, bindings: StateBindings<F>) -> SubmitFailure<F> {
+        match self {
+            Self::Refused(error) => SubmitFailure::Refused(error, bindings),
+            Self::Failed(error) => SubmitFailure::Failed(error),
         }
     }
 }
@@ -381,7 +441,6 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     target: BTreeMap<RequestId, SequenceState>,
     head: BTreeMap<RequestId, SequenceState>,
     input: BTreeMap<RequestId, RequestInput>,
-    fatal: Option<DomainError>,
     /// Group identities of the target, head and encoder executables.
     lane_identities: [ProgramIdentity; 3],
     /// When the last target selection was read to the host.
@@ -389,9 +448,6 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     target_timing: Option<TargetHostTiming>,
     /// Log each finished target step's host timing (read once at start).
     trace_host_steps: bool,
-    /// The step queued behind the last submitted target step, until claimed
-    /// or orphaned (see `lookahead`).
-    lookahead: Option<lookahead::Lookahead<F::TargetSubmission, F::HeadSubmission>>,
     /// The owner's planned successors of the group it submits next: the
     /// operations known to follow it before it finishes (a prompt's next
     /// prefill chunk). Consumed by that group's provisioning and lookahead.
@@ -428,9 +484,9 @@ impl ExecutorDomain<NativeFamily> {
         head_loader: Option<ComponentLoader<ResidentHead>>,
         vision_loader: Option<ComponentLoader<ResidentVision>>,
         resident: crate::ResidentTarget,
-        target_store: Rc<StateStore>,
-        head_store: Option<Rc<StateStore>>,
-    ) -> Result<Self, String> {
+        target_state: StoreBindings,
+        head_state: Option<StoreBindings>,
+    ) -> Result<(Self, StateBindings), String> {
         // A model's drafter (its draft head or separate draft) is enabled
         // only when its method drafts.
         if (head_loader.is_some() && definition.head.is_none() && definition.draft.is_none())
@@ -438,7 +494,7 @@ impl ExecutorDomain<NativeFamily> {
         {
             return Err("component loaders differ from enabled model components".into());
         }
-        if head_loader.is_some() != head_store.is_some() {
+        if head_loader.is_some() != head_state.is_some() {
             return Err("head state arena differs from enabled head component".into());
         }
         let family = NativeFamily::new(programs, resident, definition.decoder.clone())?;
@@ -447,8 +503,8 @@ impl ExecutorDomain<NativeFamily> {
             definition,
             resources,
             memory,
-            target_store,
-            head_store,
+            target_state,
+            head_state,
             head_loader,
             vision_loader,
             family,
@@ -625,10 +681,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     pub fn requirements(
         &self,
+        bindings: &StateBindings<F>,
         operations: &[Operation],
     ) -> Result<DomainRequirements, DomainError> {
-        self.healthy()?;
-        if let Some(class) = self.claim_class(operations) {
+        if let Some(class) = self.claim_class(bindings, operations) {
             return Ok(DomainRequirements {
                 lane: ReservationLane::Target,
                 pool: PoolClass::Target(class),
@@ -965,12 +1021,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
-    pub fn reserve(&mut self, operations: &[Operation]) -> Result<DomainReservation, DomainError> {
+    /// Reserve capacity for one group: the queued lookahead's slots when the
+    /// group claims it, otherwise its provisioned state, advances and launch
+    /// leases.
+    pub fn reserve(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+        operations: &[Operation],
+    ) -> Result<DomainReservation, DomainError> {
         self.refresh_memory()?;
-        let requirements = self.requirements(operations)?;
+        let requirements = self.requirements(bindings, operations)?;
         if requirements.claim {
             let slots = self
-                .claim_slots(operations)
+                .claim_slots(bindings, operations)
                 .ok_or_else(|| DomainError::invariant("a claimable group lost its lookahead"))?;
             return Ok(DomainReservation {
                 requirements,
@@ -980,7 +1043,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // Commit the selected group's numerical backing before a lazy
         // component import. Provisioning grants the physical growth peak
         // through the heap before any backing allocation.
-        self.provision(operations)?;
+        self.provision(bindings, operations)?;
         self.sync_static_holding().map_err(DomainError::Input)?;
         // The import and binding of an unbound component run under one heap
         // claim for their peak, released once Seismic's charge reflects them.
@@ -1164,23 +1227,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             resources,
         })
     }
+    /// The domain over `family`, and the one [`StateBindings`] of its stores.
     pub fn with_family(
         execution: Rc<ExecutionPlan>,
         definition: Rc<ModelDefinition>,
         resources: AllocatedResources,
         memory: DeviceHeap,
-        target_store: Rc<StateStore>,
-        head_store: Option<Rc<StateStore>>,
+        target_state: StoreBindings,
+        head_state: Option<StoreBindings>,
         head_loader: Option<ComponentLoader<ResidentHead>>,
         vision_loader: Option<ComponentLoader<ResidentVision>>,
         family: F,
-    ) -> Self {
+    ) -> (Self, StateBindings<F>) {
         let id = resources.domain().clone();
         let lane_identities = ["target", "head", "vision"].map(|lane| {
             ProgramIdentity::new(format!("{id}:{lane}"))
                 .expect("a lane identity names its lane and is never empty")
         });
-        Self {
+        let domain = Self {
             execution,
             definition,
             resources,
@@ -1188,24 +1252,28 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             memory: RefCell::new(memory),
             static_holding: None,
             optional_holding: None,
-            target_store,
-            head_store,
+            target_store: Rc::clone(&target_state),
+            head_store: head_state.as_ref().map(|state| Rc::clone(state)),
             family,
             head_loader,
             vision_loader,
             target: BTreeMap::new(),
             head: BTreeMap::new(),
             input: BTreeMap::new(),
-            fatal: None,
             lane_identities,
             selection_read: None,
             target_timing: None,
             trace_host_steps: std::env::var_os("MAGNITUDE_TRACE_HOST_STEP").is_some(),
-            lookahead: None,
             planned: Vec::new(),
             next_flight: 0,
             trace_lookahead: std::env::var_os("MAGNITUDE_TRACE_LOOKAHEAD").is_some(),
-        }
+        };
+        let bindings = StateBindings {
+            target: target_state,
+            head: head_state,
+            lookahead: None,
+        };
+        (domain, bindings)
     }
 
     pub fn resource_identity(&self) -> &ResourceDomainId {
@@ -1220,9 +1288,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
     pub fn resources(&self) -> &ResourceDomain {
         &self.domain
-    }
-    pub fn fatal_error(&self) -> Option<&DomainError> {
-        self.fatal.as_ref()
     }
 
     /// The compatibility key of an operation. Keying does not validate;
@@ -1244,28 +1309,5 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Host timing of the most recently finished target step.
     pub fn target_timing(&self) -> Option<TargetHostTiming> {
         self.target_timing
-    }
-
-    fn healthy(&self) -> Result<(), DomainError> {
-        self.fatal
-            .as_ref()
-            .map_or(Ok(()), |error| Err(error.clone()))
-    }
-
-    /// Record a broken executor-owned relationship. Request validation errors
-    /// never use this path; once ownership has moved into a submission, a
-    /// mismatch means the numerical domain can no longer continue safely.
-    fn fatal_invariant(&mut self, detail: impl Into<String>) -> DomainError {
-        let error = DomainError::invariant(detail);
-        self.fatal = Some(error.clone());
-        error
-    }
-
-    /// State reconciliation failures occur after request preflight and retain
-    /// their state/capacity category while poisoning this physical domain.
-    fn fatal_state(&mut self, error: magnitude_state::Error) -> DomainError {
-        let error = DomainError::from(error);
-        self.fatal = Some(error.clone());
-        error
     }
 }

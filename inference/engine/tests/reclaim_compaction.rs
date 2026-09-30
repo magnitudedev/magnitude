@@ -16,17 +16,14 @@ use magnitude_engine::{
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
-    TokenId, WorkKind,
+    ReservedResources, StateBindings, TokenId, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
-use magnitude_scheduler::{
-    domain::{self as service_domain, DomainFlight},
-    ServiceLimits,
-};
+use magnitude_scheduler::ServiceLimits;
 use magnitude_state::{KvCodec, ShrinkPolicy};
 use std::path::PathBuf;
 
-fn domain() -> (ExecutorDomain, usize, usize, usize) {
+fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
     let model = PathBuf::from(
         std::env::var_os("MAGNITUDE_TEST_MTP_GGUF").expect("set MAGNITUDE_TEST_MTP_GGUF"),
     );
@@ -62,9 +59,10 @@ fn domain() -> (ExecutorDomain, usize, usize, usize) {
     .unwrap();
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let package = resolved.host.shared_package();
-    let (domain, plan) = build_native_domain(&resolved.manifest, package).unwrap();
+    let (domain, bindings, plan) = build_native_domain(&resolved.manifest, package).unwrap();
     (
         domain,
+        bindings,
         vocabulary,
         // Qwen's target store has one Token history domain.
         plan.target_state().sole_history().unwrap().slab_rows as usize,
@@ -79,14 +77,17 @@ fn tokens(vocabulary: usize, start: usize, count: usize) -> Vec<TokenId> {
         .collect()
 }
 
+/// Run one forward, accept every row, and return its last row's logits when
+/// `logits`. The flight carries the bindings and returns them.
 fn forward(
     domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
     request: RequestId,
     position: usize,
     kind: WorkKind,
     tokens: Vec<TokenId>,
     logits: bool,
-) -> Option<Vec<u32>> {
+) -> (Option<Vec<u32>>, StateBindings) {
     let count = tokens.len();
     let operation = Operation::Forward {
         request,
@@ -99,14 +100,19 @@ fn forward(
         committed: count,
         prime: None,
     };
-    let groups = service_domain::group(domain, vec![operation]);
-    let [group] = groups.as_slice() else {
-        panic!("one forward forms one group")
-    };
-    let DomainFlight::Target(flight) = service_domain::submit_group(domain, group).unwrap() else {
+    let operations = [operation];
+    let ReservedResources::Target(reservation) = domain
+        .reserve(&mut bindings, &operations)
+        .unwrap()
+        .into_resources()
+    else {
         panic!("a forward runs on the target lane")
     };
-    let pending = domain.finish_target(flight).unwrap().pop().unwrap();
+    let flight = domain
+        .submit_target(bindings, &operations, reservation)
+        .unwrap_or_else(|failure| panic!("{}", failure.error()));
+    let (mut pending, bindings) = domain.finish_target(flight).unwrap();
+    let pending = pending.pop().unwrap();
     let Outcome::Forward { rows } = pending.outcome().clone() else {
         panic!("a forward returns rows")
     };
@@ -130,29 +136,38 @@ fn forward(
             },
         )
         .unwrap();
-    result
+    (result, bindings)
 }
 
 /// Make `request` resident on fresh state with no prompt rows.
-fn open(domain: &mut ExecutorDomain, request: RequestId) {
+fn open(domain: &mut ExecutorDomain, bindings: &mut StateBindings, request: RequestId) {
     domain
         .install_input(request, PreparedModelInput::continuation_only())
         .unwrap();
-    domain.open_state(request, None).unwrap();
+    domain.open_state(bindings, request, None).unwrap();
 }
 
-fn prefill(domain: &mut ExecutorDomain, request: RequestId, vocabulary: usize, count: usize) {
+fn prefill(
+    domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
+    request: RequestId,
+    vocabulary: usize,
+    count: usize,
+) -> StateBindings {
     for start in (0..count).step_by(64) {
         let rows = (count - start).min(64);
-        forward(
+        bindings = forward(
             domain,
+            bindings,
             request,
             start,
             WorkKind::Prefill,
             tokens(vocabulary, start, rows),
             false,
-        );
+        )
+        .1;
     }
+    bindings
 }
 
 fn assert_accounted(domain: &ExecutorDomain) {
@@ -163,38 +178,41 @@ fn assert_accounted(domain: &ExecutorDomain) {
 #[test]
 #[ignore = "requires a model with more than one bank per slab"]
 fn reclaim_relocates_live_banks_without_changing_continuation() {
-    let (mut domain, vocabulary, _, slab_banks) = domain();
+    let (mut domain, mut bindings, vocabulary, _, slab_banks) = domain();
     assert!(slab_banks > 1, "model needs multiple banks per slab");
 
     let peers = slab_banks * 2;
     let reference = RequestId(peers as u64 + 1);
     let relocated = RequestId(peers as u64 + 2);
-    open(&mut domain, reference);
-    prefill(&mut domain, reference, vocabulary, 1);
+    open(&mut domain, &mut bindings, reference);
+    bindings = prefill(&mut domain, bindings, reference, vocabulary, 1);
     for index in 0..peers {
         let request = RequestId(index as u64 + 1);
-        open(&mut domain, request);
-        prefill(&mut domain, request, vocabulary, 1);
+        open(&mut domain, &mut bindings, request);
+        bindings = prefill(&mut domain, bindings, request, vocabulary, 1);
     }
-    open(&mut domain, relocated);
-    prefill(&mut domain, relocated, vocabulary, 1);
+    open(&mut domain, &mut bindings, relocated);
+    bindings = prefill(&mut domain, bindings, relocated, vocabulary, 1);
     for index in 0..peers {
         domain.close(RequestId(index as u64 + 1)).unwrap();
     }
 
-    let expected = forward(
+    let (expected, mut bindings) = forward(
         &mut domain,
+        bindings,
         reference,
         1,
         WorkKind::Decode,
         tokens(vocabulary, 1, 1),
         true,
-    )
-    .unwrap();
+    );
+    let expected = expected.unwrap();
     let before = domain.state_compactions().0;
     let charge_before = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(charge_before.unattributed, 0, "{charge_before:?}");
-    let released = domain.shrink_state(ShrinkPolicy::Reclaim).unwrap();
+    let released = domain
+        .shrink_state(&mut bindings, ShrinkPolicy::Reclaim)
+        .unwrap();
     let after = domain.state_compactions().0;
     let charge_after = domain.reconcile_memory_charge(&[]).unwrap();
     assert!(after.banks > before.banks, "banks were not relocated");
@@ -202,17 +220,18 @@ fn reclaim_relocates_live_banks_without_changing_continuation() {
     assert_eq!(released, charge_before.charged - charge_after.charged);
     assert_eq!(charge_after.unattributed, 0, "{charge_after:?}");
 
-    let actual = forward(
+    let (actual, _) = forward(
         &mut domain,
+        bindings,
         relocated,
         1,
         WorkKind::Decode,
         tokens(vocabulary, 1, 1),
         true,
-    )
-    .unwrap();
+    );
     assert_eq!(
-        actual, expected,
+        actual.unwrap(),
+        expected,
         "continuation changed after bank relocation"
     );
     domain.close(reference).unwrap();
@@ -222,7 +241,7 @@ fn reclaim_relocates_live_banks_without_changing_continuation() {
 #[test]
 #[ignore = "requires a model device and MAGNITUDE_TEST_MTP_GGUF"]
 fn reclaim_relocates_live_history_and_banks_without_changing_continuation() {
-    let (mut domain, vocabulary, slab_rows, slab_banks) = domain();
+    let (mut domain, mut bindings, vocabulary, slab_rows, slab_banks) = domain();
     assert!(slab_rows > 0 && slab_banks > 0);
     eprintln!("history_slab_rows={slab_rows} bank_slab_banks={slab_banks}");
 
@@ -234,34 +253,37 @@ fn reclaim_relocates_live_history_and_banks_without_changing_continuation() {
     assert!(peer_rows < 8192, "test context cannot span a history slab");
     let reference = RequestId(peers as u64 + 1);
     let relocated = RequestId(peers as u64 + 2);
-    open(&mut domain, reference);
-    prefill(&mut domain, reference, vocabulary, 32);
+    open(&mut domain, &mut bindings, reference);
+    bindings = prefill(&mut domain, bindings, reference, vocabulary, 32);
     assert_accounted(&domain);
     for index in 0..peers {
         let request = RequestId(index as u64 + 1);
-        open(&mut domain, request);
-        prefill(&mut domain, request, vocabulary, peer_rows);
+        open(&mut domain, &mut bindings, request);
+        bindings = prefill(&mut domain, bindings, request, vocabulary, peer_rows);
         assert_accounted(&domain);
     }
-    open(&mut domain, relocated);
-    prefill(&mut domain, relocated, vocabulary, 32);
+    open(&mut domain, &mut bindings, relocated);
+    bindings = prefill(&mut domain, bindings, relocated, vocabulary, 32);
     assert_accounted(&domain);
     for index in 0..peers {
         domain.close(RequestId(index as u64 + 1)).unwrap();
     }
-    let expected = forward(
+    let (expected, mut bindings) = forward(
         &mut domain,
+        bindings,
         reference,
         32,
         WorkKind::Decode,
         tokens(vocabulary, 32, 1),
         true,
-    )
-    .unwrap();
+    );
+    let expected = expected.unwrap();
     let before = domain.state_compactions().0;
     let charge_before = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(charge_before.unattributed, 0, "{charge_before:?}");
-    let released = domain.shrink_state(ShrinkPolicy::Reclaim).unwrap();
+    let released = domain
+        .shrink_state(&mut bindings, ShrinkPolicy::Reclaim)
+        .unwrap();
     let after = domain.state_compactions().0;
     let charge_after = domain.reconcile_memory_charge(&[]).unwrap();
     eprintln!(
@@ -278,16 +300,20 @@ fn reclaim_relocates_live_history_and_banks_without_changing_continuation() {
     assert!(released > 0 && charge_after.charged < charge_before.charged);
     assert_eq!(released, charge_before.charged - charge_after.charged);
     assert_eq!(charge_after.unattributed, 0, "{charge_after:?}");
-    let actual = forward(
+    let (actual, _) = forward(
         &mut domain,
+        bindings,
         relocated,
         32,
         WorkKind::Decode,
         tokens(vocabulary, 32, 1),
         true,
-    )
-    .unwrap();
-    assert_eq!(actual, expected, "continuation changed after Reclaim");
+    );
+    assert_eq!(
+        actual.unwrap(),
+        expected,
+        "continuation changed after Reclaim"
+    );
     assert_accounted(&domain);
     domain.close(reference).unwrap();
     domain.close(relocated).unwrap();

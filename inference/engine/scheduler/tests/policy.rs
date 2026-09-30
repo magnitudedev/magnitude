@@ -112,6 +112,6 @@ fn availability_reconsideration_is_epoch_gated() {
     let blocked = AvailabilityEpoch::default();
     let mut current = blocked;
     assert!(!current.changed_since(blocked));
-    current.advance().unwrap();
+    current.advance();
     assert!(current.changed_since(blocked));
 }

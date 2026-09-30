@@ -2,218 +2,162 @@
 //! scheduler. Only the closed scheduler command vocabulary reaches it.
 
 use crate::error::UnloadCause;
-use magnitude_executor::{ExecutorDomain, ProgramFamily, RequestId};
+use magnitude_executor::ProgramFamily;
 use magnitude_generation::Method;
 use magnitude_scheduler::{
-    owner::{AdmissionError, Owner},
-    protocol::{AdmitRequest, RequestSnapshot, WorkerCommand, WorkerReply},
-    publication::{ModelUnloadCause, PublicationQueue, PublicationWake, RequestError},
-    worker::{CompletionWake, Drive, Driven, WorkerWakeHandle},
+    owner::{AdmissionError, Owner, Ran},
+    protocol::{AdmitRequest, WorkerCommand, WorkerReply},
+    publication::{ModelUnloadCause, RequestError},
+    worker::{Driven, Event},
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-/// Set once by the execution thread when the model stops serving; read by
-/// the worker session.
-#[derive(Default)]
-pub(crate) struct UnloadNotice {
-    cause: Mutex<Option<UnloadCause>>,
-    wake: Mutex<Option<Box<dyn Fn() + Send>>>,
-}
-
-impl UnloadNotice {
-    pub fn install_wake(&self, wake: impl Fn() + Send + 'static) {
-        *self.wake.lock().unwrap() = Some(Box::new(wake));
-    }
-
-    fn record(&self, cause: UnloadCause) {
-        let recorded = {
-            let mut current = self.cause.lock().unwrap();
-            if current.is_some() {
-                false
-            } else {
-                *current = Some(cause);
-                true
-            }
-        };
-        if recorded {
-            if let Some(wake) = self.wake.lock().unwrap().as_ref() {
-                wake();
-            }
-        }
-    }
-
-    pub fn cause(&self) -> Option<UnloadCause> {
-        self.cause.lock().unwrap().clone()
-    }
+/// The execution lifecycle. Every transition moves the owner by value.
+enum Execution<F: ProgramFamily> {
+    Serving(Owner<F>),
+    /// Every request has been terminated with the cause; the in-flight group
+    /// finishes, then `Stopped`.
+    Draining(Owner<F>, UnloadCause),
+    Stopped(UnloadCause),
 }
 
 pub(crate) struct ExecutionOwner<F: ProgramFamily> {
-    pub owner: Option<Owner<F>>,
-    pub method: Arc<dyn Method>,
-    pub wakes: Option<WorkerWakeHandle>,
-    pub notice: Arc<UnloadNotice>,
+    execution: Execution<F>,
+    method: Arc<dyn Method>,
 }
 
 impl<F: ProgramFamily> ExecutionOwner<F> {
-    fn shed_unloaded_owner(&mut self) {
-        if self.owner.as_mut().is_some_and(Owner::memory_unload_ready) {
-            self.owner.take();
-            self.notice.record(UnloadCause::MemoryPressure);
+    pub fn new(owner: Owner<F>, method: Arc<dyn Method>) -> Self {
+        Self {
+            execution: Execution::Serving(owner),
+            method,
         }
     }
 
-    fn snapshot(owner: &Owner<F>, request: RequestId) -> Option<RequestSnapshot> {
-        let usage = owner.usage(request).ok()?;
-        Some(RequestSnapshot {
-            status: owner.status(request).ok()?,
-            prompt_tokens: usage.prompt_tokens,
-            cached_tokens: usage.cached_tokens,
-            resident_position: owner.resident_position(request).ok()?,
-            output_tokens: owner.output_len(request).ok()?,
-        })
+    /// Move the execution out for a transition. The placeholder is truthful:
+    /// a transition that panics has stopped execution.
+    fn take(&mut self) -> Execution<F> {
+        std::mem::replace(
+            &mut self.execution,
+            Execution::Stopped(UnloadCause::Internal {
+                reason: "execution transition interrupted".into(),
+            }),
+        )
     }
+}
 
-    /// A fresh reading of every domain the device uses, then Seismic's
-    /// charge classified by every holder the owner keeps. Fails when an
-    /// observation fails or the charge does not reconcile.
-    fn observe(owner: &Owner<F>) -> Result<WorkerReply, String> {
-        let readings = owner.inspect_domain(|domain: &ExecutorDomain<F>| {
-            domain.refresh_memory().map_err(|error| error.to_string())
-        })?;
-        Ok(WorkerReply::Observed {
-            readings,
-            reconciliation: owner.reconcile_memory_charge()?,
-        })
+/// The admission refusal of an execution that is draining or stopped.
+fn unloaded(cause: &UnloadCause) -> AdmissionError {
+    match cause {
+        UnloadCause::MemoryPressure => AdmissionError::ModelUnloaded {
+            cause: ModelUnloadCause::MemoryPressure,
+        },
+        UnloadCause::Shutdown | UnloadCause::DeviceLost { .. } | UnloadCause::Internal { .. } => {
+            AdmissionError::Refused(RequestError::WorkerClosed)
+        }
     }
 }
 
 impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
-    fn admission_ready(&self) -> bool {
-        self.owner
-            .as_ref()
-            .is_none_or(<Owner<F> as Driven>::admission_ready)
-    }
+    type Stopped = UnloadCause;
 
-    fn settle_completion(&mut self, now: u64) -> Result<(), String> {
-        if let Some(owner) = self.owner.as_mut() {
-            <Owner<F> as Driven>::settle_completion(owner, now)?;
-        }
-        self.shed_unloaded_owner();
-        Ok(())
-    }
-
-    fn periodic(&mut self, now: u64) -> Result<(), String> {
-        if let Some(owner) = self.owner.as_mut() {
-            <Owner<F> as Driven>::periodic(owner, now)?;
-        }
-        self.shed_unloaded_owner();
-        Ok(())
-    }
-    fn install_wake_handle(&mut self, wakes: WorkerWakeHandle) {
-        self.wakes = Some(wakes);
-    }
-    fn publication_wake(
-        &mut self,
-        request: RequestId,
-        wake: PublicationWake,
-        _now: u64,
-    ) -> Result<(), String> {
-        match self.owner.as_mut() {
-            Some(owner) => owner.publication_wake(request, wake),
-            None => Ok(()),
-        }
-    }
     fn command(&mut self, command: WorkerCommand, now: u64) -> Result<WorkerReply, String> {
-        self.shed_unloaded_owner();
-        let Some(owner) = self.owner.as_mut() else {
-            return Ok(match command {
-                WorkerCommand::Admit(_) => {
-                    WorkerReply::AdmissionRefused(AdmissionError::ModelUnloaded {
-                        cause: ModelUnloadCause::MemoryPressure,
-                    })
-                }
-                WorkerCommand::Status { .. } => WorkerReply::Status(None),
-                WorkerCommand::Cancel { .. } | WorkerCommand::Stop { .. } => {
-                    WorkerReply::Acknowledged
-                }
-                // Nothing is resident; the session reports the unload.
-                WorkerCommand::Observe => WorkerReply::Acknowledged,
-                WorkerCommand::Close => {
-                    return Err("worker lifecycle command reached the execution domain".into())
-                }
-            });
-        };
         match command {
             WorkerCommand::Admit(AdmitRequest {
                 seed,
                 input,
                 prefix_cache,
                 output_capacity,
-            }) => {
-                if output_capacity == 0 {
-                    return Err("request output capacity must be positive".into());
+            }) => match &mut self.execution {
+                Execution::Serving(owner) => {
+                    let generation = seed.into_generation(self.method.clone())?;
+                    Ok(
+                        match owner.admit(generation, input, prefix_cache, output_capacity, now) {
+                            Ok((request, receiver)) => WorkerReply::Admitted { request, receiver },
+                            Err(error) => WorkerReply::AdmissionRefused(error),
+                        },
+                    )
                 }
-                let generation = seed.into_generation(self.method.clone())?;
-                let request = match owner.admit(generation, input, prefix_cache, now) {
-                    Ok(request) => request,
-                    Err(error) => return Ok(WorkerReply::AdmissionRefused(error)),
-                };
-                let wakes = self
-                    .wakes
-                    .as_ref()
-                    .ok_or("publication wake handle was not installed")?
-                    .clone();
-                let (sender, receiver) = PublicationQueue::bounded(output_capacity, move |wake| {
-                    wakes.publication(request, wake);
-                })?;
-                owner.attach_publication(request, sender, output_capacity)?;
-                Ok(WorkerReply::Admitted { request, receiver })
-            }
+                Execution::Draining(_, cause) | Execution::Stopped(cause) => {
+                    Ok(WorkerReply::AdmissionRefused(unloaded(cause)))
+                }
+            },
             WorkerCommand::Stop { request } => {
-                owner.stop(request)?;
+                if let Execution::Serving(owner) | Execution::Draining(owner, _) =
+                    &mut self.execution
+                {
+                    owner.stop(request);
+                }
                 Ok(WorkerReply::Acknowledged)
             }
-            WorkerCommand::Cancel { request } => {
-                owner.release(request)?;
-                Ok(WorkerReply::Acknowledged)
-            }
-            WorkerCommand::Status { request } => {
-                Ok(WorkerReply::Status(Self::snapshot(owner, request)))
-            }
-            WorkerCommand::Observe => Self::observe(owner),
-            WorkerCommand::Close => {
-                Err("worker lifecycle command reached the execution domain".into())
+            WorkerCommand::Status { request } => Ok(WorkerReply::Status(match &self.execution {
+                Execution::Serving(owner) | Execution::Draining(owner, _) => {
+                    owner.snapshot(request)
+                }
+                Execution::Stopped(_) => None,
+            })),
+            WorkerCommand::Observe => match &self.execution {
+                Execution::Serving(owner) | Execution::Draining(owner, _) => owner.observe(),
+                Execution::Stopped(cause) => Err(format!("execution stopped: {cause}")),
+            },
+        }
+    }
+
+    fn event(&mut self, event: Event, _: u64) {
+        match event {
+            // The owner reconciles its flight when it next runs.
+            Event::Completion => {}
+            Event::Publication(request, wake) => match &mut self.execution {
+                Execution::Serving(owner) | Execution::Draining(owner, _) => {
+                    owner.publication_wake(request, wake)
+                }
+                Execution::Stopped(_) => {}
+            },
+            Event::Cancel(request) => match &mut self.execution {
+                Execution::Serving(owner) | Execution::Draining(owner, _) => owner.cancel(request),
+                Execution::Stopped(_) => {}
+            },
+            Event::Close => {
+                self.execution = match self.take() {
+                    Execution::Serving(mut owner) => {
+                        owner.terminate_all(RequestError::WorkerClosed);
+                        Execution::Draining(owner, UnloadCause::Shutdown)
+                    }
+                    draining @ Execution::Draining(..) => draining,
+                    stopped @ Execution::Stopped(_) => stopped,
+                }
             }
         }
     }
-    fn advance(&mut self, now: u64, wake: CompletionWake) -> Result<Drive, String> {
-        self.shed_unloaded_owner();
-        let result = match self.owner.as_mut() {
-            Some(owner) => <Owner<F> as Driven>::advance(owner, now, wake),
-            None => Ok(Drive::Idle),
-        };
-        self.shed_unloaded_owner();
-        result
-    }
-    fn failed(&mut self, error: &str) {
-        if let Some(owner) = self.owner.as_mut() {
-            <Owner<F> as Driven>::failed(owner, error);
-        }
-        self.notice.record(UnloadCause::Internal {
-            reason: error.to_owned(),
-        });
-    }
-    fn failure(&self) -> Option<&RequestError> {
-        let failure = self.owner.as_ref().and_then(<Owner<F> as Driven>::failure);
-        if let Some(error) = failure {
-            self.notice.record(UnloadCause::from(error));
-        }
-        failure
-    }
-    fn shutdown(&mut self) -> Result<bool, String> {
-        match self.owner.as_mut() {
-            Some(owner) => <Owner<F> as Driven>::shutdown(owner),
-            None => Ok(true),
+
+    fn run(&mut self, now: u64) -> Result<u64, UnloadCause> {
+        loop {
+            match self.take() {
+                Execution::Serving(owner) => match owner.run(now) {
+                    Ok((owner, Ran { unload: true, .. })) => {
+                        self.execution = Execution::Draining(owner, UnloadCause::MemoryPressure)
+                    }
+                    Ok((owner, Ran { due, .. })) => {
+                        self.execution = Execution::Serving(owner);
+                        return Ok(due);
+                    }
+                    Err(error) => self.execution = Execution::Stopped(UnloadCause::from(&error)),
+                },
+                Execution::Draining(owner, cause) => match owner.run(now) {
+                    Ok((_, Ran { in_flight: false, .. })) => {
+                        self.execution = Execution::Stopped(cause)
+                    }
+                    Ok((owner, Ran { due, .. })) => {
+                        self.execution = Execution::Draining(owner, cause);
+                        return Ok(due);
+                    }
+                    Err(error) => self.execution = Execution::Stopped(UnloadCause::from(&error)),
+                },
+                Execution::Stopped(cause) => {
+                    self.execution = Execution::Stopped(cause.clone());
+                    return Err(cause);
+                }
+            }
         }
     }
 }

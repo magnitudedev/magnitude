@@ -5,8 +5,9 @@
 //! identifies the lane the service must submit next.
 
 use magnitude_executor::{
-    Completion, DomainError, DomainRequirements, GroupKey, HeadFlight, NativeFamily, Operation,
-    ProgramFamily, ReservedResources, TargetFlight, VisionFlight,
+    Completion, CompletionWake, DomainError, DomainRequirements, GroupKey, HeadFlight, NativeFamily, Operation,
+    PendingOperationOutcome, ProgramFamily, ReservedResources, StateBindings, SubmitFailure,
+    TargetFlight, VisionFlight,
 };
 pub use magnitude_executor::{ExecutorDomain, ResumeState};
 
@@ -111,57 +112,9 @@ pub fn group<F: ProgramFamily>(
 }
 
 pub enum DomainFlight<F: ProgramFamily = NativeFamily> {
-    Target(TargetFlight<F::TargetSubmission, F::HeadSubmission>),
-    Head(HeadFlight<F::HeadSubmission>),
-    Vision(VisionFlight<F::VisionSubmission>),
-}
-
-pub fn submit_group<F: ProgramFamily>(
-    domain: &mut ExecutorDomain<F>,
-    group: &OperationGroup,
-) -> Result<DomainFlight<F>, DomainError> {
-    let operations = group.operations.as_slice();
-    let resources = domain.reserve(operations)?.into_resources();
-    let submitted = match (group.lane, resources) {
-        (DomainLane::Target, ReservedResources::Target(reservation)) => domain
-            .submit_target(operations, reservation)
-            .map(DomainFlight::Target),
-        (DomainLane::Head, ReservedResources::Head(graph_workspace, graph_output, advances)) => {
-            domain
-                .submit_head(operations, graph_workspace, graph_output, advances)
-                .map(DomainFlight::Head)
-        }
-        (DomainLane::Encoder, ReservedResources::Vision(workspace, output)) => {
-            let [operation @ Operation::Encode { .. }] = operations else {
-                return Err(DomainError::Input(
-                    "vision group must contain one encode operation".into(),
-                ));
-            };
-            domain
-                .submit_vision(operation, workspace, output)
-                .map(DomainFlight::Vision)
-        }
-        _ => Err(DomainError::Invariant(magnitude_executor::InvariantError {
-            context: "reserved domain submission",
-            detail: "reserved resource lane differs from operation group".into(),
-        })),
-    };
-    submitted.map_err(|error| match error {
-        DomainError::Capacity(capacity) => {
-            DomainError::Invariant(magnitude_executor::InvariantError {
-                context: "reserved domain submission",
-                detail: format!("reserved capacity became unavailable: {capacity}"),
-            })
-        }
-        other => other,
-    })
-}
-
-pub fn requirements<F: ProgramFamily>(
-    domain: &ExecutorDomain<F>,
-    group: &OperationGroup,
-) -> Result<DomainRequirements, DomainError> {
-    domain.requirements(&group.operations)
+    Target(TargetFlight<F>),
+    Head(HeadFlight<F>),
+    Vision(VisionFlight<F>),
 }
 
 impl<F: ProgramFamily> DomainFlight<F> {
@@ -172,6 +125,104 @@ impl<F: ProgramFamily> DomainFlight<F> {
             Self::Vision(flight) => flight.completion(),
         }
     }
+}
+
+/// A finished flight's outcomes, still owning their physical transactions.
+pub enum FlightOutcomes {
+    Target(Vec<PendingOperationOutcome>),
+    Head(Vec<PendingOperationOutcome>),
+    Vision(PendingOperationOutcome),
+}
+
+/// Reserve and submit one group. Submission moves the bindings into the
+/// flight and registers `wake` with its completion; a refusal returns them.
+pub fn submit_group<F: ProgramFamily>(
+    domain: &mut ExecutorDomain<F>,
+    bindings: StateBindings<F>,
+    group: &OperationGroup,
+    wake: CompletionWake,
+) -> Result<DomainFlight<F>, SubmitFailure<F>> {
+    let mut flight = submit(domain, bindings, group)?;
+    flight.completion().notify(wake);
+    Ok(flight)
+}
+
+fn submit<F: ProgramFamily>(
+    domain: &mut ExecutorDomain<F>,
+    mut bindings: StateBindings<F>,
+    group: &OperationGroup,
+) -> Result<DomainFlight<F>, SubmitFailure<F>> {
+    let operations = group.operations.as_slice();
+    let resources = match domain.reserve(&mut bindings, operations) {
+        Ok(reservation) => reservation.into_resources(),
+        Err(error) => return Err(SubmitFailure::Refused(error, bindings)),
+    };
+    let submitted = match (group.lane, resources) {
+        (DomainLane::Target, ReservedResources::Target(reservation)) => domain
+            .submit_target(bindings, operations, reservation)
+            .map(DomainFlight::Target),
+        (DomainLane::Head, ReservedResources::Head(graph_workspace, graph_output, advances)) => {
+            domain
+                .submit_head(bindings, operations, graph_workspace, graph_output, advances)
+                .map(DomainFlight::Head)
+        }
+        (DomainLane::Encoder, ReservedResources::Vision(workspace, output)) => {
+            let [operation @ Operation::Encode { .. }] = operations else {
+                return Err(SubmitFailure::Refused(
+                    DomainError::Input("vision group must contain one encode operation".into()),
+                    bindings,
+                ));
+            };
+            domain
+                .submit_vision(bindings, operation, workspace, output)
+                .map(DomainFlight::Vision)
+        }
+        _ => {
+            return Err(SubmitFailure::Refused(
+                DomainError::Invariant(magnitude_executor::InvariantError {
+                    context: "reserved domain submission",
+                    detail: "reserved resource lane differs from operation group".into(),
+                }),
+                bindings,
+            ));
+        }
+    };
+    submitted.map_err(|failure| match failure {
+        SubmitFailure::Refused(DomainError::Capacity(capacity), bindings) => SubmitFailure::Refused(
+            DomainError::Invariant(magnitude_executor::InvariantError {
+                context: "reserved domain submission",
+                detail: format!("reserved capacity became unavailable: {capacity}"),
+            }),
+            bindings,
+        ),
+        other => other,
+    })
+}
+
+/// Finish a completed flight: its outcomes, and the bindings it held.
+pub fn finish<F: ProgramFamily>(
+    domain: &mut ExecutorDomain<F>,
+    flight: DomainFlight<F>,
+) -> Result<(FlightOutcomes, StateBindings<F>), DomainError> {
+    match flight {
+        DomainFlight::Target(flight) => domain
+            .finish_target(flight)
+            .map(|(outcomes, bindings)| (FlightOutcomes::Target(outcomes), bindings)),
+        DomainFlight::Head(flight) => domain
+            .finish_head(flight)
+            .map(|(outcomes, bindings)| (FlightOutcomes::Head(outcomes), bindings)),
+        DomainFlight::Vision(flight) => domain
+            .finish_vision(flight)
+            .map(|(outcome, bindings)| (FlightOutcomes::Vision(outcome), bindings)),
+    }
+}
+
+pub fn requirements<F: ProgramFamily>(
+    domain: &ExecutorDomain<F>,
+    bindings: &StateBindings<F>,
+    group: &OperationGroup,
+) -> Result<DomainRequirements, DomainError> {
+    domain.requirements(bindings, &group.operations)
 }
 
 #[cfg(test)]

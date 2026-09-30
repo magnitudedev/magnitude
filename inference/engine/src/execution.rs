@@ -16,7 +16,8 @@ use magnitude_executor::{
     platform::{self, DomainRole, OpenedPlatform, PlatformConfig, PlatformError},
     AttestedPrograms, ExecutionPlanDraft, ClaimRefusal, ComponentLoader, DeviceHeap, ExecutorDomain, KernelCache,
     Operation, RequestId, ReservedResources, ResidencyStore, ResourceAllocator, ResourceCapacity,
-    ResourceDomainId, ResourcePlan, ResourcePlanner, TokenId, TuningContext, TuningEvent,
+    ResourceDomainId, ResourcePlan, ResourcePlanner, StateBindings, TokenId, TuningContext,
+    TuningEvent,
     TuningObserver, TuningOrigin, WorkKind, DEFAULT_KERNEL_CACHE_BYTES,
 };
 use magnitude_family_contracts::{InputLayout, PreparedModelInput, TokenPlan};
@@ -28,6 +29,8 @@ use std::time::Instant;
 /// A constructed executor domain with the facts readiness reports.
 pub(crate) struct NativeDomain {
     pub domain: ExecutorDomain,
+    /// The domain's one right to change its stores' bindings.
+    pub bindings: StateBindings,
     pub plan: ResourcePlan,
     pub device: DeviceSelector,
     pub pool: MemoryPoolKind,
@@ -49,9 +52,10 @@ fn platform_error(error: PlatformError) -> LoadError {
 pub fn build_native_domain(
     manifest: &ExecutionManifest,
     package: Arc<Package>,
-) -> Result<(ExecutorDomain, ResourcePlan), LoadError> {
+) -> Result<(ExecutorDomain, StateBindings, ResourcePlan), LoadError> {
     let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
-    build(catalog, manifest, package, Rc::new(|_| {})).map(|built| (built.domain, built.plan))
+    build(catalog, manifest, package, Rc::new(|_| {}))
+        .map(|built| (built.domain, built.bindings, built.plan))
 }
 
 /// A load's front half on its opened device: the selected device, the plan
@@ -401,7 +405,7 @@ pub(crate) fn build(
         None
     };
     startup.claim("target binding constants", target_binding_constants, 0)?;
-    let mut domain = ExecutorDomain::new(
+    let (mut domain, bindings) = ExecutorDomain::new(
         Rc::new(execution_plan),
         definition,
         startup.into_heap(),
@@ -418,9 +422,10 @@ pub(crate) fn build(
         .register_allocated_holdings()
         .map_err(|error| internal(format!("register allocated memory holdings: {error}")))?;
     report_load_phase("state and domain allocation", &mut phase_started);
-    warm_up(&mut domain)?;
+    let bindings = warm_up(&mut domain, bindings)?;
     Ok(NativeDomain {
         domain,
+        bindings,
         plan,
         device: device_selector,
         pool,
@@ -534,7 +539,11 @@ impl StartupClaims {
 /// one-time first-forward cost is paid here. Tuning has already executed every
 /// kernel, and no row class carries its own first-use cost, so one row
 /// suffices. The request's state advance is aborted, so no state survives it.
-fn warm_up(domain: &mut ExecutorDomain) -> Result<(), LoadError> {
+/// The bindings travel with the forward and return with it.
+fn warm_up(
+    domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
+) -> Result<StateBindings, LoadError> {
     let began = std::time::Instant::now();
     let request = RequestId(u64::MAX);
     let failed = |error: String| internal(format!("load warm-up forward: {error}"));
@@ -549,7 +558,7 @@ fn warm_up(domain: &mut ExecutorDomain) -> Result<(), LoadError> {
     .map_err(|error| failed(error.to_string()))?;
     domain.install_input(request, input).map_err(failed)?;
     domain
-        .open_state(request, None)
+        .open_state(&mut bindings, request, None)
         .map_err(|error| failed(error.to_string()))?;
     let operations = [Operation::Forward {
         request,
@@ -563,19 +572,19 @@ fn warm_up(domain: &mut ExecutorDomain) -> Result<(), LoadError> {
         prime: None,
     }];
     let resources = domain
-        .reserve(&operations)
+        .reserve(&mut bindings, &operations)
         .map_err(|error| failed(error.to_string()))?
         .into_resources();
     let ReservedResources::Target(reservation) = resources else {
         return Err(failed("reserved a non-target lane".into()));
     };
     let flight = domain
-        .submit_target(&operations, reservation)
-        .map_err(|error| failed(error.to_string()))?;
-    for pending in domain
+        .submit_target(bindings, &operations, reservation)
+        .map_err(|failure| failed(failure.error().to_string()))?;
+    let (pending, bindings) = domain
         .finish_target(flight)
-        .map_err(|error| failed(error.to_string()))?
-    {
+        .map_err(|error| failed(error.to_string()))?;
+    for pending in pending {
         domain
             .abort(pending)
             .map_err(|error| failed(error.to_string()))?;
@@ -585,7 +594,7 @@ fn warm_up(domain: &mut ExecutorDomain) -> Result<(), LoadError> {
         "magnitude-engine: warm-up forward in {:.0} ms",
         began.elapsed().as_secs_f64() * 1000.0
     );
-    Ok(())
+    Ok(bindings)
 }
 
 /// Reports tuning at load: its progress to the host, and each unit on the

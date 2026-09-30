@@ -7,7 +7,7 @@ use magnitude_family_contracts::ModelDefinition;
 use magnitude_state::{
     BankCapacity, ComponentDescriptor, ComponentSpec, HistoryDomainId, HistoryDomainKind,
     HistoryDomainLayout, HistoryDomainPlan, HistoryDomainTrace, KvCodec, LayerRef,
-    ModelStateLayout, StateStore,
+    ModelStateLayout, StateStore, StoreBindings,
 };
 use seismic::{DType, Device, Element, SlabLayout, SlabRegion};
 use std::rc::Rc;
@@ -441,8 +441,9 @@ impl StateStorePlan {
             .ok_or_else(|| "initial state slab charge overflows".into())
     }
 
-    pub fn allocate(&self, device: Rc<Device>) -> Result<Rc<StateStore>, String> {
-        let store = StateStore::new(
+    /// The planned store and its one binding right.
+    pub fn allocate(&self, device: Rc<Device>) -> Result<StoreBindings, String> {
+        let (store, bindings) = StateStore::new(
             device,
             self.context_rows,
             self.max_advance,
@@ -469,7 +470,7 @@ impl StateStorePlan {
         {
             return Err("state allocation differs from its resource-plan projection".into());
         }
-        Ok(store)
+        Ok(bindings)
     }
 }
 
@@ -588,14 +589,14 @@ impl ResourcePlan {
         self.startup_peak_bytes
     }
 
-    pub fn allocate_target_state(&self, device: Rc<Device>) -> Result<Rc<StateStore>, String> {
+    pub fn allocate_target_state(&self, device: Rc<Device>) -> Result<StoreBindings, String> {
         self.target_state.allocate(device)
     }
 
     pub fn allocate_head_state(
         &self,
         device: Rc<Device>,
-    ) -> Result<Option<Rc<StateStore>>, String> {
+    ) -> Result<Option<StoreBindings>, String> {
         self.head_state
             .as_ref()
             .map(|plan| plan.allocate(device))

@@ -23,11 +23,10 @@ use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     AssessmentGraphResourceBounds, AssessmentMemoryTerms, Demand, DraftForm, ExecutionPath,
     ExecutorDomain, FeatureReader, FeatureRows, FeatureSpan, Operation, Outcome, PhysicalDecision,
-    RequestId, ResourceCapacity, ResourcePlanner, ResumeState, Sampling, SelectSpec, Shaping,
-    TokenId, WorkKind,
+    RequestId, ReservedResources, ResourceCapacity, ResourcePlanner, ResumeState, Sampling,
+    SelectSpec, Shaping, StateBindings, TokenId, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
-use magnitude_scheduler::domain::{self as service_domain, DomainFlight};
 use std::path::PathBuf;
 
 fn path(variable: &str) -> PathBuf {
@@ -83,8 +82,14 @@ fn greedy(position: usize) -> SelectSpec {
 }
 
 /// Prefill `tokens` for `request` with the features a draft conditions on,
-/// and return the committed rows' features.
-fn prefill(domain: &mut ExecutorDomain, request: RequestId, tokens: &[TokenId]) -> FeatureRows {
+/// and return the committed rows' features. The flight carries the bindings
+/// and returns them.
+fn prefill(
+    domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
+    request: RequestId,
+    tokens: &[TokenId],
+) -> (FeatureRows, StateBindings) {
     let operation = Operation::Forward {
         request,
         kind: WorkKind::Prefill,
@@ -96,13 +101,20 @@ fn prefill(domain: &mut ExecutorDomain, request: RequestId, tokens: &[TokenId]) 
         committed: tokens.len(),
         prime: None,
     };
-    let groups = service_domain::group(domain, vec![operation]);
-    let DomainFlight::Target(flight) = service_domain::submit_group(domain, &groups[0]).unwrap()
+    let operations = [operation];
+    let ReservedResources::Target(reservation) = domain
+        .reserve(&mut bindings, &operations)
+        .unwrap()
+        .into_resources()
     else {
         panic!("a prefill runs on the target lane")
     };
+    let flight = domain
+        .submit_target(bindings, &operations, reservation)
+        .unwrap_or_else(|failure| panic!("{}", failure.error()));
+    let (pending, bindings) = domain.finish_target(flight).unwrap();
     let mut features = None;
-    for pending in domain.finish_target(flight).unwrap() {
+    for pending in pending {
         let Outcome::Forward { rows } = pending.outcome().clone() else {
             panic!("a prefill returns forward rows")
         };
@@ -116,9 +128,10 @@ fn prefill(domain: &mut ExecutorDomain, request: RequestId, tokens: &[TokenId]) 
             )
             .unwrap();
     }
-    domain
+    let features = domain
         .read(&FeatureSpan::new(features.unwrap(), 0, tokens.len()).unwrap())
-        .unwrap()
+        .unwrap();
+    (features, bindings)
 }
 
 /// Rows `rows` of `features`.
@@ -135,25 +148,31 @@ fn rows(features: &FeatureRows, rows: std::ops::Range<usize>) -> FeatureRows {
 
 /// Install a request with no prompt rows and make it resident, fresh or from
 /// `from`.
-fn open(domain: &mut ExecutorDomain, request: RequestId, from: Option<&ResumeState>) {
+fn open(
+    domain: &mut ExecutorDomain,
+    bindings: &mut StateBindings,
+    request: RequestId,
+    from: Option<&ResumeState>,
+) {
     domain
         .install_input(request, PreparedModelInput::continuation_only())
         .unwrap();
-    domain.open_state(request, from).unwrap();
+    domain.open_state(bindings, request, from).unwrap();
 }
 
 /// One draft transaction at draft position `position` entering `tokens`
 /// (each paired with its row of `conditioning`), drafting `proposals` after
 /// the last. A request refuses a resume state while it is in flight. Returns
-/// the proposals.
+/// the proposals and the bindings its flight carried.
 fn transact(
     domain: &mut ExecutorDomain,
+    mut bindings: StateBindings,
     request: RequestId,
     tokens: &[TokenId],
     conditioning: FeatureRows,
     position: usize,
     proposals: usize,
-) -> Vec<(u32, u8)> {
+) -> (Vec<(u32, u8)>, StateBindings) {
     let entered = tokens.len();
     let operation = Operation::Head {
         request,
@@ -166,17 +185,24 @@ fn transact(
             .collect(),
         form: DraftForm::Block,
     };
-    let groups = service_domain::group(domain, vec![operation]);
-    let DomainFlight::Head(flight) = service_domain::submit_group(domain, &groups[0]).unwrap()
+    let operations = [operation];
+    let ReservedResources::Head(workspace, output, advances) = domain
+        .reserve(&mut bindings, &operations)
+        .unwrap()
+        .into_resources()
     else {
         panic!("a draft transaction runs on the head lane")
     };
+    let flight = domain
+        .submit_head(bindings, &operations, workspace, output, advances)
+        .unwrap_or_else(|failure| panic!("{}", failure.error()));
     assert!(
         domain.resume_state(request).is_err(),
         "a resume state waits for the in-flight draft transaction"
     );
+    let (pending, bindings) = domain.finish_head(flight).unwrap();
     let mut selected = Vec::new();
-    for pending in domain.finish_head(flight).unwrap() {
+    for pending in pending {
         let Outcome::Head { proposals } = pending.outcome().clone() else {
             panic!("a draft transaction returns proposals")
         };
@@ -193,20 +219,22 @@ fn transact(
             )
             .unwrap();
     }
-    selected
+    (selected, bindings)
 }
 
 /// Enter the prompt's pairs `(tokens[p + 1], feature p)` but the anchor's,
 /// as a prefill's draft transaction does.
 fn inject(
     domain: &mut ExecutorDomain,
+    bindings: StateBindings,
     request: RequestId,
     tokens: &[TokenId],
     features: &FeatureRows,
-) {
+) -> StateBindings {
     let committed = tokens.len() - 1;
-    let proposals = transact(
+    let (proposals, bindings) = transact(
         domain,
+        bindings,
         request,
         &tokens[1..committed],
         rows(features, 0..committed - 1),
@@ -214,19 +242,22 @@ fn inject(
         0,
     );
     assert!(proposals.is_empty());
+    bindings
 }
 
 /// The block draft anchored on `tokens`' last token.
 fn draft(
     domain: &mut ExecutorDomain,
+    bindings: StateBindings,
     request: RequestId,
     tokens: &[TokenId],
     features: &FeatureRows,
     proposals: usize,
-) -> Vec<(u32, u8)> {
+) -> (Vec<(u32, u8)>, StateBindings) {
     let committed = tokens.len() - 1;
     transact(
         domain,
+        bindings,
         request,
         &tokens[committed..],
         rows(features, committed - 1..committed),
@@ -241,7 +272,7 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
     let resolved = resolved();
     let proposals = resolved.manifest.model.method.proposals();
     assert!(proposals > 0, "the load drafts");
-    let (mut domain, _) =
+    let (mut domain, mut bindings, _) =
         build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
     let tokens = resolved
         .host
@@ -254,28 +285,28 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
     let committed = tokens.len() - 1;
 
     let source = RequestId(1);
-    open(&mut domain, source, None);
-    let conditioning = prefill(&mut domain, source, &tokens[..committed]);
-    inject(&mut domain, source, &tokens, &conditioning);
+    open(&mut domain, &mut bindings, source, None);
+    let (conditioning, bindings) = prefill(&mut domain, bindings, source, &tokens[..committed]);
+    let bindings = inject(&mut domain, bindings, source, &tokens, &conditioning);
     let before_draft = domain.resume_state(source).unwrap();
-    let drafted = draft(&mut domain, source, &tokens, &conditioning, proposals);
+    let (drafted, mut bindings) =
+        draft(&mut domain, bindings, source, &tokens, &conditioning, proposals);
     assert_eq!(drafted.len(), proposals);
 
     // Another request resumed from the state before the draft drafts the
     // same proposals.
     let copy = RequestId(2);
-    open(&mut domain, copy, Some(&before_draft));
-    assert_eq!(
-        draft(&mut domain, copy, &tokens, &conditioning, proposals),
-        drafted
-    );
+    open(&mut domain, &mut bindings, copy, Some(&before_draft));
+    let (copied, mut bindings) =
+        draft(&mut domain, bindings, copy, &tokens, &conditioning, proposals);
+    assert_eq!(copied, drafted);
     // Evicting the source and resuming it from that state drafts them too.
     domain.release_state(&[source]).unwrap();
-    domain.open_state(source, Some(&before_draft)).unwrap();
-    assert_eq!(
-        draft(&mut domain, source, &tokens, &conditioning, proposals),
-        drafted
-    );
+    domain
+        .open_state(&mut bindings, source, Some(&before_draft))
+        .unwrap();
+    let (resumed, _) = draft(&mut domain, bindings, source, &tokens, &conditioning, proposals);
+    assert_eq!(resumed, drafted);
     eprintln!("proposals after {committed} committed rows: {drafted:?}");
     for request in [source, copy] {
         domain.close(request).unwrap();
@@ -346,15 +377,16 @@ fn header_only_assessment_charges_what_a_load_commits() {
     .unwrap();
 
     // Load the target and, through one draft transaction, the draft.
-    let (mut domain, _) =
+    let (mut domain, mut bindings, _) =
         build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
     let request = RequestId(1);
-    open(&mut domain, request, None);
+    open(&mut domain, &mut bindings, request, None);
     let tokens = [1, 2, 3, 4, 5].map(TokenId);
-    let conditioning = prefill(&mut domain, request, &tokens[..4]);
-    inject(&mut domain, request, &tokens, &conditioning);
+    let (conditioning, bindings) = prefill(&mut domain, bindings, request, &tokens[..4]);
+    let bindings = inject(&mut domain, bindings, request, &tokens, &conditioning);
     draft(
         &mut domain,
+        bindings,
         request,
         &tokens,
         &conditioning,
