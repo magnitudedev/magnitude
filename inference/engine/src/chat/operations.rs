@@ -26,6 +26,12 @@ pub enum InputBound {
 pub struct PreparedInput {
     pub chat: PreparedChat,
     pub input: PreparedModelInput,
+    /// Input rows where a request that will generate retains prefix states
+    /// for later requests: where requests differing only in the last
+    /// message's content diverge from it (see
+    /// [`PreparedChat::last_message_boundary`]). Host-only sizing
+    /// ([`InputBound::Declared`]) retains nothing and has none.
+    pub cache_points: Vec<usize>,
 }
 
 fn now() -> i64 {
@@ -48,12 +54,8 @@ pub fn prepare(
     bound: InputBound,
 ) -> Result<PreparedInput, ChatError> {
     let RenderedInput { request, images } = input.render(now(), host.media_placeholder())?;
-    let chat = PreparedChat::prepare(
-        host.templates(),
-        host.tokenizer(),
-        &request,
-        &TemplateSelection::default(),
-    )?;
+    let selection = TemplateSelection::default();
+    let chat = PreparedChat::prepare(host.templates(), host.tokenizer(), &request, &selection)?;
     if let Some(constraint) = chat.constraint() {
         crate::telemetry::span_grammar(&constraint.report);
     }
@@ -62,12 +64,26 @@ pub fn prepare(
         crate::telemetry::span_relaxations(relaxations);
     }
     let tokens = chat.input().tokens.clone();
-    let input = match bound {
-        InputBound::Served => host.prepare_input(tokens, &images),
-        InputBound::Declared => host.prepare_count_input(tokens, &images),
-    }
-    .map_err(input_error)?;
-    Ok(PreparedInput { chat, input })
+    let (input, cache_points) = match bound {
+        InputBound::Served => {
+            let input = host.prepare_input(tokens, &images).map_err(input_error)?;
+            let cache_points = chat
+                .last_message_boundary(host.templates(), &request, &selection)
+                .map(|boundary| input.prompt_position_row(boundary))
+                .into_iter()
+                .collect();
+            (input, cache_points)
+        }
+        InputBound::Declared => (
+            host.prepare_count_input(tokens, &images).map_err(input_error)?,
+            Vec::new(),
+        ),
+    };
+    Ok(PreparedInput {
+        chat,
+        input,
+        cache_points,
+    })
 }
 
 /// The model input tokens a request occupies, including expanded media.

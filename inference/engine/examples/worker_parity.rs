@@ -14,7 +14,7 @@ use magnitude_engine::{
     },
     worker::{
         connect_worker,
-        protocol::{HostMessage, RetentionPolicy, WorkerMessage},
+        protocol::{HostMessage, WorkerMessage},
         serve_worker,
         transport::{stdio_worker_transport, FramedTransport},
         RequestEvent, RequestOptions,
@@ -27,6 +27,7 @@ use magnitude_executor::{
 use magnitude_generation::{
     EndOfGeneration, FinishReason, MethodChoice, Options, Sampling, Shaping, TokenId,
 };
+use magnitude_scheduler::prefix_cache::PrefixRetention;
 use std::{
     future::Future,
     path::PathBuf,
@@ -153,7 +154,7 @@ fn generate(engine: &ReadyEngine, tokens: usize) -> Result<(Vec<TokenId>, Finish
                 input,
                 options,
                 constraint: None,
-                retention: RetentionPolicy::Transient,
+                retention: PrefixRetention::Transient,
                 output_capacity: 16,
             })
             .await

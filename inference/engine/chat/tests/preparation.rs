@@ -448,3 +448,100 @@ fn json_constrained_generation_starts_with_and_without_forced_runs() {
         assert!(forward.selects[0].mask.is_some());
     }
 }
+
+fn conversation(system: &str, question: &str) -> ChatRequest {
+    ChatRequest::new(
+        vec![
+            serde_json::json!({"role": "system", "content": system}),
+            serde_json::json!({"role": "user", "content": question}),
+        ],
+        0,
+    )
+}
+
+fn tagged(source: &str) -> TemplateBundle {
+    TemplateBundle::new(
+        vec![TemplateVariant {
+            name: "default".into(),
+            source: source.into(),
+            provenance: "fixture".into(),
+        }],
+        "default".into(),
+        Default::default(),
+    )
+    .unwrap()
+}
+
+/// Each turn opens with the `<bos>` control token and closes with `<eos>`.
+const TURNS: &str =
+    "{% for m in messages %}<bos>{{ m.role }}: {{ m.content }}<eos>{% endfor %}<bos>assistant: ";
+
+/// The last message's boundary is the position after the control token
+/// that opens it. Every request differing only in the last message's
+/// content shares the tokens before it, whatever the content starts with,
+/// including content that begins like the probe.
+#[test]
+fn last_message_boundary_follows_the_token_that_opens_it() {
+    let tokenizer = tokenizer();
+    let bundle = tagged(TURNS);
+    let system = "You answer tersely and cite the harbour log. ".repeat(8);
+    let selection = TemplateSelection::default();
+    let boundary = tokenizer
+        .encode(&format!("<bos>system: {system}<eos><bos>"), SpecialTokens::Recognize)
+        .unwrap()
+        .len();
+    let questions = ["Hello there", "Hello again", "Why is the sky blue?", "\u{E000}x"];
+    let prepared = questions.map(|question| {
+        let request = conversation(&system, question);
+        let chat = PreparedChat::prepare(&bundle, &tokenizer, &request, &selection).unwrap();
+        let found = chat.last_message_boundary(&bundle, &request, &selection);
+        (chat, found)
+    });
+    for (chat, found) in &prepared {
+        assert_eq!(*found, Some(boundary));
+        assert_eq!(
+            chat.input().tokens[..boundary],
+            prepared[0].0.input().tokens[..boundary]
+        );
+    }
+}
+
+/// An inserted sequence-start token shifts the boundary by one position.
+#[test]
+fn last_message_boundary_counts_the_inserted_sequence_start() {
+    let tokenizer = ByteBpeTokenizer::new(BpeConfig {
+        implicit_bos: Some(TokenId(257)),
+        ..config()
+    })
+    .unwrap();
+    let bundle = tagged(&format!("chat\n{TURNS}"));
+    let request = conversation("be terse", "Hello");
+    let selection = TemplateSelection::default();
+    let chat = PreparedChat::prepare(&bundle, &tokenizer, &request, &selection).unwrap();
+    assert_eq!(chat.input().tokens[0], TokenId(257));
+    let opened = tokenizer
+        .encode("chat\n<bos>system: be terse<eos><bos>", SpecialTokens::Recognize)
+        .unwrap()
+        .len();
+    assert_eq!(
+        chat.last_message_boundary(&bundle, &request, &selection),
+        Some(1 + opened)
+    );
+}
+
+/// Without a rendered content, or without a token opening the message,
+/// there is no boundary.
+#[test]
+fn last_message_boundary_needs_rendered_content_after_an_added_token() {
+    let tokenizer = tokenizer();
+    let selection = TemplateSelection::default();
+    let request = conversation("system", "question");
+    for source in [
+        "{% for m in messages %}<bos>{{ m.role }}<eos>{% endfor %}",
+        "{% for m in messages %}[{{ m.role }}] {{ m.content }}\n{% endfor %}",
+    ] {
+        let bundle = tagged(source);
+        let chat = PreparedChat::prepare(&bundle, &tokenizer, &request, &selection).unwrap();
+        assert_eq!(chat.last_message_boundary(&bundle, &request, &selection), None);
+    }
+}

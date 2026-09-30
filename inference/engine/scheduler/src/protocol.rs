@@ -5,6 +5,7 @@
 //! be represented here. The engine's worker session is the only dispatcher;
 //! the host/worker IPC protocol is defined above this crate.
 
+use crate::prefix_cache::PrefixRetention;
 use crate::publication::PublicationReceiver;
 use crate::owner::{AdmissionError, Status};
 use magnitude_executor::platform::DomainReading;
@@ -15,8 +16,9 @@ use magnitude_generation::GenerationSeed;
 pub struct AdmitRequest {
     pub seed: GenerationSeed,
     pub input: PreparedModelInput,
-    /// Whether the request resumes from and contributes to the prefix cache.
-    pub prefix_cache: bool,
+    /// Whether the request resumes from and contributes to the prefix
+    /// cache, and where it retains states for later requests.
+    pub retention: PrefixRetention,
     pub output_capacity: usize,
 }
 

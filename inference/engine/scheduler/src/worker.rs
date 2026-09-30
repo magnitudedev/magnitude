@@ -536,7 +536,7 @@ mod tests {
         WorkerCommand::Admit(crate::protocol::AdmitRequest {
             seed,
             input,
-            prefix_cache: false,
+            retention: crate::prefix_cache::PrefixRetention::Transient,
             output_capacity: 1,
         })
     }

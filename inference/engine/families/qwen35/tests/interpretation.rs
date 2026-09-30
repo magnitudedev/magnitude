@@ -761,6 +761,18 @@ fn qwen_adapter_prepares_a_repeated_image_once_for_every_placement() {
         vec![[3, 3, 3], [4, 4, 4], [5, 5, 5], [6, 6, 6]]
     );
     assert_eq!(input.coordinates_at(8, 1).unwrap(), vec![[6, 6, 6]]);
+    // Each placeholder token expands to its span's rows; every other prompt
+    // token is the row of the same token.
+    let rows = (0..=tokens.len())
+        .map(|position| input.prompt_position_row(position))
+        .collect::<Vec<_>>();
+    assert_eq!(rows, [0, 1, 5, 6, 7, 8, 12, 13]);
+    for (position, token) in tokens.iter().enumerate() {
+        if *token != TokenId(99) {
+            assert_eq!(input.tokens()[rows[position]], *token);
+        }
+    }
+    assert_eq!(rows[tokens.len()], input.tokens().len());
 }
 
 /// A closed input places every image it holds and holds every image its

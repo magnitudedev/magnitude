@@ -2425,6 +2425,7 @@ dependencies = [
  "magnitude-family-contracts",
  "magnitude-generation",
  "magnitude-state",
+ "serde",
 ]
 
 [[package]]

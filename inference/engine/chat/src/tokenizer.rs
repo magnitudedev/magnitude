@@ -11,8 +11,27 @@ use tokenizers::{
         split::{Split as SplitStage, SplitPattern},
         PreTokenizerWrapper,
     },
-    AddedToken, SplitDelimiterBehavior, Tokenizer,
+    AddedToken, Encoding, SplitDelimiterBehavior, Tokenizer,
 };
+
+/// A model input sequence's tokens, and where its added tokens end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncodedSequence {
+    pub tokens: Vec<TokenId>,
+    /// Every added token (a control or user-defined piece), in order. The
+    /// text is split at added tokens before anything else is encoded, so
+    /// the tokens before an added token's end are the same for every text
+    /// sharing the bytes before it.
+    pub added_token_ends: Vec<AddedTokenEnd>,
+}
+
+/// Where an added token ends: its text's end offset in bytes, and the
+/// sequence position after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddedTokenEnd {
+    pub offset: usize,
+    pub position: usize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PieceKind {
@@ -380,27 +399,58 @@ impl ByteBpeTokenizer {
     }
     /// Encode a text fragment. No sequence-start token is inserted.
     pub fn encode(&self, text: &str, special: SpecialTokens) -> Result<Vec<TokenId>, String> {
-        let index = usize::from(special == SpecialTokens::Literal);
-        Ok(self.encoders[index]
-            .encode(text, false)
-            .map_err(|e| e.to_string())?
+        Ok(self
+            .encoding(text, special)?
             .get_ids()
             .iter()
             .map(|&id| TokenId(id))
             .collect())
     }
+
+    fn encoding(&self, text: &str, special: SpecialTokens) -> Result<Encoding, String> {
+        let index = usize::from(special == SpecialTokens::Literal);
+        self.encoders[index]
+            .encode(text, false)
+            .map_err(|e| e.to_string())
+    }
     /// Encode the complete text of a model input sequence, recognizing special
     /// tokens. The implicit BOS is part of the sequence exactly once: a
     /// sequence whose text already begins with it (a chat template that
     /// renders the BOS text) is not given a second one.
-    pub fn encode_sequence(&self, text: &str) -> Result<Vec<TokenId>, String> {
-        let mut tokens = self.encode(text, SpecialTokens::Recognize)?;
-        if let Some(bos) = self.implicit_bos {
-            if tokens.first() != Some(&bos) {
+    pub fn encode_sequence(&self, text: &str) -> Result<EncodedSequence, String> {
+        let encoding = self.encoding(text, SpecialTokens::Recognize)?;
+        let mut tokens = encoding
+            .get_ids()
+            .iter()
+            .map(|&id| TokenId(id))
+            .collect::<Vec<_>>();
+        let inserted = match self.implicit_bos {
+            Some(bos) if tokens.first() != Some(&bos) => {
                 tokens.insert(0, bos);
+                1
             }
-        }
-        Ok(tokens)
+            _ => 0,
+        };
+        let added_token_ends = encoding
+            .get_ids()
+            .iter()
+            .zip(encoding.get_offsets())
+            .enumerate()
+            .filter(|(_, (&id, _))| {
+                matches!(
+                    self.kinds[id as usize],
+                    PieceKind::Control | PieceKind::UserDefined
+                )
+            })
+            .map(|(index, (_, &(_, end)))| AddedTokenEnd {
+                offset: end,
+                position: inserted + index + 1,
+            })
+            .collect();
+        Ok(EncodedSequence {
+            tokens,
+            added_token_ends,
+        })
     }
     pub fn piece(&self, token: TokenId, skip_control: bool) -> Result<&[u8], String> {
         let id = token.0 as usize;

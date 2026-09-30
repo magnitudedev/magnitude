@@ -5,10 +5,7 @@
 use super::operations::{prepare, InputBound, PreparedInput};
 use crate::error::RequestError;
 use crate::host::HostArtifacts;
-use crate::worker::{
-    protocol::{RequestState, RetentionPolicy},
-    EngineClient, RequestEvent, RequestOptions,
-};
+use crate::worker::{protocol::RequestState, EngineClient, RequestEvent, RequestOptions};
 use magnitude_chat::{
     conformance::OutputSchemas,
     generation::{generation_options, ModelLimits},
@@ -20,6 +17,7 @@ use magnitude_chat::{
     ChatError, Event, FinishReason, GenerationRequest, SpecialTokens, TerminalCause,
     TokenChatStream,
 };
+use magnitude_scheduler::prefix_cache::PrefixRetention;
 use std::{
     collections::BTreeMap,
     sync::Arc,
@@ -117,7 +115,11 @@ async fn run(
             .map_err(|error| ChatError::Internal(format!("request preparation failed: {error}")))
             .and_then(|prepared| prepared)
     };
-    let PreparedInput { chat, input } = match prepared {
+    let PreparedInput {
+        chat,
+        input,
+        cache_points,
+    } = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return events.send(SessionEvent::Failed(SessionError::Chat(error))).await,
     };
@@ -157,8 +159,8 @@ async fn run(
             options,
             constraint: chat.input().constraint.clone(),
             retention: match request.controls.prompt_cache {
-                PromptCache::Allowed => RetentionPolicy::Retain,
-                PromptCache::Disabled => RetentionPolicy::Transient,
+                PromptCache::Allowed => PrefixRetention::Retain { cache_points },
+                PromptCache::Disabled => PrefixRetention::Transient,
             },
             output_capacity: limits.output_capacity,
         })

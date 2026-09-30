@@ -1,6 +1,6 @@
 use super::{
-    reasoning::ResolvedReasoning, ByteBpeTokenizer, ChatError, ChatRequest, PreparedRequest,
-    SpecialTokens, TemplateBundle, TemplateSelection, TokenId,
+    reasoning::ResolvedReasoning, AddedTokenEnd, ByteBpeTokenizer, ChatError, ChatRequest,
+    EncodedSequence, PreparedRequest, SpecialTokens, TemplateBundle, TemplateSelection, TokenId,
 };
 use magnitude_generation::ReasoningBudget;
 use magnitude_grammar::{CompileReport, Grammar};
@@ -39,9 +39,17 @@ pub struct ConstraintSource {
 pub struct PreparedChat {
     native: PreparedRequest,
     input: PreparedChatInput,
+    /// Where the prompt's added tokens end, from its one encoding.
+    added_token_ends: Vec<AddedTokenEnd>,
     constraint: Option<ConstraintSource>,
     reasoning: ResolvedReasoning,
 }
+
+/// Stands in for the last message's content to locate where it begins. The
+/// prompts diverge at or after the content's start; the boundary is the
+/// added token before it, so content that happens to begin like the probe
+/// finds the same boundary.
+const CONTENT_PROBE: &str = "\u{E000}";
 
 fn internal(message: String) -> ChatError {
     ChatError::Internal(message)
@@ -56,7 +64,10 @@ impl PreparedChat {
     ) -> Result<Self, ChatError> {
         let (native, reasoning) = bundle.prepare(request, selection)?;
         let description = native.description();
-        let tokens = tokenizer
+        let EncodedSequence {
+            tokens,
+            added_token_ends,
+        } = tokenizer
             .encode_sequence(&description.prompt)
             .map_err(internal)?;
         if tokens.is_empty() {
@@ -123,10 +134,53 @@ impl PreparedChat {
                 tokens,
                 constraint: plan,
             },
+            added_token_ends,
             constraint,
             reasoning,
         })
     }
+    /// The prompt token position that opens the last message: the position
+    /// after the last added token (the template's turn markup) before that
+    /// message's content. Every request differing from `request` only in
+    /// that content shares the prompt's tokens up to it, so it is where a
+    /// conversation's next variation of its last message diverges.
+    ///
+    /// `request` is rendered again with the last message's content replaced
+    /// by [`CONTENT_PROBE`]; the content begins at the first byte where the
+    /// two prompts differ. `None` when the template rejects the probe (it
+    /// may validate content) or renders the prompt unchanged, or when no
+    /// added token opens the message inside the prompt.
+    pub fn last_message_boundary(
+        &self,
+        bundle: &TemplateBundle,
+        request: &ChatRequest,
+        selection: &TemplateSelection<'_>,
+    ) -> Option<usize> {
+        let mut probe = request.clone();
+        probe
+            .messages
+            .last_mut()?
+            .as_object_mut()?
+            .insert("content".into(), CONTENT_PROBE.into());
+        let (native, _) = bundle.prepare(&probe, selection).ok()?;
+        let prompt = self.prompt();
+        let probed = &native.description().prompt;
+        if prompt == probed {
+            return None;
+        }
+        let content = prompt
+            .bytes()
+            .zip(probed.bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        self.added_token_ends
+            .iter()
+            .rev()
+            .find(|end| end.offset <= content)
+            .map(|end| end.position)
+            .filter(|&position| position < self.input.tokens.len())
+    }
+
     /// The output constraint's GBNF and compile report, when constrained.
     pub fn constraint(&self) -> Option<&ConstraintSource> {
         self.constraint.as_ref()

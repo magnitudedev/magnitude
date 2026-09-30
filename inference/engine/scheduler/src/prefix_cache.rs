@@ -17,6 +17,7 @@
 use magnitude_executor::ResourcePlan;
 use magnitude_family_contracts::{InputLayout, TokenId};
 use magnitude_generation::{Generation, MethodCheckpoint};
+use serde::{Deserialize, Serialize};
 
 pub const MIN_PREFIX_HIT: usize = 64;
 
@@ -24,6 +25,20 @@ pub const MIN_PREFIX_HIT: usize = 64;
 /// position. A branch point costs a split prefill chunk and a retained
 /// recurrent bank; below this the recomputed prefill is cheaper.
 pub const MIN_BRANCH_GAIN: usize = 128;
+
+/// Whether a request takes part in the prefix cache (`cache_prompt`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrefixRetention {
+    /// The request neither resumes from nor contributes to the cache.
+    Transient,
+    /// The request resumes from the cache and contributes its caching
+    /// points. `cache_points` are prompt positions, each an exact boundary
+    /// below the prompt's end, where the host expects later requests to
+    /// diverge (the boundary opening the last message): the request
+    /// retains a state at each one, so a later request diverging there
+    /// resumes from it instead of recomputing the shared prefix.
+    Retain { cache_points: Vec<usize> },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefixCacheCapacity {
@@ -251,6 +266,13 @@ impl<S> PrefixCache<S> {
             }
         }
         best.map(|(index, _, _)| index)
+    }
+
+    /// Whether an entry ends exactly at `position` on `path`, without
+    /// counting as a use.
+    pub fn holds(&self, path: PrefixPath, position: usize) -> bool {
+        self.best(path, position + 1)
+            .is_some_and(|index| self.entries[index].position() == position)
     }
 
     /// The deepest boundary to which `path` shares any cached path, whether
@@ -590,6 +612,28 @@ mod tests {
         let hit = lookup_any(&mut cache, &third).unwrap();
         assert_eq!(hit.position(), 200);
         assert_eq!(cache.len(), 2);
+    }
+
+    /// A state retained where the last message begins (a declared cache
+    /// point) serves every later question, whatever it shares with earlier
+    /// ones beyond that point; `holds` reports it without counting a use.
+    #[test]
+    fn a_state_at_the_last_message_serves_every_changed_message() {
+        let mut cache = PrefixCache::new(capacity(8));
+        let first = chat(200, 1, 260);
+        assert!(!cache.holds(first.path(), 200));
+        assert!(retain(&mut cache, &first, 200, rows(0..200)));
+        assert!(retain(&mut cache, &first, 260, rows(0..260)));
+        assert!(cache.holds(first.path(), 200));
+        assert!(cache.holds(first.path(), 260));
+        assert!(!cache.holds(first.path(), 230));
+        for question in 2..5 {
+            let next = chat(200, question, 240 + question);
+            assert!(cache.holds(next.path(), 200));
+            assert!(!cache.holds(next.path(), 260));
+            assert_eq!(lookup_any(&mut cache, &next).unwrap().position(), 200);
+        }
+        assert!(!cache.holds(text(260, "other").path(), 200));
     }
 
     #[test]

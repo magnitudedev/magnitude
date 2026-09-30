@@ -66,13 +66,13 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
             WorkerCommand::Admit(AdmitRequest {
                 seed,
                 input,
-                prefix_cache,
+                retention,
                 output_capacity,
             }) => match &mut self.execution {
                 Execution::Serving(owner) => {
                     let generation = seed.into_generation(self.method.clone())?;
                     Ok(
-                        match owner.admit(generation, input, prefix_cache, output_capacity, now) {
+                        match owner.admit(generation, input, retention, output_capacity, now) {
                             Ok((request, receiver)) => WorkerReply::Admitted { request, receiver },
                             Err(error) => WorkerReply::AdmissionRefused(error),
                         },

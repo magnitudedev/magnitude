@@ -21,7 +21,7 @@ use magnitude_generation::{
 };
 use magnitude_scheduler::{
     owner::{AdmissionError, Owner, Status},
-    prefix_cache::PrefixCacheCapacity,
+    prefix_cache::{PrefixCacheCapacity, PrefixRetention},
     ServiceLimits,
 };
 use magnitude_state::KvCodec;
@@ -148,7 +148,14 @@ fn admit(
         (0..prompt.len()).map(|row| [row as i32; 3]).collect(),
     )
     .unwrap();
-    host.admit(generation, input, prefix_cache, output_capacity)
+    let retention = if prefix_cache {
+        PrefixRetention::Retain {
+            cache_points: Vec::new(),
+        }
+    } else {
+        PrefixRetention::Transient
+    };
+    host.admit(generation, input, retention, output_capacity)
 }
 
 /// Whether the owner holds `stream`'s request resident and blocked on its

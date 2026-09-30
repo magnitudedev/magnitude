@@ -17,6 +17,7 @@ use crate::options::{ExecutionManifest, ReadyInfo};
 use magnitude_chat::ConstraintPlan;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
+use magnitude_scheduler::prefix_cache::PrefixRetention;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -49,22 +50,16 @@ impl fmt::Display for HostRequestId {
     }
 }
 
-/// Whether the request's prompt state is kept for later exact-prefix reuse
-/// (`cache_prompt`). The worker derives the retention key from its own
-/// package, tokenizer and codec identities.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RetentionPolicy {
-    Retain,
-    Transient,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Admission {
     pub request_id: HostRequestId,
     pub input: PreparedModelInput,
     pub options: Options,
     pub constraint: Option<ConstraintPlan>,
-    pub retention: RetentionPolicy,
+    /// Whether the request's prompt state is kept for later exact-prefix
+    /// reuse. The prefix cache belongs to the worker's one loaded model, so
+    /// package, tokenizer and codec identities are fixed for every path.
+    pub retention: PrefixRetention,
     /// Output batches the request's publication queue holds; also the host's
     /// initial credit.
     pub output_capacity: usize,

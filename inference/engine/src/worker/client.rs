@@ -7,7 +7,7 @@
 
 use super::protocol::{
     Admission, EngineBuild, ExecutionTimings, HostMessage, HostRequestId,
-    LoadProgress, MemoryObservation, RequestProgress, RetentionPolicy, WorkerMessage,
+    LoadProgress, MemoryObservation, RequestProgress, WorkerMessage,
 };
 use super::transport::{HostTransport, MessageReceiver, MessageSender};
 use crate::error::{LoadError, RequestError};
@@ -15,6 +15,7 @@ use crate::options::{ExecutionManifest, ReadyInfo};
 use magnitude_chat::ConstraintPlan;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
+use magnitude_scheduler::prefix_cache::PrefixRetention;
 use std::{
     collections::{HashMap, VecDeque},
     future::poll_fn,
@@ -28,7 +29,7 @@ pub struct RequestOptions {
     pub options: Options,
     /// The constraint description; the worker instantiates the matcher.
     pub constraint: Option<ConstraintPlan>,
-    pub retention: RetentionPolicy,
+    pub retention: PrefixRetention,
     /// Output batches buffered for this request, on each side.
     pub output_capacity: usize,
 }

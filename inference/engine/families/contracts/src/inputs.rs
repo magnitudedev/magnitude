@@ -334,6 +334,19 @@ impl PreparedModelInput {
         &self.vision
     }
 
+    /// The input row at prompt token position `position`: prompt tokens
+    /// are rows in order, except that each span's placeholder token expands
+    /// to the span's rows (see [`ModelInputAdapter`]).
+    pub fn prompt_position_row(&self, position: usize) -> usize {
+        self.layout.spans().iter().fold(position, |row, span| {
+            if row > span.start {
+                row + (span.end - span.start) - 1
+            } else {
+                row
+            }
+        })
+    }
+
     /// Re-establish every construction invariant against `definition`. A
     /// value decoded from another process is accepted only through this.
     pub fn validated(self, definition: &ModelDefinition) -> Result<Self, InputPreparationError> {
@@ -399,6 +412,10 @@ impl PreparedModelInput {
     }
 }
 
+/// Prepares a family's numerical input from prompt tokens and media. Every
+/// prompt token is one input row, in order, except each image's placeholder
+/// token, which expands to its span's rows: an input's layout alone maps
+/// prompt positions to rows ([`PreparedModelInput::prompt_position_row`]).
 pub trait ModelInputAdapter {
     fn prepare(
         &self,

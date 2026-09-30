@@ -3,6 +3,9 @@ applies_to:
   - inference/engine/scheduler/**
   - inference/engine/executor/src/domain/**
   - inference/engine/generation/**
+  - inference/engine/chat/src/preparation.rs
+  - inference/engine/chat/src/tokenizer.rs
+  - inference/engine/src/chat/operations.rs
 ---
 
 # Prefix cache
@@ -37,6 +40,7 @@ path it holds and are not part of an entry's identity.
 | A request's prepared input and media | The executor, for the request's whole lifetime |
 | A resident request's numerical state and encoded features | The executor, for its residency |
 | When to cache (branch point, prompt boundary, terminal) and when to wait for a peer | Scheduler policy |
+| Where a request's next variation is expected to diverge (its cache points) | Chat preparation, declared at admission |
 
 ## Lifecycle
 
@@ -56,10 +60,28 @@ path it holds and are not part of an entry's identity.
   length after.
 
 Caching points: a planned branch point where a request diverges from a cached path or a live
-peer's prompt; one row before the prompt end; and a finished request's whole path, prompt and
-reply, so the next turn of a conversation resumes at its end. A request whose path matches a live
-peer's prompt beyond anything cached waits, holding no numerical state, until the peer caches the
-shared prefix or stops computing it; the prefix is computed once.
+peer's prompt; a declared cache point; one row before the prompt end; and a finished request's
+whole path, prompt and reply, so the next turn of a conversation resumes at its end. A request
+whose path matches a live peer's prompt beyond anything cached waits, holding no numerical state,
+until the peer caches the shared prefix or stops computing it; the prefix is computed once.
+
+**Declared cache points.** A state can be restored only where one was retained: recurrent state
+exists at one position, and windowed history releases rows it no longer references, so no cached
+state is ever cut back to a shorter prefix. A divergence discovered only when a request arrives
+therefore costs that request a full recompute. Chat preparation anticipates the common case, a
+request that changes only its last message (a fixed system prompt and tools, a new question). It
+renders the request again with that content replaced by a probe; the content begins at the first
+byte where the two prompts differ. The tokenizer splits text at added tokens (the template's turn
+markup) before encoding anything else, so every token up to the last added token ending at or
+before that byte is the same for every request sharing those bytes. The position after that token,
+the boundary opening the last message, found in the prompt's one encoding, is mapped to its input
+row by the prepared input's layout ([model input](model-input.md)) and declared with the
+admission. The scheduler plans each declared point as a branch point: prefill
+stops there and the state is retained, so every later request whose last message differs resumes
+at that point, however its content begins. A declared point is planned only when no entry already
+holds it and it passes the same gate as any branch point: a hit, inside the prompt, and at least
+the minimum branch gain beyond where the request resumes and beyond any lower branch point it
+plans.
 
 ## Invariants
 
@@ -79,13 +101,18 @@ shared prefix or stops computing it; the prefix is computed once.
    prefixes.
 6. For any sequence of requests (interleaved, waiting, evicted, cancelled), a request whose live
    path shares a cached prefix of at least the minimum hit length, at an exact boundary below its
-   resume bound, resumes from the deepest such prefix.
+   resume bound, resumes from the deepest such prefix. The prefixes cached for it include, for
+   every earlier retaining request that reached it, the state at each of that request's declared
+   cache points it planned (unless evicted), so a request that shares an earlier request's path
+   through a declared point resumes at least there.
 
 ## Acceptance criteria
 
 - A conversation's next turn whose prompt extends the previous turn's prompt and reply resumes at
   the end of that reply, with output identical to a cold run.
 - A next turn whose template rewrites the previous reply resumes at the previous prompt boundary.
+- Requests that share a long system prompt and differ only in their last message resume, from the
+  second on, at the added token that opens that message, whatever its content begins with.
 - An evicted request with media replays to output identical to an uninterrupted run.
 - A waiting request resumes from its peer's prefix without recomputing or re-encoding it.
 - Every charged byte stays attributed while prefixes are cached, used and evicted.

@@ -31,6 +31,9 @@ The adapter is configured with tokenizer-derived family marker identities before
 request; the model definition and media alone cannot identify those tokens.
 For text-only input, the same closed contract records the family-supplied coordinates directly;
 constructing it performs alignment checks and does not derive coordinate semantics.
+Every prompt token is one input row, in order, except each image's placeholder token, which the
+adapter expands to its span's rows; the input's layout alone therefore maps a prompt position to its
+row.
 
 The tokenizer is adapted from the container's tokenizer facts, never from the model family: the
 declared scheme selects one implemented profile, and an unimplemented scheme or uninterpreted

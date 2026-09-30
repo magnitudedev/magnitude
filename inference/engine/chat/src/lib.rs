@@ -32,8 +32,8 @@ pub use templates::{
     ToolChoice, TEMPLATE_FINGERPRINT_VERSION,
 };
 pub use tokenizer::{
-    BpeConfig, ByteBpeTokenizer, Normalization, PieceEncoding, PieceKind, SpecialTokens, Split,
-    SplitBehavior, TokenDecoder, TokenizerError,
+    AddedTokenEnd, BpeConfig, ByteBpeTokenizer, EncodedSequence, Normalization, PieceEncoding,
+    PieceKind, SpecialTokens, Split, SplitBehavior, TokenDecoder, TokenizerError,
 };
 
 /// Measured physical execution time attributed to a request. Durations are

@@ -15,7 +15,10 @@ use super::{
         AvailabilityEpoch, Operation as ScheduledOperation, Phase, Scheduler, Selection,
         ServiceLimits, Victim, order_victims,
     },
-    prefix_cache::{MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache, PrefixCacheCapacity, PrefixPath},
+    prefix_cache::{
+        MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache, PrefixCacheCapacity, PrefixPath,
+        PrefixRetention,
+    },
     protocol::{RequestSnapshot, WorkerReply},
     publication::{
         CapacityResource, ModelUnloadCause, PhysicalTimings, PublicationPermit, PublicationQueue,
@@ -41,12 +44,28 @@ use std::{
     time::Duration,
 };
 
-/// Where a newly admitted request stops its prefill to retain a branch
-/// point, or the shared prefix it waits for a live peer to retain.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Where a newly admitted request stops its prefill to retain branch
+/// points, and the shared prefix it waits for a live peer to retain.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct BranchPlan {
-    branch: Option<usize>,
+    branches: BTreeSet<usize>,
     awaited: Option<usize>,
+}
+
+/// Whether retaining a state at `point` is worth a split prefill chunk and a
+/// retained state: a hit, inside the prompt, and at least
+/// [`MIN_BRANCH_GAIN`] rows beyond `from`, where the request resumes.
+fn worthwhile(point: usize, from: usize, prompt: usize) -> bool {
+    point >= MIN_PREFIX_HIT && point >= from + MIN_BRANCH_GAIN && point < prompt
+}
+
+/// Plan a branch point at `point` when it is worthwhile over both `from`
+/// and the deepest branch point already planned below it.
+fn plan_branch(branches: &mut BTreeSet<usize>, point: usize, from: usize, prompt: usize) {
+    let below = branches.range(..point).next_back().copied().unwrap_or(0);
+    if !branches.contains(&point) && worthwhile(point, from.max(below), prompt) {
+        branches.insert(point);
+    }
 }
 
 /// Where a request's prompt is retained: one row before the prompt end, the
@@ -60,6 +79,17 @@ fn prompt_boundary(record: &Record, generation: &Generation) -> Option<usize> {
         && boundary >= MIN_PREFIX_HIT
         && generation.layout().boundary(boundary))
     .then_some(boundary)
+}
+
+/// The first position after `position` where the request's prefill stops
+/// for the prefix cache: a planned branch point or its prompt boundary.
+fn next_stop(record: &Record, generation: &Generation, position: usize) -> Option<usize> {
+    let branch = record.branches.range(position + 1..).next().copied();
+    [branch, prompt_boundary(record, generation)]
+        .into_iter()
+        .flatten()
+        .filter(|&stop| stop > position)
+        .min()
 }
 
 /// Whether `generation` is resident, unfinished, and not yet past `position`.
@@ -103,10 +133,11 @@ struct Record {
     prefix_source: Option<u64>,
     prefill_retained: bool,
     terminal_retained: bool,
-    /// A planned branch point: the prompt position where this request
-    /// diverges from a path the engine holds. Prefill stops there so the
-    /// cache can retain a state every later divergent request resumes from.
-    branch: Option<usize>,
+    /// Planned branch points, in prompt order: where this request diverges
+    /// from a path the engine holds, and the cache points its admission
+    /// declared. Prefill stops at each so the cache can retain a state every
+    /// later request diverging there resumes from.
+    branches: BTreeSet<usize>,
     /// The host's stream; `None` once the host released the request.
     publication: Option<PublicationSender>,
     publication_batch_limit: usize,
@@ -605,7 +636,7 @@ impl<F: ProgramFamily> Owner<F> {
         &mut self,
         generation: Generation,
         input: PreparedModelInput,
-        prefix_cache: bool,
+        retention: PrefixRetention,
         output_capacity: usize,
         now: u64,
     ) -> Result<(RequestId, PublicationReceiver), AdmissionError> {
@@ -614,7 +645,7 @@ impl<F: ProgramFamily> Owner<F> {
             Pipeline::Idle(_) => None,
         };
         self.service
-            .admit(generation, input, prefix_cache, output_capacity, now, members)
+            .admit(generation, input, retention, output_capacity, now, members)
     }
 
     /// Stop a live request through its ordered stream. Work in flight still
@@ -783,7 +814,7 @@ impl<F: ProgramFamily> Service<F> {
         &mut self,
         generation: Generation,
         input: PreparedModelInput,
-        prefix_cache: bool,
+        retention: PrefixRetention,
         output_capacity: usize,
         now: u64,
         members: Option<&mut BTreeMap<RequestId, Member>>,
@@ -795,6 +826,19 @@ impl<F: ProgramFamily> Service<F> {
         if generation.is_resident() || generation.usage().completion_tokens != 0 {
             return Err(AdmissionError::invariant("admission")(
                 "only a fresh generation can be admitted".into(),
+            ));
+        }
+        let path = PrefixPath::of(&generation);
+        let (prefix_cache, cache_points) = match retention {
+            PrefixRetention::Transient => (false, Vec::new()),
+            PrefixRetention::Retain { cache_points } => (true, cache_points),
+        };
+        if cache_points
+            .iter()
+            .any(|&point| point >= generation.prompt().len() || !path.exact_boundary(point))
+        {
+            return Err(AdmissionError::invariant("admission")(
+                "a cache point must be an exact boundary inside the prompt".into(),
             ));
         }
         self.domain.probe_memory().map_err(AdmissionError::from)?;
@@ -811,7 +855,7 @@ impl<F: ProgramFamily> Service<F> {
             .install_input(id, input)
             .map_err(|error| AdmissionError::Refused(RequestError::Input(error)))?;
         let plan = if prefix_cache {
-            self.plan_branches(PrefixPath::of(&generation), generation.resume_bound(), members)
+            self.plan_branches(path, generation.resume_bound(), &cache_points, members)
         } else {
             BranchPlan::default()
         };
@@ -833,7 +877,7 @@ impl<F: ProgramFamily> Service<F> {
                     prefix_source: None,
                     prefill_retained: false,
                     terminal_retained: false,
-                    branch: plan.branch,
+                    branches: plan.branches,
                     publication: Some(sender),
                     publication_batch_limit: output_capacity,
                     pending_publication: None,
@@ -845,22 +889,26 @@ impl<F: ProgramFamily> Service<F> {
         Ok((id, receiver))
     }
 
-    /// Branch points for a new request's `path`: the deepest position where
-    /// it diverges from a cached path or a live request's prompt. A live
-    /// request that has not yet prefilled to its divergence from this one
-    /// stops there too, so the shared prefix is cached by whichever request
-    /// reaches it first and every later request resumes at it instead of
-    /// recomputing.
+    /// Branch points for a new request's `path`: each declared cache point
+    /// no entry holds yet, and the deepest position where it diverges from a
+    /// cached path or a live request's prompt. A live request that has not
+    /// yet prefilled to its divergence from this one stops there too, so the
+    /// shared prefix is cached by whichever request reaches it first and
+    /// every later request resumes at it instead of recomputing.
     fn plan_branches(
         &mut self,
         path: PrefixPath,
         bound: usize,
+        cache_points: &[usize],
         members: Option<&mut BTreeMap<RequestId, Member>>,
     ) -> BranchPlan {
-        let worthwhile = |point: usize, from: usize, prompt: usize| {
-            point >= MIN_PREFIX_HIT && point >= from + MIN_BRANCH_GAIN && point < prompt
-        };
         let resumed = self.prefix_cache.deepest(path, bound);
+        let mut branches = BTreeSet::new();
+        for &point in cache_points {
+            if !self.prefix_cache.holds(path, point) {
+                plan_branch(&mut branches, point, resumed, path.len());
+            }
+        }
         let cached = self.prefix_cache.shared_boundary(path);
         let mut deepest = cached;
         // The deepest shared prefix a live peer is still prefilling toward
@@ -880,31 +928,32 @@ impl<F: ProgramFamily> Service<F> {
         for (record, generation) in live {
             let shared = path.shared_with_prompt_of(PrefixPath::of(generation));
             deepest = deepest.max(shared);
-            if record.branch.is_none()
-                && worthwhile(
-                    shared,
-                    generation.resident_position(),
-                    generation.prompt().len(),
-                )
-            {
-                record.branch = Some(shared);
-            }
-            if record.branch == Some(shared) && prefilling_toward(generation, shared) {
+            plan_branch(
+                &mut record.branches,
+                shared,
+                generation.resident_position(),
+                generation.prompt().len(),
+            );
+            if record.branches.contains(&shared) && prefilling_toward(generation, shared) {
                 in_flight = in_flight.max(shared);
             }
         }
         if !worthwhile(deepest, resumed, path.len()) {
-            return BranchPlan::default();
+            return BranchPlan {
+                branches,
+                awaited: None,
+            };
         }
         if in_flight == deepest && deepest > cached {
             // A peer computes this prefix now: wait for it to be cached.
             return BranchPlan {
-                branch: None,
+                branches,
                 awaited: Some(deepest),
             };
         }
+        plan_branch(&mut branches, deepest, resumed, path.len());
         BranchPlan {
-            branch: Some(deepest),
+            branches,
             awaited: None,
         }
     }
@@ -915,7 +964,7 @@ impl<F: ProgramFamily> Service<F> {
         self.requests.iter().any(|(&id, request)| {
             id != except
                 && request.record.prefix_cache
-                && request.record.branch == Some(position)
+                && request.record.branches.contains(&position)
                 && prefilling_toward(request.state.generation(), position)
         })
     }
@@ -1618,14 +1667,10 @@ impl<F: ProgramFamily> Service<F> {
                 Err((generation, detail)) => fail(record, generation, detail),
             });
         }
-        // A prefill chunk ends exactly at a planned branch point, and at the
-        // prompt's retained boundary one row before its end.
+        // A prefill chunk ends exactly at each planned branch point, and at
+        // the prompt's retained boundary one row before its end.
         let resident = generation.resident_position();
-        let allowance = [record.branch, prompt_boundary(&record, &generation)]
-            .into_iter()
-            .flatten()
-            .filter(|&stop| stop > resident)
-            .min()
+        let allowance = next_stop(&record, &generation, resident)
             .map_or(allowance, |stop| allowance.min(stop - resident));
         let bound = match generation.publication_bound(allowance) {
             Ok(bound) => bound,
@@ -1949,17 +1994,13 @@ impl<F: ProgramFamily> Service<F> {
             return Ok(Vec::new());
         };
         let end = position + tokens.len();
-        let stops = [record.branch, prompt_boundary(record, started.generation())]
-            .into_iter()
-            .flatten()
-            .filter(|&stop| stop > *position)
-            .collect::<Vec<_>>();
-        if stops.iter().any(|&stop| stop <= end) {
+        let stop = next_stop(record, started.generation(), *position);
+        if stop.is_some_and(|stop| stop <= end) {
             return Ok(Vec::new());
         }
-        let allowance = stops
-            .iter()
+        let allowance = stop
             .map(|stop| stop - end)
+            .into_iter()
             .fold(self.scheduler.limits().prefill_tokens.max(1), usize::min);
         Ok(started
             .planned_prefill(*request, allowance)
@@ -2417,26 +2458,30 @@ impl<F: ProgramFamily> Service<F> {
         }
     }
 
-    /// Retain the request's reconciled state at its planned branch point: the
-    /// recurrent bank and method state there, sharing every history row
-    /// before it with the request itself.
+    /// Retain the request's reconciled state at a planned branch point it
+    /// has reached: the recurrent bank and method state there, sharing every
+    /// history row before it with the request itself. Points it has passed
+    /// (it resumed beyond them) or can no longer reach are dropped.
     fn retain_branch_point(&mut self, id: RequestId) -> Result<(), RequestError> {
         let Some((record, generation)) = self.between(id) else {
             return Ok(());
         };
-        let Some(branch) = record.branch else {
+        if record.branches.is_empty() {
             return Ok(());
-        };
+        }
         let resident = generation.resident_position();
-        if generation.finish_reason().is_some() || !generation.is_resident() || resident > branch {
-            self.requests.get_mut(&id).unwrap().record.branch = None;
-            return Ok(());
+        let live = generation.finish_reason().is_none() && generation.is_resident();
+        let reached = live && record.branches.contains(&resident);
+        let branches = &mut self.requests.get_mut(&id).unwrap().record.branches;
+        if live {
+            branches.retain(|&branch| branch > resident);
+        } else {
+            branches.clear();
         }
-        if resident < branch {
-            return Ok(());
+        if reached {
+            self.cache_prefix(id, resident)?;
         }
-        self.requests.get_mut(&id).unwrap().record.branch = None;
-        self.cache_prefix(id, branch)
+        Ok(())
     }
 
     /// Cache the request's reconciled state as the prefix of its path ending
@@ -2747,6 +2792,35 @@ fn memory_observation(result: Result<(), DomainError>) -> Result<MemoryObservati
         Err(DomainError::Reclaim) => Ok(MemoryObservation::Reclaim),
         Err(DomainError::Blind(_)) => Ok(MemoryObservation::Blind),
         Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod branch_plan_tests {
+    use super::{MIN_BRANCH_GAIN, MIN_PREFIX_HIT, plan_branch};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn a_branch_point_saves_enough_over_the_resume_point_and_lower_branches() {
+        let prompt = 6000;
+        let mut branches = BTreeSet::new();
+        // Below a hit, at or past the prompt's end, or too near the resume
+        // point: not worth a split chunk and a retained state.
+        plan_branch(&mut branches, MIN_PREFIX_HIT - 1, 0, prompt);
+        plan_branch(&mut branches, prompt, 0, prompt);
+        plan_branch(&mut branches, 1000 + MIN_BRANCH_GAIN - 1, 1000, prompt);
+        assert!(branches.is_empty());
+        // The declared start of the last message, then a divergence just
+        // beyond it and one far beyond it.
+        plan_branch(&mut branches, 5800, 0, prompt);
+        plan_branch(&mut branches, 5800 + MIN_BRANCH_GAIN - 1, 0, prompt);
+        plan_branch(&mut branches, 5800 + MIN_BRANCH_GAIN, 0, prompt);
+        // A shallower point is planned below the deeper ones.
+        plan_branch(&mut branches, 3000, 0, prompt);
+        assert_eq!(
+            branches,
+            BTreeSet::from([3000, 5800, 5800 + MIN_BRANCH_GAIN])
+        );
     }
 }
 

@@ -13,6 +13,7 @@ use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, Generation};
 use magnitude_scheduler::{
     owner::{AdmissionError, Owner, Ran},
+    prefix_cache::PrefixRetention,
     protocol::RequestSnapshot,
     publication::{Publication, PublicationReceiver, PublicationWake, RequestError},
     worker::Wakes,
@@ -122,7 +123,7 @@ impl Host {
         &mut self,
         generation: Generation,
         input: PreparedModelInput,
-        prefix_cache: bool,
+        retention: PrefixRetention,
         output_capacity: usize,
     ) -> Result<Stream, AdmissionError> {
         let now = self.now;
@@ -130,7 +131,7 @@ impl Host {
             .owner
             .as_mut()
             .expect("the owner is between runs")
-            .admit(generation, input, prefix_cache, output_capacity, now)?;
+            .admit(generation, input, retention, output_capacity, now)?;
         Ok(Stream {
             id,
             receiver,

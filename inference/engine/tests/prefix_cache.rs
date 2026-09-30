@@ -26,7 +26,7 @@ use magnitude_generation::{
 };
 use magnitude_scheduler::{
     owner::Owner,
-    prefix_cache::{PrefixCacheCapacity, MIN_PREFIX_HIT},
+    prefix_cache::{PrefixCacheCapacity, PrefixRetention, MIN_PREFIX_HIT},
     ServiceLimits,
 };
 use magnitude_state::KvCodec;
@@ -174,13 +174,33 @@ struct Turn {
 /// owner retires it then. Admitting several at once lets later ones wait for
 /// an earlier one's shared prefix.
 fn run(host: &mut Host, vocabulary: usize, prompts: &[Vec<TokenId>], max_tokens: usize) -> Vec<Turn> {
-    let mut streams = prompts
+    let requests = prompts
         .iter()
-        .map(|prompt| {
+        .map(|prompt| (prompt.clone(), Vec::new()))
+        .collect::<Vec<_>>();
+    run_with_cache_points(host, vocabulary, &requests, max_tokens)
+}
+
+/// [`run`] with each prompt's declared cache points.
+fn run_with_cache_points(
+    host: &mut Host,
+    vocabulary: usize,
+    requests: &[(Vec<TokenId>, Vec<usize>)],
+    max_tokens: usize,
+) -> Vec<Turn> {
+    let prompts = requests
+        .iter()
+        .map(|(prompt, _)| prompt.clone())
+        .collect::<Vec<_>>();
+    let mut streams = requests
+        .iter()
+        .map(|(prompt, cache_points)| {
             host.admit(
                 greedy(prompt, vocabulary, max_tokens),
                 text_input(prompt),
-                true,
+                PrefixRetention::Retain {
+                    cache_points: cache_points.clone(),
+                },
                 max_tokens,
             )
             .unwrap()
@@ -200,7 +220,7 @@ fn run(host: &mut Host, vocabulary: usize, prompts: &[Vec<TokenId>], max_tokens:
                 "a completed request is retired"
             );
             Turn {
-                prompt: prompt.clone(),
+                prompt,
                 cached: stream.usage().cached_tokens,
                 output: stream.output,
             }
@@ -259,6 +279,73 @@ fn a_rewritten_reply_resumes_at_the_previous_prompt() {
         .ok()
         .unwrap();
     assert_eq!(next.cached, first.len() - 1);
+}
+
+/// A long system prompt, then a last message that changes on every request,
+/// with its start declared as a cache point (as chat preparation declares
+/// the boundary opening the last message). Every request after the first
+/// resumes at that start, however its message begins: the second message
+/// shares a leading phrase with the first, the third starts differently.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn a_changed_last_message_resumes_at_its_declared_start() {
+    let (mut host, vocabulary, tokenizer) = owner();
+    let system = text(&tokenizer, 20, 1000);
+    let lead = text(&tokenizer, 21, 24);
+    let message = |parts: &[Vec<TokenId>]| {
+        let mut prompt = system.clone();
+        for part in parts {
+            prompt.extend(part);
+        }
+        (prompt, vec![system.len()])
+    };
+    let messages = [
+        message(&[lead.clone(), text(&tokenizer, 22, 40)]),
+        message(&[lead.clone(), text(&tokenizer, 23, 40)]),
+        message(&[tokenizer
+            .encode(
+                "Summarize the harbour log in one line, then list every courier by name.",
+                SpecialTokens::Literal,
+            )
+            .unwrap()]),
+    ];
+    assert_ne!(messages[2].0[system.len()], lead[0]);
+    let mut cached = Vec::new();
+    for request in &messages {
+        let [done] = run_with_cache_points(&mut host, vocabulary, &[request.clone()], 8)
+            .try_into()
+            .ok()
+            .unwrap();
+        eprintln!("prompt={} cached={}", done.prompt.len(), done.cached);
+        cached.push(done.cached);
+    }
+    assert_eq!(cached, [0, system.len(), system.len()]);
+    assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+}
+
+/// Without a declared cache point, a changed last message diverges below
+/// every retained state: the request recomputes its prompt and retains a
+/// state at the divergence, where the next request diverging there resumes.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn an_undeclared_divergence_is_retained_by_the_request_that_finds_it() {
+    let (mut host, vocabulary, tokenizer) = owner();
+    let system = text(&tokenizer, 30, 1000);
+    let message = |seed| {
+        let mut prompt = system.clone();
+        prompt.extend(text(&tokenizer, seed, 40));
+        prompt
+    };
+    let turns = [31, 32, 33].map(|seed| {
+        let [done] = run(&mut host, vocabulary, &[message(seed)], 8)
+            .try_into()
+            .ok()
+            .unwrap();
+        eprintln!("prompt={} cached={}", done.prompt.len(), done.cached);
+        done.cached
+    });
+    assert_eq!(turns[..2], [0, 0]);
+    assert!(turns[2] >= system.len());
 }
 
 /// A tiny deterministic generator, so a failing sequence reproduces.

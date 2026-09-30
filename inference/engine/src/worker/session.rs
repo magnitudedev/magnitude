@@ -9,7 +9,7 @@
 use super::binding::GenerationBinding;
 use super::protocol::{
     Admission, DomainHeadroom, ExecutionTimings, HostMessage, HostRequestId, MemoryObservation,
-    RequestProgress, RequestState, RetentionPolicy, WorkerMessage,
+    RequestProgress, RequestState, WorkerMessage,
 };
 use magnitude_executor::platform::DomainRole;
 use super::transport::{MessageReceiver, MessageSender, TransportError};
@@ -356,10 +356,7 @@ impl Session {
             WorkerCommand::Admit(AdmitRequest {
                 seed,
                 input,
-                prefix_cache: match retention {
-                    RetentionPolicy::Retain => true,
-                    RetentionPolicy::Transient => false,
-                },
+                retention,
                 output_capacity,
             }),
             output_capacity,
