@@ -75,8 +75,11 @@ export const renderCatalogStatus = (catalog: ModelCatalogState): string => {
   ].join("\n"))
 
   const { assessment } = catalog.localModelPreparation
+  const failure = Option.getOrUndefined(assessment.failure)
   const progress = `${assessment.settledModels} of ${assessment.totalModels} model${assessment.totalModels === 1 ? "" : "s"} assessed`
-  const status = assessment.complete
+  const status = failure
+    ? `Unavailable - ${failure.message}`
+    : assessment.complete
     ? `Complete - ${progress}`
     : assessment.totalModels === 0
       ? "Not complete - no assessment targets reported"

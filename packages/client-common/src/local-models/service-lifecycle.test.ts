@@ -23,7 +23,7 @@ import { MagnitudeOperations } from "../state/application-operations"
 const localModelsState: LocalModelsState = {
   preparation: {
     discovery: { complete: true, modelsFound: 0 },
-    assessment: { complete: true, settledModels: 0, totalModels: 0 },
+    assessment: { complete: true, settledModels: 0, totalModels: 0, failure: Option.none() },
   },
   models: [],
 }

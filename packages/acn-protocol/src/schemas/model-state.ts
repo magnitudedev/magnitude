@@ -853,6 +853,7 @@ export const LocalModelPreparationSchema = Schema.Struct({
     complete: Schema.Boolean,
     settledModels: NonNegativeSafeInteger,
     totalModels: NonNegativeSafeInteger,
+    failure: Schema.optionalWith(ModelFailureSchema, { as: "Option", exact: true }),
   }).pipe(Schema.filter(({ settledModels, totalModels }) => settledModels <= totalModels, {
     message: () => "settled model assessments cannot exceed total model assessments",
   })),

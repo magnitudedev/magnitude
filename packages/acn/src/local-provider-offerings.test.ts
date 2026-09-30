@@ -195,7 +195,7 @@ describe("local provider offerings", () => {
     const state = (overrides: Partial<LocalModelsState> = {}): LocalModelsState => ({
       preparation: {
         discovery: { complete: true, modelsFound: 1 },
-        assessment: { complete: true, settledModels: 1, totalModels: 1 },
+        assessment: { complete: true, settledModels: 1, totalModels: 1, failure: Option.none() },
       },
       models: [model],
       ...overrides,
@@ -205,13 +205,13 @@ describe("local provider offerings", () => {
       models: [{ ...model, servingState: { _tag: "Assessing", profile: { contextLength: 32_768 } } }],
       preparation: {
         discovery: { complete: true, modelsFound: 1 },
-        assessment: { complete: false, settledModels: 0, totalModels: 1 },
+        assessment: { complete: false, settledModels: 0, totalModels: 1, failure: Option.none() },
       },
     }))).toBe(false)
     expect(localProviderOfferingsReady(state({
       preparation: {
         discovery: { complete: true, modelsFound: 1 },
-        assessment: { complete: false, settledModels: 0, totalModels: 1 },
+        assessment: { complete: false, settledModels: 0, totalModels: 1, failure: Option.none() },
       },
     }))).toBe(false)
   })

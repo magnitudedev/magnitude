@@ -287,7 +287,7 @@ describe("LocalModelPreparationSchema", () => {
       assessment: { complete: false, settledModels: 12, totalModels: 18 },
     })).toEqual({
       discovery: { complete: false, modelsFound: 5 },
-      assessment: { complete: false, settledModels: 12, totalModels: 18 },
+      assessment: { complete: false, settledModels: 12, totalModels: 18, failure: Option.none() },
     })
     expect(() => Schema.decodeUnknownSync(LocalModelPreparationSchema)({
       discovery: { complete: false, modelsFound: 5 },
@@ -297,6 +297,11 @@ describe("LocalModelPreparationSchema", () => {
       discovery: { complete: true, modelsFound: 18 },
       assessment: { complete: true, settledModels: 17, totalModels: 18 },
     })).toThrow()
+    const failure = { code: "assessment_environment_unavailable", message: "CUDA out of memory", retryable: true }
+    expect(Schema.decodeUnknownSync(LocalModelPreparationSchema)({
+      discovery: { complete: true, modelsFound: 5 },
+      assessment: { complete: false, settledModels: 0, totalModels: 0, failure },
+    }).assessment.failure).toEqual(Option.some(failure))
   })
 })
 

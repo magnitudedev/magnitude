@@ -7,13 +7,14 @@ import {
   type ModelCatalogState,
   type ProviderModelCatalogState,
 } from "@magnitudedev/sdk"
+import { Option } from "effect"
 
 export const localModelsFromCatalog = (catalog: ModelCatalogState): LocalModelsState =>
   catalog._tag === "Initializing"
     ? {
         preparation: {
           discovery: { complete: false, modelsFound: 0 },
-          assessment: { complete: false, settledModels: 0, totalModels: 0 },
+          assessment: { complete: false, settledModels: 0, totalModels: 0, failure: Option.none() },
         },
         models: [],
       }

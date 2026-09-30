@@ -50,7 +50,7 @@ const failure = (code: string, message: string, retryable = false): ModelFailure
 const assessmentDomainProgress = (
   domain: ModelAssessmentDomainSnapshot,
   sourceRevision: number,
-): { readonly complete: boolean; readonly settledModels: number; readonly totalModels: number } => {
+): { readonly complete: boolean; readonly settledModels: number; readonly totalModels: number; readonly failure: Option.Option<ModelFailure> } => {
   switch (domain._tag) {
     case "Available": {
       const totalModels = domain.entries.length
@@ -59,10 +59,12 @@ const assessmentDomainProgress = (
         complete: domain.sourceRevision === sourceRevision && settledModels === totalModels,
         settledModels,
         totalModels,
+        failure: Option.none(),
       }
     }
     case "Pending":
-    case "Failed": return { complete: false, settledModels: 0, totalModels: 0 }
+      return { complete: false, settledModels: 0, totalModels: 0, failure: Option.none() }
+    case "Failed": return { complete: false, settledModels: 0, totalModels: 0, failure: Option.some(domain.failure) }
   }
 }
 
@@ -77,7 +79,8 @@ export const projectLocalModelPreparation = (
   if (assessments.state._tag !== "Ready") {
     return {
       discovery,
-      assessment: { complete: false, settledModels: 0, totalModels: 0 },
+      assessment: { complete: false, settledModels: 0, totalModels: 0,
+        failure: assessments.state._tag === "Failed" ? Option.some(assessments.state.failure) : Option.none() },
     }
   }
   const catalog = assessmentDomainProgress(assessments.state.catalog, source.catalogRevision)
@@ -88,6 +91,7 @@ export const projectLocalModelPreparation = (
       complete: catalog.complete && discovered.complete,
       settledModels: catalog.settledModels + discovered.settledModels,
       totalModels: catalog.totalModels + discovered.totalModels,
+      failure: Option.isSome(catalog.failure) ? catalog.failure : discovered.failure,
     },
   }
 }

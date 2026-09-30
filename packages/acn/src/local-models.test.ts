@@ -198,11 +198,11 @@ describe("local model preparation projection", () => {
 
     expect(discovering).toEqual({
       discovery: { complete: false, modelsFound: 1 },
-      assessment: { complete: false, settledModels: 2, totalModels: 4 },
+      assessment: { complete: false, settledModels: 2, totalModels: 4, failure: Option.none() },
     })
     expect(discovered).toEqual({
       discovery: { complete: true, modelsFound: 3 },
-      assessment: { complete: false, settledModels: 5, totalModels: 7 },
+      assessment: { complete: false, settledModels: 5, totalModels: 7, failure: Option.none() },
     })
   })
 
@@ -228,7 +228,17 @@ describe("local model preparation projection", () => {
       } as ModelAssessmentsSnapshot,
     )).toEqual({
       discovery: { complete: true, modelsFound: 1 },
-      assessment: { complete: true, settledModels: 3, totalModels: 3 },
+      assessment: { complete: true, settledModels: 3, totalModels: 3, failure: Option.none() },
+    })
+  })
+
+  it("preserves an assessment environment failure for clients", () => {
+    const failure = { code: "assessment_environment_unavailable", message: "CUDA out of memory", retryable: true }
+    expect(projectLocalModelPreparation(sources(true, 2, 0), {
+      revision: 2,
+      state: { _tag: "Failed", failure },
+    } as ModelAssessmentsSnapshot).assessment).toEqual({
+      complete: false, settledModels: 0, totalModels: 0, failure: Option.some(failure),
     })
   })
 
@@ -254,7 +264,7 @@ describe("local model preparation projection", () => {
       } as ModelAssessmentsSnapshot,
     )).toEqual({
       discovery: { complete: true, modelsFound: 1 },
-      assessment: { complete: false, settledModels: 3, totalModels: 3 },
+      assessment: { complete: false, settledModels: 3, totalModels: 3, failure: Option.none() },
     })
   })
 })

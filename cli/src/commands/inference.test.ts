@@ -32,7 +32,7 @@ const catalogState = (...models: ReturnType<typeof makeCatalogModel>[]): Catalog
   failures: [],
   localModelPreparation: {
     discovery: { complete: true, modelsFound: models.length },
-    assessment: { complete: true, settledModels: models.length, totalModels: models.length },
+    assessment: { complete: true, settledModels: models.length, totalModels: models.length, failure: Option.none() },
   },
 })
 
@@ -111,7 +111,7 @@ describe("inference command surface", () => {
       ...catalogState(),
       localModelPreparation: {
         discovery: { complete: true, modelsFound: 4 },
-        assessment: { complete: false, settledModels: 3, totalModels: 4 },
+        assessment: { complete: false, settledModels: 3, totalModels: 4, failure: Option.none() },
       },
     }
     expect(renderCatalogStatus(active)).toBe([
@@ -124,7 +124,7 @@ describe("inference command surface", () => {
       ...active,
       localModelPreparation: {
         discovery: { complete: true, modelsFound: 4 },
-        assessment: { complete: true, settledModels: 4, totalModels: 4 },
+        assessment: { complete: true, settledModels: 4, totalModels: 4, failure: Option.none() },
       },
     })).toContain("Assessment: Complete - 4 of 4 models assessed")
   })
@@ -143,9 +143,23 @@ describe("inference command surface", () => {
       ...catalog,
       localModelPreparation: {
         ...catalog.localModelPreparation,
-        assessment: { complete: false, settledModels: 0, totalModels: 0 },
+        assessment: { complete: false, settledModels: 0, totalModels: 0, failure: Option.none() },
       },
     })).toContain("Assessment: Not complete - no assessment targets reported")
+  })
+
+  it("shows a blocked assessment instead of indefinite progress", () => {
+    const catalog = catalogState()
+    expect(renderCatalogStatus({
+      ...catalog,
+      localModelPreparation: {
+        ...catalog.localModelPreparation,
+        assessment: {
+          complete: false, settledModels: 0, totalModels: 0,
+          failure: Option.some({ code: "assessment_environment_unavailable", message: "CUDA out of memory", retryable: true }),
+        },
+      },
+    })).toContain("Assessment: Unavailable - CUDA out of memory")
   })
 
   it("renders only fitting catalog evidence and exact model IDs", () => {

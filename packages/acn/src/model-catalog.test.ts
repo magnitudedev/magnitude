@@ -38,7 +38,7 @@ const offering = (
 const local = (overrides: Partial<LocalModelsState> = {}): LocalModelsState => ({
   preparation: {
     discovery: { complete: true, modelsFound: 0 },
-    assessment: { complete: true, settledModels: 0, totalModels: 0 },
+    assessment: { complete: true, settledModels: 0, totalModels: 0, failure: Option.none() },
   },
   models: [],
   ...overrides,
@@ -107,7 +107,7 @@ describe("ACN model catalog projection", () => {
     const result = projectModelCatalog(providers, local({
       preparation: {
         discovery: { complete: false, modelsFound: 0 },
-        assessment: { complete: false, settledModels: 0, totalModels: 0 },
+        assessment: { complete: false, settledModels: 0, totalModels: 0, failure: Option.none() },
       },
     }))
 

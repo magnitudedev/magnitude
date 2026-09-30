@@ -21,7 +21,7 @@ describe("model slot reconciliation", () => {
     const localModels = Schema.validateSync(LocalModelsStateSchema)({
       preparation: {
         discovery: { complete: true, modelsFound: 1 },
-        assessment: { complete: true, settledModels: 1, totalModels: 1 },
+        assessment: { complete: true, settledModels: 1, totalModels: 1, failure: Option.none() },
       },
       models: [{
         _tag: "Discovered",
