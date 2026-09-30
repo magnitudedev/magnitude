@@ -27,7 +27,7 @@ pub(super) fn discovered(description: seismic_vulkan::Description) -> Discovered
         DiscoveredMemory::Dedicated {
             capacity_bytes: facts.device_local_bytes,
             basis: CapacityBasis::VulkanDeviceLocalHeap,
-            ledger: LedgerKey::Vulkan(facts.uuid),
+            ledger: LedgerKey::PhysicalGpu(facts.uuid),
             max_allocation_bytes: facts.limits.max_allocation_bytes,
         }
     } else {

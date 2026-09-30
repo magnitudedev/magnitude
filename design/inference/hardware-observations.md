@@ -27,6 +27,8 @@ open observes a dedicated domain's live free bytes, so while a model is loaded t
 the resident worker's fresh reading of its device's domain; otherwise a dedicated domain reports no
 live free bytes. System RAM always keeps the service's own sample. Domain names come from the
 topology's pools, so a GPU visible through two backends is one domain whichever backend loaded it.
+The desktop hardware card shows one GPU per dedicated domain and lists the available backends
+under that GPU; backend views do not become additional physical GPU cards.
 
 An unavailable descriptive field must not make the rest of the hardware observation unavailable. Published chip facts are separate from observations and cannot override observed RAM or VRAM. Configurable chip facts require sufficient evidence to select a unique published variant; an enclosure name, product photograph, or scheduling parallelism is insufficient.
 

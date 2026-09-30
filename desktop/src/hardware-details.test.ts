@@ -156,7 +156,21 @@ it("counts dedicated memory once when two backends expose one physical domain", 
   const value = hardware("AMD", 64, 16, [{ name: "RTX 4090", memory: 24 }])
   const accelerator = value.accelerators[0]!
   const result = hardwareDetails(null, { ...value, accelerators: [accelerator, { ...accelerator, acceleratorId: "vulkan-alias" as typeof accelerator.acceleratorId, backend: "vulkan" }] })
-  expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["24 GB VRAM", "Local acceleration"])
+  expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["24 GB VRAM"])
+  expect(result.groups.at(-1)?.details).toContain("CUDA + Vulkan acceleration")
+})
+it("shows two physical GPU cards when each has CUDA and Vulkan views", () => {
+  const value = hardware("AMD", 64, 16, [{ name: "RTX 3090", memory: 24 }, { name: "RTX 3090", memory: 24 }])
+  const views = value.accelerators.flatMap(accelerator => [
+    accelerator,
+    { ...accelerator, acceleratorId: `${accelerator.acceleratorId}-vulkan` as typeof accelerator.acceleratorId, backend: "vulkan" as const },
+  ])
+  const result = hardwareDetails(null, { ...value, accelerators: views })
+  expect(result.groups.map(group => group.label)).toEqual(["CPU", "Memory", "GPU 1", "GPU 2"])
+  expect(result.groups.slice(2).map(group => group.details.slice(0, 2))).toEqual([
+    ["24 GB VRAM", "CUDA + Vulkan acceleration"],
+    ["24 GB VRAM", "CUDA + Vulkan acceleration"],
+  ])
 })
 it("keeps ordinary shared system RAM distinct from unified memory in mixed systems", () => {
   const value = hardware("AMD", 64, 16, [{ name: "Integrated graphics", memory: 64, shared: true }, { name: "RTX 4090", memory: 24 }])

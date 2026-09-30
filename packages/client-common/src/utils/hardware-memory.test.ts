@@ -4,11 +4,14 @@ import { LocalInferenceHardwareSchema, ModelInstanceAllocationSchema } from "@ma
 import { deriveHardwareMemoryView } from "./hardware-memory"
 
 const GiB = 1024 ** 3
-const hardware = (available: number | null = 8 * GiB, discrete = false) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
+const hardware = (available: number | null = 8 * GiB, discrete = false, bothBackends = false) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
   platform: discrete ? "Linux" : "MacOS", architecture: discrete ? "X64" : "Arm64",
   logicalCores: 8, totalSystemMemoryBytes: 16 * GiB, availableSystemMemoryBytes: 8 * GiB,
   systemAllocationCapacityBytes: 14 * GiB, systemAllocationHeadroomBytes: 6 * GiB, abortReserveBytes: GiB,
-  accelerators: [{ acceleratorId: "gpu", name: "Test GPU", backend: discrete ? "cuda" : "metal", memoryDomainId: discrete ? "gpu" : "system" }],
+  accelerators: [
+    { acceleratorId: "gpu", name: "Test GPU", backend: discrete ? "cuda" : "metal", memoryDomainId: discrete ? "gpu" : "system" },
+    ...(bothBackends ? [{ acceleratorId: "gpu-vulkan", name: "Test GPU", backend: "vulkan", memoryDomainId: "gpu" }] : []),
+  ],
   memoryDomains: [
     { memoryDomainId: "system", kind: discrete ? "System" : "UnifiedMemory", totalBytes: 16 * GiB, stableCapacityBytes: 14 * GiB, sharesSystemMemory: true, ...(available === null ? {} : { availableBytes: available }) },
     ...(discrete ? [{ memoryDomainId: "gpu", kind: "PhysicalDevice", totalBytes: 16 * GiB, stableCapacityBytes: 16 * GiB, availableBytes: 8 * GiB, sharesSystemMemory: false }] : []),
@@ -20,6 +23,10 @@ const allocation = (domain = "system", modelBytes = 3 * GiB) => Option.some(Sche
 }))
 
 describe("hardware memory breakdown", () => {
+  it("labels a physical GPU once when CUDA and Vulkan share its memory domain", () => {
+    const domains = deriveHardwareMemoryView(hardware(8 * GiB, true, true), Option.none()).domains
+    expect(domains[1]?.label).toBe("Test GPU · GPU 1")
+  })
   it("separates weights from engine buffers without changing the allocation total", () => {
     const domain = deriveHardwareMemoryView(hardware(), allocation()).domains[0]!
     expect(domain).toMatchObject({ modelBytes: 3 * GiB, overheadBytes: GiB, fixedBytes: 4 * GiB, kvCacheBytes: 2 * GiB, systemAndAppsBytes: 2 * GiB, freeBytes: 8 * GiB, status: "complete" })
