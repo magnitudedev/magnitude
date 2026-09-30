@@ -13,6 +13,7 @@ pub(crate) mod native_vision;
 mod submission;
 
 pub use graph::readout::PreparedTargetReadoutGraphs;
+pub use graph::GraphError;
 pub use native_draft::PreparedDraftGraphs;
 pub use native_drafter::PreparedDrafterGraphs;
 pub use native_head::PreparedHeadGraphs;

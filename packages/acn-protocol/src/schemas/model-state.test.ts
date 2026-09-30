@@ -3,7 +3,9 @@ import { Option, Schema } from "effect"
 import {
   CatalogBaseIdSchema,
   CatalogVariantIdSchema,
+  CatalogLocalModelServingStateSchema,
   CatalogSupportSchema,
+  DiscoveredLocalModelServingStateSchema,
   IntelligenceScoreSchema,
   LocalModelMemorySchema,
   LocalModelPreparationSchema,
@@ -211,13 +213,54 @@ describe("LocalModelSchema invariants", () => {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
           systemUseState: { _tag: "NotObserved" }, currentHeadroomState: { _tag: "NotObserved" },
         },
-        performance: [{
-          contextTokens: 4096, lowerTokensPerSecond: 1, estimatedTokensPerSecond: 2,
-          upperTokensPerSecond: 3, confidence: "high",
-        }],
+        speed: {
+          _tag: "Estimated",
+          samples: [{
+            contextTokens: 4096, lowerTokensPerSecond: 1, estimatedTokensPerSecond: 2,
+            upperTokensPerSecond: 3, confidence: "high",
+          }],
+        },
       },
     } as const
     expect(() => Schema.decodeUnknownSync(LocalModelServingStateSchema)(assessed)).not.toThrow()
+  })
+
+  it("admits unavailable speed for fitting models and Unsupported only for discovered models", () => {
+    const failure = { code: "unsupported_family", message: "Unrecognized family", retryable: false }
+    const assessed = {
+      _tag: "Assessed",
+      metadata: {
+        format: "gguf", architecture: "test", quantization: "q4", quantizationName: "Q4",
+        storageBytes: 1,
+      },
+      capabilities: {
+        vision: false, tools: false, structuredOutput: false,
+        reasoning: { supported: false, efforts: [] },
+      },
+    } as const
+    const fits = {
+      ...assessed,
+      assessment: {
+        _tag: "Fits",
+        assessmentId: "assessment",
+        environmentId: "environment",
+        profile: { contextLength: 4096 },
+        memory: {
+          domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
+          systemUseState: { _tag: "NotObserved" }, currentHeadroomState: { _tag: "NotObserved" },
+        },
+        speed: { _tag: "Unavailable" },
+      },
+    }
+    const unsupported = {
+      ...assessed,
+      assessment: {
+        _tag: "Unsupported", environmentId: "environment", profile: { contextLength: 4096 }, failure,
+      },
+    }
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(fits)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unsupported)).toThrow()
+    expect(() => Schema.decodeUnknownSync(DiscoveredLocalModelServingStateSchema)(unsupported)).not.toThrow()
   })
 
   it("rejects memory totals that disagree with domain evidence", () => {

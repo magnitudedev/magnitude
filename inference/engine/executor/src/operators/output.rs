@@ -4,7 +4,7 @@
 //! row op that normalizes each row first (`post_norm_residual`), since the
 //! norm spans a whole output row that a column-tiled epilogue cannot form.
 
-use crate::programs::graph::draft::GraphDraft;
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_target_graph::ScaledWeight;
 use crate::native::{PostNormKernels, SublayerOutput};
 use magnitude_kernels::{post_norm_residual, project_rows};
@@ -89,7 +89,7 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
     shape: PostNormShape,
     epsilon: f32,
     scale: f32,
-) -> Result<WorkflowTensor, String> {
+) -> Result<WorkflowTensor, GraphError> {
     let PostNormShape {
         rows,
         out,

@@ -66,7 +66,16 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
           },
           currentHeadroomState: { _tag: "NotObserved" },
         },
-        performance: [],
+        speed: {
+          _tag: "Estimated",
+          samples: [{
+            contextTokens: 32_768,
+            lowerTokensPerSecond: 40,
+            estimatedTokensPerSecond: 50,
+            upperTokensPerSecond: 60,
+            confidence: "moderate",
+          }],
+        },
       },
       rankingScores: installed
         ? Option.none()

@@ -1,17 +1,18 @@
 //! Every catalog target the executor admits derives complete assessment
 //! terms on every backend, and the fixed measurement plan covers them: its
-//! decode demand under both native codecs (every term's cost key timed, its
-//! weight format timed and its exact representation binding formed) and its
-//! memory terms. A form the executor does not run is refused at admission,
-//! with a typed reason, before any term is derived; a target past admission
-//! whose terms fail, or whose demand the plan does not cover, is a failure.
+//! decode demand under both native codecs (every term's cost key and weight
+//! format timed), its memory terms, and every graph a load prepares, so no
+//! call lies outside its kernel's domain. A form the executor does not run
+//! is refused at admission, with a typed reason, before any term is derived;
+//! a target past admission whose terms or graphs fail, or whose demand the
+//! plan does not cover, is a failure.
 
 use super::basis::MeasurementKey;
 use super::demand::DecodeDemand;
-use super::plan::{activation, measurement_plan, PlannedKey};
+use super::plan::{activation, measurement_plan};
 use crate::{
-    resident_layout, AssessmentMemoryTerms, ComponentSelection, ExecutionPath, ModelLoadPlan,
-    PlannedMethod, ResourceLimits,
+    resident_layout, AssessmentGraphResourceBounds, AssessmentMemoryTerms, ComponentSelection,
+    ExecutionPath, ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner,
 };
 use magnitude_artifacts::{
     ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
@@ -118,13 +119,7 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                 continue;
             }
             let plan = measurement_plan(backend);
-            let covered = |key: &MeasurementKey, timed: bool| {
-                plan.contains(&if timed {
-                    PlannedKey::Timed(key.clone())
-                } else {
-                    PlannedKey::Formed(key.clone())
-                })
-            };
+            let covered = |key: &MeasurementKey| plan.contains(key);
             let terms = [KvCodec::Dense, KvCodec::AffineK8V4]
                 .into_iter()
                 .map(|codec| DecodeDemand::from_model(&definition, &load, codec))
@@ -134,14 +129,9 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                     let outside = terms
                         .clone()
                         .filter(|term| {
-                            !covered(&term.key.cost(), true)
-                                || (term.key.class.binds_representation()
-                                    && !covered(&term.key, false))
+                            !covered(&term.key.cost())
                                 || term.weight().is_some_and(|weight| {
-                                    !covered(
-                                        &MeasurementKey::weight_format(weight, activation()),
-                                        true,
-                                    )
+                                    !covered(&MeasurementKey::weight_format(weight, activation()))
                                 })
                         })
                         .map(|term| term.key.to_string())
@@ -156,27 +146,52 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                 PlannedMethod::Plain,
                 LIMITS,
             );
-            match (terms, memory) {
-                (Ok((terms, outside)), Ok(_)) if outside.is_empty() => {
-                    admitted.push(format!("{model} {role} {}: {terms} terms", backend.as_str()))
-                }
-                (Ok((_, outside)), Ok(_)) => failures.push(format!(
+            // Building every graph the load prepares proves no call lies
+            // outside its kernel's domain on the backend.
+            let graphs = ResourcePlanner::state_plan(
+                &definition,
+                &load,
+                PlannedMethod::Plain,
+                KvCodec::AffineK8V4,
+                LIMITS,
+                ResourceCapacity {
+                    domain_bytes: 64 << 30,
+                },
+            )
+            .and_then(|state| {
+                AssessmentGraphResourceBounds::derive(
+                    &definition,
+                    &load,
+                    &state,
+                    PlannedMethod::Plain,
+                    KvCodec::AffineK8V4,
+                    LIMITS,
+                    backend,
+                )
+                .map_err(|error| error.to_string())
+            });
+            match (terms, memory, graphs) {
+                (Ok((terms, outside)), Ok(_), Ok(_)) if outside.is_empty() => admitted.push(
+                    format!("{model} {role} {}: {terms} terms", backend.as_str()),
+                ),
+                (Ok((_, outside)), Ok(_), Ok(_)) => failures.push(format!(
                     "{model} {role} {}: outside the plan: {}",
                     backend.as_str(),
                     outside.join(", ")
                 )),
-                (terms, memory) => failures.push(format!(
-                    "{model} {role} {}: {:?} / {:?}",
+                (terms, memory, graphs) => failures.push(format!(
+                    "{model} {role} {}: {:?} / {:?} / {:?}",
                     backend.as_str(),
                     terms.err(),
-                    memory.err()
+                    memory.err(),
+                    graphs.err()
                 )),
             }
         }
     }
     println!("admitted:\n  {}", admitted.join("\n  "));
     println!("refused:\n  {}", refused.join("\n  "));
-    assert!(failures.is_empty(), "missing terms:\n  {}", failures.join("\n  "));
+    assert!(failures.is_empty(), "failing targets:\n  {}", failures.join("\n  "));
     assert!(!admitted.is_empty());
 }
 
@@ -206,7 +221,6 @@ const SEPARATE_DRAFTS: [(&str, &str, &dyn ModelFamily); 6] = [
 
 #[test]
 fn separate_drafts_plan_and_charge_every_graph_class_from_headers() {
-    use crate::{AssessmentGraphResourceBounds, ResourceCapacity, ResourcePlanner};
     let identity = PackageIdentity {
         target: ArtifactIdentity([7; 32]),
         projector: None,

@@ -15,14 +15,14 @@
 
 use crate::operators;
 use crate::operators::output::{post_norm, CheckedPostNormEntries, PostNormShape, TailEntries};
-use crate::programs::graph::draft::GraphDraft;
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_target_graph::ScaledWeight;
 use crate::{
     native::{AttentionHistoryKernels, AttentionKernels},
     programs::native_constants::GraphConstant,
 };
 use crate::{AttentionBinding, AttentionShape, SublayerTail};
-use magnitude_family_contracts::{Attention, Rotary};
+use magnitude_family_contracts::{Attention, Rotary, WeightKind};
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project,
@@ -245,9 +245,8 @@ pub(crate) fn attention_weights(
     operator: &Attention,
     needs_output: bool,
     post_norm: bool,
-    mut weight: impl FnMut(magnitude_family_contracts::WeightKind) -> Result<WorkflowTensor, String>,
-) -> Result<AttentionWeights, String> {
-    use magnitude_family_contracts::WeightKind;
+    mut weight: impl FnMut(WeightKind) -> Result<WorkflowTensor, GraphError>,
+) -> Result<AttentionWeights, GraphError> {
     let mut present = |present: bool, kind| present.then(|| weight(kind)).transpose();
     Ok(AttentionWeights {
         input_norm: present(true, WeightKind::InputNorm)?.ok_or("input norm")?,
@@ -270,27 +269,25 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
     block: AttentionBlock<'_>,
-) -> Result<(WorkflowTensor, AttentionStatePorts, AttentionControlPorts), String> {
+) -> Result<(WorkflowTensor, AttentionStatePorts, AttentionControlPorts), GraphError> {
     let shape = block.shape;
     let (rows, width, heads) = (block.rows, shape.width, shape.heads());
     // An absent projection segment reads zero rows of the query weight.
     let empty_weight = weights.query.slice_leading(0, 0);
-    let projected = graph
-        .enqueue(
-            kernels.project,
-            &shape.project_dimensions(rows),
-            attention_project::WorkflowArgs {
-                hidden: hidden.into(),
-                input_norm: (&weights.input_norm).into(),
-                query_weight: (&weights.query).into(),
-                gate_weight: segment(&weights.gate, &empty_weight),
-                key_weight: segment(&weights.key, &empty_weight),
-                value_weight: segment(&weights.value, &empty_weight),
-                epsilon: block.epsilon,
-                project_mode: if block.inject_only { 1 } else { 0 },
-            },
-        )
-        .map_err(|error| error.to_string())?;
+    let projected = graph.enqueue(
+        kernels.project,
+        &shape.project_dimensions(rows),
+        attention_project::WorkflowArgs {
+            hidden: hidden.into(),
+            input_norm: (&weights.input_norm).into(),
+            query_weight: (&weights.query).into(),
+            gate_weight: segment(&weights.gate, &empty_weight),
+            key_weight: segment(&weights.key, &empty_weight),
+            value_weight: segment(&weights.value, &empty_weight),
+            epsilon: block.epsilon,
+            project_mode: if block.inject_only { 1 } else { 0 },
+        },
+    )?;
     // The mix entries read the projection per head.
     let projected = ProjectedRows {
         query: projected
@@ -336,8 +333,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                         gated: (&attended).into(),
                         output_weight: output_weight.into(),
                     },
-                )
-                .map_err(|error| error.to_string())?
+                )?
                 .value
         }
         (TailEntries::PostNorm(entries), Some(norm)) => {
@@ -393,7 +389,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     constants: &mut Vec<GraphConstant>,
     projected: &ProjectedRows,
     block: &AttentionBlock<'_>,
-) -> Result<(WorkflowTensor, AttentionStatePorts, AttentionControlPorts), String> {
+) -> Result<(WorkflowTensor, AttentionStatePorts, AttentionControlPorts), GraphError> {
     let shape = block.shape;
     let (rows, width) = (block.rows, shape.width);
     let dimensions = shape.mix_dimensions(rows, block.history_rows, block.segments);
@@ -492,8 +488,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                         gate_function,
                         slab_rows: block.slab_rows,
                     },
-                )
-                ?
+                )?
                 .value
         }};
     }

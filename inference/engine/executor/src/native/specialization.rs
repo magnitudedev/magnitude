@@ -9,7 +9,10 @@
 
 use super::tuning::{EntryTuning, Tuner};
 use super::CatalogFailure;
-use seismic::{Device, Entry, LoadError, NativeImplementation, NativeKernel, NativeSpecialization};
+use seismic::{
+    Device, Entry, LoadError, NativeImplementation, NativeKernel, NativeSpecialization,
+    NativeSpecializationError,
+};
 
 pub(super) struct Specializer<'a> {
     device: &'a Device,
@@ -26,10 +29,12 @@ fn failure(entry: &'static str, bindings: &str, outcome: String) -> CatalogFailu
     }
 }
 
-/// The static values of `implementation`. `values` supplies this model's
-/// value of every dimension the call site can fix; each dimension the
-/// implementation declares static must be among them.
-fn statics(
+/// The static values of `implementation`, which must lie in the kernel's
+/// domain (some configuration admits them) or the model cannot run on this
+/// backend. `values` supplies this model's value of every dimension the call
+/// site can fix; each dimension the implementation declares static must be
+/// among them.
+fn domain_statics(
     implementation: &NativeImplementation,
     entry: &'static str,
     bindings: &str,
@@ -52,7 +57,18 @@ fn statics(
             })?;
         specialization = specialization.with_static(name.clone(), value);
     }
-    Ok(specialization)
+    match implementation.default_specialization(&specialization) {
+        Ok(_) => Ok(specialization),
+        Err(NativeSpecializationError::Inadmissible) => Err(CatalogFailure::KernelDomain {
+            entry,
+            statics: specialization
+                .statics()
+                .iter()
+                .map(|(name, value)| (name.clone(), *value))
+                .collect(),
+        }),
+        Err(error) => Err(failure(entry, bindings, error.to_string())),
+    }
 }
 
 impl<'a> Specializer<'a> {
@@ -104,7 +120,7 @@ impl<'a> Specializer<'a> {
                 "the implementation declares tuning parameters, but its call site registers no tuning case".into(),
             ));
         }
-        let specialization = statics(&implementation, E::NAME, bindings, values)?;
+        let specialization = domain_statics(&implementation, E::NAME, bindings, values)?;
         prepare(&specialization)
             .map(Some)
             .map_err(|error| failure(E::NAME, bindings, error.to_string()))
@@ -122,7 +138,7 @@ impl<'a> Specializer<'a> {
         let bindings = case.bindings();
         let implementation = self.implementation::<T::Entry>(&bindings)?;
         let values = tuner.statics(case)?;
-        let fixed = statics(&implementation, entry, &bindings, &values)?;
+        let fixed = domain_statics(&implementation, entry, &bindings, &values)?;
         let specialization = if !implementation.has_tuning_parameters() {
             fixed
         } else {
@@ -134,5 +150,49 @@ impl<'a> Specializer<'a> {
         case.prepare(self.device, &specialization)
             .map(Some)
             .map_err(|error| failure(entry, &bindings, error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnitude_kernels::routed_output;
+    use seismic::{BackendName, DeviceCatalog};
+
+    /// The load's twin of graph construction's domain check: a down
+    /// projection wider than the Metal kernel's register budget admits is
+    /// refused before any tuning, naming the call's statics.
+    #[test]
+    fn statics_outside_the_kernel_domain_are_refused() {
+        let Ok(device) = DeviceCatalog::discover()
+            .unwrap()
+            .open_backend(BackendName::Metal)
+        else {
+            return;
+        };
+        let implementation =
+            seismic::generated::native_implementation::<routed_output::Entry>(&device)
+                .unwrap()
+                .unwrap();
+        let values = [("H", 256), ("K", 2), ("F", 16_384), ("S", 256)];
+        let Err(CatalogFailure::KernelDomain { entry, statics }) =
+            domain_statics(&implementation, "routed_output", "A=bf16", &values)
+        else {
+            panic!("out-of-domain statics were admitted");
+        };
+        assert_eq!(entry, "routed_output");
+        assert_eq!(
+            statics,
+            [("F", 16_384), ("H", 256), ("K", 2), ("S", 256)]
+                .map(|(name, value)| (name.to_owned(), value))
+                .to_vec()
+        );
+        assert!(domain_statics(
+            &implementation,
+            "routed_output",
+            "A=bf16",
+            &[("H", 256), ("K", 2), ("F", 512), ("S", 256)],
+        )
+        .is_ok());
     }
 }

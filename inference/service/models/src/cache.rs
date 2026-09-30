@@ -262,8 +262,8 @@ mod tests {
     use super::*;
     use magnitude_service_contracts::MemoryDomainId;
     use magnitude_service_contracts::models::{
-        MemoryAssessment, ModelAssessmentId, ModelCapabilities, ModelReasoningCapabilities,
-        PerformanceConfidence, PerformanceEvidence, ServingProfile,
+        DecodeSpeed, MemoryAssessment, ModelAssessmentId, ModelCapabilities,
+        ModelReasoningCapabilities, PerformanceConfidence, PerformanceEvidence, ServingProfile,
     };
 
     fn profile(context_length: u32) -> ServingProfile {
@@ -343,13 +343,15 @@ mod tests {
                 compatibility_reserve_bytes: 0,
                 remaining_bytes: 50,
             }],
-            performance: vec![PerformanceEvidence {
-                context_tokens: 50_000,
-                lower_tokens_per_second: 1.0,
-                estimated_tokens_per_second: 2.0,
-                upper_tokens_per_second: 3.0,
-                confidence: PerformanceConfidence::Low,
-            }],
+            speed: DecodeSpeed::Estimated {
+                samples: vec![PerformanceEvidence {
+                    context_tokens: 50_000,
+                    lower_tokens_per_second: 1.0,
+                    estimated_tokens_per_second: 2.0,
+                    upper_tokens_per_second: 3.0,
+                    confidence: PerformanceConfidence::Low,
+                }],
+            },
         };
         let does_not_fit = ModelAssessment::DoesNotFit {
             profile: profile(100_000),

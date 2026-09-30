@@ -2,7 +2,7 @@
 //! (`operators::vision`) enqueued over one validated image, one graph per
 //! exact patch class.
 
-use super::graph::draft::GraphDraft;
+use super::graph::{draft::GraphDraft, GraphError};
 use super::native_constants::{
     CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
 };
@@ -47,24 +47,24 @@ fn device(error: impl ToString) -> SubmitError {
 /// others' rows are patches.
 const CELLS: &str = "vision_cells";
 
-fn planned_weight(load: &ModelLoadPlan, role: WeightRole) -> Result<&WeightPlan, SubmitError> {
+fn planned_weight(load: &ModelLoadPlan, role: WeightRole) -> Result<&WeightPlan, GraphError> {
     load.weights()
         .find(|plan| plan.role == role)
-        .ok_or_else(|| invalid(format!("planned vision weight {role:?} is absent")))
+        .ok_or_else(|| format!("planned vision weight {role:?} is absent").into())
 }
 
 /// The projector's vision program over the planned resident elements.
 fn planned_program(
     description: &VisionDescription,
     load: &ModelLoadPlan,
-) -> Result<VisionOps, SubmitError> {
+) -> Result<VisionOps, GraphError> {
     vision_program(description, &|role| {
         load.weights()
             .find(|plan| plan.role == role)
             .map(|plan| plan.resident)
             .ok_or(PlanError::Topology("a vision weight is not planned"))
     })
-    .map_err(|error| invalid(error.to_string()))
+    .map_err(|error| error.to_string().into())
 }
 
 /// The kernel a graph binds for each vision invocation: the prepared native
@@ -73,83 +73,83 @@ trait VisionBindings<G: GraphDraft> {
     fn patch_stem(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<G::Binding<'_, vision_patch_stem::Entry>, SubmitError>;
+    ) -> Result<G::Binding<'_, vision_patch_stem::Entry>, GraphError>;
     fn norm(&self, kernel: &VisionKernel)
-        -> Result<G::Binding<'_, vision_norm::Entry>, SubmitError>;
+        -> Result<G::Binding<'_, vision_norm::Entry>, GraphError>;
     fn linear(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<G::Binding<'_, vision_linear::Entry>, SubmitError>;
+    ) -> Result<G::Binding<'_, vision_linear::Entry>, GraphError>;
     fn clamp(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<G::Binding<'_, vision_clamp::Entry>, SubmitError>;
+    ) -> Result<G::Binding<'_, vision_clamp::Entry>, GraphError>;
     fn attention(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<G::Binding<'_, vision_attention::Entry>, SubmitError>;
+    ) -> Result<G::Binding<'_, vision_attention::Entry>, GraphError>;
     fn pool(&self, kernel: &VisionKernel)
-        -> Result<G::Binding<'_, vision_pool::Entry>, SubmitError>;
+        -> Result<G::Binding<'_, vision_pool::Entry>, GraphError>;
     fn position(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<G::Binding<'_, vision_position::Entry>, SubmitError>;
+    ) -> Result<G::Binding<'_, vision_position::Entry>, GraphError>;
     fn post_norm(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<G::Binding<'_, post_norm_residual::Entry>, SubmitError>;
+    ) -> Result<G::Binding<'_, post_norm_residual::Entry>, GraphError>;
 }
 
 fn prepared<'a, E: seismic::Entry>(
     kernels: &'a HashMap<VisionKernel, NativeKernel<E>>,
     kernel: &VisionKernel,
-) -> Result<&'a NativeKernel<E>, SubmitError> {
+) -> Result<&'a NativeKernel<E>, GraphError> {
     kernels
         .get(kernel)
-        .ok_or_else(|| invalid(format!("vision kernel {kernel:?} was not prepared")))
+        .ok_or_else(|| format!("vision kernel {kernel:?} was not prepared").into())
 }
 
 impl VisionBindings<NativeGraph> for VisionKernels {
     fn patch_stem(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<&NativeKernel<vision_patch_stem::Entry>, SubmitError> {
+    ) -> Result<&NativeKernel<vision_patch_stem::Entry>, GraphError> {
         prepared(&self.patch_stem, kernel)
     }
-    fn norm(&self, kernel: &VisionKernel) -> Result<&NativeKernel<vision_norm::Entry>, SubmitError> {
+    fn norm(&self, kernel: &VisionKernel) -> Result<&NativeKernel<vision_norm::Entry>, GraphError> {
         prepared(&self.norm, kernel)
     }
     fn linear(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<&NativeKernel<vision_linear::Entry>, SubmitError> {
+    ) -> Result<&NativeKernel<vision_linear::Entry>, GraphError> {
         prepared(&self.linear, kernel)
     }
     fn clamp(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<&NativeKernel<vision_clamp::Entry>, SubmitError> {
+    ) -> Result<&NativeKernel<vision_clamp::Entry>, GraphError> {
         prepared(&self.clamp, kernel)
     }
     fn attention(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<&NativeKernel<vision_attention::Entry>, SubmitError> {
+    ) -> Result<&NativeKernel<vision_attention::Entry>, GraphError> {
         prepared(&self.attention, kernel)
     }
-    fn pool(&self, kernel: &VisionKernel) -> Result<&NativeKernel<vision_pool::Entry>, SubmitError> {
+    fn pool(&self, kernel: &VisionKernel) -> Result<&NativeKernel<vision_pool::Entry>, GraphError> {
         prepared(&self.pool, kernel)
     }
     fn position(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<&NativeKernel<vision_position::Entry>, SubmitError> {
+    ) -> Result<&NativeKernel<vision_position::Entry>, GraphError> {
         prepared(&self.position, kernel)
     }
     fn post_norm(
         &self,
         kernel: &VisionKernel,
-    ) -> Result<&NativeKernel<post_norm_residual::Entry>, SubmitError> {
+    ) -> Result<&NativeKernel<post_norm_residual::Entry>, GraphError> {
         prepared(&self.post_norm, kernel)
     }
 }
@@ -158,54 +158,49 @@ impl VisionBindings<NativeGraph> for VisionKernels {
 fn planned_elements<'a>(
     plan: &'a VisionProgramPlan,
     kernel: &VisionKernel,
-) -> Result<&'a [(&'static str, Element)], SubmitError> {
+) -> Result<&'a [(&'static str, Element)], GraphError> {
     plan.kernels()
         .iter()
         .find(|planned| *planned == kernel)
         .map(|planned| planned.elements.as_slice())
-        .ok_or_else(|| invalid(format!("vision kernel {kernel:?} is not planned")))
+        .ok_or_else(|| format!("vision kernel {kernel:?} is not planned").into())
 }
 
 impl VisionBindings<NativeGraphMetadata> for VisionProgramPlan {
-    fn patch_stem(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], SubmitError> {
+    fn patch_stem(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], GraphError> {
         planned_elements(self, kernel)
     }
-    fn norm(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], SubmitError> {
+    fn norm(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], GraphError> {
         planned_elements(self, kernel)
     }
-    fn linear(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], SubmitError> {
+    fn linear(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], GraphError> {
         planned_elements(self, kernel)
     }
-    fn clamp(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], SubmitError> {
+    fn clamp(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], GraphError> {
         planned_elements(self, kernel)
     }
-    fn attention(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], SubmitError> {
+    fn attention(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], GraphError> {
         planned_elements(self, kernel)
     }
-    fn pool(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], SubmitError> {
+    fn pool(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], GraphError> {
         planned_elements(self, kernel)
     }
-    fn position(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], SubmitError> {
+    fn position(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], GraphError> {
         planned_elements(self, kernel)
     }
-    fn post_norm(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], SubmitError> {
+    fn post_norm(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], GraphError> {
         planned_elements(self, kernel)
     }
 }
 
 /// The static dimension `name` of a kernel.
-fn static_value(kernel: &VisionKernel, name: &str) -> Result<u64, SubmitError> {
+fn static_value(kernel: &VisionKernel, name: &str) -> Result<u64, GraphError> {
     kernel
         .statics
         .iter()
         .find(|(bound, _)| *bound == name)
         .map(|(_, value)| *value)
-        .ok_or_else(|| {
-            invalid(format!(
-                "vision kernel {:?} has no dimension {name}",
-                kernel.entry
-            ))
-        })
+        .ok_or_else(|| format!("vision kernel {:?} has no dimension {name}", kernel.entry).into())
 }
 
 /// A constant of a vision graph, uploaded once at binding.
@@ -224,7 +219,7 @@ enum Constant {
 
 impl Constant {
     /// The constants `program` binds, the empty operands first.
-    fn of(program: &VisionOps) -> Result<Vec<Self>, SubmitError> {
+    fn of(program: &VisionOps) -> Result<Vec<Self>, GraphError> {
         let mut constants = vec![Self::EmptyF32, Self::EmptyI32];
         for op in &program.ops {
             let constant = match op.operands {
@@ -252,7 +247,7 @@ impl Constant {
     }
 
     /// The same value as an external port of `graph`.
-    fn draw<G: GraphDraft>(self, graph: &mut G, rows: u64) -> Result<GraphConstant, String> {
+    fn draw<G: GraphDraft>(self, graph: &mut G, rows: u64) -> Result<GraphConstant, GraphError> {
         match self {
             Self::EmptyF32 => GraphConstant::f32_shaped(graph, &[1], &[0.0]),
             Self::EmptyI32 => GraphConstant::i32(graph, &[0]),
@@ -314,27 +309,24 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
         &mut self,
         role: WeightRole,
         extents: &[u64],
-    ) -> Result<WorkflowTensorView, SubmitError> {
+    ) -> Result<WorkflowTensorView, GraphError> {
         let plan = planned_weight(self.load, role)?;
-        let port = self
-            .graph
-            .port(plan.resident, &plan.shape)
-            .map_err(device)?;
+        let port = self.graph.port(plan.resident, &plan.shape)?;
         let view = port.tensor().reshape(extents);
         self.weights.push((role, port));
         Ok(view)
     }
 
-    fn constant(&self, which: Constant) -> Result<&WorkflowTensor, SubmitError> {
+    fn constant(&self, which: Constant) -> Result<&WorkflowTensor, GraphError> {
         self.constants
             .iter()
             .find(|(constant, _)| *constant == which)
             .map(|(_, constant)| constant.port().tensor())
-            .ok_or_else(|| invalid(format!("vision graph constant {which:?} is not drawn")))
+            .ok_or_else(|| format!("vision graph constant {which:?} is not drawn").into())
     }
 
     /// Zero rows `[0, ...extents]` of an empty constant.
-    fn empty(&self, which: Constant, extents: &[u64]) -> Result<WorkflowTensorView, SubmitError> {
+    fn empty(&self, which: Constant, extents: &[u64]) -> Result<WorkflowTensorView, GraphError> {
         let shape = std::iter::once(0)
             .chain(extents.iter().copied())
             .collect::<Vec<_>>();
@@ -346,7 +338,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
         &mut self,
         role: Option<WeightRole>,
         extents: &[u64],
-    ) -> Result<WorkflowTensorView, SubmitError> {
+    ) -> Result<WorkflowTensorView, GraphError> {
         match role {
             Some(role) => {
                 let shape = std::iter::once(1)
@@ -358,38 +350,38 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
         }
     }
 
-    fn value(&self, value: VisionValue, extents: &[u64]) -> Result<WorkflowTensorView, SubmitError> {
+    fn value(&self, value: VisionValue, extents: &[u64]) -> Result<WorkflowTensorView, GraphError> {
         match value {
             VisionValue::Result(index) => self
                 .values
                 .get(index)
                 .map(|tensor| tensor.reshape(extents))
-                .ok_or_else(|| invalid("a vision operand precedes its producer")),
+                .ok_or_else(|| "a vision operand precedes its producer".into()),
             VisionValue::Pixels => input_view(&self.pixels, extents),
         }
     }
 
     /// The row width of a value.
-    fn width(&self, value: VisionValue) -> Result<u64, SubmitError> {
+    fn width(&self, value: VisionValue) -> Result<u64, GraphError> {
         match value {
             VisionValue::Result(index) => self
                 .program
                 .ops
                 .get(index)
                 .map(|op| op.width)
-                .ok_or_else(|| invalid("a vision operand precedes its producer")),
+                .ok_or_else(|| "a vision operand precedes its producer".into()),
             VisionValue::Pixels => Ok(self.program.pixel_width),
         }
     }
 
     /// Rows `L` of the position table `[L, width]`.
-    fn table_rows(&self, table: WeightRole, width: u64) -> Result<u64, SubmitError> {
+    fn table_rows(&self, table: WeightRole, width: u64) -> Result<u64, GraphError> {
         let values = planned_weight(self.load, table)?
             .shape
             .iter()
             .product::<u64>();
         if width == 0 || values % width != 0 {
-            return Err(invalid("the vision position table is not whole rows"));
+            return Err("the vision position table is not whole rows".into());
         }
         Ok(values / width)
     }
@@ -398,7 +390,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
         &mut self,
         kernel: &VisionKernel,
         operands: &VisionOperands,
-    ) -> Result<WorkflowTensor, SubmitError> {
+    ) -> Result<WorkflowTensor, GraphError> {
         let rows = self.rows;
         let statics = |name| static_value(kernel, name);
         let result = match operands {
@@ -420,18 +412,9 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                     ("NB", statics("NB")?),
                 ];
                 let binding = self.bindings.patch_stem(kernel)?;
-                let pixels = self
-                    .graph
-                    .input_for(binding, "pixels", &dims)
-                    .map_err(device)?;
-                let indices = self
-                    .graph
-                    .input_for(binding, "indices", &dims)
-                    .map_err(device)?;
-                let coefficients = self
-                    .graph
-                    .input_for(binding, "coefficients", &dims)
-                    .map_err(device)?;
+                let pixels = self.graph.input_for(binding, "pixels", &dims)?;
+                let indices = self.graph.input_for(binding, "indices", &dims)?;
+                let coefficients = self.graph.input_for(binding, "coefficients", &dims)?;
                 let frame = self.weight(*frame, &[h, c, p, p])?;
                 let next_frame = match next_frame {
                     Some(role) => self.weight(*role, &[1, h, c, p, p])?,
@@ -453,8 +436,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                             indices: indices.tensor().into(),
                             coefficients: coefficients.tensor().into(),
                         },
-                    )
-                    .map_err(device)?
+                    )?
                     .value;
                 self.pixels = Some(pixels);
                 self.indices = Some((indices, coefficients));
@@ -485,20 +467,13 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                 let binding = self.bindings.norm(kernel)?;
                 self.scope(if g == 1 { *row_kind } else { VisionRows::Cells });
                 if *source == VisionValue::Pixels {
-                    self.pixels = Some(
-                        self.graph
-                            .input_for(binding, "source", &dims)
-                            .map_err(device)?,
-                    );
+                    self.pixels = Some(self.graph.input_for(binding, "source", &dims)?);
                 }
                 let source = self.value(*source, &[cells, g, h])?;
                 let weight = self.rows_of(*weight, &[h])?;
                 let bias = self.rows_of(*bias, &[h])?;
                 let order = if *gathered {
-                    let port = self
-                        .graph
-                        .input_for(binding, "order", &dims)
-                        .map_err(device)?;
+                    let port = self.graph.input_for(binding, "order", &dims)?;
                     let view = port.tensor().reshape(&[1, cells * g]);
                     self.order = Some(port);
                     view
@@ -518,8 +493,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                             centered: i32::from(*centered),
                             interleave: i32::from(*interleave),
                         },
-                    )
-                    .map_err(device)?
+                    )?
                     .value
             }
             VisionOperands::Linear {
@@ -579,8 +553,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                             maximum: (&maximum).into(),
                             activation: *activation,
                         },
-                    )
-                    .map_err(device)?
+                    )?
                     .value
             }
             VisionOperands::Clamp {
@@ -606,8 +579,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                             minimum: (&minimum).into(),
                             maximum: (&maximum).into(),
                         },
-                    )
-                    .map_err(device)?
+                    )?
                     .value
             }
             VisionOperands::Attention {
@@ -634,18 +606,10 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                 ];
                 let binding = self.bindings.attention(kernel)?;
                 if self.coordinates.is_none() {
-                    self.coordinates = Some(
-                        self.graph
-                            .input_for(binding, "coordinates", &dims)
-                            .map_err(device)?,
-                    );
+                    self.coordinates = Some(self.graph.input_for(binding, "coordinates", &dims)?);
                 }
                 if *windowed && self.spans.is_none() {
-                    self.spans = Some(
-                        self.graph
-                            .input_for(binding, "spans", &dims)
-                            .map_err(device)?,
-                    );
+                    self.spans = Some(self.graph.input_for(binding, "spans", &dims)?);
                 }
                 let shape = [rows, heads, width];
                 let query = self.value(*query, &shape)?;
@@ -681,8 +645,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                             epsilon: *epsilon,
                             unit_scale: i32::from(*unit_scale),
                         },
-                    )
-                    .map_err(device)?
+                    )?
                     .value
             }
             VisionOperands::Pool {
@@ -710,8 +673,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                             weight: *weight,
                             scale: *scale,
                         },
-                    )
-                    .map_err(device)?
+                    )?
                     .value
             }
             VisionOperands::Position { source, table } => {
@@ -719,14 +681,8 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                 let l = self.table_rows(*table, h)?;
                 let dims = [("M", rows), ("H", h), ("L", l)];
                 let binding = self.bindings.position(kernel)?;
-                let indices = self
-                    .graph
-                    .input_for(binding, "indices", &dims)
-                    .map_err(device)?;
-                let coefficients = self
-                    .graph
-                    .input_for(binding, "coefficients", &dims)
-                    .map_err(device)?;
+                let indices = self.graph.input_for(binding, "indices", &dims)?;
+                let coefficients = self.graph.input_for(binding, "coefficients", &dims)?;
                 let source = self.value(*source, &[rows, h])?;
                 let table = self.weight(*table, &[l, h])?;
                 let value = self
@@ -740,8 +696,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                             indices: indices.tensor().into(),
                             coefficients: coefficients.tensor().into(),
                         },
-                    )
-                    .map_err(device)?
+                    )?
                     .value;
                 self.indices = Some((indices, coefficients));
                 value
@@ -771,8 +726,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                             epsilon: *epsilon,
                             scale: 1.0,
                         },
-                    )
-                    .map_err(device)?
+                    )?
                     .value
             }
         };
@@ -782,10 +736,13 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
 }
 
 /// A graph input viewed with `extents`.
-fn input_view(port: &Option<NativePort>, extents: &[u64]) -> Result<WorkflowTensorView, SubmitError> {
+fn input_view(
+    port: &Option<NativePort>,
+    extents: &[u64],
+) -> Result<WorkflowTensorView, GraphError> {
     port.as_ref()
         .map(|port| port.tensor().reshape(extents))
-        .ok_or_else(|| invalid("a vision graph input is read before it is created"))
+        .ok_or_else(|| "a vision graph input is read before it is created".into())
 }
 
 fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
@@ -794,16 +751,14 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
     load: &ModelLoadPlan,
     program: &VisionOps,
     rows: u64,
-) -> Result<(G, VisionGraphPorts), SubmitError> {
+) -> Result<(G, VisionGraphPorts), GraphError> {
     if rows == 0 || rows % program.cell_rows != 0 {
-        return Err(invalid(
-            "the vision patch class is not a positive cell multiple",
-        ));
+        return Err("the vision patch class is not a positive cell multiple".into());
     }
     let constants = Constant::of(program)?
         .into_iter()
-        .map(|constant| Ok((constant, constant.draw(&mut graph, rows).map_err(invalid)?)))
-        .collect::<Result<Vec<_>, SubmitError>>()?;
+        .map(|constant| Ok((constant, constant.draw(&mut graph, rows)?)))
+        .collect::<Result<Vec<_>, GraphError>>()?;
     let mut draft = Draft {
         graph,
         bindings,
@@ -828,19 +783,17 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
         .values
         .last()
         .cloned()
-        .ok_or_else(|| invalid("the vision program has no invocation"))?;
-    draft.graph.export(&features).map_err(device)?;
+        .ok_or("the vision program has no invocation")?;
+    draft.graph.export(&features)?;
     let (pixels, (indices, coefficients)) = draft
         .pixels
         .zip(draft.indices)
-        .ok_or_else(|| invalid("the vision program reads no pixels or positions"))?;
+        .ok_or("the vision program reads no pixels or positions")?;
     if draft.coordinates.is_some() != program.coordinates
         || draft.spans.is_some() != program.windows
         || draft.order.is_some() != program.windows
     {
-        return Err(invalid(
-            "the vision program's inputs disagree with its invocations",
-        ));
+        return Err("the vision program's inputs disagree with its invocations".into());
     }
     Ok((
         draft.graph,
@@ -870,11 +823,11 @@ pub(crate) fn checked_vision_family_resources(
     description: &VisionDescription,
     plan: &VisionProgramPlan,
     patch_rows: impl IntoIterator<Item = u64>,
-) -> Result<CheckedGraphResources, String> {
+) -> Result<CheckedGraphResources, GraphError> {
     let patch_rows = patch_rows.into_iter().collect::<Vec<_>>();
-    let program = planned_program(description, load).map_err(|error| error.to_string())?;
+    let program = planned_program(description, load)?;
     let (storage, _) = certify_vision_family(backend, load, &program, plan, &patch_rows)?;
-    let constants = Constant::of(&program).map_err(|error| error.to_string())?;
+    let constants = Constant::of(&program)?;
     let mut resources = CheckedGraphFamilyResources::new();
     for &rows in &patch_rows {
         resources.include(
@@ -885,7 +838,7 @@ pub(crate) fn checked_vision_family_resources(
                 .collect::<Result<Vec<_>, _>>()?,
         );
     }
-    resources.finish()
+    Ok(resources.finish()?)
 }
 
 fn certify_vision_family(
@@ -894,7 +847,7 @@ fn certify_vision_family(
     program: &VisionOps,
     plan: &VisionProgramPlan,
     patch_rows: &[u64],
-) -> Result<(NativeGraphStorageBytes, Vec<NativeGraphLayout>), String> {
+) -> Result<(NativeGraphStorageBytes, Vec<NativeGraphLayout>), GraphError> {
     let cell = program.cell_rows;
     let &largest = patch_rows
         .iter()
@@ -915,8 +868,7 @@ fn certify_vision_family(
         load,
         program,
         largest,
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
     // Patch-row invocations read the class's patch rows; cell-row ones its
     // cells. The norm's rows are its `C` (the stem's `C` is its channels).
     let slices = patch_rows
@@ -932,8 +884,7 @@ fn certify_vision_family(
         .collect::<Vec<_>>();
     let layout = graph
         .seal_template()
-        .and_then(|template| template.certify(&slices))
-        .map_err(|error| error.to_string())?;
+        .and_then(|template| template.certify(&slices))?;
     Ok((layout.storage_bytes(), vec![layout; patch_rows.len()]))
 }
 
@@ -944,8 +895,8 @@ pub(crate) fn verify_vision_family_certificates(
     description: &VisionDescription,
     plan: &VisionProgramPlan,
     patch_rows: &[u64],
-) -> Result<(), String> {
-    let program = planned_program(description, load).map_err(|error| error.to_string())?;
+) -> Result<(), GraphError> {
+    let program = planned_program(description, load)?;
     let (_, layouts) = certify_vision_family(backend, load, &program, plan, patch_rows)?;
     for (&rows, layout) in patch_rows.iter().zip(&layouts) {
         let (graph, _) = vision_graph_draft(
@@ -954,13 +905,12 @@ pub(crate) fn verify_vision_family_certificates(
             load,
             &program,
             rows,
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         let charged = graph
             .seal_with_layout(layout)
-            .map_err(|error| format!("vision class {rows}: {error}"))?;
+            .map_err(|error| GraphError::from(error).context(format!("vision class {rows}")))?;
         if charged != layout.storage_bytes() {
-            return Err(format!("vision class {rows} charged a different layout"));
+            return Err(format!("vision class {rows} charged a different layout").into());
         }
     }
     Ok(())
@@ -1083,17 +1033,13 @@ impl PreparedVisionGraphs {
         description: &VisionDescription,
         patch_rows: impl IntoIterator<Item = u64>,
     ) -> Result<Self, SubmitError> {
+        let graph_error = |error: GraphError| invalid(error.to_string());
         let patch_rows = patch_rows.into_iter().collect::<Vec<_>>();
-        let program = planned_program(description, load)?;
+        let program = planned_program(description, load).map_err(graph_error)?;
         let plan = VisionProgramPlan::new(program.kernels().into_iter().cloned().collect());
-        let (_, layouts) = certify_vision_family(
-            target_device.backend(),
-            load,
-            &program,
-            &plan,
-            &patch_rows,
-        )
-        .map_err(invalid)?;
+        let (_, layouts) =
+            certify_vision_family(target_device.backend(), load, &program, &plan, &patch_rows)
+                .map_err(graph_error)?;
         let mut variants = Vec::new();
         for (rows, layout) in patch_rows.into_iter().zip(layouts) {
             if variants
@@ -1108,7 +1054,8 @@ impl PreparedVisionGraphs {
                 load,
                 &program,
                 rows,
-            )?;
+            )
+            .map_err(graph_error)?;
             variants.push(PreparedVisionGraph {
                 patch_rows: rows,
                 plan: graph.seal().map_err(device)?,

@@ -101,13 +101,12 @@ const hostState = Atom.keepAlive(Atom.make(observation))
 const pageNames: Record<Page, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
 const pageIcons = { discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
 
-/** Compatibility is advice, separate from an attempted operation's failure. */
+/** Memory fit is advice, separate from an attempted operation's failure. */
 const fitNotice = (model: CatalogLocalModel): string | null => {
   const serving = model.servingState
-  if (serving._tag === "Assessing") return "Checking compatibility with your computer…"
-  if (serving._tag === "Failed") return "Compatibility is unavailable for this model."
+  if (serving._tag === "Assessing") return "Assessing memory and speed…"
+  if (serving._tag === "Failed") return "Assessment failed."
   const assessment = serving.assessment
-  if (assessment._tag === "Incompatible") return "This model can’t run on this computer. Choose another model."
   if (assessment._tag === "DoesNotFit") return `This model needs ${formatMemorySize(assessment.deficitBytes, { rounding: "up" })} more memory than this computer can provide. Choose a smaller model.`
   return null
 }
@@ -128,11 +127,13 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
           return <a className="inline-flex items-center gap-1 text-sm text-slate-600 hover:underline dark:text-slate-300" key={url} href={url} title={url} target="_blank" rel="noreferrer">{label}<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a>
         })}</div></div>}
       </div>
-      {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && serving.assessment.performance.length > 0 && <div className="min-w-0">
+      {serving._tag === "Failed" && <div className="min-w-0"><p className="mb-1 text-xs text-slate-500">Assessment</p><p className="break-words text-slate-600 dark:text-slate-300">{serving.failure.message}</p></div>}
+      {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && serving.assessment.speed._tag === "Unavailable" && <div className="min-w-0"><p className="mb-1 font-medium">Estimated speed on your machine</p><p className="text-slate-500">Speed estimate unavailable</p></div>}
+      {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && serving.assessment.speed._tag === "Estimated" && <div className="min-w-0">
         <table className="w-full text-left text-sm tabular-nums">
           <caption className="mb-3 text-left font-medium">Estimated speed on your machine</caption>
           <thead className="text-xs text-slate-500"><tr><th className="pb-2 font-normal">Context tokens</th><th className="pb-2 text-right font-normal">Tokens / sec</th></tr></thead>
-          <tbody>{serving.assessment.performance.map(sample => <tr key={sample.contextTokens} className="border-t border-slate-200 dark:border-slate-750"><td className="py-2">{sample.contextTokens.toLocaleString()}</td><td className="py-2 text-right">{Math.round(sample.estimatedTokensPerSecond)}</td></tr>)}</tbody>
+          <tbody>{serving.assessment.speed.samples.map(sample => <tr key={sample.contextTokens} className="border-t border-slate-200 dark:border-slate-750"><td className="py-2">{sample.contextTokens.toLocaleString()}</td><td className="py-2 text-right">{Math.round(sample.estimatedTokensPerSecond)}</td></tr>)}</tbody>
         </table>
       </div>}
       </div>
@@ -468,7 +469,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} models={models} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
     {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
     </>}
-    {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for compatibility details.</p>}
+    {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for memory and speed details.</p>}
   </>
 }
 function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {

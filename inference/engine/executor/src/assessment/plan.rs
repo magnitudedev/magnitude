@@ -7,16 +7,14 @@
 //! - Every representation the load planner produces for the backend is
 //!   timed once as a `WeightFormat`, the factor that carries a
 //!   weight-streaming class from the reference to it.
-//! - Every exact binding of a representation-binding entry (each entry at
-//!   each representation, and each conversion the importer runs) is formed
-//!   untimed: the basis is the compatibility set.
 //!
-//! Decoders publish BF16 activations (every family declares it), and norm
-//! weights are resident in the activation dtype. A model binding anything
-//! else is outside the basis and incompatible.
+//! The basis only prices: it decides no model's executability. Decoders
+//! publish BF16 activations (every family declares it), and norm weights are
+//! resident in the activation dtype. A model binding anything else has no
+//! cost in the basis, and its speed estimate is unavailable.
 
 use super::basis::{MeasurementKey, OperationClass};
-use crate::{resident_element, resident_layout, source_element, ExecutionPath};
+use crate::{resident_element, resident_layout, ExecutionPath};
 use magnitude_artifacts::gguf::Encoding;
 use seismic::{BackendName, Element};
 
@@ -52,61 +50,6 @@ pub fn reference_weight(backend: BackendName) -> Element {
     .expect("q4_k has a resident representation")
 }
 
-/// The conversions the importer runs into resident rows: each dense source
-/// into the activation, and each packed source into its representation.
-fn conversions(backend: BackendName) -> Vec<MeasurementKey> {
-    let layout = resident_layout(ExecutionPath::Native, backend);
-    let activation = activation();
-    let dense = activation.dtype().expect("the activation is dense");
-    let mut keys = Vec::new();
-    for encoding in Encoding::ALL {
-        let (Some(source), Some(resident)) = (
-            source_element(encoding),
-            resident_element(encoding, dense, layout),
-        ) else {
-            continue;
-        };
-        let key = if source.dtype().is_some() {
-            MeasurementKey::import_rows(source, activation)
-        } else {
-            MeasurementKey::repack_rows(source, resident)
-        };
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
-    }
-    keys
-}
-
-/// Every exact binding of `class` at `weight`, one representation.
-fn representation_bindings(class: OperationClass, weight: Element) -> Option<MeasurementKey> {
-    use OperationClass as C;
-    let a = activation();
-    Some(match class {
-        C::EmbeddingRows => MeasurementKey::embedding_rows(weight, a),
-        C::AttentionProject => MeasurementKey::attention_project(a, weight, a),
-        C::AttentionOutput => MeasurementKey::attention_output(weight, a),
-        C::DeltaProject => MeasurementKey::delta_project(a, weight, a),
-        C::DeltaOutput => MeasurementKey::delta_output(a, weight, a),
-        C::ShortConvProject => MeasurementKey::short_conv_project(a, weight, a),
-        C::DenseExpand => MeasurementKey::dense_expand(a, weight, a),
-        C::DenseUp => MeasurementKey::dense_up(a, weight, a),
-        C::DenseOutput => MeasurementKey::dense_output(weight, a),
-        C::RoutedSelect => MeasurementKey::routed_select(a, weight, a),
-        C::RoutedGateUp => MeasurementKey::routed_expansion(true, weight, a),
-        C::RoutedUp => MeasurementKey::routed_expansion(false, weight, a),
-        C::RoutedDown => MeasurementKey::routed_down(weight, a),
-        C::RoutedRoute => MeasurementKey::routed_route(a, weight, a),
-        C::RoutedExpand => MeasurementKey::routed_expand(weight, a),
-        C::RoutedOutput => MeasurementKey::routed_output(weight, a),
-        C::ProjectRows => MeasurementKey::project_rows(weight, a),
-        C::PerLayerGate => MeasurementKey::per_layer_gate(weight, a),
-        C::PerLayerInputs => MeasurementKey::per_layer_inputs(weight, a),
-        C::ReadoutHead => MeasurementKey::readout_head(a, weight, a),
-        _ => return None,
-    })
-}
-
 /// The cost key every class is timed under.
 fn cost_key(class: OperationClass) -> MeasurementKey {
     use OperationClass as C;
@@ -123,63 +66,30 @@ fn cost_key(class: OperationClass) -> MeasurementKey {
     }
 }
 
-/// One entry of the plan.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PlannedKey {
-    /// A class timed under its cost key, or a `WeightFormat`.
-    Timed(MeasurementKey),
-    /// An exact binding formed for compatibility, untimed.
-    Formed(MeasurementKey),
-}
-
-impl PlannedKey {
-    pub fn key(&self) -> &MeasurementKey {
-        match self {
-            Self::Timed(key) | Self::Formed(key) => key,
-        }
-    }
-}
-
-/// The plan of `backend`: every class timed in declaration order, the weight
-/// formats, then every exact representation binding formed.
-pub fn measurement_plan(backend: BackendName) -> Vec<PlannedKey> {
+/// The plan of `backend`: every class timed under its cost key in
+/// declaration order, with a weight format per resident representation.
+pub fn measurement_plan(backend: BackendName) -> Vec<MeasurementKey> {
     let representations = representations(backend);
-    let mut timed = Vec::new();
-    let mut formed = Vec::new();
+    let mut plan = Vec::new();
     for class in OperationClass::ALL {
         if class == OperationClass::WeightFormat {
-            timed.extend(
+            plan.extend(
                 representations
                     .iter()
-                    .map(|&weight| PlannedKey::Timed(MeasurementKey::weight_format(weight, activation()))),
+                    .map(|&weight| MeasurementKey::weight_format(weight, activation())),
             );
-            continue;
+        } else {
+            plan.push(cost_key(class));
         }
-        timed.push(PlannedKey::Timed(cost_key(class)));
-        if !class.binds_representation() {
-            continue;
-        }
-        let bindings = match class {
-            OperationClass::ImportRows | OperationClass::RepackRows => conversions(backend)
-                .into_iter()
-                .filter(|key| key.class == class)
-                .collect(),
-            _ => representations
-                .iter()
-                .filter_map(|&weight| representation_bindings(class, weight))
-                .collect::<Vec<_>>(),
-        };
-        formed.extend(bindings.into_iter().map(PlannedKey::Formed));
     }
-    timed.extend(formed);
-    timed
+    plan
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::assessment::demand::DecodeDemand;
-    use crate::{ComponentSelection, ModelLoadPlan};
+    use crate::{source_element, ComponentSelection, ModelLoadPlan};
     use magnitude_state::KvCodec;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -603,18 +513,16 @@ pub(crate) mod tests {
         for backend in BACKENDS {
             let plan = measurement_plan(backend);
             assert_eq!(plan, measurement_plan(backend));
-            for (index, entry) in plan.iter().enumerate() {
+            for (index, key) in plan.iter().enumerate() {
                 assert!(
-                    plan[..index].iter().all(|earlier| earlier.key() != entry.key()),
-                    "{}: {} is planned twice",
+                    !plan[..index].contains(key),
+                    "{}: {key} is planned twice",
                     backend.as_str(),
-                    entry.key()
                 );
             }
             // Every class is timed under its cost key.
             for class in OperationClass::ALL {
-                assert!(plan.iter().any(|entry| matches!(entry, PlannedKey::Timed(key)
-                    if key.class == class)));
+                assert!(plan.iter().any(|key| key.class == class));
             }
         }
     }
@@ -623,7 +531,7 @@ pub(crate) mod tests {
     fn every_declared_qwen_demand_is_covered_by_the_plan() {
         for backend in BACKENDS {
             let plan = measurement_plan(backend);
-            let timed = |key: &MeasurementKey| plan.contains(&PlannedKey::Timed(key.clone()));
+            let timed = |key: &MeasurementKey| plan.contains(key);
             for configuration in QWEN35_CONFIGURATIONS {
                 let (definition, manifest) = declared_model(&configuration);
                 let load = ModelLoadPlan::derive(
@@ -639,14 +547,6 @@ pub(crate) mod tests {
                 for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
                     for term in DecodeDemand::from_model(&definition, &load, codec).unwrap().terms {
                         assert!(timed(&term.key.cost()), "{}: {}", backend.as_str(), term.key);
-                        if term.key.class.binds_representation() {
-                            assert!(
-                                plan.contains(&PlannedKey::Formed(term.key.clone())),
-                                "{}: {} is not formed",
-                                backend.as_str(),
-                                term.key
-                            );
-                        }
                         if let Some(weight) = term.weight() {
                             assert!(timed(&MeasurementKey::weight_format(weight, activation())));
                         }

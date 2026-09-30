@@ -8,7 +8,7 @@
 use crate::operators::gated_delta::graph::{
     bank_ports, chunked, RecurrentControlPorts, RecurrentStatePorts,
 };
-use crate::programs::graph::draft::GraphDraft;
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{
     native::StateSpaceKernels, ModelLoadPlan, StateResourcePlan, StateSpaceBinding, StateSpaceShape,
@@ -98,7 +98,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     weights: &mut Vec<(WeightPort, NativePort)>,
     hidden: &WorkflowTensor,
     block: StateSpaceBlock,
-) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), String> {
+) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), GraphError> {
     let shape = block.shape;
     let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
     let input_norm = weight(graph, WeightKind::InputNorm)?;

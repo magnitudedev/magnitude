@@ -59,8 +59,9 @@ clamped to physical values.
   shortened history depth makes the estimate low confidence even when observed spread is small.
 
 Every result has finite positive rates with `lower <= estimated <= upper`, one per requested depth
-in ascending order. A demand term outside the basis makes the model `Incompatible`; a missing
-measurement or invalid arithmetic fails the assessment. Neither is a partial result.
+in ascending order. A demand term without a measured cost makes the speed `Unavailable`: the
+basis only prices, so a gap in it costs the estimate and never the model's memory fit or result.
+Invalid arithmetic over measured costs fails the assessment.
 
 ## Identity and caching
 

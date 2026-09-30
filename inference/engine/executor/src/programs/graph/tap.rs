@@ -7,7 +7,7 @@
 //! into the draft's conditioning features. Tap indices are run inputs, so
 //! blocks tapped at the same positions share a plan.
 
-use super::draft::GraphDraft;
+use super::{draft::GraphDraft, GraphError};
 use magnitude_kernels::tap_rows;
 use seismic::{Element, NativePort, WorkflowTensor};
 
@@ -64,7 +64,7 @@ impl<'a, G: GraphDraft + 'a> Taps<'a, G> {
         rows: u64,
         hidden_width: u64,
         activation: Element,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, GraphError> {
         Ok(Self {
             entry: tap.entry,
             width: tap.width,
@@ -82,7 +82,11 @@ impl<'a, G: GraphDraft + 'a> Taps<'a, G> {
 
     /// Round `hidden`'s rows into the column block the returned index port
     /// names.
-    pub fn tap(&mut self, graph: &mut G, hidden: &WorkflowTensor) -> Result<NativePort, String> {
+    pub fn tap(
+        &mut self,
+        graph: &mut G,
+        hidden: &WorkflowTensor,
+    ) -> Result<NativePort, GraphError> {
         let dimensions = [
             ("M", self.rows),
             ("D", self.hidden_width),

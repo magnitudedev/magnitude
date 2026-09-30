@@ -1,11 +1,10 @@
-//! One complete model assessment: memory fit per domain, compatibility with
-//! the measurement basis, and decode-speed estimates, all from headers and
-//! the allocation-free execution plan draft.
+//! One complete model assessment: memory fit per domain and decode-speed
+//! estimates, all from headers and the allocation-free execution plan draft.
 //!
-//! Order: the draft's decode demand is checked against the basis first (a
-//! class outside it is `Incompatible`); then the standard workload's clean-load
-//! charge is compared with every domain the load touches (`DoesNotFit` names
-//! the domain with the largest deficit); only a fitting model is estimated.
+//! The standard workload's clean-load charge is compared with every domain
+//! the load touches (`DoesNotFit` names the domain with the largest deficit);
+//! only a fitting model is estimated. The basis only prices: a cost it lacks
+//! makes the speed `Unavailable`, never the model.
 
 use super::basis::{MeasurementBasis, MeasurementKey};
 use super::demand::DecodeDemand;
@@ -43,14 +42,16 @@ pub struct DomainFit {
     pub remaining_bytes: i64,
 }
 
+/// A fitting model's decode speed.
 #[derive(Clone, Debug, PartialEq)]
-pub enum IncompatibleReason {
-    /// The plan needs classes the basis did not measure on this device.
-    OutsideBasis {
-        classes: Vec<(MeasurementKey, Option<String>)>,
+pub enum DecodeSpeed {
+    Estimated(Vec<PerformanceEstimate>),
+    /// The basis has no cost for these keys of the decode step: a defect of
+    /// the basis or its measurement, which costs the estimate and nothing
+    /// else.
+    Unavailable {
+        missing: Vec<MeasurementKey>,
     },
-    /// Planning rejected the model's representation or topology.
-    Unsupported { reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,7 +59,7 @@ pub enum ExecutionAssessment {
     Fits {
         fit_context_tokens: u32,
         domains: Vec<DomainFit>,
-        performance: Vec<PerformanceEstimate>,
+        speed: DecodeSpeed,
     },
     DoesNotFit {
         fit_context_tokens: u32,
@@ -66,17 +67,14 @@ pub enum ExecutionAssessment {
         limiting: MemoryPoolId,
         deficit_bytes: u64,
     },
-    Incompatible {
-        reason: IncompatibleReason,
-    },
 }
 
-/// Basis-independent decode demand and the standard workload's checked memory charge.
-/// The memory result is retained separately so an unsupported basis class keeps its
-/// `Incompatible` verdict even when this model's resource certification also fails.
+/// Basis-independent decode demand and the standard workload's checked
+/// memory charge.
 pub struct PreparedExecutionAssessment {
     demand: DecodeDemand,
-    memory: Result<(u32, AssessmentMemoryCharge), AssessmentError>,
+    fit_context_tokens: u32,
+    charge: AssessmentMemoryCharge,
 }
 
 impl PreparedExecutionAssessment {
@@ -86,7 +84,10 @@ impl PreparedExecutionAssessment {
     }
 }
 
-/// Perform model-specific arithmetic while the fixed generic basis is measured.
+/// Perform model-specific arithmetic while the fixed generic basis is
+/// measured. The memory charge builds every graph a load prepares, so this
+/// fails with `AssessmentError::Graph` exactly when the model's program
+/// cannot be built on the planned backend.
 pub fn prepare_execution_assessment(
     definition: &ModelDefinition,
     draft: &ExecutionPlanDraft,
@@ -100,15 +101,6 @@ pub fn prepare_execution_assessment(
     }
     let policy = draft.policy();
     let demand = DecodeDemand::from_model(definition, draft.load(), policy.codec())?;
-    let memory = prepare_memory_charge(definition, draft);
-    Ok(PreparedExecutionAssessment { demand, memory })
-}
-
-fn prepare_memory_charge(
-    definition: &ModelDefinition,
-    draft: &ExecutionPlanDraft,
-) -> Result<(u32, AssessmentMemoryCharge), AssessmentError> {
-    let policy = draft.policy();
     let terms = AssessmentMemoryTerms::derive(
         definition,
         draft.load(),
@@ -142,7 +134,7 @@ fn prepare_memory_charge(
         policy.limits(),
         draft.device().backend(),
     )
-    .map_err(AssessmentError::Memory)?;
+    .map_err(AssessmentError::Graph)?;
     let charge = header
         .with_graph_resource_bound(&graph)
         .and_then(|bounds| {
@@ -151,7 +143,11 @@ fn prepare_memory_charge(
                 .and_then(|state_bytes| terms.charge(bounds, state_bytes))
         })
         .map_err(AssessmentError::Memory)?;
-    Ok((fit_context_tokens, charge))
+    Ok(PreparedExecutionAssessment {
+        demand,
+        fit_context_tokens,
+        charge,
+    })
 }
 
 /// Join one prepared model with the basis and stable capacity. No graph or
@@ -164,15 +160,6 @@ pub fn finish_execution_assessment(
     basis: &MeasurementBasis,
     request: &AssessmentRequest,
 ) -> Result<ExecutionAssessment, AssessmentError> {
-    let unmeasured = prepared.demand.unmeasured(basis);
-    if !unmeasured.is_empty() {
-        return Ok(ExecutionAssessment::Incompatible {
-            reason: IncompatibleReason::OutsideBasis {
-                classes: unmeasured,
-            },
-        });
-    }
-    let &(fit_context_tokens, charge) = prepared.memory.as_ref().map_err(Clone::clone)?;
     let device = topology
         .devices()
         .iter()
@@ -185,9 +172,11 @@ pub fn finish_execution_assessment(
         })?;
     let capacities = fit_capacities(topology, device, host, &request.reserves)
         .map_err(|error| AssessmentError::Memory(error.to_string()))?;
-    let fit = charge
+    let fit = prepared
+        .charge
         .assess_fit(&capacities)
         .map_err(AssessmentError::Memory)?;
+    let fit_context_tokens = prepared.fit_context_tokens;
     match fit.verdict {
         AssessmentFitVerdict::DoesNotFit {
             limiting,
@@ -199,12 +188,17 @@ pub fn finish_execution_assessment(
             deficit_bytes,
         }),
         AssessmentFitVerdict::Fits => {
-            let depths = performance_depths(request.context_limit, &request.performance_depths);
-            let performance = estimate_performance(&prepared.demand, basis, &depths)?;
+            let missing = prepared.demand.missing_costs(basis);
+            let speed = if missing.is_empty() {
+                let depths = performance_depths(request.context_limit, &request.performance_depths);
+                DecodeSpeed::Estimated(estimate_performance(&prepared.demand, basis, &depths)?)
+            } else {
+                DecodeSpeed::Unavailable { missing }
+            };
             Ok(ExecutionAssessment::Fits {
                 fit_context_tokens,
                 domains: fit.domains,
-                performance,
+                speed,
             })
         }
     }
@@ -292,9 +286,8 @@ mod tests {
         }
     }
 
-    /// A basis holding every entry the fixture's decode needs: each term's
-    /// cost key timed at 10 µs a launch, its weight format and its exact
-    /// representation binding formed.
+    /// A basis pricing every entry the fixture's decode needs: each term's
+    /// cost key timed at 10 µs a launch, and its weight format.
     fn complete_basis(environment: &Environment) -> MeasurementBasis {
         let demand = DecodeDemand::from_model(
             &environment.definition,
@@ -343,9 +336,6 @@ mod tests {
                 }),
             };
             hold(term.key.cost(), measured(model));
-            if term.key.class.binds_representation() {
-                hold(term.key.clone(), ClassMeasurement::Formed);
-            }
         }
         MeasurementBasis {
             identity: identity(),
@@ -362,52 +352,58 @@ mod tests {
     }
 
     #[test]
-    fn classes_outside_the_basis_are_incompatible() {
+    fn a_basis_gap_costs_only_the_speed_estimate() {
         let environment = environment(128);
+        let assess = |basis: &MeasurementBasis| {
+            assess_execution(
+                &environment.definition,
+                &environment.draft,
+                &environment.topology,
+                &environment.host,
+                basis,
+                &request(128, &[64]),
+            )
+            .unwrap()
+        };
+        let complete = complete_basis(&environment);
+        let ExecutionAssessment::Fits {
+            domains,
+            speed: DecodeSpeed::Estimated(_),
+            ..
+        } = assess(&complete)
+        else {
+            panic!("the fixture fits and the complete basis prices it");
+        };
+
         let empty = MeasurementBasis {
             identity: identity(),
             classes: Vec::new(),
         };
-        let assessment = assess_execution(
-            &environment.definition,
-            &environment.draft,
-            &environment.topology,
-            &environment.host,
-            &empty,
-            &request(128, &[64]),
-        )
-        .unwrap();
-        let ExecutionAssessment::Incompatible {
-            reason: IncompatibleReason::OutsideBasis { classes },
-        } = assessment
+        let ExecutionAssessment::Fits {
+            domains: empty_domains,
+            speed: DecodeSpeed::Unavailable { missing },
+            ..
+        } = assess(&empty)
         else {
-            panic!("expected an outside-basis incompatibility, got {assessment:?}");
+            panic!("an empty basis still fits, without a speed estimate");
         };
-        assert!(!classes.is_empty());
-        assert!(classes.iter().all(|(_, reason)| reason.is_none()));
+        assert!(!missing.is_empty());
+        assert_eq!(empty_domains, domains);
 
-        let mut basis = complete_basis(&environment);
-        let (key, _) = basis.classes.remove(0);
-        basis.classes.push((
+        let mut failed = complete.clone();
+        let (key, _) = failed.classes.remove(0);
+        failed.classes.push((
             key.clone(),
             ClassMeasurement::Unsupported {
                 reason: "cannot form".into(),
             },
         ));
         assert_eq!(
-            assess_execution(
-                &environment.definition,
-                &environment.draft,
-                &environment.topology,
-                &environment.host,
-                &basis,
-                &request(128, &[64]),
-            )
-            .unwrap(),
-            ExecutionAssessment::Incompatible {
-                reason: IncompatibleReason::OutsideBasis {
-                    classes: vec![(key, Some("cannot form".into()))],
-                },
+            assess(&failed),
+            ExecutionAssessment::Fits {
+                fit_context_tokens: 128,
+                domains,
+                speed: DecodeSpeed::Unavailable { missing: vec![key] },
             }
         );
     }
@@ -428,7 +424,7 @@ mod tests {
         let ExecutionAssessment::Fits {
             fit_context_tokens,
             domains,
-            performance,
+            speed: DecodeSpeed::Estimated(performance),
         } = assessment
         else {
             panic!("the fixture fits every supported host, got {assessment:?}");

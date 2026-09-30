@@ -841,32 +841,20 @@ impl DecodeDemand {
         Ok(Self { terms: terms.0 })
     }
 
-    /// What this demand needs that the basis does not hold: each term's
-    /// cost key and weight format timed, and each exact representation
-    /// binding formed. An entry absent from the basis carries no reason, an
-    /// unsupported one its reason. A nonempty result means the model is
-    /// incompatible with the basis's device.
-    pub fn unmeasured(&self, basis: &MeasurementBasis) -> Vec<(MeasurementKey, Option<String>)> {
-        let mut missing: Vec<(MeasurementKey, Option<String>)> = Vec::new();
+    /// The costs this demand's estimate needs that the basis does not hold:
+    /// each term's cost key and weight format, unmeasured. A nonempty result
+    /// makes the speed estimate unavailable.
+    pub fn missing_costs(&self, basis: &MeasurementBasis) -> Vec<MeasurementKey> {
+        let mut missing: Vec<MeasurementKey> = Vec::new();
         for term in &self.terms {
-            let mut needed = vec![(term.key.cost(), true)];
-            if term.key.class.binds_representation() {
-                needed.push((term.key.clone(), false));
-            }
-            if let Some(weight) = term.weight() {
-                needed.push((MeasurementKey::weight_format(weight, term.key.cost().bindings[0]), true));
-            }
-            for (key, timed) in needed {
-                let absent = match basis.get(&key) {
-                    Some(ClassMeasurement::Measured { .. }) => None,
-                    Some(ClassMeasurement::Formed) if !timed => None,
-                    Some(ClassMeasurement::Unsupported { reason }) => Some(Some(reason.clone())),
-                    Some(ClassMeasurement::Formed) | None => Some(None),
-                };
-                if let Some(reason) = absent {
-                    if missing.iter().all(|(known, _)| *known != key) {
-                        missing.push((key, reason));
-                    }
+            let cost = term.key.cost();
+            let format = term
+                .weight()
+                .map(|weight| MeasurementKey::weight_format(weight, cost.bindings[0]));
+            for key in std::iter::once(cost).chain(format) {
+                let measured = matches!(basis.get(&key), Some(ClassMeasurement::Measured { .. }));
+                if !measured && !missing.contains(&key) {
+                    missing.push(key);
                 }
             }
         }
@@ -1036,7 +1024,7 @@ mod tests {
             term(&demand, OperationClass::AttentionDecode).shape,
             TermShape::Attention(HeadGeometry {
                 kv_heads: 1,
-                group: 1,
+                group: 2,
                 width: 64,
             })
         );

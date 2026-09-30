@@ -772,6 +772,18 @@ export const CountTokensResponse = S.extend(
 export type CountTokensResponse = S.Schema.Type<typeof CountTokensResponse>
 export type CountTokensResponseEncoded = S.Schema.Encoded<typeof CountTokensResponse>
 
+export const DecodeSpeed = S.Union(
+  S.extend(
+    S.TaggedStruct("Estimated", {
+      samples: S.Array(S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("Unavailable", {}), S.Record({ key: S.String, value: JsonValue })),
+)
+export type DecodeSpeed = S.Schema.Type<typeof DecodeSpeed>
+export type DecodeSpeedEncoded = S.Schema.Encoded<typeof DecodeSpeed>
+
 export const DefaultGenerationSettings = S.Struct({
   n_ctx: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
@@ -1446,10 +1458,8 @@ export const ModelAssessment = S.Union(
     S.TaggedStruct("Fits", {
       assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
-      performance: S.Array(
-        S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
-      ),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+      speed: S.suspend((): S.Schema<DecodeSpeed, DecodeSpeedEncoded> => DecodeSpeed),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -1464,7 +1474,7 @@ export const ModelAssessment = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.TaggedStruct("Incompatible", {
+    S.TaggedStruct("Unsupported", {
       failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
     }),

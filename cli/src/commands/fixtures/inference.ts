@@ -127,7 +127,7 @@ const makeModel = (overrides: Partial<ReadyDiscoveredLocalModel> = {}): ReadyDis
             },
             currentHeadroomState: { _tag: "NotObserved" },
           },
-          performance: performance(contextLength),
+          speed: { _tag: "Estimated", samples: performance(contextLength) },
         },
       },
     },

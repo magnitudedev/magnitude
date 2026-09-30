@@ -11,6 +11,7 @@
 //! the fusion of the target taps (`project_rows` over the draft input rows
 //! the tapped blocks wrote) gathered through `out_rows` (`feature_rows`).
 
+use super::GraphError;
 use crate::{
     native::AttestedTarget, programs::graph::draft::GraphDraft, DeviceError, InvariantError,
     ModelLoadPlan, ResidentTarget, ResourceLimits, SubmitError,
@@ -211,7 +212,8 @@ impl PreparedTargetReadoutGraphs {
             .ok_or("readout output projection weight is absent")?;
         let source = FeatureSource::of(load);
         let regimes =
-            certify_readout_regimes(device.backend(), geometry, norm, projection, source, limits)?;
+            certify_readout_regimes(device.backend(), geometry, norm, projection, source, limits)
+                .map_err(error)?;
         let mut classes = BTreeMap::new();
         let mut plans = Vec::new();
         let mut add = |class: ReadoutClass| -> Result<(), String> {
@@ -362,7 +364,8 @@ impl PreparedTargetReadoutGraph {
             norm_plan,
             source,
             class,
-        )?;
+        )
+        .map_err(error)?;
         let mut weight = None;
         let mut logit_rows = None;
         let mut logits = None;
@@ -380,7 +383,8 @@ impl PreparedTargetReadoutGraph {
                 class,
                 &rows.hidden,
                 &rows.norm,
-            )?;
+            )
+            .map_err(error)?;
             graph = projected_graph;
             if let ReadoutKind::Selection { .. } = class.kind {
                 let (selection_graph, ports, sampled) = selected_topology(
@@ -390,7 +394,8 @@ impl PreparedTargetReadoutGraph {
                     geometry,
                     class,
                     &projected,
-                )?;
+                )
+                .map_err(error)?;
                 graph = selection_graph;
                 selection = Some(ports);
                 selected = Some(sampled);
@@ -438,7 +443,7 @@ fn final_row_ports<G: GraphDraft>(
     geometry: &Decoder,
     norm_plan: &crate::WeightPlan,
     class: ReadoutClass,
-) -> Result<FinalRowPorts, String> {
+) -> Result<FinalRowPorts, GraphError> {
     Ok(FinalRowPorts {
         hidden: graph.port_with_class_extent(
             Element::f32(),
@@ -459,7 +464,7 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
     norm_plan: &crate::WeightPlan,
     source: FeatureSource<'_>,
     class: ReadoutClass,
-) -> Result<FeaturePrefix<G>, String> {
+) -> Result<FeaturePrefix<G>, GraphError> {
     let dimensions = [
         ("M", class.rows),
         ("O", class.outputs),
@@ -553,7 +558,7 @@ fn projected_topology<'a, G: GraphDraft + 'a>(
     class: ReadoutClass,
     hidden: &NativePort,
     norm: &NativePort,
-) -> Result<(G, (NativePort, NativePort), NativePort, WorkflowTensor), String> {
+) -> Result<(G, (NativePort, NativePort), NativePort, WorkflowTensor), GraphError> {
     let weight = graph.port(weight_plan.resident, &weight_plan.shape)?;
     // The weight's resident second-level scale, or an absent scale.
     let extent = weight_plan.scale_extent();
@@ -607,7 +612,7 @@ fn selected_topology<'a, G: GraphDraft + 'a>(
     geometry: &Decoder,
     class: ReadoutClass,
     logits: &WorkflowTensor,
-) -> Result<(G, SelectionPorts, WorkflowTensor), String> {
+) -> Result<(G, SelectionPorts, WorkflowTensor), GraphError> {
     let ReadoutKind::Selection { shaped } = class.kind else {
         return Err("selection topology requires a selection class".into());
     };
@@ -638,8 +643,8 @@ fn checked_readout_class_storage(
     norm_plan: &crate::WeightPlan,
     weight_plan: Option<&crate::WeightPlan>,
     class: ReadoutClass,
-) -> Result<NativeGraphStorageBytes, String> {
-    checked_readout_class_draft(
+) -> Result<NativeGraphStorageBytes, GraphError> {
+    Ok(checked_readout_class_draft(
         NativeGraphMetadata::new(backend),
         geometry,
         norm_plan,
@@ -647,8 +652,7 @@ fn checked_readout_class_storage(
         FeatureSource::Output,
         class,
     )?
-    .seal()
-    .map_err(error)
+    .seal()?)
 }
 
 fn checked_readout_class_draft(
@@ -658,7 +662,7 @@ fn checked_readout_class_draft(
     weight_plan: Option<&crate::WeightPlan>,
     source: FeatureSource<'_>,
     class: ReadoutClass,
-) -> Result<NativeGraphMetadata, String> {
+) -> Result<NativeGraphMetadata, GraphError> {
     let activation = match geometry.activation_dtype {
         magnitude_family_contracts::ActivationDType::F16 => Element::f16(),
         magnitude_family_contracts::ActivationDType::BF16 => Element::bf16(),
@@ -729,7 +733,7 @@ pub(crate) fn checked_projected_graph_storage(
     rows: u64,
     outputs: u64,
     projected: u64,
-) -> Result<NativeGraphStorageBytes, String> {
+) -> Result<NativeGraphStorageBytes, GraphError> {
     checked_readout_class_storage(
         backend,
         geometry,
@@ -757,7 +761,7 @@ pub(crate) fn checked_selection_graph_storage(
     projected: u64,
     selected: u64,
     shaped: bool,
-) -> Result<NativeGraphStorageBytes, String> {
+) -> Result<NativeGraphStorageBytes, GraphError> {
     checked_readout_class_storage(
         backend,
         geometry,
@@ -778,7 +782,7 @@ pub(crate) fn checked_readout_family_storage(
     load: &ModelLoadPlan,
     geometry: &Decoder,
     limits: ResourceLimits,
-) -> Result<NativeGraphStorageBytes, String> {
+) -> Result<NativeGraphStorageBytes, GraphError> {
     let weight = |kind| {
         load.weights()
             .find(|weight| {
@@ -829,7 +833,7 @@ fn certify_readout_regimes(
     projection: &crate::WeightPlan,
     source: FeatureSource<'_>,
     limits: ResourceLimits,
-) -> Result<BTreeMap<ReadoutRegime, NativeGraphLayout>, String> {
+) -> Result<BTreeMap<ReadoutRegime, NativeGraphLayout>, GraphError> {
     // The entry whose `O` is the class's feature outputs.
     let features_entry = match source {
         FeatureSource::Output => readout_features_rows::Entry::NAME,
@@ -885,8 +889,7 @@ fn certify_readout_regimes(
                 template,
             )?
             .seal_template()
-            .and_then(|template| template.certify(&slices))
-            .map_err(error)?;
+            .and_then(|template| template.certify(&slices))?;
             Ok(((kind, selected), layout))
         })
         .collect()
@@ -899,7 +902,7 @@ pub(crate) fn checked_features_graph_storage(
     norm_plan: &crate::WeightPlan,
     rows: u64,
     outputs: u64,
-) -> Result<NativeGraphStorageBytes, String> {
+) -> Result<NativeGraphStorageBytes, GraphError> {
     checked_readout_class_storage(
         backend,
         geometry,
@@ -930,7 +933,7 @@ pub(crate) fn sample<'a, G: GraphDraft + 'a>(
     rows: u64,
     shaped: bool,
     result: WorkflowTensorMut<'_>,
-) -> Result<SelectionPorts, String> {
+) -> Result<SelectionPorts, GraphError> {
     let sample_dims = [("M", rows), ("V", vocabulary)];
     let mask = graph.input_for(sample, "mask", &sample_dims)?;
     let constrained = graph.input_for(sample, "constrained", &sample_dims)?;

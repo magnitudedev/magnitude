@@ -6,7 +6,7 @@
 //! a model lacks and a latent sum's zero base are graph constants.
 
 use super::fused_graph::{decodes, grouped_blocks, TILE_ROWS};
-use crate::programs::graph::draft::GraphDraft;
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{
     resident_scale, scaled_weight, weight, WeightPort,
@@ -200,10 +200,6 @@ impl CheckedGeneralRoutedEntries {
     }
 }
 
-fn failed(error: impl std::fmt::Display) -> String {
-    error.to_string()
-}
-
 /// The general routed feed-forward of one block over `rows` rows of
 /// `residual`, returning the new residual rows (F32).
 #[allow(clippy::too_many_arguments)]
@@ -219,7 +215,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     rows: u64,
     shape: &GeneralRoutedShape,
     epsilon: f32,
-) -> Result<WorkflowTensor, String> {
+) -> Result<WorkflowTensor, GraphError> {
     let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
     let norm = weight(graph, WeightKind::InputNorm)?;
     let router_norm = if shape.router_norm {
@@ -357,8 +353,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                                 gate_scale: (&gate.scale).into(),
                                 up_scale: (&up.scale).into(),
                             },
-                        )
-                        .map_err(failed)?
+                        )?
                         .value
                 }
                 (ExpansionEntry::Plain(entry), None) => {
@@ -375,8 +370,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                                 activation,
                                 up_scale: (&up.scale).into(),
                             },
-                        )
-                        .map_err(failed)?
+                        )?
                         .value
                 }
                 _ => return Err("shared expert entries disagree with its weights".into()),
@@ -392,8 +386,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         out_rows: (&row_table()?).into(),
                         down_scale: (&down.scale).into(),
                     },
-                )
-                .map_err(failed)?
+                )?
                 .value
         }
         (None, None) => root,
@@ -401,12 +394,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     };
 
     let choices = shape.select_dimensions(rows);
-    let mut routes = graph
-        .local_for(entries.select, "routes", &choices)
-        .map_err(failed)?;
-    let mut route_weights = graph
-        .local_for(entries.select, "weights", &choices)
-        .map_err(failed)?;
+    let mut routes = graph.local_for(entries.select, "routes", &choices)?;
+    let mut route_weights = graph.local_for(entries.select, "weights", &choices)?;
     let normalized = graph
         .enqueue(
             entries.select,
@@ -426,8 +415,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                 normalization_epsilon: f32::from_bits(shape.normalization_epsilon),
                 scale: f32::from_bits(shape.scale),
             },
-        )
-        .map_err(failed)?
+        )?
         .value;
 
     // A latent operator's experts act on the projected-down input and sum
@@ -448,11 +436,9 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         weight: (&down.weight).into(),
                         weight_scale: (&down.scale).into(),
                     },
-                )
-                .map_err(failed)?
+                )?
                 .value;
-            let zeros =
-                GraphConstant::zeros_for_class(graph, rows, shape.expert_hidden, "M")?;
+            let zeros = GraphConstant::zeros_for_class(graph, rows, shape.expert_hidden, "M")?;
             Some((projected, zeros, up_entry, up))
         }
         (None, None) => None,
@@ -478,8 +464,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                             expert_up: (&expert_up).into(),
                             activation,
                         },
-                    )
-                    .map_err(failed)?
+                    )?
                     .value
             }
             (ExpertEntries::Plain { decode, .. }, None) => {
@@ -497,8 +482,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                                 .into(),
                             activation,
                         },
-                    )
-                    .map_err(failed)?
+                    )?
                     .value
             }
             _ => return Err("expert entries disagree with its weights".into()),
@@ -514,8 +498,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     weights: route_weights.tensor().into(),
                     expert_down: (&expert_down).into(),
                 },
-            )
-            .map_err(failed)?
+            )?
             .value
     } else {
         let blocks = grouped_blocks(rows, shape.experts, shape.selected)?;
@@ -526,23 +509,21 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
             ("B", blocks),
             ("T", TILE_ROWS),
         ];
-        let mut counts = graph.local_for(entries.group, "counts", &tables).map_err(failed)?;
-        let mut order = graph.local_for(entries.group, "order", &tables).map_err(failed)?;
-        let mut inverse = graph.local_for(entries.group, "inverse", &tables).map_err(failed)?;
-        let mut block_experts = graph.local_for(entries.group, "blocks", &tables).map_err(failed)?;
-        graph
-            .enqueue(
-                entries.group,
-                &tables,
-                routed_group::WorkflowArgs {
-                    routes: routes.tensor().into(),
-                    counts: counts.tensor_mut().into(),
-                    order: order.tensor_mut().into(),
-                    inverse: inverse.tensor_mut().into(),
-                    blocks: block_experts.tensor_mut().into(),
-                },
-            )
-            .map_err(failed)?;
+        let mut counts = graph.local_for(entries.group, "counts", &tables)?;
+        let mut order = graph.local_for(entries.group, "order", &tables)?;
+        let mut inverse = graph.local_for(entries.group, "inverse", &tables)?;
+        let mut block_experts = graph.local_for(entries.group, "blocks", &tables)?;
+        graph.enqueue(
+            entries.group,
+            &tables,
+            routed_group::WorkflowArgs {
+                routes: routes.tensor().into(),
+                counts: counts.tensor_mut().into(),
+                order: order.tensor_mut().into(),
+                inverse: inverse.tensor_mut().into(),
+                blocks: block_experts.tensor_mut().into(),
+            },
+        )?;
         let grouped = [
             ("M", rows),
             ("H", shape.expert_hidden),
@@ -566,8 +547,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                             expert_down: (&expert_down).into(),
                             activation,
                         },
-                    )
-                    .map_err(failed)?
+                    )?
                     .value
             }
             (ExpertEntries::Plain { grouped: entry, .. }, None) => {
@@ -587,8 +567,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                                 .into(),
                             activation,
                         },
-                    )
-                    .map_err(failed)?
+                    )?
                     .value
             }
             _ => return Err("expert entries disagree with its weights".into()),
@@ -609,8 +588,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     inverse: inverse.tensor().into(),
                     weights: route_weights.tensor().into(),
                 },
-            )
-            .map_err(failed)?
+            )?
             .value
     };
     let output = match latent {
@@ -632,8 +610,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         out_rows: (&row_table()?).into(),
                         down_scale: (&up.scale).into(),
                     },
-                )
-                .map_err(failed)?
+                )?
                 .value;
             constants.push(zeros);
             output

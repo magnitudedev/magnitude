@@ -2,9 +2,10 @@
 
 use super::{ReadySubmission, StateProgram};
 use crate::{
-    native::AttestedState, programs::graph::draft::GraphDraft, DeviceError, InvariantError,
-    NativeGraphWorkspaceLease, StateLaunchCore, StateStorePlan, StateWork, SubmitError,
-    ValidatedStateLaunch,
+    native::AttestedState,
+    programs::graph::{draft::GraphDraft, GraphError},
+    DeviceError, InvariantError, NativeGraphWorkspaceLease, StateLaunchCore, StateStorePlan,
+    StateWork, SubmitError, ValidatedStateLaunch,
 };
 use magnitude_kernels::copy_rows;
 use seismic::{
@@ -221,8 +222,8 @@ impl PreparedStateCopyGraphs {
         classes: impl IntoIterator<Item = StateCopyGraphClass>,
     ) -> Result<Self, SubmitError> {
         let classes = classes.into_iter().collect::<Vec<_>>();
-        let (_, layouts) =
-            certify_copy_family(target_device.backend(), &classes).map_err(invalid)?;
+        let (_, layouts) = certify_copy_family(target_device.backend(), &classes)
+            .map_err(|error| invalid(error.to_string()))?;
         let mut variants = Vec::new();
         for (class, layout) in classes.into_iter().zip(layouts) {
             validate_class(&class).map_err(invalid)?;
@@ -337,7 +338,7 @@ fn copy_graph_topology<'a, G: GraphDraft + 'a>(
     graph: G,
     entry: G::Binding<'a, copy_rows::Entry>,
     class: &StateCopyGraphClass,
-) -> Result<(G::Plan, NativePort, NativePort, NativePort), String> {
+) -> Result<(G::Plan, NativePort, NativePort, NativePort), GraphError> {
     let (graph, rows, from, to) = copy_graph_draft(graph, entry, class)?;
     Ok((graph.seal()?, rows, from, to))
 }
@@ -346,7 +347,7 @@ fn copy_graph_draft<'a, G: GraphDraft + 'a>(
     mut graph: G,
     entry: G::Binding<'a, copy_rows::Entry>,
     class: &StateCopyGraphClass,
-) -> Result<(G, NativePort, NativePort, NativePort), String> {
+) -> Result<(G, NativePort, NativePort, NativePort), GraphError> {
     let rows = graph.port(class.element, &class.source_extents)?;
     let dimensions = [
         ("N", class.map_rows),
@@ -373,7 +374,7 @@ fn copy_graph_draft<'a, G: GraphDraft + 'a>(
 pub(crate) fn checked_copy_family_storage(
     backend: BackendName,
     classes: impl IntoIterator<Item = StateCopyGraphClass>,
-) -> Result<NativeGraphStorageBytes, String> {
+) -> Result<NativeGraphStorageBytes, GraphError> {
     let classes = classes.into_iter().collect::<Vec<_>>();
     certify_copy_family(backend, &classes).map(|(storage, _)| storage)
 }
@@ -381,12 +382,12 @@ pub(crate) fn checked_copy_family_storage(
 fn certify_copy_family(
     backend: BackendName,
     classes: &[StateCopyGraphClass],
-) -> Result<(NativeGraphStorageBytes, Vec<NativeGraphLayout>), String> {
+) -> Result<(NativeGraphStorageBytes, Vec<NativeGraphLayout>), GraphError> {
     let mut family: Option<NativeGraphStorageBytes> = None;
     let mut layouts = vec![None; classes.len()];
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (index, class) in classes.iter().enumerate() {
-        validate_class(class).map_err(str::to_owned)?;
+        validate_class(class)?;
         if let Some(group) = groups.iter_mut().find(|group| {
             let first = &classes[group[0]];
             first.element == class.element
@@ -404,13 +405,10 @@ fn certify_copy_family(
         let elements = [("A", first.element)];
         let (graph, _, _, _) =
             copy_graph_draft(NativeGraphMetadata::new_template(backend), &elements, first)?;
-        let layout = graph
-            .seal_template()
-            .and_then(|template| {
-                template.certify(&[NativeGraphClassSlice::new()
-                    .dimension("N", group.iter().map(|&index| classes[index].map_rows))])
-            })
-            .map_err(|error| error.to_string())?;
+        let layout = graph.seal_template().and_then(|template| {
+            template.certify(&[NativeGraphClassSlice::new()
+                .dimension("N", group.iter().map(|&index| classes[index].map_rows))])
+        })?;
         let storage = layout.storage_bytes();
         match &mut family {
             Some(maximum) => {

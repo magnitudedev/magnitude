@@ -129,7 +129,9 @@ pub(crate) mod tests {
 
     /// The smallest geometry every native kernel admits: hidden and
     /// feed-forward widths a multiple of 64 (CUDA K1 k-blocks), an attention
-    /// head width a multiple of 32 (attention lanes), one head.
+    /// head width a multiple of 32 (attention lanes), and two query heads
+    /// sharing one key-value head (Vulkan prefill needs a query group of at
+    /// least two).
     pub(crate) fn fixture_definition() -> ModelDefinition {
         const HIDDEN: u64 = 128;
         const WIDTH: u64 = 64;
@@ -140,10 +142,10 @@ pub(crate) mod tests {
             epsilon: 1e-6,
         };
         let attention = Attention {
-            heads: 1,
+            heads: 2,
             kv_heads: 1,
             width: WIDTH,
-            query: descriptor("qg", &[2 * WIDTH, HIDDEN]),
+            query: descriptor("qg", &[2 * 2 * WIDTH, HIDDEN]),
             gate: AttentionGate::Interleaved {
                 function: GateFunction::Sigmoid,
             },
@@ -164,7 +166,7 @@ pub(crate) mod tests {
             scale: 1.0 / (WIDTH as f64).sqrt(),
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
-            output: descriptor("o", &[HIDDEN, WIDTH]),
+            output: descriptor("o", &[HIDDEN, 2 * WIDTH]),
         };
         let dense = DenseFfn {
             intermediate: FEATURES,

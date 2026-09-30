@@ -550,7 +550,7 @@ export const ProviderModelDisabledReasonSchema = Schema.Literal(
   "provider_unavailable",
   "model_unavailable",
   "installation_unavailable",
-  "incompatible_runtime",
+  "unsupported_model",
   "invalid_configuration",
   "catalog_disabled",
   "deprecated",
@@ -683,12 +683,22 @@ export const LocalModelMemorySchema = Schema.Struct({
 }, { message: () => "local model memory totals and domains must agree with their evidence" }))
 export type LocalModelMemory = typeof LocalModelMemorySchema.Type
 
+/**
+ * A fitting model's decode speed. `Unavailable` means the engine's measurement basis lacks a cost
+ * the model's decode needs: an engine defect that costs only the estimate.
+ */
+export const LocalModelDecodeSpeedSchema = Schema.Union(
+  Schema.TaggedStruct("Estimated", { samples: GenerationPerformanceSamplesSchema }),
+  Schema.TaggedStruct("Unavailable", {}),
+)
+export type LocalModelDecodeSpeed = typeof LocalModelDecodeSpeedSchema.Type
+
 export const LocalModelFitsAssessmentSchema = Schema.TaggedStruct("Fits", {
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
   profile: ServingProfileSchema,
   memory: LocalModelMemorySchema,
-  performance: GenerationPerformanceSamplesSchema,
+  speed: LocalModelDecodeSpeedSchema,
 })
 export type LocalModelFitsAssessment = typeof LocalModelFitsAssessmentSchema.Type
 
@@ -705,17 +715,18 @@ export const LocalModelDoesNotFitAssessmentSchema = Schema.TaggedStruct("DoesNot
 { message: () => "non-fitting assessment memory total must match its domain evidence" }))
 export type LocalModelDoesNotFitAssessment = typeof LocalModelDoesNotFitAssessmentSchema.Type
 
-export const LocalModelIncompatibleAssessmentSchema = Schema.TaggedStruct("Incompatible", {
+/** The engine cannot execute a discovered model; catalog models are never unsupported. */
+export const LocalModelUnsupportedAssessmentSchema = Schema.TaggedStruct("Unsupported", {
   environmentId: AssessmentEnvironmentIdSchema,
   profile: ServingProfileSchema,
   failure: ModelFailureSchema,
 })
-export type LocalModelIncompatibleAssessment = typeof LocalModelIncompatibleAssessmentSchema.Type
+export type LocalModelUnsupportedAssessment = typeof LocalModelUnsupportedAssessmentSchema.Type
 
 export const LocalModelAssessmentSchema = Schema.Union(
   LocalModelFitsAssessmentSchema,
   LocalModelDoesNotFitAssessmentSchema,
-  LocalModelIncompatibleAssessmentSchema,
+  LocalModelUnsupportedAssessmentSchema,
 )
 export type LocalModelAssessment = typeof LocalModelAssessmentSchema.Type
 
@@ -764,12 +775,9 @@ const CatalogModelAssessedFitsServingStateSchema = Schema.TaggedStruct("Assessed
     exact: true,
   }),
 })
-const CatalogModelAssessedUnavailableServingStateSchema = Schema.TaggedStruct("Assessed", {
+const CatalogModelAssessedDoesNotFitServingStateSchema = Schema.TaggedStruct("Assessed", {
   ...LocalModelAssessedFields,
-  assessment: Schema.Union(
-    LocalModelDoesNotFitAssessmentSchema,
-    LocalModelIncompatibleAssessmentSchema,
-  ),
+  assessment: LocalModelDoesNotFitAssessmentSchema,
 })
 const DiscoveredModelAssessedServingStateSchema = Schema.TaggedStruct("Assessed", {
   ...LocalModelAssessedFields,
@@ -779,7 +787,7 @@ export const CatalogLocalModelServingStateSchema = Schema.Union(
   LocalModelAssessingServingStateSchema,
   LocalModelFailedServingStateSchema,
   CatalogModelAssessedFitsServingStateSchema,
-  CatalogModelAssessedUnavailableServingStateSchema,
+  CatalogModelAssessedDoesNotFitServingStateSchema,
 )
 export type CatalogLocalModelServingState = typeof CatalogLocalModelServingStateSchema.Type
 

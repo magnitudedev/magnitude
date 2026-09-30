@@ -12,7 +12,7 @@ use crate::operators::dense_ffn::graph::dimensions as dense_dimensions;
 use crate::operators::routed::graph::{
     general_routed, CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum,
 };
-use crate::programs::graph::draft::GraphDraft;
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{GeneralRoutedShape, ModelLoadPlan, ParallelBinding};
@@ -93,7 +93,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     epsilon: f32,
     activation: i32,
     scale: f32,
-) -> Result<WorkflowTensor, String> {
+) -> Result<WorkflowTensor, GraphError> {
     let [dense_scope, routed_scope] = DenseBesideRouted::scopes(sublayer);
     let dimensions = dense_dimensions(load, dense_scope, rows)?;
     let [_, _, (_, hidden), (_, features)] = dimensions;

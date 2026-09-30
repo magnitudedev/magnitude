@@ -145,15 +145,15 @@ const modelFailure = (model: LocalModel): string | null => {
     return modelDownloadFailureMessage(transferFailure)
   if (model._tag === "Discovered" && model.state._tag !== "Ready") return model.state.failure.message
   const serving = servingState(model)
-  if (serving?._tag === "Failed") return serving.failure.message
+  if (serving?._tag === "Failed") return `Assessment failed. ${serving.failure.message}`
   if (serving?._tag === "Assessed") {
     if (serving.assessment._tag === "DoesNotFit") {
       return `Needs ${formatBytes(
         serving.assessment.deficitBytes
       )} more ${serving.assessment.limitingResource}.`
     }
-    if (serving.assessment._tag === "Incompatible")
-      return serving.assessment.failure.message
+    if (serving.assessment._tag === "Unsupported")
+      return `Magnitude doesn’t support this model. ${serving.assessment.failure.message}`
   }
   return null
 }
@@ -177,7 +177,7 @@ const modelStatus = (model: LocalModel): { readonly label: string; readonly tone
   const serving = servingState(model)
   if (serving?._tag === "Assessing")
     return {
-      label: "Assessing",
+      label: "Assessing memory and speed…",
       tone: "progress",
     }
   if (serving?._tag === "Failed")
@@ -190,9 +190,9 @@ const modelStatus = (model: LocalModel): { readonly label: string; readonly tone
       label: "Doesn’t fit",
       tone: "danger",
     }
-  if (serving?._tag === "Assessed" && serving.assessment._tag === "Incompatible")
+  if (serving?._tag === "Assessed" && serving.assessment._tag === "Unsupported")
     return {
-      label: "Incompatible",
+      label: "Not supported",
       tone: "danger",
     }
   if (acquisition?._tag === "UpdateAvailable")

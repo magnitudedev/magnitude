@@ -2,7 +2,7 @@
 //! port while its graph is built. Binding uploads each distinct value once and
 //! attaches it with the weights as a static binding, so no run writes it.
 
-use super::graph::draft::GraphDraft;
+use super::graph::{draft::GraphDraft, GraphError};
 use seismic::{Device, Element, NativeGraphStorageBytes, NativePort, Tensor};
 use std::sync::Arc;
 
@@ -26,7 +26,7 @@ impl GraphConstant {
     }
 
     /// A rank-1 `i32` constant.
-    pub(crate) fn i32<G: GraphDraft>(graph: &mut G, values: &[i32]) -> Result<Self, String> {
+    pub(crate) fn i32<G: GraphDraft>(graph: &mut G, values: &[i32]) -> Result<Self, GraphError> {
         Self::rank1(
             graph,
             Element::i32(),
@@ -39,7 +39,7 @@ impl GraphConstant {
     }
 
     /// A rank-1 `f32` constant.
-    pub(crate) fn f32<G: GraphDraft>(graph: &mut G, values: &[f32]) -> Result<Self, String> {
+    pub(crate) fn f32<G: GraphDraft>(graph: &mut G, values: &[f32]) -> Result<Self, GraphError> {
         Self::rank1(
             graph,
             Element::f32(),
@@ -55,7 +55,7 @@ impl GraphConstant {
     pub(crate) fn absent_scale<G: GraphDraft>(
         graph: &mut G,
         constants: &mut Vec<Self>,
-    ) -> Result<seismic::WorkflowTensor, String> {
+    ) -> Result<seismic::WorkflowTensor, GraphError> {
         let scale = Self::f32(graph, &[])?;
         let tensor = scale.port().tensor().clone();
         constants.push(scale);
@@ -67,13 +67,11 @@ impl GraphConstant {
         graph: &mut G,
         extents: &[u64],
         values: &[f32],
-    ) -> Result<Self, String> {
+    ) -> Result<Self, GraphError> {
         if extents.iter().product::<u64>() != values.len() as u64 {
             return Err("constant values disagree with its extents".into());
         }
-        let port = graph
-            .port(Element::f32(), extents)
-            .map_err(|error| error.to_string())?;
+        let port = graph.port(Element::f32(), extents)?;
         Ok(Self {
             port: Some(port),
             element: Element::f32(),
@@ -117,7 +115,7 @@ impl GraphConstant {
     }
 
     /// The rank-1 `i32` constant `0, 1, …, count - 1`.
-    pub(crate) fn identity<G: GraphDraft>(graph: &mut G, count: u64) -> Result<Self, String> {
+    pub(crate) fn identity<G: GraphDraft>(graph: &mut G, count: u64) -> Result<Self, GraphError> {
         Self::identity_for_class(graph, count, None)
     }
 
@@ -141,7 +139,7 @@ impl GraphConstant {
         graph: &mut G,
         count: u64,
         class_dimension: Option<&'static str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, GraphError> {
         let mut constant = Self::identity_value(count)?;
         let port = match class_dimension {
             Some(name) => {
@@ -175,7 +173,7 @@ impl GraphConstant {
         count: u64,
         width: u64,
         class_dimension: &'static str,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, GraphError> {
         let mut constant = Self::zeros_value(count, width)?;
         constant.port = Some(graph.port_with_class_extent(
             Element::f32(),
@@ -191,11 +189,9 @@ impl GraphConstant {
         element: Element,
         length: usize,
         bytes: Arc<[u8]>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, GraphError> {
         let extents = vec![u64::try_from(length).map_err(|_| "constant length exceeds u64")?];
-        let port = graph
-            .port(element, &extents)
-            .map_err(|error| error.to_string())?;
+        let port = graph.port(element, &extents)?;
         Ok(Self {
             port: Some(port),
             element,

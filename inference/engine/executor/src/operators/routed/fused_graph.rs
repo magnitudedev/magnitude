@@ -7,7 +7,7 @@
 //! sized from the class, the selected-expert count and [`TILE_ROWS`], so the
 //! graph plan charges them to the workspace; nothing is uploaded per step.
 
-use crate::programs::graph::draft::GraphDraft;
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{native::RoutedKernels, ModelLoadPlan, RoutedBinding};
 use magnitude_family_contracts::{
@@ -163,10 +163,6 @@ pub(crate) fn grouped_blocks(rows: u64, experts: u64, selected: u64) -> Result<u
         .ok_or_else(|| format!("grouped tiles of {rows} rows overflow"))
 }
 
-fn failed(error: impl std::fmt::Display) -> String {
-    error.to_string()
-}
-
 /// The routed feed-forward of one block over `rows` rows of `residual`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn routed<'a, G: GraphDraft + 'a>(
@@ -180,7 +176,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     hidden: u64,
     shape: &ExpertShape,
     epsilon: f32,
-) -> Result<WorkflowTensor, String> {
+) -> Result<WorkflowTensor, GraphError> {
     let norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
     let router = weight(graph, load, scope, WeightKind::Router, weights)?;
     let shared_router = weight(graph, load, scope, WeightKind::SharedRouter, weights)?;
@@ -205,45 +201,37 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         ("F", shape.intermediate),
         ("S", shape.shared_intermediate),
     ];
-    let mut routes = graph
-        .local_for(handle.route, "routes", &choices)
-        .map_err(failed)?;
-    let mut scores = graph
-        .local_for(handle.route, "scores", &choices)
-        .map_err(failed)?;
-    let routed = graph
-        .enqueue(
-            handle.route,
-            &choices,
-            routed_route::WorkflowArgs {
-                residual: residual.into(),
-                norm: (&norm).into(),
-                router: (&router).into(),
-                shared_router: (&shared_router).into(),
-                routes: routes.tensor_mut().into(),
-                scores: scores.tensor_mut().into(),
-                eps: epsilon,
-                normalize: i32::from(shape.normalize_selected),
-            },
-        )
-        .map_err(failed)?;
+    let mut routes = graph.local_for(handle.route, "routes", &choices)?;
+    let mut scores = graph.local_for(handle.route, "scores", &choices)?;
+    let routed = graph.enqueue(
+        handle.route,
+        &choices,
+        routed_route::WorkflowArgs {
+            residual: residual.into(),
+            norm: (&norm).into(),
+            router: (&router).into(),
+            shared_router: (&shared_router).into(),
+            routes: routes.tensor_mut().into(),
+            scores: scores.tensor_mut().into(),
+            eps: epsilon,
+            normalize: i32::from(shape.normalize_selected),
+        },
+    )?;
     let (normalized, coefficient) = (routed.r0, routed.r1);
 
     if decodes(rows) {
-        let expanded = graph
-            .enqueue(
-                handle.expand,
-                &experts_dims,
-                routed_expand::WorkflowArgs {
-                    normalized: (&normalized).into(),
-                    routes: routes.tensor().into(),
-                    expert_gate: (&expert_gate).into(),
-                    expert_up: (&expert_up).into(),
-                    shared_gate: (&shared_gate).into(),
-                    shared_up: (&shared_up).into(),
-                },
-            )
-            .map_err(failed)?;
+        let expanded = graph.enqueue(
+            handle.expand,
+            &experts_dims,
+            routed_expand::WorkflowArgs {
+                normalized: (&normalized).into(),
+                routes: routes.tensor().into(),
+                expert_gate: (&expert_gate).into(),
+                expert_up: (&expert_up).into(),
+                shared_gate: (&shared_gate).into(),
+                shared_up: (&shared_up).into(),
+            },
+        )?;
         return Ok(graph
             .enqueue(
                 handle.output,
@@ -258,8 +246,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     expert_down: (&expert_down).into(),
                     shared_down: (&shared_down).into(),
                 },
-            )
-            .map_err(failed)?
+            )?
             .value);
     }
 
@@ -287,31 +274,21 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         ("T", TILE_ROWS),
         ("S", shape.shared_intermediate),
     ];
-    let mut counts = graph
-        .local_for(handle.group, "counts", &tables)
-        .map_err(failed)?;
-    let mut order = graph
-        .local_for(handle.group, "order", &tables)
-        .map_err(failed)?;
-    let mut inverse = graph
-        .local_for(handle.group, "inverse", &tables)
-        .map_err(failed)?;
-    let mut block_experts = graph
-        .local_for(handle.group, "blocks", &tables)
-        .map_err(failed)?;
-    graph
-        .enqueue(
-            handle.group,
-            &tables,
-            routed_group::WorkflowArgs {
-                routes: routes.tensor().into(),
-                counts: counts.tensor_mut().into(),
-                order: order.tensor_mut().into(),
-                inverse: inverse.tensor_mut().into(),
-                blocks: block_experts.tensor_mut().into(),
-            },
-        )
-        .map_err(failed)?;
+    let mut counts = graph.local_for(handle.group, "counts", &tables)?;
+    let mut order = graph.local_for(handle.group, "order", &tables)?;
+    let mut inverse = graph.local_for(handle.group, "inverse", &tables)?;
+    let mut block_experts = graph.local_for(handle.group, "blocks", &tables)?;
+    graph.enqueue(
+        handle.group,
+        &tables,
+        routed_group::WorkflowArgs {
+            routes: routes.tensor().into(),
+            counts: counts.tensor_mut().into(),
+            order: order.tensor_mut().into(),
+            inverse: inverse.tensor_mut().into(),
+            blocks: block_experts.tensor_mut().into(),
+        },
+    )?;
     let experts = graph
         .enqueue(
             handle.experts,
@@ -326,8 +303,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 // SiLU: the fused Qwen form's experts.
                 activation: 0,
             },
-        )
-        .map_err(failed)?
+        )?
         .value;
     Ok(graph
         .enqueue(
@@ -344,7 +320,62 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 shared_up: (&shared_up).into(),
                 shared_down: (&shared_down).into(),
             },
-        )
-        .map_err(failed)?
+        )?
         .value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seismic::{BackendName, Layout};
+
+    /// A down projection wider than the Metal kernel's register budget
+    /// admits (`ceil_div(F, 32 * LANES) * ROWS <= 8`: at most 8,192) is
+    /// outside the kernel's domain, and graph construction names the call.
+    #[test]
+    fn a_call_outside_its_kernel_domain_fails_graph_construction() {
+        let (m, h, e, k, f, s) = (1, 256, 8, 2, 16_384, 256);
+        let weight = Element::stored("q4k", Layout::Rows16).unwrap();
+        let activation = Element::bf16();
+        let elements = [("EDW", weight), ("SDW", weight), ("A", activation)];
+        let mut graph = NativeGraphMetadata::new(BackendName::Metal);
+        let mut port =
+            |element, extents: &[u64]| graph.port(element, extents).unwrap().tensor().clone();
+        let residual = port(Element::f32(), &[m, h]);
+        let expert_product = port(activation, &[m, k, f]);
+        let shared_product = port(activation, &[m, s]);
+        let routes = port(Element::i32(), &[m, k]);
+        let scores = port(Element::f32(), &[m, k]);
+        let coefficient = port(Element::f32(), &[m]);
+        let expert_down = port(weight, &[e, h, f]);
+        let shared_down = port(weight, &[h, s]);
+        let Err(error) = GraphDraft::enqueue::<routed_output::Entry>(
+            &mut graph,
+            &elements,
+            &[("M", m), ("H", h), ("E", e), ("K", k), ("F", f), ("S", s)],
+            routed_output::WorkflowArgs {
+                residual: (&residual).into(),
+                expert_product: (&expert_product).into(),
+                shared_product: (&shared_product).into(),
+                routes: (&routes).into(),
+                scores: (&scores).into(),
+                coefficient: (&coefficient).into(),
+                expert_down: (&expert_down).into(),
+                shared_down: (&shared_down).into(),
+            },
+        ) else {
+            panic!("an out-of-domain call enqueued");
+        };
+        let GraphError::KernelDomain(violation) = error else {
+            panic!("expected a kernel domain violation, got {error}");
+        };
+        assert_eq!(violation.entry, "routed_output");
+        assert_eq!(violation.backend, BackendName::Metal);
+        assert_eq!(
+            violation.statics,
+            [("F", f), ("H", h), ("K", k), ("S", s)]
+                .map(|(name, value)| (name.to_owned(), value))
+                .to_vec()
+        );
+    }
 }

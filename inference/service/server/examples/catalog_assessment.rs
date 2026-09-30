@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use futures_util::future::BoxFuture;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover, ModelAssessment,
-    ModelAssessmentDomainSnapshot, ModelAssessmentEntryState, ModelAssessmentPoolState,
-    ModelAssessments, ModelId, ModelPackageId,
+    CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover, DecodeSpeed,
+    ModelAssessment, ModelAssessmentDomainSnapshot, ModelAssessmentEntryState,
+    ModelAssessmentPoolState, ModelAssessments, ModelId, ModelPackageId,
 };
 use magnitude_service_models::{
     InventoryConfig, ManagedModelDownloads, ManagedModelStore, ModelDomainResolver,
@@ -175,17 +175,20 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
                     ModelAssessment::Fits {
                         profile,
                         memory,
-                        performance,
+                        speed,
                         ..
                     },
                 ] => json!({
                     "result": "Fits",
                     "context": profile.context_length,
                     "requiredBytes": memory.iter().map(|domain| domain.required_bytes).collect::<Vec<_>>(),
-                    "tokensPerSecond": performance
-                        .iter()
-                        .map(|sample| (sample.context_tokens, (sample.estimated_tokens_per_second * 10.0).round() / 10.0))
-                        .collect::<Vec<_>>(),
+                    "tokensPerSecond": match speed {
+                        DecodeSpeed::Estimated { samples } => json!(samples
+                            .iter()
+                            .map(|sample| (sample.context_tokens, (sample.estimated_tokens_per_second * 10.0).round() / 10.0))
+                            .collect::<Vec<_>>()),
+                        DecodeSpeed::Unavailable => json!("unavailable"),
+                    },
                 }),
                 [
                     ModelAssessment::DoesNotFit {
@@ -200,8 +203,8 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
                     "limitingResource": limiting_resource,
                     "deficitBytes": deficit_bytes,
                 }),
-                [ModelAssessment::Incompatible { failure, .. }] => json!({
-                    "result": "Incompatible",
+                [ModelAssessment::Unsupported { failure, .. }] => json!({
+                    "result": "Unsupported",
                     "code": failure.code,
                     "message": failure.message.chars().take(160).collect::<String>(),
                 }),

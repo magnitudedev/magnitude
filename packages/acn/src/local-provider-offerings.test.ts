@@ -52,13 +52,16 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
         systemUseState: { _tag: "NotObserved" },
         currentHeadroomState: { _tag: "NotObserved" },
       },
-      performance: [{
-        contextTokens: 32_768,
-        lowerTokensPerSecond: 20,
-        estimatedTokensPerSecond: 25,
-        upperTokensPerSecond: 30,
-        confidence: "high",
-      }],
+      speed: {
+        _tag: "Estimated",
+        samples: [{
+          contextTokens: 32_768,
+          lowerTokensPerSecond: 20,
+          estimatedTokensPerSecond: 25,
+          upperTokensPerSecond: 30,
+          confidence: "high",
+        }],
+      },
     },
   } as const
   return Schema.validateSync(LocalModelSchema)({

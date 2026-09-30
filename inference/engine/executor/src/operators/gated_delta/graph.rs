@@ -4,7 +4,7 @@
 //! tables select which version (bank and tape rows) each slot reads and which
 //! bank it publishes to.
 
-use crate::programs::graph::draft::GraphDraft;
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{native::RecurrentKernels, ModelLoadPlan, RecurrentBinding, StateResourcePlan};
 use magnitude_family_contracts::{WeightKind, WeightScope};
@@ -121,7 +121,7 @@ pub(crate) fn bank_ports<G: GraphDraft>(
     graph: &mut G,
     state: &StateResourcePlan,
     component_index: usize,
-) -> Result<(RecurrentStatePorts, u64, u64), String> {
+) -> Result<(RecurrentStatePorts, u64, u64), GraphError> {
     let store = state.target_state();
     let banks = u64::try_from(
         store
@@ -136,7 +136,7 @@ pub(crate) fn bank_ports<G: GraphDraft>(
             .get(component_index + index)
             .ok_or_else(|| format!("recurrent {what} state component is absent"))
     };
-    let mut arena = |index: usize, what: &str| -> Result<NativePort, String> {
+    let mut arena = |index: usize, what: &str| -> Result<NativePort, GraphError> {
         let component = component(index, what)?;
         let extents = std::iter::once(Ok(banks))
             .chain(component.shape.iter().map(|extent| {
@@ -170,7 +170,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     weights: &mut Vec<(WeightPort, NativePort)>,
     hidden: &WorkflowTensor,
     block: RecurrentBlock,
-) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), String> {
+) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), GraphError> {
     let input_norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
     let qkv_weight = weight(
         graph,
@@ -223,8 +223,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                 beta_weight: (&beta_weight).into(),
                 epsilon: block.epsilon,
             },
-        )
-        .map_err(|error| error.to_string())?
+        )?
         .value;
     let dimensions = [
         ("M", block.rows),
@@ -270,8 +269,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                     grouped: block.grouped,
                     slab_banks: block.slab_banks,
                 },
-            )
-            .map_err(|error| error.to_string())?
+            )?
             .value
     } else {
         graph
@@ -295,8 +293,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                     grouped: block.grouped,
                     slab_banks: block.slab_banks,
                 },
-            )
-            .map_err(|error| error.to_string())?
+            )?
             .value
     };
     let output = graph
@@ -317,8 +314,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                 output_weight: (&output_weight).into(),
                 epsilon: block.epsilon,
             },
-        )
-        .map_err(|error| error.to_string())?
+        )?
         .value;
     Ok((
         output,

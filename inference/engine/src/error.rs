@@ -7,7 +7,7 @@
 use magnitude_executor::platform::{
     DeviceRequest, MemoryPolicyError, PlatformError, SelectionError,
 };
-use magnitude_executor::PlanError;
+use magnitude_executor::{CatalogError, CatalogFailure, GraphError, PlanError};
 use crate::census::MemoryDomain;
 use seismic::{DeviceSelector, ResolveError as SeismicResolveError};
 use serde::{Deserialize, Serialize};
@@ -80,6 +80,14 @@ pub enum UnsupportedModel {
     Representation { reason: String },
     /// The selected backend cannot execute the model's program plan.
     Backend { backend: String, reason: String },
+    /// A kernel call of the model's program has statics outside the
+    /// kernel's domain on the backend: no configuration executes them.
+    KernelDomain {
+        backend: String,
+        entry: String,
+        /// The call's static dimensions, by name.
+        statics: Vec<(String, u64)>,
+    },
 }
 
 impl fmt::Display for UnsupportedModel {
@@ -91,6 +99,21 @@ impl fmt::Display for UnsupportedModel {
             }
             Self::Backend { backend, reason } => {
                 write!(formatter, "unsupported on the {backend} backend: {reason}")
+            }
+            Self::KernelDomain {
+                backend,
+                entry,
+                statics,
+            } => {
+                let statics = statics
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    formatter,
+                    "`{entry}` has no admissible {backend} configuration at {statics}"
+                )
             }
         }
     }
@@ -471,6 +494,39 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
         error @ (PlanError::Arithmetic(_)
         | PlanError::ResourcePlanning(_)
         | PlanError::Resource(_)) => PlanOutcome::Internal(error.to_string()),
+    }
+}
+
+/// A graph construction failure: a kernel call outside its kernel's domain
+/// is a property of the model on this backend; any other failure is an
+/// engine defect.
+pub(crate) fn classify_graph(error: GraphError) -> PlanOutcome {
+    match error {
+        GraphError::KernelDomain(violation) => {
+            PlanOutcome::Unsupported(UnsupportedModel::KernelDomain {
+                backend: violation.backend.as_str().to_owned(),
+                entry: violation.entry.to_owned(),
+                statics: violation.statics,
+            })
+        }
+        GraphError::Invalid(reason) => PlanOutcome::Internal(reason),
+    }
+}
+
+/// A program preparation failure: the load-side twin of [`classify_graph`],
+/// classifying a kernel call outside its kernel's domain as the same value.
+pub(crate) fn classify_catalog(error: CatalogError) -> PlanOutcome {
+    match error.failure {
+        CatalogFailure::KernelDomain { entry, statics } => {
+            PlanOutcome::Unsupported(UnsupportedModel::KernelDomain {
+                backend: error.backend.as_str().to_owned(),
+                entry: entry.to_owned(),
+                statics,
+            })
+        }
+        CatalogFailure::Preparation { .. }
+        | CatalogFailure::Tuning { .. }
+        | CatalogFailure::Qualification { .. } => PlanOutcome::Internal(error.to_string()),
     }
 }
 

@@ -6,7 +6,7 @@
 //! uploads it.
 
 use crate::operators::output::{post_norm, CheckedPostNormEntries, PostNormShape, TailEntries};
-use crate::programs::graph::draft::GraphDraft;
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{scaled_weight, weight, WeightPort};
 use crate::{native::DenseKernels, DenseBinding, ModelLoadPlan, SublayerTail};
@@ -104,7 +104,7 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
     activation: i32,
     post_norm_epsilon: f32,
     post_norm_scale: f32,
-) -> Result<WorkflowTensor, String> {
+) -> Result<WorkflowTensor, GraphError> {
     let dimensions = dimensions(load, scope, rows)?;
     let norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
     let gate = scaled_weight(graph, load, scope, WeightKind::DenseGate, weights, constants)?;
@@ -132,24 +132,24 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
                 gate_scale: (&gate.scale).into(),
                 up_scale: (&up.scale).into(),
             },
-        )
-        .map_err(|error| error.to_string())?
+        )?
         .value;
     let output = match kernels.output {
-        TailEntries::Residual(output) => graph
-            .enqueue(
-                output,
-                &output_dimensions,
-                dense_output::WorkflowArgs {
-                    residual: residual.into(),
-                    product: (&product).into(),
-                    down_weight: (&down.weight).into(),
-                    out_rows: out_rows.port().tensor().into(),
-                    down_scale: (&down.scale).into(),
-                },
-            )
-            .map_err(|error| error.to_string())?
-            .value,
+        TailEntries::Residual(output) => {
+            graph
+                .enqueue(
+                    output,
+                    &output_dimensions,
+                    dense_output::WorkflowArgs {
+                        residual: residual.into(),
+                        product: (&product).into(),
+                        down_weight: (&down.weight).into(),
+                        out_rows: out_rows.port().tensor().into(),
+                        down_scale: (&down.scale).into(),
+                    },
+                )?
+                .value
+        }
         TailEntries::PostNorm(entries) => {
             let post_norm_weight = weight(graph, load, scope, WeightKind::PostNorm, weights)?;
             let [_, _, (_, hidden), (_, features)] = dimensions;

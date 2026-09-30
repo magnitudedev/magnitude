@@ -68,7 +68,6 @@ fn shape_json(shape: &PointShape) -> Value {
 fn measurement_json(measurement: &ClassMeasurement) -> Value {
     match measurement {
         ClassMeasurement::Unsupported { reason } => json!({ "unsupported": reason }),
-        ClassMeasurement::Formed => json!({ "formed": true }),
         ClassMeasurement::Measured { points, .. } => json!({
             "points": points
                 .iter()
@@ -133,9 +132,6 @@ fn parse_measurement(class: OperationClass, value: &Value) -> Option<ClassMeasur
         return Some(ClassMeasurement::Unsupported {
             reason: reason.as_str()?.to_owned(),
         });
-    }
-    if value.get("formed").and_then(Value::as_bool) == Some(true) {
-        return Some(ClassMeasurement::Formed);
     }
     let points = value
         .get("points")?
@@ -313,7 +309,6 @@ mod tests {
                         ],
                     ),
                 ),
-                (MeasurementKey::dense_output(q4k, bf16), ClassMeasurement::Formed),
                 (
                     MeasurementKey::dense_expand(
                         bf16,

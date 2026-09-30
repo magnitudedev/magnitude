@@ -24,15 +24,17 @@ includes one history slab per history domain and the zero-seed bank slab per sto
 are heap claims.
 Those exact model terms alone do not establish fit: prepared graph resources, workspace, startup
 transients and the device's stable fit capacity are added as upper bounds derived from the same
-header-only program plan, so a fit result never undercounts. Assessment results are complete:
-Fits, DoesNotFit or Incompatible; there is no unconfirmed fit.
+header-only program plan, so a fit result never undercounts. The graph-resource bound builds every
+graph the load prepares, so a kernel call outside its kernel's domain fails the assessment exactly
+as the load's kernel preparation fails, and both classify it `Unsupported`. Assessment results
+are complete: Fits, DoesNotFit or Unsupported; there is no unconfirmed fit.
 Speed assessment uses a measurement basis per device: every operation class the known targets'
 plans need, timed once with shipped default configurations on synthetic device-resident inputs,
 keeping every sample. Each model's decode speed at each requested depth is
-computed analytically from its header-derived launch and byte demand. The basis is also the
-qualified support set: a model needing a class the basis could not form or measure is
-Incompatible. A failed measurement supplies no prediction; real-model validation cannot be used to
-fit a correction factor.
+computed analytically from its header-derived launch and byte demand. The basis only prices: a
+class it could not form or measure leaves the speed of models that need it `Unavailable`, never
+decides their result. A failed measurement supplies no prediction; real-model validation cannot
+be used to fit a correction factor.
 The composition root prepares complete Seismic workflows for the admitted model geometry and
 finite launch classes, imports the target component, allocates the storage reported by those
 workflows, and publishes readiness only after those steps succeed. The engine does not maintain a

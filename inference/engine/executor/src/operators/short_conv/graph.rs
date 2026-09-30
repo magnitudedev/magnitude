@@ -6,7 +6,7 @@
 //! window alone.
 
 use crate::operators::gated_delta::graph::RecurrentControlPorts;
-use crate::programs::graph::draft::GraphDraft;
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{
     native::ShortConvKernels, ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan,
@@ -84,7 +84,7 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     weight_scale: &WorkflowTensor,
     hidden: &WorkflowTensor,
     block: ShortConvBlock,
-) -> Result<(WorkflowTensor, NativePort, RecurrentControlPorts), String> {
+) -> Result<(WorkflowTensor, NativePort, RecurrentControlPorts), GraphError> {
     let shape = block.shape;
     let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
     let input_norm = weight(graph, WeightKind::InputNorm)?;

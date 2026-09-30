@@ -19,7 +19,7 @@ use magnitude_engine::{
 use magnitude_executor::{
     DEFAULT_KERNEL_CACHE_BYTES, ExecutionPath, KernelCache,
     assessment::{
-        BasisIdentity, ClassMeasurement, DomainFit, ExecutionAssessment, IncompatibleReason,
+        BasisIdentity, ClassMeasurement, DecodeSpeed, DomainFit, ExecutionAssessment,
         MeasurementBasis, PerformanceConfidence, complete_basis, load_basis, store_basis,
         term_seconds,
     },
@@ -158,7 +158,6 @@ fn basis(
         |key, measurement, profile| {
             let outcome = match measurement {
                 ClassMeasurement::Measured { .. } => "measured".to_owned(),
-                ClassMeasurement::Formed => "formed".to_owned(),
                 ClassMeasurement::Unsupported { reason } => format!("unsupported: {reason}"),
             };
             eprintln!(
@@ -309,8 +308,12 @@ fn render(environment: &AssessmentEnvironment, assessment: &ModelAssessment) -> 
                 UnsupportedModel::Family { .. } => "unsupported_family",
                 UnsupportedModel::Representation { .. } => "unsupported_representation",
                 UnsupportedModel::Backend { .. } => "unsupported_backend",
+                UnsupportedModel::KernelDomain { .. } => "unsupported_kernel_domain",
             };
-            return incompatible(code, unsupported.to_string());
+            return json!({
+                "_tag": "Unsupported",
+                "failure": { "code": code, "message": unsupported.to_string(), "retryable": false },
+            });
         }
         ModelAssessment::Assessed { facts, execution } => (facts, execution),
     };
@@ -329,24 +332,31 @@ fn render(environment: &AssessmentEnvironment, assessment: &ModelAssessment) -> 
             .collect::<Vec<_>>()
     };
     let mut object = match execution {
-        ExecutionAssessment::Fits {
-            domains,
-            performance,
-            ..
-        } => json!({
+        ExecutionAssessment::Fits { domains, speed, .. } => json!({
             "_tag": "Fits",
             "memory": memory(domains),
-            "performance": performance.iter().map(|estimate| json!({
-                "contextTokens": estimate.context_tokens,
-                "lowerTokensPerSecond": estimate.lower_tokens_per_second,
-                "estimatedTokensPerSecond": estimate.estimated_tokens_per_second,
-                "upperTokensPerSecond": estimate.upper_tokens_per_second,
-                "confidence": match estimate.confidence {
-                    PerformanceConfidence::High => "high",
-                    PerformanceConfidence::Moderate => "moderate",
-                    PerformanceConfidence::Low => "low",
-                },
-            })).collect::<Vec<_>>(),
+            "speed": match speed {
+                DecodeSpeed::Estimated(performance) => json!({
+                    "_tag": "Estimated",
+                    "samples": performance.iter().map(|estimate| json!({
+                        "contextTokens": estimate.context_tokens,
+                        "lowerTokensPerSecond": estimate.lower_tokens_per_second,
+                        "estimatedTokensPerSecond": estimate.estimated_tokens_per_second,
+                        "upperTokensPerSecond": estimate.upper_tokens_per_second,
+                        "confidence": match estimate.confidence {
+                            PerformanceConfidence::High => "high",
+                            PerformanceConfidence::Moderate => "moderate",
+                            PerformanceConfidence::Low => "low",
+                        },
+                    })).collect::<Vec<_>>(),
+                }),
+                DecodeSpeed::Unavailable { missing } => {
+                    for key in missing {
+                        eprintln!("magnitude-assess: the basis has no cost for {key}");
+                    }
+                    json!({ "_tag": "Unavailable" })
+                }
+            },
         }),
         ExecutionAssessment::DoesNotFit {
             domains,
@@ -359,25 +369,6 @@ fn render(environment: &AssessmentEnvironment, assessment: &ModelAssessment) -> 
             "limitingResource": domain_id(environment, *limiting),
             "deficitBytes": deficit_bytes,
         }),
-        ExecutionAssessment::Incompatible {
-            reason: IncompatibleReason::OutsideBasis { classes },
-        } => incompatible(
-            "unsupported_operation",
-            format!(
-                "the device's measurement basis does not cover {}",
-                classes
-                    .iter()
-                    .map(|(key, reason)| match reason {
-                        Some(reason) => format!("{key}: {reason}"),
-                        None => key.to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-        ),
-        ExecutionAssessment::Incompatible {
-            reason: IncompatibleReason::Unsupported { reason },
-        } => incompatible("unsupported_representation", reason.clone()),
     };
     let reasoning = &facts.capabilities.reasoning;
     object["capabilities"] = json!({
@@ -393,13 +384,6 @@ fn render(environment: &AssessmentEnvironment, assessment: &ModelAssessment) -> 
     object["templateFingerprint"] = json!(facts.template_fingerprint);
     object["contextLimit"] = json!(facts.context_limit);
     object
-}
-
-fn incompatible(code: &str, message: String) -> Value {
-    json!({
-        "_tag": "Incompatible",
-        "failure": { "code": code, "message": message, "retryable": false },
-    })
 }
 
 /// Host RAM is the `system` domain; a dedicated device's memory is named by

@@ -4,7 +4,7 @@
 //! payload and allocates nothing; a load repeats device resolution and makes
 //! live claims.
 
-use crate::error::{classify_plan, classify_platform, PlanOutcome, PreviewError};
+use crate::error::{classify_graph, classify_plan, classify_platform, PlanOutcome, PreviewError};
 use crate::options::ExecutionManifest;
 use crate::planning::{plan_execution, ExecutionPlanningError};
 use magnitude_executor::{
@@ -74,18 +74,18 @@ impl ExecutionManifest {
             },
         )
         .map_err(|error| internal(error.to_string()))?;
+        let graph = AssessmentGraphResourceBounds::derive(
+            definition,
+            draft.load(),
+            &state,
+            policy.method(),
+            policy.codec(),
+            policy.limits(),
+            backend,
+        )
+        .map_err(|error| PreviewError::from(classify_graph(error)))?;
         let bounds = AssessmentHeaderBounds::derive(definition, draft.load(), policy.codec())
-            .and_then(|header| {
-                header.with_graph_resource_bound(&AssessmentGraphResourceBounds::derive(
-                    definition,
-                    draft.load(),
-                    &state,
-                    policy.method(),
-                    policy.codec(),
-                    policy.limits(),
-                    backend,
-                )?)
-            })
+            .and_then(|header| header.with_graph_resource_bound(&graph))
             .map_err(internal)?;
         let initial_state = state
             .target_state()

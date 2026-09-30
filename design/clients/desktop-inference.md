@@ -94,10 +94,11 @@ The packaged Linux desktop adopts the launcher's shared installation descriptor 
 children and marks it close-on-exec. The desktop retains package admission until process exit;
 service and update-helper children cannot inherit the lease and block their own installation.
 Recommendations order fitting assessed configurations using the shared preference. The remaining
-curated catalog stays discoverable with explicit pending, incompatible, or insufficient-memory
-explanations. Details expose catalog license/source links, capabilities, context, and labeled
-performance estimates. Source links open HTTPS destinations in the system browser. Loading a
-different model asks explicitly before replacing observed active residency.
+curated catalog stays discoverable with explicit pending, assessment-failed, or insufficient-memory
+explanations; a fitting model without a speed estimate says "Speed estimate unavailable". Details
+expose catalog license/source links, capabilities, context, and labeled performance estimates.
+Source links open HTTPS destinations in the system browser. Loading a different model asks
+explicitly before replacing observed active residency.
 
 The desktop session service owns navigation and bridges native menu actions into the same model
 mutations used by the window. Window and tray model commands pass through the shared local-model

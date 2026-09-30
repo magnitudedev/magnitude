@@ -4,7 +4,8 @@
 
 use crate::census::MemoryDomain;
 use crate::error::{
-    classify_plan, classify_platform, ArtifactError, InsufficientMemory, LoadError,
+    classify_catalog, classify_plan, classify_platform, ArtifactError, InsufficientMemory,
+    LoadError,
 };
 use crate::options::ExecutionManifest;
 use crate::worker::protocol::LoadProgress;
@@ -141,7 +142,7 @@ pub(crate) fn prepare(
             cache: kernel_cache.as_deref(),
         },
     )
-    .map_err(|error| internal(error.to_string()))?;
+    .map_err(|error| LoadError::from(classify_catalog(error)))?;
     let tuned = programs.tuned();
     eprintln!(
         "magnitude-engine: prepared programs in {:.2} s, {:.2} s of it tuning {} entries \

@@ -359,16 +359,12 @@ const renderCatalogDetail = ({ model, models }: {
     ]),
   ]
   const performance = (() => {
-    if (serving._tag === "Assessing") return ["Assessment", renderFields([["Status", "Assessing"]])]
-    if (serving._tag === "Failed") return ["Assessment", renderFields([["Status", "Failed"], ["Reason", serving.failure.message]])]
+    if (serving._tag === "Assessing") return ["Assessment", renderFields([["Status", "Assessing memory and speed…"]])]
+    if (serving._tag === "Failed") return ["Assessment", renderFields([["Status", "Assessment failed."], ["Reason", serving.failure.message]])]
     if (serving.assessment._tag === "DoesNotFit") return ["Performance on this machine", renderFields([
       ["Status", "Does not fit"],
       ["Memory required", formatMemorySize(serving.assessment.totalRequiredBytes)],
       ["Additional memory", formatMemorySize(serving.assessment.deficitBytes)],
-    ])]
-    if (serving.assessment._tag === "Incompatible") return ["Performance on this machine", renderFields([
-      ["Status", "Incompatible"],
-      ["Reason", serving.assessment.failure.message],
     ])]
     return ["Performance on this machine", renderFields([
       ["Speed", speedLabel(model)],

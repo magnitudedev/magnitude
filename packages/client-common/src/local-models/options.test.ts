@@ -13,7 +13,7 @@ import {
 const option = (
   modelId: string,
   totalRequiredBytes: number,
-  scores: { intelligence: number; speed: number; fidelity: number },
+  scores: { intelligence: number; speed: number; fidelity: number } | null,
   kind: LocalModelOption["kind"] = "downloadable",
   support: CatalogSupport = { _tag: "Supported" },
 ): LocalModelOption => ({
@@ -29,7 +29,7 @@ const option = (
         _tag: "Fits",
         memory: { totalRequiredBytes },
       },
-      rankingScores: Option.some(scores),
+      rankingScores: Option.fromNullable(scores),
     },
   } as unknown as LocalModel,
 })
@@ -77,6 +77,15 @@ describe("local model ranking", () => {
       [second, first],
       { fastToSmart: 0.5, memoryBudgetBytes: 1 },
     )).toEqual([first, second])
+  })
+
+  it("orders fitting models without ranking scores after every ranked model", () => {
+    const ranked = option("z-ranked", 1, { intelligence: 0.1, speed: 0.1, fidelity: 0.1 })
+    const unranked = option("a-unranked", 1, null)
+    expect(rankedLocalModelOptions(
+      [unranked, ranked],
+      { fastToSmart: 0.5, memoryBudgetBytes: 1 },
+    )).toEqual([ranked, unranked])
   })
 
   it("ranks installed and downloadable choices together", () => {

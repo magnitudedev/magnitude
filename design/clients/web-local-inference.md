@@ -58,9 +58,9 @@ The ordinary shell contains a dedicated Settings surface for local inference:
 - Catalog presents the unified assessed local catalog. Its index may be searched by model identity,
   filtered to installed models, and sorted by intelligence (the default), release date, download
   size, or name. Onboarding preference is not applied to this general catalog. Ordinary
-  downloadable rows do not repeat an `Available` label; non-default lifecycle and compatibility
-  states remain visible while completed `DoesNotFit` and `Incompatible` assessments and deprecated
-  models are excluded from the browsable catalog. Catalog owns
+  downloadable rows do not repeat an `Available` label; non-default lifecycle and assessment
+  states remain visible while completed `DoesNotFit` assessments and deprecated models are
+  excluded from the browsable catalog. Catalog owns
   install, update, and transfer cancellation; active-model selection remains in the composer and
   installed-artifact removal remains in Models.
 - Hardware presents server-reported topology and a labeled physical-memory breakdown alongside

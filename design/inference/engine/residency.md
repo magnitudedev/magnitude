@@ -25,7 +25,7 @@ IQ3_S into `q6k` (f16 super-scale × int8 scale per sixteen values × code in [-
 into `iq4g32` (the same table). Such a format adds no execution class, so the assessment
 measurement basis, keyed by resident representation, covers it unchanged, and the plan charges
 the wider representation's resident bytes. A format no representation holds exactly is not
-imported; its model is `Incompatible`.
+imported; its model is `Unsupported`.
 Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4 import into representations of their own, moving codes and
 scale fields bit for bit: the 4-bit coded family (a codebook and one scale per 32 or 16 values:
 `q4g32s` offset codes with f16 scales, `mxfp4g32` E2M1 with an E8M0 exponent per 32, `nvfp4g16`
@@ -39,7 +39,7 @@ with the weight identically by header assessment and load. Entries apply it to t
 accumulator through an accumulator-scale port; no import or family folds it into another weight.
 A missing or misshapen scale, a scaled weight dequantized for dense-only kernels, and a scaled
 weight bound by an entry without a scale port are refused at plan time, so the model is
-`Incompatible` rather than failing on a device.
+`Unsupported` rather than failing on a device.
 
 Each import takes an immutable artifact source and validates its exact WeightPlan. On Metal,
 component weights are visited in source-file order. Consecutive whole tensors whose combined

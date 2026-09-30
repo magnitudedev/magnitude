@@ -13,13 +13,15 @@ use magnitude_engine::assessment::AssessmentSetup;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     CatalogModel, CatalogModelSelection, CatalogModelState, CatalogModels, DiscoveredModel,
-    DiscoveredModelState, DiscoveredModels, EffectiveModel, ModelAssessmentDomainSnapshot,
-    ModelAssessmentEntry, ModelAssessmentEntryState, ModelAssessmentPoolState,
-    ModelAssessmentSubject, ModelAssessments, ModelAssessmentsInvalidation,
-    ModelAssessmentsSnapshot, ModelFailure as DomainModelFailure, ModelId,
-    ModelServingConfiguration, ServingProfile,
+    DiscoveredModelState, DiscoveredModels, EffectiveModel, ModelAssessment,
+    ModelAssessmentDomainSnapshot, ModelAssessmentEntry, ModelAssessmentEntryState,
+    ModelAssessmentPoolState, ModelAssessmentSubject, ModelAssessments,
+    ModelAssessmentsInvalidation, ModelAssessmentsSnapshot, ModelFailure as DomainModelFailure,
+    ModelId, ModelServingConfiguration, ServingProfile,
 };
-use magnitude_service_models::{ServableModelBundleKey, servable_model_bundle_key_for_bundle};
+use magnitude_service_models::{
+    CachedModelAssessment, ServableModelBundleKey, servable_model_bundle_key_for_bundle,
+};
 
 use assessor::{
     AssessmentOutcome, AssessmentWork, AssessmentWorkKey, ModelAssessor, PreparationResult,
@@ -470,19 +472,30 @@ impl AssessmentPoolCurrent {
                 if self.entry_keys.get(&entry.subject) == Some(&outcome.key)
                     && matches!(entry.state, ModelAssessmentEntryState::Assessing)
                 {
-                    entry.state = match &outcome.result {
-                        Ok(assessment) => ModelAssessmentEntryState::Assessed {
+                    let catalog = matches!(domain_kind, AssessmentDomain::Catalog);
+                    let dropped = match &outcome.result {
+                        // A catalog model the engine cannot execute is a release defect,
+                        // never a verdict.
+                        Ok(CachedModelAssessment {
+                            profile: ModelAssessment::Unsupported { failure, .. },
+                            ..
+                        }) if catalog => Some(failure),
+                        Ok(_) => None,
+                        Err(failure) => Some(failure),
+                    };
+                    entry.state = match (&outcome.result, dropped) {
+                        (Ok(assessment), None) => ModelAssessmentEntryState::Assessed {
                             capabilities: assessment.capabilities.clone(),
                             template_fingerprint: assessment.template_fingerprint.clone(),
                             profiles: vec![assessment.profile.clone()],
                         },
-                        Err(_) => ModelAssessmentEntryState::Dropped,
+                        _ => ModelAssessmentEntryState::Dropped,
                     };
                     applied.changed = true;
-                    if matches!(domain_kind, AssessmentDomain::Catalog) && outcome.result.is_err() {
+                    if let (true, Some(failure)) = (catalog, dropped) {
                         applied
                             .dropped_catalog_models
-                            .push(entry.subject.model_id().clone());
+                            .push((entry.subject.model_id().clone(), failure.clone()));
                     }
                 }
             }
@@ -494,7 +507,8 @@ impl AssessmentPoolCurrent {
 #[derive(Default)]
 struct AppliedAssessmentOutcome {
     changed: bool,
-    dropped_catalog_models: Vec<ModelId>,
+    /// Each dropped catalog model with its failure.
+    dropped_catalog_models: Vec<(ModelId, DomainModelFailure)>,
 }
 
 pub struct ManagedModelAssessments {
@@ -826,7 +840,6 @@ impl ManagedModelAssessments {
     }
 
     fn publish_outcome(&self, outcome: AssessmentOutcome) {
-        let failure = outcome.result.as_ref().err().cloned();
         let mut current = self
             .current
             .write()
@@ -838,15 +851,13 @@ impl ManagedModelAssessments {
         current.snapshot.revision = current.snapshot.revision.saturating_add(1);
         let revision = current.snapshot.revision;
         drop(current);
-        if let Some(failure) = failure {
-            for model_id in applied.dropped_catalog_models {
-                tracing::error!(
-                    model.id = %model_id.as_str(),
-                    failure.code = %failure.code,
-                    failure.message = %failure.message,
-                    "catalog model assessment dropped"
-                );
-            }
+        for (model_id, failure) in applied.dropped_catalog_models {
+            tracing::error!(
+                model.id = %model_id.as_str(),
+                failure.code = %failure.code,
+                failure.message = %failure.message,
+                "catalog model assessment dropped"
+            );
         }
         let _ = self.changes.send(ModelAssessmentsInvalidation { revision });
     }
@@ -1241,6 +1252,71 @@ mod tests {
             &[assessment_target(subject, "drop")],
         );
         assert!(!current.references_assessing(&key));
+    }
+
+    #[test]
+    fn an_unsupported_catalog_model_is_dropped_and_a_discovered_one_is_assessed() {
+        let catalog = assessment_subject("pool-unsupported", CatalogModelSelection::Desired);
+        let discovered = magnitude_service_contracts::models::ModelAssessmentSubject::Discovery {
+            model_id: catalog.model_id().clone(),
+        };
+        let failure = DomainModelFailure {
+            code: "unsupported_kernel_domain".to_owned(),
+            message: "`routed_output` has no admissible metal configuration".to_owned(),
+            retryable: false,
+        };
+        let mut current = assessment_pool_current();
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            1,
+            &[assessment_target(catalog.clone(), "unsupported")],
+        );
+        current.replace_domain(
+            AssessmentDomain::Discovered,
+            1,
+            &[assessment_target(discovered, "unsupported")],
+        );
+        let applied = current.apply_outcome(&AssessmentOutcome {
+            key: AssessmentWorkKey("unsupported".to_owned()),
+            result: Ok(CachedModelAssessment {
+                capabilities: magnitude_service_contracts::models::ModelCapabilities {
+                    vision: false,
+                    tools: false,
+                    structured_output: false,
+                    reasoning: magnitude_service_contracts::models::ModelReasoningCapabilities {
+                        supported: false,
+                        efforts: Vec::new(),
+                        default_effort: None,
+                    },
+                },
+                template_fingerprint: String::new(),
+                profile: ModelAssessment::Unsupported {
+                    profile: test_configuration(catalog.model_id().as_str()).profile,
+                    failure: failure.clone(),
+                },
+            }),
+        });
+        assert_eq!(
+            applied.dropped_catalog_models,
+            vec![(catalog.model_id().clone(), failure)]
+        );
+        let state = |domain| match current.domain(domain) {
+            Some(ModelAssessmentDomainSnapshot::Available { entries, .. }) => {
+                entries[0].state.clone()
+            }
+            other => panic!("expected an available slice, got {other:?}"),
+        };
+        assert!(matches!(
+            state(AssessmentDomain::Catalog),
+            ModelAssessmentEntryState::Dropped
+        ));
+        assert!(matches!(
+            state(AssessmentDomain::Discovered),
+            ModelAssessmentEntryState::Assessed {
+                profiles,
+                ..
+            } if matches!(profiles.as_slice(), [ModelAssessment::Unsupported { .. }])
+        ));
     }
 
     #[test]

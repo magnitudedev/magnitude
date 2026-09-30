@@ -18,7 +18,7 @@ applies_to:
 
 | Concern | Owner |
 | ------- | ----- |
-| Measurement basis content, per-model memory fit, compatibility, performance, capabilities | Engine |
+| Measurement basis content, per-model memory fit, executability, performance, capabilities | Engine |
 | Device selection for assessment (the rule loads use) | Engine |
 | Measurement job, assessment environment identity, targets, pool, cache, deadlines, publication | Service |
 | Serving-configuration construction, canonical identity, validation | Service |
@@ -42,13 +42,13 @@ default configurations. There is no search, tuning or per-model measurement: the
 on the backend, never on which targets exist, so measurement starts at service start and no target
 can require a class it lacks.
 
-- **Keys.** A measured key names an operation class and its exact element bindings (the activation
-  and, for classes that read weights, the resident weight representation); it carries no model
-  geometry. Every representation the backend can keep resident is formed; conversions are keyed by
-  their source and destination.
-- **Timed and formed entries.** Each class is timed at synthetic sizes chosen to fit its cost model;
-  every other binding is only formed, which proves the device executes it. The formed set is the
-  compatibility set.
+- **Keys.** A measured key names an operation class and the elements its cost depends on (its
+  activation; a weight-reading class is timed at one reference representation); it carries no
+  model geometry. Every representation the backend can keep resident is timed once as a weight
+  format, the factor that carries a weight-reading class from the reference to it.
+- **The basis only prices.** Each class is timed at synthetic sizes chosen to fit its cost model.
+  The basis decides no model's result: executability belongs to the model's program (see
+  [Executability](#executability)).
 - **Cost models.** A class's points fit one of: a per-launch cost; a line in bytes; a projection cost
   (launch overhead plus seconds per weight byte as a function of output rows, interpolated in log
   rows over a fixed row ladder at a fixed reduction, with a floor point); a history cost (a
@@ -57,8 +57,9 @@ can require a class it lacks.
   stored; costs are refitted when the basis is read.
 - **Demand.** A model's decode demand maps each term onto a measured key and a shape (plain,
   projection with its weight and launch rows, or attention with its head geometry), so estimation
-  is arithmetic over the fitted costs. Demand that maps onto no measured or formed key makes the
-  target `Incompatible` naming the key.
+  is arithmetic over the fitted costs. A demand term without a measured cost makes the speed
+  `Unavailable`; it never changes the model's result. The service logs the missing keys as an
+  engine error.
 
 A point's variants (arithmetic parameters such as `INT8`, `PARTS`, `SLICES` and `MATRIX`) are screened
 with one sample each. On CPU, the cold basis shares one wall-clock target across all still-missing
@@ -79,14 +80,14 @@ may overrun either target. Measurement records every sample actually taken.
   or a shortened depth supplies limited evidence to downstream confidence.
 - Work by other processes on the device is not observable: device times are taken as they fall and
   stored. The basis is an estimate either way; no contention is inferred or corrected.
-- A timed submission that faults on the device records the class unsupported, naming the fault;
-  models that need it are `Incompatible` with that reason.
+- A class that cannot be formed, or whose timed submission faults on the device, is recorded
+  unsupported with its reason and has no cost; models that need it get `Unavailable` speed.
 
 ### Measurement job
 
 ```text
 service start -> device discovery -> automatic device selection
-    ├── measurement job: form every planned kernel, time the timed entries ──┐
+    ├── measurement job: form and time every planned class ──────────────────┐
     └── per-target preparation from headers (capabilities, demand, memory) ─┤
                                                                complete assessment
 ```
@@ -138,9 +139,10 @@ One assessment is header arithmetic on the service's bounded blocking pool:
 2. it derives the model definition, chat capabilities and template fingerprint from its own
    tokenizer, template and reasoning inspection;
 3. it resolves the serving configuration (the bundle's declared method, codec, limits) exactly as
-   a load does and plans the allocation-free execution plan on the selected device; and
-4. after the basis is ready, it computes memory fit, compatibility against the basis and decode
-   speed at every requested depth.
+   a load does, plans the allocation-free execution plan on the selected device, and builds every
+   graph the load prepares, without a device, for the certified memory charge; and
+4. after the basis is ready, it computes memory fit and, for a fitting model, decode speed at
+   every requested depth.
 
 It reads no tensor payload, opens no device, allocates nothing and decodes nothing. A target split
 across several GGUF files is assessed as one package: the engine is given its first shard and
@@ -149,8 +151,22 @@ target from its header exactly as a load binds it: its weights, history and draf
 the memory charge, and its decode speed is the target's plain decode (no acceptance is modeled, so
 drafts add no demand terms outside the fixed basis). A draft the draft family cannot interpret
 against its target is an unsupported representation; a declared method the draft does not
-implement, or a draft the executor cannot run, makes the bundle `Incompatible`. Such a bundle is
-never assessed or served as plain decoding.
+implement is an invalid configuration, which fails the assessment as it fails a load. Such a
+bundle is never assessed or served as plain decoding.
+
+### Executability
+
+The engine can execute a model on a backend exactly when the load would: its family and
+representation are recognized, the planner accepts its program, and every kernel call of the
+program lies in the kernel's domain (some configuration of the kernel admits the call's static
+dimensions). The assessment and the load decide this with the same derivations and classify every
+refusal identically:
+
+- the assessment's memory charge builds every graph the load prepares, and a graph node outside
+  its kernel's domain fails construction;
+- the load checks every kernel it prepares against the kernel's domain before tuning it.
+
+Both report `Unsupported` with the same kernel-domain reason. The measurement basis takes no part.
 
 ### Results
 
@@ -158,12 +174,15 @@ Every assessed profile produces one complete result:
 
 | Result | Meaning |
 | ------ | ------- |
-| `Fits` | Per-domain memory accounting and one performance sample per requested depth |
+| `Fits` | Per-domain memory accounting and the decode speed: `Estimated` (one performance sample per requested depth) or `Unavailable` |
 | `DoesNotFit` | Per-domain memory accounting, the limiting domain and its deficit |
-| `Incompatible` | Unsupported family, representation (including tokenizer, template and tensor encoding), backend, or operation outside the basis |
+| `Unsupported` | The engine cannot execute a discovered model: unrecognized family, unsupported representation (including tokenizer, template and tensor encoding), a planner refusal on the backend, or a kernel call outside its kernel's domain |
 
-There is no unknown, unconfirmed or partial result. A family the engine does not implement carries
-no capabilities and an empty template fingerprint. Memory domains are named `system` for host RAM
+Memory fit is always complete. `Unavailable` speed means the basis lacks a cost the model's decode
+needs: an engine or measurement defect, which costs only the estimate. A catalog model is never
+`Unsupported`: an engine `Unsupported` for a catalog target is a release defect, settled as
+`Dropped` with an OpenTelemetry error. A family the engine does not implement carries no
+capabilities and an empty template fingerprint. Memory domains are named `system` for host RAM
 and by device selector for dedicated device memory. Results publish atomically through the
 revisioned assessment snapshot; one target's failure never invalidates siblings.
 
@@ -191,7 +210,7 @@ freshly against current memory; a cached `Fits` never authorizes residency.
 ## Assessing lifecycle
 
 ```text
-assessment admitted -> Assessing -> Fits | DoesNotFit | Incompatible | Dropped
+assessment admitted -> Assessing -> Fits | DoesNotFit | Unsupported | Dropped
 ```
 
 `Assessing` is an internal marker owned by the process-lifetime pool:
@@ -208,8 +227,9 @@ assessment admitted -> Assessing -> Fits | DoesNotFit | Incompatible | Dropped
 The cache unit is one exact profile result: capabilities, template fingerprint and the profile
 result. Its key is the whole assessment identity: environment, exact bundle and profile with its
 depths. Equivalent concurrent misses for one bundle and environment share one gate and recheck the
-cache after admission. Corruption is a miss. `Fits`, `DoesNotFit` and `Incompatible` are
-persisted; operational failures never are.
+cache after admission. Corruption is a miss. `Fits` (with either speed), `DoesNotFit` and
+`Unsupported` are persisted; operational failures never are. The environment identity includes
+the engine build and the basis digest, so a fixed engine or basis is new work.
 
 ## Automatic assessment pool
 
@@ -238,10 +258,14 @@ cap, and every target has one absolute deadline.
 - Measurement never overlaps a loading or resident instance on the device.
 - Assessment reads no tensor payload, opens no device, loads no model and runs no per-model
   measurement.
-- Every `Fits` result contains ordered performance samples at exactly the requested depths.
+- Every `Fits` result with `Estimated` speed contains ordered performance samples at exactly the
+  requested depths.
+- No result can state that a model the engine executes cannot run on this computer: the basis
+  prices and never decides a result, and `Unsupported` comes only from the derivations a load
+  makes.
 - Warm exact-cache reads invoke no engine assessment.
 - A stale assessment completion cannot overwrite state for a newer exact work identity.
-- `Fits`, `DoesNotFit`, and `Incompatible` never represent an operational defect.
+- `Fits`, `DoesNotFit`, and `Unsupported` never represent an operational defect.
 - `Assessing` cannot exist without pool-owned queued or running work.
 - A settled target cannot return to `Assessing` unless its exact work identity changes.
 - ACN contains no assessment scheduler, request correlation, or assessment mutation endpoint.

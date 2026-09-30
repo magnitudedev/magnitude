@@ -12,7 +12,7 @@
 use crate::operators::output::{
     post_norm, CheckedPostNormEntries, PostNormEntries, PostNormShape,
 };
-use crate::programs::graph::draft::GraphDraft;
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_target_graph::ScaledWeight;
 use crate::native::{PerLayerEntryKernels, PerLayerKernels, TableConversion};
 use crate::{PerLayerBinding, PerLayerEntryBinding, SublayerTail, WeightPlan};
@@ -133,7 +133,7 @@ pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
     binding: PerLayerEntryBinding,
     entry: &PerLayerEntry,
     rows: u64,
-) -> Result<PerLayerEntryPorts, String> {
+) -> Result<PerLayerEntryPorts, GraphError> {
     let channels = binding.layers * binding.width;
     let projection = graph.port(projection.resident, &projection.shape)?;
     let norm = graph.port(norm.resident, &norm.shape)?;
@@ -290,7 +290,7 @@ pub(crate) fn per_layer<'a, G: GraphDraft + 'a>(
     rows: u64,
     epsilon: f32,
     scale: f32,
-) -> Result<WorkflowTensor, String> {
+) -> Result<WorkflowTensor, GraphError> {
     let gated = graph
         .enqueue(
             entries.gate,

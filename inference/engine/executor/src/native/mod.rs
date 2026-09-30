@@ -101,6 +101,12 @@ pub enum CatalogFailure {
         bindings: String,
         outcome: String,
     },
+    /// The model's statics for an entry lie outside its kernel's domain on
+    /// the backend: no configuration of the implementation executes them.
+    KernelDomain {
+        entry: &'static str,
+        statics: Vec<(String, u64)>,
+    },
 }
 
 impl fmt::Display for CatalogError {
@@ -132,6 +138,17 @@ impl fmt::Display for CatalogError {
                 formatter,
                 "failed to qualify {entry} on {path} ({backend}) with {bindings}: {outcome}"
             ),
+            CatalogFailure::KernelDomain { entry, statics } => {
+                let statics = statics
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    formatter,
+                    "{entry} has no admissible {backend} configuration at {statics}"
+                )
+            }
         }
     }
 }

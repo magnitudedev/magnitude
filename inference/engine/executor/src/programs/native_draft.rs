@@ -32,8 +32,8 @@ use crate::{
     },
     operators::dense_ffn::graph::{self as dense_graph, CheckedDenseEntries, DenseGraphEntries},
     programs::{
-        graph::draft::GraphDraft,
         graph::readout::{self, readout_softcap, shapes, write_selection_rows, SelectionPorts},
+        graph::{draft::GraphDraft, GraphError},
         native_constants::{
             distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
             ConstantTensors, GraphConstant,
@@ -546,10 +546,11 @@ pub(crate) fn checked_draft_family_storage(
     plan: &DraftProgramPlan,
     geometry: &DraftGeometry<'_>,
     classes: impl IntoIterator<Item = DraftGraphClass>,
-) -> Result<CheckedGraphResources, String> {
+) -> Result<CheckedGraphResources, GraphError> {
     let checked = CheckedDraftEntries::new(plan);
     let mut family = CheckedGraphFamilyResources::new();
     for class in classes {
+        let context = || format!("draft graph class {class:?}");
         let parts = draft_graph(
             NativeGraphMetadata::new(backend),
             checked.entries()?,
@@ -557,12 +558,11 @@ pub(crate) fn checked_draft_family_storage(
             geometry,
             class,
         )
-        .map_err(|error| format!("draft graph class {class:?}: {error}"))?;
-        let storage = GraphDraft::seal(parts.plan)
-            .map_err(|error| format!("draft graph class {class:?}: {error}"))?;
+        .map_err(|error| error.context(context()))?;
+        let storage = GraphDraft::seal(parts.plan).map_err(|error| error.context(context()))?;
         family.include(storage, parts.constants);
     }
-    family.finish()
+    Ok(family.finish()?)
 }
 
 /// One layer's per-run ports in one pass: its attention controls and its
@@ -598,7 +598,7 @@ fn leading_port<G: GraphDraft>(
     rows: u64,
     width: u64,
     leading: &mut Vec<(WeightRole, NativePort)>,
-) -> Result<WorkflowTensor, String> {
+) -> Result<WorkflowTensor, GraphError> {
     let plan = load
         .weights()
         .find(|plan| plan.role == role)
@@ -638,7 +638,7 @@ fn absent<G: GraphDraft>(
     graph: &mut G,
     constants: &mut Vec<GraphConstant>,
     slot: &mut Option<WorkflowTensor>,
-) -> Result<WorkflowTensor, String> {
+) -> Result<WorkflowTensor, GraphError> {
     if let Some(absent) = slot {
         return Ok(absent.clone());
     }
@@ -660,7 +660,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     load: &ModelLoadPlan,
     geometry: &DraftGeometry<'_>,
     class: DraftGraphClass,
-) -> Result<DraftGraphParts<G>, String> {
+) -> Result<DraftGraphParts<G>, GraphError> {
     let decoder = &geometry.definition.decoder;
     let draft = geometry.draft;
     let (hidden, vocabulary) = (decoder.hidden, decoder.vocabulary);
@@ -1291,7 +1291,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
     constants: &mut Vec<GraphConstant>,
     absent_scale: &WorkflowTensor,
     residual: &WorkflowTensor,
-) -> Result<(WorkflowTensor, LayerPorts), String> {
+) -> Result<(WorkflowTensor, LayerPorts), GraphError> {
     let Dflash2Layer {
         entries,
         rows,
@@ -1324,7 +1324,6 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
                 },
             )
             .map(|projected| projected.value)
-            .map_err(|error| error.to_string())
     };
     // One sublayer's prologue: its normed rows, their coefficients and the
     // half-0 convolution the operator reads.
@@ -1376,7 +1375,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
                 },
             )?
             .value;
-        Ok::<_, String>((convolved, dynamic, base))
+        Ok::<_, GraphError>((convolved, dynamic, base))
     };
     let finish =
         |graph: &mut G,
@@ -1396,7 +1395,6 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
                     },
                 )
                 .map(|finished| finished.value)
-                .map_err(|error| error.to_string())
         };
 
     // Attention: plain query, key and value projections of the convolved
@@ -1567,7 +1565,7 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
     weights: &mut Vec<(WeightPort, NativePort)>,
     absent_scale: &WorkflowTensor,
     path: Dflash2Path<'_>,
-) -> Result<NativePort, String> {
+) -> Result<NativePort, GraphError> {
     let Dflash2Path {
         slots,
         rank,
@@ -1727,7 +1725,7 @@ impl PreparedDraftGraphs {
                 return Err(invalid("draft graph class is duplicated"));
             }
             let class_error =
-                |error: String| invalid(format!("draft graph class {class:?}: {error}"));
+                |error: GraphError| invalid(format!("draft graph class {class:?}: {error}"));
             let parts = draft_graph(
                 target_device.native_graph(),
                 DraftGraphEntries::prepared(draft, target),

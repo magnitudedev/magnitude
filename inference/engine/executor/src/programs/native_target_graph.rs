@@ -13,6 +13,7 @@ use crate::{
     },
     programs::graph::draft::GraphDraft,
     programs::graph::tap::{TapEntry, TapPorts, TapPositions, Taps},
+    programs::graph::GraphError,
     programs::graph::RowForm,
     programs::native_constants::{
         distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
@@ -339,7 +340,8 @@ impl PreparedTargetGraphs {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let certificate =
-            certify_target_family(device.backend(), load, geometry, state, plan, limits)?;
+            certify_target_family(device.backend(), load, geometry, state, plan, limits)
+                .map_err(|error| error.to_string())?;
         let row_classes = magnitude_batching::row_classes(limits.max_launch_rows);
         if row_classes.is_empty() {
             return Err(format!(
@@ -670,7 +672,7 @@ impl<'a> PerLayerEntryGraphSource<'a> {
             rows,
         )
         .map_err(|error| format!("per-layer entry graph rows {rows}: {error}"))?;
-        let plan = GraphDraft::seal(graph)?;
+        let plan = GraphDraft::seal(graph).map_err(|error| error.to_string())?;
         // It writes the bound per-layer rows and exports nothing.
         if plan.output_bytes() != 0 {
             return Err(format!("per-layer entry graph rows {rows} exports outputs"));
@@ -831,8 +833,9 @@ impl PreparedTargetEntryGraph {
             geometry,
             rows,
             source,
-        )?;
-        let plan = GraphDraft::seal(graph)?;
+        )
+        .map_err(|error| error.to_string())?;
+        let plan = GraphDraft::seal(graph).map_err(|error| error.to_string())?;
         Ok(Self {
             plan,
             table,
@@ -863,7 +866,7 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     geometry: &Decoder,
     rows: u64,
     source: EntryTokens,
-) -> Result<(G, NativePort, NativePort, WorkflowTensor), String> {
+) -> Result<(G, NativePort, NativePort, WorkflowTensor), GraphError> {
     let table = graph.port(weight.resident, &weight.shape)?;
     let dimensions = [
         ("M", rows),
@@ -913,7 +916,7 @@ pub(crate) fn checked_entry_graph_storage(
     geometry: &Decoder,
     rows: u64,
     uploaded: bool,
-) -> Result<NativeGraphStorageBytes, String> {
+) -> Result<NativeGraphStorageBytes, GraphError> {
     let weight = embedding_weight(load)?;
     let elements = [("EW", weight.resident), ("A", activation(geometry))];
     let (graph, _, _, _) = entry_graph_topology(
@@ -985,7 +988,7 @@ fn weight_port<G: GraphDraft>(
     role: WeightRole,
     part: WeightPart,
     ports: &mut Vec<(WeightPort, NativePort)>,
-) -> Result<seismic::WorkflowTensor, String> {
+) -> Result<seismic::WorkflowTensor, GraphError> {
     let plan = load
         .weights()
         .find(|plan| plan.role == role)
@@ -994,10 +997,9 @@ fn weight_port<G: GraphDraft>(
         (WeightPart::Values, _) => graph.port(plan.resident, &plan.shape),
         (WeightPart::Scale, Some(scale)) => graph.port(Element::f32(), &[scale.extent]),
         (WeightPart::Scale, None) => {
-            return Err(format!("planned weight {role:?} has no second-level scale"))
+            return Err(format!("planned weight {role:?} has no second-level scale").into())
         }
-    }
-    .map_err(|error| error.to_string())?;
+    }?;
     let tensor = port.tensor().clone();
     ports.push((WeightPort { role, part }, port));
     Ok(tensor)
@@ -1011,7 +1013,7 @@ pub(crate) fn weight<G: GraphDraft>(
     scope: WeightScope,
     kind: WeightKind,
     ports: &mut Vec<(WeightPort, NativePort)>,
-) -> Result<seismic::WorkflowTensor, String> {
+) -> Result<seismic::WorkflowTensor, GraphError> {
     weight_port(graph, load, WeightRole { scope, kind }, WeightPart::Values, ports)
 }
 
@@ -1044,14 +1046,14 @@ pub(crate) fn scaled_weight<G: GraphDraft>(
     kind: WeightKind,
     ports: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
-) -> Result<ScaledWeight, String> {
+) -> Result<ScaledWeight, GraphError> {
     let role = WeightRole { scope, kind };
     let weight = weight_port(graph, load, role, WeightPart::Values, ports)?;
     let extent = planned_scale_extent(load, role)?;
     let scale = match extent {
         0 => GraphConstant::absent_scale(graph, constants)?,
         1 => weight_port(graph, load, role, WeightPart::Scale, ports)?,
-        _ => return Err(format!("{role:?} has a per-matrix scale at a per-tensor port")),
+        _ => return Err(format!("{role:?} has a per-matrix scale at a per-tensor port").into()),
     };
     Ok(ScaledWeight {
         weight,
@@ -1068,7 +1070,7 @@ pub(crate) fn resident_scale<G: GraphDraft>(
     scope: WeightScope,
     kind: WeightKind,
     ports: &mut Vec<(WeightPort, NativePort)>,
-) -> Result<Option<WorkflowTensor>, String> {
+) -> Result<Option<WorkflowTensor>, GraphError> {
     let role = WeightRole { scope, kind };
     match planned_scale_extent(load, role)? {
         0 => Ok(None),
@@ -1138,7 +1140,8 @@ impl PreparedTargetBlockGraph {
             },
             &mut weights,
             &mut constants,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         graph.export(&parts.output).map_err(|error| error.to_string())?;
         let plan = graph.seal().map_err(|error| error.to_string())?;
         Ok(Self {
@@ -1190,7 +1193,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     inputs: BlockGraphInputs<'_>,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
-) -> Result<BlockGraphParts, String> {
+) -> Result<BlockGraphParts, GraphError> {
     let BlockGraphInputs {
         load,
         geometry,
@@ -1261,7 +1264,7 @@ fn checked_block_graph_draft(
     rows: u64,
     segments: u64,
     slots: u64,
-) -> Result<(NativeGraphMetadata, Vec<GraphConstant>), String> {
+) -> Result<(NativeGraphMetadata, Vec<GraphConstant>), GraphError> {
     let mut weights = Vec::new();
     let mut constants = Vec::new();
     let tap_elements = [("A", activation(geometry))];
@@ -1326,7 +1329,7 @@ pub(crate) fn checked_block_graph_resources(
     rows: u64,
     segments: u64,
     slots: u64,
-) -> Result<(NativeGraphStorageBytes, Vec<GraphConstant>), String> {
+) -> Result<(NativeGraphStorageBytes, Vec<GraphConstant>), GraphError> {
     let (graph, constants) = checked_block_graph_draft(
         NativeGraphMetadata::new(backend),
         load,
@@ -1352,7 +1355,7 @@ pub(crate) fn checked_target_family_storage(
     state: &StateResourcePlan,
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
-) -> Result<CheckedGraphResources, String> {
+) -> Result<CheckedGraphResources, GraphError> {
     certify_target_family(backend, load, geometry, state, plan, limits)
         .map(|certificate| certificate.resources)
 }
@@ -1372,7 +1375,7 @@ fn certify_target_family(
     state: &StateResourcePlan,
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
-) -> Result<TargetFamilyCertificate, String> {
+) -> Result<TargetFamilyCertificate, GraphError> {
     if plan.blocks().len() != geometry.blocks.len() {
         return Err("planned target block count disagrees with geometry".into());
     }

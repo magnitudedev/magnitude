@@ -2,6 +2,7 @@ import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   LocalModelsStateSchema,
   LocalModelAssessmentSchema,
+  LocalModelDoesNotFitAssessmentSchema,
   CatalogLocalModelSchema,
   DiscoveredLocalModelSchema,
   LocalModelPresentationSchema,
@@ -119,7 +120,7 @@ const projectAssessment = (environmentId: string, assessment: ModelAssessment): 
         systemUseState: { _tag: "NotObserved" },
         currentHeadroomState: { _tag: "NotObserved" },
       },
-      performance: assessment.performance,
+      speed: assessment.speed,
     })
   }
   if (assessment._tag === "DoesNotFit") {
@@ -132,7 +133,7 @@ const projectAssessment = (environmentId: string, assessment: ModelAssessment): 
     })
   }
   return Schema.decodeUnknownSync(LocalModelAssessmentSchema)({
-    _tag: "Incompatible", environmentId, profile: assessment.profile, failure: assessment.failure,
+    _tag: "Unsupported", environmentId, profile: assessment.profile, failure: assessment.failure,
   })
 }
 
@@ -227,15 +228,16 @@ export const catalogModelServingState = (
   if (assessment === undefined || assessment._tag === "Assessing") return {
     _tag: "Assessing", profile: ready.profile,
   }
-  const fits = assessment.assessment._tag === "Fits"
   const assessed = {
     metadata: ready.metadata,
     capabilities: Schema.validateSync(ModelCapabilitiesSchema)(assessment.capabilities),
     speculativeMethod: ready.speculativeMethod,
   }
-  return fits
+  return assessment.assessment._tag === "Fits"
     ? { _tag: "Assessed", ...assessed, assessment: assessment.assessment, rankingScores }
-    : { _tag: "Assessed", ...assessed, assessment: assessment.assessment }
+    // The service never reports a catalog model as Unsupported; validation rejects that contract violation.
+    : { _tag: "Assessed", ...assessed,
+        assessment: Schema.validateSync(LocalModelDoesNotFitAssessmentSchema)(assessment.assessment) }
 }
 
 export const discoveredModelServingState = (
@@ -301,11 +303,12 @@ const catalogModel = (
     ? source.localState.effective.failure
     : undefined
   const rankingScores = assessment?._tag === "Assessed" && assessment.assessment._tag === "Fits"
+    && assessment.assessment.speed._tag === "Estimated"
     ? modelRankingScores({
         intelligenceScore: source.intelligence,
         fidelityRank: source.fidelityRank,
         profile: ready?.profile ?? source.desired.profile,
-        performance: assessment.assessment.performance,
+        performance: assessment.assessment.speed.samples,
       })
     : Option.none()
   return Schema.validateSync(CatalogLocalModelSchema)({

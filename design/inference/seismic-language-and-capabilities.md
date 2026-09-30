@@ -241,6 +241,10 @@ it is evaluated with the launch geometry (per standalone call, once per node whe
 is sealed). The same condition form restricts tuning configurations in `where`, which reads only
 static dimensions and parameters. `where` may combine conjuncts from different launches, but each
 conjunct reads local parameters from at most one launch; a reused local name is ambiguous there.
+The default configuration at given static dimensions is the first configuration `where` admits,
+in declared parameter and value order, so reordering values or adding a `where` conjunct cannot
+leave admissible statics without a default. Statics that no configuration admits lie outside the
+kernel's domain: graph construction rejects such a node, naming the call and its statics.
 An inactive launch is neither encoded nor checked against pipeline or device limits, its geometry is not
 evaluated, and it keeps its ordinal (formed functions and trace entries stay in declaration order;
 a trace records it as an empty launch). An inactive scratch buffer keeps its ABI slot at the minimum

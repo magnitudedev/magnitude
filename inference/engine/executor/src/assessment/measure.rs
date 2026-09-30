@@ -1,11 +1,11 @@
 //! The fixed device measurement behind a basis.
 //!
 //! Every entry of the backend's plan ([`super::plan`]) is formed with its
-//! shipped default specialization; timed entries are timed over synthetic
-//! device-resident tensors at the plan's generic sizes. Nothing inspects a
-//! model artifact, tunes a parameter or loads a model. An entry the backend
-//! cannot form is recorded unsupported. Measured times are taken as they
-//! are.
+//! shipped default specialization and timed over synthetic device-resident
+//! tensors at the plan's generic sizes. Nothing inspects a model artifact,
+//! tunes a parameter or loads a model. An entry the backend cannot form is
+//! recorded unsupported, which leaves its cost absent from the basis.
+//! Measured times are taken as they are.
 //!
 //! The measurement shares a cold CPU time target across all cost-model points:
 //!
@@ -31,7 +31,7 @@ use super::basis::{
     median, BasisIdentity, ClassCost, ClassMeasurement, CostModel, CostShape, HeadGeometry,
     MeasuredPoint, MeasurementBasis, MeasurementKey, OperationClass, PointShape,
 };
-use super::plan::{activation, measurement_plan, reference_weight, PlannedKey};
+use super::plan::{activation, measurement_plan, reference_weight};
 
 mod general_routed;
 mod post_norm;
@@ -97,12 +97,6 @@ fn projection_launches() -> Vec<Launch> {
         }])
         .collect()
 }
-
-/// The launch an exact representation binding is formed at.
-const FORM_LAUNCH: Launch = Launch {
-    rows: FLOOR_ROWS,
-    reduction: REDUCTION,
-};
 
 /// The point of a weight-streaming launch that ran `rows` output rows.
 fn launch_point(
@@ -448,11 +442,7 @@ pub fn complete_basis(
     let plan = measurement_plan(device.backend());
     let missing = plan
         .iter()
-        .filter(|planned| {
-            !classes
-                .iter()
-                .any(|(measured, _)| measured == planned.key())
-        })
+        .filter(|key| !classes.iter().any(|(measured, _)| measured == *key))
         .cloned()
         .collect::<Vec<_>>();
     let measured = (|| {
@@ -462,8 +452,8 @@ pub fn complete_basis(
         let session = Session::open(device)?;
         session.begin_budget(&missing);
         let formation = session.form_all(&missing);
-        for (index, planned) in missing.into_iter().enumerate() {
-            let (measurement, mut profile) = match session.measure(catalog, &reserves, &planned) {
+        for (index, key) in missing.into_iter().enumerate() {
+            let (measurement, mut profile) = match session.measure(catalog, &reserves, &key) {
                 Ok(measured) => measured,
                 Err(MeasurementError::Fault { key, message }) => {
                     classes.push((
@@ -480,13 +470,12 @@ pub fn complete_basis(
                 profile.formation += formation;
                 profile.total += formation;
             }
-            let key = planned.key().clone();
             observe(&key, &measurement, &profile);
             classes.push((key, measurement));
         }
         Ok(())
     })();
-    classes.sort_by_key(|(key, _)| plan.iter().position(|planned| planned.key() == key));
+    classes.sort_by_key(|(key, _)| plan.iter().position(|planned| planned == key));
     let basis = MeasurementBasis { identity, classes };
     match measured {
         Ok(()) => Ok(basis),
@@ -499,9 +488,9 @@ pub fn measure_entry(
     catalog: &DeviceCatalog,
     device: &Device,
     reserves: &MemoryReserves,
-    planned: &PlannedKey,
+    key: &MeasurementKey,
 ) -> Result<(ClassMeasurement, ClassProfile), MeasurementError> {
-    Session::open(device)?.measure(catalog, reserves, planned)
+    Session::open(device)?.measure(catalog, reserves, key)
 }
 
 /// Why a class produced no points.
@@ -514,8 +503,6 @@ enum Stop {
     Fault(String),
     /// The formation pass queued this point's forms and stopped.
     Queued,
-    /// The compatibility pass formed this point's entry and stopped.
-    Formed,
 }
 
 type Step<T> = Result<T, Stop>;
@@ -624,8 +611,7 @@ type FormJob<'a> = Box<dyn FnOnce() + Send + 'a>;
 /// reuses the classes the plan already timed.
 type Measured = RefCell<HashMap<MeasurementKey, Vec<MeasuredPoint>>>;
 
-/// A target shared by all still-missing timed points. Formed-only entries do
-/// not spend a point, but their formation time is charged to the same clock.
+/// A target shared by all still-missing timed points.
 #[derive(Clone, Copy)]
 struct MeasurementBudget {
     deadline: Instant,
@@ -640,11 +626,8 @@ fn point_weight(class: OperationClass) -> usize {
     }
 }
 
-fn planned_point_count(planned: &PlannedKey) -> usize {
-    if !matches!(planned, PlannedKey::Timed(_)) {
-        return 0;
-    }
-    match planned.key().class.cost_shape() {
+fn planned_point_count(key: &MeasurementKey) -> usize {
+    match key.class.cost_shape() {
         CostShape::PerLaunch | CostShape::PerByte => 1,
         CostShape::Linear => 2,
         CostShape::Projection => projection_launches().len(),
@@ -686,13 +669,13 @@ impl<'a> Session<'a> {
         })
     }
 
-    fn begin_budget(&self, missing: &[PlannedKey]) {
+    fn begin_budget(&self, missing: &[MeasurementKey]) {
         if self.device.backend() == BackendName::Cpu {
             self.budget.set(Some(MeasurementBudget {
                 deadline: Instant::now() + CPU_BASIS_TARGET,
                 remaining_units: missing
                     .iter()
-                    .map(|planned| planned_point_count(planned) * point_weight(planned.key().class))
+                    .map(|key| planned_point_count(key) * point_weight(key.class))
                     .sum(),
             }));
         }
@@ -800,14 +783,14 @@ impl<'a> Session<'a> {
 
     /// Form every native kernel of `plan` in parallel: a formation pass over
     /// the plan queues each point's forms, then worker threads form them.
-    fn form_all(&self, plan: &[PlannedKey]) -> Duration {
+    fn form_all(&self, plan: &[MeasurementKey]) -> Duration {
         let began = Instant::now();
         let jobs: Mutex<Vec<FormJob<'_>>> = Mutex::new(Vec::new());
-        for planned in plan {
-            let runner = Runner::new(self, Pass::Queue(&jobs), planned);
+        for key in plan {
+            let runner = Runner::new(self, Pass::Queue(&jobs), key);
             // Every outcome of the pass is a queued form or a class that
             // needs none; the timing pass reports failures.
-            let _ = runner.points(planned.key());
+            let _ = runner.points(key);
         }
         let jobs = jobs
             .into_inner()
@@ -838,21 +821,16 @@ impl<'a> Session<'a> {
         &self,
         catalog: &DeviceCatalog,
         reserves: &MemoryReserves,
-        planned: &PlannedKey,
+        key: &MeasurementKey,
     ) -> Result<(ClassMeasurement, ClassProfile), MeasurementError> {
         let began = Instant::now();
-        let key = planned.key();
         self.pools.borrow_mut().clear();
         if self.budget.get().is_some() && key.class.cost_shape() != CostShape::History {
             self.rotation.set(128 << 20);
         }
         refresh_device_ceiling(catalog, self.device, reserves)
             .map_err(MeasurementError::Ceiling)?;
-        let pass = match planned {
-            PlannedKey::Timed(_) => Pass::Time,
-            PlannedKey::Formed(_) => Pass::Form,
-        };
-        let runner = Runner::new(self, pass, planned);
+        let runner = Runner::new(self, Pass::Time, key);
         let measurement = match runner.points(key) {
             Ok(points) => ClassCost::from_points(key.class, &points)
                 .map(|cost| ClassMeasurement::Measured { points, cost })
@@ -860,7 +838,6 @@ impl<'a> Session<'a> {
                     key: key.clone(),
                     message,
                 })?,
-            Err(Stop::Formed) => ClassMeasurement::Formed,
             Err(Stop::Unsupported(reason)) => ClassMeasurement::Unsupported { reason },
             Err(Stop::Failed(message)) => {
                 return Err(MeasurementError::Device {
@@ -960,8 +937,6 @@ impl Timed {
 enum Pass<'q, 's> {
     /// Queue every form the points need and stop each point.
     Queue(&'q Mutex<Vec<FormJob<'s>>>),
-    /// Form the first point's entry and stop: a compatibility binding.
-    Form,
     /// Time every point.
     Time,
 }
@@ -970,19 +945,15 @@ struct Runner<'q, 's, 'a> {
     session: &'s Session<'a>,
     pass: Pass<'q, 's>,
     point_weight: usize,
-    /// Whether forms include the varied parameters' variants: only a timed
-    /// entry picks its fastest variant.
-    variants: bool,
     profile: Cell<ClassProfile>,
 }
 
 impl<'q, 's, 'a> Runner<'q, 's, 'a> {
-    fn new(session: &'s Session<'a>, pass: Pass<'q, 's>, planned: &PlannedKey) -> Self {
+    fn new(session: &'s Session<'a>, pass: Pass<'q, 's>, key: &MeasurementKey) -> Self {
         Self {
             session,
             pass,
-            point_weight: point_weight(planned.key().class),
-            variants: matches!(planned, PlannedKey::Timed(_)),
+            point_weight: point_weight(key.class),
             profile: Cell::new(ClassProfile::default()),
         }
     }
@@ -1050,10 +1021,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             })?;
         let mut specializations = vec![defaults.clone()];
         for parameter in &implementation.params {
-            if self.variants
-                && VARIED_PARAMETERS.contains(&parameter.name.as_str())
-                && parameter.arithmetic
-            {
+            if VARIED_PARAMETERS.contains(&parameter.name.as_str()) && parameter.arithmetic {
                 for value in &parameter.values[1..] {
                     let variant = defaults.clone().with_param(parameter.name.clone(), *value);
                     // A value some default excludes (packed decode rows
@@ -1299,11 +1267,8 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
     }
 
     /// Start a point once its entry is formed: its views begin at every
-    /// pool's start. The compatibility pass stops here.
+    /// pool's start.
     fn begin(&self) -> Step<()> {
-        if let Pass::Form = self.pass {
-            return Err(Stop::Formed);
-        }
         for pool in self.session.pools.borrow_mut().iter_mut() {
             pool.cursor = 0;
         }
@@ -1587,22 +1552,15 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         use OperationClass as C;
         let reference = reference_weight(self.device().backend());
         let unexpected = || failed(format!("{key} has an unexpected binding list"));
-        // A weight-streaming entry's bindings: its exact ones, or for its cost
-        // key the reference representation with the activation as the norm.
+        // A weight-streaming entry is timed at the reference representation,
+        // with the activation as its norm.
         let weighted = || -> Step<(Element, Element, Element)> {
             match key.bindings.as_slice() {
                 &[activation] => Ok((activation, reference, activation)),
-                &[weight, activation] => Ok((activation, weight, activation)),
-                &[norm, weight, activation] => Ok((norm, weight, activation)),
                 _ => Err(unexpected()),
             }
         };
-        // A timed class runs its ladder; a formed binding its one launch.
-        let launches = if self.variants {
-            projection_launches()
-        } else {
-            vec![FORM_LAUNCH]
-        };
+        let launches = projection_launches();
         let project = |point: &dyn Fn(Element, Element, Element, Launch) -> Step<MeasuredPoint>| {
             let (norm, weight, activation) = weighted()?;
             self.each(&launches, |at| point(norm, weight, activation, at))
@@ -1611,9 +1569,6 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         match (key.class, key.bindings.as_slice()) {
             (C::EmbeddingRows, &[activation]) => {
                 self.each(&[()], |()| self.embedding_rows(reference, activation))
-            }
-            (C::EmbeddingRows, &[table, activation]) => {
-                self.each(&[()], |()| self.embedding_rows(table, activation))
             }
             (C::AttentionDecode | C::AttentionDecodeK8V4, &[activation]) => {
                 let affine = key.class == C::AttentionDecodeK8V4;
@@ -1625,22 +1580,13 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             (C::DeltaStep, &[activation]) => self.each(&DELTA_STEP_HEADS, |heads| {
                 self.delta_step(activation, heads)
             }),
-            (C::RoutedSelect | C::RoutedRoute, bindings) => {
-                let (norm, router, activation) = match bindings {
-                    &[activation] => (activation, activation, activation),
-                    &[norm, router, activation] => (norm, router, activation),
-                    _ => return Err(unexpected()),
-                };
-                let sizes = if self.variants {
-                    &ROUTING_SIZES[..]
-                } else {
-                    &ROUTING_SIZES[..1]
-                };
-                self.each(sizes, |(hidden, experts)| {
+            // The norm and router are timed in the activation's element.
+            (C::RoutedSelect | C::RoutedRoute, &[activation]) => {
+                self.each(&ROUTING_SIZES, |(hidden, experts)| {
                     if key.class == C::RoutedSelect {
-                        self.routed_select(norm, router, activation, hidden, experts)
+                        self.routed_select(activation, activation, activation, hidden, experts)
                     } else {
-                        self.routed_route(norm, router, activation, hidden, experts)
+                        self.routed_route(activation, activation, activation, hidden, experts)
                     }
                 })
             }
@@ -1680,38 +1626,19 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             ),
             (C::PostNormResidual, &[norm]) => self.each(&[()], |()| self.post_norm_residual(norm)),
             (C::MoeTail, &[norm]) => self.each(&[()], |()| self.moe_tail(norm)),
-            (C::PerLayerInputs, bindings) => {
-                let (table, norm) = match bindings {
-                    &[norm] => (reference, norm),
-                    &[table, norm] => (table, norm),
-                    _ => return Err(unexpected()),
-                };
-                self.each(&PER_LAYER_LAYERS, |layers| {
-                    self.per_layer_inputs(table, norm, layers)
-                })
-            }
-            (C::ImportRows, bindings) => {
-                let (source, destination) = match bindings {
-                    &[] => (Element::f32(), a),
-                    &[source, destination] => (source, destination),
-                    _ => return Err(unexpected()),
-                };
+            (C::PerLayerInputs, &[norm]) => self.each(&PER_LAYER_LAYERS, |layers| {
+                self.per_layer_inputs(reference, norm, layers)
+            }),
+            // A dense import is timed from F32 into the activation; a repack
+            // from the Q4_K source into the reference representation.
+            (C::ImportRows, &[]) => self.each(&CONVERTED_ELEMENTS, |elements| {
+                self.convert_rows(false, Element::f32(), a, elements)
+            }),
+            (C::RepackRows, &[]) => {
+                let source = crate::source_element(magnitude_artifacts::gguf::Encoding::Q4K)
+                    .ok_or_else(|| failed("q4_k has a source element"))?;
                 self.each(&CONVERTED_ELEMENTS, |elements| {
-                    self.convert_rows(false, source, destination, elements)
-                })
-            }
-            (C::RepackRows, bindings) => {
-                let (source, destination) = match bindings {
-                    &[] => (
-                        crate::source_element(magnitude_artifacts::gguf::Encoding::Q4K)
-                            .ok_or_else(|| failed("q4_k has a source element"))?,
-                        reference,
-                    ),
-                    &[source, destination] => (source, destination),
-                    _ => return Err(unexpected()),
-                };
-                self.each(&CONVERTED_ELEMENTS, |elements| {
-                    self.convert_rows(true, source, destination, elements)
+                    self.convert_rows(true, source, reference, elements)
                 })
             }
             (C::CopyRows, &[]) => {
@@ -3382,12 +3309,7 @@ mod tests {
     #[test]
     fn cpu_budget_covers_every_timed_point() {
         let plan = measurement_plan(BackendName::Cpu);
-        assert_eq!(
-            plan.iter()
-                .filter(|entry| matches!(entry, PlannedKey::Timed(_)))
-                .count(),
-            47
-        );
+        assert_eq!(plan.len(), 47);
         assert_eq!(plan.iter().map(planned_point_count).sum::<usize>(), 131);
     }
 
@@ -3420,7 +3342,6 @@ mod tests {
         assert!(LADDER_ROWS.contains(&FLOOR_ROWS));
         assert!(FLOOR_REDUCTION < REDUCTION);
         assert_eq!(launches.len(), LADDER_ROWS.len() + 1);
-        assert_eq!(FORM_LAUNCH.reduction, REDUCTION);
     }
 
     #[test]

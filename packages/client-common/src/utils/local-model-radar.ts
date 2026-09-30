@@ -1,5 +1,10 @@
 import { Option } from "effect"
-import { localModelServingState, type LocalModel, type LocalModelServingState } from "@magnitudedev/sdk"
+import {
+  localModelServingState,
+  type GenerationPerformanceSamples,
+  type LocalModel,
+  type LocalModelServingState,
+} from "@magnitudedev/sdk"
 import { formatMemorySize } from "./format-bytes"
 import { localModelSpeculativeMethodLabel } from "./model-presentation"
 
@@ -99,18 +104,16 @@ const memoryFitLabel = (assessment: ModelAssessment): string => {
   return "Tight"
 }
 
-const performanceRangeSpeedLabel = (model: LocalModel): string => {
-  const serving = Option.getOrUndefined(localModelServingState(model))
-  if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits") {
-    return "Not assessed"
-  }
-  const assessment = serving.assessment
-  const lowerContext = Math.min(25_000, assessment.profile.contextLength)
-  const upperContext = Math.min(75_000, assessment.profile.contextLength)
-  const lowerSample = assessment.performance.find(
+const performanceRangeSpeedLabel = (
+  samples: GenerationPerformanceSamples,
+  contextLength: number
+): string => {
+  const lowerContext = Math.min(25_000, contextLength)
+  const upperContext = Math.min(75_000, contextLength)
+  const lowerSample = samples.find(
     ({ contextTokens }) => contextTokens === lowerContext
   )
-  const upperSample = assessment.performance.find(
+  const upperSample = samples.find(
     ({ contextTokens }) => contextTokens === upperContext
   )
   if (lowerSample === undefined || upperSample === undefined) return "Not assessed"
@@ -136,14 +139,10 @@ export const localModelRadarAxes = (
   }
 
   const assessment = serving.assessment
-  if (assessment.performance.length === 0) return Option.none()
   const comparisonContext = Math.min(50_000, assessment.profile.contextLength)
-  const performance = assessment.performance.reduce((closest, candidate) =>
-    Math.abs(candidate.contextTokens - comparisonContext) <
-    Math.abs(closest.contextTokens - comparisonContext)
-      ? candidate
-      : closest
-  )
+  const speed = assessment.speed._tag === "Estimated"
+    ? Option.some(assessment.speed.samples)
+    : Option.none()
   const catalog = model._tag === "Catalog" ? Option.some(model.catalogData) : Option.none()
   const speculation = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
   const bits = quantizationBits(model)
@@ -160,11 +159,21 @@ export const localModelRadarAxes = (
       }),
     },
     {
-      value: Option.some(
-        normalizeLocalModelRadarSpeed(performance.estimatedTokensPerSecond)
-      ),
+      value: Option.map(speed, (samples) => {
+        const closest = samples.reduce((closest, candidate) =>
+          Math.abs(candidate.contextTokens - comparisonContext) <
+          Math.abs(closest.contextTokens - comparisonContext)
+            ? candidate
+            : closest
+        )
+        return normalizeLocalModelRadarSpeed(closest.estimatedTokensPerSecond)
+      }),
       label: "SPEED",
-      detail: performanceRangeSpeedLabel(model),
+      detail: Option.match(speed, {
+        onNone: () => "Speed estimate unavailable",
+        onSome: (samples) =>
+          performanceRangeSpeedLabel(samples, assessment.profile.contextLength),
+      }),
     },
     {
       value: Option.some(speculationValue(model)),

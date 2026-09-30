@@ -16,15 +16,16 @@ use magnitude_engine::assessment::{
 use magnitude_engine::error::UnsupportedModel;
 use magnitude_engine::options::ModelMethod;
 use magnitude_executor::assessment::{
-    DomainFit, ExecutionAssessment, IncompatibleReason, PerformanceConfidence as EngineConfidence,
-    PerformanceEstimate,
+    DecodeSpeed as EngineDecodeSpeed, DomainFit, ExecutionAssessment,
+    PerformanceConfidence as EngineConfidence, PerformanceEstimate,
 };
 use magnitude_service_contracts::models::{
-    AssessmentEnvironmentId, InstalledModelPackages as _, MemoryAssessment, ModelAssessment,
-    ModelAssessmentId, ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure,
-    ModelPackageOperand, ModelReasoningCapabilities, ModelServingConfiguration,
-    PerformanceConfidence, PerformanceEvidence, ResolvedServableModelBundle, ServableModelBundle,
-    SpeculativeDraftSource, SpeculativeDraftSourceInput, SpeculativeMethod,
+    AssessmentEnvironmentId, DecodeSpeed, InstalledModelPackages as _, MemoryAssessment,
+    ModelAssessment, ModelAssessmentId, ModelAssessmentProfile, ModelBundleInput,
+    ModelCapabilities, ModelFailure, ModelPackageOperand, ModelReasoningCapabilities,
+    ModelServingConfiguration, PerformanceConfidence, PerformanceEvidence,
+    ResolvedServableModelBundle, ServableModelBundle, SpeculativeDraftSource,
+    SpeculativeDraftSourceInput, SpeculativeMethod,
 };
 use magnitude_service_contracts::{ComponentRole, InventoryError, MemoryDomainId, ResolvedModel};
 use magnitude_service_models::{
@@ -428,8 +429,9 @@ fn model_assessment(
                 UnsupportedModel::Family { .. } => "unsupported_family",
                 UnsupportedModel::Representation { .. } => "unsupported_representation",
                 UnsupportedModel::Backend { .. } => "unsupported_backend",
+                UnsupportedModel::KernelDomain { .. } => "unsupported_kernel_domain",
             };
-            return Ok(incompatible(requested, code, unsupported.to_string()));
+            return Ok(unsupported_model(requested, code, unsupported.to_string()));
         }
         EngineAssessment::Assessed { facts, execution } => (facts, execution),
     };
@@ -449,31 +451,44 @@ fn model_assessment(
         performance_context_tokens,
     } = requested;
     let assessment = match execution {
-        ExecutionAssessment::Fits {
-            domains,
-            performance,
-            ..
-        } => {
-            let evidence = performance
-                .iter()
-                .map(performance_evidence)
-                .collect::<Vec<_>>();
-            if evidence
-                .iter()
-                .map(|sample| sample.context_tokens)
-                .ne(performance_context_tokens.iter().copied())
-            {
-                return Err(InventoryError::ModelOperation {
-                    code: "assessment_incomplete".to_owned(),
-                    message: "the engine did not estimate every requested depth".to_owned(),
-                    retryable: false,
-                });
-            }
+        ExecutionAssessment::Fits { domains, speed, .. } => {
+            let speed = match speed {
+                EngineDecodeSpeed::Estimated(performance) => {
+                    let samples = performance
+                        .iter()
+                        .map(performance_evidence)
+                        .collect::<Vec<_>>();
+                    if samples
+                        .iter()
+                        .map(|sample| sample.context_tokens)
+                        .ne(performance_context_tokens.iter().copied())
+                    {
+                        return Err(InventoryError::ModelOperation {
+                            code: "assessment_incomplete".to_owned(),
+                            message: "the engine did not estimate every requested depth".to_owned(),
+                            retryable: false,
+                        });
+                    }
+                    DecodeSpeed::Estimated { samples }
+                }
+                EngineDecodeSpeed::Unavailable { missing } => {
+                    tracing::error!(
+                        target.id = %bundle_key.0,
+                        missing = %missing
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                        "the measurement basis lacks costs a fitting model's decode needs"
+                    );
+                    DecodeSpeed::Unavailable
+                }
+            };
             ModelAssessment::Fits {
                 profile,
                 assessment_id,
                 memory: memory_assessments(&domains, environment),
-                performance: evidence,
+                speed,
             }
         }
         ExecutionAssessment::DoesNotFit {
@@ -488,35 +503,6 @@ fn model_assessment(
             limiting_resource: domain_id(limiting, environment).as_str().to_owned(),
             deficit_bytes,
         },
-        ExecutionAssessment::Incompatible { reason } => {
-            let (code, message) = match reason {
-                IncompatibleReason::OutsideBasis { classes } => (
-                    "unsupported_operation",
-                    format!(
-                        "the device's measurement basis does not cover {}",
-                        classes
-                            .iter()
-                            .map(|(key, reason)| match reason {
-                                Some(reason) => format!("{key}: {reason}"),
-                                None => key.to_string(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                ),
-                IncompatibleReason::Unsupported { reason } => {
-                    ("unsupported_representation", reason)
-                }
-            };
-            ModelAssessment::Incompatible {
-                profile,
-                failure: ModelFailure {
-                    code: code.to_owned(),
-                    message,
-                    retryable: false,
-                },
-            }
-        }
     };
     Ok(CachedModelAssessment {
         capabilities: capabilities(facts.capabilities),
@@ -525,8 +511,8 @@ fn model_assessment(
     })
 }
 
-/// A package the engine cannot interpret has no engine-derived capabilities or template.
-fn incompatible(
+/// A package the engine cannot execute has no engine-derived capabilities or template.
+fn unsupported_model(
     requested: ModelAssessmentProfile,
     code: &str,
     message: String,
@@ -543,7 +529,7 @@ fn incompatible(
             },
         },
         template_fingerprint: String::new(),
-        profile: ModelAssessment::Incompatible {
+        profile: ModelAssessment::Unsupported {
             profile: requested.profile,
             failure: ModelFailure {
                 code: code.to_owned(),

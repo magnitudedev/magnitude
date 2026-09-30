@@ -23,9 +23,9 @@ use crate::{
     operators::output::TailEntries,
     operators::routed::fused_graph::{self as routed, CheckedRoutedEntries, RoutedGraphEntries},
     programs::{
-        graph::draft::GraphDraft,
         graph::readout::{self, shapes, SelectionPorts},
         graph::RowForm,
+        graph::{draft::GraphDraft, GraphError},
         native_constants::{
             distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
             ConstantTensors, GraphConstant,
@@ -297,8 +297,8 @@ type PreparedHeadGraph = HeadGraphParts<NativeGraphPlan>;
 impl<P> HeadGraphParts<P> {
     fn map_plan<Q>(
         self,
-        map: impl FnOnce(P) -> Result<Q, String>,
-    ) -> Result<HeadGraphParts<Q>, String> {
+        map: impl FnOnce(P) -> Result<Q, GraphError>,
+    ) -> Result<HeadGraphParts<Q>, GraphError> {
         Ok(HeadGraphParts {
             plan: map(self.plan)?,
             tokens: self.tokens,
@@ -329,7 +329,7 @@ fn planned_weight<G: GraphDraft>(
     load: &ModelLoadPlan,
     role: WeightRole,
     weights: &mut Vec<(WeightPort, NativePort)>,
-) -> Result<WorkflowTensor, String> {
+) -> Result<WorkflowTensor, GraphError> {
     let plan = load
         .weights()
         .find(|plan| plan.role == role)
@@ -354,7 +354,7 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
     head: &HeadBlock,
     feed_forward: FeedForwardProgramSlot,
     class: HeadGraphClass,
-) -> Result<HeadGraphParts<G::Plan>, String> {
+) -> Result<HeadGraphParts<G::Plan>, GraphError> {
     head_graph_draft(graph, entries, load, geometry, head, feed_forward, class)?
         .map_plan(|graph| graph.seal())
 }
@@ -367,14 +367,14 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     head: &HeadBlock,
     feed_forward: FeedForwardProgramSlot,
     class: HeadGraphClass,
-) -> Result<HeadGraphParts<G>, String> {
+) -> Result<HeadGraphParts<G>, GraphError> {
     if class.entry_rows == 0
         || class.slots == 0
         || class.slots > class.entry_rows
         || class.history_rows == 0
         || (class.steps == 0 && class.shaped)
     {
-        return Err(format!("head graph class {class:?} is inconsistent"));
+        return Err(format!("head graph class {class:?} is inconsistent").into());
     }
     let hidden = geometry.hidden;
     let vocabulary = geometry.vocabulary;
@@ -425,7 +425,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     let output_norm = weight!(head, WeightKind::OutputNorm);
     let draft_vocabulary = draft_vocabulary(vocabulary);
     let projection = (class.steps > 0)
-        .then(|| -> Result<_, String> {
+        .then(|| -> Result<_, GraphError> {
             let plan = load
                 .weights()
                 .find(|plan| {
@@ -710,7 +710,7 @@ pub(crate) fn checked_head_family_storage(
     head: &HeadBlock,
     binding: HeadBinding,
     classes: impl IntoIterator<Item = HeadGraphClass>,
-) -> Result<CheckedGraphResources, String> {
+) -> Result<CheckedGraphResources, GraphError> {
     let classes = classes.into_iter().collect::<Vec<_>>();
     certify_head_family(backend, load, geometry, head, binding, &classes)
         .map(|(resources, _)| resources)
@@ -728,7 +728,7 @@ fn certify_head_family(
         CheckedGraphResources,
         BTreeMap<HeadGraphClass, NativeGraphLayout>,
     ),
-    String,
+    GraphError,
 > {
     let checked = CheckedHeadEntries::new(binding)?;
     let mut family = CheckedGraphFamilyResources::new();
@@ -765,10 +765,7 @@ fn certify_head_family(
             binding.feed_forward,
             largest,
         )?;
-        let template = draft
-            .plan
-            .seal_template()
-            .map_err(|error| error.to_string())?;
+        let template = draft.plan.seal_template()?;
         family.include(
             NativeGraphStorageBytes {
                 workspace: 0,
@@ -805,9 +802,7 @@ fn certify_head_family(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let layout = template
-            .certify(&slices)
-            .map_err(|error| error.to_string())?;
+        let layout = template.certify(&slices)?;
         family.include(layout.storage_bytes(), []);
         for &class in &group {
             if matches!(binding.feed_forward, FeedForwardProgramSlot::Dense(_)) {
@@ -834,7 +829,7 @@ pub(crate) fn verify_head_family_certificates(
     head: &HeadBlock,
     binding: HeadBinding,
     classes: &[HeadGraphClass],
-) -> Result<(), String> {
+) -> Result<(), GraphError> {
     let (_, layouts) = certify_head_family(backend, load, geometry, head, binding, classes)?;
     let checked = CheckedHeadEntries::new(binding)?;
     for &class in classes {
@@ -850,9 +845,9 @@ pub(crate) fn verify_head_family_certificates(
         let charged = exact
             .plan
             .seal_with_layout(&layouts[&class])
-            .map_err(|error| format!("head class {class:?}: {error}"))?;
+            .map_err(|error| GraphError::from(error).context(format!("head class {class:?}")))?;
         if charged != layouts[&class].storage_bytes() {
-            return Err(format!("head class {class:?} charged a different layout"));
+            return Err(format!("head class {class:?} charged a different layout").into());
         }
     }
     Ok(())
@@ -889,7 +884,7 @@ impl PreparedHeadGraphs {
             binding,
             &classes,
         )
-        .map_err(invalid)?;
+        .map_err(|error| invalid(error.to_string()))?;
         let mut prepared = BTreeMap::new();
         for class in classes {
             if prepared.contains_key(&class) {
@@ -942,7 +937,7 @@ impl PreparedHeadGraphs {
             block.binding.feed_forward,
             class,
         )
-        .map_err(invalid)
+        .map_err(|error| invalid(error.to_string()))
     }
 
     pub fn family(&self) -> &NativeGraphFamily {

@@ -17,7 +17,7 @@ use super::{
 };
 use crate::assessment::DomainFit;
 use crate::platform::{DomainRole, FitCapacity};
-use crate::AttestedPrograms;
+use crate::{AttestedPrograms, GraphError};
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_state::{BankCapacity, KvCodec, ModelStateLayout};
 use seismic::{BackendName, MemoryPoolId};
@@ -98,7 +98,10 @@ pub enum AssessmentFitVerdict {
 
 /// Checked graph-pool demand and distinct bound constants from the same class
 /// enumeration and slot multipliers as native preparation: an upper bound for
-/// every graph pool a clean load commits on the selected backend.
+/// every graph pool a clean load commits on the selected backend. Deriving
+/// it builds every graph a load prepares, so it fails with
+/// `GraphError::KernelDomain` exactly when the model's program calls a kernel
+/// outside its domain on the backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssessmentGraphResourceBounds {
     pub target: NativeGraphCharge,
@@ -119,7 +122,7 @@ impl AssessmentGraphResourceBounds {
         codec: KvCodec,
         limits: super::ResourceLimits,
         backend: BackendName,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, GraphError> {
         let plan = load
             .program_plan(definition, codec)
             .map_err(|error| error.to_string())?;

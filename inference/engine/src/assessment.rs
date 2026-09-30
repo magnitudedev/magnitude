@@ -9,7 +9,7 @@
 //! template and reasoning inspection over header metadata. No device is
 //! opened, no weight payload is read and nothing is decoded.
 
-use crate::error::UnsupportedModel;
+use crate::error::{classify_graph, classify_plan, PlanOutcome, UnsupportedModel};
 use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy};
 use crate::planning::{ExecutionPlanningError, plan_execution};
 use magnitude_artifacts::PackageHeaders;
@@ -18,11 +18,10 @@ use magnitude_chat::{
     artifacts::{gguf_templates, gguf_tokenizer_vocabulary},
 };
 use magnitude_executor::{
-    ExecutionPath, ExecutionPlanDraft, PlanError,
+    ExecutionPath, ExecutionPlanDraft,
     assessment::{
-        AssessmentError, AssessmentRequest, ExecutionAssessment, IncompatibleReason,
-        MeasurementBasis, PreparedExecutionAssessment, finish_execution_assessment,
-        prepare_execution_assessment,
+        AssessmentError, AssessmentRequest, ExecutionAssessment, MeasurementBasis,
+        PreparedExecutionAssessment, finish_execution_assessment, prepare_execution_assessment,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
 };
@@ -164,10 +163,11 @@ pub enum ModelAssessment {
         facts: ModelFacts,
         execution: ExecutionAssessment,
     },
-    /// The engine cannot serve the package at all, before any device fact:
-    /// no family recognizes it, or its definition, tokenizer or templates
-    /// are outside what the engine executes (the same classification a
-    /// load's resolution makes).
+    /// The engine cannot execute the package: no family recognizes it, its
+    /// definition, tokenizer or templates are outside what the engine
+    /// executes, the planner refuses it on the backend, or its program calls
+    /// a kernel outside the kernel's domain. The same classification a load
+    /// makes.
     Unsupported(UnsupportedModel),
 }
 
@@ -180,7 +180,8 @@ pub enum ModelAssessmentError {
     ContextLimit(u64),
     /// The engine configuration could not be resolved for the model.
     Configuration(String),
-    Planning(ExecutionPlanningError),
+    /// Planning or graph construction failed in the engine itself.
+    Planning(String),
     Platform(PlatformError),
     /// The basis was measured on a different backend than the selected device.
     BasisBackend {
@@ -217,10 +218,6 @@ impl std::error::Error for ModelAssessmentError {}
 /// Basis-independent evidence from the exact package and selected execution configuration.
 pub enum PreparedModelAssessment {
     Unsupported(UnsupportedModel),
-    Incompatible {
-        facts: ModelFacts,
-        reason: String,
-    },
     Planned {
         facts: ModelFacts,
         draft: ExecutionPlanDraft,
@@ -237,16 +234,6 @@ pub fn finish_model_assessment(
     let (facts, draft, preparation) = match prepared {
         PreparedModelAssessment::Unsupported(unsupported) => {
             return Ok(ModelAssessment::Unsupported(unsupported.clone()));
-        }
-        PreparedModelAssessment::Incompatible { facts, reason } => {
-            return Ok(ModelAssessment::Assessed {
-                facts: facts.clone(),
-                execution: ExecutionAssessment::Incompatible {
-                    reason: IncompatibleReason::Unsupported {
-                        reason: reason.clone(),
-                    },
-                },
-            });
         }
         PreparedModelAssessment::Planned {
             facts,
@@ -327,11 +314,10 @@ pub fn prepare_model_assessment(
         ..setup.policy.clone()
     };
     // A method the package cannot run (a declared draft of another variant)
-    // is a property of the bundle, not an assessment failure.
-    let model = match policy.resolve(&definition) {
-        Ok(model) => model,
-        Err(reason) => return Ok(PreparedModelAssessment::Incompatible { facts, reason }),
-    };
+    // is an invalid configuration of the bundle, as it is for a load.
+    let model = policy
+        .resolve(&definition)
+        .map_err(ModelAssessmentError::Configuration)?;
     let manifest = ExecutionManifest::new(
         headers.manifest(),
         definition,
@@ -343,18 +329,26 @@ pub fn prepare_model_assessment(
         setup.reserves,
     )
     .map_err(ModelAssessmentError::Configuration)?;
+    // Planner refusals and kernel domains classify exactly as a load's do.
+    let refused = |outcome: PlanOutcome| match outcome {
+        PlanOutcome::Unsupported(unsupported) => {
+            Ok(PreparedModelAssessment::Unsupported(unsupported))
+        }
+        PlanOutcome::Internal(reason) => Err(ModelAssessmentError::Planning(reason)),
+    };
     let draft = match plan_execution(&manifest, &setup.selected) {
         Ok(draft) => draft,
-        Err(ExecutionPlanningError::Plan(error)) if is_unsupported(&error) => {
-            return Ok(PreparedModelAssessment::Incompatible {
-                facts,
-                reason: error.to_string(),
-            });
+        Err(ExecutionPlanningError::Plan(error)) => {
+            return refused(classify_plan(error, setup.selected.info.backend));
         }
-        Err(error) => return Err(ModelAssessmentError::Planning(error)),
+        Err(error) => return Err(ModelAssessmentError::Planning(error.to_string())),
     };
-    let execution = prepare_execution_assessment(&manifest.definition, &draft, context_limit)
-        .map_err(ModelAssessmentError::Assessment)?;
+    let execution = match prepare_execution_assessment(&manifest.definition, &draft, context_limit)
+    {
+        Ok(execution) => execution,
+        Err(AssessmentError::Graph(error)) => return refused(classify_graph(error)),
+        Err(error) => return Err(ModelAssessmentError::Assessment(error)),
+    };
     Ok(PreparedModelAssessment::Planned {
         facts,
         draft,
@@ -389,21 +383,6 @@ fn model_facts(
         template_fingerprint: chat.fingerprint,
         context_limit,
     })
-}
-
-/// Planner rejections of a recognized, validated definition are properties
-/// of the artifact's representation or topology on this execution path; the
-/// remaining variants are arithmetic or resource failures.
-fn is_unsupported(error: &PlanError) -> bool {
-    match error {
-        PlanError::Unsupported(_)
-        | PlanError::UnsupportedOperator { .. }
-        | PlanError::Deferred(_)
-        | PlanError::UnportedScale(_)
-        | PlanError::InvalidDefinition(_)
-        | PlanError::Topology(_) => true,
-        PlanError::Arithmetic(_) | PlanError::ResourcePlanning(_) | PlanError::Resource(_) => false,
-    }
 }
 
 /// The engine's own tokenizer and template construction over header

@@ -1391,6 +1391,37 @@ impl NativeImplementation {
         &self,
         statics: &NativeSpecialization,
     ) -> Result<Vec<NativeSpecialization>, NativeSpecializationError> {
+        let mut admissible = Vec::new();
+        self.walk_admissible(statics, |configuration| {
+            admissible.push(configuration.clone());
+            true
+        })?;
+        Ok(admissible)
+    }
+
+    /// The default configuration at the given static values: the first
+    /// admissible specialization in declaration order, which is the declared
+    /// defaults (`values[0]`) whenever they satisfy `where`. `Inadmissible`
+    /// exactly when the statics lie outside the implementation's domain.
+    pub fn default_specialization(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> Result<NativeSpecialization, NativeSpecializationError> {
+        let mut first = None;
+        self.walk_admissible(statics, |configuration| {
+            first = Some(configuration.clone());
+            false
+        })?;
+        first.ok_or(NativeSpecializationError::Inadmissible)
+    }
+
+    /// Visit the admissible specializations at `statics` in declaration
+    /// order until `visit` returns false.
+    fn walk_admissible(
+        &self,
+        statics: &NativeSpecialization,
+        mut visit: impl FnMut(&NativeSpecialization) -> bool,
+    ) -> Result<(), NativeSpecializationError> {
         let mut base = NativeSpecialization::new();
         for name in &self.statics {
             let value = statics
@@ -1435,10 +1466,13 @@ impl NativeImplementation {
             };
         }
         let mut steps = vec![0usize; domains.len()];
-        let mut admissible = Vec::new();
         loop {
             match self.validate(&configuration) {
-                Ok(()) => admissible.push(configuration.clone()),
+                Ok(()) => {
+                    if !visit(&configuration) {
+                        return Ok(());
+                    }
+                }
                 Err(NativeSpecializationError::Inadmissible) => {}
                 Err(error) => return Err(error),
             }
@@ -1446,7 +1480,7 @@ impl NativeImplementation {
                 .rev()
                 .find(|&position| steps[position] + 1 < domains[position].1.values.len())
             else {
-                return Ok(admissible);
+                return Ok(());
             };
             let next = steps[position] + 1;
             let mut set = |position: usize, step: usize| {
@@ -1472,29 +1506,6 @@ impl NativeImplementation {
             }
             set(position, next);
         }
-    }
-
-    /// The configuration of declared defaults (`values[0]`) at the given
-    /// static values.
-    pub fn default_specialization(
-        &self,
-        statics: &NativeSpecialization,
-    ) -> Result<NativeSpecialization, NativeSpecializationError> {
-        let mut specialization = statics.clone();
-        for parameter in &self.params {
-            specialization = specialization.with_param(parameter.name.clone(), parameter.values[0]);
-        }
-        for (launch, declaration) in self.launches.iter().enumerate() {
-            for parameter in &declaration.params {
-                specialization = specialization.with_launch_param(
-                    launch,
-                    parameter.name.clone(),
-                    parameter.values[0],
-                );
-            }
-        }
-        self.validate(&specialization)?;
-        Ok(specialization)
     }
 }
 
@@ -1836,6 +1847,7 @@ mod native_tests {
             native.default_specialization(&small),
             Err(NativeSpecializationError::Inadmissible)
         ));
+        assert!(native.admissible(&small).unwrap().is_empty());
         assert!(matches!(
             native.validate(&default.clone().with_param("WIDTH", 96)),
             Err(NativeSpecializationError::OutsideDomain { .. })
@@ -1843,6 +1855,38 @@ mod native_tests {
         assert!(matches!(
             native.admissible(&NativeSpecialization::new()),
             Err(NativeSpecializationError::MissingStatic(_))
+        ));
+    }
+
+    /// The declared defaults are only the first candidate: at statics where
+    /// they violate `where` but another configuration satisfies it, the
+    /// default is the first admissible configuration in declaration order.
+    #[test]
+    fn default_is_the_first_admissible_configuration() {
+        let module = check_source(source(
+            "native scale for metal from \"scale.metal\":\n    static (N)\n    params (ROWS in [2, 1, 4], LANES in [16, 32])\n    where ceil_div(N, 32 * LANES) * ROWS <= 8\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ))
+        .expect("declaration checks");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let at = |n| NativeSpecialization::new().with_static("N", n);
+        let narrow = native.default_specialization(&at(512)).unwrap();
+        assert_eq!(
+            (narrow.param("ROWS"), narrow.param("LANES")),
+            (Some(2), Some(16))
+        );
+        // At N = 4096, ROWS = 2 with LANES = 16 needs 16 packets; ROWS = 2
+        // with LANES = 32 needs 8.
+        let wide = native.default_specialization(&at(4096)).unwrap();
+        assert_eq!(
+            (wide.param("ROWS"), wide.param("LANES")),
+            (Some(2), Some(32))
+        );
+        assert_eq!(Some(&wide), native.admissible(&at(4096)).unwrap().first());
+        assert!(matches!(
+            native.default_specialization(&at(65_536)),
+            Err(NativeSpecializationError::Inadmissible)
         ));
     }
 

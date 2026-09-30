@@ -18,9 +18,10 @@ mod planning;
 pub mod programs;
 pub use programs::{
     CommitSpan, CompletedHeadWork, CompletedImportWork, CompletedStateWork, CompletedTargetWork,
-    CompletedVisionWork, HeadProgram, ImportProgram, PreparedDraftGraphs, PreparedDrafterGraphs,
-    PreparedHeadGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs, PreparedTargetReadoutGraphs,
-    PreparedVisionGraphs, SealReport, StateProgram, TargetOutput, TargetProgram, VisionProgram,
+    CompletedVisionWork, GraphError, HeadProgram, ImportProgram, PreparedDraftGraphs,
+    PreparedDrafterGraphs, PreparedHeadGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs,
+    PreparedTargetReadoutGraphs, PreparedVisionGraphs, SealReport, StateProgram, TargetOutput,
+    TargetProgram, VisionProgram,
 };
 pub mod platform;
 mod residency;

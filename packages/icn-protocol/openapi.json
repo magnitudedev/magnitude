@@ -3281,6 +3281,47 @@
           }
         }
       },
+      "DecodeSpeed": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "samples",
+              "_tag"
+            ],
+            "properties": {
+              "samples": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PerformanceEvidence"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Estimated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The device's measurement basis lacks a cost the model's decode needs:\nan engine defect that costs only the estimate.",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unavailable"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A fitting model's decode speed."
+      },
       "DefaultGenerationSettings": {
         "type": "object",
         "required": [
@@ -4927,7 +4968,7 @@
               "profile",
               "assessmentId",
               "memory",
-              "performance",
+              "speed",
               "_tag"
             ],
             "properties": {
@@ -4943,11 +4984,8 @@
                   "$ref": "#/components/schemas/MemoryAssessment"
                 }
               },
-              "performance": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/PerformanceEvidence"
-                }
+              "speed": {
+                "$ref": "#/components/schemas/DecodeSpeed"
               },
               "_tag": {
                 "type": "string",
@@ -4998,6 +5036,7 @@
           },
           {
             "type": "object",
+            "description": "The engine cannot execute a discovered model. A catalog model is\nnever unsupported: the pool drops a catalog target the engine cannot\nexecute as a release defect.",
             "required": [
               "profile",
               "failure",
@@ -5013,7 +5052,7 @@
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "Incompatible"
+                  "Unsupported"
                 ]
               }
             }

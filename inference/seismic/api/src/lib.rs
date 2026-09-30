@@ -1246,6 +1246,8 @@ impl NativeGraphClassSlice {
 pub enum NativeGraphMetadataError {
     Bundle(CheckedBundleError),
     Unsupported(String),
+    /// A call at statics outside its implementation's domain.
+    Inadmissible(KernelDomainViolation),
     Tensor(TensorError),
     Call(CallError),
     Workflow(WorkflowError),
@@ -1256,10 +1258,38 @@ impl fmt::Display for NativeGraphMetadataError {
         match self {
             Self::Bundle(error) => write!(f, "{error}"),
             Self::Unsupported(reason) => write!(f, "{reason}"),
+            Self::Inadmissible(violation) => write!(f, "{violation}"),
             Self::Tensor(error) => write!(f, "{error}"),
             Self::Call(error) => write!(f, "{error}"),
             Self::Workflow(error) => write!(f, "{error}"),
         }
+    }
+}
+
+/// An entry call whose statics lie outside its implementation's domain on
+/// a backend: no configuration satisfies the implementation's `where`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelDomainViolation {
+    pub entry: &'static str,
+    pub backend: BackendName,
+    /// The call's static dimensions, by name.
+    pub statics: Vec<(String, u64)>,
+}
+
+impl fmt::Display for KernelDomainViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let statics = self
+            .statics
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            f,
+            "`{}` has no admissible {} configuration at {statics}",
+            self.entry,
+            self.backend.as_str()
+        )
     }
 }
 
@@ -1449,6 +1479,19 @@ impl NativeGraphResourceTemplate {
             (Vec<u64>, Vec<u64>),
         >::new();
         for source in &self.recorder.nodes {
+            // Every class calls the node's entry at the statics it was
+            // enqueued and domain-checked at: classes vary only dynamic
+            // dimensions.
+            if let Some(name) = source.checked.implementation().statics.iter().find(|name| {
+                first
+                    .values(source.entry_name, source.class_scope, name)
+                    .is_some()
+            }) {
+                return Err(unsupported(format!(
+                    "graph regime classes vary `{}`'s static dimension `{name}`",
+                    source.entry_name
+                )));
+            }
             let key = (
                 source.checked.identity(),
                 source.class_scope,
@@ -1732,6 +1775,44 @@ impl NativeGraphMetadata {
             .shapes(dimensions)
             .map_err(NativeGraphMetadataError::Unsupported)?;
         let implementation = checked.implementation();
+        // A graph can only call an entry at statics its implementation
+        // admits, so every checked call can be prepared.
+        let mut statics = NativeSpecialization::new();
+        for name in &implementation.statics {
+            let value = dimensions
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, value)| *value)
+                .ok_or_else(|| {
+                    NativeGraphMetadataError::Unsupported(format!(
+                        "`{}` declares `{name}` static, but the call supplies no value",
+                        E::NAME
+                    ))
+                })?;
+            statics = statics.with_static(name.clone(), value);
+        }
+        match implementation.default_specialization(&statics) {
+            Ok(_) => {}
+            Err(NativeSpecializationError::Inadmissible) => {
+                return Err(NativeGraphMetadataError::Inadmissible(
+                    KernelDomainViolation {
+                        entry: E::NAME,
+                        backend: self.backend,
+                        statics: statics
+                            .statics()
+                            .iter()
+                            .map(|(name, value)| (name.clone(), *value))
+                            .collect(),
+                    },
+                ));
+            }
+            Err(error) => {
+                return Err(NativeGraphMetadataError::Unsupported(format!(
+                    "`{}`: {error}",
+                    E::NAME
+                )))
+            }
+        }
         let scratch = checked_native_scratch_bound(
             &implementation.scratch,
             &implementation.params,

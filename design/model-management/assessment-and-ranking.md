@@ -52,14 +52,16 @@ worker, template worker, inventory capability state, or post-download assessment
 immutable tokenizer and template content may share derived preparation within the process without
 becoming a separate capability authority.
 
-`Fits`, `DoesNotFit`, and `Incompatible` are genuine terminal evidence. Transport or operation
-failure drops the target rather than fabricating compatibility evidence. Hardware observations
-that were not performed are represented as `NotObserved`; zero-valued headroom is never fabricated.
+`Fits`, `DoesNotFit`, and `Unsupported` (discovered models only) are genuine terminal evidence.
+Transport or operation failure drops the target rather than fabricating assessment evidence.
+Hardware observations that were not performed are represented as `NotObserved`; zero-valued
+headroom is never fabricated.
 
 Ranking exists only for reviewed catalog models with `Fits` evidence and the required bounded
 performance sample. Intelligence and fidelity come from authored catalog evidence; speed comes
-from engine assessment. Missing evidence yields absent ranking scores, never zeros. Discovered
-models receive no invented intelligence or fidelity score.
+from engine assessment. Missing evidence yields absent ranking scores, never zeros: a fitting
+model whose speed is `Unavailable` is unranked, orders after every ranked model, and is otherwise
+usable. Discovered models receive no invented intelligence or fidelity score.
 
 Provider selection requires `Fits`, current selectability, profile, and capabilities from the same
 assessed state. Package validation establishes only structural artifact validity and presence;

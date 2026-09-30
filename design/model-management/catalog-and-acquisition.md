@@ -121,9 +121,10 @@ Every model declaration states one reviewed support level, shared by all its var
   removal. A lock update never advances a deprecated model's revisions.
 
 Support level and assessment are independent facts. Support is what the release promises for a
-model; assessment is what this device can do with it. A supported model can be `DoesNotFit`, and a
-model whose family the engine does not implement assesses `Incompatible` whatever its level. Such
-a catalog declaration is disabled until support is implemented and qualified.
+model; assessment is what this device can do with it. A supported model can be `DoesNotFit`. A
+catalog model is never `Unsupported`: a catalog model the engine cannot execute is a release
+defect, whose assessment is dropped with an error. A declaration whose family the engine does not
+implement is disabled until support is implemented and qualified.
 
 ## Package resolution
 

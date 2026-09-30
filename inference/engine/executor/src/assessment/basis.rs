@@ -8,17 +8,16 @@
 //! model: output rows for a weight-streaming launch, head geometry for decode
 //! attention, bytes for everything else.
 //!
-//! The basis is also the compatibility set. Every entry binding a weight
-//! representation is formed on the device at every representation the load
-//! planner produces; one that cannot be formed is recorded unsupported, and a
-//! model that needs it is incompatible with this device.
+//! The basis only prices. It decides no model's executability: a class it
+//! could not measure leaves that class's cost absent, and a model that needs
+//! the cost gets no speed estimate.
 
 use crate::StreamingCost;
 use seismic::Element;
 
 /// Changes whenever the measured classes, key rules, sizes or timing rules
 /// change, so a cached basis from an older protocol is never reused.
-pub const MEASUREMENT_PROTOCOL_VERSION: u32 = 12;
+pub const MEASUREMENT_PROTOCOL_VERSION: u32 = 13;
 
 /// One native entry a plain target decode step launches. A plain step is one
 /// row through the embedding entry graph, every decoder block graph (decode
@@ -254,8 +253,7 @@ impl OperationClass {
 
     /// Whether the class binds a stored representation (a weight, table or
     /// router) or converts into one. Its cost is timed at one reference
-    /// representation and keyed without it ([`MeasurementKey::cost`]); its
-    /// exact bindings are formed for compatibility.
+    /// representation and keyed without it ([`MeasurementKey::cost`]).
     pub const fn binds_representation(self) -> bool {
         matches!(self.cost_shape(), CostShape::Projection)
             || matches!(
@@ -946,11 +944,9 @@ pub enum ClassMeasurement {
         points: Vec<MeasuredPoint>,
         cost: ClassCost,
     },
-    /// Formed on the device and not timed: an exact binding of a class
-    /// whose cost is measured under its cost key.
-    Formed,
-    /// The backend cannot form this binding. This is compatibility
-    /// evidence, not a measurement failure.
+    /// The backend could not form this entry at the plan's sizes, so the
+    /// basis has no cost for it: a defect of the basis, which costs the
+    /// speed estimate of any model that needs it.
     Unsupported { reason: String },
 }
 

@@ -34,7 +34,7 @@ use super::{
     FeedForward, Mixer, PairedBlock,
 };
 use crate::native::{AttestedFeedForward, AttestedMixer, OutputScales};
-use crate::programs::graph::draft::GraphDraft;
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{activation, weight, WeightPort};
 use crate::{
@@ -234,7 +234,7 @@ impl BlockSublayers<'_> {
         hidden: &WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<(WorkflowTensor, BlockStatePorts, BlockControlPorts), String> {
+    ) -> Result<(WorkflowTensor, BlockStatePorts, BlockControlPorts), GraphError> {
         let Self {
             paired,
             load,
@@ -394,7 +394,7 @@ impl BlockSublayers<'_> {
         mixed: WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<WorkflowTensor, String> {
+    ) -> Result<WorkflowTensor, GraphError> {
         let Self {
             paired,
             load,
@@ -485,7 +485,7 @@ impl BlockSublayers<'_> {
         residual: WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<(WorkflowTensor, Option<NativePort>), String> {
+    ) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
         let Self {
             paired,
             load,

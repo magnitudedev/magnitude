@@ -1411,6 +1411,18 @@ pub struct PerformanceEvidence {
     pub confidence: PerformanceConfidence,
 }
 
+/// A fitting model's decode speed.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum DecodeSpeed {
+    #[serde(rename_all = "camelCase")]
+    Estimated { samples: Vec<PerformanceEvidence> },
+    /// The device's measurement basis lacks a cost the model's decode needs:
+    /// an engine defect that costs only the estimate.
+    Unavailable,
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
@@ -1420,7 +1432,7 @@ pub enum ModelAssessment {
         profile: ServingProfile,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
-        performance: Vec<PerformanceEvidence>,
+        speed: DecodeSpeed,
     },
     #[serde(rename_all = "camelCase")]
     DoesNotFit {
@@ -1430,8 +1442,11 @@ pub enum ModelAssessment {
         limiting_resource: String,
         deficit_bytes: u64,
     },
+    /// The engine cannot execute a discovered model. A catalog model is
+    /// never unsupported: the pool drops a catalog target the engine cannot
+    /// execute as a release defect.
     #[serde(rename_all = "camelCase")]
-    Incompatible {
+    Unsupported {
         profile: ServingProfile,
         failure: ModelFailure,
     },
