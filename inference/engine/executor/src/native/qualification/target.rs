@@ -1131,6 +1131,7 @@ fn qualify_state_space(
             key_weight: &empty,
             value_weight: &empty,
             epsilon: 1.0e-5,
+            project_mode: 0,
         })
         .map_err(|error| qualification_dynamic("attention_project", &label, error))?
         .r0;
