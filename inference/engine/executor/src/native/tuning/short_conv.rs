@@ -50,10 +50,6 @@ impl EntryTuning for ShortConvProjectTuning {
         self.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
-
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
@@ -156,10 +152,6 @@ impl EntryTuning for ShortConvOutputTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
-    }
-
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
     }
 
     fn bindings(&self) -> String {

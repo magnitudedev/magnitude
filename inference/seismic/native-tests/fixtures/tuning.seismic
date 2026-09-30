@@ -85,3 +85,16 @@ native omitted_write for metal from "metal/omitted_write.metal":
     launch omitted_write:
         threadgroups (ceil_div(N, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
+
+# The second choice writes a wrong last row. A tuning point that declares
+# only the leading rows written does not observe it; a point observed whole
+# rejects it.
+fn stray_write[N](state: &mut tensor[N] f32, x: &tensor[N] f32):
+    parallel for i in 0..N:
+        state[i] = x[i]
+
+native stray_write for metal from "metal/stray_write.metal":
+    params (STRAY in [0, 1])
+    launch stray_write:
+        threadgroups (ceil_div(N, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)

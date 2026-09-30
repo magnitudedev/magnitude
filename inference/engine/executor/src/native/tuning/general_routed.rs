@@ -65,10 +65,6 @@ impl EntryTuning for RoutedSelectTuning {
         self.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
-
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
@@ -153,8 +149,8 @@ impl EntryTuning for RoutedSelectTuning {
         }
     }
 
-    fn state(case: &Self::Case) -> Vec<&CaseState> {
-        vec![&case.routes, &case.weights]
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![("routes", &case.routes), ("weights", &case.weights)]
     }
 
     generated_entry!(routed_select, this => routed_select::Elements {
@@ -239,10 +235,6 @@ impl EntryTuning for RoutedGateUpTuning {
         self.0.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.0.scopes
-    }
-
     fn bindings(&self) -> String {
         let b = self.0.binding;
         format!(
@@ -295,10 +287,6 @@ impl EntryTuning for RoutedUpTuning {
 
     fn launches(&self) -> usize {
         self.0.scopes.len()
-    }
-
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.0.scopes
     }
 
     fn bindings(&self) -> String {
@@ -359,10 +347,6 @@ impl EntryTuning for RoutedDownTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
-    }
-
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
     }
 
     fn bindings(&self) -> String {
@@ -514,10 +498,6 @@ impl EntryTuning for RoutedGatedTilesTuning {
         self.0.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.0.scopes
-    }
-
     fn bindings(&self) -> String {
         let b = self.0.binding;
         format!(
@@ -574,10 +554,6 @@ impl EntryTuning for RoutedUpTilesTuning {
 
     fn launches(&self) -> usize {
         self.0.scopes.len()
-    }
-
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.0.scopes
     }
 
     fn bindings(&self) -> String {

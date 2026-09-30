@@ -27,13 +27,17 @@ use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
-    ops::Deref,
+    ops::{Deref, Range},
     rc::Rc,
     sync::Arc,
     time::Instant,
 };
 
 pub(super) type Initializer<'a> = Rc<RefCell<TuningInitializer<'a>>>;
+
+/// A `&mut` parameter's ordinal and the leading rows observed of it (`None`:
+/// the whole tensor).
+type Observed = (usize, Option<Range<u64>>);
 
 #[derive(Clone, Debug)]
 enum Observation {
@@ -117,6 +121,7 @@ impl<'a> PreparedPoint<'a> {
                 class: self.class.clone(),
                 rotation: self.rotation.clone(),
                 initialize: None,
+                written: self.written.clone(),
             },
             case: self.case.clone(),
         }
@@ -185,7 +190,7 @@ struct ReferenceCase<'a> {
     initialize: Option<Initializer<'a>>,
     policy: Arc<PrecisionPolicy>,
     subjects: Vec<String>,
-    mutable: Vec<usize>,
+    mutable: Vec<Observed>,
     reference: Vec<Vec<Observation>>,
     identity: String,
     verdicts: RefCell<BTreeMap<String, Result<NumericalEvidence, Exclusion>>>,
@@ -203,7 +208,7 @@ pub(super) fn prepare<'a>(
     entry: EntryId,
     bindings: &ElementBindings,
     logical: &LogicalEntry,
-    mutable: &[usize],
+    mutable: &[(usize, String)],
     points: Vec<TuningPoint<'a>>,
     policy: &PrecisionPolicy,
     reuse: Option<TuningReuse<'_>>,
@@ -221,7 +226,7 @@ pub(super) fn prepare<'a>(
         .results()
         .iter()
         .map(|result| result_subject(&result.path))
-        .chain(mutable.iter().map(|&i| input_subject(i)))
+        .chain(mutable.iter().map(|(i, _)| input_subject(*i)))
         .collect();
     if let PrecisionPolicy::Bounded {
         outputs, inputs, ..
@@ -270,9 +275,26 @@ pub(super) fn prepare<'a>(
     let policy = Arc::new(policy.clone());
     let mut identified = Vec::new();
     for mut point in points {
+        if let Some(name) = point
+            .written
+            .keys()
+            .find(|name| !mutable.iter().any(|(_, parameter)| parameter == *name))
+        {
+            return Err(TuneError::Declaration(format!(
+                "point `{}` declares written rows of `{name}`, which is not a `&mut` parameter",
+                point.label
+            )));
+        }
+        let observed: Vec<Observed> = mutable
+            .iter()
+            .map(|(ordinal, name)| (*ordinal, point.written.get(name).cloned()))
+            .collect();
         let initialize = point.initialize.take().map(|f| Rc::new(RefCell::new(f)));
+        // The case's identity covers its argument structure, not tensor
+        // contents: tuning inputs are generated test data, and the caller's
+        // tuning key names what they are generated from.
         let mut digest = Sha256::new();
-        digest.update(b"native-validation-v4");
+        digest.update(b"native-validation-v5");
         digest.update(format!("{reference_kind:?}"));
         if let Some(reference) = &native_reference {
             digest.update(&reference.artifact.0);
@@ -284,16 +306,11 @@ pub(super) fn prepare<'a>(
         digest.update(reference_device.tuning_identity());
         digest.update(PolicyIdentity::of(&policy).0);
         digest.update(point.label.as_bytes());
+        digest.update(format!("{observed:?}").as_bytes());
         digest.update((point.rotation.len() as u64).to_le_bytes());
         for args in &point.rotation {
-            if let Some(reset) = &initialize {
-                reset.borrow_mut()().map_err(|e| TuneError::Reference(e.to_string()))?;
-            }
             for (value, tensor) in args.values().iter().zip(args.tensors()) {
                 if let Some(tensor) = tensor {
-                    let bytes = tensor
-                        .read_to_host()
-                        .map_err(|e| TuneError::Reference(e.to_string()))?;
                     let descriptor = tensor.descriptor();
                     digest.update(
                         format!(
@@ -306,14 +323,17 @@ pub(super) fn prepare<'a>(
                         )
                         .as_bytes(),
                     );
-                    digest.update((bytes.len() as u64).to_le_bytes());
-                    digest.update(&bytes);
                 } else {
                     digest.update(format!("{value:?}").as_bytes());
                 }
             }
         }
-        identified.push((point, initialize, crate::telemetry::hex(&digest.finalize())));
+        identified.push((
+            point,
+            observed,
+            initialize,
+            crate::telemetry::hex(&digest.finalize()),
+        ));
     }
     let previous = reuse.map(|reuse| reuse.result().clone());
     let previous_artifact = previous.as_ref().and_then(|result| {
@@ -343,7 +363,7 @@ pub(super) fn prepare<'a>(
             .cloned()
     };
     if matches!(reuse, Some(TuningReuse::Completed(_)))
-        && identified.iter().all(|(point, _, identity)| {
+        && identified.iter().all(|(point, _, _, identity)| {
             evidence(identity).is_some()
                 && previous.as_ref().unwrap().points.iter().any(|stored| {
                     stored.label == point.label
@@ -383,7 +403,7 @@ pub(super) fn prepare<'a>(
     };
     let mut pages = ReferencePages::default();
     let mut prepared = Vec::new();
-    for (point, initialize, identity) in identified {
+    for (point, observed, initialize, identity) in identified {
         let mut expected = Vec::new();
         for args in &point.rotation {
             if let Some(reset) = &initialize {
@@ -395,7 +415,7 @@ pub(super) fn prepare<'a>(
                 args.clone()
             } else {
                 args.map_tensors(|ordinal, tensor| {
-                    if mutable.contains(&ordinal)
+                    if mutable.iter().any(|(i, _)| *i == ordinal)
                         || tensor.is_slabbed()
                         || !Arc::ptr_eq(device, &reference_device)
                     {
@@ -425,9 +445,10 @@ pub(super) fn prepare<'a>(
             }
             .map_err(|e| TuneError::Reference(e.to_string()))?;
             let values = results.into_values();
-            let observed = observe(values, &reference_args, mutable, Some(&mut pages))
-                .map_err(|e| TuneError::Reference(format!("{e:?}")))?;
-            expected.push(observed);
+            expected.push(
+                observe(values, &reference_args, &observed, Some(&mut pages))
+                    .map_err(|e| TuneError::Reference(format!("{e:?}")))?,
+            );
         }
         let mut verdicts = BTreeMap::new();
         if let Some(evidence) = evidence(&identity) {
@@ -438,7 +459,7 @@ pub(super) fn prepare<'a>(
             initialize,
             policy: policy.clone(),
             subjects: subjects.clone(),
-            mutable: mutable.to_vec(),
+            mutable: observed,
             reference: expected,
             identity,
             verdicts: RefCell::new(verdicts),
@@ -452,14 +473,25 @@ pub(super) fn prepare<'a>(
 fn observe(
     values: Vec<DecodedValue>,
     args: &EncodedArgs,
-    mutable: &[usize],
+    mutable: &[Observed],
     mut pages: Option<&mut ReferencePages>,
 ) -> Result<Vec<Observation>, Exclusion> {
+    let states = mutable
+        .iter()
+        .map(|(i, rows)| {
+            let tensor = args.tensor(*i).expect("checked writable tensor");
+            match rows {
+                Some(rows) => tensor
+                    .slice_leading(rows.start, rows.end)
+                    .map(|slice| DecodedValue::Tensor(Arc::new(slice)))
+                    .map_err(|e| Exclusion::Execution(e.to_string())),
+                None => Ok(DecodedValue::Tensor(tensor.clone())),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     values
         .into_iter()
-        .chain(mutable.iter().map(|&i| {
-            DecodedValue::Tensor(args.tensor(i).expect("checked writable tensor").clone())
-        }))
+        .chain(states)
         .map(|value| match value {
             DecodedValue::Tensor(tensor) => Ok(Observation::Tensor {
                 representation: tensor.representation(),

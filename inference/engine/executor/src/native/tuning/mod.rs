@@ -23,7 +23,7 @@
 //!   ([`TuningInputs::batch`]);
 //! - scratch state, KV history and routing tables owned by each case. An
 //!   entry's `&mut` parameters bind [`CaseState`]s, whose complete contents are
-//!   restored before each invocation (Seismic's
+//!   restored before each reference and validated invocation (Seismic's
 //!   `TuningPoint::initialize`); real state is never bound.
 //!
 //! Each entry uses the compiler precision policy with explicit floating result/state limits.
@@ -169,9 +169,10 @@ use std::time::{Duration, Instant};
 /// The row counts whose shares of step time weigh the objective (§5.3).
 pub const TUNING_ROWS: [u64; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
 /// History lengths of attention tuning points (§5.3).
-// Empty and short histories expose fresh-only and partially occupied subgroup
-// paths that disappear in long-history averages (the Gemma G8 regression).
-pub const TUNING_CONTEXTS: [u64; 7] = [0, 1, 32, 256, 4096, 16384, 65536];
+// An empty history exercises the fresh-only path, where the Gemma G8
+// defect reproduces. Longer histories plus their appended rows already
+// cover partially occupied groups.
+pub const TUNING_CONTEXTS: [u64; 5] = [0, 256, 4096, 16384, 65536];
 /// Distinct layers a decode-row rotation cycles through where the model has
 /// them. Decode rows stream every weight once per call, so repeated calls
 /// must not find the weights cache resident. A prefill chunk reuses each
@@ -201,7 +202,10 @@ pub const STREAMING_ROWS: u64 = 8;
 /// 13: bounded first-execution validation, complete state resets, short-history
 ///     coverage and 2 ms steady timing windows.
 /// 14: budget and cache units distinguish model weight groups.
-pub const SEARCH_VERSION: u32 = 14;
+/// 15: batched timing without per-invocation resets, 200 us sample windows,
+///     histories 0 and 256 upward, units by entry, bindings and statics,
+///     validation of written state rows with one whole-state guard point.
+pub const SEARCH_VERSION: u32 = 15;
 /// Version of the CPU projection screening policy in keys that use it.
 const CPU_PROJECTION_SCREENING_VERSION: u32 = 3;
 /// Configurations one model's tuning may evaluate in all (`B_model`,
@@ -244,10 +248,7 @@ pub(crate) fn search_settings(backend: seismic::BackendName, screening: bool) ->
 }
 /// Minimum device time of one sample; device timestamps resolve
 /// microseconds.
-// A two-millisecond device window amortizes clock/submission variance after
-// pristine-state resets. The previous 200 us window rejected all finalists on
-// real Gemma loads (11–41% median deviation), despite numerical agreement.
-pub const MIN_SAMPLE_SECONDS: f64 = 0.002;
+pub const MIN_SAMPLE_SECONDS: f64 = 0.0002;
 /// The safety stop of one preparation's tuning: past it every search ends
 /// with the best found so far, and its result is not stored. It exists for
 /// pathological machines; budgets, not time, bound tuning otherwise.
@@ -414,12 +415,20 @@ pub fn attention_points(limits: TuningLimits) -> Vec<PointShape> {
     with_contexts(limits, row_points(limits))
 }
 
-/// In-place state a case lends to an entry's `&mut` parameter. Its complete
-/// backing storage is restored before every reference or candidate invocation.
+/// In-place state a case lends to an entry's `&mut` parameter: the tensor,
+/// the leading-axis rows the entry writes, and their initial contents. At
+/// most points only those rows are restored before every reference and
+/// validated invocation and observed by validation; the rest is input the
+/// entry only reads. One point per unit ([`guard_point`]) restores and
+/// observes the complete storage, so a write outside the declared rows is
+/// rejected without paying for whole long histories everywhere.
 pub(crate) struct CaseState {
     tensor: Tensor,
-    backing: Tensor,
+    written: Range<u64>,
+    region: Tensor,
     initial: Arc<[u8]>,
+    /// The complete physical storage behind `tensor`.
+    backing: Tensor,
     _slab: Option<Arc<seismic::SlabTensor>>,
 }
 
@@ -432,31 +441,70 @@ impl CaseState {
     pub fn share(&self) -> Self {
         Self {
             tensor: self.tensor.clone(),
-            backing: self.backing.clone(),
+            written: self.written.clone(),
+            region: self.region.clone(),
             initial: self.initial.clone(),
+            backing: self.backing.clone(),
             _slab: self._slab.clone(),
         }
     }
 
-    fn restorer(&self) -> impl FnMut() -> Result<(), TensorError> + 'static {
-        let mut backing = self.backing.clone();
+    /// Restores the written rows.
+    fn restorer(&self) -> Restorer {
+        let mut region = self.region.clone();
         let initial = self.initial.clone();
-        move || backing.write_from_host(&initial)
+        Box::new(move || region.write_from_host(&initial))
+    }
+
+    /// Restores the complete storage to its contents now, before any
+    /// invocation of the unit.
+    fn complete_restorer(&self) -> Result<Restorer, String> {
+        let mut backing = self.backing.clone();
+        let initial: Arc<[u8]> = backing
+            .read_to_host()
+            .map_err(|error| error.to_string())?
+            .into();
+        Ok(Box::new(move || backing.write_from_host(&initial)))
     }
 }
 
-/// Restores every writable state in every argument rotation of a point.
-fn initializer(states: Vec<&CaseState>) -> Option<TuningInitializer<'static>> {
+type Restorer = Box<dyn FnMut() -> Result<(), TensorError>>;
+
+/// Restores every writable state in every argument rotation of a point:
+/// completely at the guard point, their written rows elsewhere.
+fn initializer(
+    states: Vec<&CaseState>,
+    complete: bool,
+) -> Result<Option<TuningInitializer<'static>>, String> {
     if states.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut restorers = states
         .into_iter()
-        .map(CaseState::restorer)
-        .collect::<Vec<_>>();
-    Some(Box::new(move || {
+        .map(|state| {
+            if complete {
+                state.complete_restorer()
+            } else {
+                Ok(state.restorer())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(Box::new(move || {
         restorers.iter_mut().try_for_each(|restore| restore())
-    }))
+    })))
+}
+
+/// The point whose states are observed whole: the one with the least state
+/// storage, so the guard costs a short history, not a long one. `None` for a
+/// unit without states.
+fn guard_point<C>(rotations: &[Vec<C>], state: impl Fn(&C) -> u64) -> Option<usize> {
+    rotations
+        .iter()
+        .enumerate()
+        .filter_map(|(point, cases)| cases.first().map(|case| (point, state(case))))
+        .filter(|(_, bytes)| *bytes > 0)
+        .min_by_key(|(_, bytes)| *bytes)
+        .map(|(point, _)| point)
 }
 
 /// Entry-specific tuning knowledge. One implementation exists per native
@@ -464,11 +512,6 @@ fn initializer(states: Vec<&CaseState>) -> Option<TuningInitializer<'static>> {
 pub(crate) trait EntryTuning {
     type Entry: seismic::Entry;
     fn precision(&self) -> Result<PrecisionPolicy, TuneError>;
-    /// Model weight groups defining this case, distinct from its kernel geometry.
-    /// This separates cache slots; runtime still fingerprints the actual input bytes.
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &[]
-    }
     /// One argument set: every tensor its arguments borrow, owned, including
     /// the [`CaseState`]s its `&mut` parameters bind.
     type Case;
@@ -504,10 +547,10 @@ pub(crate) trait EntryTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, String>;
     fn args<'a>(case: &'a mut Self::Case) -> <Self::Entry as seismic::Entry>::Args<'a>;
-    /// The states `case` lends through `&mut` parameters; none for an entry
-    /// without them. Seismic rejects a point that binds a `&mut` parameter
-    /// whose state is not listed here.
-    fn state(_case: &Self::Case) -> Vec<&CaseState> {
+    /// The states `case` lends through `&mut` parameters, by parameter name;
+    /// none for an entry without them. Seismic rejects a point that binds a
+    /// `&mut` parameter whose state is not listed here.
+    fn state(_case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
         Vec::new()
     }
     /// The entry's generated `native_tune[_with]`.
@@ -823,18 +866,18 @@ impl TuningInputs<'_, '_> {
     }
 
     /// `tensor` lent to a `&mut` parameter that writes leading-axis rows
-    /// `written`; every invocation starts from the complete tensor's current
-    /// contents, so out-of-region writes cannot pollute later observations.
+    /// `written`; their current contents are what every validated invocation
+    /// starts from.
     pub fn state(&self, tensor: Tensor, written: Range<u64>) -> Result<CaseState, String> {
-        // Check the declared write region, but restore the complete observable state.
-        tensor
+        let region = tensor
             .slice_leading(written.start, written.end)
             .map_err(|error| error.to_string())?;
-        let region = tensor.clone();
         let initial = region.read_to_host().map_err(|error| error.to_string())?;
         Ok(CaseState {
+            backing: tensor.clone(),
             tensor,
-            backing: region,
+            written,
+            region,
             initial: initial.into(),
             _slab: None,
         })
@@ -874,17 +917,21 @@ impl TuningInputs<'_, '_> {
             .map_err(|error| error.to_string())?
             .write_from_host(&bytes)
             .map_err(|error| error.to_string())?;
-        let initial = slab
-            .region_rows(0, 0, view)
+        let region = slab
+            .region_rows(0, written.start, written.end - written.start)
             .map_err(|error| error.to_string())?;
         let tensor = slab.logical_region(0).map_err(|error| error.to_string())?;
         Ok(CaseState {
             tensor,
-            backing: initial.clone(),
-            initial: initial
+            written,
+            initial: region
                 .read_to_host()
                 .map_err(|error| error.to_string())?
                 .into(),
+            region,
+            backing: slab
+                .region_rows(0, 0, view)
+                .map_err(|error| error.to_string())?,
             _slab: Some(Arc::new(slab)),
         })
     }
@@ -989,12 +1036,7 @@ fn f16_bits(value: f32) -> u16 {
 
 /// An entry, its element bindings and its static values: what one tuning
 /// result applies to (a tuning unit).
-type TuningKey = (
-    &'static str,
-    String,
-    BTreeMap<String, u64>,
-    Vec<WeightScope>,
-);
+type TuningKey = (&'static str, String, BTreeMap<String, u64>);
 
 /// Split `total` configurations among tuning units, each given as its
 /// admissible configurations and its share of expected step time
@@ -1223,7 +1265,6 @@ pub(crate) struct Tuner<'a> {
     deadline: Instant,
     tuned: Vec<TunedEntry>,
     chosen: HashMap<TuningKey, NativeSpecialization>,
-    results: HashMap<TuningKey, TuningResult>,
     /// The latest choice for each parameter declaration of an entry, a start
     /// for the next unit with the same declaration.
     winners: HashMap<String, ParameterValues>,
@@ -1301,7 +1342,6 @@ impl<'a> Tuner<'a> {
             deadline: Instant::now() + SAFETY_STOP,
             tuned: Vec::new(),
             chosen: HashMap::new(),
-            results: HashMap::new(),
             winners: HashMap::new(),
             searching,
             measurements,
@@ -1413,12 +1453,7 @@ impl<'a> Tuner<'a> {
     ) -> Result<NativeSpecialization, CatalogFailure> {
         let entry = <T::Entry as seismic::Entry>::NAME;
         let bindings = case.bindings();
-        let key = (
-            entry,
-            bindings.clone(),
-            statics.statics().clone(),
-            case.weight_scopes().to_vec(),
-        );
+        let key = (entry, bindings.clone(), statics.statics().clone());
         let failure = |outcome: String| CatalogFailure::Tuning {
             entry,
             bindings: bindings.clone(),
@@ -1450,6 +1485,9 @@ impl<'a> Tuner<'a> {
                 .get(&key)
                 .ok_or_else(|| failure("the tuning census did not count this unit".into()))?,
         };
+        if let Some(chosen) = self.chosen.get(&key) {
+            return Ok(chosen.clone());
+        }
         #[cfg(feature = "pinned-tuning")]
         if let pinned::Pinned::Chosen(chosen) =
             pinned::lookup(&key, implementation).map_err(failure)?
@@ -1468,6 +1506,10 @@ impl<'a> Tuner<'a> {
         let stored = self
             .stored(case, statics, &shapes, &screening)
             .map_err(failure)?;
+        if let Some((_, _, Some(result))) = &stored {
+            let tuned = tuned_entry(entry, bindings, result, TuningOrigin::Stored, began);
+            return Ok(self.finish(key, declaration, tuned));
+        }
         self.context.observer.event(&TuningEvent::Started {
             entry,
             bindings: bindings.clone(),
@@ -1490,23 +1532,19 @@ impl<'a> Tuner<'a> {
                 screening,
             }),
         };
-        let previous = self
-            .results
-            .get(&key)
-            .cloned()
-            .or_else(|| stored.as_ref().and_then(|(_, _, result)| result.clone()));
         let census = self
             .measurements
             .get(&key)
             .map(|(_, result)| result.clone());
-        let reuse = previous
-            .as_ref()
-            .map(seismic::TuningReuse::Completed)
-            .or_else(|| census.as_ref().map(seismic::TuningReuse::Seed));
         let result = self
-            .run(case, statics, &shapes, strategy, reuse)
+            .run(
+                case,
+                statics,
+                &shapes,
+                strategy,
+                census.as_ref().map(seismic::TuningReuse::Seed),
+            )
             .map_err(failure)?;
-        self.results.insert(key.clone(), result.clone());
         #[cfg(feature = "tuning-survey")]
         if surveyed {
             survey::record(&key, budget, &result).map_err(failure)?;
@@ -1522,17 +1560,12 @@ impl<'a> Tuner<'a> {
             }
         );
         // A search the safety stop ended is not the search its key names.
-        if let Some((cache, key, _)) = &stored {
+        if let Some((cache, key, None)) = &stored {
             if !stopped && !surveyed {
                 cache.store_tuning(key, &result);
             }
         }
-        let origin = if result.reused {
-            TuningOrigin::Stored
-        } else {
-            TuningOrigin::Searched
-        };
-        let mut tuned = tuned_entry(entry, bindings, &result, origin, began);
+        let mut tuned = tuned_entry(entry, bindings, &result, TuningOrigin::Searched, began);
         // The census's measurement of the defaults is part of the unit's
         // tuning.
         if let Some((seconds, census)) = self.measurements.remove(&key) {
@@ -1671,9 +1704,8 @@ impl<'a> Tuner<'a> {
         );
         let policy = case.precision().map_err(|error| error.to_string())?;
         let key = TuningCacheKey::of(&format!(
-            "{material}\npolicy {:?}\nweight scopes {:?}",
-            seismic::precision::PolicyIdentity::of(&policy).0,
-            case.weight_scopes()
+            "{material}\npolicy {:?}",
+            seismic::precision::PolicyIdentity::of(&policy).0
         ));
         let hit = cache
             .tuning(&key)
@@ -1704,20 +1736,53 @@ impl<'a> Tuner<'a> {
             .iter()
             .map(|point| case.rotation(&mut inputs, point))
             .collect::<Result<Vec<_>, _>>()?;
+        let guard = guard_point(&rotations, |case| {
+            T::state(case)
+                .iter()
+                .map(|(_, state)| state.backing.byte_len())
+                .sum()
+        });
         let initializers = rotations
             .iter()
-            .map(|cases| initializer(cases.iter().flat_map(T::state).collect()))
+            .enumerate()
+            .map(|(point, cases)| {
+                initializer(
+                    cases
+                        .iter()
+                        .flat_map(T::state)
+                        .map(|(_, state)| state)
+                        .collect(),
+                    Some(point) == guard,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Every argument set of a point writes the same rows; the guard
+        // point declares none, so its states are observed whole.
+        let written = rotations
+            .iter()
+            .enumerate()
+            .map(|(point, cases)| {
+                cases
+                    .iter()
+                    .take(1)
+                    .filter(|_| Some(point) != guard)
+                    .flat_map(T::state)
+                    .map(|(name, state)| (name.to_owned(), state.written.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
             .collect::<Vec<_>>();
         let points = shapes
             .iter()
             .zip(rotations.iter_mut())
             .zip(initializers)
-            .map(|((shape, cases), initialize)| TuningPoint {
+            .zip(written)
+            .map(|(((shape, cases), initialize), written)| TuningPoint {
                 label: shape.label.clone(),
                 weight: shape.weight,
                 class: shape.class.clone(),
                 rotation: cases.iter_mut().map(T::args).collect(),
                 initialize,
+                written,
             })
             .collect();
         let result = case

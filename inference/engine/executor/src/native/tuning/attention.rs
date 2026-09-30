@@ -83,10 +83,6 @@ impl EntryTuning for AttentionProjectTuning {
         self.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
-
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
@@ -199,10 +195,6 @@ impl EntryTuning for AttentionOutputTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
-    }
-
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
     }
 
     fn bindings(&self) -> String {
@@ -327,7 +319,8 @@ pub(crate) trait MixHistory: Sized {
         appended: Range<u64>,
     ) -> Result<Self, String>;
     fn share(&self) -> Self;
-    fn states(&self) -> Vec<&CaseState>;
+    /// The planes, by the entry parameter each binds.
+    fn states(&self) -> Vec<(&'static str, &CaseState)>;
 }
 
 /// Dense key and value planes `[T, KV, W]` in the activation dtype.
@@ -365,8 +358,8 @@ impl MixHistory for DenseMixHistory {
         }
     }
 
-    fn states(&self) -> Vec<&CaseState> {
-        vec![&self.key, &self.value]
+    fn states(&self) -> Vec<(&'static str, &CaseState)> {
+        vec![("history_key", &self.key), ("history_value", &self.value)]
     }
 }
 
@@ -461,12 +454,12 @@ impl MixHistory for AffineMixHistory {
         }
     }
 
-    fn states(&self) -> Vec<&CaseState> {
+    fn states(&self) -> Vec<(&'static str, &CaseState)> {
         vec![
-            &self.key_codes,
-            &self.key_coefficients,
-            &self.value_codes,
-            &self.value_coefficients,
+            ("history_key_codes", &self.key_codes),
+            ("history_key_coefficients", &self.key_coefficients),
+            ("history_value_codes", &self.value_codes),
+            ("history_value_coefficients", &self.value_coefficients),
         ]
     }
 }
@@ -628,13 +621,6 @@ macro_rules! mix_entry {
                 self.0.scopes.len()
             }
 
-
-            fn weight_scopes(&self) -> &[WeightScope] {
-
-                &self.0.scopes
-
-            }
-
             fn bindings(&self) -> String {
                 self.0.bindings()
             }
@@ -683,7 +669,7 @@ macro_rules! mix_entry {
                 }
             }
 
-            fn state(case: &Self::Case) -> Vec<&CaseState> {
+            fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
                 case.history.states()
             }
 

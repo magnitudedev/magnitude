@@ -66,7 +66,7 @@ preparation, on the first preparation for each tuning key, whether by a load or 
 job that follows a catalog installation: each such entry registers a tuning case
 that supplies static values from model geometry, weighted tuning points over the shape classes that
 entry serves (every row class of its graph path, crossed with served history lengths for attention,
-including empty and short histories that exercise fresh-only and partially occupied groups;
+including the empty history that exercises the fresh-only path;
 projected-row classes for the readout, each retaining its own step-time share), rotations over real
 resident weights of distinct layers for weight-streaming decode rows,
 control tables packed by the batch builder. Every tuned entry uses a bounded precision policy,
@@ -76,17 +76,24 @@ reference. This checks candidate agreement with the baseline, not independent ag
 source semantics; kernel and model regressions must detect shared defects. Every candidate, including the
 default, must pass every case before continued performance sampling. The first suitable timed
 execution supplies its validation outputs. Integer, Boolean and packed-code state remains exact.
-Every tensor an entry writes in place is case-owned and restored to its pristine state; real
-serving state is never bound. Matching evidence from the startup census or a prior search can be
+Every tensor an entry writes in place is case-owned, and its case declares the rows the entry
+writes; real serving state is never bound. Those rows are restored before each reference and
+validated invocation, and validation compares every result element and every written row. The
+rest is input the entry only reads, so no long history is re-uploaded or read back per candidate.
+One case per unit, the one with the least state, restores and compares its state whole, so a
+write outside the declared rows is rejected. Timed passes after a
+candidate's validated invocation are batched and run on the state they leave, the same way for
+every configuration, so timing never pays a host reset per invocation. Matching evidence from the startup census or a prior search can be
 reused, but timing equivalence alone is not numerical evidence. Whole-model numerical and raw
 output/parser regressions are development and release qualification, not another startup gate or
 a search over kernel combinations. Local bounded policies do not claim a mathematical bound on
 whole-model accumulated error.
 An entry that declares parameters without a case fails preparation; there are no
-engine-side default parameter values. An entry prepared again with identical element bindings,
-static values, weight groups and initialized inputs can reuse its earlier result. Entry-wide
+engine-side default parameter values. An entry prepared again with identical element bindings
+and static values reuses the load's first tuning result; its rotations already span the weights
+of several layers. Entry-wide
 declarations use a configuration budget: a census counts the model's tuning units (entry,
-element bindings, static values and weight groups), their admissible configurations and launches
+element bindings and static values), their admissible configurations and launches
 per step, finds which units have a stored result, and finds and measures the first numerically passing seed of
 each unit that will search (one configuration of the per-model budget each; a
 stored result supplies the defaults' times of a stored unit). Each row class's
@@ -111,15 +118,15 @@ The engine owns every cache, under a directory the host names (`--cache-dir`; wi
 is cached). It holds the program artifacts Seismic keeps (CUDA CUBINs, Vulkan SPIR-V), through
 the device's artifact store, one directory per toolchain namespace, and one tuning result per
 tuning key. The key is a digest over the device and toolchain identity (Metal OS
-build; CUDA driver and NVRTC release), the unit including its model weight groups, the implementation digest (declaration and
-rendered source), and the search definition (search version, per-model budget, settings, point
-labels and weights, screening points and folded weights, validation rule, sample time); a unit's
-own budget follows the measured shares of the load that searched it and is not part of the key.
-Equal kernel geometry with different model weight groups has distinct budget and cache units,
-so one group's evidence cannot overwrite another's. A possible hit recomputes the requested
-initialized-input fingerprints and checks its winner's complete numerical evidence against the
-reference, source, policy and device identities. Only matching evidence skips candidate execution
-and timing; changed input contents require fresh qualification even in the same structural slot.
+build; CUDA driver and NVRTC release), the unit, the implementation digest (declaration and
+rendered source), the precision policy, and the search definition (search version, per-model
+budget, settings, point labels and weights, screening points and folded weights, validation rule,
+sample time); a unit's own budget follows the measured shares of the load that searched it and is
+not part of the key. Only a completed, fully validated search is stored, so a hit prepares the
+stored choice with no forming, measuring, validation or input construction: its key pins
+everything that validation depended on. Tuning inputs are generated test data and resident
+weights, not a fixed corpus, so numerical evidence is identified by the case's structure, policy
+and reference rather than by input bytes.
 Persisted numerical policies and search weights round-trip exactly; serialization must not
 change eligibility or invalidate an otherwise identical objective.
 Keys are content addresses for that structural and policy identity. Each unit's result is stored

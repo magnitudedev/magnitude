@@ -323,6 +323,7 @@ fn cuda_recurrent_scoped_tuning_completes() {
             delta.write_from_host(&initial_delta)?;
             tape.write_from_host(&initial_tape)
         })),
+        written: Default::default(),
     }];
     let result = gated_delta_chunk::native_tune_with(
         &device,

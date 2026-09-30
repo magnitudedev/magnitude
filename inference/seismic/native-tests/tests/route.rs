@@ -154,6 +154,7 @@ fn metal_scoped_tuning_searches_launches_separately() {
             class: None,
             rotation: vec![scoped_scale::Args { x: &small }],
             initialize: None,
+            written: Default::default(),
         },
         TuningPoint {
             label: "m35".into(),
@@ -161,6 +162,7 @@ fn metal_scoped_tuning_searches_launches_separately() {
             class: None,
             rotation: vec![scoped_scale::Args { x: &large }],
             initialize: None,
+            written: Default::default(),
         },
     ];
     let result = scoped_scale::native_tune(
@@ -211,6 +213,7 @@ fn metal_scoped_tuning_expired_deadline_keeps_defaults_incomplete() {
             class: None,
             rotation: vec![scoped_scale::Args { x: &small }],
             initialize: None,
+            written: Default::default(),
         },
         TuningPoint {
             label: "m35".into(),
@@ -218,6 +221,7 @@ fn metal_scoped_tuning_expired_deadline_keeps_defaults_incomplete() {
             class: None,
             rotation: vec![scoped_scale::Args { x: &large }],
             initialize: None,
+            written: Default::default(),
         },
     ];
     let Strategy::Search(mut plan) = search(1) else {
@@ -438,6 +442,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
                     class: None,
                     rotation: inputs.iter().map(|x| split_sum::Args { x }).collect(),
                     initialize: None,
+                    written: Default::default(),
                 },
                 TuningPoint {
                     label: "long".into(),
@@ -445,6 +450,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
                     class: None,
                     rotation: inputs.iter().map(|x| split_sum::Args { x }).collect(),
                     initialize: None,
+                    written: Default::default(),
                 },
             ]
         }
@@ -570,6 +576,7 @@ fn screened_search_confirms_and_validates_the_full_workload() {
             class: None,
             rotation: vec![split_sum::Args { x: &short }],
             initialize: None,
+            written: Default::default(),
         },
         TuningPoint {
             label: "long".into(),
@@ -577,6 +584,7 @@ fn screened_search_confirms_and_validates_the_full_workload() {
             class: None,
             rotation: vec![split_sum::Args { x: &long }],
             initialize: None,
+            written: Default::default(),
         },
     ];
     let Strategy::Search(mut plan) = search(1) else {
@@ -1093,6 +1101,7 @@ fn tuning_rejects_shared_mutable_state_without_an_initializer() {
                 x: &x,
             }],
             initialize: None,
+            written: Default::default(),
         }];
         match accumulate::native_tune(
             &device,
@@ -1134,6 +1143,7 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
                 x: &x,
             }],
             initialize: Some(initialize),
+            written: Default::default(),
         }];
         let result = accumulate::native_tune(
             &device,
@@ -1753,6 +1763,7 @@ fn wrong_default_and_shared_defect_are_rejected_against_portable_source() {
                 x: &x,
             }],
             initialize: Some(Box::new(move || reset.write_from_host(&initial))),
+            written: Default::default(),
         }],
         PrecisionPolicy::Exact,
         search(3),
@@ -1790,6 +1801,7 @@ fn factored_search_finds_a_complete_passing_seed_after_bad_defaults() {
             class: None,
             rotation: vec![scoped_wrong_default::Args { x }],
             initialize: None,
+            written: Default::default(),
         })
         .collect();
     let result = scoped_wrong_default::native_tune(
@@ -1808,7 +1820,7 @@ fn factored_search_finds_a_complete_passing_seed_after_bad_defaults() {
 }
 
 #[test]
-fn complete_evidence_reuses_only_matching_inputs_and_policy() {
+fn complete_evidence_reuses_only_matching_policy_and_reference() {
     let device = DeviceCatalog::discover()
         .unwrap()
         .open_backend(BackendName::Metal)
@@ -1841,6 +1853,7 @@ fn complete_evidence_reuses_only_matching_inputs_and_policy() {
                     count.set(count.get() + 1);
                     reset.write_from_host(&bytes)
                 })),
+                written: Default::default(),
             }],
             policy,
             search(2),
@@ -1867,18 +1880,8 @@ fn complete_evidence_reuses_only_matching_inputs_and_policy() {
     assert_eq!(first.overall, reused.overall);
     assert_eq!(
         count.get(),
-        1,
-        "a matching cache only initializes and fingerprints the input"
-    );
-    let changed = run(
-        2.,
-        PrecisionPolicy::Exact,
-        Some(&first),
-        seismic::TuningReference::Portable,
-    );
-    assert_ne!(
-        first.numerical_evidence[0].identity,
-        changed.numerical_evidence[0].identity
+        0,
+        "matching evidence neither initializes nor reads the input"
     );
     let bounded = run(
         0.,
@@ -1950,6 +1953,7 @@ fn rejected_candidates_stop_after_the_first_timed_invocation() {
                 captures.borrow_mut().push(read_f32(&reset)[0]);
                 reset.write_from_host(&initial)
             })),
+            written: Default::default(),
         }],
         PrecisionPolicy::Exact,
         search(3),
@@ -1983,6 +1987,7 @@ fn pooled_results_cannot_hide_a_candidates_missing_writes() {
             class: None,
             rotation: vec![omitted_write::Args { x: &x }],
             initialize: None,
+            written: Default::default(),
         }],
         PrecisionPolicy::Exact,
         search(2),
@@ -2006,5 +2011,84 @@ fn pooled_results_cannot_hide_a_candidates_missing_writes() {
             Outcome::Excluded(Exclusion::Validation { .. })
         ),
         "{omitted:?}"
+    );
+}
+
+/// Validation observes a `&mut` parameter's declared written rows, not its
+/// whole storage; one point observed whole rejects a write outside them.
+#[test]
+fn declared_rows_scope_state_observation_and_a_whole_point_rejects_stray_writes() {
+    use seismic_native_tests::stray_write;
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    const N: usize = 8;
+    let x = f32_tensor(&device, &[N as u64], &[1.; N]);
+    let initial: Vec<u8> = [0f32; N].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let stray = |whole: bool| {
+        let mut declared = f32_tensor(&device, &[N as u64], &[0.; N]);
+        let mut observed = f32_tensor(&device, &[N as u64], &[0.; N]);
+        let point = |label: &str, state: &Tensor, written: bool| {
+            let mut reset = state.clone();
+            let initial = initial.clone();
+            (
+                label.to_owned(),
+                Box::new(move || reset.write_from_host(&initial)) as TuningInitializer<'static>,
+                if written {
+                    [("state".to_owned(), 0..N as u64 - 1)]
+                        .into_iter()
+                        .collect()
+                } else {
+                    Default::default()
+                },
+            )
+        };
+        let mut points = vec![point("declared", &declared, true)];
+        if whole {
+            points.push(point("whole", &observed, false));
+        }
+        let states = [&mut declared, &mut observed];
+        let result = stray_write::native_tune(
+            &device,
+            &NativeSpecialization::new(),
+            points
+                .into_iter()
+                .zip(states)
+                .map(|((label, initialize, written), state)| TuningPoint {
+                    label,
+                    weight: 1.,
+                    class: None,
+                    rotation: vec![stray_write::Args { state, x: &x }],
+                    initialize: Some(initialize),
+                    written,
+                })
+                .collect(),
+            PrecisionPolicy::Exact,
+            search(2),
+            None,
+            seismic::TuningReference::NativeDefault,
+        )
+        .unwrap();
+        result
+            .configurations
+            .into_iter()
+            .find(|record| record.configuration.params["STRAY"] == 1)
+            .unwrap()
+            .outcome
+    };
+    assert!(
+        matches!(
+            stray(false),
+            Outcome::Measured {
+                validated: true,
+                ..
+            }
+        ),
+        "rows outside the declared ones are not observed"
+    );
+    assert!(
+        matches!(stray(true), Outcome::Excluded(Exclusion::Validation { .. })),
+        "a point observed whole rejects the stray write"
     );
 }

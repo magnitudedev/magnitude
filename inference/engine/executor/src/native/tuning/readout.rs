@@ -52,10 +52,6 @@ impl EntryTuning for DraftRowsTuning {
         self.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
-
     fn bindings(&self) -> String {
         format!(
             "EW={},EN={},HN={},CW={},A={}",
@@ -518,8 +514,8 @@ impl EntryTuning for ShapeRowsTuning {
         }
     }
 
-    fn state(case: &Self::Case) -> Vec<&CaseState> {
-        vec![&case.out]
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![("out", &case.out)]
     }
 
     generated_entry!(shape_rows);
@@ -595,8 +591,8 @@ impl EntryTuning for SampleRowsTuning {
         }
     }
 
-    fn state(case: &Self::Case) -> Vec<&CaseState> {
-        vec![&case.result]
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![("result", &case.result)]
     }
 
     generated_entry!(sample_rows);

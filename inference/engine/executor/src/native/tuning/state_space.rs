@@ -69,10 +69,6 @@ impl EntryTuning for StateSpaceProjectTuning {
         self.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
-
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
@@ -166,10 +162,6 @@ impl EntryTuning for StateSpaceOutputTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
-    }
-
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
     }
 
     fn bindings(&self) -> String {
@@ -352,13 +344,6 @@ macro_rules! state_entry {
                 self.0.scopes.len()
             }
 
-
-            fn weight_scopes(&self) -> &[WeightScope] {
-
-                &self.0.scopes
-
-            }
-
             fn bindings(&self) -> String {
                 format!("A={}", self.0.activation.name())
             }
@@ -406,8 +391,12 @@ macro_rules! state_entry {
                 }
             }
 
-            fn state(case: &Self::Case) -> Vec<&CaseState> {
-                vec![&case.window, &case.state, &case.tape]
+            fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+                vec![
+                    ("window", &case.window),
+                    ("state", &case.state),
+                    ("tape", &case.tape),
+                ]
             }
 
             generated_entry!($module, this => $module::Elements { A: this.0.activation });

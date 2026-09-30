@@ -197,10 +197,12 @@ fn the_pinned_4b_uses_stored_tuning_on_its_second_load() {
             .collect::<Vec<_>>()
     };
     assert_eq!(choices(first), choices(second));
+    // Seismic stores formed images under one directory per toolchain
+    // namespace.
     if backend == BackendName::Cuda {
-        assert!(files("cuda") > 0, "CUDA images are stored");
+        assert!(files("artifacts/cuda") > 0, "CUDA images are stored");
     } else {
-        assert_eq!(files("cuda"), 0);
+        assert!(!root.join("artifacts/cuda").exists());
     }
     std::fs::remove_dir_all(root).unwrap();
 }

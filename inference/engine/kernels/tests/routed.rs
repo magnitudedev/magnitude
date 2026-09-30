@@ -1807,6 +1807,7 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
                 shared_up: &block.shared_up,
             }],
             initialize: None,
+            written: Default::default(),
         })
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
@@ -1916,6 +1917,7 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
                 shared_down: &block.shared_down,
             }],
             initialize: None,
+            written: Default::default(),
         })
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
@@ -3014,6 +3016,7 @@ fn routed_kernel_timings() {
                 })
                 .collect(),
             initialize: Some(Box::new(|| Ok(()))),
+            written: Default::default(),
         })
         .collect();
     print_timings(
@@ -3076,6 +3079,7 @@ fn routed_kernel_timings() {
                 })
                 .collect(),
             initialize: None,
+            written: Default::default(),
         })
         .collect();
     print_timings(
@@ -3119,6 +3123,7 @@ fn routed_kernel_timings() {
                 })
                 .collect(),
             initialize: None,
+            written: Default::default(),
         })
         .collect();
     print_timings(
@@ -3194,6 +3199,7 @@ fn routed_kernel_timings() {
                 })
                 .collect(),
             initialize: None,
+            written: Default::default(),
         })
         .collect();
     print_timings(
@@ -3237,6 +3243,7 @@ fn routed_kernel_timings() {
                 })
                 .collect(),
             initialize: None,
+            written: Default::default(),
         })
         .collect();
     print_timings(
@@ -3299,6 +3306,7 @@ fn routed_kernel_timings() {
                 )
                 .collect(),
             initialize: Some(Box::new(|| Ok(()))),
+            written: Default::default(),
         })
         .collect();
     print_timings(

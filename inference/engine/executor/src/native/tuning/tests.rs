@@ -169,7 +169,7 @@ fn metal_sample_policy_is_part_of_the_tuning_cache_identity() {
         &row_points(LIMITS),
         &[],
     );
-    assert!(key.contains("search 14"));
+    assert!(key.contains("search 15"));
     assert!(key.contains("model budget 100"));
     assert!(key.contains("samples: 1"));
     assert!(key.contains("confirmation_samples: 5"));
@@ -181,7 +181,7 @@ fn attention_points_cross_rows_with_served_contexts() {
     let points = attention_points(LIMITS);
     assert_eq!(
         points.len(),
-        TUNING_ROWS.len() * 6,
+        TUNING_ROWS.len() * 4,
         "64k exceeds the served context"
     );
     assert!(points.iter().all(|point| point.context.unwrap() <= 16384));
@@ -189,7 +189,7 @@ fn attention_points_cross_rows_with_served_contexts() {
     // The history lengths of one row point form its class.
     assert_eq!(points[0].class.as_deref(), Some("m1"));
     assert_eq!(points[2].class.as_deref(), Some("m1"));
-    assert_eq!(points[6].class.as_deref(), Some("m2"));
+    assert_eq!(points[4].class.as_deref(), Some("m2"));
     assert!((points.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
     let short = attention_points(TuningLimits {
         max_rows: 1,
@@ -198,7 +198,7 @@ fn attention_points_cross_rows_with_served_contexts() {
     });
     assert_eq!(
         short.iter().map(|p| p.context.unwrap()).collect::<Vec<_>>(),
-        [0, 1, 32]
+        [0]
     );
 }
 
@@ -378,7 +378,6 @@ struct FakeCase {
     seen: RefCell<Vec<(String, f64, usize)>>,
     /// The implementation digest the case reports.
     digest: String,
-    scopes: Vec<WeightScope>,
     chosen: Configuration,
 }
 
@@ -397,7 +396,6 @@ impl FakeCase {
         Self {
             seen: RefCell::new(Vec::new()),
             digest: digest.into(),
-            scopes: Vec::new(),
             chosen: Configuration {
                 statics: chosen.statics().clone(),
                 params: chosen.params().clone(),
@@ -432,9 +430,6 @@ struct FakeArgs {
 }
 
 impl EntryTuning for FakeCase {
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
     fn precision(&self) -> Result<PrecisionPolicy, TuneError> {
         Ok(PrecisionPolicy::Exact)
     }
@@ -488,20 +483,13 @@ impl EntryTuning for FakeCase {
         points: Vec<TuningPoint<'_, Self::Entry>>,
         validation: PrecisionPolicy,
         _strategy: Strategy,
-        reuse: Option<seismic::TuningReuse<'_>>,
+        _reuse: Option<seismic::TuningReuse<'_>>,
     ) -> Result<TuningResult, TuneError> {
         self.seen.borrow_mut().extend(
             points
                 .iter()
                 .map(|point| (point.label.clone(), point.weight, point.rotation.len())),
         );
-        // This fake tests the engine's routing of cache records. Numerical
-        // identity checks are exercised by the native-runtime integration tests.
-        if let Some(seismic::TuningReuse::Completed(previous)) = reuse {
-            let mut result = previous.clone();
-            result.reused = true;
-            return Ok(result);
-        }
         let mut rejected = self.chosen.clone();
         rejected.launches[0].insert("ROWS".into(), 4);
         assert_eq!(&self.chosen.statics, statics.statics());
@@ -778,8 +766,8 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     let (stored, started, planned) = load_once(&again, limits);
     assert_eq!(stored.origin, TuningOrigin::Stored);
     assert!(
-        started && !again.seen.borrow().is_empty(),
-        "a stored result still passes through runtime evidence validation"
+        !started && again.seen.borrow().is_empty(),
+        "a stored result is used without tuning"
     );
     assert_eq!(
         planned, 0,
@@ -811,29 +799,6 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
         TuningOrigin::Searched
     );
     assert_eq!(stored_results(), 3);
-
-    // Equal geometry with different model weight groups must retain distinct
-    // cache slots. Alternating groups must reuse both, not overwrite one slot.
-    let scoped = |block| {
-        let mut case = FakeCase::new(&implementation, &statics, "implementation a");
-        case.scopes = vec![WeightScope::TargetSublayer(
-            magnitude_family_contracts::SublayerIndex { block, sublayer: 0 },
-        )];
-        case
-    };
-    for block in [0, 1] {
-        assert_eq!(
-            load_once(&scoped(block), limits).0.origin,
-            TuningOrigin::Searched
-        );
-    }
-    for block in [0, 1, 0] {
-        assert_eq!(
-            load_once(&scoped(block), limits).0.origin,
-            TuningOrigin::Stored
-        );
-    }
-    assert_eq!(stored_results(), 5);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -868,12 +833,7 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
             },
         )],
     };
-    let key = (
-        "dense_output",
-        case.bindings(),
-        statics.statics().clone(),
-        case.weight_scopes().to_vec(),
-    );
+    let key = ("dense_output", case.bindings(), statics.statics().clone());
     let mut tuner = Tuner::new(
         &device,
         TuningContext {
@@ -974,14 +934,36 @@ fn case_state_restores_its_written_rows() {
     let tensor = inputs.f32s(&[4, 2], &values).unwrap();
     let mut state = inputs.state(tensor, 1..3).unwrap();
     let mut other = state.share();
-    other.tensor_mut().write_from_host(&[0u8; 32]).unwrap();
-    let mut restore = initializer(vec![&state]).unwrap();
-    restore().unwrap();
-    let bytes = state.tensor_mut().read_to_host().unwrap();
-    let restored = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect::<Vec<_>>();
-    assert_eq!(restored, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-    assert!(initializer(Vec::new()).is_none());
+    let mut written = initializer(vec![&state], false).unwrap().unwrap();
+    // The guard point's restorer captures the complete storage before any
+    // invocation.
+    let mut complete = initializer(vec![&state], true).unwrap().unwrap();
+    let mut restored = |restore: &mut TuningInitializer<'static>| {
+        other.tensor_mut().write_from_host(&[0u8; 32]).unwrap();
+        restore().unwrap();
+        state
+            .tensor_mut()
+            .read_to_host()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        restored(&mut written),
+        [0.0, 0.0, 2.0, 3.0, 4.0, 5.0, 0.0, 0.0]
+    );
+    assert_eq!(
+        restored(&mut complete),
+        [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    );
+    assert!(initializer(Vec::new(), false).unwrap().is_none());
+}
+
+#[test]
+fn the_guard_point_is_the_smallest_stateful_point() {
+    let rotations = vec![vec![4096u64], vec![], vec![0], vec![256, 256], vec![1024]];
+    assert_eq!(guard_point(&rotations, |bytes| *bytes), Some(3));
+    let stateless = vec![vec![0u64], vec![0]];
+    assert_eq!(guard_point(&stateless, |bytes| *bytes), None);
 }

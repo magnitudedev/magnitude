@@ -25,6 +25,7 @@ use seismic_lang::precision::PrecisionPolicy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -48,8 +49,13 @@ pub struct TuningPoint<'a> {
     /// Argument sets cycled through by measurement and numerical validation.
     pub rotation: Vec<EncodedArgs>,
     /// Required when the entry has `&mut` parameters: called before every
-    /// invocation, it restores all writable tensors in every rotation.
+    /// reference and validated invocation, it restores all writable tensors
+    /// in every rotation. Timed passes after validation run without it.
     pub initialize: Option<TuningInitializer<'a>>,
+    /// The leading-axis rows each named `&mut` parameter's entry writes:
+    /// validation observes exactly those rows. A `&mut` parameter absent
+    /// here is observed whole.
+    pub written: BTreeMap<String, Range<u64>>,
 }
 
 /// A configuration as recorded: its static values and parameter values.
@@ -1285,10 +1291,6 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
             parameter: parameter.clone(),
         });
     }
-    let mutable = mutable
-        .into_iter()
-        .map(|(ordinal, _)| ordinal)
-        .collect::<Vec<_>>();
     let implementation_identity =
         implementation_digest(device, module, entry, &bindings, &statics, cpu)?;
     let reuse = reuse.filter(|reuse| {
@@ -2448,6 +2450,7 @@ impl Tuned<'_> {
             mut time,
             ..
         } = live;
+        let default = self.space.default_index();
         let chosen = *trace.ranking.first().ok_or_else(|| {
             TuneError::NoValidatedCandidate(
                 trace
@@ -2467,11 +2470,12 @@ impl Tuned<'_> {
             .map(|(index, result)| {
                 let configuration =
                     Configuration::of(&specialization(self.statics, &self.space.values(*index)));
-                // Failed confirmation excludes a finalist, including the default.
+                // Failed confirmation excludes a finalist; the validated
+                // defaults stay the fallback whatever their confirmation showed.
                 let unconfirmed = trace
                     .confirmed
                     .iter()
-                    .find(|(finalist, _)| finalist == index)
+                    .find(|(finalist, _)| finalist == index && *index != default)
                     .and_then(|(_, confirmed)| confirmed.as_ref().err());
                 let outcome = match (result, unconfirmed) {
                     (Err(exclusion), _) | (Ok(_), Some(exclusion)) => {

@@ -105,10 +105,6 @@ impl EntryTuning for DenseExpandTuning {
         self.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
-
     fn bindings(&self) -> String {
         format!(
             "NW={},GW={},UW={},A={}",
@@ -219,10 +215,6 @@ impl EntryTuning for DenseUpTuning {
         self.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
-
     fn bindings(&self) -> String {
         format!(
             "NW={},UW={},A={}",
@@ -328,10 +320,6 @@ impl EntryTuning for DenseOutputTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
-    }
-
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
     }
 
     fn bindings(&self) -> String {

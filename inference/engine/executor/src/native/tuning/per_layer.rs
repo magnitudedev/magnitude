@@ -44,10 +44,6 @@ impl EntryTuning for PerLayerGateTuning {
         self.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
-
     fn bindings(&self) -> String {
         format!(
             "GW={},A={}",

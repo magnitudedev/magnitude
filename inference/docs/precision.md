@@ -73,14 +73,21 @@ is explicit; failure to execute a reference does not silently switch to another 
 ## How the tuner enforces it
 
 A candidate is a complete kernel entry with concrete tuning parameters. It can contain several
-GPU launches. Validation checks the entry's returned outputs and final writable input state.
+GPU launches. Validation checks every element of the entry's returned outputs and of the rows
+its writable state declares written. Each case declares, per writable parameter, the rows the
+entry writes (for attention, the appended rows of the history); the rest of that state is input
+the entry only reads, so comparing it would re-read bytes that were just restored. Long
+histories would make that the dominant startup cost. One case per tuned unit, the one with the
+least state, instead restores and compares its writable state whole, so a candidate that writes
+outside its declared rows is still rejected.
 
 For a candidate without matching prior evidence, the tuner performs this sequence:
 
-1. Restore the case's full mutable backing to its pristine contents and clear reused output
-   storage. This prevents a missing write from inheriting a previous candidate's correct output.
+1. Restore the case's written rows (the whole state at the unit's one whole case) to their
+   pristine contents and clear reused output storage. This prevents a missing write from
+   inheriting a previous candidate's correct output.
 2. Execute and time the candidate's first invocation for the case.
-3. Read its outputs and writable state, then compare them with the retained reference. Readback,
+3. Read its outputs and written state, then compare them with the retained reference. Readback,
    comparison, and state initialization are outside the GPU timing interval.
 4. On failure, reject the candidate immediately and stop its remaining performance samples.
    On success, check the remaining required cases and input rotations.
@@ -88,9 +95,10 @@ For a candidate without matching prior evidence, the tuner performs this sequenc
    duration as a speed sample when it meets the existing warmup/calibration rules; otherwise it
    serves as calibration. There is no extra kernel invocation solely to obtain validation output.
 
-Later timing calls also restore pristine mutable state. Serving state is never used as tuning
-scratch. Comparison still has a host-side cost even though the validation execution is shared
-with timing.
+Later timing passes are batched and do not restore mutable state: every configuration is timed
+the same way, so the state they leave behind affects all of them alike, and only the validated
+first invocation needs pristine state. Serving state is never used as tuning scratch. Comparison
+still has a host-side cost even though the validation execution is shared with timing.
 
 Ordinary search, searches over launch-local choices, startup census seeds, and final assembled
 configurations obey the same numerical gate. Timing equivalence between two choices does not
@@ -98,22 +106,22 @@ authorize numerical reuse. The default configuration is also a candidate that mu
 it is not an unchecked fallback after a failure. If no candidate qualifies, preparation fails.
 
 Test coverage is part of enforcement. Cases include served row classes, real model-weight
-rotations where appropriate, and short as well as long attention histories. Attention history
-lengths include `0, 1, 32, 256, 4096, 16384, 65536`, subject to the model's supported limits.
-The original Gemma attention defect was much larger at short histories, so checking only long
-histories could miss it even with a tighter tolerance.
+rotations where appropriate, and the empty as well as long attention histories. Attention history
+lengths are `0, 256, 4096, 16384, 65536`, subject to the model's supported limits. The original
+Gemma attention defect reproduces on the fresh-only path of an empty history and passed at long
+histories, so checking only long histories would miss it even with a tighter tolerance.
 
 ## Cache reuse
 
-A saved configuration needs matching numerical evidence for every required case. A Boolean
-“validated” flag by itself is insufficient. Evidence binds the initialized input contents,
-policy, source, reference kind and artifact, candidate artifact, and device. The cache also
-distinguishes model weight groups and the search objective.
+Only a completed search whose choice passed every case is stored. Evidence binds the case
+structure, policy, source, reference kind and artifact, candidate artifact, and device; the
+cache key covers the implementation, the precision policy and the search objective. Tuning
+inputs are generated test data and resident weights, so evidence is not bound to their bytes.
 
-On a possible hit, the engine initializes and fingerprints the requested inputs and verifies
-compatibility. Matching evidence permits reuse without rerunning candidate validation and
-timing. Changed inputs or policy require fresh qualification. Persisted policy values and
-search weights retain their exact floating-point values through JSON round trips.
+A hit uses the stored choice without constructing inputs, validating or timing. A changed
+implementation, policy or objective is a different key and requires fresh qualification.
+Persisted policy values and search weights retain their exact floating-point values through
+JSON round trips.
 
 ## Relationship to compiler precision
 

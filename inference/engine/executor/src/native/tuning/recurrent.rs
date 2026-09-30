@@ -116,10 +116,6 @@ impl EntryTuning for RecurrentProjectTuning {
         self.shape.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.shape.scopes
-    }
-
     fn bindings(&self) -> String {
         format!(
             "NW={},QW={},GW={},AW={},BW={},A={}",
@@ -223,10 +219,6 @@ impl EntryTuning for RecurrentOutputTuning {
 
     fn launches(&self) -> usize {
         self.shape.scopes.len()
-    }
-
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.shape.scopes
     }
 
     fn bindings(&self) -> String {
@@ -445,13 +437,6 @@ macro_rules! state_entry {
                 self.0.shape.scopes.len()
             }
 
-
-            fn weight_scopes(&self) -> &[WeightScope] {
-
-                &self.0.shape.scopes
-
-            }
-
             fn bindings(&self) -> String {
                 self.0.bindings()
             }
@@ -495,8 +480,12 @@ macro_rules! state_entry {
                 }
             }
 
-            fn state(case: &Self::Case) -> Vec<&CaseState> {
-                vec![&case.window, &case.delta, &case.tape]
+            fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+                vec![
+                    ("window", &case.window),
+                    ("delta", &case.delta),
+                    ("tape", &case.tape),
+                ]
             }
 
             generated_entry!($module, this => $module::Elements { A: this.0.activation });

@@ -1107,10 +1107,14 @@ pub struct TuningPoint<'a, E: Entry> {
     pub class: Option<String>,
     pub rotation: Vec<E::Args<'a>>,
     /// Required when the entry has `&mut` parameters: restores every writable
-    /// tensor in every rotation before each invocation. The caller owns the
-    /// pristine bytes; the tuner invokes this initializer before reference,
-    /// validation, warmup and timing executions.
+    /// tensor in every rotation. The caller owns the pristine bytes; the tuner
+    /// invokes this initializer before reference and validation executions.
+    /// Timed passes after a candidate's validated invocation run without it.
     pub initialize: Option<TuningInitializer<'a>>,
+    /// The leading-axis rows each named `&mut` parameter's entry writes:
+    /// validation observes exactly those rows. A `&mut` parameter absent
+    /// here is observed whole.
+    pub written: std::collections::BTreeMap<String, std::ops::Range<u64>>,
 }
 
 /// A direct-native graph is assembled from generated entry arguments and
@@ -3224,6 +3228,7 @@ pub mod generated {
                     class: point.class,
                     rotation: point.rotation.into_iter().map(E::encode).collect(),
                     initialize: point.initialize,
+                    written: point.written,
                 })
                 .collect(),
             validation,

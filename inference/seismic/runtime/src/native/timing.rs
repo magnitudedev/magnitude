@@ -71,28 +71,16 @@ impl OutputPool {
 
 /// A submitted sample of one point.
 pub(crate) struct PendingSample {
-    completion: SampleCompletion,
+    submission: NativeSubmission,
     calls: usize,
     /// Whether the kernel had completed a timed submission before this one.
     exercised: bool,
 }
 
-enum SampleCompletion {
-    Submitted(NativeSubmission),
-    Completed(f64),
-}
-
 impl PendingSample {
     /// Device seconds per call, once the sample completes.
     pub(crate) fn seconds(self) -> Result<f64, CallError> {
-        let calls = self.calls;
-        Ok(self.device_seconds()? / calls as f64)
-    }
-    fn device_seconds(self) -> Result<f64, CallError> {
-        match self.completion {
-            SampleCompletion::Submitted(submission) => submission.device_seconds(),
-            SampleCompletion::Completed(seconds) => Ok(seconds),
-        }
+        Ok(self.submission.device_seconds()? / self.calls as f64)
     }
 }
 
@@ -203,47 +191,21 @@ impl<'a> PointTiming<'a> {
     }
 
     /// Submit `passes` passes over the rotation as one unit of device work.
+    /// Writable state is not restored between timed passes: every
+    /// configuration is timed the same way, and only the first, validated
+    /// invocation ([`PointTiming::observe_first`]) needs pristine state.
     fn submit_passes(&self, passes: usize) -> Result<PendingSample, CallError> {
         let exercised = self
             .kernel
             .exercised
             .load(std::sync::atomic::Ordering::Acquire);
-        let completion = if self.initialize.is_some() || self.kernel.scalar_bytes != 0 {
-            // A mutable case is a sequence of separately initialized invocations. Host resets
-            // are outside each device interval; never compare or time progressively dirty state.
-            let mut seconds = 0.;
-            for _ in 0..passes {
-                for call in &self.calls {
-                    if let Some(initialize) = &self.initialize {
-                        initialize.borrow_mut()().map_err(|e| {
-                            CallError::Execution(
-                                seismic_compiler::errors::ExecutionError::SubmissionFailed(
-                                    e.to_string(),
-                                ),
-                            )
-                        })?;
-                    }
-                    self.kernel.reset_scalar_results()?;
-                    seconds += StandaloneCalls {
-                        kernel: &self.kernel,
-                        calls: std::slice::from_ref(call),
-                    }
-                    .submit(1)?
-                    .device_seconds()?;
-                }
-            }
-            SampleCompletion::Completed(seconds)
-        } else {
-            SampleCompletion::Submitted(
-                StandaloneCalls {
-                    kernel: &self.kernel,
-                    calls: &self.calls,
-                }
-                .submit(passes)?,
-            )
-        };
+        let submission = StandaloneCalls {
+            kernel: &self.kernel,
+            calls: &self.calls,
+        }
+        .submit(passes)?;
         Ok(PendingSample {
-            completion,
+            submission,
             calls: passes * self.calls.len(),
             exercised,
         })
@@ -379,7 +341,7 @@ const WARM_LIMIT_SECONDS: f64 = 0.5;
 /// [`WARM_CHUNK_SECONDS`] until two consecutive chunks take the same time
 /// per pass within [`WARM_AGREEMENT`], at most [`WARM_LIMIT_SECONDS`].
 pub(crate) fn warm(point: &PointTiming) -> Result<(), CallError> {
-    let pass = point.submit_passes(1)?.device_seconds()?;
+    let pass = point.submit_passes(1)?.submission.device_seconds()?;
     point
         .kernel
         .exercised
@@ -393,11 +355,12 @@ pub(crate) fn warm(point: &PointTiming) -> Result<(), CallError> {
     };
     let mut spent = point
         .submit_passes(passes(WARM_MIN_SECONDS))?
+        .submission
         .device_seconds()?;
     let chunk = passes(WARM_CHUNK_SECONDS);
     let mut previous = f64::INFINITY;
     while spent < WARM_LIMIT_SECONDS {
-        let seconds = point.submit_passes(chunk)?.device_seconds()?;
+        let seconds = point.submit_passes(chunk)?.submission.device_seconds()?;
         spent += seconds;
         if (seconds - previous).abs() <= WARM_AGREEMENT * previous {
             break;

@@ -85,13 +85,20 @@ There is no automatic fallback between references. Native-default agreement cann
 shared implementation defects; neither kind of observation establishes compiler applicability. Native tuning applies the
 caller's bounded or exact policy to every result and writable input subject using the compiler's
 comparison rules. Discrete state stays exact. Mutable cases provide initialization for equivalent
-pristine reference and candidate invocations and valid timing repetitions.
+pristine reference and validated candidate invocations; timing repetitions that follow are
+batched without re-initialization, identically for every configuration. A case may declare the
+leading rows each writable parameter's entry writes; validation then observes exactly those rows
+of it, and observes an undeclared writable parameter whole. Callers keep at least one case per
+tuned entry whole so writes outside the declared rows are rejected.
 The default receives the same validation as every candidate. The first fully passing candidate
 establishes the timing anchor; if none passes, tuning returns a failure with the observed exclusions.
-A failed or unstable default cannot be selected as an implicit fallback. A startup census finds a
+A default that failed validation or measurement cannot be selected as an implicit fallback;
+a default that passed both but whose timing re-measurement was unstable remains the choice,
+since timing noise is not a numerical verdict. A startup census finds a
 passing seed and carries its numerical evidence and measurements into subsequent search.
-Complete cache reuse requires matching source, numerical policy, case contents and observation
-scope, native implementation, configuration and device identities. A timing reuse key alone never
+Complete cache reuse requires matching source, numerical policy, case structure and observation
+scope, native implementation, configuration and device identities; the caller's key names what
+case inputs are generated from, so reuse never reads them back. A timing reuse key alone never
 establishes numerical agreement. Old Boolean-only records cannot authorize selection.
 The distinct public handle makes direct-only use structural.
 Launch-scoped declarations use a factored search. The checked declaration gives each parameter

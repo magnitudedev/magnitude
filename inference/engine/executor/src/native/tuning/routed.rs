@@ -179,10 +179,6 @@ impl EntryTuning for RoutedRouteTuning {
         self.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
-
     fn bindings(&self) -> String {
         format!(
             "NW={},RW={},A={}",
@@ -249,8 +245,8 @@ impl EntryTuning for RoutedRouteTuning {
         }
     }
 
-    fn state(case: &Self::Case) -> Vec<&CaseState> {
-        vec![&case.routes, &case.scores]
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![("routes", &case.routes), ("scores", &case.scores)]
     }
 
     generated_entry!(routed_route, this => this.elements());
@@ -324,8 +320,13 @@ impl EntryTuning for RoutedGroupTuning {
         }
     }
 
-    fn state(case: &Self::Case) -> Vec<&CaseState> {
-        vec![&case.counts, &case.order, &case.inverse, &case.blocks]
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![
+            ("counts", &case.counts),
+            ("order", &case.order),
+            ("inverse", &case.inverse),
+            ("blocks", &case.blocks),
+        ]
     }
 
     generated_entry!(routed_group);
@@ -370,10 +371,6 @@ impl EntryTuning for RoutedExpandTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
-    }
-
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
     }
 
     fn bindings(&self) -> String {
@@ -479,10 +476,6 @@ impl EntryTuning for RoutedOutputTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
-    }
-
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
     }
 
     fn bindings(&self) -> String {
@@ -595,10 +588,6 @@ impl EntryTuning for RoutedExpertsTuning {
         self.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
-
     fn bindings(&self) -> String {
         format!(
             "EGW={},EUW={},EDW={},A={}",
@@ -700,10 +689,6 @@ impl EntryTuning for RoutedCombineTuning {
 
     fn launches(&self) -> usize {
         self.scopes.len()
-    }
-
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
     }
 
     fn bindings(&self) -> String {

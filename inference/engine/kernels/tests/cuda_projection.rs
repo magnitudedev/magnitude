@@ -335,6 +335,7 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
                 up_scale: &absent_scale,
             }],
             initialize: None,
+            written: Default::default(),
         })
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
@@ -433,6 +434,7 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
                     down_scale: &absent_scale,
                 }],
                 initialize: None,
+                written: Default::default(),
             },
         )
         .collect();

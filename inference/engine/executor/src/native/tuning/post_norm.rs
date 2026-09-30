@@ -47,10 +47,6 @@ impl EntryTuning for ProjectRowsTuning {
         self.scopes.len()
     }
 
-    fn weight_scopes(&self) -> &[WeightScope] {
-        &self.scopes
-    }
-
     fn bindings(&self) -> String {
         format!(
             "A={},W={},Y={}",

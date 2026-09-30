@@ -16,7 +16,9 @@
 //! ranked by those costs; a finalist the evaluator cannot confirm (its
 //! re-measurement failed or is not trustworthy) leaves the ranking, and the
 //! defaults rank first unless the leader beats them by `default_margin` or
-//! could not be confirmed themselves. Only successful confirmations can rank.
+//! could not be confirmed themselves. When the defaults passed the search but
+//! their re-measurement did not, they are the choice; only defaults that
+//! failed the search itself leave the ranking to confirmed finalists.
 //!
 //! The objective ([`Cost`]) is per point: each tuning point contributes its
 //! weight (share of step time) times the configuration's time there relative
@@ -700,7 +702,11 @@ pub fn search(
             }
             ranked
         }
-        // A failed default cannot authorize selection of itself or another failure.
+        // Re-measuring the defaults failed, but they passed validation and
+        // measurement in the search: timing noise is not a numerical
+        // verdict, so the defaults are the choice.
+        None if finalists.contains(&default) => vec![default],
+        // The defaults themselves failed: only confirmed finalists can rank.
         None => {
             let mut ranked: Vec<_> = finalists
                 .iter()
@@ -949,6 +955,21 @@ mod tests {
             .map(|index| space.values(*index)["A"])
             .collect::<Vec<_>>();
         assert_eq!(ranked, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn defaults_that_passed_the_search_stay_the_choice_when_unconfirmed() {
+        // The defaults (A 1) are evaluated but cannot be re-measured.
+        let space = space(&[("A", &[1, 2, 3, 4])]);
+        let trace = search(
+            &space,
+            &[],
+            10,
+            &settings(),
+            &mut Unconfirmable { space: &space },
+        );
+        assert_eq!(trace.ranking, vec![space.default_index()]);
+        assert_eq!(space.values(trace.ranking[0])["A"], 1);
     }
 
     #[test]

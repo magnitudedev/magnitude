@@ -1652,6 +1652,7 @@ fn gemma_g8_tuning_uses_portable_reference() {
             class: None,
             rotation: vec![args!(attention_decode_k8v4, bound, encoded.case)],
             initialize: Some(initialize),
+            written: Default::default(),
         }],
         seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
             absolute: seismic::precision::Limit::new(0.01).unwrap(),
@@ -1854,6 +1855,7 @@ fn gemma_fresh_only_with_scale(scale: f64) {
                 }
                 Ok(())
             })),
+            written: Default::default(),
         }],
         seismic::PrecisionPolicy::bounded(seismic::Tolerance {
             absolute: seismic::Limit::new(0.01 * scale).unwrap(),
