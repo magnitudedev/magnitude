@@ -209,7 +209,7 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
             tool_calls = p.optional(tool_calls);
         }
 
-        auto content_before_tools = p.content(p.until(FC_START));
+        auto content_before_tools = p.text_before_calls(p.content(p.until(FC_START)), inputs.tool_choice);
         return generation_prompt + reasoning + content_before_tools + tool_calls + end;
     });
 

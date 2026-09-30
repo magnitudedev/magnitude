@@ -10,6 +10,7 @@
 //! paths between them are found by elimination by reference.
 use crate::{
     elimination,
+    language::Regexes,
     network::{Network, Node, RepeatId, RuleId},
     terminal::{is_regular, Allowance, Class, Term, TermId, Terms, EMPTY},
 };
@@ -79,6 +80,9 @@ pub(crate) struct Plan {
     index: HashMap<Key, usize>,
     pub unflattened: usize,
     pub hubs: usize,
+    /// Unbounded repetitions built with their first iteration before the
+    /// loop head.
+    pub peeled: usize,
 }
 
 enum Raw {
@@ -93,7 +97,15 @@ struct Skeleton {
     /// Loop heads of repetitions whose part contains a call: boundaries, so
     /// a lexeme spans one iteration rather than any number of the part's
     /// regular iterations around the calls.
-    heads: Vec<u32>,
+    heads: Vec<(u32, Head)>,
+}
+
+/// A loop head's repetition, and the terminals its part leads with (`EMPTY`
+/// when it leads with a call).
+#[derive(Clone, Copy)]
+struct Head {
+    repeat: RepeatId,
+    leading: TermId,
 }
 
 struct Builder<'n, 'b> {
@@ -101,6 +113,7 @@ struct Builder<'n, 'b> {
     regular: &'b [Option<TermId>],
     classes: &'b [Class],
     flattened: &'b BTreeSet<RuleId>,
+    peeled: &'b BTreeSet<RepeatId>,
     repeats: &'b mut BTreeMap<RepeatId, &'n Node>,
     terms: &'b mut Terms,
     skeleton: Skeleton,
@@ -123,6 +136,27 @@ impl<'n> Builder<'n, '_> {
             .edges
             .push((enter, exit, Raw::Call(key, min, max)));
         self.eps(exit, to);
+    }
+    /// The terminals a loop part built from `head` leads with, over the
+    /// part's edges from index `built` on: those its ε-edges reach first.
+    fn leading(&mut self, head: u32, built: usize) -> TermId {
+        let mut leading = Vec::new();
+        let mut visited = BTreeSet::from([head]);
+        let mut pending = vec![head];
+        while let Some(state) = pending.pop() {
+            for &(from, to, ref raw) in &self.skeleton.edges[built..] {
+                match raw {
+                    Raw::Term(EMPTY) if from == state && visited.insert(to) => pending.push(to),
+                    Raw::Term(term) if from == state && *term != EMPTY => leading.push(*term),
+                    _ => {}
+                }
+            }
+        }
+        if leading.is_empty() {
+            EMPTY
+        } else {
+            self.terms.alt(leading)
+        }
     }
     fn build(&mut self, node: &'n Node, from: u32, to: u32) {
         if is_regular(node, self.regular) {
@@ -171,10 +205,27 @@ impl<'n> Builder<'n, '_> {
                 }
                 match max {
                     None => {
+                        // A peeled `X*` is built as `(X X*)?`: the text
+                        // before the loop then shares a lexeme with the text
+                        // the part leads with.
+                        if *min == 0 && self.peeled.contains(id) {
+                            let first = self.state();
+                            self.eps(current, to);
+                            self.build(part, current, first);
+                            current = first;
+                        }
                         let repeat = self.state();
-                        self.skeleton.heads.push(repeat);
                         self.eps(current, repeat);
+                        let built = self.skeleton.edges.len();
                         self.build(part, repeat, repeat);
+                        let leading = self.leading(repeat, built);
+                        self.skeleton.heads.push((
+                            repeat,
+                            Head {
+                                repeat: *id,
+                                leading,
+                            },
+                        ));
                         self.eps(repeat, to);
                     }
                     Some(max) => {
@@ -459,6 +510,7 @@ impl Plan {
         classes: &[Class],
         terms: &mut Terms,
         allowance: &mut Allowance,
+        regexes: &mut Regexes,
     ) -> Self {
         let regular = classes
             .iter()
@@ -474,8 +526,15 @@ impl Plan {
         loop {
             let flattened = choose_flattened(network, &regular, classes, &kept);
             let mut attempt = allowance.clone();
-            let mut plan =
-                Self::assemble(network, &regular, classes, &flattened, terms, &mut attempt);
+            let mut plan = Self::assemble(
+                network,
+                &regular,
+                classes,
+                &flattened,
+                terms,
+                &mut attempt,
+                regexes,
+            );
             plan.unflattened = structural - flattened.len();
             let next = if plan.fanout() > FANOUT {
                 costliest(network, &regular, classes, &flattened)
@@ -518,12 +577,14 @@ impl Plan {
         flattened: &BTreeSet<RuleId>,
         terms: &mut Terms,
         allowance: &mut Allowance,
+        regexes: &mut Regexes,
     ) -> Self {
         let mut plan = Self {
             rules: Vec::new(),
             index: HashMap::new(),
             unflattened: 0,
             hubs: 0,
+            peeled: 0,
         };
         let mut repeats: BTreeMap<RepeatId, &Node> = BTreeMap::new();
         let mut pending = VecDeque::from([Key::Rule(network.root)]);
@@ -538,40 +599,59 @@ impl Plan {
                 Key::Repeat(id) => repeats[&id],
                 Key::Twin(_) => unreachable!("twins are added by certification"),
             };
-            let mut discovered = BTreeMap::new();
-            let skeleton = {
-                let mut builder = Builder {
-                    network,
-                    regular,
-                    classes,
-                    flattened,
-                    repeats: &mut discovered,
-                    terms,
-                    skeleton: Skeleton {
-                        states: 2,
-                        edges: Vec::new(),
-                        heads: Vec::new(),
-                    },
+            // A loop head that splits text from the delimiter its part leads
+            // with is peeled and the rule planned again, while the allowance
+            // pays for the copy.
+            let mut peeled = BTreeSet::new();
+            let (boundaries, edges, hubs) = loop {
+                let mut discovered = BTreeMap::new();
+                let skeleton = {
+                    let mut builder = Builder {
+                        network,
+                        regular,
+                        classes,
+                        flattened,
+                        peeled: &peeled,
+                        repeats: &mut discovered,
+                        terms,
+                        skeleton: Skeleton {
+                            states: 2,
+                            edges: Vec::new(),
+                            heads: Vec::new(),
+                        },
+                    };
+                    builder.build(body, 0, 1);
+                    builder.skeleton
                 };
-                builder.build(body, 0, 1);
-                builder.skeleton
-            };
-            repeats.extend(discovered);
-            let mut resolve = |key: Key, plan: &mut Plan| -> usize {
-                if let Some(&index) = plan.index.get(&key) {
-                    return index;
+                let size = skeleton.edges.len();
+                let mut resolve = |key: Key, plan: &mut Plan| -> usize {
+                    if let Some(&index) = plan.index.get(&key) {
+                        return index;
+                    }
+                    let index = plan.rules.len();
+                    plan.index.insert(key, index);
+                    plan.rules.push(Earley {
+                        boundaries: 0,
+                        edges: Vec::new(),
+                    });
+                    pending.push_back(key);
+                    index
+                };
+                let mut attempt = allowance.clone();
+                let (boundaries, edges, heads, hubs) =
+                    regions(skeleton, terms, &mut attempt, |key| resolve(key, &mut plan));
+                let delimiting = delimiting(&edges, &heads, terms, regexes)
+                    .difference(&peeled)
+                    .copied()
+                    .collect::<Vec<_>>();
+                if delimiting.is_empty() || !allowance.spend(size) {
+                    *allowance = attempt;
+                    repeats.extend(discovered);
+                    plan.peeled += peeled.len();
+                    break (boundaries, edges, hubs);
                 }
-                let index = plan.rules.len();
-                plan.index.insert(key, index);
-                plan.rules.push(Earley {
-                    boundaries: 0,
-                    edges: Vec::new(),
-                });
-                pending.push_back(key);
-                index
+                peeled.extend(delimiting);
             };
-            let (boundaries, edges, hubs) =
-                regions(skeleton, terms, allowance, |key| resolve(key, &mut plan));
             let rule = plan.index[&key];
             plan.rules[rule].boundaries = boundaries;
             plan.rules[rule].edges = edges;
@@ -673,18 +753,19 @@ impl Plan {
 
 /// Collapse a skeleton to its boundaries: calls keep their endpoints; every
 /// regular path between two boundaries becomes one lexeme. Returns the
-/// boundary count, the edges, and how many states the allowance kept.
+/// boundary count, the edges, the loop heads by boundary, and how many
+/// states the allowance kept.
 fn regions(
     skeleton: Skeleton,
     terms: &mut Terms,
     allowance: &mut Allowance,
     mut resolve: impl FnMut(Key) -> usize,
-) -> (u32, Vec<Edge>, usize) {
+) -> (u32, Vec<Edge>, BTreeMap<u32, Head>, usize) {
     let states = skeleton.states as usize;
     let mut boundary = vec![false; states];
     boundary[0] = true;
     boundary[1] = true;
-    for &head in &skeleton.heads {
+    for &(head, _) in &skeleton.heads {
         boundary[head as usize] = true;
     }
     let mut calls = Vec::new();
@@ -752,5 +833,44 @@ fn regions(
         to,
         kind: EdgeKind::Eps,
     }));
-    (count, edges, eliminated.kept.len())
+    let heads = skeleton
+        .heads
+        .iter()
+        .map(|&(state, head)| (number(state), head))
+        .collect();
+    (count, edges, heads, eliminated.kept.len())
+}
+
+/// Repetitions whose loop head ends a lexeme that continues over the text
+/// the part leads with, yet never contains it: a scanner cut from the
+/// delimiter that ends it, which greedy lexing cannot scan exactly apart.
+fn delimiting(
+    edges: &[Edge],
+    heads: &BTreeMap<u32, Head>,
+    terms: &Terms,
+    regexes: &mut Regexes,
+) -> BTreeSet<RepeatId> {
+    let ended = edges
+        .iter()
+        .filter_map(|edge| match edge.kind {
+            EdgeKind::Lexeme { lexeme, .. } => heads.get(&edge.to).map(|head| (lexeme, *head)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let questions = ended
+        .iter()
+        .flat_map(|&(text, head)| {
+            [
+                regexes.overrun(terms, text, terms.first(head.leading), &[text]),
+                regexes.contains(terms, text, head.leading),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let answers = regexes.nonempty(&questions);
+    ended
+        .iter()
+        .zip(answers.chunks(2))
+        .filter(|(_, answers)| answers == &[true, false])
+        .map(|((_, head), _)| head.repeat)
+        .collect()
 }

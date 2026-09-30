@@ -14,28 +14,16 @@
 //! waiting. Allowed sets are therefore kept per calling context rather than
 //! merged across every caller of a rule.
 use crate::{
+    language::Regexes,
     lexeme::{EdgeKind, Plan},
-    terminal::{has_byte, intersects, union, Bytes, Term, TermId, Terms},
+    terminal::{intersects, union, Bytes, TermId, Terms},
 };
-use llguidance::derivre::{raw::RelevanceCache, ExprRef, RegexAst, RegexBuilder};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-/// Derivative work allowed for one emptiness question.
-const FUEL: u64 = 200_000;
-/// Derivative work allowed per compilation. A question left unanswered
-/// counts as positive, which only makes the rendering finer.
-const TOTAL_FUEL: u64 = 20_000_000;
 /// Calling contexts kept apart per rule; beyond this they are merged, which
 /// only over-approximates what is allowed together. Contexts are call
 /// sites, which flattening bounds, so this bound is only a backstop.
 const CONTEXTS: usize = 1024;
-
-#[derive(Default)]
-pub(crate) struct Certification {
-    pub questions: usize,
-    pub exhausted: usize,
-    pub characters: usize,
-}
 
 struct Occurrence {
     rule: usize,
@@ -95,148 +83,6 @@ fn add_context(sets: &mut Vec<Set>, set: Set) -> bool {
     let changed = sets.len() != 1 || sets[0] != merged;
     *sets = vec![merged];
     changed
-}
-
-/// derivre expressions for terminals and batched emptiness questions.
-struct Regexes {
-    builder: RegexBuilder,
-    exprs: Vec<Option<ExprRef>>,
-    fuel: u64,
-}
-
-impl Regexes {
-    fn new() -> Self {
-        Self {
-            builder: RegexBuilder::new(),
-            exprs: Vec::new(),
-            fuel: TOTAL_FUEL,
-        }
-    }
-    fn byte_set(bytes: &Bytes) -> RegexAst {
-        let mut words = vec![0u32; 8];
-        for byte in 0..=255u8 {
-            if has_byte(bytes, byte) {
-                words[byte as usize / 32] |= 1 << (byte % 32);
-            }
-        }
-        RegexAst::ByteSet(words)
-    }
-    fn any_bytes(min: u32) -> RegexAst {
-        RegexAst::Repeat(Box::new(Self::byte_set(&[u64::MAX; 4])), min, u32::MAX)
-    }
-    /// Terminals are interned after their operands, so building in id
-    /// order never recurses.
-    fn expr(&mut self, terms: &Terms, id: TermId) -> ExprRef {
-        while self.exprs.len() <= id as usize {
-            self.exprs.push(None);
-        }
-        if let Some(expr) = self.exprs[id as usize] {
-            return expr;
-        }
-        for current in 0..=id {
-            if self.exprs[current as usize].is_some() {
-                continue;
-            }
-            let child = |term: TermId, exprs: &[Option<ExprRef>]| {
-                RegexAst::ExprRef(exprs[term as usize].expect("operands precede their terminal"))
-            };
-            let ast = match terms.get(current) {
-                Term::Chars(set) => {
-                    let mut class = String::from("[");
-                    for &(start, end) in set.ranges() {
-                        class.push_str(&format!("\\x{{{start:x}}}-\\x{{{end:x}}}"));
-                    }
-                    class.push(']');
-                    RegexAst::Regex(class)
-                }
-                Term::Literal(text) => RegexAst::Literal(text.clone()),
-                Term::Seq(parts) => {
-                    RegexAst::Concat(parts.iter().map(|&p| child(p, &self.exprs)).collect())
-                }
-                Term::Alt(parts) => {
-                    RegexAst::Or(parts.iter().map(|&p| child(p, &self.exprs)).collect())
-                }
-                Term::Repeat(part, min, max) => RegexAst::Repeat(
-                    Box::new(child(*part, &self.exprs)),
-                    *min,
-                    max.unwrap_or(u32::MAX),
-                ),
-                Term::NonEmpty(part) => {
-                    RegexAst::And(vec![child(*part, &self.exprs), Self::any_bytes(1)])
-                }
-            };
-            let expr = self
-                .builder
-                .mk(&ast)
-                .expect("terminal expressions are well formed");
-            self.exprs[current as usize] = Some(expr);
-        }
-        self.exprs[id as usize].unwrap()
-    }
-    fn union(&mut self, terms: &Terms, parts: &[TermId]) -> RegexAst {
-        RegexAst::Or(
-            parts
-                .iter()
-                .map(|&part| RegexAst::ExprRef(self.expr(terms, part)))
-                .collect(),
-        )
-    }
-    /// Some text of `a` is also text of one of `others`.
-    fn shared(&mut self, terms: &Terms, a: TermId, others: &[TermId]) -> ExprRef {
-        let ast = RegexAst::And(vec![
-            RegexAst::ExprRef(self.expr(terms, a)),
-            self.union(terms, others),
-        ]);
-        self.builder.mk(&ast).expect("intersection of terminals")
-    }
-    /// Some text of `ended`, then a byte of `follow`, begins text of one of
-    /// `continued`.
-    fn overrun(
-        &mut self,
-        terms: &Terms,
-        ended: TermId,
-        follow: &Bytes,
-        continued: &[TermId],
-    ) -> ExprRef {
-        let ast = RegexAst::And(vec![
-            self.union(terms, continued),
-            RegexAst::Concat(vec![
-                RegexAst::ExprRef(self.expr(terms, ended)),
-                Self::byte_set(follow),
-                Self::any_bytes(0),
-            ]),
-        ]);
-        self.builder.mk(&ast).expect("overrun of terminals")
-    }
-    /// Non-emptiness of each expression; unanswerable questions count as
-    /// non-empty.
-    fn nonempty(&mut self, questions: &[ExprRef], report: &mut Certification) -> Vec<bool> {
-        if questions.is_empty() {
-            return Vec::new();
-        }
-        report.questions += questions.len();
-        let mut exprs = self.builder.exprset().clone();
-        let mut relevance = RelevanceCache::new();
-        questions
-            .iter()
-            .map(|&question| {
-                let answer = if self.fuel == 0 {
-                    None
-                } else {
-                    let before = exprs.cost();
-                    let answer = relevance
-                        .is_non_empty_limited(&mut exprs, question, FUEL.min(self.fuel))
-                        .ok();
-                    self.fuel = self.fuel.saturating_sub(exprs.cost() - before);
-                    answer
-                };
-                if answer.is_none() {
-                    report.exhausted += 1;
-                }
-                answer.unwrap_or(true)
-            })
-            .collect()
-    }
 }
 
 struct Analysis {
@@ -546,7 +392,6 @@ fn simultaneity(
     terms: &Terms,
     regexes: &mut Regexes,
     overlaps: &mut HashMap<(TermId, TermId), bool>,
-    report: &mut Certification,
 ) -> (Vec<Set>, BTreeSet<(usize, usize)>) {
     let occurrences = &analysis.occurrences;
     let lexeme = |index: usize| occurrences[index].lexeme;
@@ -590,7 +435,7 @@ fn simultaneity(
             .iter()
             .map(|(a, others)| regexes.shared(terms, *a, others))
             .collect::<Vec<_>>();
-        let answers = regexes.nonempty(&questions, report);
+        let answers = regexes.nonempty(&questions);
         // Resolve positive unions pair by pair.
         let mut pairs = Vec::new();
         let mut queued = HashSet::new();
@@ -610,7 +455,7 @@ fn simultaneity(
             .iter()
             .map(|&(a, b)| regexes.shared(terms, a, &[b]))
             .collect::<Vec<_>>();
-        for (key, answer) in pairs.into_iter().zip(regexes.nonempty(&questions, report)) {
+        for (key, answer) in pairs.into_iter().zip(regexes.nonempty(&questions)) {
             overlaps.insert(key, answer);
         }
         for set in &batch {
@@ -653,14 +498,13 @@ fn conflicts(
     regexes: &mut Regexes,
     overlaps: &mut HashMap<(TermId, TermId), bool>,
     overruns: &mut HashMap<(TermId, TermId, Bytes), bool>,
-    report: &mut Certification,
 ) -> BTreeSet<(usize, usize)> {
     // Positions active together change which call sites share a callee, so
     // analysis and simultaneity are solved together.
     let mut together: BTreeSet<(usize, usize)> = BTreeSet::new();
     let (analysis, sets) = loop {
         let analysis = analyze(plan, terms, &together);
-        let (sets, found) = simultaneity(&analysis, terms, regexes, overlaps, report);
+        let (sets, found) = simultaneity(&analysis, terms, regexes, overlaps);
         if found.is_subset(&together) {
             break (analysis, sets);
         }
@@ -699,7 +543,7 @@ fn conflicts(
         .iter()
         .map(|(a, follow, continued)| regexes.overrun(terms, *a, follow, continued))
         .collect::<Vec<_>>();
-    let answers = regexes.nonempty(&questions, report);
+    let answers = regexes.nonempty(&questions);
     let mut pairs = Vec::new();
     let mut queued = HashSet::new();
     for ((a, follow, continued), positive) in pending.into_iter().zip(answers) {
@@ -718,7 +562,7 @@ fn conflicts(
         .iter()
         .map(|(a, b, follow)| regexes.overrun(terms, *a, follow, &[*b]))
         .collect::<Vec<_>>();
-    for (key, answer) in pairs.into_iter().zip(regexes.nonempty(&questions, report)) {
+    for (key, answer) in pairs.into_iter().zip(regexes.nonempty(&questions)) {
         overruns.insert(key, answer);
     }
 
@@ -749,25 +593,17 @@ fn conflicts(
 }
 
 /// Render conflicting lexemes at character level until the plan is
-/// certified.
-pub(crate) fn certify(plan: &mut Plan, terms: &mut Terms) -> Certification {
-    let mut report = Certification::default();
-    let mut regexes = Regexes::new();
+/// certified; the number of lexemes rendered.
+pub(crate) fn certify(plan: &mut Plan, terms: &mut Terms, regexes: &mut Regexes) -> usize {
+    let mut characters = 0;
     let mut overlaps = HashMap::new();
     let mut overruns = HashMap::new();
     loop {
-        let marked = conflicts(
-            plan,
-            terms,
-            &mut regexes,
-            &mut overlaps,
-            &mut overruns,
-            &mut report,
-        );
+        let marked = conflicts(plan, terms, regexes, &mut overlaps, &mut overruns);
         if marked.is_empty() {
-            return report;
+            return characters;
         }
-        report.characters += marked.len();
+        characters += marked.len();
         for (rule, edge) in marked {
             plan.characters(rule, edge, terms);
         }

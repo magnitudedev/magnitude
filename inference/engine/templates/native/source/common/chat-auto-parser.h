@@ -366,6 +366,10 @@ struct analyze_tools : analyze_base {
     common_peg_parser build_tool_parser_tag_json(parser_build_context & ctx) const;
     common_peg_parser build_tool_parser_tag_tagged(parser_build_context & ctx) const;
 
+    // Shared helper: the turn of a tagged format, from reasoning through content up to the
+    // calls' trigger marker, then `tool_calls`.
+    common_peg_parser build_tagged_turn(parser_build_context & ctx, common_peg_parser tool_calls) const;
+
     // Shared helper: builds func_parser from open+call_id+args, handling atomic wrapping and close.
     // atomic_peek: if present, used as the peek expression in the third atomicity branch.
     common_peg_parser build_func_parser(common_chat_peg_builder & p, const std::string & name,

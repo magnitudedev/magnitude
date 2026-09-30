@@ -62,11 +62,9 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
 
         auto ret = p.eps();
         if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
-            if (inputs.parallel_tool_calls) {
-                ret = p.choice({ content_and_tools, tools_only }) + p.end();
-            } else {
-                ret = p.choice({ content_until_tool + tool_choice, tools_only }) + p.end();
-            }
+            // A required call opens the turn: content before it would leave
+            // the model free to answer in text that can never end.
+            ret = tools_only + p.end();
         } else if (inputs.parallel_tool_calls) {
             ret = p.choice({ content_and_tools, content_only, tools_only }) + p.end();
         } else {

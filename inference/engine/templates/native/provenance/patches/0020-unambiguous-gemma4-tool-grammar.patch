@@ -1,0 +1,33 @@
+--- a/common/parsers/gemma4.cpp
++++ b/common/parsers/gemma4.cpp
+@@ -450,7 +450,10 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &
+             p.rule("gemma4-bool", p.json_bool());
+             p.rule("gemma4-null", p.json_null());
+             p.rule("gemma4-number", p.json_number());
+-            p.rule("gemma4-dict-key", p.rule("gemma4-dict-key-name", p.chars("[^:}]", 1, -1)) + p.literal(":"));
++            // The whitespace before a key is the separator's: a key name
++            // never starts with it, so the grammar reads it one way only.
++            p.rule("gemma4-dict-key", p.rule("gemma4-dict-key-name",
++                p.chars("[^:} \\t\\n\\r\\x0B\\x0C]", 1, 1) + p.chars("[^:}]", 0, -1)) + p.literal(":"));
+             p.rule("gemma4-dict-kv", p.ref("gemma4-dict-key") + p.space() + p.ref("gemma4-value"));
+             p.rule("gemma4-dict", [&]() {
+                 auto ws = p.space();
+@@ -501,7 +504,17 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &
+             auto scan_to_toolcall = p.rule("scan-to-toolcall", p.until("<|tool_call>"));
+             auto content = p.rule("content", p.content(p.until_one_of({"<|channel>", "<channel|>", "<|tool_call>"})));
+             auto message = p.rule("message", thought + content);
+-            return start + p.zero_or_more(message) + scan_to_toolcall + tool_call;
++            // GBNF has no lookahead: rendered literally, `message*` overlaps
++            // the scan after it and a thought's text may hold a call opener,
++            // so text before the calls would read many ways. The scan alone
++            // admits the same text, thoughts included, up to the first call.
++            // A required call may follow only a thought, whose text ends
++            // where a call opens.
++            auto preamble = p.gbnf(p.zero_or_more(message) + scan_to_toolcall,
++                inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED
++                    ? "(\"<|channel>thought\" space content \"<channel|>\")?"
++                    : "scan-to-toolcall");
++            return start + preamble + tool_call;
+         }
+ 
+         // Gemma 4 may emit an extra <|channel>thought\n<channel|> at the end of the content. It may

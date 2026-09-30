@@ -49,7 +49,7 @@ common_chat_params common_chat_params_init_gigachat_v3(
             auto tool_call = p.rule("tool-call", p.literal(tool_call_start_prefix) + tool_choice);
             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(tool_call, /* min = */ min_calls, /* max = */ max_calls));
 
-            ret = p.content(p.until("<|message_sep|>\n\n")) << tool_calls;
+            ret = p.text_before_calls(p.content(p.until("<|message_sep|>\n\n")), inputs.tool_choice) << tool_calls;
         } else {
             // Content only parser
             include_grammar = false;

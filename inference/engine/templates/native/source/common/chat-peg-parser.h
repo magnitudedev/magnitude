@@ -167,6 +167,14 @@ class common_chat_peg_builder : public common_peg_parser_builder {
                                               bool                           parallel_tool_calls,
                                               bool                           allow_json_literals);
 
+    // What a turn writes between its reasoning and its tool calls: `content`,
+    // or only whitespace when a call is required. The whole completion is
+    // constrained and a required call must come, so content before it would
+    // leave the model free to write text that can never end.
+    common_peg_parser text_before_calls(const common_peg_parser & content, common_chat_tool_choice choice) {
+        return choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? space() : content;
+    }
+
   private:
     // Python values plus JSON true/false/null.
     common_peg_parser python_or_json_value();

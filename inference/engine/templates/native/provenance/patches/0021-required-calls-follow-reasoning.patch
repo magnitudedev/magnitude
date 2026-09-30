@@ -1,0 +1,261 @@
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -226,12 +226,6 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
+             format.fun_name_is_key, format.id_field, format.gen_id_field, format.parameter_order, format.openai_wrapper_trigger);
+     }
+ 
+-    // Handle content wrappers if present
+-    if (ctx.content && ctx.content->is_always_wrapped()) {
+-        auto wrapped_content = ctx.content->build_optional_wrapped(ctx);
+-        return ctx.reasoning_parser + wrapped_content + tools_parser + p.end();
+-    }
+-
+     std::string tool_start = "{";
+     if (!format.section_start.empty()) {
+         tool_start = format.section_start;
+@@ -239,7 +233,10 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
+         tool_start = format.per_call_start;
+     }
+ 
+-    return ctx.reasoning_parser + p.optional(p.content(p.until(tool_start))) + tools_parser + p.end();
++    // Handle content wrappers if present
++    auto content = ctx.content && ctx.content->is_always_wrapped() ? ctx.content->build_optional_wrapped(ctx)
++                                                                   : p.optional(p.content(p.until(tool_start)));
++    return ctx.reasoning_parser + p.text_before_calls(content, inputs.tool_choice) + tools_parser + p.end();
+ }
+ 
+ common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, const std::string & name,
+@@ -330,8 +327,6 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
+         tool_choice |= p.rule("tool-" + name, func_parser);
+     });
+ 
+-    auto require_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+-
+     common_peg_parser tool_calls = p.eps();
+ 
+     if (!format.per_call_start.empty()) {
+@@ -356,13 +351,21 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
+         }
+     }
+ 
+-    if (!require_calls) {
++    return build_tagged_turn(ctx, tool_calls);
++}
++
++common_peg_parser analyze_tools::build_tagged_turn(parser_build_context & ctx, common_peg_parser tool_calls) const {
++    auto &       p      = ctx.p;
++    const auto & inputs = ctx.inputs;
++
++    if (inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+         tool_calls = p.optional(tool_calls);
+     }
+ 
+     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
+     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
+-    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
++    auto        content              = p.optional(p.content(content_before_tools));
++    return ctx.reasoning_parser + p.text_before_calls(content, inputs.tool_choice) + tool_calls + p.end();
+ }
+ 
+ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
+@@ -449,8 +452,6 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+         tool_choice |= p.rule("tool-" + name, func_parser);
+     });
+ 
+-    auto require_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+-
+     common_peg_parser tool_calls = p.eps();
+ 
+     if (!format.per_call_start.empty()) {
+@@ -478,13 +479,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+         }
+     }
+ 
+-    if (!require_tools) {
+-        tool_calls = p.optional(tool_calls);
+-    }
+-
+-    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
+-    auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
+-    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
++    return build_tagged_turn(ctx, tool_calls);
+ }
+ 
+ }  // namespace autoparser
+--- a/common/chat-auto-parser.h
++++ b/common/chat-auto-parser.h
+@@ -366,6 +366,10 @@ struct analyze_tools : analyze_base {
+     common_peg_parser build_tool_parser_tag_json(parser_build_context & ctx) const;
+     common_peg_parser build_tool_parser_tag_tagged(parser_build_context & ctx) const;
+ 
++    // Shared helper: the turn of a tagged format, from reasoning through content up to the
++    // calls' trigger marker, then `tool_calls`.
++    common_peg_parser build_tagged_turn(parser_build_context & ctx, common_peg_parser tool_calls) const;
++
+     // Shared helper: builds func_parser from open+call_id+args, handling atomic wrapping and close.
+     // atomic_peek: if present, used as the peek expression in the third atomicity branch.
+     common_peg_parser build_func_parser(common_chat_peg_builder & p, const std::string & name,
+--- a/common/chat-peg-parser.h
++++ b/common/chat-peg-parser.h
+@@ -167,6 +167,14 @@ class common_chat_peg_builder : public common_peg_parser_builder {
+                                               bool                           parallel_tool_calls,
+                                               bool                           allow_json_literals);
+ 
++    // What a turn writes between its reasoning and its tool calls: `content`,
++    // or only whitespace when a call is required. The whole completion is
++    // constrained and a required call must come, so content before it would
++    // leave the model free to write text that can never end.
++    common_peg_parser text_before_calls(const common_peg_parser & content, common_chat_tool_choice choice) {
++        return choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? space() : content;
++    }
++
+   private:
+     // Python values plus JSON true/false/null.
+     common_peg_parser python_or_json_value();
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -246,9 +246,9 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+             return generation_prompt + reasoning + p.content(p.rest()) + end;
+         }
+ 
+-        auto content_before_tools = p.negate(p.literal(THINK_START)) +
++        auto content_before_tools = p.text_before_calls(p.negate(p.literal(THINK_START)) +
+             p.content(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START })) +
+-            p.space();
++            p.space(), inputs.tool_choice);
+         return allow_reasoning_with_tc ? generation_prompt + (reasoning_with_tc | (reasoning + content_before_tools + tool_calls)) + end :
+             generation_prompt + reasoning + content_before_tools + tool_calls + end;
+     });
+--- a/common/parsers/functionary-v3-2.cpp
++++ b/common/parsers/functionary-v3-2.cpp
+@@ -62,11 +62,9 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
+ 
+         auto ret = p.eps();
+         if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+-            if (inputs.parallel_tool_calls) {
+-                ret = p.choice({ content_and_tools, tools_only }) + p.end();
+-            } else {
+-                ret = p.choice({ content_until_tool + tool_choice, tools_only }) + p.end();
+-            }
++            // A required call opens the turn: content before it would leave
++            // the model free to answer in text that can never end.
++            ret = tools_only + p.end();
+         } else if (inputs.parallel_tool_calls) {
+             ret = p.choice({ content_and_tools, content_only, tools_only }) + p.end();
+         } else {
+--- a/common/parsers/gigachat-v3.cpp
++++ b/common/parsers/gigachat-v3.cpp
+@@ -49,7 +49,7 @@ common_chat_params common_chat_params_init_gigachat_v3(
+             auto tool_call = p.rule("tool-call", p.literal(tool_call_start_prefix) + tool_choice);
+             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(tool_call, /* min = */ min_calls, /* max = */ max_calls));
+ 
+-            ret = p.content(p.until("<|message_sep|>\n\n")) << tool_calls;
++            ret = p.text_before_calls(p.content(p.until("<|message_sep|>\n\n")), inputs.tool_choice) << tool_calls;
+         } else {
+             // Content only parser
+             include_grammar = false;
+--- a/common/parsers/kimi-k2.cpp
++++ b/common/parsers/kimi-k2.cpp
+@@ -106,7 +106,8 @@ common_chat_params common_chat_params_init_kimi_k2(const common_chat_template &
+                 p.optional(p.literal(SECTION_END)))
+         );
+ 
+-        auto content_before_tools = p.content(p.until_one_of({ SECTION_BEGIN, CALL_BEGIN }));
++        auto content_before_tools =
++            p.text_before_calls(p.content(p.until_one_of({ SECTION_BEGIN, CALL_BEGIN })), inputs.tool_choice);
+ 
+         return generation_prompt + reasoning + content_before_tools + tool_calls + end;
+     });
+--- a/common/parsers/kimi-k3.cpp
++++ b/common/parsers/kimi-k3.cpp
+@@ -147,7 +147,7 @@ common_chat_params common_chat_params_init_kimi_k3(const common_chat_template &
+         auto tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? tools_section :
+                                                                               p.optional(tools_section);
+ 
+-        return start + reasoning + response + tools + trailer + end;
++        return start + reasoning + p.text_before_calls(response, inputs.tool_choice) + tools + trailer + end;
+     });
+ 
+     data.parser = parser.save();
+--- a/common/parsers/lfm2.cpp
++++ b/common/parsers/lfm2.cpp
+@@ -93,7 +93,7 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &
+             tool_calls = p.optional(tool_calls);
+         }
+ 
+-        auto content = p.content(p.until(TOOL_CALL_START));
++        auto content = p.text_before_calls(p.content(p.until(TOOL_CALL_START)), inputs.tool_choice);
+ 
+         return generation_prompt + reasoning + content + tool_calls + end;
+     });
+--- a/common/parsers/minicpm5.cpp
++++ b/common/parsers/minicpm5.cpp
+@@ -110,7 +110,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+                 tool_calls = p.optional(tool_calls);
+             }
+ 
+-            auto content = p.content(p.until("<function"));
++            auto content = p.text_before_calls(p.content(p.until("<function")), inputs.tool_choice);
+ 
+             return generation_prompt + reasoning + content + tool_calls + p.end();
+         }
+--- a/common/parsers/minimax-m3.cpp
++++ b/common/parsers/minimax-m3.cpp
+@@ -209,7 +209,7 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
+             tool_calls = p.optional(tool_calls);
+         }
+ 
+-        auto content_before_tools = p.content(p.until(FC_START));
++        auto content_before_tools = p.text_before_calls(p.content(p.until(FC_START)), inputs.tool_choice);
+         return generation_prompt + reasoning + content_before_tools + tool_calls + end;
+     });
+ 
+--- a/common/parsers/ministral3.cpp
++++ b/common/parsers/ministral3.cpp
+@@ -100,7 +100,9 @@ common_chat_params common_chat_params_init_ministral_3(const common_chat_templat
+             auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
+             auto tool_calls = p.trigger_rule("tool-call", p.repeat("[TOOL_CALLS]" + tool_choice, min_calls, max_calls));
+ 
+-            return generation_prompt + (reasoning << p.content(p.until("[TOOL_CALLS]")) << tool_calls);
++            return generation_prompt +
++                   (reasoning << p.text_before_calls(p.content(p.until("[TOOL_CALLS]")), inputs.tool_choice)
++                              << tool_calls);
+         }
+ 
+         // Content only parser
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -195,18 +195,28 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
+             auto content    = p.rule("content-text", p.content(p.until_one_of(tool_call_starts)));
+ 
+-            auto body = reasoning << content << tool_calls;
++            auto body = reasoning << p.text_before_calls(content, inputs.tool_choice) << tool_calls;
+             if (supports_reasoning && extract_reasoning) {
+                 // GBNF has no lookahead. Reasoning closed implicitly by a tool
+                 // call is exactly reasoning followed directly by the calls;
+                 // rendering the peek as empty would let reasoning run into
+                 // content and split a tool-call opener across both. Every
+                 // way to reach the first call shares one path into the calls.
+-                std::string grammar =
+-                    "((\"<think>\" space reasoning-text (\"</think>\" space content-text space)?"
+-                    " | space content-text space) tool-calls";
++                std::string think         = "\"<think>\" space reasoning-text";
++                std::string closed        = think + " \"</think>\"";
++                std::string text          = min_calls == 0 ? " space content-text space" : " space";
++                std::string before_calls  = think + " (\"</think>\"" + text + ")?";
++                std::string without_calls = closed + text;
++                // Reasoning the generation prompt opens is only reasoning: it
++                // closes before the turn ends, as the parser requires of text
++                // it has streamed as reasoning. Otherwise it may be skipped.
++                if (data.generation_prompt.find("<think>") == std::string::npos) {
++                    before_calls += " |" + text;
++                    without_calls = "(" + closed + ")?" + text;
++                }
++                std::string grammar = "((" + before_calls + ") tool-calls";
+                 if (min_calls == 0) {
+-                    grammar += " | (\"<think>\" space reasoning-text \"</think>\")? space content-text space";
++                    grammar += " | " + without_calls;
+                 }
+                 body = p.gbnf(body, grammar + ")");
+             }

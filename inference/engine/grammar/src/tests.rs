@@ -236,6 +236,37 @@ fn recursive_scanners_and_nested_structure() {
     );
 }
 
+/// Text up to a delimiter, then any number of calls each opened by that
+/// delimiter and holding recursion: the tool-call section of a whole-completion
+/// grammar whose arguments are free-form objects.
+const SCANNED_CALLS: &str = r#"root ::= text ("<c>" nest ">")*
+text ::= | "<" open | [^<] text
+open ::= | "<" open | "c" tag | [^<c] text
+tag ::= | "<" open | [^<>] text
+nest ::= "(" nest ")" | "x"
+"#;
+
+#[test]
+fn a_scanner_and_its_delimiter_share_a_lexeme_across_a_call_loop() {
+    // The scanner continues over the delimiter's first byte, so it is exact
+    // under greedy lexing only in one lexeme with the delimiter: the loop is
+    // peeled rather than its head left between them, which would render the
+    // free text one character at a time.
+    let report = check_language(
+        SCANNED_CALLS,
+        &[
+            "",
+            "free <text> <c",
+            "a<c>(x)><c>((x))>",
+            "<<c<c x<c>x>",
+            "<c>x>",
+        ],
+        &["a<c>", "a<c>(x)> b", "<c>(x)", "a<c>(x)>><c", "<c>>"],
+    );
+    assert_eq!(report.peeled, 1, "{report:?}");
+    assert_eq!(report.character_lexemes, 0, "{report:?}");
+}
+
 /// llama.cpp's any-order argument lattice: one rule per subset of the
 /// remaining required arguments.
 fn lattice(arguments: usize, recursive: bool) -> String {

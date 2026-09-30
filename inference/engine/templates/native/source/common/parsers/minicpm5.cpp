@@ -110,7 +110,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
                 tool_calls = p.optional(tool_calls);
             }
 
-            auto content = p.content(p.until("<function"));
+            auto content = p.text_before_calls(p.content(p.until("<function")), inputs.tool_choice);
 
             return generation_prompt + reasoning + content + tool_calls + p.end();
         }

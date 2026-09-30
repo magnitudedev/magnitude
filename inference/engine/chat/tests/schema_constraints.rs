@@ -1,14 +1,15 @@
 //! Every valid JSON Schema lowers to a grammar that admits values within the
 //! schema, and exactly those values wherever no relaxation is recorded.
+mod support;
+
 use magnitude_chat::{
-    BpeConfig, ByteBpeTokenizer, ChatRequest, Normalization, PieceEncoding, PieceKind,
-    PreparedChat, SpecialTokens, Split, SplitBehavior, TemplateBundle, TemplateSelection,
-    TemplateVariant, TokenId, ToolChoice,
+    ByteBpeTokenizer, ChatRequest, PreparedChat, SpecialTokens, TemplateBundle, TemplateSelection,
+    TokenId, ToolChoice,
 };
-use magnitude_grammar::{CacheLimits, Vocabulary};
+use magnitude_grammar::Vocabulary;
 use magnitude_templates::{Relaxation, RelaxationReason, RelaxationSubject};
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
 const ASSETS: &[(&str, &str)] = &[
     (
@@ -49,61 +50,12 @@ const ASSETS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Byte pieces 0..=255 and the stop token 256.
 fn tokenizer() -> Arc<ByteBpeTokenizer> {
-    let mut bytes: Vec<u8> = (33..=126).chain(161..=172).chain(174..=255).collect();
-    let mut alphabet: Vec<u32> = bytes.iter().map(|&byte| u32::from(byte)).collect();
-    let mut next = 256;
-    for byte in 0..=255 {
-        if !bytes.contains(&byte) {
-            bytes.push(byte);
-            alphabet.push(next);
-            next += 1;
-        }
-    }
-    let mut pieces = vec![String::new(); 256];
-    for (byte, code) in bytes.into_iter().zip(alphabet) {
-        pieces[byte as usize] = char::from_u32(code).unwrap().to_string();
-    }
-    pieces.push("<|stop|>".into());
-    let mut kinds = vec![PieceKind::Normal; 256];
-    kinds.push(PieceKind::Control);
-    Arc::new(
-        ByteBpeTokenizer::new(BpeConfig {
-            artifact_identity: "fixture".into(),
-            pieces,
-            kinds,
-            merges: vec![],
-            normalization: Normalization::None,
-            splits: vec![Split {
-                pattern: r".+|\s".into(),
-                behavior: SplitBehavior::Isolated,
-            }],
-            encoding: PieceEncoding::ByteLevel,
-            ignore_merges: false,
-            implicit_bos: None,
-            stop_tokens: BTreeSet::from([TokenId(256)]),
-            suppressed_tokens: BTreeSet::new(),
-        })
-        .unwrap(),
-    )
+    support::byte_tokenizer("<|stop|>")
 }
 
 fn bundle(source: &str) -> TemplateBundle {
-    TemplateBundle::new(
-        vec![TemplateVariant {
-            name: "default".into(),
-            source: source.into(),
-            provenance: "fixture".into(),
-        }],
-        "default".into(),
-        [
-            ("bos_token".to_string(), "<s>".to_string()),
-            ("eos_token".to_string(), "</s>".to_string()),
-        ]
-        .into(),
-    )
-    .unwrap()
+    support::bundle(source, "<s>", "</s>")
 }
 
 /// JSON output constrained by one schema under the Qwen3 template.
@@ -116,19 +68,10 @@ struct JsonOutput {
 impl JsonOutput {
     fn new() -> Self {
         let tokenizer = tokenizer();
-        let vocabulary = Vocabulary::new(
-            tokenizer.clone(),
-            tokenizer.vocabulary(),
-            CacheLimits {
-                entries: 0,
-                bytes: 0,
-            },
-        )
-        .unwrap();
         Self {
+            vocabulary: support::vocabulary(&tokenizer),
             tokenizer,
             bundle: bundle(ASSETS[0].1),
-            vocabulary,
         }
     }
 

@@ -61,6 +61,10 @@ required. A selection of none omits tools. Rendering communicates required/named
 selection without mutating the caller's history; exact instruction wording is
 not a performance guarantee. The checkpoint still owns chat and argument syntax.
 Prompt instructions communicate intent; request-local grammar enforces it.
+Under a selection that requires a call, the output language admits only
+reasoning before it, never content: content could not end, since the turn
+cannot end without the call. Reasoning is read the way the output parser reads
+it, so reasoning the prompt opens closes before the turn ends.
 Template keyword overrides cannot replace request-owned tool selection or other
 rendering inputs.
 

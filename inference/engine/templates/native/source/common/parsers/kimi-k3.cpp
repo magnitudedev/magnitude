@@ -147,7 +147,7 @@ common_chat_params common_chat_params_init_kimi_k3(const common_chat_template & 
         auto tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? tools_section :
                                                                               p.optional(tools_section);
 
-        return start + reasoning + response + tools + trailer + end;
+        return start + reasoning + p.text_before_calls(response, inputs.tool_choice) + tools + trailer + end;
     });
 
     data.parser = parser.save();

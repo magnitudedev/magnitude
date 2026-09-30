@@ -1,3 +1,5 @@
+mod support;
+
 use magnitude_chat::{
     generation::{generation_options, MethodPolicy, ModelLimits},
     request::{PromptCache, SamplingControls},
@@ -25,20 +27,7 @@ fn method_policy_is_qualified_against_the_prepared_method() {
 
 /// Byte pieces 0..=255, `<eos>` 256 and `<bos>` 257.
 fn config() -> BpeConfig {
-    let mut bytes: Vec<u8> = (33..=126).chain(161..=172).chain(174..=255).collect();
-    let mut alphabet: Vec<u32> = bytes.iter().map(|&byte| u32::from(byte)).collect();
-    let mut next = 256;
-    for byte in 0..=255 {
-        if !bytes.contains(&byte) {
-            bytes.push(byte);
-            alphabet.push(next);
-            next += 1;
-        }
-    }
-    let mut pieces = vec![String::new(); 256];
-    for (byte, code) in bytes.into_iter().zip(alphabet) {
-        pieces[byte as usize] = char::from_u32(code).unwrap().to_string();
-    }
+    let mut pieces = support::byte_pieces();
     pieces.extend(["<eos>".into(), "<bos>".into()]);
     let mut kinds = vec![PieceKind::Normal; 256];
     kinds.extend([PieceKind::Control, PieceKind::Control]);

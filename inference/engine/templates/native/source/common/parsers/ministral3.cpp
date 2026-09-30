@@ -100,7 +100,9 @@ common_chat_params common_chat_params_init_ministral_3(const common_chat_templat
             auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
             auto tool_calls = p.trigger_rule("tool-call", p.repeat("[TOOL_CALLS]" + tool_choice, min_calls, max_calls));
 
-            return generation_prompt + (reasoning << p.content(p.until("[TOOL_CALLS]")) << tool_calls);
+            return generation_prompt +
+                   (reasoning << p.text_before_calls(p.content(p.until("[TOOL_CALLS]")), inputs.tool_choice)
+                              << tool_calls);
         }
 
         // Content only parser

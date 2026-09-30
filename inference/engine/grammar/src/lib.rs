@@ -4,7 +4,8 @@
 //! Compilation turns GBNF into a lexical plan. Regular rules become
 //! terminals defined by reference; recursive rules become Earley rules whose
 //! skeletons flatten non-recursive structure within a size allowance; a
-//! lexeme is every regular path between two parse boundaries. Each lexeme is
+//! lexeme is every regular path between two parse boundaries, and a scanner
+//! stays in one lexeme with the delimiter that ends it. Each lexeme is
 //! certified exact under llguidance's greedy lexing or rendered one character
 //! at a time, so the result accepts exactly the GBNF language and its size is
 //! bounded by a fixed multiple of the source.
@@ -13,6 +14,7 @@ mod certify;
 mod constraint;
 mod elimination;
 mod gbnf;
+mod language;
 mod lark;
 mod lexeme;
 mod network;
@@ -83,6 +85,9 @@ pub struct CompileReport {
     /// Skeleton states kept as boundaries because eliminating them exceeded
     /// the allowance.
     pub hubs: usize,
+    /// Unbounded repetitions built with their first iteration before the
+    /// loop, so text before them shares a lexeme with its delimiter.
+    pub peeled: usize,
     /// Lexemes rendered one character at a time.
     pub character_lexemes: usize,
     pub certification_questions: usize,
@@ -102,8 +107,10 @@ pub fn compile(gbnf: &str) -> Result<Compiled, GrammarError> {
     let mut terms = terminal::Terms::new();
     let mut allowance = terminal::Allowance::new(network.symbols);
     let (classes, scanners) = terminal::classify(&network, &mut terms, &mut allowance);
-    let mut plan = lexeme::Plan::build(&network, &classes, &mut terms, &mut allowance);
-    let certification = certify::certify(&mut plan, &mut terms);
+    let mut regexes = language::Regexes::new();
+    let mut plan =
+        lexeme::Plan::build(&network, &classes, &mut terms, &mut allowance, &mut regexes);
+    let characters = certify::certify(&mut plan, &mut terms, &mut regexes);
     let rendered = lark::render(&plan, &terms);
     Ok(Compiled {
         report: CompileReport {
@@ -116,9 +123,10 @@ pub fn compile(gbnf: &str) -> Result<Compiled, GrammarError> {
             scanners,
             unflattened: plan.unflattened,
             hubs: plan.hubs,
-            character_lexemes: certification.characters,
-            certification_questions: certification.questions,
-            exhausted_questions: certification.exhausted,
+            peeled: plan.peeled,
+            character_lexemes: characters,
+            certification_questions: regexes.questions,
+            exhausted_questions: regexes.exhausted,
             compile_us: started.elapsed().as_micros() as u64,
         },
         grammar: Grammar {
@@ -136,7 +144,13 @@ pub(crate) fn compile_characters(gbnf: &str) -> Result<Grammar, GrammarError> {
     let mut terms = terminal::Terms::new();
     let mut allowance = terminal::Allowance::new(network.symbols);
     let (classes, _) = terminal::classify(&network, &mut terms, &mut allowance);
-    let mut plan = lexeme::Plan::build(&network, &classes, &mut terms, &mut allowance);
+    let mut plan = lexeme::Plan::build(
+        &network,
+        &classes,
+        &mut terms,
+        &mut allowance,
+        &mut language::Regexes::new(),
+    );
     loop {
         let view = &terms;
         let lexemes = plan

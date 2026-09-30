@@ -106,7 +106,8 @@ common_chat_params common_chat_params_init_kimi_k2(const common_chat_template & 
                 p.optional(p.literal(SECTION_END)))
         );
 
-        auto content_before_tools = p.content(p.until_one_of({ SECTION_BEGIN, CALL_BEGIN }));
+        auto content_before_tools =
+            p.text_before_calls(p.content(p.until_one_of({ SECTION_BEGIN, CALL_BEGIN })), inputs.tool_choice);
 
         return generation_prompt + reasoning + content_before_tools + tool_calls + end;
     });

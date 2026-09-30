@@ -66,6 +66,10 @@ A compiled grammar is a lexical plan:
   Boundaries are rule entries and exits, private endpoints of each call (so a
   path that bypasses a call never ends where the call starts), and heads of
   repetitions whose body contains a call (so a lexeme spans one iteration).
+  Text before such a repetition that continues over the text its body leads
+  with, yet never contains it, is a scanner before its delimiter: the
+  repetition's first iteration is built before its head, so both stay in one
+  lexeme.
 
 Each multi-character lexeme is certified exact against every lexeme that can
 be allowed with it. Allowed sets are tracked per calling context; call sites
