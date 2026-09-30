@@ -43,7 +43,7 @@ const domainLabel = (
   if (domain.kind === "System") return "System memory"
   const accelerators = hardware.accelerators.filter((accelerator) =>
     accelerator.memoryDomainId === domain.memoryDomainId)
-  const name = accelerators.map(({ name }) => name).join(" + ")
+  const name = [...new Set(accelerators.map(({ name }) => name.trim()).filter(Boolean))].join(" + ")
   return domain.kind === "UnifiedMemory"
     ? `${name || Option.getOrElse(hardware.processor, () => "System")} · Unified memory`
     : `${name || "Accelerator"} · GPU ${physicalOrdinal}`

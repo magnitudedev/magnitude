@@ -177,6 +177,14 @@ impl Catalog {
 /// Enumerates host and backend facts into one validated topology.
 fn inventory(revision: u64) -> Result<DeviceTopology, DiscoveryError> {
     let capacity = host::capacity().map_err(DiscoveryError::HostMemory)?;
+    Ok(inventory_from(revision, capacity, backends::discover()))
+}
+
+fn inventory_from(
+    revision: u64,
+    capacity: host::HostCapacity,
+    discovered: backends::BackendDiscovery,
+) -> DeviceTopology {
     let host_pool = MemoryPoolId { revision, index: 0 };
     let mut pools = vec![MemoryPoolInfo {
         id: host_pool,
@@ -185,7 +193,6 @@ fn inventory(revision: u64) -> Result<DeviceTopology, DiscoveryError> {
         basis: capacity.basis,
         ledger: LedgerKey::Host,
     }];
-    let discovered = backends::discover();
     let mut devices = Vec::with_capacity(discovered.devices.len());
     for device in discovered.devices {
         let memory = match device.memory {
@@ -243,12 +250,12 @@ fn inventory(revision: u64) -> Result<DeviceTopology, DiscoveryError> {
             descriptor: Arc::new(device.descriptor),
         });
     }
-    Ok(DeviceTopology {
+    DeviceTopology {
         revision,
         devices,
         pools,
         diagnostics: discovered.diagnostics,
-    })
+    }
 }
 
 impl DeviceTopology {
@@ -271,6 +278,118 @@ impl DeviceTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::{BackendDiscovery, Descriptor, DiscoveredDevice};
+    use crate::devices::{CapacityBasis, DeviceKind};
+
+    #[cfg(not(target_os = "macos"))]
+    fn gpu(backend: BackendName, uuid: [u8; 16]) -> DiscoveredDevice {
+        DiscoveredDevice {
+            selector: match backend {
+                BackendName::Cuda => DeviceSelector::Cuda { uuid },
+                BackendName::Vulkan => DeviceSelector::Vulkan { uuid },
+                _ => unreachable!(),
+            },
+            name: "Discrete GPU".into(),
+            kind: DeviceKind::Gpu,
+            backend,
+            availability: Availability::Available,
+            memory: DiscoveredMemory::Dedicated {
+                capacity_bytes: 24_000_000_000,
+                basis: if backend == BackendName::Cuda {
+                    CapacityBasis::CudaDeviceTotal
+                } else {
+                    CapacityBasis::VulkanDeviceLocalHeap
+                },
+                ledger: LedgerKey::PhysicalGpu(uuid),
+                max_allocation_bytes: 24_000_000_000,
+            },
+            descriptor: match backend {
+                BackendName::Cuda => Descriptor::Cuda { ordinal: 0, uuid },
+                BackendName::Vulkan => Descriptor::Vulkan { uuid },
+                _ => unreachable!(),
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn gpu_topology(devices: Vec<DiscoveredDevice>) -> DeviceTopology {
+        inventory_from(
+            0,
+            host::HostCapacity {
+                bytes: 64_000_000_000,
+                basis: CapacityBasis::OsUsableRam,
+            },
+            BackendDiscovery {
+                devices,
+                diagnostics: vec![],
+            },
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn gpu_pools(topology: &DeviceTopology) -> Vec<MemoryPoolId> {
+        topology
+            .devices
+            .iter()
+            .map(|device| match &device.memory {
+                DeviceMemory::Established(memory) => memory.allocation_pool,
+                _ => panic!("GPU memory must be established"),
+            })
+            .collect()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn cuda_and_vulkan_views_share_pools_by_uuid_at_any_count() {
+        for count in [1, 2, 4] {
+            let devices = [BackendName::Cuda, BackendName::Vulkan]
+                .into_iter()
+                .flat_map(|backend| (1..=count).map(move |id| gpu(backend, [id; 16])))
+                .collect();
+            let topology = gpu_topology(devices);
+            let pools = gpu_pools(&topology);
+            assert_eq!(topology.pools.len(), usize::from(count) + 1);
+            for index in 0..usize::from(count) {
+                assert_eq!(pools[index], pools[index + usize::from(count)]);
+            }
+            assert_eq!(
+                pools[..usize::from(count)]
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                usize::from(count)
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn unmatched_backend_views_keep_separate_pools() {
+        let topology = gpu_topology(vec![
+            gpu(BackendName::Cuda, [1; 16]),
+            gpu(BackendName::Cuda, [2; 16]),
+            gpu(BackendName::Vulkan, [1; 16]),
+            gpu(BackendName::Vulkan, [3; 16]),
+        ]);
+        let pools = gpu_pools(&topology);
+        assert_eq!(pools[0], pools[2]);
+        assert_ne!(pools[1], pools[3]);
+        assert_eq!(topology.pools.len(), 4);
+
+        // Identical marketing names cannot establish physical identity.
+        let cuda_only = gpu_topology(vec![
+            gpu(BackendName::Cuda, [5; 16]),
+            gpu(BackendName::Cuda, [6; 16]),
+        ]);
+        assert_ne!(gpu_pools(&cuda_only)[0], gpu_pools(&cuda_only)[1]);
+
+        // Enumeration order is irrelevant to the physical pool association.
+        let reverse = gpu_topology(vec![
+            gpu(BackendName::Vulkan, [7; 16]),
+            gpu(BackendName::Cuda, [7; 16]),
+        ]);
+        assert_eq!(gpu_pools(&reverse)[0], gpu_pools(&reverse)[1]);
+    }
 
     #[test]
     fn host_cpu_is_always_discovered_on_the_host_pool() {

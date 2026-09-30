@@ -1,7 +1,7 @@
 import { Option, Schema } from "effect"
 import type { LocalInferenceHardware } from "@magnitudedev/sdk"
 import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
-import { formatMemorySize } from "@magnitudedev/client-common"
+import { formatLocalInferenceBackend, formatMemorySize } from "@magnitudedev/client-common"
 import { hardwarePresentation, normalizeGpuName, normalizeHardwareName } from "./hardware-photos"
 import facts from "../../assets/hardware/facts.json"
 
@@ -70,19 +70,25 @@ export const hardwareDetails = (identity: MachineIdentityObservation | null, har
     ...processorFacts.filter(fact => !fact.label.startsWith("CPU core")),
     ...Option.match(presentation.deviceId, { onNone: () => [], onSome: id => publishedFacts("Device", id) }),
   ]
-  // One memory total per domain, even when multiple accelerator APIs expose that device.
+  // One card per physical memory domain, even when multiple APIs expose that GPU.
   const displayedDomains = new Set<string>()
-  const accelerators = hardware.accelerators.map(accelerator => {
+  const accelerators = hardware.accelerators.flatMap(accelerator => {
     const domain = domainFor(accelerator.memoryDomainId)
+    if (domain?.kind === "PhysicalDevice" && displayedDomains.has(accelerator.memoryDomainId)) return []
     const shared = domain?.sharesSystemMemory === true
     const showMemory = !displayedDomains.has(accelerator.memoryDomainId) && !shared && domain?.kind === "PhysicalDevice" && domain.totalBytes > 0
     displayedDomains.add(accelerator.memoryDomainId)
-    return {
+    const backends = domain?.kind === "PhysicalDevice"
+      ? [...new Set(hardware.accelerators.filter(candidate => candidate.memoryDomainId === accelerator.memoryDomainId)
+        .map(candidate => formatLocalInferenceBackend(candidate.backend)))]
+      : []
+    return [{
       id: accelerator.acceleratorId, name: accelerator.name,
       detail: showMemory ? `${formatMemorySize(domain.totalBytes)} VRAM` : shared ? (unified ? "Shares unified memory" : "Shares system RAM") : "Local acceleration",
+      acceleration: backends.length > 1 ? `${backends.join(" + ")} acceleration` : null,
       facts: publishedFacts("Accelerator", accelerator.name, Option.none(),
         !shared && domain?.kind === "PhysicalDevice" && domain.totalBytes > 0 ? Option.some(domain.totalBytes) : Option.none()),
-    }
+    }]
   })
   const processorName = Option.getOrElse(hardware.processor, () => "Unknown processor")
   const integratedChip = /^(Apple M[1-9]\d*\b|NVIDIA GB10$)/i.test(processorName)
@@ -97,7 +103,8 @@ export const hardwareDetails = (identity: MachineIdentityObservation | null, har
     { label: "Memory", name: memoryFacts[0]?.value ?? "Unknown", truncateName: false, details: memoryFacts.map((fact, index) => index === 0 ? fact.label : `${fact.value} ${fact.label}`) },
     ...visibleAccelerators.map((accelerator, index) => ({
       label: visibleAccelerators.length > 1 ? `GPU ${index + 1}` : "GPU", name: accelerator.name, truncateName: !findHardwareFacts("Accelerator", accelerator.name),
-      details: [accelerator.detail, ...accelerator.facts.filter(fact => !hiddenAcceleratorFactLabels.has(fact.label)).map(fact => `${fact.value} ${fact.label}`)],
+      details: [accelerator.detail, ...(accelerator.acceleration === null ? [] : [accelerator.acceleration]),
+        ...accelerator.facts.filter(fact => !hiddenAcceleratorFactLabels.has(fact.label)).map(fact => `${fact.value} ${fact.label}`)],
     })),
   ]
   return { ...presentation, summary, accelerators, groups, cpuInference: hardware.accelerators.length === 0 }

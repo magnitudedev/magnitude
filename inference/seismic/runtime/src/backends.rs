@@ -368,7 +368,7 @@ pub(crate) fn discover() -> BackendDiscovery {
                     DiscoveredMemory::Dedicated {
                         capacity_bytes: descriptor.total_memory_bytes,
                         basis: CapacityBasis::CudaDeviceTotal,
-                        ledger: LedgerKey::Cuda(descriptor.uuid),
+                        ledger: LedgerKey::PhysicalGpu(descriptor.uuid),
                         max_allocation_bytes: seismic_cuda::max_allocation_bytes(
                             descriptor.total_memory_bytes,
                         ),

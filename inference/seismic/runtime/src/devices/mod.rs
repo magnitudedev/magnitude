@@ -207,9 +207,8 @@ pub struct MemoryPoolInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum LedgerKey {
     Host,
-    Cuda([u8; 16]),
-    #[cfg(not(target_os = "macos"))]
-    Vulkan([u8; 16]),
+    /// Stable physical UUID shared by CUDA and Vulkan views of a GPU.
+    PhysicalGpu([u8; 16]),
     /// A device whose backing is not normalized accounts privately.
     Unestablished(DeviceSelector),
 }
