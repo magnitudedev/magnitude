@@ -1,5 +1,15 @@
 # @magnitudedev/cli
 
+## 0.2.0-alpha.2
+
+### Patch Changes
+
+- [`9b929cf`](https://github.com/magnitudedev/magnitude/commit/9b929cfef434742e0f43043dfbf212f7801d5ba5) Thanks [@anerli](https://github.com/anerli)! - - Fix models that load and run, such as Gemma 4 26B-A4B and Qwen3.6 35B-A3B on Apple Silicon, being reported as unable to run on this computer.
+
+  - A model is reported as unsupported only when Magnitude cannot actually run it. A gap in the device's speed measurements now shows "Speed estimate unavailable" instead of hiding the model.
+
+- [`f29bcb2`](https://github.com/magnitudedev/magnitude/commit/f29bcb218cc60d6cf01c930a54cd6e735ba4ba7f) Thanks [@anerli](https://github.com/anerli)! - - Fix long prompts failing partway through with "target graph class ... was not sealed" and the model server going down, as with Qwen3.8-27B on a 64k-token prompt on Apple Silicon. Attention history now stays within the bound its kernels were prepared for on every model, however requests interleave, fork or are reclaimed.
+
 ## 0.2.0-alpha.1
 
 ### Patch Changes

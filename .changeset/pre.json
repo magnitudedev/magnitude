@@ -40,8 +40,10 @@
     "@magnitudedev/version": "0.0.1"
   },
   "changesets": [
+    "assessment-outcomes",
     "faster-decode-and-speculative-drafts",
     "headless-serve",
+    "history-span-bound",
     "native-inference-engine",
     "remote-gate-case-insensitive-paths"
   ]
