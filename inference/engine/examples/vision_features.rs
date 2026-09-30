@@ -132,7 +132,8 @@ fn main() -> Result<(), String> {
     let input = host
         .prepare_input(tokens, &[image])
         .map_err(|error| error.to_string())?;
-    let [prepared] = input.vision() else {
+    let mut images = input.vision().values();
+    let (Some(prepared), None) = (images.next(), images.next()) else {
         return Err("the prompt must prepare exactly one image".into());
     };
     let grid = prepared.grid();

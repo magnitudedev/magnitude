@@ -48,8 +48,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Make a request with installed input resident: fresh state at zero, or
-    /// `from`'s state at its position. Features `from` holds for spans of
-    /// this input straddling that position are adopted; every span ending
+    /// `from`'s state at its position. Features `from` holds for an image
+    /// with a span straddling that position are adopted; every image placed
     /// after it that still lacks features is returned as an encode. Opening
     /// into free banks changes no bindings; growing one orphans a queued
     /// lookahead first.
@@ -82,17 +82,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let installed = self.input.get_mut(&request).expect("input checked above");
         installed.resident = true;
+        let spans = installed.input.layout().spans();
         let mut encodes = Vec::new();
-        for span in installed.input.layout().spans() {
-            if span.end <= position {
+        for (identity, slot) in &mut installed.images {
+            // Spans are ordered and disjoint: only an image's next placement
+            // can straddle the position.
+            let Some(next) = spans
+                .iter()
+                .find(|span| span.identity == *identity && position < span.end)
+            else {
                 continue;
-            }
-            let slot = installed
-                .images
-                .get_mut(&span.identity)
-                .expect("installed input has a slot for every span");
-            if slot.features.is_none() && span.start < position {
-                slot.features = from.and_then(|from| from.features.get(&span.identity).cloned());
+            };
+            if next.start < position {
+                slot.features = from.and_then(|from| from.features.get(identity).cloned());
             }
             if slot.features.is_none() {
                 encodes.push(Operation::Encode {

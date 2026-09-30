@@ -628,7 +628,11 @@ fn projector_rejects_malformed_shapes_for_every_role_class() {
     }
 }
 
-fn prepared_qwen_media(model: &magnitude_family_contracts::ModelDefinition) -> PreparedMedia {
+/// `images` identical 4 x 4-patch images of zero pixels, in one media item.
+fn prepared_qwen_media(
+    model: &magnitude_family_contracts::ModelDefinition,
+    images: usize,
+) -> PreparedMedia {
     let vision = model.vision.as_ref().unwrap();
     let processor = ImageProcessor::new(vision.image_processor_config().unwrap()).unwrap();
     PreparedMedia::new(
@@ -637,15 +641,16 @@ fn prepared_qwen_media(model: &magnitude_family_contracts::ModelDefinition) -> P
             PreparedTensor::new(
                 "pixel_values".into(),
                 DType::F32,
-                vec![16, 24],
-                vec![0; 16 * 24 * 4],
+                vec![16 * images, 24],
+                vec![0; 16 * images * 24 * 4],
             )
             .unwrap(),
             PreparedTensor::new(
                 "image_grid_thw".into(),
                 DType::I64,
-                vec![1, 3],
+                vec![images, 3],
                 [1i64, 4, 4]
+                    .repeat(images)
                     .into_iter()
                     .flat_map(i64::to_le_bytes)
                     .collect(),
@@ -676,7 +681,7 @@ fn qwen_adapter_closes_token_and_vision_coordinates() {
         InputLayout::new(tokens.len(), vec![]).unwrap(),
     )
     .unwrap();
-    let media = prepared_qwen_media(&model);
+    let media = prepared_qwen_media(&model, 1);
     let input = adapter.prepare(&model, plan, &[media.clone()]).unwrap();
     assert_eq!(input.tokens().len(), 7);
     assert_eq!(input.layout().spans().len(), 1);
@@ -700,12 +705,11 @@ fn qwen_adapter_closes_token_and_vision_coordinates() {
         ]
     );
     assert_eq!(input.continuation(), 5);
-    assert_eq!(input.vision()[0].grid(), [1, 4, 4]);
-    assert_eq!(input.vision()[0].pixels().shape(), [16, 24]);
-    assert_eq!(
-        input.vision()[0].spatial().patch_order(),
-        &(0..16).collect::<Vec<_>>()
-    );
+    let image = &input.vision()[&input.layout().spans()[0].identity];
+    assert_eq!(input.vision().len(), 1);
+    assert_eq!(image.grid(), [1, 4, 4]);
+    assert_eq!(image.pixels().shape(), [16, 24]);
+    assert_eq!(image.spatial().patch_order(), &(0..16).collect::<Vec<_>>());
 
     let expanded = input.tokens().to_vec();
     let expanded = TokenPlan::new(
@@ -714,6 +718,96 @@ fn qwen_adapter_closes_token_and_vision_coordinates() {
     )
     .unwrap();
     assert!(adapter.prepare(&model, expanded, &[media]).is_err());
+}
+
+/// One image placed twice is two spans naming one prepared image; the
+/// second placement takes its own rotary coordinates after the first.
+#[test]
+fn qwen_adapter_prepares_a_repeated_image_once_for_every_placement() {
+    let model = inspect_components(
+        &directory(false),
+        Some(&projector()),
+        PackageIdentity {
+            target: ArtifactIdentity([1; 32]),
+            projector: Some(ArtifactIdentity([2; 32])),
+        },
+    )
+    .unwrap();
+    let adapter = QwenInputAdapter::new(Some(
+        QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap(),
+    ));
+    let placeholder = [TokenId(98), TokenId(99), TokenId(100)];
+    let tokens = [&placeholder[..], &[TokenId(7)], &placeholder[..]].concat();
+    let plan = TokenPlan::new(
+        tokens.clone(),
+        InputLayout::new(tokens.len(), vec![]).unwrap(),
+    )
+    .unwrap();
+    let input = adapter
+        .prepare(&model, plan, &[prepared_qwen_media(&model, 2)])
+        .unwrap();
+    let [first, second] = input.layout().spans() else {
+        panic!("two placements")
+    };
+    assert_eq!((first.start, first.end), (1, 5));
+    assert_eq!((second.start, second.end), (8, 12));
+    assert_eq!(first.identity, second.identity);
+    assert_eq!(input.vision().len(), 1);
+    assert_eq!(input.vision()[&first.identity].grid(), [1, 4, 4]);
+    // Text resumes after the first image's extent; the second image starts
+    // one row past the text between them.
+    assert_eq!(
+        input.coordinates_at(5, 4).unwrap(),
+        vec![[3, 3, 3], [4, 4, 4], [5, 5, 5], [6, 6, 6]]
+    );
+    assert_eq!(input.coordinates_at(8, 1).unwrap(), vec![[6, 6, 6]]);
+}
+
+/// A closed input places every image it holds and holds every image its
+/// spans place.
+#[test]
+fn prepared_input_holds_exactly_the_images_its_spans_place() {
+    use magnitude_family_contracts::{InputPreparationError, PreparedModelInput};
+    let model = inspect_components(
+        &directory(false),
+        Some(&projector()),
+        PackageIdentity {
+            target: ArtifactIdentity([1; 32]),
+            projector: Some(ArtifactIdentity([2; 32])),
+        },
+    )
+    .unwrap();
+    let adapter = QwenInputAdapter::new(Some(
+        QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap(),
+    ));
+    let tokens = vec![TokenId(98), TokenId(99), TokenId(100), TokenId(7)];
+    let plan = TokenPlan::new(
+        tokens.clone(),
+        InputLayout::new(tokens.len(), vec![]).unwrap(),
+    )
+    .unwrap();
+    let input = adapter
+        .prepare(&model, plan, &[prepared_qwen_media(&model, 1)])
+        .unwrap();
+    let close = |vision| {
+        PreparedModelInput::new(
+            &model,
+            TokenPlan::new(input.tokens().to_vec(), input.layout().clone()).unwrap(),
+            input.coordinates().to_vec(),
+            input.continuation(),
+            vision,
+        )
+        .map(|_| ())
+    };
+    assert_eq!(close(input.vision().clone()), Ok(()));
+    let mut unplaced = input.vision().clone();
+    let image = unplaced.values().next().unwrap().clone();
+    unplaced.insert("unplaced".into(), image);
+    assert_eq!(close(unplaced), Err(InputPreparationError::InputAlignment));
+    assert_eq!(
+        close(Default::default()),
+        Err(InputPreparationError::InputAlignment)
+    );
 }
 
 #[test]
@@ -736,7 +830,7 @@ fn qwen_adapter_rejects_media_with_wrong_processor_identity() {
         InputLayout::new(tokens.len(), vec![]).unwrap(),
     )
     .unwrap();
-    let original = prepared_qwen_media(&model);
+    let original = prepared_qwen_media(&model, 1);
     let altered = PreparedMedia::new("b".repeat(64), original.tensors().to_vec()).unwrap();
     assert!(adapter.prepare(&model, plan, &[altered]).is_err());
 }

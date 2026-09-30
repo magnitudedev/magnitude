@@ -13,6 +13,7 @@ use magnitude_artifacts::{
     BoundaryRule, ImageProcessor, InputLayout, InputSpan, TokenId,
 };
 use sha2::{Digest, Sha256};
+use std::collections::{btree_map::Entry, BTreeMap};
 
 /// The three tokens an image renders as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,7 +201,7 @@ impl ModelInputAdapter for SequentialImageInput {
             .map_or(1, |vision| vision.cell_rows() as usize);
         let mut expanded = Vec::with_capacity(tokens.len());
         let mut spans = Vec::with_capacity(images.len());
-        let mut vision_inputs = Vec::with_capacity(images.len());
+        let mut vision_inputs = BTreeMap::new();
         let mut images = images.into_iter();
         let mut source = 0usize;
         while source < tokens.len() {
@@ -227,13 +228,14 @@ impl ModelInputAdapter for SequentialImageInput {
                         boundaries: self.boundaries,
                         language_history: false,
                     });
-                    vision_inputs.push(PreparedVisionInput::new(
-                        definition,
-                        identity,
-                        image.grid,
-                        image.pixels,
-                        (self.spatial)(definition, image.grid)?,
-                    )?);
+                    if let Entry::Vacant(entry) = vision_inputs.entry(identity) {
+                        entry.insert(PreparedVisionInput::new(
+                            definition,
+                            image.grid,
+                            image.pixels,
+                            (self.spatial)(definition, image.grid)?,
+                        )?);
+                    }
                     source += 3;
                 }
                 Some(markers) if markers.contains(token) => {

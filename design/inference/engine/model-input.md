@@ -53,6 +53,8 @@ identity, so both sides name one package. Live device resources remain worker-co
 - Any valid GGUF header, split or not, parses; a split package plans and loads as one package.
 - The family adapter computes every spatial value consumed by the vision lane.
 - A prepared numerical input cannot contain mismatched token, span, media, or patch domains.
+- A prepared numerical input holds each distinct image once, keyed by content identity: every
+  span names a held image and every held image is placed by a span.
 - A prepared prompt holds the tokenizer's implicit BOS exactly once, and no BOS otherwise beyond
   what the template renders.
 - Execution performs no model-family coordinate or interpolation calculation.

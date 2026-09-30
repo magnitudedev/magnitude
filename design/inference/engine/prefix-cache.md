@@ -43,8 +43,9 @@ path it holds and are not part of an entry's identity.
 - **Input** is installed once at admission and released only when the request closes.
 - **Residency** comes and goes within that lifetime. Becoming resident is one transition: look up
   the deepest cached prefix of the request's path below its resume bound, fork its state (or
-  create fresh state), adopt cached features for straddling spans, encode every span that ends
-  after the position and still lacks features, and set the generation's position.
+  create fresh state), adopt cached features for straddling spans, encode once each image placed
+  by a span that ends after the position and still lacks features (placements of one image share
+  its features), and set the generation's position.
 - A **newly admitted request**, a **request waiting for a peer's prefix**, and an **evicted
   request** all become resident through that one transition, when rounds are formed. They differ
   only in when it runs.

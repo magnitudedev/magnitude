@@ -2,6 +2,7 @@
 applies_to:
   - inference/engine/src/inputs/**
   - inference/engine/families/qwen35/**
+  - inference/engine/families/contracts/src/inputs.rs
   - inference/engine/serving/**
 ---
 
@@ -12,7 +13,11 @@ applies_to:
 A request binds an immutable model input plan before decoder admission. The plan
 identifies token inputs, conditioning spans, processor identity, rotary coordinates
 and continuation semantics. Image ordering and repeated occurrences are meaningful;
-equal image content does not merge distinct positions in the prompt. Serving owns
+equal image content does not merge distinct positions in the prompt. A span is one
+placement and names its image by content identity; the plan holds each distinct
+image once. Placements of the same image, within one message or across turns,
+share one prepared image and one encoding, and each placement reads those features
+at its own rows and coordinates. Serving owns
 validated source decoding and host preparation; model formulas own numerical
 encoding and projection through the ordinary execution owner.
 

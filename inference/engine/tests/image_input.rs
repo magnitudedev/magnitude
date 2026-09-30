@@ -84,10 +84,8 @@ fn image_parts_expand_to_conditioned_spans_with_spatial_coordinates() {
     let [span] = input.layout().spans() else {
         panic!("one image span")
     };
-    let [vision] = input.vision() else {
-        panic!("one vision input")
-    };
-    assert_eq!(span.identity, vision.identity());
+    assert_eq!(input.vision().len(), 1, "one vision input");
+    let vision = &input.vision()[&span.identity];
     let [t, h, w] = vision.grid();
     assert_eq!(t, 1, "a still image is one temporal patch");
     assert_eq!(
@@ -136,6 +134,7 @@ fn image_parts_expand_to_conditioned_spans_with_spatial_coordinates() {
     };
     assert_eq!(first.identity, span.identity);
     assert_eq!(second.identity, span.identity);
+    assert_eq!(two.vision().len(), 1, "a repeated image is prepared once");
     assert_eq!(second.end - second.start, span.end - span.start);
     // The second image starts past the first image's extent.
     let first_after = two.coordinates()[first.end][0];

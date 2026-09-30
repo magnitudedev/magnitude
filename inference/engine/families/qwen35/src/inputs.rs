@@ -10,6 +10,7 @@ use magnitude_family_contracts::{
     PreparedModelInput, PreparedVisionInput, TokenPlan, VisionSpatialControls,
 };
 use sha2::{Digest, Sha256};
+use std::collections::{btree_map::Entry, BTreeMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QwenImageTokens {
@@ -203,7 +204,7 @@ impl ModelInputAdapter for QwenInputAdapter {
             return Err(InputPreparationError::InputAlignment);
         }
         let mut coordinates = Vec::with_capacity(expanded.len());
-        let mut vision_inputs = Vec::with_capacity(sizes.len());
+        let mut vision_inputs = BTreeMap::new();
         let mut spans = Vec::with_capacity(sizes.len());
         let (mut cursor, mut pixel_start, mut rotary) = (0usize, 0usize, 0usize);
         for grid in sizes {
@@ -282,13 +283,14 @@ impl ModelInputAdapter for QwenInputAdapter {
                 boundaries: BoundaryRule::Causal,
                 language_history: false,
             });
-            vision_inputs.push(PreparedVisionInput::new(
-                definition,
-                identity,
-                grid,
-                values,
-                spatial_controls(grid, merge, table_side)?,
-            )?);
+            if let Entry::Vacant(entry) = vision_inputs.entry(identity) {
+                entry.insert(PreparedVisionInput::new(
+                    definition,
+                    grid,
+                    values,
+                    spatial_controls(grid, merge, table_side)?,
+                )?);
+            }
             rotary = next_rotary;
             cursor = end;
             pixel_start += patches;

@@ -19,32 +19,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if input.vision().len() > self.execution.policy().limits().max_images_per_request {
             return Err("input exceeds planned image capacity".into());
         }
-        let mut images = BTreeMap::new();
-        for prepared in input.vision() {
-            let image = ImageRef::prepared(self.domain.id().clone(), prepared.clone())
-                .map_err(|error| error.to_string())?;
-            if images
-                .insert(
-                    prepared.identity().to_owned(),
+        let images = input
+            .vision()
+            .iter()
+            .map(|(identity, prepared)| {
+                let image = ImageRef::prepared(self.domain.id().clone(), prepared.clone())
+                    .map_err(|error| error.to_string())?;
+                Ok((
+                    identity.clone(),
                     InputImage {
                         image,
                         features: None,
                     },
-                )
-                .is_some()
-            {
-                return Err("prepared input repeats a vision identity".into());
-            }
-        }
-        if images.len() != input.layout().spans().len()
-            || input
-                .layout()
-                .spans()
-                .iter()
-                .any(|span| !images.contains_key(&span.identity))
-        {
-            return Err("prepared vision inputs differ from conditioned layout".into());
-        }
+                ))
+            })
+            .collect::<Result<_, String>>()?;
         self.input.insert(
             request,
             RequestInput {

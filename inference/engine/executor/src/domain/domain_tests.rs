@@ -822,3 +822,295 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
         .unwrap();
     assert_eq!(domain.target.get(&request).unwrap().position(), 0);
 }
+
+/// The tiny model with a minimal vision description: 2 x 2 patches of two
+/// frames (24-wide patch rows), 2 x 2 cells, a 4 x 4 position table. Only
+/// input preparation reads it; the domain encodes nothing here.
+fn vision_definition() -> ModelDefinition {
+    use magnitude_family_contracts::{
+        ActivationDType, CellReduction, PositionSampling, VisionDescription, VisionMerger,
+        VisionPositions, VisionPreprocessing, VisionResampling, VisionResize, VisionStem,
+        WeightDescriptor,
+    };
+    let stored = |name: &str, shape: &[u64]| WeightDescriptor::stored(name, shape);
+    let mut definition = tiny_definition();
+    definition.vision = Some(VisionDescription {
+        activation_dtype: ActivationDType::BF16,
+        hidden: 128,
+        output_hidden: definition.decoder.hidden,
+        preprocessing: VisionPreprocessing {
+            resize: VisionResize::PixelBounds {
+                min_pixels: 16,
+                max_pixels: 64,
+            },
+            resampling: VisionResampling::Bicubic,
+            mean: [0.5; 3],
+            std: [0.5; 3],
+            channels: 3,
+            patch: 2,
+            merge: 2,
+        },
+        stem: VisionStem::Patch {
+            frames: vec![
+                stored("patch.0", &[128, 3, 2, 2]),
+                stored("patch.1", &[128, 3, 2, 2]),
+            ],
+            bias: None,
+            positions: VisionPositions {
+                table: stored("position", &[16, 128]),
+                sampling: PositionSampling::AlignedCorners { side: 4 },
+            },
+            norm: None,
+        },
+        window: None,
+        blocks: Vec::new(),
+        merger: VisionMerger {
+            norm: None,
+            reduction: CellReduction::Concatenate,
+            standardize: None,
+            projection_norm: None,
+            stages: Vec::new(),
+            output_norm: None,
+        },
+    });
+    definition
+}
+
+/// A prompt of `count` `TEXT` rows with images placed at the given rows,
+/// each named by identity. Every image is one 2 x 2-patch cell, so one
+/// media row.
+fn vision_input(placements: &[(usize, &str)], count: usize) -> PreparedModelInput {
+    use magnitude_artifacts::{
+        media::{DType, PreparedTensor},
+        BoundaryRule, InputLayout, InputSpan,
+    };
+    use magnitude_family_contracts::{PreparedVisionInput, TokenPlan, VisionSpatialControls};
+    let definition = vision_definition();
+    let image = || {
+        let pixels = PreparedTensor::new(
+            "pixel_values".into(),
+            DType::F32,
+            vec![4, 24],
+            vec![0; 4 * 24 * 4],
+        )
+        .unwrap();
+        let spatial = VisionSpatialControls::new(
+            (0..4).collect(),
+            vec![[0, 0]; 4],
+            std::array::from_fn(|_| vec![0; 4]),
+            std::array::from_fn(|_| vec![0.25; 4]),
+            Vec::new(),
+        )
+        .unwrap();
+        PreparedVisionInput::new(&definition, [1, 2, 2], pixels, spatial).unwrap()
+    };
+    let mut tokens = vec![TEXT; count];
+    let spans = placements
+        .iter()
+        .map(|&(start, identity)| {
+            tokens[start] = MEDIA;
+            InputSpan {
+                start,
+                end: start + 1,
+                identity: identity.into(),
+                boundaries: BoundaryRule::Causal,
+                language_history: false,
+            }
+        })
+        .collect();
+    PreparedModelInput::new(
+        &definition,
+        TokenPlan::new(tokens, InputLayout::new(count, spans).unwrap()).unwrap(),
+        (0..count as i32).map(|position| [position; 3]).collect(),
+        count,
+        placements
+            .iter()
+            .map(|&(_, identity)| (identity.to_owned(), image()))
+            .collect(),
+    )
+    .unwrap()
+}
+
+const TEXT: crate::TokenId = crate::TokenId(5);
+const MEDIA: crate::TokenId = crate::TokenId(9);
+
+/// The image each encode names, in order.
+fn encoded_images(operations: &[Operation]) -> Vec<ImageRef> {
+    operations
+        .iter()
+        .map(|operation| match operation {
+            Operation::Encode { image, .. } => image.clone(),
+            _ => panic!("opening a request yields only encodes"),
+        })
+        .collect()
+}
+
+/// Install `image`'s encoder output (one feature row per cell) as a
+/// reconciled encode, and return it.
+fn reconcile_encode<F: ProgramFamily>(
+    domain: &mut ExecutorDomain<F>,
+    request: RequestId,
+    image: ImageRef,
+) -> FeatureRef {
+    let tensor = Tensor::zeros(
+        domain.domain.device(),
+        seismic::Element::f32(),
+        &[
+            (image.patches() / 4) as u64,
+            domain.definition.decoder.hidden,
+        ],
+    )
+    .unwrap();
+    let features = domain.domain.publish_features(tensor).unwrap();
+    domain
+        .reconcile(
+            PendingOperationOutcome {
+                request,
+                outcome: Outcome::Encode {
+                    features: features.clone(),
+                },
+                advance: None,
+                primed: None,
+                rows: 0,
+                committed_rows: 0,
+                kind: WorkKind::Prefill,
+                physical_duration: Duration::ZERO,
+                image: Some(image),
+            },
+            PhysicalDecision { accepted_rows: 0 },
+        )
+        .unwrap();
+    features
+}
+
+/// Where each conditioning slice of the prompt rows from `position` reads
+/// from: its destination row, source features, and source row range.
+fn placements<F: ProgramFamily>(
+    domain: &ExecutorDomain<F>,
+    request: RequestId,
+    position: usize,
+) -> Vec<(usize, FeatureRef, usize, usize)> {
+    let tokens = domain.input[&request].input.tokens()[position..].to_vec();
+    let (_, slices) = domain.input_rows(request, position, &tokens).unwrap();
+    slices
+        .into_iter()
+        .map(|slice| {
+            (
+                slice.destination,
+                slice.source.features,
+                slice.source.start,
+                slice.source.count,
+            )
+        })
+        .collect()
+}
+
+/// One image placed twice in one prompt is one image: it is admitted,
+/// encoded once, and both placements read its features. A distinct image
+/// between them keeps its own encode.
+#[test]
+fn a_repeated_image_is_encoded_once_and_placed_at_every_occurrence() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
+        return;
+    };
+    let request = RequestId(60);
+    domain
+        .install_input(
+            request,
+            vision_input(&[(1, "repeated"), (3, "other"), (5, "repeated")], 7),
+        )
+        .unwrap();
+    assert_eq!(domain.input[&request].images.len(), 2);
+
+    let images = encoded_images(&domain.open_state(&mut bindings, request, None).unwrap());
+    let [first, second] = images.as_slice() else {
+        panic!("two distinct images form two encodes, not three")
+    };
+    assert_ne!(first, second);
+    let features =
+        [first, second].map(|image| reconcile_encode(&mut domain, request, image.clone()));
+    let repeated_features = if domain.input[&request].images["repeated"].image == *first {
+        &features[0]
+    } else {
+        &features[1]
+    };
+    let placed = placements(&domain, request, 0);
+    assert_eq!(placed.len(), 3);
+    assert_eq!(
+        placed
+            .iter()
+            .map(|(row, _, start, count)| (*row, *start, *count))
+            .collect::<Vec<_>>(),
+        vec![(1, 0, 1), (3, 0, 1), (5, 0, 1)]
+    );
+    assert!(placed[0].1 == *repeated_features && placed[2].1 == *repeated_features);
+    assert!(placed[1].1 != *repeated_features);
+}
+
+/// A later turn re-sends the conversation, so an image from an earlier turn
+/// placed again is a repeat within the new prompt. Resuming past the first
+/// placement encodes the image once more for the remaining placement only.
+#[test]
+fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
+        return;
+    };
+
+    // Turn one: prefill the whole prompt, then take its resume state.
+    let first = RequestId(61);
+    domain
+        .install_input(first, vision_input(&[(1, "shared")], 3))
+        .unwrap();
+    let [encode] = encoded_images(&domain.open_state(&mut bindings, first, None).unwrap())
+        .try_into()
+        .unwrap_or_else(|_| panic!("one image forms one encode"));
+    reconcile_encode(&mut domain, first, encode);
+    let prefill_rows = |position: usize, tokens: Vec<crate::TokenId>| Operation::Forward {
+        request: first,
+        kind: WorkKind::Prefill,
+        committed: tokens.len(),
+        tokens,
+        position,
+        conditioning: None,
+        demand: crate::batching::Demand::NONE,
+        select: Vec::new(),
+        prime: None,
+    };
+    for (position, tokens) in [(0, vec![TEXT, MEDIA]), (2, vec![TEXT])] {
+        let rows = tokens.len();
+        let flight =
+            submit_reserved_target(&mut domain, bindings, vec![prefill_rows(position, tokens)]);
+        let (pending, returned) = finish_one(&mut domain, flight);
+        domain
+            .reconcile(
+                pending,
+                PhysicalDecision {
+                    accepted_rows: rows,
+                },
+            )
+            .unwrap();
+        bindings = returned;
+    }
+    let resume = domain.resume_state(first).unwrap();
+    assert_eq!(resume.position(), 3);
+
+    // Turn two: the same image again after the resumed prefix.
+    let second = RequestId(62);
+    domain
+        .install_input(second, vision_input(&[(1, "shared"), (4, "shared")], 6))
+        .unwrap();
+    let [encode] = encoded_images(
+        &domain
+            .open_state(&mut bindings, second, Some(&resume))
+            .unwrap(),
+    )
+    .try_into()
+    .unwrap_or_else(|_| panic!("the unresumed placement forms one encode"));
+    let features = reconcile_encode(&mut domain, second, encode);
+    let placed = placements(&domain, second, 3);
+    let [(row, source, start, count)] = placed.as_slice() else {
+        panic!("one placement past the resumed position")
+    };
+    assert_eq!((*row, *start, *count), (1, 0, 1));
+    assert!(*source == features);
+}

@@ -6,7 +6,7 @@ use magnitude_artifacts::{
     InputLayout, TokenId,
 };
 use serde::{Deserialize, Serialize};
-use std::{error, fmt};
+use std::{collections::BTreeMap, error, fmt};
 
 /// Tokenized host input before a model family assigns numerical coordinates.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,9 +133,10 @@ impl VisionSpatialControls {
     }
 }
 
+/// One image's encoder input. Which image it is (its content identity) is
+/// the key it is held under in [`PreparedModelInput`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreparedVisionInput {
-    identity: String,
     grid: [usize; 3],
     pixels: PreparedTensor,
     spatial: VisionSpatialControls,
@@ -144,7 +145,6 @@ pub struct PreparedVisionInput {
 impl PreparedVisionInput {
     pub fn new(
         definition: &ModelDefinition,
-        identity: String,
         grid: [usize; 3],
         pixels: PreparedTensor,
         spatial: VisionSpatialControls,
@@ -168,8 +168,7 @@ impl PreparedVisionInput {
             .try_fold(1usize, |product, extent| product.checked_mul(extent))
             .ok_or(InputPreparationError::VisionGeometry)?;
         let windowed = vision.window.is_some();
-        if identity.is_empty()
-            || grid.contains(&0)
+        if grid.contains(&0)
             || pixels.dtype() != DType::F32
             || pixels.shape().len() != 2
             || pixels.shape()[0] != rows
@@ -192,15 +191,10 @@ impl PreparedVisionInput {
             return Err(InputPreparationError::VisionGeometry);
         }
         Ok(Self {
-            identity,
             grid,
             pixels,
             spatial,
         })
-    }
-
-    pub fn identity(&self) -> &str {
-        &self.identity
     }
 
     pub fn grid(&self) -> [usize; 3] {
@@ -217,13 +211,18 @@ impl PreparedVisionInput {
 }
 
 /// The only numerical input value accepted after model-family preparation.
+///
+/// Each layout span is one placement of an image; `vision` holds each
+/// distinct image once, keyed by the content identity its spans name. An
+/// image placed repeatedly (within one message or across turns) is one
+/// entry, encoded once.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreparedModelInput {
     tokens: Vec<TokenId>,
     layout: InputLayout,
     coordinates: Vec<[i32; 3]>,
     continuation: usize,
-    vision: Vec<PreparedVisionInput>,
+    vision: BTreeMap<String, PreparedVisionInput>,
 }
 
 impl PreparedModelInput {
@@ -250,7 +249,7 @@ impl PreparedModelInput {
             layout,
             coordinates,
             continuation,
-            vision: Vec::new(),
+            vision: BTreeMap::new(),
         })
     }
 
@@ -263,7 +262,7 @@ impl PreparedModelInput {
             layout: InputLayout::new(0, Vec::new()).expect("an empty layout is valid"),
             coordinates: Vec::new(),
             continuation: 0,
-            vision: Vec::new(),
+            vision: BTreeMap::new(),
         }
     }
 
@@ -272,20 +271,19 @@ impl PreparedModelInput {
         tokens: TokenPlan,
         coordinates: Vec<[i32; 3]>,
         continuation: usize,
-        vision: Vec<PreparedVisionInput>,
+        vision: BTreeMap<String, PreparedVisionInput>,
     ) -> Result<Self, InputPreparationError> {
         let (tokens, layout) = tokens.into_parts();
+        let spans = layout.spans();
         if coordinates.len() != tokens.len()
             || continuation > i32::MAX as usize
             || coordinates
                 .iter()
                 .any(|axes| axes.iter().any(|coordinate| *coordinate < 0))
-            || layout.spans().len() != vision.len()
-            || layout
-                .spans()
-                .iter()
-                .zip(&vision)
-                .any(|(span, image)| span.identity != image.identity)
+            || spans.iter().any(|span| !vision.contains_key(&span.identity))
+            || vision
+                .keys()
+                .any(|identity| !spans.iter().any(|span| span.identity == *identity))
         {
             return Err(InputPreparationError::InputAlignment);
         }
@@ -294,8 +292,8 @@ impl PreparedModelInput {
                 .ok()
                 .filter(|area| *area > 0)
                 .ok_or(InputPreparationError::VisionGeometry)?;
-            if layout.spans().iter().zip(&vision).any(|(span, image)| {
-                let [t, h, w] = image.grid();
+            if spans.iter().any(|span| {
+                let [t, h, w] = vision[&span.identity].grid();
                 t.checked_mul(h)
                     .and_then(|patches| patches.checked_mul(w))
                     .map(|patches| patches / merge_area != span.end - span.start)
@@ -331,7 +329,8 @@ impl PreparedModelInput {
         self.continuation
     }
 
-    pub fn vision(&self) -> &[PreparedVisionInput] {
+    /// The distinct images, keyed by the identity their spans name.
+    pub fn vision(&self) -> &BTreeMap<String, PreparedVisionInput> {
         &self.vision
     }
 
@@ -341,7 +340,7 @@ impl PreparedModelInput {
         let vision = self
             .vision
             .into_iter()
-            .map(|image| {
+            .map(|(identity, image)| {
                 let VisionSpatialControls {
                     patch_order,
                     attention_coordinates,
@@ -349,9 +348,8 @@ impl PreparedModelInput {
                     interpolation_coefficients,
                     window_ranges,
                 } = image.spatial;
-                PreparedVisionInput::new(
+                let image = PreparedVisionInput::new(
                     definition,
-                    image.identity,
                     image.grid,
                     image.pixels,
                     VisionSpatialControls::new(
@@ -361,9 +359,10 @@ impl PreparedModelInput {
                         interpolation_coefficients,
                         window_ranges,
                     )?,
-                )
+                )?;
+                Ok((identity, image))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<_, InputPreparationError>>()?;
         Self::new(
             definition,
             TokenPlan::new(self.tokens, self.layout)?,
