@@ -31,7 +31,6 @@ use magnitude_service_models::{
     InventoryConfig, ManagedModelDownloads, ManagedModelStore, ModelDomainResolver,
     load_release_catalog, managed_model_services,
 };
-use magnitude_service_server::assessment::measurement::DeviceExclusion;
 use magnitude_service_server::configurations::ResolvedConfigurations;
 use magnitude_service_server::hardware::HardwareInventory;
 use magnitude_service_server::residency::controller::{ModelInstances, ResidencyEnvironment};
@@ -111,7 +110,6 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         inventory.derived_cache().kernel_directory(),
         reserves,
     ));
-    let device_exclusion = DeviceExclusion::default();
     let harness = |idle_timeout: Duration, namespace: &str| {
         let instances = ModelInstances::start(ResidencyEnvironment {
             models: inventory.clone(),
@@ -122,7 +120,6 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
             host_memory: host_memory.clone(),
             idle_timeout,
             launcher: WorkerLauncher::current().expect("harness executable"),
-            device_exclusion: device_exclusion.clone(),
             instance_id_namespace: namespace.to_owned(),
         });
         let router = app(

@@ -13,9 +13,7 @@ use magnitude_service_models::{
 };
 use magnitude_service_server::assessment::ManagedModelAssessments;
 use magnitude_service_server::assessment::assessor::ModelAssessor;
-use magnitude_service_server::assessment::measurement::{
-    DeviceExclusion, MeasurementJob, MeasurementWorkerArgs, run_measurement_worker,
-};
+use magnitude_service_server::assessment::environment::AssessmentEnvironment;
 use magnitude_service_server::build_identity;
 use magnitude_service_server::configurations::ResolvedConfigurations;
 use magnitude_service_server::hardware::HardwareInventory;
@@ -78,16 +76,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// The contained measurement job: establish one device's assessment measurement basis.
-    #[command(hide = true)]
-    MeasurementWorker {
-        #[arg(long)]
-        device: seismic::DeviceSelector,
-        #[arg(long = "basis-dir")]
-        basis_directory: PathBuf,
-        #[arg(long = "kernel-dir")]
-        kernel_directory: PathBuf,
-    },
     /// The contained engine worker: load one model and serve it over standard streams.
     #[command(hide = true)]
     InferenceWorker,
@@ -122,9 +110,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
     } else {
         None
     };
-    if matches!(&command, Command::MeasurementWorker { .. }) {
-        worker_process::install_parent_watchdog()?;
-    }
     let _telemetry = telemetry::init(matches!(&command, Command::Serve { .. }))?;
     match command {
         Command::Serve {
@@ -141,7 +126,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 .context("invalid ICN installation")?;
             let release_catalog = Arc::new(open_installation_catalog(&installation)?);
             let worker_launcher = WorkerLauncher::current()?;
-            let device_exclusion = DeviceExclusion::default();
             let reserves = MemoryReserves::standard();
             let catalog = Arc::new(
                 tokio::task::spawn_blocking(seismic::DeviceCatalog::discover)
@@ -149,6 +133,17 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     .context("device discovery task failed")?
                     .context("device discovery failed")?,
             );
+            // Every model is assessed on the device a load selects, established once from the
+            // discovered devices: selection, host memory and bandwidth.
+            let assessment_environment = {
+                let catalog = Arc::clone(&catalog);
+                Arc::new(
+                    tokio::task::spawn_blocking(move || AssessmentEnvironment::establish(&catalog))
+                        .await
+                        .context("assessment environment task failed")?
+                        .context("failed to establish the assessment environment")?,
+                )
+            };
             let inventory_root = match model_store {
                 Some(root) => root,
                 None => InventoryConfig::default_root()
@@ -181,13 +176,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 inventory.clone(),
                 model_variants.clone(),
                 release_catalog.clone(),
-                catalog.clone(),
-                MeasurementJob::new(
-                    worker_launcher.clone(),
-                    inventory.derived_cache().measurement_basis_directory(),
-                    kernel_directory.clone(),
-                    device_exclusion.clone(),
-                ),
+                assessment_environment,
             ));
             let instances = ModelInstances::start(ResidencyEnvironment {
                 models: inventory.clone(),
@@ -202,7 +191,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 reserves,
                 idle_timeout: MODEL_IDLE_TIMEOUT,
                 launcher: worker_launcher,
-                device_exclusion,
                 instance_id_namespace: instance_id.clone(),
             });
             let model_services = managed_model_services(
@@ -288,15 +276,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 println!("{}", env!("CARGO_PKG_VERSION"));
             }
         }
-        Command::MeasurementWorker {
-            device,
-            basis_directory,
-            kernel_directory,
-        } => run_measurement_worker(MeasurementWorkerArgs {
-            device,
-            basis_directory,
-            kernel_directory,
-        })?,
         Command::InferenceWorker => unreachable!("the inference worker runs without the service runtime"),
     }
     Ok(())

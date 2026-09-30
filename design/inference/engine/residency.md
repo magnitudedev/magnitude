@@ -22,9 +22,8 @@ Every import is exact: each resident value equals the source format's reference 
 bit for bit. A source format without a representation of its own imports, through a registered
 Seismic conversion, into an existing representation that holds every value it encodes: Q3_K and
 IQ3_S into `q6k` (f16 super-scale × int8 scale per sixteen values × code in [-32, 31]), IQ4_NL
-into `iq4g32` (the same table). Such a format adds no execution class, so the assessment
-measurement basis, keyed by resident representation, covers it unchanged, and the plan charges
-the wider representation's resident bytes. A format no representation holds exactly is not
+into `iq4g32` (the same table). Such a format adds no execution class, and the plan and the
+assessment's decode demand charge the wider representation's resident bytes. A format no representation holds exactly is not
 imported; its model is `Unsupported`.
 Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4 import into representations of their own, moving codes and
 scale fields bit for bit: the 4-bit coded family (a codebook and one scale per 32 or 16 values:

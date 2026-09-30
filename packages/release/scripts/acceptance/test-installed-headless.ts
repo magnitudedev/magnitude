@@ -26,7 +26,6 @@ const run = Effect.scoped(Effect.gen(function* () {
   const environment = { MAGNITUDE_DEV_DATA_DIR: profile, MAGNITUDE_DESKTOP_STATE_DIR: stateDirectory,
     MAGNITUDE_DEV_PORT: "11237", MAGNITUDE_RELEASE_BASE_URL: process.env.MAGNITUDE_RELEASE_BASE_URL ?? "https://github.com/magnitudedev/magnitude/releases/download",
     MAGNITUDE_ACCEPTANCE_ASSESSMENT_DIAGNOSTICS: assessmentDiagnostics,
-    MAGNITUDE_MEASUREMENT_PROFILE: "1",
     RUST_LOG: "magnitude_service_server=info",
     ...Option.match(inference, { onNone: () => ({}), onSome: path => ({ MAGNITUDE_ICN_PATH: path }) }) }
   const cachedManifest = join(profile, "releases", "manifests", version, "magnitude-release.json")

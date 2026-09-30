@@ -63,7 +63,6 @@ def main():
     if args.cpuset_cpus:
         run_args += ["--cpuset-cpus", args.cpuset_cpus]
     docker(*run_args,
-           "-e", "MAGNITUDE_MEASUREMENT_PROFILE=1",
            "-e", "RUST_LOG=magnitude_service_server=info",
            "-v", f"{root}:/work", "ubuntu:22.04", "sh", "-c", command)
     last = None

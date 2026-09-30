@@ -1536,7 +1536,7 @@ fn tap_buffer_bytes(width: Option<u64>, rows: u64, geometry: &Decoder) -> Result
 mod resource_template_tests {
     use super::*;
     use crate::{
-        assessment::plan::tests::{declared_model, QWEN35_CONFIGURATIONS},
+        assessment::fixtures::{declared_model, QWEN35_CONFIGURATIONS},
         resident_layout, ComponentSelection, ExecutionPath, PlannedMethod, ResourceCapacity,
         ResourcePlanner,
     };

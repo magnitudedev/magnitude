@@ -146,14 +146,7 @@ impl ModelCache {
         self.write_index(ModelIndexKind::ModelAssessment, evidence, assessment);
     }
 
-    /// The directory of measured assessment bases. The engine names each basis file by its
-    /// measurement identity, so a basis of another environment is simply absent.
-    #[must_use]
-    pub fn measurement_basis_directory(&self) -> PathBuf {
-        self.root.join("indexes/assessment-bases")
-    }
-
-    /// The engine's compiled-kernel store, shared by measurement and loads.
+    /// The engine's compiled-kernel store, shared by loads and tuning.
     #[must_use]
     pub fn kernel_directory(&self) -> PathBuf {
         self.root.join("kernels")
@@ -262,8 +255,8 @@ mod tests {
     use super::*;
     use magnitude_service_contracts::MemoryDomainId;
     use magnitude_service_contracts::models::{
-        DecodeSpeed, MemoryAssessment, ModelAssessmentId, ModelCapabilities,
-        ModelReasoningCapabilities, PerformanceConfidence, PerformanceEvidence, ServingProfile,
+        MemoryAssessment, ModelAssessmentId, ModelCapabilities, ModelReasoningCapabilities,
+        PerformanceEvidence, ServingProfile,
     };
 
     fn profile(context_length: u32) -> ServingProfile {
@@ -343,15 +336,10 @@ mod tests {
                 compatibility_reserve_bytes: 0,
                 remaining_bytes: 50,
             }],
-            speed: DecodeSpeed::Estimated {
-                samples: vec![PerformanceEvidence {
-                    context_tokens: 50_000,
-                    lower_tokens_per_second: 1.0,
-                    estimated_tokens_per_second: 2.0,
-                    upper_tokens_per_second: 3.0,
-                    confidence: PerformanceConfidence::Low,
-                }],
-            },
+            performance: vec![PerformanceEvidence {
+                context_tokens: 50_000,
+                estimated_tokens_per_second: 2.0,
+            }],
         };
         let does_not_fit = ModelAssessment::DoesNotFit {
             profile: profile(100_000),

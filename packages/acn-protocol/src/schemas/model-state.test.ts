@@ -213,19 +213,13 @@ describe("LocalModelSchema invariants", () => {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
           systemUseState: { _tag: "NotObserved" }, currentHeadroomState: { _tag: "NotObserved" },
         },
-        speed: {
-          _tag: "Estimated",
-          samples: [{
-            contextTokens: 4096, lowerTokensPerSecond: 1, estimatedTokensPerSecond: 2,
-            upperTokensPerSecond: 3, confidence: "high",
-          }],
-        },
+        performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
       },
     } as const
     expect(() => Schema.decodeUnknownSync(LocalModelServingStateSchema)(assessed)).not.toThrow()
   })
 
-  it("admits unavailable speed for fitting models and Unsupported only for discovered models", () => {
+  it("requires performance for fitting models and admits Unsupported only for discovered models", () => {
     const failure = { code: "unsupported_family", message: "Unrecognized family", retryable: false }
     const assessed = {
       _tag: "Assessed",
@@ -249,9 +243,10 @@ describe("LocalModelSchema invariants", () => {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
           systemUseState: { _tag: "NotObserved" }, currentHeadroomState: { _tag: "NotObserved" },
         },
-        speed: { _tag: "Unavailable" },
+        performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
       },
     }
+    const withoutPerformance = { ...fits, assessment: { ...fits.assessment, performance: [] } }
     const unsupported = {
       ...assessed,
       assessment: {
@@ -259,6 +254,7 @@ describe("LocalModelSchema invariants", () => {
       },
     }
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(fits)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(withoutPerformance)).toThrow()
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unsupported)).toThrow()
     expect(() => Schema.decodeUnknownSync(DiscoveredLocalModelServingStateSchema)(unsupported)).not.toThrow()
   })

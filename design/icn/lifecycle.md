@@ -74,9 +74,8 @@ adopt an ICN started by another process. A model is not a public process resourc
 service starts without a loaded model and privately creates or destroys a disposable inference
 worker behind model-centric load, replace, and unload operations.
 
-Model assessment is header arithmetic on a bounded blocking pool in the ICN process. Its
-measurement basis comes from one contained measurement child of the same executable, which alone
-opens the selected device, and never runs while a model is loading or resident. The
+Model assessment is header arithmetic on a bounded blocking pool in the ICN process; it opens no
+device. The
 private inference worker owns one resident model topology and lives only
 for that residency generation. It uses the same verified executable, communicates only with ICN
 over private standard I/O, exposes no listener or public lifecycle, and terminates with its
@@ -321,8 +320,8 @@ Startup is one scoped acquisition:
 ICN's HTTP listener is created before it emits the startup record. Its readiness response is
 successful only after storage, inventory recovery and API state are usable. After the server
 state is constructed, ICN starts inventory discovery and the automatic assessment pool without
-awaiting either; the pool reports `Preparing` until the measurement job has established the
-environment's measurement basis, and assessment never measures lazily. Startup retry applies only to
+awaiting either. The assessment environment is established during startup, beside device
+discovery, and a failure to establish it fails startup. Startup retry applies only to
 transient connection/unready outcomes. Authentication failure, instance mismatch, incompatible
 identity, malformed response, and child exit fail immediately.
 
@@ -410,9 +409,6 @@ the ICN-created Instance; a later load after terminalization uses a new identity
 incompatible mutations are serialized by `ModelInstanceController`; they
 never rely on ACN-side locking. Ready state carries the serving context and the engine's
 per-domain allocation census. Hardware snapshots do not own that evidence.
-The measurement job is one contained `measurement-worker` child with one absolute deadline; a
-failed or timed-out job is killed, reported as a retryable assessment-pool failure and retried with
-bounded backoff.
 Each resident load creates one private `inference-worker` child running the engine's worker: it
 opens its own device catalog, loads exactly one model on the device it is given, and owns the
 device, weights, state and scheduler until it exits. ICN keeps the model's chat semantics and

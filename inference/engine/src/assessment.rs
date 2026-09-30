@@ -3,8 +3,8 @@
 //! Opens only the GGUF headers of the target and optional projector, derives
 //! the family definition, resolves the execution manifest exactly as engine
 //! configuration does, plans it through [`crate::planning::plan_execution`]
-//! (the production planning inputs) and assesses the draft against the
-//! environment's measurement basis and stable memory capacity. Chat
+//! (the production planning inputs) and assesses the draft against stable
+//! memory capacity and the selected device's memory bandwidth. Chat
 //! capabilities come from the engine's own tokenizer validation and
 //! template and reasoning inspection over header metadata. No device is
 //! opened, no weight payload is read and nothing is decoded.
@@ -20,8 +20,9 @@ use magnitude_chat::{
 use magnitude_executor::{
     ExecutionPath, ExecutionPlanDraft,
     assessment::{
-        AssessmentError, AssessmentRequest, ExecutionAssessment, MeasurementBasis,
+        AssessmentError, AssessmentRequest, DeviceBandwidth, ExecutionAssessment,
         PreparedExecutionAssessment, finish_execution_assessment, prepare_execution_assessment,
+        resolve_bandwidth,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
 };
@@ -49,24 +50,23 @@ pub struct ModelPackagePaths {
     pub method: ModelMethod,
 }
 
-/// The selected execution configuration paired with its generic measurement basis.
-pub struct AssessmentEnvironment {
-    pub setup: Arc<AssessmentSetup>,
-    pub basis: MeasurementBasis,
-}
-
-/// Device and serving facts available before generic measurements finish.
+/// The execution configuration every model is assessed on: the device a
+/// native load selects, its memory bandwidth, the host and the serving
+/// policy.
 pub struct AssessmentSetup {
     pub topology: Arc<DeviceTopology>,
     pub host: HostMemoryStatus,
     pub device: DeviceRequest,
     pub selected: SelectedDevice,
+    pub bandwidth: DeviceBandwidth,
     pub reserves: MemoryReserves,
     pub policy: ModelPolicy,
     pub service: ServiceLimits,
 }
 
 impl AssessmentSetup {
+    /// Select the device a native load would select, resolve its bandwidth
+    /// and observe the host.
     pub fn discover(
         catalog: &DeviceCatalog,
         device: DeviceRequest,
@@ -79,45 +79,22 @@ impl AssessmentSetup {
         let host = catalog
             .host_memory_status()
             .map_err(|error| ModelAssessmentError::Platform(PlatformError::Observation(error)))?;
+        let topology = catalog.topology();
+        // Apple silicon, the only chips whose bins the core count selects,
+        // has no simultaneous multithreading.
+        let cpu_cores = std::thread::available_parallelism()
+            .map_or(1, |cores| u32::try_from(cores.get()).unwrap_or(u32::MAX));
+        let bandwidth = resolve_bandwidth(&topology, &selected.info, cpu_cores);
         Ok(Self {
-            topology: catalog.topology(),
+            topology,
             host,
             device,
             selected,
+            bandwidth,
             reserves,
             policy,
             service,
         })
-    }
-
-    pub fn with_basis(
-        self: Arc<Self>,
-        basis: MeasurementBasis,
-    ) -> Result<AssessmentEnvironment, ModelAssessmentError> {
-        if basis.identity.backend != self.selected.info.backend.as_str() {
-            return Err(ModelAssessmentError::BasisBackend {
-                basis: basis.identity.backend.clone(),
-                selected: self.selected.info.backend.as_str().to_owned(),
-            });
-        }
-        Ok(AssessmentEnvironment { setup: self, basis })
-    }
-}
-
-impl AssessmentEnvironment {
-    /// Select the device a native load would select and observe the host.
-    pub fn discover(
-        catalog: &DeviceCatalog,
-        device: DeviceRequest,
-        reserves: MemoryReserves,
-        basis: MeasurementBasis,
-        policy: ModelPolicy,
-        service: ServiceLimits,
-    ) -> Result<Self, ModelAssessmentError> {
-        Arc::new(AssessmentSetup::discover(
-            catalog, device, reserves, policy, service,
-        )?)
-        .with_basis(basis)
     }
 }
 
@@ -183,11 +160,6 @@ pub enum ModelAssessmentError {
     /// Planning or graph construction failed in the engine itself.
     Planning(String),
     Platform(PlatformError),
-    /// The basis was measured on a different backend than the selected device.
-    BasisBackend {
-        basis: String,
-        selected: String,
-    },
     Assessment(AssessmentError),
 }
 
@@ -204,10 +176,6 @@ impl fmt::Display for ModelAssessmentError {
             Self::Configuration(error) => write!(formatter, "engine configuration: {error}"),
             Self::Planning(error) => write!(formatter, "execution planning: {error}"),
             Self::Platform(error) => write!(formatter, "platform: {error}"),
-            Self::BasisBackend { basis, selected } => write!(
-                formatter,
-                "measurement basis backend {basis} differs from the selected {selected} device"
-            ),
             Self::Assessment(error) => error.fmt(formatter),
         }
     }
@@ -215,7 +183,7 @@ impl fmt::Display for ModelAssessmentError {
 
 impl std::error::Error for ModelAssessmentError {}
 
-/// Basis-independent evidence from the exact package and selected execution configuration.
+/// Evidence from the exact package and selected execution configuration.
 pub enum PreparedModelAssessment {
     Unsupported(UnsupportedModel),
     Planned {
@@ -225,10 +193,11 @@ pub enum PreparedModelAssessment {
     },
 }
 
-/// Complete a prepared model using only the fixed measurement basis and stable capacity.
+/// Complete a prepared model against stable capacity and the device's
+/// bandwidth.
 pub fn finish_model_assessment(
     prepared: &PreparedModelAssessment,
-    environment: &AssessmentEnvironment,
+    setup: &AssessmentSetup,
     performance_depths: &[u32],
 ) -> Result<ModelAssessment, ModelAssessmentError> {
     let (facts, draft, preparation) = match prepared {
@@ -244,13 +213,13 @@ pub fn finish_model_assessment(
     let execution = finish_execution_assessment(
         preparation,
         draft,
-        &environment.setup.topology,
-        &environment.setup.host,
-        &environment.basis,
+        &setup.topology,
+        &setup.host,
+        setup.bandwidth,
         &AssessmentRequest {
             context_limit: facts.context_limit,
             performance_depths: performance_depths.to_vec(),
-            reserves: environment.setup.reserves,
+            reserves: setup.reserves,
         },
     )
     .map_err(ModelAssessmentError::Assessment)?;
@@ -260,19 +229,18 @@ pub fn finish_model_assessment(
     })
 }
 
-
-/// Assess one package on the environment's selected device.
+/// Assess one package on the setup's selected device.
 pub fn assess_model(
     package: &ModelPackagePaths,
-    environment: &AssessmentEnvironment,
+    setup: &AssessmentSetup,
     performance_depths: &[u32],
 ) -> Result<ModelAssessment, ModelAssessmentError> {
-    let prepared = prepare_model_assessment(package, &environment.setup)?;
-    finish_model_assessment(&prepared, environment, performance_depths)
+    let prepared = prepare_model_assessment(package, setup)?;
+    finish_model_assessment(&prepared, setup, performance_depths)
 }
 
 /// Prepare one package from its headers on the selected execution
-/// configuration, independent of the measurement basis: recognition, the
+/// configuration: recognition, the
 /// family definition, capabilities from the engine's own chat inspection,
 /// the execution manifest and its allocation-free plan, then decode demand
 /// and the checked memory charge. A tokenizer or template the engine cannot

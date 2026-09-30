@@ -77,8 +77,6 @@ pub struct EngineWorker {
     process: Mutex<ProcessState>,
     client: OnceLock<EngineClient>,
     diagnostics: Arc<Mutex<DiagnosticTail>>,
-    /// Keeps the measurement job off the device for as long as the worker may hold it.
-    _device: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
 /// A spawned worker and the host end of its transport, before the load handshake.
@@ -93,12 +91,8 @@ pub struct SpawnedWorker {
 }
 
 impl EngineWorker {
-    /// Spawn an `inference-worker` process holding `device` (the residency side of the device
-    /// exclusion) for its lifetime.
-    pub fn spawn(
-        launcher: &WorkerLauncher,
-        device: tokio::sync::OwnedRwLockReadGuard<()>,
-    ) -> anyhow::Result<SpawnedWorker> {
+    /// Spawn an `inference-worker` process.
+    pub fn spawn(launcher: &WorkerLauncher) -> anyhow::Result<SpawnedWorker> {
         let command = launcher.command(WorkerRole::Inference)?;
         let BlockingChild {
             process,
@@ -111,7 +105,6 @@ impl EngineWorker {
             process: Mutex::new(ProcessState::Owned(process)),
             client: OnceLock::new(),
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
-            _device: device,
         });
         drain_diagnostics(stderr, Arc::clone(&worker.diagnostics), pid)?;
         Ok(SpawnedWorker {
@@ -308,13 +301,10 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = process.id();
-        let lock = Arc::new(tokio::sync::RwLock::new(()));
-        let guard = lock.clone().try_read_owned().unwrap();
         let worker = EngineWorker {
             process: Mutex::new(ProcessState::Owned(process)),
             client: OnceLock::new(),
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
-            _device: guard,
         };
         assert_eq!(worker.pid(), Some(pid));
         assert!(worker.try_wait().unwrap().is_none());
@@ -322,8 +312,5 @@ mod tests {
         let status = worker.try_wait().unwrap().expect("unready shutdown terminates");
         assert_eq!(worker.pid(), None);
         assert_eq!(worker.retire().unwrap(), status);
-        assert!(lock.try_write().is_err(), "the device stays excluded while the worker exists");
-        drop(worker);
-        assert!(lock.try_write().is_ok());
     }
 }

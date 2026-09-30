@@ -1,23 +1,21 @@
 //! The automatic assessment pool: one revisioned snapshot over the current catalog and discovery
-//! sources, with exact-work reconciliation, deduplication, per-target deadlines, publication
-//! guards and one-attempt `Dropped` semantics.
+//! sources in the service's one environment, with exact-work reconciliation, deduplication,
+//! per-target deadlines, publication guards and one-attempt `Dropped` semantics.
 
 pub mod assessor;
 pub mod environment;
-pub mod measurement;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use futures_util::{StreamExt, future::BoxFuture, stream::BoxStream};
-use magnitude_engine::assessment::AssessmentSetup;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     CatalogModel, CatalogModelSelection, CatalogModelState, CatalogModels, DiscoveredModel,
     DiscoveredModelState, DiscoveredModels, EffectiveModel, ModelAssessment,
     ModelAssessmentDomainSnapshot, ModelAssessmentEntry, ModelAssessmentEntryState,
-    ModelAssessmentPoolState, ModelAssessmentSubject, ModelAssessments,
-    ModelAssessmentsInvalidation, ModelAssessmentsSnapshot, ModelFailure as DomainModelFailure,
-    ModelId, ModelServingConfiguration, ServingProfile,
+    ModelAssessmentSubject, ModelAssessments, ModelAssessmentsInvalidation,
+    ModelAssessmentsSnapshot, ModelFailure as DomainModelFailure, ModelId,
+    ModelServingConfiguration, ServingProfile,
 };
 use magnitude_service_models::{
     CachedModelAssessment, ServableModelBundleKey, servable_model_bundle_key_for_bundle,
@@ -27,13 +25,10 @@ use assessor::{
     AssessmentOutcome, AssessmentWork, AssessmentWorkKey, ModelAssessor, PreparationResult,
     inventory_model_failure,
 };
-use environment::AssessmentEnvironment;
 
 /// Bounds one target's whole attempt: material resolution and the engine's arithmetic.
 const MODEL_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const MODEL_ASSESSMENT_SOURCE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-const ENVIRONMENT_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
-const ENVIRONMENT_RETRY_MAXIMUM: std::time::Duration = std::time::Duration::from_secs(60);
 /// Concurrent targets, each holding at most one blocking-pool task of header arithmetic.
 const MAX_ASSESSMENT_CONCURRENCY: usize = 8;
 
@@ -43,125 +38,35 @@ struct AssessmentTarget {
     work: Option<AssessmentWork>,
 }
 
-/// One setup-scoped preparation authority shared by both source domains and the final join.
+/// One preparation per bundle, shared by every profile and source slice that names it.
+#[derive(Default)]
 struct PreparationCoordinator {
     cells: Mutex<
         std::collections::BTreeMap<
             ServableModelBundleKey,
-            std::sync::Weak<tokio::sync::OnceCell<PreparationResult>>,
+            Weak<tokio::sync::OnceCell<PreparationResult>>,
         >,
     >,
-    primed: Mutex<Vec<Arc<tokio::sync::OnceCell<PreparationResult>>>>,
-    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
-    permits: Arc<tokio::sync::Semaphore>,
-    assessor: Arc<ModelAssessor>,
-    setup: Arc<AssessmentSetup>,
 }
 
 impl PreparationCoordinator {
-    fn new(assessor: Arc<ModelAssessor>, setup: Arc<AssessmentSetup>) -> Self {
-        Self {
-            cells: Mutex::new(std::collections::BTreeMap::new()),
-            primed: Mutex::new(Vec::new()),
-            tasks: Mutex::new(Vec::new()),
-            permits: Arc::new(tokio::sync::Semaphore::new(assessment_concurrency())),
-            assessor,
-            setup,
-        }
-    }
-
     fn prepare(
         &self,
-        configuration: ModelServingConfiguration,
-        eager: bool,
+        configuration: &ModelServingConfiguration,
     ) -> Arc<tokio::sync::OnceCell<PreparationResult>> {
         let key = servable_model_bundle_key_for_bundle(&configuration.bundle);
         let mut cells = self.cells.lock().expect("preparation cells lock poisoned");
         cells.retain(|_, cell| cell.strong_count() > 0);
-        if let Some(cell) = cells.get(&key).and_then(std::sync::Weak::upgrade) {
+        if let Some(cell) = cells.get(&key).and_then(Weak::upgrade) {
             return cell;
         }
         let cell = Arc::new(tokio::sync::OnceCell::new());
         cells.insert(key, Arc::downgrade(&cell));
-        drop(cells);
-        if !eager {
-            return cell;
-        }
-        self.primed
-            .lock()
-            .expect("primed cells lock poisoned")
-            .push(Arc::clone(&cell));
-        let assessor = Arc::clone(&self.assessor);
-        let setup = Arc::clone(&self.setup);
-        let permits = Arc::clone(&self.permits);
-        let task_cell = Arc::clone(&cell);
-        let task = tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            task_cell
-                .get_or_init(|| async move {
-                    tokio::time::timeout(MODEL_ASSESSMENT_TIMEOUT, async {
-                        let _permit = permits.acquire_owned().await.map_err(|error| {
-                            inventory_model_failure(InventoryError::Internal(format!(
-                                "preparation admission failed: {error}"
-                            )))
-                        })?;
-                        assessor.prepare_bundle(configuration, setup).await
-                    })
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(inventory_model_failure(InventoryError::ModelOperation {
-                            code: "assessment_deadline".to_owned(),
-                            message: "model assessment target deadline expired".to_owned(),
-                            retryable: true,
-                        }))
-                    })
-                })
-                .await;
-            tracing::info!(
-                preparation.seconds = started.elapsed().as_secs_f64(),
-                "model preparation finished"
-            );
-        });
-        self.tasks
-            .lock()
-            .expect("preparation tasks lock poisoned")
-            .push(task.abort_handle());
         cell
     }
-
-    fn prime(
-        &self,
-        candidates: impl IntoIterator<Item = (ModelAssessmentSubject, ServingProfile)>,
-    ) {
-        for (subject, _) in candidates {
-            if let Ok(configuration) = self.assessor.configuration_for(&subject) {
-                self.prepare(configuration, true);
-            }
-        }
-    }
-
-    fn release_primed(&self) {
-        self.primed
-            .lock()
-            .expect("primed cells lock poisoned")
-            .clear();
-    }
 }
 
-impl Drop for PreparationCoordinator {
-    fn drop(&mut self) {
-        for task in self
-            .tasks
-            .lock()
-            .expect("preparation tasks lock poisoned")
-            .drain(..)
-        {
-            task.abort();
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum AssessmentDomain {
     Catalog,
     Discovered,
@@ -214,91 +119,43 @@ fn discovered_candidates(
 
 struct AssessmentPoolCurrent {
     snapshot: ModelAssessmentsSnapshot,
-    entry_keys: std::collections::BTreeMap<
-        magnitude_service_contracts::models::ModelAssessmentSubject,
-        AssessmentWorkKey,
-    >,
+    entry_keys: std::collections::BTreeMap<ModelAssessmentSubject, AssessmentWorkKey>,
+    /// Sources whose last read failed. A failed read is the model inventory's failure, which the
+    /// catalog reports from the same listing; the pool keeps the slice it has and reads again.
+    failed_reads: std::collections::BTreeSet<AssessmentDomain>,
 }
 
 fn assessment_domain_entries(domain: &ModelAssessmentDomainSnapshot) -> &[ModelAssessmentEntry] {
     match domain {
         ModelAssessmentDomainSnapshot::Available { entries, .. } => entries,
-        ModelAssessmentDomainSnapshot::Pending { .. }
-        | ModelAssessmentDomainSnapshot::Failed { .. } => &[],
-    }
-}
-
-fn assessment_domain_entries_mut(
-    domain: &mut ModelAssessmentDomainSnapshot,
-) -> Option<&mut Vec<ModelAssessmentEntry>> {
-    match domain {
-        ModelAssessmentDomainSnapshot::Available { entries, .. } => Some(entries),
-        ModelAssessmentDomainSnapshot::Pending { .. }
-        | ModelAssessmentDomainSnapshot::Failed { .. } => None,
-    }
-}
-
-fn assessment_domain_source_revision(domain: &ModelAssessmentDomainSnapshot) -> u64 {
-    match domain {
-        ModelAssessmentDomainSnapshot::Pending { source_revision }
-        | ModelAssessmentDomainSnapshot::Available {
-            source_revision, ..
-        }
-        | ModelAssessmentDomainSnapshot::Failed {
-            source_revision, ..
-        } => *source_revision,
+        ModelAssessmentDomainSnapshot::Pending { .. } => &[],
     }
 }
 
 impl AssessmentPoolCurrent {
-    fn ready_domains(
-        &self,
-    ) -> Option<(
-        &ModelAssessmentDomainSnapshot,
-        &ModelAssessmentDomainSnapshot,
-    )> {
-        match &self.snapshot.state {
-            ModelAssessmentPoolState::Ready {
-                catalog,
-                discovered,
-                ..
-            } => Some((catalog, discovered)),
-            _ => None,
+    fn domains(&self) -> [&ModelAssessmentDomainSnapshot; 2] {
+        [&self.snapshot.catalog, &self.snapshot.discovered]
+    }
+
+    fn domain(&self, domain: AssessmentDomain) -> &ModelAssessmentDomainSnapshot {
+        match domain {
+            AssessmentDomain::Catalog => &self.snapshot.catalog,
+            AssessmentDomain::Discovered => &self.snapshot.discovered,
         }
     }
 
-    fn domain(&self, domain: AssessmentDomain) -> Option<&ModelAssessmentDomainSnapshot> {
-        let (catalog, discovered) = self.ready_domains()?;
-        Some(match domain {
-            AssessmentDomain::Catalog => catalog,
-            AssessmentDomain::Discovered => discovered,
-        })
-    }
-
-    fn domain_mut(
-        &mut self,
-        domain: AssessmentDomain,
-    ) -> Option<&mut ModelAssessmentDomainSnapshot> {
-        let ModelAssessmentPoolState::Ready {
-            catalog,
-            discovered,
-            ..
-        } = &mut self.snapshot.state
-        else {
-            return None;
-        };
-        Some(match domain {
-            AssessmentDomain::Catalog => catalog,
-            AssessmentDomain::Discovered => discovered,
-        })
+    fn domain_mut(&mut self, domain: AssessmentDomain) -> &mut ModelAssessmentDomainSnapshot {
+        match domain {
+            AssessmentDomain::Catalog => &mut self.snapshot.catalog,
+            AssessmentDomain::Discovered => &mut self.snapshot.discovered,
+        }
     }
 
     fn retained_terminal_states(
         &self,
     ) -> std::collections::BTreeMap<AssessmentWorkKey, ModelAssessmentEntryState> {
-        self.ready_domains()
+        self.domains()
             .into_iter()
-            .flat_map(|(catalog, discovered)| [catalog, discovered])
             .flat_map(assessment_domain_entries)
             .filter_map(|entry| {
                 self.entry_keys
@@ -342,9 +199,7 @@ impl AssessmentPoolCurrent {
             source_revision,
             entries,
         };
-        let Some(previous) = self.domain(domain) else {
-            return false;
-        };
+        let previous = self.domain(domain);
         let old_subjects = assessment_domain_entries(previous)
             .iter()
             .map(|entry| entry.subject.clone())
@@ -364,17 +219,13 @@ impl AssessmentPoolCurrent {
             self.entry_keys.remove(&subject);
         }
         self.entry_keys.extend(work_by_entry);
-        *self
-            .domain_mut(domain)
-            .expect("ready assessment domain was checked") = next;
+        *self.domain_mut(domain) = next;
         true
     }
 
     fn set_domain_pending(&mut self, domain: AssessmentDomain, source_revision: u64) -> bool {
         let next = ModelAssessmentDomainSnapshot::Pending { source_revision };
-        let Some(previous) = self.domain(domain) else {
-            return false;
-        };
+        let previous = self.domain(domain);
         if previous == &next {
             return false;
         }
@@ -385,87 +236,36 @@ impl AssessmentPoolCurrent {
         for subject in old_subjects {
             self.entry_keys.remove(&subject);
         }
-        *self
-            .domain_mut(domain)
-            .expect("ready assessment domain was checked") = next;
+        *self.domain_mut(domain) = next;
         true
-    }
-
-    fn set_domain_failure(
-        &mut self,
-        domain: AssessmentDomain,
-        failure: DomainModelFailure,
-    ) -> bool {
-        let Some(previous) = self.domain(domain) else {
-            return false;
-        };
-        let next = ModelAssessmentDomainSnapshot::Failed {
-            source_revision: assessment_domain_source_revision(previous),
-            failure,
-        };
-        if previous == &next {
-            return false;
-        }
-        let old_subjects = assessment_domain_entries(previous)
-            .iter()
-            .map(|entry| entry.subject.clone())
-            .collect::<Vec<_>>();
-        for subject in old_subjects {
-            self.entry_keys.remove(&subject);
-        }
-        *self
-            .domain_mut(domain)
-            .expect("ready assessment domain was checked") = next;
-        true
-    }
-
-    fn domain_source_failed(&self, domain: AssessmentDomain) -> bool {
-        self.domain(domain)
-            .is_some_and(|state| matches!(state, ModelAssessmentDomainSnapshot::Failed { .. }))
     }
 
     fn references_assessing(&self, key: &AssessmentWorkKey) -> bool {
-        self.ready_domains().is_some_and(|(catalog, discovered)| {
-            [catalog, discovered].into_iter().any(|domain| {
-                assessment_domain_entries(domain).iter().any(|entry| {
-                    self.entry_keys.get(&entry.subject) == Some(key)
-                        && matches!(entry.state, ModelAssessmentEntryState::Assessing)
-                })
+        self.domains().into_iter().any(|domain| {
+            assessment_domain_entries(domain).iter().any(|entry| {
+                self.entry_keys.get(&entry.subject) == Some(key)
+                    && matches!(entry.state, ModelAssessmentEntryState::Assessing)
             })
         })
     }
 
-    fn references_dropped(
-        &self,
-        subject: &magnitude_service_contracts::models::ModelAssessmentSubject,
-        key: &AssessmentWorkKey,
-    ) -> bool {
+    fn references_dropped(&self, subject: &ModelAssessmentSubject, key: &AssessmentWorkKey) -> bool {
         self.entry_keys.get(subject) == Some(key)
-            && self.ready_domains().is_some_and(|(catalog, discovered)| {
-                [catalog, discovered].into_iter().any(|domain| {
-                    assessment_domain_entries(domain).iter().any(|entry| {
-                        &entry.subject == subject
-                            && matches!(entry.state, ModelAssessmentEntryState::Dropped)
-                    })
+            && self.domains().into_iter().any(|domain| {
+                assessment_domain_entries(domain).iter().any(|entry| {
+                    &entry.subject == subject
+                        && matches!(entry.state, ModelAssessmentEntryState::Dropped)
                 })
             })
     }
 
     fn apply_outcome(&mut self, outcome: &AssessmentOutcome) -> AppliedAssessmentOutcome {
-        let ModelAssessmentPoolState::Ready {
-            catalog,
-            discovered,
-            ..
-        } = &mut self.snapshot.state
-        else {
-            return AppliedAssessmentOutcome::default();
-        };
         let mut applied = AppliedAssessmentOutcome::default();
         for (domain_kind, domain) in [
-            (AssessmentDomain::Catalog, catalog),
-            (AssessmentDomain::Discovered, discovered),
+            (AssessmentDomain::Catalog, &mut self.snapshot.catalog),
+            (AssessmentDomain::Discovered, &mut self.snapshot.discovered),
         ] {
-            let Some(entries) = assessment_domain_entries_mut(domain) else {
+            let ModelAssessmentDomainSnapshot::Available { entries, .. } = domain else {
                 continue;
             };
             for entry in entries.iter_mut() {
@@ -518,6 +318,7 @@ pub struct ManagedModelAssessments {
     current: std::sync::RwLock<AssessmentPoolCurrent>,
     changes: tokio::sync::broadcast::Sender<ModelAssessmentsInvalidation>,
     active: Mutex<ActiveAssessments>,
+    preparations: PreparationCoordinator,
     concurrency: Arc<tokio::sync::Semaphore>,
 }
 
@@ -581,8 +382,8 @@ impl ActiveAssessments {
 }
 
 impl ManagedModelAssessments {
-    /// Start the pool. It is `Preparing` until the assessment environment, with its measurement
-    /// basis, is established.
+    /// Start the pool in the assessor's environment. Both source slices are `Pending` until
+    /// their first read.
     pub fn start(
         assessor: Arc<ModelAssessor>,
         catalog: Arc<dyn CatalogModels>,
@@ -590,6 +391,7 @@ impl ManagedModelAssessments {
     ) -> Arc<Self> {
         let (changes, _) = tokio::sync::broadcast::channel(64);
         let concurrency = assessment_concurrency();
+        let environment_id = assessor.environment().id.clone();
         let service = Arc::new(Self {
             assessor,
             catalog,
@@ -597,12 +399,16 @@ impl ManagedModelAssessments {
             current: std::sync::RwLock::new(AssessmentPoolCurrent {
                 snapshot: ModelAssessmentsSnapshot {
                     revision: 0,
-                    state: ModelAssessmentPoolState::Preparing,
+                    environment_id,
+                    catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
+                    discovered: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
                 },
                 entry_keys: std::collections::BTreeMap::new(),
+                failed_reads: std::collections::BTreeSet::new(),
             }),
             changes,
             active: Mutex::new(ActiveAssessments::new()),
+            preparations: PreparationCoordinator::default(),
             concurrency: Arc::new(tokio::sync::Semaphore::new(concurrency)),
         });
         let owner = Arc::clone(&service);
@@ -625,37 +431,20 @@ impl ManagedModelAssessments {
         true
     }
 
-    fn publish_pool_failure(&self, error: InventoryError) {
-        let failure = inventory_model_failure(error);
-        self.publish(|current| {
-            let next = ModelAssessmentPoolState::Failed { failure };
-            if current.snapshot.state == next {
-                return false;
-            }
-            current.entry_keys.clear();
-            current.snapshot.state = next;
-            true
-        });
-        self.cancel_unreferenced();
-    }
-
-    fn publish_domain_failure(&self, domain: AssessmentDomain, error: InventoryError) {
-        let failure = inventory_model_failure(error);
-        self.publish(|current| current.set_domain_failure(domain, failure));
-        self.cancel_unreferenced();
-    }
-
     fn target_entry(
         &self,
         domain: AssessmentDomain,
-        environment: &AssessmentEnvironment,
-        preparations: &PreparationCoordinator,
         subject: ModelAssessmentSubject,
         profile: ServingProfile,
     ) -> AssessmentTarget {
         let unresolved_key = AssessmentWorkKey(
-            serde_json::to_string(&(&environment.id, &subject, &profile, "unresolved"))
-                .expect("assessment target identity is serializable"),
+            serde_json::to_string(&(
+                &self.assessor.environment().id,
+                &subject,
+                &profile,
+                "unresolved",
+            ))
+            .expect("assessment target identity is serializable"),
         );
         if self
             .current
@@ -676,9 +465,8 @@ impl ManagedModelAssessments {
             .assessor
             .configuration_for(&subject)
             .and_then(|configuration| {
-                let preparation = preparations.prepare(configuration.clone(), false);
-                self.assessor
-                    .work_for(&environment.id, configuration, profile, preparation)
+                let preparation = self.preparations.prepare(&configuration);
+                self.assessor.work_for(configuration, profile, preparation)
             });
         match work {
             Ok(work) => AssessmentTarget {
@@ -711,36 +499,17 @@ impl ManagedModelAssessments {
         }
     }
 
-    async fn reconcile_catalog(
-        self: &Arc<Self>,
-        environment: &Arc<AssessmentEnvironment>,
-        preparations: &PreparationCoordinator,
-    ) -> Result<(), InventoryError> {
+    async fn reconcile_catalog(self: &Arc<Self>) -> Result<(), InventoryError> {
         let source = self.catalog.list_catalog().await?;
-        let mut targets = Vec::new();
-        for (subject, profile) in catalog_candidates(source.models) {
-            targets.push(self.target_entry(
-                AssessmentDomain::Catalog,
-                environment,
-                preparations,
-                subject,
-                profile,
-            ));
-        }
-        let work = targets
-            .iter()
-            .filter_map(|target| target.work.clone())
+        let targets = catalog_candidates(source.models)
+            .into_iter()
+            .map(|(subject, profile)| self.target_entry(AssessmentDomain::Catalog, subject, profile))
             .collect::<Vec<_>>();
         self.replace_domain(AssessmentDomain::Catalog, source.revision, targets);
-        self.schedule(work, environment);
         Ok(())
     }
 
-    async fn reconcile_discovered(
-        self: &Arc<Self>,
-        environment: &Arc<AssessmentEnvironment>,
-        preparations: &PreparationCoordinator,
-    ) -> Result<(), InventoryError> {
+    async fn reconcile_discovered(self: &Arc<Self>) -> Result<(), InventoryError> {
         let source = self.discovery.list_discovered().await?;
         if !source.reconciliation_complete {
             self.publish(|current| {
@@ -749,40 +518,54 @@ impl ManagedModelAssessments {
             self.cancel_unreferenced();
             return Ok(());
         }
-        let mut targets = Vec::new();
-        for (subject, profile) in discovered_candidates(source.models) {
-            targets.push(self.target_entry(
-                AssessmentDomain::Discovered,
-                environment,
-                preparations,
-                subject,
-                profile,
-            ));
-        }
-        let work = targets
-            .iter()
-            .filter_map(|target| target.work.clone())
+        let targets = discovered_candidates(source.models)
+            .into_iter()
+            .map(|(subject, profile)| {
+                self.target_entry(AssessmentDomain::Discovered, subject, profile)
+            })
             .collect::<Vec<_>>();
         self.replace_domain(AssessmentDomain::Discovered, source.revision, targets);
-        self.schedule(work, environment);
         Ok(())
     }
 
+    /// Read one source and reconcile its slice. A failed read keeps the slice as it is and marks
+    /// the source for the next retry.
+    async fn read_source(self: &Arc<Self>, domain: AssessmentDomain) {
+        let read = match domain {
+            AssessmentDomain::Catalog => self.reconcile_catalog().await,
+            AssessmentDomain::Discovered => self.reconcile_discovered().await,
+        };
+        let mut current = self
+            .current
+            .write()
+            .expect("assessment state lock poisoned");
+        match read {
+            Ok(()) => {
+                current.failed_reads.remove(&domain);
+            }
+            Err(error) => {
+                tracing::warn!(?domain, %error, "model assessment source read failed");
+                current.failed_reads.insert(domain);
+            }
+        }
+    }
+
     fn replace_domain(
-        &self,
+        self: &Arc<Self>,
         domain: AssessmentDomain,
         source_revision: u64,
         targets: Vec<AssessmentTarget>,
     ) {
+        let work = targets
+            .iter()
+            .filter_map(|target| target.work.clone())
+            .collect::<Vec<_>>();
         self.publish(|current| current.replace_domain(domain, source_revision, &targets));
         self.cancel_unreferenced();
+        self.schedule(work);
     }
 
-    fn schedule(
-        self: &Arc<Self>,
-        work: Vec<AssessmentWork>,
-        environment: &Arc<AssessmentEnvironment>,
-    ) {
+    fn schedule(self: &Arc<Self>, work: Vec<AssessmentWork>) {
         for item in work {
             let current = self.current.read().expect("assessment state lock poisoned");
             if !current.references_assessing(&item.key) {
@@ -797,7 +580,6 @@ impl ManagedModelAssessments {
             let service = Arc::clone(self);
             let task_key = item.key.clone();
             let runner_key = task_key.clone();
-            let task_environment = Arc::clone(environment);
             let handle = tokio::spawn(async move {
                 let Ok(_permit) = Arc::clone(&service.concurrency).acquire_owned().await else {
                     let mut active = service
@@ -807,22 +589,20 @@ impl ManagedModelAssessments {
                     active.finish(&runner_key, active_id);
                     return;
                 };
-                let outcome = tokio::time::timeout(
-                    MODEL_ASSESSMENT_TIMEOUT,
-                    service.assessor.assess(item, task_environment),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(InventoryError::ModelOperation {
-                        code: "assessment_deadline".to_owned(),
-                        message: "model assessment target deadline expired".to_owned(),
-                        retryable: true,
-                    })
-                })
-                .unwrap_or_else(|error| AssessmentOutcome {
-                    key: runner_key.clone(),
-                    result: Err(inventory_model_failure(error)),
-                });
+                let outcome =
+                    tokio::time::timeout(MODEL_ASSESSMENT_TIMEOUT, service.assessor.assess(item))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(InventoryError::ModelOperation {
+                                code: "assessment_deadline".to_owned(),
+                                message: "model assessment target deadline expired".to_owned(),
+                                retryable: true,
+                            })
+                        })
+                        .unwrap_or_else(|error| AssessmentOutcome {
+                            key: runner_key.clone(),
+                            result: Err(inventory_model_failure(error)),
+                        });
                 drop(_permit);
                 service.publish_outcome(outcome);
                 let mut active = service
@@ -876,125 +656,34 @@ impl ManagedModelAssessments {
     }
 
     async fn run(self: Arc<Self>) {
-        let mut retry = ENVIRONMENT_RETRY_INITIAL;
-        let (environment, preparations) = loop {
-            let setup = match self.assessor.select_setup().await {
-                Ok(setup) => setup,
-                Err(error) => {
-                    tracing::error!(%error, "assessment setup unavailable");
-                    self.publish_pool_failure(InventoryError::ModelOperation {
-                        code: "assessment_environment_unavailable".to_owned(),
-                        message: error.to_string(),
-                        retryable: true,
-                    });
-                    tokio::time::sleep(retry).await;
-                    retry = (retry * 2).min(ENVIRONMENT_RETRY_MAXIMUM);
-                    continue;
-                }
-            };
-            let preparations =
-                PreparationCoordinator::new(Arc::clone(&self.assessor), Arc::clone(&setup));
-            let preparing_started = std::time::Instant::now();
-            tokio::join!(
-                async {
-                    match self.catalog.list_catalog().await {
-                        Ok(source) => preparations.prime(catalog_candidates(source.models)),
-                        Err(error) => {
-                            tracing::warn!(%error, "initial catalog preparation source unavailable")
-                        }
-                    }
-                },
-                async {
-                    match self.discovery.list_discovered().await {
-                        Ok(source) if source.reconciliation_complete => {
-                            preparations.prime(discovered_candidates(source.models))
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, "initial discovery preparation source unavailable")
-                        }
-                    }
-                }
-            );
-            tracing::info!(
-                preparation_admission.seconds = preparing_started.elapsed().as_secs_f64(),
-                "initial model preparation admitted"
-            );
-            // The basis is model-free: it is measured while the models are prepared.
-            match self.assessor.establish_with_setup(Arc::clone(&setup)).await {
-                Ok(environment) => break (Arc::new(environment), preparations),
-                Err(error) => {
-                    let message = error.to_string();
-                    tracing::error!(%message, "assessment environment unavailable");
-                    self.publish_pool_failure(InventoryError::ModelOperation {
-                        code: "assessment_environment_unavailable".to_owned(),
-                        message,
-                        retryable: true,
-                    });
-                    tokio::time::sleep(retry).await;
-                    retry = (retry * 2).min(ENVIRONMENT_RETRY_MAXIMUM);
-                }
-            }
-        };
-        self.publish(|current| {
-            current.snapshot.state = ModelAssessmentPoolState::Ready {
-                environment_id: environment.id.clone(),
-                catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
-                discovered: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
-            };
-            true
-        });
         // Subscribe before the initial reads so a source revision published between a read and
         // entering the select loop is buffered and reconciled rather than missed.
         let mut catalog = self.catalog.watch_catalog().skip(1);
         let mut discovered = self.discovery.watch_discovery().skip(1);
-        if let Err(error) = self.reconcile_catalog(&environment, &preparations).await {
-            tracing::warn!(%error, "catalog assessment reconciliation failed");
-            self.publish_domain_failure(AssessmentDomain::Catalog, error);
-        }
-        if let Err(error) = self.reconcile_discovered(&environment, &preparations).await {
-            tracing::warn!(%error, "discovered-model assessment reconciliation failed");
-            self.publish_domain_failure(AssessmentDomain::Discovered, error);
-        }
-        preparations.release_primed();
+        self.read_source(AssessmentDomain::Catalog).await;
+        self.read_source(AssessmentDomain::Discovered).await;
         let mut source_retry = tokio::time::interval(MODEL_ASSESSMENT_SOURCE_RETRY_DELAY);
         source_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         source_retry.tick().await;
         loop {
             tokio::select! {
                 event = catalog.next() => match event {
-                    Some(_) => if let Err(error) = self.reconcile_catalog(&environment, &preparations).await {
-                        tracing::warn!(%error, "catalog assessment reconciliation failed");
-                        self.publish_domain_failure(AssessmentDomain::Catalog, error);
-                    },
+                    Some(_) => self.read_source(AssessmentDomain::Catalog).await,
                     None => return,
                 },
                 event = discovered.next() => match event {
-                    Some(_) => if let Err(error) = self.reconcile_discovered(&environment, &preparations).await {
-                        tracing::warn!(%error, "discovered-model assessment reconciliation failed");
-                        self.publish_domain_failure(AssessmentDomain::Discovered, error);
-                    },
+                    Some(_) => self.read_source(AssessmentDomain::Discovered).await,
                     None => return,
                 },
                 _ = source_retry.tick() => {
-                    let (catalog_retry, discovered_retry) = {
-                        let current = self.current.read().expect("assessment state lock poisoned");
-                        (
-                            current.domain_source_failed(AssessmentDomain::Catalog),
-                            current.domain_source_failed(AssessmentDomain::Discovered),
-                        )
-                    };
-                    if catalog_retry
-                        && let Err(error) = self.reconcile_catalog(&environment, &preparations).await
-                    {
-                        tracing::warn!(%error, "catalog assessment reconciliation retry failed");
-                        self.publish_domain_failure(AssessmentDomain::Catalog, error);
-                    }
-                    if discovered_retry
-                        && let Err(error) = self.reconcile_discovered(&environment, &preparations).await
-                    {
-                        tracing::warn!(%error, "discovered-model assessment reconciliation retry failed");
-                        self.publish_domain_failure(AssessmentDomain::Discovered, error);
+                    let failed = self
+                        .current
+                        .read()
+                        .expect("assessment state lock poisoned")
+                        .failed_reads
+                        .clone();
+                    for domain in failed {
+                        self.read_source(domain).await;
                     }
                 },
             }
@@ -1121,13 +810,12 @@ mod tests {
         AssessmentPoolCurrent {
             snapshot: ModelAssessmentsSnapshot {
                 revision: 0,
-                state: ModelAssessmentPoolState::Ready {
-                    environment_id: AssessmentEnvironmentId("test-environment".to_owned()),
-                    catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
-                    discovered: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
-                },
+                environment_id: AssessmentEnvironmentId("test-environment".to_owned()),
+                catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
+                discovered: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
             },
             entry_keys: std::collections::BTreeMap::new(),
+            failed_reads: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1214,9 +902,7 @@ mod tests {
             3,
             &[assessment_target(discovered, "shared")],
         );
-        let discovered = current
-            .domain(AssessmentDomain::Discovered)
-            .expect("discovered assessment slice");
+        let discovered = current.domain(AssessmentDomain::Discovered);
         assert!(matches!(
             discovered,
             ModelAssessmentDomainSnapshot::Available { entries, .. }
@@ -1301,9 +987,7 @@ mod tests {
             vec![(catalog.model_id().clone(), failure)]
         );
         let state = |domain| match current.domain(domain) {
-            Some(ModelAssessmentDomainSnapshot::Available { entries, .. }) => {
-                entries[0].state.clone()
-            }
+            ModelAssessmentDomainSnapshot::Available { entries, .. } => entries[0].state.clone(),
             other => panic!("expected an available slice, got {other:?}"),
         };
         assert!(matches!(
@@ -1334,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_source_slice_recovers_without_disturbing_the_other_slice() {
+    fn a_source_slice_updates_without_disturbing_the_other_slice() {
         let catalog = assessment_subject("pool-source", CatalogModelSelection::Desired);
         let discovered = magnitude_service_contracts::models::ModelAssessmentSubject::Discovery {
             model_id: catalog.model_id().clone(),
@@ -1350,17 +1034,13 @@ mod tests {
             3,
             &[assessment_target(discovered.clone(), "discovered")],
         );
-        let failure = DomainModelFailure {
-            code: "source_unavailable".to_owned(),
-            message: "source unavailable".to_owned(),
-            retryable: true,
-        };
-        assert!(current.set_domain_failure(AssessmentDomain::Discovered, failure.clone()));
-        assert!(!current.set_domain_failure(AssessmentDomain::Discovered, failure));
+        assert!(current.set_domain_pending(AssessmentDomain::Discovered, 4));
+        assert!(!current.set_domain_pending(AssessmentDomain::Discovered, 4));
         assert!(current.references_assessing(&AssessmentWorkKey("catalog".to_owned())));
+        assert!(!current.references_assessing(&AssessmentWorkKey("discovered".to_owned())));
         assert!(current.replace_domain(
             AssessmentDomain::Discovered,
-            4,
+            5,
             &[assessment_target(discovered, "discovered")],
         ));
         assert!(current.references_assessing(&AssessmentWorkKey("discovered".to_owned())));
@@ -1383,7 +1063,7 @@ mod tests {
                 work: None,
             }],
         ));
-        assert!(!current.domain_source_failed(AssessmentDomain::Catalog));
+        assert!(current.failed_reads.is_empty());
         assert!(current.references_dropped(&subject, &key));
         assert!(!current.replace_domain(
             AssessmentDomain::Catalog,

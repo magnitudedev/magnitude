@@ -88,6 +88,7 @@ pub(crate) struct DiscoveredDevice {
     pub(crate) backend: seismic_lang::registry::BackendName,
     pub(crate) availability: Availability,
     pub(crate) memory: DiscoveredMemory,
+    pub(crate) memory_bandwidth: Option<u64>,
     pub(crate) descriptor: Descriptor,
 }
 
@@ -306,6 +307,7 @@ pub(crate) fn discover() -> BackendDiscovery {
         memory: DiscoveredMemory::Host {
             max_allocation_bytes: seismic_cpu::MAX_ALLOCATION_BYTES,
         },
+        memory_bandwidth: None,
         descriptor: Descriptor::Cpu,
     });
 
@@ -334,6 +336,7 @@ pub(crate) fn discover() -> BackendDiscovery {
             backend: BackendName::Metal,
             availability: Availability::Available,
             memory,
+            memory_bandwidth: None,
             descriptor: Descriptor::Metal { handle },
         });
     }
@@ -383,6 +386,7 @@ pub(crate) fn discover() -> BackendDiscovery {
                     backend: BackendName::Cuda,
                     availability: Availability::Available,
                     memory,
+                    memory_bandwidth: descriptor.memory_bandwidth,
                     descriptor: Descriptor::Cuda {
                         ordinal,
                         uuid: descriptor.uuid,

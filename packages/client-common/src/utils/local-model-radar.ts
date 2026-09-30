@@ -104,7 +104,14 @@ const memoryFitLabel = (assessment: ModelAssessment): string => {
   return "Tight"
 }
 
-const performanceRangeSpeedLabel = (
+/** How to read an estimated speed: arithmetic over bandwidth, not a benchmark. */
+export const localModelSpeedNote = "Rough estimate. Does not account for speculative decoding."
+
+/** The explanation behind an estimated speed's info icon. */
+export const localModelSpeedTooltip =
+  "Estimated from your machine's memory bandwidth. Actual performance will differ. Does not include speculative decoding."
+
+export const performanceRangeSpeedLabel = (
   samples: GenerationPerformanceSamples,
   contextLength: number
 ): string => {
@@ -140,9 +147,7 @@ export const localModelRadarAxes = (
 
   const assessment = serving.assessment
   const comparisonContext = Math.min(50_000, assessment.profile.contextLength)
-  const speed = assessment.speed._tag === "Estimated"
-    ? Option.some(assessment.speed.samples)
-    : Option.none()
+  const samples = assessment.performance
   const catalog = model._tag === "Catalog" ? Option.some(model.catalogData) : Option.none()
   const speculation = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
   const bits = quantizationBits(model)
@@ -159,21 +164,14 @@ export const localModelRadarAxes = (
       }),
     },
     {
-      value: Option.map(speed, (samples) => {
-        const closest = samples.reduce((closest, candidate) =>
-          Math.abs(candidate.contextTokens - comparisonContext) <
-          Math.abs(closest.contextTokens - comparisonContext)
-            ? candidate
-            : closest
-        )
-        return normalizeLocalModelRadarSpeed(closest.estimatedTokensPerSecond)
-      }),
+      value: Option.some(normalizeLocalModelRadarSpeed(samples.reduce((closest, candidate) =>
+        Math.abs(candidate.contextTokens - comparisonContext) <
+        Math.abs(closest.contextTokens - comparisonContext)
+          ? candidate
+          : closest
+      ).estimatedTokensPerSecond)),
       label: "SPEED",
-      detail: Option.match(speed, {
-        onNone: () => "Speed estimate unavailable",
-        onSome: (samples) =>
-          performanceRangeSpeedLabel(samples, assessment.profile.contextLength),
-      }),
+      detail: performanceRangeSpeedLabel(samples, assessment.profile.contextLength),
     },
     {
       value: Option.some(speculationValue(model)),

@@ -3,10 +3,10 @@
 //!
 //! The standard workload's clean-load charge is compared with every domain
 //! the load touches (`DoesNotFit` names the domain with the largest deficit);
-//! only a fitting model is estimated. The basis only prices: a cost it lacks
-//! makes the speed `Unavailable`, never the model.
+//! only a fitting model is estimated, from its decode demand over the
+//! device's bandwidth.
 
-use super::basis::{MeasurementBasis, MeasurementKey};
+use super::bandwidth::DeviceBandwidth;
 use super::demand::DecodeDemand;
 use super::estimate::{estimate_performance, performance_depths, PerformanceEstimate};
 use super::AssessmentError;
@@ -42,24 +42,13 @@ pub struct DomainFit {
     pub remaining_bytes: i64,
 }
 
-/// A fitting model's decode speed.
-#[derive(Clone, Debug, PartialEq)]
-pub enum DecodeSpeed {
-    Estimated(Vec<PerformanceEstimate>),
-    /// The basis has no cost for these keys of the decode step: a defect of
-    /// the basis or its measurement, which costs the estimate and nothing
-    /// else.
-    Unavailable {
-        missing: Vec<MeasurementKey>,
-    },
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExecutionAssessment {
     Fits {
         fit_context_tokens: u32,
         domains: Vec<DomainFit>,
-        speed: DecodeSpeed,
+        /// One estimate per requested depth, ascending.
+        performance: Vec<PerformanceEstimate>,
     },
     DoesNotFit {
         fit_context_tokens: u32,
@@ -150,14 +139,14 @@ pub fn prepare_execution_assessment(
     })
 }
 
-/// Join one prepared model with the basis and stable capacity. No graph or
-/// model material is constructed here.
+/// Join one prepared model with stable capacity and the device's bandwidth.
+/// No graph or model material is constructed here.
 pub fn finish_execution_assessment(
     prepared: &PreparedExecutionAssessment,
     draft: &ExecutionPlanDraft,
     topology: &DeviceTopology,
     host: &HostMemoryStatus,
-    basis: &MeasurementBasis,
+    bandwidth: DeviceBandwidth,
     request: &AssessmentRequest,
 ) -> Result<ExecutionAssessment, AssessmentError> {
     let device = topology
@@ -187,44 +176,37 @@ pub fn finish_execution_assessment(
             limiting,
             deficit_bytes,
         }),
-        AssessmentFitVerdict::Fits => {
-            let missing = prepared.demand.missing_costs(basis);
-            let speed = if missing.is_empty() {
-                let depths = performance_depths(request.context_limit, &request.performance_depths);
-                DecodeSpeed::Estimated(estimate_performance(&prepared.demand, basis, &depths)?)
-            } else {
-                DecodeSpeed::Unavailable { missing }
-            };
-            Ok(ExecutionAssessment::Fits {
-                fit_context_tokens,
-                domains: fit.domains,
-                speed,
-            })
-        }
+        AssessmentFitVerdict::Fits => Ok(ExecutionAssessment::Fits {
+            fit_context_tokens,
+            domains: fit.domains,
+            performance: estimate_performance(
+                &prepared.demand,
+                bandwidth,
+                &performance_depths(request.context_limit, &request.performance_depths),
+            ),
+        }),
     }
 }
 
-/// Assess one planned model against stable capacity and the basis. Opens no
-/// device, reads no weight payload and allocates nothing.
+/// Assess one planned model against stable capacity and the device's
+/// bandwidth. Opens no device, reads no weight payload and allocates
+/// nothing.
 pub fn assess_execution(
     definition: &ModelDefinition,
     draft: &ExecutionPlanDraft,
     topology: &DeviceTopology,
     host: &HostMemoryStatus,
-    basis: &MeasurementBasis,
+    bandwidth: DeviceBandwidth,
     request: &AssessmentRequest,
 ) -> Result<ExecutionAssessment, AssessmentError> {
     let prepared = prepare_execution_assessment(definition, draft, request.context_limit)?;
-    finish_execution_assessment(&prepared, draft, topology, host, basis, request)
+    finish_execution_assessment(&prepared, draft, topology, host, bandwidth, request)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assessment::{
-        BasisIdentity, ClassCost, ClassMeasurement, CostModel, HistoryCost, MeasurementKey,
-        ProjectionCost, TermShape,
-    };
+    use crate::assessment::bandwidth::BandwidthSource;
     use crate::{
         ComponentSelection, ExecutionPath, ExecutionPlanner, PlannedMethod, ResourceLimits,
     };
@@ -277,71 +259,10 @@ mod tests {
         }
     }
 
-    fn identity() -> BasisIdentity {
-        BasisIdentity {
-            engine_build: "test".into(),
-            backend: "test".into(),
-            device: "test".into(),
-            protocol_version: crate::assessment::MEASUREMENT_PROTOCOL_VERSION,
-        }
-    }
-
-    /// A basis pricing every entry the fixture's decode needs: each term's
-    /// cost key timed at 10 µs a launch, and its weight format.
-    fn complete_basis(environment: &Environment) -> MeasurementBasis {
-        let demand = DecodeDemand::from_model(
-            &environment.definition,
-            environment.draft.load(),
-            environment.draft.policy().codec(),
-        )
-        .unwrap();
-        let measured = |model| ClassMeasurement::Measured {
-            points: Vec::new(),
-            cost: ClassCost {
-                model,
-                slow_factor: 1.1,
-                fast_factor: 0.9,
-                limited_evidence: false,
-            },
-        };
-        let mut classes: Vec<(MeasurementKey, ClassMeasurement)> = Vec::new();
-        let mut hold = |key: MeasurementKey, measurement: ClassMeasurement| {
-            if classes.iter().all(|(known, _)| *known != key) {
-                classes.push((key, measurement));
-            }
-        };
-        for term in &demand.terms {
-            let model = match term.shape {
-                TermShape::Plain => CostModel::PerLaunch { seconds: 1e-5 },
-                TermShape::Projection { weight, .. } => {
-                    hold(
-                        MeasurementKey::weight_format(weight, term.key.cost().bindings[0]),
-                        measured(CostModel::PerByte {
-                            seconds_per_byte: 1e-12,
-                        }),
-                    );
-                    CostModel::Projection(ProjectionCost {
-                        launch_seconds: 1e-5,
-                        weight,
-                        seconds_per_byte: vec![(1, 0.0)],
-                    })
-                }
-                TermShape::Attention(reference) => CostModel::History(HistoryCost {
-                    launch_seconds: 1e-5,
-                    seconds_per_byte: 0.0,
-                    reference,
-                    kv_heads: vec![(reference.kv_heads, 1.0)],
-                    group: vec![(reference.group, 1.0)],
-                    width: vec![(reference.width, 1.0)],
-                }),
-            };
-            hold(term.key.cost(), measured(model));
-        }
-        MeasurementBasis {
-            identity: identity(),
-            classes,
-        }
-    }
+    const BANDWIDTH: DeviceBandwidth = DeviceBandwidth {
+        bytes_per_second: 100_000_000_000,
+        source: BandwidthSource::Published,
+    };
 
     fn request(context_limit: u32, depths: &[u32]) -> AssessmentRequest {
         AssessmentRequest {
@@ -351,83 +272,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_basis_gap_costs_only_the_speed_estimate() {
-        let environment = environment(128);
-        let assess = |basis: &MeasurementBasis| {
-            assess_execution(
-                &environment.definition,
-                &environment.draft,
-                &environment.topology,
-                &environment.host,
-                basis,
-                &request(128, &[64]),
-            )
-            .unwrap()
-        };
-        let complete = complete_basis(&environment);
-        let ExecutionAssessment::Fits {
-            domains,
-            speed: DecodeSpeed::Estimated(_),
-            ..
-        } = assess(&complete)
-        else {
-            panic!("the fixture fits and the complete basis prices it");
-        };
-
-        let empty = MeasurementBasis {
-            identity: identity(),
-            classes: Vec::new(),
-        };
-        let ExecutionAssessment::Fits {
-            domains: empty_domains,
-            speed: DecodeSpeed::Unavailable { missing },
-            ..
-        } = assess(&empty)
-        else {
-            panic!("an empty basis still fits, without a speed estimate");
-        };
-        assert!(!missing.is_empty());
-        assert_eq!(empty_domains, domains);
-
-        let mut failed = complete.clone();
-        let (key, _) = failed.classes.remove(0);
-        failed.classes.push((
-            key.clone(),
-            ClassMeasurement::Unsupported {
-                reason: "cannot form".into(),
-            },
-        ));
-        assert_eq!(
-            assess(&failed),
-            ExecutionAssessment::Fits {
-                fit_context_tokens: 128,
-                domains,
-                speed: DecodeSpeed::Unavailable { missing: vec![key] },
-            }
-        );
+    fn assess(environment: &Environment, request: &AssessmentRequest) -> ExecutionAssessment {
+        assess_execution(
+            &environment.definition,
+            &environment.draft,
+            &environment.topology,
+            &environment.host,
+            BANDWIDTH,
+            request,
+        )
+        .unwrap()
     }
 
     #[test]
     fn fit_depth_is_independent_of_performance_depths() {
         let environment = environment(150_000);
-        let basis = complete_basis(&environment);
-        let assessment = assess_execution(
-            &environment.definition,
-            &environment.draft,
-            &environment.topology,
-            &environment.host,
-            &basis,
-            &request(150_000, &[25_000, 50_000, 50_000, 200_000]),
-        )
-        .unwrap();
         let ExecutionAssessment::Fits {
             fit_context_tokens,
             domains,
-            speed: DecodeSpeed::Estimated(performance),
-        } = assessment
+            performance,
+        } = assess(
+            &environment,
+            &request(150_000, &[25_000, 50_000, 50_000, 200_000]),
+        )
         else {
-            panic!("the fixture fits every supported host, got {assessment:?}");
+            panic!("the fixture fits every supported host");
         };
         assert_eq!(fit_context_tokens, 100_000);
         assert_eq!(
@@ -437,6 +306,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![25_000, 50_000, 150_000]
         );
+        assert!(performance
+            .iter()
+            .all(|estimate| estimate.tokens_per_second.is_finite()
+                && estimate.tokens_per_second > 0.0));
         assert_eq!(domains[0].role, DomainRole::Allocation);
         assert!(domains.iter().all(|domain| domain.remaining_bytes >= 0));
         for domain in &domains {
@@ -448,19 +321,10 @@ mod tests {
             );
         }
         // The charge depends on the fit depth only, not on the depths asked.
-        let other = assess_execution(
-            &environment.definition,
-            &environment.draft,
-            &environment.topology,
-            &environment.host,
-            &basis,
-            &request(150_000, &[1_000]),
-        )
-        .unwrap();
         let ExecutionAssessment::Fits {
             domains: other_domains,
             ..
-        } = other
+        } = assess(&environment, &request(150_000, &[1_000]))
         else {
             panic!("expected a fit");
         };
@@ -479,14 +343,13 @@ mod tests {
     #[test]
     fn a_mismatched_context_limit_is_an_error() {
         let environment = environment(128);
-        let basis = complete_basis(&environment);
         assert!(matches!(
             assess_execution(
                 &environment.definition,
                 &environment.draft,
                 &environment.topology,
                 &environment.host,
-                &basis,
+                BANDWIDTH,
                 &request(256, &[64]),
             ),
             Err(AssessmentError::Plan(_))

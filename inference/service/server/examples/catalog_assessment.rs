@@ -1,14 +1,11 @@
 //! Assess the complete release catalog through the service's production assessment path (the
-//! measurement job, the environment identity, the automatic pool and the per-target assessor) and
-//! report the snapshot with its timings. Development evidence only.
+//! environment and its identity, the automatic pool and the per-target assessor) and report the
+//! snapshot with its timings. Development evidence only.
 //!
 //! ```text
 //! catalog_assessment --bundle model-planner-inputs.bundle --cache-root DIR --model-store DIR \
 //!     [--snapshot OUT.json]
 //! ```
-//!
-//! The executable is also its own measurement worker (`measurement-worker ...`), exactly as the
-//! service binary is.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,9 +14,9 @@ use std::time::{Duration, Instant};
 use futures_util::future::BoxFuture;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover, DecodeSpeed,
-    ModelAssessment, ModelAssessmentDomainSnapshot, ModelAssessmentEntryState,
-    ModelAssessmentPoolState, ModelAssessments, ModelId, ModelPackageId,
+    CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover, ModelAssessment,
+    ModelAssessmentDomainSnapshot, ModelAssessmentEntryState, ModelAssessments, ModelId,
+    ModelPackageId,
 };
 use magnitude_service_models::{
     InventoryConfig, ManagedModelDownloads, ManagedModelStore, ModelDomainResolver,
@@ -27,10 +24,7 @@ use magnitude_service_models::{
 };
 use magnitude_service_server::assessment::ManagedModelAssessments;
 use magnitude_service_server::assessment::assessor::ModelAssessor;
-use magnitude_service_server::assessment::measurement::{
-    DeviceExclusion, MeasurementJob, MeasurementWorkerArgs, run_measurement_worker,
-};
-use magnitude_service_server::worker_process::{WorkerLauncher, install_parent_watchdog};
+use magnitude_service_server::assessment::environment::AssessmentEnvironment;
 use serde_json::json;
 
 const POLL: Duration = Duration::from_millis(20);
@@ -82,18 +76,6 @@ fn main() -> anyhow::Result<()> {
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if arguments.first().map(String::as_str) == Some("measurement-worker") {
-        install_parent_watchdog()?;
-        run_measurement_worker(MeasurementWorkerArgs {
-            device: flag(&arguments, "--device")
-                .expect("--device")
-                .parse()
-                .map_err(|error| anyhow::anyhow!("--device: {error:?}"))?,
-            basis_directory: required(&arguments, "--basis-dir"),
-            kernel_directory: required(&arguments, "--kernel-dir"),
-        })?;
-        return Ok(());
-    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -114,59 +96,31 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
     let resolver = ModelDomainResolver::new(inventory.clone(), release.catalog().clone());
     let downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()).await?);
     let services = managed_model_services(resolver.clone(), downloads, Arc::new(NoCatalogEffects), Arc::new(NoCatalogEffects))?;
-    let cache = inventory.derived_cache().clone();
-    let assessor = Arc::new(ModelAssessor::new(
-        inventory,
-        resolver,
-        release,
-        Arc::new(seismic::DeviceCatalog::discover()?),
-        MeasurementJob::new(
-            WorkerLauncher::current()?,
-            cache.measurement_basis_directory(),
-            cache.kernel_directory(),
-            DeviceExclusion::default(),
-        ),
-    ));
-    let opened = started.elapsed();
+    let environment = Arc::new(AssessmentEnvironment::establish(
+        &seismic::DeviceCatalog::discover()?,
+    )?);
+    let environment_established = started.elapsed();
+    let assessor = Arc::new(ModelAssessor::new(inventory, resolver, release, environment));
     let pool = ManagedModelAssessments::start(
         assessor,
         services.catalog.clone(),
         services.discovered.clone(),
     );
     let pool_started = Instant::now();
-    let mut ready_after = None;
     let snapshot = loop {
         let snapshot = pool.snapshot().await?;
-        match &snapshot.state {
-            ModelAssessmentPoolState::Preparing => {}
-            ModelAssessmentPoolState::Failed { failure } => {
-                anyhow::bail!(
-                    "assessment pool failed: {} {}",
-                    failure.code,
-                    failure.message
-                )
-            }
-            ModelAssessmentPoolState::Ready { catalog, .. } => {
-                ready_after.get_or_insert_with(|| pool_started.elapsed());
-                if let ModelAssessmentDomainSnapshot::Available { entries, .. } = catalog
-                    && entries
-                        .iter()
-                        .all(|entry| !matches!(entry.state, ModelAssessmentEntryState::Assessing))
-                {
-                    break snapshot;
-                }
-            }
+        if let ModelAssessmentDomainSnapshot::Available { entries, .. } = &snapshot.catalog
+            && entries
+                .iter()
+                .all(|entry| !matches!(entry.state, ModelAssessmentEntryState::Assessing))
+        {
+            break snapshot;
         }
         tokio::time::sleep(POLL).await;
     };
     let settled = pool_started.elapsed();
-    let ModelAssessmentPoolState::Ready {
-        environment_id,
-        catalog: ModelAssessmentDomainSnapshot::Available { entries, .. },
-        ..
-    } = &snapshot.state
-    else {
-        unreachable!("the loop returns a ready snapshot with an available catalog");
+    let ModelAssessmentDomainSnapshot::Available { entries, .. } = &snapshot.catalog else {
+        unreachable!("the loop returns an available catalog");
     };
     for entry in entries {
         let summary = match &entry.state {
@@ -175,20 +129,17 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
                     ModelAssessment::Fits {
                         profile,
                         memory,
-                        speed,
+                        performance,
                         ..
                     },
                 ] => json!({
                     "result": "Fits",
                     "context": profile.context_length,
                     "requiredBytes": memory.iter().map(|domain| domain.required_bytes).collect::<Vec<_>>(),
-                    "tokensPerSecond": match speed {
-                        DecodeSpeed::Estimated { samples } => json!(samples
-                            .iter()
-                            .map(|sample| (sample.context_tokens, (sample.estimated_tokens_per_second * 10.0).round() / 10.0))
-                            .collect::<Vec<_>>()),
-                        DecodeSpeed::Unavailable => json!("unavailable"),
-                    },
+                    "tokensPerSecond": performance
+                        .iter()
+                        .map(|sample| (sample.context_tokens, (sample.estimated_tokens_per_second * 10.0).round() / 10.0))
+                        .collect::<Vec<_>>(),
                 }),
                 [
                     ModelAssessment::DoesNotFit {
@@ -218,11 +169,10 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
     println!(
         "{}",
         json!({
-            "environmentId": environment_id.0,
+            "environmentId": snapshot.environment_id.0,
             "entries": entries.len(),
             "catalogLoadSeconds": catalog_loaded.as_secs_f64(),
-            "openSeconds": opened.as_secs_f64(),
-            "environmentReadySeconds": ready_after.expect("ready").as_secs_f64(),
+            "environmentEstablishedSeconds": environment_established.as_secs_f64(),
             "catalogSettledSeconds": settled.as_secs_f64(),
             "processTotalSeconds": process_started.elapsed().as_secs_f64(),
         })

@@ -28,13 +28,9 @@ header-only program plan, so a fit result never undercounts. The graph-resource 
 graph the load prepares, so a kernel call outside its kernel's domain fails the assessment exactly
 as the load's kernel preparation fails, and both classify it `Unsupported`. Assessment results
 are complete: Fits, DoesNotFit or Unsupported; there is no unconfirmed fit.
-Speed assessment uses a measurement basis per device: every operation class the known targets'
-plans need, timed once with shipped default configurations on synthetic device-resident inputs,
-keeping every sample. Each model's decode speed at each requested depth is
-computed analytically from its header-derived launch and byte demand. The basis only prices: a
-class it could not form or measure leaves the speed of models that need it `Unavailable`, never
-decides their result. A failed measurement supplies no prediction; real-model validation cannot
-be used to fit a correction factor.
+Speed assessment runs nothing on the device: each model's decode speed at each requested depth is
+computed from its header-derived byte, history and launch demand over the device's memory
+bandwidth (see [performance estimation](../../icn/performance-estimation.md)).
 The composition root prepares complete Seismic workflows for the admitted model geometry and
 finite launch classes, imports the target component, allocates the storage reported by those
 workflows, and publishes readiness only after those steps succeed. The engine does not maintain a
@@ -290,15 +286,15 @@ ordered as a used resource until submitted work completes. The entry resolves on
 slab-contained part of a visible span (a span may cross slab edges), one per destination row, or
 one per recurrent bank; its inner loops retain their direct component layout. This is ordered by construction: destinations are freshly reserved rows,
 so no row of the batch sees one through its visible spans, and fresh rows are read from the batch's
-own projections. The fixed device measurement basis uses the same slab binding as served work.
+own projections.
 An attention sublayer is one segmented query | gate | key | value projection, the fused entry and
 the output projection, whatever its form: each optional part of the operator (interleaved or
 separate gate, own keys and values, head norms, value norm, rotated pairs) is a static axis of
 extent 0 or 1, so a form is a kernel specialization, never a different graph. An absent weight
 segment binds zero rows of the query weight and an absent head norm zero rows of a unit norm row;
 the rotary table (axis, frequency and amplitude per pair), the unit row, the score scale and the
-gate function come from the operator. Attention decode measurements are keyed by head geometry;
-the per-row work a form adds is small beside the history the entry streams. Wide heads (up to 512
+gate function come from the operator. The per-row work a form adds is small beside the history the
+entry streams. Wide heads (up to 512
 columns, query groups up to 16) stay within each backend's workgroup memory (the 32 KiB floor on
 Metal and Vulkan, 32-lane subgroups): decode splits a kv head's query group into register-resident slices that each
 stream the history once, or in its grouped-query matrix form makes the group's query heads the rows

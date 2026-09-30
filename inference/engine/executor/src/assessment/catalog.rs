@@ -1,15 +1,11 @@
 //! Every catalog target the executor admits derives complete assessment
-//! terms on every backend, and the fixed measurement plan covers them: its
-//! decode demand under both native codecs (every term's cost key and weight
-//! format timed), its memory terms, and every graph a load prepares, so no
-//! call lies outside its kernel's domain. A form the executor does not run
-//! is refused at admission, with a typed reason, before any term is derived;
-//! a target past admission whose terms or graphs fail, or whose demand the
-//! plan does not cover, is a failure.
+//! terms on every backend: its decode demand under both native codecs, its
+//! memory terms, and every graph a load prepares, so no call lies outside
+//! its kernel's domain. A form the executor does not run is refused at
+//! admission, with a typed reason, before any term is derived; a target past
+//! admission whose terms or graphs fail is a failure.
 
-use super::basis::MeasurementKey;
 use super::demand::DecodeDemand;
-use super::plan::{activation, measurement_plan};
 use crate::{
     resident_layout, AssessmentGraphResourceBounds, AssessmentMemoryTerms, ComponentSelection,
     ExecutionPath, ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner,
@@ -118,26 +114,10 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                 failures.push(format!("{model} {role} {}: {error}", backend.as_str()));
                 continue;
             }
-            let plan = measurement_plan(backend);
-            let covered = |key: &MeasurementKey| plan.contains(key);
-            let terms = [KvCodec::Dense, KvCodec::AffineK8V4]
+            let demands = [KvCodec::Dense, KvCodec::AffineK8V4]
                 .into_iter()
                 .map(|codec| DecodeDemand::from_model(&definition, &load, codec))
-                .collect::<Result<Vec<_>, _>>()
-                .map(|demands| {
-                    let terms = demands.iter().flat_map(|demand| &demand.terms);
-                    let outside = terms
-                        .clone()
-                        .filter(|term| {
-                            !covered(&term.key.cost())
-                                || term.weight().is_some_and(|weight| {
-                                    !covered(&MeasurementKey::weight_format(weight, activation()))
-                                })
-                        })
-                        .map(|term| term.key.to_string())
-                        .collect::<Vec<_>>();
-                    (terms.count(), outside)
-                });
+                .collect::<Result<Vec<_>, _>>();
             let memory = AssessmentMemoryTerms::derive(
                 &definition,
                 &load,
@@ -170,19 +150,28 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                 )
                 .map_err(|error| error.to_string())
             });
-            match (terms, memory, graphs) {
-                (Ok((terms, outside)), Ok(_), Ok(_)) if outside.is_empty() => admitted.push(
-                    format!("{model} {role} {}: {terms} terms", backend.as_str()),
-                ),
-                (Ok((_, outside)), Ok(_), Ok(_)) => failures.push(format!(
-                    "{model} {role} {}: outside the plan: {}",
-                    backend.as_str(),
-                    outside.join(", ")
+            match (demands, memory, graphs) {
+                // A decode step streams its weights and launches its entries.
+                (Ok(demands), Ok(_), Ok(_))
+                    if demands
+                        .iter()
+                        .all(|demand| demand.streamed_bytes > 0 && demand.launches > 0) =>
+                {
+                    admitted.push(format!(
+                        "{model} {role} {}: {} launches, {} bytes",
+                        backend.as_str(),
+                        demands[0].launches,
+                        demands[0].streamed_bytes
+                    ))
+                }
+                (Ok(demands), Ok(_), Ok(_)) => failures.push(format!(
+                    "{model} {role} {}: an empty decode step: {demands:?}",
+                    backend.as_str()
                 )),
-                (terms, memory, graphs) => failures.push(format!(
+                (demands, memory, graphs) => failures.push(format!(
                     "{model} {role} {}: {:?} / {:?} / {:?}",
                     backend.as_str(),
-                    terms.err(),
+                    demands.err(),
                     memory.err(),
                     graphs.err()
                 )),

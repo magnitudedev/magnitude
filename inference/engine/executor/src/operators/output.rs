@@ -135,7 +135,6 @@ pub(crate) struct PostNormShape {
 
 #[cfg(test)]
 mod tests {
-    use crate::assessment::basis::OperationClass;
     use crate::assessment::demand::DecodeDemand;
     use crate::planning::tests::{fixture_definition, fixture_manifest};
     use crate::programs::native_target_graph::checked_target_family_storage;
@@ -225,19 +224,10 @@ mod tests {
                 limits,
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+            // Each post-norm tail is a projection into F32 rows and a row
+            // op: two sublayers add two launches to the plain fixture's nine.
             let demand = DecodeDemand::from_model(&definition, &load, KvCodec::Dense).unwrap();
-            let launches = |class| {
-                demand
-                    .terms
-                    .iter()
-                    .filter(|term| term.key.class == class)
-                    .map(|term| term.launches)
-                    .sum::<u64>()
-            };
-            assert_eq!(launches(OperationClass::ProjectRows), 2);
-            assert_eq!(launches(OperationClass::PostNormResidual), 2);
-            assert_eq!(launches(OperationClass::AttentionOutput), 0);
-            assert_eq!(launches(OperationClass::DenseOutput), 0);
+            assert_eq!(demand.launches, 11);
         }
     }
 

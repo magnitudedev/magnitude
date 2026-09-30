@@ -507,28 +507,14 @@ mod tests {
                 limits,
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-            // Every launch of a decode step has a measured class.
-            let classes = crate::assessment::DecodeDemand::from_model(
+            // The decode step streams every block's state and weights.
+            let demand = crate::assessment::DecodeDemand::from_model(
                 &definition,
                 &load,
                 magnitude_state::KvCodec::Dense,
             )
-            .unwrap()
-            .terms
-            .into_iter()
-            .map(|term| term.key.class.name())
-            .collect::<Vec<_>>();
-            for class in [
-                "state_space_step",
-                "state_space_gate",
-                "routed_select",
-                "routed_up",
-                "routed_down",
-                "dense_up",
-                "project_rows",
-            ] {
-                assert!(classes.contains(&class), "{backend:?} lacks {class}");
-            }
+            .unwrap();
+            assert!(demand.streamed_bytes > 0 && demand.launches > 0, "{backend:?}");
         }
     }
 
@@ -663,22 +649,17 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
 
-            // Scales change no demand class: the measurement keys are the
-            // representation's.
-            let classes = |definition: &ModelDefinition, load: &ModelLoadPlan| {
-                crate::assessment::DecodeDemand::from_model(definition, load, KvCodec::Dense)
-                    .unwrap()
-                    .terms
-                    .into_iter()
-                    .map(|term| term.key.class.name())
-                    .collect::<std::collections::BTreeSet<_>>()
+            // Scales change no launch or history read: they ride with their
+            // weights.
+            let shape = |definition: &ModelDefinition, load: &ModelLoadPlan| {
+                let demand =
+                    crate::assessment::DecodeDemand::from_model(definition, load, KvCodec::Dense)
+                        .unwrap();
+                (demand.launches, demand.history)
             };
             let unscaled_load =
                 ModelLoadPlan::derive(&unscaled_manifest, &unscaled, selection, layout).unwrap();
-            assert_eq!(
-                classes(&definition, &load),
-                classes(&unscaled, &unscaled_load)
-            );
+            assert_eq!(shape(&definition, &load), shape(&unscaled, &unscaled_load));
         }
     }
 

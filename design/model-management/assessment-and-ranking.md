@@ -34,18 +34,16 @@ The automatic assessment pool assesses catalog desired material when not install
 when installed, and only `Ready` discoveries. It publishes a read-only revisioned snapshot with
 independent catalog and discovery source slices. Exact work identity guards publication, so removed
 or superseded models cannot retain stale results. Packages, bundles, and serving configurations do
-not cross the boundary. Whole-source failures are observed and retried with bounded background
-backoff. Each exact target is attempted once; any target failure settles as `Dropped`, is never
+not cross the boundary. A failed source read keeps that slice as it is and is retried in the
+background; it is the inventory's failure, which the catalog reports. Each exact target is attempted once; any target failure settles as `Dropped`, is never
 retried, and is omitted by ACN. Catalog drops emit an OpenTelemetry error; discovered drops are
 silent.
 
-One assessment reads the target's Assessment Material headers once, in the service process.
-The measurement basis is model-free and measured from service start, concurrently with every
-target's header preparation (family definition, execution plan, decode demand and resources);
-neither waits for the other. The engine's own tokenizer,
+One assessment reads the target's Assessment Material headers once, in the service process, and
+is arithmetic over them and the assessment environment the service establishes at start (the
+selected device, its memory bandwidth and the host). The engine's own tokenizer,
 template and reasoning inspection supplies capabilities and the template fingerprint; its method
-resolution decides speculative execution. Only the final support, memory-fit and performance
-calculation waits for the basis.
+resolution decides speculative execution.
 One deadline covers the target, and one flat assessed result
 publishes capabilities, template fingerprint, and profile evidence together. There is no planning
 worker, template worker, inventory capability state, or post-download assessment gate. Equal
@@ -59,9 +57,8 @@ headroom is never fabricated.
 
 Ranking exists only for reviewed catalog models with `Fits` evidence and the required bounded
 performance sample. Intelligence and fidelity come from authored catalog evidence; speed comes
-from engine assessment. Missing evidence yields absent ranking scores, never zeros: a fitting
-model whose speed is `Unavailable` is unranked, orders after every ranked model, and is otherwise
-usable. Discovered models receive no invented intelligence or fidelity score.
+from engine assessment, which every fitting model has. Missing evidence yields absent ranking
+scores, never zeros. Discovered models receive no invented intelligence or fidelity score.
 
 Provider selection requires `Fits`, current selectability, profile, and capabilities from the same
 assessed state. Package validation establishes only structural artifact validity and presence;

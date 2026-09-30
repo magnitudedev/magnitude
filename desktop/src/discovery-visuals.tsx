@@ -4,12 +4,18 @@ import { pageLayout } from "./page-layout"
 import { Option } from "effect"
 import { useMemo } from "react"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
-import { MemoryIcon, CircuitryIcon, CpuIcon } from "@phosphor-icons/react"
-import { DesktopSession, useAgentClient, localModelRadarAxes, useLocalInferenceHardware } from "@magnitudedev/client-common"
+import { MemoryIcon, CircuitryIcon, CpuIcon, InfoIcon } from "@phosphor-icons/react"
+import { DesktopSession, useAgentClient, localModelRadarAxes, localModelSpeedTooltip, useLocalInferenceHardware } from "@magnitudedev/client-common"
+import { ActionTooltip } from "../../web/src/components/ui/tooltip"
 import { type HardwarePhoto } from "./hardware-photos"
 import { hardwareDetails } from "./hardware-details"
 import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import type { CatalogLocalModel, LocalInferenceHardware } from "@magnitudedev/sdk"
+
+/** An estimated speed's small slate info icon, explaining what the estimate leaves out. */
+export function SpeedInfo() {
+  return <ActionTooltip label={localModelSpeedTooltip} trigger={<button type="button" aria-label={localModelSpeedTooltip} className="inline-flex rounded-sm text-slate-400 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-500 dark:hover:text-slate-300"><InfoIcon aria-hidden="true" className="size-3" /></button>} />
+}
 
 export function ModelRadar({ model }: { model: CatalogLocalModel }) {
   const axes = localModelRadarAxes(model)
@@ -27,10 +33,17 @@ export function ModelRadar({ model }: { model: CatalogLocalModel }) {
       <path d={profilePath} style={{ d: `path("${profilePath}")` }} className="motion-safe:transition-[d] motion-safe:duration-300 motion-safe:ease-out" fill="currentColor" fillOpacity="0.13" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
       {axes.value.map((axis,index) => {
         const [x,y] = [[180,20],[290,83],[258,238],[102,238],[70,83]][index]!
-        return <text key={axis.label} x={x} y={y} textAnchor="middle">
-          <tspan x={x} className="fill-slate-500 dark:fill-slate-400" fontSize="11">{axis.label.charAt(0)+axis.label.slice(1).toLowerCase()}</tspan>
-          <tspan x={x} dy="18" className="fill-slate-800 dark:fill-slate-200" fontSize="13" fontWeight="500">{axis.detail}</tspan>
-        </text>
+        const label = axis.label.charAt(0)+axis.label.slice(1).toLowerCase()
+        // Speed's label carries its estimate marker and info icon: an HTML row centered on the
+        // axis, occupying the label line's box above the detail's baseline.
+        return <g key={axis.label}>
+          {axis.label === "SPEED"
+            ? <foreignObject x={x - 70} y={y - 11} width="140" height="14">
+                <div className="flex h-full items-center justify-center gap-1 text-[11px] leading-none text-slate-500 dark:text-slate-400">{label} (est.)<SpeedInfo /></div>
+              </foreignObject>
+            : <text x={x} y={y} textAnchor="middle" className="fill-slate-500 dark:fill-slate-400" fontSize="11">{label}</text>}
+          <text x={x} y={y + 18} textAnchor="middle" className="fill-slate-800 dark:fill-slate-200" fontSize="13" fontWeight="500">{axis.detail}</text>
+        </g>
       })}
     </svg>
   </div>

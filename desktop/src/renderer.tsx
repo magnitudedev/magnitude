@@ -51,10 +51,10 @@ import {
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
   formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
-  catalogModelReplacement,
+  catalogModelReplacement, performanceRangeSpeedLabel, localModelSpeedNote,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
-import { HardwareOverview, ModelRadar } from "./discovery-visuals"
+import { HardwareOverview, ModelRadar, SpeedInfo } from "./discovery-visuals"
 import { MemoryBreakdown } from "./memory-breakdown"
 import { HarnessConnections } from "./harness-connections"
 import { LabLogo, ModelLogo, modelLab, modelLabs, type ModelLab } from "./model-logo"
@@ -128,13 +128,10 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
         })}</div></div>}
       </div>
       {serving._tag === "Failed" && <div className="min-w-0"><p className="mb-1 text-xs text-slate-500">Assessment</p><p className="break-words text-slate-600 dark:text-slate-300">{serving.failure.message}</p></div>}
-      {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && serving.assessment.speed._tag === "Unavailable" && <div className="min-w-0"><p className="mb-1 font-medium">Estimated speed on your machine</p><p className="text-slate-500">Speed estimate unavailable</p></div>}
-      {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && serving.assessment.speed._tag === "Estimated" && <div className="min-w-0">
-        <table className="w-full text-left text-sm tabular-nums">
-          <caption className="mb-3 text-left font-medium">Estimated speed on your machine</caption>
-          <thead className="text-xs text-slate-500"><tr><th className="pb-2 font-normal">Context tokens</th><th className="pb-2 text-right font-normal">Tokens / sec</th></tr></thead>
-          <tbody>{serving.assessment.speed.samples.map(sample => <tr key={sample.contextTokens} className="border-t border-slate-200 dark:border-slate-750"><td className="py-2">{sample.contextTokens.toLocaleString()}</td><td className="py-2 text-right">{Math.round(sample.estimatedTokensPerSecond)}</td></tr>)}</tbody>
-        </table>
+      {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && <div className="min-w-0">
+        <p className="mb-1 flex items-center gap-1.5 font-medium">Estimated speed on your machine<SpeedInfo /></p>
+        <p className="text-sm tabular-nums">{performanceRangeSpeedLabel(serving.assessment.performance, serving.assessment.profile.contextLength)}</p>
+        <p className="mt-1 text-xs text-slate-500">{localModelSpeedNote}</p>
       </div>}
       </div>
       {radar && <ModelRadar model={model} />}

@@ -21,10 +21,7 @@ const candidate = (input: {
     profile: { contextLength },
     performance: input.includeComparisonSample === false ? [] : [{
         contextTokens: comparisonContext,
-        lowerTokensPerSecond: input.speed ?? 40,
         estimatedTokensPerSecond: input.speed ?? 40,
-        upperTokensPerSecond: input.speed ?? 40,
-        confidence: "high",
       }],
   }
 }

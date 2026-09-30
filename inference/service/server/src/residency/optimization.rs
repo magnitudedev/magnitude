@@ -146,8 +146,7 @@ async fn prepare(
     };
     let device = load_plan(&preview)?.device;
     progress(CatalogOptimizationProgress::preparing(Some(device.clone())));
-    let exclusion = environment.device_exclusion.residency().await;
-    let spawned = EngineWorker::spawn(&environment.launcher, exclusion).map_err(|error| {
+    let spawned = EngineWorker::spawn(&environment.launcher).map_err(|error| {
         ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true)
     })?;
     let worker = Arc::clone(&spawned.worker);

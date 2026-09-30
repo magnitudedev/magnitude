@@ -42,7 +42,6 @@ use super::{
     PreparedResidency, ReleaseControl, ResidencyAcquisition, ResidencyClient, ResidencyGrant,
     ResidencyLease, ResidencyNotification, ResidencyWorker, ResolvedResidencyTarget,
 };
-use crate::assessment::measurement::DeviceExclusion;
 use crate::configurations::{ResolvedConfiguration, ResolvedConfigurations};
 use crate::hardware::execution_backend;
 use crate::memory_domains::instance_allocation;
@@ -77,7 +76,6 @@ pub struct ResidencyEnvironment {
     /// [`MODEL_IDLE_TIMEOUT`] in the service.
     pub idle_timeout: std::time::Duration,
     pub launcher: WorkerLauncher,
-    pub device_exclusion: DeviceExclusion,
     /// Distinguishes this service run's instance identifiers.
     pub instance_id_namespace: String,
 }
@@ -529,8 +527,7 @@ impl EngineResidency {
         // A load tunes whatever its post-install preparation has not stored yet.
         self.preparations
             .stop(&servable_model_bundle_key_for_bundle(&configuration.bundle));
-        let device = environment.device_exclusion.residency().await;
-        let spawned = EngineWorker::spawn(&environment.launcher, device).map_err(|error| {
+        let spawned = EngineWorker::spawn(&environment.launcher).map_err(|error| {
             ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true)
         })?;
         let worker: Arc<dyn ResidencyWorker> = spawned.worker.clone();

@@ -49,6 +49,7 @@ pub(super) fn discovered(description: seismic_vulkan::Description) -> Discovered
             Err(reason) => Availability::Unavailable { reason },
         },
         memory,
+        memory_bandwidth: None,
         descriptor: Descriptor::Vulkan { uuid: facts.uuid },
     }
 }

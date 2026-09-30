@@ -62,16 +62,10 @@ const capabilities = {
 const performance = (contextLength: number) => [...new Set([
   ...[25_000, 50_000, 75_000].filter((context) => context <= contextLength),
   contextLength,
-])].sort((left, right) => left - right).map((contextTokens) => {
-  const estimatedTokensPerSecond = contextTokens === contextLength ? 24 : 28
-  return {
-    contextTokens,
-    lowerTokensPerSecond: estimatedTokensPerSecond - 4,
-    estimatedTokensPerSecond,
-    upperTokensPerSecond: estimatedTokensPerSecond + 4,
-    confidence: "moderate" as const,
-  }
-})
+])].sort((left, right) => left - right).map((contextTokens) => ({
+  contextTokens,
+  estimatedTokensPerSecond: contextTokens === contextLength ? 24 : 28,
+}))
 
 type ReadyDiscoveredLocalModel = Omit<DiscoveredLocalModel, "state"> & {
   readonly state: Extract<DiscoveredLocalModel["state"], { readonly _tag: "Ready" }>
@@ -127,7 +121,7 @@ const makeModel = (overrides: Partial<ReadyDiscoveredLocalModel> = {}): ReadyDis
             },
             currentHeadroomState: { _tag: "NotObserved" },
           },
-          speed: { _tag: "Estimated", samples: performance(contextLength) },
+          performance: performance(contextLength),
         },
       },
     },

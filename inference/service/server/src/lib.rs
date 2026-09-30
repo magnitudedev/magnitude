@@ -1,5 +1,5 @@
-//! The inference service's composition-root library: model assessment (the measurement job, the
-//! per-environment identity and the automatic assessment pool), model residency on the engine
+//! The inference service's composition-root library: model assessment (the environment and its
+//! identity, and the automatic assessment pool), model residency on the engine
 //! worker, the shared resolved-configuration cache, the hardware endpoint's provider and
 //! contained child processes.
 

@@ -3326,47 +3326,6 @@
           }
         }
       },
-      "DecodeSpeed": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "samples",
-              "_tag"
-            ],
-            "properties": {
-              "samples": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/PerformanceEvidence"
-                }
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Estimated"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "description": "The device's measurement basis lacks a cost the model's decode needs:\nan engine defect that costs only the estimate.",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Unavailable"
-                ]
-              }
-            }
-          }
-        ],
-        "description": "A fitting model's decode speed."
-      },
       "DefaultGenerationSettings": {
         "type": "object",
         "required": [
@@ -5009,11 +4968,12 @@
         "oneOf": [
           {
             "type": "object",
+            "description": "A fitting model, with one decode-speed estimate per requested depth.",
             "required": [
               "profile",
               "assessmentId",
               "memory",
-              "speed",
+              "performance",
               "_tag"
             ],
             "properties": {
@@ -5029,8 +4989,11 @@
                   "$ref": "#/components/schemas/MemoryAssessment"
                 }
               },
-              "speed": {
-                "$ref": "#/components/schemas/DecodeSpeed"
+              "performance": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PerformanceEvidence"
+                }
               },
               "_tag": {
                 "type": "string",
@@ -5152,32 +5115,9 @@
                 ]
               }
             }
-          },
-          {
-            "type": "object",
-            "required": [
-              "sourceRevision",
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "sourceRevision": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Failed"
-                ]
-              }
-            }
           }
-        ]
+        ],
+        "description": "One source's assessments. `Pending` until the source has been read (and, for discovery,\nreconciled)."
       },
       "ModelAssessmentEntry": {
         "type": "object",
@@ -5259,68 +5199,6 @@
       "ModelAssessmentId": {
         "type": "string"
       },
-      "ModelAssessmentPoolState": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Preparing"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "environmentId",
-              "catalog",
-              "discovered",
-              "_tag"
-            ],
-            "properties": {
-              "environmentId": {
-                "$ref": "#/components/schemas/AssessmentEnvironmentId"
-              },
-              "catalog": {
-                "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
-              },
-              "discovered": {
-                "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Ready"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Failed"
-                ]
-              }
-            }
-          }
-        ]
-      },
       "ModelAssessmentSubject": {
         "oneOf": [
           {
@@ -5367,9 +5245,12 @@
       },
       "ModelAssessmentsSnapshot": {
         "type": "object",
+        "description": "Every model assessment in the service's one environment, established at service start.",
         "required": [
           "revision",
-          "state"
+          "environmentId",
+          "catalog",
+          "discovered"
         ],
         "properties": {
           "revision": {
@@ -5377,8 +5258,14 @@
             "format": "int64",
             "minimum": 0
           },
-          "state": {
-            "$ref": "#/components/schemas/ModelAssessmentPoolState"
+          "environmentId": {
+            "$ref": "#/components/schemas/AssessmentEnvironmentId"
+          },
+          "catalog": {
+            "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
+          },
+          "discovered": {
+            "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
           }
         },
         "additionalProperties": false
@@ -6196,22 +6083,12 @@
           }
         }
       },
-      "PerformanceConfidence": {
-        "type": "string",
-        "enum": [
-          "high",
-          "moderate",
-          "low"
-        ]
-      },
       "PerformanceEvidence": {
         "type": "object",
+        "description": "An estimated decode speed at one context depth: the model's bytes per decode step over the\ndevice's memory bandwidth.",
         "required": [
           "contextTokens",
-          "lowerTokensPerSecond",
-          "estimatedTokensPerSecond",
-          "upperTokensPerSecond",
-          "confidence"
+          "estimatedTokensPerSecond"
         ],
         "properties": {
           "contextTokens": {
@@ -6219,20 +6096,9 @@
             "format": "int32",
             "minimum": 0
           },
-          "lowerTokensPerSecond": {
-            "type": "number",
-            "format": "double"
-          },
           "estimatedTokensPerSecond": {
             "type": "number",
             "format": "double"
-          },
-          "upperTokensPerSecond": {
-            "type": "number",
-            "format": "double"
-          },
-          "confidence": {
-            "$ref": "#/components/schemas/PerformanceConfidence"
           }
         },
         "additionalProperties": false

@@ -9,23 +9,19 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use magnitude_engine::assessment::{
-    AssessmentSetup, ModelAssessment as EngineAssessment, ModelAssessmentError,
+    ModelAssessment as EngineAssessment, ModelAssessmentError,
     ModelCapabilities as EngineCapabilities, ModelPackagePaths, PreparedModelAssessment,
     finish_model_assessment, prepare_model_assessment,
 };
 use magnitude_engine::error::UnsupportedModel;
 use magnitude_engine::options::ModelMethod;
-use magnitude_executor::assessment::{
-    DecodeSpeed as EngineDecodeSpeed, DomainFit, ExecutionAssessment,
-    PerformanceConfidence as EngineConfidence, PerformanceEstimate,
-};
+use magnitude_executor::assessment::{DomainFit, ExecutionAssessment, PerformanceEstimate};
 use magnitude_service_contracts::models::{
-    AssessmentEnvironmentId, DecodeSpeed, InstalledModelPackages as _, MemoryAssessment,
-    ModelAssessment, ModelAssessmentId, ModelAssessmentProfile, ModelBundleInput,
-    ModelCapabilities, ModelFailure, ModelPackageOperand, ModelReasoningCapabilities,
-    ModelServingConfiguration, PerformanceConfidence, PerformanceEvidence,
-    ResolvedServableModelBundle, ServableModelBundle, SpeculativeDraftSource,
-    SpeculativeDraftSourceInput, SpeculativeMethod,
+    AssessmentEnvironmentId, InstalledModelPackages as _, MemoryAssessment, ModelAssessment,
+    ModelAssessmentId, ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure,
+    ModelPackageOperand, ModelReasoningCapabilities, ModelServingConfiguration,
+    PerformanceEvidence, ResolvedServableModelBundle, ServableModelBundle,
+    SpeculativeDraftSource, SpeculativeDraftSourceInput, SpeculativeMethod,
 };
 use magnitude_service_contracts::{ComponentRole, InventoryError, MemoryDomainId, ResolvedModel};
 use magnitude_service_models::{
@@ -34,8 +30,7 @@ use magnitude_service_models::{
 };
 use sha2::{Digest, Sha256};
 
-use super::environment::{AssessmentEnvironment, EnvironmentError};
-use super::measurement::MeasurementJob;
+use super::environment::AssessmentEnvironment;
 
 /// The service's performance depths: 25K, 50K and 75K where the context admits them, then the
 /// full context. ACN ranking reads `min(50_000, context)`, which this set contains.
@@ -99,41 +94,29 @@ pub struct ModelAssessor {
     models: Arc<ManagedModelStore>,
     model_domains: Arc<ModelDomainResolver>,
     release_catalog: Arc<ReleaseCatalog>,
-    catalog: Arc<seismic::DeviceCatalog>,
-    measurement: MeasurementJob,
+    environment: Arc<AssessmentEnvironment>,
     work_gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl ModelAssessor {
-    /// `catalog` is the service's device catalog, shared with residency and the hardware
-    /// endpoint.
     pub fn new(
         models: Arc<ManagedModelStore>,
         model_domains: Arc<ModelDomainResolver>,
         release_catalog: Arc<ReleaseCatalog>,
-        catalog: Arc<seismic::DeviceCatalog>,
-        measurement: MeasurementJob,
+        environment: Arc<AssessmentEnvironment>,
     ) -> Self {
         Self {
             models,
             model_domains,
             release_catalog,
-            catalog,
-            measurement,
+            environment,
             work_gates: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
-    pub async fn select_setup(&self) -> Result<Arc<AssessmentSetup>, EnvironmentError> {
-        AssessmentEnvironment::select(Arc::clone(&self.catalog)).await
-    }
-
-    /// The environment of `setup` with the device's measured basis.
-    pub async fn establish_with_setup(
-        &self,
-        setup: Arc<AssessmentSetup>,
-    ) -> Result<AssessmentEnvironment, EnvironmentError> {
-        AssessmentEnvironment::establish(setup, &self.measurement).await
+    /// The environment every model is assessed in.
+    pub fn environment(&self) -> &Arc<AssessmentEnvironment> {
+        &self.environment
     }
 
     pub fn configuration_for(
@@ -145,7 +128,6 @@ impl ModelAssessor {
 
     pub fn work_for(
         &self,
-        environment: &AssessmentEnvironmentId,
         configuration: ModelServingConfiguration,
         profile: magnitude_service_contracts::models::ServingProfile,
         preparation: Arc<tokio::sync::OnceCell<PreparationResult>>,
@@ -156,19 +138,16 @@ impl ModelAssessor {
         };
         let bundle = servable_model_bundle_key_for_bundle(&configuration.bundle);
         Ok(AssessmentWork {
-            key: AssessmentWorkKey::new(environment, &bundle, &profile),
+            key: AssessmentWorkKey::new(&self.environment.id, &bundle, &profile),
             profile,
             configuration,
             preparation,
         })
     }
 
-    /// Resolve and prepare one bundle from its headers, independent of the measurement basis.
-    pub async fn prepare_bundle(
-        &self,
-        configuration: ModelServingConfiguration,
-        setup: Arc<AssessmentSetup>,
-    ) -> PreparationResult {
+    /// Resolve and prepare one bundle from its headers.
+    pub async fn prepare_bundle(&self, configuration: ModelServingConfiguration) -> PreparationResult {
+        let environment = Arc::clone(&self.environment);
         let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
         let resolved = self
             .resolve(&bundle_key, configuration.bundle)
@@ -179,7 +158,7 @@ impl ModelAssessor {
             // The resolved material (a catalog bundle's materialized headers) lives until
             // preparation has read it.
             let _material = resolved;
-            prepare_model_assessment(&package, &setup)
+            prepare_model_assessment(&package, &environment.setup)
         })
         .await
         .map_err(preparation_task_failure)?
@@ -189,11 +168,8 @@ impl ModelAssessor {
 
     /// One attempt at `work`. `Ok` carries the target's terminal disposition; `Err` is an
     /// operational failure the pool records as `Dropped`.
-    pub async fn assess(
-        &self,
-        work: AssessmentWork,
-        environment: Arc<AssessmentEnvironment>,
-    ) -> Result<AssessmentOutcome, InventoryError> {
+    pub async fn assess(&self, work: AssessmentWork) -> Result<AssessmentOutcome, InventoryError> {
+        let environment = Arc::clone(&self.environment);
         let AssessmentWork {
             key,
             profile,
@@ -221,9 +197,7 @@ impl ModelAssessor {
             });
         }
         let prepared = preparation
-            .get_or_init(|| {
-                self.prepare_bundle(configuration, Arc::clone(&environment.engine.setup))
-            })
+            .get_or_init(|| self.prepare_bundle(configuration))
             .await;
         let prepared = match prepared {
             Ok(prepared) => Arc::clone(prepared),
@@ -391,7 +365,7 @@ async fn assess_prepared(
     let engine_environment = Arc::clone(&environment);
     let started = std::time::Instant::now();
     let assessed = crate::spawn_blocking_traced(move || {
-        finish_model_assessment(&prepared, &engine_environment.engine, &depths)
+        finish_model_assessment(&prepared, &engine_environment.setup, &depths)
     })
     .await
     .map_err(|error| InventoryError::Internal(format!("model assessment task failed: {error}")))?;
@@ -451,44 +425,31 @@ fn model_assessment(
         performance_context_tokens,
     } = requested;
     let assessment = match execution {
-        ExecutionAssessment::Fits { domains, speed, .. } => {
-            let speed = match speed {
-                EngineDecodeSpeed::Estimated(performance) => {
-                    let samples = performance
-                        .iter()
-                        .map(performance_evidence)
-                        .collect::<Vec<_>>();
-                    if samples
-                        .iter()
-                        .map(|sample| sample.context_tokens)
-                        .ne(performance_context_tokens.iter().copied())
-                    {
-                        return Err(InventoryError::ModelOperation {
-                            code: "assessment_incomplete".to_owned(),
-                            message: "the engine did not estimate every requested depth".to_owned(),
-                            retryable: false,
-                        });
-                    }
-                    DecodeSpeed::Estimated { samples }
-                }
-                EngineDecodeSpeed::Unavailable { missing } => {
-                    tracing::error!(
-                        target.id = %bundle_key.0,
-                        missing = %missing
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join("; "),
-                        "the measurement basis lacks costs a fitting model's decode needs"
-                    );
-                    DecodeSpeed::Unavailable
-                }
-            };
+        ExecutionAssessment::Fits {
+            domains,
+            performance,
+            ..
+        } => {
+            let performance = performance
+                .iter()
+                .map(performance_evidence)
+                .collect::<Vec<_>>();
+            if performance
+                .iter()
+                .map(|sample| sample.context_tokens)
+                .ne(performance_context_tokens.iter().copied())
+            {
+                return Err(InventoryError::ModelOperation {
+                    code: "assessment_incomplete".to_owned(),
+                    message: "the engine did not estimate every requested depth".to_owned(),
+                    retryable: false,
+                });
+            }
             ModelAssessment::Fits {
                 profile,
                 assessment_id,
                 memory: memory_assessments(&domains, environment),
-                speed,
+                performance,
             }
         }
         ExecutionAssessment::DoesNotFit {
@@ -554,7 +515,7 @@ fn capabilities(capabilities: EngineCapabilities) -> ModelCapabilities {
 }
 
 fn domain_id(domain: seismic::MemoryPoolId, environment: &AssessmentEnvironment) -> MemoryDomainId {
-    crate::memory_domains::pool_domain_id(&environment.engine.setup.topology, domain)
+    crate::memory_domains::pool_domain_id(&environment.setup.topology, domain)
 }
 
 fn memory_assessments(
@@ -576,14 +537,7 @@ fn memory_assessments(
 fn performance_evidence(estimate: &PerformanceEstimate) -> PerformanceEvidence {
     PerformanceEvidence {
         context_tokens: estimate.context_tokens,
-        lower_tokens_per_second: estimate.lower_tokens_per_second,
-        estimated_tokens_per_second: estimate.estimated_tokens_per_second,
-        upper_tokens_per_second: estimate.upper_tokens_per_second,
-        confidence: match estimate.confidence {
-            EngineConfidence::High => PerformanceConfidence::High,
-            EngineConfidence::Moderate => PerformanceConfidence::Moderate,
-            EngineConfidence::Low => PerformanceConfidence::Low,
-        },
+        estimated_tokens_per_second: estimate.tokens_per_second,
     }
 }
 
@@ -868,15 +822,9 @@ mod tests {
     fn engine_estimates_map_one_to_one() {
         let evidence = performance_evidence(&PerformanceEstimate {
             context_tokens: 50_000,
-            lower_tokens_per_second: 9.0,
-            estimated_tokens_per_second: 10.0,
-            upper_tokens_per_second: 11.0,
-            confidence: EngineConfidence::Moderate,
+            tokens_per_second: 10.0,
         });
         assert_eq!(evidence.context_tokens, 50_000);
-        assert_eq!(evidence.lower_tokens_per_second, 9.0);
         assert_eq!(evidence.estimated_tokens_per_second, 10.0);
-        assert_eq!(evidence.upper_tokens_per_second, 11.0);
-        assert_eq!(evidence.confidence, PerformanceConfidence::Moderate);
     }
 }

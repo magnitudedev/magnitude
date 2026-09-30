@@ -338,56 +338,6 @@ impl AssessmentHeaderBounds {
     }
 }
 
-/// Cost of one shipped default streaming-kernel launch, inferred from two
-/// device measurements at different resident byte counts. This keeps the
-/// fixed launch cost separate from weight traffic in a decode prediction.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct StreamingCost {
-    pub launch_seconds: f64,
-    pub seconds_per_byte: f64,
-}
-
-impl StreamingCost {
-    pub fn from_samples(
-        small_bytes: u64,
-        small_seconds: f64,
-        large_bytes: u64,
-        large_seconds: f64,
-    ) -> Result<Self, String> {
-        if small_bytes == 0
-            || large_bytes <= small_bytes
-            || !small_seconds.is_finite()
-            || !large_seconds.is_finite()
-            || small_seconds <= 0.0
-            || large_seconds <= small_seconds
-        {
-            return Err("streaming measurements do not establish a positive size slope".into());
-        }
-        let seconds_per_byte = (large_seconds - small_seconds) / (large_bytes - small_bytes) as f64;
-        let launch_seconds = small_seconds - seconds_per_byte * small_bytes as f64;
-        if !seconds_per_byte.is_finite()
-            || seconds_per_byte <= 0.0
-            || !launch_seconds.is_finite()
-            || launch_seconds < 0.0
-        {
-            return Err("streaming measurements do not establish a nonnegative launch cost".into());
-        }
-        Ok(Self {
-            launch_seconds,
-            seconds_per_byte,
-        })
-    }
-
-    pub fn predict(self, bytes: u64) -> Result<f64, String> {
-        let seconds = self.launch_seconds + self.seconds_per_byte * bytes as f64;
-        if seconds.is_finite() && seconds > 0.0 {
-            Ok(seconds)
-        } else {
-            Err("streaming prediction is outside the finite positive time domain".into())
-        }
-    }
-}
-
 impl AssessmentMemoryTerms {
     /// The standard assessment workload is one conversation at the lesser
     /// of the supported context and 100,000 tokens. Method state and optional
@@ -1540,16 +1490,6 @@ mod tests {
             long.history_at_fit_depth().unwrap(),
             100_000 * terms.history_per_token
         );
-    }
-
-    #[test]
-    fn streaming_measurements_reject_unresolved_or_nonphysical_costs() {
-        let cost = StreamingCost::from_samples(2_000_000, 0.001, 30_000_000, 0.0038).unwrap();
-        assert!((cost.launch_seconds - 0.0008).abs() < 1e-12);
-        assert!((cost.predict(10_000_000).unwrap() - 0.0018).abs() < 1e-12);
-        assert!(StreamingCost::from_samples(2_000_000, 0.001, 30_000_000, 0.001).is_err());
-        assert!(StreamingCost::from_samples(2_000_000, 0.001, 30_000_000, 0.03).is_err());
-        assert!(StreamingCost::from_samples(2_000_000, f64::NAN, 30_000_000, 0.0038).is_err());
     }
 
     fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemoryCharge {

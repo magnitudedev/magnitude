@@ -356,16 +356,11 @@ export const MemoryAssessmentSchema = Schema.Struct({
 })
 export type MemoryAssessment = typeof MemoryAssessmentSchema.Type
 
+/** An estimated decode speed at one context depth: bytes per decode step over the device's bandwidth. */
 export const GenerationPerformanceEvidenceSchema = Schema.Struct({
   contextTokens: PositiveSafeInteger,
-  lowerTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
   estimatedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-  upperTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-  confidence: Schema.Literal("high", "moderate", "low"),
-}).pipe(Schema.filter((sample) =>
-  sample.lowerTokensPerSecond <= sample.estimatedTokensPerSecond
-  && sample.estimatedTokensPerSecond <= sample.upperTokensPerSecond,
-{ message: () => "performance rates must be ordered lower, expected, upper" }))
+})
 export type GenerationPerformanceEvidence =
   typeof GenerationPerformanceEvidenceSchema.Type
 
@@ -683,22 +678,13 @@ export const LocalModelMemorySchema = Schema.Struct({
 }, { message: () => "local model memory totals and domains must agree with their evidence" }))
 export type LocalModelMemory = typeof LocalModelMemorySchema.Type
 
-/**
- * A fitting model's decode speed. `Unavailable` means the engine's measurement basis lacks a cost
- * the model's decode needs: an engine defect that costs only the estimate.
- */
-export const LocalModelDecodeSpeedSchema = Schema.Union(
-  Schema.TaggedStruct("Estimated", { samples: GenerationPerformanceSamplesSchema }),
-  Schema.TaggedStruct("Unavailable", {}),
-)
-export type LocalModelDecodeSpeed = typeof LocalModelDecodeSpeedSchema.Type
-
+/** A fitting model, with one decode-speed estimate per assessed context depth. */
 export const LocalModelFitsAssessmentSchema = Schema.TaggedStruct("Fits", {
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
   profile: ServingProfileSchema,
   memory: LocalModelMemorySchema,
-  speed: LocalModelDecodeSpeedSchema,
+  performance: GenerationPerformanceSamplesSchema,
 })
 export type LocalModelFitsAssessment = typeof LocalModelFitsAssessmentSchema.Type
 

@@ -744,7 +744,7 @@ Unsupported or resource-limited observations never count as passing checks.
 The engine build identity covers its Rust implementation, Seismic, the Seismic
 standard library and solver implementations, authored kernel and native helper
 sources, and the workspace dependency lock and toolchain selection. A change to
-those inputs invalidates worker compatibility and the measurement basis identity.
+those inputs invalidates worker compatibility and the assessment environment identity.
 
 For the explicit direct-native route, runtime renders the canonical registry descriptors of those
 compile-time bindings and of every tensor ABI leaf into the Metal source prefix before compiling

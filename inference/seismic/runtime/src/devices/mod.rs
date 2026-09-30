@@ -222,6 +222,9 @@ pub struct DeviceInfo {
     pub backend: BackendName,
     pub availability: Availability,
     pub memory: DeviceMemory,
+    /// Peak memory bandwidth in bytes per second, when the driver reports the
+    /// memory clock and bus width without opening the device (CUDA).
+    pub memory_bandwidth: Option<u64>,
     pub(crate) descriptor: Arc<crate::backends::Descriptor>,
 }
 
@@ -248,6 +251,7 @@ impl fmt::Debug for DeviceInfo {
             .field("backend", &self.backend)
             .field("availability", &self.availability)
             .field("memory", &self.memory)
+            .field("memory_bandwidth", &self.memory_bandwidth)
             .finish()
     }
 }
@@ -261,6 +265,7 @@ impl PartialEq for DeviceInfo {
             && self.backend == other.backend
             && self.availability == other.availability
             && self.memory == other.memory
+            && self.memory_bandwidth == other.memory_bandwidth
     }
 }
 impl Eq for DeviceInfo {}

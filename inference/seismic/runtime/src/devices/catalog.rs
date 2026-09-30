@@ -247,6 +247,7 @@ fn inventory_from(
             backend: device.backend,
             availability: device.availability,
             memory,
+            memory_bandwidth: device.memory_bandwidth,
             descriptor: Arc::new(device.descriptor),
         });
     }
@@ -303,6 +304,7 @@ mod tests {
                 ledger: LedgerKey::PhysicalGpu(uuid),
                 max_allocation_bytes: 24_000_000_000,
             },
+            memory_bandwidth: None,
             descriptor: match backend {
                 BackendName::Cuda => Descriptor::Cuda { ordinal: 0, uuid },
                 BackendName::Vulkan => Descriptor::Vulkan { uuid },

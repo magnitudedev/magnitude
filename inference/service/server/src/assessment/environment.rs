@@ -1,26 +1,16 @@
-//! The assessment environment: the selected execution device, its measurement basis and the
+//! The assessment environment: the selected execution device, its memory bandwidth and the
 //! engine configuration every model is assessed with, and the identity that keys every cached
-//! assessment made in it.
+//! assessment made in it. Established once, during service start.
 
-use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
-
-use magnitude_engine::assessment::{
-    AssessmentEnvironment as EngineEnvironment, AssessmentSetup, ModelAssessmentError,
-};
+use magnitude_engine::assessment::{AssessmentSetup, ModelAssessmentError};
 use magnitude_engine::options::{ModelPolicy, standard_service_limits};
-use magnitude_executor::assessment::{MeasurementBasis, basis_json};
+use magnitude_engine::worker::protocol::EngineBuild;
+use magnitude_executor::assessment::{BandwidthSource, DeviceClass};
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_service_contracts::models::AssessmentEnvironmentId;
-use seismic::{DeviceCatalog, DeviceMemory, DeviceSelector, DeviceTopology, HostMemoryStatus};
+use seismic::{DeviceCatalog, DeviceMemory, DeviceTopology, HostMemoryStatus};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-
-use super::measurement::{BasisSource, MeasurementJob, MeasurementJobError};
-
-/// Requests one conversation per batch: the engine's standard batch width. Loads use the same
-/// limits, so an assessed plan is the plan a load prepares.
 
 /// The engine configuration the service loads and assesses every model with.
 pub fn serving_policy() -> ModelPolicy {
@@ -29,117 +19,65 @@ pub fn serving_policy() -> ModelPolicy {
 
 pub struct AssessmentEnvironment {
     pub id: AssessmentEnvironmentId,
-    pub engine: EngineEnvironment,
+    pub setup: AssessmentSetup,
 }
-
-#[derive(Debug)]
-pub enum EnvironmentError {
-    Measurement(MeasurementJobError),
-    Environment(ModelAssessmentError),
-    Task(String),
-}
-
-impl fmt::Display for EnvironmentError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Measurement(error) => error.fmt(formatter),
-            Self::Environment(error) => write!(formatter, "assessment environment: {error}"),
-            Self::Task(error) => write!(formatter, "assessment environment task: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for EnvironmentError {}
 
 impl AssessmentEnvironment {
-    /// Select once, before the measurement and model-preparation branches diverge.
-    pub async fn select(
-        catalog: Arc<DeviceCatalog>,
-    ) -> Result<Arc<AssessmentSetup>, EnvironmentError> {
-        crate::spawn_blocking_traced(move || {
-            AssessmentSetup::discover(
-                &catalog,
-                DeviceRequest::Automatic,
-                MemoryReserves::standard(),
-                serving_policy(),
-                standard_service_limits(),
-            )
-            .map(Arc::new)
-            .map_err(EnvironmentError::Environment)
-        })
-        .await
-        .map_err(|error| EnvironmentError::Task(error.to_string()))?
-    }
-
-    /// Add the device's measured basis to the one selected setup and derive its cache identity.
-    pub async fn establish(
-        setup: Arc<AssessmentSetup>,
-        measurement: &MeasurementJob,
-    ) -> Result<Self, EnvironmentError> {
-        let device = setup.selected.info.selector;
-        let established = measurement
-            .establish(device)
-            .await
-            .map_err(EnvironmentError::Measurement)?;
-        log_basis(
-            device,
-            established.source,
-            established.elapsed,
-            &established.basis,
+    /// Select the device a native load selects, resolve its bandwidth, observe the host and
+    /// derive the environment's identity. Opens no device.
+    pub fn establish(catalog: &DeviceCatalog) -> Result<Self, ModelAssessmentError> {
+        let setup = AssessmentSetup::discover(
+            catalog,
+            DeviceRequest::Automatic,
+            MemoryReserves::standard(),
+            serving_policy(),
+            standard_service_limits(),
+        )?;
+        let bandwidth = setup.bandwidth;
+        tracing::info!(
+            device = %setup.selected.info.selector,
+            device.name = %setup.selected.info.name,
+            backend = setup.selected.info.backend.as_str(),
+            bandwidth.bytes_per_second = bandwidth.bytes_per_second,
+            bandwidth.source = bandwidth_source(bandwidth.source),
+            "assessment environment established"
         );
-        crate::spawn_blocking_traced(move || {
-            let engine = setup
-                .with_basis(established.basis)
-                .map_err(EnvironmentError::Environment)?;
-            Ok(Self {
-                id: environment_id(&engine),
-                engine,
-            })
+        Ok(Self {
+            id: environment_id(&setup),
+            setup,
         })
-        .await
-        .map_err(|error| EnvironmentError::Task(error.to_string()))?
     }
 }
 
-fn log_basis(
-    device: DeviceSelector,
-    source: BasisSource,
-    elapsed: Duration,
-    basis: &MeasurementBasis,
-) {
-    let (source, measured_entries, measured_seconds) = match source {
-        BasisSource::Cached => ("cached", 0, None),
-        BasisSource::Measured { entries, seconds } => ("measured", entries, Some(seconds)),
-    };
-    tracing::info!(
-        device = %device,
-        basis.source = source,
-        basis.measured_entries = measured_entries,
-        basis.measured_seconds = measured_seconds,
-        basis.entries = basis.classes.len(),
-        job.seconds = elapsed.as_secs_f64(),
-        "assessment measurement basis established"
-    );
+fn bandwidth_source(source: BandwidthSource) -> &'static str {
+    match source {
+        BandwidthSource::Reported => "reported",
+        BandwidthSource::Published => "published",
+        BandwidthSource::Assumed(DeviceClass::DedicatedGpu) => "assumed_dedicated_gpu",
+        BandwidthSource::Assumed(DeviceClass::IntegratedGpu) => "assumed_integrated_gpu",
+        BandwidthSource::Assumed(DeviceClass::Cpu) => "assumed_cpu",
+    }
 }
 
 /// The identity of everything an assessment result depends on besides the model: engine build
-/// (with its kernel bundle), backend and toolchain, device, the stable topology and process
-/// limits that bound fit capacity, the measurement basis itself, the reserve policy and the
-/// serving configuration. The engine build covers everything the engine computes, including model
-/// families and the fit workload. Live free memory is not an input.
-fn environment_id(engine: &EngineEnvironment) -> AssessmentEnvironmentId {
+/// (covering model families, the fit workload, decode costs and the bandwidth table), device and
+/// its resolved bandwidth, the stable topology and process limits that bound fit capacity, the
+/// reserve policy and the serving configuration. Live free memory is not an input.
+fn environment_id(setup: &AssessmentSetup) -> AssessmentEnvironmentId {
     let material = json!({
-        "engine_build": engine.basis.identity.engine_build,
-        "backend": engine.basis.identity.backend,
-        "toolchain": engine.basis.identity.device,
-        "measurement_protocol": engine.basis.identity.protocol_version,
-        "device": engine.setup.selected.info.selector,
-        "topology": normalized_topology(&engine.setup.topology),
-        "process_limits": process_limits(&engine.setup.host),
-        "basis": format!("{:x}", Sha256::digest(basis_json(&engine.basis).to_string().as_bytes())),
-        "reserves": format!("{:?}", engine.setup.reserves),
-        "policy": format!("{:?}", engine.setup.policy),
-        "service": format!("{:?}", engine.setup.service),
+        "engine_build": EngineBuild::current().0,
+        "backend": setup.selected.info.backend.as_str(),
+        "device": setup.selected.info.selector,
+        "device_name": setup.selected.info.name,
+        "bandwidth": {
+            "bytes_per_second": setup.bandwidth.bytes_per_second,
+            "source": bandwidth_source(setup.bandwidth.source),
+        },
+        "topology": normalized_topology(&setup.topology),
+        "process_limits": process_limits(&setup.host),
+        "reserves": format!("{:?}", setup.reserves),
+        "policy": format!("{:?}", setup.policy),
+        "service": format!("{:?}", setup.service),
     });
     AssessmentEnvironmentId(format!(
         "environment_{:x}",

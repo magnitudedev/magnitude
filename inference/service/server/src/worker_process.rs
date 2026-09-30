@@ -9,14 +9,12 @@ use anyhow::Context;
 /// The private subcommands the service executable runs as a contained child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerRole {
-    Measurement,
     Inference,
 }
 
 impl WorkerRole {
     pub fn subcommand(self) -> &'static str {
         match self {
-            Self::Measurement => "measurement-worker",
             Self::Inference => "inference-worker",
         }
     }
@@ -484,10 +482,7 @@ mod tests {
     #[test]
     fn every_worker_role_uses_the_same_command_boundary() {
         let launcher = WorkerLauncher::current().expect("service executable");
-        for (role, expected_subcommand) in [
-            (WorkerRole::Measurement, "measurement-worker"),
-            (WorkerRole::Inference, "inference-worker"),
-        ] {
+        for (role, expected_subcommand) in [(WorkerRole::Inference, "inference-worker")] {
             let command = launcher.command(role).expect("worker command");
             assert_eq!(
                 command

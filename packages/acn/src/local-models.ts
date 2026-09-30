@@ -61,8 +61,7 @@ const assessmentDomainProgress = (
         totalModels,
       }
     }
-    case "Pending":
-    case "Failed": return { complete: false, settledModels: 0, totalModels: 0 }
+    case "Pending": return { complete: false, settledModels: 0, totalModels: 0 }
   }
 }
 
@@ -74,14 +73,8 @@ export const projectLocalModelPreparation = (
     complete: source.reconciliationComplete,
     modelsFound: source.discoveredModels.length,
   }
-  if (assessments.state._tag !== "Ready") {
-    return {
-      discovery,
-      assessment: { complete: false, settledModels: 0, totalModels: 0 },
-    }
-  }
-  const catalog = assessmentDomainProgress(assessments.state.catalog, source.catalogRevision)
-  const discovered = assessmentDomainProgress(assessments.state.discovered, source.discoveryRevision)
+  const catalog = assessmentDomainProgress(assessments.catalog, source.catalogRevision)
+  const discovered = assessmentDomainProgress(assessments.discovered, source.discoveryRevision)
   return {
     discovery,
     assessment: {
@@ -120,7 +113,7 @@ const projectAssessment = (environmentId: string, assessment: ModelAssessment): 
         systemUseState: { _tag: "NotObserved" },
         currentHeadroomState: { _tag: "NotObserved" },
       },
-      speed: assessment.speed,
+      performance: assessment.performance,
     })
   }
   if (assessment._tag === "DoesNotFit") {
@@ -143,10 +136,8 @@ export const coordinatedAssessment = (
   source: "catalog" | "discovered",
   modelId: ModelId,
 ): CoordinatedLocalModelAssessment | undefined => {
-  if (snapshot.state._tag !== "Ready") return undefined
-  const domain: ModelAssessmentDomainSnapshot = snapshot.state[source]
+  const domain: ModelAssessmentDomainSnapshot = snapshot[source]
   if (domain.sourceRevision !== sourceRevision || domain._tag === "Pending") return undefined
-  if (domain._tag === "Failed") return undefined
   const entry = domain.entries.find(({ subject }) => subject.modelId === modelId)
   if (entry === undefined || entry.state._tag === "Assessing") return undefined
   if (entry.state._tag === "Dropped") return { _tag: "Dropped" }
@@ -155,7 +146,7 @@ export const coordinatedAssessment = (
     ? { _tag: "Dropped" }
     : {
         _tag: "Assessed",
-        assessment: projectAssessment(snapshot.state.environmentId, assessment),
+        assessment: projectAssessment(snapshot.environmentId, assessment),
         capabilities: entry.state.capabilities,
       }
 }
@@ -303,12 +294,11 @@ const catalogModel = (
     ? source.localState.effective.failure
     : undefined
   const rankingScores = assessment?._tag === "Assessed" && assessment.assessment._tag === "Fits"
-    && assessment.assessment.speed._tag === "Estimated"
     ? modelRankingScores({
         intelligenceScore: source.intelligence,
         fidelityRank: source.fidelityRank,
         profile: ready?.profile ?? source.desired.profile,
-        performance: assessment.assessment.speed.samples,
+        performance: assessment.assessment.performance,
       })
     : Option.none()
   return Schema.validateSync(CatalogLocalModelSchema)({

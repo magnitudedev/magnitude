@@ -1,0 +1,416 @@
+//! Header-shaped model fixtures: declared configurations of the release
+//! catalog's Qwen3.5-family models, built into definitions and manifests
+//! without weights.
+
+use crate::source_element;
+use magnitude_artifacts::gguf::Encoding;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeclaredFeedForward {
+    Dense {
+        intermediate: u64,
+    },
+    Routed {
+        experts: u64,
+        selected: u64,
+        intermediate: u64,
+        shared_intermediate: u64,
+    },
+}
+
+/// Header geometry of a Qwen3.5-family model, the fixture the plan and
+/// graph tests build header-shaped definitions from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeclaredConfiguration {
+    pub model: &'static str,
+    pub blocks: u64,
+    /// Every `attention_interval`-th block is attention; the rest recurrent.
+    pub attention_interval: u64,
+    pub hidden: u64,
+    pub vocabulary: u64,
+    pub heads: u64,
+    pub kv_heads: u64,
+    pub head_width: u64,
+    pub rotary_width: u64,
+    pub key_heads: u64,
+    pub value_heads: u64,
+    pub state_width: u64,
+    pub convolution_width: u64,
+    pub feed_forward: DeclaredFeedForward,
+}
+
+const fn qwen35(
+    model: &'static str,
+    blocks: u64,
+    hidden: u64,
+    heads: u64,
+    kv_heads: u64,
+    value_heads: u64,
+    feed_forward: DeclaredFeedForward,
+) -> DeclaredConfiguration {
+    DeclaredConfiguration {
+        model,
+        blocks,
+        attention_interval: 4,
+        hidden,
+        vocabulary: 248_320,
+        heads,
+        kv_heads,
+        head_width: 256,
+        rotary_width: 64,
+        key_heads: 16,
+        value_heads,
+        state_width: 128,
+        convolution_width: 4,
+        feed_forward,
+    }
+}
+
+/// The release catalog's Qwen3.5-family (`qwen35`, `qwen35moe`) models
+/// as their headers declare them; `blocks` excludes the MTP layer.
+pub(crate) const QWEN35_CONFIGURATIONS: [DeclaredConfiguration; 5] = [
+    qwen35(
+        "qwen3.5-4b",
+        32,
+        2560,
+        16,
+        4,
+        32,
+        DeclaredFeedForward::Dense { intermediate: 9216 },
+    ),
+    qwen35(
+        "qwen3.5-9b",
+        32,
+        4096,
+        16,
+        4,
+        32,
+        DeclaredFeedForward::Dense {
+            intermediate: 12_288,
+        },
+    ),
+    qwen35(
+        "qwen3.8-27b",
+        64,
+        5120,
+        24,
+        4,
+        48,
+        DeclaredFeedForward::Dense {
+            intermediate: 17_408,
+        },
+    ),
+    qwen35(
+        "qwen3.6-35b-a3b",
+        40,
+        2048,
+        16,
+        2,
+        32,
+        DeclaredFeedForward::Routed {
+            experts: 256,
+            selected: 8,
+            intermediate: 512,
+            shared_intermediate: 512,
+        },
+    ),
+    qwen35(
+        "qwen3.5-122b-a10b",
+        48,
+        3072,
+        32,
+        2,
+        64,
+        DeclaredFeedForward::Routed {
+            experts: 256,
+            selected: 8,
+            intermediate: 1024,
+            shared_intermediate: 1024,
+        },
+    ),
+];
+use magnitude_artifacts::{
+    gguf::TensorDescriptor, ArtifactIdentity, ComponentFile, ComponentManifest,
+    PackageIdentity, PackageManifest,
+};
+use magnitude_family_contracts::{
+    ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
+    EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FeedForwardUp,
+    GateFunction, GatedDelta, HeadNorm, HistoryDomain, HistoryReads, InputNorm,
+    InputSemantics, KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm,
+    RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn,
+    Router, RouterInput,
+    ScoreFunction, SharedExpert, SharedExpertGate, Sublayer,
+    ValueNorm, ValueSource, WeightDescriptor,
+};
+
+/// A header-shaped definition and manifest of a declared configuration.
+/// Matrices take packed encodings in rotation (so segmented entries bind
+/// mixed representations as the catalog's UD quantizations do); vectors
+/// and fixed-f32 roles are F32.
+pub(crate) fn declared_model(
+    configuration: &DeclaredConfiguration,
+) -> (ModelDefinition, PackageManifest) {
+    const PACKED: [Encoding; 6] = [
+        Encoding::Q4K,
+        Encoding::Q5K,
+        Encoding::Q6K,
+        Encoding::Q8_0,
+        Encoding::Iq4Xs,
+        Encoding::BF16,
+    ];
+    let mut tensors = Vec::new();
+    let mut offset = 0u64;
+    let mut rotation = 0usize;
+    let mut tensor = |name: String, shape: Vec<u64>, packed: bool| {
+        let encoding = if packed {
+            rotation += 1;
+            PACKED[rotation % PACKED.len()]
+        } else {
+            Encoding::F32
+        };
+        let nbytes = source_element(encoding)
+            .unwrap()
+            .canonical_byte_len(&shape)
+            .unwrap();
+        tensors.push(TensorDescriptor {
+            name: name.clone(),
+            shape: shape.clone(),
+            encoding,
+            offset,
+            nbytes,
+        });
+        offset += nbytes;
+        WeightDescriptor::stored(name, shape)
+    };
+    let c = configuration;
+    let channels = (2 * c.key_heads + c.value_heads) * c.state_width;
+    let inner = c.value_heads * c.state_width;
+    let rms = |weight| RmsNorm {
+        weight,
+        epsilon: 1e-6,
+    };
+    let silu = |gate, up| FeedForwardUp::Gated {
+        activation: ActivationFunction::Silu,
+        gate,
+        up,
+    };
+    let mut blocks = Vec::new();
+    for index in 0..c.blocks {
+        let name = |suffix: &str| format!("blk.{index}.{suffix}");
+        let input_norm = tensor(name("attn_norm"), vec![c.hidden], false);
+        let mixer = if (index + 1) % c.attention_interval == 0 {
+            Operator::Attention(Box::new(Attention {
+                heads: c.heads,
+                kv_heads: c.kv_heads,
+                width: c.head_width,
+                query: tensor(
+                    name("attn_q"),
+                    vec![2 * c.heads * c.head_width, c.hidden],
+                    true,
+                ),
+                gate: AttentionGate::Interleaved {
+                    function: GateFunction::Sigmoid,
+                },
+                key_value: KeyValue::Owned {
+                    key: tensor(
+                        name("attn_k"),
+                        vec![c.kv_heads * c.head_width, c.hidden],
+                        true,
+                    ),
+                    value: ValueSource::Projected(tensor(
+                        name("attn_v"),
+                        vec![c.kv_heads * c.head_width, c.hidden],
+                        true,
+                    )),
+                    key_norm: HeadNorm::Rms(rms(tensor(
+                        name("attn_k_norm"),
+                        vec![c.head_width],
+                        false,
+                    ))),
+                    value_norm: ValueNorm::None,
+                    domain: HistoryDomain::Token,
+                },
+                query_norm: HeadNorm::Rms(rms(tensor(
+                    name("attn_q_norm"),
+                    vec![c.head_width],
+                    false,
+                ))),
+                rotary: Rotary::Interleaved {
+                    width: c.rotary_width,
+                    base: 10_000_000.0,
+                    sections: vec![c.rotary_width / 2],
+                    axis_pattern: vec![0],
+                },
+                scale: 1.0 / (c.head_width as f64).sqrt(),
+                reads: HistoryReads::Visible,
+                media_rows: MediaRowAttention::Causal,
+                output: tensor(
+                    name("attn_output"),
+                    vec![c.hidden, c.heads * c.head_width],
+                    true,
+                ),
+            }))
+        } else {
+            Operator::GatedDelta(Box::new(GatedDelta {
+                convolution_width: c.convolution_width,
+                key_heads: c.key_heads,
+                value_heads: c.value_heads,
+                width: c.state_width,
+                head_mapping: RecurrentHeadMapping::Tiled,
+                query_key_value: tensor(name("attn_qkv"), vec![channels, c.hidden], true),
+                gate: tensor(name("attn_gate"), vec![inner, c.hidden], true),
+                alpha: tensor(name("ssm_alpha"), vec![c.value_heads, c.hidden], true),
+                beta: tensor(name("ssm_beta"), vec![c.value_heads, c.hidden], true),
+                convolution: tensor(
+                    name("ssm_conv1d"),
+                    vec![channels, c.convolution_width],
+                    false,
+                ),
+                decay: tensor(name("ssm_a"), vec![c.value_heads], false),
+                time_bias: tensor(name("ssm_dt"), vec![c.value_heads], false),
+                norm: rms(tensor(name("ssm_norm"), vec![c.state_width], false)),
+                output: tensor(name("ssm_out"), vec![c.hidden, inner], true),
+            }))
+        };
+        let feedforward_norm = tensor(name("post_attention_norm"), vec![c.hidden], false);
+        let feedforward = match c.feed_forward {
+            DeclaredFeedForward::Dense { intermediate } => Operator::DenseFfn(Box::new(DenseFfn {
+                intermediate,
+                up: silu(
+                    tensor(name("ffn_gate"), vec![intermediate, c.hidden], true),
+                    tensor(name("ffn_up"), vec![intermediate, c.hidden], true),
+                ),
+                down: tensor(name("ffn_down"), vec![c.hidden, intermediate], true),
+            })),
+            DeclaredFeedForward::Routed {
+                experts,
+                selected,
+                intermediate,
+                shared_intermediate,
+            } => Operator::RoutedFfn(Box::new(RoutedFfn {
+                experts,
+                selected,
+                intermediate,
+                router: Router {
+                    weight: tensor(name("ffn_gate_inp"), vec![experts, c.hidden], true),
+                    input: RouterInput::Operator,
+                    score: ScoreFunction::Softmax,
+                    selection: ExpertSelection::TopK { bias: None },
+                    normalization: RouteNormalization::Sum,
+                    scale: 1.0,
+                },
+                expert_up: silu(
+                    tensor(
+                        name("ffn_gate_exps"),
+                        vec![experts, intermediate, c.hidden],
+                        true,
+                    ),
+                    tensor(
+                        name("ffn_up_exps"),
+                        vec![experts, intermediate, c.hidden],
+                        true,
+                    ),
+                ),
+                expert_down: tensor(
+                    name("ffn_down_exps"),
+                    vec![experts, c.hidden, intermediate],
+                    true,
+                ),
+                expert_scale: None,
+                latent: None,
+                shared: Some(SharedExpert {
+                    intermediate: shared_intermediate,
+                    up: silu(
+                        tensor(
+                            name("ffn_gate_shexp"),
+                            vec![shared_intermediate, c.hidden],
+                            true,
+                        ),
+                        tensor(
+                            name("ffn_up_shexp"),
+                            vec![shared_intermediate, c.hidden],
+                            true,
+                        ),
+                    ),
+                    down: tensor(
+                        name("ffn_down_shexp"),
+                        vec![c.hidden, shared_intermediate],
+                        true,
+                    ),
+                    gate: SharedExpertGate::Sigmoid(tensor(
+                        name("ffn_gate_inp_shexp"),
+                        vec![c.hidden],
+                        false,
+                    )),
+                }),
+            })),
+        };
+        blocks.push(Block {
+            sublayers: vec![
+                Sublayer {
+                    input: InputNorm::Rms(rms(input_norm)),
+                    op: mixer,
+                    output: OutputForm::Residual,
+                },
+                Sublayer {
+                    input: InputNorm::Rms(rms(feedforward_norm)),
+                    op: feedforward,
+                    output: OutputForm::Residual,
+                },
+            ],
+        });
+    }
+    let embedding = tensor("token_embd".into(), vec![c.vocabulary, c.hidden], true);
+    let output_norm = tensor("output_norm".into(), vec![c.hidden], false);
+    let output = tensor("output".into(), vec![c.vocabulary, c.hidden], true);
+    let identity = PackageIdentity {
+        target: ArtifactIdentity([3; 32]),
+        projector: None,
+    };
+    let definition = ModelDefinition {
+        family: magnitude_family_contracts::FamilyId("declared-qwen35".into()),
+        artifact_identity: identity,
+        inputs: InputSemantics {
+            coordinate_axes: 1,
+        },
+        decoder: Decoder {
+            activation_dtype: ActivationDType::BF16,
+            hidden: c.hidden,
+            vocabulary: c.vocabulary,
+            context_limit: 262_144,
+            residual: ResidualForm::Single,
+            entry: EntryForm {
+                embedding,
+                scale: EmbeddingScale::Unit,
+                norm: None,
+                per_layer: None,
+                hash_routing: None,
+            },
+            blocks,
+            exit: ExitForm {
+                norm: ExitNorm::Rms(rms(output_norm)),
+                output,
+                softcap: None,
+            },
+        },
+        head: None,
+        vision: None,
+        draft: None,
+    };
+    let manifest = PackageManifest {
+        identity,
+        target: ComponentManifest {
+            files: vec![ComponentFile {
+                path: format!("{}.gguf", c.model).into(),
+                size: offset,
+            }],
+            identity: identity.target,
+            tensors,
+        },
+        projector: None,
+        draft: None,
+    };
+    (definition, manifest)
+}
+

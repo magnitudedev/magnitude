@@ -1391,48 +1391,27 @@ pub struct MemoryAssessment {
     pub remaining_bytes: i64,
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PerformanceConfidence {
-    High,
-    Moderate,
-    Low,
-}
-
+/// An estimated decode speed at one context depth: the model's bytes per decode step over the
+/// device's memory bandwidth.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PerformanceEvidence {
     pub context_tokens: u32,
-    pub lower_tokens_per_second: f64,
     pub estimated_tokens_per_second: f64,
-    pub upper_tokens_per_second: f64,
-    pub confidence: PerformanceConfidence,
-}
-
-/// A fitting model's decode speed.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum DecodeSpeed {
-    #[serde(rename_all = "camelCase")]
-    Estimated { samples: Vec<PerformanceEvidence> },
-    /// The device's measurement basis lacks a cost the model's decode needs:
-    /// an engine defect that costs only the estimate.
-    Unavailable,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
 pub enum ModelAssessment {
+    /// A fitting model, with one decode-speed estimate per requested depth.
     #[serde(rename_all = "camelCase")]
     Fits {
         profile: ServingProfile,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
-        speed: DecodeSpeed,
+        performance: Vec<PerformanceEvidence>,
     },
     #[serde(rename_all = "camelCase")]
     DoesNotFit {
@@ -1474,6 +1453,8 @@ pub struct ModelAssessmentEntry {
     pub state: ModelAssessmentEntryState,
 }
 
+/// One source's assessments. `Pending` until the source has been read (and, for discovery,
+/// reconciled).
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
@@ -1485,36 +1466,17 @@ pub enum ModelAssessmentDomainSnapshot {
         source_revision: u64,
         entries: Vec<ModelAssessmentEntry>,
     },
-    #[serde(rename_all = "camelCase")]
-    Failed {
-        source_revision: u64,
-        failure: ModelFailure,
-    },
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum ModelAssessmentPoolState {
-    Preparing,
-    #[serde(rename_all = "camelCase")]
-    Ready {
-        environment_id: AssessmentEnvironmentId,
-        catalog: ModelAssessmentDomainSnapshot,
-        discovered: ModelAssessmentDomainSnapshot,
-    },
-    #[serde(rename_all = "camelCase")]
-    Failed {
-        failure: ModelFailure,
-    },
-}
-
+/// Every model assessment in the service's one environment, established at service start.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelAssessmentsSnapshot {
     pub revision: u64,
-    pub state: ModelAssessmentPoolState,
+    pub environment_id: AssessmentEnvironmentId,
+    pub catalog: ModelAssessmentDomainSnapshot,
+    pub discovered: ModelAssessmentDomainSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

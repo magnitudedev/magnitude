@@ -21,7 +21,7 @@ use magnitude_service_contracts::models::{
     CatalogInstallationRemoval, CatalogInstallations, CatalogInstallationsResponse, CatalogModel,
     CatalogModelState, CatalogModels, CatalogModelsResponse, DiscoveredModel, DiscoveredModelState,
     DiscoveredModels, DiscoveredModelsResponse, EffectiveModel, ModelAssessmentDomainSnapshot,
-    ModelAssessmentEntryState, ModelAssessmentPoolState, ModelAssessmentSubject, ModelAssessments,
+    ModelAssessmentEntryState, ModelAssessmentSubject, ModelAssessments,
     ModelAssessmentsSnapshot, ModelCapabilities, ModelDownloads, ModelId, ModelInstance,
     ModelInstanceId, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice,
     ModelLoadPlan, ParsedModelId,
@@ -1195,20 +1195,11 @@ async fn standard_models(
 fn assessed_capabilities(
     snapshot: &ModelAssessmentsSnapshot,
 ) -> BTreeMap<ModelAssessmentSubject, ModelCapabilities> {
-    let ModelAssessmentPoolState::Ready {
-        catalog,
-        discovered,
-        ..
-    } = &snapshot.state
-    else {
-        return BTreeMap::new();
-    };
-    [catalog, discovered]
+    [&snapshot.catalog, &snapshot.discovered]
         .into_iter()
         .filter_map(|domain| match domain {
             ModelAssessmentDomainSnapshot::Available { entries, .. } => Some(entries),
-            ModelAssessmentDomainSnapshot::Pending { .. }
-            | ModelAssessmentDomainSnapshot::Failed { .. } => None,
+            ModelAssessmentDomainSnapshot::Pending { .. } => None,
         })
         .flatten()
         .filter_map(|entry| match &entry.state {
@@ -2032,7 +2023,11 @@ mod tests {
     async fn exposes_the_automatic_model_assessment_snapshot() {
         let assessments = Arc::new(StubModelAssessments(ModelAssessmentsSnapshot {
             revision: 7,
-            state: magnitude_service_contracts::models::ModelAssessmentPoolState::Preparing,
+            environment_id: magnitude_service_contracts::models::AssessmentEnvironmentId(
+                "environment".to_owned(),
+            ),
+            catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
+            discovered: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
         }));
         let response = test_app(AppState::new().with_model_assessments(assessments))
             .oneshot(
@@ -2048,7 +2043,8 @@ mod tests {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(body["revision"], 7);
-        assert_eq!(body["state"]["_tag"], "Preparing");
+        assert_eq!(body["environmentId"], "environment");
+        assert_eq!(body["catalog"]["_tag"], "Pending");
     }
 
     #[test]

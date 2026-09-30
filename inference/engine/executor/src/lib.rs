@@ -90,7 +90,7 @@ pub use planning::{
     ProgramPlan, ReadoutBinding, RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity,
     ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding, ScalableWeight, SelectorBinding,
     StartupSlots, StateCapacityPlan, StateProgramPlan, StateResourcePlan, StateStorePlan,
-    StreamingCost, SublayerTail, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan,
+    SublayerTail, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan,
     VisionProgramPlan, WeightPlan, WeightScalePlan, WeightStorageIdentity, MAX_DRAFT_PROPOSALS,
 };
 

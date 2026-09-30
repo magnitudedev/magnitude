@@ -1,41 +1,31 @@
 //! Metadata-only model assessment.
 //!
-//! A fixed, model-free measurement basis is taken once per device
-//! ([`plan`], [`basis`], [`measure`]). Every model is then assessed
-//! analytically from its headers and allocation-free execution plan: decode
-//! demand ([`demand`]), speed at each requested depth ([`estimate`]), and
-//! memory fit ([`assess`]). No model is loaded, benchmarked or tuned.
+//! Every model is assessed analytically from its headers and
+//! allocation-free execution plan: memory fit ([`assess`]), and decode speed
+//! at each requested depth from its decode demand ([`demand`]) over the
+//! device's memory bandwidth ([`bandwidth`], [`costs`], [`estimate`]). No
+//! model is loaded and nothing runs on the device.
 
 pub mod assess;
-pub mod basis;
+pub mod bandwidth;
 #[cfg(test)]
 mod catalog;
+pub mod costs;
 pub mod demand;
 pub mod estimate;
-pub mod measure;
-pub mod persist;
-pub mod plan;
+#[cfg(test)]
+pub(crate) mod fixtures;
 
 pub use assess::{
     assess_execution, finish_execution_assessment, prepare_execution_assessment, AssessmentRequest,
-    DecodeSpeed, DomainFit, ExecutionAssessment, PreparedExecutionAssessment,
+    DomainFit, ExecutionAssessment, PreparedExecutionAssessment,
 };
-pub use basis::{
-    BasisIdentity, ClassCost, ClassMeasurement, CostModel, HeadGeometry, HistoryCost,
-    MeasuredPoint, MeasurementBasis, MeasurementKey, OperationClass, PointShape, ProjectionCost,
-    SecondsBand, MEASUREMENT_PROTOCOL_VERSION,
-};
-pub use demand::{DecodeDemand, DemandTerm, TermShape};
+pub use bandwidth::{normalize_name, resolve_bandwidth, BandwidthSource, DeviceBandwidth, DeviceClass};
+pub use costs::{DecodeCosts, DECODE_COSTS};
+pub use demand::{DecodeDemand, HistoryRead};
 pub use estimate::{
-    estimate_performance, performance_depths, term_seconds, PerformanceConfidence,
-    PerformanceEstimate, HIGH_CONFIDENCE_RANGE, MODERATE_CONFIDENCE_RANGE,
+    estimate_performance, performance_depths, step_seconds, PerformanceEstimate, StepSeconds,
 };
-pub use measure::{
-    complete_basis, measure_basis, measure_entry, ClassProfile, MeasurementError,
-    MeasurementFailure,
-};
-pub use persist::{basis_file_name, basis_json, load_basis, parse_basis, store_basis};
-pub use plan::measurement_plan;
 
 use crate::GraphError;
 use std::fmt;
@@ -54,8 +44,6 @@ pub enum AssessmentError {
     Graph(GraphError),
     /// A memory observation or fit bound could not be established.
     Memory(String),
-    /// A measured cost produced a non-finite or nonpositive time.
-    Estimate(String),
 }
 
 impl fmt::Display for AssessmentError {
@@ -67,7 +55,6 @@ impl fmt::Display for AssessmentError {
                 write!(formatter, "assessment graph construction failed: {error}")
             }
             Self::Memory(message) => write!(formatter, "assessment memory bound failed: {message}"),
-            Self::Estimate(message) => write!(formatter, "assessment estimate failed: {message}"),
         }
     }
 }

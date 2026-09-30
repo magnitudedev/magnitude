@@ -158,11 +158,9 @@ the next access regenerates it. Negative or operational results are cached only 
 domain facts with complete validity evidence; transient failures are never persisted as facts.
 
 Model-assessment entries are keyed by the complete assessment identity: the assessment environment
-(engine build, device and toolchain, normalized stable topology and process limits, measurement
-basis, reserve policy and serving configuration), the exact bundle, and the profile with its
-performance depths. A measurement basis is keyed by its measurement identity (engine build,
-backend, device tuning identity and protocol). Live available/free memory is not cached assessment
-evidence. An absent or unreadable entry is an entry-level miss; readers do not
+(engine build, device and its resolved memory bandwidth, normalized stable topology and process
+limits, reserve policy and serving configuration), the exact bundle, and the profile with its
+performance depths. Live available/free memory is not cached assessment evidence. An absent or unreadable entry is an entry-level miss; readers do not
 recognize historical aliases or add a cache-format revision to force invalidation.
 
 Model inventory indexes, content hashes, GGUF inspection, source resolution, package construction,

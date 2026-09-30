@@ -799,18 +799,6 @@ export const CountTokensResponse = S.extend(
 export type CountTokensResponse = S.Schema.Type<typeof CountTokensResponse>
 export type CountTokensResponseEncoded = S.Schema.Encoded<typeof CountTokensResponse>
 
-export const DecodeSpeed = S.Union(
-  S.extend(
-    S.TaggedStruct("Estimated", {
-      samples: S.Array(S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(S.TaggedStruct("Unavailable", {}), S.Record({ key: S.String, value: JsonValue })),
-)
-export type DecodeSpeed = S.Schema.Type<typeof DecodeSpeed>
-export type DecodeSpeedEncoded = S.Schema.Encoded<typeof DecodeSpeed>
-
 export const DefaultGenerationSettings = S.Struct({
   n_ctx: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
@@ -1485,8 +1473,10 @@ export const ModelAssessment = S.Union(
     S.TaggedStruct("Fits", {
       assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
+      performance: S.Array(
+        S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
+      ),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
-      speed: S.suspend((): S.Schema<DecodeSpeed, DecodeSpeedEncoded> => DecodeSpeed),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -1527,13 +1517,6 @@ export const ModelAssessmentDomainSnapshot = S.Union(
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
-  S.extend(
-    S.TaggedStruct("Failed", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
-      sourceRevision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
 )
 export type ModelAssessmentDomainSnapshot = S.Schema.Type<typeof ModelAssessmentDomainSnapshot>
 export type ModelAssessmentDomainSnapshotEncoded = S.Schema.Encoded<typeof ModelAssessmentDomainSnapshot>
@@ -1566,37 +1549,17 @@ export const ModelAssessmentId = S.String
 export type ModelAssessmentId = S.Schema.Type<typeof ModelAssessmentId>
 export type ModelAssessmentIdEncoded = S.Schema.Encoded<typeof ModelAssessmentId>
 
-export const ModelAssessmentPoolState = S.Union(
-  S.extend(S.TaggedStruct("Preparing", {}), S.Record({ key: S.String, value: JsonValue })),
-  S.extend(
-    S.TaggedStruct("Ready", {
-      catalog: S.suspend(
-        (): S.Schema<ModelAssessmentDomainSnapshot, ModelAssessmentDomainSnapshotEncoded> =>
-          ModelAssessmentDomainSnapshot,
-      ),
-      discovered: S.suspend(
-        (): S.Schema<ModelAssessmentDomainSnapshot, ModelAssessmentDomainSnapshotEncoded> =>
-          ModelAssessmentDomainSnapshot,
-      ),
-      environmentId: S.suspend(
-        (): S.Schema<AssessmentEnvironmentId, AssessmentEnvironmentIdEncoded> => AssessmentEnvironmentId,
-      ),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Failed", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type ModelAssessmentPoolState = S.Schema.Type<typeof ModelAssessmentPoolState>
-export type ModelAssessmentPoolStateEncoded = S.Schema.Encoded<typeof ModelAssessmentPoolState>
-
 export const ModelAssessmentsSnapshot = S.Struct({
+  catalog: S.suspend(
+    (): S.Schema<ModelAssessmentDomainSnapshot, ModelAssessmentDomainSnapshotEncoded> => ModelAssessmentDomainSnapshot,
+  ),
+  discovered: S.suspend(
+    (): S.Schema<ModelAssessmentDomainSnapshot, ModelAssessmentDomainSnapshotEncoded> => ModelAssessmentDomainSnapshot,
+  ),
+  environmentId: S.suspend(
+    (): S.Schema<AssessmentEnvironmentId, AssessmentEnvironmentIdEncoded> => AssessmentEnvironmentId,
+  ),
   revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  state: S.suspend((): S.Schema<ModelAssessmentPoolState, ModelAssessmentPoolStateEncoded> => ModelAssessmentPoolState),
 })
 export type ModelAssessmentsSnapshot = S.Schema.Type<typeof ModelAssessmentsSnapshot>
 export type ModelAssessmentsSnapshotEncoded = S.Schema.Encoded<typeof ModelAssessmentsSnapshot>
@@ -1980,16 +1943,9 @@ export const OutputConfig = S.extend(
 export type OutputConfig = S.Schema.Type<typeof OutputConfig>
 export type OutputConfigEncoded = S.Schema.Encoded<typeof OutputConfig>
 
-export const PerformanceConfidence = S.Union(S.Literal("high"), S.Literal("moderate"), S.Literal("low"))
-export type PerformanceConfidence = S.Schema.Type<typeof PerformanceConfidence>
-export type PerformanceConfidenceEncoded = S.Schema.Encoded<typeof PerformanceConfidence>
-
 export const PerformanceEvidence = S.Struct({
-  confidence: S.suspend((): S.Schema<PerformanceConfidence, PerformanceConfidenceEncoded> => PerformanceConfidence),
   contextTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   estimatedTokensPerSecond: S.Number,
-  lowerTokensPerSecond: S.Number,
-  upperTokensPerSecond: S.Number,
 })
 export type PerformanceEvidence = S.Schema.Type<typeof PerformanceEvidence>
 export type PerformanceEvidenceEncoded = S.Schema.Encoded<typeof PerformanceEvidence>

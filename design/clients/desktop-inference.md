@@ -95,8 +95,11 @@ children and marks it close-on-exec. The desktop retains package admission until
 service and update-helper children cannot inherit the lease and block their own installation.
 Recommendations order fitting assessed configurations using the shared preference. The remaining
 curated catalog stays discoverable with explicit pending, assessment-failed, or insufficient-memory
-explanations; a fitting model without a speed estimate says "Speed estimate unavailable". Details
-expose catalog license/source links, capabilities, context, and labeled performance estimates.
+explanations; every fitting model has a speed estimate. Details
+expose catalog license/source links, capabilities, context, and the estimated speed as one range
+(the radar's) with a dim note that it is a rough estimate and does not account for speculative
+decoding. Speed is a plain-decode estimate from memory bandwidth, accurate to roughly ±20% for most
+models, and is never shown as a per-context table of exact rates.
 Source links open HTTPS destinations in the system browser. Loading a different model asks
 explicitly before replacing observed active residency.
 

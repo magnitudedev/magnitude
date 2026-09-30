@@ -78,7 +78,12 @@ describe("ICN discovery", () => {
 
 describe("ICN automatic model assessments", () => {
   it("observes the read-only assessment snapshot without starting work", async () => {
-    const snapshot = { revision: 4, state: { _tag: "Preparing" as const } }
+    const snapshot = {
+      revision: 4,
+      environmentId: "environment",
+      catalog: { _tag: "Pending" as const, sourceRevision: 0 },
+      discovered: { _tag: "Pending" as const, sourceRevision: 0 },
+    }
     const reads = { count: 0 }
     const client = { models: {
       getModelAssessments: () => Effect.sync(() => {
