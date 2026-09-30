@@ -695,6 +695,7 @@ fn attention_project(ctx: &Ctx) -> Vec<Variant> {
                         Arg::Shared(k.clone()),
                         Arg::Shared(v.clone()),
                         f32s(1e-6),
+                        i32s(0),
                     ],
                 })
                 .collect();
@@ -2106,49 +2107,46 @@ fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
 /// of cells of four rows side by side.
 fn vision_norm(ctx: &Ctx) -> Vec<Variant> {
     let h = 128usize;
-    [
-        ("f16", f16(), f32e()),
-        ("bf16", bf16(), bf16()),
-    ]
-    .into_iter()
-    .flat_map(|(label, a, n)| {
-        [1usize, 4].into_iter().map(move |g| {
-            let mut rng = Rng::new(25);
-            let cases = [2usize, 70]
-                .into_iter()
-                .map(|cells| Case {
-                    label: format!("c{cells}"),
-                    args: vec![
-                        ctx.dense(
-                            f32e(),
-                            &[cells as u64, g as u64, h as u64],
-                            &uniform(&mut rng, cells * g * h, -1.0, 1.0),
-                        ),
-                        ctx.dense(n, &[1, h as u64], &uniform(&mut rng, h, 0.5, 1.5)),
-                        ctx.dense(n, &[1, h as u64], &uniform(&mut rng, h, -0.1, 0.1)),
-                        ctx.ints(&[0, (cells * g) as u64], &[]),
-                        f32s(1e-6),
-                        i32s(1),
-                        i32s(0),
+    [("f16", f16(), f32e()), ("bf16", bf16(), bf16())]
+        .into_iter()
+        .flat_map(|(label, a, n)| {
+            [1usize, 4].into_iter().map(move |g| {
+                let mut rng = Rng::new(25);
+                let cases = [2usize, 70]
+                    .into_iter()
+                    .map(|cells| Case {
+                        label: format!("c{cells}"),
+                        args: vec![
+                            ctx.dense(
+                                f32e(),
+                                &[cells as u64, g as u64, h as u64],
+                                &uniform(&mut rng, cells * g * h, -1.0, 1.0),
+                            ),
+                            ctx.dense(n, &[1, h as u64], &uniform(&mut rng, h, 0.5, 1.5)),
+                            ctx.dense(n, &[1, h as u64], &uniform(&mut rng, h, -0.1, 0.1)),
+                            ctx.ints(&[0, (cells * g) as u64], &[]),
+                            f32s(1e-6),
+                            i32s(1),
+                            i32s(0),
+                        ],
+                    })
+                    .collect();
+                Variant {
+                    label: format!("{label}_g{g}"),
+                    elements: vec![("NWE", n), ("NBE", n), ("Y", a)],
+                    statics: vec![
+                        ("G", g as u64),
+                        ("H", h as u64),
+                        ("NW", 1),
+                        ("NB", 1),
+                        ("NO", 0),
                     ],
-                })
-                .collect();
-            Variant {
-                label: format!("{label}_g{g}"),
-                elements: vec![("NWE", n), ("NBE", n), ("Y", a)],
-                statics: vec![
-                    ("G", g as u64),
-                    ("H", h as u64),
-                    ("NW", 1),
-                    ("NB", 1),
-                    ("NO", 0),
-                ],
-                every_configuration: true,
-                cases,
-            }
+                    every_configuration: true,
+                    cases,
+                }
+            })
         })
-    })
-    .collect()
+        .collect()
 }
 
 /// The Qwen forms of the vision linear: a projection to A, the tanh and erf
@@ -2169,49 +2167,59 @@ fn vision_linear(ctx: &Ctx) -> Vec<Variant> {
     ]
     .into_iter()
     .flat_map(|(label, a, w, b)| {
-        forms.into_iter().map(move |(form, activation, residual, f32_output)| {
-            let mut rng = Rng::new(26);
-            let nr = u64::from(residual);
-            let cases = [2usize, 70]
-                .into_iter()
-                .map(|m| Case {
-                    label: format!("m{m}"),
-                    args: vec![
-                        ctx.dense(a, &[m as u64, k as u64], &uniform(&mut rng, m * k, -1.0, 1.0)),
-                        ctx.dense(w, &[n as u64, k as u64], &uniform(&mut rng, n * k, -0.1, 0.1)),
-                        ctx.dense(b, &[1, n as u64], &uniform(&mut rng, n, -0.1, 0.1)),
-                        ctx.dense(
-                            f32e(),
-                            &[nr, m as u64, n as u64],
-                            &uniform(&mut rng, nr as usize * m * n, -1.0, 1.0),
-                        ),
-                        ctx.dense(a, &[0, m as u64, n as u64], &[]),
-                        ctx.dense(f32e(), &[0], &[]),
-                        ctx.dense(f32e(), &[0], &[]),
-                        i32s(activation),
+        forms
+            .into_iter()
+            .map(move |(form, activation, residual, f32_output)| {
+                let mut rng = Rng::new(26);
+                let nr = u64::from(residual);
+                let cases = [2usize, 70]
+                    .into_iter()
+                    .map(|m| Case {
+                        label: format!("m{m}"),
+                        args: vec![
+                            ctx.dense(
+                                a,
+                                &[m as u64, k as u64],
+                                &uniform(&mut rng, m * k, -1.0, 1.0),
+                            ),
+                            ctx.dense(
+                                w,
+                                &[n as u64, k as u64],
+                                &uniform(&mut rng, n * k, -0.1, 0.1),
+                            ),
+                            ctx.dense(b, &[1, n as u64], &uniform(&mut rng, n, -0.1, 0.1)),
+                            ctx.dense(
+                                f32e(),
+                                &[nr, m as u64, n as u64],
+                                &uniform(&mut rng, nr as usize * m * n, -1.0, 1.0),
+                            ),
+                            ctx.dense(a, &[0, m as u64, n as u64], &[]),
+                            ctx.dense(f32e(), &[0], &[]),
+                            ctx.dense(f32e(), &[0], &[]),
+                            i32s(activation),
+                        ],
+                    })
+                    .collect();
+                Variant {
+                    label: format!("{label}_{form}"),
+                    elements: vec![
+                        ("A", a),
+                        ("W", w),
+                        ("B", b),
+                        ("Y", if f32_output { f32e() } else { a }),
                     ],
-                })
-                .collect();
-            Variant {
-                label: format!("{label}_{form}"),
-                elements: vec![
-                    ("A", a),
-                    ("W", w),
-                    ("B", b),
-                    ("Y", if f32_output { f32e() } else { a }),
-                ],
-                statics: vec![
-                    ("N", n as u64),
-                    ("K", k as u64),
-                    ("NB", 1),
-                    ("NR", nr),
-                    ("NG", 0),
-                    ("NC", 0),
-                ],
-                every_configuration: true,
-                cases,
-            }
-        })
+                    statics: vec![
+                        ("N", n as u64),
+                        ("K", k as u64),
+                        ("NB", 1),
+                        ("NR", nr),
+                        ("NG", 0),
+                        ("NC", 0),
+                    ],
+                    every_configuration: true,
+                    cases,
+                }
+            })
     })
     .collect()
 }
@@ -2509,12 +2517,16 @@ fn parameters(native: &NativeImplementation) -> Vec<Parameter> {
         name: p.name.clone(),
         values: p.values.clone(),
     });
-    let scoped = native.launches.iter().enumerate().flat_map(|(launch, declared)| {
-        declared.params.iter().map(move |p| Parameter {
-            name: format!("{}@{launch}", p.name),
-            values: p.values.clone(),
-        })
-    });
+    let scoped = native
+        .launches
+        .iter()
+        .enumerate()
+        .flat_map(|(launch, declared)| {
+            declared.params.iter().map(move |p| Parameter {
+                name: format!("{}@{launch}", p.name),
+                values: p.values.clone(),
+            })
+        });
     entry.chain(scoped).collect()
 }
 
@@ -2594,15 +2606,17 @@ fn configurations(
                 .zip(config)
                 .collect::<Vec<_>>()
         })
-        .filter(|config| match native.validate(&specialization(statics, config)) {
-            Ok(_) => true,
-            Err(error) => {
-                if std::env::var_os("GOLDEN_VERBOSE").is_some() {
-                    println!("{seed}: configuration {config:?} rejected: {error:?}");
+        .filter(
+            |config| match native.validate(&specialization(statics, config)) {
+                Ok(_) => true,
+                Err(error) => {
+                    if std::env::var_os("GOLDEN_VERBOSE").is_some() {
+                        println!("{seed}: configuration {config:?} rejected: {error:?}");
+                    }
+                    false
                 }
-                false
-            }
-        })
+            },
+        )
         .collect()
 }
 
@@ -2612,12 +2626,12 @@ fn specialization(statics: &[(&str, u64)], config: &[(String, u64)]) -> NativeSp
         .fold(NativeSpecialization::new(), |s, (name, value)| {
             s.with_static(*name, *value)
         });
-    config
-        .iter()
-        .fold(with_statics, |s, (name, value)| match name.split_once('@') {
+    config.iter().fold(with_statics, |s, (name, value)| {
+        match name.split_once('@') {
             Some((scoped, launch)) => s.with_launch_param(launch.parse().unwrap(), scoped, *value),
             None => s.with_param(name.clone(), *value),
-        })
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2723,14 +2737,21 @@ fn run_entry(
     let started = std::time::Instant::now();
     // `GOLDEN_VARIANTS` runs only the listed variants (a long entry split
     // over several runs); their keys go to their own golden file.
-    let only = std::env::var("GOLDEN_VARIANTS").ok().filter(|list| !list.is_empty());
+    let only = std::env::var("GOLDEN_VARIANTS")
+        .ok()
+        .filter(|list| !list.is_empty());
     // `GOLDEN_CONFIGURATIONS=a..b` runs configurations a..b of each variant
     // (a variant whose configurations outlast one run); its keys go to their
     // own golden file too.
-    let slice = std::env::var("GOLDEN_CONFIGURATIONS").ok().filter(|range| !range.is_empty()).map(|range| {
-        let (start, end) = range.split_once("..").expect("GOLDEN_CONFIGURATIONS is a..b");
-        start.parse::<usize>().unwrap()..end.parse::<usize>().unwrap()
-    });
+    let slice = std::env::var("GOLDEN_CONFIGURATIONS")
+        .ok()
+        .filter(|range| !range.is_empty())
+        .map(|range| {
+            let (start, end) = range
+                .split_once("..")
+                .expect("GOLDEN_CONFIGURATIONS is a..b");
+            start.parse::<usize>().unwrap()..end.parse::<usize>().unwrap()
+        });
     let variants = (spec.build)(ctx)
         .into_iter()
         .filter(|variant| {
@@ -2753,7 +2774,11 @@ fn run_entry(
             configs.truncate(3);
         }
         if let Some(range) = &slice {
-            configs = configs.into_iter().skip(range.start).take(range.end - range.start).collect();
+            configs = configs
+                .into_iter()
+                .skip(range.start)
+                .take(range.end - range.start)
+                .collect();
         }
         let elements = variant
             .elements
@@ -2823,8 +2848,12 @@ fn run_entry(
             }
         }
     }
-    let variants_part = only.as_ref().map_or(String::new(), |list| format!(".{}", list.replace(',', "+")));
-    let slice_part = slice.as_ref().map_or(String::new(), |range| format!(".c{}-{}", range.start, range.end));
+    let variants_part = only
+        .as_ref()
+        .map_or(String::new(), |list| format!(".{}", list.replace(',', "+")));
+    let slice_part = slice.as_ref().map_or(String::new(), |range| {
+        format!(".c{}-{}", range.start, range.end)
+    });
     let path = dir.join(format!("{}{variants_part}{slice_part}.golden", spec.id));
     match mode {
         Mode::Record => {

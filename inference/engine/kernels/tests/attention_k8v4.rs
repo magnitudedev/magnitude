@@ -414,8 +414,151 @@ fn k8v4_devices() -> Vec<Device> {
         .collect()
 }
 
-/// Declared decode configurations of `backend`.
-fn decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, u64)>> {
+/// Whether Vulkan's vector decode form (SIMDS, SLICES, KEYWISE) is within the
+/// declaration's `where`: the per-key walk needs four subgroups, and the
+/// walk's shared bytes (the keywise walk's staging tiles among them) fit.
+fn vulkan_vector_fits(geometry: Geometry, simds: u64, slices: u64, keywise: u64) -> bool {
+    let (g, w) = (geometry.g as u64, geometry.w() as u64);
+    let heads = g / slices;
+    let bytes = if keywise == 0 {
+        simds * heads * 8 + simds.max(g.div_ceil(2)) * w * 4
+    } else {
+        let pitch = (w.min(128) / 16).max(w / 32 + w.div_ceil(128)) + 1;
+        simds * heads * 8
+            + (simds * w * 4)
+                .max(32 + g * w * 4 + simds * heads * 128 + g * w / 8 + simds * 512 * pitch)
+    };
+    (keywise == 1 || simds >= 4) && bytes <= 32768
+}
+
+/// Vulkan's grouped-query matrix decode configurations (PARTS, SIMDS) whose
+/// SIMDS * 16 matrix rows hold the query group, within the declaration's
+/// shared bytes (the K/V tile, the subgroup scratch, the query tile).
+fn vulkan_matrix_configs(
+    geometry: Geometry,
+    configs: &[(u64, u64)],
+) -> Vec<Vec<(&'static str, u64)>> {
+    let w = geometry.w() as u64;
+    configs
+        .iter()
+        .filter(|(_, simds)| {
+            geometry.g as u64 <= simds * 16
+                && 64 * (w.min(256) + 8) + simds * 2048 + simds * 16 * (w + 8) * 2 <= 32768
+        })
+        .map(|&(parts, simds)| {
+            vec![
+                ("SPAN", 32),
+                ("PARTS", parts),
+                ("SIMDS", simds),
+                ("SLICES", 1),
+                ("MATRIX", 1),
+                ("KEYWISE", 0),
+            ]
+        })
+        .collect()
+}
+
+/// CUDA's grouped-query matrix decode configurations (PARTS, WARPS) whose
+/// WARPS * 16 matrix rows hold the query group, within the declaration's
+/// shared bytes.
+fn cuda_matrix_configs(
+    geometry: Geometry,
+    configs: &[(u64, u64, u64, u64)],
+) -> Vec<Vec<(&'static str, u64)>> {
+    configs
+        .iter()
+        .filter(|(_, warps, stages, columns)| {
+            // The declaration's shared bound: the query tile, STAGES K-piece +
+            // V-window stages (16-key tiles above W = 256), the exchange.
+            let w = geometry.w() as u64;
+            let keys = if w > 256 { 16 } else { 32 };
+            geometry.g as u64 <= warps * 16
+                && (w <= 256 || w % 256 == 0)
+                && w.min(256 * columns) % (16 * columns) == 0
+                && (warps * 16 * w + stages * keys * (w.min(256) + w.min(256 * columns))) * 2
+                    + warps * columns * w * 4
+                    <= 98304
+        })
+        .map(|&(parts, warps, stages, columns)| {
+            vec![
+                ("PARTS", parts),
+                ("WARPS", warps),
+                ("SLICES", 1),
+                ("MATRIX", 1),
+                ("STAGES", stages),
+                ("COLUMNS", columns),
+            ]
+        })
+        .collect()
+}
+
+/// Metal's grouped-query matrix decode form at `geometry`: its column slices
+/// (a simdgroup's outputs cover at most 128 columns of every 8-row block),
+/// each team being one simdgroup per slice, and whether `simds` simdgroups of `keys`-key tiles fit the declaration's
+/// threadgroup bytes.
+fn metal_matrix_slices(geometry: Geometry, tokens: u64) -> u64 {
+    ((tokens * geometry.g as u64).div_ceil(8) * geometry.w() as u64 / 128).max(1)
+}
+
+fn metal_matrix_admits(geometry: Geometry, tokens: u64, simds: u64, keys: u64) -> bool {
+    // The packed form: one simdgroup per token, K and V tiles staged apart.
+    if geometry.g == 8 && matches!(geometry.w(), 128 | 256) && tokens == 4 && simds == 4 {
+        let w = geometry.w() as u64;
+        return (4 * 8 * w * 2).max(keys * w * 4).max(8 * w * 4) + 8 * 8 <= 32768;
+    }
+    let (w, rows) = (
+        geometry.w() as u64,
+        (tokens * geometry.g as u64).div_ceil(8) * 8,
+    );
+    let cols = metal_matrix_slices(geometry, tokens);
+    let wc = w / cols;
+    let exchange = if cols > 1 {
+        2 * simds * rows * keys * 4
+    } else {
+        0
+    };
+    let tile = simds * keys * wc * 2;
+    let middle = if simds == cols {
+        tile.max(exchange)
+    } else {
+        (simds * keys * (wc + 8) * 2 + exchange).max(rows * w * 4) + simds / cols * rows * 8
+    };
+    w % cols == 0 && wc % 32 == 0 && simds % cols == 0 && rows * w * 2 + middle <= 32768
+}
+
+/// Metal's grouped-query matrix decode configurations admissible at
+/// `geometry`, as (span, parts, simds, keys), each at one row and at four
+/// rows per threadgroup; with several column slices at least one team's
+/// simdgroups.
+fn metal_matrix_configs(
+    geometry: Geometry,
+    configs: &[(u64, u64, u64, u64)],
+) -> Vec<Vec<(&'static str, u64)>> {
+    let mut admitted: Vec<Vec<(&'static str, u64)>> = Vec::new();
+    for tokens in [1u64, 2, 4] {
+        let cols = metal_matrix_slices(geometry, tokens);
+        for &(span, parts, simds, keys) in configs {
+            let simds = simds.max(cols);
+            let config = vec![
+                ("SPAN", span),
+                ("PARTS", parts),
+                ("SIMDS", simds),
+                ("SLICES", 1),
+                ("MATRIX", 1),
+                ("KEYS", keys),
+                ("TOKENS", tokens),
+            ];
+            if metal_matrix_admits(geometry, tokens, simds, keys) && !admitted.contains(&config) {
+                admitted.push(config);
+            }
+        }
+    }
+    admitted
+}
+
+/// Declared decode configurations of `backend` at `geometry`.
+fn decode_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> {
+    let group = geometry.g;
     match backend {
         // The last configuration slices the query group as finely as the
         // group and the warps admit.
@@ -424,12 +567,24 @@ fn decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, 
                 .into_iter()
                 .find(|s| group as u64 % s == 0)
                 .unwrap();
-            [(12, 4, 1), (24, 8, 1), (48, 4, 1), (48, 8, slices)]
+            let mut configs = [(12, 4, 1), (24, 8, 1), (48, 4, 1), (48, 8, slices)]
                 .into_iter()
                 .map(|(parts, warps, slices)| {
-                    vec![("PARTS", parts), ("WARPS", warps), ("SLICES", slices)]
+                    vec![
+                        ("PARTS", parts),
+                        ("WARPS", warps),
+                        ("SLICES", slices),
+                        ("MATRIX", 0),
+                        ("STAGES", 2),
+                        ("COLUMNS", 1),
+                    ]
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            configs.extend(cuda_matrix_configs(
+                geometry,
+                &[(12, 1, 2, 4), (48, 2, 3, 2), (24, 4, 4, 1)],
+            ));
+            configs
         }
         BackendName::Cpu => [8, 4, 16, 1]
             .into_iter()
@@ -442,7 +597,7 @@ fn decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, 
                 .into_iter()
                 .find(|s| group as u64 % s == 0)
                 .unwrap();
-            [
+            let mut configs = [
                 (32, 16, 4, 1),
                 (64, 32, 8, 1),
                 (256, 8, 8, 1),
@@ -455,12 +610,28 @@ fn decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, 
                     ("PARTS", parts),
                     ("SIMDS", simds),
                     ("SLICES", slices),
+                    ("MATRIX", 0),
+                    ("KEYS", 16),
+                    ("TOKENS", 1),
                 ]
             })
-            .collect()
+            .collect::<Vec<_>>();
+            configs.extend(metal_matrix_configs(
+                geometry,
+                &[
+                    (32, 16, 4, 16),
+                    (64, 32, 8, 8),
+                    (256, 8, 4, 32),
+                    (32, 16, 2, 16),
+                ],
+            ));
+            configs
         }
         // A slice count must divide the geometry's query group. The portable
-        // comparison also uses a two-query group.
+        // comparison also uses a two-query group. Each vector configuration
+        // runs both walks (KEYWISE) where the declaration admits them; the
+        // keywise walk's staging tiles need one or two subgroups at wide
+        // heads.
         BackendName::Vulkan => [
             (32, 16, 4, 1),
             (64, 32, 8, 2),
@@ -468,36 +639,108 @@ fn decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, 
             (32, 16, 8, 2),
             (32, 16, 4, 4),
             (32, 16, 8, 8),
+            (32, 16, 2, 1),
+            (64, 32, 2, 2),
+            (64, 16, 1, 1),
         ]
         .into_iter()
         .filter(|(_, _, _, slices)| group.is_multiple_of(*slices as usize))
-        .map(|(span, parts, simds, slices)| {
-            vec![
-                ("SPAN", span),
-                ("PARTS", parts),
-                ("SIMDS", simds),
-                ("SLICES", slices),
-            ]
+        .flat_map(|(span, parts, simds, slices)| {
+            [0, 1]
+                .into_iter()
+                .filter(move |&keywise| vulkan_vector_fits(geometry, simds, slices, keywise))
+                .map(move |keywise| {
+                    vec![
+                        ("SPAN", span),
+                        ("PARTS", parts),
+                        ("SIMDS", simds),
+                        ("SLICES", slices),
+                        ("MATRIX", 0),
+                        ("KEYWISE", keywise),
+                    ]
+                })
         })
+        .chain(vulkan_matrix_configs(
+            geometry,
+            &[(16, 1), (64, 2), (32, 4)],
+        ))
         .collect(),
     }
 }
 
 /// Declared prefill configurations of `backend` admissible at `geometry`
-/// (CUDA's 8-warp block fits shared memory up to 192-column heads).
+/// (CUDA's 8-warp block fits shared memory up to 192-column heads unless the
+/// queries stay in registers).
 fn prefill_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> {
     match backend {
-        BackendName::Cuda => [(4, 1), (2, 1), (4, 256), (2, 512), (8, 1), (8, 256)]
-            .into_iter()
-            .filter(|(warps, _)| {
-                // The declaration's shared bound: the query tile and two
-                // K-piece + V-window stages (16-key tiles above W = 256).
-                let w = geometry.w();
-                let keys = if w > 256 { 16 } else { 32 };
-                (*warps as usize * 16 * w + 4 * keys * w.min(256)) * 2 <= 98304
-            })
-            .map(|(warps, split)| vec![("WARPS", warps), ("SPLIT_GROUPS", split)])
-            .collect(),
+        // (WARPS, SPLIT_GROUPS, STAGES, COLUMNS, QREG, PRODUCERS), or
+        // `K8V4_PREFILL_CONFIGS` as `;`-separated comma sextuples.
+        // PRODUCERS = 0 decodes in the MMA warps (heads of 128 to 256
+        // columns, with code stages beside the operand stages).
+        BackendName::Cuda => match std::env::var("K8V4_PREFILL_CONFIGS") {
+            Ok(configs) => configs
+                .split(';')
+                .map(|config| {
+                    let v = config
+                        .split(',')
+                        .map(|x| x.trim().parse::<usize>().unwrap())
+                        .collect::<Vec<_>>();
+                    (v[0], v[1] as u64, v[2], v[3], v[4], v[5])
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => vec![
+                (4, 1, 2, 1, 0, 4),
+                (2, 1, 2, 1, 0, 2),
+                (4, 256, 2, 1, 0, 4),
+                (2, 512, 2, 1, 0, 1),
+                (8, 1, 2, 1, 0, 2),
+                (8, 256, 2, 1, 0, 8),
+                (4, 256, 2, 2, 0, 2),
+                (2, 1, 2, 2, 0, 4),
+                (2, 1, 3, 1, 0, 2),
+                (4, 256, 2, 1, 1, 1),
+                (8, 256, 2, 1, 1, 2),
+                (8, 1, 2, 1, 1, 0),
+                (8, 256, 2, 1, 1, 0),
+                (4, 1, 3, 1, 0, 0),
+                (2, 256, 2, 2, 0, 0),
+                (8, 256, 2, 1, 0, 0),
+            ],
+        }
+        .into_iter()
+        .filter(|&(warps, _, stages, columns, qreg, producers)| {
+            // The declaration's shared bound: the query tile and STAGES
+            // K-piece + V-window stages (16-key tiles above W = 256), plus
+            // code stages when the MMA warps decode, which share one region
+            // when the queries stay in registers.
+            let w = geometry.w();
+            let keys = if w > 256 { 16 } else { 32 };
+            let codes = if producers == 0 { stages * 56 * w } else { 0 };
+            let (queries, stage_bytes) = (
+                warps * 16 * w * 2,
+                stages * keys * (w.min(256) + w.min(256 * columns)) * 2 + codes,
+            );
+            let region = if qreg == 1 {
+                queries.max(stage_bytes)
+            } else {
+                queries + stage_bytes
+            };
+            w.min(256 * columns) % (16 * columns) == 0
+                && (qreg == 0 || w <= 256)
+                && (producers > 0 || (128..=256).contains(&w))
+                && region <= 98304
+        })
+        .map(|(warps, split, stages, columns, qreg, producers)| {
+            vec![
+                ("WARPS", warps as u64),
+                ("SPLIT_GROUPS", split),
+                ("STAGES", stages as u64),
+                ("COLUMNS", columns as u64),
+                ("QREG", qreg as u64),
+                ("PRODUCERS", producers as u64),
+            ]
+        })
+        .collect(),
         // One CPU form, without parameters.
         BackendName::Cpu => vec![Vec::new()],
         // ROWS = 64 is admissible at every tested geometry (ROWS / G <= 32,
@@ -790,7 +1033,7 @@ fn decode_matches_portable_body() {
 fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
     let backend = device.backend();
     let expected = encoded.expected();
-    for config in decode_configs(backend, GROUPED.g) {
+    for config in decode_configs(backend, GROUPED) {
         let kernel = decode_kernel(device, GROUPED, &config);
         let mut bound = Bound::new(device, encoded);
         let gated = kernel
@@ -827,10 +1070,7 @@ fn decode_reads_and_writes_across_affine_history_slabs() {
     let expected = encoded.expected();
     for device in k8v4_devices() {
         let backend = device.backend();
-        let config = decode_configs(backend, GROUPED.g)
-            .into_iter()
-            .next()
-            .unwrap();
+        let config = decode_configs(backend, GROUPED).into_iter().next().unwrap();
         let kernel = decode_kernel(&device, GROUPED, &config);
         for reused in [false, true] {
             let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, reused);
@@ -872,7 +1112,7 @@ fn decode_reads_spans_crossing_affine_history_slabs() {
     let expected = encoded.expected();
     for device in k8v4_devices() {
         let backend = device.backend();
-        for config in decode_configs(backend, GROUPED.g) {
+        for config in decode_configs(backend, GROUPED) {
             let kernel = decode_kernel(&device, GROUPED, &config);
             // A reused middle slab puts consecutive slabs at unrelated
             // addresses.
@@ -991,7 +1231,7 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
             5,
         ));
         let expected = encoded.expected();
-        for config in decode_configs(backend, QWEN.g) {
+        for config in decode_configs(backend, QWEN) {
             let kernel = decode_kernel(device, QWEN, &config);
             let mut bound = Bound::new(device, &encoded);
             let gated = kernel
@@ -1015,20 +1255,29 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
                 13,
             ));
             let expected = encoded.expected();
-            let config = &decode_configs(backend, QWEN.g)[0];
-            let kernel = decode_kernel(device, QWEN, config);
-            let mut bound = Bound::new(device, &encoded);
-            let gated = kernel
-                .call(args!(attention_decode_k8v4, bound, encoded.case))
-                .unwrap()
-                .value;
-            check(
-                &format!("{backend:?} speculative decode {rows} rows context {context} {config:?}"),
-                &encoded,
-                &gated,
-                &bound,
-                &expected,
-            );
+            // The first configuration, and on Vulkan the first of the keywise
+            // walk too.
+            let configs = decode_configs(backend, QWEN);
+            let keywise = configs
+                .iter()
+                .find(|config| config.contains(&("KEYWISE", 1)));
+            for config in std::iter::once(&configs[0]).chain(keywise) {
+                let kernel = decode_kernel(device, QWEN, config);
+                let mut bound = Bound::new(device, &encoded);
+                let gated = kernel
+                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .unwrap()
+                    .value;
+                check(
+                    &format!(
+                        "{backend:?} speculative decode {rows} rows context {context} {config:?}"
+                    ),
+                    &encoded,
+                    &gated,
+                    &bound,
+                    &expected,
+                );
+            }
         }
     }
     for (rows, history) in [(40, 300), (128, 1000), (64, 4096), (48, 16384)] {
@@ -1117,7 +1366,7 @@ fn wide_head_decode_and_prefill_match_host_model() {
             7,
         ));
         for (encoded, configs, is_decode) in [
-            (&decode, decode_configs(backend, geometry.g), true),
+            (&decode, decode_configs(backend, geometry), true),
             (&prefill, prefill_configs(backend, geometry), false),
         ] {
             let expected = encoded.expected();
@@ -1183,7 +1432,7 @@ fn large_group_decode_and_prefill_at_4k_match_host_model(geometry: Geometry) {
             5,
         ));
         let expected = encoded.expected();
-        for config in decode_configs(backend, geometry.g) {
+        for config in decode_configs(backend, geometry) {
             let kernel = decode_kernel(&device, geometry, &config);
             let mut bound = Bound::new(&device, &encoded);
             let gated = kernel
@@ -1322,6 +1571,179 @@ const MINICPM5: Geometry = Geometry {
     s: 0,
 };
 
+#[test]
+fn metal_packed_four_minicpm5_matches_host_model() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let geometry = MINICPM5;
+    let context = 4096;
+    let encoded = Encoded::new(Case::new(
+        geometry,
+        context + 128,
+        2,
+        &decode_rows(context as i32 - 40),
+        5,
+    ));
+    let expected = encoded.expected();
+    for keys in [16, 32] {
+        let config = [
+            ("SPAN", 32),
+            ("PARTS", 16),
+            ("SIMDS", 4),
+            ("SLICES", 1),
+            ("MATRIX", 1),
+            ("KEYS", keys),
+            ("TOKENS", 4),
+        ];
+        let kernel = decode_kernel(&device, geometry, &config);
+        let mut bound = Bound::new(&device, &encoded);
+        let gated = kernel
+            .call(args!(attention_decode_k8v4, bound, encoded.case))
+            .unwrap()
+            .value;
+        check(
+            &format!("Metal packed-four MiniCPM5 decode KEYS={keys}"),
+            &encoded,
+            &gated,
+            &bound,
+            &expected,
+        );
+    }
+}
+
+#[test]
+fn metal_packed_four_qwen35b_matches_host_model() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let geometry = QWEN35B;
+    let context = 4096;
+    for (label, rows) in [
+        (
+            "M2",
+            decode_rows(context as i32 - 40)
+                .into_iter()
+                .take(2)
+                .collect(),
+        ),
+        ("M4", decode_rows(context as i32 - 40)),
+        ("M8", prefill_rows(8, context as i32)),
+    ] {
+        let encoded = Encoded::new(Case::new(geometry, context + 128, 2, &rows, 5));
+        let expected = encoded.expected();
+        // W = 256 packs one token per simdgroup; 16-key K and V tiles fit.
+        for keys in [8, 16] {
+            let config = [
+                ("SPAN", 32),
+                ("PARTS", 16),
+                ("SIMDS", 4),
+                ("SLICES", 1),
+                ("MATRIX", 1),
+                ("KEYS", keys),
+                ("TOKENS", 4),
+            ];
+            let kernel = decode_kernel(&device, geometry, &config);
+            let mut bound = Bound::new(&device, &encoded);
+            let gated = kernel
+                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .unwrap()
+                .value;
+            check(
+                &format!("Metal packed-four Qwen35B {label} KEYS={keys}"),
+                &encoded,
+                &gated,
+                &bound,
+                &expected,
+            );
+        }
+    }
+}
+
+#[test]
+fn metal_qwen35b_single_row_matrix_slices_match_host_model() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let geometry = QWEN35B;
+    for context in [256, 4096] {
+        let rows = decode_rows(context as i32 - 40)
+            .into_iter()
+            .take(1)
+            .collect::<Vec<_>>();
+        let encoded = Encoded::new(Case::new(geometry, context + 128, 2, &rows, 5));
+        let expected = encoded.expected();
+        let config = [
+            ("SPAN", 64),
+            ("PARTS", 64),
+            ("SIMDS", 2),
+            ("SLICES", 1),
+            ("MATRIX", 1),
+            ("KEYS", 8),
+            ("TOKENS", 1),
+        ];
+        let kernel = decode_kernel(&device, geometry, &config);
+        let mut bound = Bound::new(&device, &encoded);
+        let gated = kernel
+            .call(args!(attention_decode_k8v4, bound, encoded.case))
+            .unwrap()
+            .value;
+        check(
+            &format!("Metal Qwen35B M1 matrix slices context={context}"),
+            &encoded,
+            &gated,
+            &bound,
+            &expected,
+        );
+    }
+}
+
+#[test]
+fn metal_packed_four_qwen35b_long_context_matches_host_model() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let geometry = QWEN35B;
+    let context = 65_536;
+    let rows = decode_rows(context as i32 - 40);
+    let encoded = Encoded::new(Case::new(geometry, context + 128, 2, &rows, 5));
+    let expected = encoded.expected();
+    let config = [
+        ("SPAN", 32),
+        ("PARTS", 64),
+        ("SIMDS", 4),
+        ("SLICES", 1),
+        ("MATRIX", 1),
+        ("KEYS", 16),
+        ("TOKENS", 4),
+    ];
+    let kernel = decode_kernel(&device, geometry, &config);
+    let mut bound = Bound::new(&device, &encoded);
+    let gated = kernel
+        .call(args!(attention_decode_k8v4, bound, encoded.case))
+        .unwrap()
+        .value;
+    check(
+        "Metal packed-four Qwen35B M4 65k P64",
+        &encoded,
+        &gated,
+        &bound,
+        &expected,
+    );
+}
+
 /// Gemma 4 31B's full-attention layers: 4 kv heads of 8 query heads,
 /// W = 512.
 const GEMMA31_FULL: Geometry = Geometry {
@@ -1331,25 +1753,121 @@ const GEMMA31_FULL: Geometry = Geometry {
     s: 384,
 };
 
+/// Gemma 4 26B-A4B's sliding layers: 8 kv heads of 2 query heads, W = 256.
+const GEMMA26_SLIDING: Geometry = Geometry {
+    kv: 8,
+    g: 2,
+    p: 128,
+    s: 0,
+};
+
+/// Gemma 4 26B-A4B's full-attention layers: 2 kv heads of 8 query heads,
+/// W = 512.
+const GEMMA26_FULL: Geometry = Geometry {
+    kv: 2,
+    g: 8,
+    p: 256,
+    s: 0,
+};
+
 /// The decode configurations a timing sweeps: the test configurations plus
 /// the larger partition counts long histories over few kv heads need.
-fn timing_decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'static str, u64)>> {
-    let mut configs = decode_configs(backend, group);
+fn timing_decode_configs(
+    backend: BackendName,
+    geometry: Geometry,
+) -> Vec<Vec<(&'static str, u64)>> {
+    let group = geometry.g;
+    let mut configs = decode_configs(backend, geometry);
+    if backend == BackendName::Metal {
+        let sweep = [8u64, 16, 32, 64, 128, 256, 512]
+            .into_iter()
+            .flat_map(|parts| [2u64, 4, 8].into_iter().map(move |simds| (parts, simds)))
+            .flat_map(|(parts, simds)| {
+                [8u64, 16, 32]
+                    .into_iter()
+                    .map(move |keys| (parts, simds, keys))
+            })
+            .flat_map(|(parts, simds, keys)| {
+                [32u64, 128]
+                    .into_iter()
+                    .map(move |span| (span, parts, simds, keys))
+            })
+            .collect::<Vec<_>>();
+        configs.extend(metal_matrix_configs(geometry, &sweep));
+        // The packed form: one simdgroup per token of four.
+        if geometry.g == 8 && geometry.w() == 256 {
+            for parts in [16, 32, 64, 128, 256] {
+                for keys in [8, 16] {
+                    configs.push(vec![
+                        ("SPAN", 32),
+                        ("PARTS", parts),
+                        ("SIMDS", 4),
+                        ("SLICES", 1),
+                        ("MATRIX", 1),
+                        ("KEYS", keys),
+                        ("TOKENS", 4),
+                    ]);
+                }
+            }
+        }
+    }
+    if backend == BackendName::Vulkan {
+        let sweep = [16u64, 32, 64, 128, 256]
+            .into_iter()
+            .flat_map(|parts| [1u64, 2, 4].into_iter().map(move |simds| (parts, simds)))
+            .collect::<Vec<_>>();
+        configs.extend(vulkan_matrix_configs(geometry, &sweep));
+    }
+    if backend == BackendName::Cuda {
+        let sweep = [12u64, 24, 48, 96]
+            .into_iter()
+            .flat_map(|parts| [1u64, 2, 4].into_iter().map(move |warps| (parts, warps)))
+            .flat_map(|(parts, warps)| {
+                [2u64, 3, 4]
+                    .into_iter()
+                    .map(move |stages| (parts, warps, stages))
+            })
+            .flat_map(|(parts, warps, stages)| {
+                [1u64, 2, 4]
+                    .into_iter()
+                    .map(move |columns| (parts, warps, stages, columns))
+            })
+            .collect::<Vec<_>>();
+        configs.extend(cuda_matrix_configs(geometry, &sweep));
+    }
     let slicings = [1u64, 2, 4, 8]
         .into_iter()
         .filter(|s| group as u64 % s == 0)
         .collect::<Vec<_>>();
     match backend {
         BackendName::Metal | BackendName::Vulkan => {
-            for parts in [64u64, 128] {
-                for simds in [4u64, 8] {
+            // Vulkan also times both vector walks, the keywise one down to one
+            // subgroup (the sweep skips what the `where` refuses).
+            let simd_counts: &[u64] = if backend == BackendName::Vulkan {
+                &[1, 2, 4, 8]
+            } else {
+                &[4, 8]
+            };
+            for parts in [64u64, 128, 256, 512] {
+                for &simds in simd_counts {
                     for &slices in slicings.iter().filter(|s| simds % **s == 0) {
-                        configs.push(vec![
+                        let mut config = vec![
                             ("SPAN", 32),
                             ("PARTS", parts),
                             ("SIMDS", simds),
                             ("SLICES", slices),
-                        ]);
+                        ];
+                        config.push(("MATRIX", 0));
+                        if backend == BackendName::Metal {
+                            config.extend([("KEYS", 16), ("TOKENS", 1)]);
+                            configs.push(config);
+                        } else {
+                            for keywise in [0, 1] {
+                                let mut config = config.clone();
+                                config.push(("KEYWISE", keywise));
+                                configs.push(config);
+                            }
+                        }
                     }
                 }
             }
@@ -1357,7 +1875,14 @@ fn timing_decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'stati
         BackendName::Cuda => {
             for warps in [4u64, 8] {
                 for &slices in slicings.iter().filter(|s| warps % **s == 0) {
-                    configs.push(vec![("PARTS", 96), ("WARPS", warps), ("SLICES", slices)]);
+                    configs.push(vec![
+                        ("PARTS", 96),
+                        ("WARPS", warps),
+                        ("SLICES", slices),
+                        ("MATRIX", 0),
+                        ("STAGES", 2),
+                        ("COLUMNS", 1),
+                    ]);
                 }
             }
         }
@@ -1368,46 +1893,104 @@ fn timing_decode_configs(backend: BackendName, group: usize) -> Vec<Vec<(&'stati
 
 fn decode_timing_on(device: &Device) {
     let backend = device.backend();
-    // `K8V4_DECODE_GEOMETRY=minicpm5` times MiniCPM5-2B's heads over the
-    // wider configuration sweep instead of the Qwen geometries.
+    // `K8V4_DECODE_GEOMETRY=<name>[,<name>...]` (qwen4b, qwen35b, qwen122b,
+    // minicpm5, gemma31, gemma26sliding, gemma26) times those models' heads over the wider
+    // configuration sweep instead of the Qwen geometries.
     let (geometries, contexts, sweep): (Vec<Geometry>, Vec<usize>, bool) =
-        match std::env::var("K8V4_DECODE_GEOMETRY").as_deref() {
-            Ok("minicpm5") => (vec![MINICPM5], vec![256, 4096, 16384], true),
-            Ok("gemma31") => (vec![GEMMA31_FULL], vec![4096, 16384], true),
-            _ => (
+        match std::env::var("K8V4_DECODE_GEOMETRY") {
+            Ok(names) => (
+                names
+                    .split(',')
+                    .map(|name| match name {
+                        "qwen4b" => QWEN,
+                        "qwen35b" => QWEN35B,
+                        "qwen122b" => QWEN122B,
+                        "minicpm5" => MINICPM5,
+                        "gemma31" => GEMMA31_FULL,
+                        "gemma26sliding" => GEMMA26_SLIDING,
+                        "gemma26" => GEMMA26_FULL,
+                        other => panic!("unknown K8V4_DECODE_GEOMETRY {other}"),
+                    })
+                    .collect(),
+                vec![256, 4096, 16384, 65536, 131072],
+                true,
+            ),
+            Err(_) => (
                 vec![QWEN, QWEN35B, QWEN122B],
                 vec![1, 256, 4096, 16384, 65536],
                 false,
             ),
         };
+    // Narrow a timing sweep to one context and matching native parameters.
+    let selected_context = std::env::var("K8V4_DECODE_CONTEXT")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap());
+    let selected_params = std::env::var("K8V4_DECODE_CONFIG_FILTER")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|part| {
+                    let (name, value) = part
+                        .split_once('=')
+                        .expect("expected NAME=VALUE in K8V4_DECODE_CONFIG_FILTER");
+                    (name.to_owned(), value.parse::<u64>().unwrap())
+                })
+                .collect::<Vec<_>>()
+        });
+    let contexts = selected_context.map_or(contexts, |context| vec![context]);
     for (geometry, context) in geometries.into_iter().flat_map(|geometry| {
         contexts
             .clone()
             .into_iter()
             .map(move |context| (geometry, context))
     }) {
-        let rows = [Row {
-            spans: vec![(0, context as i32 - 1)],
-            fresh: (0, 1),
-            destination: context as i32 - 1,
-            position: context as i32 - 1,
-        }];
+        // `K8V4_DECODE_ROWS=M` times a verification step of M rows: row j sees
+        // the history and the batch's first j + 1 rows.
+        let verified =
+            std::env::var("K8V4_DECODE_ROWS").map_or(1, |rows| rows.parse::<i32>().unwrap());
+        let rows = (0..verified)
+            .map(|j| Row {
+                spans: vec![(0, context as i32 - 1)],
+                fresh: (0, j + 1),
+                destination: context as i32 - 1 + j,
+                position: context as i32 - 1 + j,
+            })
+            .collect::<Vec<_>>();
         let encoded = Encoded::new(Case::new(geometry, context + 64, 1, &rows, 3));
         let mut dense = DenseHistory::new(device, &encoded.case);
         let configs = if sweep {
-            timing_decode_configs(backend, geometry.g)
+            timing_decode_configs(backend, geometry)
         } else {
-            decode_configs(backend, geometry.g)
+            decode_configs(backend, geometry)
         };
         for config in configs {
+            if selected_params.as_ref().is_some_and(|params| {
+                params.iter().any(|(name, value)| {
+                    config
+                        .iter()
+                        .find(|(key, _)| *key == name)
+                        .is_none_or(|(_, actual)| actual != value)
+                })
+            }) {
+                continue;
+            }
             // A sweep configuration the declaration's `where` refuses at this
-            // geometry is skipped.
-            let Ok(kernel) = attention_decode_k8v4::native_for_device_with(
+            // geometry is skipped; any other failure is a broken sweep.
+            let kernel = match attention_decode_k8v4::native_for_device_with(
                 device,
                 attention_decode_k8v4::Elements { A: Element::bf16() },
                 &specialization_on(device, geometry, &config),
-            ) else {
-                continue;
+            ) {
+                Ok(kernel) => kernel,
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("violates the native `where` condition") =>
+                {
+                    continue
+                }
+                Err(error) => panic!("{backend:?} decode {config:?}: {error}"),
             };
             let mut bound = Bound::new(device, &encoded);
             let affine = kernel
@@ -1422,23 +2005,39 @@ fn decode_timing_on(device: &Device) {
                 * (geometry.w() + geometry.w() / 2 + 4 * coefficient_elements(geometry.w())))
                 as f64;
             let dense_bytes = (context * geometry.kv * geometry.w() * 4) as f64;
-            // The dense entry's domain may not admit this configuration.
-            let dense_time = attention_decode::native_for_device_with(
-                device,
-                attention_decode::Elements { A: Element::bf16() },
-                &specialization_on(device, geometry, &config),
-            )
-            .ok()
-            .map(|dense_kernel| {
-                dense_kernel
-                    .measure(
-                        vec![dense_args!(attention_decode, bound, dense, encoded.case)],
-                        &TIMING,
+            // The dense entry's domain may not admit this configuration. It has
+            // no keywise walk: Vulkan's configurations time it once, beside the
+            // per-key walk.
+            let dense_config = match config.iter().find(|(name, _)| *name == "KEYWISE") {
+                Some(&(_, 0)) => Some(
+                    config
+                        .iter()
+                        .copied()
+                        .filter(|(name, _)| *name != "KEYWISE")
+                        .collect::<Vec<_>>(),
+                ),
+                Some(_) => None,
+                None => Some(config.clone()),
+            };
+            let dense_time = dense_config
+                .and_then(|dense_config| {
+                    attention_decode::native_for_device_with(
+                        device,
+                        attention_decode::Elements { A: Element::bf16() },
+                        &specialization_on(device, geometry, &dense_config),
                     )
-                    .unwrap()
-                    .median
-            });
-            let dense_report = dense_time.map_or("dense not admitted".to_owned(), |dense_time| {
+                    .ok()
+                })
+                .map(|dense_kernel| {
+                    dense_kernel
+                        .measure(
+                            vec![dense_args!(attention_decode, bound, dense, encoded.case)],
+                            &TIMING,
+                        )
+                        .unwrap()
+                        .median
+                });
+            let dense_report = dense_time.map_or("dense not timed".to_owned(), |dense_time| {
                 format!(
                     "dense {:.1} us ({:.0} GB/s), k8v4/dense {:.2}",
                     dense_time * 1e6,
@@ -1447,8 +2046,9 @@ fn decode_timing_on(device: &Device) {
                 )
             });
             eprintln!(
-                "{backend:?} decode group {} context {context} {config:?}: k8v4 {:.1} us ({:.0} GB/s), {dense_report}",
+                "{backend:?} decode group {} width {} context {context} {config:?}: k8v4 {:.1} us ({:.0} GB/s), {dense_report}",
                 geometry.g,
+                geometry.w(),
                 affine * 1e6,
                 affine_bytes / affine / 1e9,
             );
@@ -1537,7 +2137,16 @@ fn prefill_timing_on(device: &Device) {
             let dense_kernel = attention_prefill::native_for_device_with(
                 device,
                 attention_prefill::Elements { A: Element::bf16() },
-                &specialization_on(device, geometry, &config),
+                // The dense entry has no producer warps.
+                &specialization_on(
+                    device,
+                    geometry,
+                    &config
+                        .iter()
+                        .copied()
+                        .filter(|(name, _)| *name != "PRODUCERS")
+                        .collect::<Vec<_>>(),
+                ),
             )
             .unwrap();
             let dense_time = dense_kernel

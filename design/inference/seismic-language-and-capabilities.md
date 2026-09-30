@@ -124,10 +124,12 @@ participants of each launch and the tier.
 intrinsics, so a `lower … for vulkan` body is rejected at checking. A `native … for vulkan`
 declaration is checked, and its `threads_per_threadgroup` and `shared_bytes` may read only static
 dimensions and tuning parameters, because a Vulkan pipeline fixes its group size and shared memory
-when the kernel is prepared. Its assets include library files under the same rule. Until a Vulkan ABI prefix
-and runtime exist, the build refuses a Vulkan native implementation (it cannot be ABI-validated),
-and discovery reports a `vulkan` diagnostic that this build has no Vulkan runtime, so a request for a
-Vulkan device fails with that reason.
+when the kernel is prepared. Its assets include library files under the same rule. The generated
+GLSL prefix enables an optional extension only after device discovery verifies and device creation
+enables its required features. Workgroup-scope flexible cooperative matrices are an independent
+capability from subgroup cooperative matrices; a device may provide the former while the latter
+is disabled because of driver behavior. Shared memory reserved by a native launch must fit the
+opened device's reported limit. The enabled matrix capability and rendered source enter formation identity.
 
 At each static call occurrence, compilation considers every applicable portable body and every
 applicable lowering for the selected backend. Portable bodies are not fallback implementations and

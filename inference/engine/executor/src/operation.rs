@@ -237,6 +237,9 @@ pub enum Operation {
         /// prefill supplies one for its final row. Other rows have no spec.
         select: Vec<SelectSpec>,
         committed: usize,
+        /// A prompt chunk's entry into a separate drafter, drafted on the
+        /// device right behind the chunk from the chunk's own features.
+        prime: Option<Priming>,
     },
     /// One drafter transaction. The entry rows pair each accepted token with
     /// the target's feature of the preceding row (`conditioning`, in row
@@ -245,6 +248,7 @@ pub enum Operation {
     /// `form`; its speculative work is never committed.
     Head {
         request: RequestId,
+        phase: HeadPhase,
         tokens: Vec<TokenId>,
         conditioning: FeatureRows,
         position: usize,
@@ -255,6 +259,33 @@ pub enum Operation {
         request: RequestId,
         image: ImageRef,
     },
+}
+
+/// A prompt chunk's drafter entry: `tokens[i]` pairs with the chunk's
+/// feature of row `i` (the row that selected it; the prompt knows every
+/// token, so the chunk's own rows condition it), committed to drafter state
+/// at `position` when the chunk commits. Entry rows never exceed the chunk's.
+/// The first draft anchors at `draft_from` (see [`HeadPhase::Priming`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Priming {
+    pub tokens: Vec<TokenId>,
+    pub position: usize,
+    pub draft_from: usize,
+}
+
+/// Whether a head transaction primes accepted history or serves generation.
+/// Both use the same executor lane, but their physical time has different
+/// service accounting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadPhase {
+    /// Entering committed history before drafting; the first draft block
+    /// will anchor at `draft_from` (the position after the primed history),
+    /// so windowed draft histories never read rows before
+    /// `draft_from + 1 - window`.
+    Priming {
+        draft_from: usize,
+    },
+    Generation,
 }
 
 /// How a drafter drafts its proposals after entering its rows.
@@ -390,6 +421,7 @@ impl Operation {
                 demand,
                 select,
                 committed,
+                prime,
                 ..
             } => {
                 if *committed == 0 || *committed > tokens.len() {
@@ -399,13 +431,26 @@ impl Operation {
                     });
                 }
                 validate_forward_select(*kind, tokens.len(), *demand, select)?;
+                if let Some(prime) = prime {
+                    if *kind != WorkKind::Prefill
+                        || !demand.contains(Demand::FEATURES)
+                        || prime.tokens.is_empty()
+                        || prime.tokens.len() > tokens.len()
+                    {
+                        return Err(OperationError::Priming);
+                    }
+                }
             }
             Self::Head {
+                phase,
                 tokens,
                 conditioning,
                 proposals,
                 ..
             } => {
+                if matches!(phase, HeadPhase::Priming { .. }) && !proposals.is_empty() {
+                    return Err(OperationError::PrimingHeadProposals);
+                }
                 if conditioning.rows() != tokens.len() {
                     return Err(OperationError::FeatureSpan {
                         count: conditioning.rows(),
@@ -479,6 +524,8 @@ fn validate_select(select: &SelectSpec) -> Result<(), OperationError> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationError {
     EmptyRows,
+    PrimingHeadProposals,
+    Priming,
     CommittedRows {
         committed: usize,
         rows: usize,
@@ -509,6 +556,10 @@ impl fmt::Display for OperationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyRows => formatter.write_str("operation requires at least one row"),
+            Self::PrimingHeadProposals => formatter.write_str("priming head cannot draft proposals"),
+            Self::Priming => formatter.write_str(
+                "a drafter entry primes a feature-demanding prompt chunk from at most its rows",
+            ),
             Self::CommittedRows { committed, rows } => write!(
                 formatter,
                 "operation declares {committed} committed rows for a width of {rows}"

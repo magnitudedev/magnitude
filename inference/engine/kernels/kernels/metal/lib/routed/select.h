@@ -30,26 +30,32 @@ inline bool precedes(float value, int expert, float best, int best_expert) {
     return value > best || (value == best && expert > best_expert);
 }
 
-// The scores of this lane's experts from their logits (in place).
+// The scores of this lane's experts from their logits (in place). Every loop
+// unrolls fully, so every register index is static.
 template <uint P>
 inline void scores(int function, thread float (&values)[P]) {
     if (function == softmax) {
         float maximum = -INFINITY;
+        _Pragma("clang loop unroll(full)")
         for (uint i = 0; i < P; ++i)
             maximum = metal::max(maximum, values[i]);
         maximum = simd_max(maximum);
         float total = 0.0f;
+        _Pragma("clang loop unroll(full)")
         for (uint i = 0; i < P; ++i) {
             values[i] = metal::exp(values[i] - maximum);
             total += values[i];
         }
         total = simd_sum(total);
+        _Pragma("clang loop unroll(full)")
         for (uint i = 0; i < P; ++i)
             values[i] = values[i] / total;
     } else if (function == sigmoid) {
+        _Pragma("clang loop unroll(full)")
         for (uint i = 0; i < P; ++i)
             values[i] = 1.0f / (1.0f + metal::exp(-values[i]));
     } else {
+        _Pragma("clang loop unroll(full)")
         for (uint i = 0; i < P; ++i)
             values[i] = metal::sqrt(metal::max(values[i], 0.0f) + metal::log(1.0f + metal::exp(-metal::abs(values[i]))));
     }

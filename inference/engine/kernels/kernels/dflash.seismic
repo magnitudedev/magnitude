@@ -13,12 +13,14 @@ fn tap_rows[M, D, T](residual: &tensor[M, D] f32, index: &tensor[1] i32,
         for column in 0..D:
             taps[row, index[0] * D + column] = residual[row, column]
 
-# Metal, CUDA: one thread per copied element.
+# Metal: one thread per copied element on a (column, row) grid; Apple GPUs
+# emulate 64-bit division, which a flat index would need per element.
 native tap_rows for metal from "metal/tap_rows.metal":
     launch tap_rows:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threadgroups (ceil_div(D, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
+# CUDA: one thread per copied element.
 native tap_rows for cuda from "cuda/tap_rows.cu":
     launch tap_rows:
         threadgroups (ceil_div(M * D, 256), 1, 1)
@@ -48,12 +50,14 @@ fn feature_rows[M, O, D](fused: &tensor[M, D] f32, out_rows: &tensor[O] i32) -> 
             features[row, column] = fused[out_rows[row], column]
     return features
 
-# Metal, CUDA: one thread per copied element.
+# Metal: one thread per copied element on a (column, row) grid (see
+# `tap_rows`).
 native feature_rows for metal from "metal/feature_rows.metal":
     launch feature_rows:
-        threadgroups (ceil_div(O * D, 256), 1, 1)
+        threadgroups (ceil_div(D, 256), O, 1)
         threads_per_threadgroup (256, 1, 1)
 
+# CUDA: one thread per copied element.
 native feature_rows for cuda from "cuda/feature_rows.cu":
     launch feature_rows:
         threadgroups (ceil_div(O * D, 256), 1, 1)
@@ -70,6 +74,42 @@ native feature_rows for vulkan from "vulkan/feature_rows.comp":
 native feature_rows for cpu from "cpu/feature_rows.rs":
     launch feature_rows:
         threadgroups (O, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+
+# Activation rows widened to F32: a prompt chunk's conditioning features,
+# read on the device by the drafter entry drafted behind the chunk (the host
+# path widens the same rounded rows).
+fn widen_rows[M, D](rows: &tensor[M, D] A) -> tensor[M, D] f32:
+    let mut widened = tensor[M, D] f32
+    parallel for row in 0..M:
+        parallel for column in 0..D:
+            widened[row, column] = f32(rows[row, column])
+    return widened
+
+# Metal: one thread per element on a (column, row) grid (see `tap_rows`).
+native widen_rows for metal from "metal/widen_rows.metal":
+    launch widen_rows:
+        threadgroups (ceil_div(D, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CUDA: one thread per element.
+native widen_rows for cuda from "cuda/widen_rows.cu":
+    launch widen_rows:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: a grid-stride loop over every element; the x grid is capped at the
+# 65535-group floor (Vulkan spec §5.3).
+native widen_rows for vulkan from "vulkan/widen_rows.comp":
+    launch widen_rows:
+        threadgroups (min(ceil_div(M * D, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row.
+native widen_rows for cpu from "cpu/widen_rows.rs":
+    launch widen_rows:
+        threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
 

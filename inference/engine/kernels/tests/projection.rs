@@ -6,7 +6,7 @@
 
 use magnitude_kernels::{
     attention_output, attention_project, dense_expand, dense_output, embedding_rows,
-    gated_delta_output, gated_delta_project, head_logits_rows, readout_features_rows,
+    gated_delta_output, gated_delta_project, head_logits_rows, project_rows, readout_features_rows,
     readout_head_rows, readout_selected_rows,
 };
 use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
@@ -147,7 +147,13 @@ enum Repr {
 }
 
 /// The formats with a representation of their own, imported from GGUF.
-const GGUF_REPRS: [Repr; 5] = [Repr::Q4g32s, Repr::Q5g32s, Repr::Q5g32, Repr::Mxfp4, Repr::Nvfp4];
+const GGUF_REPRS: [Repr; 5] = [
+    Repr::Q4g32s,
+    Repr::Q5g32s,
+    Repr::Q5g32,
+    Repr::Mxfp4,
+    Repr::Nvfp4,
+];
 
 /// The iq4g32 code table (the registry's `iq4g32` interpretation).
 const IQ4_TABLE: [i8; 16] = [
@@ -445,7 +451,9 @@ fn gguf_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> 
     assert_eq!(k % block_values, 0, "{repr:?} rows of whole GGUF blocks");
     let mut external = Vec::with_capacity(rows * k / block_values * block_bytes);
     for _ in 0..rows * k / block_values {
-        let mut block = (0..block_bytes).map(|_| rng.next() as u8).collect::<Vec<_>>();
+        let mut block = (0..block_bytes)
+            .map(|_| rng.next() as u8)
+            .collect::<Vec<_>>();
         let factor = scale * (0.5 + rng.uniform());
         match repr {
             Repr::Q4g32s => block[..2].copy_from_slice(&f16_bits(factor / 8.0).to_le_bytes()),
@@ -846,7 +854,8 @@ fn dense_output_specialization_on(
             gemm: 4,
         },
         true,
-    ).with_static("DS", 0)
+    )
+    .with_static("DS", 0)
 }
 
 fn gated_delta_output_specialization_on(
@@ -900,7 +909,9 @@ fn dense_expand_specialization_on(
             gemm: 4,
         },
         false,
-    ).with_static("GS", 0).with_static("US", 0)
+    )
+    .with_static("GS", 0)
+    .with_static("US", 0)
 }
 
 fn readout_projection_specialization_on(
@@ -1075,8 +1086,19 @@ fn bf16_norm(device: &Device, values: &[f32]) -> Tensor {
 
 /// `attention_project`'s statics in Qwen's form: the query segment holds the
 /// interleaved query and gate rows, no separate gate segment.
-fn attention_project_statics(d: usize, kv: usize, g: usize, w: usize) -> [(&'static str, usize); 5] {
-    [("D", d), ("Q", kv * g * 2 * w), ("GR", 0), ("K", kv * w), ("V", kv * w)]
+fn attention_project_statics(
+    d: usize,
+    kv: usize,
+    g: usize,
+    w: usize,
+) -> [(&'static str, usize); 5] {
+    [
+        ("D", d),
+        ("Q", kv * g * 2 * w),
+        ("GR", 0),
+        ("K", kv * w),
+        ("V", kv * w),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1241,6 +1263,10 @@ fn dense_expand_matches_its_portable_body_on(device: &Device, pairs: &[(Repr, Re
                     ints(&[out_rows.len()], &out_rows),
                     Input::F32(1e-6),
                     Input::I32(0),
+                    floats(&[0], &[]),
+                    floats(&[0], &[]),
+                    floats(&[0], &[]),
+                    floats(&[0], &[]),
                 ],
             );
             let oracle = result(&outcome, 0);
@@ -1553,8 +1579,9 @@ fn dense_output_gguf_formats_at_32_granular_k_on(device: &Device) {
         let oracle = result(&outcome, 0);
         let (_, bound) = dense_output_reference(act, &down, &residual, &product, &out_rows);
         for mapping in MAPPINGS {
-            let native =
-                dense_output_native(&device, act, &down, &residual, rows, &product, &out_rows, mapping);
+            let native = dense_output_native(
+                &device, act, &down, &residual, rows, &product, &out_rows, mapping,
+            );
             assert_within(
                 &format!("dense_output portable {repr:?} K {f} {mapping:?}"),
                 &native,
@@ -2190,6 +2217,39 @@ fn metal_attention_scoped_launches_match_the_host() {
     attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, true);
 }
 
+#[test]
+fn cuda_attention_scoped_launches_match_the_host() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Cuda)
+    else {
+        return;
+    };
+    attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, true);
+}
+
+#[test]
+fn vulkan_attention_scoped_launches_match_the_host() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Vulkan)
+    else {
+        return;
+    };
+    attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, true);
+}
+
+#[test]
+fn cpu_attention_scoped_launches_match_the_host() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Cpu)
+    else {
+        return;
+    };
+    attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, true);
+}
+
 fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
     device: &Device,
     scoped: bool,
@@ -2218,7 +2278,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             .map(|i| weight(reprs[i], rows_of[i], d, 60 + i as u64, 1.0))
             .collect::<Vec<_>>();
         let norm = norm_values(d, 7);
-        let project = |hidden: &[f32], rows: usize, mapping: Mapping| {
+        let project = |hidden: &[f32], rows: usize, mapping: Mapping, project_mode: i32| {
             let kernel = attention_project::native_for_device_with(
                 &device,
                 attention_project::Elements {
@@ -2251,6 +2311,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     key_weight: &weights[1].tensor(&device),
                     value_weight: &weights[2].tensor(&device),
                     epsilon: 1e-6,
+                    project_mode,
                 })
                 .unwrap();
             [
@@ -2304,11 +2365,12 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     Input::Data(weights[1].oracle()),
                     Input::Data(weights[2].oracle()),
                     Input::F32(1e-6),
+                    Input::I32(0),
                 ],
             );
             for mapping in MAPPINGS {
                 let expected = under(rows, || reference(&hidden, rows));
-                let native = project(&hidden, rows, mapping);
+                let native = project(&hidden, rows, mapping, 0);
                 for i in 0..3 {
                     assert_within(
                         &format!("attention_project[{i}] portable rows {rows} {mapping:?}"),
@@ -2327,10 +2389,29 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 .collect::<Vec<_>>();
             for &mapping in &mappings {
                 let expected = under(rows, || reference(&hidden, rows));
-                let native = project(&hidden, rows, mapping);
+                let native = project(&hidden, rows, mapping, 0);
                 for i in 0..3 {
                     assert_within(
                         &format!("attention_project[{i}] D {d} M {rows} {mapping:?}"),
+                        &native[i],
+                        &expected[i].0,
+                        &expected[i].1,
+                    );
+                }
+            }
+        }
+        if scoped {
+            for rows in [1, 8, 128] {
+                let mut rng = Rng::new(rows as u64 + 155);
+                let hidden = (0..rows * d)
+                    .map(|_| rng.symmetric() * 2.0)
+                    .collect::<Vec<_>>();
+                let expected = under(rows, || reference(&hidden, rows));
+                let native = project(&hidden, rows, MAPPINGS[0], 1);
+                assert!(native[0].iter().all(|&value| value == 0.0));
+                for i in 1..3 {
+                    assert_within(
+                        &format!("attention_project injection[{i}] M {rows}"),
                         &native[i],
                         &expected[i].0,
                         &expected[i].1,
@@ -2672,7 +2753,13 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
             let capped = |values: &[f32]| {
                 values
                     .iter()
-                    .map(|z| if cap > 0.0 { (f64::from(cap) * (f64::from(*z) / f64::from(cap)).tanh()) as f32 } else { *z })
+                    .map(|z| {
+                        if cap > 0.0 {
+                            (f64::from(cap) * (f64::from(*z) / f64::from(cap)).tanh()) as f32
+                        } else {
+                            *z
+                        }
+                    })
                     .collect::<Vec<_>>()
             };
             for &mapping in check.mappings {
@@ -2745,7 +2832,8 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     &bounds(&chosen_bound),
                 );
             }
-            if check.portable && (outputs == 2 || check.weight_scale.is_some() && outputs == 1)
+            if check.portable
+                && (outputs == 2 || check.weight_scale.is_some() && outputs == 1)
                 && repr == Repr::Q6k
             {
                 let bindings = [
@@ -2765,9 +2853,15 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                 head_inputs.push(Input::F32(1e-6));
                 head_inputs.push(Input::F32(cap));
                 head_inputs.push(floats(&[scale_extent], &scale_values));
-                let oracle = result(&interpret(&module, "readout_head_rows", &bindings, head_inputs), 0);
+                let oracle = result(
+                    &interpret(&module, "readout_head_rows", &bindings, head_inputs),
+                    0,
+                );
                 assert_within(
-                    &format!("head_rows portable softcap {cap} scale {:?}", check.weight_scale),
+                    &format!(
+                        "head_rows portable softcap {cap} scale {:?}",
+                        check.weight_scale
+                    ),
                     &oracle,
                     &capped(&scaled_logits),
                     &bounds(&scaled_logit_bound),
@@ -2776,7 +2870,10 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                 selected_inputs.push(ints(&[selected.len()], &selected));
                 selected_inputs.push(Input::F32(1e-6));
                 selected_inputs.push(Input::F32(cap));
-                let oracle = result(&interpret(&module, "readout_selected_rows", &bindings, selected_inputs), 0);
+                let oracle = result(
+                    &interpret(&module, "readout_selected_rows", &bindings, selected_inputs),
+                    0,
+                );
                 assert_within(
                     &format!("selected_rows portable softcap {cap}"),
                     &oracle,
@@ -2979,6 +3076,7 @@ fn timing_on(device: &Device) {
             9216usize,
         ),
         ("dense_output 4b q4k 2560x9216", Repr::Q4k, 2560, 9216),
+        ("dense_output dflash q8 2048x6144", Repr::Q8, 2048, 6144),
     ] {
         if !timing_selected(label.split(' ').next().unwrap()) {
             continue;
@@ -3019,12 +3117,15 @@ fn timing_on(device: &Device) {
     }
 
     // RMS prologue, paired SiLU epilogue: gate+up.
-    for (label, repr, h, f) in [(
-        "dense_expand 4b q4k 2x9216x2560",
-        Repr::Q4k,
-        2560usize,
-        9216usize,
-    )] {
+    for (label, repr, h, f) in [
+        (
+            "dense_expand 4b q4k 2x9216x2560",
+            Repr::Q4k,
+            2560usize,
+            9216usize,
+        ),
+        ("dense_expand dflash q8 2x6144x2048", Repr::Q8, 2048, 6144),
+    ] {
         if !timing_selected(label.split(' ').next().unwrap()) {
             continue;
         }
@@ -3305,6 +3406,7 @@ fn timing_on(device: &Device) {
                         key_weight: &set[1],
                         value_weight: &set[2],
                         epsilon: 1e-6,
+                        project_mode: 0,
                     })
                     .collect();
                 let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
@@ -3454,7 +3556,14 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
     let module = module();
     let act = Act::Bf16;
     let (v, d) = (300usize, 2560usize);
-    for repr in [Repr::Q6k, Repr::Q4k, Repr::Q5k, Repr::Q8, Repr::Iq4, Repr::Bf16] {
+    for repr in [
+        Repr::Q6k,
+        Repr::Q4k,
+        Repr::Q5k,
+        Repr::Q8,
+        Repr::Iq4,
+        Repr::Bf16,
+    ] {
         let table = weight(repr, v, d, 90, 8.0);
         for rows in [1usize, 3, 8, 64] {
             let tokens = (0..rows)
@@ -3509,9 +3618,16 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
                 let (values, bound): (Vec<f32>, Vec<f32>) = tokens
                     .iter()
                     .flat_map(|t| {
-                        let row = table.row(*t as usize).iter().map(|v| v * scale).collect::<Vec<_>>();
+                        let row = table
+                            .row(*t as usize)
+                            .iter()
+                            .map(|v| v * scale)
+                            .collect::<Vec<_>>();
                         let inverse = if normalize != 0 {
-                            let squares = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>();
+                            let squares = row
+                                .iter()
+                                .map(|v| f64::from(*v) * f64::from(*v))
+                                .sum::<f64>();
                             (1.0 / (squares / d as f64 + 1e-5).sqrt()) as f32
                         } else {
                             1.0

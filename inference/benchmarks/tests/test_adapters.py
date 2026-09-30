@@ -6,7 +6,7 @@ from magnitude_benchmarks.adapters import ADAPTERS
 from magnitude_benchmarks.adapters.native import engine_sources, sources_digest
 from magnitude_benchmarks.adapters.omlx_native import instrumentation
 from magnitude_benchmarks.session_bench.models import Target, prepare
-from magnitude_benchmarks.session_bench.options import EngineOptions, NativeOptions
+from magnitude_benchmarks.session_bench.options import EngineOptions, LlamaOptions, NativeOptions
 from magnitude_benchmarks.session_bench.policy import project_root
 from magnitude_benchmarks.session_bench.results import RunStore
 
@@ -71,6 +71,37 @@ def test_native_launch_passes_engine_selection(artifact_path, tmp_path):
         with pytest.raises(ValueError, match=f"{method} requires --native-draft"):
             NativeOptions(method=method)
         assert NativeOptions(method=method, draft=tmp_path / "draft.gguf", mtp_proposals=7)
+
+
+def test_llama_launch_passes_dflash_and_gpu_selection(artifact_path, tmp_path):
+    target = Target(engine="llama.cpp", reference=str(artifact_path))
+    artifact = prepare(Target(engine="mlx-vlm", reference=str(artifact_path)))
+    draft = tmp_path / "draft.gguf"
+    options = EngineOptions(llama=LlamaOptions(draft=draft, draft_proposals=3, gpu_layers=99))
+    adapter = ADAPTERS["llama.cpp"](
+        project_root(), target, artifact, RunStore(tmp_path, "test", {}), options
+    )
+    adapter.executable = str(tmp_path / "llama-server")
+    argv = adapter.argv(1234, 65536, 1, tmp_path)
+
+    def flag(name):
+        return argv[argv.index(name) + 1]
+
+    assert flag("--model") == str(artifact_path)
+    assert flag("--ctx-size") == "65536"
+    assert flag("--parallel") == "1"
+    assert flag("--n-gpu-layers") == "99"
+    assert flag("--model-draft") == str(draft)
+    assert flag("--spec-type") == "draft-dflash"
+    assert flag("--spec-draft-n-max") == "3"
+    assert flag("--n-gpu-layers-draft") == "99"
+
+    dspark = options.model_copy(
+        update={"llama": LlamaOptions(draft=draft, draft_method="dspark")}
+    )
+    adapter.options = dspark
+    dspark_argv = adapter.argv(1234, 65536, 1, tmp_path)
+    assert dspark_argv[dspark_argv.index("--spec-type") + 1] == "draft-dspark"
 
 
 def write(root: Path, name: str, content: str = "before") -> Path:

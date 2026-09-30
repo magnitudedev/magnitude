@@ -15,6 +15,7 @@ from . import models
 from .options import (
     DEFAULT_ENGINE_OPTIONS,
     EngineOptions,
+    LlamaOptions,
     NativeOptions,
     Watchdog,
     default_native_binary,
@@ -98,8 +99,21 @@ def parser() -> argparse.ArgumentParser:
         choices=("auto", "plain", "mtp", "dflash", "dspark", "dflash2"),
         default="auto",
     )
-    native.add_argument("--native-mtp-proposals", type=int, help="MTP or separate-draft proposal width")
-    native.add_argument("--native-draft", type=Path, help="separate draft model (DFlash, DSpark, DFlash2)")
+    native.add_argument(
+        "--native-mtp-proposals", type=int, help="MTP or separate-draft proposal width"
+    )
+    native.add_argument(
+        "--native-prefill-tokens", type=int, help="native engine prefill row budget"
+    )
+    native.add_argument(
+        "--native-draft", type=Path, help="separate draft model (DFlash, DSpark, DFlash2)"
+    )
+    llama = execute.add_argument_group("llama.cpp engine (--engine llama.cpp)")
+    llama.add_argument("--llama-binary", type=Path, help="upstream llama-server executable")
+    llama.add_argument("--llama-draft", type=Path, help="speculative draft GGUF")
+    llama.add_argument("--llama-draft-method", choices=("dflash", "dspark"), default="dflash")
+    llama.add_argument("--llama-draft-proposals", type=int, default=3)
+    llama.add_argument("--llama-gpu-layers", type=int, default=99)
     watchdog = execute.add_argument_group("watchdog")
     watchdog.add_argument(
         "--stall-seconds",
@@ -252,9 +266,19 @@ def main(argv=None) -> int:
                     ),
                     method=args.native_method,
                     mtp_proposals=args.native_mtp_proposals,
+                    prefill_tokens=args.native_prefill_tokens,
                     draft=(
                         args.native_draft.expanduser().absolute() if args.native_draft else None
                     ),
+                ),
+                llama=LlamaOptions(
+                    binary=(
+                        args.llama_binary.expanduser().absolute() if args.llama_binary else None
+                    ),
+                    draft=(args.llama_draft.expanduser().absolute() if args.llama_draft else None),
+                    draft_method=args.llama_draft_method,
+                    draft_proposals=args.llama_draft_proposals,
+                    gpu_layers=args.llama_gpu_layers,
                 ),
                 watchdog=Watchdog(
                     stall_seconds=args.stall_seconds, request_seconds=args.request_seconds

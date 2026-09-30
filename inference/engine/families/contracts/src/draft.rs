@@ -5,9 +5,10 @@
 //! target layers are concatenated, fused (`fusion`, then `fusion_norm`) into
 //! one context feature, and each draft layer's key and value projections of
 //! that feature (without the layer's input norm) enter the draft's history.
-//! A draft pass then runs one non-causal block `[anchor, mask, …]` through
-//! the draft layers over that history and the whole block, and reads the
-//! block's slots out through the target's vocabulary projection.
+//! A draft pass then runs one block `[anchor, mask, …]` through the draft
+//! layers over that history and the block (all of it, or its rows up to the
+//! reading row, per layer's [`BlockAttention`]), and reads the block's slots
+//! out through the target's vocabulary projection.
 
 use crate::decoder::{self, Context};
 use crate::{
@@ -46,6 +47,15 @@ pub enum BlockLayout {
     /// Slot `i ≥ 0` predicts position `n + 1 + i` (DSpark,
     /// `sample_from_anchor`): a block of `B` rows drafts at most `B` tokens.
     AnchorFirst,
+}
+
+/// How one draft layer's block rows attend the block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockAttention {
+    /// Each row reads the block's rows up to and including itself.
+    Causal,
+    /// Each row reads the whole block.
+    Bidirectional,
 }
 
 /// DSpark's rank-`R` Markov bias: slot `i`'s logits gain
@@ -174,10 +184,13 @@ pub struct DraftDefinition {
     pub fusion_norm: RmsNorm,
     pub embedding: DraftEmbedding,
     /// Draft layers over the target's width. Their attention reads the
-    /// injected context and the whole fresh block (non-causal).
+    /// injected context and the fresh block.
     pub blocks: Vec<Block>,
+    /// One per draft layer: how its block rows attend the block.
+    pub block_attention: Vec<BlockAttention>,
     pub output_norm: RmsNorm,
-    /// Rows of one draft block, anchor included.
+    /// Rows of the trained draft block, anchor included: the widest block a
+    /// pass runs (`block_rows`).
     pub block_size: u64,
     pub mask_token: TokenId,
     pub layout: BlockLayout,
@@ -192,6 +205,14 @@ impl DraftDefinition {
         }
     }
 
+    /// Rows of the block a pass drafting `proposals` tokens runs: through its
+    /// last proposing row, as serving engines size the block to the verify
+    /// window. A causal layer's rows do not read later rows, so only the
+    /// bidirectional layers see fewer mask rows than in training.
+    pub fn block_rows(&self, proposals: u64) -> u64 {
+        (self.proposal_row(proposals.max(1) - 1) + 1).clamp(2, self.block_size)
+    }
+
     /// The block row whose output drafts proposal `proposal` (the token at
     /// position `n + 1 + proposal`).
     pub fn proposal_row(&self, proposal: u64) -> u64 {
@@ -204,10 +225,19 @@ impl DraftDefinition {
     pub fn validate(&self, decoder: &Decoder, coordinate_axes: u8) -> Result<(), DefinitionError> {
         let hidden = decoder.hidden;
         if self.taps.is_empty() || self.blocks.is_empty() || self.block_size < 2 {
-            return Err(DefinitionError::new("draft has no taps, blocks or proposals"));
+            return Err(DefinitionError::new(
+                "draft has no taps, blocks or proposals",
+            ));
+        }
+        if self.block_attention.len() != self.blocks.len() {
+            return Err(DefinitionError::new(
+                "draft block attention differs from its layer count",
+            ));
         }
         if u64::from(self.mask_token.0) >= decoder.vocabulary {
-            return Err(DefinitionError::new("draft mask token is outside the vocabulary"));
+            return Err(DefinitionError::new(
+                "draft mask token is outside the vocabulary",
+            ));
         }
         for (index, tap) in self.taps.iter().enumerate() {
             if self.taps[..index].contains(tap) {
@@ -227,7 +257,11 @@ impl DraftDefinition {
         expect_shape(&self.fusion, &[hidden, fused], "draft fusion projection")?;
         decoder::validate_rms(&self.fusion_norm, hidden, "draft fusion norm")?;
         if let DraftEmbedding::Own(table) = &self.embedding {
-            expect_shape(table, &[decoder.vocabulary, hidden], "draft token embedding")?;
+            expect_shape(
+                table,
+                &[decoder.vocabulary, hidden],
+                "draft token embedding",
+            )?;
         }
         decoder::validate_blocks(
             &self.blocks,
@@ -289,7 +323,11 @@ impl DraftDefinition {
                 let coefficients = checked_product(&[2, *kernel, hidden / *group])?;
                 for layer in convolutions {
                     for convolution in [&layer.attention, &layer.feed_forward] {
-                        expect_shape(&convolution.base, &[2, *kernel, hidden], "draft convolution base")?;
+                        expect_shape(
+                            &convolution.base,
+                            &[2, *kernel, hidden],
+                            "draft convolution base",
+                        )?;
                         expect_shape(
                             &convolution.projection,
                             &[coefficients, hidden],
@@ -297,12 +335,21 @@ impl DraftDefinition {
                         )?;
                     }
                 }
-                if selector.rank == 0 || selector.top_k == 0 || selector.top_k > decoder.vocabulary {
+                if selector.rank == 0 || selector.top_k == 0 || selector.top_k > decoder.vocabulary
+                {
                     return Err(DefinitionError::new("draft candidate selector geometry"));
                 }
                 let codebook = [decoder.vocabulary, selector.rank];
-                expect_shape(&selector.hidden, &[selector.rank, hidden], "draft selector projection")?;
-                expect_shape(&selector.predecessor, &codebook, "draft predecessor codebook")?;
+                expect_shape(
+                    &selector.hidden,
+                    &[selector.rank, hidden],
+                    "draft selector projection",
+                )?;
+                expect_shape(
+                    &selector.predecessor,
+                    &codebook,
+                    "draft predecessor codebook",
+                )?;
                 expect_shape(&selector.successor, &codebook, "draft successor codebook")?;
             }
         }

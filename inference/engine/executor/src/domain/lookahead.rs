@@ -1,9 +1,12 @@
 //! Cross-step pipelining ("lookahead"). Right after a continuable target
 //! step N is submitted, the domain queues step N+1 behind it on the device:
-//! each slot's successor advance follows N's in-flight advance, its input
-//! token is N's selection read on the device, and its selection is N's with
-//! the position advanced by one. The device then runs N+1 without waiting for
-//! the host to observe N and submit the next step.
+//! each slot's successor advance follows N's in-flight advance. A decode
+//! continuation's input token is N's selection read on the device, and its
+//! selection is N's with the position advanced by one. A prompt's next
+//! prefill chunk is known before N finishes: the owner plans it
+//! (`plan_successors`) and it is queued with its own tokens. The device then
+//! runs N+1 without waiting for the host to observe N and submit the next
+//! step.
 //!
 //! The owner never sees the lookahead. When the operations it next submits
 //! equal the prediction (token included, known once N finished) and the
@@ -15,15 +18,23 @@
 //! own, so an orphan never changes accepted state.
 
 use super::*;
-use crate::programs::SubmittedTarget;
+use crate::programs::{SubmittedHead, SubmittedTarget};
 use magnitude_state::TentativeAdvance;
 
-pub(super) struct Lookahead<S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork>> {
-    flight: TargetFlight<S>,
+pub(super) struct Lookahead<
+    S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork>,
+    H: ProgramSubmission<CompletedWork = crate::CompletedHeadWork>,
+> {
+    flight: TargetFlight<S, H>,
     /// The flight whose selections are this one's tokens.
     predecessor: u64,
-    /// Per slot, the operation that claims it, with a placeholder token.
+    /// Per slot, the operation that claims it (a decode continuation with a
+    /// placeholder token).
     predicted: Vec<Operation>,
+    /// Whether the queued step's tokens are its predecessor's selections (a
+    /// decode continuation) rather than its operations' own (a planned
+    /// prefill chunk).
+    selected_tokens: bool,
     /// Per slot, the predecessor's selection, once it finished.
     selected: Option<Vec<Selected>>,
 }
@@ -42,6 +53,7 @@ pub(super) fn continuation_of(operation: &Operation) -> Option<Operation> {
         demand,
         select,
         committed: 1,
+        prime: None,
     } = operation
     else {
         return None;
@@ -67,10 +79,55 @@ pub(super) fn continuation_of(operation: &Operation) -> Option<Operation> {
         demand: *demand,
         select: vec![next],
         committed: 1,
+        prime: None,
     })
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
+    /// Plan the operations that follow the next submitted target group, when
+    /// they are known before it finishes. Its provisioning makes room for
+    /// them and its lookahead queues them; any other group discards them.
+    pub fn plan_successors(&mut self, planned: Vec<Operation>) {
+        self.planned = planned;
+    }
+
+    /// The step to queue behind `operation`, and whether its tokens are
+    /// `operation`'s selections: the decode continuation, or the planned
+    /// prompt chunk after a prefill chunk that selects nothing.
+    pub(super) fn successor_of(&self, operation: &Operation) -> Option<(Operation, bool)> {
+        if let Some(next) = continuation_of(operation) {
+            return Some((next, true));
+        }
+        let Operation::Forward {
+            request,
+            kind: WorkKind::Prefill,
+            tokens,
+            position,
+            conditioning: None,
+            select,
+            ..
+        } = operation
+        else {
+            return None;
+        };
+        if !select.is_empty() {
+            return None;
+        }
+        let end = position.checked_add(tokens.len())?;
+        self.planned
+            .iter()
+            .find(|planned| {
+                matches!(planned, Operation::Forward {
+                    request: next,
+                    kind: WorkKind::Prefill,
+                    position: start,
+                    conditioning: None,
+                    ..
+                } if next == request && *start == end)
+            })
+            .map(|planned| (planned.clone(), false))
+    }
+
     pub(super) fn flight_id(&mut self) -> u64 {
         self.next_flight += 1;
         self.next_flight
@@ -88,14 +145,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .predicted
                 .iter()
                 .position(|predicted| predicted.request() == operation.request())?;
-            let choice = selected.get(slot).filter(|choice| choice.status == 0)?;
             let mut expected = lookahead.predicted[slot].clone();
-            if let Operation::Forward { tokens, .. } = &mut expected {
-                tokens[0] = choice.token;
+            if lookahead.selected_tokens {
+                let choice = selected.get(slot).filter(|choice| choice.status == 0)?;
+                if let Operation::Forward { tokens, .. } = &mut expected {
+                    tokens[0] = choice.token;
+                }
             }
             let state = self.target.get(&operation.request())?;
             let advance = advances.get(slot)?;
+            let drafter_follows = match operation {
+                Operation::Forward {
+                    prime: Some(prime), ..
+                } => self
+                    .head
+                    .get(&operation.request())
+                    .is_some_and(|head| head.position() == prime.position),
+                _ => true,
+            };
             if slots.contains(&slot)
+                || !drafter_follows
                 || operation != &expected
                 || state.position() != advance.position()
                 || state.bank_index() != advance.bindings().previous_bank
@@ -123,7 +192,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         &mut self,
         operations: &[Operation],
         slots: Vec<usize>,
-    ) -> Result<TargetFlight<F::TargetSubmission>, DomainError> {
+    ) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
         self.healthy()?;
         if self.claim_slots(operations).as_ref() != Some(&slots) {
             return Err(self.fatal_invariant("claimed lookahead changed after reservation"));
@@ -140,6 +209,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .map(InFlightState::new);
         }
         flight.continuation = Some(sources);
+        if let Some(priming) = &mut flight.priming {
+            priming.continuation = Some(self.head.remove(&priming.request).map(InFlightState::new));
+        }
         if self.trace_lookahead {
             eprintln!(
                 "lookahead claimed flight={} slots={}",
@@ -182,12 +254,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 lookahead.selected.is_some()
             );
         }
-        match lookahead.flight.submission.finish() {
-            Ok(completed) => {
-                drop(completed);
-                Ok(())
-            }
-            Err(error) => {
+        // Its drafter entry runs behind it on the device and finishes too,
+        // so no lease returns while the device still uses it.
+        let priming = lookahead
+            .flight
+            .priming
+            .map(|priming| priming.submission.finish().map(drop));
+        match (lookahead.flight.submission.finish().map(drop), priming) {
+            (Ok(()), None | Some(Ok(()))) => Ok(()),
+            (Err(error), _) | (_, Some(Err(error))) => {
                 let failure = DomainError::Device(error);
                 self.fatal = Some(failure.clone());
                 Err(failure)
@@ -195,16 +270,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// Queue the continuation of `flight` (just submitted or claimed for
-    /// `operations`) when every slot continues by one decode row, the flight
-    /// has a selection tensor to read tokens from, and the successors and
-    /// leases fit without growing anything. Otherwise the next step is
-    /// submitted by the owner as usual.
+    /// Queue the successor of `flight` (just submitted or claimed for
+    /// `operations`) when every slot has one of the same kind (see
+    /// `successor_of`), a decode continuation's flight has a selection tensor
+    /// to read tokens from, and the successors and leases fit without growing
+    /// anything. Otherwise the next step is submitted by the owner as usual.
     pub(super) fn queue_lookahead(
         &mut self,
-        flight: &TargetFlight<F::TargetSubmission>,
+        flight: &TargetFlight<F::TargetSubmission, F::HeadSubmission>,
         operations: &[Operation],
     ) -> Result<(), DomainError> {
+        let successors = operations
+            .iter()
+            .map(|operation| self.successor_of(operation))
+            .collect::<Option<Vec<_>>>();
+        self.planned.clear();
         if !self.execution.policy().limits().lookahead {
             return Ok(());
         }
@@ -221,25 +301,34 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         {
             return Ok(());
         }
-        let Some(predicted) = operations
-            .iter()
-            .map(continuation_of)
-            .collect::<Option<Vec<_>>>()
-        else {
+        let Some(successors) = successors else {
             return Ok(());
         };
-        let Some(selected) = flight
-            .submission
-            .output()
-            .readout
-            .as_ref()
-            .and_then(|readout| readout.selected.clone())
-        else {
+        let selected_tokens = successors.iter().all(|(_, selected)| *selected);
+        if !selected_tokens && successors.iter().any(|(_, selected)| *selected) {
             return Ok(());
+        }
+        let predicted = successors
+            .into_iter()
+            .map(|(operation, _)| operation)
+            .collect::<Vec<_>>();
+        let selected = if selected_tokens {
+            let Some(selected) = flight
+                .submission
+                .output()
+                .readout
+                .as_ref()
+                .and_then(|readout| readout.selected.clone())
+            else {
+                return Ok(());
+            };
+            Some(selected)
+        } else {
+            None
         };
         let mut advances = Vec::with_capacity(operations.len());
-        for advance in flight.submission.launch().advances() {
-            match advance.successor(1) {
+        for (advance, operation) in flight.submission.launch().advances().iter().zip(&predicted) {
+            match advance.successor(operation.row_count()) {
                 Ok(successor) => advances.push(TentativeAdvance::Successor(successor)),
                 // No room without growing the backing (or a limit): the next
                 // step runs unpipelined and provisions as usual.
@@ -252,6 +341,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         let mut slots = Vec::with_capacity(predicted.len());
+        let mut segments = 1usize;
         for (operation, advance) in predicted.iter().zip(&advances) {
             let (slot, slices) = self
                 .target_slot(operation, advance)
@@ -259,27 +349,40 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             if !slices.is_empty() {
                 return Ok(());
             }
+            segments = segments.max(super::target::reserved_segments(
+                &self.target_store,
+                advance.span_count(),
+                operation.row_count(),
+            ));
             slots.push(slot);
         }
         let limits = self.execution.policy().limits();
-        let batch = ValidatedTargetBatch::from_slots(
-            &slots,
-            self.definition.decoder.vocabulary as usize,
-            limits.max_launch_rows,
-        )
-        .map_err(|error| DomainError::Input(error.to_string()))?;
-        let rows = batch.class().rows() as u64;
-        if selected
-            .tensor()
-            .extents()
-            .first()
-            .is_none_or(|extent| *extent < rows)
-        {
-            return Ok(());
+        let vocabulary = self.definition.decoder.vocabulary as usize;
+        let batch = if selected_tokens {
+            ValidatedTargetBatch::from_slots(&slots, vocabulary, limits.max_launch_rows)
+        } else {
+            ValidatedTargetBatch::covering(&slots, vocabulary, limits.max_launch_rows, segments)
         }
-        let tokens = selected
-            .slice_leading(0, rows)
-            .map_err(|error| DomainError::Input(error.to_string()))?;
+        .map_err(|error| DomainError::Input(error.to_string()))?;
+        let tokens = match selected {
+            Some(selected) => {
+                let rows = batch.class().rows() as u64;
+                if selected
+                    .tensor()
+                    .extents()
+                    .first()
+                    .is_none_or(|extent| *extent < rows)
+                {
+                    return Ok(());
+                }
+                TargetTokens::Selected(
+                    selected
+                        .slice_leading(0, rows)
+                        .map_err(|error| DomainError::Input(error.to_string()))?,
+                )
+            }
+            None => TargetTokens::Host,
+        };
         let graph = self.resources.target_graph();
         let readout = self.resources.target_readout_graph();
         if graph.available_workspace() == 0
@@ -308,7 +411,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let count = operations.len();
         let inputs = TargetLaunchInputs::new(
             batch,
-            TargetTokens::Selected(tokens),
+            tokens,
             advances,
             vec![None; count],
             vec![Vec::new(); count],
@@ -330,6 +433,52 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(failure);
             }
         };
+        // A planned prompt chunk's drafter entry follows the in-flight entry
+        // of the chunk before it, with its own draft launch leases.
+        let priming = match &predicted[..] {
+            [Operation::Forward {
+                request,
+                prime: Some(prime),
+                ..
+            }] => {
+                let Some(successor) = flight
+                    .priming
+                    .as_ref()
+                    .filter(|priming| priming.request == *request)
+                    .and_then(|priming| priming.submission.launch().advances().first())
+                    .and_then(|advance| advance.successor(prime.tokens.len()).ok())
+                else {
+                    if self.trace_lookahead {
+                        eprintln!(
+                            "lookahead skipped after={}: drafter entry has no room",
+                            flight.id
+                        );
+                    }
+                    return Ok(());
+                };
+                let Some(head) = self
+                    .resources
+                    .head_graph()
+                    .filter(|head| head.available_workspace() > 0 && head.available_output() > 0)
+                else {
+                    if self.trace_lookahead {
+                        eprintln!(
+                            "lookahead skipped after={}: no free drafter launch leases",
+                            flight.id
+                        );
+                    }
+                    return Ok(());
+                };
+                Some((
+                    *request,
+                    prime.clone(),
+                    successor,
+                    head.acquire_workspace().map_err(invariant)?,
+                    head.acquire_output().map_err(invariant)?,
+                ))
+            }
+            _ => None,
+        };
         let started = Instant::now();
         let submission = match self.family.submit_target(launch) {
             Ok(submission) => submission,
@@ -341,27 +490,53 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let requests = predicted
             .iter()
-            .map(|operation| (operation.request(), 1, None, WorkKind::Decode, 1))
+            .map(|operation| {
+                let Operation::Forward {
+                    request,
+                    kind,
+                    committed,
+                    ..
+                } = operation
+                else {
+                    unreachable!("a successor is a forward operation")
+                };
+                (*request, operation.row_count(), None, *kind, *committed)
+            })
             .collect();
         let id = self.flight_id();
         if self.trace_lookahead {
             eprintln!(
-                "lookahead queued flight={id} after={} slots={count}",
-                flight.id
+                "lookahead queued flight={id} after={} slots={count} rows={}",
+                flight.id,
+                predicted.iter().map(Operation::row_count).sum::<usize>()
             );
         }
+        let mut queued = TargetFlight {
+            launch_trace: None,
+            requests,
+            submission,
+            priming: None,
+            started,
+            runnable: started,
+            previous_selection: None,
+            id,
+            continuation: None,
+        };
+        if let Some((request, prime, successor, workspace, output)) = priming {
+            queued = self.launch_priming(
+                queued,
+                request,
+                &prime,
+                TentativeAdvance::Successor(successor),
+                workspace,
+                output,
+            )?;
+        }
         self.lookahead = Some(Lookahead {
-            flight: TargetFlight {
-                requests,
-                submission,
-                started,
-                runnable: started,
-                previous_selection: None,
-                id,
-                continuation: None,
-            },
+            flight: queued,
             predecessor: flight.id,
             predicted,
+            selected_tokens,
             selected: None,
         });
         Ok(())

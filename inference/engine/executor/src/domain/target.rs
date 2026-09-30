@@ -1,6 +1,11 @@
 //! Target submission, completion, and row construction.
 
 use super::*;
+use crate::programs::SubmittedTarget;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static TARGET_PREFILL_LAUNCH_TRACED: AtomicBool = AtomicBool::new(false);
+static TARGET_VERIFY_LAUNCH_TRACED: AtomicBool = AtomicBool::new(false);
 
 /// Host timing of one finished target step. Device execution overlaps the
 /// encode span; the selection gap is time the device may idle between steps.
@@ -25,7 +30,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         &mut self,
         operations: &[Operation],
         reservation: TargetGraphReservation,
-    ) -> Result<TargetFlight<F::TargetSubmission>, DomainError> {
+    ) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
         let flight = match reservation {
             TargetGraphReservation::Claim(slots) => self.claim_lookahead(operations, slots)?,
             TargetGraphReservation::Launch(reservation) => {
@@ -36,17 +41,134 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(flight)
     }
 
+    /// Launch the group's target step, then a primed prompt chunk's drafter
+    /// entry behind it.
     fn launch_target(
         &mut self,
         operations: &[Operation],
+        mut reservation: TargetLaunchReservation,
+    ) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
+        let priming = reservation.priming.take();
+        let flight = match self.launch_target_graph(operations, reservation) {
+            Ok(flight) => flight,
+            Err(error) => {
+                if let (Some(priming), [operation]) = (priming, operations) {
+                    self.head.insert(operation.request(), priming.advance.abort());
+                }
+                return Err(error);
+            }
+        };
+        let Some(PrimingReservation {
+            advance,
+            graph_workspace,
+            graph_output,
+        }) = priming
+        else {
+            return Ok(flight);
+        };
+        let [Operation::Forward {
+            request,
+            prime: Some(prime),
+            ..
+        }] = operations
+        else {
+            return Err(self.fatal_invariant("a drafter entry was reserved for an unprimed group"));
+        };
+        self.launch_priming(
+            flight,
+            *request,
+            prime,
+            TentativeAdvance::Accepted(advance),
+            graph_workspace,
+            graph_output,
+        )
+    }
+
+    /// Draft `prime` behind `flight` (whose lone slot is its prompt chunk),
+    /// conditioned by the flight's feature output on the device.
+    pub(super) fn launch_priming(
+        &mut self,
+        mut flight: TargetFlight<F::TargetSubmission, F::HeadSubmission>,
+        request: RequestId,
+        prime: &Priming,
+        advance: TentativeAdvance,
+        graph_workspace: NativeGraphWorkspaceLease,
+        graph_output: NativeGraphOutputLease,
+    ) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
+        let features = flight
+            .submission
+            .output()
+            .readout
+            .as_ref()
+            .map(|readout| readout.features.clone())
+            .ok_or_else(|| self.fatal_invariant("a primed prompt chunk publishes no features"))?;
+        let store = self
+            .head_store
+            .clone()
+            .ok_or_else(|| self.fatal_invariant("a drafter entry without a drafter store"))?;
+        let slot = self
+            .block_slot(&prime.tokens, prime.position, &[], &advance, 0)
+            .map_err(|error| self.fatal_invariant(error))?;
+        let batch = crate::batching::ValidatedHeadBatch::from_block_slots(
+            &[slot],
+            self.definition.decoder.vocabulary as usize,
+            self.execution.policy().limits().max_launch_rows,
+        )
+        .map_err(|error| self.fatal_invariant(error.to_string()))?;
+        // Entry rows every window drops before the first draft skip the
+        // windowed layers (see `submit_head`).
+        let windowed = super::head::skippable_window(&store).is_none_or(|window| {
+            prime.position + prime.tokens.len() + window > prime.draft_from
+        });
+        let inputs = HeadLaunchInputs::new(
+            batch,
+            vec![advance],
+            HeadConditioning::Features(features),
+            windowed,
+            graph_workspace,
+            graph_output,
+        );
+        let launch = match ValidatedHeadLaunch::new(
+            inputs,
+            &store,
+            self.domain.id(),
+            self.head_conditioning_bytes(),
+        ) {
+            Ok(launch) => launch,
+            Err((_, error)) => {
+                let failure = DomainError::Invariant(error);
+                self.fatal = Some(failure.clone());
+                return Err(failure);
+            }
+        };
+        let submission = match self.family.submit_head(launch) {
+            Ok(submission) => submission,
+            Err((error, _)) => {
+                let failure = DomainError::from(error);
+                self.fatal = Some(failure.clone());
+                return Err(failure);
+            }
+        };
+        flight.priming = Some(PrimingFlight {
+            request,
+            submission,
+            continuation: None,
+        });
+        Ok(flight)
+    }
+
+    fn launch_target_graph(
+        &mut self,
+        operations: &[Operation],
         reservation: TargetLaunchReservation,
-    ) -> Result<TargetFlight<F::TargetSubmission>, DomainError> {
+    ) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
         let TargetLaunchReservation {
             advances,
             graph_workspace,
             graph_outputs,
             readout_workspace,
             readout_output,
+            priming: _,
         } = reservation;
         let advances = advances
             .into_iter()
@@ -183,6 +305,51 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(failure);
             }
         };
+        let trace_position = std::env::var("MAGNITUDE_TRACE_TARGET_PREFILL_MIN_POSITION")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let trace_prefill = std::env::var_os("MAGNITUDE_TRACE_TARGET_PREFILL_LAUNCHES").is_some()
+            && operations.iter().any(|operation| {
+                matches!(operation, Operation::Forward { position, kind: WorkKind::Prefill, .. }
+                    if *position >= trace_position)
+            });
+        let verify_position = std::env::var("MAGNITUDE_TRACE_TARGET_VERIFY_MIN_POSITION")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let trace_verify = std::env::var_os("MAGNITUDE_TRACE_TARGET_VERIFY_LAUNCHES").is_some()
+            && operations.iter().any(|operation| {
+                matches!(operation, Operation::Forward {
+                    position,
+                    kind: WorkKind::Verify | WorkKind::Decode,
+                    ..
+                } if *position >= verify_position)
+            });
+        let traced = if trace_prefill && !TARGET_PREFILL_LAUNCH_TRACED.swap(true, Ordering::Relaxed)
+        {
+            Some(&TARGET_PREFILL_LAUNCH_TRACED)
+        } else if trace_verify && !TARGET_VERIFY_LAUNCH_TRACED.swap(true, Ordering::Relaxed) {
+            Some(&TARGET_VERIFY_LAUNCH_TRACED)
+        } else {
+            None
+        };
+        let launch_trace = if let Some(traced) = traced {
+            match self
+                .domain
+                .device()
+                .trace_submissions(seismic::TraceDetail::Launches)
+            {
+                Ok(trace) => Some(trace),
+                Err(error) => {
+                    traced.store(false, Ordering::Relaxed);
+                    eprintln!("target launch attribution unavailable: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let started = Instant::now();
         let submission = match self.family.submit_target(launch) {
             Ok(submission) => submission,
@@ -198,6 +365,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(TargetFlight {
             requests: metadata,
             submission,
+            priming: None,
+            launch_trace,
             started,
             runnable: started,
             previous_selection: self.selection_read.take(),
@@ -211,7 +380,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// views before choosing physical prefixes.
     pub fn finish_target(
         &mut self,
-        flight: TargetFlight<F::TargetSubmission>,
+        flight: TargetFlight<F::TargetSubmission, F::HeadSubmission>,
     ) -> Result<Vec<PendingOperationOutcome>, DomainError> {
         let result = self.finish_target_inner(flight);
         if let Err(error) = &result {
@@ -222,7 +391,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     fn finish_target_inner(
         &mut self,
-        flight: TargetFlight<F::TargetSubmission>,
+        flight: TargetFlight<F::TargetSubmission, F::HeadSubmission>,
     ) -> Result<Vec<PendingOperationOutcome>, DomainError> {
         let completed = match flight.submission.finish() {
             Ok(completed) => completed,
@@ -230,8 +399,79 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(DomainError::Device(error));
             }
         };
+        // The drafter entry follows its chunk on the device; its advance
+        // commits with the chunk. A claimed lookahead's entry attaches to the
+        // accepted drafter state; an unclaimed one's rows are discarded.
+        let mut primed = match flight.priming {
+            None => None,
+            Some(priming) => {
+                let completed = priming.submission.finish().map_err(DomainError::Device)?;
+                let (core, _) = completed.into_parts();
+                let (_, advances, _) = core.into_parts();
+                let [advance]: [TentativeAdvance; 1] = advances.try_into().map_err(|_| {
+                    DomainError::invariant("a drafter entry has other than one slot")
+                })?;
+                match (advance, priming.continuation) {
+                    (TentativeAdvance::Accepted(advance), None) => Some((priming.request, advance)),
+                    (TentativeAdvance::Successor(successor), Some(Some(state))) => {
+                        match successor.attach(state.into_state()) {
+                            Ok(advance) => Some((priming.request, advance)),
+                            Err((state, error)) => {
+                                self.head.insert(priming.request, state);
+                                return Err(DomainError::invariant(format!(
+                                    "claimed drafter entry no longer follows its state: {error}"
+                                )));
+                            }
+                        }
+                    }
+                    (TentativeAdvance::Successor(_), Some(None)) => None,
+                    _ => {
+                        return Err(DomainError::invariant(
+                            "drafter entry advance differs from its continuation",
+                        ))
+                    }
+                }
+            }
+        };
+        if let Some(trace) = &flight.launch_trace {
+            let submissions = trace
+                .collect()
+                .map_err(|error| DomainError::Input(error.to_string()))?;
+            let mut entries = BTreeMap::<String, (usize, f64)>::new();
+            for submission in submissions {
+                for launch in submission.launches {
+                    if let Some((start, end)) = launch.device {
+                        let label = if launch.launch == 0 {
+                            launch.entry
+                        } else {
+                            format!("{}#{}", launch.entry, launch.launch)
+                        };
+                        let entry = entries.entry(label).or_default();
+                        entry.0 += 1;
+                        entry.1 += (end - start) * 1_000.0;
+                    }
+                }
+            }
+            let mut entries = entries.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
+            eprintln!("target launch attribution (one flight):");
+            for (entry, (launches, ms)) in entries {
+                eprintln!("  {entry}: {ms:.3} ms across {launches} launches");
+            }
+        }
         let finish_started = Instant::now();
         let physical_duration = flight.runnable.elapsed();
+        if std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some() {
+            eprintln!(
+                "flight target duration_ms={:.3} requests={:?}",
+                physical_duration.as_secs_f64() * 1000.0,
+                flight
+                    .requests
+                    .iter()
+                    .map(|(request, rows, _, kind, committed)| { (request, rows, kind, committed) })
+                    .collect::<Vec<_>>()
+            );
+        }
         let (core, output) = completed.into_parts();
         let crate::TargetOutput {
             readout: output,
@@ -390,12 +630,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 request,
                 outcome: Outcome::Forward { rows: result },
                 advance: Some(advance),
+                primed: primed
+                    .take_if(|(primed, _)| *primed == request)
+                    .map(|(_, advance)| advance),
                 rows,
                 committed_rows,
                 kind,
                 physical_duration,
                 image: None,
             });
+        }
+        if primed.is_some() {
+            return Err(DomainError::invariant(
+                "a drafter entry's chunk is absent from its flight",
+            ));
         }
         let timing = TargetHostTiming {
             launch: commits.first.saturating_duration_since(flight.started),

@@ -263,6 +263,7 @@ class Adapter:
             )
 
             async def sample():
+                sample_index = 0
                 while True:
                     if reason := running.violation():
                         running.retired = reason
@@ -283,6 +284,28 @@ class Adapter:
                             "rss_bytes": memory,
                         },
                     )
+                    if running.readiness and sample_index % 4 == 0:
+                        try:
+                            allocation = await self.memory_observation(running)
+                        except (httpx.HTTPError, ValueError) as error:
+                            self.store.event(
+                                "allocation_sample_failed",
+                                target=self.target.id,
+                                label=label,
+                                error=str(error),
+                            )
+                        else:
+                            if allocation is not None:
+                                self.store.append(
+                                    "allocations.jsonl",
+                                    {
+                                        "target": self.target.id,
+                                        "label": label,
+                                        "at": time.time(),
+                                        "observation": allocation,
+                                    },
+                                )
+                    sample_index += 1
                     await asyncio.sleep(0.25)
 
             sampling = asyncio.create_task(sample())
@@ -337,6 +360,10 @@ class Adapter:
 
     async def prompt_counts(self, plan: Plan) -> dict[str, int]:
         raise NotImplementedError
+
+    async def memory_observation(self, engine: Running) -> dict | None:
+        """Optional allocation census after the measured requests finish."""
+        return None
 
     def context_plan(self, context: Context) -> Plan:
         return Plan(

@@ -2,7 +2,7 @@ use crate::{
     accept_prefix, verification_selects, Constraint, Demand, MethodRequirements, Sampling,
     SelectSpec, Shaping, TokenId, WorkKind,
 };
-use magnitude_executor::{ConditioningRef, Operation, RequestId};
+use magnitude_executor::{ConditioningRef, Operation, Priming, RequestId};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -13,6 +13,8 @@ pub struct RoundForward {
     /// One selection row per input row for Decode/Verify.
     pub selects: Vec<SelectSpec>,
     pub committed: usize,
+    /// A prompt chunk's drafter entry, drafted behind the chunk.
+    pub prime: Option<Priming>,
 }
 
 impl RoundForward {
@@ -31,6 +33,7 @@ impl RoundForward {
             demand: self.demand,
             select: self.selects,
             committed: self.committed,
+            prime: self.prime,
         };
         operation.validate().map_err(|error| error.to_string())?;
         Ok(operation)
@@ -82,6 +85,7 @@ impl RoundState {
         tokens: Vec<TokenId>,
         emitted: Vec<TokenId>,
         select: Option<SelectSpec>,
+        prime: Option<Priming>,
         requirements: MethodRequirements,
     ) -> Result<Self, String> {
         if tokens.is_empty()
@@ -108,6 +112,7 @@ impl RoundState {
                 tokens,
                 demand,
                 selects: select.into_iter().collect(),
+                prime,
             },
             kind: RoundKind::Progress {
                 emitted,
@@ -179,6 +184,7 @@ impl RoundState {
                 demand: Demand::SELECT | requirements.verify_demand,
                 selects,
                 committed: 1,
+                prime: None,
             },
             kind: RoundKind::Verification { proposal },
         })
@@ -205,6 +211,7 @@ impl RoundState {
                 demand: requirements.verify_demand & Demand::FEATURES,
                 selects: Vec::new(),
                 committed,
+                prime: None,
             },
             kind: RoundKind::Forced { emitted: forced },
         })
@@ -379,6 +386,7 @@ mod tests {
             vec![TokenId(1)],
             vec![TokenId(2)],
             None,
+            None,
             requirements(),
         )
         .unwrap();
@@ -439,6 +447,7 @@ mod tests {
             WorkKind::Replay,
             vec![TokenId(1), TokenId(2)],
             vec![],
+            None,
             None,
             requirements,
         )

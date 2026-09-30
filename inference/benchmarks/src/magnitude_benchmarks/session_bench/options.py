@@ -26,6 +26,7 @@ class NativeOptions(Record):
     cache_dir: Path | None = None
     method: Literal["auto", "plain", "mtp", "dflash", "dspark", "dflash2"] = "auto"
     mtp_proposals: int | None = Field(default=None, gt=0)
+    prefill_tokens: int | None = Field(default=None, gt=0)
     #: A separate draft model (DFlash, DSpark, DFlash2) for the target; the
     #: engine refuses a draft that is not the requested method's.
     draft: Path | None = None
@@ -48,8 +49,31 @@ class NativeOptions(Record):
         args += ["--native-method", self.method]
         if self.mtp_proposals is not None:
             args += ["--native-mtp-proposals", str(self.mtp_proposals)]
+        if self.prefill_tokens is not None:
+            args += ["--native-prefill-tokens", str(self.prefill_tokens)]
         if self.draft is not None:
             args += ["--native-draft", str(self.draft)]
+        return args
+
+
+class LlamaOptions(Record):
+    """Upstream llama-server selection recorded with each benchmark run."""
+
+    binary: Path | None = None
+    draft: Path | None = None
+    draft_method: Literal["dflash", "dspark"] = "dflash"
+    draft_proposals: int = Field(default=3, gt=0)
+    gpu_layers: int = Field(default=99, ge=0)
+
+    def arguments(self) -> list[str]:
+        args = []
+        if self.binary is not None:
+            args += ["--llama-binary", str(self.binary)]
+        if self.draft is not None:
+            args += ["--llama-draft", str(self.draft)]
+            args += ["--llama-draft-method", self.draft_method]
+            args += ["--llama-draft-proposals", str(self.draft_proposals)]
+        args += ["--llama-gpu-layers", str(self.gpu_layers)]
         return args
 
 
@@ -79,6 +103,7 @@ class Watchdog(Record):
 
 class EngineOptions(Record):
     native: NativeOptions = Field(default_factory=NativeOptions)
+    llama: LlamaOptions = Field(default_factory=LlamaOptions)
     watchdog: Watchdog = Field(default_factory=Watchdog)
 
 

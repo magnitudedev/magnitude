@@ -11,7 +11,10 @@
 #define DECODE_BATCH 4
 
 // L1: threadgroup (kv head, partition, row), as `attention_decode`, over
-// affine K8/V4 history. History keys score as the sum over groups of
+// affine K8/V4 history. With MATRIX, the grouped-query matrix form
+// (attention::decode_matrix): history tiles are decoded to F16 as they are
+// staged and every product takes F16 operands. Otherwise the vector form:
+// history keys score as the sum over groups of
 // scale * (q . code) + zero * sum(q) and values accumulate (p * scale) * code
 // plus the carried bias sum(p * zero) of each lane's group
 // (attention::absorb_affine), so no history element is decoded. The fresh
@@ -55,22 +58,31 @@ kernel void attention_decode_k8v4_partial(
     constexpr uint SLICES = SEISMIC_TUNE_SLICES;
     constexpr uint H = G / SLICES;
     const ulong R = SEISMIC_DIM_R;
+    // Rows per threadgroup: TOKENS decode rows packed into the matrix form's
+    // rows; one row otherwise.
+    constexpr uint TOKENS = SEISMIC_TUNE_TOKENS;
     const uint kv_head = group.x;
     const uint partition = group.y;
-    const ulong row = group.z;
+    const ulong row0 = group.z * TOKENS;
+    const ulong row = row0;
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
     device const int *row_coordinates = coordinates + row * 4;
 
-    if (ATTENTION_FRESH && partition == 0 && simd < 2) {
-        const int destination = destinations[row];
+    // Partition 0 appends the rows' keys and values encoded, a simdgroup per
+    // (row, key or value).
+    for (uint item = simd; ATTENTION_FRESH && partition == 0 && item < 2 * TOKENS; item += SIMDS) {
+        const ulong appended = row0 + item / 2;
+        if (appended >= SEISMIC_DIM_M)
+            break;
+        const int destination = destinations[appended];
         if (destination >= 0) {
-            const ulong source = (row * KV + kv_head) * W;
+            const ulong source = (appended * KV + kv_head) * W;
             const ulong vector = kv_head;
             const ulong slab_rows = ulong(SEISMIC_PARAM_SLAB_ROWS);
             float x[E];
-            if (simd == 0) {
-                attention::head_rotary<ATTENTION_NORM>(key + source, key_norm, row_coordinates,
+            if (item % 2 == 0) {
+                attention::head_rotary<ATTENTION_NORM>(key + source, key_norm, coordinates + appended * 4,
                     rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, lane, x);
                 ATTENTION_UNROLL
                 for (uint i = 0; i < E; ++i)
@@ -94,6 +106,15 @@ kernel void attention_decode_k8v4_partial(
         }
     }
 
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
+#if SEISMIC_TUNE_MATRIX
+    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS>(attention::affine_history{key_codes,
+        key_coefficients, value_codes, value_coefficients, ulong(SEISMIC_PARAM_SLAB_ROWS)}, query, key, value,
+        query_norm, key_norm, value_norm, rotary_components, rotary_frequencies, rotary_amplitudes, coordinates,
+        visible, fresh, partials, statistics, reinterpret_cast<threadgroup uchar *>(shared), R, SEISMIC_DIM_M, epsilon,
+        scale * ATTENTION_LOG2E, SEISMIC_TUNE_SPAN, kv_head, partition, group.z, thread_index, simd, lane);
+#else
     const uint total = attention::form_total(visible, fresh, row, R);
     const uint span_keys = attention::partition_span(total, SEISMIC_TUNE_SPAN, PARTS);
     const uint partition_lo = partition * span_keys;
@@ -195,7 +216,7 @@ kernel void attention_decode_k8v4_partial(
                         vc[j] = float2(value_pairs[(t + j) * value_pair_step]);
                     }
                     attention::absorb_affine<DECODE_BATCH>(q, qsum, k, kc, v, vc, maximum, denominator,
-                        output, bias);
+                        output, bias, lane);
                 }
                 for (; position < part_end; ++position, ++t) {
                     uint k[1][key_lane::words];
@@ -206,7 +227,7 @@ kernel void attention_decode_k8v4_partial(
                     value_lane::load(value_rows + t * value_step, lane, v[0]);
                     kc[0] = float2(key_pairs[t * key_pair_step]);
                     vc[0] = float2(value_pairs[t * value_pair_step]);
-                    attention::absorb_affine<1>(q, qsum, k, kc, v, vc, maximum, denominator, output, bias);
+                    attention::absorb_affine<1>(q, qsum, k, kc, v, vc, maximum, denominator, output, bias, lane);
                 }
             }
         } else {
@@ -231,7 +252,7 @@ kernel void attention_decode_k8v4_partial(
                     k[0][i] = float(attention::Scalar(k[0][i]));
                     v[0][i] = float(attention::Scalar(v[0][i]));
                 }
-                attention::absorb_heads<H, 1>(q, k, v, maximum, denominator, output);
+                attention::absorb_heads<H, 1>(q, k, v, maximum, denominator, output, lane);
             }
         }
         offset += length;
@@ -245,6 +266,7 @@ kernel void attention_decode_k8v4_partial(
 
     attention::publish_slices<SIMDS, PARTS, H, SLICES>(maximum, denominator, output, states, columns,
         partials, statistics, (row * KV + kv_head) * G * PARTS + partition, simd, lane, thread_index);
+#endif
 }
 
 // L2: threadgroup (query head, row), one thread per column: the fixed-order
@@ -260,6 +282,9 @@ kernel void attention_decode_k8v4_merge(
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint column [[thread_index_in_threadgroup]]) {
-    attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS>(query, gate, visible, fresh, result,
-        partials, statistics, SEISMIC_DIM_R, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0);
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
+    attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS>(query, gate, visible, fresh, result,
+        partials, statistics, SEISMIC_DIM_R, SEISMIC_DIM_M, group.x, group.y, column,
+        SEISMIC_PARAM_GATE_FUNCTION != 0);
 }

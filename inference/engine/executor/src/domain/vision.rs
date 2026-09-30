@@ -107,6 +107,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             request: flight.request,
             outcome: Outcome::Encode { features },
             advance: None,
+            primed: None,
             rows: 0,
             committed_rows: 0,
             kind: WorkKind::Prefill,

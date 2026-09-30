@@ -7,10 +7,11 @@
 //!   only itself: the entry K/V norm, rotary and append every attention
 //!   layer uses write the context K/V at the rows' destinations. The
 //!   attention's own output is not read.
-//! - **Block.** When drafting, one non-causal pass over each slot's block
+//! - **Block.** When drafting, one pass over each slot's block
 //!   `[anchor, mask, …]`: the raw token embedding, every draft layer's
-//!   attention (over the domain's accepted and injected rows, and the whole
-//!   block) and dense feed-forward, then the output norm and the target's
+//!   attention (over the domain's accepted and injected rows, and the block
+//!   through the reading row or wholly, per the layer's block attention) and
+//!   dense feed-forward, then the output norm and the target's
 //!   vocabulary projection of the proposing rows and position-keyed
 //!   selection. DSpark then chains its slots: slot `k`'s logits gain the
 //!   Markov projection of the token before it, its selection feeds slot
@@ -20,6 +21,7 @@
 //! `k · slots + s`.
 
 use super::{DeviceSubmission, HeadProgram};
+use crate::operators::{self, Mixer};
 use crate::{
     completion::CompletionWaiter,
     native::{AttestedDraft, AttestedTarget},
@@ -38,20 +40,19 @@ use crate::{
         },
         native_target_graph::{resident_scale, weight, WeightPort},
     },
-    DeviceError, DraftProgramPlan, GraphOutputTensor, HeadLaunchCore, InvariantError, ModelLoadPlan,
-    NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentWeight,
+    DeviceError, DraftProgramPlan, GraphOutputTensor, HeadLaunchCore, InvariantError,
+    ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentWeight,
     ResourceLimits, StateStorePlan, SubmitError, ValidatedHeadLaunch,
 };
-use crate::operators::{self, Mixer};
 use magnitude_batching::{row_class, TargetBatchUpload};
 use magnitude_family_contracts::{
-    ActivationDType, DraftDefinition, DraftEmbedding, DraftMethod, ModelDefinition, SublayerIndex,
-    WeightKind, WeightRole, WeightScope,
+    ActivationDType, BlockAttention, DraftDefinition, DraftEmbedding, DraftMethod, HistoryDomain,
+    KeyValue, ModelDefinition, SublayerIndex, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::{
     dense_output, draft_confidence, draft_convolve_input, draft_convolve_residual,
     draft_gated_rows, draft_path_step, draft_top_k, embedding_rows, project_rows,
-    readout_features_rows, readout_head_rows, sample_rows, shape_rows,
+    readout_features_rows, readout_head_rows, sample_rows, shape_rows, widen_rows,
 };
 use magnitude_state::LayerRef;
 use seismic::{
@@ -95,6 +96,38 @@ pub(crate) struct DraftGraphClass {
     /// 0 for an injection-only transaction.
     pub slots: u64,
     pub shaped: bool,
+    /// Whether windowed history layers inject the entry rows. Always for a
+    /// drafting class; an injection-only class may skip them when every
+    /// entry row falls before the first draft's windows
+    /// (`HeadLaunchCore::windowed`).
+    pub windowed: bool,
+    /// Whether an injection-only entry reads its conditioning from a target
+    /// feature output on the device (a prompt chunk's entry drafted behind
+    /// the chunk) rather than host-written rows.
+    pub device: bool,
+}
+
+/// Whether some of the draft's layers keep a windowed history and some do
+/// not: only then can an injection skip the windowed layers (every layer
+/// windowed leaves nothing to inject).
+pub(crate) fn skips_windowed_layers(draft: &DraftDefinition) -> Result<bool, String> {
+    let mut windowed = false;
+    let mut full = false;
+    for index in 0..draft.blocks.len() {
+        let paired =
+            operators::draft::draft_block(draft, index).map_err(|error| error.to_string())?;
+        let Mixer::Attention(attention) = paired.mixer else {
+            return Err("draft layers attend".into());
+        };
+        match attention.key_value {
+            KeyValue::Owned {
+                domain: HistoryDomain::Window { .. },
+                ..
+            } => windowed = true,
+            _ => full = true,
+        }
+    }
+    Ok(windowed && full)
 }
 
 /// The admitted draft classes: every entry row class injecting only, and
@@ -103,8 +136,10 @@ pub(crate) struct DraftGraphClass {
 pub(crate) fn draft_graph_classes(
     limits: ResourceLimits,
     proposals: usize,
-    block: u64,
+    draft: &DraftDefinition,
 ) -> Result<Vec<DraftGraphClass>, String> {
+    let block = draft.block_size;
+    let skips = skips_windowed_layers(draft)?;
     let row_classes = magnitude_batching::row_classes(limits.max_launch_rows)
         .into_iter()
         .map(|rows| rows as u64)
@@ -115,19 +150,25 @@ pub(crate) fn draft_graph_classes(
             limits.max_launch_rows
         )
     })?;
-    let slot_classes = magnitude_batching::row_classes(
-        limits.max_launch_slots.min(limits.max_launch_rows),
-    )
-    .into_iter()
-    .map(|slots| slots as u64)
-    .filter(|slots| slots * block <= max_rows)
-    .collect::<Vec<_>>();
+    let slot_classes =
+        magnitude_batching::row_classes(limits.max_launch_slots.min(limits.max_launch_rows))
+            .into_iter()
+            .map(|slots| slots as u64)
+            .filter(|slots| slots * block <= max_rows)
+            .collect::<Vec<_>>();
     let mut classes = row_classes
         .iter()
-        .map(|&entry_rows| DraftGraphClass {
-            entry_rows,
-            slots: 0,
-            shaped: false,
+        .flat_map(|&entry_rows| {
+            [(true, false), (false, false), (true, true), (false, true)]
+                .into_iter()
+                .filter(move |(windowed, _)| *windowed || skips)
+                .map(move |(windowed, device)| DraftGraphClass {
+                    entry_rows,
+                    slots: 0,
+                    shaped: false,
+                    windowed,
+                    device,
+                })
         })
         .collect::<Vec<_>>();
     for &slots in &slot_classes {
@@ -146,6 +187,8 @@ pub(crate) fn draft_graph_classes(
                     entry_rows,
                     slots,
                     shaped,
+                    windowed: true,
+                    device: false,
                 });
             }
         }
@@ -210,6 +253,8 @@ pub(crate) struct DraftGraphEntries<'a, G: GraphDraft + 'a> {
     pub head: G::Binding<'a, readout_head_rows::Entry>,
     pub shape: G::Binding<'a, shape_rows::Entry>,
     pub sample: G::Binding<'a, sample_rows::Entry>,
+    /// Widens a device-conditioned entry's target features to F32.
+    pub widen: G::Binding<'a, widen_rows::Entry>,
     pub markov: Option<MarkovEntries<'a, G>>,
     pub dflash2: Option<Dflash2Entries<'a, G>>,
 }
@@ -269,8 +314,9 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
                 .collect(),
             embedding: &draft.embedding,
             head: &draft.head,
-            shape: &target.shape,
-            sample: &target.sample,
+            shape: &draft.shape,
+            sample: &draft.sample,
+            widen: &draft.widen,
             markov: draft.markov.as_ref().map(|markov| MarkovEntries {
                 embedding: &markov.embedding,
                 projection: &markov.projection,
@@ -312,10 +358,15 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
 /// The draft's entries as element assignments of its program plan, for the
 /// metadata-only (checked) graphs.
 struct CheckedDraftEntries {
-    layers: Vec<(CheckedAttentionEntries, CheckedAttentionEntries, CheckedDenseEntries)>,
+    layers: Vec<(
+        CheckedAttentionEntries,
+        CheckedAttentionEntries,
+        CheckedDenseEntries,
+    )>,
     embedding: [(&'static str, Element); 2],
     head: [(&'static str, Element); 3],
     selection: [(&'static str, Element); 0],
+    widen: [(&'static str, Element); 1],
     markov: Option<CheckedMarkovEntries>,
     dflash2: Option<CheckedDflash2Entries>,
 }
@@ -349,9 +400,8 @@ struct CheckedDflash2Layer {
 impl CheckedDflash2Entries {
     fn new(plan: &DraftProgramPlan, binding: &crate::Dflash2Binding) -> Self {
         let activation = plan.activation();
-        let projection = |weight: Element, output: Element| {
-            [("A", activation), ("W", weight), ("Y", output)]
-        };
+        let projection =
+            |weight: Element, output: Element| [("A", activation), ("W", weight), ("Y", output)];
         let (a, f32) = (activation, Element::f32());
         Self {
             layers: plan
@@ -445,6 +495,7 @@ impl CheckedDraftEntries {
                 ("A", activation),
             ],
             selection: [],
+            widen: [("A", activation)],
             markov: plan.markov().map(|markov| CheckedMarkovEntries {
                 embedding: [("EW", markov.embedding), ("A", activation)],
                 projection: [("DW", markov.projection), ("A", activation)],
@@ -474,6 +525,7 @@ impl CheckedDraftEntries {
             head: &self.head[..],
             shape: &self.selection[..],
             sample: &self.selection[..],
+            widen: &self.widen[..],
             markov: self.markov.as_ref().map(|markov| MarkovEntries {
                 embedding: &markov.embedding[..],
                 projection: &markov.projection[..],
@@ -530,13 +582,49 @@ struct BlockPorts {
     selections: Vec<SelectionPorts>,
     /// DSpark: each slot's anchor, the token its first step conditions on.
     anchors: Option<NativePort>,
+    /// Weights whose rows are vocabulary entries of the readout (the target's
+    /// projection, DSpark's Markov projection), bound to their leading
+    /// `readout_vocabulary` rows.
+    leading: Vec<(WeightRole, NativePort)>,
+    readout_vocabulary: u64,
+}
+
+/// A port over the leading `rows` rows of `role`'s planned weight, whose
+/// rows are `width` wide.
+fn leading_port<G: GraphDraft>(
+    graph: &mut G,
+    load: &ModelLoadPlan,
+    role: WeightRole,
+    rows: u64,
+    width: u64,
+    leading: &mut Vec<(WeightRole, NativePort)>,
+) -> Result<WorkflowTensor, String> {
+    let plan = load
+        .weights()
+        .find(|plan| plan.role == role)
+        .ok_or_else(|| format!("planned weight {role:?} is absent"))?;
+    let port = graph.port(plan.resident, &[rows, width])?;
+    let tensor = port.tensor().clone();
+    leading.push((role, port));
+    Ok(tensor)
+}
+
+/// Where a draft graph's `[entry rows, hidden]` conditioning comes from.
+#[derive(Clone)]
+enum DraftConditioning {
+    /// F32 rows the host writes.
+    Rows(NativePort),
+    /// A bound target feature output (activation rows), widened in the
+    /// graph.
+    Features(NativePort),
 }
 
 struct DraftGraphParts<P> {
     plan: P,
-    /// `[entry rows, hidden]` F32 conditioning rows.
-    conditioning: NativePort,
-    injection: Vec<LayerPorts>,
+    conditioning: DraftConditioning,
+    /// Per draft layer, its injection pass; `None` for a windowed layer an
+    /// injection-only class without windowed layers skips.
+    injection: Vec<Option<LayerPorts>>,
     block: Option<BlockPorts>,
     constants: Vec<GraphConstant>,
     weights: Vec<(WeightPort, NativePort)>,
@@ -600,14 +688,32 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         let Mixer::Attention(attention) = paired.mixer else {
             return Err("draft layers attend".into());
         };
+        let windowed_layer = matches!(
+            attention.key_value,
+            KeyValue::Owned {
+                domain: HistoryDomain::Window { .. },
+                ..
+            }
+        );
+        if windowed_layer && !class.windowed {
+            layer_weights.push(None);
+            continue;
+        }
         let shape =
             operators::attention::shape(hidden, attention).map_err(|error| error.to_string())?;
         let scope = draft_sublayer(index, 0)?;
-        let injection = attention_weights(&shape, attention, false, |kind| match kind {
-            WeightKind::InputNorm => Ok(fusion_norm.clone()),
-            kind => weight(&mut graph, load, scope, kind, &mut weights),
-        })?;
-        layer_weights.push((attention, shape, injection));
+        let injection =
+            attention_weights(
+                &shape,
+                attention,
+                class.slots > 0,
+                false,
+                |kind| match kind {
+                    WeightKind::InputNorm => Ok(fusion_norm.clone()),
+                    kind => weight(&mut graph, load, scope, kind, &mut weights),
+                },
+            )?;
+        layer_weights.push(Some((attention, shape, injection)));
     }
     fn attention_block<'o>(
         operator: &'o magnitude_family_contracts::Attention,
@@ -617,6 +723,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         (history_rows, slab_rows): (u64, u32),
         epsilon: f32,
         activation: Element,
+        inject_only: bool,
     ) -> AttentionBlock<'o> {
         AttentionBlock {
             rows,
@@ -630,24 +737,48 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             post_norm_epsilon: 0.0,
             post_norm_scale: 1.0,
             activation,
+            inject_only,
         }
     }
 
     // Injection: each entry row appends its context K/V at its destination.
-    // The host writes the rows: an input of the first injection's
-    // projection (every layer's projection reads the same rows).
-    let (_, first_shape, _) = layer_weights.first().ok_or("a draft has no layers")?;
-    let conditioning = graph.input_for(
-        entries.layers[0].injection.project,
-        "hidden",
-        &first_shape.project_dimensions(class.entry_rows),
-    )?;
-    let conditioning_rows = conditioning.tensor().clone();
+    // The host writes the rows (an input of the first injection's
+    // projection; every layer's projection reads the same rows), or a
+    // device-conditioned class widens its bound target features.
+    let (first, (_, first_shape, _)) = layer_weights
+        .iter()
+        .enumerate()
+        .find_map(|(index, layer)| layer.as_ref().map(|layer| (index, layer)))
+        .ok_or("a draft has no injected layers")?;
+    let (conditioning, conditioning_rows) = if class.device {
+        let features =
+            graph.port_with_class_extent(activation, &[class.entry_rows, hidden], 0, "M")?;
+        let widened = graph
+            .enqueue(
+                entries.widen,
+                &[("M", class.entry_rows), ("D", hidden)],
+                widen_rows::WorkflowArgs {
+                    rows: features.tensor().into(),
+                },
+            )?
+            .value;
+        (DraftConditioning::Features(features), widened)
+    } else {
+        let rows = graph.input_for(
+            entries.layers[first].injection.project,
+            "hidden",
+            &first_shape.project_dimensions(class.entry_rows),
+        )?;
+        let tensor = rows.tensor().clone();
+        (DraftConditioning::Rows(rows), tensor)
+    };
     let mut injection = Vec::with_capacity(draft.blocks.len());
     let mut injected = None;
-    for (index, ((operator, shape, weights_of), layer)) in
-        layer_weights.iter().zip(&entries.layers).enumerate()
-    {
+    for (index, (layer_weight, layer)) in layer_weights.iter().zip(&entries.layers).enumerate() {
+        let Some((operator, shape, weights_of)) = layer_weight else {
+            injection.push(None);
+            continue;
+        };
         let (mixed, state, controls) = attention_graph::attention(
             &mut graph,
             layer.injection,
@@ -662,12 +793,13 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 geometry.layers[index],
                 epsilon,
                 activation,
+                true,
             ),
         )?;
-        injection.push(LayerPorts {
+        injection.push(Some(LayerPorts {
             controls,
             planes: state.planes,
-        });
+        }));
         injected = Some(mixed);
     }
     let injected = injected.ok_or("a draft has no layers")?;
@@ -690,8 +822,9 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     // unread port.
     let mut absent_scale = None;
     let slots = class.slots;
-    let rows = slots * draft.block_size;
     let proposals = geometry.proposals;
+    let block_rows = draft.block_rows(proposals);
+    let rows = slots * block_rows;
     let outputs = proposals * slots;
     let table = match &draft.embedding {
         DraftEmbedding::Target => weight(
@@ -739,9 +872,11 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         }
         (DraftMethod::DFlash | DraftMethod::DSpark { .. }, None) => None,
     };
-    for (index, ((operator, shape, injection_weights), layer)) in
-        layer_weights.iter().zip(&entries.layers).enumerate()
-    {
+    for (index, (layer_weight, layer)) in layer_weights.iter().zip(&entries.layers).enumerate() {
+        // A drafting class injects every layer.
+        let (operator, shape, injection_weights) = layer_weight
+            .as_ref()
+            .ok_or("a drafting class skips a layer's injection")?;
         if let Some((dflash2, kernel, group, rows_map)) = &dflash2 {
             let absent_scale = absent(&mut graph, &mut constants, &mut absent_scale)?;
             let ports;
@@ -759,7 +894,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                     attention_weights: injection_weights,
                     rows,
                     rows_map,
-                    block_size: draft.block_size,
+                    block_rows,
                     kernel: *kernel,
                     group: *group,
                     hidden,
@@ -810,6 +945,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 geometry.layers[index],
                 epsilon,
                 activation,
+                false,
             ),
         )?;
         layers.push(LayerPorts {
@@ -848,12 +984,21 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         WeightKind::OutputNorm,
         &mut weights,
     )?;
-    let projection = weight(
+    let readout_vocabulary = crate::native::draft_readout_vocabulary(
+        matches!(draft.method, DraftMethod::DSpark { .. }),
+        vocabulary,
+    );
+    let mut leading = Vec::new();
+    let projection = leading_port(
         &mut graph,
         load,
-        WeightScope::Target,
-        WeightKind::Output,
-        &mut weights,
+        WeightRole {
+            scope: WeightScope::Target,
+            kind: WeightKind::Output,
+        },
+        readout_vocabulary,
+        hidden,
+        &mut leading,
     )?;
     // The projection's accumulator-scale port: its resident second-level
     // scale, else the absent scale.
@@ -871,7 +1016,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let head_dims = [
         ("M", rows),
         ("O", outputs),
-        ("V", vocabulary),
+        ("V", readout_vocabulary),
         ("D", hidden),
         ("WS", scale_extent),
     ];
@@ -894,7 +1039,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let result = graph.local_for(
         entries.sample,
         "result",
-        &[("M", outputs), ("V", vocabulary)],
+        &[("M", outputs), ("V", readout_vocabulary)],
     )?;
     let mut selections = Vec::new();
     let anchors = match (&draft.method, &entries.markov) {
@@ -904,7 +1049,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 &mut graph,
                 entries.shape,
                 entries.sample,
-                vocabulary,
+                readout_vocabulary,
                 (&logits).into(),
                 outputs,
                 class.shaped,
@@ -921,12 +1066,17 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 WeightKind::MarkovEmbedding,
                 &mut weights,
             )?;
-            let markov_projection = weight(
+            // Its bias adds one logit per readout vocabulary row.
+            let markov_projection = leading_port(
                 &mut graph,
                 load,
-                WeightScope::Draft,
-                WeightKind::MarkovProjection,
-                &mut weights,
+                WeightRole {
+                    scope: WeightScope::Draft,
+                    kind: WeightKind::MarkovProjection,
+                },
+                readout_vocabulary,
+                rank,
+                &mut leading,
             )?;
             let confidence_weight = weight(
                 &mut graph,
@@ -974,7 +1124,13 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 let biased = graph
                     .enqueue(
                         chain.projection,
-                        &[("M", outputs), ("O", slots), ("H", vocabulary), ("F", rank), ("DS", 0)],
+                        &[
+                            ("M", outputs),
+                            ("O", slots),
+                            ("H", readout_vocabulary),
+                            ("F", rank),
+                            ("DS", 0),
+                        ],
                         dense_output::WorkflowArgs {
                             residual: (&logits).into(),
                             product: (&memory).into(),
@@ -991,7 +1147,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                     &mut graph,
                     entries.shape,
                     entries.sample,
-                    vocabulary,
+                    readout_vocabulary,
                     (&biased).into(),
                     slots,
                     class.shaped,
@@ -1049,6 +1205,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                     slots,
                     proposals,
                     vocabulary,
+                    readout_vocabulary,
                     hidden,
                     rank: selector.rank,
                     top_k: selector.top_k,
@@ -1070,6 +1227,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             layers,
             selections,
             anchors,
+            leading,
+            readout_vocabulary,
         }),
         constants,
         weights,
@@ -1102,7 +1261,8 @@ struct Dflash2Layer<'a, 'o, G: GraphDraft + 'a> {
     rows: u64,
     /// The identity row map of the block rows.
     rows_map: &'o WorkflowTensor,
-    block_size: u64,
+    /// Rows of each slot's block (`DraftDefinition::block_rows`).
+    block_rows: u64,
     kernel: u64,
     group: u64,
     hidden: u64,
@@ -1147,7 +1307,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         ("C", layer.group),
         ("K", layer.kernel),
     ];
-    let block = u32::try_from(layer.block_size).map_err(|_| "draft block exceeds u32")?;
+    let block = u32::try_from(layer.block_rows).map_err(|_| "draft block exceeds u32")?;
     let project = |graph: &mut G,
                    entry: G::Binding<'a, project_rows::Entry>,
                    source: seismic::WorkflowTensorRef<'_>,
@@ -1177,7 +1337,13 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         let scope = draft_sublayer(layer.index, sublayer)?;
         let norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
         let base = weight(graph, load, scope, WeightKind::ConvolutionBase, weights)?;
-        let projection = weight(graph, load, scope, WeightKind::ConvolutionProjection, weights)?;
+        let projection = weight(
+            graph,
+            load,
+            scope,
+            WeightKind::ConvolutionProjection,
+            weights,
+        )?;
         let normed = graph
             .enqueue(
                 norm_entry,
@@ -1212,25 +1378,26 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
             .value;
         Ok::<_, String>((convolved, dynamic, base))
     };
-    let finish = |graph: &mut G,
-                  residual: &WorkflowTensor,
-                  output: &WorkflowTensor,
-                  (dynamic, base): (&seismic::WorkflowTensorView, &WorkflowTensor)| {
-        graph
-            .enqueue(
-                layer.convolve_residual,
-                &convolution_dims,
-                draft_convolve_residual::WorkflowArgs {
-                    residual: residual.into(),
-                    output: output.into(),
-                    dynamic: dynamic.into(),
-                    base: base.into(),
-                    block,
-                },
-            )
-            .map(|finished| finished.value)
-            .map_err(|error| error.to_string())
-    };
+    let finish =
+        |graph: &mut G,
+         residual: &WorkflowTensor,
+         output: &WorkflowTensor,
+         (dynamic, base): (&seismic::WorkflowTensorView, &WorkflowTensor)| {
+            graph
+                .enqueue(
+                    layer.convolve_residual,
+                    &convolution_dims,
+                    draft_convolve_residual::WorkflowArgs {
+                        residual: residual.into(),
+                        output: output.into(),
+                        dynamic: dynamic.into(),
+                        base: base.into(),
+                        block,
+                    },
+                )
+                .map(|finished| finished.value)
+                .map_err(|error| error.to_string())
+        };
 
     // Attention: plain query, key and value projections of the convolved
     // rows, the history codec's attention, and the output projection.
@@ -1256,7 +1423,13 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         &attention.query,
         (hidden, heads * width),
     )?;
-    let key = project(graph, entries.key, (&convolved).into(), key_weight, (hidden, key_width))?;
+    let key = project(
+        graph,
+        entries.key,
+        (&convolved).into(),
+        key_weight,
+        (hidden, key_width),
+    )?;
     let value = project(
         graph,
         entries.value,
@@ -1288,13 +1461,17 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
             post_norm_epsilon: 0.0,
             post_norm_scale: 1.0,
             activation: layer.activation,
+            inject_only: false,
         },
     )?;
     let output = project(
         graph,
         entries.output,
         (&attended.reshape(&[rows, heads * width])).into(),
-        &attention.output,
+        attention
+            .output
+            .as_ref()
+            .ok_or("draft block output weight is absent")?,
         (heads * width, hidden),
     )?;
     let residual = finish(graph, residual, &output, (&dynamic, &base))?;
@@ -1314,8 +1491,20 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
     let up_weight = weight(graph, load, scope, WeightKind::DenseUp, weights)?;
     let down_weight = weight(graph, load, scope, WeightKind::DenseDown, weights)?;
     let features = layer.intermediate;
-    let gate = project(graph, entries.gate, (&convolved).into(), &gate_weight, (hidden, features))?;
-    let up = project(graph, entries.up, (&convolved).into(), &up_weight, (hidden, features))?;
+    let gate = project(
+        graph,
+        entries.gate,
+        (&convolved).into(),
+        &gate_weight,
+        (hidden, features),
+    )?;
+    let up = project(
+        graph,
+        entries.up,
+        (&convolved).into(),
+        &up_weight,
+        (hidden, features),
+    )?;
     let product = graph
         .enqueue(
             layer.gated,
@@ -1326,7 +1515,13 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    let down = project(graph, entries.down, (&product).into(), &down_weight, (features, hidden))?;
+    let down = project(
+        graph,
+        entries.down,
+        (&product).into(),
+        &down_weight,
+        (features, hidden),
+    )?;
     let residual = finish(graph, &residual, &down, (&dynamic, &base))?;
     Ok((
         residual,
@@ -1343,14 +1538,16 @@ struct Dflash2Path<'t> {
     output_norm: &'t WorkflowTensor,
     /// The block row of each proposal, step-major.
     head_rows: &'t WorkflowTensor,
-    /// The proposing rows' vocabulary logits `[outputs, V]`.
+    /// The proposing rows' readout logits `[outputs, readout_vocabulary]`.
     logits: &'t WorkflowTensor,
     /// The selections `[outputs, 2]`, step-major.
     result: &'t WorkflowTensor,
     rows: u64,
     slots: u64,
     proposals: u64,
+    /// The codebooks' rows: any token id.
     vocabulary: u64,
+    readout_vocabulary: u64,
     hidden: u64,
     rank: u64,
     top_k: u64,
@@ -1376,11 +1573,18 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
         rank,
         top_k,
         vocabulary,
+        readout_vocabulary,
         hidden,
         ..
     } = path;
     let outputs = path.proposals * slots;
-    let selector_hidden = weight(graph, load, WeightScope::Draft, WeightKind::SelectorHidden, weights)?;
+    let selector_hidden = weight(
+        graph,
+        load,
+        WeightScope::Draft,
+        WeightKind::SelectorHidden,
+        weights,
+    )?;
     let predecessor_codes = weight(
         graph,
         load,
@@ -1395,7 +1599,7 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
         WeightKind::SelectorSuccessor,
         weights,
     )?;
-    let top_k_dims = [("M", outputs), ("V", vocabulary), ("K", top_k)];
+    let top_k_dims = [("M", outputs), ("V", readout_vocabulary), ("K", top_k)];
     let mut candidates = graph.local_for(entries.top_k, "candidates", &top_k_dims)?;
     let mut unary = graph.local_for(entries.top_k, "unary", &top_k_dims)?;
     graph.enqueue(
@@ -1522,7 +1726,8 @@ impl PreparedDraftGraphs {
             if prepared.contains_key(&class) {
                 return Err(invalid("draft graph class is duplicated"));
             }
-            let class_error = |error: String| invalid(format!("draft graph class {class:?}: {error}"));
+            let class_error =
+                |error: String| invalid(format!("draft graph class {class:?}: {error}"));
             let parts = draft_graph(
                 target_device.native_graph(),
                 DraftGraphEntries::prepared(draft, target),
@@ -1581,6 +1786,20 @@ impl PreparedDraftGraphs {
                 .iter()
                 .map(|constant| Ok((constant.port(), uploaded.tensor(constant).map_err(device)?)))
                 .collect::<Result<Vec<_>, SubmitError>>()?;
+            // Readout-vocabulary weights bind their leading rows.
+            let leading = graph
+                .block
+                .iter()
+                .flat_map(|block| {
+                    block.leading.iter().map(|(role, port)| {
+                        let tensor = resident_draft_weight(resident, *role)?
+                            .tensor()
+                            .slice_leading(0, block.readout_vocabulary)
+                            .map_err(device)?;
+                        Ok((port, tensor))
+                    })
+                })
+                .collect::<Result<Vec<_>, SubmitError>>()?;
             let fixed = graph
                 .weights
                 .iter()
@@ -1589,6 +1808,7 @@ impl PreparedDraftGraphs {
                     Ok((port, weight.part.of(resident).map_err(invalid)?))
                 })
                 .chain(constants.iter().map(|(port, tensor)| Ok((*port, tensor))))
+                .chain(leading.iter().map(|(port, tensor)| Ok((*port, tensor))))
                 .collect::<Result<Vec<_>, SubmitError>>()?;
             bound.insert(*class, graph.plan.bind_static(&fixed).map_err(device)?);
         }
@@ -1643,7 +1863,9 @@ fn resident_draft_weight(
 
 /// One pass's attention controls for one layer's history domain, padded to
 /// `rows` rows and `segments` spans: padding rows attend to nothing and
-/// append nowhere. The block pass reads its whole slot block fresh.
+/// append nowhere. A block pass (`block` is the layer's block attention)
+/// reads its history and its slot's block fresh, through the reading row
+/// when causal and wholly when bidirectional; the entry pass reads nothing.
 struct PassControls {
     coordinates: Vec<u8>,
     visible: Vec<u8>,
@@ -1657,7 +1879,7 @@ impl PassControls {
         domain: usize,
         rows: usize,
         segments: usize,
-        whole_slot_fresh: bool,
+        block: Option<BlockAttention>,
     ) -> Result<Self, SubmitError> {
         let actual = pass.actual_rows;
         if actual > rows {
@@ -1668,31 +1890,35 @@ impl PassControls {
             .get(domain)
             .ok_or_else(|| invalid("draft pass lacks a layer's history domain"))?;
         let mut visible = vec![0_i32; rows * segments * 2];
-        for (row, ranges) in history.visible[..actual].iter().enumerate() {
-            let used = ranges
-                .iter()
-                .rposition(|range| range[1] > range[0])
-                .map_or(0, |last| last + 1);
-            if used > segments {
-                return Err(invalid(format!(
-                    "draft row attends {used} history spans; the draft admits {segments}"
-                )));
-            }
-            for (span, [start, end]) in ranges[..used].iter().enumerate() {
-                let at = (row * segments + span) * 2;
-                visible[at] = *start;
-                visible[at + 1] = *end;
+        // Entry rows only append their K/V. Their attention result does not
+        // feed the block pass, so scanning the existing history here would
+        // repeat a full-context decode for each draft layer.
+        if block.is_some() {
+            for (row, ranges) in history.visible[..actual].iter().enumerate() {
+                let used = ranges
+                    .iter()
+                    .rposition(|range| range[1] > range[0])
+                    .map_or(0, |last| last + 1);
+                if used > segments {
+                    return Err(invalid(format!(
+                        "draft row attends {used} history spans; the draft admits {segments}"
+                    )));
+                }
+                for (span, [start, end]) in ranges[..used].iter().enumerate() {
+                    let at = (row * segments + span) * 2;
+                    visible[at] = *start;
+                    visible[at + 1] = *end;
+                }
             }
         }
         let fresh = (0..rows).map(|row| {
             if row >= actual {
                 return [0, 0];
             }
-            if whole_slot_fresh {
-                let slot = pass.row_slots[row] as usize;
-                pass.segments[slot]
-            } else {
-                history.fresh[row]
+            match block {
+                Some(BlockAttention::Causal) => history.fresh[row],
+                Some(BlockAttention::Bidirectional) => pass.segments[pass.row_slots[row] as usize],
+                None => [0, 0],
             }
         });
         Ok(Self {
@@ -1795,6 +2021,8 @@ impl NativeDraftProgram {
             entry_rows: entry_rows as u64,
             slots: slots as u64,
             shaped,
+            windowed: block.is_some() || core.windowed(),
+            device: matches!(core.conditioning(), crate::HeadConditioning::Features(_)),
         };
         let (graph, bound) = self.graphs.class(class)?;
         let planes = core
@@ -1818,7 +2046,8 @@ impl NativeDraftProgram {
                 .domain
                 .0;
             layer_domains.push(domain);
-            let passes = std::iter::once(&graph.injection[layer])
+            let passes = graph.injection[layer]
+                .iter()
                 .chain(graph.block.iter().map(|block| &block.layers[layer]));
             for ports in passes {
                 if ports.planes.len() != layer_planes.len() {
@@ -1831,40 +2060,71 @@ impl NativeDraftProgram {
                 }
             }
         }
-        // Conditioning rows in entry-row order, widened to F32 and padded.
-        let mut conditioning = Vec::new();
-        for rows in core.conditioning() {
-            conditioning.extend(widen(rows.bytes(), decoder.activation_dtype));
-        }
-        let row_bytes = decoder.hidden as usize * 4;
-        if conditioning.len() != entry.actual_rows * row_bytes {
-            return Err(invalid("draft conditioning bytes differ from the entry rows"));
-        }
-        conditioning.resize(entry_rows * row_bytes, 0);
         let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
-        active
-            .write_input(&graph.conditioning, &conditioning)
-            .map_err(device)?;
+        match (&graph.conditioning, core.conditioning()) {
+            // Host rows in entry-row order, widened to F32 and padded.
+            (DraftConditioning::Rows(port), crate::HeadConditioning::Rows(rows)) => {
+                let mut conditioning = Vec::new();
+                for rows in rows {
+                    conditioning.extend(widen(rows.bytes(), decoder.activation_dtype));
+                }
+                let row_bytes = decoder.hidden as usize * 4;
+                if conditioning.len() != entry.actual_rows * row_bytes {
+                    return Err(invalid(
+                        "draft conditioning bytes differ from the entry rows",
+                    ));
+                }
+                conditioning.resize(entry_rows * row_bytes, 0);
+                active.write_input(port, &conditioning).map_err(device)?;
+            }
+            // The target features' leading class rows; rows past the entry
+            // rows condition padding rows, whose injection writes nothing.
+            (DraftConditioning::Features(port), crate::HeadConditioning::Features(features)) => {
+                let features = features
+                    .tensor()
+                    .slice_leading(0, entry_rows as u64)
+                    .map_err(|error| invalid(format!("draft conditioning features: {error}")))?;
+                bindings.set(port, &features).map_err(device)?;
+            }
+            _ => return Err(invalid("draft conditioning differs from its graph class")),
+        }
         for (ports, &domain) in graph.injection.iter().zip(&layer_domains) {
-            let controls = PassControls::new(&entry, domain, entry_rows, 1, false)?;
+            let Some(ports) = ports else { continue };
+            let controls = PassControls::new(&entry, domain, entry_rows, 1, None)?;
             write_controls(&mut active, &ports.controls, &controls)?;
         }
         if let (Some(ports), Some(block)) = (&graph.block, &block) {
             if steps as u64 != self.graphs.prepared.proposals {
-                return Err(invalid("a draft batch drafts other than the load's proposals"));
+                return Err(invalid(
+                    "a draft batch drafts other than the load's proposals",
+                ));
             }
-            let block_rows = slots * draft.block_size as usize;
+            let block_rows = slots * draft.block_rows(steps as u64) as usize;
             let segments = self.graphs.prepared.segments as usize;
             active
                 .write_input(
                     &ports.tokens,
                     &i32_bytes((0..block_rows).flat_map(|row| {
-                        [block.tokens.get(row).copied().filter(|_| row < block.actual_rows).unwrap_or(0), 0]
+                        [
+                            block
+                                .tokens
+                                .get(row)
+                                .copied()
+                                .filter(|_| row < block.actual_rows)
+                                .unwrap_or(0),
+                            0,
+                        ]
                     })),
                 )
                 .map_err(device)?;
-            for (layer, &domain) in ports.layers.iter().zip(&layer_domains) {
-                let controls = PassControls::new(block, domain, block_rows, segments, true)?;
+            for ((layer, &domain), &attention) in ports
+                .layers
+                .iter()
+                .zip(&layer_domains)
+                .zip(&draft.block_attention)
+            {
+                let controls =
+                    PassControls::new(block, domain, block_rows, segments, Some(attention))?;
                 write_controls(&mut active, &layer.controls, &controls)?;
             }
             // Proposal k of slot s: graph row k · slots + s, packed
@@ -1876,9 +2136,7 @@ impl NativeDraftProgram {
                     0
                 }
             };
-            let head_rows = (0..steps).flat_map(|step| {
-                (0..slots).map(move |slot| (step, slot))
-            });
+            let head_rows = (0..steps).flat_map(|step| (0..slots).map(move |slot| (step, slot)));
             let rows = head_rows
                 .map(|(step, slot)| {
                     let index = packed(step, slot);
@@ -1896,7 +2154,7 @@ impl NativeDraftProgram {
             active
                 .write_input(&ports.head_rows, &i32_bytes(rows))
                 .map_err(device)?;
-            let words = block.mask_words;
+            let words = ports.readout_vocabulary.div_ceil(32) as usize;
             match ports.selections.as_slice() {
                 [selection] => {
                     let order = (0..steps)
@@ -1916,8 +2174,16 @@ impl NativeDraftProgram {
             }
             if let Some(anchors) = &ports.anchors {
                 let anchors_of = (0..slots).flat_map(|slot| {
-                    let row = slot * draft.block_size as usize;
-                    [block.tokens.get(row).copied().filter(|_| slot < actual_slots).unwrap_or(0), 0]
+                    let row = slot * draft.block_rows(steps as u64) as usize;
+                    [
+                        block
+                            .tokens
+                            .get(row)
+                            .copied()
+                            .filter(|_| slot < actual_slots)
+                            .unwrap_or(0),
+                        0,
+                    ]
                 });
                 active
                     .write_input(anchors, &i32_bytes(anchors_of))

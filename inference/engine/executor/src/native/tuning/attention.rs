@@ -32,6 +32,119 @@ use magnitude_kernels::{
 use seismic::{Device, Element, ScreeningPoint, Tensor};
 use std::ops::Range;
 
+/// Start the Vulkan key-parallel form and Metal's grouped-query matrix
+/// forms at a bounded encoded-history slice. A start changes only the form's
+/// first measurement; every admissible configuration remains searchable and
+/// is judged on the case's served points.
+fn decode_starts(
+    mix: &AttentionMix,
+    device: &Device,
+    implementation: &seismic::NativeImplementation,
+    statics: &seismic::NativeSpecialization,
+    limits: TuningLimits,
+) -> Vec<seismic::ParameterValues> {
+    let Some(defaults) = implementation.default_specialization(statics).ok() else {
+        return Vec::new();
+    };
+    let Some(admissible) = implementation.admissible(statics).ok() else {
+        return Vec::new();
+    };
+    let default_parts = defaults.param("PARTS").unwrap_or(1);
+    // K8/V4 codes and the scale/zero pairs use 7W/4 bytes per KV head row.
+    let bytes_per_head = limits
+        .context_tokens
+        .saturating_mul(mix.shape.width)
+        .saturating_mul(7)
+        / 4;
+    // Wide heads run the keywise walk in one subgroup. Across multiple
+    // verification rows, extra partitions multiply its merge and dispatch
+    // work; start at the default partition count and let the search compare
+    // wider choices on the rows this variant actually serves.
+    let wide_verification =
+        mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2) && mix.shape.width >= 512;
+    let desired_parts = if wide_verification {
+        default_parts
+    } else {
+        bytes_per_head.div_ceil(256 * 1024)
+    };
+    match device.backend() {
+        seismic::BackendName::Vulkan if desired_parts > default_parts || wide_verification => {
+            admissible
+                .into_iter()
+                .filter(|choice| {
+                    choice.param("MATRIX") == Some(0) && choice.param("KEYWISE") == Some(1)
+                })
+                .min_by_key(|choice| {
+                    let parts = choice.param("PARTS").unwrap_or(1);
+                    let distance = defaults
+                        .params()
+                        .iter()
+                        .filter(|(name, _)| name.as_str() != "PARTS" && name.as_str() != "KEYWISE")
+                        .map(|(name, value)| choice.param(name).unwrap_or(0).abs_diff(*value))
+                        .sum::<u64>();
+                    (
+                        parts.abs_diff(desired_parts),
+                        parts < desired_parts,
+                        distance,
+                    )
+                })
+                .map(|choice| choice.params().clone())
+                .into_iter()
+                .collect()
+        }
+        seismic::BackendName::Metal
+            if mix.shape.width <= 256
+                && ((mix.shape.group <= 4
+                    && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2))
+                    || mix.shape.group == 8) =>
+        {
+            admissible
+                .into_iter()
+                .filter(|choice| choice.param("MATRIX") == Some(1))
+                .min_by_key(|choice| {
+                    let parts = choice.param("PARTS").unwrap_or(1);
+                    // The long-context G8/W256 multirow form reuses one decoded
+                    // K/V tile across four verification rows. Seed it at the
+                    // measured tile geometry; the tuner still compares legal
+                    // configurations over all served rows and contexts.
+                    let wide_group = mix.shape.group == 8;
+                    let packed_g8 = wide_group
+                        && mix.shape.width == 256
+                        && limits.context_tokens >= 16_384
+                        && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2);
+                    let history_parts = limits
+                        .context_tokens
+                        .min(65_536)
+                        .saturating_mul(mix.shape.width)
+                        .saturating_mul(7)
+                        .div_ceil(4 * if wide_group { 512 * 1024 } else { 256 * 1024 });
+                    // Fewer than 32 partitions underfill the G8 decode grid on
+                    // the measured Apple GPUs even when history is short.
+                    // The packed form runs one simdgroup per token; its K and V
+                    // tiles fit 16 keys at W = 256.
+                    let (tokens, target_parts, keys, simds, span) = if packed_g8 {
+                        (4, history_parts.max(32).next_power_of_two(), 16, 4, 32)
+                    } else if wide_group {
+                        (1, history_parts.max(32), 8, 2, 128)
+                    } else {
+                        (4, history_parts, 8, 4, 128)
+                    };
+                    (
+                        choice.param("TOKENS").unwrap_or(1).abs_diff(tokens),
+                        parts.abs_diff(target_parts),
+                        choice.param("KEYS").unwrap_or(16).abs_diff(keys),
+                        choice.param("SIMDS").unwrap_or(4).abs_diff(simds),
+                        choice.param("SPAN").unwrap_or(128).abs_diff(span),
+                    )
+                })
+                .map(|choice| choice.params().clone())
+                .into_iter()
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// `attention_project`: RMS prologue, one segmented query | gate | key |
 /// value projection.
 pub(crate) struct AttentionProjectTuning {
@@ -160,6 +273,7 @@ impl EntryTuning for AttentionProjectTuning {
             key_weight: &case.key,
             value_weight: &case.value,
             epsilon: case.epsilon,
+            project_mode: 0,
         }
     }
 
@@ -260,11 +374,15 @@ impl EntryTuning for AttentionOutputTuning {
 }
 
 /// What every fused attention entry tunes over.
+#[derive(Clone)]
 pub(crate) struct AttentionMix {
     pub activation: Element,
     pub shape: AttentionShape,
     pub scopes: Vec<WeightScope>,
     pub epsilon: f32,
+    /// The row classes this variant serves. Distinct ranges have distinct
+    /// tuning identities and are validated on their own rows.
+    pub decode_rows: Option<Range<u64>>,
 }
 
 /// `attention_decode`, for row classes up to [`DECODE_ROWS`].
@@ -466,7 +584,15 @@ impl MixHistory for AffineMixHistory {
 
 impl AttentionMix {
     fn bindings(&self) -> String {
-        format!("A={}", self.activation.name())
+        match &self.decode_rows {
+            Some(rows) => format!(
+                "A={},M={}..{}",
+                self.activation.name(),
+                rows.start,
+                rows.end
+            ),
+            None => format!("A={}", self.activation.name()),
+        }
     }
 
     fn statics(&self) -> Vec<(&'static str, u64)> {
@@ -606,10 +732,21 @@ impl AttentionMix {
 /// planes; they share every other argument.
 macro_rules! mix_entry {
     ($tuning:ident, $module:ident, $history:ty, $serves:expr,
-     |$case:ident| { $($plane:ident: $state:expr),* $(,)? }) => {
+     |$case:ident| { $($plane:ident: $state:expr),* $(,)? }
+     $(, search_starts $starts:path)?) => {
         impl $tuning {
-            fn served(limits: TuningLimits) -> Vec<PointShape> {
-                with_contexts(limits, served_row_points(limits.max_rows, $serves))
+            fn served(&self, limits: TuningLimits) -> Vec<PointShape> {
+                with_contexts(
+                    limits,
+                    served_row_points(limits.max_rows, |rows| {
+                        ($serves)(rows)
+                            && self
+                                .0
+                                .decode_rows
+                                .as_ref()
+                                .is_none_or(|range| range.contains(&rows))
+                    }),
+                )
             }
         }
 
@@ -633,15 +770,25 @@ macro_rules! mix_entry {
             }
 
             fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-                Self::served(limits)
+                self.served(limits)
             }
+
+            $(fn search_starts(
+                &self,
+                device: &Device,
+                implementation: &seismic::NativeImplementation,
+                statics: &seismic::NativeSpecialization,
+                limits: TuningLimits,
+            ) -> Vec<seismic::ParameterValues> {
+                $starts(&self.0, device, implementation, statics, limits)
+            })?
 
             fn rotation(
                 &self,
                 inputs: &mut TuningInputs<'_, '_>,
                 point: &PointShape,
             ) -> Result<Vec<Self::Case>, String> {
-                let points = Self::served(inputs.limits);
+                let points = self.served(inputs.limits);
                 self.0.rotation(inputs, point, points)
             }
 
@@ -686,7 +833,8 @@ mix_entry!(
     |case| {
         history_key: case.history.key.tensor_mut(),
         history_value: case.history.value.tensor_mut(),
-    }
+    },
+    search_starts decode_starts
 );
 mix_entry!(
     AttentionPrefillTuning,
@@ -708,7 +856,8 @@ mix_entry!(
         history_key_coefficients: case.history.key_coefficients.tensor_mut(),
         history_value_codes: case.history.value_codes.tensor_mut(),
         history_value_coefficients: case.history.value_coefficients.tensor_mut(),
-    }
+    },
+    search_starts decode_starts
 );
 mix_entry!(
     AttentionPrefillK8V4Tuning,
@@ -722,3 +871,74 @@ mix_entry!(
         history_value_coefficients: case.history.value_coefficients.tensor_mut(),
     }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_decode_has_distinct_tuning_identity_and_served_rows() {
+        let mix = AttentionMix {
+            activation: Element::bf16(),
+            shape: AttentionShape {
+                hidden: 2560,
+                kv_heads: 4,
+                group: 4,
+                rotary_pairs: 64,
+                width: 256,
+                interleaved_gate: 256,
+                separate_gate: 0,
+                fresh: 1,
+                head_norm: 1,
+                value_norm: 0,
+                projected_value: true,
+            },
+            scopes: Vec::new(),
+            epsilon: 1.0e-5,
+            decode_rows: Some(1..2),
+        };
+        let single = AttentionDecodeK8V4Tuning(mix);
+        let limits = TuningLimits {
+            max_rows: 8,
+            max_projected_rows: 8,
+            context_tokens: 256,
+        };
+        // Each served row is measured at several contexts.
+        assert_eq!(
+            single
+                .points(limits)
+                .iter()
+                .map(|point| point.rows)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [1].into()
+        );
+        assert_eq!(single.bindings(), "A=bf16,M=1..2");
+        let mut mix = single.0;
+        mix.decode_rows = Some(2..DECODE_ROWS + 1);
+        let verify = AttentionDecodeK8V4Tuning(mix);
+        assert_eq!(
+            verify
+                .points(limits)
+                .iter()
+                .map(|point| point.rows)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [2, 4, 8].into()
+        );
+        assert_eq!(verify.bindings(), "A=bf16,M=2..9");
+
+        let mut classes = Vec::new();
+        for range in [2..4, 4..5, 5..DECODE_ROWS + 1] {
+            let mut mix = verify.0.clone();
+            mix.decode_rows = Some(range.clone());
+            let tuned = AttentionDecodeK8V4Tuning(mix);
+            let rows = tuned
+                .points(limits)
+                .iter()
+                .map(|point| point.rows)
+                .collect::<Vec<_>>();
+            assert!(rows.iter().all(|row| range.contains(row)));
+            classes.extend(range);
+        }
+        assert_eq!(classes, (2..DECODE_ROWS + 1).collect::<Vec<_>>());
+    }
+}

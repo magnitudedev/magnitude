@@ -201,6 +201,77 @@ void attention_absorb(const uint n, float q[ATTENTION_HEADS][ATTENTION_E], float
     }
 }
 
+// ---------------------------------------------------------------------------
+// The key-parallel decode form (`attention_decode_k8v4`'s KEYWISE parameter;
+// its history part is `history_keywise_absorb`): a subgroup absorbs up to
+// ATTENTION_KEYS keys at a time. Lane t scores key t for all ATTENTION_HEADS
+// heads of its slice over the whole width, reading the prepared queries from
+// shared memory as broadcasts, so a score needs no subgroup reduction; the
+// batch takes one subgroup maximum and sum per head. Its probabilities pass
+// through the subgroup's shared weights [ATTENTION_KEYS][ATTENTION_HEADS]
+// (floats) to the value product, which keeps `attention_absorb`'s
+// lane-owns-columns layout, so the state is the vector form's.
+//
+// Keywise prepared queries: [G][W] F32 (rounded to A, times scale * log2e)
+// from shared float `queries`, 16-byte aligned.
+#define ATTENTION_KEYS 32u
+
+// Query head `head`'s prepared columns [column, column + 4).
+vec4 attention_keywise_query(uint queries, uint head, uint column) {
+    return uintBitsToFloat(seismic_shared_uvec4[(queries + head * ATTENTION_W + column) / 4u]);
+}
+
+// Lane `lane`'s E columns of query head `head` from the keywise queries.
+void attention_keywise_columns(uint queries, uint head, uint lane, out float q[ATTENTION_E]) {
+    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+        q[i] = seismic_shared_f32[queries + head * ATTENTION_W + lane * ATTENTION_E + i];
+}
+
+// Folds a batch of `n` keys into the online state from each lane's scores of
+// its key (lanes at or past `n` hold none): per head one maximum over the
+// batch; the outputs rescale, and the probabilities go to the subgroup's
+// weights at shared float `weights`.
+void attention_keywise_softmax(const uint n, float score[ATTENTION_HEADS], uint weights,
+    inout float maximum[ATTENTION_HEADS], inout float denominator[ATTENTION_HEADS],
+    inout float result[ATTENTION_HEADS][ATTENTION_E]) {
+    const uint lane = SEISMIC_LANE;
+    // The previous batch's weights are read.
+    subgroupBarrier();
+    [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g) {
+        const float s = lane < n ? score[g] : -ATTENTION_INF;
+        const float next = max(maximum[g], seismic_subgroup_max_f32(s));
+        const float carry = exp2(maximum[g] - next);
+        const float probability = exp2(s - next);
+        denominator[g] = seismic_fma_rn(denominator[g], carry, seismic_subgroup_sum_f32(probability));
+        maximum[g] = next;
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+            result[g][i] *= carry;
+        seismic_shared_f32[weights + lane * ATTENTION_HEADS + g] = probability;
+    }
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+}
+
+// Accumulates key `key` of the batch (this lane's E value columns `v`) with
+// its weights into the outputs.
+void attention_keywise_accumulate(uint weights, uint key, float v[ATTENTION_E],
+    inout float result[ATTENTION_HEADS][ATTENTION_E]) {
+    float p[ATTENTION_HEADS];
+    if (ATTENTION_HEADS % 4u == 0u) {
+        [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; g += 4u) {
+            const vec4 four = uintBitsToFloat(seismic_shared_uvec4[(weights + key * ATTENTION_HEADS + g) / 4u]);
+            [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                p[g + j] = four[j];
+        }
+    } else {
+        [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g)
+            p[g] = seismic_shared_f32[weights + key * ATTENTION_HEADS + g];
+    }
+    [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g)
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+            result[g][i] = seismic_fma_rn(p[g], v[i], result[g][i]);
+}
+
 // The fixed-order merge of `count` partial attention states for one column:
 // state p is slot first + p * stride, with its unnormalized output at
 // partials[slot * W + column] (relative to its maximum) and (maximum,

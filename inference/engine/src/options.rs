@@ -6,18 +6,18 @@
 
 use magnitude_artifacts::{Package, PackageIdentity, PackageManifest};
 use magnitude_chat::generation::MethodPolicy;
-use magnitude_generation::{DFlash, Method, Mtp, Plain};
-use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, Operator};
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     ExecutionPath, ResourcePlan, MAX_DRAFT_PROPOSALS,
 };
+use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, Operator};
+use magnitude_generation::{DFlash, Method, Mtp, Plain};
 
 /// Dense-target MTP width when none is requested.
 const DEFAULT_PROPOSALS: u8 = 3;
-use magnitude_state::KvCodec;
-use magnitude_scheduler::ServiceLimits;
 use crate::census::AllocationCensus;
+use magnitude_scheduler::ServiceLimits;
+use magnitude_state::KvCodec;
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
 
@@ -122,7 +122,9 @@ pub enum ResolvedMethod {
         sampled_proposals: u8,
     },
     /// A separate draft drafting `proposals` tokens per block.
-    DFlash { proposals: u8 },
+    DFlash {
+        proposals: u8,
+    },
 }
 
 impl ResolvedMethod {
@@ -380,7 +382,9 @@ fn resolve_method(
         let proposals = match override_width {
             Some(0) => return Err("mtp_proposals must be positive".into()),
             Some(width) if width > bound => {
-                return Err(format!("the draft proposes at most {bound} tokens per block"))
+                return Err(format!(
+                    "the draft proposes at most {bound} tokens per block"
+                ))
             }
             Some(width) => width,
             None => DEFAULT_PROPOSALS.min(bound),
@@ -390,10 +394,9 @@ fn resolve_method(
     let use_mtp = match requested {
         // A head this executor does not run leaves the model plain.
         ModelMethod::Auto => magnitude_executor::head_admitted(definition),
-        ModelMethod::Plain
-        | ModelMethod::DFlash
-        | ModelMethod::DSpark
-        | ModelMethod::DFlash2 => false,
+        ModelMethod::Plain | ModelMethod::DFlash | ModelMethod::DSpark | ModelMethod::DFlash2 => {
+            false
+        }
         ModelMethod::Mtp => true,
     };
     if !use_mtp {
@@ -516,9 +519,7 @@ mod tests {
                 target: magnitude_artifacts::ArtifactIdentity([1; 32]),
                 projector: None,
             },
-            inputs: magnitude_family_contracts::InputSemantics {
-                coordinate_axes: 1,
-            },
+            inputs: magnitude_family_contracts::InputSemantics { coordinate_axes: 1 },
             decoder: Decoder {
                 activation_dtype: ActivationDType::BF16,
                 hidden: 2,
@@ -578,7 +579,8 @@ mod tests {
 
     fn with_draft(method: magnitude_family_contracts::DraftMethod) -> ModelDefinition {
         use magnitude_family_contracts::{
-            BlockLayout, DraftDefinition, DraftEmbedding, SublayerIndex, TapPoint, TokenId,
+            BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, SublayerIndex, TapPoint,
+            TokenId,
         };
         ModelDefinition {
             draft: Some(DraftDefinition {
@@ -591,6 +593,7 @@ mod tests {
                 fusion_norm: rms("enc"),
                 embedding: DraftEmbedding::Target,
                 blocks: vec![block("d")],
+                block_attention: vec![BlockAttention::Bidirectional],
                 output_norm: rms("don"),
                 block_size: 4,
                 mask_token: TokenId(7),

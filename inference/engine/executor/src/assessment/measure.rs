@@ -28,8 +28,8 @@
 //! than the planning reserve.
 
 use super::basis::{
-    median, BasisIdentity, ClassCost, ClassMeasurement, CostModel, CostShape, HeadGeometry, MeasuredPoint,
-    MeasurementBasis, MeasurementKey, OperationClass, PointShape,
+    median, BasisIdentity, ClassCost, ClassMeasurement, CostModel, CostShape, HeadGeometry,
+    MeasuredPoint, MeasurementBasis, MeasurementKey, OperationClass, PointShape,
 };
 use super::plan::{activation, measurement_plan, reference_weight, PlannedKey};
 
@@ -41,15 +41,15 @@ mod state_space;
 use crate::platform::{refresh_device_ceiling, MemoryPolicyError, MemoryReserves};
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_project, dense_expand,
-    dense_output, embedding_rows, gated_delta_output, gated_delta_project,
-    gated_delta_step, readout_features_rows, readout_head_rows, routed_expand, routed_output,
-    routed_route, sample_rows,
+    dense_output, embedding_rows, gated_delta_output, gated_delta_project, gated_delta_step,
+    readout_features_rows, readout_head_rows, routed_expand, routed_output, routed_route,
+    sample_rows,
 };
 use magnitude_state::{BankComponent, ComponentDescriptor, KvCodec, LayerRef};
 use seismic::{
     generated, BackendName, Device, DeviceCatalog, Element, Entry, LoadError, NativeGraph,
-    NativeGraphPlan, NativeGraphSlot, NativeKernel, NativePort, NativeSpecialization, SlabLayout, SlabRegion, SlabTensor,
-    SubmissionTrace, Tensor, TraceDetail, WorkflowTensor,
+    NativeGraphPlan, NativeGraphSlot, NativeKernel, NativePort, NativeSpecialization, SlabLayout,
+    SlabRegion, SlabTensor, SubmissionTrace, Tensor, TraceDetail, WorkflowTensor,
 };
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -105,7 +105,13 @@ const FORM_LAUNCH: Launch = Launch {
 };
 
 /// The point of a weight-streaming launch that ran `rows` output rows.
-fn launch_point(at: Launch, rows: u64, weight: Element, bytes: u64, samples: Vec<f64>) -> MeasuredPoint {
+fn launch_point(
+    at: Launch,
+    rows: u64,
+    weight: Element,
+    bytes: u64,
+    samples: Vec<f64>,
+) -> MeasuredPoint {
     MeasuredPoint {
         shape: PointShape::Launch {
             rows,
@@ -237,7 +243,11 @@ const HISTORY_ROTARY_PAIRS: u64 = 32;
 /// axis's other values at one depth.
 fn history_points(backend: BackendName) -> Vec<(HeadGeometry, u64)> {
     let reference = HISTORY_REFERENCE;
-    let depths = if backend == BackendName::Cpu { &CPU_HISTORY_DEPTHS } else { &HISTORY_DEPTHS };
+    let depths = if backend == BackendName::Cpu {
+        &CPU_HISTORY_DEPTHS
+    } else {
+        &HISTORY_DEPTHS
+    };
     depths
         .iter()
         .map(|&depth| (reference, depth))
@@ -250,24 +260,16 @@ fn history_points(backend: BackendName) -> Vec<(HeadGeometry, u64)> {
                 HISTORY_DEPTH,
             )
         }))
-        .chain(HISTORY_GROUPS.iter().map(|&group| {
-            (
-                HeadGeometry {
-                    group,
-                    ..reference
-                },
-                HISTORY_DEPTH,
-            )
-        }))
-        .chain(HISTORY_WIDTHS.iter().map(|&width| {
-            (
-                HeadGeometry {
-                    width,
-                    ..reference
-                },
-                HISTORY_DEPTH,
-            )
-        }))
+        .chain(
+            HISTORY_GROUPS
+                .iter()
+                .map(|&group| (HeadGeometry { group, ..reference }, HISTORY_DEPTH)),
+        )
+        .chain(
+            HISTORY_WIDTHS
+                .iter()
+                .map(|&width| (HeadGeometry { width, ..reference }, HISTORY_DEPTH)),
+        )
         .collect()
 }
 
@@ -345,7 +347,10 @@ impl fmt::Display for MeasurementError {
                 write!(formatter, "device fault while timing {key}: {message}")
             }
             Self::Fit { key, message } => {
-                write!(formatter, "measured {key} does not fit its cost model: {message}")
+                write!(
+                    formatter,
+                    "measured {key} does not fit its cost model: {message}"
+                )
             }
             Self::Trace(message) => write!(formatter, "measurement trace: {message}"),
         }
@@ -443,7 +448,11 @@ pub fn complete_basis(
     let plan = measurement_plan(device.backend());
     let missing = plan
         .iter()
-        .filter(|planned| !classes.iter().any(|(measured, _)| measured == planned.key()))
+        .filter(|planned| {
+            !classes
+                .iter()
+                .any(|(measured, _)| measured == planned.key())
+        })
         .cloned()
         .collect::<Vec<_>>();
     let measured = (|| {
@@ -624,7 +633,11 @@ struct MeasurementBudget {
 }
 
 fn point_weight(class: OperationClass) -> usize {
-    if class.cost_shape() == CostShape::History { 4 } else { 1 }
+    if class.cost_shape() == CostShape::History {
+        4
+    } else {
+        1
+    }
 }
 
 fn planned_point_count(planned: &PlannedKey) -> usize {
@@ -705,7 +718,13 @@ impl<'a> Session<'a> {
     /// Choose a history extent whose predicted graph can be sampled within
     /// this point's allowance. The first reference extent establishes a rate;
     /// its second extent separates the launch floor from streamed bytes.
-    fn history_depth(&self, affine: bool, heads: HeadGeometry, requested: u64, row_bytes: u64) -> u64 {
+    fn history_depth(
+        &self,
+        affine: bool,
+        heads: HeadGeometry,
+        requested: u64,
+        row_bytes: u64,
+    ) -> u64 {
         if self.budget.get().is_none() {
             return requested;
         }
@@ -716,17 +735,32 @@ impl<'a> Session<'a> {
         }
         let rate = if points.len() >= 2 && points[0].0 != points[1].0 {
             let slope = (points[1].1 - points[0].1) / (points[1].0 as f64 - points[0].0 as f64);
-            if slope > 0.0 { slope } else { points[1].1 / points[1].0.max(1) as f64 }
+            if slope > 0.0 {
+                slope
+            } else {
+                points[1].1 / points[1].0.max(1) as f64
+            }
         } else {
             (points[0].1 / points[0].0.max(1) as f64).max(f64::MIN_POSITIVE)
         };
         let group_factor = heads.group as f64 / HISTORY_REFERENCE.group as f64;
         let seconds_per_row = rate * row_bytes as f64 * group_factor;
-        let available = self.point_budget(point_weight(OperationClass::AttentionDecode)).as_secs_f64() / 3.0;
+        let available = self
+            .point_budget(point_weight(OperationClass::AttentionDecode))
+            .as_secs_f64()
+            / 3.0;
         let rows = (available / seconds_per_row).floor() as u64;
-        let mut depth = rows.clamp(256, requested).div_ceil(256).saturating_mul(256).min(requested);
+        let mut depth = rows
+            .clamp(256, requested)
+            .div_ceil(256)
+            .saturating_mul(256)
+            .min(requested);
         if heads == HISTORY_REFERENCE && points.len() == 1 && depth * row_bytes == points[0].0 {
-            depth = if depth < requested { (depth * 2).min(requested) } else { depth / 2 };
+            depth = if depth < requested {
+                (depth * 2).min(requested)
+            } else {
+                depth / 2
+            };
         }
         depth
     }
@@ -747,13 +781,21 @@ impl<'a> Session<'a> {
         let points = &references[usize::from(affine)];
         let launches = if let Some((reference_bytes, reference_seconds)) = points.last() {
             let estimated = reference_seconds * bytes as f64 / *reference_bytes as f64
-                * heads.group as f64 / HISTORY_REFERENCE.group as f64;
-            let target = self.point_budget(point_weight(OperationClass::AttentionDecode)).as_secs_f64() / 3.0;
+                * heads.group as f64
+                / HISTORY_REFERENCE.group as f64;
+            let target = self
+                .point_budget(point_weight(OperationClass::AttentionDecode))
+                .as_secs_f64()
+                / 3.0;
             (target / estimated.max(f64::MIN_POSITIVE)).floor() as u64
         } else {
             1
         };
-        self.rotation.set(bytes.saturating_mul(launches.clamp(1, MAX_LAUNCHES)).min(128 << 20));
+        self.rotation.set(
+            bytes
+                .saturating_mul(launches.clamp(1, MAX_LAUNCHES))
+                .min(128 << 20),
+        );
     }
 
     /// Form every native kernel of `plan` in parallel: a formation pass over
@@ -1030,7 +1072,9 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                                 }),
                         )
                         .find(|candidate| implementation.validate(candidate).is_ok());
-                    if let Some(variant) = admitted.filter(|variant| !specializations.contains(variant)) {
+                    if let Some(variant) =
+                        admitted.filter(|variant| !specializations.contains(variant))
+                    {
                         specializations.push(variant);
                     }
                 }
@@ -1215,11 +1259,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         if pool.cursor + needed > pool.rows {
             // Views already handed out keep the old allocation alive; the
             // point continues in a pool that holds all of its views.
-            *pool = self.pool(
-                element,
-                trailing,
-                (pool.cursor + needed).max(2 * pool.rows),
-            )?;
+            *pool = self.pool(element, trailing, (pool.cursor + needed).max(2 * pool.rows))?;
         }
         let views = (0..count)
             .map(|_| {
@@ -1418,12 +1458,16 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 } else {
                     self.per_launch(&mut variant, 1)?[0]
                 };
-                if chosen.as_ref().is_none_or(|(_, _, fastest)| sample < *fastest) {
+                if chosen
+                    .as_ref()
+                    .is_none_or(|(_, _, fastest)| sample < *fastest)
+                {
                     chosen = Some((index, variant, sample));
                 }
                 index += 1;
             }
-            let (chosen, mut sealed, _) = chosen.ok_or_else(|| failed("no formed variant was timed"))?;
+            let (chosen, mut sealed, _) =
+                chosen.ok_or_else(|| failed("no formed variant was timed"))?;
             let probe = sealed.probe.max(1e-7) * sealed.passes as f64;
             let remaining = POINT_BUDGET.saturating_sub(began.elapsed()).as_secs_f64();
             let runs = ((remaining / probe).floor() as usize).clamp(MIN_TIMED_SAMPLES, RUNS);
@@ -1454,12 +1498,16 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             } else {
                 self.per_launch(&mut variant, 1)?[0]
             };
-            if chosen.as_ref().is_none_or(|(_, _, fastest)| sample < *fastest) {
+            if chosen
+                .as_ref()
+                .is_none_or(|(_, _, fastest)| sample < *fastest)
+            {
                 chosen = Some((index, variant, sample));
             }
             index += 1;
         }
-        let (chosen, mut sealed, _) = chosen.ok_or_else(|| failed("no formed variant was timed"))?;
+        let (chosen, mut sealed, _) =
+            chosen.ok_or_else(|| failed("no formed variant was timed"))?;
         // Screening includes the graph's first execution. Its cold bindings
         // and native preparation can differ from a served steady launch, so
         // it selects the variant but does not become fitted cost evidence.
@@ -1569,13 +1617,14 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             }
             (C::AttentionDecode | C::AttentionDecodeK8V4, &[activation]) => {
                 let affine = key.class == C::AttentionDecodeK8V4;
-                self.each(&history_points(self.device().backend()), |(heads, depth)| {
-                    self.attention_decode(affine, activation, heads, depth)
-                })
+                self.each(
+                    &history_points(self.device().backend()),
+                    |(heads, depth)| self.attention_decode(affine, activation, heads, depth),
+                )
             }
-            (C::DeltaStep, &[activation]) => {
-                self.each(&DELTA_STEP_HEADS, |heads| self.delta_step(activation, heads))
-            }
+            (C::DeltaStep, &[activation]) => self.each(&DELTA_STEP_HEADS, |heads| {
+                self.delta_step(activation, heads)
+            }),
             (C::RoutedSelect | C::RoutedRoute, bindings) => {
                 let (norm, router, activation) = match bindings {
                     &[activation] => (activation, activation, activation),
@@ -1629,9 +1678,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 }],
                 |at| self.project_rows(weight, activation, at),
             ),
-            (C::PostNormResidual, &[norm]) => {
-                self.each(&[()], |()| self.post_norm_residual(norm))
-            }
+            (C::PostNormResidual, &[norm]) => self.each(&[()], |()| self.post_norm_residual(norm)),
             (C::MoeTail, &[norm]) => self.each(&[()], |()| self.moe_tail(norm)),
             (C::PerLayerInputs, bindings) => {
                 let (table, norm) = match bindings {
@@ -1802,6 +1849,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                             key_weight: key.tensor().into(),
                             value_weight: value.tensor().into(),
                             epsilon: 1e-6,
+                            project_mode: 0,
                         },
                     )
                     .map_err(failed)?;
@@ -1811,7 +1859,13 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             }
             Ok((timed, launches))
         })?;
-        Ok(launch_point(at, query + 2 * key_rows, weight, point_bytes, samples))
+        Ok(launch_point(
+            at,
+            query + 2 * key_rows,
+            weight,
+            point_bytes,
+            samples,
+        ))
     }
 
     /// Fused attention of one decode row over `depth` history rows at
@@ -2027,7 +2081,8 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
                 Ok((timed, launches))
             })?
         };
-        self.session.observe_history(affine, heads, history_bytes, &samples);
+        self.session
+            .observe_history(affine, heads, history_bytes, &samples);
         Ok(MeasuredPoint {
             shape: PointShape::Heads(heads),
             bytes: history_bytes,
@@ -2415,7 +2470,14 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let device = self.device();
         let kernels = self.form::<dense_expand::Entry>(
             &[norm, weight, activation],
-            &[("M", 1), ("O", 1), ("H", hidden), ("F", features), ("GS", 0), ("US", 0)],
+            &[
+                ("M", 1),
+                ("O", 1),
+                ("H", hidden),
+                ("F", features),
+                ("GS", 0),
+                ("US", 0),
+            ],
             move |specialization| {
                 dense_expand::native_for_device_with(
                     device,
@@ -2482,7 +2544,13 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let device = self.device();
         let kernels = self.form::<dense_output::Entry>(
             &[weight, activation],
-            &[("M", 1), ("O", 1), ("H", hidden), ("F", features), ("DS", 0)],
+            &[
+                ("M", 1),
+                ("O", 1),
+                ("H", hidden),
+                ("F", features),
+                ("DS", 0),
+            ],
             move |specialization| {
                 dense_output::native_for_device_with(
                     device,
@@ -2539,7 +2607,12 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         hidden: u64,
         experts: u64,
     ) -> Step<MeasuredPoint> {
-        let dimensions = [("M", 1), ("H", hidden), ("E", experts), ("K", ROUTED_SELECTED)];
+        let dimensions = [
+            ("M", 1),
+            ("H", hidden),
+            ("E", experts),
+            ("K", ROUTED_SELECTED),
+        ];
         let device = self.device();
         let kernels = self.form::<routed_route::Entry>(
             &[norm, router, activation],
@@ -2687,7 +2760,13 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             }
             Ok((timed, launches))
         })?;
-        Ok(launch_point(at, 2 * (experts + 1) * features, weight, point_bytes, samples))
+        Ok(launch_point(
+            at,
+            2 * (experts + 1) * features,
+            weight,
+            point_bytes,
+            samples,
+        ))
     }
 
     /// Decode down projection of 8 selected experts and a shared expert over
@@ -2772,7 +2851,13 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             }
             Ok((timed, launches))
         })?;
-        Ok(launch_point(at, (experts + 1) * hidden, weight, point_bytes, samples))
+        Ok(launch_point(
+            at,
+            (experts + 1) * hidden,
+            weight,
+            point_bytes,
+            samples,
+        ))
     }
 
     /// The final norm of one 4096-wide output row: a launch-dominated class.
@@ -2836,7 +2921,13 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let device = self.device();
         let kernels = self.form::<readout_head_rows::Entry>(
             &[norm, weight, activation],
-            &[("M", 1), ("O", 1), ("V", vocabulary), ("D", hidden), ("WS", 0)],
+            &[
+                ("M", 1),
+                ("O", 1),
+                ("V", vocabulary),
+                ("D", hidden),
+                ("WS", 0),
+            ],
             move |specialization| {
                 readout_head_rows::native_for_device_with(
                     device,
@@ -3006,7 +3097,14 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         );
         let expand = self.form::<dense_expand::Entry>(
             &[activation, weight, activation],
-            &[("M", 1), ("O", 1), ("H", hidden), ("F", features), ("GS", 0), ("US", 0)],
+            &[
+                ("M", 1),
+                ("O", 1),
+                ("H", hidden),
+                ("F", features),
+                ("GS", 0),
+                ("US", 0),
+            ],
             move |specialization| {
                 dense_expand::native_for_device_with(
                     device,
@@ -3022,7 +3120,13 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         );
         let down = self.form::<dense_output::Entry>(
             &[weight, activation],
-            &[("M", 1), ("O", 1), ("H", hidden), ("F", features), ("DS", 0)],
+            &[
+                ("M", 1),
+                ("O", 1),
+                ("H", hidden),
+                ("F", features),
+                ("DS", 0),
+            ],
             move |specialization| {
                 dense_output::native_for_device_with(
                     device,
@@ -3047,15 +3151,19 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         }
         // The same standalone costs used to isolate dependency also predict
         // how many chained cycles can fit the point allowance.
-        let class_seconds = |class: OperationClass, rows: u64, streamed: u64| -> Step<f64> {
-            let key = MeasurementKey::new(class, &[activation]);
-            let points = self.points(&key)?;
-            match ClassCost::from_points(class, &points).map_err(failed)?.model {
-                CostModel::Projection(projection) => Ok(projection.launch_seconds
-                    + projection.seconds_per_byte(rows) * streamed as f64),
-                _ => Err(failed(format!("{} is not a projection", class.name()))),
-            }
-        };
+        let class_seconds =
+            |class: OperationClass, rows: u64, streamed: u64| -> Step<f64> {
+                let key = MeasurementKey::new(class, &[activation]);
+                let points = self.points(&key)?;
+                match ClassCost::from_points(class, &points)
+                    .map_err(failed)?
+                    .model
+                {
+                    CostModel::Projection(projection) => Ok(projection.launch_seconds
+                        + projection.seconds_per_byte(rows) * streamed as f64),
+                    _ => Err(failed(format!("{} is not a projection", class.name()))),
+                }
+            };
         let project_bytes = sum(&[
             bytes(weight, &[channels, hidden])?,
             bytes(weight, &[inner, hidden])?,
@@ -3066,27 +3174,27 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
             bytes(weight, &[features, hidden])?,
             bytes(weight, &[features, hidden])?,
         ])?;
-        let standalone_per_call = (class_seconds(
-            OperationClass::DeltaProject,
-            channels + inner + 2 * value_heads,
-            project_bytes,
-        )? + class_seconds(
-            OperationClass::DeltaOutput,
-            hidden,
-            bytes(weight, &[hidden, inner])?,
-        )? + class_seconds(OperationClass::DenseExpand, 2 * features, expand_bytes)?
-            + class_seconds(
-                OperationClass::DenseOutput,
+        let standalone_per_call =
+            (class_seconds(
+                OperationClass::DeltaProject,
+                channels + inner + 2 * value_heads,
+                project_bytes,
+            )? + class_seconds(
+                OperationClass::DeltaOutput,
                 hidden,
-                bytes(weight, &[hidden, features])?,
-            )?)
-            / CHAIN_CALLS_PER_CYCLE as f64;
+                bytes(weight, &[hidden, inner])?,
+            )? + class_seconds(OperationClass::DenseExpand, 2 * features, expand_bytes)?
+                + class_seconds(
+                    OperationClass::DenseOutput,
+                    hidden,
+                    bytes(weight, &[hidden, features])?,
+                )?)
+                / CHAIN_CALLS_PER_CYCLE as f64;
         self.begin()?;
         let cycles = if self.session.budget.get().is_some() {
             (self.session.point_budget(1).as_secs_f64()
-                / (standalone_per_call * CHAIN_CALLS_PER_CYCLE as f64 * 3.0)
-                    .max(f64::MIN_POSITIVE))
-                .floor() as usize
+                / (standalone_per_call * CHAIN_CALLS_PER_CYCLE as f64 * 3.0).max(f64::MIN_POSITIVE))
+            .floor() as usize
         } else {
             CHAIN_CYCLES
         }
@@ -3210,7 +3318,7 @@ impl<'q, 's, 'a> Runner<'q, 's, 'a> {
         let count = if self.session.budget.get().is_some() {
             (self.session.point_budget(1).as_secs_f64()
                 / (chained_call * calls as f64).max(f64::MIN_POSITIVE))
-                .floor() as usize
+            .floor() as usize
         } else {
             CHAIN_SAMPLES
         }
@@ -3274,16 +3382,27 @@ mod tests {
     #[test]
     fn cpu_budget_covers_every_timed_point() {
         let plan = measurement_plan(BackendName::Cpu);
-        assert_eq!(plan.iter().filter(|entry| matches!(entry, PlannedKey::Timed(_))).count(), 47);
+        assert_eq!(
+            plan.iter()
+                .filter(|entry| matches!(entry, PlannedKey::Timed(_)))
+                .count(),
+            47
+        );
         assert_eq!(plan.iter().map(planned_point_count).sum::<usize>(), 131);
     }
 
     #[test]
     fn history_points_differ_from_the_reference_in_one_axis() {
         let points = history_points(BackendName::Cpu);
-        assert_eq!(&points[..2], &[(HISTORY_REFERENCE, 1024), (HISTORY_REFERENCE, 32_768)]);
+        assert_eq!(
+            &points[..2],
+            &[(HISTORY_REFERENCE, 1024), (HISTORY_REFERENCE, 32_768)]
+        );
         let metal = history_points(BackendName::Metal);
-        assert_eq!(&metal[..2], &[(HISTORY_REFERENCE, 4096), (HISTORY_REFERENCE, 32_768)]);
+        assert_eq!(
+            &metal[..2],
+            &[(HISTORY_REFERENCE, 4096), (HISTORY_REFERENCE, 32_768)]
+        );
         for (heads, depth) in &points[2..] {
             assert_eq!(*depth, HISTORY_DEPTH);
             let differing = [

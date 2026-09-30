@@ -80,9 +80,20 @@ void history_lane_load(const uint b, uint64_t row, uint lane, out uint w[HISTORY
     }
 }
 
+// The B-bit code at bit `shift` of `word`, as F32 (exact). The code becomes
+// the top mantissa bits of 1 + code / 2^B, which one exact FMA rescales:
+// shifts and a logic op instead of an integer conversion (a quarter-rate
+// instruction on NVIDIA hardware).
+float history_code_at(const uint b, uint word, const uint shift) {
+    const uint top = 23u - b;
+    const uint placed = shift <= top ? word << (top - shift) : word >> (shift - top);
+    const float mantissa = uintBitsToFloat((placed & (history_levels(b) << top)) | 0x3f800000u);
+    return seismic_fma_rn(mantissa, float(1u << b), -float(1u << b));
+}
+
 // Code i of this lane's columns, as F32 (exact).
 float history_code(const uint b, uint w[HISTORY_LANE_WORDS], uint i) {
-    return float((w[(i * b) / 32u] >> ((i * b) % 32u)) & history_levels(b));
+    return history_code_at(b, w[(i * b) / 32u], (i * b) % 32u);
 }
 
 // Encodes one vector held by a subgroup (lane `lane` owns columns [lane * E,
@@ -201,6 +212,202 @@ void history_stage(attention_history h, const bool is_key, int first, int end, u
         }
         seismic_shared_uvec4[(base + k * flash_pitch(w) + staged) / 8u] = bits;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The keywise form (`attention_keywise_*`) over affine history, a batch of up
+// to ATTENTION_KEYS keys at a time. Lane t's score of key t is, per group,
+// scale * (q . code) + zero * sum(q) over the whole width; each lane decodes
+// its E value columns (code * scale + zero) as it accumulates them. Every
+// history row is read coalesced (consecutive lanes read consecutive 16 bytes
+// of a row) through the subgroup's staging tile: lane t reading key t's row
+// directly leaves each load instruction one 16-byte piece of 32 rows, which
+// streams DRAM at about half the rate. The tile is [ATTENTION_KEYS]
+// [HISTORY_STAGE_PITCH] uvec4: a row holds HISTORY_STAGE_CHUNK key code
+// bytes, or a value's codes (HISTORY_VALUE_PIECES uvec4) then its coefficient
+// pairs, then a pad keeping a quarter subgroup's row reads on distinct banks.
+#define HISTORY_STAGE_CHUNK (ATTENTION_W < 128u ? ATTENTION_W : 128u)
+#define HISTORY_VALUE_PIECES (ATTENTION_W / 32u)
+#define HISTORY_STAGE_PITCH (max(HISTORY_STAGE_CHUNK / 16u, HISTORY_VALUE_PIECES + (HISTORY_PAIRS + 3u) / 4u) + 1u)
+// The words a lane's value codes of one vector span, when whole.
+#define HISTORY_VALUE_WORDS (ATTENTION_E > 8u ? ATTENTION_E / 8u : 1u)
+
+// One group's share of a keywise score: its 32 codes (`low`, then `high`,
+// four a word) against the heads head0.. of the keywise queries, corrected
+// with the group's pair `sz` and the query group sums at shared float `sums`
+// ([G][HISTORY_PAIRS]).
+void history_keywise_group(uint group, uvec4 low, uvec4 high, vec2 sz, uint queries, uint sums, uint head0,
+    inout float score[ATTENTION_HEADS]) {
+    float dot[ATTENTION_HEADS];
+    [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g)
+        dot[g] = 0.0;
+    [[unroll]] for (uint piece = 0u; piece < 2u; ++piece) {
+        const uvec4 words = piece == 0u ? low : high;
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+            const uint column = group * HISTORY_GROUP + piece * 16u + j * 4u;
+            vec4 k;
+            [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                k[i] = history_code_at(HISTORY_KEY_BITS, words[j], 8u * i);
+            [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g) {
+                const vec4 q = attention_keywise_query(queries, head0 + g, column);
+                float d = dot[g];
+                [[unroll]] for (uint i = 0u; i < 4u; ++i)
+                    d = seismic_fma_rn(q[i], k[i], d);
+                dot[g] = d;
+            }
+        }
+    }
+    [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g)
+        score[g] = seismic_fma_rn(sz.x, dot[g],
+            seismic_fma_rn(sz.y, seismic_shared_f32[sums + (head0 + g) * HISTORY_PAIRS + group], score[g]));
+}
+
+// Lane t's scores of key t of a batch of `n` keys (key j's code row at `rows`
+// + j * `row_stride` bytes; `pairs` is lane t's key's coefficient row), the
+// rows passing through the tile at shared uvec4 `tile` HISTORY_STAGE_CHUNK
+// columns at a time. Rows past the batch repeat its last key.
+void history_keywise_score(const uint n, uint64_t rows, uint64_t row_stride, uint64_t pairs, uint tile,
+    uint queries, uint sums, uint head0, out float score[ATTENTION_HEADS]) {
+    const uint lane = SEISMIC_LANE;
+    const uint pieces = HISTORY_STAGE_CHUNK / 16u;
+    const uint pitch = HISTORY_STAGE_PITCH;
+    [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g)
+        score[g] = 0.0;
+    [[unroll]] for (uint first = 0u; first < ATTENTION_W; first += HISTORY_STAGE_CHUNK) {
+        uvec4 staged[HISTORY_STAGE_CHUNK / 16u];
+        [[unroll]] for (uint i = 0u; i < pieces; ++i) {
+            const uint item = i * 32u + lane;
+            staged[i] = element_uvec4_at(rows + uint64_t(min(item / pieces, n - 1u)) * row_stride
+                + uint64_t(first + (item % pieces) * 16u));
+        }
+        // The tile's previous rows are read.
+        subgroupBarrier();
+        [[unroll]] for (uint i = 0u; i < pieces; ++i) {
+            const uint item = i * 32u + lane;
+            seismic_shared_uvec4[tile + (item / pieces) * pitch + item % pieces] = staged[i];
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        [[unroll]] for (uint group = first / HISTORY_GROUP; group < (first + HISTORY_STAGE_CHUNK) / HISTORY_GROUP;
+            ++group) {
+            const uint piece = (group * HISTORY_GROUP - first) / 16u;
+            history_keywise_group(group, seismic_shared_uvec4[tile + lane * pitch + piece],
+                seismic_shared_uvec4[tile + lane * pitch + piece + 1u],
+                unpackHalf2x16(element_u32_at(pairs + uint64_t(group) * 4ul)), queries, sums, head0, score);
+        }
+    }
+}
+
+// Stage the value rows after scoring. Reading them directly into the tile
+// avoids keeping W/16 code vectors and W/32 coefficient words live across the
+// key score, which otherwise limits occupancy for wide heads.
+void history_keywise_value_stage(const uint n, uint64_t rows, uint64_t row_stride, uint64_t pairs,
+    uint64_t pair_stride, uint tile) {
+    const uint lane = SEISMIC_LANE;
+    const uint pitch = HISTORY_STAGE_PITCH;
+    [[unroll]] for (uint i = 0u; i < HISTORY_VALUE_PIECES; ++i) {
+        const uint item = i * 32u + lane;
+        seismic_shared_uvec4[tile + (item / HISTORY_VALUE_PIECES) * pitch + item % HISTORY_VALUE_PIECES] =
+            element_uvec4_at(rows + uint64_t(min(item / HISTORY_VALUE_PIECES, n - 1u)) * row_stride
+            + uint64_t(item % HISTORY_VALUE_PIECES) * 16ul);
+    }
+    [[unroll]] for (uint i = 0u; i < HISTORY_PAIRS; ++i) {
+        const uint item = i * 32u + lane;
+        seismic_shared_u32[(tile + (item / HISTORY_PAIRS) * pitch + HISTORY_VALUE_PIECES) * 4u + item % HISTORY_PAIRS] =
+            element_u32_at(pairs + uint64_t(min(item / HISTORY_PAIRS, n - 1u)) * pair_stride
+                + uint64_t(item % HISTORY_PAIRS) * 4ul);
+    }
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+}
+
+// The narrower-head path prefetches values while keys are scored. It retains
+// that overlap where storing the batch in registers does not cost occupancy.
+void history_keywise_value_load(const uint n, uint64_t rows, uint64_t row_stride, uint64_t pairs,
+    uint64_t pair_stride, out uvec4 codes[HISTORY_VALUE_PIECES], out uint coefficients[HISTORY_PAIRS]) {
+    const uint lane = SEISMIC_LANE;
+    [[unroll]] for (uint i = 0u; i < HISTORY_VALUE_PIECES; ++i) {
+        const uint item = i * 32u + lane;
+        codes[i] = element_uvec4_at(rows + uint64_t(min(item / HISTORY_VALUE_PIECES, n - 1u)) * row_stride
+            + uint64_t(item % HISTORY_VALUE_PIECES) * 16ul);
+    }
+    [[unroll]] for (uint i = 0u; i < HISTORY_PAIRS; ++i) {
+        const uint item = i * 32u + lane;
+        coefficients[i] = element_u32_at(pairs + uint64_t(min(item / HISTORY_PAIRS, n - 1u)) * pair_stride
+            + uint64_t(item % HISTORY_PAIRS) * 4ul);
+    }
+}
+
+void history_keywise_value_store(uvec4 codes[HISTORY_VALUE_PIECES], uint coefficients[HISTORY_PAIRS], uint tile) {
+    const uint lane = SEISMIC_LANE;
+    const uint pitch = HISTORY_STAGE_PITCH;
+    subgroupBarrier();
+    [[unroll]] for (uint i = 0u; i < HISTORY_VALUE_PIECES; ++i) {
+        const uint item = i * 32u + lane;
+        seismic_shared_uvec4[tile + (item / HISTORY_VALUE_PIECES) * pitch + item % HISTORY_VALUE_PIECES] = codes[i];
+    }
+    [[unroll]] for (uint i = 0u; i < HISTORY_PAIRS; ++i) {
+        const uint item = i * 32u + lane;
+        seismic_shared_u32[(tile + (item / HISTORY_PAIRS) * pitch + HISTORY_VALUE_PIECES) * 4u + item % HISTORY_PAIRS] =
+            coefficients[i];
+    }
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+}
+
+// The value product of a batch of `n` keys from the tile: each lane decodes
+// its E columns of key j (code * scale + zero) and accumulates them with the
+// key's weights.
+void history_keywise_values(const uint n, uint tile, uint weights, inout float result[ATTENTION_HEADS][ATTENTION_E]) {
+    const uint lane = SEISMIC_LANE;
+    const uint bits = ATTENTION_E * HISTORY_VALUE_BITS;
+    for (uint j = 0u; j < n; ++j) {
+        const uint row = (tile + j * HISTORY_STAGE_PITCH) * 4u;
+        uint w[HISTORY_LANE_WORDS];
+        [[unroll]] for (uint k = 0u; k < HISTORY_LANE_WORDS; ++k)
+            w[k] = 0u;
+        if (bits >= 32u) {
+            [[unroll]] for (uint k = 0u; k < HISTORY_VALUE_WORDS; ++k)
+                w[k] = seismic_shared_u32[row + lane * HISTORY_VALUE_WORDS + k];
+        } else {
+            w[0] = seismic_shared_u32[row + lane * bits / 32u] >> ((lane * bits) % 32u);
+        }
+        const vec2 sz = unpackHalf2x16(seismic_shared_u32[row + HISTORY_VALUE_PIECES * 4u + lane / HISTORY_PAIR_LANES]);
+        float v[ATTENTION_E];
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+            v[i] = seismic_fma_rn(history_code(HISTORY_VALUE_BITS, w, i), sz.x, sz.y);
+        attention_keywise_accumulate(weights, j, v, result);
+    }
+}
+
+// Absorbs a batch of `n` (at most ATTENTION_KEYS) affine keys and values into
+// the online state of the heads head0..: key j's code row at `keys` + j *
+// `key_stride` bytes and coefficient pairs at `key_pairs` + j * `pair_stride`,
+// its value's likewise. `tile` is the subgroup's staging tile (shared uvec4),
+// `weights` its shared weights (`attention_keywise_softmax`).
+void history_keywise_absorb(const uint n, uint64_t keys, uint64_t key_pairs, uint64_t key_stride, uint64_t values,
+    uint64_t value_pairs, uint64_t value_stride, uint64_t pair_stride, uint tile, uint queries, uint sums, uint head0,
+    uint weights, inout float maximum[ATTENTION_HEADS], inout float denominator[ATTENTION_HEADS],
+    inout float result[ATTENTION_HEADS][ATTENTION_E]) {
+    // At 512 columns the prefetched values occupy at least 144 registers;
+    // shorter heads retain their overlap with scoring.
+    if (ATTENTION_W < 512u) {
+        uvec4 codes[HISTORY_VALUE_PIECES];
+        uint coefficients[HISTORY_PAIRS];
+        history_keywise_value_load(n, values, value_stride, value_pairs, pair_stride, codes, coefficients);
+        float score[ATTENTION_HEADS];
+        history_keywise_score(n, keys, key_stride, key_pairs + uint64_t(min(SEISMIC_LANE, n - 1u)) * pair_stride, tile,
+            queries, sums, head0, score);
+        attention_keywise_softmax(n, score, weights, maximum, denominator, result);
+        history_keywise_value_store(codes, coefficients, tile);
+    } else {
+        float score[ATTENTION_HEADS];
+        history_keywise_score(n, keys, key_stride, key_pairs + uint64_t(min(SEISMIC_LANE, n - 1u)) * pair_stride, tile,
+            queries, sums, head0, score);
+        attention_keywise_softmax(n, score, weights, maximum, denominator, result);
+        history_keywise_value_stage(n, values, value_stride, value_pairs, pair_stride, tile);
+    }
+    history_keywise_values(n, tile, weights, result);
 }
 
 // ---------------------------------------------------------------------------

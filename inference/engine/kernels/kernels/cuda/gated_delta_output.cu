@@ -87,21 +87,24 @@ template <unsigned INT8>
 __global__ void gated_delta_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     extern __shared__ uint4 dynamic_shared[];
-    if (blockIdx.x < projection::gemm_columns(SEISMIC_DIM_H))
+    const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
+    if (column < projection::gemm_columns(SEISMIC_DIM_H))
         projection::gemm_run_split<projection::SmallGemm, S8>(reinterpret_cast<projection::u8 *>(dynamic_shared),
                                                               STAGING, GATED, GROUPS, (unsigned)SEISMIC_DIM_M, GATED,
-                                                              blockIdx.x, SEISMIC_DIM_H, OUTPUT, EPILOGUE, PARTIALS);
+                                                              column, SEISMIC_DIM_H, OUTPUT, EPILOGUE, PARTIALS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_OUTPUT_GEMM
-extern "C" __global__ void gated_delta_output_gemm(SEISMIC_KERNEL_PARAMS) {
+template <unsigned ROTATE>
+__global__ void gated_delta_output_gemm(SEISMIC_KERNEL_PARAMS) {
+    using Shape = projection::LargeGemm<ROTATE>;
     extern __shared__ uint4 dynamic_shared[];
-    if (blockIdx.x < projection::gemm_columns(SEISMIC_DIM_H))
-        projection::gemm_run_split<projection::LargeGemm, false>(reinterpret_cast<projection::u8 *>(dynamic_shared),
-                                                                 STAGING, GATED, GROUPS, (unsigned)SEISMIC_DIM_M,
-                                                                 GATED, blockIdx.x, SEISMIC_DIM_H, OUTPUT, EPILOGUE,
-                                                                 PARTIALS);
+    const unsigned long long column = projection::gemm_column<Shape>();
+    if (column < projection::gemm_columns(SEISMIC_DIM_H))
+        projection::gemm_run_split<Shape, false>(reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, GATED,
+                                                 GROUPS, (unsigned)SEISMIC_DIM_M, GATED, column, SEISMIC_DIM_H, OUTPUT,
+                                                 EPILOGUE, PARTIALS);
 }
 #endif
 

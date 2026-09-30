@@ -4,16 +4,16 @@
 use super::preparation::PreparationInputs;
 use super::tuning::{TunedEntry, TuningContext, TuningLimits};
 use super::*;
+use crate::SublayerTail;
 use crate::{
     ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, ImportProgramSlot, MixerProgramSlot,
     PlanError, PlannedDevice, ProgramPlan,
 };
-use crate::SublayerTail;
 use magnitude_family_contracts::SublayerIndex;
 use magnitude_kernels::{
     draft_confidence, draft_convolve_input, draft_convolve_residual, draft_gated_rows,
     draft_path_step, draft_top_k, feature_rows, import_dense, post_norm_residual, project_rows,
-    repack_weight, tap_rows,
+    repack_weight, tap_rows, widen_rows,
 };
 use magnitude_state::KvCodec;
 use std::{collections::HashSet, rc::Rc};
@@ -155,7 +155,10 @@ fn output_scale(
     };
     match source_f32s(load, tuning, role).map_err(failure)?[..] {
         [scale] => Ok(scale),
-        ref values => Err(failure(format!("the layer scale holds {} values", values.len()))),
+        ref values => Err(failure(format!(
+            "the layer scale holds {} values",
+            values.len()
+        ))),
     }
 }
 
@@ -201,6 +204,11 @@ pub(crate) struct AttestedDraft {
     pub blocks: Vec<DraftBlockKernels>,
     pub embedding: NativeKernel<embedding_rows::Entry>,
     pub head: NativeKernel<readout_head_rows::Entry>,
+    /// Token selection over the readout vocabulary.
+    pub shape: NativeKernel<shape_rows::Entry>,
+    pub sample: NativeKernel<sample_rows::Entry>,
+    /// Widens a device-conditioned entry's target features to F32.
+    pub widen: NativeKernel<widen_rows::Entry>,
     pub markov: Option<MarkovKernels>,
     pub dflash2: Option<super::AttestedDflash2>,
 }
@@ -335,11 +343,8 @@ impl AttestedPrograms {
                 .ok_or("draft graphs require a draft")?;
             let geometry =
                 crate::programs::native_draft::DraftGeometry::new(definition, state, proposals)?;
-            let classes = crate::programs::native_draft::draft_graph_classes(
-                limits,
-                proposals,
-                draft.block_size,
-            )?;
+            let classes =
+                crate::programs::native_draft::draft_graph_classes(limits, proposals, draft)?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Draft(Rc::new(
                 crate::programs::native_draft::PreparedDraftGraphs::prepare(
                     device,
@@ -501,9 +506,7 @@ impl AttestedPrograms {
                             }
                         }
                         + match binding.history {
-                            KvCodec::Dense => {
-                                bytes!(attention_decode) + bytes!(attention_prefill)
-                            }
+                            KvCodec::Dense => bytes!(attention_decode) + bytes!(attention_prefill),
                             KvCodec::AffineK8V4 => {
                                 bytes!(attention_decode_k8v4) + bytes!(attention_prefill_k8v4)
                             }
@@ -652,7 +655,11 @@ impl AttestedPrograms {
                     bytes += bytes!(dense_expand) + bytes!(dense_output);
                 }
             }
-            bytes += bytes!(embedding_rows) + bytes!(readout_head_rows);
+            bytes += bytes!(embedding_rows)
+                + bytes!(readout_head_rows)
+                + bytes!(shape_rows)
+                + bytes!(sample_rows)
+                + bytes!(widen_rows);
             if draft.markov().is_some() {
                 bytes += bytes!(embedding_rows)
                     + bytes!(dense_output)
@@ -1049,21 +1056,20 @@ impl AttestedPrograms {
                         .cloned()
                         .ok_or_else(|| missing("draft_attention_stages", binding))
                 };
-                let blocks = draft_plan
-                    .blocks()
-                    .iter()
-                    .map(|block| {
-                        Ok(DraftBlockKernels {
-                            attention: attention(block.attention)?,
-                            injection: attention(block.injection)?,
-                            dense: handles
-                                .dense
-                                .get(&block.feed_forward)
-                                .cloned()
-                                .ok_or_else(|| missing("draft_dense_stages", block.feed_forward))?,
+                let blocks =
+                    draft_plan
+                        .blocks()
+                        .iter()
+                        .map(|block| {
+                            Ok(DraftBlockKernels {
+                                attention: attention(block.attention)?,
+                                injection: attention(block.injection)?,
+                                dense: handles.dense.get(&block.feed_forward).cloned().ok_or_else(
+                                    || missing("draft_dense_stages", block.feed_forward),
+                                )?,
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>, CatalogFailure>>()?;
+                        .collect::<Result<Vec<_>, CatalogFailure>>()?;
                 Ok::<_, CatalogFailure>(AttestedDraft {
                     blocks,
                     embedding: handles
@@ -1074,6 +1080,18 @@ impl AttestedPrograms {
                         .head
                         .clone()
                         .ok_or_else(|| missing("readout_head_rows", "draft"))?,
+                    shape: handles
+                        .shape
+                        .clone()
+                        .ok_or_else(|| missing("shape_rows", "draft"))?,
+                    sample: handles
+                        .sample
+                        .clone()
+                        .ok_or_else(|| missing("sample_rows", "draft"))?,
+                    widen: handles
+                        .widen
+                        .clone()
+                        .ok_or_else(|| missing("widen_rows", "draft"))?,
                     markov: draft_plan
                         .markov()
                         .map(|binding| {
@@ -1246,11 +1264,13 @@ impl AttestedPrograms {
             bytes += u128::from(handles.expand.invocation_workspace_bytes())
                 + u128::from(handles.output.invocation_workspace_bytes());
         }
-        let general_routed = prepared
-            .target
-            .general_routed
-            .values()
-            .chain(prepared.target.parallel.values().map(|handles| &handles.routed));
+        let general_routed = prepared.target.general_routed.values().chain(
+            prepared
+                .target
+                .parallel
+                .values()
+                .map(|handles| &handles.routed),
+        );
         for handles in prepared.target.parallel.values() {
             bytes += u128::from(handles.expand.invocation_workspace_bytes())
                 + u128::from(handles.down.invocation_workspace_bytes())
@@ -1361,6 +1381,9 @@ impl AttestedPrograms {
             }
             charge!(draft.embedding.iter());
             charge!(draft.head.iter());
+            charge!(draft.shape.iter());
+            charge!(draft.sample.iter());
+            charge!(draft.widen.iter());
             if let Some(markov) = &draft.markov {
                 bytes += u128::from(markov.embedding.invocation_workspace_bytes())
                     + u128::from(markov.projection.invocation_workspace_bytes())
@@ -1439,13 +1462,15 @@ impl AttestedPrograms {
             Other(WeightScope),
         }
         let fixture_scope = |scope| match scope {
-            WeightScope::TargetSublayer(index) | WeightScope::TargetBranch { sublayer: index, .. } => {
-                FixtureScope::Block(index.block)
-            }
+            WeightScope::TargetSublayer(index)
+            | WeightScope::TargetBranch {
+                sublayer: index, ..
+            } => FixtureScope::Block(index.block),
             WeightScope::HeadBlock(block) => FixtureScope::Head(block),
-            WeightScope::HeadSublayer(index) | WeightScope::HeadBranch { sublayer: index, .. } => {
-                FixtureScope::Head(index.block)
-            }
+            WeightScope::HeadSublayer(index)
+            | WeightScope::HeadBranch {
+                sublayer: index, ..
+            } => FixtureScope::Head(index.block),
             other => FixtureScope::Other(other),
         };
         let mut scopes = HashMap::<FixtureScope, u64>::new();
@@ -1693,12 +1718,34 @@ impl AttestedPrograms {
                 let handles = $handles;
                 charge!(&handles.project);
                 match &handles.history {
-                    super::target::AttentionHistoryKernels::Dense { decode, prefill } => {
+                    super::target::AttentionHistoryKernels::Dense {
+                        decode,
+                        verify,
+                        prefill,
+                    } => {
                         charge!(decode);
+                        if let Some(verify) = verify {
+                            charge!(verify);
+                        }
                         charge!(prefill);
                     }
-                    super::target::AttentionHistoryKernels::AffineK8V4 { decode, prefill } => {
+                    super::target::AttentionHistoryKernels::AffineK8V4 {
+                        decode,
+                        verify,
+                        verify_four,
+                        verify_eight,
+                        prefill,
+                    } => {
                         charge!(decode);
+                        if let Some(verify) = verify {
+                            charge!(verify);
+                        }
+                        if let Some(verify_four) = verify_four {
+                            charge!(verify_four);
+                        }
+                        if let Some(verify_eight) = verify_eight {
+                            charge!(verify_eight);
+                        }
                         charge!(prefill);
                     }
                 }
@@ -1838,6 +1885,9 @@ impl AttestedPrograms {
             }
             charge!(&draft.embedding);
             charge!(&draft.head);
+            charge!(&draft.shape);
+            charge!(&draft.sample);
+            charge!(&draft.widen);
             if let Some(markov) = &draft.markov {
                 charge!(&markov.embedding);
                 charge!(&markov.projection);

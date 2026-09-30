@@ -1,13 +1,13 @@
-use magnitude_generation::{
-    BoundaryRule, Constraint, Demand, EndOfGeneration, FinishReason, Generation, InputLayout, InputSpan, Method,
-    MethodCheckpoint, MethodCheckpointError, MethodChoice, MethodEffects, MethodRequirements,
-    MethodState, Mtp, DFlash, Options, Propose, ReasoningBudget, RequestId, RoundStart, Sampling,
-    SelectSpec, Shaping,
-    TokenId, Verification, WaitReason, WorkKind,
-};
 use magnitude_executor::{
     FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Operation, Outcome, ResourceDomainId,
     Selected,
+};
+use magnitude_generation::{
+    BoundaryRule, Constraint, DFlash, Demand, EndOfGeneration, FinishReason, Generation,
+    InputLayout, InputSpan, Method, MethodCheckpoint, MethodCheckpointError, MethodChoice,
+    MethodEffects, MethodRequirements, MethodState, Mtp, Options, Propose, ReasoningBudget,
+    RequestId, RoundStart, Sampling, SelectSpec, Shaping, TokenId, Verification, WaitReason,
+    WorkKind,
 };
 use std::{
     cell::RefCell,
@@ -404,6 +404,13 @@ fn prefill_chunks_enter_target_conditioned_pairs_and_keep_the_anchor() {
     let [head] = effects.as_slice() else {
         panic!("a non-final chunk enters its complete pairs")
     };
+    assert!(matches!(
+        head,
+        Operation::Head {
+            phase: magnitude_executor::HeadPhase::Priming { .. },
+            ..
+        }
+    ));
     let (tokens, rows, position, proposals) = head_parts(head);
     assert_eq!(
         (tokens, rows, position),
@@ -418,6 +425,13 @@ fn prefill_chunks_enter_target_conditioned_pairs_and_keep_the_anchor() {
     let [head] = effects.as_slice() else {
         panic!("the final chunk enters all but the anchor")
     };
+    assert!(matches!(
+        head,
+        Operation::Head {
+            phase: magnitude_executor::HeadPhase::Priming { .. },
+            ..
+        }
+    ));
     let (tokens, rows, position, _) = head_parts(head);
     assert_eq!(
         (tokens, rows, position),
@@ -578,12 +592,17 @@ impl MethodState for PrimeState {
     fn fork_transition(&self) -> Box<dyn MethodState> {
         Box::new(self.clone())
     }
+    fn priming_position(&self) -> Option<usize> {
+        None
+    }
     fn prime(
         &mut self,
         _: RequestId,
         tokens: &[TokenId],
         next: Option<TokenId>,
         _features: FeatureRef,
+        _draft_from: usize,
+        _primed: usize,
         _: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
         self.calls.lock().unwrap().push((tokens.to_vec(), next));
@@ -709,7 +728,9 @@ fn retained_prefix_requires_an_exact_layout_boundary() {
     configured.context_limit = 128;
     configured.vocabulary = 256;
     let mut fresh = Generation::new(prompt, layout, configured, None).unwrap();
-    assert!(fresh.resume_at(Some((64, &MethodCheckpoint::Plain))).is_err());
+    assert!(fresh
+        .resume_at(Some((64, &MethodCheckpoint::Plain)))
+        .is_err());
     assert!(!fresh.is_resident());
     assert_eq!(fresh.resident_position(), 0);
     assert_eq!(fresh.detailed_usage().cached_tokens, 0);
@@ -767,7 +788,10 @@ fn ignored_end_of_generation_masks_stop_tokens_from_every_selection() {
     .unwrap();
     generation.resume_at(None).unwrap();
     let round = start(&mut generation, 2);
-    let mask = round.selects[0].mask.clone().expect("suppression masks selection");
+    let mask = round.selects[0]
+        .mask
+        .clone()
+        .expect("suppression masks selection");
     assert_eq!(mask[99 / 32] & (1 << (99 % 32)), 0);
     assert_ne!(mask[98 / 32] & (1 << (98 % 32)), 0);
     assert!(generation
@@ -831,10 +855,11 @@ fn dflash_drafting(proposals: u8) -> (Generation, Operation) {
         panic!("decode drafts first")
     };
     let [draft] = <[Operation; 1]>::try_from(draft).unwrap();
-    let Operation::Head { form, .. } = &draft else {
+    let Operation::Head { form, phase, .. } = &draft else {
         panic!("a draft is a head transaction")
     };
     assert_eq!(*form, magnitude_executor::DraftForm::Block);
+    assert_eq!(*phase, magnitude_executor::HeadPhase::Generation);
     (generation, draft)
 }
 
@@ -873,7 +898,10 @@ fn dflash_verification_publishes_the_accepted_prefix_and_re_enters_it() {
             panic!("decode drafts again")
         };
         let (tokens, rows, position, _) = head_parts(&next[0]);
-        assert_eq!(tokens, entered.iter().copied().map(TokenId).collect::<Vec<_>>());
+        assert_eq!(
+            tokens,
+            entered.iter().copied().map(TokenId).collect::<Vec<_>>()
+        );
         assert_eq!(
             rows,
             (0..=accepted as u8).map(|row| (2, row)).collect::<Vec<_>>()

@@ -128,6 +128,7 @@ native head_logits_rows for cuda from "cuda/head_logits_rows.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
     launch head_logits_rows_gemm when O > 64:
+        params (code ROTATE in [2, 1, 4])
         threadgroups (ceil_div(ceil_div(V, 16), 8), ceil_div(O, 128), 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (2 * (128 * 144 + 10240) + 2048)

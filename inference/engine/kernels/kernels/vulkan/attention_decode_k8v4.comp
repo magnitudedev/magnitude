@@ -3,17 +3,25 @@
 // subgroup walk and merge of `attention_decode`.
 //
 // L1: workgroup (kv head, partition, row). History keys score as the sum over
-// groups of scale * (q . code) + zero * sum(q) and values accumulate
-// (p * scale) * code plus the carried bias sum(p * zero) of each lane's group
-// (`history_absorb_affine`), so no history element is decoded. The fresh span
-// stays dense; the bias is folded into the output before it. Partition 0 of a
-// layer with fresh rows appends the row's key (prepared, rounded to A) and
-// value encoded (`history_encode`).
+// groups of scale * (q . code) + zero * sum(q). In the vector form each lane
+// holds W / 32 columns of every key, and values accumulate (p * scale) * code
+// plus the carried bias sum(p * zero) of each lane's group
+// (`history_absorb_affine`), so no history element is decoded. In the keywise
+// form (KEYWISE, `history_keywise_absorb`) lane t scores key t of each 32-key
+// batch over the whole width, so a score needs no subgroup reduction, and
+// each lane decodes its value columns (code * scale + zero) as it accumulates
+// them. The fresh span stays dense; the bias is folded into the output before
+// it. Partition 0 of a layer with fresh rows appends the row's key (prepared,
+// rounded to A) and value encoded (`history_encode`).
 //
 // Shared words: the subgroup states [SIMDS][G / SLICES][2] (floats), then the
-// prepared queries [ceil(G / 2)][W] (two activation-dtype heads per word, as
-// `attention_decode`), which the merge columns [SIMDS][W] (floats) alias:
-// every subgroup has read its queries before the publication's first barrier.
+// prepared queries: in the vector form [ceil(G / 2)][W] (two activation-dtype
+// heads per word, as `attention_decode`); in the keywise form, from a 16-byte
+// boundary, [G][W] (floats), the subgroups' weights [SIMDS][32][G / SLICES]
+// (floats), the query group sums [G][W / 32] (floats) and, from a 16-byte
+// boundary, the subgroups' staging tiles [SIMDS][32][HISTORY_STAGE_PITCH]
+// (uvec4). The merge columns [SIMDS][W] (floats) alias them: every subgroup
+// has finished its walk before the publication's first barrier.
 #define ATTENTION_HEADS uint(SEISMIC_DIM_G / SEISMIC_TUNE_SLICES)
 #define ATTENTION_I uint(SEISMIC_DIM_I)
 #define ATTENTION_U uint(SEISMIC_DIM_U)
@@ -25,12 +33,37 @@
 #define ATTENTION_GATE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_GATE)
 #define ATTENTION_AMPLITUDE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)
 #define ATTENTION_VALUE_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_VALUE_NORM)
+// Both forms' shared code (an entry's includes expand once, whatever the
+// branch).
 #include "lib/attention/history.glsl"
+
+#if SEISMIC_TUNE_MATRIX
+// The grouped-query matrix form: the prefill body's L2 over decode rows
+// (`lib/attention/prefill.glsl`, PREFILL_DECODE), 16 matrix rows per
+// subgroup; history tiles are staged as f16 and the products are cooperative
+// matrices.
+#define PREFILL_DECODE
+#define PREFILL_ROWS (16u * uint(SEISMIC_TUNE_SIMDS))
+#define PREFILL_PARTS uint(SEISMIC_TUNE_PARTS)
+#include "lib/attention/prefill.glsl"
+
+void attention_decode_k8v4_partial() {
+    prefill_attend(attention_affine_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES),
+        SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES),
+        SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)),
+        prefill_scratch(0ul, 0ul, 0ul, 0ul));
+}
+
+void attention_decode_k8v4_merge() { prefill_decode_merge(); }
+
+#else
 
 // The prepared queries pack two activation elements per shared word.
 #if !defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) && !defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
 #error "attention_decode_k8v4 requires a bf16 or f16 activation"
 #endif
+
+#define DECODE_KEYWISE (SEISMIC_TUNE_KEYWISE != 0)
 
 void attention_decode_k8v4_partial() {
     const uint64_t amplitudes = ATTENTION_AMPLITUDE_BUFFER;
@@ -59,12 +92,14 @@ void attention_decode_k8v4_partial() {
     const uint key_words = history_row_words(HISTORY_KEY_BITS);
     const uint value_words = history_row_words(HISTORY_VALUE_BITS);
 
-    if (ATTENTION_FRESH && part == 0u && sg < 2u) {
+    // Plane 0 (the key) and plane 1 (the value) append from subgroups 0 and 1,
+    // or both from a workgroup's one subgroup.
+    if (ATTENTION_FRESH && part == 0u) {
         const int destination = element_i32_at(destinations + row * 4ul);
-        if (destination >= 0) {
+        for (uint plane = sg; destination >= 0 && plane < 2u; plane += simds) {
             const uint64_t source = (row * KV + kv_head) * W;
             float x[ATTENTION_E];
-            if (sg == 0u) {
+            if (plane == 0u) {
                 attention_prepare(key + source * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), key_norm, row_coordinates,
                     components, frequencies, amplitudes, epsilon, lane, x);
                 [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
@@ -73,7 +108,7 @@ void attention_decode_k8v4_partial() {
                 attention_value(value + source * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), ATTENTION_VALUE_NORM_BUFFER,
                     epsilon, lane, x);
             }
-            history_append(h, sg == 0u, destination, kv_head, lane, x);
+            history_append(h, plane == 0u, destination, kv_head, lane, x);
         }
     }
 
@@ -86,30 +121,59 @@ void attention_decode_k8v4_partial() {
 
     const uint states = 0u;
     const uint columns = states + simds * ATTENTION_HEADS * 2u;
-    const uint prepared = columns;
+    // Keywise queries are read as vec4: 16-byte aligned.
+    const uint prepared = DECODE_KEYWISE ? (columns + 3u) & ~3u : columns;
+    const uint weights = prepared + G * W + sg * ATTENTION_KEYS * ATTENTION_HEADS;
+    const uint sums = prepared + G * W + simds * ATTENTION_KEYS * ATTENTION_HEADS;
+    // This subgroup's staging tile (a uvec4 index).
+    const uint staging = (sums + G * HISTORY_PAIRS + 3u) / 4u + sg * ATTENTION_KEYS * HISTORY_STAGE_PITCH;
     const float query_scale = scale * ATTENTION_LOG2E;
     const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
-    // Head pair p's prepared queries share words: head 2p in the low half,
-    // head 2p + 1 in the high half.
-    for (uint pair = sg; pair < (G + 1u) / 2u; pair += simds) {
-        float low[ATTENTION_E];
-        float high[ATTENTION_E];
-        attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + 2u * pair)
-            * ATTENTION_QUERY_STRIDE) * act_bytes, query_norm, row_coordinates, components, frequencies,
-            amplitudes, epsilon, lane, low);
-        if (2u * pair + 1u < G)
-            attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + 2u * pair + 1u)
+    if (DECODE_KEYWISE) {
+        // Each head's prepared queries as F32, and their group sums.
+        for (uint head = sg; head < G; head += simds) {
+            float x[ATTENTION_E];
+            attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + head)
                 * ATTENTION_QUERY_STRIDE) * act_bytes, query_norm, row_coordinates, components, frequencies,
-                amplitudes, epsilon, lane, high);
-        else
+                amplitudes, epsilon, lane, x);
+            float sum = 0.0;
+            [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
+                const float q = element_round(ELEMENT_ACT, x[i]) * query_scale;
+                seismic_shared_f32[prepared + head * W + lane * E + i] = q;
+                sum += q;
+            }
+            // The group's HISTORY_PAIR_LANES neighbouring lanes.
+            [[unroll]] for (uint offset = 1u; offset < 32u; offset *= 2u)
+                if (offset < HISTORY_PAIR_LANES)
+                    sum += subgroupShuffleXor(sum, offset);
+            if (lane % HISTORY_PAIR_LANES == 0u)
+                seismic_shared_f32[sums + head * HISTORY_PAIRS + lane / HISTORY_PAIR_LANES] = sum;
+        }
+    } else {
+        // Head pair p's prepared queries share words: head 2p in the low
+        // half, head 2p + 1 in the high half.
+        for (uint pair = sg; pair < (G + 1u) / 2u; pair += simds) {
+            float low[ATTENTION_E];
+            float high[ATTENTION_E];
+            attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + 2u * pair)
+                * ATTENTION_QUERY_STRIDE) * act_bytes, query_norm, row_coordinates, components, frequencies,
+                amplitudes, epsilon, lane, low);
+            if (2u * pair + 1u < G)
+                attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + 2u * pair + 1u)
+                    * ATTENTION_QUERY_STRIDE) * act_bytes, query_norm, row_coordinates, components, frequencies,
+                    amplitudes, epsilon, lane, high);
+            else
+                [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+                    high[i] = 0.0;
             [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-                high[i] = 0.0;
-        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-            seismic_shared_u32[prepared + pair * W + lane * E + i] =
-                element_store(ELEMENT_ACT, low[i]) | (element_store(ELEMENT_ACT, high[i]) << 16u);
+                seismic_shared_u32[prepared + pair * W + lane * E + i] =
+                    element_store(ELEMENT_ACT, low[i]) | (element_store(ELEMENT_ACT, high[i]) << 16u);
+        }
     }
     barrier();
     const uint head0 = attention_slice(sg) * ATTENTION_HEADS;
+    // The vector form holds the queries in registers throughout; the keywise
+    // form loads them for the fresh span only.
     float q[ATTENTION_HEADS][ATTENTION_E];
     float qsum[ATTENTION_HEADS];
     float maximum[ATTENTION_HEADS];
@@ -120,9 +184,11 @@ void attention_decode_k8v4_partial() {
         const uint head = head0 + g;
         float sum = 0.0;
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
-            const uint word = seismic_shared_u32[prepared + (head / 2u) * W + lane * E + i];
-            q[g][i] = element_load(ELEMENT_ACT, (word >> (16u * (head % 2u))) & 0xffffu) * query_scale;
-            sum += q[g][i];
+            if (!DECODE_KEYWISE) {
+                const uint word = seismic_shared_u32[prepared + (head / 2u) * W + lane * E + i];
+                q[g][i] = element_load(ELEMENT_ACT, (word >> (16u * (head % 2u))) & 0xffffu) * query_scale;
+                sum += q[g][i];
+            }
             result[g][i] = 0.0;
         }
         qsum[g] = sum;
@@ -163,7 +229,16 @@ void attention_decode_k8v4_partial() {
                 const uint64_t key_pairs = slab_region(h.key_coefficients, uint64_t(slab)) + first_vector * pair_bytes;
                 const uint64_t value_pairs =
                     slab_region(h.value_coefficients, uint64_t(slab)) + first_vector * pair_bytes;
-                while (position < part_end) {
+                while (DECODE_KEYWISE && position < part_end) {
+                    const uint n = min(ATTENTION_KEYS, part_end - position);
+                    const uint64_t step = uint64_t(position - part_start) * KV;
+                    history_keywise_absorb(n, key_rows + step * key_bytes, key_pairs + step * pair_bytes,
+                        uint64_t(KV) * key_bytes, value_rows + step * value_bytes, value_pairs + step * pair_bytes,
+                        uint64_t(KV) * value_bytes, uint64_t(KV) * pair_bytes, staging, prepared, sums, head0,
+                        weights, maximum, denominator, result);
+                    position += n;
+                }
+                while (!DECODE_KEYWISE && position < part_end) {
                     const uint n = min(HISTORY_BATCH, part_end - position);
                     uint k[HISTORY_BATCH][HISTORY_LANE_WORDS];
                     uint v[HISTORY_BATCH][HISTORY_LANE_WORDS];
@@ -195,6 +270,9 @@ void attention_decode_k8v4_partial() {
                     result[g][i] += bias[g];
                 bias[g] = 0.0;
             }
+            if (DECODE_KEYWISE)
+                [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g)
+                    attention_keywise_columns(prepared, head0 + g, lane, q[g]);
             for (; position < end; ++position) {
                 const uint64_t token = uint64_t(lo) + (position - offset);
                 const uint64_t at = (token * KV + kv_head) * W;
@@ -228,3 +306,5 @@ void attention_decode_k8v4_merge() {
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), SEISMIC_DIM_R,
         gl_WorkGroupID.x, gl_WorkGroupID.y, gl_LocalInvocationIndex, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
 }
+
+#endif

@@ -68,12 +68,31 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Err("accepted target prefix is outside the submitted row commitment".into());
         }
         let request = pending.request;
-        if self.target.contains_key(&request) {
+        if self.target.contains_key(&request)
+            || (pending.primed.is_some() && self.head.contains_key(&request))
+        {
             return Err(self.fatal_invariant("request already has another physical state owner"));
         }
         let Some(advance) = pending.advance.take() else {
             return Err(self.fatal_invariant("target outcome has no owned target advance"));
         };
+        // A prompt chunk commits whole, and its drafter entry with it.
+        if let Some(primed) = pending.primed.take() {
+            let rows = primed.rows();
+            match primed.commit(rows) {
+                Ok(
+                    OwnedAdvanceResolution::Aborted(state)
+                    | OwnedAdvanceResolution::Committed(state),
+                ) => {
+                    self.head.insert(request, state);
+                }
+                Err((state, error)) => {
+                    self.head.insert(request, state);
+                    self.target.insert(request, advance.abort());
+                    return Err(self.fatal_state(error));
+                }
+            }
+        }
         match advance.commit(decision.accepted_rows) {
             Ok(
                 OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state),
@@ -93,11 +112,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn abort(&mut self, pending: PendingOperationOutcome) -> Result<(), DomainError> {
         let conflicting_owner = match &pending.outcome {
             Outcome::Head { .. } => self.head.contains_key(&pending.request),
-            Outcome::Forward { .. } => self.target.contains_key(&pending.request),
+            Outcome::Forward { .. } => {
+                self.target.contains_key(&pending.request)
+                    || (pending.primed.is_some() && self.head.contains_key(&pending.request))
+            }
             Outcome::Encode { .. } => false,
         };
         if conflicting_owner {
             return Err(self.fatal_invariant("request already has another physical state owner"));
+        }
+        if let Some(primed) = pending.primed {
+            self.head.insert(pending.request, primed.abort());
         }
         if let Some(advance) = pending.advance {
             match pending.outcome {

@@ -62,21 +62,25 @@ template <unsigned INT8>
 __global__ void project_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     extern __shared__ uint4 dynamic_shared[];
-    if (blockIdx.x < projection::gemm_columns(SEISMIC_DIM_N))
+    const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
+    if (column < projection::gemm_columns(SEISMIC_DIM_N))
         projection::gemm_run_split<projection::SmallGemm, S8>(
             reinterpret_cast<projection::u8 *>(dynamic_shared), S8 ? STAGING : SEISMIC_PTR(SEISMIC_BUFFER_SOURCE),
-            S8 ? SEISMIC_DIM_K : SEISMIC_SOURCE_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_K, blockIdx.x,
+            S8 ? SEISMIC_DIM_K : SEISMIC_SOURCE_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_K, column,
             SEISMIC_DIM_N, WEIGHT, EPILOGUE, PARTIALS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_GEMM
-extern "C" __global__ void project_rows_gemm(SEISMIC_KERNEL_PARAMS) {
+template <unsigned ROTATE>
+__global__ void project_rows_gemm(SEISMIC_KERNEL_PARAMS) {
+    using Shape = projection::LargeGemm<ROTATE>;
     extern __shared__ uint4 dynamic_shared[];
-    if (blockIdx.x < projection::gemm_columns(SEISMIC_DIM_N))
-        projection::gemm_run_split<projection::LargeGemm, false>(
+    const unsigned long long column = projection::gemm_column<Shape>();
+    if (column < projection::gemm_columns(SEISMIC_DIM_N))
+        projection::gemm_run_split<Shape, false>(
             reinterpret_cast<projection::u8 *>(dynamic_shared), SEISMIC_PTR(SEISMIC_BUFFER_SOURCE),
-            SEISMIC_SOURCE_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_K, blockIdx.x, SEISMIC_DIM_N, WEIGHT,
+            SEISMIC_SOURCE_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_K, column, SEISMIC_DIM_N, WEIGHT,
             EPILOGUE, PARTIALS);
 }
 #endif

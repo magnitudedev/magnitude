@@ -1,7 +1,7 @@
 use crate::Demand;
 use std::fmt;
 
-pub const MAX_CLASS_ROWS: usize = 512;
+pub const MAX_CLASS_ROWS: usize = 1024;
 
 /// Row classes at and below this bound are powers of two (decode, verify and
 /// concurrency rows); above it they are multiples of [`PREFILL_ROW_QUANTUM`].
@@ -103,12 +103,13 @@ impl LaunchClass {
                 limit,
             })?;
         let actual_segments = actual_segments.max(1);
-        let segments = actual_segments
-            .checked_next_power_of_two()
-            .ok_or(ClassError::SegmentsTooLarge {
-                segments: actual_segments,
-                limit: usize::MAX,
-            })?;
+        let segments =
+            actual_segments
+                .checked_next_power_of_two()
+                .ok_or(ClassError::SegmentsTooLarge {
+                    segments: actual_segments,
+                    limit: usize::MAX,
+                })?;
         Ok(Self {
             rows,
             segments,
@@ -180,11 +181,13 @@ mod tests {
         assert_eq!(row_classes(20), [1, 2, 4, 8, 16, 32]);
         assert_eq!(row_classes(100), [1, 2, 4, 8, 16, 32, 64, 128]);
         assert!(row_classes(0).is_empty());
-        assert!(row_classes(513).is_empty());
-        for actual in 1..=512 {
+        assert_eq!(row_class(513), Some(576));
+        assert_eq!(row_class(1024), Some(1024));
+        assert!(row_classes(1025).is_empty());
+        for actual in 1..=1024 {
             let class = row_class(actual).unwrap();
             assert!(class >= actual);
-            assert!(row_classes(512).contains(&class));
+            assert!(row_classes(1024).contains(&class));
         }
     }
 
@@ -197,6 +200,11 @@ mod tests {
                 limit: 128
             })
         );
-        assert_eq!(LaunchClass::covering(1, 17, Demand::NONE, 512).unwrap().segments(), 32);
+        assert_eq!(
+            LaunchClass::covering(1, 17, Demand::NONE, 512)
+                .unwrap()
+                .segments(),
+            32
+        );
     }
 }

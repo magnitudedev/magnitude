@@ -5,14 +5,27 @@ use crate::{
     ResourceDomainId,
 };
 use magnitude_batching::{HeadPasses, ValidatedHeadBatch};
-use magnitude_state::{OwnedStateAdvance, StateStore};
+use magnitude_state::{StateStore, TentativeAdvance};
 use std::rc::Rc;
+
+/// What conditions a head launch's entry rows.
+pub enum HeadConditioning {
+    /// Per slot, the host rows conditioning its entry rows in row order.
+    Rows(Vec<FeatureRows>),
+    /// A lone slot's entry rows, conditioned by the leading rows of a target
+    /// feature output on the device (`[rows, hidden]` activation rows): a
+    /// prompt chunk's entry drafted behind the chunk. Holding the output
+    /// keeps its arena from recycling until the entry is drafted.
+    Features(crate::GraphOutputTensor),
+}
 
 pub struct HeadLaunchInputs {
     batch: ValidatedHeadBatch,
-    advances: Vec<OwnedStateAdvance>,
-    /// Per slot, the host rows conditioning its entry rows in row order.
-    conditioning: Vec<FeatureRows>,
+    advances: Vec<TentativeAdvance>,
+    conditioning: HeadConditioning,
+    /// Whether windowed history domains keep these entry rows: false for
+    /// priming rows every window drops before the first draft reads it.
+    windowed: bool,
     graph_workspace: NativeGraphWorkspaceLease,
     graph_output: Option<NativeGraphOutputLease>,
 }
@@ -20,8 +33,9 @@ pub struct HeadLaunchInputs {
 impl HeadLaunchInputs {
     pub fn new(
         batch: ValidatedHeadBatch,
-        advances: Vec<OwnedStateAdvance>,
-        conditioning: Vec<FeatureRows>,
+        advances: Vec<TentativeAdvance>,
+        conditioning: HeadConditioning,
+        windowed: bool,
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
     ) -> Self {
@@ -29,6 +43,7 @@ impl HeadLaunchInputs {
             batch,
             advances,
             conditioning,
+            windowed,
             graph_workspace,
             graph_output: Some(graph_output),
         }
@@ -38,8 +53,8 @@ impl HeadLaunchInputs {
         self,
     ) -> (
         ValidatedHeadBatch,
-        Vec<OwnedStateAdvance>,
-        Vec<FeatureRows>,
+        Vec<TentativeAdvance>,
+        HeadConditioning,
         NativeGraphWorkspaceLease,
         Option<NativeGraphOutputLease>,
     ) {
@@ -62,8 +77,12 @@ impl HeadLaunchInputs {
             context: "head launch",
             detail,
         };
+        let conditioned = match &self.conditioning {
+            HeadConditioning::Rows(rows) => rows.len(),
+            HeadConditioning::Features(_) => 1,
+        };
         if self.batch.actual_slots() != self.advances.len()
-            || self.batch.actual_slots() != self.conditioning.len()
+            || self.batch.actual_slots() != conditioned
         {
             return Err(invalid(
                 "slot, advance, and conditioning counts disagree".into(),
@@ -79,24 +98,30 @@ impl HeadLaunchInputs {
                 "workspace or output lease differs from head domain/class".into(),
             ));
         }
-        for (index, ((slot, advance), rows)) in self
-            .batch
-            .slots()
-            .zip(&self.advances)
-            .zip(&self.conditioning)
-            .enumerate()
-        {
+        for (index, (slot, advance)) in self.batch.slots().zip(&self.advances).enumerate() {
             let binding = advance.bindings();
             if i32::try_from(binding.previous_bank).ok() != Some(slot.bank())
                 || i32::try_from(binding.following_bank).ok() != Some(slot.following_bank())
             {
                 return Err(invalid(format!("slot {index} uses another state bank")));
             }
-            if rows.rows() != slot.rows() || rows.row_bytes() != row_bytes {
+            // Bound features' width is checked where the graph binds them.
+            let (rows, fits) = match &self.conditioning {
+                HeadConditioning::Rows(rows) => (
+                    rows[index].rows(),
+                    rows[index].rows() == slot.rows() && rows[index].row_bytes() == row_bytes,
+                ),
+                HeadConditioning::Features(features) => match features.tensor().extents() {
+                    [rows, _] => {
+                        let rows = usize::try_from(*rows).unwrap_or(0);
+                        (rows, rows >= slot.rows())
+                    }
+                    _ => (0, false),
+                },
+            };
+            if !fits {
                 return Err(invalid(format!(
-                    "slot {index} conditioning has {} rows of {} bytes for {} entry rows",
-                    rows.rows(),
-                    rows.row_bytes(),
+                    "slot {index} conditioning has {rows} rows for {} entry rows",
                     slot.rows()
                 )));
             }
@@ -216,6 +241,7 @@ impl ValidatedHeadLaunch {
             batch,
             advances,
             conditioning,
+            windowed,
             graph_workspace,
             graph_output,
         } = inputs;
@@ -224,6 +250,7 @@ impl ValidatedHeadLaunch {
                 batch,
                 advances,
                 conditioning,
+                windowed,
                 domain: domain.clone(),
             },
             graph_workspace,
@@ -263,8 +290,9 @@ impl ValidatedHeadLaunch {
 
 pub struct HeadLaunchCore {
     batch: ValidatedHeadBatch,
-    advances: Vec<OwnedStateAdvance>,
-    conditioning: Vec<FeatureRows>,
+    advances: Vec<TentativeAdvance>,
+    conditioning: HeadConditioning,
+    windowed: bool,
     domain: ResourceDomainId,
 }
 
@@ -272,13 +300,17 @@ impl HeadLaunchCore {
     pub fn batch(&self) -> &ValidatedHeadBatch {
         &self.batch
     }
-    pub fn advances(&self) -> &[OwnedStateAdvance] {
+    pub fn advances(&self) -> &[TentativeAdvance] {
         &self.advances
     }
-    pub fn conditioning(&self) -> &[FeatureRows] {
+    pub fn conditioning(&self) -> &HeadConditioning {
         &self.conditioning
     }
-    pub fn into_parts(self) -> (ValidatedHeadBatch, Vec<OwnedStateAdvance>, Vec<FeatureRows>) {
+    /// Whether windowed history domains keep the entry rows.
+    pub fn windowed(&self) -> bool {
+        self.windowed
+    }
+    pub fn into_parts(self) -> (ValidatedHeadBatch, Vec<TentativeAdvance>, HeadConditioning) {
         (self.batch, self.advances, self.conditioning)
     }
 }

@@ -138,6 +138,7 @@ impl EntryTuning for StateSpaceProjectTuning {
             key_weight: &case.empty,
             value_weight: &case.empty,
             epsilon: case.epsilon,
+            project_mode: 0,
         }
     }
 

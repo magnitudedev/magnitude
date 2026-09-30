@@ -4,14 +4,28 @@ use magnitude_family_contracts::WeightKind;
 use magnitude_kernels::{
     dense_output, draft_confidence, draft_convolve_input, draft_convolve_residual,
     draft_gated_rows, draft_path_step, draft_top_k, embedding_rows, project_rows,
-    readout_features_rows, readout_head_rows,
+    readout_features_rows, readout_head_rows, sample_rows, shape_rows, widen_rows,
 };
 use seismic::{Element, NativeKernel};
 use std::collections::HashMap;
 
+/// The vocabulary a separate draft's readout projects onto and selects over.
+/// Like the MTP head (`draft_vocabulary`), it scores the frequency-ordered
+/// leading rows: verification still selects over the whole vocabulary, so
+/// this bounds which tokens can be proposed, never which are emitted.
+/// DSpark's Markov bias is prepared over the whole vocabulary, so a draft
+/// with a Markov chain reads it all.
+pub(crate) fn draft_readout_vocabulary(markov: bool, vocabulary: u64) -> u64 {
+    if markov {
+        vocabulary
+    } else {
+        super::draft_vocabulary(vocabulary)
+    }
+}
+
 /// Immutable specializations of a separate draft (DFlash, DSpark, DFlash2), one per
-/// distinct binding. Token selection reuses the target's entries (the draft
-/// selects over the whole vocabulary through the target's projection).
+/// distinct binding. Token selection runs over the draft's readout
+/// vocabulary (`draft_readout_vocabulary`).
 #[derive(Debug, Default)]
 pub struct DraftKernels {
     /// The layers' block attention and their context injection (the same
@@ -23,6 +37,11 @@ pub struct DraftKernels {
     /// The output norm and the target's vocabulary projection of the
     /// proposing rows.
     pub(super) head: Option<NativeKernel<readout_head_rows::Entry>>,
+    /// Token selection over the readout vocabulary.
+    pub(super) shape: Option<NativeKernel<shape_rows::Entry>>,
+    pub(super) sample: Option<NativeKernel<sample_rows::Entry>>,
+    /// Widens a device-conditioned entry's target features to F32.
+    pub(super) widen: Option<NativeKernel<widen_rows::Entry>>,
     pub(super) markov: Option<MarkovKernels>,
     pub(super) dflash2: Option<Dflash2Kernels>,
 }
@@ -124,7 +143,13 @@ impl Dflash2Kernels {
             self.projections
                 .get(&(kind, weight, output))
                 .cloned()
-                .ok_or_else(|| format!("project_rows {kind:?} W={} Y={}", weight.name(), output.name()))
+                .ok_or_else(|| {
+                    format!(
+                        "project_rows {kind:?} W={} Y={}",
+                        weight.name(),
+                        output.name()
+                    )
+                })
         };
         let layers = plan
             .blocks()
@@ -158,7 +183,11 @@ impl Dflash2Kernels {
         Ok(AttestedDflash2 {
             layers,
             features: norm(plan.output_norm())?,
-            hidden: projection(WeightKind::SelectorHidden, binding.selector.hidden, activation)?,
+            hidden: projection(
+                WeightKind::SelectorHidden,
+                binding.selector.hidden,
+                activation,
+            )?,
             convolve_input: self.convolve_input.clone(),
             convolve_residual: self.convolve_residual.clone(),
             gated: self.gated.clone(),
@@ -181,7 +210,13 @@ pub type Dflash2ProjectionKey = (WeightKind, Element, Element);
 pub(crate) fn dflash2_entries(
     plan: &crate::DraftProgramPlan,
     binding: &crate::Dflash2Binding,
-) -> (Vec<(Dflash2ProjectionKey, Vec<magnitude_family_contracts::WeightScope>)>, Vec<Element>) {
+) -> (
+    Vec<(
+        Dflash2ProjectionKey,
+        Vec<magnitude_family_contracts::WeightScope>,
+    )>,
+    Vec<Element>,
+) {
     use magnitude_family_contracts::{SublayerIndex, WeightScope};
     let activation = plan.activation();
     let f32 = Element::f32();
@@ -192,11 +227,12 @@ pub(crate) fn dflash2_entries(
         })
     };
     let mut projections: Vec<(Dflash2ProjectionKey, Vec<WeightScope>)> = Vec::new();
-    let mut add = |key: Dflash2ProjectionKey, scope: WeightScope| {
-        match projections.iter_mut().find(|(existing, _)| *existing == key) {
-            Some((_, scopes)) => scopes.push(scope),
-            None => projections.push((key, vec![scope])),
-        }
+    let mut add = |key: Dflash2ProjectionKey, scope: WeightScope| match projections
+        .iter_mut()
+        .find(|(existing, _)| *existing == key)
+    {
+        Some((_, scopes)) => scopes.push(scope),
+        None => projections.push((key, vec![scope])),
     };
     let mut norms = vec![plan.output_norm()];
     for (index, (block, [attention_coefficients, dense_coefficients])) in
@@ -213,14 +249,31 @@ pub(crate) fn dflash2_entries(
         add((WeightKind::Key, attention.key, activation), mixer);
         add((WeightKind::Value, attention.value, activation), mixer);
         add((WeightKind::AttentionOutput, attention.output, f32), mixer);
-        add((WeightKind::ConvolutionProjection, *attention_coefficients, f32), mixer);
-        add((WeightKind::ConvolutionProjection, *dense_coefficients, f32), feed_forward);
-        add((WeightKind::DenseGate, dense.gate, activation), feed_forward);
+        add(
+            (
+                WeightKind::ConvolutionProjection,
+                *attention_coefficients,
+                f32,
+            ),
+            mixer,
+        );
+        add(
+            (WeightKind::ConvolutionProjection, *dense_coefficients, f32),
+            feed_forward,
+        );
+        add(
+            (WeightKind::DenseGate, dense.gate, activation),
+            feed_forward,
+        );
         add((WeightKind::DenseUp, dense.up, activation), feed_forward);
         add((WeightKind::DenseDown, dense.down, f32), feed_forward);
     }
     add(
-        (WeightKind::SelectorHidden, binding.selector.hidden, activation),
+        (
+            WeightKind::SelectorHidden,
+            binding.selector.hidden,
+            activation,
+        ),
         WeightScope::Draft,
     );
     (projections, norms)

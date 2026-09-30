@@ -91,9 +91,11 @@ whole-model accumulated error.
 An entry that declares parameters without a case fails preparation; there are no
 engine-side default parameter values. An entry prepared again with identical element bindings
 and static values reuses the load's first tuning result; its rotations already span the weights
-of several layers. Entry-wide
+of several layers. Disjoint row-class workloads may prepare distinct configurations of the same
+entry contract; each is tuned and validated on the classes it serves, and the exact graph class
+binds its prepared configuration. Entry-wide
 declarations use a configuration budget: a census counts the model's tuning units (entry,
-element bindings and static values), their admissible configurations and launches
+element bindings, static values and served workload), their admissible configurations and launches
 per step, finds which units have a stored result, and finds and measures the first numerically passing seed of
 each unit that will search (one configuration of the per-model budget each; a
 stored result supplies the defaults' times of a stored unit). Each row class's
@@ -297,7 +299,9 @@ gate function come from the operator. Attention decode measurements are keyed by
 the per-row work a form adds is small beside the history the entry streams. Wide heads (up to 512
 columns, query groups up to 16) stay within each backend's workgroup memory (the 32 KiB floor on
 Metal and Vulkan, 32-lane subgroups): decode splits a kv head's query group into register-resident slices that each
-stream the history once, and prefill scores whole heads but accumulates outputs one 256-column
+stream the history once, or in its grouped-query matrix form makes the group's query heads the rows
+of tensor-core tiles that stream the history once per kv head (the prefill's tile body on CUDA and
+Vulkan), and prefill scores whole heads but accumulates outputs one 256-column
 window per pass, so a wide form is a specialization of the same entries. Few kv heads over long
 history are parallelized across the history, never across a different graph: decode splits a row's
 keys into tuned partitions, and prefill may split a tile's history keys across tuned partition

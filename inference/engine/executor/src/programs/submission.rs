@@ -38,6 +38,24 @@ impl<S> SubmittedTarget for ReadySubmission<crate::TargetLaunchCore, S, crate::T
     }
 }
 
+/// A head submission's launch, readable while it executes: the drafter
+/// entry of a prompt chunk queued behind it follows its advances.
+pub trait SubmittedHead {
+    fn launch(&self) -> &crate::HeadLaunchCore;
+}
+
+impl<S, O> SubmittedHead for DeviceSubmission<crate::HeadLaunchCore, S, O> {
+    fn launch(&self) -> &crate::HeadLaunchCore {
+        &self.launch
+    }
+}
+
+impl<S, O> SubmittedHead for ReadySubmission<crate::HeadLaunchCore, S, O> {
+    fn launch(&self) -> &crate::HeadLaunchCore {
+        &self.launch
+    }
+}
+
 /// Physical output plus the launch's owned reconciliation payload. The launch
 /// remains unavailable to callers until `finish` consumes its submission.
 pub struct CompletedWork<L, O> {

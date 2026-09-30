@@ -239,7 +239,10 @@ mod tuning_pin {
                         .into_iter()
                         .map(|(key, value)| {
                             let (launch, name) = key.split_once(':').ok_or_else(malformed)?;
-                            Ok(((launch.parse().map_err(|_| malformed())?, name.to_owned()), value))
+                            Ok((
+                                (launch.parse().map_err(|_| malformed())?, name.to_owned()),
+                                value,
+                            ))
                         })
                         .collect::<Result<_, String>>()?,
                 })
@@ -694,6 +697,7 @@ impl Bench {
             demand,
             select,
             committed,
+            prime: None,
         }
     }
 
@@ -1378,6 +1382,7 @@ fn verify_cell(
                     demand: Demand::SELECT,
                     select,
                     committed: width,
+                    prime: None,
                 }
             })
             .collect()
@@ -2005,6 +2010,7 @@ mod qualify {
                 .collect(),
             committed: forced.len(),
             tokens: forced,
+            prime: None,
         }
     }
 

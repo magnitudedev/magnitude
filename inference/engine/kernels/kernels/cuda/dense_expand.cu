@@ -51,9 +51,10 @@ __device__ __forceinline__ void expand_gemm(const projection::u8 *staged, const 
                                             unsigned long long H, unsigned long long F, const packets::W0 &gate,
                                             const packets::W1 &up, const Epi &epi) {
     extern __shared__ uint4 dynamic_shared[];
-    if (blockIdx.x < projection::gemm_columns(F))
+    const unsigned long long column = projection::gemm_column<Shape>();
+    if (column < projection::gemm_columns(F))
         projection::gemm_run<Shape, Q>(reinterpret_cast<projection::u8 *>(dynamic_shared), staged, H, groups, M, H,
-                                       blockIdx.x, F, gate, up, epi);
+                                       column, F, gate, up, epi);
 }
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_STAGE
@@ -98,8 +99,9 @@ __global__ void dense_expand_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMM
-extern "C" __global__ void dense_expand_gemm(SEISMIC_KERNEL_PARAMS) {
-    expand_gemm<projection::LargeGemm, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F,
-                                              GATE, UP, EPILOGUE);
+template <unsigned ROTATE>
+__global__ void dense_expand_gemm(SEISMIC_KERNEL_PARAMS) {
+    expand_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
+                                                      SEISMIC_DIM_F, GATE, UP, EPILOGUE);
 }
 #endif

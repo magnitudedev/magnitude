@@ -10,10 +10,11 @@ use crate::platform::{DomainReading, DomainRole};
 use crate::programs::ProgramSubmission;
 use crate::{
     AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader,
-    ExecutionPlan, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GroupKey, HeadLaunchInputs,
-    ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation, Outcome, PoolClass,
-    ProgramIdentity, RequestId, ResidentHead, ResidentVision, ResourceDomain, ResourceDomainId,
-    ResourceKind, RowResult, Selected, StateLaunchInputs, StateWork, TargetLaunchInputs,
+    ExecutionPlan, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GraphOutputTensor,
+    GroupKey, HeadConditioning, HeadLaunchInputs, ImageRef, NativeGraphOutputLease,
+    NativeGraphWorkspaceLease, Operation, Outcome, PoolClass, Priming, ProgramIdentity, RequestId,
+    ResidentHead, ResidentVision, ResourceDomain, ResourceDomainId, ResourceKind, RowResult,
+    SelectSpec, Selected, StateLaunchInputs, StateWork, TargetLaunchInputs, TokenId,
     TargetTokens, ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
     ValidatedVisionLaunch, VisionLaunchInputs, WorkKind,
 };
@@ -42,7 +43,7 @@ mod domain_tests;
 
 pub use family::{NativeFamily, ProgramFamily};
 pub use heap::{ClaimRefusal, DeviceHeap};
-use in_flight::decode_selected;
+use in_flight::{decode_selected, PrimingFlight};
 pub use in_flight::{HeadFlight, TargetFlight, VisionFlight};
 pub use ownership::OpenRequirements;
 pub use state::MemoryChargeReconciliation;
@@ -195,6 +196,8 @@ pub struct PendingOperationOutcome {
     request: RequestId,
     outcome: Outcome,
     advance: Option<OwnedStateAdvance>,
+    /// A prompt chunk's drafter entry, committed whole with the chunk.
+    primed: Option<OwnedStateAdvance>,
     rows: usize,
     committed_rows: usize,
     kind: WorkKind,
@@ -233,6 +236,10 @@ pub struct DomainRequirements {
     pool: PoolClass,
     state_rows: usize,
     successor_banks: usize,
+    /// Head rows (and one successor bank each) of the drafter entries the
+    /// target group's prompt chunks prime.
+    priming_rows: usize,
+    priming_banks: usize,
     /// The operations claim the queued lookahead step: nothing is reserved.
     claim: bool,
 }
@@ -284,6 +291,15 @@ pub struct TargetLaunchReservation {
     graph_outputs: [NativeGraphOutputLease; 2],
     readout_workspace: NativeGraphWorkspaceLease,
     readout_output: NativeGraphOutputLease,
+    priming: Option<PrimingReservation>,
+}
+
+/// A lone prompt chunk's drafter entry: its head advance and draft launch
+/// leases.
+pub struct PrimingReservation {
+    advance: OwnedStateAdvance,
+    graph_workspace: NativeGraphWorkspaceLease,
+    graph_output: NativeGraphOutputLease,
 }
 
 impl DomainReservation {
@@ -354,7 +370,11 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     trace_host_steps: bool,
     /// The step queued behind the last submitted target step, until claimed
     /// or orphaned (see `lookahead`).
-    lookahead: Option<lookahead::Lookahead<F::TargetSubmission>>,
+    lookahead: Option<lookahead::Lookahead<F::TargetSubmission, F::HeadSubmission>>,
+    /// The owner's planned successors of the group it submits next: the
+    /// operations known to follow it before it finishes (a prompt's next
+    /// prefill chunk). Consumed by that group's provisioning and lookahead.
+    planned: Vec<Operation>,
     /// Identity of the next target flight.
     next_flight: u64,
     /// Log lookahead queues, claims and orphans (read once at start).
@@ -571,6 +591,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 pool: PoolClass::Target(class),
                 state_rows: 0,
                 successor_banks: 0,
+                priming_rows: 0,
+                priming_banks: 0,
                 claim: true,
             });
         }
@@ -595,6 +617,32 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ));
         }
         let limits = self.execution.policy().limits();
+        let mut priming_rows = 0usize;
+        let mut priming_banks = 0usize;
+        for operation in operations {
+            if let Operation::Forward {
+                request,
+                prime: Some(prime),
+                ..
+            } = operation
+            {
+                if operations.len() != 1 {
+                    return Err(DomainError::Input(
+                        "a primed prompt chunk launches alone".into(),
+                    ));
+                }
+                let state = self.head.get(request).ok_or_else(|| {
+                    DomainError::Input("a primed prompt chunk's drafter is not idle".into())
+                })?;
+                if state.position() != prime.position {
+                    return Err(DomainError::Input(
+                        "drafter entry position differs from accepted drafter state".into(),
+                    ));
+                }
+                priming_rows += prime.tokens.len();
+                priming_banks += 1;
+            }
+        }
         let (pool, state_rows, successor_banks) = match lane {
             ReservationLane::Target | ReservationLane::Head => {
                 let mut rows = 0usize;
@@ -717,6 +765,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             pool,
             state_rows,
             successor_banks,
+            priming_rows,
+            priming_banks,
             claim: false,
         })
     }
@@ -791,6 +841,36 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     Some(graph.available_workspace()),
                     Some(graph.available_output()),
                 )?;
+            }
+        }
+        if requirements.priming_banks != 0 {
+            let graph = self.resources.head_graph().ok_or(CapacityError {
+                resource: ResourceKind::Workspace,
+                required: 1,
+                available: 0,
+            })?;
+            available(
+                Some(graph.available_workspace()),
+                Some(graph.available_output()),
+            )?;
+            let store = self.head_store.as_ref().ok_or(CapacityError {
+                resource: ResourceKind::StateRows,
+                required: requirements.priming_rows as u64,
+                available: 0,
+            })?;
+            if store.available_rows() < requirements.priming_rows {
+                return Err(CapacityError {
+                    resource: ResourceKind::StateRows,
+                    required: requirements.priming_rows as u64,
+                    available: store.available_rows() as u64,
+                });
+            }
+            if store.available_banks() < requirements.priming_banks {
+                return Err(CapacityError {
+                    resource: ResourceKind::RecurrentBanks,
+                    required: requirements.priming_banks as u64,
+                    available: store.available_banks() as u64,
+                });
             }
         }
         let store = if requirements.lane == ReservationLane::Head {
@@ -871,7 +951,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 self.claim_device_growth(required, staged, HoldingClass::Dormant)
             })
             .transpose()?;
-        let bound = self.bind_component(requirements.lane);
+        let bound = self.bind_component(requirements.lane).and_then(|()| {
+            if requirements.priming_banks != 0 {
+                self.bind_component(ReservationLane::Head)
+            } else {
+                Ok(())
+            }
+        });
         if let Some(claim) = claim {
             self.release_claim(claim);
         }
@@ -912,6 +998,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     graph_outputs,
                     readout_workspace,
                     readout_output,
+                    priming: None,
                 }))
             }
             ReservationLane::Head => {
@@ -941,8 +1028,44 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut resources = resources;
         match &mut resources {
             ReservedResources::Target(TargetGraphReservation::Launch(
-                TargetLaunchReservation { advances, .. },
+                TargetLaunchReservation {
+                    advances, priming, ..
+                },
             )) => {
+                if let [Operation::Forward {
+                    request,
+                    prime: Some(prime),
+                    ..
+                }] = operations
+                {
+                    let graph = self.resources.head_graph().expect("checked head graph");
+                    let graph_workspace = graph
+                        .acquire_workspace()
+                        .map_err(|error| invariant("drafter entry workspace", error))?;
+                    let graph_output = graph
+                        .acquire_output()
+                        .map_err(|error| invariant("drafter entry output", error))?;
+                    let state = self
+                        .head
+                        .remove(request)
+                        .expect("reservation preflight established drafter ownership");
+                    let rows = prime.tokens.len();
+                    match OwnedStateAdvance::begin_speculative(state, rows, rows) {
+                        Ok(advance) => {
+                            *priming = Some(PrimingReservation {
+                                advance,
+                                graph_workspace,
+                                graph_output,
+                            })
+                        }
+                        Err((state, error)) => {
+                            self.head.insert(*request, state);
+                            return Err(DomainError::invariant(format!(
+                                "drafter state capacity changed after availability check: {error}"
+                            )));
+                        }
+                    }
+                }
                 for operation in operations {
                     let request = operation.request();
                     let state = self
@@ -959,6 +1082,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             self.target.insert(request, state);
                             for (operation, advance) in operations.iter().zip(advances.drain(..)) {
                                 self.target.insert(operation.request(), advance.abort());
+                            }
+                            if let Some(priming) = priming.take() {
+                                self.head.insert(request, priming.advance.abort());
                             }
                             return Err(DomainError::invariant(format!(
                                 "target state capacity changed after availability check: {error}"
@@ -1037,6 +1163,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             target_timing: None,
             trace_host_steps: std::env::var_os("MAGNITUDE_TRACE_HOST_STEP").is_some(),
             lookahead: None,
+            planned: Vec::new(),
             next_flight: 0,
             trace_lookahead: std::env::var_os("MAGNITUDE_TRACE_LOOKAHEAD").is_some(),
         }

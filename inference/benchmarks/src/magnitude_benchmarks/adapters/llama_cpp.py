@@ -12,11 +12,22 @@ class LlamaCpp(Adapter):
     extensions = {"cache_prompt": False}
 
     async def prepare(self):
-        executable = shutil.which("llama-server")
+        executable = (
+            str(self.options.llama.binary)
+            if self.options.llama.binary
+            else shutil.which("llama-server")
+        )
         if not executable:
             raise ValueError("upstream llama-server is required on PATH for --engine llama.cpp")
+        if not Path(executable).is_file():
+            raise ValueError(f"llama-server executable does not exist: {executable}")
         self.executable = executable
         self.identity = {"executable": executable, "sha256": file_hash(Path(executable))}
+        if self.options.llama.draft is not None:
+            self.identity["draft"] = {
+                "path": str(self.options.llama.draft),
+                "sha256": file_hash(self.options.llama.draft),
+            }
         self.identity["version"] = await command(
             [self.executable, "--version"],
             self.root,
@@ -27,6 +38,10 @@ class LlamaCpp(Adapter):
         super().verify()
         if file_hash(Path(self.executable)) != self.identity["sha256"]:
             raise ValueError("llama-server changed after preparation")
+        if self.options.llama.draft is not None and file_hash(
+            self.options.llama.draft
+        ) != self.identity["draft"]["sha256"]:
+            raise ValueError("llama.cpp draft changed after preparation")
 
     def argv(self, port, context, parallel, directory):
         return [
@@ -43,6 +58,22 @@ class LlamaCpp(Adapter):
             str(context * parallel),
             "--parallel",
             str(parallel),
+            "--n-gpu-layers",
+            str(self.options.llama.gpu_layers),
+            *(
+                [
+                    "--model-draft",
+                    str(self.options.llama.draft),
+                    "--spec-type",
+                    f"draft-{self.options.llama.draft_method}",
+                    "--spec-draft-n-max",
+                    str(self.options.llama.draft_proposals),
+                    "--n-gpu-layers-draft",
+                    str(self.options.llama.gpu_layers),
+                ]
+                if self.options.llama.draft is not None
+                else []
+            ),
             "--jinja",
             "--flash-attn",
             "on",

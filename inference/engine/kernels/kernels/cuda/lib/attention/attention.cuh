@@ -7,8 +7,8 @@
 // fixed-order merge of partial softmax states, the decode publication and
 // gated merge, the history policies (dense planes; the affine codec: encode on
 // append, per-lane code access), and the entries' tensor addressing. Each
-// kernel keeps its own loop structure and calls these; the prefill bodies are
-// in lib/attention/prefill.cuh. Every activation tensor is canonical (unit
+// kernel keeps its own loop structure and calls these; the tensor-core bodies
+// (prefill, and the decode matrix form) are in lib/attention/prefill.cuh. Every activation tensor is canonical (unit
 // innermost stride); rows and heads are addressed through their ABI strides.
 
 #include "../core/activation.cuh"
@@ -175,11 +175,54 @@ __device__ __forceinline__ void clear(Heads<H> &state) {
     }
 }
 
+__host__ __device__ constexpr int sums_pow2(int n) { return n <= 1 ? 1 : 2 * sums_pow2((n + 1) / 2); }
+__host__ __device__ constexpr int sums_log2(int p) { return p <= 1 ? 0 : 1 + sums_log2(p / 2); }
+
+// The warp sums of a lane's N x H scores, each returned on every lane. A
+// halving exchange sums them transposed: each step keeps half of the
+// remaining values and sends the partner the other half, so after
+// min(5, log2 N H) steps a lane holds N H / 32 sums (one when N H <= 32), of
+// the indices its lane bits select; the remaining offsets sum within them and
+// a broadcast returns every sum. About 2 N H shuffles against 5 N H for
+// independent sums; the lanes' addition order is fixed.
+template <int N, int H>
+__device__ __forceinline__ void score_sums(float (&score)[N][H], int lane) {
+    constexpr int COUNT = N * H;
+    constexpr int P = sums_pow2(COUNT);
+    constexpr int HALVINGS = sums_log2(P) < 5 ? sums_log2(P) : 5;
+    constexpr int HELD = P >> HALVINGS;
+    float y[P];
+#pragma unroll
+    for (int i = 0; i < P; ++i) y[i] = i < COUNT ? score[i / H][i % H] : 0.0f;
+#pragma unroll
+    for (int step = 0; step < 5; ++step) {
+        const unsigned offset = 16u >> step;
+        if (step < HALVINGS) {
+            const int half_count = P >> (step + 1);
+            const bool upper = (lane & offset) != 0;
+#pragma unroll
+            for (int i = 0; i < P / 2; ++i) {
+                if (i < half_count) {
+                    const float keep = upper ? y[i + half_count] : y[i];
+                    const float send = upper ? y[i] : y[i + half_count];
+                    y[i] = seismic_add_rn(keep, seismic_shfl_xor_f32(send, offset));
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < HELD; ++i) y[i] = seismic_add_rn(y[i], seismic_shfl_xor_f32(y[i], offset));
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < COUNT; ++j)
+        score[j / H][j % H] = seismic_shfl_idx_f32(y[j % HELD], (j / HELD) << (5 - HALVINGS));
+}
+
 // The scores (exp2 domain when `q` is scaled into it) of N keys for H query
-// heads: warp-reduced dot products.
+// heads: warp-reduced dot products (`score_sums`).
 template <int N, int H>
 __device__ __forceinline__ void scores(const float (&q)[H][DPL], const float (&k)[N][DPL],
-                                       float (&score)[N][H]) {
+                                       float (&score)[N][H], int lane) {
 #pragma unroll
     for (int t = 0; t < N; ++t) {
 #pragma unroll
@@ -187,9 +230,10 @@ __device__ __forceinline__ void scores(const float (&q)[H][DPL], const float (&k
             float dot = 0.0f;
 #pragma unroll
             for (int d = 0; d < DPL; ++d) dot = __fmaf_rn(q[h][d], k[t][d], dot);
-            score[t][h] = seismic_warp_sum_f32(dot);
+            score[t][h] = dot;
         }
     }
+    score_sums(score, lane);
 }
 
 // Absorb `count` (1..N) keys with scores `score` (exp2 domain) and values `v`.

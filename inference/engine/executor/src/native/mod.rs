@@ -18,7 +18,8 @@ pub(crate) use attestation::{
 };
 use draft::DraftKernels;
 pub(crate) use draft::{
-    AttestedDflash2, DraftBlockKernels, Dflash2Kernels, Dflash2Projections, MarkovKernels,
+    draft_readout_vocabulary, AttestedDflash2, Dflash2Kernels, Dflash2Projections,
+    DraftBlockKernels, MarkovKernels,
 };
 use glue::GlueKernels;
 pub(crate) use head::draft_vocabulary;
@@ -28,11 +29,10 @@ use preparation::NativePreparationCache;
 use qualification::QualificationView;
 use target::TargetKernels;
 pub(crate) use target::{
-    AttentionHistoryKernels, AttentionKernels, DenseKernels, PostNormKernels, ReadoutKernels,
-    DenseExpansionKernel, ExpertKernels, GeneralRoutedKernels, RecurrentKernels, RoutedKernels,
-    ParallelKernels, PerLayerEntryKernels, PerLayerKernels, ShortConvKernels, StateSpaceKernels,
-    SublayerOutput,
-    TableConversion, TapKernels,
+    AttentionHistoryKernels, AttentionKernels, DenseExpansionKernel, DenseKernels, ExpertKernels,
+    GeneralRoutedKernels, ParallelKernels, PerLayerEntryKernels, PerLayerKernels, PostNormKernels,
+    ReadoutKernels, RecurrentKernels, RoutedKernels, ShortConvKernels, StateSpaceKernels,
+    SublayerOutput, TableConversion, TapKernels,
 };
 #[cfg(feature = "pinned-tuning")]
 pub use tuning::pinned as pinned_tuning;
@@ -50,17 +50,16 @@ use crate::{
     ProgramPlan, RecurrentBinding, RoutedBinding, SublayerTail, VisionEntry,
 };
 use magnitude_kernels::{
-    attention_output, conditioning_overlay, copy_rows, dense_expand, dense_output, draft_rows,
-    embedding_rows, attention_decode, attention_decode_k8v4, attention_prefill, moe_tail,
-    per_layer_gate, per_layer_inputs,
-    attention_prefill_k8v4, attention_project, gated_delta_chunk, gated_delta_output,
-    gated_delta_project, gated_delta_step, head_logits_rows, import_dense, post_norm_residual,
-    project_rows, readout_features_rows, readout_head_rows, readout_selected_rows, repack_weight,
-    routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
-    sample_rows, shape_rows, short_conv_project, short_conv_rows, state_space_chunk,
-    state_space_gate, state_space_step,
-    dense_up, routed_down, routed_experts_up, routed_gate_up, routed_scatter, routed_select,
-    routed_up, vision_attention, vision_clamp, vision_linear, vision_norm, vision_patch_stem, vision_pool,
+    attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
+    attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows, dense_expand,
+    dense_output, dense_up, draft_rows, embedding_rows, gated_delta_chunk, gated_delta_output,
+    gated_delta_project, gated_delta_step, head_logits_rows, import_dense, moe_tail,
+    per_layer_gate, per_layer_inputs, post_norm_residual, project_rows, readout_features_rows,
+    readout_head_rows, readout_selected_rows, repack_weight, routed_combine, routed_down,
+    routed_expand, routed_experts, routed_experts_up, routed_gate_up, routed_group, routed_output,
+    routed_route, routed_scatter, routed_select, routed_up, sample_rows, shape_rows,
+    short_conv_project, short_conv_rows, state_space_chunk, state_space_gate, state_space_step,
+    vision_attention, vision_clamp, vision_linear, vision_norm, vision_patch_stem, vision_pool,
     vision_position,
 };
 use seismic::{BackendName, DType, Device, Element, NativeKernel, Tensor};

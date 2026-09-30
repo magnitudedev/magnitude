@@ -1208,7 +1208,8 @@ struct CensusUnit {
     key: TuningKey,
     /// Admissible configurations.
     size: usize,
-    /// Defaults plus one start per other admissible value of each form axis.
+    /// Defaults plus one start per other admissible value of each form axis
+    /// and each of the case's own search starts.
     form_starts: usize,
     /// Launches per step over every preparation of the unit.
     launches: usize,
@@ -1621,7 +1622,16 @@ impl<'a> Tuner<'a> {
                     .len()
             })
             .sum::<usize>();
-        let form_starts = form_starts.min(admissible.len());
+        // The case's own starts (measured good geometries) are first
+        // measurements too: a unit left only its defaults would never try
+        // them.
+        let seeded = case
+            .search_starts(self.device, implementation, statics, self.limits)
+            .into_iter()
+            .filter(|start| *start != *defaults.params())
+            .collect::<HashSet<_>>()
+            .len();
+        let form_starts = (form_starts + seeded).min(admissible.len());
         let mut unit = CensusUnit {
             key: key.clone(),
             size: admissible.len(),

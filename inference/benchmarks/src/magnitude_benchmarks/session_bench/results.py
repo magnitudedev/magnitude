@@ -49,6 +49,8 @@ def public_command(
         args += ["--target", f"{target.engine}={target.reference}"]
     if any(target.engine == "magnitude" for target in targets):
         args += options.native.arguments()
+    if any(target.engine == "llama.cpp" for target in targets):
+        args += options.llama.arguments()
     args += options.watchdog.arguments()
     args += [
         "--suite",

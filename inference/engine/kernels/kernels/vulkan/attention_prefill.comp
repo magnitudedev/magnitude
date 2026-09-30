@@ -10,12 +10,18 @@
 #define ATTENTION_GATE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_GATE)
 #define ATTENTION_AMPLITUDE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)
 #define ATTENTION_VALUE_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_VALUE_NORM)
+#define PREFILL_ROWS uint(SEISMIC_TUNE_ROWS)
 #include "lib/attention/prefill.glsl"
 
 attention_history prefill_history() {
     return attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE));
 }
 
-void attention_prefill_prepare() { prefill_prepare(prefill_history()); }
-void attention_prefill_attend() { prefill_attend(prefill_history()); }
-void attention_prefill_merge() { prefill_merge(); }
+prefill_scratch prefill_scratch_planes() {
+    return prefill_scratch(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTS));
+}
+
+void attention_prefill_prepare() { prefill_prepare(prefill_history(), prefill_scratch_planes()); }
+void attention_prefill_attend() { prefill_attend(prefill_history(), prefill_scratch_planes()); }
+void attention_prefill_merge() { prefill_merge(prefill_scratch_planes()); }

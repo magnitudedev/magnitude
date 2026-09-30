@@ -169,6 +169,7 @@ fn forward(request: RequestId, position: usize) -> Operation {
         demand: crate::batching::Demand::NONE,
         select: Vec::new(),
         committed: 1,
+        prime: None,
     }
 }
 
@@ -274,6 +275,12 @@ impl<L, W, O> ProgramSubmission for PendingSubmission<L, W, O> {
         self.completion.result()?;
         drop(self.workspace);
         Ok(CompletedWork::new(self.core, self.output))
+    }
+}
+
+impl crate::programs::SubmittedHead for PendingFailureSubmission<CompletedHeadWork> {
+    fn launch(&self) -> &crate::HeadLaunchCore {
+        unreachable!("controlled fixture submits no head launch")
     }
 }
 
@@ -395,7 +402,7 @@ impl ProgramFamily for TestFamily {
 fn submit_reserved_target<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
     operations: Vec<Operation>,
-) -> Result<TargetFlight<F::TargetSubmission>, DomainError> {
+) -> Result<TargetFlight<F::TargetSubmission, F::HeadSubmission>, DomainError> {
     let resources = domain.reserve(&operations)?.into_resources();
     let ReservedResources::Target(reservation) = resources else {
         panic!("target operation produced another reservation lane")
@@ -523,6 +530,7 @@ fn pending_head_and_vision_device_failures_poison_the_domain_owner() {
         steps: 0,
         submission: PendingFailureSubmission::<CompletedHeadWork>::new(head_control.clone()),
         started: Instant::now(),
+        launch_trace: None,
     };
     assert!(!head.completion().is_complete());
     head_control.resolve(Err(failure("head")));
@@ -576,6 +584,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops_without_pois
                 proposals: Vec::new(),
             },
             advance: Some(head_advance),
+            primed: None,
             rows: 1,
             committed_rows: 0,
             kind: WorkKind::Decode,
@@ -603,6 +612,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops_without_pois
                 features: vision_features,
             },
             advance: None,
+            primed: None,
             rows: 0,
             committed_rows: 0,
             kind: WorkKind::Prefill,

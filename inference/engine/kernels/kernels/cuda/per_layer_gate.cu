@@ -69,21 +69,24 @@ template <unsigned INT8>
 __global__ void per_layer_gate_gemm_small(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     extern __shared__ uint4 dynamic_shared[];
-    if (blockIdx.x < projection::gemm_columns(SEISMIC_DIM_P))
+    const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
+    if (column < projection::gemm_columns(SEISMIC_DIM_P))
         projection::gemm_run<projection::SmallGemm, S8>(reinterpret_cast<projection::u8 *>(dynamic_shared),
                                                         S8 ? STAGING : ROUNDED, SEISMIC_DIM_D, GROUPS,
-                                                        (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, blockIdx.x,
+                                                        (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, column,
                                                         SEISMIC_DIM_P, GATE, projection::NoWeight{}, EPILOGUE);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMM
-extern "C" __global__ void per_layer_gate_gemm(SEISMIC_KERNEL_PARAMS) {
+template <unsigned ROTATE>
+__global__ void per_layer_gate_gemm(SEISMIC_KERNEL_PARAMS) {
+    using Shape = projection::LargeGemm<ROTATE>;
     extern __shared__ uint4 dynamic_shared[];
-    if (blockIdx.x < projection::gemm_columns(SEISMIC_DIM_P))
-        projection::gemm_run<projection::LargeGemm, false>(reinterpret_cast<projection::u8 *>(dynamic_shared), ROUNDED,
-                                                           SEISMIC_DIM_D, GROUPS, (unsigned)SEISMIC_DIM_M,
-                                                           SEISMIC_DIM_D, blockIdx.x, SEISMIC_DIM_P, GATE,
-                                                           projection::NoWeight{}, EPILOGUE);
+    const unsigned long long column = projection::gemm_column<Shape>();
+    if (column < projection::gemm_columns(SEISMIC_DIM_P))
+        projection::gemm_run<Shape, false>(reinterpret_cast<projection::u8 *>(dynamic_shared), ROUNDED, SEISMIC_DIM_D,
+                                           GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, column, SEISMIC_DIM_P,
+                                           GATE, projection::NoWeight{}, EPILOGUE);
 }
 #endif

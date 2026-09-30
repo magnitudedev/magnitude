@@ -1,19 +1,20 @@
 use crate::{
-    AttentionBinding, DenseBinding, EmbeddingBinding, FeaturesBinding, ReadoutBinding,
-    GeneralRoutedBinding, RecurrentBinding, RoutedBinding, ShortConvBinding, StateSpaceBinding,
-};
-use magnitude_kernels::{short_conv_project, short_conv_rows};
-use magnitude_kernels::{
-    dense_up, feature_rows, routed_down, routed_experts_up, routed_gate_up, routed_scatter,
-    routed_select, routed_up, state_space_chunk, state_space_gate, state_space_step, tap_rows,
+    AttentionBinding, DenseBinding, EmbeddingBinding, FeaturesBinding, GeneralRoutedBinding,
+    ReadoutBinding, RecurrentBinding, RoutedBinding, ShortConvBinding, StateSpaceBinding,
 };
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project, dense_expand, dense_output, embedding_rows,
-    gated_delta_chunk, gated_delta_output, gated_delta_project,
-    gated_delta_step, post_norm_residual, project_rows, readout_features_rows, readout_head_rows, readout_selected_rows,
-    routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
+    gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
+    post_norm_residual, project_rows, readout_features_rows, readout_head_rows,
+    readout_selected_rows, routed_combine, routed_expand, routed_experts, routed_group,
+    routed_output, routed_route,
 };
+use magnitude_kernels::{
+    dense_up, feature_rows, routed_down, routed_experts_up, routed_gate_up, routed_scatter,
+    routed_select, routed_up, state_space_chunk, state_space_gate, state_space_step, tap_rows,
+};
+use magnitude_kernels::{short_conv_project, short_conv_rows};
 use seismic::NativeKernel;
 use std::collections::HashMap;
 
@@ -156,10 +157,17 @@ impl<E: seismic::Entry> SublayerOutput<NativeKernel<E>> {
 pub enum AttentionHistoryKernels {
     Dense {
         decode: NativeKernel<attention_decode::Entry>,
+        /// The multi-row decode (draft blocks, verification), tuned on its
+        /// own row classes so it can read each history tile once for all
+        /// rows.
+        verify: Option<NativeKernel<attention_decode::Entry>>,
         prefill: NativeKernel<attention_prefill::Entry>,
     },
     AffineK8V4 {
         decode: NativeKernel<attention_decode_k8v4::Entry>,
+        verify: Option<NativeKernel<attention_decode_k8v4::Entry>>,
+        verify_four: Option<NativeKernel<attention_decode_k8v4::Entry>>,
+        verify_eight: Option<NativeKernel<attention_decode_k8v4::Entry>>,
         prefill: NativeKernel<attention_prefill_k8v4::Entry>,
     },
 }
@@ -167,11 +175,41 @@ pub enum AttentionHistoryKernels {
 impl AttentionHistoryKernels {
     pub fn invocation_workspace_bytes(&self) -> u64 {
         match self {
-            Self::Dense { decode, prefill } => {
-                decode.invocation_workspace_bytes() + prefill.invocation_workspace_bytes()
+            Self::Dense {
+                decode,
+                verify,
+                prefill,
+            } => {
+                decode
+                    .invocation_workspace_bytes()
+                    .max(verify.as_ref().map_or(0, |kernel| kernel.invocation_workspace_bytes()))
+                    + prefill.invocation_workspace_bytes()
             }
-            Self::AffineK8V4 { decode, prefill } => {
-                decode.invocation_workspace_bytes() + prefill.invocation_workspace_bytes()
+            Self::AffineK8V4 {
+                decode,
+                verify,
+                verify_four,
+                verify_eight,
+                prefill,
+            } => {
+                decode
+                    .invocation_workspace_bytes()
+                    .max(
+                        verify
+                            .as_ref()
+                            .map_or(0, NativeKernel::invocation_workspace_bytes),
+                    )
+                    .max(
+                        verify_four
+                            .as_ref()
+                            .map_or(0, NativeKernel::invocation_workspace_bytes),
+                    )
+                    .max(
+                        verify_eight
+                            .as_ref()
+                            .map_or(0, NativeKernel::invocation_workspace_bytes),
+                    )
+                    + prefill.invocation_workspace_bytes()
             }
         }
     }
@@ -208,7 +246,10 @@ pub struct GeneralRoutedKernels {
     pub shared: Option<(DenseExpansionKernel, NativeKernel<dense_output::Entry>)>,
     /// A latent operator's down projection (into activations) and up
     /// projection onto the base.
-    pub latent: Option<(NativeKernel<project_rows::Entry>, NativeKernel<dense_output::Entry>)>,
+    pub latent: Option<(
+        NativeKernel<project_rows::Entry>,
+        NativeKernel<dense_output::Entry>,
+    )>,
 }
 
 /// The routed experts' expansion entries: decode, then grouped.

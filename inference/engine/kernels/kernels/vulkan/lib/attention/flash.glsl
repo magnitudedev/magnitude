@@ -30,9 +30,10 @@
 #define FLASH_FACTORS 256u
 #define FLASH_INF uintBitsToFloat(0x7f800000u)
 // The widest output window a device takes in one pass: the whole head, or 4
-// accumulator fragments where the compiler mishandles wider accumulator
-// arrays (NVIDIA 580, `SEISMIC_HAS_WIDE_ACCUMULATORS` 0).
-#if SEISMIC_HAS_WIDE_ACCUMULATORS
+// accumulator fragments where the compiler mishandles wider cooperative-matrix
+// accumulator arrays (NVIDIA 580, `SEISMIC_HAS_WIDE_ACCUMULATORS` 0). The FMA
+// path's accumulators are plain floats, so it always takes the whole head.
+#if SEISMIC_HAS_WIDE_ACCUMULATORS || !SEISMIC_HAS_MATRIX
 #define FLASH_WINDOW FLASH_MAX_W
 #else
 #define FLASH_WINDOW 64u
@@ -165,6 +166,37 @@ void flash_scores_publish(flash_scores_state state, uint scratch) {
 #endif
     subgroupMemoryBarrierShared();
     subgroupBarrier();
+}
+
+// `flash_scores_add` with the block's query rows in shared memory: its first
+// row's columns at shared half `q_half`, rows `q_pitch` halves apart (a
+// multiple of 8).
+void flash_scores_add_shared(uint q_half, uint q_pitch, const uint w, uint k_base, inout flash_scores_state state) {
+    const uint pitch = flash_pitch(w);
+#if SEISMIC_HAS_MATRIX
+    [[unroll]] for (uint d = 0u; d < FLASH_MAX_W; d += 16u) {
+        if (d < w) {
+            FLASH_FRAGMENT_A a;
+            coopMatLoad(a, seismic_shared_f16, q_half + d, q_pitch, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint j = 0u; j < 2u; ++j) {
+                FLASH_FRAGMENT_B b;
+                coopMatLoad(b, seismic_shared_f16, k_base + j * 16u * pitch + d, pitch, gl_CooperativeMatrixLayoutColumnMajor);
+                state.s[j] = coopMatMulAdd(a, b, state.s[j]);
+            }
+        }
+    }
+#else
+    const uint lane = SEISMIC_LANE;
+    const uint r = lane % 16u, h = lane / 16u;
+    for (uint d = 0u; d < w; d += 2u) {
+        const vec2 x = unpackHalf2x16(seismic_shared_u32[(q_half + r * q_pitch + d) / 2u]);
+        [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+            const vec2 k = unpackHalf2x16(seismic_shared_u32[(k_base + (16u * h + j) * pitch + d) / 2u]);
+            state.s[j] = seismic_fma_rn(x.x, k.x, state.s[j]);
+            state.s[j] = seismic_fma_rn(x.y, k.y, state.s[j]);
+        }
+    }
+#endif
 }
 
 // The scores of a head of w <= FLASH_MAX_W columns, published to `scratch`.

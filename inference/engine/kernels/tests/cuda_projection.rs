@@ -294,6 +294,123 @@ fn dense_output_cases(device: &Device, formats: &[Format], h: usize, f: usize, r
     }
 }
 
+/// FNV-1a of an output's bytes: GEMM restructurings that keep the arithmetic
+/// print the same digests (compared across builds).
+fn digest(tensor: &Tensor) -> u64 {
+    tensor
+        .read_to_host()
+        .unwrap()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+        })
+}
+
+/// The large GEMM over several row bands (ordered block walk, a partial last
+/// band) and, for the output, a K with a partial last superblock, under every
+/// loader rotation: each result matches the host model, the rotations agree
+/// bit for bit, and each result's digest is printed (to compare across
+/// builds).
+#[test]
+fn cuda_gemm_row_bands_match_host_model() {
+    let Some(device) = cuda() else { return };
+    let mut rng = Rng(23);
+    let (h, f) = (512, 272);
+    let rotations = [2, 1, 4].map(|rotate| Mapping {
+        rotate,
+        ..GEMM_MAPPINGS[0]
+    });
+    let mapping = rotations[0];
+    for format in Format::ALL {
+        // The output projects K codes onto f rows: 704 (11 k-blocks, a
+        // partial last superblock) where the format's blocks allow it.
+        let k = if format.block_values() == 256 {
+            1280
+        } else {
+            704
+        };
+        let gate = weight(&device, format, f, h, &mut rng);
+        let up = weight(&device, format, f, h, &mut rng);
+        let down = weight(&device, format, f, k, &mut rng);
+        // 100: one band, the output split over K; 300 and 1100: several
+        // bands, the last partial.
+        for o in [100usize, 300, 1100] {
+            let case = DenseCase::new(o, h, f, &mut rng);
+            let residual = f32_tensor(&device, &[case.m as u64, h as u64], &case.residual);
+            let norm = f32_tensor(&device, &[h as u64], &case.norm);
+            let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
+            let (expected, tolerance) = case.expand(&gate, &up, mapping);
+            let label = format!("expand {format:?} O={o}");
+            let digests = rotations.map(|rotation| {
+                let product = expand_kernel(&device, format, &case, rotation)
+                    .call(dense_expand::Args {
+                        residual: &residual,
+                        norm: &norm,
+                        gate_weight: &gate.tensor,
+                        up_weight: &up.tensor,
+                        out_rows: &out_rows,
+                        eps: EPSILON,
+                        activation: 0,
+                        gate_scale: &f32_tensor(&device, &[0], &[]),
+                        up_scale: &f32_tensor(&device, &[0], &[]),
+                    })
+                    .unwrap()
+                    .value;
+                check(&label, &read_bf16(&product), &expected, &tolerance);
+                digest(&product)
+            });
+            assert!(
+                digests.iter().all(|value| *value == digests[0]),
+                "{label}: rotations differ {digests:x?}"
+            );
+            println!("BITS {label} {:016x}", digests[0]);
+
+            let m = o + 2;
+            let rows: Vec<i32> = (0..o).map(|i| ((i * 5 + 3) % m) as i32).collect();
+            let values: Vec<f32> = (0..o * k)
+                .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
+                .collect();
+            let base: Vec<f32> = (0..m * f).map(|_| rng.uniform(-2.0, 2.0)).collect();
+            let (x, _) = operand_rows(&values, k, mapping);
+            let (projected, magnitude) = project(&x, &down.values, o, f, k);
+            let dequant = if format.scaled_gemm() {
+                vec![0.0; o * f]
+            } else {
+                dequant_bound(&x, &down.values, o, f, k, mapping)
+            };
+            let expected: Vec<f64> = (0..o * f)
+                .map(|i| f64::from(base[rows[i / f] as usize * f + i % f]) + projected[i])
+                .collect();
+            let tolerance: Vec<f64> = (0..o * f)
+                .map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + dequant[i] + 1e-6)
+                .collect();
+            let residual = f32_tensor(&device, &[m as u64, f as u64], &base);
+            let product = bf16_tensor(&device, &[o as u64, k as u64], &values);
+            let out_rows = i32_tensor(&device, &[o as u64], &rows);
+            let label = format!("output {format:?} O={o}");
+            let digests = rotations.map(|rotation| {
+                let result = output_kernel(&device, format, f, k, rotation)
+                    .call(dense_output::Args {
+                        residual: &residual,
+                        product: &product,
+                        down_weight: &down.tensor,
+                        out_rows: &out_rows,
+                        down_scale: &f32_tensor(&device, &[0], &[]),
+                    })
+                    .unwrap()
+                    .value;
+                check(&label, &read_f32(&result), &expected, &tolerance);
+                digest(&result)
+            });
+            assert!(
+                digests.iter().all(|value| *value == digests[0]),
+                "{label}: rotations differ {digests:x?}"
+            );
+            println!("BITS {label} {:016x}", digests[0]);
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn cuda_dense_expand_scoped_tuning_is_factored() {
@@ -784,7 +901,8 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
                 .with_static("V", v as u64)
                 .with_static("D", d as u64)
                 .with_launch_param(0, "KSPLIT", ksplit)
-                .with_launch_param(1, "KSPLIT", ksplit);
+                .with_launch_param(1, "KSPLIT", ksplit)
+                .with_launch_param(3, "ROTATE", 2);
             let kernel = head_logits_rows::native_for_device_with(
                 &device,
                 head_logits_rows::Elements {
@@ -967,6 +1085,8 @@ fn dense_expand_host_model_matches_portable_body() {
                 Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::I32, vec![o], rows))),
                 Arg::Scalar(ReferenceScalar::F32(EPSILON.to_bits())),
                 Arg::Scalar(ReferenceScalar::I32(0)),
+                Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![0], vec![]))),
+                Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![0], vec![]))),
             ];
         let outcome = interpreter.run(&args).unwrap();
         if let SourceTermination::Failed(failure) = outcome.termination() {
@@ -1319,6 +1439,125 @@ fn cuda_shape_rows_match_portable_semantics() {
 // ---------------------------------------------------------------------------
 // Timings on the 4B geometry (run explicitly on the measurement host), over
 // zero-filled resident weights (`timing_weight`).
+
+/// The GEMM band (16-bit path) of the dense entries over prefill rows at real
+/// geometries: Qwen3.5-4B (H 2560, F 9216), MiniCPM5-2B (H 2048, F 6144) and
+/// the Qwen3.6-35B-A3B shared expert (H 2048, F 512), under the loader
+/// rotations `CUDA_TIMING_ROTATE` (comma-separated, default 2). Each (entry,
+/// rows, rotation) is measured `CUDA_TIMING_ROUNDS` times (default 3),
+/// reporting the fastest and the median round, which separates the kernel
+/// from host and device noise.
+#[test]
+#[ignore = "timing; run explicitly on the measurement host"]
+fn cuda_gemm_timings() {
+    let Some(device) = cuda() else { return };
+    let absent_scale = f32_tensor(&device, &[0], &[]);
+    let mut rng = Rng(37);
+    let options = seismic::MeasureOptions {
+        samples: 15,
+        min_sample_seconds: 0.002,
+    };
+    let rounds: usize =
+        std::env::var("CUDA_TIMING_ROUNDS").map_or(3, |value| value.parse().unwrap());
+    let shapes: Vec<(&str, usize, usize)> = match std::env::var("CUDA_TIMING_SHAPES") {
+        Ok(list) => list
+            .split(',')
+            .map(|name| match name.trim() {
+                "4b" => ("4b", 2560, 9216),
+                "2b" => ("2b", 2048, 6144),
+                "35b" => ("35b", 2048, 512),
+                other => panic!("CUDA_TIMING_SHAPES: unknown shape {other}"),
+            })
+            .collect(),
+        Err(_) => vec![("4b", 2560, 9216)],
+    };
+    let rotates: Vec<u64> = std::env::var("CUDA_TIMING_ROTATE").map_or(vec![2], |list| {
+        list.split(',')
+            .map(|rotate| {
+                rotate
+                    .trim()
+                    .parse()
+                    .expect("CUDA_TIMING_ROTATE: loader rotations")
+            })
+            .collect()
+    });
+    let summary = |mut times: Vec<f64>| {
+        times.sort_by(f64::total_cmp);
+        (times[0], times[times.len() / 2])
+    };
+    for (name, h, f) in shapes {
+        // Rotations exceed the 24 MiB L2 at the 4B geometry.
+        let rotation = 4;
+        for format in timing_formats() {
+            let gates: Vec<Tensor> = (0..rotation)
+                .map(|_| timing_weight(&device, format, f, h))
+                .collect();
+            let ups: Vec<Tensor> = (0..rotation)
+                .map(|_| timing_weight(&device, format, f, h))
+                .collect();
+            let downs: Vec<Tensor> = (0..rotation)
+                .map(|_| timing_weight(&device, format, h, f))
+                .collect();
+            for m in timing_rows(&[128, 512, 2048]) {
+                let case = DenseCase::new(m, h, f, &mut rng);
+                let residual = f32_tensor(&device, &[case.m as u64, h as u64], &case.residual);
+                let norm = f32_tensor(&device, &[h as u64], &case.norm);
+                let out_rows = i32_tensor(&device, &[m as u64], &case.out_rows);
+                let product = bf16_tensor(&device, &[m as u64, f as u64], &vec![0.5; m * f]);
+                for &rotate in &rotates {
+                    let mapping = Mapping {
+                        rotate,
+                        ..GEMM_MAPPINGS[0]
+                    };
+                    let expand = expand_kernel(&device, format, &case, mapping);
+                    let output = output_kernel(&device, format, h, f, mapping);
+                    let mut expand_times = Vec::new();
+                    let mut output_times = Vec::new();
+                    for _ in 0..rounds {
+                        let args = (0..rotation)
+                            .map(|r| dense_expand::Args {
+                                residual: &residual,
+                                norm: &norm,
+                                gate_weight: &gates[r],
+                                up_weight: &ups[r],
+                                out_rows: &out_rows,
+                                eps: EPSILON,
+                                activation: 0,
+                                gate_scale: &absent_scale,
+                                up_scale: &absent_scale,
+                            })
+                            .collect();
+                        expand_times.push(expand.measure(args, &options).unwrap().median);
+                        let args = (0..rotation)
+                            .map(|r| dense_output::Args {
+                                residual: &residual,
+                                product: &product,
+                                down_weight: &downs[r],
+                                out_rows: &out_rows,
+                                down_scale: &absent_scale,
+                            })
+                            .collect();
+                        output_times.push(output.measure(args, &options).unwrap().median);
+                    }
+                    let (best, median) = summary(expand_times);
+                    println!(
+                        "gemm {name} expand {format:?} M={m} R={rotate}: {:.1} us ({:.1} median), {:.2} TFLOP/s",
+                        best * 1e6,
+                        median * 1e6,
+                        4.0 * (m * h * f) as f64 / best / 1e12
+                    );
+                    let (best, median) = summary(output_times);
+                    println!(
+                        "gemm {name} output {format:?} M={m} R={rotate}: {:.1} us ({:.1} median), {:.2} TFLOP/s",
+                        best * 1e6,
+                        median * 1e6,
+                        2.0 * (m * h * f) as f64 / best / 1e12
+                    );
+                }
+            }
+        }
+    }
+}
 
 #[test]
 #[ignore = "timing; run explicitly on the measurement host"]

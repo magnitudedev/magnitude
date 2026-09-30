@@ -65,7 +65,7 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
         KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_ALPHA_WEIGHT)), KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_BETA_WEIGHT))
 
 // The segmented GEMM of one row band over the staged rows (A rows, or q8_1
-// rows with Q): block column blockIdx.x of qkv | z | alpha | beta.
+// rows with Q): block column `gemm_column` of qkv | z | alpha | beta.
 template <class Shape, bool Q>
 __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const void *groups, unsigned M,
                                              unsigned long long H, const unsigned long long (&rows)[4],
@@ -73,7 +73,7 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
                                              const packets::W3 &w3, const Out (&out)[4]) {
     extern __shared__ uint4 dynamic_shared[];
     projection::u8 *shared = reinterpret_cast<projection::u8 *>(dynamic_shared);
-    unsigned long long column = blockIdx.x;
+    unsigned long long column = projection::gemm_column<Shape>();
     const unsigned long long columns[4] = {projection::gemm_columns(rows[0]), projection::gemm_columns(rows[1]),
                                            projection::gemm_columns(rows[2]), projection::gemm_columns(rows[3])};
     switch (projection::locate_segment(column, columns)) {
@@ -143,10 +143,11 @@ __global__ void gated_delta_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM
-extern "C" __global__ void gated_delta_project_gemm(SEISMIC_KERNEL_PARAMS) {
+template <unsigned ROTATE>
+__global__ void gated_delta_project_gemm(SEISMIC_KERNEL_PARAMS) {
     const unsigned long long rows[4] = SEGMENT_ROWS;
     const Out out[4] = SEGMENT_OUT;
-    project_gemm<projection::LargeGemm, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS,
-                                               out);
+    project_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows,
+                                                       WEIGHTS, out);
 }
 #endif

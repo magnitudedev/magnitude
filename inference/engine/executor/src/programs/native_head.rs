@@ -9,6 +9,7 @@
 //! before the chain ends.
 
 use super::{DeviceSubmission, HeadProgram};
+use crate::operators::{self, paired_block, Mixer};
 use crate::{
     completion::CompletionWaiter,
     native::{draft_vocabulary, AttestedFeedForward, AttestedHead, AttestedHeadBlock},
@@ -36,7 +37,6 @@ use crate::{
     ResidentWeight, ResourceLimits, SubmitError, ValidatedHeadLaunch,
 };
 use magnitude_batching::{row_class, TargetBatchUpload};
-use crate::operators::{self, paired_block, Mixer};
 use magnitude_family_contracts::{
     ActivationDType, Decoder, HeadBlock, SublayerIndex, WeightKind, WeightRole, WeightScope,
 };
@@ -355,16 +355,8 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
     feed_forward: FeedForwardProgramSlot,
     class: HeadGraphClass,
 ) -> Result<HeadGraphParts<G::Plan>, String> {
-    head_graph_draft(
-        graph,
-        entries,
-        load,
-        geometry,
-        head,
-        feed_forward,
-        class,
-    )?
-    .map_plan(|graph| graph.seal())
+    head_graph_draft(graph, entries, load, geometry, head, feed_forward, class)?
+        .map_plan(|graph| graph.seal())
 }
 
 fn head_graph_draft<'a, G: GraphDraft + 'a>(
@@ -419,7 +411,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     let head_epsilon = operators::attention::head_norm_epsilon(attention, paired.epsilon())
         .map_err(|error| error.to_string())? as f32;
     // Draft head sublayers add their outputs to the residual (admission).
-    let attention_weights = attention_weights(&attention_shape, attention, false, |kind| {
+    let attention_weights = attention_weights(&attention_shape, attention, true, false, |kind| {
         planned_weight(
             &mut graph,
             load,
@@ -540,6 +532,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 post_norm_epsilon: 0.0,
                 post_norm_scale: 1.0,
                 activation: activation(geometry.activation_dtype),
+                inject_only: false,
             },
         )?;
         let advanced = match (&entries.feed_forward, feed_forward) {
@@ -574,7 +567,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                             activation: operators::dense_ffn::activation_code(
                                 dense_operator.up.activation(),
                             ),
-                            gate_scale: absent_scale.as_ref().ok_or("dense scale is absent")?.into(),
+                            gate_scale: absent_scale
+                                .as_ref()
+                                .ok_or("dense scale is absent")?
+                                .into(),
                             up_scale: absent_scale.as_ref().ok_or("dense scale is absent")?.into(),
                         },
                     )?
@@ -591,7 +587,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                             product: (&product).into(),
                             down_weight: (&down_weight).into(),
                             out_rows: dense_rows.port().tensor().into(),
-                            down_scale: absent_scale.as_ref().ok_or("dense scale is absent")?.into(),
+                            down_scale: absent_scale
+                                .as_ref()
+                                .ok_or("dense scale is absent")?
+                                .into(),
                         },
                     )?
                     .value;
@@ -1121,10 +1120,7 @@ impl NativeHeadProgram {
         self.graphs.constant_bytes()
     }
 
-    pub(crate) fn new(
-        geometry: Decoder,
-        graphs: BoundHeadGraphs,
-    ) -> Result<Self, SubmitError> {
+    pub(crate) fn new(geometry: Decoder, graphs: BoundHeadGraphs) -> Result<Self, SubmitError> {
         let waiter = CompletionWaiter::spawn().map_err(device)?;
         Ok(Self {
             geometry,
@@ -1210,8 +1206,13 @@ impl NativeHeadProgram {
         // Conditioning rows in entry-row order (the launch checked each
         // slot's rows against the activation width), padded with zeros.
         let row_bytes = self.geometry.hidden as usize * self.geometry.activation_dtype.bytes();
+        let crate::HeadConditioning::Rows(rows) = core.conditioning() else {
+            return Err(invalid(
+                "an embedded head enters host conditioning rows",
+            ));
+        };
         let mut conditioning = Vec::with_capacity(entry_rows * row_bytes);
-        for rows in core.conditioning() {
+        for rows in rows {
             conditioning.extend_from_slice(rows.bytes());
         }
         if conditioning.len() != entry.actual_rows * row_bytes {

@@ -94,6 +94,7 @@ fn prefill(domain: &mut ExecutorDomain, request: RequestId, tokens: &[TokenId]) 
         demand: Demand::FEATURES,
         select: Vec::new(),
         committed: tokens.len(),
+        prime: None,
     };
     let groups = service_domain::group(domain, vec![operation]);
     let DomainFlight::Target(flight) = service_domain::submit_group(domain, &groups[0]).unwrap()
@@ -156,6 +157,7 @@ fn transact(
     let entered = tokens.len();
     let operation = Operation::Head {
         request,
+        phase: magnitude_executor::HeadPhase::Generation,
         tokens: tokens.to_vec(),
         conditioning,
         position,
@@ -196,7 +198,12 @@ fn transact(
 
 /// Enter the prompt's pairs `(tokens[p + 1], feature p)` but the anchor's,
 /// as a prefill's draft transaction does.
-fn inject(domain: &mut ExecutorDomain, request: RequestId, tokens: &[TokenId], features: &FeatureRows) {
+fn inject(
+    domain: &mut ExecutorDomain,
+    request: RequestId,
+    tokens: &[TokenId],
+    features: &FeatureRows,
+) {
     let committed = tokens.len() - 1;
     let proposals = transact(
         domain,
@@ -358,7 +365,10 @@ fn header_only_assessment_charges_what_a_load_commits() {
     let charge = domain.reconcile_memory_charge(&[&held]).unwrap();
     eprintln!("assessed {terms:?} graphs {graphs:?}\nloaded {charge:?}");
     assert_eq!(charge.unattributed, 0);
-    assert_eq!(charge.target_weights, terms.target_weights, "target weights");
+    assert_eq!(
+        charge.target_weights, terms.target_weights,
+        "target weights"
+    );
     assert_eq!(charge.optional_weights, terms.head_weights, "draft weights");
     assert!(
         charge.bound_constants <= graphs.binding_constant_bytes,

@@ -249,11 +249,31 @@ projection_epilogue attention_project_value_out() {
         SEISMIC_RESULT_3_STRIDE_1, 0ul);
 }
 
+void attention_project_zero_tile(projection_epilogue out_, uint rows, uint columns,
+    uint row_start, uint row_count, uint column_start, uint column_count) {
+    for (uint item = gl_LocalInvocationIndex; item < row_count * column_count;
+        item += gl_WorkGroupSize.x) {
+        const uint row = row_start + item / column_count;
+        const uint column = column_start + item % column_count;
+        if (row < rows && column < columns)
+            projection_put(out_, row, column, 0.0);
+    }
+}
+
 void attention_project_gemv() {
     const uint per = projection_gemv_rows(SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES);
     const uint rows = uint(SEISMIC_DIM_M), tile = gl_WorkGroupID.x;
     const uint t0 = (PROJECT_QUERY_ROWS + per - 1u) / per, t1 = (PROJECT_GATE_ROWS + per - 1u) / per;
     const uint t2 = (PROJECT_KEY_ROWS + per - 1u) / per;
+    if (SEISMIC_PARAM_PROJECT_MODE != 0 && tile < t0 + t1) {
+        if (tile < t0)
+            attention_project_zero_tile(attention_project_query_out(), rows, PROJECT_QUERY_ROWS,
+                0u, rows, tile * per, per);
+        else
+            attention_project_zero_tile(attention_project_gate_out(), rows, PROJECT_GATE_ROWS,
+                0u, rows, (tile - t0) * per, per);
+        return;
+    }
     const projection_prologue x = attention_project_input();
     if (tile < t0) {
         const projection_weights w = attention_project_query();
@@ -288,6 +308,15 @@ void attention_project_gemm() {
     const uint m = uint(SEISMIC_DIM_M), n = gl_WorkGroupID.x;
     const uint t0 = (PROJECT_QUERY_ROWS + tn - 1u) / tn, t1 = (PROJECT_GATE_ROWS + tn - 1u) / tn;
     const uint t2 = (PROJECT_KEY_ROWS + tn - 1u) / tn;
+    if (SEISMIC_PARAM_PROJECT_MODE != 0 && n < t0 + t1) {
+        if (n < t0)
+            attention_project_zero_tile(attention_project_query_out(), m, PROJECT_QUERY_ROWS,
+                gl_WorkGroupID.y * SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_M, n * tn, tn);
+        else
+            attention_project_zero_tile(attention_project_gate_out(), m, PROJECT_GATE_ROWS,
+                gl_WorkGroupID.y * SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_M, (n - t0) * tn, tn);
+        return;
+    }
     int kind;
     projection_weights w;
     projection_epilogue out_;

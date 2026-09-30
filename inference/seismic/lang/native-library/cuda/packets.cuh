@@ -151,9 +151,12 @@ template <> struct NativeOperand<OpF16, element::F16> {
 //          superblock, lane) (packed coefficients, one vector load per row),
 //          coefficients(block, q, c)
 //   GEMM:  CHUNKS, chunk_source(tile, kb, chunk), from_shared(staged, lane),
-//          COEF_WORDS, coef_word(row, kb, word) (the 4-byte words of a row's
-//          coefficients that k-block kb reads, staged with the codes),
-//          staged_coefficient(words, kb, group, scale, bias)
+//          SUPER_WORDS, super_word(row, superblock, word) (the 4-byte words
+//          of a row's coefficient record for one superblock, staged once per
+//          superblock), word_kblock(word) (the first k-block of the
+//          superblock that reads the word: a partial last superblock stages
+//          only the words of its k-blocks), staged_coefficient(record, kb,
+//          group, scale, bias) (k-block kb of the record's superblock)
 //   rows:  Raw fetch(tile, kb, lane), code(raw, step, slot), apply(code,
 //          scale, bias), coefficient(row, kb, group, scale, bias)
 // with value = scale * code - bias per group of GROUP codes (GROUPS per
@@ -299,25 +302,26 @@ template <int HIGH_BITS> struct KQuant45 {
         }
         return block;
     }
-    __device__ static __forceinline__ u32 field(const u32 (&packed)[3], u32 index) {
+    __device__ static __forceinline__ u32 field(const u32 *packed, u32 index) {
         const u32 bit = 6 * index;
         const u32 word = bit / 32;
         const u64 wide = (u64)packed[word] | (word < 2 ? (u64)packed[word + 1] << 32 : 0ull);
         return (u32)(wide >> (bit % 32)) & 63u;
     }
-    // GEMM staging: the 12 packed scale bytes and the (d, dmin) word of the
-    // k-block's superblock.
-    static constexpr int COEF_WORDS = 4;
-    __device__ __forceinline__ const u8 *coef_word(u64 row, u64 kblock, int word) const {
+    // GEMM staging: the superblock's 12 packed scale bytes and (d, dmin) word.
+    static constexpr int SUPER_WORDS = 4;
+    __device__ __forceinline__ const u8 *super_word(u64 row, u64 superblock, int word) const {
         const u8 *line = base + row * stride;
-        return word < 3 ? line + scales + (kblock / 4) * 12 + 4 * word : line + supers + (kblock / 4) * 4;
+        return word < 3 ? line + scales + superblock * 12 + 4 * word : line + supers + superblock * 4;
     }
+    __device__ static __forceinline__ int word_kblock(int) { return 0; }
     __device__ __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
                                                        float &bias) const {
-        const u32 packed[3] = {words[0], words[1], words[2]};
+        // The record's packed fields are read in place (in shared memory): a
+        // register copy would be indexed dynamically, through local memory.
         const u32 index = 2 * ((u32)(kblock % 4) * 2 + (u32)group);
-        scale = seismic_f16_to_f32((u16)(words[3] & 0xFFFFu)) * (float)field(packed, index);
-        bias = seismic_f16_to_f32((u16)(words[3] >> 16)) * (float)field(packed, index + 1);
+        scale = seismic_f16_to_f32((u16)(words[3] & 0xFFFFu)) * (float)field(words, index);
+        bias = seismic_f16_to_f32((u16)(words[3] >> 16)) * (float)field(words, index + 1);
     }
     // Coefficients of k-block `q` of the superblock.
     __device__ __forceinline__ void coefficients(const Block &block, int q, Coefficients<2> &c) const {
@@ -466,17 +470,19 @@ struct KQuant6 {
         }
         return block;
     }
-    // GEMM staging: the k-block's four int8 scales and the aligned word
-    // holding the superblock's f16 d (the supers plane is padded to 16 B).
-    static constexpr int COEF_WORDS = 2;
-    __device__ __forceinline__ const u8 *coef_word(u64 row, u64 kblock, int word) const {
+    // GEMM staging: the superblock's sixteen int8 scales (four per k-block)
+    // and the aligned word holding its f16 d (the supers plane is padded to
+    // 16 B).
+    static constexpr int SUPER_WORDS = 5;
+    __device__ __forceinline__ const u8 *super_word(u64 row, u64 superblock, int word) const {
         const u8 *line = base + row * stride;
-        return word == 0 ? line + scales + kblock * 4 : line + supers + ((kblock / 4) * 2 & ~3ull);
+        return word < 4 ? line + scales + superblock * 16 + 4 * word : line + supers + (superblock * 2 & ~3ull);
     }
+    __device__ static __forceinline__ int word_kblock(int word) { return word < 4 ? word : 0; }
     __device__ __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
                                                        float &bias) const {
-        const u16 d = (u16)(words[1] >> (16 * ((kblock / 4) % 2)));
-        scale = seismic_f16_to_f32(d) * (float)(((int)(words[0] << (24 - 8 * group))) >> 24);
+        const u16 d = (u16)(words[4] >> (16 * ((kblock / 4) % 2)));
+        scale = seismic_f16_to_f32(d) * (float)(((int)(words[kblock % 4] << (24 - 8 * group))) >> 24);
         bias = 0.0f;
     }
     __device__ __forceinline__ void coefficients(const Block &block, int q, Coefficients<4> &c) const {
@@ -581,14 +587,16 @@ struct Q8 {
                 seismic_ld_nc_v4(base + (tile * 16 + lane / 4 + 8 * r) * stride + supers + superblock * 16);
         return block;
     }
-    // GEMM staging: the k-block's two f16 group scales.
-    static constexpr int COEF_WORDS = 1;
-    __device__ __forceinline__ const u8 *coef_word(u64 row, u64 kblock, int) const {
-        return base + row * stride + supers + kblock * 4;
+    // GEMM staging: the superblock's eight f16 group scales (a word per
+    // k-block).
+    static constexpr int SUPER_WORDS = 4;
+    __device__ __forceinline__ const u8 *super_word(u64 row, u64 superblock, int word) const {
+        return base + row * stride + supers + superblock * 16 + 4 * word;
     }
-    __device__ __forceinline__ void staged_coefficient(const u32 *words, u64, int group, float &scale,
+    __device__ static __forceinline__ int word_kblock(int word) { return word; }
+    __device__ __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
                                                        float &bias) const {
-        scale = seismic_f16_to_f32((u16)(words[0] >> (16 * group)));
+        scale = seismic_f16_to_f32((u16)(words[kblock % 4] >> (16 * group)));
         bias = 0.0f;
     }
     __device__ __forceinline__ void coefficients(const Block &block, int q, Coefficients<2> &c) const {
@@ -714,11 +722,11 @@ struct F32Scale {
     __device__ static __forceinline__ float read(const u8 *supers, u64 group) {
         return *reinterpret_cast<const float *>(supers + group * 4);
     }
-    // GEMM staging: the k-block's two scales.
-    static constexpr int COEF_WORDS = 2;
-    __device__ static __forceinline__ u64 coef_offset(u64 kblock, int word) { return kblock * 8 + 4 * word; }
-    __device__ static __forceinline__ float staged(const u32 *words, u64, int group) {
-        return __uint_as_float(words[group]);
+    // GEMM staging: the superblock's eight scales (two words per k-block).
+    static constexpr int SUPER_WORDS = 8;
+    __device__ static __forceinline__ int word_kblock(int word) { return word / 2; }
+    __device__ static __forceinline__ float staged(const u32 *words, u64 kblock, int group) {
+        return __uint_as_float(words[(kblock % 4) * 2 + group]);
     }
 };
 struct F16Scale {
@@ -734,10 +742,10 @@ struct F16Scale {
         return seismic_f16_to_f32((u16)(word_of(block.packed[r], group / 2) >> (16 * (group % 2))));
     }
     __device__ static __forceinline__ float read(const u8 *supers, u64 group) { return f16_at(supers + group * 2); }
-    static constexpr int COEF_WORDS = 1;
-    __device__ static __forceinline__ u64 coef_offset(u64 kblock, int) { return kblock * 4; }
-    __device__ static __forceinline__ float staged(const u32 *words, u64, int group) {
-        return seismic_f16_to_f32((u16)(words[0] >> (16 * group)));
+    static constexpr int SUPER_WORDS = 4;
+    __device__ static __forceinline__ int word_kblock(int word) { return word; }
+    __device__ static __forceinline__ float staged(const u32 *words, u64 kblock, int group) {
+        return seismic_f16_to_f32((u16)(words[kblock % 4] >> (16 * group)));
     }
 };
 // E8M0 2^(e - 127), halved for the doubled codebook: 2^(e - 128) (e < 2 are
@@ -759,11 +767,11 @@ struct E8M0Scale {
         return decode((word >> (8 * (group % 4))) & 0xFFu);
     }
     __device__ static __forceinline__ float read(const u8 *supers, u64 group) { return decode(supers[group]); }
-    // GEMM staging: the aligned word holding the k-block's two fields.
-    static constexpr int COEF_WORDS = 1;
-    __device__ static __forceinline__ u64 coef_offset(u64 kblock, int) { return (kblock * 2) & ~3ull; }
+    // GEMM staging: the superblock's eight fields (a word per two k-blocks).
+    static constexpr int SUPER_WORDS = 2;
+    __device__ static __forceinline__ int word_kblock(int word) { return 2 * word; }
     __device__ static __forceinline__ float staged(const u32 *words, u64 kblock, int group) {
-        return decode((words[0] >> (16 * (kblock % 2) + 8 * group)) & 0xFFu);
+        return decode((words[(kblock % 4) / 2] >> (16 * (kblock % 2) + 8 * group)) & 0xFFu);
     }
 };
 // UE4M3 (sign bit ignored; 0x7f is NaN), halved for the doubled codebook:
@@ -787,10 +795,10 @@ struct UE4M3Scale {
         return decode((word_of(block.packed[r], group / 4) >> (8 * (group % 4))) & 0xFFu);
     }
     __device__ static __forceinline__ float read(const u8 *supers, u64 group) { return decode(supers[group]); }
-    static constexpr int COEF_WORDS = 1;
-    __device__ static __forceinline__ u64 coef_offset(u64 kblock, int) { return kblock * 4; }
-    __device__ static __forceinline__ float staged(const u32 *words, u64, int group) {
-        return decode((words[0] >> (8 * group)) & 0xFFu);
+    static constexpr int SUPER_WORDS = 4;
+    __device__ static __forceinline__ int word_kblock(int word) { return word; }
+    __device__ static __forceinline__ float staged(const u32 *words, u64 kblock, int group) {
+        return decode((words[kblock % 4] >> (8 * group)) & 0xFFu);
     }
 };
 
@@ -849,11 +857,12 @@ template <class C, class S, bool WHOLE, bool SCALED> struct Coded4 {
             S::load(base + (tile * 16 + lane / 4 + 8 * r) * stride + supers + superblock * S::BLOCK_BYTES, block, r);
         return block;
     }
-    // GEMM staging: the words holding the k-block's scale fields.
-    static constexpr int COEF_WORDS = S::COEF_WORDS;
-    __device__ __forceinline__ const u8 *coef_word(u64 row, u64 kblock, int word) const {
-        return base + row * stride + supers + S::coef_offset(kblock, word);
+    // GEMM staging: the superblock's scale fields.
+    static constexpr int SUPER_WORDS = S::SUPER_WORDS;
+    __device__ __forceinline__ const u8 *super_word(u64 row, u64 superblock, int word) const {
+        return base + row * stride + supers + superblock * S::BLOCK_BYTES + 4 * word;
     }
+    __device__ static __forceinline__ int word_kblock(int word) { return S::word_kblock(word); }
     __device__ __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
                                                        float &bias) const {
         scale = S::staged(words, kblock, group);
@@ -993,18 +1002,20 @@ template <bool MINIMUM> struct Q5G32 {
                 }
             }
     }
-    // GEMM staging: the k-block's two groups' fields.
-    static constexpr int COEF_WORDS = MINIMUM ? 2 : 1;
-    __device__ __forceinline__ const u8 *coef_word(u64 row, u64 kblock, int word) const {
-        return base + row * stride + supers + kblock * 2 * FIELD + 4 * word;
+    // GEMM staging: the superblock's fields (a word per group).
+    static constexpr int SUPER_WORDS = MINIMUM ? 8 : 4;
+    __device__ __forceinline__ const u8 *super_word(u64 row, u64 superblock, int word) const {
+        return base + row * stride + supers + superblock * 8 * FIELD + 4 * word;
     }
-    __device__ __forceinline__ void staged_coefficient(const u32 *words, u64, int group, float &scale,
+    __device__ static __forceinline__ int word_kblock(int word) { return MINIMUM ? word / 2 : word; }
+    __device__ __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
                                                        float &bias) const {
         if constexpr (MINIMUM) {
-            scale = seismic_f16_to_f32((u16)(words[group] & 0xFFFFu));
-            bias = -seismic_f16_to_f32((u16)(words[group] >> 16));
+            const u32 word = words[(kblock % 4) * 2 + group];
+            scale = seismic_f16_to_f32((u16)(word & 0xFFFFu));
+            bias = -seismic_f16_to_f32((u16)(word >> 16));
         } else {
-            scale = seismic_f16_to_f32((u16)(words[0] >> (16 * group)));
+            scale = seismic_f16_to_f32((u16)(words[kblock % 4] >> (16 * group)));
             bias = 0.0f;
         }
     }
@@ -1128,9 +1139,10 @@ template <class E> struct Dense {
     }
     // GEMM: nothing is staged; fragments come from `fetch`.
     static constexpr int CHUNKS = 0;
-    static constexpr int COEF_WORDS = 0;
+    static constexpr int SUPER_WORDS = 0;
     __device__ __forceinline__ const u8 *chunk_source(u64, u64, u32) const { return base; }
-    __device__ __forceinline__ const u8 *coef_word(u64, u64, int) const { return base; }
+    __device__ __forceinline__ const u8 *super_word(u64, u64, int) const { return base; }
+    __device__ static __forceinline__ int word_kblock(int) { return 0; }
     __device__ __forceinline__ void staged_coefficient(const u32 *, u64, int, float &scale, float &bias) const {
         scale = 1.0f;
         bias = 0.0f;

@@ -19,9 +19,8 @@ pub mod programs;
 pub use programs::{
     CommitSpan, CompletedHeadWork, CompletedImportWork, CompletedStateWork, CompletedTargetWork,
     CompletedVisionWork, HeadProgram, ImportProgram, PreparedDraftGraphs, PreparedDrafterGraphs,
-    PreparedHeadGraphs, PreparedStateCopyGraphs,
-    PreparedTargetGraphs, PreparedTargetReadoutGraphs, PreparedVisionGraphs, SealReport,
-    StateProgram, TargetOutput, TargetProgram, VisionProgram,
+    PreparedHeadGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs, PreparedTargetReadoutGraphs,
+    PreparedVisionGraphs, SealReport, StateProgram, TargetOutput, TargetProgram, VisionProgram,
 };
 pub mod platform;
 mod residency;
@@ -34,8 +33,8 @@ pub use device_resources::{
     ResourceError,
 };
 pub use domain::{
-    ClaimRefusal, DeviceHeap, DomainError, DomainRequirements, DomainReservation,
-    ExecutorDomain, HeadFlight, MemoryChargeReconciliation, NativeFamily, OpenRequirements,
+    ClaimRefusal, DeviceHeap, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
+    HeadFlight, MemoryChargeReconciliation, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, ProgramFamily, ReservedResources, ResumeState,
     TargetFlight, TargetHostTiming, VisionFlight,
 };
@@ -44,7 +43,7 @@ pub use execution_path::ExecutionPath;
 pub use kernel_cache::{KernelCache, KernelCacheError, TuningCacheKey, DEFAULT_KERNEL_CACHE_BYTES};
 pub use lanes::ConditioningSlice;
 pub use lanes::{
-    HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore, ImportLaunchInputs, ResidentWeightSlot,
+    HeadConditioning, HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore, ImportLaunchInputs, ResidentWeightSlot,
     StateLaunchCore, StateLaunchInputs, StateWork, TargetLaunchCore, TargetLaunchInputs,
     TargetLaunchWorkspace, TargetTokens, ValidatedHeadLaunch, ValidatedImportLaunch,
     ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchCore,
@@ -67,27 +66,9 @@ pub use native::{
 };
 pub use operation::{
     CommittedClass, DraftForm, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, GroupKey,
-    Operation,
-    OperationError, Outcome, ProgramIdentity, RequestId, ResourceDomainId, RowResult, Sampling,
-    SelectSpec, Selected, Shaping, TokenId, WorkKind,
-};
-pub use planning::{
-    resident_element, resident_layout, source_element, ArtifactComponent, ArtifactComponentKind,
-    AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding,
-    AttentionShape, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding, DenseScales,
-    EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
-    FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HostTablePlan,
-    ImportProgramSlot, MixerProgramSlot, ModelLoadPlan, NativeGraphCharge, DenseBranchBinding,
-    ParallelBinding, PerLayerBinding,
-    PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
-    ReadoutBinding, RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity,
-    ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding, StartupSlots, StateCapacityPlan,
-    ScalableWeight, StateProgramPlan, StateResourcePlan, StateStorePlan, StreamingCost,
-    SublayerTail, WeightScalePlan,
-    TargetBlockProgramSlot, DraftBlockBinding, DraftProgramPlan, Dflash2Binding, MarkovBinding, SelectorBinding, TapProgramPlan,
-    TargetProgramPlan, VisionProgramPlan, WeightPlan, WeightStorageIdentity,
-    MAX_DRAFT_PROPOSALS,
+    HeadPhase, Operation, OperationError, Outcome, Priming, ProgramIdentity, RequestId,
+    ResourceDomainId,
+    RowResult, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
 };
 pub use operators::routed::{
     Expansion, GeneralRoutedBinding, GeneralRoutedScales, GeneralRoutedShape,
@@ -95,6 +76,22 @@ pub use operators::routed::{
 pub use operators::short_conv::{ShortConvBinding, ShortConvShape};
 pub use operators::state_space::{StateSpaceBinding, StateSpaceShape};
 pub use operators::vision::{VisionEntry, VisionKernel};
+pub use planning::{
+    resident_element, resident_layout, source_element, ArtifactComponent, ArtifactComponentKind,
+    AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
+    AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding,
+    AttentionShape, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
+    DenseBranchBinding, DenseScales, Dflash2Binding, DraftBlockBinding, DraftProgramPlan,
+    EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
+    FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HostTablePlan,
+    ImportProgramSlot, MarkovBinding, MixerProgramSlot, ModelLoadPlan, NativeGraphCharge,
+    ParallelBinding, PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod,
+    ProgramPlan, ReadoutBinding, RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity,
+    ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding, ScalableWeight, SelectorBinding,
+    StartupSlots, StateCapacityPlan, StateProgramPlan, StateResourcePlan, StateStorePlan,
+    StreamingCost, SublayerTail, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan,
+    VisionProgramPlan, WeightPlan, WeightScalePlan, WeightStorageIdentity, MAX_DRAFT_PROPOSALS,
+};
 
 /// Whether this executor runs `definition` with its draft head selected.
 pub fn head_admitted(definition: &magnitude_family_contracts::ModelDefinition) -> bool {

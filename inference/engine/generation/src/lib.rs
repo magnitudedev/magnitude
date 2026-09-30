@@ -10,15 +10,15 @@ mod round;
 mod shaping;
 pub use acceptance::accept_prefix;
 pub use controls::{EndOfGeneration, ReasoningBudget};
+pub use dflash::DFlash;
 pub use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan};
 pub use magnitude_executor::{
-    Demand, FeatureReader, FeatureRef, Operation, RequestId, Sampling, SelectSpec, Shaping,
-    TokenId, WorkKind,
+    Demand, FeatureReader, FeatureRef, Operation, Priming, RequestId, Sampling, SelectSpec,
+    Shaping, TokenId, WorkKind,
 };
-pub use dflash::DFlash;
 pub use method::{
-    DraftCheckpoint, Method, MethodCheckpoint, MethodCheckpointError, MethodChoice,
-    MethodEffects, MethodRequirements, MethodState, Propose, Verification,
+    DraftCheckpoint, Method, MethodCheckpoint, MethodCheckpointError, MethodChoice, MethodEffects,
+    MethodRequirements, MethodState, Propose, Verification,
 };
 pub use mtp::Mtp;
 pub use plain::Plain;
@@ -465,35 +465,9 @@ impl Generation {
                 .take(end - position)
                 .copied()
                 .collect();
-            RoundState::progress(WorkKind::Replay, tokens, Vec::new(), None, requirements)?
+            RoundState::progress(WorkKind::Replay, tokens, Vec::new(), None, None, requirements)?
         } else if position < self.prompt.len() {
-            let end = self
-                .layout
-                .chunk_end(position, self.prompt.len(), allowance)?;
-            let finishing = end == self.prompt.len();
-            let tokens = self.prompt[position..end].to_vec();
-            let forced = if finishing {
-                self.forced_tokens(1)?
-            } else {
-                Vec::new()
-            };
-            let select = if finishing && forced.is_empty() {
-                Some(
-                    verification_selects(
-                        self.generated.len(),
-                        &self.generated,
-                        &[],
-                        self.constraint.as_deref(),
-                        self.options.sampling,
-                        self.options.shaping,
-                        self.options.seed,
-                    )?
-                    .remove(0),
-                )
-            } else {
-                None
-            };
-            RoundState::progress(WorkKind::Prefill, tokens, forced, select, requirements)?
+            self.prefill_round(position, allowance, self.method.priming_position())?
         } else {
             if self.generated.is_empty()
                 || position != self.prompt.len() + self.generated.len() - 1
@@ -560,6 +534,90 @@ impl Generation {
         };
         self.round = Some(round);
         Ok(RoundStart::Target)
+    }
+
+    /// The prompt chunk from `position`, at most `allowance` rows; the chunk
+    /// ending the prompt selects (or forces) the first generated token. A
+    /// drafter entering chunks on the device at `drafter` enters, behind the
+    /// chunk, each following prompt token with the chunk row before it.
+    fn prefill_round(
+        &self,
+        position: usize,
+        allowance: usize,
+        drafter: Option<usize>,
+    ) -> Result<RoundState, String> {
+        let end = self
+            .layout
+            .chunk_end(position, self.prompt.len(), allowance)?;
+        let requirements = self.method_factory.requires();
+        let prime = drafter
+            .filter(|_| requirements.head && requirements.prefill_demand.contains(Demand::FEATURES))
+            .map(|drafter| Priming {
+                tokens: self.prompt[position + 1..(end + 1).min(self.prompt.len())].to_vec(),
+                position: drafter,
+                draft_from: self.prompt.len() + self.generated.len(),
+            })
+            .filter(|prime| !prime.tokens.is_empty());
+        let finishing = end == self.prompt.len();
+        let tokens = self.prompt[position..end].to_vec();
+        let forced = if finishing {
+            self.forced_tokens(1)?
+        } else {
+            Vec::new()
+        };
+        let select = if finishing && forced.is_empty() {
+            Some(
+                verification_selects(
+                    self.generated.len(),
+                    &self.generated,
+                    &[],
+                    self.constraint.as_deref(),
+                    self.options.sampling,
+                    self.options.shaping,
+                    self.options.seed,
+                )?
+                .remove(0),
+            )
+        } else {
+            None
+        };
+        RoundState::progress(WorkKind::Prefill, tokens, forced, select, prime, requirements)
+    }
+
+    /// The prompt chunk of at most `allowance` rows that follows the
+    /// suspended round once it commits, when that is known now: the round is
+    /// a prompt chunk that selects nothing, and the prompt is plain text (a
+    /// conditioned span's rows need its encoding).
+    pub fn planned_prefill(
+        &self,
+        request: RequestId,
+        allowance: usize,
+    ) -> Result<Option<Operation>, String> {
+        let Some(forward) = self.round.as_ref().map(RoundState::forward) else {
+            return Ok(None);
+        };
+        if forward.kind != WorkKind::Prefill
+            || !forward.selects.is_empty()
+            || forward.committed != forward.tokens.len()
+            || !self.layout.spans().is_empty()
+            || self.finish.is_some()
+            || allowance == 0
+        {
+            return Ok(None);
+        }
+        let position = self.resident_position + forward.tokens.len();
+        if position < self.reconciliation_target || position >= self.prompt.len() {
+            return Ok(None);
+        }
+        let drafter = forward
+            .prime
+            .as_ref()
+            .map(|prime| prime.position + prime.tokens.len());
+        self.prefill_round(position, allowance, drafter)?
+            .forward()
+            .clone()
+            .into_operation(request, position, None)
+            .map(Some)
     }
 
     /// One selection per proposal, keyed like the target's selection of the
@@ -637,6 +695,7 @@ impl Generation {
             WorkKind::Replay,
             tokens,
             Vec::new(),
+            None,
             None,
             self.method_factory.requires(),
         )?;
@@ -824,6 +883,12 @@ impl Generation {
                         &acceptance.inputs,
                         acceptance.emitted.first().copied(),
                         features,
+                        self.prompt.len() + self.generated.len(),
+                        round
+                            .forward()
+                            .prime
+                            .as_ref()
+                            .map_or(0, |prime| prime.tokens.len()),
                         reader,
                     )?,
                     None => MethodEffects::default(),
@@ -1000,7 +1065,9 @@ impl Generation {
                     || position >= self.resume_bound()
                     || (position < self.prompt.len() && !self.layout.boundary(position))
                 {
-                    return Err("resumed prefix is not an exact boundary of the request path".into());
+                    return Err(
+                        "resumed prefix is not an exact boundary of the request path".into(),
+                    );
                 }
                 self.method = self.method_at(position, checkpoint)?;
                 position

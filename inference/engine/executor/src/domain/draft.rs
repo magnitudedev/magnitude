@@ -1,7 +1,6 @@
 //! The rows of a separate draft's (DFlash, DSpark) transactions: entry rows
 //! inject the target's conditioning into every history domain of the draft
-//! store, then one non-causal block `[anchor, mask, …]` drafts the
-//! proposals.
+//! store, then one block `[anchor, mask, …]` drafts the proposals.
 
 use super::*;
 use crate::batching::BlockSlot;
@@ -14,14 +13,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// rows sit at `n = position + entry rows` onward: the anchor (the entry's
     /// last token, the one after the last committed row), then mask tokens.
     /// Every block row reads each domain's accepted rows and injected entry
-    /// rows from its window start, and the whole block (the program widens
-    /// its fresh span). Proposal `k < steps` selects on its layout's row;
+    /// rows from its window start, and the block through itself (the program
+    /// widens the fresh span to the whole block for a bidirectional layer).
+    /// Proposal `k < steps` selects on its layout's row;
     /// a slot's surplus proposals repeat its last selection and are
     /// discarded.
     pub(super) fn draft_slot(
         &self,
         operation: &Operation,
-        advance: &OwnedStateAdvance,
+        advance: &TentativeAdvance,
         steps: usize,
     ) -> Result<BlockSlot, String> {
         let Operation::Head {
@@ -34,6 +34,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         else {
             return Err("a draft slot needs a block-form head operation".into());
         };
+        self.block_slot(tokens, *position, proposals, advance, steps)
+    }
+
+    /// A block drafter's slot: entry rows `tokens` at `position`, then with
+    /// `steps` one drafting block selecting `proposals`.
+    pub(super) fn block_slot(
+        &self,
+        tokens: &[TokenId],
+        position: usize,
+        proposals: &[SelectSpec],
+        advance: &TentativeAdvance,
+        steps: usize,
+    ) -> Result<BlockSlot, String> {
         let draft = self
             .definition
             .draft
@@ -56,7 +69,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Ok([
                 i32_of(start, "history start")?,
                 i32_of(
-                    start.checked_add(count).ok_or("draft history end overflow")?,
+                    start
+                        .checked_add(count)
+                        .ok_or("draft history end overflow")?,
                     "history end",
                 )?,
             ])
@@ -87,11 +102,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let mut block = Vec::new();
         if steps > 0 {
-            let anchor = tokens.last().ok_or("a drafting transaction has no entry rows")?;
+            let anchor = tokens
+                .last()
+                .ok_or("a drafting transaction has no entry rows")?;
             let start = position
                 .checked_add(tokens.len())
                 .ok_or("draft block position overflows")?;
-            let rows = usize::try_from(draft.block_size).map_err(|_| "draft block exceeds host")?;
+            let rows = usize::try_from(draft.block_rows(steps as u64))
+                .map_err(|_| "draft block exceeds host")?;
             let proposing = (0..steps)
                 .map(|proposal| {
                     usize::try_from(draft.proposal_row(proposal as u64))
@@ -189,9 +207,6 @@ mod tests {
     #[test]
     fn adjacent_spans_merge_only_within_a_slab() {
         let spans = [[0, 3], [3, 4], [4, 5], [5, 6], [9, 10]];
-        assert_eq!(
-            coalesce_within_slabs(&spans, 4),
-            [[0, 4], [4, 6], [9, 10]]
-        );
+        assert_eq!(coalesce_within_slabs(&spans, 4), [[0, 4], [4, 6], [9, 10]]);
     }
 }

@@ -24,11 +24,12 @@ use magnitude_family_common::{
     HeaderError, Metadata, Tensors,
 };
 use magnitude_family_contracts::{
-    checked_product, ActivationFunction, Attention, AttentionGate, Block, BlockLayout,
-    CandidateSelector, ConfidenceHead, DynamicConvolution, LayerConvolutions, DefinitionError, DenseFfn, DraftDefinition, DraftEmbedding, DraftMethod,
-    FamilyError, FeedForwardUp, HeadNorm, HistoryDomain, HistoryReads, ImportTransform,
-    InputNorm, KeyValue, MarkovHead, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-    RmsNorm, Rotary, Sublayer, TapPoint, ValueNorm, ValueSource, WeightDescriptor,
+    checked_product, ActivationFunction, Attention, AttentionGate, Block, BlockAttention,
+    BlockLayout, CandidateSelector, ConfidenceHead, DefinitionError, DenseFfn, DraftDefinition,
+    DraftEmbedding, DraftMethod, DynamicConvolution, FamilyError, FeedForwardUp, HeadNorm,
+    HistoryDomain, HistoryReads, ImportTransform, InputNorm, KeyValue, LayerConvolutions,
+    MarkovHead, MediaRowAttention, ModelDefinition, Operator, OutputForm, RmsNorm, Rotary,
+    Sublayer, TapPoint, ValueNorm, ValueSource, WeightDescriptor,
 };
 use std::{error, fmt};
 
@@ -242,9 +243,7 @@ pub fn recognize(directory: &Directory) -> Result<(), Error> {
             Some(key) if !ADMITTED_KEYS.contains(&key) => {
                 return Err(Error::UnknownMetadata(metadata.name.clone()));
             }
-            Some(key)
-                if matches!(metadata.value, Value::Array(_)) != ARRAY_KEYS.contains(&key) =>
-            {
+            Some(key) if matches!(metadata.value, Value::Array(_)) != ARRAY_KEYS.contains(&key) => {
                 return Err(Error::Metadata {
                     key: metadata.name.clone(),
                     expected: "of its admitted arity",
@@ -297,8 +296,7 @@ fn rotary_table(m: &Metadata, width: u64) -> Result<Rotary, Error> {
     if m.value("rope.dimension_sections").is_some() {
         let sections = m.counts("rope.dimension_sections")?;
         let pairs = sections.first().copied().unwrap_or(0);
-        if sections.iter().skip(1).any(|pairs| *pairs != 0) || pairs.checked_mul(2) != Some(width)
-        {
+        if sections.iter().skip(1).any(|pairs| *pairs != 0) || pairs.checked_mul(2) != Some(width) {
             return Err(Error::Geometry(format!(
                 "rotary sections {sections:?} other than one text axis over the head"
             )));
@@ -353,12 +351,6 @@ pub fn inspect(
     let width = m.integer("attention.key_length")?;
     let epsilon = m.positive_number("attention.layer_norm_rms_epsilon")?;
     let block_size = m.integer("block_size")?;
-    // A draft block is non-causal; only that is admitted.
-    if m.optional_flag("attention.causal")? == Some(true) {
-        return Err(Error::Geometry(
-            "a causal draft block is not admitted".into(),
-        ));
-    }
     if hidden != decoder.hidden {
         return Err(Error::Target(format!(
             "draft width {hidden} differs from the target's {}",
@@ -402,7 +394,8 @@ pub fn inspect(
         return Err(Error::Geometry("draft taps no target layer".into()));
     }
 
-    let domains = history_domains(&m, block_count)?;
+    let (domains, block_attention): (Vec<_>, Vec<_>) =
+        layer_attention(&m, block_count)?.into_iter().unzip();
     let rotary = rotary_table(&m, width)?;
     let query_rows = product(&[heads, width])?;
     let key_rows = product(&[kv_heads, width])?;
@@ -411,14 +404,14 @@ pub fn inspect(
     // Projections and tables carry their NVFP4 second-level scale (`X.scale`
     // beside `X.weight`, `[1]` F32) when the file stores one.
     let mut binder = Tensors::new(directory);
-    let fusion =
-        binder.bind_scaled("fc.weight", &[hidden, product(&[taps.len() as u64, hidden])?])?;
+    let fusion = binder.bind_scaled(
+        "fc.weight",
+        &[hidden, product(&[taps.len() as u64, hidden])?],
+    )?;
     let fusion_norm = rms(binder.bind_scaled("enc.output_norm.weight", &[hidden])?);
     let output_norm = rms(binder.bind_scaled("output_norm.weight", &[hidden])?);
     let embedding = if binder.contains("token_embd.weight") {
-        DraftEmbedding::Own(
-            binder.bind_scaled("token_embd.weight", &[decoder.vocabulary, hidden])?,
-        )
+        DraftEmbedding::Own(binder.bind_scaled("token_embd.weight", &[decoder.vocabulary, hidden])?)
     } else {
         DraftEmbedding::Target
     };
@@ -521,9 +514,14 @@ pub fn inspect(
         DraftMethod::DFlash
     };
     if !dflash2
-        && ["conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"]
-            .iter()
-            .any(|key| m.value(key).is_some())
+        && [
+            "conv_kernel_size",
+            "conv_group_size",
+            "selector_rank",
+            "selector_top_k",
+        ]
+        .iter()
+        .any(|key| m.value(key).is_some())
     {
         return Err(Error::Geometry(
             "convolution or selector metadata without the DFlash2 roles".into(),
@@ -544,6 +542,7 @@ pub fn inspect(
         fusion_norm,
         embedding,
         blocks,
+        block_attention,
         output_norm,
         block_size,
         mask_token,
@@ -576,7 +575,10 @@ fn dflash2_method(
         .map(|index| {
             let mut convolution = |name: &str| -> Result<DynamicConvolution, Error> {
                 Ok(DynamicConvolution {
-                    base: binder.bind(&format!("blk.{index}.{name}_conv_base"), &[2, kernel, hidden])?,
+                    base: binder.bind(
+                        &format!("blk.{index}.{name}_conv_base"),
+                        &[2, kernel, hidden],
+                    )?,
                     projection: binder.bind_scaled(
                         &format!("blk.{index}.{name}_conv_proj.weight"),
                         &[coefficients, hidden],
@@ -610,21 +612,26 @@ fn dflash2_method(
     })
 }
 
-/// Each draft layer's history: a window of `attention.sliding_window` keys
-/// on the layers the pattern marks sliding, the whole context otherwise.
-/// Without a window every layer is full.
-fn history_domains(m: &Metadata<'_>, block_count: u64) -> Result<Vec<HistoryDomain>, Error> {
+/// Each draft layer's history and block attention. A sliding layer (the
+/// pattern's, or every layer when a window has no pattern) keeps the
+/// `attention.sliding_window` positions with `q − k < W`, its own included,
+/// and reads its block causally; a full layer keeps the whole context and
+/// reads the whole block. `attention.causal`, when present, sets every
+/// layer's block attention instead (the reference `is_causal` override).
+fn layer_attention(
+    m: &Metadata<'_>,
+    block_count: u64,
+) -> Result<Vec<(HistoryDomain, BlockAttention)>, Error> {
     let window = m.optional_integer("attention.sliding_window")?;
+    let causal = m.optional_flag("attention.causal")?;
     let sliding = m
         .optional_flags("attention.sliding_window_pattern", block_count)?
         .unwrap_or_else(|| vec![window.is_some(); block_count as usize]);
     sliding
         .into_iter()
         .map(|sliding| {
-            Ok(match (sliding, window) {
-                // A draft's sliding layer keeps keys with |q − k| ≤ W: the
-                // query's own position and the W before it.
-                (true, Some(tokens)) => HistoryDomain::Window { tokens: tokens + 1 },
+            let domain = match (sliding, window) {
+                (true, Some(tokens)) => HistoryDomain::Window { tokens },
                 (true, None) => {
                     return Err(Error::Metadata {
                         key: m.key("attention.sliding_window"),
@@ -632,7 +639,12 @@ fn history_domains(m: &Metadata<'_>, block_count: u64) -> Result<Vec<HistoryDoma
                     })
                 }
                 (false, _) => HistoryDomain::Token,
-            })
+            };
+            let attention = match causal.unwrap_or(sliding) {
+                true => BlockAttention::Causal,
+                false => BlockAttention::Bidirectional,
+            };
+            Ok((domain, attention))
         })
         .collect()
 }

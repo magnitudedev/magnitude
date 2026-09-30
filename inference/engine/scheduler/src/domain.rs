@@ -66,6 +66,12 @@ impl OperationGroup {
     }
 }
 
+/// Whether `operation` is a prompt chunk with a drafter entry drafted behind
+/// it, which launches alone (its entry reads the chunk's own features).
+fn primes(operation: &Operation) -> bool {
+    matches!(operation, Operation::Forward { prime: Some(_), .. })
+}
+
 /// Preserve input order while coalescing adjacent compatible operations. A
 /// request may occupy only one slot in a group; another operation starts a new
 /// group so dependencies never leap across an intervening lane. The domain
@@ -79,10 +85,13 @@ pub fn group<F: ProgramFamily>(
         let lane = DomainLane::for_operation(&operation);
         let key = domain.group_key(&operation);
         let request = operation.request();
+        let alone = primes(&operation);
         let existing = groups.last_mut().filter(|group| {
             group.lane == lane
                 && group.key == key
                 && group.lane != DomainLane::Encoder
+                && !alone
+                && !group.operations.iter().any(primes)
                 && group
                     .operations
                     .iter()
@@ -102,7 +111,7 @@ pub fn group<F: ProgramFamily>(
 }
 
 pub enum DomainFlight<F: ProgramFamily = NativeFamily> {
-    Target(TargetFlight<F::TargetSubmission>),
+    Target(TargetFlight<F::TargetSubmission, F::HeadSubmission>),
     Head(HeadFlight<F::HeadSubmission>),
     Vision(VisionFlight<F::VisionSubmission>),
 }
@@ -132,12 +141,10 @@ pub fn submit_group<F: ProgramFamily>(
                 .submit_vision(operation, workspace, output)
                 .map(DomainFlight::Vision)
         }
-        _ => Err(DomainError::Invariant(
-            magnitude_executor::InvariantError {
-                context: "reserved domain submission",
-                detail: "reserved resource lane differs from operation group".into(),
-            },
-        )),
+        _ => Err(DomainError::Invariant(magnitude_executor::InvariantError {
+            context: "reserved domain submission",
+            detail: "reserved resource lane differs from operation group".into(),
+        })),
     };
     submitted.map_err(|error| match error {
         DomainError::Capacity(capacity) => {
@@ -190,6 +197,7 @@ mod tests {
             demand: Demand::NONE,
             select: Vec::new(),
             committed: 1,
+            prime: None,
         };
         let group = OperationGroup {
             lane: DomainLane::Target,

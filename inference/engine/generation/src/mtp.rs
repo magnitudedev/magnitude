@@ -11,12 +11,12 @@
 //! DFlash draft reads one block).
 
 use crate::{
-    method::PendingRows, DraftCheckpoint, Method, MethodCheckpoint, MethodCheckpointError,
-    MethodEffects, MethodRequirements, MethodState, Propose, Verification,
+    DraftCheckpoint, Method, MethodCheckpoint, MethodCheckpointError, MethodEffects,
+    MethodRequirements, MethodState, Propose, Verification, method::PendingRows,
 };
 use magnitude_executor::{
-    Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Operation, Outcome,
-    RequestId, SelectSpec, TokenId,
+    Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, HeadPhase, Operation,
+    Outcome, RequestId, SelectSpec, TokenId,
 };
 
 #[derive(Clone, Debug)]
@@ -133,7 +133,10 @@ impl DrafterState {
                 open: None,
             },
             Some(checkpoint) => drafter.restored(checkpoint).cloned().ok_or_else(|| {
-                format!("another method's checkpoint cannot restore {} state", drafter.name())
+                format!(
+                    "another method's checkpoint cannot restore {} state",
+                    drafter.name()
+                )
             })?,
         };
         Ok(Self {
@@ -155,14 +158,20 @@ impl DrafterState {
 
     fn ensure_idle(&self) -> Result<(), String> {
         if self.head.is_some() || self.proposal.is_some() {
-            return Err(format!("{} method already has unresolved work", self.drafter.name()));
+            return Err(format!(
+                "{} method already has unresolved work",
+                self.drafter.name()
+            ));
         }
         Ok(())
     }
 
     fn append(&mut self, tokens: Vec<TokenId>, features: FeatureRows) -> Result<(), String> {
         if tokens.len() != features.rows() {
-            return Err(format!("{} pairs differ from their feature rows", self.drafter.name()));
+            return Err(format!(
+                "{} pairs differ from their feature rows",
+                self.drafter.name()
+            ));
         }
         self.pending = Some(match self.pending.take() {
             None => PendingRows { tokens, features },
@@ -180,7 +189,12 @@ impl DrafterState {
 
     /// Enter every pending pair but the last `keep` as a drafter transaction
     /// without proposals.
-    fn flush(&mut self, request: RequestId, keep: usize) -> Result<MethodEffects, String> {
+    fn flush(
+        &mut self,
+        request: RequestId,
+        keep: usize,
+        phase: HeadPhase,
+    ) -> Result<MethodEffects, String> {
         let Some(pending) = self.pending.take() else {
             return Ok(MethodEffects::default());
         };
@@ -205,6 +219,7 @@ impl DrafterState {
         }
         let operation = Operation::Head {
             request,
+            phase,
             tokens: pending.tokens[..entered].to_vec(),
             conditioning,
             position: self.position,
@@ -221,9 +236,10 @@ impl DrafterState {
     fn read(
         reader: &mut dyn FeatureReader,
         features: FeatureRef,
+        start: usize,
         count: usize,
     ) -> Result<FeatureRows, String> {
-        let span = FeatureSpan::new(features, 0, count).map_err(|error| error.to_string())?;
+        let span = FeatureSpan::new(features, start, count).map_err(|error| error.to_string())?;
         reader.read(&span)
     }
 }
@@ -233,19 +249,54 @@ impl MethodState for DrafterState {
         Box::new(self.clone())
     }
 
+    fn priming_position(&self) -> Option<usize> {
+        (self.drafter == Drafter::DFlash
+            && self.pending.is_none()
+            && self.open.is_none()
+            && self.head.is_none()
+            && self.proposal.is_none())
+        .then_some(self.position)
+    }
+
     fn prime(
         &mut self,
         request: RequestId,
         tokens: &[TokenId],
         next: Option<TokenId>,
         features: FeatureRef,
+        draft_from: usize,
+        primed: usize,
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
+        if primed > 0 {
+            // The chunk's entry was drafted behind it on the device: each
+            // prompt token with the feature of the row before it, through
+            // the chunk's last row when the prompt continues. A finishing
+            // chunk's last feature selected `next`: the first draft's anchor.
+            if self.priming_position() != Some(self.position) || primed > tokens.len() {
+                return Err(format!(
+                    "{} state cannot take a device-primed chunk",
+                    self.drafter.name()
+                ));
+            }
+            self.position = self
+                .position
+                .checked_add(primed)
+                .ok_or_else(|| format!("{} drafter position exhausted", self.drafter.name()))?;
+            if let Some(next) = next {
+                let last = Self::read(reader, features, tokens.len() - 1, 1)?;
+                self.append(vec![next], last)?;
+            }
+            return Ok(MethodEffects::default());
+        }
         self.ensure_idle()?;
         let Some((&first, rest)) = tokens.split_first() else {
-            return Err(format!("{} cannot prime an empty target chunk", self.drafter.name()));
+            return Err(format!(
+                "{} cannot prime an empty target chunk",
+                self.drafter.name()
+            ));
         };
-        let rows = Self::read(reader, features, tokens.len())?;
+        let rows = Self::read(reader, features, 0, tokens.len())?;
         // The open feature selected this chunk's first token; each chunk
         // row's feature selected the token after it.
         if let Some(open) = self.open.take() {
@@ -265,11 +316,11 @@ impl MethodState for DrafterState {
             Some(next) => {
                 self.append(vec![next], last)?;
                 // Keep the anchor for the first draft.
-                self.flush(request, 1)
+                self.flush(request, 1, HeadPhase::Priming { draft_from })
             }
             None => {
                 self.open = Some(last);
-                self.flush(request, 0)
+                self.flush(request, 0, HeadPhase::Priming { draft_from })
             }
         }
     }
@@ -286,6 +337,7 @@ impl MethodState for DrafterState {
         }
         let operation = Operation::Head {
             request,
+            phase: HeadPhase::Generation,
             tokens: pending.tokens.clone(),
             conditioning: pending.features.clone(),
             position: self.position,
@@ -329,11 +381,13 @@ impl MethodState for DrafterState {
             .and_then(|pending| pending.tokens.last())
             .is_some_and(|anchor| *anchor != verification.inputs[0])
         {
-            return Err(format!("{name} pending anchor differs from the verified anchor"));
+            return Err(format!(
+                "{name} pending anchor differs from the verified anchor"
+            ));
         }
         // Committed row i's feature selected the token after it: the next
         // accepted input, or the round's successor after the last row.
-        let rows = Self::read(reader, features, accepted)?;
+        let rows = Self::read(reader, features, 0, accepted)?;
         let mut tokens = verification.inputs[1..accepted].to_vec();
         tokens.push(verification.next);
         self.append(tokens, rows)?;
@@ -343,7 +397,7 @@ impl MethodState for DrafterState {
             .as_ref()
             .is_some_and(|pending| pending.tokens.len() > bound)
         {
-            return self.flush(request, 1);
+            return self.flush(request, 1, HeadPhase::Generation);
         }
         Ok(MethodEffects::default())
     }
@@ -366,7 +420,9 @@ impl MethodState for DrafterState {
             return Err(format!("{name} drafter outcome has the wrong kind"));
         };
         if head != *operation || selected.len() != proposals.len() {
-            return Err(format!("{name} drafter outcome differs from its transaction"));
+            return Err(format!(
+                "{name} drafter outcome differs from its transaction"
+            ));
         }
         self.position = self
             .position

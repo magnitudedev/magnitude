@@ -55,6 +55,16 @@ fn attention_project_rows<L: Isa, E: Elements>(
         cx.arg_value_weight(),
     ][segment];
     let result = [cx.result_0(), cx.result_1(), cx.result_2(), cx.result_3()][segment];
+    if segment < 2 && cx.arg_project_mode() != 0 {
+        let zero = vec![0.0f32; rows.len()];
+        for row in 0..m {
+            // SAFETY: this work item owns these columns of this segment's result.
+            activation::store::<E::A>(&zero, unsafe {
+                result.span_mut([row, rows.start], rows.len())
+            });
+        }
+        return;
+    }
     // SAFETY: the normalize launch wrote every row before this launch.
     let normalized = unsafe { cx.scratch_normalized().slice::<f32>(0, m * d) };
     let blocks = seismic::cpu::quant::blocks(d);

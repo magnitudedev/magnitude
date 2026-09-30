@@ -54,6 +54,10 @@ Terminal success carries measured physical prompt and predicted durations accumu
 execution owner at completed program boundaries. The host response converts these durations to
 milliseconds without inferring them from token counts or scheduler estimates. A successful response
 requiring timing metadata fails closed if those measurements are absent.
+Draft history prepared from prompt or replay rows contributes to prompt duration, including
+separate-draft injection after each prompt or replay chunk. Proposal and catch-up work during generation
+contributes to predicted duration. The executor lane used for an operation does not determine its
+timing phase.
 
 ## Acceptance criteria
 
@@ -65,3 +69,4 @@ requiring timing metadata fails closed if those measurements are absent.
 - Dropping the worker sender gives an open receiver one terminal failure.
 - Every terminal path releases request-owned resources after physical work and state reconciliation.
 - Terminal timing fields represent measured execution and remain consistent in streaming and complete responses.
+- Prompt and replay draft preparation are charged to prompt time even when they use the head executor lane.

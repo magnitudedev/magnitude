@@ -19,8 +19,8 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
-    Demand, DomainError, ExecutionPath, ExecutorDomain, FeatureRows, Operation, Outcome, PhysicalDecision,
-    RequestId, RowResult, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
+    Demand, DomainError, ExecutionPath, ExecutorDomain, FeatureRows, Operation, Outcome,
+    PhysicalDecision, RequestId, RowResult, Sampling, SelectSpec, Shaping, TokenId, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_scheduler::{
@@ -148,6 +148,7 @@ impl Fingerprint {
                 demand,
                 select,
                 committed: rows,
+                prime: None,
             });
             sequences.push((sequence, rows));
         }
@@ -192,6 +193,7 @@ impl Fingerprint {
             .collect::<Vec<u8>>();
         let operation = Operation::Head {
             request: sequence.request,
+            phase: magnitude_executor::HeadPhase::Generation,
             tokens: vec![token],
             conditioning: FeatureRows::new(row.into(), 1).map_err(|error| error.to_string())?,
             position: sequence.position,
@@ -294,7 +296,12 @@ fn main() -> Result<(), String> {
     let prompt = run.forced(0, PROMPT);
     let mut hasher = Sha256::new();
     let mut tokens = Vec::new();
-    for rows in run.step(vec![(&mut first, WorkKind::Prefill, prompt, Demand::LOGITS)])? {
+    for rows in run.step(vec![(
+        &mut first,
+        WorkKind::Prefill,
+        prompt,
+        Demand::LOGITS,
+    )])? {
         digest(&rows, &mut hasher, &mut tokens)?;
     }
     println!("prefill rows={PROMPT} logits={}", hex(hasher));
@@ -321,7 +328,11 @@ fn main() -> Result<(), String> {
         }
         next = TokenId(*greedy_tokens.last().ok_or("decode selected no token")?);
     }
-    println!("decode steps={} tokens={greedy_tokens:?} logits={}", options.steps, hex(hasher));
+    println!(
+        "decode steps={} tokens={greedy_tokens:?} logits={}",
+        options.steps,
+        hex(hasher)
+    );
 
     let mut second = run.open(2)?;
     let prompt = run.forced(1000, PROMPT + 13);
@@ -351,7 +362,10 @@ fn main() -> Result<(), String> {
             pair_tokens.extend(selected);
         }
     }
-    println!("concurrent steps=8 tokens={pair_tokens:?} logits={}", hex(hasher));
+    println!(
+        "concurrent steps=8 tokens={pair_tokens:?} logits={}",
+        hex(hasher)
+    );
 
     if options.head {
         let mut proposals = Vec::new();

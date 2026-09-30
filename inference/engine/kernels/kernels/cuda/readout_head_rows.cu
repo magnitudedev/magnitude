@@ -45,9 +45,10 @@ template <class Shape>
 __device__ __forceinline__ void head_gemm(const projection::u8 *staged, unsigned O, unsigned long long D,
                                           unsigned long long V, const packets::W0 &head, const Epi &epi) {
     extern __shared__ uint4 dynamic_shared[];
-    if (blockIdx.x < projection::gemm_columns(V))
+    const unsigned long long column = projection::gemm_column<Shape>();
+    if (column < projection::gemm_columns(V))
         projection::gemm_run<Shape, false>(reinterpret_cast<projection::u8 *>(dynamic_shared), staged, D, nullptr, O,
-                                           D, blockIdx.x, V, head, projection::NoWeight{}, epi);
+                                           D, column, V, head, projection::NoWeight{}, epi);
 }
 
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_STAGE
@@ -79,7 +80,9 @@ extern "C" __global__ void readout_head_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMM
-extern "C" __global__ void readout_head_rows_gemm(SEISMIC_KERNEL_PARAMS) {
-    head_gemm<projection::LargeGemm>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+template <unsigned ROTATE>
+__global__ void readout_head_rows_gemm(SEISMIC_KERNEL_PARAMS) {
+    head_gemm<projection::LargeGemm<ROTATE>>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD,
+                                             EPILOGUE);
 }
 #endif

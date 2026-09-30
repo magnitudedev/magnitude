@@ -559,6 +559,7 @@ fn warm_up(domain: &mut ExecutorDomain) -> Result<(), LoadError> {
         demand: Demand::NONE,
         select: Vec::new(),
         committed: 1,
+        prime: None,
     }];
     let resources = domain
         .reserve(&operations)

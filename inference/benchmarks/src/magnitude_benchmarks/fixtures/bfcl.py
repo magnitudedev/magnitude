@@ -37,13 +37,23 @@ def normalize_schema(value):
     if not isinstance(value, dict):
         return value
     kinds = {"dict": "object", "list": "array", "tuple": "array", "float": "number"}
-    return {
-        key: kinds.get(item, item)
-        if key == "type" and isinstance(item, str)
-        else normalize_schema(item)
-        for key, item in value.items()
-        if not (key == "type" and item == "any")
-    }
+    result = {}
+    for key, item in value.items():
+        if key in ("optional", "format") or (key == "type" and item == "any"):
+            continue
+        if key == "required":
+            properties = value.get("properties")
+            if not isinstance(properties, dict):
+                continue
+            item = [name for name in item if name in properties]
+            if not item:
+                continue
+        result[key] = (
+            kinds.get(item, item)
+            if key == "type" and isinstance(item, str)
+            else normalize_schema(item)
+        )
+    return result
 
 
 def materialize(question: dict, answer: dict, category: str, commit: str) -> Interaction:

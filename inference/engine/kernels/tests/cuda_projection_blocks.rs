@@ -463,6 +463,7 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                     key_weight: &weights[1].tensor,
                     value_weight: &weights[2].tensor,
                     epsilon: EPSILON,
+                    project_mode: 0,
                 })
                 .unwrap();
                 for (name, tensor, (values, tolerance)) in [

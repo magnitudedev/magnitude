@@ -2,11 +2,12 @@ use magnitude_artifacts::{
     gguf::{Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
     ArtifactIdentity, PackageIdentity, TokenId,
 };
-use magnitude_family_contracts::{
-    AttentionGate, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod, DraftVariant, HeadNorm, HistoryDomain, ImportTransform, KeyValue, ModelDefinition, ModelFamily, Operator,
-    Rotary, SublayerIndex, TapPoint,
-};
 use magnitude_family_common::headers;
+use magnitude_family_contracts::{
+    AttentionGate, BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod,
+    DraftVariant, HeadNorm, HistoryDomain, ImportTransform, KeyValue, ModelDefinition, ModelFamily,
+    Operator, Rotary, SublayerIndex, TapPoint,
+};
 use magnitude_family_dflash::{inspect, recognize, recognizes, Error};
 use magnitude_family_lfm2::Lfm2Family;
 use magnitude_family_llama::LlamaFamily;
@@ -23,15 +24,30 @@ fn identity() -> PackageIdentity {
 
 /// Every catalog draft with its target's family and header.
 const PAIRS: [(&str, &str); 6] = [
-    ("qwen3.6-35b-a3b__draft.json", "qwen3.6-35b-a3b__target-gguf_q4.json"),
-    ("muse-glimmer-30b__draft.json", "muse-glimmer-30b__target-gguf_q4.json"),
+    (
+        "qwen3.6-35b-a3b__draft.json",
+        "qwen3.6-35b-a3b__target-gguf_q4.json",
+    ),
+    (
+        "muse-glimmer-30b__draft.json",
+        "muse-glimmer-30b__target-gguf_q4.json",
+    ),
     (
         "nemotron-3.5-lightning-30b-a3b__draft.json",
         "nemotron-3.5-lightning-30b-a3b__target-gguf_nvfp4-qat.json",
     ),
-    ("lfm2.5-2.6b__draft.json", "lfm2.5-2.6b__target-gguf_q4.json"),
-    ("lfm2.5-8b-a1b__draft.json", "lfm2.5-8b-a1b__target-gguf_q4.json"),
-    ("minicpm5-2b__draft.json", "minicpm5-2b__target-gguf_q4.json"),
+    (
+        "lfm2.5-2.6b__draft.json",
+        "lfm2.5-2.6b__target-gguf_q4.json",
+    ),
+    (
+        "lfm2.5-8b-a1b__draft.json",
+        "lfm2.5-8b-a1b__target-gguf_q4.json",
+    ),
+    (
+        "minicpm5-2b__draft.json",
+        "minicpm5-2b__target-gguf_q4.json",
+    ),
 ];
 
 fn family(target: &str) -> &'static dyn ModelFamily {
@@ -86,10 +102,13 @@ fn domains(draft: &DraftDefinition) -> Vec<HistoryDomain> {
 #[test]
 fn every_catalog_draft_binds_against_its_target() {
     for (draft, target_file) in PAIRS {
-        let definition = draft_of(draft, target_file).unwrap_or_else(|error| panic!("{draft}: {error}"));
+        let definition =
+            draft_of(draft, target_file).unwrap_or_else(|error| panic!("{draft}: {error}"));
         let mut model = target(target_file);
         model.draft = Some(definition.clone());
-        model.validate().unwrap_or_else(|error| panic!("{draft}: {error:?}"));
+        model
+            .validate()
+            .unwrap_or_else(|error| panic!("{draft}: {error:?}"));
         assert!(model.deferred_forms().is_empty(), "{draft}");
         for block in &definition.blocks {
             let [mixer, feed_forward] = block.sublayers.as_slice() else {
@@ -116,17 +135,43 @@ fn qwen_dflash_taps_eight_layers_with_five_sliding_windows() {
     assert_eq!(draft.taps, block_taps(&[2, 7, 12, 17, 23, 28, 33, 38]));
     assert_eq!(draft.fusion.shape, [2048, 8 * 2048]);
     assert_eq!(draft.embedding, DraftEmbedding::Target);
-    // A draft's window of W keeps |q − k| ≤ W: W + 1 positions.
-    let window = HistoryDomain::Window { tokens: 4097 };
+    // A draft's window of W keeps q − k < W: W positions, its own included.
+    let window = HistoryDomain::Window { tokens: 4096 };
     assert_eq!(
         domains(&draft),
-        [window.clone(), window.clone(), window.clone(), window.clone(), window, HistoryDomain::Token]
+        [
+            window.clone(),
+            window.clone(),
+            window.clone(),
+            window.clone(),
+            window,
+            HistoryDomain::Token
+        ]
+    );
+    // Sliding layers read their block causally, the full layer wholly.
+    assert_eq!(
+        draft.block_attention,
+        [
+            BlockAttention::Causal,
+            BlockAttention::Causal,
+            BlockAttention::Causal,
+            BlockAttention::Causal,
+            BlockAttention::Causal,
+            BlockAttention::Bidirectional
+        ]
     );
     let Operator::Attention(attention) = &draft.blocks[0].sublayers[0].op else {
         unreachable!()
     };
-    assert_eq!((attention.heads, attention.kv_heads, attention.width), (32, 8, 128));
-    let Rotary::Table { pairs, divisors: None } = &attention.rotary else {
+    assert_eq!(
+        (attention.heads, attention.kv_heads, attention.width),
+        (32, 8, 128)
+    );
+    let Rotary::Table {
+        pairs,
+        divisors: None,
+    } = &attention.rotary
+    else {
         panic!("plain rotary table");
     };
     assert_eq!(pairs.len(), 64);
@@ -138,7 +183,11 @@ fn qwen_dflash_taps_eight_layers_with_five_sliding_windows() {
 fn muse_dflash_windows_every_layer() {
     let draft = draft_of(PAIRS[1].0, PAIRS[1].1).unwrap();
     assert_eq!(draft.taps, block_taps(&[2, 14, 26, 38, 50]));
-    assert_eq!(domains(&draft), vec![HistoryDomain::Window { tokens: 2049 }; 5]);
+    assert_eq!(
+        domains(&draft),
+        vec![HistoryDomain::Window { tokens: 2048 }; 5]
+    );
+    assert_eq!(draft.block_attention, vec![BlockAttention::Causal; 5]);
     assert_eq!(draft.fusion.shape, [6656, 5 * 6656]);
     assert_eq!(draft.mask_token, TokenId(201818));
 }
@@ -146,7 +195,9 @@ fn muse_dflash_windows_every_layer() {
 #[test]
 fn nemotron_dflash_has_yarn_its_own_embedding_and_second_level_scales() {
     let draft = draft_of(PAIRS[2].0, PAIRS[2].1).unwrap();
-    assert!(matches!(draft.embedding, DraftEmbedding::Own(ref table) if table.shape == [131072, 2688]));
+    assert!(
+        matches!(draft.embedding, DraftEmbedding::Own(ref table) if table.shape == [131072, 2688])
+    );
     assert_eq!(domains(&draft), vec![HistoryDomain::Token; 6]);
     assert_eq!(draft.taps.len(), 6);
     assert_eq!(draft.taps.last(), Some(&TapPoint::Exit));
@@ -253,7 +304,11 @@ fn drafts_and_targets_are_recognized_by_disjoint_families() {
         assert_eq!(recognizes(&directory), draft, "{file}");
         if draft {
             for family in targets {
-                assert!(!family.recognizes(&directory), "{} claims {file}", family.name());
+                assert!(
+                    !family.recognizes(&directory),
+                    "{} claims {file}",
+                    family.name()
+                );
             }
         }
     }
@@ -264,13 +319,17 @@ fn qwen_draft() -> (Directory, ModelDefinition) {
 }
 
 fn inspect_qwen(directory: &Directory, model: &ModelDefinition) -> Result<DraftDefinition, Error> {
-    inspect(directory, model, &|layer| Qwen35Family.layer_entry(model, layer))
+    inspect(directory, model, &|layer| {
+        Qwen35Family.layer_entry(model, layer)
+    })
 }
 
 #[test]
 fn a_missing_weight_is_refused() {
     let (mut directory, model) = qwen_draft();
-    directory.tensors.retain(|tensor| tensor.name != "blk.3.attn_k_norm.weight");
+    directory
+        .tensors
+        .retain(|tensor| tensor.name != "blk.3.attn_k_norm.weight");
     assert_eq!(
         inspect_qwen(&directory, &model).unwrap_err(),
         Error::MissingWeight("blk.3.attn_k_norm.weight".into())
@@ -345,7 +404,8 @@ fn a_draft_for_another_target_is_refused() {
     let directory = headers::directory(PAIRS[0].0);
     let model = target(PAIRS[5].1);
     assert!(matches!(
-        inspect(&directory, &model, &|layer| LlamaFamily.layer_entry(&model, layer)),
+        inspect(&directory, &model, &|layer| LlamaFamily
+            .layer_entry(&model, layer)),
         Err(Error::Metadata { .. })
     ));
     // The Muse draft against the Qwen target: the width differs.
@@ -433,7 +493,10 @@ fn qwen38_dspark_drafts_seven_from_the_anchor_with_yarn() {
     let Operator::Attention(attention) = &draft.blocks[0].sublayers[0].op else {
         unreachable!()
     };
-    assert_eq!((attention.heads, attention.kv_heads, attention.width), (40, 8, 128));
+    assert_eq!(
+        (attention.heads, attention.kv_heads, attention.width),
+        (40, 8, 128)
+    );
     // YaRN folds into the pairs: the scaled low frequencies differ from the
     // plain table's.
     let Rotary::Table { pairs, .. } = &attention.rotary else {
@@ -451,7 +514,15 @@ fn qwen38_dflash2_convolves_every_sublayer_and_selects_a_path() {
     assert_eq!((draft.block_size, draft.max_proposals()), (8, 7));
     assert_eq!(draft.mask_token, TokenId(248070));
     assert_eq!(draft.taps, block_taps(&[6, 20, 34, 48, 62]));
-    assert_eq!(domains(&draft), vec![HistoryDomain::Window { tokens: 2049 }; 5]);
+    assert_eq!(
+        domains(&draft),
+        vec![HistoryDomain::Window { tokens: 2048 }; 5]
+    );
+    // Its header declares `attention.causal = false` for every layer.
+    assert_eq!(
+        draft.block_attention,
+        vec![BlockAttention::Bidirectional; 5]
+    );
     let DraftMethod::DFlash2 {
         kernel,
         group,
@@ -477,7 +548,11 @@ fn qwen38_dflash2_convolves_every_sublayer_and_selects_a_path() {
     let Operator::Attention(attention) = &draft.blocks[0].sublayers[0].op else {
         unreachable!()
     };
-    let Rotary::Table { pairs, divisors: None } = &attention.rotary else {
+    let Rotary::Table {
+        pairs,
+        divisors: None,
+    } = &attention.rotary
+    else {
         panic!("plain rotary table");
     };
     assert_eq!(pairs.len(), 64);
@@ -490,7 +565,9 @@ fn dflash2_roles_are_all_or_nothing() {
         .inspect(&headers::directory(QWEN38_TARGET), None, identity())
         .unwrap();
     let bind = |directory: &Directory| {
-        inspect(directory, &model, &|layer| Qwen35Family.layer_entry(&model, layer))
+        inspect(directory, &model, &|layer| {
+            Qwen35Family.layer_entry(&model, layer)
+        })
     };
     let mut missing = headers::directory(QWEN38_DFLASH2);
     headers::remove_tensor(&mut missing, "blk.4.ffn_conv_proj.weight");
@@ -511,7 +588,12 @@ fn dflash2_roles_are_all_or_nothing() {
     headers::set(
         &mut sectioned,
         "dflash.rope.dimension_sections",
-        Value::Array(vec![Scalar::Unsigned(32), Scalar::Unsigned(32), Scalar::Unsigned(0), Scalar::Unsigned(0)]),
+        Value::Array(vec![
+            Scalar::Unsigned(32),
+            Scalar::Unsigned(32),
+            Scalar::Unsigned(0),
+            Scalar::Unsigned(0),
+        ]),
     );
     assert!(matches!(bind(&sectioned), Err(Error::Geometry(_))));
 }

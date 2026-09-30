@@ -11,7 +11,28 @@
 #define ATTENTION_GATE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_GATE)
 #define ATTENTION_AMPLITUDE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)
 #define ATTENTION_VALUE_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_VALUE_NORM)
-#include "lib/attention/attention.glsl"
+// Both forms' shared code (an entry's includes expand once, whatever the
+// branch).
+#include "lib/attention/history.glsl"
+
+#if SEISMIC_TUNE_MATRIX
+// The grouped-query matrix form: the prefill body's L2 over decode rows
+// (`lib/attention/prefill.glsl`, PREFILL_DECODE), 16 matrix rows per
+// subgroup; history tiles are staged as f16 and the products are cooperative
+// matrices.
+#define PREFILL_DECODE
+#define PREFILL_ROWS (16u * uint(SEISMIC_TUNE_SIMDS))
+#define PREFILL_PARTS uint(SEISMIC_TUNE_PARTS)
+#include "lib/attention/prefill.glsl"
+
+void attention_decode_partial() {
+    prefill_attend(attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE)),
+        prefill_scratch(0ul, 0ul, 0ul, 0ul));
+}
+
+void attention_decode_merge() { prefill_decode_merge(); }
+
+#else
 #include <seismic/slab.glsl>
 
 // The prepared queries pack two activation elements per shared word.
@@ -203,3 +224,5 @@ void attention_decode_merge() {
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), SEISMIC_DIM_R,
         gl_WorkGroupID.x, gl_WorkGroupID.y, gl_LocalInvocationIndex, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
 }
+
+#endif

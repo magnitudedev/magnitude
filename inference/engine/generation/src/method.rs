@@ -6,9 +6,13 @@ use magnitude_executor::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MethodChoice {
     Plain,
-    Mtp { proposals: u8 },
+    Mtp {
+        proposals: u8,
+    },
     /// A separate DFlash or DSpark draft model.
-    DFlash { proposals: u8 },
+    DFlash {
+        proposals: u8,
+    },
 }
 
 impl MethodChoice {
@@ -134,14 +138,25 @@ pub trait Method: Send + Sync {
 pub trait MethodState {
     /// Clone request-local method state for a fallible transition.
     fn fork_transition(&self) -> Box<dyn MethodState>;
+    /// The drafter position a prompt chunk's entry takes when the drafter
+    /// enters prompt chunks on the device, behind the chunk (a separate
+    /// drafter with no rows pending); `None` when chunks are entered by
+    /// method work after they commit.
+    fn priming_position(&self) -> Option<usize>;
     /// Enter a committed target chunk. `next` is the token the chunk's last
-    /// row selected, when it selected one.
+    /// row selected, when it selected one; `draft_from` is the position the
+    /// first draft after this history anchors at (the prefilled length).
+    /// `primed` rows of the chunk's entry were drafted on the device behind
+    /// it (see [`MethodState::priming_position`]).
+    #[allow(clippy::too_many_arguments)]
     fn prime(
         &mut self,
         request: RequestId,
         tokens: &[TokenId],
         next: Option<TokenId>,
         features: FeatureRef,
+        draft_from: usize,
+        primed: usize,
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String>;
     /// Propose one token per selection (keyed by the target's position), or

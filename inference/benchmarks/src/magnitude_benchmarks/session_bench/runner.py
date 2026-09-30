@@ -379,6 +379,16 @@ async def run(
                                     raise RuntimeError(f"{target.id} watchdog: {engine.retired}")
                                 raise RuntimeError(f"{target.id} exited during execution")
                             await execution
+                            allocation = await adapter.memory_observation(engine)
+                            if allocation is not None:
+                                store.append(
+                                    "allocations.jsonl",
+                                    {
+                                        "target": target.id,
+                                        "block": block,
+                                        "observation": allocation,
+                                    },
+                                )
                         finally:
                             for task in (execution, exit_watch):
                                 if not task.done():

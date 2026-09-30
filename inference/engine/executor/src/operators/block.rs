@@ -16,7 +16,9 @@ use super::parallel::graph::{parallel, CheckedParallelEntries, ParallelGraphEntr
 use super::per_layer::graph::{
     per_layer as per_layer_graph, CheckedPerLayerEntries, PerLayerEntries, PerLayerWeights,
 };
-use super::routed::fused_graph::{self as routed_graph, CheckedRoutedEntries, ExpertShape, RoutedGraphEntries};
+use super::routed::fused_graph::{
+    self as routed_graph, CheckedRoutedEntries, ExpertShape, RoutedGraphEntries,
+};
 use super::routed::graph::{
     class_constants, general_routed, CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries,
     RoutedSum,
@@ -161,7 +163,9 @@ pub(crate) enum CheckedFeedForwardEntries {
 impl CheckedFeedForwardEntries {
     pub(crate) fn new(slot: FeedForwardProgramSlot) -> Self {
         match slot {
-            FeedForwardProgramSlot::Dense(binding) => Self::Dense(CheckedDenseEntries::new(binding)),
+            FeedForwardProgramSlot::Dense(binding) => {
+                Self::Dense(CheckedDenseEntries::new(binding))
+            }
             FeedForwardProgramSlot::Routed(binding) => {
                 Self::Routed(CheckedRoutedEntries::new(binding))
             }
@@ -251,10 +255,13 @@ impl BlockSublayers<'_> {
                 let shape = attention_operator::shape(geometry.hidden, operator)
                     .map_err(|error| error.to_string())?;
                 let post_norm_epsilon = post_norm_epsilon(paired.mixer_output);
-                let attention_weights =
-                    attention_weights(&shape, operator, post_norm_epsilon.is_some(), |kind| {
-                        weight(graph, load, scope, kind, weights)
-                    })?;
+                let attention_weights = attention_weights(
+                    &shape,
+                    operator,
+                    true,
+                    post_norm_epsilon.is_some(),
+                    |kind| weight(graph, load, scope, kind, weights),
+                )?;
                 // The block reads its history domain's slab tensor, a Shared
                 // layer its source's.
                 let history = state
@@ -286,6 +293,7 @@ impl BlockSublayers<'_> {
                         post_norm_epsilon: post_norm_epsilon.unwrap_or_default() as f32,
                         post_norm_scale: output_scales.mixer,
                         activation: activation(geometry),
+                        inject_only: false,
                     },
                 )?;
                 (
@@ -428,22 +436,23 @@ impl BlockSublayers<'_> {
                         epsilon,
                     )?
                 }
-                (FeedForward::GeneralRouted(operator), FeedForwardEntries::GeneralRouted(entries)) => {
-                    general_routed(
-                        graph,
-                        entries,
-                        load,
-                        scope,
-                        weights,
-                        constants,
-                        &mixed,
-                        RoutedSum::Residual,
-                        rows,
-                        &GeneralRoutedShape::of(geometry.hidden, operator)
-                            .map_err(|error| error.to_string())?,
-                        epsilon,
-                    )?
-                }
+                (
+                    FeedForward::GeneralRouted(operator),
+                    FeedForwardEntries::GeneralRouted(entries),
+                ) => general_routed(
+                    graph,
+                    entries,
+                    load,
+                    scope,
+                    weights,
+                    constants,
+                    &mixed,
+                    RoutedSum::Residual,
+                    rows,
+                    &GeneralRoutedShape::of(geometry.hidden, operator)
+                        .map_err(|error| error.to_string())?,
+                    epsilon,
+                )?,
                 (FeedForward::Parallel(branches), FeedForwardEntries::Parallel(entries)) => {
                     parallel(
                         graph,
@@ -490,7 +499,13 @@ impl BlockSublayers<'_> {
                 let scope = self.scope(2)?;
                 let per_layer_weights = PerLayerWeights {
                     gate: weight(graph, load, scope, WeightKind::PerLayerGate, weights)?,
-                    projection: weight(graph, load, scope, WeightKind::PerLayerProjection, weights)?,
+                    projection: weight(
+                        graph,
+                        load,
+                        scope,
+                        WeightKind::PerLayerProjection,
+                        weights,
+                    )?,
                     post_norm: weight(graph, load, scope, WeightKind::PostNorm, weights)?,
                 };
                 let rows_port = graph.port_with_class_extent(

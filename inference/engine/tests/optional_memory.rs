@@ -14,10 +14,10 @@ use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     ExecutionPath, FeatureRows, Operation, PhysicalDecision, RequestId, TokenId,
 };
+use magnitude_family_contracts::{PreparedModelInput, TokenPlan};
 use magnitude_generation::{
     EndOfGeneration, Generation, InputLayout, MethodChoice, Mtp, Options, Sampling, Shaping,
 };
-use magnitude_family_contracts::{PreparedModelInput, TokenPlan};
 use magnitude_scheduler::{
     domain::{self as service_domain, DomainFlight},
     owner::{AdmissionError, Owner, Status, Step},
@@ -415,6 +415,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         domain.open_state(request, None).unwrap();
         let head = Operation::Head {
             request,
+            phase: magnitude_executor::HeadPhase::Priming { draft_from: 1 },
             tokens: vec![TokenId(1)],
             conditioning: FeatureRows::new(vec![0; row_bytes].into(), 1).unwrap(),
             position: 0,

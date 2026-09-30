@@ -17,11 +17,11 @@ use crate::operators;
 use crate::operators::output::{post_norm, CheckedPostNormEntries, PostNormShape, TailEntries};
 use crate::programs::graph::draft::GraphDraft;
 use crate::programs::native_target_graph::ScaledWeight;
-use crate::{AttentionBinding, AttentionShape, SublayerTail};
 use crate::{
     native::{AttentionHistoryKernels, AttentionKernels},
     programs::native_constants::GraphConstant,
 };
+use crate::{AttentionBinding, AttentionShape, SublayerTail};
 use magnitude_family_contracts::{Attention, Rotary};
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
@@ -50,10 +50,14 @@ impl<'a, G: GraphDraft + 'a> Clone for AttentionGraphEntries<'a, G> {
 pub(crate) enum AttentionHistoryEntries<'a, G: GraphDraft + 'a> {
     Dense {
         decode: G::Binding<'a, attention_decode::Entry>,
+        verify: Option<G::Binding<'a, attention_decode::Entry>>,
         prefill: G::Binding<'a, attention_prefill::Entry>,
     },
     AffineK8V4 {
         decode: G::Binding<'a, attention_decode_k8v4::Entry>,
+        verify: Option<G::Binding<'a, attention_decode_k8v4::Entry>>,
+        verify_four: Option<G::Binding<'a, attention_decode_k8v4::Entry>>,
+        verify_eight: Option<G::Binding<'a, attention_decode_k8v4::Entry>>,
         prefill: G::Binding<'a, attention_prefill_k8v4::Entry>,
     },
 }
@@ -68,12 +72,28 @@ impl<'a, G: GraphDraft + 'a> Clone for AttentionHistoryEntries<'a, G> {
 impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
     fn from(kernels: &'a AttentionKernels) -> Self {
         let history = match &kernels.history {
-            AttentionHistoryKernels::Dense { decode, prefill } => {
-                AttentionHistoryEntries::Dense { decode, prefill }
-            }
-            AttentionHistoryKernels::AffineK8V4 { decode, prefill } => {
-                AttentionHistoryEntries::AffineK8V4 { decode, prefill }
-            }
+            AttentionHistoryKernels::Dense {
+                decode,
+                verify,
+                prefill,
+            } => AttentionHistoryEntries::Dense {
+                decode,
+                verify: verify.as_ref(),
+                prefill,
+            },
+            AttentionHistoryKernels::AffineK8V4 {
+                decode,
+                verify,
+                verify_four,
+                verify_eight,
+                prefill,
+            } => AttentionHistoryEntries::AffineK8V4 {
+                decode,
+                verify: verify.as_ref(),
+                verify_four: verify_four.as_ref(),
+                verify_eight: verify_eight.as_ref(),
+                prefill,
+            },
         };
         Self {
             project: &kernels.project,
@@ -122,10 +142,14 @@ impl CheckedAttentionEntries {
         let history = match self.history {
             KvCodec::Dense => AttentionHistoryEntries::Dense {
                 decode: &self.mix[..],
+                verify: None,
                 prefill: &self.mix[..],
             },
             KvCodec::AffineK8V4 => AttentionHistoryEntries::AffineK8V4 {
                 decode: &self.mix[..],
+                verify: None,
+                verify_four: None,
+                verify_eight: None,
                 prefill: &self.mix[..],
             },
             KvCodec::RotatedK4V4 => {
@@ -169,7 +193,7 @@ pub(crate) struct AttentionWeights {
     pub value: Option<WorkflowTensor>,
     pub query_norm: Option<WorkflowTensor>,
     pub key_norm: Option<WorkflowTensor>,
-    pub output: WorkflowTensor,
+    pub output: Option<WorkflowTensor>,
     /// The sublayer's post-norm weight, when its tail is a post-norm.
     pub post_norm: Option<WorkflowTensor>,
 }
@@ -191,6 +215,8 @@ pub(crate) struct AttentionBlock<'a> {
     /// The post-norm's output scale: 1, or the layer's output scale.
     pub post_norm_scale: f32,
     pub activation: Element,
+    /// Draft priming only publishes K/V history; its attention output is unused.
+    pub inject_only: bool,
 }
 
 /// The layer's history planes, bound to the state store's planes per run, in
@@ -217,6 +243,7 @@ pub(crate) struct AttentionControlPorts {
 pub(crate) fn attention_weights(
     shape: &AttentionShape,
     operator: &Attention,
+    needs_output: bool,
     post_norm: bool,
     mut weight: impl FnMut(magnitude_family_contracts::WeightKind) -> Result<WorkflowTensor, String>,
 ) -> Result<AttentionWeights, String> {
@@ -231,7 +258,7 @@ pub(crate) fn attention_weights(
         query_norm: present(shape.head_norm > 0, WeightKind::QueryNorm)?,
         // A Shared layer projects no keys, so it has no key norm.
         key_norm: present(shape.head_norm > 0 && shape.fresh > 0, WeightKind::KeyNorm)?,
-        output: present(true, WeightKind::AttentionOutput)?.ok_or("attention output")?,
+        output: present(needs_output, WeightKind::AttentionOutput)?,
         post_norm: present(post_norm, WeightKind::PostNorm)?,
     })
 }
@@ -260,6 +287,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 key_weight: segment(&weights.key, &empty_weight),
                 value_weight: segment(&weights.value, &empty_weight),
                 epsilon: block.epsilon,
+                project_mode: if block.inject_only { 1 } else { 0 },
             },
         )
         .map_err(|error| error.to_string())?;
@@ -269,11 +297,17 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             .r0
             .reshape(&[rows, heads, width + shape.interleaved_gate]),
         gate: projected.r1.reshape(&[rows, heads, shape.separate_gate]),
-        key: projected.r2.reshape(&[shape.fresh, rows, shape.kv_heads * width]),
+        key: projected
+            .r2
+            .reshape(&[shape.fresh, rows, shape.kv_heads * width]),
         value: if shape.projected_value {
-            projected.r3.reshape(&[shape.fresh, rows, shape.kv_heads * width])
+            projected
+                .r3
+                .reshape(&[shape.fresh, rows, shape.kv_heads * width])
         } else {
-            projected.r2.reshape(&[shape.fresh, rows, shape.kv_heads * width])
+            projected
+                .r2
+                .reshape(&[shape.fresh, rows, shape.kv_heads * width])
         },
     };
     let (attended, state, controls) = mix(
@@ -284,19 +318,28 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         &projected,
         &block,
     )?;
+    if block.inject_only {
+        return Ok((hidden.clone(), state, controls));
+    }
+    let output_weight = weights
+        .output
+        .as_ref()
+        .ok_or("attention output weight is absent")?;
     let mixed = match (kernels.output, &weights.post_norm) {
-        (TailEntries::Residual(output), None) => graph
-            .enqueue(
-                output,
-                &[("M", rows), ("D", shape.hidden), ("Q", heads), ("W", width)],
-                attention_output::WorkflowArgs {
-                    hidden: hidden.into(),
-                    gated: (&attended).into(),
-                    output_weight: (&weights.output).into(),
-                },
-            )
-            .map_err(|error| error.to_string())?
-            .value,
+        (TailEntries::Residual(output), None) => {
+            graph
+                .enqueue(
+                    output,
+                    &[("M", rows), ("D", shape.hidden), ("Q", heads), ("W", width)],
+                    attention_output::WorkflowArgs {
+                        hidden: hidden.into(),
+                        gated: (&attended).into(),
+                        output_weight: output_weight.into(),
+                    },
+                )
+                .map_err(|error| error.to_string())?
+                .value
+        }
         (TailEntries::PostNorm(entries), Some(norm)) => {
             let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
             let absent_scale = GraphConstant::absent_scale(graph, constants)?;
@@ -305,7 +348,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 entries,
                 hidden,
                 (&attended.reshape(&[rows, heads * width])).into(),
-                &ScaledWeight::unscaled(weights.output.clone(), absent_scale),
+                &ScaledWeight::unscaled(output_weight.clone(), absent_scale),
                 norm,
                 out_rows.port().tensor(),
                 PostNormShape {
@@ -411,7 +454,13 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         ],
     };
     let scale = block.operator.scale as f32;
-    let gate_function = operators::attention::gate_function(block.operator);
+    // -1 marks the injection-only route. Metal still runs the prepare/append
+    // launch, while its attention and merge launches have no work to do.
+    let gate_function = if block.inject_only {
+        -1
+    } else {
+        operators::attention::gate_function(block.operator)
+    };
     // Every entry takes the same arguments but its history planes.
     macro_rules! mix {
         ($kernel:expr, $module:ident, $($plane:ident),*) => {{
@@ -450,6 +499,12 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     }
     let decode = decodes(rows);
     let attended = match &history {
+        AttentionHistoryEntries::Dense {
+            verify: Some(kernel),
+            ..
+        } if decode && rows > 1 => {
+            mix!(kernel, attention_decode, history_key, history_value)
+        }
         AttentionHistoryEntries::Dense { decode: kernel, .. } if decode => {
             mix!(kernel, attention_decode, history_key, history_value)
         }
@@ -458,6 +513,39 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         } => {
             mix!(kernel, attention_prefill, history_key, history_value)
         }
+        AttentionHistoryEntries::AffineK8V4 {
+            verify_four: Some(kernel),
+            ..
+        } if decode && rows == 4 => mix!(
+            kernel,
+            attention_decode_k8v4,
+            history_key_codes,
+            history_key_coefficients,
+            history_value_codes,
+            history_value_coefficients
+        ),
+        AttentionHistoryEntries::AffineK8V4 {
+            verify_eight: Some(kernel),
+            ..
+        } if decode && rows > 4 => mix!(
+            kernel,
+            attention_decode_k8v4,
+            history_key_codes,
+            history_key_coefficients,
+            history_value_codes,
+            history_value_coefficients
+        ),
+        AttentionHistoryEntries::AffineK8V4 {
+            verify: Some(kernel),
+            ..
+        } if decode && rows > 1 => mix!(
+            kernel,
+            attention_decode_k8v4,
+            history_key_codes,
+            history_key_coefficients,
+            history_value_codes,
+            history_value_coefficients
+        ),
         AttentionHistoryEntries::AffineK8V4 { decode: kernel, .. } if decode => mix!(
             kernel,
             attention_decode_k8v4,

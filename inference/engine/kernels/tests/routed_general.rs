@@ -6,8 +6,8 @@
 //! Super).
 
 use magnitude_kernels::{
-    routed_down, routed_experts, routed_experts_up, routed_gate_up, routed_group, routed_scatter, routed_select,
-    routed_up,
+    routed_down, routed_experts, routed_experts_up, routed_gate_up, routed_group, routed_scatter,
+    routed_select, routed_up,
 };
 use seismic_lang::{
     checked::{check_source, CheckedModule, SourceFile},
@@ -23,9 +23,15 @@ fn module() -> CheckedModule {
     let mut sources = seismic_std::sources();
     for (path, text) in [
         ("routed.seismic", include_str!("../kernels/routed.seismic")),
-        ("functions.seismic", include_str!("../kernels/functions.seismic")),
+        (
+            "functions.seismic",
+            include_str!("../kernels/functions.seismic"),
+        ),
     ] {
-        sources.push(SourceFile { path: path.into(), text: text.into() });
+        sources.push(SourceFile {
+            path: path.into(),
+            text: text.into(),
+        });
     }
     check_source(sources).unwrap()
 }
@@ -37,18 +43,35 @@ enum Input {
 }
 
 fn floats(dtype: DType, shape: &[usize], values: &[f32]) -> Input {
-    Input::Tensor(dtype, shape.to_vec(), values.iter().map(|v| f64::from(*v)).collect())
+    Input::Tensor(
+        dtype,
+        shape.to_vec(),
+        values.iter().map(|v| f64::from(*v)).collect(),
+    )
 }
 
 fn ints(shape: &[usize], values: &[i32]) -> Input {
-    Input::Tensor(DType::I32, shape.to_vec(), values.iter().map(|v| f64::from(*v)).collect())
+    Input::Tensor(
+        DType::I32,
+        shape.to_vec(),
+        values.iter().map(|v| f64::from(*v)).collect(),
+    )
 }
 
-fn interpret(module: &CheckedModule, name: &str, bindings: &[(&str, DType)], inputs: Vec<Input>) -> OracleOutcome {
+fn interpret(
+    module: &CheckedModule,
+    name: &str,
+    bindings: &[(&str, DType)],
+    inputs: Vec<Input>,
+) -> OracleOutcome {
     let elements = bindings
         .iter()
-        .fold(ElementBindings::new(), |elements, (name, dtype)| elements.bind(name, registry::dense(*dtype)));
-    let logical = module.entry(module.entry_named(name).unwrap(), &elements).unwrap();
+        .fold(ElementBindings::new(), |elements, (name, dtype)| {
+            elements.bind(name, registry::dense(*dtype))
+        });
+    let logical = module
+        .entry(module.entry_named(name).unwrap(), &elements)
+        .unwrap();
     let mut interpreter = Interpreter::new(&logical);
     let arguments = inputs
         .into_iter()
@@ -60,8 +83,9 @@ fn interpret(module: &CheckedModule, name: &str, bindings: &[(&str, DType)], inp
             Input::I32(value) => Arg::Scalar(ReferenceScalar::I32(value)),
         })
         .collect::<Vec<_>>();
-    let outcome =
-        interpreter.run(&arguments).unwrap_or_else(|error| panic!("{name} interpreter error: {error}"));
+    let outcome = interpreter
+        .run(&arguments)
+        .unwrap_or_else(|error| panic!("{name} interpreter error: {error}"));
     if let SourceTermination::Failed(failure) = outcome.termination() {
         panic!("{name} failed: {failure}");
     }
@@ -70,15 +94,24 @@ fn interpret(module: &CheckedModule, name: &str, bindings: &[(&str, DType)], inp
 
 fn result(outcome: &OracleOutcome, index: usize) -> Vec<f64> {
     let result = outcome.results().nth(index).unwrap();
-    let OutcomeValue::Tensor(tensor) = result.value() else { panic!("tensor result") };
-    (0..tensor.element_count()).map(|i| tensor.read(i).unwrap()).collect()
+    let OutcomeValue::Tensor(tensor) = result.value() else {
+        panic!("tensor result")
+    };
+    (0..tensor.element_count())
+        .map(|i| tensor.read(i).unwrap())
+        .collect()
 }
 
 /// Final contents of the tensor argument at parameter ordinal `ordinal`.
 fn input(outcome: &OracleOutcome, ordinal: usize) -> Vec<f64> {
-    let input = outcome.inputs().find(|input| input.ordinal() == ordinal).unwrap();
+    let input = outcome
+        .inputs()
+        .find(|input| input.ordinal() == ordinal)
+        .unwrap();
     let tensor = input.tensor();
-    (0..tensor.element_count()).map(|i| tensor.read(i).unwrap()).collect()
+    (0..tensor.element_count())
+        .map(|i| tensor.read(i).unwrap())
+        .collect()
 }
 
 /// Deterministic values in [-scale, scale).
@@ -110,9 +143,17 @@ fn stored(dtype: DType, values: &[f32]) -> Vec<f32> {
     }
 }
 
-fn tensor(device: &seismic::Device, dtype: DType, shape: &[usize], values: &[f32]) -> seismic::Tensor {
+fn tensor(
+    device: &seismic::Device,
+    dtype: DType,
+    shape: &[usize],
+    values: &[f32],
+) -> seismic::Tensor {
     let bytes = match dtype {
-        DType::F32 => values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+        DType::F32 => values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
         DType::BF16 => values
             .iter()
             .flat_map(|v| ((registry::bf16_round(*v).to_bits() >> 16) as u16).to_le_bytes())
@@ -124,17 +165,30 @@ fn tensor(device: &seismic::Device, dtype: DType, shape: &[usize], values: &[f32
 }
 
 fn i32_tensor(device: &seismic::Device, shape: &[usize], values: &[i32]) -> seismic::Tensor {
-    let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
     let shape = shape.iter().map(|d| *d as u64).collect::<Vec<_>>();
     seismic::Tensor::from_host(device, seismic::Element::i32(), &shape, &bytes).unwrap()
 }
 
 fn read_f32(tensor: &seismic::Tensor) -> Vec<f32> {
-    tensor.read_to_host().unwrap().chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+    tensor
+        .read_to_host()
+        .unwrap()
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect()
 }
 
 fn read_i32(tensor: &seismic::Tensor) -> Vec<i32> {
-    tensor.read_to_host().unwrap().chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect()
+    tensor
+        .read_to_host()
+        .unwrap()
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+        .collect()
 }
 
 fn read_activation(tensor: &seismic::Tensor, dtype: DType) -> Vec<f32> {
@@ -155,14 +209,20 @@ fn read_activation(tensor: &seismic::Tensor, dtype: DType) -> Vec<f32> {
 fn devices() -> Vec<seismic::Device> {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
     let gpu = match std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() {
-        Some("vulkan") => Some(catalog.open_backend(seismic::BackendName::Vulkan).expect("the Vulkan device opens")),
+        Some("vulkan") => Some(
+            catalog
+                .open_backend(seismic::BackendName::Vulkan)
+                .expect("the Vulkan device opens"),
+        ),
         Some(other) => panic!("SEISMIC_TEST_BACKEND={other}: only vulkan is selectable"),
         None => [seismic::BackendName::Cuda, seismic::BackendName::Metal]
             .into_iter()
             .find_map(|backend| catalog.open_backend(backend).ok()),
     };
     gpu.into_iter()
-        .chain(std::iter::once(catalog.open_backend(seismic::BackendName::Cpu).unwrap()))
+        .chain(std::iter::once(
+            catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
+        ))
         .collect()
 }
 
@@ -176,16 +236,22 @@ fn specialization(
     params: &[(&'static str, u64)],
 ) -> seismic::NativeSpecialization {
     let statics = if is_cpu(device) { &[][..] } else { statics };
-    let specialization = statics
-        .iter()
-        .fold(seismic::NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value as u64));
-    params.iter().fold(specialization, |spec, (name, value)| spec.with_param(*name, *value))
+    let specialization = statics.iter().fold(
+        seismic::NativeSpecialization::new(),
+        |spec, (name, value)| spec.with_static(*name, *value as u64),
+    );
+    params.iter().fold(specialization, |spec, (name, value)| {
+        spec.with_param(*name, *value)
+    })
 }
 
 /// The route's tuning parameters on `device`.
 fn select_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
     match device.backend() {
-        seismic::BackendName::Cuda => vec![vec![("SIMDGROUPS", 8), ("SPLIT", 8)], vec![("SIMDGROUPS", 2), ("SPLIT", 4)]],
+        seismic::BackendName::Cuda => vec![
+            vec![("SIMDGROUPS", 8), ("SPLIT", 8)],
+            vec![("SIMDGROUPS", 2), ("SPLIT", 4)],
+        ],
         seismic::BackendName::Cpu => vec![vec![("ROWS", 8)], vec![("ROWS", 1)]],
         _ => vec![vec![("SIMDGROUPS", 8)], vec![("SIMDGROUPS", 2)]],
     }
@@ -211,11 +277,66 @@ struct Routing {
 const CLAMP: f32 = 6.103_515_6e-5;
 
 const ROUTINGS: [Routing; 5] = [
-    Routing { name: "lfm2-moe", hidden: 2048, experts: 32, selected: 4, score: 1, normalization: 3, scale: 1.0, biased: true, expert_scales: false, router_norm: false },
-    Routing { name: "laguna", hidden: 3072, experts: 256, selected: 10, score: 1, normalization: 3, scale: 2.5, biased: true, expert_scales: false, router_norm: false },
-    Routing { name: "gemma4-26b", hidden: 2816, experts: 128, selected: 8, score: 0, normalization: 3, scale: 1.0, biased: false, expert_scales: true, router_norm: true },
-    Routing { name: "nemotron-lightning", hidden: 2688, experts: 128, selected: 6, score: 1, normalization: 3, scale: 2.5, biased: true, expert_scales: true, router_norm: false },
-    Routing { name: "nemotron-super", hidden: 4096, experts: 512, selected: 22, score: 1, normalization: 3, scale: 5.0, biased: true, expert_scales: false, router_norm: false },
+    Routing {
+        name: "lfm2-moe",
+        hidden: 2048,
+        experts: 32,
+        selected: 4,
+        score: 1,
+        normalization: 3,
+        scale: 1.0,
+        biased: true,
+        expert_scales: false,
+        router_norm: false,
+    },
+    Routing {
+        name: "laguna",
+        hidden: 3072,
+        experts: 256,
+        selected: 10,
+        score: 1,
+        normalization: 3,
+        scale: 2.5,
+        biased: true,
+        expert_scales: false,
+        router_norm: false,
+    },
+    Routing {
+        name: "gemma4-26b",
+        hidden: 2816,
+        experts: 128,
+        selected: 8,
+        score: 0,
+        normalization: 3,
+        scale: 1.0,
+        biased: false,
+        expert_scales: true,
+        router_norm: true,
+    },
+    Routing {
+        name: "nemotron-lightning",
+        hidden: 2688,
+        experts: 128,
+        selected: 6,
+        score: 1,
+        normalization: 3,
+        scale: 2.5,
+        biased: true,
+        expert_scales: true,
+        router_norm: false,
+    },
+    Routing {
+        name: "nemotron-super",
+        hidden: 4096,
+        experts: 512,
+        selected: 22,
+        score: 1,
+        normalization: 3,
+        scale: 5.0,
+        biased: true,
+        expert_scales: false,
+        router_norm: false,
+    },
 ];
 
 struct SelectCase {
@@ -239,21 +360,42 @@ impl SelectCase {
         let mut router = pattern(e * h, 7, 0.05);
         router[5 * h..6 * h].fill(0.02);
         router.copy_within(5 * h..6 * h, 21 * h);
-        let residual = pattern(rows * h, 3, 1.0).iter().map(|v| v.abs() + 0.1).collect::<Vec<_>>();
-        let norm = pattern(h, 11, 0.5).iter().map(|v| v + 1.0).collect::<Vec<_>>();
+        let residual = pattern(rows * h, 3, 1.0)
+            .iter()
+            .map(|v| v.abs() + 0.1)
+            .collect::<Vec<_>>();
+        let norm = pattern(h, 11, 0.5)
+            .iter()
+            .map(|v| v + 1.0)
+            .collect::<Vec<_>>();
         let router_norm = if routing.router_norm {
             pattern(h, 13, 0.02).iter().map(|v| v + 0.03).collect()
         } else {
             norm.clone()
         };
-        let mut bias = if routing.biased { pattern(e, 17, 1.0) } else { vec![0.0; e] };
+        let mut bias = if routing.biased {
+            pattern(e, 17, 1.0)
+        } else {
+            vec![0.0; e]
+        };
         if routing.biased {
             bias[5] = 1.0;
             bias[21] = 1.0;
         }
-        let expert_scale =
-            if routing.expert_scales { pattern(e, 19, 0.5).iter().map(|v| v + 1.0).collect() } else { vec![1.0; e] };
-        Self { rows, residual, norm, router_norm, router, bias, expert_scale }
+        let expert_scale = if routing.expert_scales {
+            pattern(e, 19, 0.5).iter().map(|v| v + 1.0).collect()
+        } else {
+            vec![1.0; e]
+        };
+        Self {
+            rows,
+            residual,
+            norm,
+            router_norm,
+            router,
+            bias,
+            expert_scale,
+        }
     }
 }
 
@@ -269,7 +411,12 @@ fn portable_select(
     let outcome = interpret(
         module,
         "routed_select",
-        &[("NW", DType::F32), ("RNW", DType::F32), ("RW", router), ("A", activation)],
+        &[
+            ("NW", DType::F32),
+            ("RNW", DType::F32),
+            ("RW", router),
+            ("A", activation),
+        ],
         vec![
             floats(DType::F32, &[m, h], &case.residual),
             floats(DType::F32, &[h], &case.norm),
@@ -313,18 +460,27 @@ fn host_select(routing: &Routing, case: &SelectCase) -> Selection {
         case.residual
             .chunks_exact(h)
             .flat_map(|row| {
-                let inverse = 1.0 / (row.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / h as f64 + 1e-6).sqrt();
-                row.iter()
-                    .zip(norm)
-                    .map(move |(x, w)| f64::from(registry::bf16_round((f64::from(*x) * inverse * f64::from(*w)) as f32)))
+                let inverse = 1.0
+                    / (row.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / h as f64 + 1e-6)
+                        .sqrt();
+                row.iter().zip(norm).map(move |(x, w)| {
+                    f64::from(registry::bf16_round(
+                        (f64::from(*x) * inverse * f64::from(*w)) as f32,
+                    ))
+                })
             })
             .collect::<Vec<_>>()
     };
     let (normalized, router_rows) = (rms(&case.norm), rms(&case.router_norm));
-    let (mut routes, mut weights, mut ranked) = (vec![0; m * k], vec![0.0; m * k], Vec::with_capacity(m * e));
+    let (mut routes, mut weights, mut ranked) =
+        (vec![0; m * k], vec![0.0; m * k], Vec::with_capacity(m * e));
     for row in 0..m {
         let logits = (0..e)
-            .map(|expert| (0..h).map(|j| router_rows[row * h + j] * f64::from(case.router[expert * h + j])).sum::<f64>())
+            .map(|expert| {
+                (0..h)
+                    .map(|j| router_rows[row * h + j] * f64::from(case.router[expert * h + j]))
+                    .sum::<f64>()
+            })
             .collect::<Vec<_>>();
         let maximum = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let total = logits.iter().map(|l| (l - maximum).exp()).sum::<f64>();
@@ -337,7 +493,11 @@ fn host_select(routing: &Routing, case: &SelectCase) -> Selection {
                 other => panic!("score function {other}"),
             })
             .collect::<Vec<_>>();
-        let row_ranked = scores.iter().zip(&case.bias).map(|(s, b)| s + f64::from(*b)).collect::<Vec<_>>();
+        let row_ranked = scores
+            .iter()
+            .zip(&case.bias)
+            .map(|(s, b)| s + f64::from(*b))
+            .collect::<Vec<_>>();
         // Descending ranked value; equal values rank the higher expert first.
         let mut order = (0..e).collect::<Vec<_>>();
         order.sort_by(|a, b| row_ranked[*b].total_cmp(&row_ranked[*a]).then(b.cmp(a)));
@@ -355,12 +515,18 @@ fn host_select(routing: &Routing, case: &SelectCase) -> Selection {
                 other => panic!("normalization {other}"),
             };
             let expert = routes[row * k + slot] as usize;
-            weights[row * k + slot] =
-                weights[row * k + slot] / divisor * f64::from(routing.scale) * f64::from(case.expert_scale[expert]);
+            weights[row * k + slot] = weights[row * k + slot] / divisor
+                * f64::from(routing.scale)
+                * f64::from(case.expert_scale[expert]);
         }
         ranked.extend(row_ranked);
     }
-    Selection { routes, weights, normalized, ranked }
+    Selection {
+        routes,
+        weights,
+        normalized,
+        ranked,
+    }
 }
 
 /// Checks a selection (native or portable) against the host reference: slot
@@ -379,7 +545,9 @@ fn assert_selection(
         for slot in 0..k {
             let (actual, expected) = (routes[row * k + slot], reference.routes[row * k + slot]);
             if actual != expected {
-                let gap = (reference.ranked[row * e + actual as usize] - reference.ranked[row * e + expected as usize]).abs();
+                let gap = (reference.ranked[row * e + actual as usize]
+                    - reference.ranked[row * e + expected as usize])
+                    .abs();
                 assert!(gap < NEAR_TIE, "{label} row {row} slot {slot}: expert {actual}, reference {expected}, gap {gap}");
             }
         }
@@ -390,7 +558,9 @@ fn assert_selection(
         if actual_set == expected_set {
             for slot in 0..k {
                 let expert = routes[row * k + slot];
-                let at = (0..k).find(|s| reference.routes[row * k + s] == expert).unwrap();
+                let at = (0..k)
+                    .find(|s| reference.routes[row * k + s] == expert)
+                    .unwrap();
                 let (actual, expected) = (weights[row * k + slot], reference.weights[row * k + at]);
                 assert!(
                     (actual - expected).abs() <= 5e-4 * expected.abs().max(1e-3),
@@ -416,12 +586,23 @@ const SELECT_ROWS: [usize; 2] = [1, 9];
 #[test]
 fn portable_select_matches_host_reference() {
     let module = module();
-    for routing in ROUTINGS.iter().map(|routing| Routing { hidden: 256, ..*routing }) {
+    for routing in ROUTINGS.iter().map(|routing| Routing {
+        hidden: 256,
+        ..*routing
+    }) {
         for rows in SELECT_ROWS {
             let case = SelectCase::new(&routing, rows);
-            let (routes, weights, normalized) = portable_select(&module, &routing, &case, DType::BF16, DType::F32);
+            let (routes, weights, normalized) =
+                portable_select(&module, &routing, &case, DType::BF16, DType::F32);
             let label = format!("portable {} rows {rows}", routing.name);
-            assert_selection(&label, &routing, &host_select(&routing, &case), &routes, &weights, &normalized);
+            assert_selection(
+                &label,
+                &routing,
+                &host_select(&routing, &case),
+                &routes,
+                &weights,
+                &normalized,
+            );
         }
     }
 }
@@ -443,7 +624,11 @@ fn native_select_matches_host_reference_at_catalog_shapes() {
         for (routing, case, reference) in &cases {
             let (h, e, k, rows) = (routing.hidden, routing.experts, routing.selected, case.rows);
             for mapping in select_mappings(&device) {
-                let label = format!("{:?} {} rows {rows} {mapping:?}", device.backend(), routing.name);
+                let label = format!(
+                    "{:?} {} rows {rows} {mapping:?}",
+                    device.backend(),
+                    routing.name
+                );
                 let kernel = routed_select::native_for_device_with(
                     &device,
                     routed_select::Elements {
@@ -474,13 +659,29 @@ fn native_select_matches_host_reference_at_catalog_shapes() {
                         scale: routing.scale,
                     })
                     .unwrap();
-                let weights = read_f32(&weights).into_iter().map(f64::from).collect::<Vec<_>>();
-                let normalized =
-                    read_activation(&outcome.value, DType::BF16).into_iter().map(f64::from).collect::<Vec<_>>();
-                assert_selection(&label, routing, reference, &read_i32(&routes), &weights, &normalized);
+                let weights = read_f32(&weights)
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>();
+                let normalized = read_activation(&outcome.value, DType::BF16)
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>();
+                assert_selection(
+                    &label,
+                    routing,
+                    reference,
+                    &read_i32(&routes),
+                    &weights,
+                    &normalized,
+                );
             }
         }
-        eprintln!("{:?} selection: {:.1}s", device.backend(), started.elapsed().as_secs_f64());
+        eprintln!(
+            "{:?} selection: {:.1}s",
+            device.backend(),
+            started.elapsed().as_secs_f64()
+        );
     }
 }
 
@@ -489,14 +690,28 @@ fn native_select_matches_host_reference_at_catalog_shapes() {
 #[test]
 fn portable_select_ranks_ties_to_the_higher_expert() {
     let module = module();
-    let routing = Routing { hidden: 256, ..ROUTINGS[1] };
+    let routing = Routing {
+        hidden: 256,
+        ..ROUTINGS[1]
+    };
     let case = SelectCase::new(&routing, 1);
     let (routes, weights, _) = portable_select(&module, &routing, &case, DType::F32, DType::F32);
-    let slot = |expert: i32| routes.iter().position(|r| *r == expert).expect("the tied experts are selected");
+    let slot = |expert: i32| {
+        routes
+            .iter()
+            .position(|r| *r == expert)
+            .expect("the tied experts are selected")
+    };
     let (high, low) = (slot(21), slot(5));
     // Rank r is stored at slot K - 1 - r: the higher expert ranks first.
-    assert!(high > low, "expert 21 must precede expert 5: routes {routes:?}");
-    assert_eq!(weights[high], weights[low], "tied experts carry equal weights");
+    assert!(
+        high > low,
+        "expert 21 must precede expert 5: routes {routes:?}"
+    );
+    assert_eq!(
+        weights[high], weights[low],
+        "tied experts carry equal weights"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +788,11 @@ const EXPERT_SHAPES: [ExpertShape; 5] = [
 fn published_forms(shape: &ExpertShape, case: &ExpertCase) -> Vec<(DType, Vec<f32>, Vec<f32>)> {
     let mut forms = vec![(DType::F32, case.base.clone(), case.output.clone())];
     if shape.latent {
-        let latent = case.selected.iter().map(|v| registry::bf16_round(*v)).collect();
+        let latent = case
+            .selected
+            .iter()
+            .map(|v| registry::bf16_round(*v))
+            .collect();
         forms.push((DType::BF16, vec![0.0; case.base.len()], latent));
     }
     forms
@@ -599,7 +818,9 @@ fn activate(function: i32, a: f32) -> f32 {
 }
 
 fn dot(x: &[f32], w: &[f32]) -> f32 {
-    x.iter().zip(w).fold(0.0f32, |total, (x, w)| x.mul_add(*w, total))
+    x.iter()
+        .zip(w)
+        .fold(0.0f32, |total, (x, w)| x.mul_add(*w, total))
 }
 
 /// The expanding weights of an expert block: gated (the gate rows
@@ -624,20 +845,40 @@ impl ExpertBlock {
     fn new(shape: ExpertShape) -> Self {
         let experts = shape.selected + SPARE_EXPERTS;
         let count = experts * shape.features * shape.hidden;
-        let weights = |seed| pattern(count, seed, 0.05).into_iter().map(registry::bf16_round).collect::<Vec<_>>();
+        let weights = |seed| {
+            pattern(count, seed, 0.05)
+                .into_iter()
+                .map(registry::bf16_round)
+                .collect::<Vec<_>>()
+        };
         // Up scales in [0.5, 2), as Lightning's per-expert `ffn_up_exps.scale`.
         let expansion = if shape.gated {
             Expansion::Gated(weights(31))
         } else {
-            Expansion::Up(pattern(experts, 59, 0.75).iter().map(|v| v + 1.25).collect())
+            Expansion::Up(
+                pattern(experts, 59, 0.75)
+                    .iter()
+                    .map(|v| v + 1.25)
+                    .collect(),
+            )
         };
-        Self { shape, experts, expansion, up: weights(37), down: weights(41) }
+        Self {
+            shape,
+            experts,
+            expansion,
+            up: weights(37),
+            down: weights(41),
+        }
     }
 
     /// A(A(act(A(gate))) * A(up)) or A(act(A(scale[e] * up))) of one
     /// normalized row.
     fn product(&self, x: &[f32], expert: usize) -> Vec<f32> {
-        let (h, f, function) = (self.shape.hidden, self.shape.features, self.shape.activation);
+        let (h, f, function) = (
+            self.shape.hidden,
+            self.shape.features,
+            self.shape.activation,
+        );
         (0..f)
             .map(|feature| {
                 let row = (expert * f + feature) * h;
@@ -645,11 +886,15 @@ impl ExpertBlock {
                 match &self.expansion {
                     Expansion::Gated(gate) => {
                         let gate = registry::bf16_round(dot(x, &gate[row..row + h]));
-                        registry::bf16_round(registry::bf16_round(activate(function, gate)) * registry::bf16_round(up))
+                        registry::bf16_round(
+                            registry::bf16_round(activate(function, gate))
+                                * registry::bf16_round(up),
+                        )
                     }
-                    Expansion::Up(scales) => {
-                        registry::bf16_round(activate(function, registry::bf16_round(scales[expert] * up)))
-                    }
+                    Expansion::Up(scales) => registry::bf16_round(activate(
+                        function,
+                        registry::bf16_round(scales[expert] * up),
+                    )),
                 }
             })
             .collect()
@@ -687,25 +932,45 @@ impl ExpertCase {
     /// Choice k of row m routes to expert (k + 3m) mod E: distinct within a
     /// row, and some experts receive more than one tile at prefill sizes.
     fn new(block: &ExpertBlock, rows: usize) -> Self {
-        let (h, f, k, e) = (block.shape.hidden, block.shape.features, block.shape.selected, block.experts);
-        let normalized =
-            pattern(rows * h, 43 + rows as u32, 1.5).into_iter().map(registry::bf16_round).collect::<Vec<_>>();
-        let routes = (0..rows * k).map(|flat| ((flat % k + 3 * (flat / k)) % e) as i32).collect::<Vec<_>>();
-        let weights = pattern(rows * k, 47, 0.5).iter().map(|v| v + 0.6).collect::<Vec<_>>();
+        let (h, f, k, e) = (
+            block.shape.hidden,
+            block.shape.features,
+            block.shape.selected,
+            block.experts,
+        );
+        let normalized = pattern(rows * h, 43 + rows as u32, 1.5)
+            .into_iter()
+            .map(registry::bf16_round)
+            .collect::<Vec<_>>();
+        let routes = (0..rows * k)
+            .map(|flat| ((flat % k + 3 * (flat / k)) % e) as i32)
+            .collect::<Vec<_>>();
+        let weights = pattern(rows * k, 47, 0.5)
+            .iter()
+            .map(|v| v + 0.6)
+            .collect::<Vec<_>>();
         let base = pattern(rows * h, 53, 1.0);
         let choices = rows * k;
         let (mut products, mut published) = (vec![0.0; choices * f], vec![0.0; choices * h]);
         let per = choices.div_ceil(std::thread::available_parallelism().unwrap().get());
         std::thread::scope(|scope| {
-            for (index, (products, published)) in products.chunks_mut(per * f).zip(published.chunks_mut(per * h)).enumerate() {
+            for (index, (products, published)) in products
+                .chunks_mut(per * f)
+                .zip(published.chunks_mut(per * h))
+                .enumerate()
+            {
                 let (normalized, routes) = (&normalized, &routes);
                 scope.spawn(move || {
-                    for (offset, (product, projection)) in
-                        products.chunks_exact_mut(f).zip(published.chunks_exact_mut(h)).enumerate()
+                    for (offset, (product, projection)) in products
+                        .chunks_exact_mut(f)
+                        .zip(published.chunks_exact_mut(h))
+                        .enumerate()
                     {
                         let flat = index * per + offset;
                         let (row, expert) = (flat / k, routes[flat] as usize);
-                        product.copy_from_slice(&block.product(&normalized[row * h..(row + 1) * h], expert));
+                        product.copy_from_slice(
+                            &block.product(&normalized[row * h..(row + 1) * h], expert),
+                        );
                         projection.copy_from_slice(&block.projection(product, expert));
                     }
                 });
@@ -715,12 +980,27 @@ impl ExpertCase {
             .map(|flat| {
                 let (row, column) = (flat / h, flat % h);
                 (0..k).fold(0.0f32, |selected, choice| {
-                    weights[row * k + choice].mul_add(published[(row * k + choice) * h + column], selected)
+                    weights[row * k + choice]
+                        .mul_add(published[(row * k + choice) * h + column], selected)
                 })
             })
             .collect::<Vec<_>>();
-        let output = base.iter().zip(&selected).map(|(base, selected)| base + selected).collect();
-        Self { rows, normalized, routes, weights, base, products, published, selected, output }
+        let output = base
+            .iter()
+            .zip(&selected)
+            .map(|(base, selected)| base + selected)
+            .collect();
+        Self {
+            rows,
+            normalized,
+            routes,
+            weights,
+            base,
+            products,
+            published,
+            selected,
+            output,
+        }
     }
 
     /// B for T-row tiles: ceil((M * K + min(E, M * K) * (T - 1)) / T).
@@ -739,7 +1019,11 @@ fn host_group(
     tile: usize,
     blocks: usize,
 ) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
-    let (mut order, mut inverse, mut table) = (vec![-1; blocks * tile], vec![0; routes.len()], vec![-1; blocks]);
+    let (mut order, mut inverse, mut table) = (
+        vec![-1; blocks * tile],
+        vec![0; routes.len()],
+        vec![-1; blocks],
+    );
     let mut block = 0;
     for expert in 0..experts as i32 {
         let mut lane = 0;
@@ -764,9 +1048,17 @@ fn host_group(
 
 /// Results agree within `relative * |reference| + absolute_fraction *
 /// max |reference|`.
-fn assert_near(label: &str, actual: &[f32], expected: &[f32], relative: f32, absolute_fraction: f32) {
+fn assert_near(
+    label: &str,
+    actual: &[f32],
+    expected: &[f32],
+    relative: f32,
+    absolute_fraction: f32,
+) {
     assert_eq!(actual.len(), expected.len(), "{label} length");
-    let scale = expected.iter().fold(0.0f32, |max, value| max.max(value.abs()));
+    let scale = expected
+        .iter()
+        .fold(0.0f32, |max, value| max.max(value.abs()));
     let (index, excess) = actual
         .iter()
         .zip(expected)
@@ -775,7 +1067,13 @@ fn assert_near(label: &str, actual: &[f32], expected: &[f32], relative: f32, abs
             (actual - expected).abs() - (relative * expected.abs() + absolute_fraction * scale)
         })
         .enumerate()
-        .fold((0, f32::NEG_INFINITY), |worst, (index, excess)| if excess > worst.1 { (index, excess) } else { worst });
+        .fold((0, f32::NEG_INFINITY), |worst, (index, excess)| {
+            if excess > worst.1 {
+                (index, excess)
+            } else {
+                worst
+            }
+        });
     assert!(
         excess <= 0.0,
         "{label}[{index}]: native {}, reference {} (scale {scale})",
@@ -787,12 +1085,27 @@ fn assert_near(label: &str, actual: &[f32], expected: &[f32], relative: f32, abs
 /// The CPU's INT8 arithmetic variant: the tuner's relative output-norm
 /// defect guard.
 fn assert_norm(label: &str, actual: &[f32], expected: &[f32]) {
-    let error = actual.iter().zip(expected).map(|(a, e)| (a - e).powi(2)).sum::<f32>();
+    let error = actual
+        .iter()
+        .zip(expected)
+        .map(|(a, e)| (a - e).powi(2))
+        .sum::<f32>();
     let scale = expected.iter().map(|e| e.powi(2)).sum::<f32>();
-    assert!(error <= 0.05f32.powi(2) * scale, "{label}: relative error {}", (error / scale).sqrt());
+    assert!(
+        error <= 0.05f32.powi(2) * scale,
+        "{label}: relative error {}",
+        (error / scale).sqrt()
+    );
 }
 
-fn assert_outcome(label: &str, actual: &[f32], expected: &[f32], int8: bool, relative: f32, absolute_fraction: f32) {
+fn assert_outcome(
+    label: &str,
+    actual: &[f32],
+    expected: &[f32],
+    int8: bool,
+    relative: f32,
+    absolute_fraction: f32,
+) {
     if int8 {
         assert_norm(label, actual, expected);
     } else {
@@ -803,7 +1116,11 @@ fn assert_outcome(label: &str, actual: &[f32], expected: &[f32], int8: bool, rel
 fn gather_rows(values: &[f32], positions: &[i32], width: usize) -> Vec<f32> {
     positions
         .iter()
-        .flat_map(|position| values[*position as usize * width..(*position as usize + 1) * width].iter().copied())
+        .flat_map(|position| {
+            values[*position as usize * width..(*position as usize + 1) * width]
+                .iter()
+                .copied()
+        })
         .collect()
 }
 
@@ -813,12 +1130,22 @@ fn gather_rows(values: &[f32], positions: &[i32], width: usize) -> Vec<f32> {
 #[test]
 fn portable_expert_entries_match_host_reference() {
     let module = module();
-    for shape in EXPERT_SHAPES.map(|shape| ExpertShape { hidden: 64, features: 32, ..shape }) {
+    for shape in EXPERT_SHAPES.map(|shape| ExpertShape {
+        hidden: 64,
+        features: 32,
+        ..shape
+    }) {
         let block = ExpertBlock::new(shape);
         let (h, f, k, e) = (shape.hidden, shape.features, shape.selected, block.experts);
         let bf16 = |shape: &[usize], values: &[f32]| floats(DType::BF16, shape, values);
-        let weights = |values: &[f32], rows: usize, columns: usize| bf16(&[e, rows, columns], values);
-        let elements = |names: &[&'static str]| names.iter().map(|name| (*name, DType::BF16)).collect::<Vec<_>>();
+        let weights =
+            |values: &[f32], rows: usize, columns: usize| bf16(&[e, rows, columns], values);
+        let elements = |names: &[&'static str]| {
+            names
+                .iter()
+                .map(|name| (*name, DType::BF16))
+                .collect::<Vec<_>>()
+        };
 
         let case = ExpertCase::new(&block, 3);
         let m = case.rows;
@@ -848,8 +1175,17 @@ fn portable_expert_entries_match_host_reference() {
                 ],
             ),
         };
-        let product = result(&product, 0).into_iter().map(|v| v as f32).collect::<Vec<_>>();
-        assert_near(&format!("portable {} product", shape.name), &product, &case.products, 1e-2, 1e-3);
+        let product = result(&product, 0)
+            .into_iter()
+            .map(|v| v as f32)
+            .collect::<Vec<_>>();
+        assert_near(
+            &format!("portable {} product", shape.name),
+            &product,
+            &case.products,
+            1e-2,
+            1e-3,
+        );
         for (published, base, expected) in published_forms(&shape, &case) {
             let down = interpret(
                 &module,
@@ -863,8 +1199,17 @@ fn portable_expert_entries_match_host_reference() {
                     weights(&block.down, h, f),
                 ],
             );
-            let down = result(&down, 0).into_iter().map(|v| v as f32).collect::<Vec<_>>();
-            assert_near(&format!("portable {} down {published:?}", shape.name), &down, &expected, 4e-3, 1e-4);
+            let down = result(&down, 0)
+                .into_iter()
+                .map(|v| v as f32)
+                .collect::<Vec<_>>();
+            assert_near(
+                &format!("portable {} down {published:?}", shape.name),
+                &down,
+                &expected,
+                4e-3,
+                1e-4,
+            );
         }
 
         let (case, tile) = (ExpertCase::new(&block, 5), 4);
@@ -900,7 +1245,10 @@ fn portable_expert_entries_match_host_reference() {
                 ],
             ),
         };
-        let grouped = result(&grouped, 0).into_iter().map(|v| v as f32).collect::<Vec<_>>();
+        let grouped = result(&grouped, 0)
+            .into_iter()
+            .map(|v| v as f32)
+            .collect::<Vec<_>>();
         // `routed_experts` forms act(gate) * up unrounded (the Qwen body):
         // each product term differs by up to a BF16 ulp of its factors.
         assert_near(
@@ -917,13 +1265,25 @@ fn portable_expert_entries_match_host_reference() {
                 &[("A", DType::BF16), ("R", published)],
                 vec![
                     floats(DType::F32, &[m, h], &base),
-                    bf16(&[b, tile, h], &scatter_table(&case.published, &inverse, b * tile, h)),
+                    bf16(
+                        &[b, tile, h],
+                        &scatter_table(&case.published, &inverse, b * tile, h),
+                    ),
                     ints(&[m, k], &inverse),
                     floats(DType::F32, &[m, k], &case.weights),
                 ],
             );
-            let scattered = result(&scattered, 0).into_iter().map(|v| v as f32).collect::<Vec<_>>();
-            assert_near(&format!("portable {} scatter {published:?}", shape.name), &scattered, &expected, 4e-3, 1e-4);
+            let scattered = result(&scattered, 0)
+                .into_iter()
+                .map(|v| v as f32)
+                .collect::<Vec<_>>();
+            assert_near(
+                &format!("portable {} scatter {published:?}", shape.name),
+                &scattered,
+                &expected,
+                4e-3,
+                1e-4,
+            );
         }
     }
 }
@@ -934,7 +1294,8 @@ fn scatter_table(published: &[f32], inverse: &[i32], positions: usize, width: us
     let mut table = vec![0.0; positions * width];
     for (flat, position) in inverse.iter().enumerate() {
         let position = *position as usize;
-        table[position * width..(position + 1) * width].copy_from_slice(&published[flat * width..(flat + 1) * width]);
+        table[position * width..(position + 1) * width]
+            .copy_from_slice(&published[flat * width..(flat + 1) * width]);
     }
     table
 }
@@ -943,9 +1304,16 @@ fn scatter_table(published: &[f32], inverse: &[i32], positions: usize, width: us
 fn decode_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
     match device.backend() {
         seismic::BackendName::Cuda => {
-            vec![vec![("TPW", 1), ("KSPLIT", 1)], vec![("TPW", 2), ("KSPLIT", 2)], vec![("TPW", 1), ("KSPLIT", 4)]]
+            vec![
+                vec![("TPW", 1), ("KSPLIT", 1)],
+                vec![("TPW", 2), ("KSPLIT", 2)],
+                vec![("TPW", 1), ("KSPLIT", 4)],
+            ]
         }
-        seismic::BackendName::Vulkan => vec![vec![("SIMDGROUPS", 2), ("ROWS", 1)], vec![("SIMDGROUPS", 8), ("ROWS", 4)]],
+        seismic::BackendName::Vulkan => vec![
+            vec![("SIMDGROUPS", 2), ("ROWS", 1)],
+            vec![("SIMDGROUPS", 8), ("ROWS", 4)],
+        ],
         seismic::BackendName::Cpu => vec![vec![("ROWS", 8)], vec![("ROWS", 1)]],
         seismic::BackendName::Metal => vec![
             vec![("SIMDGROUPS", 2), ("ROWS", 1), ("LANES", 32)],
@@ -955,22 +1323,57 @@ fn decode_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
     }
 }
 
+/// The mapping of `routed_down` beside decode mapping `index` for experts of
+/// `features` columns: Metal tiles its channels itself (ROWS channels per
+/// lane group of LANES lanes, at most 8 weight packets per lane); elsewhere
+/// the expansion's mapping.
+fn down_mapping(
+    device: &seismic::Device,
+    index: usize,
+    mapping: &[(&'static str, u64)],
+    features: usize,
+) -> Vec<(&'static str, u64)> {
+    match device.backend() {
+        seismic::BackendName::Metal => {
+            let admissible = [(2u64, 16u64), (4, 32), (1, 16), (8, 16), (1, 32)]
+                .into_iter()
+                .filter(|(rows, lanes)| (features as u64).div_ceil(32 * lanes) * rows <= 8)
+                .collect::<Vec<_>>();
+            let (rows, lanes) = admissible[index % admissible.len()];
+            vec![("ROWS", rows), ("LANES", lanes)]
+        }
+        _ => mapping.to_vec(),
+    }
+}
+
 /// The grouped mappings of the expert entries on `device`.
 fn grouped_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
     match device.backend() {
         seismic::BackendName::Cuda => vec![vec![]],
         seismic::BackendName::Cpu => vec![vec![("ROWS", 8)], vec![("ROWS", 2)]],
         seismic::BackendName::Vulkan => vec![
-            vec![("TILE_M", 32), ("TILE_N", 128), ("SUB_M", 32), ("SUB_N", 32)],
+            vec![
+                ("TILE_M", 32),
+                ("TILE_N", 128),
+                ("SUB_M", 32),
+                ("SUB_N", 32),
+            ],
             vec![("TILE_M", 64), ("TILE_N", 64), ("SUB_M", 64), ("SUB_N", 64)],
         ],
-        seismic::BackendName::Metal => vec![vec![("TILE_M", 32), ("TILE_N", 128)], vec![("TILE_M", 64), ("TILE_N", 64)]],
+        seismic::BackendName::Metal => vec![
+            vec![("TILE_M", 32), ("TILE_N", 128)],
+            vec![("TILE_M", 64), ("TILE_N", 64)],
+        ],
     }
 }
 
 /// The CPU runs every mapping in both arithmetic variants.
 fn arithmetic_variants(device: &seismic::Device) -> Vec<bool> {
-    if is_cpu(device) { vec![false, true] } else { vec![false] }
+    if is_cpu(device) {
+        vec![false, true]
+    } else {
+        vec![false]
+    }
 }
 
 /// Metal and CUDA decode projections own their parameters on their sole
@@ -983,15 +1386,22 @@ fn expert_specialization(
     int8: bool,
 ) -> seismic::NativeSpecialization {
     let specialization = if launch_scoped
-        && matches!(device.backend(), seismic::BackendName::Metal | seismic::BackendName::Cuda)
-    {
-        mapping
-            .iter()
-            .fold(specialization(device, statics, &[]), |spec, (name, value)| spec.with_launch_param(0, *name, *value))
+        && matches!(
+            device.backend(),
+            seismic::BackendName::Metal | seismic::BackendName::Cuda
+        ) {
+        mapping.iter().fold(
+            specialization(device, statics, &[]),
+            |spec, (name, value)| spec.with_launch_param(0, *name, *value),
+        )
     } else {
         specialization(device, statics, mapping)
     };
-    if is_cpu(device) { specialization.with_param("INT8", u64::from(int8)) } else { specialization }
+    if is_cpu(device) {
+        specialization.with_param("INT8", u64::from(int8))
+    } else {
+        specialization
+    }
 }
 
 /// The device tensors of an `ExpertBlock` (`expansion`: the gate rows or
@@ -1011,7 +1421,9 @@ impl DeviceExperts {
     fn new(device: &seismic::Device, block: &ExpertBlock) -> Self {
         let (h, f, e) = (block.shape.hidden, block.shape.features, block.experts);
         let expansion = match &block.expansion {
-            Expansion::Gated(gate) => DeviceExpansion::Gated(tensor(device, DType::BF16, &[e, f, h], gate)),
+            Expansion::Gated(gate) => {
+                DeviceExpansion::Gated(tensor(device, DType::BF16, &[e, f, h], gate))
+            }
             Expansion::Up(scales) => DeviceExpansion::Up(tensor(device, DType::F32, &[e], scales)),
         };
         Self {
@@ -1041,49 +1453,76 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                 let m = case.rows;
                 let normalized = tensor(device, DType::BF16, &[m, h], &case.normalized);
                 let routes = i32_tensor(device, &[m, k], &case.routes);
-                for mapping in decode_mappings(device) {
+                for (index, mapping) in decode_mappings(device).into_iter().enumerate() {
+                    let down = down_mapping(device, index, &mapping, f);
                     for int8 in arithmetic_variants(device) {
-                        let label = format!("{:?} {} rows {m} {mapping:?} INT8 {int8}", device.backend(), shape.name);
-                        let specialization = expert_specialization(device, &statics, &mapping, true, int8);
+                        let label = format!(
+                            "{:?} {} rows {m} {mapping:?} down {down:?} INT8 {int8}",
+                            device.backend(),
+                            shape.name
+                        );
+                        let specialization =
+                            expert_specialization(device, &statics, &mapping, true, int8);
+                        let down_specialization =
+                            expert_specialization(device, &statics, &down, true, int8);
                         let product = match &experts.expansion {
-                            DeviceExpansion::Gated(gate) => routed_gate_up::native_for_device_with(
-                                device,
-                                routed_gate_up::Elements { A: bf16, EGW: bf16, EUW: bf16 },
-                                &specialization,
-                            )
-                            .unwrap()
-                            .call(routed_gate_up::Args {
-                                normalized: &normalized,
-                                routes: &routes,
-                                expert_gate: gate,
-                                expert_up: &experts.up,
-                                activation: shape.activation,
-                            })
-                            .unwrap()
-                            .value,
-                            DeviceExpansion::Up(scales) => routed_up::native_for_device_with(
-                                device,
-                                routed_up::Elements { A: bf16, EUW: bf16 },
-                                &specialization,
-                            )
-                            .unwrap()
-                            .call(routed_up::Args {
-                                normalized: &normalized,
-                                routes: &routes,
-                                expert_up: &experts.up,
-                                up_scale: scales,
-                                activation: shape.activation,
-                            })
-                            .unwrap()
-                            .value,
+                            DeviceExpansion::Gated(gate) => {
+                                routed_gate_up::native_for_device_with(
+                                    device,
+                                    routed_gate_up::Elements {
+                                        A: bf16,
+                                        EGW: bf16,
+                                        EUW: bf16,
+                                    },
+                                    &specialization,
+                                )
+                                .unwrap()
+                                .call(routed_gate_up::Args {
+                                    normalized: &normalized,
+                                    routes: &routes,
+                                    expert_gate: gate,
+                                    expert_up: &experts.up,
+                                    activation: shape.activation,
+                                })
+                                .unwrap()
+                                .value
+                            }
+                            DeviceExpansion::Up(scales) => {
+                                routed_up::native_for_device_with(
+                                    device,
+                                    routed_up::Elements { A: bf16, EUW: bf16 },
+                                    &specialization,
+                                )
+                                .unwrap()
+                                .call(routed_up::Args {
+                                    normalized: &normalized,
+                                    routes: &routes,
+                                    expert_up: &experts.up,
+                                    up_scale: scales,
+                                    activation: shape.activation,
+                                })
+                                .unwrap()
+                                .value
+                            }
                         };
                         let product = read_activation(&product, DType::BF16);
-                        assert_outcome(&format!("{label} product"), &product, &case.products, int8, 2e-2, 2e-3);
+                        assert_outcome(
+                            &format!("{label} product"),
+                            &product,
+                            &case.products,
+                            int8,
+                            2e-2,
+                            2e-3,
+                        );
                         for (published, base, expected) in published_forms(&shape, case) {
                             let output = routed_down::native_for_device_with(
                                 device,
-                                routed_down::Elements { A: bf16, EDW: bf16, R: element(published) },
-                                &specialization,
+                                routed_down::Elements {
+                                    A: bf16,
+                                    EDW: bf16,
+                                    R: element(published),
+                                },
+                                &down_specialization,
                             )
                             .unwrap()
                             .call(routed_down::Args {
@@ -1096,12 +1535,24 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                             .unwrap()
                             .value;
                             let actual = read_activation(&output, published);
-                            assert_outcome(&format!("{label} output {published:?}"), &actual, &expected, int8, 1e-2, 2e-3);
+                            assert_outcome(
+                                &format!("{label} output {published:?}"),
+                                &actual,
+                                &expected,
+                                int8,
+                                1e-2,
+                                2e-3,
+                            );
                         }
                     }
                 }
             }
-            eprintln!("{:?} {} decode: {:.1}s", device.backend(), shape.name, started.elapsed().as_secs_f64());
+            eprintln!(
+                "{:?} {} decode: {:.1}s",
+                device.backend(),
+                shape.name,
+                started.elapsed().as_secs_f64()
+            );
         }
     }
 }
@@ -1116,7 +1567,13 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
     for shape in EXPERT_SHAPES {
         let block = ExpertBlock::new(shape);
         let case = ExpertCase::new(&block, 64);
-        let (h, f, k, e, m) = (shape.hidden, shape.features, shape.selected, block.experts, case.rows);
+        let (h, f, k, e, m) = (
+            shape.hidden,
+            shape.features,
+            shape.selected,
+            block.experts,
+            case.rows,
+        );
         let b = case.blocks(&block, TILE);
         let (order, inverse, table) = host_group(&case.routes, k, e, TILE, b);
         for device in &devices {
@@ -1124,7 +1581,8 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
             let experts = DeviceExperts::new(device, &block);
             let bf16 = seismic::Element::bf16();
             let routes = i32_tensor(device, &[m, k], &case.routes);
-            let fill = |shape: &[usize]| i32_tensor(device, shape, &vec![-9; shape.iter().product()]);
+            let fill =
+                |shape: &[usize]| i32_tensor(device, shape, &vec![-9; shape.iter().product()]);
             let (mut counts, mut native_order, mut native_inverse, mut native_table) =
                 (fill(&[e]), fill(&[b, TILE]), fill(&[m, k]), fill(&[b]));
             let group = if is_cpu(device) {
@@ -1150,42 +1608,56 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
             for mapping in grouped_mappings(device) {
                 for int8 in arithmetic_variants(device) {
                     let label = format!("{label} {mapping:?} INT8 {int8}");
-                    let specialization = expert_specialization(device, &[("H", h), ("F", f)], &mapping, false, int8);
+                    let specialization =
+                        expert_specialization(device, &[("H", h), ("F", f)], &mapping, false, int8);
                     let grouped = match &experts.expansion {
-                        DeviceExpansion::Gated(gate) => routed_experts::native_for_device_with(
-                            device,
-                            routed_experts::Elements { A: bf16, EGW: bf16, EUW: bf16, EDW: bf16 },
-                            &specialization,
-                        )
-                        .unwrap()
-                        .call(routed_experts::Args {
-                            normalized: &normalized,
-                            order: &native_order,
-                            blocks: &native_table,
-                            expert_gate: gate,
-                            expert_up: &experts.up,
-                            expert_down: &experts.down,
-                            activation: shape.activation,
-                        })
-                        .unwrap()
-                        .value,
-                        DeviceExpansion::Up(scales) => routed_experts_up::native_for_device_with(
-                            device,
-                            routed_experts_up::Elements { A: bf16, EUW: bf16, EDW: bf16 },
-                            &specialization,
-                        )
-                        .unwrap()
-                        .call(routed_experts_up::Args {
-                            normalized: &normalized,
-                            order: &native_order,
-                            blocks: &native_table,
-                            expert_up: &experts.up,
-                            expert_down: &experts.down,
-                            up_scale: scales,
-                            activation: shape.activation,
-                        })
-                        .unwrap()
-                        .value,
+                        DeviceExpansion::Gated(gate) => {
+                            routed_experts::native_for_device_with(
+                                device,
+                                routed_experts::Elements {
+                                    A: bf16,
+                                    EGW: bf16,
+                                    EUW: bf16,
+                                    EDW: bf16,
+                                },
+                                &specialization,
+                            )
+                            .unwrap()
+                            .call(routed_experts::Args {
+                                normalized: &normalized,
+                                order: &native_order,
+                                blocks: &native_table,
+                                expert_gate: gate,
+                                expert_up: &experts.up,
+                                expert_down: &experts.down,
+                                activation: shape.activation,
+                            })
+                            .unwrap()
+                            .value
+                        }
+                        DeviceExpansion::Up(scales) => {
+                            routed_experts_up::native_for_device_with(
+                                device,
+                                routed_experts_up::Elements {
+                                    A: bf16,
+                                    EUW: bf16,
+                                    EDW: bf16,
+                                },
+                                &specialization,
+                            )
+                            .unwrap()
+                            .call(routed_experts_up::Args {
+                                normalized: &normalized,
+                                order: &native_order,
+                                blocks: &native_table,
+                                expert_up: &experts.up,
+                                expert_down: &experts.down,
+                                up_scale: scales,
+                                activation: shape.activation,
+                            })
+                            .unwrap()
+                            .value
+                        }
                     };
                     let rows = gather_rows(&read_activation(&grouped, DType::BF16), &inverse, h);
                     // `routed_experts` forms A(act(gate) * up) unrounded on the
@@ -1193,11 +1665,21 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                     // reference rounds gate and up (the GPU forms): each of the
                     // F down terms differs by up to a BF16 ulp of its product.
                     let absolute = if shape.gated { 1e-2 } else { 2e-3 };
-                    assert_outcome(&format!("{label} grouped"), &rows, &case.published, int8, 2e-2, absolute);
+                    assert_outcome(
+                        &format!("{label} grouped"),
+                        &rows,
+                        &case.published,
+                        int8,
+                        2e-2,
+                        absolute,
+                    );
                     for (published, base, expected) in published_forms(&shape, &case) {
                         let output = routed_scatter::native_for_device_with(
                             device,
-                            routed_scatter::Elements { A: bf16, R: element(published) },
+                            routed_scatter::Elements {
+                                A: bf16,
+                                R: element(published),
+                            },
                             &seismic::NativeSpecialization::new(),
                         )
                         .unwrap()

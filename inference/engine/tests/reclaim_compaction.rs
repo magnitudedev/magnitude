@@ -18,11 +18,11 @@ use magnitude_executor::{
     Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
     TokenId, WorkKind,
 };
+use magnitude_family_contracts::PreparedModelInput;
 use magnitude_scheduler::{
     domain::{self as service_domain, DomainFlight},
     ServiceLimits,
 };
-use magnitude_family_contracts::PreparedModelInput;
 use magnitude_state::{KvCodec, ShrinkPolicy};
 use std::path::PathBuf;
 
@@ -97,6 +97,7 @@ fn forward(
         demand: if logits { Demand::LOGITS } else { Demand::NONE },
         select: Vec::new(),
         committed: count,
+        prime: None,
     };
     let groups = service_domain::group(domain, vec![operation]);
     let [group] = groups.as_slice() else {

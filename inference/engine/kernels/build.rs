@@ -53,6 +53,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         &[BackendName::Vulkan],
         "representation ladder of `expert_down` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
     ),
+    (
+        "lib/routed/router",
+        &[BackendName::Metal],
+        "decode router logits shared by the Metal route and select GEMVs over the projection GEMV body (any activation element, unlike `routed.h`); CUDA and Vulkan keep their router GEMVs inline",
+    ),
 ];
 
 fn main() {

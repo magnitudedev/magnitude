@@ -87,6 +87,7 @@ driver! {
     stream_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuStreamCreate",
     stream_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamDestroy_v2",
     stream_synchronize: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamSynchronize",
+    stream_wait_event: unsafe extern "system" fn(Handle, Handle, c_uint) -> ResultCode => "cuStreamWaitEvent",
     event_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuEventCreate",
     event_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuEventDestroy_v2",
     event_record: unsafe extern "system" fn(Handle, Handle) -> ResultCode => "cuEventRecord",
@@ -99,9 +100,8 @@ driver! {
     free_host: unsafe extern "system" fn(*mut c_void) -> ResultCode => "cuMemFreeHost",
     host_alloc: unsafe extern "system" fn(*mut *mut c_void, usize, c_uint) -> ResultCode => "cuMemHostAlloc",
     host_device_pointer: unsafe extern "system" fn(*mut u64, *mut c_void, c_uint) -> ResultCode => "cuMemHostGetDevicePointer_v2",
-    upload: unsafe extern "system" fn(u64, *const c_void, usize) -> ResultCode => "cuMemcpyHtoD_v2",
     upload_async: unsafe extern "system" fn(u64, *const c_void, usize, Handle) -> ResultCode => "cuMemcpyHtoDAsync_v2",
-    download: unsafe extern "system" fn(*mut c_void, u64, usize) -> ResultCode => "cuMemcpyDtoH_v2",
+    download_async: unsafe extern "system" fn(*mut c_void, u64, usize, Handle) -> ResultCode => "cuMemcpyDtoHAsync_v2",
     memcpy_device_async: unsafe extern "system" fn(u64, u64, usize, Handle) -> ResultCode => "cuMemcpyDtoDAsync_v2",
     memset_d8_async: unsafe extern "system" fn(u64, c_uchar, usize, Handle) -> ResultCode => "cuMemsetD8Async",
     memset_d16_async: unsafe extern "system" fn(u64, u16, usize, Handle) -> ResultCode => "cuMemsetD16Async",
@@ -229,6 +229,11 @@ pub(crate) struct Context {
     pub driver: Arc<Driver>,
     raw: Handle,
     ordinal: c_int,
+    /// A non-blocking stream for synchronous host reads. A read waits for
+    /// its producer through the runtime's access fences; on the legacy
+    /// default stream it would also wait for every later queued launch of
+    /// the blocking execution streams (a pipelined next step).
+    transfer: Handle,
 }
 
 // The raw handle is an opaque driver object usable from any thread once made
@@ -245,11 +250,24 @@ impl Context {
                 "primary context retain",
             )?;
         }
-        Ok(Arc::new(Self {
+        let mut context = Self {
             driver,
             raw,
             ordinal,
-        }))
+            transfer: std::ptr::null_mut(),
+        };
+        let mut transfer = std::ptr::null_mut();
+        {
+            let _current = context.enter()?;
+            unsafe {
+                context.driver.check(
+                    (context.driver.stream_create)(&mut transfer, CU_STREAM_NON_BLOCKING),
+                    "transfer stream creation",
+                )?;
+            }
+        }
+        context.transfer = transfer;
+        Ok(Arc::new(context))
     }
 
     pub fn ordinal(&self) -> c_int {
@@ -277,11 +295,22 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
+        if !self.transfer.is_null() {
+            if let Ok(_current) = self.enter() {
+                unsafe {
+                    (self.driver.stream_destroy)(self.transfer);
+                }
+            }
+        }
         unsafe {
             (self.driver.primary_context_release)(self.ordinal);
         }
     }
 }
+
+/// `CU_STREAM_NON_BLOCKING`: a stream that never synchronizes with the
+/// legacy default stream.
+const CU_STREAM_NON_BLOCKING: c_uint = 0x1;
 
 /// One explicit CUDA stream bound to the opened production context. The
 /// executor and profiler never rely on legacy-default-stream process state.
@@ -323,6 +352,24 @@ impl Stream {
             self.context.driver.check(
                 (self.context.driver.stream_synchronize)(self.raw),
                 "stream synchronization",
+            )
+        }
+    }
+
+    /// Enqueue a dependency on work recorded in `event` without synchronizing
+    /// the host. This is the primitive required to run independent target and
+    /// DFlash flights on separate streams while preserving target-feature and
+    /// draft-history ordering.
+    pub fn wait_event(&self, event: &Event) -> Result<(), DriverError> {
+        assert!(
+            Arc::ptr_eq(&self.context, event.context()),
+            "Stream::wait_event precondition: event and stream belong to one opened CUDA context"
+        );
+        let _current = self.context.enter()?;
+        unsafe {
+            self.context.driver.check(
+                (self.context.driver.stream_wait_event)(self.raw, event.raw(), 0),
+                "stream wait event",
             )
         }
     }
@@ -373,6 +420,14 @@ impl Event {
                 "event record",
             )
         }
+    }
+
+    pub fn raw(&self) -> Handle {
+        self.raw
+    }
+
+    pub fn context(&self) -> &Arc<Context> {
+        &self.context
     }
 
     pub fn synchronize(&self) -> Result<(), DriverError> {
@@ -743,7 +798,10 @@ impl Drop for Reservation {
     }
 }
 
-/// Synchronous host copy into device memory at `pointer`.
+/// Synchronous host copy into device memory at `pointer`, on the context's
+/// non-blocking transfer stream: it waits for nothing but itself (callers
+/// hold the destination's access fence, so no queued launch still reads or
+/// writes it).
 pub(crate) fn upload(context: &Context, pointer: u64, bytes: &[u8]) -> Result<(), DriverError> {
     if bytes.is_empty() {
         return Ok(());
@@ -751,13 +809,24 @@ pub(crate) fn upload(context: &Context, pointer: u64, bytes: &[u8]) -> Result<()
     let _current = context.enter()?;
     unsafe {
         context.driver.check(
-            (context.driver.upload)(pointer, bytes.as_ptr().cast(), bytes.len()),
+            (context.driver.upload_async)(
+                pointer,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                context.transfer,
+            ),
             "upload",
+        )?;
+        context.driver.check(
+            (context.driver.stream_synchronize)(context.transfer),
+            "upload synchronization",
         )
     }
 }
 
-/// Synchronous device-to-host copy from `pointer`.
+/// Synchronous device-to-host copy from `pointer`, on the context's
+/// non-blocking transfer stream: it waits for nothing but itself (callers
+/// hold the producer's access fence).
 pub(crate) fn download(
     context: &Context,
     pointer: u64,
@@ -769,8 +838,17 @@ pub(crate) fn download(
     let _current = context.enter()?;
     unsafe {
         context.driver.check(
-            (context.driver.download)(bytes.as_mut_ptr().cast(), pointer, bytes.len()),
+            (context.driver.download_async)(
+                bytes.as_mut_ptr().cast(),
+                pointer,
+                bytes.len(),
+                context.transfer,
+            ),
             "download",
+        )?;
+        context.driver.check(
+            (context.driver.stream_synchronize)(context.transfer),
+            "download synchronization",
         )
     }
 }

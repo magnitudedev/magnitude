@@ -10,8 +10,8 @@
 use crate::options::{ExecutionManifest, ResolvedMethod};
 use magnitude_batching::MAX_CLASS_ROWS;
 use magnitude_executor::{
-    ComponentSelection, ExecutionPlanDraft, ExecutionPlanner, PlanError, PlannedMethod,
-    ResourceLimits, platform::SelectedDevice,
+    platform::SelectedDevice, ComponentSelection, ExecutionPlanDraft, ExecutionPlanner, PlanError,
+    PlannedMethod, ResourceLimits,
 };
 use magnitude_scheduler::ServiceLimits;
 use std::fmt;
@@ -60,7 +60,11 @@ pub fn plan_execution(
         },
         ResolvedMethod::DFlash { proposals } => PlannedMethod::DFlash { proposals },
     };
-    let limits = resource_limits(&manifest.service, manifest.model.lookahead)?;
+    let limits = resource_limits(
+        &manifest.service,
+        manifest.model.lookahead,
+        selected.info.backend,
+    )?;
     ExecutionPlanner::prepare(
         selected,
         &manifest.package,
@@ -78,12 +82,20 @@ pub fn plan_execution(
 fn resource_limits(
     service: &ServiceLimits,
     lookahead: bool,
+    backend: seismic::BackendName,
 ) -> Result<ResourceLimits, ExecutionPlanningError> {
     let max_launch_rows = service.prefill_tokens.max(service.decode_tokens);
-    if max_launch_rows > MAX_CLASS_ROWS {
+    // Larger prefill classes have a served gain and memory gate on CUDA.
+    // Other backends retain their measured 512-row admission bound.
+    let admitted = if backend == seismic::BackendName::Cuda {
+        MAX_CLASS_ROWS
+    } else {
+        512
+    };
+    if max_launch_rows > admitted {
         return Err(ExecutionPlanningError::LaunchRows {
             required: max_launch_rows,
-            admitted: MAX_CLASS_ROWS,
+            admitted,
         });
     }
     Ok(ResourceLimits {
@@ -112,10 +124,34 @@ mod tests {
                 locality_seconds: 1.0,
             },
             false,
+            seismic::BackendName::Metal,
         )
         .unwrap();
         assert_eq!(limits.max_launch_rows, 64);
         assert_eq!(limits.max_launch_slots, 64);
         assert_eq!(limits.max_projected_rows, 64);
+    }
+
+    #[test]
+    fn large_prefill_classes_require_cuda() {
+        let service = ServiceLimits {
+            prefill_tokens: 1024,
+            decode_tokens: 32,
+            decode_share: 0.5,
+            locality_seconds: 1.0,
+        };
+        assert_eq!(
+            resource_limits(&service, false, seismic::BackendName::Cuda)
+                .unwrap()
+                .max_launch_rows,
+            1024
+        );
+        assert_eq!(
+            resource_limits(&service, false, seismic::BackendName::Metal),
+            Err(ExecutionPlanningError::LaunchRows {
+                required: 1024,
+                admitted: 512,
+            })
+        );
     }
 }

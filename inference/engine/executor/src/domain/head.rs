@@ -3,6 +3,9 @@
 use super::*;
 use crate::batching::{HeadPasses, HeadSlot};
 use crate::DraftForm;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static HEAD_LAUNCH_TRACED: AtomicBool = AtomicBool::new(false);
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Bytes of one head conditioning row: the target's normalized output
@@ -34,6 +37,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 self.fatal_invariant("head reservation advance count differs from operations")
             );
         }
+        let advances = advances
+            .into_iter()
+            .map(TentativeAdvance::Accepted)
+            .collect::<Vec<_>>();
         let mut seen = BTreeSet::new();
         let mut steps = 0usize;
         for (operation, advance) in operations.iter().zip(&advances) {
@@ -89,10 +96,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Operation::Head { form, .. } => *form,
             _ => unreachable!("validated head group"),
         };
-        if operations
-            .iter()
-            .any(|operation| !matches!(operation, Operation::Head { form: other, .. } if *other == form))
-        {
+        if operations.iter().any(
+            |operation| !matches!(operation, Operation::Head { form: other, .. } if *other == form),
+        ) {
             self.restore_head_advances(&metadata, advances);
             return Err("head group mixes draft forms".into());
         }
@@ -133,15 +139,38 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(error.to_string().into());
             }
         };
-        let conditioning = operations
-            .iter()
-            .map(|operation| match operation {
-                Operation::Head { conditioning, .. } => conditioning.clone(),
-                _ => unreachable!("validated head group"),
-            })
-            .collect();
-        let inputs =
-            HeadLaunchInputs::new(batch, advances, conditioning, graph_workspace, graph_output);
+        let conditioning = HeadConditioning::Rows(
+            operations
+                .iter()
+                .map(|operation| match operation {
+                    Operation::Head { conditioning, .. } => conditioning.clone(),
+                    _ => unreachable!("validated head group"),
+                })
+                .collect(),
+        );
+        // A block drafter's first draft anchors at `draft_from` and its
+        // windowed layers read history only from `draft_from + 1 - window`:
+        // priming rows before that every window drops unread.
+        let windowed = !(form == DraftForm::Block && steps == 0)
+            || skippable_window(&store).is_none_or(|window| {
+                operations.iter().any(|operation| match operation {
+                    Operation::Head {
+                        phase: crate::HeadPhase::Priming { draft_from },
+                        tokens,
+                        position,
+                        ..
+                    } => position + tokens.len() + window > *draft_from,
+                    _ => true,
+                })
+            });
+        let inputs = HeadLaunchInputs::new(
+            batch,
+            advances,
+            conditioning,
+            windowed,
+            graph_workspace,
+            graph_output,
+        );
         let launch = match ValidatedHeadLaunch::new(
             inputs,
             &store,
@@ -156,6 +185,34 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 self.fatal = Some(failure.clone());
                 return Err(failure);
             }
+        };
+        // A single proposing flight supplies kernel attribution without
+        // making every served step pay launch-detail tracing overhead.
+        let trace_position = std::env::var("MAGNITUDE_TRACE_HEAD_MIN_POSITION")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let launch_trace = if steps > 0
+            && std::env::var_os("MAGNITUDE_TRACE_HEAD_LAUNCHES").is_some()
+            && operations.iter().any(|operation| {
+                matches!(operation, Operation::Head { position, .. } if *position >= trace_position)
+            })
+            && !HEAD_LAUNCH_TRACED.swap(true, Ordering::Relaxed)
+        {
+            match self
+                .domain
+                .device()
+                .trace_submissions(seismic::TraceDetail::Launches)
+            {
+                Ok(trace) => Some(trace),
+                Err(error) => {
+                    HEAD_LAUNCH_TRACED.store(false, Ordering::Relaxed);
+                    eprintln!("head launch attribution unavailable: {error}");
+                    None
+                }
+            }
+        } else {
+            None
         };
         let started = Instant::now();
         let submission = match self.family.submit_head(launch) {
@@ -174,16 +231,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             steps,
             submission,
             started,
+            launch_trace,
         })
     }
 
-    fn restore_head_advances(
+    /// Return launches' accepted head states; a successor's tentative rows
+    /// return to the store when it drops.
+    pub(super) fn restore_head_advances(
         &mut self,
         metadata: &[(RequestId, usize, usize)],
-        advances: Vec<OwnedStateAdvance>,
+        advances: Vec<TentativeAdvance>,
     ) {
         for ((request, _, _), advance) in metadata.iter().zip(advances) {
-            self.head.insert(*request, advance.abort());
+            if let TentativeAdvance::Accepted(advance) = advance {
+                self.head.insert(*request, advance.abort());
+            }
         }
     }
 
@@ -195,7 +257,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     fn head_slot(
         &self,
         operation: &Operation,
-        advance: &OwnedStateAdvance,
+        advance: &TentativeAdvance,
         steps: usize,
     ) -> Result<HeadSlot, String> {
         let Operation::Head {
@@ -327,7 +389,50 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         flight: HeadFlight<F::HeadSubmission>,
     ) -> Result<Vec<PendingOperationOutcome>, DomainError> {
         let completed = flight.submission.finish().map_err(DomainError::Device)?;
+        if let Some(trace) = &flight.launch_trace {
+            let submissions = trace
+                .collect()
+                .map_err(|error| DomainError::Input(error.to_string()))?;
+            let mut entries = BTreeMap::<String, (usize, f64)>::new();
+            let detail = std::env::var_os("MAGNITUDE_TRACE_HEAD_DETAIL").is_some();
+            let mut attention_layer = 0;
+            for submission in submissions {
+                for launch in submission.launches {
+                    if let Some((start, end)) = launch.device {
+                        if detail && launch.entry == "attention_prefill" && launch.launch == 1 {
+                            eprintln!(
+                                "head attention layer={} attend_ms={:.3}",
+                                attention_layer,
+                                (end - start) * 1_000.0
+                            );
+                            attention_layer += 1;
+                        }
+                        let label = if launch.launch == 0 {
+                            launch.entry
+                        } else {
+                            format!("{}#{}", launch.entry, launch.launch)
+                        };
+                        let entry = entries.entry(label).or_default();
+                        entry.0 += 1;
+                        entry.1 += (end - start) * 1_000.0;
+                    }
+                }
+            }
+            let mut entries = entries.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
+            eprintln!("head launch attribution (one proposing flight):");
+            for (entry, (launches, ms)) in entries {
+                eprintln!("  {entry}: {ms:.3} ms across {launches} launches");
+            }
+        }
         let duration = flight.started.elapsed();
+        if std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some() {
+            eprintln!(
+                "flight head duration_ms={:.3} requests={:?}",
+                duration.as_secs_f64() * 1000.0,
+                flight.requests
+            );
+        }
         let (core, selections) = completed.into_parts();
         let slots = core.batch().actual_slots();
         if slots != flight.requests.len() {
@@ -366,6 +471,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         let (_, advances, _) = core.into_parts();
+        let advances = advances
+            .into_iter()
+            .map(|advance| match advance {
+                TentativeAdvance::Accepted(advance) => Ok(advance),
+                TentativeAdvance::Successor(_) => Err(DomainError::invariant(
+                    "a head transaction follows an in-flight advance",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(flight
             .requests
             .into_iter()
@@ -380,6 +494,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             .collect(),
                     },
                     advance: Some(advance),
+                    primed: None,
                     rows: advance_rows(passes, rows, proposals),
                     committed_rows: rows,
                     kind: WorkKind::Decode,
@@ -389,6 +504,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             )
             .collect())
     }
+}
+
+/// The widest window of a drafter store whose injection can skip its
+/// windowed layers: one that also keeps a history no window drops (with
+/// every layer windowed, skipping them leaves nothing to inject).
+pub(super) fn skippable_window(store: &StateStore) -> Option<usize> {
+    let mut widest = None;
+    let mut full = false;
+    for domain in store.history_domains() {
+        match store.history_domain_kind(domain) {
+            magnitude_state::HistoryDomainKind::Window { rows } => {
+                widest = widest.max(Some(rows))
+            }
+            _ => full = true,
+        }
+    }
+    widest.filter(|_| full)
 }
 
 /// Rows a head transaction advances its state by: the entry rows, and a

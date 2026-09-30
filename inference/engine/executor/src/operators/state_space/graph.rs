@@ -11,8 +11,7 @@ use crate::operators::gated_delta::graph::{
 use crate::programs::graph::draft::GraphDraft;
 use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{
-    native::StateSpaceKernels, ModelLoadPlan, StateResourcePlan, StateSpaceBinding,
-    StateSpaceShape,
+    native::StateSpaceKernels, ModelLoadPlan, StateResourcePlan, StateSpaceBinding, StateSpaceShape,
 };
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
@@ -128,6 +127,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                 key_weight: (&empty).into(),
                 value_weight: (&empty).into(),
                 epsilon: block.epsilon,
+                project_mode: 0,
             },
         )?
         .r0;
@@ -207,10 +207,11 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
 mod tests {
     use crate::programs::native_target_graph::checked_target_family_storage;
     use crate::{
-        resident_layout, source_element, ComponentSelection, ExecutionPath,
-        FeedForwardProgramSlot, MixerProgramSlot,
-        ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner,
+        resident_layout, source_element, ComponentSelection, ExecutionPath, FeedForwardProgramSlot,
+        MixerProgramSlot, ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits,
+        ResourcePlanner,
     };
+    use crate::{DenseScales, GeneralRoutedScales, PlanError};
     use magnitude_artifacts::{
         gguf::{Encoding, TensorDescriptor},
         ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
@@ -218,14 +219,12 @@ mod tests {
     use magnitude_family_contracts::{
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId, FeedForwardUp,
-        HeadNorm, HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue,
-        LatentExperts, MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm,
-        RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
-        SharedExpert, SharedExpertGate, StateSpace, Sublayer, ValueNorm,
-        ValueSource, WeightDescriptor, ImportTransform, WeightKind, WeightRole, WeightScope,
-        SublayerIndex,
+        HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics,
+        KeyValue, LatentExperts, MediaRowAttention, ModelDefinition, Operator, OutputForm,
+        ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
+        ScoreFunction, SharedExpert, SharedExpertGate, StateSpace, Sublayer, SublayerIndex,
+        ValueNorm, ValueSource, WeightDescriptor, WeightKind, WeightRole, WeightScope,
     };
-    use crate::{GeneralRoutedScales, DenseScales, PlanError};
     use magnitude_state::KvCodec;
     use seismic::BackendName;
 
@@ -270,9 +269,9 @@ mod tests {
                     stored(name.clone(), shape, Encoding::Nvfp4);
                     let scale_name = format!("{name}.scale");
                     stored(scale_name.clone(), scale, Encoding::F32);
-                    descriptor.transforms.push(ImportTransform::ScaleByTensor {
-                        tensor: scale_name,
-                    });
+                    descriptor
+                        .transforms
+                        .push(ImportTransform::ScaleByTensor { tensor: scale_name });
                 }
                 None if shape.len() > 1 => stored(name, shape, Encoding::BF16),
                 None => stored(name, shape, Encoding::F32),
@@ -406,9 +405,7 @@ mod tests {
         let definition = ModelDefinition {
             family: FamilyId("hybrid-state-space".into()),
             artifact_identity: identity,
-            inputs: InputSemantics {
-                coordinate_axes: 1,
-            },
+            inputs: InputSemantics { coordinate_axes: 1 },
             decoder: Decoder {
                 activation_dtype: ActivationDType::BF16,
                 hidden: HIDDEN,
@@ -586,7 +583,10 @@ mod tests {
                     .iter()
                     .find(|weight| weight.role == WeightRole { scope, kind })
                     .unwrap();
-                (plan.scale_extent(), plan.scale.as_ref().map(|scale| scale.resident_bytes))
+                (
+                    plan.scale_extent(),
+                    plan.scale.as_ref().map(|scale| scale.resident_bytes),
+                )
             };
             let (latent, plain) = (feed_forward_scope(1), feed_forward_scope(2));
             assert_eq!(extent(latent, WeightKind::ExpertUp), (32, Some(128)));
@@ -595,7 +595,10 @@ mod tests {
             assert_eq!(extent(plain, WeightKind::ExpertUp), (32, Some(128)));
             assert_eq!(extent(plain, WeightKind::SharedUp), (1, Some(4)));
             assert_eq!(extent(latent, WeightKind::LatentDown), (1, Some(4)));
-            assert_eq!(extent(WeightScope::Target, WeightKind::Output), (1, Some(4)));
+            assert_eq!(
+                extent(WeightScope::Target, WeightKind::Output),
+                (1, Some(4))
+            );
             assert_eq!(extent(plain, WeightKind::Router), (0, None));
             let scale_bytes = load
                 .target()
@@ -610,7 +613,11 @@ mod tests {
                 .sum::<u64>();
             assert_eq!(
                 packed_bytes,
-                load.target().iter().map(|weight| weight.resident_bytes).sum::<u64>() + scale_bytes
+                load.target()
+                    .iter()
+                    .map(|weight| weight.resident_bytes)
+                    .sum::<u64>()
+                    + scale_bytes
             );
 
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
@@ -668,7 +675,10 @@ mod tests {
             };
             let unscaled_load =
                 ModelLoadPlan::derive(&unscaled_manifest, &unscaled, selection, layout).unwrap();
-            assert_eq!(classes(&definition, &load), classes(&unscaled, &unscaled_load));
+            assert_eq!(
+                classes(&definition, &load),
+                classes(&unscaled, &unscaled_load)
+            );
         }
     }
 
@@ -680,7 +690,10 @@ mod tests {
             (
                 "blk.3.attn_q",
                 WeightRole {
-                    scope: WeightScope::TargetSublayer(SublayerIndex { block: 2, sublayer: 0 }),
+                    scope: WeightScope::TargetSublayer(SublayerIndex {
+                        block: 2,
+                        sublayer: 0,
+                    }),
                     kind: WeightKind::Query,
                 },
             ),
@@ -692,8 +705,7 @@ mod tests {
                 },
             ),
         ] {
-            let (definition, manifest) =
-                hybrid_stored(|stored| (stored == name).then(|| vec![1]));
+            let (definition, manifest) = hybrid_stored(|stored| (stored == name).then(|| vec![1]));
             let load = ModelLoadPlan::derive(
                 &manifest,
                 &definition,
@@ -735,7 +747,10 @@ mod tests {
         assert!(error.contains("not F32 [1] or [1]"), "{error}");
         // A named scale the component lacks.
         let (definition, mut manifest) = hybrid_stored(|name| (name == "output").then(|| vec![1]));
-        manifest.target.tensors.retain(|tensor| tensor.name != "output.scale");
+        manifest
+            .target
+            .tensors
+            .retain(|tensor| tensor.name != "output.scale");
         let error = ModelLoadPlan::derive(
             &manifest,
             &definition,

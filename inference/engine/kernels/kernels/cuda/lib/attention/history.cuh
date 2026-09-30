@@ -184,6 +184,28 @@ struct AffineHistory {
             + static_cast<u64>(kv_head) * value_pairs_head / 2;
     }
 
+    // A (history row, kv head)'s vectors in the four planes, its slab located
+    // once (32-bit: rows and slab_rows, the entry's u32 SLAB_ROWS, fit).
+    struct Vectors {
+        const u32 *key_codes;
+        const u32 *key_pairs;
+        const u32 *value_codes;
+        const u32 *value_pairs;
+    };
+    __device__ __forceinline__ Vectors vectors(int token, int kv_head) const {
+        const u32 rows = static_cast<u32>(slab_rows);
+        const u64 index = static_cast<u32>(token) / rows;
+        const u64 within = static_cast<u32>(token) % rows;
+        auto at = [&](const u32 *table, u64 row_bytes, u64 head_words) {
+            return reinterpret_cast<const u32 *>(slab::region(table, index) + within * row_bytes) +
+                   static_cast<u64>(kv_head) * head_words;
+        };
+        return Vectors{at(key_codes, key_codes_row * 4, key_codes_head),
+                       at(key_pairs, key_pairs_row * 2, key_pairs_head / 2),
+                       at(value_codes, value_codes_row * 4, value_codes_head),
+                       at(value_pairs, value_pairs_row * 2, value_pairs_head / 2)};
+    }
+
     // The key is the prepared key rounded to the activation element (as `k`
     // holds it), the value the projected value.
     __device__ __forceinline__ void append(int destination, int kv_head, const float (&k)[DPL],

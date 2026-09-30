@@ -38,7 +38,8 @@ kernel void attention_prefill_k8v4_prepare(
             ulong(SEISMIC_PARAM_SLAB_ROWS)},
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, destinations, queries, keys, values, SEISMIC_DIM_M,
-        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), group, simd, lane);
+        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1,
+        group, simd, lane);
 }
 
 kernel void attention_prefill_k8v4_attend(
@@ -64,6 +65,8 @@ kernel void attention_prefill_k8v4_attend(
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
     attention::prefill_attend<SEISMIC_TUNE_QT>(
         attention::affine_history{key_codes, key_coefficients, value_codes, value_coefficients,
             ulong(SEISMIC_PARAM_SLAB_ROWS)},
@@ -82,6 +85,8 @@ kernel void attention_prefill_k8v4_merge(
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint column [[thread_index_in_threadgroup]]) {
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
     attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, result, partials, statistics, counts,
         SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0);
 }

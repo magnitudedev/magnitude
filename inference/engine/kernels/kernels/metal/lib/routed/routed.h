@@ -26,6 +26,71 @@ inline projection::Plain<Act, projection::AllRows> activation(device const uchar
     return projection::Plain<Act, projection::AllRows>{x, stride0, stride1, columns, {}};
 }
 
+// The decode down projections of one simdgroup (the choices of a row, and
+// the shared expert, run side by side, one simdgroup each): channels
+// first + g + G * r (lane group g of G = 32 / LANES, r < ROWS) of weights `w`
+// against the one-row product `in` of COLUMNS values, stored unrounded at
+// projected[g + G * r]. The lanes of a group own the packets sub,
+// sub + LANES, ... of every channel's row, as the K1 GEMV's lanes do, and
+// sum them in the same order, so every projection is the GEMV's sum for the
+// same LANES (`projection::gemv_body`). A lane reads its packets of the
+// product straight from device memory (no staging, no barrier) and issues
+// the weight loads of all its channels before it accumulates any.
+template <typename W, uint ROWS, uint LANES, uint COLUMNS, typename In>
+inline void project_channels(thread const In &in, thread const projection::Weights<W> &w, uint first,
+    uint rows, threadgroup float *projected, uint lane) {
+    constexpr uint G = 32u / LANES;
+    constexpr uint P = (COLUMNS + 31u) / 32u;
+    // Packets per lane.
+    constexpr uint PL = (P + LANES - 1u) / LANES;
+    const uint g = lane / LANES, sub = lane % LANES;
+    typename W::packet packets[ROWS][PL];
+    PROJECTION_UNROLL
+    for (uint r = 0; r < ROWS; ++r) {
+        const uint n = min(first + g + G * r, rows - 1u);
+        PROJECTION_UNROLL
+        for (uint i = 0; i < PL; ++i) {
+            const uint p = sub + LANES * i;
+            if (p < P)
+                packets[r][i] = w.packet(n, p);
+        }
+    }
+    uint4 x[PL][4];
+    PROJECTION_UNROLL
+    for (uint i = 0; i < PL; ++i) {
+        const uint p = sub + LANES * i;
+        PROJECTION_UNROLL
+        for (uint step = 0; step < 4; ++step)
+            x[i][step] = p < P ? in.words8(0, 32u * p + 8u * step) : uint4(0);
+    }
+    float acc[ROWS];
+    PROJECTION_UNROLL
+    for (uint r = 0; r < ROWS; ++r)
+        acc[r] = 0.0f;
+    PROJECTION_UNROLL
+    for (uint i = 0; i < PL; ++i) {
+        if (sub + LANES * i >= P)
+            continue;
+        PROJECTION_UNROLL
+        for (uint step = 0; step < 4; ++step) {
+            float4 xe, xo;
+            Act::split8(x[i][step], xe, xo);
+            PROJECTION_UNROLL
+            for (uint r = 0; r < ROWS; ++r) {
+                float4 we, wo;
+                projection::gemv_weights<W>(packets[r][i], step, we, wo);
+                acc[r] = projection::gemv_step_dot(acc[r], we, wo, xe, xo);
+            }
+        }
+    }
+    PROJECTION_UNROLL
+    for (uint r = 0; r < ROWS; ++r) {
+        const float total = projection::gemv_group_sum<LANES>(acc[r]);
+        if (sub == 0)
+            projected[g + G * r] = total;
+    }
+}
+
 // The live rows of a grouped block: its `order` entries are one expert's rows
 // followed by -1 padding, so the count is the index of the first -1. The
 // expert GEMMs skip the MMAs of padding rows (`live_rows`).

@@ -100,6 +100,10 @@ Complete cache reuse requires matching source, numerical policy, case structure 
 scope, native implementation, configuration and device identities; the caller's key names what
 case inputs are generated from, so reuse never reads them back. A timing reuse key alone never
 establishes numerical agreement. Old Boolean-only records cannot authorize selection.
+A consumer may tune the same native entry for disjoint served workload classes as separate
+units, then bind each prepared choice into the corresponding exact graph class. Each unit has
+its own search identity, measurement points and validation; the prepared choices share the
+entry's checked invocation contract.
 The distinct public handle makes direct-only use structural.
 Launch-scoped declarations use a factored search. The checked declaration gives each parameter
 its launch ownership, including explicit entry-parameter reads by kernels that are absent from

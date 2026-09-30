@@ -1,0 +1,17 @@
+// widen_rows: widened[row, column] = f32(rows[row, column]); one invocation
+// per element over a grid-stride loop (the grid is capped below the
+// 65535-group floor).
+#include "lib/core/activation.glsl"
+
+void widen_rows() {
+    const uint64_t rows = SEISMIC_PTR(SEISMIC_BUFFER_ROWS);
+    const uint64_t widened = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t width = SEISMIC_DIM_D;
+    const uint64_t count = SEISMIC_DIM_M * width;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
+        const uint64_t row = index / width, column = index % width;
+        element_f32_put(widened + (row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
+            element_at(ELEMENT_ACT, rows, row * SEISMIC_ROWS_STRIDE_0 + column * SEISMIC_ROWS_STRIDE_1));
+    }
+}

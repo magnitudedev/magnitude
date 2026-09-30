@@ -311,12 +311,14 @@ pub const GEMV_ROWS: usize = 16;
 /// (`projection::SMALL_GEMM_ROWS`); larger counts run the large-band GEMM.
 pub const SMALL_GEMM_ROWS: usize = 64;
 
-/// A native mapping: the GEMV K split and the small-band GEMM's INT8 operand
-/// path (the large-band GEMM is the 16-bit path).
+/// A native mapping: the GEMV K split, the small-band GEMM's INT8 operand
+/// path (the large-band GEMM is the 16-bit path) and the large-band GEMM's
+/// loader rotation.
 #[derive(Clone, Copy, Debug)]
 pub struct Mapping {
     pub ksplit: u64,
     pub int8: u64,
+    pub rotate: u64,
 }
 
 impl Mapping {
@@ -325,7 +327,8 @@ impl Mapping {
         spec.with_param("KSPLIT", self.ksplit)
             .with_param("INT8", self.int8)
     }
-    /// Dense expansion owns KSPLIT on its two GEMV launches.
+    /// Dense expansion owns KSPLIT on its two GEMV launches and ROTATE on its
+    /// GEMM.
     pub fn dense_expand_params(
         self,
         spec: seismic::NativeSpecialization,
@@ -333,8 +336,10 @@ impl Mapping {
         spec.with_param("INT8", self.int8)
             .with_launch_param(2, "KSPLIT", self.ksplit)
             .with_launch_param(3, "KSPLIT", self.ksplit)
+            .with_launch_param(5, "ROTATE", self.rotate)
     }
-    /// Dense output owns KSPLIT on its two GEMV launches.
+    /// Dense output owns KSPLIT on its two GEMV launches and ROTATE on its
+    /// GEMM.
     pub fn dense_output_params(
         self,
         spec: seismic::NativeSpecialization,
@@ -342,8 +347,10 @@ impl Mapping {
         spec.with_param("INT8", self.int8)
             .with_launch_param(1, "KSPLIT", self.ksplit)
             .with_launch_param(2, "KSPLIT", self.ksplit)
+            .with_launch_param(4, "ROTATE", self.rotate)
     }
-    /// Attention output owns KSPLIT on its two GEMV launches.
+    /// Attention output owns KSPLIT on its two GEMV launches and ROTATE on
+    /// its GEMM.
     pub fn attention_output_params(
         self,
         spec: seismic::NativeSpecialization,
@@ -351,8 +358,10 @@ impl Mapping {
         spec.with_param("INT8", self.int8)
             .with_launch_param(1, "KSPLIT", self.ksplit)
             .with_launch_param(2, "KSPLIT", self.ksplit)
+            .with_launch_param(4, "ROTATE", self.rotate)
     }
-    /// Attention projection owns KSPLIT on its two GEMV launches.
+    /// Attention projection owns KSPLIT on its two GEMV launches and ROTATE
+    /// on its GEMM.
     pub fn attention_project_params(
         self,
         spec: seismic::NativeSpecialization,
@@ -360,18 +369,21 @@ impl Mapping {
         spec.with_param("INT8", self.int8)
             .with_launch_param(2, "KSPLIT", self.ksplit)
             .with_launch_param(3, "KSPLIT", self.ksplit)
+            .with_launch_param(5, "ROTATE", self.rotate)
     }
-    /// Recurrent projection and output entries share the two GEMV launch indices.
+    /// Recurrent projection and output entries share the GEMV and GEMM launch
+    /// indices.
     pub fn recurrent_params(
         self,
         spec: seismic::NativeSpecialization,
     ) -> seismic::NativeSpecialization {
         self.attention_project_params(spec)
     }
-    /// Readout head GEMVs own KSPLIT on launches 1 and 2.
+    /// Readout head GEMVs own KSPLIT on launches 1 and 2, its GEMM ROTATE.
     pub fn head_params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
         spec.with_launch_param(1, "KSPLIT", self.ksplit)
             .with_launch_param(2, "KSPLIT", self.ksplit)
+            .with_launch_param(4, "ROTATE", self.rotate)
     }
     /// Whether `rows` rows run the INT8 path (only the small-band GEMM has
     /// one).
@@ -382,15 +394,51 @@ impl Mapping {
 
 /// GEMV mappings. INT8 1 is included to show the GEMV ignores it.
 pub const GEMV_MAPPINGS: [Mapping; 4] = [
-    Mapping { ksplit: 4, int8: 0 },
-    Mapping { ksplit: 2, int8: 0 },
-    Mapping { ksplit: 8, int8: 1 },
-    Mapping { ksplit: 4, int8: 1 },
+    Mapping {
+        ksplit: 4,
+        int8: 0,
+        rotate: 2,
+    },
+    Mapping {
+        ksplit: 2,
+        int8: 0,
+        rotate: 2,
+    },
+    Mapping {
+        ksplit: 8,
+        int8: 1,
+        rotate: 2,
+    },
+    Mapping {
+        ksplit: 4,
+        int8: 1,
+        rotate: 2,
+    },
 ];
-/// GEMM mappings: both operand paths (the large band ignores INT8).
-pub const GEMM_MAPPINGS: [Mapping; 2] = [
-    Mapping { ksplit: 4, int8: 0 },
-    Mapping { ksplit: 4, int8: 1 },
+/// GEMM mappings: both operand paths (the large band ignores INT8) and every
+/// loader rotation of the large band (which ignores INT8 and keeps the
+/// arithmetic).
+pub const GEMM_MAPPINGS: [Mapping; 4] = [
+    Mapping {
+        ksplit: 4,
+        int8: 0,
+        rotate: 2,
+    },
+    Mapping {
+        ksplit: 4,
+        int8: 1,
+        rotate: 2,
+    },
+    Mapping {
+        ksplit: 4,
+        int8: 0,
+        rotate: 1,
+    },
+    Mapping {
+        ksplit: 4,
+        int8: 0,
+        rotate: 4,
+    },
 ];
 
 pub fn mappings(m: usize) -> &'static [Mapping] {
@@ -423,7 +471,9 @@ pub fn timing_formats() -> Vec<Format> {
                 *Format::ALL
                     .iter()
                     .find(|format| format.representation() == name.trim())
-                    .expect("CUDA_TIMING_FORMATS: a resident representation name, e.g. q4k or mxfp4g32")
+                    .expect(
+                        "CUDA_TIMING_FORMATS: a resident representation name, e.g. q4k or mxfp4g32",
+                    )
             })
             .collect(),
         Err(_) => Format::ALL.to_vec(),

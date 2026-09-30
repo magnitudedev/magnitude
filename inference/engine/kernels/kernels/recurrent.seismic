@@ -137,6 +137,7 @@ native gated_delta_project for cuda from "cuda/gated_delta_project.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
     launch gated_delta_project_gemm when M > 64:
+        params (code ROTATE in [2, 1, 4])
         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16), 8)
             + ceil_div(ceil_div(NV * W, 16), 8) + 2 * ceil_div(ceil_div(NV, 16), 8), ceil_div(M, 128), 1)
         threads_per_threadgroup (256, 1, 1)
@@ -593,6 +594,7 @@ native gated_delta_output for cuda from "cuda/gated_delta_output.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
     launch gated_delta_output_gemm when M > 64:
+        params (code ROTATE in [2, 1, 4])
         threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(M, 128), 1 + min(1, 128 / M))
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (2 * (128 * 144 + 10240) + 2048)

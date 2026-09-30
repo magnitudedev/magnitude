@@ -27,11 +27,11 @@ pub use decoder::{
     InputNorm, KeyValue, LatentAttention, LatentExperts, LayerNorm, MediaRowAttention, Operator,
     OutputForm, PerLayerEntry, PerLayerInput, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary,
     RotaryDivisors, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
-    SharedExpert, SharedExpertGate,
-    ShortConv, StateSpace, Sublayer, SublayerIndex, UnweightedRms, ValueNorm, ValueSource,
+    SharedExpert, SharedExpertGate, ShortConv, StateSpace, Sublayer, SublayerIndex, UnweightedRms,
+    ValueNorm, ValueSource,
 };
 pub use draft::{
-    BlockLayout, CandidateSelector, ConfidenceHead, DraftDefinition, DraftEmbedding, DraftMethod,
+    BlockAttention, BlockLayout, CandidateSelector, ConfidenceHead, DraftDefinition, DraftEmbedding, DraftMethod,
     DraftVariant, DynamicConvolution, LayerConvolutions, MarkovHead, TapPoint,
 };
 pub use family::{FamilyError, FamilyInputAdapter, MarkerTokens, ModelFamily};
@@ -43,9 +43,9 @@ pub use inputs::{
 pub use vision::{
     CellReduction, LinearClamp, LinearPart, MergerStage, NormPart, PositionSampling, Standardize,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
-    VisionDescription, VisionFeedForward, VisionLinear, VisionLinearSite, VisionMerger,
-    VisionNorm, VisionNormSite, VisionPositions, VisionPreprocessing, VisionResampling,
-    VisionResize, VisionStem, VisionUp, VisionWeight,
+    VisionDescription, VisionFeedForward, VisionLinear, VisionLinearSite, VisionMerger, VisionNorm,
+    VisionNormSite, VisionPositions, VisionPreprocessing, VisionResampling, VisionResize,
+    VisionStem, VisionUp, VisionWeight,
 };
 
 /// Stable identity selected by a family adapter after artifact recognition.
@@ -212,12 +212,18 @@ pub enum WeightScope {
     /// Entry and exit weights of the decoder.
     Target,
     TargetSublayer(SublayerIndex),
-    TargetBranch { sublayer: SublayerIndex, branch: u32 },
+    TargetBranch {
+        sublayer: SublayerIndex,
+        branch: u32,
+    },
     /// Weights of a draft head block outside its sublayers.
     HeadBlock(u32),
     /// A sublayer of a draft head block (`block` is the head block).
     HeadSublayer(SublayerIndex),
-    HeadBranch { sublayer: SublayerIndex, branch: u32 },
+    HeadBranch {
+        sublayer: SublayerIndex,
+        branch: u32,
+    },
     /// Projector weights outside its patch frames, blocks and merger stages.
     Vision,
     /// One frame of a projector's patch convolution.
@@ -567,9 +573,7 @@ mod tests {
                 target: ArtifactIdentity([0; 32]),
                 projector: None,
             },
-            inputs: InputSemantics {
-                coordinate_axes: 1,
-            },
+            inputs: InputSemantics { coordinate_axes: 1 },
             decoder: Decoder {
                 activation_dtype: ActivationDType::BF16,
                 hidden: 4,

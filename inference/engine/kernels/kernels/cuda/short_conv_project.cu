@@ -61,11 +61,12 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
     extern __shared__ uint4 dynamic_shared[];
     projection::u8 *shared = reinterpret_cast<projection::u8 *>(dynamic_shared);
     const unsigned long long segment = projection::gemm_columns(CH);
-    if (blockIdx.x < segment)
-        projection::gemm_run<Shape, Q>(shared, staged, H, groups, M, H, blockIdx.x, CH, segments.b, segments.x,
+    const unsigned long long column = projection::gemm_column<Shape>();
+    if (column < segment)
+        projection::gemm_run<Shape, Q>(shared, staged, H, groups, M, H, column, CH, segments.b, segments.x,
                                        segments.product);
-    else if (blockIdx.x < 2 * segment)
-        projection::gemm_run<Shape, Q>(shared, staged, H, groups, M, H, blockIdx.x - segment, CH, segments.c,
+    else if (column < 2 * segment)
+        projection::gemm_run<Shape, Q>(shared, staged, H, groups, M, H, column - segment, CH, segments.c,
                                        projection::NoWeight{}, segments.gate);
 }
 
@@ -111,8 +112,9 @@ __global__ void short_conv_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMM
-extern "C" __global__ void short_conv_project_gemm(SEISMIC_KERNEL_PARAMS) {
-    project_gemm<projection::LargeGemm, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H,
-                                               SEISMIC_DIM_CH, SEGMENTS);
+template <unsigned ROTATE>
+__global__ void short_conv_project_gemm(SEISMIC_KERNEL_PARAMS) {
+    project_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H,
+                                                       SEISMIC_DIM_CH, SEGMENTS);
 }
 #endif

@@ -156,6 +156,9 @@ pub(crate) struct HeadRowsTuning {
     pub weight: Element,
     pub activation: Element,
     pub epsilon: f32,
+    /// The output weight's leading rows it projects onto (a draft readout's
+    /// `draft_vocabulary`); `None` projects onto every row.
+    pub rows: Option<u64>,
 }
 
 pub(crate) struct HeadRowsCase {
@@ -197,7 +200,10 @@ impl EntryTuning for HeadRowsTuning {
     fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = vocabulary_shape(inputs)?;
         Ok(vec![
-            ("V", vocabulary),
+            (
+                "V",
+                self.rows.map_or(vocabulary, |rows| rows.min(vocabulary)),
+            ),
             ("D", hidden),
             (
                 "WS",
@@ -222,7 +228,12 @@ impl EntryTuning for HeadRowsTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, String> {
         let weight = inputs.weight(WeightScope::Target, WeightKind::Output)?;
-        let hidden = weight.extents()[1];
+        let [vocabulary, hidden] = weight.extents()[..] else {
+            return Err("the output weight is not a matrix".into());
+        };
+        let weight = weight
+            .slice_leading(0, self.rows.map_or(vocabulary, |rows| rows.min(vocabulary)))
+            .map_err(|error| error.to_string())?;
         Ok(vec![HeadRowsCase {
             hidden: inputs.activation(Element::f32(), &[point.rows, hidden], 1)?,
             norm: inputs.weight(WeightScope::Target, WeightKind::OutputNorm)?,
@@ -315,6 +326,7 @@ impl EntryTuning for SelectedRowsTuning {
             weight: self.weight,
             activation: self.activation,
             epsilon: self.epsilon,
+            rows: None,
         }
         .rotation(inputs, point)?;
         let (vocabulary, _) = vocabulary_shape(inputs)?;

@@ -54,9 +54,11 @@ impl ResourceLimits {
                 workspace: launches,
                 output: 1 + launches,
             },
+            // A prompt chunk's drafter entry rides with each target launch
+            // in flight.
             head: GraphSlots {
-                workspace: 1,
-                output: 2,
+                workspace: launches,
+                output: 1 + launches,
             },
             vision: GraphSlots {
                 workspace: 1,
@@ -302,8 +304,8 @@ impl StateStorePlan {
                     .layer_history(source)
                     .ok_or_else(|| format!("shared history source {source:?} has no domain"))?
                     .store;
-                let slab_rows = usize::try_from(store.slab_rows)
-                    .map_err(|_| "slab rows exceed the host")?;
+                let slab_rows =
+                    usize::try_from(store.slab_rows).map_err(|_| "slab rows exceed the host")?;
                 Ok(store.span_bound + self.max_advance.div_ceil(slab_rows) + 1)
             })
             .collect::<Result<Vec<_>, String>>()?;

@@ -49,20 +49,39 @@ struct Segments {
         }                                                                                                 \
     }
 
+__device__ __forceinline__ void project_zero(const Out &out, unsigned M, unsigned long long columns,
+                                              unsigned row_start, unsigned row_count,
+                                              unsigned long long column_start, unsigned column_count,
+                                              unsigned tid, unsigned threads) {
+    for (unsigned item = tid; item < row_count * column_count; item += threads) {
+        const unsigned row = row_start + item / column_count;
+        const unsigned long long column = column_start + item % column_count;
+        if (row < M && column < columns)
+            out(row, column, 0.0f, 0.0f);
+    }
+}
+
 // The segmented GEMV over NB column blocks of 8 rows: query | gate | key |
 // value.
 template <int NB, int KSPLIT>
 __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged,
-                                             unsigned M, unsigned long long D, const Segments &s) {
+                                             unsigned M, unsigned long long D, const Segments &s,
+                                             unsigned project_mode) {
     using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
     __shared__ projection::GemvShared<Shape, Source::type> shared;
-    const Source::type x = Source::make(pro, row, M, D, staged);
     const unsigned long long kblocks = D / 64;
     unsigned long long group = Shape::tile_group();
     const unsigned long long groups[4] = {
         projection::gemv_groups<Shape>(s.rows[0]), projection::gemv_groups<Shape>(s.rows[1]),
         projection::gemv_groups<Shape>(s.rows[2]), projection::gemv_groups<Shape>(s.rows[3])};
-    switch (projection::locate_segment(group, groups)) {
+    const int segment = projection::locate_segment(group, groups);
+    if (project_mode != 0 && segment < 2) {
+        project_zero(s.out[segment], M, s.rows[segment], 0, M, group * Shape::TPW * 16,
+                     Shape::TPW * 16, threadIdx.x % (32 * Shape::KSPLIT), 32 * Shape::KSPLIT);
+        return;
+    }
+    const Source::type x = Source::make(pro, row, M, D, staged);
+    switch (segment) {
     case 0:
         projection::gemv_segment<Shape>(shared, x, M, kblocks, group, s.rows[0], s.query, projection::NoWeight{},
                                         s.out[0]);
@@ -83,17 +102,25 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
 }
 
 // The segmented GEMM of one row band over the staged rows (A rows, or q8_1
-// rows with Q): block column blockIdx.x of query | gate | key | value.
+// rows with Q): block column `gemm_column` of query | gate | key | value.
 template <class Shape, bool Q>
 __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const void *groups, unsigned M,
-                                             unsigned long long D, const Segments &s) {
+                                             unsigned long long D, const Segments &s,
+                                             unsigned project_mode) {
     extern __shared__ uint4 dynamic_shared[];
     projection::u8 *shared = reinterpret_cast<projection::u8 *>(dynamic_shared);
-    unsigned long long column = blockIdx.x;
+    unsigned long long column = projection::gemm_column<Shape>();
     const unsigned long long columns[4] = {
         projection::gemm_columns(s.rows[0]), projection::gemm_columns(s.rows[1]),
         projection::gemm_columns(s.rows[2]), projection::gemm_columns(s.rows[3])};
-    switch (projection::locate_segment(column, columns)) {
+    const int segment = projection::locate_segment(column, columns);
+    if (project_mode != 0 && segment < 2) {
+        project_zero(s.out[segment], M, s.rows[segment],
+                     projection::gemm_band<Shape>() * Shape::BM, Shape::BM,
+                     column * 128, 128, threadIdx.x, Shape::THREADS);
+        return;
+    }
+    switch (segment) {
     case 0:
         projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[0], s.query,
                                        projection::NoWeight{}, s.out[0]);
@@ -141,14 +168,16 @@ template <unsigned KSPLIT>
 __global__ void attention_project_gemv(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
     project_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING,
-                            (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, SEGMENTS);
+                            (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, SEGMENTS,
+                            (unsigned)SEISMIC_PARAM_PROJECT_MODE);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV16
 template <unsigned KSPLIT>
 __global__ void attention_project_gemv16(SEISMIC_KERNEL_PARAMS) {
-    project_gemv<2, KSPLIT>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, SEGMENTS);
+    project_gemv<2, KSPLIT>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
+                            SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
 }
 #endif
 
@@ -156,12 +185,15 @@ __global__ void attention_project_gemv16(SEISMIC_KERNEL_PARAMS) {
 template <unsigned INT8>
 __global__ void attention_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
-    project_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, SEGMENTS);
+    project_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
+                                             SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMM
-extern "C" __global__ void attention_project_gemm(SEISMIC_KERNEL_PARAMS) {
-    project_gemm<projection::LargeGemm, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, SEGMENTS);
+template <unsigned ROTATE>
+__global__ void attention_project_gemm(SEISMIC_KERNEL_PARAMS) {
+    project_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
+                                                       SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
 }
 #endif

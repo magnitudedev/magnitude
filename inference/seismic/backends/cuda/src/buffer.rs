@@ -65,9 +65,9 @@ impl Buffer {
             Memory::Reserved { reservation, .. } => reservation.base,
         }
     }
-    /// Synchronous host write. Device memory is written by a driver copy,
-    /// which is ordered after all previously queued device work; mapped
-    /// memory is written in place.
+    /// Synchronous host write. Device memory is written by a driver copy
+    /// on the non-blocking transfer stream, ordered only by the caller's
+    /// access fence; mapped memory is written in place.
     pub(crate) fn upload_at(&self, offset: usize, bytes: &[u8]) -> Result<(), DriverError> {
         match &*self.memory {
             Memory::Device(allocation) => allocation.upload_at(offset, bytes),

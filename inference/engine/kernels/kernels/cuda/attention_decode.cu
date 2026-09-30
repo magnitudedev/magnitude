@@ -1,19 +1,56 @@
 // attention_decode (M <= 8): split-KV decode attention.
 //
-// L1 `attention_decode_partial`, one block per (kv head, partition, row): the
-// block prepares the row's G queries (rounded to the activation element as
-// the contract publishes them, then scaled into the exp2 domain) and, in
-// partition 0 of a layer with fresh rows, appends the row's K/V. A row's
-// tokens (its visible spans in order, then its fresh span) split into PARTS
-// contiguous partitions; within a partition each warp scans a contiguous
-// range of its key group for the query heads of its slice, lanes owning W /
-// 32 dimensions, so every K/V row is read once per slice of the G query heads
-// of its kv head. Warp states merge in key-group order into one partial
-// (maximum, denominator, accumulator) per (row, query head, partition). L2
+// L1 `attention_decode_partial`, one block per (kv head, partition, row
+// tile). A row's tokens (its visible spans in order, then its fresh span)
+// split into PARTS contiguous partitions; partition 0 of a layer with fresh
+// rows appends the rows' K/V. Each partition publishes one partial (maximum,
+// denominator, accumulator) per (row, query head). L2
 // `attention_decode_merge`, one block per (query head, row): the partitions
 // merge in partition order, then the output gate.
+//
+// Vector form (MATRIX = 0), row tiles of one row: the block prepares the
+// row's G queries (rounded to the activation element as the contract
+// publishes them, then scaled into the exp2 domain); within a partition each
+// warp scans a contiguous range of its key group for the query heads of its
+// slice, lanes owning W / 32 dimensions, so every K/V row is read once per
+// slice of the G query heads of its kv head. Warp states merge in key-group
+// order.
+//
+// Grouped-query matrix form (MATRIX = 1): the tensor-core flash body
+// (`attention::prefill::attend` with decode rows) over row tiles of WARPS * 16
+// / G rows, their query heads the matrix rows; K/V tiles are read once per
+// kv head, in equal runs of key tiles per partition.
 
+// Both forms' shared code (an entry's includes expand once, whatever the
+// branch).
 #include "lib/attention/attention.cuh"
+
+#if SEISMIC_TUNE_MATRIX
+
+#define ATTENTION_STAGES SEISMIC_TUNE_STAGES
+#define ATTENTION_COLUMNS SEISMIC_TUNE_COLUMNS
+#define ATTENTION_Q_REGISTERS 0
+#define ATTENTION_PRODUCER_WARPS 0
+#include "lib/attention/prefill.cuh"
+
+extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS)
+    attention_decode_partial(SEISMIC_KERNEL_PARAMS) {
+    attention::prefill::attend(
+        ATTENTION_INPUTS(),
+        attention::DenseHistory{
+            reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY)),
+            reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE)),
+            SEISMIC_HISTORY_KEY_STRIDE_0, SEISMIC_HISTORY_KEY_STRIDE_1,
+            SEISMIC_HISTORY_VALUE_STRIDE_0, SEISMIC_HISTORY_VALUE_STRIDE_1,
+            SEISMIC_PARAM_SLAB_ROWS},
+        attention::prefill::DecodeRows<SEISMIC_TUNE_PARTS>{
+            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),
+            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS))},
+        attention::prefill::Block{static_cast<int>(blockIdx.z), static_cast<int>(blockIdx.x),
+                                static_cast<int>(blockIdx.y), SEISMIC_TUNE_PARTS});
+}
+
+#else
 
 namespace {
 
@@ -127,7 +164,7 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
                             }
                         }
                         float score[TOKENS][H];
-                        attention::scores(q, k, score);
+                        attention::scores(q, k, score, lane);
                         attention::absorb(state, score, v, count);
                     }
                     part_lo = part_hi;
@@ -139,7 +176,7 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
                     attention::prepared_key(in, token, kv, k[0], own, lane);
                     attention::fresh_value(in, token, kv, v[0], lane);
                     float score[1][H];
-                    attention::scores(q, k, score);
+                    attention::scores(q, k, score, lane);
                     attention::absorb(state, score, v, 1);
                 }
             }
@@ -151,8 +188,11 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
                                      part, warp, lane);
 }
 
+#endif
+
+
 extern "C" __global__ void attention_decode_merge(SEISMIC_KERNEL_PARAMS) {
-    attention::decode_gate<PARTS>(
+    attention::decode_gate<SEISMIC_TUNE_PARTS>(
         ATTENTION_INPUTS(),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS)),

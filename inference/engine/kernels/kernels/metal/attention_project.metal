@@ -46,6 +46,18 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     projection::Store<activation> value_out{value, SEISMIC_RESULT_3_STRIDE_0,           \
         SEISMIC_RESULT_3_STRIDE_1, 0}
 
+template <typename Output>
+inline void attention_project_zero_tile(Output out, uint rows, uint columns,
+    uint row_start, uint row_count, uint column_start, uint column_count,
+    uint thread_index, uint threads) {
+    for (uint item = thread_index; item < row_count * column_count; item += threads) {
+        uint row = row_start + item / column_count;
+        uint column = column_start + item % column_count;
+        if (row < rows && column < columns)
+            out.store(row, column, 0.0f);
+    }
+}
+
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV
 template <uint ROWS, uint LANES>
 kernel void attention_project_gemv(ATTENTION_PROJECT_ARGUMENTS,
@@ -57,11 +69,20 @@ kernel void attention_project_gemv(ATTENTION_PROJECT_ARGUMENTS,
     ATTENTION_PROJECT_OPERANDS;
     uint per = simdgroups * ROWS * (32u / LANES);
     uint rows = uint(SEISMIC_DIM_M);
+    uint t0 = (query_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
+    uint t2 = (key_rows + per - 1) / per;
+    if (SEISMIC_PARAM_PROJECT_MODE != 0 && tile < t0 + t1) {
+        if (tile < t0)
+            attention_project_zero_tile(query_out, rows, query_rows, 0, rows,
+                tile * per, per, sg * 32 + lane, simdgroups * 32);
+        else
+            attention_project_zero_tile(gate_out, rows, gate_rows, 0, rows,
+                (tile - t0) * per, per, sg * 32 + lane, simdgroups * 32);
+        return;
+    }
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
     projection::SharedNorm<decltype(in)> x{in, squares};
-    uint t0 = (query_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
-    uint t2 = (key_rows + per - 1) / per;
     if (tile < t0) {
         PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
             x, query_out, query_w, rows, query_rows, k, tile, shared, simdgroups, sg, lane));
@@ -89,11 +110,20 @@ kernel void attention_project_batch(ATTENTION_PROJECT_ARGUMENTS,
     ATTENTION_PROJECT_OPERANDS;
     uint per = simdgroups * BATCH_ROWS * 8u;
     uint rows = uint(SEISMIC_DIM_M);
+    uint t0 = (query_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
+    uint t2 = (key_rows + per - 1) / per;
+    if (SEISMIC_PARAM_PROJECT_MODE != 0 && tile < t0 + t1) {
+        if (tile < t0)
+            attention_project_zero_tile(query_out, rows, query_rows, 0, rows,
+                tile * per, per, sg * 32 + lane, simdgroups * 32);
+        else
+            attention_project_zero_tile(gate_out, rows, gate_rows, 0, rows,
+                (tile - t0) * per, per, sg * 32 + lane, simdgroups * 32);
+        return;
+    }
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
     projection::SharedNorm<decltype(in)> x{in, squares};
-    uint t0 = (query_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
-    uint t2 = (key_rows + per - 1) / per;
     if (tile < t0)
         projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(x, query_out, query_w, rows, query_rows, k,
             tile, shared, simdgroups, sg, lane);
@@ -127,6 +157,15 @@ kernel void attention_project_stage(ATTENTION_PROJECT_ARGUMENTS,
     uint t0 = (query_rows + TN - 1) / TN, t1 = (gate_rows + TN - 1) / TN;               \
     uint t2 = (key_rows + TN - 1) / TN;                                                 \
     uint n = tile.x;                                                                    \
+    if (SEISMIC_PARAM_PROJECT_MODE != 0 && n < t0 + t1) {                               \
+        if (n < t0)                                                                     \
+            attention_project_zero_tile(query_out, m, query_rows, tile.y * TM, TM,    \
+                n * TN, TN, sg * 32 + lane, max(TM, 64u) * TN / 32u);                  \
+        else                                                                            \
+            attention_project_zero_tile(gate_out, m, gate_rows, tile.y * TM, TM,      \
+                (n - t0) * TN, TN, sg * 32 + lane, max(TM, 64u) * TN / 32u);          \
+        return;                                                                         \
+    }                                                                                   \
     if (n < t0)                                                                         \
         projection::gemm<packets::W0, TM, TN>(x, query_out, query_w, m, query_rows, k, tile.y, n, shared, sg, lane); \
     else if (n < t0 + t1)                                                               \

@@ -1,24 +1,24 @@
 //! Serialized ownership of logical generation and one executor resource domain.
 use super::{
     domain::{
-        group, requirements, submit_group, DomainFlight, ExecutorDomain, OperationGroup,
-        ResumeState,
+        DomainFlight, ExecutorDomain, OperationGroup, ResumeState, group, requirements,
+        submit_group,
     },
     policy::{
-        order_victims, AvailabilityEpoch, Operation as ScheduledOperation, Phase, Scheduler,
-        Selection, ServiceLimits, Victim,
+        AvailabilityEpoch, Operation as ScheduledOperation, Phase, Scheduler, Selection,
+        ServiceLimits, Victim, order_victims,
     },
-    prefix_cache::{PrefixCache, PrefixCacheCapacity, PrefixPath, MIN_BRANCH_GAIN, MIN_PREFIX_HIT},
+    prefix_cache::{MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache, PrefixCacheCapacity, PrefixPath},
     publication::{
         CapacityResource, ModelUnloadCause, PhysicalTimings, PublicationPermit, PublicationSender,
         PublicationWake, PublicationWakeKind, PublishError, RequestError, ServiceCapacityError,
     },
-    round_driver::{lower_round, reconcile_forward, RoundError},
+    round_driver::{RoundError, lower_round, reconcile_forward},
 };
 use magnitude_executor::{
-    platform::DomainRole, DomainError, DomainRequirements, InvariantError,
-    MemoryChargeReconciliation, NativeFamily, OpenRequirements, Operation, Outcome,
-    PhysicalDecision, ProgramFamily, RequestId, ResourceKind, ResourcePlan, SubmitError, WorkKind,
+    DomainError, DomainRequirements, HeadPhase, InvariantError, MemoryChargeReconciliation,
+    NativeFamily, OpenRequirements, Operation, Outcome, PhysicalDecision, ProgramFamily, RequestId,
+    ResourceKind, ResourcePlan, SubmitError, WorkKind, platform::DomainRole,
 };
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{
@@ -554,7 +554,9 @@ impl<F: ProgramFamily> Owner<F> {
             }
         }
         match resource {
-            ResourceKind::DeviceMemory => self.record_memory_deficit(DomainRole::Allocation, required),
+            ResourceKind::DeviceMemory => {
+                self.record_memory_deficit(DomainRole::Allocation, required)
+            }
             ResourceKind::HostStaging => self.record_memory_deficit(DomainRole::Staging, required),
             _ => {}
         }
@@ -760,14 +762,11 @@ impl<F: ProgramFamily> Owner<F> {
         };
         let record = self.records.get_mut(&id).expect("known request");
         let resumed = match hit {
-            Some(hit) => self
-                .prefix_cache
-                .entry(hit)
-                .and_then(|cached| {
-                    record
-                        .generation
-                        .resume_at(Some((hit.position(), cached.method())))
-                }),
+            Some(hit) => self.prefix_cache.entry(hit).and_then(|cached| {
+                record
+                    .generation
+                    .resume_at(Some((hit.position(), cached.method())))
+            }),
             None => record.generation.resume_at(None),
         };
         if let Err(error) = resumed {
@@ -801,7 +800,11 @@ impl<F: ProgramFamily> Owner<F> {
         // The deepest shared prefix a live peer is still prefilling toward
         // and will cache at its branch point.
         let mut in_flight = 0;
-        for record in self.records.values_mut().filter(|record| record.prefix_cache) {
+        for record in self
+            .records
+            .values_mut()
+            .filter(|record| record.prefix_cache)
+        {
             let live = PrefixPath::of(&record.generation);
             let shared = path.shared_with_prompt_of(live);
             deepest = deepest.max(shared);
@@ -1431,7 +1434,10 @@ impl<F: ProgramFamily> Owner<F> {
                     let rows = next
                         .iter()
                         .filter(|operation| {
-                            matches!(operation, Operation::Forward { .. } | Operation::Head { .. })
+                            matches!(
+                                operation,
+                                Operation::Forward { .. } | Operation::Head { .. }
+                            )
                         })
                         .map(Operation::row_count)
                         .sum::<usize>();
@@ -1604,6 +1610,47 @@ impl<F: ProgramFamily> Owner<F> {
         Ok(Step::Waiting)
     }
 
+    /// The prompt chunk a lone prefill group's request submits next, when it
+    /// is known now, so the domain queues it behind this group. A chunk
+    /// ending at a planned branch or retention point is followed by that
+    /// retention, not planned past.
+    fn planned_prefill(&self, operations: &[Operation]) -> Result<Vec<Operation>, String> {
+        let [Operation::Forward {
+            request,
+            kind: WorkKind::Prefill,
+            tokens,
+            position,
+            ..
+        }] = operations
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(record) = self.records.get(request) else {
+            return Ok(Vec::new());
+        };
+        if !record.encodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let end = position + tokens.len();
+        let stops = [record.branch, prompt_boundary(record)]
+            .into_iter()
+            .flatten()
+            .filter(|&stop| stop > *position)
+            .collect::<Vec<_>>();
+        if stops.iter().any(|&stop| stop <= end) {
+            return Ok(Vec::new());
+        }
+        let allowance = stops
+            .iter()
+            .map(|stop| stop - end)
+            .fold(self.scheduler.limits().prefill_tokens.max(1), usize::min);
+        Ok(record
+            .generation
+            .planned_prefill(*request, allowance)?
+            .into_iter()
+            .collect())
+    }
+
     fn submit_next(&mut self) -> Result<Step, String> {
         let mut queued = self.batch.as_mut().unwrap().queued.pop_front().unwrap();
         let ended = queued
@@ -1639,6 +1686,8 @@ impl<F: ProgramFamily> Owner<F> {
             self.epoch.advance()?;
             return Ok(Step::Progress);
         }
+        let planned = self.planned_prefill(queued.operations())?;
+        self.domain.plan_successors(planned);
         let first_provision = match self.domain.provision(queued.operations()) {
             Ok(()) => Ok(()),
             Err(
@@ -1743,7 +1792,7 @@ impl<F: ProgramFamily> Owner<F> {
                     deficit.resource,
                     deficit.required,
                     deficit.available,
-                )
+                );
             }
             Err(DomainError::Reclaim) => unreachable!("reclaim handled above"),
             Err(error) => {
@@ -2119,13 +2168,19 @@ impl<F: ProgramFamily> Owner<F> {
         for item in pending {
             let request = item.request();
             let duration = item.physical_duration();
-            let kind = item.kind();
             let operation = expected[&request];
             let correct = matches!(operation, Operation::Head { .. })
                 && matches!(item.outcome(), Outcome::Head { .. });
             let Some(record) = self.records.get_mut(&request) else {
                 self.abort_pending(item)?;
                 continue;
+            };
+            let kind = match operation {
+                Operation::Head {
+                    phase: HeadPhase::Priming { .. },
+                    ..
+                } => WorkKind::Prefill,
+                _ => item.kind(),
             };
             record.add_physical_duration(kind, duration);
             if matches!(
@@ -2251,7 +2306,11 @@ impl<F: ProgramFamily> Owner<F> {
         if state.position() != position {
             return Err("cached prefix state differs from its path position".into());
         }
-        let generation = &self.records.get(&request).ok_or("unknown request")?.generation;
+        let generation = &self
+            .records
+            .get(&request)
+            .ok_or("unknown request")?
+            .generation;
         let method = generation.method_checkpoint()?;
         if self
             .prefix_cache
@@ -2414,7 +2473,10 @@ impl<F: ProgramFamily> super::worker::Driven for Owner<F> {
         self.reconcile_active()?;
         self.release_deferred_reclaim()?;
         if self.memory_condition != MemoryCondition::Unloading
-            && self.batch.as_ref().is_some_and(|batch| batch.queued.is_empty())
+            && self
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.queued.is_empty())
         {
             self.finish_batch(now)?;
         }
@@ -2497,7 +2559,7 @@ impl<F: ProgramFamily> super::worker::Driven for Owner<F> {
 
 #[cfg(test)]
 mod memory_condition_tests {
-    use super::{MemoryCondition, MemoryObservation, MEMORY_ESCALATION_NS};
+    use super::{MEMORY_ESCALATION_NS, MemoryCondition, MemoryObservation};
 
     #[test]
     fn continuous_blind_escalates_to_immediately_eligible_reclaim() {

@@ -113,6 +113,7 @@ fn forward(
         demand: Demand::LOGITS,
         select: Vec::new(),
         committed: rows,
+        prime: None,
     };
     let groups = service_domain::group(domain, vec![operation]);
     let [group] = groups.as_slice() else {
@@ -128,7 +129,11 @@ fn forward(
             return Err("a forward returns forward rows".into());
         };
         for logits_row in results.iter().filter_map(|row| row.logits.as_ref()) {
-            logits.extend(logits_row.read_to_host().map_err(|error| error.to_string())?);
+            logits.extend(
+                logits_row
+                    .read_to_host()
+                    .map_err(|error| error.to_string())?,
+            );
         }
         domain
             .reconcile(

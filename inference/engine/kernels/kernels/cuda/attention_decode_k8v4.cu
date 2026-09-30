@@ -10,8 +10,45 @@
 // folded into the accumulator before it. Partition 0 of a layer with fresh
 // rows appends the row's key and value encoded. L2 `attention_decode_k8v4_merge`:
 // the dense entry's merge and gate.
+//
+// Grouped-query matrix form (MATRIX = 1): `attention_decode`'s, over affine
+// history: producer warps decode code tiles into F16 operands beside the MMA
+// warps (`attention::prefill::attend`).
 
+// Both forms' shared code (an entry's includes expand once, whatever the
+// branch).
 #include "lib/attention/attention.cuh"
+
+#if SEISMIC_TUNE_MATRIX
+
+#define ATTENTION_STAGES SEISMIC_TUNE_STAGES
+#define ATTENTION_COLUMNS SEISMIC_TUNE_COLUMNS
+#define ATTENTION_Q_REGISTERS 0
+#define ATTENTION_PRODUCER_WARPS (SEISMIC_TUNE_WARPS * SEISMIC_TUNE_COLUMNS)
+#include "lib/attention/prefill.cuh"
+
+extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS + attention::prefill::PRODUCERS)
+    attention_decode_k8v4_partial(SEISMIC_KERNEL_PARAMS) {
+    attention::prefill::attend(
+        ATTENTION_INPUTS(),
+        attention::AffineHistory{
+            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),
+            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS)),
+            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES)),
+            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)),
+            SEISMIC_HISTORY_KEY_CODES_STRIDE_0, SEISMIC_HISTORY_KEY_CODES_STRIDE_1,
+            SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_0, SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_1,
+            SEISMIC_HISTORY_VALUE_CODES_STRIDE_0, SEISMIC_HISTORY_VALUE_CODES_STRIDE_1,
+            SEISMIC_HISTORY_VALUE_COEFFICIENTS_STRIDE_0, SEISMIC_HISTORY_VALUE_COEFFICIENTS_STRIDE_1,
+            SEISMIC_PARAM_SLAB_ROWS},
+        attention::prefill::DecodeRows<SEISMIC_TUNE_PARTS>{
+            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),
+            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS))},
+        attention::prefill::Block{static_cast<int>(blockIdx.z), static_cast<int>(blockIdx.x),
+                                static_cast<int>(blockIdx.y), SEISMIC_TUNE_PARTS});
+}
+
+#else
 
 namespace {
 
@@ -48,7 +85,7 @@ __device__ __forceinline__ void absorb(State &state, float (&bias)[H],
                                        const u32 (&k)[N][KeyCodes::words],
                                        const float2 (&kc)[N],
                                        const u32 (&v)[N][ValueCodes::words],
-                                       const float2 (&vc)[N], int count) {
+                                       const float2 (&vc)[N], int count, int lane) {
     float score[N][H];
 #pragma unroll
     for (int t = 0; t < N; ++t) {
@@ -60,9 +97,10 @@ __device__ __forceinline__ void absorb(State &state, float (&bias)[H],
             float dot = 0.0f;
 #pragma unroll
             for (int d = 0; d < DPL; ++d) dot = __fmaf_rn(q[h][d], key[d], dot);
-            score[t][h] = seismic_warp_sum_f32(__fmaf_rn(kc[t].x, dot, kc[t].y * qsum[h]));
+            score[t][h] = __fmaf_rn(kc[t].x, dot, kc[t].y * qsum[h]);
         }
     }
+    attention::score_sums(score, lane);
     float value[N][DPL];
 #pragma unroll
     for (int t = 0; t < N; ++t)
@@ -221,7 +259,7 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
                             kc[t] = attention::coefficients(key_pairs + at * key_pair_step);
                             vc[t] = attention::coefficients(value_pairs + at * value_pair_step);
                         }
-                        absorb(state, bias, q, qsum, k, kc, v, vc, count);
+                        absorb(state, bias, q, qsum, k, kc, v, vc, count, lane);
                     }
                     part_lo = part_hi;
                 }
@@ -233,7 +271,7 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
                     attention::prepared_key(in, token, kv, k[0], own, lane);
                     attention::fresh_value(in, token, kv, v[0], lane);
                     float score[1][H];
-                    attention::scores(q, k, score);
+                    attention::scores(q, k, score, lane);
                     attention::absorb(state, score, v, 1);
                 }
             }
@@ -245,8 +283,10 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
                                              kv, part, warp, lane);
 }
 
+#endif
+
 extern "C" __global__ void attention_decode_k8v4_merge(SEISMIC_KERNEL_PARAMS) {
-    attention::decode_gate<PARTS>(
+    attention::decode_gate<SEISMIC_TUNE_PARTS>(
         ATTENTION_INPUTS(),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS)),

@@ -70,6 +70,7 @@ pub(super) fn qualify_attention(
             key_weight: &key,
             value_weight: &value,
             epsilon: 1.0e-5,
+            project_mode: 0,
         })
         .map_err(|e| qualification_dynamic("attention_project", label, e))?;
     let per_head = |tensor: &Tensor, extents: &[u64]| {
@@ -136,7 +137,9 @@ pub(super) fn qualify_attention(
     }
     let activation = binding.activation;
     let mixed = match &kernels.history {
-        AttentionHistoryKernels::Dense { decode, prefill } => [
+        AttentionHistoryKernels::Dense {
+            decode, prefill, ..
+        } => [
             (
                 "attention_decode",
                 mix!(decode, attention_decode,
@@ -148,7 +151,9 @@ pub(super) fn qualify_attention(
                     history_key: activation, width, history_value: activation, width),
             ),
         ],
-        AttentionHistoryKernels::AffineK8V4 { decode, prefill } => {
+        AttentionHistoryKernels::AffineK8V4 {
+            decode, prefill, ..
+        } => {
             let pairs = crate::operators::attention::graph::affine_coefficients(width);
             [
                 (
@@ -172,14 +177,16 @@ pub(super) fn qualify_attention(
     };
     for (entry, gated) in mixed.iter().map(|(entry, gated)| (*entry, gated)) {
         let result = match (&kernels.output, binding.tail) {
-            (SublayerOutput::Residual(output_kernel), SublayerTail::Residual) => output_kernel
-                .call(attention_output::Args {
-                    hidden: &residual,
-                    gated,
-                    output_weight: &output,
-                })
-                .map_err(|e| qualification_dynamic("attention_output", label, e))?
-                .value,
+            (SublayerOutput::Residual(output_kernel), SublayerTail::Residual) => {
+                output_kernel
+                    .call(attention_output::Args {
+                        hidden: &residual,
+                        gated,
+                        output_weight: &output,
+                    })
+                    .map_err(|e| qualification_dynamic("attention_output", label, e))?
+                    .value
+            }
             (SublayerOutput::PostNorm(tail), SublayerTail::PostNorm { norm, .. }) => {
                 let source = gated
                     .reshape(&[1, heads * width])
@@ -213,8 +220,13 @@ pub(super) fn qualify_post_norm(
     label: &str,
 ) -> Result<Tensor, CatalogFailure> {
     let hidden = residual.extents()[1];
-    let weight_scale =
-        semantic_ones(device, Element::f32(), &[weight_scale], "project_rows", label)?;
+    let weight_scale = semantic_ones(
+        device,
+        Element::f32(),
+        &[weight_scale],
+        "project_rows",
+        label,
+    )?;
     let projected = kernels
         .project
         .call(project_rows::Args {
@@ -473,7 +485,10 @@ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
             unit_packet(24, &[(0, &[0x00, 0x3c]), (8, &[0x11; 16])]),
         ),
         // E2M1 code 2 (value 1) and E8M0 scale 127 (2^0).
-        "mxfp4g32" => ("gguf_mxfp4", unit_packet(17, &[(0, &[127]), (1, &[0x22; 16])])),
+        "mxfp4g32" => (
+            "gguf_mxfp4",
+            unit_packet(17, &[(0, &[127]), (1, &[0x22; 16])]),
+        ),
         // E2M1 code 2 (value 1) and four UE4M3 scales 0x38 (1.0).
         "nvfp4g16" => (
             "gguf_nvfp4",

@@ -94,6 +94,12 @@ class Native(Adapter):
         if sources_digest(engine_sources(self.workspace)) != self.identity["engine_source_sha256"]:
             raise ValueError("native engine source changed after preparation")
 
+    async def memory_observation(self, engine):
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
+            response = await client.get(engine.endpoint + "/v1/memory")
+            response.raise_for_status()
+            return response.json()
+
     def argv(self, port, context, parallel, directory):
         native = self.native
         return [
@@ -114,6 +120,11 @@ class Native(Adapter):
             *(["--cache-dir", str(native.cache_dir)] if native.cache_dir else []),
             "--output-capacity",
             str(OUTPUT_CAPACITY),
+            *(
+                ["--prefill-tokens", str(native.prefill_tokens)]
+                if native.prefill_tokens is not None
+                else []
+            ),
             "--method",
             native.method,
             *(
@@ -142,7 +153,11 @@ class Native(Adapter):
                 response = await client.post(
                     engine.endpoint + "/v1/count", json=request.body(engine.model)
                 )
-                response.raise_for_status()
+                if response.is_error:
+                    raise ValueError(
+                        f"/v1/count rejected {request.id}: "
+                        f"HTTP {response.status_code}: {response.text[:2000]}"
+                    )
                 count = response.json()["prompt_tokens"]
                 if type(count) is not int or count <= 0:
                     raise ValueError(f"/v1/count returned no prompt token count: {response.text}")

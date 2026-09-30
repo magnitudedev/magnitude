@@ -21,7 +21,8 @@ pub use native_target::{CommitSpan, TargetOutput, TargetReadoutGraphResult};
 pub use native_target_graph::{PreparedTargetGraphs, SealReport};
 pub use native_vision::PreparedVisionGraphs;
 pub use submission::{
-    CompletedWork, DeviceSubmission, ProgramSubmission, ReadySubmission, SubmittedTarget,
+    CompletedWork, DeviceSubmission, ProgramSubmission, ReadySubmission, SubmittedHead,
+    SubmittedTarget,
 };
 
 use crate::{

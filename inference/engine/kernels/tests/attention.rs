@@ -4,7 +4,10 @@
 // (Metal, or Vulkan elsewhere) and the CPU.
 
 use magnitude_kernels::{attention_decode, attention_prefill};
-use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
+use seismic::{
+    BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor,
+    Tensor,
+};
 
 include!("attention_common/fixtures.rs");
 
@@ -35,14 +38,30 @@ struct Bound {
 /// Slab-stored key and value history. The two tensors' slabs are allocated
 /// alternately, so a slab's successor in one tensor never follows it in
 /// memory (a read running past a slab's rows lands in the other tensor).
-fn history_slabs(device: &Device, case: &Case, slab_rows: u32, reuse_middle: bool) -> [(SlabTensor, Tensor); 2] {
+fn history_slabs(
+    device: &Device,
+    case: &Case,
+    slab_rows: u32,
+    reuse_middle: bool,
+) -> [(SlabTensor, Tensor); 2] {
     let (rows, kv, width) = (case.history_rows, case.geometry.kv, case.geometry.w());
     let slab_rows = u64::from(slab_rows);
     let row_bytes = kv * width * 2;
     let mut tensors = [&case.history_key, &case.history_value].map(|values| {
-        let slabs = SlabTensor::new(device, slab_rows, rows as u64,
-            vec![SlabRegion { element: Element::bf16(), row_shape: vec![kv as u64, width as u64] }]).unwrap();
-        let bytes = values.iter().flat_map(|value| bf16_bits(*value).to_le_bytes()).collect::<Vec<_>>();
+        let slabs = SlabTensor::new(
+            device,
+            slab_rows,
+            rows as u64,
+            vec![SlabRegion {
+                element: Element::bf16(),
+                row_shape: vec![kv as u64, width as u64],
+            }],
+        )
+        .unwrap();
+        let bytes = values
+            .iter()
+            .flat_map(|value| bf16_bits(*value).to_le_bytes())
+            .collect::<Vec<_>>();
         (slabs, bytes)
     });
     for index in 0..(rows as u64).div_ceil(slab_rows) {
@@ -50,8 +69,13 @@ fn history_slabs(device: &Device, case: &Case, slab_rows: u32, reuse_middle: boo
             slabs.add_slab().unwrap();
             let start = index * slab_rows;
             let count = slab_rows.min(rows as u64 - start);
-            slabs.region_rows(0, start, count).unwrap()
-                .write_from_host(&bytes[start as usize * row_bytes..(start + count) as usize * row_bytes]).unwrap();
+            slabs
+                .region_rows(0, start, count)
+                .unwrap()
+                .write_from_host(
+                    &bytes[start as usize * row_bytes..(start + count) as usize * row_bytes],
+                )
+                .unwrap();
         }
     }
     if reuse_middle {
@@ -60,10 +84,18 @@ fn history_slabs(device: &Device, case: &Case, slab_rows: u32, reuse_middle: boo
             let old = slabs.slab(1).unwrap().observe_storage();
             slabs.free_slab(1).unwrap();
             assert_eq!(slabs.add_slab().unwrap(), 1);
-            assert_ne!(old.identity(), slabs.slab(1).unwrap().observe_storage().identity());
+            assert_ne!(
+                old.identity(),
+                slabs.slab(1).unwrap().observe_storage().identity()
+            );
             let start = slab_rows as usize;
-            slabs.region_rows(0, slab_rows, slab_rows).unwrap()
-                .write_from_host(&bytes[start * row_bytes..(start + slab_rows as usize) * row_bytes]).unwrap();
+            slabs
+                .region_rows(0, slab_rows, slab_rows)
+                .unwrap()
+                .write_from_host(
+                    &bytes[start * row_bytes..(start + slab_rows as usize) * row_bytes],
+                )
+                .unwrap();
         }
     }
     tensors.map(|(slabs, _)| {
@@ -142,15 +174,105 @@ fn decode_specializations_on(
             let base = qwen_form(statics(geometry), geometry)
                 .with_param("SPAN", span)
                 .with_param("PARTS", parts)
-                .with_param("SIMDS", simds);
-            let label = format!("{:?} (SPAN, PARTS, SIMDS) {:?}", device.backend(), (span, parts, simds));
+                .with_param("SIMDS", simds)
+                .with_param("MATRIX", 0);
+            // Metal's vector form also names its (unused) matrix key tile.
+            let base = if device.backend() == BackendName::Metal {
+                base.with_param("KEYS", 16).with_param("TOKENS", 1)
+            } else {
+                base
+            };
+            let label = format!(
+                "{:?} (SPAN, PARTS, SIMDS) {:?}",
+                device.backend(),
+                (span, parts, simds)
+            );
             // The query group also splits across simdgroups/subgroups: every
             // admissible slicing.
             decode_slices(geometry, simds)
-                .map(|slices| (format!("{label} SLICES {slices}"), base.clone().with_param("SLICES", slices)))
+                .map(|slices| {
+                    (
+                        format!("{label} SLICES {slices}"),
+                        base.clone().with_param("SLICES", slices),
+                    )
+                })
                 .collect::<Vec<_>>()
         })
+        .chain(vulkan_matrix_specialization(device, geometry, configs[0].1))
+        .chain(metal_matrix_specializations(device, geometry, configs[0].1))
         .collect()
+}
+
+/// Metal's grouped-query matrix decode form at `geometry` over `parts`
+/// partitions, one row and four rows per threadgroup where admissible: a
+/// simdgroup's outputs cover at most 128 columns of every 8-row block, one
+/// team of the column slices (four simdgroups for one slice), 16-key tiles.
+fn metal_matrix_specializations(
+    device: &Device,
+    geometry: Geometry,
+    parts: u64,
+) -> Vec<(String, NativeSpecialization)> {
+    if device.backend() != BackendName::Metal {
+        return Vec::new();
+    }
+    let (w, keys) = (geometry.w() as u64, 16u64);
+    [1u64, 4]
+        .into_iter()
+        .filter_map(|tokens| {
+            let rows = (tokens * geometry.g as u64).div_ceil(8) * 8;
+            let cols = (rows / 8 * w / 128).max(1);
+            let simds = if cols > 1 { cols } else { 4 };
+            let exchange = if cols > 1 {
+                2 * simds * rows * keys * 4
+            } else {
+                0
+            };
+            let bytes = rows * w * 2
+                + (simds * keys * (w / cols + 8) * 2 + exchange).max(rows * w * 4)
+                + simds / cols * rows * 8;
+            (w % cols == 0 && (w / cols) % 32 == 0 && bytes <= 32768).then(|| {
+                (
+                    format!(
+                        "Metal matrix (PARTS, SIMDS, TOKENS) {:?}",
+                        (parts, simds, tokens)
+                    ),
+                    qwen_form(statics(geometry), geometry)
+                        .with_param("SPAN", 32)
+                        .with_param("PARTS", parts)
+                        .with_param("SIMDS", simds)
+                        .with_param("SLICES", 1)
+                        .with_param("MATRIX", 1)
+                        .with_param("KEYS", keys)
+                        .with_param("TOKENS", tokens),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Vulkan's grouped-query matrix decode form at `geometry` over `parts`
+/// partitions: the fewest subgroups whose 16-row blocks hold the query
+/// group.
+fn vulkan_matrix_specialization(
+    device: &Device,
+    geometry: Geometry,
+    parts: u64,
+) -> Option<(String, NativeSpecialization)> {
+    if device.backend() != BackendName::Vulkan {
+        return None;
+    }
+    let simds = [1u64, 2, 4, 8]
+        .into_iter()
+        .find(|simds| geometry.g as u64 <= simds * 16)?;
+    Some((
+        format!("Vulkan matrix (PARTS, SIMDS) {:?}", (parts, simds)),
+        qwen_form(statics(geometry), geometry)
+            .with_param("SPAN", 32)
+            .with_param("PARTS", parts)
+            .with_param("SIMDS", simds)
+            .with_param("SLICES", 1)
+            .with_param("MATRIX", 1),
+    ))
 }
 
 /// The CPU forms' statics: the head width and Qwen's form.
@@ -255,7 +377,10 @@ fn run_decode(
     bound: &mut Bound,
     case: &Case,
 ) -> Tensor {
-    kernel.call(args!(attention_decode, bound, case)).unwrap().value
+    kernel
+        .call(args!(attention_decode, bound, case))
+        .unwrap()
+        .value
 }
 
 fn run_prefill(
@@ -263,7 +388,10 @@ fn run_prefill(
     bound: &mut Bound,
     case: &Case,
 ) -> Tensor {
-    kernel.call(args!(attention_prefill, bound, case)).unwrap().value
+    kernel
+        .call(args!(attention_prefill, bound, case))
+        .unwrap()
+        .value
 }
 
 /// Gated outputs agree within bf16 publication plus reduced-precision query
@@ -461,8 +589,18 @@ fn prefill_matches_portable_body_on(device: &Device, case: &Case) {
 #[test]
 fn attention_reads_and_writes_across_history_slabs() {
     let rows = [
-        Row { spans: vec![(0, 16)], fresh: (0, 1), destination: 49, position: 16 },
-        Row { spans: vec![(32, 48)], fresh: (1, 2), destination: 50, position: 16 },
+        Row {
+            spans: vec![(0, 16)],
+            fresh: (0, 1),
+            destination: 49,
+            position: 16,
+        },
+        Row {
+            spans: vec![(32, 48)],
+            fresh: (1, 2),
+            destination: 50,
+            position: 16,
+        },
     ];
     let case = Case::new(SMALL, 64, 1, &rows, 41);
     check_attention_slab_case(&case, false);
@@ -474,8 +612,18 @@ fn attention_reads_and_writes_across_history_slabs() {
 #[test]
 fn attention_reads_spans_crossing_history_slabs() {
     let rows = [
-        Row { spans: vec![(0, 200)], fresh: (0, 1), destination: 200, position: 200 },
-        Row { spans: vec![(7, 150), (170, 199)], fresh: (1, 2), destination: 201, position: 199 },
+        Row {
+            spans: vec![(0, 200)],
+            fresh: (0, 1),
+            destination: 200,
+            position: 200,
+        },
+        Row {
+            spans: vec![(7, 150), (170, 199)],
+            fresh: (1, 2),
+            destination: 201,
+            position: 199,
+        },
     ];
     let case = Case::new(SMALL, 224, 2, &rows, 43);
     // A reused middle slab puts consecutive slabs at unrelated addresses.
@@ -505,8 +653,18 @@ fn attention_reads_spans_crossing_history_slabs() {
 #[test]
 fn attention_reads_and_writes_after_reusing_an_interior_slab() {
     let rows = [
-        Row { spans: vec![(0, 16)], fresh: (0, 1), destination: 81, position: 16 },
-        Row { spans: vec![(32, 48)], fresh: (1, 2), destination: 82, position: 16 },
+        Row {
+            spans: vec![(0, 16)],
+            fresh: (0, 1),
+            destination: 81,
+            position: 16,
+        },
+        Row {
+            spans: vec![(32, 48)],
+            fresh: (1, 2),
+            destination: 82,
+            position: 16,
+        },
     ];
     let case = Case::new(SMALL, 96, 1, &rows, 41);
     check_attention_slab_case(&case, true);
@@ -515,32 +673,67 @@ fn attention_reads_and_writes_after_reusing_an_interior_slab() {
 fn check_attention_slab_case(case: &Case, reused: bool) {
     let expected = case.expected();
     let catalog = DeviceCatalog::discover().unwrap();
-    for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
-        let Ok(device) = catalog.open_backend(backend) else { continue };
-        let decode_spec = if backend == BackendName::Cuda {
-            qwen_form(statics(SMALL), SMALL)
-                .with_param("PARTS", 12)
-                .with_param("WARPS", 4)
-                .with_param("SLICES", 1)
-        } else {
-            decode_specializations_on(&device, SMALL, &[(32, 16, 4)])
-                .into_iter().next().unwrap().1
+    for backend in [
+        BackendName::Cpu,
+        BackendName::Metal,
+        BackendName::Cuda,
+        BackendName::Vulkan,
+    ] {
+        let Ok(device) = catalog.open_backend(backend) else {
+            continue;
         };
-        let mut bound = if reused {
-            Bound::new_with_reused_slab_rows(&device, case, 32)
+        // CUDA: the vector and the grouped-query matrix forms.
+        let decode_specs = if backend == BackendName::Cuda {
+            [(4, 0, 2, 1), (1, 1, 3, 2)]
+                .into_iter()
+                .map(|(warps, matrix, stages, columns)| {
+                    qwen_form(statics(SMALL), SMALL)
+                        .with_param("PARTS", 12)
+                        .with_param("WARPS", warps)
+                        .with_param("SLICES", 1)
+                        .with_param("MATRIX", matrix)
+                        .with_param("STAGES", stages)
+                        .with_param("COLUMNS", columns)
+                })
+                .collect::<Vec<_>>()
         } else {
-            Bound::new_with_slab_rows(&device, case, 32)
+            vec![
+                decode_specializations_on(&device, SMALL, &[(32, 16, 4)])
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .1,
+            ]
         };
-        let gated = run_decode(&decode_kernel(&device, &decode_spec), &mut bound, case);
-        check(&format!("{backend:?} slab decode"), case, &gated, &bound, &expected);
+        for decode_spec in &decode_specs {
+            let mut bound = if reused {
+                Bound::new_with_reused_slab_rows(&device, case, 32)
+            } else {
+                Bound::new_with_slab_rows(&device, case, 32)
+            };
+            let gated = run_decode(&decode_kernel(&device, decode_spec), &mut bound, case);
+            check(
+                &format!("{backend:?} slab decode {decode_spec:?}"),
+                case,
+                &gated,
+                &bound,
+                &expected,
+            );
+        }
 
         let prefill_spec = if backend == BackendName::Cuda {
             qwen_form(statics(SMALL), SMALL)
                 .with_param("WARPS", 4)
                 .with_param("SPLIT_GROUPS", 1)
+                .with_param("STAGES", 3)
+                .with_param("COLUMNS", 2)
+                .with_param("QREG", 1)
         } else {
             prefill_specializations_on(&device, SMALL, &[(8, 1)])
-                .into_iter().next().unwrap().1
+                .into_iter()
+                .next()
+                .unwrap()
+                .1
         };
         let mut bound = if reused {
             Bound::new_with_reused_slab_rows(&device, case, 32)
@@ -548,7 +741,13 @@ fn check_attention_slab_case(case: &Case, reused: bool) {
             Bound::new_with_slab_rows(&device, case, 32)
         };
         let gated = run_prefill(&prefill_kernel(&device, &prefill_spec), &mut bound, case);
-        check(&format!("{backend:?} slab prefill"), case, &gated, &bound, &expected);
+        check(
+            &format!("{backend:?} slab prefill"),
+            case,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }
 

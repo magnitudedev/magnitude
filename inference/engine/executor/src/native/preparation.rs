@@ -39,7 +39,7 @@ use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{
     conditioning_overlay, draft_confidence, draft_convolve_input, draft_convolve_residual,
     draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, moe_tail,
-    per_layer_inputs, post_norm_residual, repack_weight, tap_rows,
+    per_layer_inputs, post_norm_residual, repack_weight, tap_rows, widen_rows,
 };
 use magnitude_state::KvCodec;
 
@@ -199,6 +199,7 @@ impl NativePreparationCache {
             device,
             plan,
             tuning,
+            limits,
             epsilon,
             Specializer::census(device),
             Tuner::census(
@@ -215,6 +216,7 @@ impl NativePreparationCache {
             device,
             plan,
             tuning,
+            limits,
             epsilon,
             spec,
             Tuner::new(device, tuning, limits, weights, budgets),
@@ -244,6 +246,7 @@ impl NativePreparationCache {
 
 struct Preparation<'a> {
     device: &'a Device,
+    limits: TuningLimits,
     spec: Specializer<'a>,
     tuner: Tuner<'a>,
     epsilon: f32,
@@ -262,12 +265,14 @@ impl<'a> Preparation<'a> {
         device: &'a Device,
         plan: &ProgramPlan,
         tuning: TuningContext<'a>,
+        limits: TuningLimits,
         epsilon: f32,
         spec: Specializer<'a>,
         tuner: Tuner<'a>,
     ) -> Self {
         Self {
             device,
+            limits,
             spec,
             tuner,
             epsilon,
@@ -390,28 +395,30 @@ impl<'a> Preparation<'a> {
                 | FeedForwardProgramSlot::Parallel(_) => None,
             },
         ));
-        let general_routed_layers =
-            BindingLayers::of(target.blocks().iter().enumerate().filter_map(|(index, block)| {
-                match block.feed_forward()? {
+        let general_routed_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, block)| match block.feed_forward()? {
                     FeedForwardProgramSlot::GeneralRouted(binding) => {
                         Some((binding, sublayer_scope(index, 1)))
                     }
                     FeedForwardProgramSlot::Dense(_)
                     | FeedForwardProgramSlot::Routed(_)
                     | FeedForwardProgramSlot::Parallel(_) => None,
+                }),
+        );
+        let parallel_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.feed_forward()? {
+                FeedForwardProgramSlot::Parallel(binding) => {
+                    Some((binding, sublayer_scope(index, 1)))
                 }
-            }));
-        let parallel_layers =
-            BindingLayers::of(target.blocks().iter().enumerate().filter_map(|(index, block)| {
-                match block.feed_forward()? {
-                    FeedForwardProgramSlot::Parallel(binding) => {
-                        Some((binding, sublayer_scope(index, 1)))
-                    }
-                    FeedForwardProgramSlot::Dense(_)
-                    | FeedForwardProgramSlot::Routed(_)
-                    | FeedForwardProgramSlot::GeneralRouted(_) => None,
-                }
-            }));
+                FeedForwardProgramSlot::Dense(_)
+                | FeedForwardProgramSlot::Routed(_)
+                | FeedForwardProgramSlot::GeneralRouted(_) => None,
+            },
+        ));
         for block in target.blocks() {
             match block.mixer() {
                 MixerProgramSlot::Attention(b) if !self.target.attention.contains_key(&b) => {
@@ -504,6 +511,7 @@ impl<'a> Preparation<'a> {
                 weight: b.weight,
                 activation: b.activation,
                 epsilon: self.epsilon,
+                rows: None,
             },
         )?;
         let selected = self.spec.tuned(
@@ -622,39 +630,116 @@ impl<'a> Preparation<'a> {
             shape,
             scopes: scopes.clone(),
             epsilon: self.epsilon,
+            decode_rows: None,
         };
-        let history =
-            match binding.history {
-                KvCodec::Dense => {
-                    let decode = self
-                        .spec
-                        .tuned(&mut self.tuner, &AttentionDecodeTuning(mix()))?;
-                    let prefill = self
-                        .spec
-                        .tuned(&mut self.tuner, &AttentionPrefillTuning(mix()))?;
-                    decode
-                        .zip(prefill)
-                        .map(|(decode, prefill)| AttentionHistoryKernels::Dense { decode, prefill })
+        let history = match binding.history {
+            KvCodec::Dense => {
+                // As for K8/V4, multi-row launches (draft blocks,
+                // verification) get their own tuning identity, so their
+                // grouped form is not displaced by the single-row one.
+                let split_decode = matches!(
+                    self.device.backend(),
+                    seismic::BackendName::Metal | seismic::BackendName::Vulkan
+                ) && self.limits.max_rows >= 2;
+                let mut single = mix();
+                if split_decode {
+                    single.decode_rows = Some(1..2);
                 }
-                KvCodec::AffineK8V4 => {
-                    let decode = self
-                        .spec
-                        .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(mix()))?;
-                    let prefill = self
-                        .spec
-                        .tuned(&mut self.tuner, &AttentionPrefillK8V4Tuning(mix()))?;
-                    decode.zip(prefill).map(|(decode, prefill)| {
-                        AttentionHistoryKernels::AffineK8V4 { decode, prefill }
+                let decode = self
+                    .spec
+                    .tuned(&mut self.tuner, &AttentionDecodeTuning(single))?;
+                let verify = if split_decode {
+                    let mut selected = mix();
+                    selected.decode_rows =
+                        Some(2..crate::operators::attention::graph::DECODE_ROWS + 1);
+                    self.spec
+                        .tuned(&mut self.tuner, &AttentionDecodeTuning(selected))?
+                } else {
+                    None
+                };
+                let prefill = self
+                    .spec
+                    .tuned(&mut self.tuner, &AttentionPrefillTuning(mix()))?;
+                decode
+                    .zip(prefill)
+                    .map(|(decode, prefill)| AttentionHistoryKernels::Dense {
+                        decode,
+                        verify,
+                        prefill,
                     })
+            }
+            KvCodec::AffineK8V4 => {
+                let split_decode = matches!(
+                    self.device.backend(),
+                    seismic::BackendName::Metal | seismic::BackendName::Vulkan
+                ) && self.limits.max_rows >= 2;
+                let mut single = mix();
+                if self.device.backend() == seismic::BackendName::Vulkan && split_decode {
+                    single.decode_rows = Some(1..2);
                 }
-                KvCodec::RotatedK4V4 => {
-                    return Err(CatalogFailure::Preparation {
-                        entry: "attention_decode",
-                        bindings: format!("{shape:?}"),
-                        outcome: "the native path has no rotated K4/V4 history entries".into(),
+                let decode = self
+                    .spec
+                    .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(single))?;
+                let specialized_m4 = split_decode
+                    && self.device.backend() == seismic::BackendName::Metal
+                    && shape.group == 8
+                    && shape.width == 256
+                    && self.limits.max_rows >= 4;
+                let verify = if split_decode {
+                    let mut selected = mix();
+                    selected.decode_rows = Some(
+                        2..if specialized_m4 {
+                            4
+                        } else {
+                            crate::operators::attention::graph::DECODE_ROWS + 1
+                        },
+                    );
+                    self.spec
+                        .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(selected))?
+                } else {
+                    None
+                };
+                // The packed form reuses each K/V tile across four Verify
+                // rows. Give that workload its own tuning identity so
+                // shorter and wider rows cannot displace its form.
+                let verify_four = if specialized_m4 {
+                    let mut selected = mix();
+                    selected.decode_rows = Some(4..5);
+                    self.spec
+                        .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(selected))?
+                } else {
+                    None
+                };
+                let verify_eight = if specialized_m4 && self.limits.max_rows >= 5 {
+                    let mut selected = mix();
+                    selected.decode_rows =
+                        Some(5..crate::operators::attention::graph::DECODE_ROWS + 1);
+                    self.spec
+                        .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(selected))?
+                } else {
+                    None
+                };
+                let prefill = self
+                    .spec
+                    .tuned(&mut self.tuner, &AttentionPrefillK8V4Tuning(mix()))?;
+                decode
+                    .zip(prefill)
+                    .map(|(decode, prefill)| AttentionHistoryKernels::AffineK8V4 {
+                        decode,
+                        verify,
+                        verify_four,
+                        verify_eight,
+                        prefill,
                     })
-                }
-            };
+            }
+            KvCodec::RotatedK4V4 => {
+                return Err(CatalogFailure::Preparation {
+                    entry: "attention_decode",
+                    bindings: format!("{shape:?}"),
+                    outcome: "the native path has no rotated K4/V4 history entries".into(),
+                })
+            }
+        };
         let output = match binding.tail {
             SublayerTail::Residual => self
                 .spec
@@ -669,7 +754,13 @@ impl<'a> Preparation<'a> {
                 )?
                 .map(SublayerOutput::Residual),
             SublayerTail::PostNorm { norm, .. } => self
-                .post_norm(WeightKind::AttentionOutput, output, activation, norm, scopes)?
+                .post_norm(
+                    WeightKind::AttentionOutput,
+                    output,
+                    activation,
+                    norm,
+                    scopes,
+                )?
                 .map(SublayerOutput::PostNorm),
         };
         Ok(match (project, history, output) {
@@ -718,15 +809,16 @@ impl<'a> Preparation<'a> {
             state_space_gate::Elements {
                 A: binding.activation
             },
-            statics &[("G", shape.norm_groups()), ("U", shape.norm_heads), ("P", shape.head_width)]
+            statics
+                & [
+                    ("G", shape.norm_groups()),
+                    ("U", shape.norm_heads),
+                    ("P", shape.head_width)
+                ]
         );
-        let output = self.spec.tuned(
-            &mut self.tuner,
-            &StateSpaceOutputTuning {
-                binding,
-                scopes,
-            },
-        )?;
+        let output = self
+            .spec
+            .tuned(&mut self.tuner, &StateSpaceOutputTuning { binding, scopes })?;
         Ok(match (project, step, chunk, gate, output) {
             (Some(project), Some(step), Some(chunk), Some(gate), Some(output)) => {
                 Some(StateSpaceKernels {
@@ -1151,7 +1243,9 @@ impl<'a> Preparation<'a> {
                 .zip(grouped)
                 .map(|(decode, grouped)| ExpertKernels::Gated { decode, grouped })
         } else {
-            let decode = self.spec.tuned(&mut self.tuner, &RoutedUpTuning(decode()))?;
+            let decode = self
+                .spec
+                .tuned(&mut self.tuner, &RoutedUpTuning(decode()))?;
             let grouped = self
                 .spec
                 .tuned(&mut self.tuner, &RoutedUpTilesTuning(tiles()))?;
@@ -1509,15 +1603,14 @@ impl<'a> Preparation<'a> {
                 sublayer,
             })
         };
-        let attention_layers = BindingLayers::of(
-            draft_plan
-                .blocks()
-                .iter()
-                .enumerate()
-                .flat_map(|(index, b)| {
-                    [(b.attention, draft_scope(index, 0)), (b.injection, draft_scope(index, 0))]
-                }),
-        );
+        let attention_layers = BindingLayers::of(draft_plan.blocks().iter().enumerate().flat_map(
+            |(index, b)| {
+                [
+                    (b.attention, draft_scope(index, 0)),
+                    (b.injection, draft_scope(index, 0)),
+                ]
+            },
+        ));
         let dense_layers = BindingLayers::of(
             draft_plan
                 .blocks()
@@ -1530,7 +1623,9 @@ impl<'a> Preparation<'a> {
                 if self.draft_kernels().attention.contains_key(&attention) {
                     continue;
                 }
-                if let Some(kernels) = self.attention(attention, attention_layers.scopes(attention))? {
+                if let Some(kernels) =
+                    self.attention(attention, attention_layers.scopes(attention))?
+                {
                     self.draft_kernels().attention.insert(attention, kernels);
                 }
             }
@@ -1557,6 +1652,8 @@ impl<'a> Preparation<'a> {
                 )
             },
         )?;
+        let readout_vocabulary =
+            draft_readout_vocabulary(draft_plan.markov().is_some(), self.vocabulary);
         let head = self.spec.tuned(
             &mut self.tuner,
             &HeadRowsTuning {
@@ -1564,8 +1661,30 @@ impl<'a> Preparation<'a> {
                 weight: draft_plan.projection(),
                 activation: draft_plan.activation(),
                 epsilon: self.epsilon,
+                rows: Some(readout_vocabulary),
             },
         )?;
+        let shape = self.spec.tuned(
+            &mut self.tuner,
+            &ShapeRowsTuning {
+                vocabulary: readout_vocabulary,
+            },
+        )?;
+        let sample = self.spec.tuned(
+            &mut self.tuner,
+            &SampleRowsTuning {
+                vocabulary: readout_vocabulary,
+            },
+        )?;
+        let widen = fixed!(
+            self.spec,
+            device,
+            widen_rows,
+            format!("A={}", draft_plan.activation().name()),
+            widen_rows::Elements {
+                A: draft_plan.activation()
+            }
+        );
         let markov = match draft_plan.markov() {
             None => None,
             Some(markov) => {
@@ -1595,15 +1714,14 @@ impl<'a> Preparation<'a> {
                         scopes: vec![WeightScope::Draft],
                     },
                 )?;
-                let features =
-                    self.features(&bindings, draft_plan.output_norm(), activation)?;
+                let features = self.features(&bindings, draft_plan.output_norm(), activation)?;
                 let confidence = fixed!(
                     self.spec,
                     device,
                     draft_confidence,
                     bindings,
                     draft_confidence::Elements { A: activation },
-                    statics &[("D", self.hidden), ("R", rank)]
+                    statics & [("D", self.hidden), ("R", rank)]
                 );
                 match (embedding, projection, features, confidence) {
                     (Some(embedding), Some(projection), Some(features), Some(confidence)) => {
@@ -1625,6 +1743,9 @@ impl<'a> Preparation<'a> {
         let draft = self.draft_kernels();
         draft.embedding = embedding;
         draft.head = head;
+        draft.shape = shape;
+        draft.sample = sample;
+        draft.widen = widen;
         draft.markov = markov;
         draft.dflash2 = dflash2;
         Ok(())
@@ -1714,42 +1835,46 @@ impl<'a> Preparation<'a> {
         };
         let predecessor = codebook(&mut self.spec, selector.predecessor)?;
         let successor = codebook(&mut self.spec, selector.successor)?;
-        Ok(match (
-            complete,
-            convolve_input,
-            convolve_residual,
-            gated,
-            top_k,
-            path,
-            predecessor,
-            successor,
-        ) {
-            (
-                true,
-                Some(convolve_input),
-                Some(convolve_residual),
-                Some(gated),
-                Some(top_k),
-                Some(path),
-                Some(predecessor),
-                Some(successor),
-            ) => Some(Dflash2Kernels {
-                norms,
-                projections: prepared,
+        Ok(
+            match (
+                complete,
                 convolve_input,
                 convolve_residual,
                 gated,
                 top_k,
+                path,
                 predecessor,
                 successor,
-                path,
-            }),
-            _ => None,
-        })
+            ) {
+                (
+                    true,
+                    Some(convolve_input),
+                    Some(convolve_residual),
+                    Some(gated),
+                    Some(top_k),
+                    Some(path),
+                    Some(predecessor),
+                    Some(successor),
+                ) => Some(Dflash2Kernels {
+                    norms,
+                    projections: prepared,
+                    convolve_input,
+                    convolve_residual,
+                    gated,
+                    top_k,
+                    predecessor,
+                    successor,
+                    path,
+                }),
+                _ => None,
+            },
+        )
     }
 
     fn draft_kernels(&mut self) -> &mut DraftKernels {
-        self.draft.as_mut().expect("a draft plan creates the draft group")
+        self.draft
+            .as_mut()
+            .expect("a draft plan creates the draft group")
     }
 
     fn vision(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
@@ -1772,7 +1897,9 @@ impl<'a> Preparation<'a> {
             macro_rules! prepare {
                 ($module:ident, $map:ident, $elements:expr) => {{
                     let elements = $elements;
-                    if let Some(native) = fixed!(spec, device, $module, label, elements, statics & statics) {
+                    if let Some(native) =
+                        fixed!(spec, device, $module, label, elements, statics & statics)
+                    {
                         vision.$map.insert(kernel.clone(), native);
                     }
                 }};

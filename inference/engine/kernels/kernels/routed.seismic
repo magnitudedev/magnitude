@@ -48,24 +48,29 @@ fn routed_route[M, H, E, K](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
     return (normalized, coefficient)
 
 # Both backends: rows <= 8 form the router logits as a GEMV (one simdgroup or
-# warp per logit column, normalizing on the fly); larger classes normalize
-# once per row (`stage`), then a 32 x 32 tiled GEMM; selection with one
-# simdgroup or warp per row. SIMDGROUPS (columns per GEMV threadgroup) never
-# changes result bits.
+# warp per logit column); larger classes normalize once per row (`stage`),
+# then a 32 x 32 tiled GEMM; selection with one simdgroup or warp per row.
+# SIMDGROUPS (columns per GEMV threadgroup) never changes result bits.
 #
-# Metal: the GEMM runs on 8x8 F32 simdgroup matrices (128 threads). (CUDA:
+# Metal: the GEMV is the K1 GEMV body (32-lane groups, dense rows loaded a
+# whole packet at a time) over the normalized rows each threadgroup stages,
+# plus one threadgroup for the shared-expert gate row; F32 activations,
+# which the GEMV body does not stage, run one simdgroup per column that
+# normalizes on the fly, in the same sum order. The GEMM runs on 8x8 F32
+# simdgroup matrices (128 threads). (CUDA: the GEMV normalizes on the fly;
 # scalar FMAs over shared tiles, 256 threads.)
 native routed_route for metal from "metal/routed_route.metal":
     static (H, E, K)
-    params (SIMDGROUPS in [8, 4, 2])
+    params (SIMDGROUPS in [8, 16, 4, 2])
     where H % 32 == 0 and E % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
     launch routed_route_stage when M > 8:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch routed_route_gemv when M <= 8:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
+        threadgroups (ceil_div(E, SIMDGROUPS) + 1, 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
     launch routed_route_gemm when M > 8:
         threadgroups (ceil_div(E + 1, 32), ceil_div(M, 32), 1)
         threads_per_threadgroup (128, 1, 1)
@@ -240,20 +245,26 @@ fn routed_output[M, H, E, K, F, S](residual: &tensor[M, H] f32,
             value[row, column] = residual[row, column] + selected + f32(shared[row, column]) * coefficient[row]
     return value
 
-# Both backends: the storing lane carries each channel's running sum across
-# the choices in registers. Metal: the rows16 GEMV, lane groups as in the
-# expansion (a K = F or S row of 16-32 packets fills a 16-lane group). (CUDA:
-# the mma16 swap-AB GEMV.)
+# Metal: the K choices and the shared expert project side by side, one
+# simdgroup each, over a tile of (32 / LANES) * ROWS output channels; each
+# lane group of LANES lanes owns ROWS channels and issues all their packet
+# loads at once, reading the product straight from device memory. The
+# projections are the rows16 GEMV's sums for the same LANES (so LANES is
+# arithmetic); they meet in threadgroup memory, and one thread per channel
+# carries the slot-order sum. A lane holds ROWS * ceil(F / (32 LANES))
+# weight packets in registers (at most 8: more spill). (CUDA: the mma16
+# swap-AB GEMV per choice in slot order.)
 native routed_output for metal from "metal/routed_output.metal":
     static (H, K, F, S)
+    where K < 32 and ceil_div(max(F, S), 32 * LANES) * ROWS <= 8
     launch routed_output:
-        params (SIMDGROUPS in [2, 4, 8, 16], code ROWS in [1, 2, 4], code arithmetic LANES in [32, 16])
-        threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(max(F, S), 32), 448) * 64)
+        params (code ROWS in [2, 1, 4, 8], code arithmetic LANES in [16, 32])
+        threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
+        threads_per_threadgroup (32 * (K + 1), 1, 1)
 
-# CUDA: the swap-AB GEMV (TPW, KSPLIT as in the expansion). (Metal: the
-# rows16 GEMV.)
+# CUDA: the swap-AB GEMV (TPW, KSPLIT as in the expansion), the storing lane
+# carrying each channel's running sum across the choices. (Metal: the
+# side-by-side form.)
 native routed_output for cuda from "cuda/routed_output.cu":
     static (H, K, F, S)
     launch routed_output:
@@ -655,9 +666,11 @@ fn routed_select[M, H, E, K](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
 # 32 x 32 tiled GEMM over the router input; the selection with one
 # simdgroup or warp per row sorts each lane's E / 32 candidates once, then
 # takes K single-argmax rounds over the lane heads (the single-pass top-K).
+# Metal's GEMV is `routed_route`'s (`metal/lib/routed/router.h`): the K1 GEMV
+# body over the router input each threadgroup stages.
 native routed_select for metal from "metal/routed_select.metal":
     static (H, E, K)
-    params (SIMDGROUPS in [8, 4, 2])
+    params (SIMDGROUPS in [8, 16, 4, 2])
     where H % 32 == 0 and E % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (M * E * 4)
     scratch router_rows bytes (M * H * 4) when M > 8
@@ -667,6 +680,7 @@ native routed_select for metal from "metal/routed_select.metal":
     launch routed_select_gemv when M <= 8:
         threadgroups (ceil_div(E, SIMDGROUPS), 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
     launch routed_select_gemm when M > 8:
         threadgroups (ceil_div(E, 32), ceil_div(M, 32), 1)
         threads_per_threadgroup (128, 1, 1)
@@ -943,15 +957,19 @@ native routed_up for cpu from "cpu/routed_up.rs":
         threadgroups (ceil_div(F, ROWS), M * K, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Decode output: the storing lane carries each channel's running sum across
-# the choices in registers (as `routed_output`).
+# Decode output, as `routed_output` without the shared expert. Metal runs the
+# K choices side by side, one simdgroup each, over (32 / LANES) * ROWS
+# output channels per threadgroup; the projections meet in threadgroup
+# memory, and one thread per channel carries the slot-order sum. (CUDA: the
+# storing lane carries each channel's running sum across the choices in
+# registers.)
 native routed_down for metal from "metal/routed_down.metal":
     static (H, K, F)
+    where K <= 32 and ceil_div(F, 32 * LANES) * ROWS <= 8
     launch routed_down:
-        params (SIMDGROUPS in [2, 4, 8, 16], code ROWS in [1, 2, 4], code arithmetic LANES in [32, 16])
-        threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(F, 32), 448) * 64)
+        params (code ROWS in [2, 1, 4, 8], code arithmetic LANES in [16, 32])
+        threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
+        threads_per_threadgroup (32 * K, 1, 1)
 
 native routed_down for cuda from "cuda/routed_down.cu":
     static (H, K, F)

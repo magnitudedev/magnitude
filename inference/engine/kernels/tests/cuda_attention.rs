@@ -23,7 +23,10 @@ fn cuda_decode(
         &qwen_form(statics(geometry), geometry)
             .with_param("PARTS", parts)
             .with_param("WARPS", warps)
-            .with_param("SLICES", slices),
+            .with_param("SLICES", slices)
+            .with_param("MATRIX", 0)
+            .with_param("STAGES", 2)
+            .with_param("COLUMNS", 1),
     )
     .unwrap()
 }
@@ -38,7 +41,10 @@ fn cuda_prefill(
         attention_prefill::Elements { A: Element::bf16() },
         &qwen_form(statics(geometry), geometry)
             .with_param("WARPS", warps)
-            .with_param("SPLIT_GROUPS", split_groups),
+            .with_param("SPLIT_GROUPS", split_groups)
+            .with_param("STAGES", 2)
+            .with_param("COLUMNS", 1)
+            .with_param("QREG", 0),
     )
     .unwrap()
 }
@@ -74,8 +80,18 @@ fn cuda_decode_matches_portable_body() {
 fn cuda_decode_reads_spans_crossing_history_slabs() {
     let Some(device) = cuda() else { return };
     let rows = [
-        Row { spans: vec![(0, 200)], fresh: (0, 1), destination: 200, position: 200 },
-        Row { spans: vec![(7, 150), (170, 199)], fresh: (1, 2), destination: 201, position: 199 },
+        Row {
+            spans: vec![(0, 200)],
+            fresh: (0, 1),
+            destination: 200,
+            position: 200,
+        },
+        Row {
+            spans: vec![(7, 150), (170, 199)],
+            fresh: (1, 2),
+            destination: 201,
+            position: 199,
+        },
     ];
     let case = Case::new(SMALL, 224, 2, &rows, 43);
     let expected = case.expected();
@@ -265,7 +281,9 @@ fn cuda_attention_timings() {
         let mut bound = Bound::new(&device, &case);
         for config in PREFILL_CONFIGS {
             let kernel = cuda_prefill(&device, QWEN, config);
-            let measured = kernel.measure(vec![args!(attention_prefill, bound, case)], &options).unwrap();
+            let measured = kernel
+                .measure(vec![args!(attention_prefill, bound, case)], &options)
+                .unwrap();
             println!(
                 "prefill {rows} rows after {history} history WARPS,SPLIT_GROUPS {config:?}: {:.1} us",
                 measured.median * 1e6

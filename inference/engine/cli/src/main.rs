@@ -20,7 +20,9 @@ use magnitude_engine::worker::EngineClient;
 use magnitude_executor::ExecutionPath;
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_serving::engine::{EngineHost, EngineInvocation};
-use magnitude_serving::{HostChat, LoadProgress, ModelInvocation, ServedModels, Serving, ServingError};
+use magnitude_serving::{
+    HostChat, LoadProgress, ModelInvocation, ServedModels, Serving, ServingError,
+};
 use magnitude_state::KvCodec;
 use serde_json::json;
 use std::path::PathBuf;
@@ -36,6 +38,7 @@ struct Options {
     served_model: String,
     context_tokens: Option<usize>,
     output_capacity: usize,
+    prefill_tokens: usize,
     method: ModelMethod,
     mtp_proposals: Option<u8>,
     kv_codec: KvCodec,
@@ -47,7 +50,7 @@ struct Options {
 
 const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
 [--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
-[--output-capacity N] [--method auto|plain|mtp|dflash|dspark|dflash2] [--mtp-proposals N] \
+[--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2] [--mtp-proposals N] \
 [--kv-codec dense|affine-k8v4] [--lookahead on|off] [--telemetry URL] \
 [--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR]";
 
@@ -61,7 +64,8 @@ fn switch(flag: &str, value: &str) -> Result<bool, String> {
 }
 
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
-    args.next().ok_or_else(|| format!("{flag} requires a value"))
+    args.next()
+        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn number<T: std::str::FromStr>(
@@ -86,6 +90,7 @@ fn parse() -> Result<Options, String> {
     let mut served_model = None;
     let mut context_tokens = None;
     let mut output_capacity = 256;
+    let mut prefill_tokens = standard_service_limits().prefill_tokens;
     let mut method = ModelMethod::Auto;
     let mut mtp_proposals = None;
     let mut kv_codec = defaults.kv_codec;
@@ -107,6 +112,7 @@ fn parse() -> Result<Options, String> {
             "--served-model" => served_model = Some(value(&flag, &mut args)?),
             "--context-tokens" => context_tokens = Some(number(&flag, &mut args)?),
             "--output-capacity" => output_capacity = number(&flag, &mut args)?,
+            "--prefill-tokens" => prefill_tokens = number(&flag, &mut args)?,
             "--method" => {
                 method = match value(&flag, &mut args)?.as_str() {
                     "auto" => ModelMethod::Auto,
@@ -143,8 +149,8 @@ fn parse() -> Result<Options, String> {
             .map(|name| name.to_string_lossy().into_owned())
             .ok_or("--served-model is required when the model path has no file name")?,
     };
-    if context_tokens == Some(0) || output_capacity == 0 {
-        return Err("context and output capacity must be positive".into());
+    if context_tokens == Some(0) || output_capacity == 0 || prefill_tokens == 0 {
+        return Err("context, output capacity, and prefill tokens must be positive".into());
     }
     Ok(Options {
         target,
@@ -155,6 +161,7 @@ fn parse() -> Result<Options, String> {
         served_model,
         context_tokens,
         output_capacity,
+        prefill_tokens,
         method,
         mtp_proposals,
         kv_codec,
@@ -180,7 +187,8 @@ impl ServedModels for Standalone {
         let model = model.to_owned();
         Box::pin(async move {
             let invocation = self.engine.resolve(&model).await?;
-            Ok(Box::new(EngineInvocation::new(invocation, self.limits)) as Box<dyn ModelInvocation>)
+            Ok(Box::new(EngineInvocation::new(invocation, self.limits))
+                as Box<dyn ModelInvocation>)
         })
     }
 
@@ -226,6 +234,17 @@ async fn models(State(identity): State<Identity>) -> Json<serde_json::Value> {
     }))
 }
 
+async fn memory(State(identity): State<Identity>) -> Response {
+    match identity.engine.observe().await {
+        Ok(observation) => Json(json!(observation)).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": {"message": error.to_string(), "type": "server_error"}})),
+        )
+            .into_response(),
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("magnitude-engine: {error}");
@@ -237,7 +256,8 @@ fn run() -> Result<(), String> {
     let load_started = Instant::now();
     let options = parse()?;
     let _telemetry = Telemetry::open(&options.telemetry_endpoint);
-    let service = standard_service_limits();
+    let mut service = standard_service_limits();
+    service.prefill_tokens = options.prefill_tokens;
     let resolved = EngineConfiguration {
         package: PackageOptions {
             target: options.target,
@@ -298,10 +318,14 @@ fn run() -> Result<(), String> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/v1/memory", get(memory))
         .with_state(identity)
         .merge(
             Router::new()
-                .route("/v1/count", post(magnitude_serving::chat::count_chat_tokens))
+                .route(
+                    "/v1/count",
+                    post(magnitude_serving::chat::count_chat_tokens),
+                )
                 .with_state(serving.clone()),
         )
         .merge(magnitude_serving::router(serving));

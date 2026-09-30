@@ -3,6 +3,10 @@
 // encoded rows; the attend launch's producer warps decode code tiles into F16
 // operands beside its MMA warps (every product is F16).
 
+#define ATTENTION_STAGES SEISMIC_TUNE_STAGES
+#define ATTENTION_COLUMNS SEISMIC_TUNE_COLUMNS
+#define ATTENTION_Q_REGISTERS SEISMIC_TUNE_QREG
+#define ATTENTION_PRODUCER_WARPS SEISMIC_TUNE_PRODUCERS
 #include "lib/attention/prefill.cuh"
 
 // Affine history planes: codes [T, KV, W * B / 32] u32 and group (scale,
@@ -36,13 +40,16 @@ extern "C" __global__ void __launch_bounds__(256)
             reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTS)) \
     }
 
-extern "C" __global__ void __launch_bounds__(attention::prefill::WARPS * 64, 1)
+extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS + attention::prefill::PRODUCERS, 1)
     attention_prefill_k8v4_attend(SEISMIC_KERNEL_PARAMS) {
-    attention::prefill::attend(ATTENTION_INPUTS(), HISTORY(),
-                               SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES),
-                               SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
-                               SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES),
-                               SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SPLIT());
+    attention::prefill::attend(
+        ATTENTION_INPUTS(), HISTORY(),
+        attention::prefill::PrefillRows{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES),
+                                      SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
+                                      SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES),
+                                      SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SPLIT()},
+        attention::prefill::Block{static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y),
+                                static_cast<int>(blockIdx.z), static_cast<int>(gridDim.z)});
 }
 
 extern "C" __global__ void attention_prefill_k8v4_merge(SEISMIC_KERNEL_PARAMS) {

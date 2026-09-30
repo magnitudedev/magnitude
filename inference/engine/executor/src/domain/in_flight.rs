@@ -22,6 +22,8 @@ pub struct HeadFlight<S: ProgramSubmission<CompletedWork = crate::CompletedHeadW
     pub(super) steps: usize,
     pub(super) submission: S,
     pub(super) started: Instant,
+    /// Optional one-flight launch attribution for diagnosing a proposing head.
+    pub(super) launch_trace: Option<seismic::SubmissionTrace>,
 }
 
 impl<S: ProgramSubmission<CompletedWork = crate::CompletedHeadWork>> HeadFlight<S> {
@@ -30,7 +32,22 @@ impl<S: ProgramSubmission<CompletedWork = crate::CompletedHeadWork>> HeadFlight<
     }
 }
 
-pub struct TargetFlight<S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork> = <NativeFamily as ProgramFamily>::TargetSubmission> {
+/// A prompt chunk's drafter entry, drafted on the device behind its target
+/// flight, conditioned by the flight's feature output. It commits with the
+/// chunk.
+pub(super) struct PrimingFlight<H> {
+    pub(super) request: RequestId,
+    pub(super) submission: H,
+    /// For a claimed lookahead: the accepted head state its successor
+    /// advance attaches to at finish, or `None` when nobody claimed it (its
+    /// rows are discarded). `None` for an ordinary flight.
+    pub(super) continuation: Option<Option<InFlightState>>,
+}
+
+pub struct TargetFlight<
+    S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork> = <NativeFamily as ProgramFamily>::TargetSubmission,
+    H: ProgramSubmission<CompletedWork = crate::CompletedHeadWork> = <NativeFamily as ProgramFamily>::HeadSubmission,
+> {
     pub(super) requests: Vec<(
         RequestId,
         usize,
@@ -39,6 +56,10 @@ pub struct TargetFlight<S: ProgramSubmission<CompletedWork = crate::CompletedTar
         usize,
     )>,
     pub(super) submission: S,
+    /// The drafter entry of the flight's prompt chunk, when it primes one.
+    pub(super) priming: Option<PrimingFlight<H>>,
+    /// Optional attribution for one prefill flight selected by diagnostics.
+    pub(super) launch_trace: Option<seismic::SubmissionTrace>,
     pub(super) started: Instant,
     /// When the device could begin this step: its submission, or for a step
     /// queued behind its predecessor (lookahead), the predecessor's
@@ -55,7 +76,11 @@ pub struct TargetFlight<S: ProgramSubmission<CompletedWork = crate::CompletedTar
     pub(super) continuation: Option<Vec<Option<InFlightState>>>,
 }
 
-impl<S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork>> TargetFlight<S> {
+impl<
+        S: ProgramSubmission<CompletedWork = crate::CompletedTargetWork>,
+        H: ProgramSubmission<CompletedWork = crate::CompletedHeadWork>,
+    > TargetFlight<S, H>
+{
     pub fn completion(&mut self) -> &mut dyn Completion {
         self.submission.completion()
     }

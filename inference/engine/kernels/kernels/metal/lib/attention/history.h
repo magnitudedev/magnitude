@@ -153,7 +153,7 @@ inline void absorb_affine(thread const float (&q)[G][ATTENTION_E],
     thread const uint (&value)[N][lane_codes<ATTENTION_VALUE_BITS>::words],
     thread const float2 (&value_coefficients)[N],
     thread float (&maximum)[G], thread float (&denominator)[G],
-    thread float (&output)[G][ATTENTION_E], thread float (&bias)[G]) {
+    thread float (&output)[G][ATTENTION_E], thread float (&bias)[G], uint lane) {
     typedef lane_codes<ATTENTION_KEY_BITS> key_codes;
     typedef lane_codes<ATTENTION_VALUE_BITS> value_codes;
     // Codes unpack one token at a time, so only one token's columns are live
@@ -169,10 +169,10 @@ inline void absorb_affine(thread const float (&q)[G][ATTENTION_E],
             ATTENTION_UNROLL
             for (uint i = 0; i < ATTENTION_E; ++i)
                 partial = metal::fma(q[g][i], k[i], partial);
-            score[g][j] = simd_sum(metal::fma(key_coefficients[j].x, partial,
-                key_coefficients[j].y * qsum[g]));
+            score[g][j] = metal::fma(key_coefficients[j].x, partial, key_coefficients[j].y * qsum[g]);
         }
     }
+    score_sums(score, lane);
     // Each value code's weight: its probability times the value scale.
     float weight[G][N];
     ATTENTION_UNROLL

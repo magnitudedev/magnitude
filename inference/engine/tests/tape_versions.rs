@@ -15,15 +15,15 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
-    Demand, ExecutionPath, ExecutorDomain, Operation, Outcome,
-    PhysicalDecision, RequestId, RowResult, TokenId, WorkKind,
+    Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
+    RowResult, TokenId, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
-use magnitude_state::KvCodec;
 use magnitude_scheduler::{
     domain::{self as service_domain, DomainFlight},
     ServiceLimits,
 };
+use magnitude_state::KvCodec;
 use std::path::PathBuf;
 
 /// Draft rows the plan records on the tape; every verification below has
@@ -98,6 +98,7 @@ fn advance(
         demand,
         select: Vec::new(),
         committed,
+        prime: None,
     };
     let groups = service_domain::group(domain, vec![operation]);
     let [group] = groups.as_slice() else {

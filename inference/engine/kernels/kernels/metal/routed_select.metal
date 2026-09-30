@@ -3,10 +3,10 @@
 //   routed_select_stage (M > 8, one threadgroup per row): the row's RMS and
 //     its two normalized forms, published once: `normalized` (norm, the
 //     experts' input) and the router input (router_norm) into scratch.
-//   routed_select_gemv (M <= 8): one simdgroup per logit column reads the
-//     column's weights once and dots them with every row, forming the router
-//     input on the fly from RMS partials shared across the threadgroup;
-//     threadgroup 0 publishes `normalized`.
+//   routed_select_gemv (M <= 8): the router logits (`lib/routed/router.h`),
+//     one simdgroup per logit column over the router input each threadgroup
+//     forms from RMS partials of its own; threadgroup 0 publishes
+//     `normalized`.
 //   routed_select_gemm (M > 8): 32 rows x 32 columns per threadgroup on 8x8
 //     F32 simdgroup matrices over the staged router input.
 //   routed_select_select (one simdgroup per row): scores, biased ranking,
@@ -15,15 +15,16 @@
 // expert, so experts with equal router rows tie exactly.
 
 #define KERNEL_W0 SEISMIC_ROUTER
-#include "lib/projection/projection.h"
+#include "lib/routed/router.h"
 #include "lib/routed/select.h"
 
 typedef element::Act Act;
 typedef ELEMENT_OF(SEISMIC_NORM) Norm;
 typedef ELEMENT_OF(SEISMIC_ROUTER_NORM) RouterNorm;
+typedef routing::Packets<packets::W0>::type Router;
 
-constant constexpr uint select_threads = 256;
-constant constexpr uint select_simdgroups = select_threads / 32;
+constant constexpr uint select_threads = routing::stage_threads;
+constant constexpr uint select_simdgroups = routing::stage_simdgroups;
 
 kernel void routed_select_stage(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
@@ -56,9 +57,9 @@ kernel void routed_select_stage(
 }
 
 // M <= 8, one launch before the selection: the threadgroup computes its rows'
-// RMS inverses (in the stage launch's order), then each simdgroup forms one
-// logit column, forming each router input element as it reads it;
-// threadgroup 0 publishes the normalized rows.
+// RMS inverses (in the stage launch's order); threadgroup 0 publishes the
+// normalized rows; each threadgroup then forms the logits of SIMDGROUPS
+// router rows over the router input (`routing::Gemv`).
 kernel void routed_select_gemv(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
@@ -67,35 +68,18 @@ kernel void routed_select_gemv(
     device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    threadgroup uchar *shared [[threadgroup(0)]],
     uint group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float parts[8][select_simdgroups];
+    threadgroup float parts[8 * select_simdgroups];
     threadgroup float inverses[8];
     const uint rows = uint(SEISMIC_DIM_M);
-    const float eps = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
-    // The stage launch's sum order (256 strided partials, simdgroup sums, then
-    // the eight simdgroup partials in order).
-    for (uint item = simd; item < rows * select_simdgroups; item += SEISMIC_TUNE_SIMDGROUPS) {
-        const uint row = item / select_simdgroups, part = item % select_simdgroups;
-        float squares = 0.0f;
-        for (uint source = part * 32 + lane; source < SEISMIC_DIM_H; source += select_threads) {
-            const float value = residual[ulong(row) * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-            squares = metal::fma(value, value, squares);
-        }
-        squares = simd_sum(squares);
-        if (lane == 0)
-            parts[row][part] = squares;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < rows) {
-        float total = 0.0f;
-        for (uint part = 0; part < select_simdgroups; ++part)
-            total += parts[tid][part];
-        inverses[tid] = metal::rsqrt(total / float(SEISMIC_DIM_H) + eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint k = uint(SEISMIC_DIM_H);
+    routing::inverses(residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, k,
+        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), rows, parts, inverses, SEISMIC_TUNE_SIMDGROUPS, simd, lane,
+        tid);
     if (group == 0) {
         for (uint item = tid; item < rows * uint(SEISMIC_DIM_H); item += 32 * SEISMIC_TUNE_SIMDGROUPS) {
             const ulong row = item / SEISMIC_DIM_H, source = item % SEISMIC_DIM_H;
@@ -104,40 +88,12 @@ kernel void routed_select_gemv(
                 Act::round(value * inverses[row] * element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0)));
         }
     }
-    const ulong expert = ulong(group) * SEISMIC_TUNE_SIMDGROUPS + simd;
-    if (expert >= SEISMIC_DIM_E)
-        return;
-    projection::Weights<packets::W0> router_rows{router, KERNEL_W0_LAYOUT(uint(SEISMIC_DIM_H)),
-        uint(SEISMIC_DIM_H), nullptr};
-    // One lane decodes one 32-value packet at a time, then applies its
-    // weights to every row before loading the next packet.
-    float sums[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    for (uint p = lane; p < SEISMIC_DIM_H / 32; p += 32) {
-        typename packets::W0::packet packet = router_rows.packet(uint(expert), p);
-        for (uint step = 0; step < 4; ++step) {
-            float4 even, odd;
-            packets::W0::codes(packet, step, even, odd);
-            for (uint i = 0; i < 8; ++i) {
-                const ulong source = 32ul * p + 8ul * step + i;
-                const float code = (i & 1u) ? odd[i >> 1] : even[i >> 1];
-                const float weight = packets::W0::value(packet, step, code);
-                const float scale = element::at<RouterNorm>(router_norm, source * SEISMIC_ROUTER_NORM_STRIDE_0);
-                for (uint row = 0; row < 8; ++row)
-                    if (row < rows) {
-                        const float value = residual[ulong(row) * SEISMIC_RESIDUAL_STRIDE_0
-                            + source * SEISMIC_RESIDUAL_STRIDE_1];
-                        sums[row] = metal::fma(Act::round(value * inverses[row] * scale), weight, sums[row]);
-                    }
-            }
-        }
-    }
-    for (uint row = 0; row < 8; ++row) {
-        if (row < rows) {
-            const float sum = simd_sum(sums[row]);
-            if (lane == 0)
-                logits[ulong(row) * SEISMIC_DIM_E + expert] = sum;
-        }
-    }
+    const routing::Rows<RouterNorm> in{residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1,
+        router_norm, SEISMIC_ROUTER_NORM_STRIDE_0, inverses, k};
+    const projection::Weights<Router> weights{router, KERNEL_W0_LAYOUT(k), k, nullptr};
+    const routing::Logits out{logits, SEISMIC_DIM_E, 0};
+    routing::Gemv<Act::bytes>::columns(in, weights, out, rows, uint(SEISMIC_DIM_E), group, shared,
+        SEISMIC_TUNE_SIMDGROUPS, simd, lane);
 }
 
 // Rows and logit columns per GEMM threadgroup, and hidden coordinates per
@@ -234,17 +190,22 @@ kernel void routed_select_select(
     const int normalization = int(SEISMIC_PARAM_NORMALIZATION);
     float score[P], ranked[P];
     int expert[P];
+    // Every loop over a register array unrolls: a dynamically indexed array
+    // lives in stack memory.
+    PROJECTION_UNROLL
     for (uint i = 0; i < P; ++i) {
         expert[i] = int(lane + 32 * i);
         score[i] = logits[row * SEISMIC_DIM_E + lane + 32 * i];
     }
     select::scores<P>(int(SEISMIC_PARAM_SCORE), score);
+    PROJECTION_UNROLL
     for (uint i = 0; i < P; ++i)
         ranked[i] = score[i] + bias[ulong(expert[i]) * SEISMIC_BIAS_STRIDE_0];
     select::sort<P>(ranked, score, expert);
 
     float chosen[SEISMIC_DIM_K];
     int winners[SEISMIC_DIM_K];
+    PROJECTION_UNROLL
     for (uint rank = 0; rank < SEISMIC_DIM_K; ++rank) {
         float best;
         const int winner = reduce::argmax<reduce::HigherIndex>(ranked[0], expert[0], best);
@@ -265,11 +226,13 @@ kernel void routed_select_select(
     }
     // The slot-order sum: slot s holds rank K - 1 - s.
     float denominator = 0.0f;
+    PROJECTION_UNROLL
     for (uint slot = 0; slot < SEISMIC_DIM_K; ++slot)
         denominator += chosen[slot];
     if (lane == 0) {
         const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
         const float epsilon = as_type<float>(uint(SEISMIC_PARAM_NORMALIZATION_EPSILON));
+        PROJECTION_UNROLL
         for (uint slot = 0; slot < SEISMIC_DIM_K; ++slot) {
             const float weight = select::normalized(normalization, chosen[slot], denominator, epsilon);
             routes[row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1] = winners[slot];

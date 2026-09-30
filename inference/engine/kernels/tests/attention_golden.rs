@@ -71,7 +71,11 @@ fn encode(x: &[f32], bits: u32) -> (Vec<u32>, Vec<u16>) {
         let high = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let zero = f16_bits(low);
         let scale = f16_bits((high - low) / levels as f32);
-        let inverse = if f16_to_f32(scale) > 0.0 { 1.0 / f16_to_f32(scale) } else { 0.0 };
+        let inverse = if f16_to_f32(scale) > 0.0 {
+            1.0 / f16_to_f32(scale)
+        } else {
+            0.0
+        };
         for (offset, value) in values.iter().enumerate() {
             let i = group * GROUP + offset;
             let code = ((value - f16_to_f32(zero)).mul_add(inverse, 0.5) as u32).min(levels);
@@ -117,15 +121,32 @@ struct Plane {
 
 fn planes(case: &Case, affine: bool) -> Vec<Plane> {
     let w = case.geometry.w();
-    let bf16_bytes = |values: &[f32]| values.iter().flat_map(|v| bf16_bits(*v).to_le_bytes()).collect::<Vec<_>>();
+    let bf16_bytes = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|v| bf16_bits(*v).to_le_bytes())
+            .collect::<Vec<_>>()
+    };
     if !affine {
         return vec![
-            Plane { element: Element::bf16(), width: w, bytes: bf16_bytes(&case.history_key) },
-            Plane { element: Element::bf16(), width: w, bytes: bf16_bytes(&case.history_value) },
+            Plane {
+                element: Element::bf16(),
+                width: w,
+                bytes: bf16_bytes(&case.history_key),
+            },
+            Plane {
+                element: Element::bf16(),
+                width: w,
+                bytes: bf16_bytes(&case.history_value),
+            },
         ];
     }
     let (mut kc, mut kf, mut vc, mut vf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for (key, value) in case.history_key.chunks_exact(w).zip(case.history_value.chunks_exact(w)) {
+    for (key, value) in case
+        .history_key
+        .chunks_exact(w)
+        .zip(case.history_value.chunks_exact(w))
+    {
         let (codes, coefficients) = encode(key, KEY_BITS);
         kc.extend(codes.iter().flat_map(|c| c.to_le_bytes()));
         kf.extend(coefficients.iter().flat_map(|c| c.to_le_bytes()));
@@ -134,16 +155,37 @@ fn planes(case: &Case, affine: bool) -> Vec<Plane> {
         vf.extend(coefficients.iter().flat_map(|c| c.to_le_bytes()));
     }
     vec![
-        Plane { element: Element::u32(), width: w / 4, bytes: kc },
-        Plane { element: Element::f16(), width: w / 16, bytes: kf },
-        Plane { element: Element::u32(), width: w / 8, bytes: vc },
-        Plane { element: Element::f16(), width: w / 16, bytes: vf },
+        Plane {
+            element: Element::u32(),
+            width: w / 4,
+            bytes: kc,
+        },
+        Plane {
+            element: Element::f16(),
+            width: w / 16,
+            bytes: kf,
+        },
+        Plane {
+            element: Element::u32(),
+            width: w / 8,
+            bytes: vc,
+        },
+        Plane {
+            element: Element::f16(),
+            width: w / 16,
+            bytes: vf,
+        },
     ]
 }
 
 /// The history planes in one slab tensor of `slab_rows` rows per slab, and
 /// each plane's logical region.
-fn history(device: &Device, case: &Case, affine: bool, slab_rows: usize) -> (SlabTensor, Vec<Tensor>) {
+fn history(
+    device: &Device,
+    case: &Case,
+    affine: bool,
+    slab_rows: usize,
+) -> (SlabTensor, Vec<Tensor>) {
     let kv = case.geometry.kv;
     let rows = case.history_rows;
     let planes = planes(case, affine);
@@ -153,7 +195,10 @@ fn history(device: &Device, case: &Case, affine: bool, slab_rows: usize) -> (Sla
         rows as u64,
         planes
             .iter()
-            .map(|plane| SlabRegion { element: plane.element, row_shape: vec![kv as u64, plane.width as u64] })
+            .map(|plane| SlabRegion {
+                element: plane.element,
+                row_shape: vec![kv as u64, plane.width as u64],
+            })
             .collect(),
     )
     .unwrap();
@@ -170,7 +215,9 @@ fn history(device: &Device, case: &Case, affine: bool, slab_rows: usize) -> (Sla
                 .unwrap();
         }
     }
-    let logical = (0..planes.len()).map(|region| slabs.logical_region(region).unwrap()).collect();
+    let logical = (0..planes.len())
+        .map(|region| slabs.logical_region(region).unwrap())
+        .collect();
     (slabs, logical)
 }
 
@@ -204,26 +251,65 @@ struct Named {
     slab_rows: usize,
 }
 
-fn named(label: &str, geometry: Geometry, history_rows: usize, rows: Vec<Row>, slab_rows: usize, seed: u64) -> Named {
+fn named(
+    label: &str,
+    geometry: Geometry,
+    history_rows: usize,
+    rows: Vec<Row>,
+    slab_rows: usize,
+    seed: u64,
+) -> Named {
     let rows = slab_rows_spans(rows, slab_rows as i32);
     let spans = rows.iter().map(|row| row.spans.len()).max().unwrap().max(1);
     let history_rows = history_rows.div_ceil(slab_rows) * slab_rows;
-    Named { label: label.into(), case: Case::new(geometry, history_rows, spans, &rows, seed), slab_rows }
+    Named {
+        label: label.into(),
+        case: Case::new(geometry, history_rows, spans, &rows, seed),
+        slab_rows,
+    }
 }
 
 fn cases(kind: Kind, geometry: Geometry) -> Vec<Named> {
     if kind.decode() {
         vec![
-            named("spec1@256", geometry, 256 + 64, speculative_rows(1, 256), 512, 11),
-            named("spec8@4096", geometry, 4096 + 64, speculative_rows(8, 4096), 1024, 12),
+            named(
+                "spec1@256",
+                geometry,
+                256 + 64,
+                speculative_rows(1, 256),
+                512,
+                11,
+            ),
+            named(
+                "spec8@4096",
+                geometry,
+                4096 + 64,
+                speculative_rows(8, 4096),
+                1024,
+                12,
+            ),
             named("mixed4@300", geometry, 300 + 128, decode_rows(300), 128, 13),
             named("spec2@1", geometry, 64, speculative_rows(2, 1), 64, 14),
         ]
     } else {
         vec![
             named("m16@0", geometry, 256, prefill_rows(16, 0), 256, 20),
-            named("m40@300", geometry, 300 + 256, prefill_rows(40, 300), 128, 21),
-            named("m128@1000", geometry, 1000 + 256, prefill_rows(128, 1000), 512, 22),
+            named(
+                "m40@300",
+                geometry,
+                300 + 256,
+                prefill_rows(40, 300),
+                128,
+                21,
+            ),
+            named(
+                "m128@1000",
+                geometry,
+                1000 + 256,
+                prefill_rows(128, 1000),
+                512,
+                22,
+            ),
         ]
     }
 }
@@ -232,7 +318,9 @@ fn cases(kind: Kind, geometry: Geometry) -> Vec<Named> {
 /// variations, each admissible at both geometries.
 fn configurations(backend: BackendName, kind: Kind) -> Vec<Vec<(&'static str, u64)>> {
     match (backend, kind.decode()) {
-        (BackendName::Cpu, true) => vec![vec![("PARTS", 8)], vec![("PARTS", 1)], vec![("PARTS", 16)]],
+        (BackendName::Cpu, true) => {
+            vec![vec![("PARTS", 8)], vec![("PARTS", 1)], vec![("PARTS", 16)]]
+        }
         (BackendName::Cpu, false) => vec![vec![]],
         (BackendName::Metal, true) => vec![
             vec![("SPAN", 32), ("PARTS", 16), ("SIMDS", 4)],
@@ -318,7 +406,9 @@ impl Family {
         let Geometry { kv, g, p, .. } = case.geometry;
         let (m, w) = (case.rows as u64, case.geometry.w() as u64);
         let heads = (kv * g) as u64;
-        let empty = |element: Element, shape: &[u64]| Tensor::from_host(device, element, shape, &[]).unwrap();
+        let empty = |element: Element, shape: &[u64]| {
+            Tensor::from_host(device, element, shape, &[]).unwrap()
+        };
         Self {
             query: inputs.query_gate.reshape(&[m, heads, 2 * w]).unwrap(),
             gate: empty(Element::bf16(), &[m, heads, 0]),
@@ -337,11 +427,14 @@ impl Family {
         let w = geometry.w() as u64;
         let form = [("I", w), ("U", 0), ("F", 1), ("N", 1), ("NV", 0)];
         let base = if device.backend() == BackendName::Cpu {
-            NativeSpecialization::new().with_static("P", geometry.p as u64).with_static("S", geometry.s as u64)
+            NativeSpecialization::new()
+                .with_static("P", geometry.p as u64)
+                .with_static("S", geometry.s as u64)
         } else {
             statics(geometry)
         };
-        form.into_iter().fold(base, |s, (name, value)| s.with_static(name, value))
+        form.into_iter()
+            .fold(base, |s, (name, value)| s.with_static(name, value))
     }
 }
 
@@ -362,9 +455,15 @@ fn run_family(
     {
         macro_rules! dense {
             ($module:ident) => {{
-                let kernel = $module::native_for_device_with(device, $module::Elements { A: elements }, specialization)
-                    .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
-                let [history_key, history_value] = &mut *history else { panic!("dense history has two planes") };
+                let kernel = $module::native_for_device_with(
+                    device,
+                    $module::Elements { A: elements },
+                    specialization,
+                )
+                .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
+                let [history_key, history_value] = &mut *history else {
+                    panic!("dense history has two planes")
+                };
                 kernel
                     .call($module::Args {
                         query: &family.query,
@@ -394,9 +493,14 @@ fn run_family(
         }
         macro_rules! affine {
             ($module:ident) => {{
-                let kernel = $module::native_for_device_with(device, $module::Elements { A: elements }, specialization)
-                    .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
-                let [key_codes, key_coefficients, value_codes, value_coefficients] = &mut *history else {
+                let kernel = $module::native_for_device_with(
+                    device,
+                    $module::Elements { A: elements },
+                    specialization,
+                )
+                .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
+                let [key_codes, key_coefficients, value_codes, value_coefficients] = &mut *history
+                else {
                     panic!("affine history has four planes")
                 };
                 kernel
@@ -440,7 +544,12 @@ fn run_family(
 
 fn outputs(result: &Tensor, history: &[Tensor]) -> Vec<(String, Vec<u8>)> {
     std::iter::once(("result".to_owned(), result.read_to_host().unwrap()))
-        .chain(history.iter().enumerate().map(|(index, plane)| (format!("history{index}"), plane.read_to_host().unwrap())))
+        .chain(
+            history
+                .iter()
+                .enumerate()
+                .map(|(index, plane)| (format!("history{index}"), plane.read_to_host().unwrap())),
+        )
         .collect()
 }
 
@@ -456,7 +565,10 @@ fn open(backend: &str) -> Device {
         "cpu" => BackendName::Cpu,
         other => panic!("ATTENTION_GOLDEN_BACKEND={other}: expected metal, cuda, vulkan or cpu"),
     };
-    DeviceCatalog::discover().unwrap().open_backend(backend).unwrap()
+    DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(backend)
+        .unwrap()
 }
 
 #[test]
@@ -469,19 +581,28 @@ fn attention_golden() {
     };
     let backend = std::env::var("ATTENTION_GOLDEN_BACKEND").expect("ATTENTION_GOLDEN_BACKEND");
     let device = open(&backend);
-    let path = std::path::PathBuf::from(std::env::var("ATTENTION_GOLDEN_DIR").expect("ATTENTION_GOLDEN_DIR"))
-        .join(format!("{backend}.golden"));
+    let path = std::path::PathBuf::from(
+        std::env::var("ATTENTION_GOLDEN_DIR").expect("ATTENTION_GOLDEN_DIR"),
+    )
+    .join(format!("{backend}.golden"));
     let started = std::time::Instant::now();
     let mut lines = BTreeMap::new();
     let mut nondeterministic = Vec::new();
-    for kind in [Kind::Decode, Kind::Prefill, Kind::DecodeK8V4, Kind::PrefillK8V4] {
+    for kind in [
+        Kind::Decode,
+        Kind::Prefill,
+        Kind::DecodeK8V4,
+        Kind::PrefillK8V4,
+    ] {
         for (geometry_label, geometry) in geometries() {
             for named in cases(kind, geometry) {
                 let inputs = Inputs::new(&device, &named.case);
                 let family_inputs = Family::new(&device, &inputs, &named.case);
                 for config in configurations(device.backend(), kind) {
                     let base = Family::statics(&device, geometry);
-                    let mut specialization = config.iter().fold(base, |s, (name, value)| s.with_param(*name, *value));
+                    let mut specialization = config
+                        .iter()
+                        .fold(base, |s, (name, value)| s.with_param(*name, *value));
                     // Metal's and CUDA's decode and affine decode also slice
                     // the query group; the goldens (recorded
                     // before slicing existed) are one slice's walk.
@@ -493,16 +614,67 @@ fn attention_golden() {
                     if sliced {
                         specialization = specialization.with_param("SLICES", 1);
                     }
+                    // Metal's and CUDA's decodes also have the grouped-query
+                    // matrix form; the goldens are the vector form's walk.
+                    if matches!(kind, Kind::Decode | Kind::DecodeK8V4) {
+                        match device.backend() {
+                            BackendName::Metal => {
+                                specialization = specialization
+                                    .with_param("MATRIX", 0)
+                                    .with_param("KEYS", 16)
+                                    .with_param("TOKENS", 1);
+                            }
+                            BackendName::Cuda => {
+                                specialization = specialization
+                                    .with_param("MATRIX", 0)
+                                    .with_param("STAGES", 2)
+                                    .with_param("COLUMNS", 1)
+                            }
+                            BackendName::Vulkan => {
+                                specialization = specialization.with_param("MATRIX", 0);
+                                if kind == Kind::DecodeK8V4 {
+                                    specialization = specialization.with_param("KEYWISE", 0);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     // CUDA's prefill also splits key tiles; the goldens are
                     // one partition's walk.
                     if device.backend() == BackendName::Cuda && !kind.decode() {
-                        specialization = specialization.with_param("SPLIT_GROUPS", 1);
+                        specialization = specialization
+                            .with_param("SPLIT_GROUPS", 1)
+                            .with_param("STAGES", 2)
+                            .with_param("COLUMNS", 1)
+                            .with_param("QREG", 0);
+                        // Neither the producer warps' count nor decoding in
+                        // the MMA warps (PRODUCERS = 0) changes the result.
+                        if kind == Kind::PrefillK8V4 {
+                            specialization = specialization.with_param("PRODUCERS", 4);
+                        }
                     }
-                    let config_label = config.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(",");
-                    let key = format!("{}|{geometry_label}|{config_label}|{}", kind.name(), named.label);
+                    let config_label = config
+                        .iter()
+                        .map(|(n, v)| format!("{n}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let key = format!(
+                        "{}|{geometry_label}|{config_label}|{}",
+                        kind.name(),
+                        named.label
+                    );
                     let run = || {
-                        let (_slabs, mut planes) = history(&device, &named.case, kind.affine(), named.slab_rows);
-                        run_family(&device, kind, &specialization, &inputs, &family_inputs, &mut planes, &named)
+                        let (_slabs, mut planes) =
+                            history(&device, &named.case, kind.affine(), named.slab_rows);
+                        run_family(
+                            &device,
+                            kind,
+                            &specialization,
+                            &inputs,
+                            &family_inputs,
+                            &mut planes,
+                            &named,
+                        )
                     };
                     let first = match run() {
                         Ok(first) => first,
@@ -515,11 +687,16 @@ fn attention_golden() {
                     let second = if record { Some(run().unwrap()) } else { None };
                     for (index, (output, bytes)) in first.iter().enumerate() {
                         let digest = hash(bytes);
-                        let stable = second.as_ref().is_none_or(|second| second[index].1 == *bytes);
+                        let stable = second
+                            .as_ref()
+                            .is_none_or(|second| second[index].1 == *bytes);
                         if !stable {
                             nondeterministic.push(format!("{key}|{output}"));
                         }
-                        lines.insert(format!("{key}|{output}"), if stable { digest } else { "NONDET".into() });
+                        lines.insert(
+                            format!("{key}|{output}"),
+                            if stable { digest } else { "NONDET".into() },
+                        );
                     }
                 }
             }
@@ -535,7 +712,12 @@ fn attention_golden() {
             writeln!(text, "{key}\t{value}").unwrap();
         }
         std::fs::write(&path, text).unwrap();
-        println!("recorded {} keys to {} in {:.1}s", lines.len(), path.display(), started.elapsed().as_secs_f64());
+        println!(
+            "recorded {} keys to {} in {:.1}s",
+            lines.len(),
+            path.display(),
+            started.elapsed().as_secs_f64()
+        );
         return;
     }
     let golden = std::fs::read_to_string(&path)
@@ -547,7 +729,11 @@ fn attention_golden() {
         })
         .collect::<BTreeMap<_, _>>();
     let mut mismatches = Vec::new();
-    for key in golden.keys().chain(lines.keys()).collect::<std::collections::BTreeSet<_>>() {
+    for key in golden
+        .keys()
+        .chain(lines.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
         let (expected, actual) = (golden.get(key), lines.get(key));
         if expected.map(String::as_str) == Some("NONDET") {
             continue;
@@ -559,6 +745,15 @@ fn attention_golden() {
     for line in &mismatches {
         println!("MISMATCH {line}");
     }
-    println!("compared {} keys, {} mismatches, {:.1}s", lines.len(), mismatches.len(), started.elapsed().as_secs_f64());
-    assert!(mismatches.is_empty(), "{} golden mismatches", mismatches.len());
+    println!(
+        "compared {} keys, {} mismatches, {:.1}s",
+        lines.len(),
+        mismatches.len(),
+        started.elapsed().as_secs_f64()
+    );
+    assert!(
+        mismatches.is_empty(),
+        "{} golden mismatches",
+        mismatches.len()
+    );
 }

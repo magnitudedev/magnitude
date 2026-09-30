@@ -155,11 +155,10 @@ impl AssessmentGraphResourceBounds {
         )?;
         let (head, head_constant_bytes) = match (plan.head(), plan.draft(), state.head_state()) {
             (None, Some(draft_plan), Some(head_state)) => {
-                let block = definition
+                let draft = definition
                     .draft
                     .as_ref()
-                    .ok_or("a draft program without a draft")?
-                    .block_size;
+                    .ok_or("a draft program without a draft")?;
                 let geometry = crate::programs::native_draft::DraftGeometry::new(
                     definition,
                     head_state,
@@ -173,7 +172,7 @@ impl AssessmentGraphResourceBounds {
                     crate::programs::native_draft::draft_graph_classes(
                         limits,
                         method.draft_rows(),
-                        block,
+                        draft,
                     )?,
                 )?;
                 (
@@ -1274,7 +1273,10 @@ mod tests {
                 merge: 2,
             },
             stem: VisionStem::Patch {
-                frames: vec![stored("patch.0", &[128, 3, 2, 2]), stored("patch.1", &[128, 3, 2, 2])],
+                frames: vec![
+                    stored("patch.0", &[128, 3, 2, 2]),
+                    stored("patch.1", &[128, 3, 2, 2]),
+                ],
                 bias: Some(stored("patch.bias", &[128])),
                 positions: VisionPositions {
                     table: stored("position", &[16, 128]),

@@ -47,12 +47,18 @@ impl MethodState for PlainState {
         Box::new(self.clone())
     }
 
+    fn priming_position(&self) -> Option<usize> {
+        None
+    }
+
     fn prime(
         &mut self,
         _: RequestId,
         _: &[TokenId],
         _: Option<TokenId>,
         _: FeatureRef,
+        _: usize,
+        _: usize,
         _: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
         Ok(MethodEffects::default())

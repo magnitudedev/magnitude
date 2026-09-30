@@ -159,6 +159,7 @@ fn main() -> Result<(), String> {
         demand: Demand::FEATURES,
         select: Vec::new(),
         committed,
+        prime: None,
     };
     let groups = service_domain::group(&domain, vec![prefill]);
     let [group] = groups.as_slice() else {
@@ -185,14 +186,14 @@ fn main() -> Result<(), String> {
             .map_err(text)?;
     }
     let features = features.ok_or("the prefill returned no features")?;
-    let conditioning = domain.read(
-        &FeatureSpan::new(features, 0, committed).map_err(|error| error.to_string())?,
-    )?;
+    let conditioning = domain
+        .read(&FeatureSpan::new(features, 0, committed).map_err(|error| error.to_string())?)?;
 
     // Entry row p pairs the token after target row p with row p's feature;
     // the last entry token is the anchor.
     let head = Operation::Head {
         request,
+        phase: magnitude_executor::HeadPhase::Generation,
         tokens: options.tokens[1..].to_vec(),
         conditioning,
         position: 0,
@@ -220,8 +221,14 @@ fn main() -> Result<(), String> {
             (0..proposals.len())
                 .map(|proposal| committed + 1 + proposal)
                 .collect::<Vec<_>>(),
-            proposals.iter().map(|selected| selected.token.0).collect::<Vec<_>>(),
-            proposals.iter().map(|selected| selected.status).collect::<Vec<_>>(),
+            proposals
+                .iter()
+                .map(|selected| selected.token.0)
+                .collect::<Vec<_>>(),
+            proposals
+                .iter()
+                .map(|selected| selected.status)
+                .collect::<Vec<_>>(),
         );
         domain
             .reconcile(

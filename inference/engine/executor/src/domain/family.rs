@@ -3,7 +3,7 @@
 
 use crate::programs::{
     CompletedHeadWork, CompletedStateWork, CompletedTargetWork, CompletedVisionWork, HeadProgram,
-    ProgramSubmission, StateProgram, SubmittedTarget, TargetProgram, VisionProgram,
+    ProgramSubmission, StateProgram, SubmittedHead, SubmittedTarget, TargetProgram, VisionProgram,
 };
 use crate::{
     AttestedPrograms, ResidentHead, ResidentTarget, ResidentVision, SubmitError,
@@ -16,7 +16,9 @@ pub trait ProgramFamily: 'static {
     type TargetSubmission: ProgramSubmission<CompletedWork = CompletedTargetWork>
         + SubmittedTarget
         + 'static;
-    type HeadSubmission: ProgramSubmission<CompletedWork = CompletedHeadWork> + 'static;
+    type HeadSubmission: ProgramSubmission<CompletedWork = CompletedHeadWork>
+        + SubmittedHead
+        + 'static;
     type VisionSubmission: ProgramSubmission<CompletedWork = CompletedVisionWork> + 'static;
     type StateSubmission: ProgramSubmission<CompletedWork = CompletedStateWork> + 'static;
 

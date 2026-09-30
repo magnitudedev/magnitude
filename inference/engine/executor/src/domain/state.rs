@@ -228,8 +228,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         &self,
         operations: &[Operation],
     ) -> Result<Option<(u64, u64)>, DomainError> {
+        let head = matches!(operations.first(), Some(Operation::Head { .. }))
+            || operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::Forward { prime: Some(_), .. }));
         let (resident_bytes, upload_peak) = match operations.first() {
-            Some(Operation::Head { .. }) if !self.family.head_is_bound() => {
+            Some(_) if head && !self.family.head_is_bound() => {
                 let binding_constants = self
                     .head_loader
                     .as_ref()
@@ -261,12 +265,61 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// keep growing in place. A refused minimum grant returns a byte deficit.
     /// Histories at the segment limit are repacked first.
     pub fn provision(&mut self, operations: &[Operation]) -> Result<(), DomainError> {
-        // A group claiming the queued lookahead needs nothing; any other
-        // group first waits for the lookahead and releases it.
+        fn primed(operation: &Operation) -> Option<&Priming> {
+            match operation {
+                Operation::Forward { prime, .. } => prime.as_ref(),
+                _ => None,
+            }
+        }
+        // A group claiming the queued lookahead needs no rows of its own, only
+        // room for the step it queues next (its rows follow the claimed
+        // step's). Growth adds slabs and never moves the rows the in-flight
+        // step writes. Any other target group first waits for the lookahead
+        // and releases it; a head or encoder group touches no target state
+        // and runs beside it.
         if self.claim_slots(operations).is_some() {
+            let mut target = Vec::new();
+            let mut banks = 0usize;
+            let mut head = Vec::new();
+            let mut head_banks = 0usize;
+            for operation in operations {
+                let request = operation.request();
+                if let (Some((next, false)), Some(state)) =
+                    (self.successor_of(operation), self.target.get(&request))
+                {
+                    target.extend(state.demands(next.row_count()));
+                    banks += 1;
+                    if let (Operation::Forward { prime: Some(prime), .. }, Some(state)) =
+                        (&next, self.head.get(&request))
+                    {
+                        head.extend(state.demands(prime.tokens.len()));
+                        head_banks += 1;
+                    }
+                }
+            }
+            // The queued step is optional: without room, the next step
+            // runs unpipelined and provisions as usual.
+            let optional = |grant: Result<(), DomainError>| match grant {
+                Ok(())
+                | Err(DomainError::Capacity(_) | DomainError::Blind(_) | DomainError::Reclaim) => {
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            };
+            if banks != 0 {
+                optional(self.grant_state_growth(self.target_store.clone(), &target, banks))?;
+            }
+            if let (true, Some(store)) = (head_banks != 0, self.head_store.clone()) {
+                optional(self.grant_state_growth(store, &head, head_banks))?;
+            }
             return Ok(());
         }
-        self.orphan_lookahead()?;
+        if operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::Forward { .. }))
+        {
+            self.orphan_lookahead()?;
+        }
         for operation in operations {
             if let Operation::Forward { request, .. } = operation {
                 self.compact_target(*request)?;
@@ -282,13 +335,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         for operation in operations {
             let rows = operation.row_count();
             match operation {
-                Operation::Forward { request, .. } => {
+                Operation::Forward { request, prime, .. } => {
+                    let next = lookahead
+                        .then(|| self.successor_of(operation))
+                        .flatten()
+                        .map(|(next, _)| next);
+                    // A primed chunk's drafter entry, and the entry of the
+                    // chunk queued behind it.
+                    let entries = [prime.as_ref(), next.as_ref().and_then(primed)]
+                        .into_iter()
+                        .flatten()
+                        .map(|prime| prime.tokens.len())
+                        .collect::<Vec<_>>();
+                    if let (false, Some(state)) = (entries.is_empty(), self.head.get(request)) {
+                        head.extend(state.demands(entries.iter().sum()));
+                        head_banks += entries.len();
+                    }
                     if let Some(state) = self.target.get(request) {
-                        let ahead = usize::from(
-                            lookahead && lookahead::continuation_of(operation).is_some(),
-                        );
+                        let ahead = next.as_ref().map_or(0, Operation::row_count);
                         target.extend(state.demands(rows + ahead));
-                        target_banks += 1 + ahead;
+                        target_banks += 1 + usize::from(ahead != 0);
                     }
                 }
                 Operation::Head { request, .. } => {
