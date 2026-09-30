@@ -4,8 +4,11 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <limits>
 #include <map>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -42,191 +45,354 @@ static std::string build_repetition(const std::string & item_rule, int min_items
     return result;
 }
 
-static void build_min_max_int(int64_t min_value, int64_t max_value, std::stringstream & out, int decimals_left = 16, bool top_level = true) {
-    auto has_min = min_value != std::numeric_limits<int64_t>::min();
-    auto has_max = max_value != std::numeric_limits<int64_t>::max();
+// ---------------------------------------------------------------------------
+// Numeric ranges
+//
+// A bounded number is written in plain decimal notation (no exponent), which
+// every finite decimal value has, so the grammar admits exactly the values
+// within the bounds. Digit counts are capped as for unbounded numbers, and
+// never below what the bounds themselves need.
 
-    auto digit_range = [&](char from, char to) {
-        out << "[";
-        if (from == to) {
-            out << from;
-        } else {
-            out << from << "-" << to;
-        }
-        out << "]";
-    };
-    auto more_digits = [&](int min_digits, int max_digits) {
-        out << "[0-9]";
-        if (min_digits == max_digits && min_digits == 1) {
-            return;
-        }
-        out << "{";
-        out << min_digits;
-        if (max_digits != min_digits) {
-            out << ",";
-            if (max_digits != std::numeric_limits<int>::max()) {
-                out << max_digits;
-            }
-        }
-        out << "}";
-    };
-    std::function<void(const std::string_view &, const std::string_view &)> uniform_range =
-        [&](const std::string_view & from, const std::string_view & to) {
-            size_t i = 0;
-            while (i < from.length() && i < to.length() && from[i] == to[i]) {
-                i++;
-            }
-            if (i > 0) {
-                out << "\"" << from.substr(0, i) << "\"";
-            }
-            if (i < from.length() && i < to.length()) {
-                if (i > 0) {
-                    out << " ";
-                }
-                auto sub_len = from.length() - i - 1;
-                if (sub_len > 0) {
-                    auto from_sub = from.substr(i + 1);
-                    auto to_sub = to.substr(i + 1);
-                    auto sub_zeros = string_repeat("0", sub_len);
-                    auto sub_nines = string_repeat("9", sub_len);
+static std::string digit_class(char from, char to) {
+    return from == to ? std::string("[") + from + "]" : std::string("[") + from + "-" + to + "]";
+}
 
-                    auto to_reached = false;
-                    out << "(";
-                    if (from_sub == sub_zeros) {
-                        digit_range(from[i], to[i] - 1);
-                        out << " ";
-                        more_digits(sub_len, sub_len);
-                    } else {
-                        out << "[" << from[i] << "] ";
-                        out << "(";
-                        uniform_range(from_sub, sub_nines);
-                        out << ")";
-                        if (from[i] < to[i] - 1) {
-                            out << " | ";
-                            if (to_sub == sub_nines) {
-                                digit_range(from[i] + 1, to[i]);
-                                to_reached = true;
-                            } else {
-                                digit_range(from[i] + 1, to[i] - 1);
-                            }
-                            out << " ";
-                            more_digits(sub_len, sub_len);
-                        }
-                    }
-                    if (!to_reached) {
-                        out << " | ";
-                        digit_range(to[i], to[i]);
-                        out << " ";
-                        uniform_range(sub_zeros, to_sub);
-                    }
-                    out << ")";
-                } else {
-                    out << "[" << from[i] << "-" << to[i] << "]";
-                }
+static std::string digits(size_t min_count, size_t max_count) {
+    if (min_count == max_count) {
+        return min_count == 1 ? "[0-9]" : "[0-9]{" + std::to_string(min_count) + "}";
+    }
+    return "[0-9]{" + std::to_string(min_count) + "," + std::to_string(max_count) + "}";
+}
+
+// Digit strings of one length from `low` to `high`, inclusive.
+static std::string same_length_range(const std::string & low, const std::string & high) {
+    size_t i = 0;
+    while (i < low.size() && low[i] == high[i]) {
+        i++;
+    }
+    std::string prefix = i > 0 ? "\"" + low.substr(0, i) + "\"" : "";
+    if (i == low.size()) {
+        return prefix;
+    }
+    const size_t      rest    = low.size() - i - 1;
+    const std::string zeros   = std::string(rest, '0');
+    const std::string nines   = std::string(rest, '9');
+    const std::string low_rest  = low.substr(i + 1);
+    const std::string high_rest = high.substr(i + 1);
+    std::vector<std::string> alternatives;
+    if (rest == 0) {
+        alternatives.push_back(digit_class(low[i], high[i]));
+    } else {
+        const char first = low_rest == zeros ? low[i] : (char) (low[i] + 1);
+        const char last  = high_rest == nines ? high[i] : (char) (high[i] - 1);
+        if (low_rest != zeros) {
+            alternatives.push_back(digit_class(low[i], low[i]) + " (" + same_length_range(low_rest, nines) + ")");
+        }
+        if (first <= last) {
+            alternatives.push_back(digit_class(first, last) + " " + digits(rest, rest));
+        }
+        if (high_rest != nines) {
+            alternatives.push_back(digit_class(high[i], high[i]) + " (" + same_length_range(zeros, high_rest) + ")");
+        }
+    }
+    auto body = alternatives.size() == 1 ? alternatives[0] : "(" + string_join(alternatives, " | ") + ")";
+    return prefix.empty() ? body : prefix + " " + body;
+}
+
+static int compare_digit_strings(const std::string & a, const std::string & b) {
+    if (a.size() != b.size()) {
+        return a.size() < b.size() ? -1 : 1;
+    }
+    int c = a.compare(b);
+    return c < 0 ? -1 : c > 0 ? 1 : 0;
+}
+
+static std::string increment_digits(std::string value) {
+    for (size_t i = value.size(); i-- > 0;) {
+        if (value[i] != '9') {
+            value[i]++;
+            return value;
+        }
+        value[i] = '0';
+    }
+    return "1" + value;
+}
+
+// The canonical integer one less; `value` is positive.
+static std::string decrement_digits(std::string value) {
+    for (size_t i = value.size(); i-- > 0;) {
+        if (value[i] != '0') {
+            value[i]--;
+            break;
+        }
+        value[i] = '9';
+    }
+    auto first = value.find_first_not_of('0');
+    return first == std::string::npos ? "0" : value.substr(first);
+}
+
+// Canonical nonnegative integers from `low` to `high` (inclusive) of at most
+// `longest` digits, by digit count.
+static std::vector<std::pair<size_t, std::string>> integer_ranges(const std::string &                low,
+                                                                  const std::optional<std::string> & high,
+                                                                  size_t                             longest) {
+    std::vector<std::pair<size_t, std::string>> ranges;
+    for (size_t length = low.size(); length <= longest && (!high || length <= high->size()); length++) {
+        const std::string from = length == low.size() ? low : "1" + std::string(length - 1, '0');
+        const std::string to   = high && length == high->size() ? *high : std::string(length, '9');
+        if (compare_digit_strings(from, to) <= 0) {
+            ranges.emplace_back(length, same_length_range(from, to));
+        }
+    }
+    return ranges;
+}
+
+// A bound on a magnitude (a nonnegative decimal).
+struct magnitude_bound {
+    std::string integer;
+    std::string fraction;
+    bool        exclusive = false;
+};
+
+// The fraction digits after an integer part, from position `i`, while the
+// digits so far equal the lower and/or upper bound's fraction digits.
+class fraction_grammar {
+    enum lower_state { LOWER_FREE, LOWER_TIGHT, LOWER_PENDING };  // pending: equal to an exclusive bound
+    enum upper_state { UPPER_FREE, UPPER_TIGHT, UPPER_ZEROS, UPPER_DEAD };
+
+    const magnitude_bound * low_;
+    const magnitude_bound * high_;
+    size_t                  cap_;
+
+  public:
+    fraction_grammar(const magnitude_bound * low, const magnitude_bound * high, size_t cap) : low_(low), high_(high), cap_(cap) {}
+
+    // The optional fraction part, or null when no fraction (not even none) satisfies the bounds.
+    std::optional<std::string> part(bool integral) const {
+        lower_state lower = low_ ? LOWER_TIGHT : LOWER_FREE;
+        upper_state upper = high_ ? UPPER_TIGHT : UPPER_FREE;
+        normalize(0, lower, upper);
+        if (upper == UPPER_DEAD) {
+            return std::nullopt;
+        }
+        const bool none = can_end(0, lower, upper);
+        auto       more = integral ? std::nullopt : from(0, lower, upper, /* may_end = */ false);
+        if (none && more) {
+            return "(\".\" " + *more + ")?";
+        }
+        if (more) {
+            return "\".\" " + *more;
+        }
+        if (none) {
+            return std::string();
+        }
+        return std::nullopt;
+    }
+
+  private:
+    void normalize(size_t i, lower_state & lower, upper_state & upper) const {
+        if (lower == LOWER_TIGHT && i >= low_->fraction.size()) {
+            lower = low_->exclusive ? LOWER_PENDING : LOWER_FREE;
+        }
+        if (upper == UPPER_TIGHT && i >= high_->fraction.size()) {
+            upper = high_->exclusive ? UPPER_DEAD : UPPER_ZEROS;
+        }
+    }
+
+    bool can_end(size_t i, lower_state lower, upper_state upper) const {
+        // Ending pads with zeros: below a lower bound with digits left, and
+        // equal to a bound the digits have reached.
+        return lower == LOWER_FREE && upper != UPPER_DEAD && (upper != UPPER_TIGHT || i < high_->fraction.size());
+    }
+
+    // Digits from position `i`; null when no continuation satisfies the bounds.
+    std::optional<std::string> from(size_t i, lower_state lower, upper_state upper, bool may_end) const {
+        normalize(i, lower, upper);
+        if (upper == UPPER_DEAD) {
+            return std::nullopt;
+        }
+        const bool   end       = may_end && can_end(i, lower, upper);
+        const size_t remaining = i < cap_ ? cap_ - i : 0;
+        if (remaining == 0) {
+            return end ? std::optional<std::string>("") : std::nullopt;
+        }
+        if (lower == LOWER_FREE && upper == UPPER_FREE) {
+            return digits(may_end ? 0 : 1, remaining);
+        }
+        if (lower == LOWER_FREE && upper == UPPER_ZEROS) {
+            return "[0]{" + std::to_string(may_end ? 0 : 1) + "," + std::to_string(remaining) + "}";
+        }
+        // Group the next digit by the state it leads to.
+        std::vector<std::string> alternatives;
+        char                     start = 0;
+        std::optional<std::pair<lower_state, upper_state>> group;
+        auto flush = [&](char last) {
+            if (!group) {
+                return;
+            }
+            auto next = from(i + 1, group->first, group->second, true);
+            if (next) {
+                alternatives.push_back(digit_class(start, last) + (next->empty() ? "" : " " + *next));
             }
         };
-
-    if (has_min && has_max) {
-        if (min_value < 0 && max_value < 0) {
-            out << "\"-\" (";
-            build_min_max_int(-max_value, -min_value, out, decimals_left, /* top_level= */ true);
-            out << ")";
-            return;
+        for (char d = '0'; d <= '9'; d++) {
+            std::optional<std::pair<lower_state, upper_state>> next;
+            lower_state                                        l = lower;
+            upper_state                                        u = upper;
+            bool                                               allowed = true;
+            if (lower == LOWER_TIGHT) {
+                const char bound = low_->fraction[i];
+                l                = d > bound ? LOWER_FREE : LOWER_TIGHT;
+                allowed          = d >= bound;
+            } else if (lower == LOWER_PENDING) {
+                l = d > '0' ? LOWER_FREE : LOWER_PENDING;
+            }
+            if (upper == UPPER_TIGHT) {
+                const char bound = high_->fraction[i];
+                u                = d < bound ? UPPER_FREE : UPPER_TIGHT;
+                allowed          = allowed && d <= bound;
+            } else if (upper == UPPER_ZEROS) {
+                allowed = allowed && d == '0';
+            }
+            if (allowed) {
+                next = std::make_pair(l, u);
+            }
+            if (next != group) {
+                flush((char) (d - 1));
+                group = next;
+                start = d;
+            }
         }
-
-        if (min_value < 0) {
-            out << "\"-\" (";
-            build_min_max_int(0, -min_value, out, decimals_left, /* top_level= */ true);
-            out << ") | ";
-            min_value = 0;
+        flush('9');
+        if (alternatives.empty()) {
+            return end ? std::optional<std::string>("") : std::nullopt;
         }
-
-        auto min_s = std::to_string(min_value);
-        auto max_s = std::to_string(max_value);
-        auto min_digits = min_s.length();
-        auto max_digits = max_s.length();
-
-        for (auto digits = min_digits; digits < max_digits; digits++) {
-            uniform_range(min_s, string_repeat("9", digits));
-            min_s = "1" + string_repeat("0", digits);
-            out << " | ";
+        auto body = alternatives.size() == 1 ? alternatives[0] : "(" + string_join(alternatives, " | ") + ")";
+        if (end) {
+            return "(" + body + ")?";
         }
-        uniform_range(min_s, max_s);
-        return;
+        return body;
     }
+};
 
-    auto less_decimals = std::max(decimals_left - 1, 1);
-
-    if (has_min) {
-        if (min_value < 0) {
-            out << "\"-\" (";
-            build_min_max_int(std::numeric_limits<int64_t>::min(), -min_value, out, decimals_left, /* top_level= */ false);
-            out << ") | [0] | [1-9] ";
-            more_digits(0, decimals_left - 1);
-        } else if (min_value == 0) {
-            if (top_level) {
-                out << "[0] | [1-9] ";
-                more_digits(0, less_decimals);
+// Magnitudes (nonnegative decimals, no sign) within the bounds, written with
+// at most `budget` digits, or null when none.
+static std::optional<std::string> magnitude_range(const std::optional<magnitude_bound> & low,
+                                                  const std::optional<magnitude_bound> & high,
+                                                  bool integral, size_t budget) {
+    if (low && high) {
+        int c = compare_digit_strings(low->integer, high->integer);
+        if (c == 0) {
+            const size_t width = std::max(low->fraction.size(), high->fraction.size());
+            c = (low->fraction + std::string(width - low->fraction.size(), '0'))
+                    .compare(high->fraction + std::string(width - high->fraction.size(), '0'));
+        }
+        if (c > 0 || (c == 0 && (low->exclusive || high->exclusive))) {
+            return std::nullopt;
+        }
+    }
+    // Fraction digits left after an integer part of `length` digits.
+    auto fraction_cap = [&](size_t length) { return length < budget ? budget - length : 0; };
+    auto with_fraction = [&](const std::string & integer, const std::string & fraction) {
+        return fraction.empty() ? integer : integer + " " + fraction;
+    };
+    auto literal = [&](const magnitude_bound * lower, const magnitude_bound * upper, const std::string & integer) {
+        auto fraction = fraction_grammar(lower, upper, fraction_cap(integer.size())).part(integral);
+        return fraction ? std::optional<std::string>(with_fraction("\"" + integer + "\"", *fraction)) : std::nullopt;
+    };
+    std::vector<std::string> alternatives;
+    if (low && high && low->integer == high->integer) {
+        if (auto value = literal(&*low, &*high, low->integer)) {
+            alternatives.push_back(*value);
+        }
+    } else {
+        // Integer parts strictly between the bounds' integer parts.
+        const std::string between_low = low ? increment_digits(low->integer) : "0";
+        std::optional<std::string> between_high;
+        bool                       between = true;
+        if (high) {
+            if (high->integer == "0") {
+                between = false;
             } else {
-                more_digits(1, decimals_left);
-            }
-        } else if (min_value <= 9) {
-            char c = '0' + min_value;
-            auto range_start = top_level ? '1' : '0';
-            if (c > range_start) {
-                digit_range(range_start, c - 1);
-                out << " ";
-                more_digits(1, less_decimals);
-                out << " | ";
-            }
-            digit_range(c, '9');
-            out << " ";
-            more_digits(0, less_decimals);
-        } else {
-            auto min_s = std::to_string(min_value);
-            auto len = min_s.length();
-            auto c = min_s[0];
-
-            if (c > '1') {
-                digit_range(top_level ? '1' : '0', c - 1);
-                out << " ";
-                more_digits(len, less_decimals);
-                out << " | ";
-            }
-            digit_range(c, c);
-            out << " (";
-            build_min_max_int(std::stoll(min_s.substr(1)), std::numeric_limits<int64_t>::max(), out, less_decimals, /* top_level= */ false);
-            out << ")";
-            if (c < '9') {
-                out << " | ";
-                digit_range(c + 1, '9');
-                out << " ";
-                more_digits(len - 1, less_decimals);
+                between_high = decrement_digits(high->integer);
             }
         }
-        return;
-    }
-
-    if (has_max) {
-        if (max_value >= 0) {
-            if (top_level) {
-                out << "\"-\" [1-9] ";
-                more_digits(0, less_decimals);
-                out << " | ";
+        if (between) {
+            for (const auto & [length, integers] : integer_ranges(between_low, between_high, budget)) {
+                const size_t cap = fraction_cap(length);
+                alternatives.push_back(with_fraction(integers, integral || cap == 0 ? "" : "(\".\" " + digits(1, cap) + ")?"));
             }
-            build_min_max_int(0, max_value, out, decimals_left, /* top_level= */ true);
-        } else {
-            out << "\"-\" (";
-            build_min_max_int(-max_value, std::numeric_limits<int64_t>::max(), out, decimals_left, /* top_level= */ false);
-            out << ")";
         }
-        return;
+        if (low) {
+            if (auto value = literal(&*low, nullptr, low->integer)) {
+                alternatives.push_back(*value);
+            }
+        }
+        if (high) {
+            if (auto value = literal(nullptr, &*high, high->integer)) {
+                alternatives.push_back(*value);
+            }
+        }
     }
+    if (alternatives.empty()) {
+        return std::nullopt;
+    }
+    return alternatives.size() == 1 ? alternatives[0] : "(" + string_join(alternatives, " | ") + ")";
+}
 
-    throw std::runtime_error("At least one of min_value or max_value must be set");
+std::optional<std::string> json_schema_numeric_range(const common_chat_schema_numeric & bounds, bool integral) {
+    // Validators compare decimals as doubles. Decimals of at most 15 digits
+    // read back as distinct doubles, so one within the bounds stays within
+    // them as a double; integers of at most 18 digits are read exactly.
+    const size_t budget = integral ? 18 : 15;
+    auto magnitude = [](const common_chat_numeric_bound & bound) {
+        return magnitude_bound{ bound.value.integer, bound.value.fraction, bound.exclusive };
+    };
+    const auto & minimum = bounds.minimum;
+    const auto & maximum = bounds.maximum;
+    std::vector<std::string> alternatives;
+
+    // Zero and positive values, written without a sign.
+    const bool nonnegative = !maximum || (!maximum->value.negative && !(maximum->value.is_zero() && maximum->exclusive));
+    if (nonnegative) {
+        std::optional<magnitude_bound> low;
+        std::optional<magnitude_bound> high;
+        if (minimum && !minimum->value.negative && !(minimum->value.is_zero() && !minimum->exclusive)) {
+            low = magnitude(*minimum);
+        }
+        if (maximum) {
+            high = magnitude(*maximum);
+        }
+        if (auto range = magnitude_range(low, high, integral, budget)) {
+            alternatives.push_back(*range);
+        }
+    }
+    // Negative values: a sign and a positive magnitude.
+    const bool negative = !minimum || minimum->value.negative;
+    if (negative) {
+        magnitude_bound low{ "0", "", true };
+        if (maximum && maximum->value.negative) {
+            low = magnitude(*maximum);
+        }
+        std::optional<magnitude_bound> high;
+        if (minimum) {
+            high = magnitude(*minimum);
+        }
+        if (auto range = magnitude_range(low, high, integral, budget)) {
+            alternatives.push_back("\"-\" " + *range);
+        }
+    }
+    if (alternatives.empty()) {
+        return std::nullopt;
+    }
+    return alternatives.size() == 1 ? alternatives[0] : "(" + string_join(alternatives, " | ") + ")";
 }
 
 const std::string SPACE_RULE = "| \" \" | \"\\n\"{1,2} [ \\t]{0,20}";
+
+const char * const GBNF_JSON_UNICODE_ESCAPE =
+    "\"u\" ([0-9a-cA-CeEfF] [0-9a-fA-F]{3} | [dD] [0-7] [0-9a-fA-F]{2}"
+    " | [dD] [89abAB] [0-9a-fA-F]{2} \"\\\\u\" [dD] [c-fC-F] [0-9a-fA-F]{2})";
 
 struct BuiltinRule {
     std::string content;
@@ -243,7 +409,7 @@ static std::unordered_map<std::string, BuiltinRule> PRIMITIVE_RULES = {
     {"object", {"\"{\" space ( string \":\" space value (\",\" space string \":\" space value)* )? space \"}\"", {"string", "value"}}},
     {"array", {"\"[\" space ( value (\",\" space value)* )? space \"]\"", {"value"}}},
     {"uuid", {"\"\\\"\" [0-9a-fA-F]{8} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{12} \"\\\"\"", {}}},
-    {"char",   {"[^\"\\\\\\x7F\\x00-\\x1F] | [\\\\] ([\"\\\\bfnrt] | \"u\" [0-9a-fA-F]{4})", {}}},
+    {"char",   {std::string("[^\"\\\\\\x7F\\x00-\\x1F] | [\\\\] ([\"\\\\bfnrt] | ") + GBNF_JSON_UNICODE_ESCAPE + ")", {}}},
     {"string", {"\"\\\"\" char* \"\\\"\"", {"char"}}},
     {"null", {"\"null\"", {}}},
 };
@@ -282,7 +448,181 @@ static std::unordered_map<char, std::string> GRAMMAR_LITERAL_ESCAPES = {
 static const int MAX_PATTERN_DEPTH = 100;
 
 static std::unordered_set<char> NON_LITERAL_SET = {'|', '.', '(', ')', '[', ']', '{', '}', '*', '+', '?', '^', '$'};
-static std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
+
+// A pattern constrains a string's value; the grammar constrains its JSON text.
+// Characters JSON must escape (quotation mark, reverse solidus, controls)
+// match as their escape sequences, never raw.
+
+using codepoint_ranges = std::vector<std::pair<uint32_t, uint32_t>>;
+
+static codepoint_ranges normalize_ranges(codepoint_ranges ranges) {
+    std::sort(ranges.begin(), ranges.end());
+    codepoint_ranges merged;
+    for (const auto & range : ranges) {
+        if (!merged.empty() && range.first <= merged.back().second + 1) {
+            merged.back().second = std::max(merged.back().second, range.second);
+        } else {
+            merged.push_back(range);
+        }
+    }
+    return merged;
+}
+
+static codepoint_ranges subtract_ranges(const codepoint_ranges & ranges, const codepoint_ranges & removed) {
+    codepoint_ranges result;
+    for (auto range : normalize_ranges(ranges)) {
+        for (const auto & cut : normalize_ranges(removed)) {
+            if (cut.second < range.first || cut.first > range.second) {
+                continue;
+            }
+            if (cut.first > range.first) {
+                result.push_back({ range.first, cut.first - 1 });
+            }
+            if (cut.second >= range.second) {
+                range.first = range.second + 1;
+                break;
+            }
+            range.first = cut.second + 1;
+        }
+        if (range.first <= range.second) {
+            result.push_back(range);
+        }
+    }
+    return result;
+}
+
+static bool ranges_contain(const codepoint_ranges & ranges, uint32_t cp) {
+    return std::any_of(ranges.begin(), ranges.end(), [&](const auto & range) { return cp >= range.first && cp <= range.second; });
+}
+
+// Characters a JSON string writes only as escape sequences.
+static const codepoint_ranges JSON_ESCAPED = { { 0x00, 0x1F }, { 0x22, 0x22 }, { 0x5C, 0x5C } };
+
+// The GBNF literal body matching how a JSON string writes one character.
+static std::string json_text_literal(uint32_t cp) {
+    switch (cp) {
+        case 0x22: return "\\\\\\\"";
+        case 0x5C: return "\\\\\\\\";
+        case 0x08: return "\\\\b";
+        case 0x0C: return "\\\\f";
+        case 0x0A: return "\\\\n";
+        case 0x0D: return "\\\\r";
+        case 0x09: return "\\\\t";
+        default: break;
+    }
+    if (cp < 0x20) {
+        char buffer[16];
+        snprintf(buffer, sizeof(buffer), "\\\\u%04x", cp);
+        return buffer;
+    }
+    std::string text;
+    if (cp < 0x80) {
+        text += (char) cp;
+    } else if (cp < 0x800) {
+        text += (char) (0xC0 | (cp >> 6));
+        text += (char) (0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        text += (char) (0xE0 | (cp >> 12));
+        text += (char) (0x80 | ((cp >> 6) & 0x3F));
+        text += (char) (0x80 | (cp & 0x3F));
+    } else {
+        text += (char) (0xF0 | (cp >> 18));
+        text += (char) (0x80 | ((cp >> 12) & 0x3F));
+        text += (char) (0x80 | ((cp >> 6) & 0x3F));
+        text += (char) (0x80 | (cp & 0x3F));
+    }
+    return text;
+}
+
+static std::string class_endpoint(uint32_t cp) {
+    char buffer[16];
+    if (cp <= 0xFFFF) {
+        snprintf(buffer, sizeof(buffer), "\\u%04X", cp);
+    } else {
+        snprintf(buffer, sizeof(buffer), "\\U%08X", cp);
+    }
+    return buffer;
+}
+
+static std::string class_items(const codepoint_ranges & ranges) {
+    std::string items;
+    // Surrogates are not characters of UTF-8 text.
+    for (const auto & range : subtract_ranges(ranges, { { 0xD800, 0xDFFF } })) {
+        items += class_endpoint(range.first);
+        if (range.second != range.first) {
+            items += "-" + class_endpoint(range.second);
+        }
+    }
+    return items;
+}
+
+// A GBNF expression matching the JSON text of one character in the set
+// (or outside it, when negated). Empty when no character matches.
+static std::string json_text_class(const codepoint_ranges & ranges, bool negated) {
+    std::vector<std::string> alternatives;
+    if (negated) {
+        codepoint_ranges excluded = ranges;
+        excluded.insert(excluded.end(), JSON_ESCAPED.begin(), JSON_ESCAPED.end());
+        alternatives.push_back("[^" + class_items(excluded) + "]");
+        for (uint32_t cp : { 0x22u, 0x5Cu, 0x08u, 0x0Cu, 0x0Au, 0x0Du, 0x09u }) {
+            if (!ranges_contain(ranges, cp)) {
+                alternatives.push_back("\"" + json_text_literal(cp) + "\"");
+            }
+        }
+    } else {
+        auto raw = subtract_ranges(ranges, JSON_ESCAPED);
+        if (!raw.empty()) {
+            alternatives.push_back("[" + class_items(raw) + "]");
+        }
+        for (const auto & range : normalize_ranges(ranges)) {
+            for (uint32_t cp = range.first; cp <= std::min<uint32_t>(range.second, 0x5C); cp++) {
+                if (ranges_contain(JSON_ESCAPED, cp)) {
+                    alternatives.push_back("\"" + json_text_literal(cp) + "\"");
+                }
+            }
+        }
+    }
+    if (alternatives.empty()) {
+        return "";
+    }
+    if (alternatives.size() == 1) {
+        return alternatives[0];
+    }
+    return "(" + string_join(alternatives, " | ") + ")";
+}
+
+static const codepoint_ranges DIGIT_RANGES = { { '0', '9' } };
+static const codepoint_ranges WORD_RANGES  = { { '0', '9' }, { 'A', 'Z' }, { '_', '_' }, { 'a', 'z' } };
+static const codepoint_ranges SPACE_RANGES = {
+    { 0x09, 0x0D }, { 0x20, 0x20 }, { 0xA0, 0xA0 }, { 0x1680, 0x1680 }, { 0x2000, 0x200A },
+    { 0x2028, 0x2029 }, { 0x202F, 0x202F }, { 0x205F, 0x205F }, { 0x3000, 0x3000 }, { 0xFEFF, 0xFEFF },
+};
+static const codepoint_ranges LINE_TERMINATORS = { { 0x0A, 0x0A }, { 0x0D, 0x0D }, { 0x2028, 0x2029 } };
+
+// The ranges of a character class escape (\d, \w, \s and their negations).
+static bool class_escape(char c, codepoint_ranges & ranges, bool & negated) {
+    switch (c) {
+        case 'd': ranges = DIGIT_RANGES; negated = false; return true;
+        case 'D': ranges = DIGIT_RANGES; negated = true;  return true;
+        case 'w': ranges = WORD_RANGES;  negated = false; return true;
+        case 'W': ranges = WORD_RANGES;  negated = true;  return true;
+        case 's': ranges = SPACE_RANGES; negated = false; return true;
+        case 'S': ranges = SPACE_RANGES; negated = true;  return true;
+        default:  return false;
+    }
+}
+
+// Decodes the UTF-8 character at `i`, advancing past it.
+static uint32_t decode_utf8(const std::string & text, size_t & i) {
+    const unsigned char lead = text[i];
+    size_t              length = lead < 0x80 ? 1 : (lead >> 5) == 0x6 ? 2 : (lead >> 4) == 0xE ? 3 : 4;
+    uint32_t            cp     = length == 1 ? lead : length == 2 ? lead & 0x1F : length == 3 ? lead & 0x0F : lead & 0x07;
+    for (size_t k = 1; k < length && i + k < text.size(); k++) {
+        cp = (cp << 6) | ((unsigned char) text[i + k] & 0x3F);
+    }
+    i += length;
+    return cp;
+}
 
 static std::string replacePattern(const std::string & input, const std::regex & regex, const std::function<std::string(const std::smatch  &)> & replacement) {
     std::smatch match;
@@ -312,40 +652,151 @@ static std::string format_literal(const std::string & literal) {
 
 std::string gbnf_format_literal(const std::string & literal) { return format_literal(literal); }
 
-static size_t gbnf_escape_length(const std::string & pattern, size_t pos) {
-    if (pos + 1 >= pattern.length() || pattern[pos] != '\\') {
-        return 0;
+// Decodes the escape at `i` (a backslash) when it names one character,
+// advancing past it. False for escapes naming no single character: class
+// escapes, backreferences, assertions and property escapes.
+static bool decode_escape(const std::string & pattern, size_t & i, uint32_t & cp) {
+    if (i + 1 >= pattern.size()) {
+        return false;
     }
-    size_t n_hex = 0;
-    switch (pattern[pos + 1]) {
-        case 'x': n_hex = 2; break;
-        case 'u': n_hex = 4; break;
-        case 'U': n_hex = 8; break;
-        case 't': case 'r': case 'n': case '\\': case '"': case '[': case ']':
-            return 2;
+    auto hex = [&](size_t start, size_t count, uint32_t & value) {
+        if (start + count > pattern.size()) {
+            return false;
+        }
+        value = 0;
+        for (size_t k = start; k < start + count; k++) {
+            const char h = pattern[k];
+            if (!std::isxdigit((unsigned char) h)) {
+                return false;
+            }
+            value = value * 16 + (uint32_t) (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
+        }
+        return true;
+    };
+    const char c = pattern[i + 1];
+    switch (c) {
+        case 't': cp = 0x09; i += 2; return true;
+        case 'n': cp = 0x0A; i += 2; return true;
+        case 'v': cp = 0x0B; i += 2; return true;
+        case 'f': cp = 0x0C; i += 2; return true;
+        case 'r': cp = 0x0D; i += 2; return true;
+        case '0':
+            if (i + 2 < pattern.size() && std::isdigit((unsigned char) pattern[i + 2])) {
+                return false;
+            }
+            cp = 0;
+            i += 2;
+            return true;
+        case 'x':
+            if (!hex(i + 2, 2, cp)) {
+                return false;
+            }
+            i += 4;
+            return true;
+        case 'u': {
+            if (i + 2 < pattern.size() && pattern[i + 2] == '{') {
+                auto close = pattern.find('}', i + 3);
+                if (close == std::string::npos || close - (i + 3) < 1 || close - (i + 3) > 6 ||
+                    !hex(i + 3, close - (i + 3), cp) || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+                    return false;
+                }
+                i = close + 1;
+                return true;
+            }
+            if (!hex(i + 2, 4, cp)) {
+                return false;
+            }
+            size_t next = i + 6;
+            if (cp >= 0xD800 && cp <= 0xDBFF) {
+                uint32_t low = 0;
+                if (next + 1 < pattern.size() && pattern[next] == '\\' && pattern[next + 1] == 'u' &&
+                    hex(next + 2, 4, low) && low >= 0xDC00 && low <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                    i  = next + 6;
+                    return true;
+                }
+                return false;
+            }
+            if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                return false;
+            }
+            i = next;
+            return true;
+        }
         default:
-            return 0;
+            break;
     }
-    if (pos + 2 + n_hex > pattern.length()) {
-        return 0;
+    // Identity escapes of punctuation.
+    if ((unsigned char) c < 0x80 && std::ispunct((unsigned char) c)) {
+        cp = (uint32_t) c;
+        i += 2;
+        return true;
     }
-    for (size_t i = pos + 2; i < pos + 2 + n_hex; i++) {
-        char h = pattern[i];
-        if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) {
-            return 0;
+    return false;
+}
+
+// Parses the class at `i` ('['), advancing past its ']'.
+template <typename Unsupported, typename Invalid>
+static void parse_class(const std::string & pattern, size_t & i, codepoint_ranges & ranges, bool & negated) {
+    i++;
+    negated = i < pattern.size() && pattern[i] == '^';
+    if (negated) {
+        i++;
+    }
+    auto atom = [&](uint32_t & cp) {
+        if (pattern[i] != '\\') {
+            cp = decode_utf8(pattern, i);
+            return;
+        }
+        if (i + 1 < pattern.size() && pattern[i + 1] == 'b') {
+            cp = 0x08;  // backspace, within a class
+            i += 2;
+            return;
+        }
+        if (!decode_escape(pattern, i, cp)) {
+            throw Unsupported("unsupported escape in character class: " + pattern.substr(i, 2));
+        }
+    };
+    while (i < pattern.size() && pattern[i] != ']') {
+        codepoint_ranges escaped;
+        bool             escaped_negated = false;
+        if (pattern[i] == '\\' && i + 1 < pattern.size() && class_escape(pattern[i + 1], escaped, escaped_negated)) {
+            if (escaped_negated) {
+                throw Unsupported("negated class escape inside a character class");
+            }
+            ranges.insert(ranges.end(), escaped.begin(), escaped.end());
+            i += 2;
+            continue;
+        }
+        uint32_t first = 0;
+        atom(first);
+        if (i + 1 < pattern.size() && pattern[i] == '-' && pattern[i + 1] != ']') {
+            i++;
+            if (pattern[i] == '\\' && i + 1 < pattern.size() && class_escape(pattern[i + 1], escaped, escaped_negated)) {
+                throw Unsupported("class escape as a range endpoint");
+            }
+            uint32_t last = 0;
+            atom(last);
+            if (last < first) {
+                throw Invalid("character class range out of order");
+            }
+            ranges.push_back({ first, last });
+        } else {
+            ranges.push_back({ first, first });
         }
     }
-    return 2 + n_hex;
+    if (i >= pattern.size()) {
+        throw Invalid("unterminated character class");
+    }
+    i++;
 }
 
 class common_chat_schema_converter {
 private:
-    friend std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb, const common_grammar_options & options);
-    bool _dotall;
+    friend std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb);
     std::map<std::string, std::string> _rules;
     std::unordered_set<std::string> _refs_being_resolved;
     std::vector<std::string> _errors;
-    std::vector<std::string> _warnings;
 
     template <typename T>
     static const T & as(const common_chat_schema & node) {
@@ -386,27 +837,40 @@ private:
         using std::runtime_error::runtime_error;
     };
 
+    // Lowering keeps only patterns this translates; see json_schema_pattern_supported.
     std::string _visit_pattern(const std::string & pattern, const std::string & name) {
-        auto rules_snapshot = _rules;
         try {
             return _pattern_to_rule(pattern, name);
         } catch (const unsupported_pattern & err) {
-            // revert rules
-            _rules = std::move(rules_snapshot);
-            _warnings.push_back("pattern " + pattern + " is not supported (" + err.what() + "), accepting any string");
-            return _add_rule(name, _add_primitive("string", PRIMITIVE_RULES.at("string")));
+            throw std::logic_error("lowered pattern " + pattern + " is not translatable: " + err.what());
         } catch (const invalid_pattern & err) {
-            _rules = std::move(rules_snapshot);
-            _errors.push_back("Invalid pattern " + pattern + ": " + err.what());
-            return "";
+            throw std::logic_error("lowered pattern " + pattern + " is invalid: " + err.what());
         }
     }
 
+    // The JSON text of one character a pattern's `.` matches: any but a line terminator.
+    std::string _dot_rule() {
+        return _add_rule("dot", json_text_class(LINE_TERMINATORS, true));
+    }
+
     std::string _pattern_to_rule(const std::string & pattern, const std::string & name) {
-        if (pattern.length() < 2 || pattern.front() != '^' || pattern.back() != '$') {
-            throw unsupported_pattern("not anchored with '^' and '$'");
+        // A pattern matches anywhere in the string unless anchored.
+        std::string sub_pattern    = pattern;
+        const bool  anchored_start = !sub_pattern.empty() && sub_pattern.front() == '^';
+        if (anchored_start) {
+            sub_pattern.erase(0, 1);
         }
-        std::string sub_pattern = pattern.substr(1, pattern.length() - 2);
+        bool anchored_end = false;
+        if (!sub_pattern.empty() && sub_pattern.back() == '$') {
+            size_t backslashes = 0;
+            for (size_t k = sub_pattern.size() - 1; k > 0 && sub_pattern[k - 1] == '\\'; k--) {
+                backslashes++;
+            }
+            if (backslashes % 2 == 0) {
+                anchored_end = true;
+                sub_pattern.pop_back();
+            }
+        }
         std::unordered_map<std::string, std::string> sub_rule_ids;
 
         size_t i = 0;
@@ -421,16 +885,6 @@ private:
         };
         std::function<literal_or_rule()> transform = [&]() -> literal_or_rule {
             std::vector<literal_or_rule> seq;
-
-            auto get_dot = [&]() {
-                std::string rule;
-                if (_dotall) {
-                    rule = "[\\U00000000-\\U0010FFFF]";
-                } else {
-                    rule = "[^\\x0A\\x0D]";
-                }
-                return _add_rule("dot", rule);
-            };
 
             // Joins the sequence, merging consecutive literals together.
             auto join_seq = [&]() {
@@ -468,15 +922,23 @@ private:
             while (i < length) {
                 char c = sub_pattern[i];
                 if (c == '.') {
-                    seq.emplace_back(get_dot(), false);
+                    seq.emplace_back(_dot_rule(), false);
                     i++;
                 } else if (c == '(') {
                     i++;
                     if (i < length && sub_pattern[i] == '?') {
                         if (i + 1 < length && sub_pattern[i + 1] == ':') {
                             i += 2; // skip "?:" for non-capturing group, treat as regular group
+                        } else if (i + 1 < length && sub_pattern[i + 1] == '<' && i + 2 < length &&
+                                   sub_pattern[i + 2] != '=' && sub_pattern[i + 2] != '!') {
+                            // a named group matches as a group
+                            auto close = sub_pattern.find('>', i + 2);
+                            if (close == std::string::npos) {
+                                throw invalid_pattern("unterminated group name");
+                            }
+                            i = close + 1;
                         } else {
-                            // lookaround, named group, inline flags, ...
+                            // lookaround, inline flags, ...
                             throw unsupported_pattern("unsupported group syntax");
                         }
                     }
@@ -495,27 +957,14 @@ private:
                 } else if (c == '^' || c == '$') {
                     throw unsupported_pattern("anchor inside the pattern");
                 } else if (c == '[') {
-                    std::string square_brackets = std::string(1, c);
-                    i++;
-                    while (i < length && sub_pattern[i] != ']') {
-                        if (sub_pattern[i] == '\\') {
-                            auto escape_length = gbnf_escape_length(sub_pattern, i);
-                            if (escape_length == 0) {
-                                throw unsupported_pattern("unsupported escape in character class: " + sub_pattern.substr(i, 2));
-                            }
-                            square_brackets += sub_pattern.substr(i, escape_length);
-                            i += escape_length;
-                        } else {
-                            square_brackets += sub_pattern[i];
-                            i++;
-                        }
+                    codepoint_ranges ranges;
+                    bool             negated = false;
+                    parse_class<unsupported_pattern, invalid_pattern>(sub_pattern, i, ranges, negated);
+                    auto expression = json_text_class(ranges, negated);
+                    if (expression.empty()) {
+                        throw unsupported_pattern("character class matches nothing");
                     }
-                    if (i >= length) {
-                        throw invalid_pattern("unterminated character class");
-                    }
-                    square_brackets += ']';
-                    i++;
-                    seq.emplace_back(square_brackets, false);
+                    seq.emplace_back(expression, false);
                 } else if (c == '|') {
                     seq.emplace_back("|", false);
                     i++;
@@ -578,44 +1027,28 @@ private:
                         ""
                     );
                     seq.back().second = false;
+                } else if (c == '\\') {
+                    if (i == length - 1) {
+                        throw invalid_pattern("trailing backslash");
+                    }
+                    codepoint_ranges ranges;
+                    bool             negated = false;
+                    if (class_escape(sub_pattern[i + 1], ranges, negated)) {
+                        seq.emplace_back(json_text_class(ranges, negated), false);
+                        i += 2;
+                        continue;
+                    }
+                    uint32_t cp = 0;
+                    if (!decode_escape(sub_pattern, i, cp)) {
+                        throw unsupported_pattern("unsupported escape: " + sub_pattern.substr(i, 2));
+                    }
+                    seq.emplace_back(json_text_literal(cp), true);
+                } else if (NON_LITERAL_SET.find(c) != NON_LITERAL_SET.end()) {
+                    // a stray ']' or '}'
+                    throw unsupported_pattern(std::string("unsupported character: ") + c);
                 } else {
-                    std::string literal;
-                    auto is_non_literal = [&](char c) {
-                        return NON_LITERAL_SET.find(c) != NON_LITERAL_SET.end();
-                    };
-                    while (i < length) {
-                        if (sub_pattern[i] == '\\') {
-                            if (i == length - 1) {
-                                throw invalid_pattern("trailing backslash");
-                            }
-                            char next = sub_pattern[i + 1];
-                            if (ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.find(next) != ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.end()) {
-                                i++;
-                                literal += sub_pattern[i];
-                                i++;
-                            } else {
-                                auto escape_length = gbnf_escape_length(sub_pattern, i);
-                                if (escape_length == 0) {
-                                    throw unsupported_pattern("unsupported escape: " + sub_pattern.substr(i, 2));
-                                }
-                                literal += sub_pattern.substr(i, escape_length);
-                                i += escape_length;
-                            }
-                        } else if (sub_pattern[i] == '"') {
-                            literal += "\\\"";
-                            i++;
-                        } else if (!is_non_literal(sub_pattern[i]) &&
-                                (i == length - 1 || literal.empty() || sub_pattern[i + 1] == '.' || !is_non_literal(sub_pattern[i + 1]))) {
-                            literal += sub_pattern[i];
-                            i++;
-                        } else {
-                            break;
-                        }
-                    }
-                    if (literal.empty()) { // nothing was consumed, ex. a stray ']' or '}'
-                        throw unsupported_pattern(std::string("unsupported character: ") + c);
-                    }
-                    seq.emplace_back(literal, true);
+                    // One character, as its JSON text; a following quantifier applies to it alone.
+                    seq.emplace_back(json_text_literal(decode_utf8(sub_pattern, i)), true);
                 }
             }
             return join_seq();
@@ -626,7 +1059,18 @@ private:
             throw invalid_pattern("unbalanced parentheses");
         }
 
-        return _add_rule(name, "\"\\\"\" (" + rule + ") \"\\\"\"");
+        std::vector<std::string> parts = { "\"\\\"\"" };
+        if (!anchored_start) {
+            parts.push_back(_dot_rule() + "*");
+        }
+        if (!rule.empty()) {
+            parts.push_back("(" + rule + ")");
+        }
+        if (!anchored_end && (anchored_start || !rule.empty())) {
+            parts.push_back(_dot_rule() + "*");
+        }
+        parts.push_back("\"\\\"\"");
+        return _add_rule(name, string_join(parts, " "));
     }
 
     /*
@@ -812,7 +1256,7 @@ private:
     }
 
 public:
-    explicit common_chat_schema_converter(bool dotall) : _dotall(dotall) {
+    common_chat_schema_converter() {
         _rules["space"] = SPACE_RULE;
     }
 
@@ -828,49 +1272,15 @@ public:
         return _add_primitive(rule_name == "root" ? "root" : type, PRIMITIVE_RULES.at(type));
     }
 
-    std::string _visit_all_of(const common_chat_schema_all_of & schema, const std::string & name, const std::string & rule_name) {
-        std::unordered_set<std::string> required;
-        std::vector<std::pair<std::string, const common_chat_schema *>> properties;
-        std::map<std::string, size_t> enum_values;
-        std::function<void(const common_chat_schema &, bool)> add_component = [&](const common_chat_schema & comp, bool is_required) {
-            if (comp.kind() == common_chat_schema::KIND_REF) {
-                if (const auto * target = as<common_chat_schema_ref>(comp).target) {
-                    add_component(*target, is_required);
-                }
-            } else if (comp.kind() == common_chat_schema::KIND_OBJECT) {
-                for (const auto & prop : as<common_chat_schema_object>(comp).properties) {
-                    properties.emplace_back(prop.name, prop.schema.get());
-                    if (is_required) {
-                        required.insert(prop.name);
-                    }
-                }
-            } else if (comp.kind() == common_chat_schema::KIND_ENUM) {
-                for (const auto & v : as<common_chat_schema_enum>(comp).values) {
-                    enum_values[_generate_constant_rule(v)] += 1;
-                }
-            }
-        };
-        for (const auto & child : schema.children) {
-            if (child->kind() == common_chat_schema::KIND_ANY_OF) {
-                for (const auto & alt : as<common_chat_schema_any_of>(*child).children) {
-                    add_component(*alt, false);
-                }
-            } else {
-                add_component(*child, true);
-            }
+    std::string _visit_numeric(const std::string & rule_name, const common_chat_schema_numeric & bounds, bool integral) {
+        if (!bounds.bounded()) {
+            return _visit_primitive(rule_name, integral ? "integer" : "number");
         }
-        if (!enum_values.empty()) {
-            std::vector<std::string> enum_intersection;
-            for (const auto & p : enum_values) {
-                if (p.second == schema.children.size()) {
-                    enum_intersection.push_back(p.first);
-                }
-            }
-            if (!enum_intersection.empty()) {
-                return _add_rule(rule_name, "(" + string_join(enum_intersection, " | ") + ")");
-            }
+        auto range = json_schema_numeric_range(bounds, integral);
+        if (!range) {
+            throw std::logic_error("lowered numeric range admits no value");
         }
-        return _add_rule(rule_name, _build_object_rule(properties, required, name, nullptr));
+        return _add_rule(rule_name, *range);
     }
 
     std::string visit(const common_chat_schema & schema, const std::string & name) {
@@ -882,8 +1292,8 @@ public:
                 return _add_rule(rule_name, _resolve_ref(as<common_chat_schema_ref>(schema)));
             case common_chat_schema::KIND_ANY_OF:
                 return _add_rule(rule_name, _generate_union_rule(name, as<common_chat_schema_any_of>(schema).children));
-            case common_chat_schema::KIND_ALL_OF:
-                return _visit_all_of(as<common_chat_schema_all_of>(schema), name, rule_name);
+            case common_chat_schema::KIND_NEVER:
+                throw std::logic_error("unsettled schema node");
             case common_chat_schema::KIND_CONST:
                 return _add_rule(rule_name, _generate_constant_rule(as<common_chat_schema_const>(schema).value));
             case common_chat_schema::KIND_ENUM: {
@@ -895,7 +1305,7 @@ public:
             }
             case common_chat_schema::KIND_OBJECT: {
                 const auto & obj = as<common_chat_schema_object>(schema);
-                if (obj.properties.empty() && obj.additional_properties && obj.additional_properties->kind() == common_chat_schema::KIND_ANY) {
+                if (obj.properties.empty() && obj.additional() && obj.additional()->kind() == common_chat_schema::KIND_ANY) {
                     return _add_rule(rule_name, _add_primitive("object", PRIMITIVE_RULES.at("object")));
                 }
                 std::vector<std::pair<std::string, const common_chat_schema *>> properties;
@@ -906,7 +1316,7 @@ public:
                         required.insert(prop.name);
                     }
                 }
-                return _add_rule(rule_name, _build_object_rule(properties, required, name, obj.additional_properties.get()));
+                return _add_rule(rule_name, _build_object_rule(properties, required, name, obj.additional()));
             }
             case common_chat_schema::KIND_TUPLE: {
                 const auto & items = as<common_chat_schema_tuple>(schema).items;
@@ -948,19 +1358,10 @@ public:
                 }
                 return _visit_primitive(rule_name, "string");
             }
-            case common_chat_schema::KIND_INTEGER: {
-                const auto & i = as<common_chat_schema_integer>(schema);
-                if (i.minimum == std::numeric_limits<int64_t>::min() && i.maximum == std::numeric_limits<int64_t>::max()) {
-                    return _visit_primitive(rule_name, "integer");
-                }
-                std::stringstream out;
-                out << "(";
-                build_min_max_int(i.minimum, i.maximum, out);
-                out << ")";
-                return _add_rule(rule_name, out.str());
-            }
+            case common_chat_schema::KIND_INTEGER:
+                return _visit_numeric(rule_name, as<common_chat_schema_integer>(schema), true);
             case common_chat_schema::KIND_NUMBER:
-                return _visit_primitive(rule_name, "number");
+                return _visit_numeric(rule_name, as<common_chat_schema_number>(schema), false);
             case common_chat_schema::KIND_BOOLEAN:
                 return _visit_primitive(rule_name, "boolean");
             case common_chat_schema::KIND_NULL:
@@ -971,12 +1372,22 @@ public:
         return "";
     }
 
+    // Lowered schemas convert exactly; any conversion error is a defect.
     void check_errors() {
         if (!_errors.empty()) {
-            throw std::invalid_argument("JSON schema conversion failed:\n" + string_join(_errors, "\n"));
+            throw std::logic_error("lowered JSON schema conversion failed: " + string_join(_errors, "; "));
         }
-        if (!_warnings.empty()) {
-            throw std::invalid_argument("Unsupported JSON schema conversion: " + string_join(_warnings, "; "));
+    }
+
+    // Whether a pattern translates to a grammar.
+    bool pattern_supported(const std::string & pattern) {
+        try {
+            _pattern_to_rule(pattern, "pattern");
+            return true;
+        } catch (const unsupported_pattern &) {
+            return false;
+        } catch (const invalid_pattern &) {
+            return false;
         }
     }
 
@@ -997,22 +1408,22 @@ std::string json_schema_to_grammar(const common_json & schema, bool force_gbnf) 
 #else
     (void)force_gbnf;
 #endif // LLAMA_USE_LLGUIDANCE
-    try {
-        return json_schema_to_grammar(common_chat_schema_from_json(schema));
-    } catch (const std::runtime_error & e) {
-        throw std::invalid_argument(std::string("JSON schema conversion failed:\n") + e.what());
-    }
+    return json_schema_to_grammar(common_chat_schema_from_json(schema));
+}
+
+bool json_schema_pattern_supported(const std::string & pattern) {
+    return common_chat_schema_converter().pattern_supported(pattern);
 }
 
 std::string json_schema_to_grammar(const common_chat_schema_document & schema) {
-    common_chat_schema_converter converter(false);
+    common_chat_schema_converter converter;
     converter.visit(*schema.root, "");
     converter.check_errors();
     return converter.format_grammar();
 }
 
-std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb, const common_grammar_options & options) {
-    common_chat_schema_converter converter(options.dotall);
+std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb) {
+    common_chat_schema_converter converter;
     common_grammar_builder builder {
         /* .add_rule = */ [&](const std::string & name, const std::string & rule) {
             return converter._add_rule(name, rule);

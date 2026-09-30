@@ -1,4 +1,7 @@
-use magnitude_templates::{build_info, Event, Request, Template, TerminalCause, ToolChoice};
+use magnitude_templates::{
+    build_info, Event, Relaxation, RelaxationReason, RelaxationSubject, Request, Template,
+    TerminalCause, ToolChoice,
+};
 use serde_json::json;
 
 const QWEN: &str = include_str!("assets/Qwen-Qwen3-0.6B.jinja");
@@ -171,7 +174,7 @@ fn failures_are_local_and_output_limits_include_pending_utf8() {
 }
 
 #[test]
-fn required_tools_and_unsupported_schemas_fail_explicitly() {
+fn required_tools_fail_explicitly_and_every_schema_prepares() {
     let template = Template::new(QWEN, &Default::default()).unwrap();
     let mut request = request();
     request.tool_choice = ToolChoice::Required;
@@ -183,9 +186,26 @@ fn required_tools_and_unsupported_schemas_fail_explicitly() {
         .feed(b"ordinary prose")
         .and_then(|_| stream.finish(TerminalCause::Natural))
         .is_err());
-    // A length bound is enforced by the JSON argument grammar.
-    request.tools[0]["function"]["parameters"]["properties"]["query"]["minLength"] = json!(3);
-    assert!(template.prepare(&request).is_ok());
-    request.tools[0]["function"]["parameters"]["properties"]["query"]["uniqueItems"] = json!(true);
-    assert!(template.prepare(&request).is_err());
+    // A length bound is enforced by the JSON argument grammar, and an array
+    // keyword on a string constrains nothing.
+    let query = &mut request.tools[0]["function"]["parameters"]["properties"]["query"];
+    query["minLength"] = json!(3);
+    query["uniqueItems"] = json!(true);
+    let plan = template.prepare(&request).unwrap();
+    assert!(plan.description().relaxations.is_empty());
+    // A keyword no grammar enforces is loosened and recorded.
+    request.tools[0]["function"]["parameters"]["properties"]["query"]["not"] =
+        json!({"const": "x"});
+    let plan = template.prepare(&request).unwrap();
+    assert_eq!(
+        plan.description().relaxations,
+        vec![Relaxation {
+            subject: RelaxationSubject::Tool {
+                name: "search".into()
+            },
+            path: "#/properties/query".into(),
+            keyword: "not".into(),
+            reason: RelaxationReason::Unenforced,
+        }]
+    );
 }

@@ -157,7 +157,8 @@ namespace {
 // to JSON, so parsing and the generation grammar come from the same rules.
 class gemma4_argument_rules {
   public:
-    gemma4_argument_rules(common_chat_peg_builder & p, std::string prefix) : p(p), prefix(std::move(prefix)) {}
+    gemma4_argument_rules(common_chat_peg_builder & p, std::string prefix, std::string tool) :
+        p(p), prefix(std::move(prefix)), tool(std::move(tool)) {}
 
     common_peg_parser visit(const common_chat_schema & schema) {
         switch (schema.kind()) {
@@ -168,12 +169,10 @@ class gemma4_argument_rules {
             case common_chat_schema::KIND_BOOLEAN:
                 return p.ref("gemma4-bool");
             case common_chat_schema::KIND_NUMBER:
+                bounds(schema, static_cast<const common_chat_schema_number &>(schema));
                 return p.ref("gemma4-number");
             case common_chat_schema::KIND_INTEGER: {
-                const auto & integer = static_cast<const common_chat_schema_integer &>(schema);
-                if (integer.minimum != INT64_MIN || integer.maximum != INT64_MAX) {
-                    unsupported("integer bounds");
-                }
+                bounds(schema, static_cast<const common_chat_schema_integer &>(schema));
                 return p.rule("gemma4-number--" + path(), p.sequence({
                     p.optional(p.literal("-")),
                     p.choice({p.literal("0"), p.chars("[1-9]", 1, 1) + p.chars("[0-9]", 0, -1)}),
@@ -182,20 +181,24 @@ class gemma4_argument_rules {
             }
             case common_chat_schema::KIND_STRING: {
                 const auto & string = static_cast<const common_chat_schema_string &>(schema);
-                if (!string.pattern.empty() || string.format != common_chat_schema::FORMAT_NONE ||
-                    string.min_length != 0 || string.max_length != -1) {
-                    unsupported("string patterns, formats or lengths");
+                if (!string.pattern.empty()) {
+                    unenforced(schema, "pattern");
+                }
+                if (string.min_length > 0) {
+                    unenforced(schema, "minLength");
+                }
+                if (string.max_length >= 0) {
+                    unenforced(schema, "maxLength");
                 }
                 return p.ref("gemma4-string");
             }
-            case common_chat_schema::KIND_CONST:
-                return constant(static_cast<const common_chat_schema_const &>(schema).value);
+            case common_chat_schema::KIND_CONST: {
+                auto rules = literals(schema, { static_cast<const common_chat_schema_const &>(schema).value }, "const");
+                return rules ? rules->front() : p.ref("gemma4-value");
+            }
             case common_chat_schema::KIND_ENUM: {
-                std::vector<common_peg_parser> values;
-                for (const auto & value : static_cast<const common_chat_schema_enum &>(schema).values) {
-                    values.push_back(constant(value));
-                }
-                return alternatives(values);
+                auto rules = literals(schema, static_cast<const common_chat_schema_enum &>(schema).values, "enum");
+                return rules ? alternatives(*rules) : p.ref("gemma4-value");
             }
             case common_chat_schema::KIND_ANY_OF: {
                 std::vector<common_peg_parser> values;
@@ -206,9 +209,6 @@ class gemma4_argument_rules {
             }
             case common_chat_schema::KIND_REF: {
                 const auto * target = static_cast<const common_chat_schema_ref &>(schema).target;
-                if (!target) {
-                    unsupported("unresolved references");
-                }
                 // The placeholder rule lets a recursive schema refer to itself.
                 auto index = references.emplace(target, references.size()).first->second;
                 return p.rule("gemma4-value--" + prefix + "-ref-" + std::to_string(index),
@@ -218,34 +218,69 @@ class gemma4_argument_rules {
                 return array(static_cast<const common_chat_schema_array &>(schema));
             case common_chat_schema::KIND_OBJECT:
                 return object(static_cast<const common_chat_schema_object &>(schema));
-            case common_chat_schema::KIND_ALL_OF:
-                unsupported("allOf");
             case common_chat_schema::KIND_TUPLE:
-                unsupported("tuples");
+                unenforced(schema, "prefixItems");
+                return p.ref("gemma4-array");
+            case common_chat_schema::KIND_NEVER:
+                throw std::logic_error("unsettled schema node");
         }
-        unsupported("this schema");
+        throw std::logic_error("unhandled schema node");
     }
 
   private:
     common_chat_peg_builder &                     p;
     std::string                                   prefix;
+    std::string                                   tool;
     size_t                                        next = 0;
     std::map<const common_chat_schema *, size_t>  references;
 
-    [[noreturn]] static void unsupported(const std::string & what) {
-        throw std::invalid_argument("Unsupported JSON schema: Gemma tool arguments cannot enforce " + what);
+    // The dictionary syntax does not enforce this keyword.
+    void unenforced(const common_chat_schema & schema, const std::string & keyword) {
+        templates_native::relax(tool, schema, keyword, common_chat_schema_relaxation::REASON_UNENFORCED);
+    }
+
+    // Numbers are written without bounds.
+    void bounds(const common_chat_schema & schema, const common_chat_schema_numeric & numeric) {
+        if (numeric.minimum) {
+            unenforced(schema, numeric.minimum->exclusive ? "exclusiveMinimum" : "minimum");
+        }
+        if (numeric.maximum) {
+            unenforced(schema, numeric.maximum->exclusive ? "exclusiveMaximum" : "maximum");
+        }
     }
 
     std::string path() { return prefix + "-" + std::to_string(next++); }
 
-    // A value rendered literally.
+    // The listed values (const or enum) rendered literally, or none when the
+    // list admits any value instead: a structured value is listed (those are
+    // not rendered), or every value contains the string delimiter. Strings
+    // containing the delimiter cannot be written and are left out.
+    std::optional<std::vector<common_peg_parser>> literals(const common_chat_schema & schema, const std::vector<json> & values,
+                                                           const std::string & keyword) {
+        if (std::any_of(values.begin(), values.end(), [](const json & value) { return value.is_object() || value.is_array(); })) {
+            unenforced(schema, keyword);
+            return std::nullopt;
+        }
+        std::vector<common_peg_parser> rules;
+        for (const auto & value : values) {
+            if (value.is_string() && value.get<std::string>().find("<|\"|>") != std::string::npos) {
+                templates_native::relax(tool, schema, keyword, common_chat_schema_relaxation::REASON_UNREPRESENTABLE);
+                continue;
+            }
+            rules.push_back(constant(value));
+        }
+        if (rules.empty()) {
+            unenforced(schema, keyword);
+            return std::nullopt;
+        }
+        return rules;
+    }
+
+    // A scalar rendered literally.
     common_peg_parser constant(const json & value) {
         auto at = path();
         if (value.is_string()) {
             const auto text = value.get<std::string>();
-            if (text.find("<|\"|>") != std::string::npos) {
-                unsupported("strings containing the <|\"|> delimiter");
-            }
             return p.rule("gemma4-string--" + at,
                           p.literal("<|\"|>") + p.rule("gemma4-string-content--" + at, p.literal(text)) + p.literal("<|\"|>"));
         }
@@ -255,10 +290,7 @@ class gemma4_argument_rules {
         if (value.is_null()) {
             return p.rule("gemma4-null--" + at, p.literal("null"));
         }
-        if (value.is_number()) {
-            return p.rule("gemma4-number--" + at, p.literal(value.dump()));
-        }
-        unsupported("object or array constants");
+        return p.rule("gemma4-number--" + at, p.literal(value.dump()));
     }
 
     // One of several values. A PEG choice commits to the first alternative
@@ -287,17 +319,22 @@ class gemma4_argument_rules {
     }
 
     common_peg_parser object(const common_chat_schema_object & object) {
-        if (object.properties.empty() && object.additional_properties &&
-            object.additional_properties->kind() == common_chat_schema::KIND_ANY) {
+        const auto * additional = object.additional();
+        if (object.properties.empty() && additional && additional->kind() == common_chat_schema::KIND_ANY) {
             return p.ref("gemma4-dict");
         }
-        if (object.additional_properties) {
-            unsupported("undeclared properties");
+        if (additional) {
+            // Declared and undeclared members in one sorted dictionary.
+            unenforced(object, "additionalProperties");
+            return p.ref("gemma4-dict");
         }
         std::vector<const common_chat_schema_property *> properties;
         for (const auto & property : object.properties) {
             if (property.name.empty() || property.name.find_first_of(":}") != std::string::npos) {
-                unsupported("property names that are not bare dictionary keys");
+                // A dictionary key is bare text without ':' or '}'.
+                templates_native::relax(tool, *property.schema, "properties",
+                                        common_chat_schema_relaxation::REASON_UNREPRESENTABLE);
+                continue;
             }
             properties.push_back(&property);
         }
@@ -447,7 +484,7 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
                 const auto   schema   = common_chat_schema_from_json(common_chat_tool_parameters(function));
-                gemma4_argument_rules arguments(p, "tool-" + std::to_string(index++));
+                gemma4_argument_rules arguments(p, "tool-" + std::to_string(index++), name);
 
                 tool_choice |= p.rule("tool-" + name, p.tool(p.sequence({
                     p.tool_open(p.tool_name(p.literal(name)) + p.peek(p.literal("{"))),

@@ -8,6 +8,7 @@
 //! provider installed the global tracer is a no-op, so telemetry never breaks
 //! execution; export failures are ignored.
 
+use magnitude_chat::conformance::{Conformance, Enforcement};
 use opentelemetry::global;
 use opentelemetry::trace::{Span, SpanKind, Tracer};
 use opentelemetry::KeyValue;
@@ -100,6 +101,88 @@ pub fn span_grammar(report: &magnitude_grammar::CompileReport) {
             key_u64("magnitude.grammar.compile_us", report.compile_us),
         ])
         .start(&tracer);
+    span.end();
+}
+
+fn relaxation_lines(relaxations: &[magnitude_chat::Relaxation]) -> Vec<opentelemetry::StringValue> {
+    relaxations
+        .iter()
+        .map(|relaxation| {
+            let subject = match &relaxation.subject {
+                magnitude_chat::RelaxationSubject::Tool { name } => format!("tool {name}"),
+                magnitude_chat::RelaxationSubject::Output => "output".to_string(),
+            };
+            format!(
+                "{subject} {} {}: {:?}",
+                relaxation.path, relaxation.keyword, relaxation.reason
+            )
+            .into()
+        })
+        .collect()
+}
+
+/// Record the schema keywords a request's output constraint loosened.
+pub fn span_relaxations(relaxations: &[magnitude_chat::Relaxation]) {
+    let tracer = tracer();
+    let mut span = tracer
+        .span_builder("loosen schemas")
+        .with_kind(SpanKind::Internal)
+        .with_attributes(vec![
+            key_u64("magnitude.schema.relaxations", relaxations.len() as u64),
+            KeyValue::new(
+                "magnitude.schema.relaxation",
+                opentelemetry::Value::Array(relaxation_lines(relaxations).into()),
+            ),
+        ])
+        .start(&tracer);
+    span.end();
+}
+
+/// Record a generated value that fails its schema (a conforming value records
+/// nothing); it was published as generated. Under a grammar that enforces the
+/// schema exactly, the grammar admitted a value it should not have: a defect.
+pub fn span_nonconforming_output(subject: &str, conformance: &Conformance) {
+    let (violations, enforcement, defect) = match conformance {
+        Conformance::Conforms => return,
+        Conformance::Unenforced {
+            violations,
+            enforcement,
+        } => (violations, enforcement, false),
+        Conformance::GrammarDefect { violations } => (violations, &Enforcement::Exact, true),
+    };
+    let (enforcement, relaxations): (&str, &[magnitude_chat::Relaxation]) = match enforcement {
+        Enforcement::Exact => ("exact", &[]),
+        Enforcement::Loosened(relaxations) => ("loosened", relaxations),
+        Enforcement::Unconstrained => ("unconstrained", &[]),
+    };
+    let tracer = tracer();
+    let mut span = tracer
+        .span_builder("nonconforming output")
+        .with_kind(SpanKind::Internal)
+        .with_attributes(vec![
+            key_str("magnitude.schema.subject", subject),
+            key_str("magnitude.schema.enforcement", enforcement),
+            KeyValue::new(
+                "magnitude.schema.violation",
+                opentelemetry::Value::Array(
+                    violations
+                        .iter()
+                        .map(|violation| opentelemetry::StringValue::from(violation.clone()))
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+            ),
+            KeyValue::new(
+                "magnitude.schema.relaxation",
+                opentelemetry::Value::Array(relaxation_lines(relaxations).into()),
+            ),
+        ])
+        .start(&tracer);
+    if defect {
+        span.set_status(opentelemetry::trace::Status::error(
+            "the grammar admitted a value its schema rejects",
+        ));
+    }
     span.end();
 }
 

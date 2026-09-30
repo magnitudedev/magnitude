@@ -1,0 +1,3645 @@
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -381,7 +381,9 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+         std::vector<common_peg_parser> required_parsers;
+         std::vector<common_peg_parser> optional_parsers;
+         foreach_parameter(func, [&](const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
+-            templates_require_unconstrained_raw_string(*param.schema);
++            if (param.schema->may_be_string()) {
++                templates_raw_string_argument(name, *param.schema);
++            }
+             auto arg =
+                 p.tool_arg(p.tool_arg_open(arguments.name_prefix + p.tool_arg_name(p.literal(param.name)) +
+                                            arguments.name_suffix) +
+--- a/common/json-schema-to-grammar.cpp
++++ b/common/json-schema-to-grammar.cpp
+@@ -4,8 +4,11 @@
+ #include "unicode.h"
+ 
+ #include <algorithm>
++#include <cctype>
++#include <cstdio>
+ #include <limits>
+ #include <map>
++#include <optional>
+ #include <regex>
+ #include <sstream>
+ #include <string>
+@@ -42,192 +45,355 @@ static std::string build_repetition(const std::string & item_rule, int min_items
+     return result;
+ }
+ 
+-static void build_min_max_int(int64_t min_value, int64_t max_value, std::stringstream & out, int decimals_left = 16, bool top_level = true) {
+-    auto has_min = min_value != std::numeric_limits<int64_t>::min();
+-    auto has_max = max_value != std::numeric_limits<int64_t>::max();
++// ---------------------------------------------------------------------------
++// Numeric ranges
++//
++// A bounded number is written in plain decimal notation (no exponent), which
++// every finite decimal value has, so the grammar admits exactly the values
++// within the bounds. Digit counts are capped as for unbounded numbers, and
++// never below what the bounds themselves need.
+ 
+-    auto digit_range = [&](char from, char to) {
+-        out << "[";
+-        if (from == to) {
+-            out << from;
+-        } else {
+-            out << from << "-" << to;
++static std::string digit_class(char from, char to) {
++    return from == to ? std::string("[") + from + "]" : std::string("[") + from + "-" + to + "]";
++}
++
++static std::string digits(size_t min_count, size_t max_count) {
++    if (min_count == max_count) {
++        return min_count == 1 ? "[0-9]" : "[0-9]{" + std::to_string(min_count) + "}";
++    }
++    return "[0-9]{" + std::to_string(min_count) + "," + std::to_string(max_count) + "}";
++}
++
++// Digit strings of one length from `low` to `high`, inclusive.
++static std::string same_length_range(const std::string & low, const std::string & high) {
++    size_t i = 0;
++    while (i < low.size() && low[i] == high[i]) {
++        i++;
++    }
++    std::string prefix = i > 0 ? "\"" + low.substr(0, i) + "\"" : "";
++    if (i == low.size()) {
++        return prefix;
++    }
++    const size_t      rest    = low.size() - i - 1;
++    const std::string zeros   = std::string(rest, '0');
++    const std::string nines   = std::string(rest, '9');
++    const std::string low_rest  = low.substr(i + 1);
++    const std::string high_rest = high.substr(i + 1);
++    std::vector<std::string> alternatives;
++    if (rest == 0) {
++        alternatives.push_back(digit_class(low[i], high[i]));
++    } else {
++        const char first = low_rest == zeros ? low[i] : (char) (low[i] + 1);
++        const char last  = high_rest == nines ? high[i] : (char) (high[i] - 1);
++        if (low_rest != zeros) {
++            alternatives.push_back(digit_class(low[i], low[i]) + " (" + same_length_range(low_rest, nines) + ")");
+         }
+-        out << "]";
+-    };
+-    auto more_digits = [&](int min_digits, int max_digits) {
+-        out << "[0-9]";
+-        if (min_digits == max_digits && min_digits == 1) {
+-            return;
++        if (first <= last) {
++            alternatives.push_back(digit_class(first, last) + " " + digits(rest, rest));
+         }
+-        out << "{";
+-        out << min_digits;
+-        if (max_digits != min_digits) {
+-            out << ",";
+-            if (max_digits != std::numeric_limits<int>::max()) {
+-                out << max_digits;
+-            }
++        if (high_rest != nines) {
++            alternatives.push_back(digit_class(high[i], high[i]) + " (" + same_length_range(zeros, high_rest) + ")");
+         }
+-        out << "}";
+-    };
+-    std::function<void(const std::string_view &, const std::string_view &)> uniform_range =
+-        [&](const std::string_view & from, const std::string_view & to) {
+-            size_t i = 0;
+-            while (i < from.length() && i < to.length() && from[i] == to[i]) {
+-                i++;
+-            }
+-            if (i > 0) {
+-                out << "\"" << from.substr(0, i) << "\"";
+-            }
+-            if (i < from.length() && i < to.length()) {
+-                if (i > 0) {
+-                    out << " ";
+-                }
+-                auto sub_len = from.length() - i - 1;
+-                if (sub_len > 0) {
+-                    auto from_sub = from.substr(i + 1);
+-                    auto to_sub = to.substr(i + 1);
+-                    auto sub_zeros = string_repeat("0", sub_len);
+-                    auto sub_nines = string_repeat("9", sub_len);
+-
+-                    auto to_reached = false;
+-                    out << "(";
+-                    if (from_sub == sub_zeros) {
+-                        digit_range(from[i], to[i] - 1);
+-                        out << " ";
+-                        more_digits(sub_len, sub_len);
+-                    } else {
+-                        out << "[" << from[i] << "] ";
+-                        out << "(";
+-                        uniform_range(from_sub, sub_nines);
+-                        out << ")";
+-                        if (from[i] < to[i] - 1) {
+-                            out << " | ";
+-                            if (to_sub == sub_nines) {
+-                                digit_range(from[i] + 1, to[i]);
+-                                to_reached = true;
+-                            } else {
+-                                digit_range(from[i] + 1, to[i] - 1);
+-                            }
+-                            out << " ";
+-                            more_digits(sub_len, sub_len);
+-                        }
+-                    }
+-                    if (!to_reached) {
+-                        out << " | ";
+-                        digit_range(to[i], to[i]);
+-                        out << " ";
+-                        uniform_range(sub_zeros, to_sub);
+-                    }
+-                    out << ")";
+-                } else {
+-                    out << "[" << from[i] << "-" << to[i] << "]";
+-                }
+-            }
+-        };
++    }
++    auto body = alternatives.size() == 1 ? alternatives[0] : "(" + string_join(alternatives, " | ") + ")";
++    return prefix.empty() ? body : prefix + " " + body;
++}
+ 
+-    if (has_min && has_max) {
+-        if (min_value < 0 && max_value < 0) {
+-            out << "\"-\" (";
+-            build_min_max_int(-max_value, -min_value, out, decimals_left, /* top_level= */ true);
+-            out << ")";
+-            return;
++static int compare_digit_strings(const std::string & a, const std::string & b) {
++    if (a.size() != b.size()) {
++        return a.size() < b.size() ? -1 : 1;
++    }
++    int c = a.compare(b);
++    return c < 0 ? -1 : c > 0 ? 1 : 0;
++}
++
++static std::string increment_digits(std::string value) {
++    for (size_t i = value.size(); i-- > 0;) {
++        if (value[i] != '9') {
++            value[i]++;
++            return value;
++        }
++        value[i] = '0';
++    }
++    return "1" + value;
++}
++
++// The canonical integer one less; `value` is positive.
++static std::string decrement_digits(std::string value) {
++    for (size_t i = value.size(); i-- > 0;) {
++        if (value[i] != '0') {
++            value[i]--;
++            break;
+         }
++        value[i] = '9';
++    }
++    auto first = value.find_first_not_of('0');
++    return first == std::string::npos ? "0" : value.substr(first);
++}
+ 
+-        if (min_value < 0) {
+-            out << "\"-\" (";
+-            build_min_max_int(0, -min_value, out, decimals_left, /* top_level= */ true);
+-            out << ") | ";
+-            min_value = 0;
++// Canonical nonnegative integers from `low` to `high` (inclusive) of at most
++// `longest` digits, by digit count.
++static std::vector<std::pair<size_t, std::string>> integer_ranges(const std::string &                low,
++                                                                  const std::optional<std::string> & high,
++                                                                  size_t                             longest) {
++    std::vector<std::pair<size_t, std::string>> ranges;
++    for (size_t length = low.size(); length <= longest && (!high || length <= high->size()); length++) {
++        const std::string from = length == low.size() ? low : "1" + std::string(length - 1, '0');
++        const std::string to   = high && length == high->size() ? *high : std::string(length, '9');
++        if (compare_digit_strings(from, to) <= 0) {
++            ranges.emplace_back(length, same_length_range(from, to));
+         }
++    }
++    return ranges;
++}
+ 
+-        auto min_s = std::to_string(min_value);
+-        auto max_s = std::to_string(max_value);
+-        auto min_digits = min_s.length();
+-        auto max_digits = max_s.length();
++// A bound on a magnitude (a nonnegative decimal).
++struct magnitude_bound {
++    std::string integer;
++    std::string fraction;
++    bool        exclusive = false;
++};
+ 
+-        for (auto digits = min_digits; digits < max_digits; digits++) {
+-            uniform_range(min_s, string_repeat("9", digits));
+-            min_s = "1" + string_repeat("0", digits);
+-            out << " | ";
++// The fraction digits after an integer part, from position `i`, while the
++// digits so far equal the lower and/or upper bound's fraction digits.
++class fraction_grammar {
++    enum lower_state { LOWER_FREE, LOWER_TIGHT, LOWER_PENDING };  // pending: equal to an exclusive bound
++    enum upper_state { UPPER_FREE, UPPER_TIGHT, UPPER_ZEROS, UPPER_DEAD };
++
++    const magnitude_bound * low_;
++    const magnitude_bound * high_;
++    size_t                  cap_;
++
++  public:
++    fraction_grammar(const magnitude_bound * low, const magnitude_bound * high, size_t cap) : low_(low), high_(high), cap_(cap) {}
++
++    // The optional fraction part, or null when no fraction (not even none) satisfies the bounds.
++    std::optional<std::string> part(bool integral) const {
++        lower_state lower = low_ ? LOWER_TIGHT : LOWER_FREE;
++        upper_state upper = high_ ? UPPER_TIGHT : UPPER_FREE;
++        normalize(0, lower, upper);
++        if (upper == UPPER_DEAD) {
++            return std::nullopt;
+         }
+-        uniform_range(min_s, max_s);
+-        return;
++        const bool none = can_end(0, lower, upper);
++        auto       more = integral ? std::nullopt : from(0, lower, upper, /* may_end = */ false);
++        if (none && more) {
++            return "(\".\" " + *more + ")?";
++        }
++        if (more) {
++            return "\".\" " + *more;
++        }
++        if (none) {
++            return std::string();
++        }
++        return std::nullopt;
+     }
+ 
+-    auto less_decimals = std::max(decimals_left - 1, 1);
+-
+-    if (has_min) {
+-        if (min_value < 0) {
+-            out << "\"-\" (";
+-            build_min_max_int(std::numeric_limits<int64_t>::min(), -min_value, out, decimals_left, /* top_level= */ false);
+-            out << ") | [0] | [1-9] ";
+-            more_digits(0, decimals_left - 1);
+-        } else if (min_value == 0) {
+-            if (top_level) {
+-                out << "[0] | [1-9] ";
+-                more_digits(0, less_decimals);
+-            } else {
+-                more_digits(1, decimals_left);
++  private:
++    void normalize(size_t i, lower_state & lower, upper_state & upper) const {
++        if (lower == LOWER_TIGHT && i >= low_->fraction.size()) {
++            lower = low_->exclusive ? LOWER_PENDING : LOWER_FREE;
++        }
++        if (upper == UPPER_TIGHT && i >= high_->fraction.size()) {
++            upper = high_->exclusive ? UPPER_DEAD : UPPER_ZEROS;
++        }
++    }
++
++    bool can_end(size_t i, lower_state lower, upper_state upper) const {
++        // Ending pads with zeros: below a lower bound with digits left, and
++        // equal to a bound the digits have reached.
++        return lower == LOWER_FREE && upper != UPPER_DEAD && (upper != UPPER_TIGHT || i < high_->fraction.size());
++    }
++
++    // Digits from position `i`; null when no continuation satisfies the bounds.
++    std::optional<std::string> from(size_t i, lower_state lower, upper_state upper, bool may_end) const {
++        normalize(i, lower, upper);
++        if (upper == UPPER_DEAD) {
++            return std::nullopt;
++        }
++        const bool   end       = may_end && can_end(i, lower, upper);
++        const size_t remaining = i < cap_ ? cap_ - i : 0;
++        if (remaining == 0) {
++            return end ? std::optional<std::string>("") : std::nullopt;
++        }
++        if (lower == LOWER_FREE && upper == UPPER_FREE) {
++            return digits(may_end ? 0 : 1, remaining);
++        }
++        if (lower == LOWER_FREE && upper == UPPER_ZEROS) {
++            return "[0]{" + std::to_string(may_end ? 0 : 1) + "," + std::to_string(remaining) + "}";
++        }
++        // Group the next digit by the state it leads to.
++        std::vector<std::string> alternatives;
++        char                     start = 0;
++        std::optional<std::pair<lower_state, upper_state>> group;
++        auto flush = [&](char last) {
++            if (!group) {
++                return;
+             }
+-        } else if (min_value <= 9) {
+-            char c = '0' + min_value;
+-            auto range_start = top_level ? '1' : '0';
+-            if (c > range_start) {
+-                digit_range(range_start, c - 1);
+-                out << " ";
+-                more_digits(1, less_decimals);
+-                out << " | ";
++            auto next = from(i + 1, group->first, group->second, true);
++            if (next) {
++                alternatives.push_back(digit_class(start, last) + (next->empty() ? "" : " " + *next));
+             }
+-            digit_range(c, '9');
+-            out << " ";
+-            more_digits(0, less_decimals);
+-        } else {
+-            auto min_s = std::to_string(min_value);
+-            auto len = min_s.length();
+-            auto c = min_s[0];
+-
+-            if (c > '1') {
+-                digit_range(top_level ? '1' : '0', c - 1);
+-                out << " ";
+-                more_digits(len, less_decimals);
+-                out << " | ";
++        };
++        for (char d = '0'; d <= '9'; d++) {
++            std::optional<std::pair<lower_state, upper_state>> next;
++            lower_state                                        l = lower;
++            upper_state                                        u = upper;
++            bool                                               allowed = true;
++            if (lower == LOWER_TIGHT) {
++                const char bound = low_->fraction[i];
++                l                = d > bound ? LOWER_FREE : LOWER_TIGHT;
++                allowed          = d >= bound;
++            } else if (lower == LOWER_PENDING) {
++                l = d > '0' ? LOWER_FREE : LOWER_PENDING;
++            }
++            if (upper == UPPER_TIGHT) {
++                const char bound = high_->fraction[i];
++                u                = d < bound ? UPPER_FREE : UPPER_TIGHT;
++                allowed          = allowed && d <= bound;
++            } else if (upper == UPPER_ZEROS) {
++                allowed = allowed && d == '0';
+             }
+-            digit_range(c, c);
+-            out << " (";
+-            build_min_max_int(std::stoll(min_s.substr(1)), std::numeric_limits<int64_t>::max(), out, less_decimals, /* top_level= */ false);
+-            out << ")";
+-            if (c < '9') {
+-                out << " | ";
+-                digit_range(c + 1, '9');
+-                out << " ";
+-                more_digits(len - 1, less_decimals);
++            if (allowed) {
++                next = std::make_pair(l, u);
+             }
++            if (next != group) {
++                flush((char) (d - 1));
++                group = next;
++                start = d;
++            }
++        }
++        flush('9');
++        if (alternatives.empty()) {
++            return end ? std::optional<std::string>("") : std::nullopt;
++        }
++        auto body = alternatives.size() == 1 ? alternatives[0] : "(" + string_join(alternatives, " | ") + ")";
++        if (end) {
++            return "(" + body + ")?";
+         }
+-        return;
++        return body;
+     }
++};
+ 
+-    if (has_max) {
+-        if (max_value >= 0) {
+-            if (top_level) {
+-                out << "\"-\" [1-9] ";
+-                more_digits(0, less_decimals);
+-                out << " | ";
++// Magnitudes (nonnegative decimals, no sign) within the bounds, written with
++// at most `budget` digits, or null when none.
++static std::optional<std::string> magnitude_range(const std::optional<magnitude_bound> & low,
++                                                  const std::optional<magnitude_bound> & high,
++                                                  bool integral, size_t budget) {
++    if (low && high) {
++        int c = compare_digit_strings(low->integer, high->integer);
++        if (c == 0) {
++            const size_t width = std::max(low->fraction.size(), high->fraction.size());
++            c = (low->fraction + std::string(width - low->fraction.size(), '0'))
++                    .compare(high->fraction + std::string(width - high->fraction.size(), '0'));
++        }
++        if (c > 0 || (c == 0 && (low->exclusive || high->exclusive))) {
++            return std::nullopt;
++        }
++    }
++    // Fraction digits left after an integer part of `length` digits.
++    auto fraction_cap = [&](size_t length) { return length < budget ? budget - length : 0; };
++    auto with_fraction = [&](const std::string & integer, const std::string & fraction) {
++        return fraction.empty() ? integer : integer + " " + fraction;
++    };
++    auto literal = [&](const magnitude_bound * lower, const magnitude_bound * upper, const std::string & integer) {
++        auto fraction = fraction_grammar(lower, upper, fraction_cap(integer.size())).part(integral);
++        return fraction ? std::optional<std::string>(with_fraction("\"" + integer + "\"", *fraction)) : std::nullopt;
++    };
++    std::vector<std::string> alternatives;
++    if (low && high && low->integer == high->integer) {
++        if (auto value = literal(&*low, &*high, low->integer)) {
++            alternatives.push_back(*value);
++        }
++    } else {
++        // Integer parts strictly between the bounds' integer parts.
++        const std::string between_low = low ? increment_digits(low->integer) : "0";
++        std::optional<std::string> between_high;
++        bool                       between = true;
++        if (high) {
++            if (high->integer == "0") {
++                between = false;
++            } else {
++                between_high = decrement_digits(high->integer);
++            }
++        }
++        if (between) {
++            for (const auto & [length, integers] : integer_ranges(between_low, between_high, budget)) {
++                const size_t cap = fraction_cap(length);
++                alternatives.push_back(with_fraction(integers, integral || cap == 0 ? "" : "(\".\" " + digits(1, cap) + ")?"));
+             }
+-            build_min_max_int(0, max_value, out, decimals_left, /* top_level= */ true);
+-        } else {
+-            out << "\"-\" (";
+-            build_min_max_int(-max_value, std::numeric_limits<int64_t>::max(), out, decimals_left, /* top_level= */ false);
+-            out << ")";
+         }
+-        return;
++        if (low) {
++            if (auto value = literal(&*low, nullptr, low->integer)) {
++                alternatives.push_back(*value);
++            }
++        }
++        if (high) {
++            if (auto value = literal(nullptr, &*high, high->integer)) {
++                alternatives.push_back(*value);
++            }
++        }
++    }
++    if (alternatives.empty()) {
++        return std::nullopt;
+     }
++    return alternatives.size() == 1 ? alternatives[0] : "(" + string_join(alternatives, " | ") + ")";
++}
+ 
+-    throw std::runtime_error("At least one of min_value or max_value must be set");
++std::optional<std::string> json_schema_numeric_range(const common_chat_schema_numeric & bounds, bool integral) {
++    // Validators compare decimals as doubles. Decimals of at most 15 digits
++    // read back as distinct doubles, so one within the bounds stays within
++    // them as a double; integers of at most 18 digits are read exactly.
++    const size_t budget = integral ? 18 : 15;
++    auto magnitude = [](const common_chat_numeric_bound & bound) {
++        return magnitude_bound{ bound.value.integer, bound.value.fraction, bound.exclusive };
++    };
++    const auto & minimum = bounds.minimum;
++    const auto & maximum = bounds.maximum;
++    std::vector<std::string> alternatives;
++
++    // Zero and positive values, written without a sign.
++    const bool nonnegative = !maximum || (!maximum->value.negative && !(maximum->value.is_zero() && maximum->exclusive));
++    if (nonnegative) {
++        std::optional<magnitude_bound> low;
++        std::optional<magnitude_bound> high;
++        if (minimum && !minimum->value.negative && !(minimum->value.is_zero() && !minimum->exclusive)) {
++            low = magnitude(*minimum);
++        }
++        if (maximum) {
++            high = magnitude(*maximum);
++        }
++        if (auto range = magnitude_range(low, high, integral, budget)) {
++            alternatives.push_back(*range);
++        }
++    }
++    // Negative values: a sign and a positive magnitude.
++    const bool negative = !minimum || minimum->value.negative;
++    if (negative) {
++        magnitude_bound low{ "0", "", true };
++        if (maximum && maximum->value.negative) {
++            low = magnitude(*maximum);
++        }
++        std::optional<magnitude_bound> high;
++        if (minimum) {
++            high = magnitude(*minimum);
++        }
++        if (auto range = magnitude_range(low, high, integral, budget)) {
++            alternatives.push_back("\"-\" " + *range);
++        }
++    }
++    if (alternatives.empty()) {
++        return std::nullopt;
++    }
++    return alternatives.size() == 1 ? alternatives[0] : "(" + string_join(alternatives, " | ") + ")";
+ }
+ 
+ const std::string SPACE_RULE = "| \" \" | \"\\n\"{1,2} [ \\t]{0,20}";
+ 
++const char * const GBNF_JSON_UNICODE_ESCAPE =
++    "\"u\" ([0-9a-cA-CeEfF] [0-9a-fA-F]{3} | [dD] [0-7] [0-9a-fA-F]{2}"
++    " | [dD] [89abAB] [0-9a-fA-F]{2} \"\\\\u\" [dD] [c-fC-F] [0-9a-fA-F]{2})";
++
+ struct BuiltinRule {
+     std::string content;
+     std::vector<std::string> deps;
+@@ -243,7 +409,7 @@ static std::unordered_map<std::string, BuiltinRule> PRIMITIVE_RULES = {
+     {"object", {"\"{\" space ( string \":\" space value (\",\" space string \":\" space value)* )? space \"}\"", {"string", "value"}}},
+     {"array", {"\"[\" space ( value (\",\" space value)* )? space \"]\"", {"value"}}},
+     {"uuid", {"\"\\\"\" [0-9a-fA-F]{8} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{12} \"\\\"\"", {}}},
+-    {"char",   {"[^\"\\\\\\x7F\\x00-\\x1F] | [\\\\] ([\"\\\\bfnrt] | \"u\" [0-9a-fA-F]{4})", {}}},
++    {"char",   {std::string("[^\"\\\\\\x7F\\x00-\\x1F] | [\\\\] ([\"\\\\bfnrt] | ") + GBNF_JSON_UNICODE_ESCAPE + ")", {}}},
+     {"string", {"\"\\\"\" char* \"\\\"\"", {"char"}}},
+     {"null", {"\"null\"", {}}},
+ };
+@@ -282,7 +448,181 @@ static std::unordered_map<char, std::string> GRAMMAR_LITERAL_ESCAPES = {
+ static const int MAX_PATTERN_DEPTH = 100;
+ 
+ static std::unordered_set<char> NON_LITERAL_SET = {'|', '.', '(', ')', '[', ']', '{', '}', '*', '+', '?', '^', '$'};
+-static std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
++
++// A pattern constrains a string's value; the grammar constrains its JSON text.
++// Characters JSON must escape (quotation mark, reverse solidus, controls)
++// match as their escape sequences, never raw.
++
++using codepoint_ranges = std::vector<std::pair<uint32_t, uint32_t>>;
++
++static codepoint_ranges normalize_ranges(codepoint_ranges ranges) {
++    std::sort(ranges.begin(), ranges.end());
++    codepoint_ranges merged;
++    for (const auto & range : ranges) {
++        if (!merged.empty() && range.first <= merged.back().second + 1) {
++            merged.back().second = std::max(merged.back().second, range.second);
++        } else {
++            merged.push_back(range);
++        }
++    }
++    return merged;
++}
++
++static codepoint_ranges subtract_ranges(const codepoint_ranges & ranges, const codepoint_ranges & removed) {
++    codepoint_ranges result;
++    for (auto range : normalize_ranges(ranges)) {
++        for (const auto & cut : normalize_ranges(removed)) {
++            if (cut.second < range.first || cut.first > range.second) {
++                continue;
++            }
++            if (cut.first > range.first) {
++                result.push_back({ range.first, cut.first - 1 });
++            }
++            if (cut.second >= range.second) {
++                range.first = range.second + 1;
++                break;
++            }
++            range.first = cut.second + 1;
++        }
++        if (range.first <= range.second) {
++            result.push_back(range);
++        }
++    }
++    return result;
++}
++
++static bool ranges_contain(const codepoint_ranges & ranges, uint32_t cp) {
++    return std::any_of(ranges.begin(), ranges.end(), [&](const auto & range) { return cp >= range.first && cp <= range.second; });
++}
++
++// Characters a JSON string writes only as escape sequences.
++static const codepoint_ranges JSON_ESCAPED = { { 0x00, 0x1F }, { 0x22, 0x22 }, { 0x5C, 0x5C } };
++
++// The GBNF literal body matching how a JSON string writes one character.
++static std::string json_text_literal(uint32_t cp) {
++    switch (cp) {
++        case 0x22: return "\\\\\\\"";
++        case 0x5C: return "\\\\\\\\";
++        case 0x08: return "\\\\b";
++        case 0x0C: return "\\\\f";
++        case 0x0A: return "\\\\n";
++        case 0x0D: return "\\\\r";
++        case 0x09: return "\\\\t";
++        default: break;
++    }
++    if (cp < 0x20) {
++        char buffer[16];
++        snprintf(buffer, sizeof(buffer), "\\\\u%04x", cp);
++        return buffer;
++    }
++    std::string text;
++    if (cp < 0x80) {
++        text += (char) cp;
++    } else if (cp < 0x800) {
++        text += (char) (0xC0 | (cp >> 6));
++        text += (char) (0x80 | (cp & 0x3F));
++    } else if (cp < 0x10000) {
++        text += (char) (0xE0 | (cp >> 12));
++        text += (char) (0x80 | ((cp >> 6) & 0x3F));
++        text += (char) (0x80 | (cp & 0x3F));
++    } else {
++        text += (char) (0xF0 | (cp >> 18));
++        text += (char) (0x80 | ((cp >> 12) & 0x3F));
++        text += (char) (0x80 | ((cp >> 6) & 0x3F));
++        text += (char) (0x80 | (cp & 0x3F));
++    }
++    return text;
++}
++
++static std::string class_endpoint(uint32_t cp) {
++    char buffer[16];
++    if (cp <= 0xFFFF) {
++        snprintf(buffer, sizeof(buffer), "\\u%04X", cp);
++    } else {
++        snprintf(buffer, sizeof(buffer), "\\U%08X", cp);
++    }
++    return buffer;
++}
++
++static std::string class_items(const codepoint_ranges & ranges) {
++    std::string items;
++    // Surrogates are not characters of UTF-8 text.
++    for (const auto & range : subtract_ranges(ranges, { { 0xD800, 0xDFFF } })) {
++        items += class_endpoint(range.first);
++        if (range.second != range.first) {
++            items += "-" + class_endpoint(range.second);
++        }
++    }
++    return items;
++}
++
++// A GBNF expression matching the JSON text of one character in the set
++// (or outside it, when negated). Empty when no character matches.
++static std::string json_text_class(const codepoint_ranges & ranges, bool negated) {
++    std::vector<std::string> alternatives;
++    if (negated) {
++        codepoint_ranges excluded = ranges;
++        excluded.insert(excluded.end(), JSON_ESCAPED.begin(), JSON_ESCAPED.end());
++        alternatives.push_back("[^" + class_items(excluded) + "]");
++        for (uint32_t cp : { 0x22u, 0x5Cu, 0x08u, 0x0Cu, 0x0Au, 0x0Du, 0x09u }) {
++            if (!ranges_contain(ranges, cp)) {
++                alternatives.push_back("\"" + json_text_literal(cp) + "\"");
++            }
++        }
++    } else {
++        auto raw = subtract_ranges(ranges, JSON_ESCAPED);
++        if (!raw.empty()) {
++            alternatives.push_back("[" + class_items(raw) + "]");
++        }
++        for (const auto & range : normalize_ranges(ranges)) {
++            for (uint32_t cp = range.first; cp <= std::min<uint32_t>(range.second, 0x5C); cp++) {
++                if (ranges_contain(JSON_ESCAPED, cp)) {
++                    alternatives.push_back("\"" + json_text_literal(cp) + "\"");
++                }
++            }
++        }
++    }
++    if (alternatives.empty()) {
++        return "";
++    }
++    if (alternatives.size() == 1) {
++        return alternatives[0];
++    }
++    return "(" + string_join(alternatives, " | ") + ")";
++}
++
++static const codepoint_ranges DIGIT_RANGES = { { '0', '9' } };
++static const codepoint_ranges WORD_RANGES  = { { '0', '9' }, { 'A', 'Z' }, { '_', '_' }, { 'a', 'z' } };
++static const codepoint_ranges SPACE_RANGES = {
++    { 0x09, 0x0D }, { 0x20, 0x20 }, { 0xA0, 0xA0 }, { 0x1680, 0x1680 }, { 0x2000, 0x200A },
++    { 0x2028, 0x2029 }, { 0x202F, 0x202F }, { 0x205F, 0x205F }, { 0x3000, 0x3000 }, { 0xFEFF, 0xFEFF },
++};
++static const codepoint_ranges LINE_TERMINATORS = { { 0x0A, 0x0A }, { 0x0D, 0x0D }, { 0x2028, 0x2029 } };
++
++// The ranges of a character class escape (\d, \w, \s and their negations).
++static bool class_escape(char c, codepoint_ranges & ranges, bool & negated) {
++    switch (c) {
++        case 'd': ranges = DIGIT_RANGES; negated = false; return true;
++        case 'D': ranges = DIGIT_RANGES; negated = true;  return true;
++        case 'w': ranges = WORD_RANGES;  negated = false; return true;
++        case 'W': ranges = WORD_RANGES;  negated = true;  return true;
++        case 's': ranges = SPACE_RANGES; negated = false; return true;
++        case 'S': ranges = SPACE_RANGES; negated = true;  return true;
++        default:  return false;
++    }
++}
++
++// Decodes the UTF-8 character at `i`, advancing past it.
++static uint32_t decode_utf8(const std::string & text, size_t & i) {
++    const unsigned char lead = text[i];
++    size_t              length = lead < 0x80 ? 1 : (lead >> 5) == 0x6 ? 2 : (lead >> 4) == 0xE ? 3 : 4;
++    uint32_t            cp     = length == 1 ? lead : length == 2 ? lead & 0x1F : length == 3 ? lead & 0x0F : lead & 0x07;
++    for (size_t k = 1; k < length && i + k < text.size(); k++) {
++        cp = (cp << 6) | ((unsigned char) text[i + k] & 0x3F);
++    }
++    i += length;
++    return cp;
++}
+ 
+ static std::string replacePattern(const std::string & input, const std::regex & regex, const std::function<std::string(const std::smatch  &)> & replacement) {
+     std::smatch match;
+@@ -312,40 +652,151 @@ static std::string format_literal(const std::string & literal) {
+ 
+ std::string gbnf_format_literal(const std::string & literal) { return format_literal(literal); }
+ 
+-static size_t gbnf_escape_length(const std::string & pattern, size_t pos) {
+-    if (pos + 1 >= pattern.length() || pattern[pos] != '\\') {
+-        return 0;
++// Decodes the escape at `i` (a backslash) when it names one character,
++// advancing past it. False for escapes naming no single character: class
++// escapes, backreferences, assertions and property escapes.
++static bool decode_escape(const std::string & pattern, size_t & i, uint32_t & cp) {
++    if (i + 1 >= pattern.size()) {
++        return false;
+     }
+-    size_t n_hex = 0;
+-    switch (pattern[pos + 1]) {
+-        case 'x': n_hex = 2; break;
+-        case 'u': n_hex = 4; break;
+-        case 'U': n_hex = 8; break;
+-        case 't': case 'r': case 'n': case '\\': case '"': case '[': case ']':
+-            return 2;
++    auto hex = [&](size_t start, size_t count, uint32_t & value) {
++        if (start + count > pattern.size()) {
++            return false;
++        }
++        value = 0;
++        for (size_t k = start; k < start + count; k++) {
++            const char h = pattern[k];
++            if (!std::isxdigit((unsigned char) h)) {
++                return false;
++            }
++            value = value * 16 + (uint32_t) (h <= '9' ? h - '0' : (h | 0x20) - 'a' + 10);
++        }
++        return true;
++    };
++    const char c = pattern[i + 1];
++    switch (c) {
++        case 't': cp = 0x09; i += 2; return true;
++        case 'n': cp = 0x0A; i += 2; return true;
++        case 'v': cp = 0x0B; i += 2; return true;
++        case 'f': cp = 0x0C; i += 2; return true;
++        case 'r': cp = 0x0D; i += 2; return true;
++        case '0':
++            if (i + 2 < pattern.size() && std::isdigit((unsigned char) pattern[i + 2])) {
++                return false;
++            }
++            cp = 0;
++            i += 2;
++            return true;
++        case 'x':
++            if (!hex(i + 2, 2, cp)) {
++                return false;
++            }
++            i += 4;
++            return true;
++        case 'u': {
++            if (i + 2 < pattern.size() && pattern[i + 2] == '{') {
++                auto close = pattern.find('}', i + 3);
++                if (close == std::string::npos || close - (i + 3) < 1 || close - (i + 3) > 6 ||
++                    !hex(i + 3, close - (i + 3), cp) || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
++                    return false;
++                }
++                i = close + 1;
++                return true;
++            }
++            if (!hex(i + 2, 4, cp)) {
++                return false;
++            }
++            size_t next = i + 6;
++            if (cp >= 0xD800 && cp <= 0xDBFF) {
++                uint32_t low = 0;
++                if (next + 1 < pattern.size() && pattern[next] == '\\' && pattern[next + 1] == 'u' &&
++                    hex(next + 2, 4, low) && low >= 0xDC00 && low <= 0xDFFF) {
++                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
++                    i  = next + 6;
++                    return true;
++                }
++                return false;
++            }
++            if (cp >= 0xDC00 && cp <= 0xDFFF) {
++                return false;
++            }
++            i = next;
++            return true;
++        }
+         default:
+-            return 0;
++            break;
+     }
+-    if (pos + 2 + n_hex > pattern.length()) {
+-        return 0;
++    // Identity escapes of punctuation.
++    if ((unsigned char) c < 0x80 && std::ispunct((unsigned char) c)) {
++        cp = (uint32_t) c;
++        i += 2;
++        return true;
+     }
+-    for (size_t i = pos + 2; i < pos + 2 + n_hex; i++) {
+-        char h = pattern[i];
+-        if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) {
+-            return 0;
++    return false;
++}
++
++// Parses the class at `i` ('['), advancing past its ']'.
++template <typename Unsupported, typename Invalid>
++static void parse_class(const std::string & pattern, size_t & i, codepoint_ranges & ranges, bool & negated) {
++    i++;
++    negated = i < pattern.size() && pattern[i] == '^';
++    if (negated) {
++        i++;
++    }
++    auto atom = [&](uint32_t & cp) {
++        if (pattern[i] != '\\') {
++            cp = decode_utf8(pattern, i);
++            return;
++        }
++        if (i + 1 < pattern.size() && pattern[i + 1] == 'b') {
++            cp = 0x08;  // backspace, within a class
++            i += 2;
++            return;
++        }
++        if (!decode_escape(pattern, i, cp)) {
++            throw Unsupported("unsupported escape in character class: " + pattern.substr(i, 2));
++        }
++    };
++    while (i < pattern.size() && pattern[i] != ']') {
++        codepoint_ranges escaped;
++        bool             escaped_negated = false;
++        if (pattern[i] == '\\' && i + 1 < pattern.size() && class_escape(pattern[i + 1], escaped, escaped_negated)) {
++            if (escaped_negated) {
++                throw Unsupported("negated class escape inside a character class");
++            }
++            ranges.insert(ranges.end(), escaped.begin(), escaped.end());
++            i += 2;
++            continue;
++        }
++        uint32_t first = 0;
++        atom(first);
++        if (i + 1 < pattern.size() && pattern[i] == '-' && pattern[i + 1] != ']') {
++            i++;
++            if (pattern[i] == '\\' && i + 1 < pattern.size() && class_escape(pattern[i + 1], escaped, escaped_negated)) {
++                throw Unsupported("class escape as a range endpoint");
++            }
++            uint32_t last = 0;
++            atom(last);
++            if (last < first) {
++                throw Invalid("character class range out of order");
++            }
++            ranges.push_back({ first, last });
++        } else {
++            ranges.push_back({ first, first });
+         }
+     }
+-    return 2 + n_hex;
++    if (i >= pattern.size()) {
++        throw Invalid("unterminated character class");
++    }
++    i++;
+ }
+ 
+ class common_chat_schema_converter {
+ private:
+-    friend std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb, const common_grammar_options & options);
+-    bool _dotall;
++    friend std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb);
+     std::map<std::string, std::string> _rules;
+     std::unordered_set<std::string> _refs_being_resolved;
+     std::vector<std::string> _errors;
+-    std::vector<std::string> _warnings;
+ 
+     template <typename T>
+     static const T & as(const common_chat_schema & node) {
+@@ -386,27 +837,40 @@ private:
+         using std::runtime_error::runtime_error;
+     };
+ 
++    // Lowering keeps only patterns this translates; see json_schema_pattern_supported.
+     std::string _visit_pattern(const std::string & pattern, const std::string & name) {
+-        auto rules_snapshot = _rules;
+         try {
+             return _pattern_to_rule(pattern, name);
+         } catch (const unsupported_pattern & err) {
+-            // revert rules
+-            _rules = std::move(rules_snapshot);
+-            _warnings.push_back("pattern " + pattern + " is not supported (" + err.what() + "), accepting any string");
+-            return _add_rule(name, _add_primitive("string", PRIMITIVE_RULES.at("string")));
++            throw std::logic_error("lowered pattern " + pattern + " is not translatable: " + err.what());
+         } catch (const invalid_pattern & err) {
+-            _rules = std::move(rules_snapshot);
+-            _errors.push_back("Invalid pattern " + pattern + ": " + err.what());
+-            return "";
++            throw std::logic_error("lowered pattern " + pattern + " is invalid: " + err.what());
+         }
+     }
+ 
++    // The JSON text of one character a pattern's `.` matches: any but a line terminator.
++    std::string _dot_rule() {
++        return _add_rule("dot", json_text_class(LINE_TERMINATORS, true));
++    }
++
+     std::string _pattern_to_rule(const std::string & pattern, const std::string & name) {
+-        if (pattern.length() < 2 || pattern.front() != '^' || pattern.back() != '$') {
+-            throw unsupported_pattern("not anchored with '^' and '$'");
++        // A pattern matches anywhere in the string unless anchored.
++        std::string sub_pattern    = pattern;
++        const bool  anchored_start = !sub_pattern.empty() && sub_pattern.front() == '^';
++        if (anchored_start) {
++            sub_pattern.erase(0, 1);
++        }
++        bool anchored_end = false;
++        if (!sub_pattern.empty() && sub_pattern.back() == '$') {
++            size_t backslashes = 0;
++            for (size_t k = sub_pattern.size() - 1; k > 0 && sub_pattern[k - 1] == '\\'; k--) {
++                backslashes++;
++            }
++            if (backslashes % 2 == 0) {
++                anchored_end = true;
++                sub_pattern.pop_back();
++            }
+         }
+-        std::string sub_pattern = pattern.substr(1, pattern.length() - 2);
+         std::unordered_map<std::string, std::string> sub_rule_ids;
+ 
+         size_t i = 0;
+@@ -422,16 +886,6 @@ private:
+         std::function<literal_or_rule()> transform = [&]() -> literal_or_rule {
+             std::vector<literal_or_rule> seq;
+ 
+-            auto get_dot = [&]() {
+-                std::string rule;
+-                if (_dotall) {
+-                    rule = "[\\U00000000-\\U0010FFFF]";
+-                } else {
+-                    rule = "[^\\x0A\\x0D]";
+-                }
+-                return _add_rule("dot", rule);
+-            };
+-
+             // Joins the sequence, merging consecutive literals together.
+             auto join_seq = [&]() {
+                 std::vector<literal_or_rule> ret;
+@@ -468,15 +922,23 @@ private:
+             while (i < length) {
+                 char c = sub_pattern[i];
+                 if (c == '.') {
+-                    seq.emplace_back(get_dot(), false);
++                    seq.emplace_back(_dot_rule(), false);
+                     i++;
+                 } else if (c == '(') {
+                     i++;
+                     if (i < length && sub_pattern[i] == '?') {
+                         if (i + 1 < length && sub_pattern[i + 1] == ':') {
+                             i += 2; // skip "?:" for non-capturing group, treat as regular group
++                        } else if (i + 1 < length && sub_pattern[i + 1] == '<' && i + 2 < length &&
++                                   sub_pattern[i + 2] != '=' && sub_pattern[i + 2] != '!') {
++                            // a named group matches as a group
++                            auto close = sub_pattern.find('>', i + 2);
++                            if (close == std::string::npos) {
++                                throw invalid_pattern("unterminated group name");
++                            }
++                            i = close + 1;
+                         } else {
+-                            // lookaround, named group, inline flags, ...
++                            // lookaround, inline flags, ...
+                             throw unsupported_pattern("unsupported group syntax");
+                         }
+                     }
+@@ -495,27 +957,14 @@ private:
+                 } else if (c == '^' || c == '$') {
+                     throw unsupported_pattern("anchor inside the pattern");
+                 } else if (c == '[') {
+-                    std::string square_brackets = std::string(1, c);
+-                    i++;
+-                    while (i < length && sub_pattern[i] != ']') {
+-                        if (sub_pattern[i] == '\\') {
+-                            auto escape_length = gbnf_escape_length(sub_pattern, i);
+-                            if (escape_length == 0) {
+-                                throw unsupported_pattern("unsupported escape in character class: " + sub_pattern.substr(i, 2));
+-                            }
+-                            square_brackets += sub_pattern.substr(i, escape_length);
+-                            i += escape_length;
+-                        } else {
+-                            square_brackets += sub_pattern[i];
+-                            i++;
+-                        }
+-                    }
+-                    if (i >= length) {
+-                        throw invalid_pattern("unterminated character class");
++                    codepoint_ranges ranges;
++                    bool             negated = false;
++                    parse_class<unsupported_pattern, invalid_pattern>(sub_pattern, i, ranges, negated);
++                    auto expression = json_text_class(ranges, negated);
++                    if (expression.empty()) {
++                        throw unsupported_pattern("character class matches nothing");
+                     }
+-                    square_brackets += ']';
+-                    i++;
+-                    seq.emplace_back(square_brackets, false);
++                    seq.emplace_back(expression, false);
+                 } else if (c == '|') {
+                     seq.emplace_back("|", false);
+                     i++;
+@@ -578,44 +1027,28 @@ private:
+                         ""
+                     );
+                     seq.back().second = false;
+-                } else {
+-                    std::string literal;
+-                    auto is_non_literal = [&](char c) {
+-                        return NON_LITERAL_SET.find(c) != NON_LITERAL_SET.end();
+-                    };
+-                    while (i < length) {
+-                        if (sub_pattern[i] == '\\') {
+-                            if (i == length - 1) {
+-                                throw invalid_pattern("trailing backslash");
+-                            }
+-                            char next = sub_pattern[i + 1];
+-                            if (ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.find(next) != ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.end()) {
+-                                i++;
+-                                literal += sub_pattern[i];
+-                                i++;
+-                            } else {
+-                                auto escape_length = gbnf_escape_length(sub_pattern, i);
+-                                if (escape_length == 0) {
+-                                    throw unsupported_pattern("unsupported escape: " + sub_pattern.substr(i, 2));
+-                                }
+-                                literal += sub_pattern.substr(i, escape_length);
+-                                i += escape_length;
+-                            }
+-                        } else if (sub_pattern[i] == '"') {
+-                            literal += "\\\"";
+-                            i++;
+-                        } else if (!is_non_literal(sub_pattern[i]) &&
+-                                (i == length - 1 || literal.empty() || sub_pattern[i + 1] == '.' || !is_non_literal(sub_pattern[i + 1]))) {
+-                            literal += sub_pattern[i];
+-                            i++;
+-                        } else {
+-                            break;
+-                        }
++                } else if (c == '\\') {
++                    if (i == length - 1) {
++                        throw invalid_pattern("trailing backslash");
+                     }
+-                    if (literal.empty()) { // nothing was consumed, ex. a stray ']' or '}'
+-                        throw unsupported_pattern(std::string("unsupported character: ") + c);
++                    codepoint_ranges ranges;
++                    bool             negated = false;
++                    if (class_escape(sub_pattern[i + 1], ranges, negated)) {
++                        seq.emplace_back(json_text_class(ranges, negated), false);
++                        i += 2;
++                        continue;
+                     }
+-                    seq.emplace_back(literal, true);
++                    uint32_t cp = 0;
++                    if (!decode_escape(sub_pattern, i, cp)) {
++                        throw unsupported_pattern("unsupported escape: " + sub_pattern.substr(i, 2));
++                    }
++                    seq.emplace_back(json_text_literal(cp), true);
++                } else if (NON_LITERAL_SET.find(c) != NON_LITERAL_SET.end()) {
++                    // a stray ']' or '}'
++                    throw unsupported_pattern(std::string("unsupported character: ") + c);
++                } else {
++                    // One character, as its JSON text; a following quantifier applies to it alone.
++                    seq.emplace_back(json_text_literal(decode_utf8(sub_pattern, i)), true);
+                 }
+             }
+             return join_seq();
+@@ -626,7 +1059,18 @@ private:
+             throw invalid_pattern("unbalanced parentheses");
+         }
+ 
+-        return _add_rule(name, "\"\\\"\" (" + rule + ") \"\\\"\"");
++        std::vector<std::string> parts = { "\"\\\"\"" };
++        if (!anchored_start) {
++            parts.push_back(_dot_rule() + "*");
++        }
++        if (!rule.empty()) {
++            parts.push_back("(" + rule + ")");
++        }
++        if (!anchored_end && (anchored_start || !rule.empty())) {
++            parts.push_back(_dot_rule() + "*");
++        }
++        parts.push_back("\"\\\"\"");
++        return _add_rule(name, string_join(parts, " "));
+     }
+ 
+     /*
+@@ -812,7 +1256,7 @@ private:
+     }
+ 
+ public:
+-    explicit common_chat_schema_converter(bool dotall) : _dotall(dotall) {
++    common_chat_schema_converter() {
+         _rules["space"] = SPACE_RULE;
+     }
+ 
+@@ -828,49 +1272,15 @@ public:
+         return _add_primitive(rule_name == "root" ? "root" : type, PRIMITIVE_RULES.at(type));
+     }
+ 
+-    std::string _visit_all_of(const common_chat_schema_all_of & schema, const std::string & name, const std::string & rule_name) {
+-        std::unordered_set<std::string> required;
+-        std::vector<std::pair<std::string, const common_chat_schema *>> properties;
+-        std::map<std::string, size_t> enum_values;
+-        std::function<void(const common_chat_schema &, bool)> add_component = [&](const common_chat_schema & comp, bool is_required) {
+-            if (comp.kind() == common_chat_schema::KIND_REF) {
+-                if (const auto * target = as<common_chat_schema_ref>(comp).target) {
+-                    add_component(*target, is_required);
+-                }
+-            } else if (comp.kind() == common_chat_schema::KIND_OBJECT) {
+-                for (const auto & prop : as<common_chat_schema_object>(comp).properties) {
+-                    properties.emplace_back(prop.name, prop.schema.get());
+-                    if (is_required) {
+-                        required.insert(prop.name);
+-                    }
+-                }
+-            } else if (comp.kind() == common_chat_schema::KIND_ENUM) {
+-                for (const auto & v : as<common_chat_schema_enum>(comp).values) {
+-                    enum_values[_generate_constant_rule(v)] += 1;
+-                }
+-            }
+-        };
+-        for (const auto & child : schema.children) {
+-            if (child->kind() == common_chat_schema::KIND_ANY_OF) {
+-                for (const auto & alt : as<common_chat_schema_any_of>(*child).children) {
+-                    add_component(*alt, false);
+-                }
+-            } else {
+-                add_component(*child, true);
+-            }
++    std::string _visit_numeric(const std::string & rule_name, const common_chat_schema_numeric & bounds, bool integral) {
++        if (!bounds.bounded()) {
++            return _visit_primitive(rule_name, integral ? "integer" : "number");
+         }
+-        if (!enum_values.empty()) {
+-            std::vector<std::string> enum_intersection;
+-            for (const auto & p : enum_values) {
+-                if (p.second == schema.children.size()) {
+-                    enum_intersection.push_back(p.first);
+-                }
+-            }
+-            if (!enum_intersection.empty()) {
+-                return _add_rule(rule_name, "(" + string_join(enum_intersection, " | ") + ")");
+-            }
++        auto range = json_schema_numeric_range(bounds, integral);
++        if (!range) {
++            throw std::logic_error("lowered numeric range admits no value");
+         }
+-        return _add_rule(rule_name, _build_object_rule(properties, required, name, nullptr));
++        return _add_rule(rule_name, *range);
+     }
+ 
+     std::string visit(const common_chat_schema & schema, const std::string & name) {
+@@ -882,8 +1292,8 @@ public:
+                 return _add_rule(rule_name, _resolve_ref(as<common_chat_schema_ref>(schema)));
+             case common_chat_schema::KIND_ANY_OF:
+                 return _add_rule(rule_name, _generate_union_rule(name, as<common_chat_schema_any_of>(schema).children));
+-            case common_chat_schema::KIND_ALL_OF:
+-                return _visit_all_of(as<common_chat_schema_all_of>(schema), name, rule_name);
++            case common_chat_schema::KIND_NEVER:
++                throw std::logic_error("unsettled schema node");
+             case common_chat_schema::KIND_CONST:
+                 return _add_rule(rule_name, _generate_constant_rule(as<common_chat_schema_const>(schema).value));
+             case common_chat_schema::KIND_ENUM: {
+@@ -895,7 +1305,7 @@ public:
+             }
+             case common_chat_schema::KIND_OBJECT: {
+                 const auto & obj = as<common_chat_schema_object>(schema);
+-                if (obj.properties.empty() && obj.additional_properties && obj.additional_properties->kind() == common_chat_schema::KIND_ANY) {
++                if (obj.properties.empty() && obj.additional() && obj.additional()->kind() == common_chat_schema::KIND_ANY) {
+                     return _add_rule(rule_name, _add_primitive("object", PRIMITIVE_RULES.at("object")));
+                 }
+                 std::vector<std::pair<std::string, const common_chat_schema *>> properties;
+@@ -906,7 +1316,7 @@ public:
+                         required.insert(prop.name);
+                     }
+                 }
+-                return _add_rule(rule_name, _build_object_rule(properties, required, name, obj.additional_properties.get()));
++                return _add_rule(rule_name, _build_object_rule(properties, required, name, obj.additional()));
+             }
+             case common_chat_schema::KIND_TUPLE: {
+                 const auto & items = as<common_chat_schema_tuple>(schema).items;
+@@ -948,19 +1358,10 @@ public:
+                 }
+                 return _visit_primitive(rule_name, "string");
+             }
+-            case common_chat_schema::KIND_INTEGER: {
+-                const auto & i = as<common_chat_schema_integer>(schema);
+-                if (i.minimum == std::numeric_limits<int64_t>::min() && i.maximum == std::numeric_limits<int64_t>::max()) {
+-                    return _visit_primitive(rule_name, "integer");
+-                }
+-                std::stringstream out;
+-                out << "(";
+-                build_min_max_int(i.minimum, i.maximum, out);
+-                out << ")";
+-                return _add_rule(rule_name, out.str());
+-            }
++            case common_chat_schema::KIND_INTEGER:
++                return _visit_numeric(rule_name, as<common_chat_schema_integer>(schema), true);
+             case common_chat_schema::KIND_NUMBER:
+-                return _visit_primitive(rule_name, "number");
++                return _visit_numeric(rule_name, as<common_chat_schema_number>(schema), false);
+             case common_chat_schema::KIND_BOOLEAN:
+                 return _visit_primitive(rule_name, "boolean");
+             case common_chat_schema::KIND_NULL:
+@@ -971,12 +1372,22 @@ public:
+         return "";
+     }
+ 
++    // Lowered schemas convert exactly; any conversion error is a defect.
+     void check_errors() {
+         if (!_errors.empty()) {
+-            throw std::invalid_argument("JSON schema conversion failed:\n" + string_join(_errors, "\n"));
++            throw std::logic_error("lowered JSON schema conversion failed: " + string_join(_errors, "; "));
+         }
+-        if (!_warnings.empty()) {
+-            throw std::invalid_argument("Unsupported JSON schema conversion: " + string_join(_warnings, "; "));
++    }
++
++    // Whether a pattern translates to a grammar.
++    bool pattern_supported(const std::string & pattern) {
++        try {
++            _pattern_to_rule(pattern, "pattern");
++            return true;
++        } catch (const unsupported_pattern &) {
++            return false;
++        } catch (const invalid_pattern &) {
++            return false;
+         }
+     }
+ 
+@@ -997,22 +1408,22 @@ std::string json_schema_to_grammar(const common_json & schema, bool force_gbnf)
+ #else
+     (void)force_gbnf;
+ #endif // LLAMA_USE_LLGUIDANCE
+-    try {
+-        return json_schema_to_grammar(common_chat_schema_from_json(schema));
+-    } catch (const std::runtime_error & e) {
+-        throw std::invalid_argument(std::string("JSON schema conversion failed:\n") + e.what());
+-    }
++    return json_schema_to_grammar(common_chat_schema_from_json(schema));
++}
++
++bool json_schema_pattern_supported(const std::string & pattern) {
++    return common_chat_schema_converter().pattern_supported(pattern);
+ }
+ 
+ std::string json_schema_to_grammar(const common_chat_schema_document & schema) {
+-    common_chat_schema_converter converter(false);
++    common_chat_schema_converter converter;
+     converter.visit(*schema.root, "");
+     converter.check_errors();
+     return converter.format_grammar();
+ }
+ 
+-std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb, const common_grammar_options & options) {
+-    common_chat_schema_converter converter(options.dotall);
++std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb) {
++    common_chat_schema_converter converter;
+     common_grammar_builder builder {
+         /* .add_rule = */ [&](const std::string & name, const std::string & rule) {
+             return converter._add_rule(name, rule);
+--- a/common/json-schema-to-grammar.h
++++ b/common/json-schema-to-grammar.h
+@@ -4,20 +4,28 @@
+ #include "json.h"
+ 
+ #include <functional>
++#include <optional>
+ #include <string>
+ 
+ std::string json_schema_to_grammar(const common_json & schema, bool force_gbnf = false);
+ std::string json_schema_to_grammar(const common_chat_schema_document & schema);
+ 
++// Whether a JSON Schema pattern translates to a grammar over JSON string text.
++bool json_schema_pattern_supported(const std::string & pattern);
++
++// The GBNF of plain decimal JSON numbers within the bounds (integers only when
++// integral); null when no value is within them.
++std::optional<std::string> json_schema_numeric_range(const common_chat_schema_numeric & bounds, bool integral);
++
+ struct common_grammar_builder {
+     std::function<std::string(const std::string &, const std::string &)>    add_rule;
+     std::function<std::string(const std::string &, const common_chat_schema &)> add_schema;
+ };
+ 
+-struct common_grammar_options {
+-    bool dotall = false;
+-};
+-
+ std::string gbnf_format_literal(const std::string & literal);
+ 
+-std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb, const common_grammar_options & options = {});
++// A JSON string's \u escape after its backslash: one character outside the
++// surrogates, or a complete surrogate pair. JSON parsers reject lone surrogates.
++extern const char * const GBNF_JSON_UNICODE_ESCAPE;
++
++std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb);
+--- a/common/json-schema.cpp
++++ b/common/json-schema.cpp
+@@ -1,345 +1,1424 @@
+ #include "json-schema.h"
++#include "json-schema-to-grammar.h"
+ #include "templates-support.h"
+ 
++#include <algorithm>
++#include <cctype>
+ #include <cmath>
++#include <limits>
+ #include <map>
++#include <optional>
++#include <regex>
++#include <set>
+ #include <stdexcept>
+ #include <string>
++#include <tuple>
+ #include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+-class common_chat_schema_builder {
+-    const common_json &      root_;
+-    common_chat_schema_document & doc_;
++using json = common_json;
+ 
+-    // the targets built here, moved into doc_ once the whole schema is built
+-    std::map<std::string, common_chat_schema_ptr> refs_;
++// ---------------------------------------------------------------------------
++// Exact decimals
+ 
+-    // ref nodes get their target once every $ref is built, a cycle would otherwise need it too early
+-    std::vector<common_chat_schema_ref *> pending_;
++static std::string strip_leading_zeros(const std::string & digits) {
++    auto first = digits.find_first_not_of('0');
++    return first == std::string::npos ? "0" : digits.substr(first);
++}
+ 
+-    [[noreturn]] static void fail(const std::string & path, const std::string & msg) {
+-        throw std::runtime_error("JSON schema error at " + path + ": " + msg);
+-    }
++static std::string strip_trailing_zeros(const std::string & digits) {
++    auto last = digits.find_last_not_of('0');
++    return last == std::string::npos ? "" : digits.substr(0, last + 1);
++}
+ 
+-    static int get_count(const common_json & schema, const std::string & key, const std::string & path, int def) {
+-        if (!schema.contains(key)) {
+-            return def;
+-        }
+-        const common_json & value = schema.at(key);
+-        if (!value.is_number_integer() || value.get<int>() < 0) {
+-            fail(path, key + " must be a non-negative integer");
++common_chat_decimal common_chat_decimal::from_json(const common_json & value) {
++    if (!value.is_number() || (value.is_number_float() && !std::isfinite(value.get<double>()))) {
++        throw std::logic_error("not a finite JSON number: " + value.dump());
++    }
++    // Doubles dump as the shortest text that reads back as the same double.
++    const std::string text = value.dump();
++    common_chat_decimal result;
++    size_t              i = 0;
++    if (i < text.size() && text[i] == '-') {
++        result.negative = true;
++        i++;
++    }
++    std::string digits;
++    long long   point = -1;
++    for (; i < text.size() && text[i] != 'e' && text[i] != 'E'; i++) {
++        if (text[i] == '.') {
++            point = (long long) digits.size();
++        } else {
++            digits += text[i];
+         }
+-        return value.get<int>();
+     }
++    if (point < 0) {
++        point = (long long) digits.size();
++    }
++    if (i < text.size()) {
++        point += std::stoll(text.substr(i + 1));
++    }
++    std::string integer;
++    std::string fraction;
++    if (point <= 0) {
++        integer  = "0";
++        fraction = std::string((size_t) -point, '0') + digits;
++    } else if (point >= (long long) digits.size()) {
++        integer = digits + std::string((size_t) point - digits.size(), '0');
++    } else {
++        integer  = digits.substr(0, (size_t) point);
++        fraction = digits.substr((size_t) point);
++    }
++    result.integer  = strip_leading_zeros(integer);
++    result.fraction = strip_trailing_zeros(fraction);
++    if (result.is_zero()) {
++        result.negative = false;
++    }
++    return result;
++}
+ 
+-    // a fractional bound is rounded inwards, towards the integers it still admits
+-    static int64_t get_bound(const common_json & schema, const std::string & key, const std::string & path, bool round_up) {
+-        const common_json & value = schema.at(key);
+-        if (value.is_number_integer()) {
+-            return value.get<int64_t>();
+-        }
+-        if (!value.is_number()) {
+-            fail(path, key + " must be a number");
+-        }
+-        double d = value.get<double>();
+-        return (int64_t) (round_up ? std::ceil(d) : std::floor(d));
++std::string common_chat_decimal::to_string() const {
++    return (negative ? "-" : "") + integer + (fraction.empty() ? "" : "." + fraction);
++}
++
++static int compare_magnitudes(const common_chat_decimal & a, const common_chat_decimal & b) {
++    if (a.integer.size() != b.integer.size()) {
++        return a.integer.size() < b.integer.size() ? -1 : 1;
++    }
++    if (int c = a.integer.compare(b.integer)) {
++        return c < 0 ? -1 : 1;
++    }
++    const size_t width = std::max(a.fraction.size(), b.fraction.size());
++    const auto   fa    = a.fraction + std::string(width - a.fraction.size(), '0');
++    const auto   fb    = b.fraction + std::string(width - b.fraction.size(), '0');
++    int          c     = fa.compare(fb);
++    return c < 0 ? -1 : c > 0 ? 1 : 0;
++}
++
++int common_chat_decimal_compare(const common_chat_decimal & a, const common_chat_decimal & b) {
++    if (a.negative != b.negative) {
++        return a.negative ? -1 : 1;
+     }
++    int magnitude = compare_magnitudes(a, b);
++    return a.negative ? -magnitude : magnitude;
++}
++
++// ---------------------------------------------------------------------------
++// Nodes
++
++template <typename T>
++common_chat_schema_ptr common_chat_schema_node<T>::clone() const {
++    return std::make_unique<T>(static_cast<const T &>(*this));
++}
++
++template struct common_chat_schema_node<common_chat_schema_any>;
++template struct common_chat_schema_node<common_chat_schema_never>;
++template struct common_chat_schema_node<common_chat_schema_ref>;
++template struct common_chat_schema_node<common_chat_schema_any_of>;
++template struct common_chat_schema_node<common_chat_schema_const>;
++template struct common_chat_schema_node<common_chat_schema_enum>;
++template struct common_chat_schema_node<common_chat_schema_null>;
++template struct common_chat_schema_node<common_chat_schema_boolean>;
++template struct common_chat_schema_node<common_chat_schema_number>;
++template struct common_chat_schema_node<common_chat_schema_integer>;
++template struct common_chat_schema_node<common_chat_schema_string>;
++template struct common_chat_schema_node<common_chat_schema_array>;
++template struct common_chat_schema_node<common_chat_schema_tuple>;
++template struct common_chat_schema_node<common_chat_schema_object>;
++
++common_chat_schema_any_of::common_chat_schema_any_of(const common_chat_schema_any_of & other) :
++    common_chat_schema_node(other) {
++    for (const auto & child : other.children) {
++        children.push_back(child->clone());
++    }
++}
++
++common_chat_schema_array::common_chat_schema_array(const common_chat_schema_array & other) :
++    common_chat_schema_node(other),
++    items(other.items->clone()),
++    min_items(other.min_items),
++    max_items(other.max_items) {}
++
++common_chat_schema_tuple::common_chat_schema_tuple(const common_chat_schema_tuple & other) :
++    common_chat_schema_node(other) {
++    for (const auto & item : other.items) {
++        items.push_back(item->clone());
++    }
++}
++
++common_chat_schema_object::common_chat_schema_object(const common_chat_schema_object & other) :
++    common_chat_schema_node(other),
++    undeclared(other.undeclared),
++    additional_properties(other.additional_properties ? other.additional_properties->clone() : nullptr) {
++    for (const auto & property : other.properties) {
++        properties.push_back({ property.name, property.schema->clone(), property.required });
++    }
++}
++
++const common_chat_schema * common_chat_schema_object::additional() const {
++    static const common_chat_schema_any any;
++    switch (undeclared) {
++        case UNDECLARED_ANY:    return &any;
++        case UNDECLARED_NONE:   return nullptr;
++        case UNDECLARED_STATED: return additional_properties.get();
++    }
++    return nullptr;
++}
++
++const char * common_chat_schema_relaxation::reason_name(reason_kind reason) {
++    switch (reason) {
++        case REASON_UNENFORCED:       return "unenforced";
++        case REASON_UNREPRESENTABLE:  return "unrepresentable";
++        case REASON_UNSATISFIABLE:    return "unsatisfiable";
++    }
++    return "?";
++}
+ 
+-    static common_chat_schema::string_format get_format(const common_json & schema, const std::string & path) {
+-        if (!schema.contains("format")) {
+-            return common_chat_schema::FORMAT_NONE;
++bool common_chat_schema_relaxation::operator<(const common_chat_schema_relaxation & other) const {
++    return std::tie(path, keyword, reason) < std::tie(other.path, other.keyword, other.reason);
++}
++
++bool common_chat_schema_relaxation::operator==(const common_chat_schema_relaxation & other) const {
++    return path == other.path && keyword == other.keyword && reason == other.reason;
++}
++
++// ---------------------------------------------------------------------------
++// Lowering
++
++namespace {
++
++using relaxation = common_chat_schema_relaxation;
++
++// Every keyword with validation meaning, in every draft, is lowered below:
++// enforced, or recorded as a relaxation. Type-specific keywords constrain only
++// values of their type. Anything else is an annotation (including unknown
++// keywords) and is ignored exactly.
++
++const std::vector<std::string> OBJECT_KEYWORDS = {
++    "properties", "required", "additionalProperties", "patternProperties", "propertyNames", "minProperties",
++    "maxProperties", "dependentRequired", "dependentSchemas", "dependencies", "unevaluatedProperties",
++};
++const std::vector<std::string> ARRAY_KEYWORDS = {
++    "items", "prefixItems", "additionalItems", "minItems", "maxItems", "uniqueItems", "contains", "minContains",
++    "maxContains", "unevaluatedItems",
++};
++const std::vector<std::string> STRING_KEYWORDS  = { "minLength", "maxLength", "pattern" };
++const std::vector<std::string> NUMERIC_KEYWORDS = { "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf" };
++
++// Integers enumerated to enforce multipleOf exactly.
++constexpr int64_t MAX_MULTIPLES = 256;
++
++bool has_any(const json & schema, const std::vector<std::string> & keys) {
++    return std::any_of(keys.begin(), keys.end(), [&](const std::string & key) { return schema.contains(key); });
++}
++
++std::string pointer_segment(const std::string & name) {
++    std::string result;
++    for (char c : name) {
++        if (c == '~') {
++            result += "~0";
++        } else if (c == '/') {
++            result += "~1";
++        } else {
++            result += c;
+         }
+-        const common_json & value = schema.at("format");
+-        if (!value.is_string()) {
+-            fail(path, "format must be a string");
++    }
++    return result;
++}
++
++[[noreturn]] void malformed(const std::string & path, const std::string & message) {
++    throw std::logic_error("JSON schema was not admitted: " + path + ": " + message);
++}
++
++template <typename T, typename... Args>
++std::unique_ptr<T> make(const std::string & path, Args &&... args) {
++    auto node  = std::make_unique<T>(std::forward<Args>(args)...);
++    node->path = path;
++    return node;
++}
++
++common_chat_schema_ptr never(const std::string & path, const std::string & cause) {
++    return make<common_chat_schema_never>(path, cause);
++}
++
++size_t utf8_length(const std::string & text) {
++    size_t count = 0;
++    for (unsigned char c : text) {
++        if ((c & 0xC0) != 0x80) {
++            count++;
+         }
+-        std::string format = value.get<std::string>();
+-        if (format == "date") {
+-            return common_chat_schema::FORMAT_DATE;
++    }
++    return count;
++}
++
++enum class admission { yes, no, unknown };
++
++class common_chat_schema_builder {
++    const json &                                    root_;
++    common_chat_schema_document &                   doc_;
++    // Targets by reference; null while the target is being built.
++    std::map<std::string, common_chat_schema_ptr>   refs_;
++    std::set<relaxation>                            relaxations_;
++
++    void relax(const std::string & path, const std::string & keyword, relaxation::reason_kind reason) {
++        relaxations_.insert({ path, keyword, reason });
++    }
++
++    // ----- references
++
++    // The JSON value a local JSON pointer reference names, or null when the
++    // reference is not a local JSON pointer.
++    const json * resolve_pointer(const std::string & ref) {
++        if (ref.empty() || ref[0] != '#') {
++            return nullptr;
+         }
+-        if (format == "time") {
+-            return common_chat_schema::FORMAT_TIME;
++        const json * target = &root_;
++        if (ref.size() == 1) {
++            return target;
+         }
+-        if (format == "date-time") {
+-            return common_chat_schema::FORMAT_DATE_TIME;
++        if (ref[1] != '/') {
++            return nullptr;  // an anchor
+         }
+-        if (format == "uuid" || (format.size() == 5 && format.compare(0, 4, "uuid") == 0 && format[4] >= '1' && format[4] <= '5')) {
+-            return common_chat_schema::FORMAT_UUID;
++        std::string decoded;
++        for (size_t i = 1; i < ref.size(); i++) {
++            if (ref[i] == '%' && i + 2 < ref.size() && std::isxdigit((unsigned char) ref[i + 1]) &&
++                std::isxdigit((unsigned char) ref[i + 2])) {
++                decoded += (char) std::stoi(ref.substr(i + 1, 2), nullptr, 16);
++                i += 2;
++            } else {
++                decoded += ref[i];
++            }
+         }
+-        return common_chat_schema::FORMAT_NONE;
+-    }
+-
+-    const common_json & resolve_ref(const std::string & ref, const std::string & path) {
+-        const common_json * target = &root_;
+-        auto tokens = string_split(ref.substr(1), "/");
+-        for (size_t i = 1; i < tokens.size(); i++) {
+-            const std::string & sel = tokens[i];
+-            if (target->is_object() && target->contains(sel)) {
+-                target = &target->at(sel);
+-            } else if (target->is_array()) {
+-                size_t idx;
+-                try {
+-                    idx = std::stoull(sel);
+-                } catch (const std::logic_error &) {
+-                    idx = target->size();
++        size_t start = 1;
++        while (start <= decoded.size()) {
++            size_t      end     = decoded.find('/', start);
++            std::string segment = decoded.substr(start, end == std::string::npos ? std::string::npos : end - start);
++            std::string name;
++            for (size_t i = 0; i < segment.size(); i++) {
++                if (segment[i] == '~' && i + 1 < segment.size() && (segment[i + 1] == '0' || segment[i + 1] == '1')) {
++                    name += segment[i + 1] == '0' ? '~' : '/';
++                    i++;
++                } else {
++                    name += segment[i];
+                 }
+-                if (idx >= target->size()) {
+-                    fail(path, "cannot resolve $ref " + ref + ", " + sel + " is out of range");
+-                }
+-                target = &target->at(idx);
++            }
++            if (target->is_object() && target->contains(name)) {
++                target = &target->at(name);
++            } else if (target->is_array() && !name.empty() &&
++                       std::all_of(name.begin(), name.end(), [](char c) { return std::isdigit((unsigned char) c); }) &&
++                       std::stoull(name) < target->size()) {
++                target = &target->at(std::stoull(name));
+             } else {
+-                fail(path, "cannot resolve $ref " + ref + ", " + sel + " not found");
++                return nullptr;
++            }
++            if (end == std::string::npos) {
++                break;
+             }
++            start = end + 1;
+         }
+-        return *target;
++        return target;
+     }
+ 
+-    common_chat_schema_ptr build_ref(const common_json & value, const std::string & path) {
++    common_chat_schema_ptr build_ref(const json & value, const std::string & path) {
+         if (!value.is_string()) {
+-            fail(path, "$ref must be a string");
++            malformed(path, "$ref must be a string");
+         }
+-        std::string ref = value.get<std::string>();
+-        if (ref.compare(0, 2, "#/") != 0) {
+-            fail(path, "unsupported $ref " + ref + ", only references into the same document are supported");
++        const std::string ref    = value.get<std::string>();
++        const json *      target = resolve_pointer(ref);
++        if (!target) {
++            // Anchors and identifier-relative references resolve against
++            // schema resources this lowering does not track.
++            relax(path, "$ref", relaxation::REASON_UNENFORCED);
++            return make<common_chat_schema_any>(path);
+         }
+         if (refs_.find(ref) == refs_.end()) {
+-            // reserve the key first, so that a cycle back to this $ref stops here
++            // Reserve the key first, so that a cycle back to this $ref stops here.
+             refs_[ref] = nullptr;
+-            refs_[ref] = build_node(resolve_ref(ref, path), ref);
++            refs_[ref] = build(*target, ref);
+         }
+-        auto node = std::make_unique<common_chat_schema_ref>(ref);
+-        pending_.push_back(node.get());
++        return make<common_chat_schema_ref>(path, ref);
++    }
++
++    // The node a reference names, following reference chains; null while it is being built.
++    const common_chat_schema * resolve(const common_chat_schema & node) {
++        const common_chat_schema * current = &node;
++        for (size_t hops = 0; current && current->kind() == common_chat_schema::KIND_REF; hops++) {
++            if (hops > refs_.size()) {
++                return nullptr;  // a cycle of aliases
++            }
++            auto it = refs_.find(static_cast<const common_chat_schema_ref *>(current)->ref);
++            current = it == refs_.end() ? nullptr : it->second.get();
++        }
++        return current;
++    }
++
++    // ----- typed schemas
++
++    common_chat_schema_ptr build_numeric(const json & schema, const std::string & path, bool integer) {
++        common_chat_schema_numeric bounds;
++        auto tighten = [&](std::optional<common_chat_numeric_bound> & slot, common_chat_numeric_bound bound, bool lower) {
++            if (!slot) {
++                slot = bound;
++                return;
++            }
++            int c = common_chat_decimal_compare(bound.value, slot->value);
++            if ((lower && c > 0) || (!lower && c < 0) || (c == 0 && bound.exclusive)) {
++                slot = bound;
++            }
++        };
++        // Draft 4 spells exclusive bounds as booleans modifying minimum and maximum.
++        const bool exclusive_minimum = schema.contains("exclusiveMinimum") && schema.at("exclusiveMinimum").is_boolean() &&
++                                       schema.at("exclusiveMinimum").get<bool>();
++        const bool exclusive_maximum = schema.contains("exclusiveMaximum") && schema.at("exclusiveMaximum").is_boolean() &&
++                                       schema.at("exclusiveMaximum").get<bool>();
++        if (schema.contains("minimum")) {
++            tighten(bounds.minimum, { common_chat_decimal::from_json(schema.at("minimum")), exclusive_minimum }, true);
++        }
++        if (schema.contains("exclusiveMinimum") && schema.at("exclusiveMinimum").is_number()) {
++            tighten(bounds.minimum, { common_chat_decimal::from_json(schema.at("exclusiveMinimum")), true }, true);
++        }
++        if (schema.contains("maximum")) {
++            tighten(bounds.maximum, { common_chat_decimal::from_json(schema.at("maximum")), exclusive_maximum }, false);
++        }
++        if (schema.contains("exclusiveMaximum") && schema.at("exclusiveMaximum").is_number()) {
++            tighten(bounds.maximum, { common_chat_decimal::from_json(schema.at("exclusiveMaximum")), true }, false);
++        }
++        if (bounds.bounded() && !json_schema_numeric_range(bounds, integer)) {
++            return never(path, "minimum");
++        }
++        if (schema.contains("multipleOf")) {
++            auto enumerated = integer ? enumerate_multiples(schema.at("multipleOf"), bounds, path) : nullptr;
++            if (enumerated) {
++                return enumerated;
++            }
++            relax(path, "multipleOf", relaxation::REASON_UNENFORCED);
++        }
++        if (integer) {
++            auto node = make<common_chat_schema_integer>(path);
++            static_cast<common_chat_schema_numeric &>(*node) = bounds;
++            return node;
++        }
++        auto node = make<common_chat_schema_number>(path);
++        static_cast<common_chat_schema_numeric &>(*node) = bounds;
+         return node;
+     }
+ 
+-    template <typename T>
+-    common_chat_schema_ptr build_alternatives(const common_json & alts, const std::string & path) {
+-        if (!alts.is_array()) {
+-            fail(path, "must be an array of schemas");
++    // The integers within the bounds that are multiples of an integral divisor,
++    // when there are few enough to list; otherwise null.
++    common_chat_schema_ptr enumerate_multiples(const json & divisor, const common_chat_schema_numeric & bounds, const std::string & path) {
++        auto k = common_chat_decimal::from_json(divisor);
++        if (!k.is_integer() || k.negative || k.is_zero() || !bounds.minimum || !bounds.maximum ||
++            k.integer.size() > 15 || bounds.minimum->value.integer.size() > 15 || bounds.maximum->value.integer.size() > 15) {
++            return nullptr;
++        }
++        auto to_double = [](const common_chat_decimal & d) {
++            return std::stod(d.to_string());
++        };
++        const int64_t step  = std::stoll(k.integer);
++        const double  low   = to_double(bounds.minimum->value);
++        const double  high  = to_double(bounds.maximum->value);
++        int64_t       first = (int64_t) std::ceil(low / (double) step) * step;
++        if ((double) first == low && bounds.minimum->exclusive) {
++            first += step;
++        }
++        int64_t last = (int64_t) std::floor(high / (double) step) * step;
++        if ((double) last == high && bounds.maximum->exclusive) {
++            last -= step;
+         }
+-        if (alts.empty()) {
+-            fail(path, "must not be empty");
++        if (first > last) {
++            return never(path, "multipleOf");
+         }
+-        auto node = std::make_unique<T>();
+-        size_t i = 0;
+-        for (const auto & alt : alts) {
+-            node->children.push_back(build_node(alt, path + "/" + std::to_string(i++)));
++        if ((last - first) / step + 1 > MAX_MULTIPLES) {
++            return nullptr;
++        }
++        auto node = make<common_chat_schema_enum>(path);
++        for (int64_t value = first; value <= last; value += step) {
++            node->values.push_back(value);
+         }
+         return node;
+     }
+ 
+-    common_chat_schema_ptr build_object(const common_json & schema, const std::string & path) {
+-        auto node = std::make_unique<common_chat_schema_object>();
++    common_chat_schema_ptr build_string(const json & schema, const std::string & path) {
++        auto node        = make<common_chat_schema_string>(path);
++        node->min_length = count(schema, "minLength", 0, path);
++        node->max_length = count(schema, "maxLength", -1, path);
++        if (node->max_length >= 0 && node->min_length > node->max_length) {
++            return never(path, "minLength");
++        }
++        if (schema.contains("pattern")) {
++            const auto & pattern = schema.at("pattern");
++            if (!pattern.is_string()) {
++                malformed(path, "pattern must be a string");
++            }
++            if (json_schema_pattern_supported(pattern.get<std::string>())) {
++                node->pattern = pattern.get<std::string>();
++            } else {
++                relax(path, "pattern", relaxation::REASON_UNENFORCED);
++            }
++        }
++        if (!node->pattern.empty()) {
++            // A pattern's grammar does not count characters.
++            if (schema.contains("minLength") && node->min_length > 0) {
++                relax(path, "minLength", relaxation::REASON_UNENFORCED);
++            }
++            if (schema.contains("maxLength")) {
++                relax(path, "maxLength", relaxation::REASON_UNENFORCED);
++            }
++            node->min_length = 0;
++            node->max_length = -1;
++        } else if (node->min_length == 0 && node->max_length < 0 && schema.contains("format") &&
++                   schema.at("format").is_string()) {
++            // Formats are annotations; recognized ones shape the string.
++            const auto format = schema.at("format").get<std::string>();
++            if (format == "date") {
++                node->format = common_chat_schema::FORMAT_DATE;
++            } else if (format == "time") {
++                node->format = common_chat_schema::FORMAT_TIME;
++            } else if (format == "date-time") {
++                node->format = common_chat_schema::FORMAT_DATE_TIME;
++            } else if (format == "uuid" ||
++                       (format.size() == 5 && format.compare(0, 4, "uuid") == 0 && format[4] >= '1' && format[4] <= '5')) {
++                node->format = common_chat_schema::FORMAT_UUID;
++            }
++        }
++        return node;
++    }
+ 
+-        std::unordered_set<std::string> required;
+-        if (schema.contains("required") && schema.at("required").is_array()) {
+-            for (const auto & name : schema.at("required")) {
+-                if (name.is_string()) {
+-                    required.insert(name.get<std::string>());
+-                }
++    // A non-negative count keyword, saturated to int.
++    static int count(const json & schema, const char * key, int fallback, const std::string & path) {
++        if (!schema.contains(key)) {
++            return fallback;
++        }
++        const auto & value = schema.at(key);
++        if (!value.is_number() || value.get<double>() < 0) {
++            malformed(path, std::string(key) + " must be a non-negative integer");
++        }
++        return (int) std::min(value.get<double>(), (double) std::numeric_limits<int>::max());
++    }
++
++    common_chat_schema_ptr build_array(const json & schema, const std::string & path) {
++        const int min_items = count(schema, "minItems", 0, path);
++        const int max_items = count(schema, "maxItems", -1, path);
++        if (max_items >= 0 && min_items > max_items) {
++            return never(path, "minItems");
++        }
++        if (schema.contains("uniqueItems") && schema.at("uniqueItems") == true) {
++            relax(path, "uniqueItems", relaxation::REASON_UNENFORCED);
++        }
++        if (schema.contains("contains")) {
++            relax(path, "contains", relaxation::REASON_UNENFORCED);
++        }
++        if (schema.contains("unevaluatedItems") && schema.at("unevaluatedItems") != true) {
++            relax(path, "unevaluatedItems", relaxation::REASON_UNENFORCED);
++        }
++
++        // Draft 2020-12 lists leading items in prefixItems and the rest in
++        // items; earlier drafts list them in items and the rest in additionalItems.
++        const json * prefix = nullptr;
++        const json * rest   = nullptr;
++        std::string  prefix_key;
++        std::string  rest_key;
++        if (schema.contains("prefixItems")) {
++            prefix     = &schema.at("prefixItems");
++            prefix_key = "prefixItems";
++            if (schema.contains("items")) {
++                rest     = &schema.at("items");
++                rest_key = "items";
++            }
++        } else if (schema.contains("items") && schema.at("items").is_array()) {
++            prefix     = &schema.at("items");
++            prefix_key = "items";
++            if (schema.contains("additionalItems")) {
++                rest     = &schema.at("additionalItems");
++                rest_key = "additionalItems";
+             }
++        } else if (schema.contains("items")) {
++            rest     = &schema.at("items");
++            rest_key = "items";
++        }
++
++        auto rest_schema = rest ? build(*rest, path + "/" + rest_key) : make<common_chat_schema_any>(path);
++        if (prefix && prefix->is_array() && prefix->empty()) {
++            prefix = nullptr;
++        }
++        if (!prefix) {
++            auto node       = make<common_chat_schema_array>(path);
++            node->items     = std::move(rest_schema);
++            node->min_items = min_items;
++            node->max_items = max_items;
++            return node;
++        }
++        if (!prefix->is_array()) {
++            malformed(path, prefix_key + " must be an array");
++        }
++        std::vector<common_chat_schema_ptr> items;
++        for (size_t i = 0; i < prefix->size(); i++) {
++            items.push_back(build(prefix->at(i), path + "/" + prefix_key + "/" + std::to_string(i)));
++        }
++        // A tuple admits exactly its items, a prefix every valid array can take
++        // when that many items are allowed.
++        size_t length = items.size();
++        if (max_items >= 0 && (size_t) max_items < length) {
++            length = (size_t) max_items;
++        }
++        if ((size_t) min_items <= length) {
++            auto node = make<common_chat_schema_tuple>(path);
++            items.resize(length);
++            node->items = std::move(items);
++            return node;
++        }
++        if (rest_schema->kind() == common_chat_schema::KIND_NEVER) {
++            return never(path, "minItems");
+         }
++        // More items are required than the prefix lists: any listed schema may
++        // appear at any position.
++        relax(path, prefix_key, relaxation::REASON_UNENFORCED);
++        auto alternatives  = make<common_chat_schema_any_of>(path);
++        alternatives->children = std::move(items);
++        alternatives->children.push_back(std::move(rest_schema));
++        auto node       = make<common_chat_schema_array>(path);
++        node->items     = std::move(alternatives);
++        node->min_items = min_items;
++        node->max_items = max_items;
++        return node;
++    }
+ 
++    common_chat_schema_ptr build_object(const json & schema, const std::string & path) {
++        auto node = make<common_chat_schema_object>(path);
+         if (schema.contains("properties")) {
+-            const common_json & properties = schema.at("properties");
++            const auto & properties = schema.at("properties");
+             if (!properties.is_object()) {
+-                fail(path, "properties must be an object");
++                malformed(path, "properties must be an object");
+             }
+-            for (const auto & [name, prop] : properties.items()) {
+-                node->properties.push_back({name, build_node(prop, path + "/properties/" + name), required.count(name) > 0});
++            for (const auto & [name, property] : properties.items()) {
++                node->properties.push_back({ name, build(property, path + "/properties/" + pointer_segment(name)), false });
+             }
+         }
+-
++        // An object that lists properties is closed unless its schema
++        // explicitly allows more.
++        node->undeclared = schema.contains("properties") ? common_chat_schema_object::UNDECLARED_NONE
++                                                         : common_chat_schema_object::UNDECLARED_ANY;
+         if (schema.contains("additionalProperties")) {
+-            const common_json & additional = schema.at("additionalProperties");
++            const auto & additional = schema.at("additionalProperties");
++            node->undeclared        = common_chat_schema_object::UNDECLARED_STATED;
+             if (additional.is_boolean()) {
+                 if (additional.get<bool>()) {
+-                    node->additional_properties = std::make_unique<common_chat_schema_any>();
++                    node->additional_properties = make<common_chat_schema_any>(path + "/additionalProperties");
+                 }
+-            } else if (additional.is_object()) {
+-                node->additional_properties = build_node(additional, path + "/additionalProperties");
+             } else {
+-                fail(path, "additionalProperties must be a boolean or a schema");
++                node->additional_properties = build(additional, path + "/additionalProperties");
+             }
+-        } else if (!schema.contains("properties")) {
+-            // {"type": "object"} on its own accepts any object
+-            node->additional_properties = std::make_unique<common_chat_schema_any>();
+         }
+-
++        const bool pattern_properties = schema.contains("patternProperties") && schema.at("patternProperties").is_object() &&
++                                        !schema.at("patternProperties").empty();
++        if (schema.contains("required")) {
++            const auto & required = schema.at("required");
++            if (!required.is_array()) {
++                malformed(path, "required must be an array");
++            }
++            for (const auto & entry : required) {
++                if (!entry.is_string()) {
++                    malformed(path, "required names must be strings");
++                }
++                const auto name = entry.get<std::string>();
++                auto it = std::find_if(node->properties.begin(), node->properties.end(),
++                                       [&](const common_chat_schema_property & p) { return p.name == name; });
++                if (it != node->properties.end()) {
++                    it->required = true;
++                    continue;
++                }
++                // A required name without a declared schema takes the schema of
++                // undeclared properties.
++                const auto property_path = path + "/properties/" + pointer_segment(name);
++                common_chat_schema_ptr property_schema;
++                if (node->undeclared != common_chat_schema_object::UNDECLARED_STATED) {
++                    property_schema = make<common_chat_schema_any>(property_path);
++                } else if (node->additional_properties) {
++                    property_schema = node->additional_properties->clone();
++                } else if (pattern_properties) {
++                    relax(path, "patternProperties", relaxation::REASON_UNENFORCED);
++                    property_schema = make<common_chat_schema_any>(property_path);
++                } else {
++                    return never(path, "required");
++                }
++                node->properties.push_back({ name, std::move(property_schema), true });
++            }
++        }
++        const bool open = node->additional() != nullptr;
++        if (pattern_properties && open) {
++            relax(path, "patternProperties", relaxation::REASON_UNENFORCED);
++        }
++        if (schema.contains("propertyNames") && schema.at("propertyNames") != true &&
++            schema.at("propertyNames") != json::object()) {
++            relax(path, "propertyNames", relaxation::REASON_UNENFORCED);
++        }
++        if (schema.contains("minProperties")) {
++            const auto required = std::count_if(node->properties.begin(), node->properties.end(),
++                                                [](const common_chat_schema_property & p) { return p.required; });
++            if (count(schema, "minProperties", 0, path) > required) {
++                relax(path, "minProperties", relaxation::REASON_UNENFORCED);
++            }
++        }
++        if (schema.contains("maxProperties") &&
++            (open || (size_t) count(schema, "maxProperties", 0, path) < node->properties.size())) {
++            relax(path, "maxProperties", relaxation::REASON_UNENFORCED);
++        }
++        for (const auto * key : { "dependentRequired", "dependentSchemas", "dependencies" }) {
++            if (schema.contains(key)) {
++                relax(path, key, relaxation::REASON_UNENFORCED);
++            }
++        }
++        if (schema.contains("unevaluatedProperties") && schema.at("unevaluatedProperties") != true) {
++            relax(path, "unevaluatedProperties", relaxation::REASON_UNENFORCED);
++        }
+         return node;
+     }
+ 
+-    common_chat_schema_ptr build_array(const common_json & schema, const std::string & path) {
+-        auto node = std::make_unique<common_chat_schema_array>();
+-        if (schema.contains("items") || schema.contains("prefixItems")) {
+-            // "items" wins when both are present; as in the converter, a schema instead of an array is the item schema
+-            const std::string key = schema.contains("items") ? "items" : "prefixItems";
+-            const common_json & items = schema.at(key);
+-            if (items.is_array()) {
+-                auto tuple = std::make_unique<common_chat_schema_tuple>();
+-                size_t i = 0;
+-                for (const auto & item : items) {
+-                    tuple->items.push_back(build_node(item, path + "/" + key + "/" + std::to_string(i++)));
++    common_chat_schema_ptr build_type(const std::string & type, const json & schema, const std::string & path) {
++        if (type == "null") {
++            return make<common_chat_schema_null>(path);
++        }
++        if (type == "boolean") {
++            return make<common_chat_schema_boolean>(path);
++        }
++        if (type == "integer" || type == "number") {
++            return build_numeric(schema, path, type == "integer");
++        }
++        if (type == "string") {
++            return build_string(schema, path);
++        }
++        if (type == "array") {
++            return build_array(schema, path);
++        }
++        if (type == "object") {
++            return build_object(schema, path);
++        }
++        malformed(path, "unknown type " + type);
++    }
++
++    // The schema's type and type-specific keywords. Without a type, the types
++    // whose keywords appear; without either, any value.
++    common_chat_schema_ptr build_typed(const json & schema, const std::string & path) {
++        std::vector<std::string> types;
++        if (schema.contains("type")) {
++            const auto & type = schema.at("type");
++            if (type.is_string()) {
++                types.push_back(type.get<std::string>());
++            } else if (type.is_array() && !type.empty()) {
++                for (const auto & entry : type) {
++                    if (!entry.is_string()) {
++                        malformed(path, "type entries must be strings");
++                    }
++                    types.push_back(entry.get<std::string>());
+                 }
+-                return tuple;
++            } else {
++                malformed(path, "type must be a string or a nonempty array");
+             }
+-            node->items = build_node(items, path + "/" + key);
+         } else {
+-            node->items = std::make_unique<common_chat_schema_any>();
++            if (has_any(schema, OBJECT_KEYWORDS)) {
++                types.push_back("object");
++            }
++            if (has_any(schema, ARRAY_KEYWORDS)) {
++                types.push_back("array");
++            }
++            if (has_any(schema, STRING_KEYWORDS)) {
++                types.push_back("string");
++            }
++            if (has_any(schema, NUMERIC_KEYWORDS)) {
++                types.push_back("number");
++            }
++        }
++        if (types.empty()) {
++            return make<common_chat_schema_any>(path);
++        }
++        if (types.size() == 1) {
++            return build_type(types[0], schema, path);
++        }
++        auto node = make<common_chat_schema_any_of>(path);
++        for (const auto & type : types) {
++            node->children.push_back(build_type(type, schema, path));
+         }
+-        node->min_items = get_count(schema, "minItems", path, 0);
+-        node->max_items = get_count(schema, "maxItems", path, -1);
+         return node;
+     }
+ 
+-    common_chat_schema_ptr build_string(const common_json & schema, const std::string & path) {
+-        auto node = std::make_unique<common_chat_schema_string>();
+-        if (schema.contains("pattern")) {
+-            const common_json & pattern = schema.at("pattern");
+-            if (!pattern.is_string()) {
+-                fail(path, "pattern must be a string");
+-            }
+-            node->pattern = pattern.get<std::string>();
++    common_chat_schema_ptr build_alternatives(const json & alternatives, const std::string & path) {
++        if (!alternatives.is_array() || alternatives.empty()) {
++            malformed(path, "alternatives must be a nonempty array");
++        }
++        auto node = make<common_chat_schema_any_of>(path);
++        for (size_t i = 0; i < alternatives.size(); i++) {
++            node->children.push_back(build(alternatives.at(i), path + "/" + std::to_string(i)));
+         }
+-        node->format     = get_format(schema, path);
+-        node->min_length = get_count(schema, "minLength", path, 0);
+-        node->max_length = get_count(schema, "maxLength", path, -1);
+         return node;
+     }
+ 
+-    common_chat_schema_ptr build_integer(const common_json & schema, const std::string & path) {
+-        auto node = std::make_unique<common_chat_schema_integer>();
+-        if (schema.contains("minimum")) {
+-            node->minimum = get_bound(schema, "minimum", path, /* round_up */ true);
+-        } else if (schema.contains("exclusiveMinimum")) {
+-            node->minimum = get_bound(schema, "exclusiveMinimum", path, /* round_up */ false) + 1;
++    // ----- composition
++
++    // Whether a value can satisfy the node: decided for scalars, unknown for
++    // structures the node constrains.
++    admission admits(const common_chat_schema & node, const json & value, int depth = 0) {
++        if (depth > 32) {
++            return admission::unknown;
+         }
+-        if (schema.contains("maximum")) {
+-            node->maximum = get_bound(schema, "maximum", path, /* round_up */ false);
+-        } else if (schema.contains("exclusiveMaximum")) {
+-            node->maximum = get_bound(schema, "exclusiveMaximum", path, /* round_up */ true) - 1;
++        switch (node.kind()) {
++            case common_chat_schema::KIND_ANY:
++                return admission::yes;
++            case common_chat_schema::KIND_NEVER:
++                return admission::no;
++            case common_chat_schema::KIND_REF: {
++                const auto * target = resolve(node);
++                return target ? admits(*target, value, depth + 1) : admission::unknown;
++            }
++            case common_chat_schema::KIND_ANY_OF: {
++                bool unknown = false;
++                for (const auto & child : static_cast<const common_chat_schema_any_of &>(node).children) {
++                    auto result = admits(*child, value, depth + 1);
++                    if (result == admission::yes) {
++                        return admission::yes;
++                    }
++                    unknown = unknown || result == admission::unknown;
++                }
++                return unknown ? admission::unknown : admission::no;
++            }
++            case common_chat_schema::KIND_CONST:
++                return static_cast<const common_chat_schema_const &>(node).value == value ? admission::yes : admission::no;
++            case common_chat_schema::KIND_ENUM: {
++                const auto & values = static_cast<const common_chat_schema_enum &>(node).values;
++                return std::find(values.begin(), values.end(), value) != values.end() ? admission::yes : admission::no;
++            }
++            case common_chat_schema::KIND_NULL:
++                return value.is_null() ? admission::yes : admission::no;
++            case common_chat_schema::KIND_BOOLEAN:
++                return value.is_boolean() ? admission::yes : admission::no;
++            case common_chat_schema::KIND_NUMBER:
++            case common_chat_schema::KIND_INTEGER: {
++                if (!value.is_number() || (value.is_number_float() && !std::isfinite(value.get<double>()))) {
++                    return admission::no;
++                }
++                const auto   decimal = common_chat_decimal::from_json(value);
++                const auto & bounds  = node.kind() == common_chat_schema::KIND_NUMBER ?
++                    static_cast<const common_chat_schema_numeric &>(static_cast<const common_chat_schema_number &>(node)) :
++                    static_cast<const common_chat_schema_numeric &>(static_cast<const common_chat_schema_integer &>(node));
++                if (node.kind() == common_chat_schema::KIND_INTEGER && !decimal.is_integer()) {
++                    return admission::no;
++                }
++                if (bounds.minimum) {
++                    int c = common_chat_decimal_compare(decimal, bounds.minimum->value);
++                    if (c < 0 || (c == 0 && bounds.minimum->exclusive)) {
++                        return admission::no;
++                    }
++                }
++                if (bounds.maximum) {
++                    int c = common_chat_decimal_compare(decimal, bounds.maximum->value);
++                    if (c > 0 || (c == 0 && bounds.maximum->exclusive)) {
++                        return admission::no;
++                    }
++                }
++                return admission::yes;
++            }
++            case common_chat_schema::KIND_STRING: {
++                if (!value.is_string()) {
++                    return admission::no;
++                }
++                const auto & string = static_cast<const common_chat_schema_string &>(node);
++                const auto   text   = value.get<std::string>();
++                const auto   length = utf8_length(text);
++                if (length < (size_t) string.min_length || (string.max_length >= 0 && length > (size_t) string.max_length)) {
++                    return admission::no;
++                }
++                if (!string.pattern.empty()) {
++                    // std::regex matches bytes, which are characters only in ASCII.
++                    auto ascii = [](const std::string & s) {
++                        return std::all_of(s.begin(), s.end(), [](unsigned char c) { return c < 0x80; });
++                    };
++                    if (!ascii(text) || !ascii(string.pattern)) {
++                        return admission::unknown;
++                    }
++                    try {
++                        return std::regex_search(text, std::regex(string.pattern, std::regex::ECMAScript)) ?
++                                   admission::yes : admission::no;
++                    } catch (const std::regex_error &) {
++                        return admission::unknown;
++                    }
++                }
++                return admission::yes;
++            }
++            case common_chat_schema::KIND_ARRAY:
++            case common_chat_schema::KIND_TUPLE:
++                return value.is_array() ? admission::unknown : admission::no;
++            case common_chat_schema::KIND_OBJECT:
++                return value.is_object() ? admission::unknown : admission::no;
+         }
+-        return node;
++        return admission::unknown;
+     }
+ 
+-    common_chat_schema_ptr build_node(const common_json & schema, const std::string & path) {
+-        if (!schema.is_object()) {
+-            fail(path, "schema must be an object");
++    common_chat_schema_ptr intersect_values(std::vector<json> values, const common_chat_schema & other, const std::string & path) {
++        std::vector<json> kept;
++        for (auto & value : values) {
++            switch (admits(other, value)) {
++                case admission::yes:
++                    kept.push_back(std::move(value));
++                    break;
++                case admission::no:
++                    break;
++                case admission::unknown:
++                    relax(other.path, "enum", relaxation::REASON_UNENFORCED);
++                    kept.push_back(std::move(value));
++                    break;
++            }
+         }
+-        if (schema.contains("$ref")) {
+-            return build_ref(schema.at("$ref"), path);
++        if (kept.empty()) {
++            return never(path, "enum");
+         }
+-        if (schema.contains("oneOf") || schema.contains("anyOf")) {
+-            const std::string key = schema.contains("oneOf") ? "oneOf" : "anyOf";
+-            return build_alternatives<common_chat_schema_any_of>(schema.at(key), path + "/" + key);
++        auto node    = make<common_chat_schema_enum>(path);
++        node->values = std::move(kept);
++        return node;
++    }
++
++    static std::vector<json> listed_values(const common_chat_schema & node) {
++        if (node.kind() == common_chat_schema::KIND_CONST) {
++            return { static_cast<const common_chat_schema_const &>(node).value };
+         }
++        return static_cast<const common_chat_schema_enum &>(node).values;
++    }
+ 
+-        common_json type;
+-        if (schema.contains("type")) {
+-            type = schema.at("type");
++    static const common_chat_schema_numeric & numeric(const common_chat_schema & node) {
++        if (node.kind() == common_chat_schema::KIND_NUMBER) {
++            return static_cast<const common_chat_schema_number &>(node);
++        }
++        return static_cast<const common_chat_schema_integer &>(node);
++    }
++
++    // Values that satisfy both nodes. Keywords that cannot be combined are
++    // recorded; the result then admits a superset of the intersection.
++    common_chat_schema_ptr intersect(common_chat_schema_ptr a, common_chat_schema_ptr b, const std::string & path) {
++        using K = common_chat_schema;
++        if (a->kind() == K::KIND_ANY) {
++            return b;
++        }
++        if (b->kind() == K::KIND_ANY) {
++            return a;
++        }
++        if (a->kind() == K::KIND_NEVER) {
++            return a;
++        }
++        if (b->kind() == K::KIND_NEVER) {
++            return b;
+         }
+-        if (type.is_array()) {
+-            // {"type": ["a", "b"], ...} is {"anyOf": [{"type": "a", ...}, {"type": "b", ...}]}
+-            if (type.empty()) {
+-                fail(path, "type must not be empty");
++        for (auto * side : { &a, &b }) {
++            if ((*side)->kind() == K::KIND_REF) {
++                auto &       other  = side == &a ? b : a;
++                const auto * target = resolve(**side);
++                if (!target) {
++                    // A reference into the schema being built cannot be combined.
++                    relax(path, "$ref", relaxation::REASON_UNENFORCED);
++                    return std::move(other);
++                }
++                return intersect(target->clone(), std::move(other), path);
+             }
+-            auto node = std::make_unique<common_chat_schema_any_of>();
+-            size_t i = 0;
+-            for (const auto & t : type) {
+-                common_json alt = schema;
+-                alt["type"] = t;
+-                node->children.push_back(build_node(alt, path + "/type/" + std::to_string(i++)));
++        }
++        for (auto * side : { &a, &b }) {
++            if ((*side)->kind() == K::KIND_ANY_OF) {
++                auto & other  = side == &a ? b : a;
++                auto   result = make<common_chat_schema_any_of>((*side)->path);
++                for (auto & child : static_cast<common_chat_schema_any_of &>(**side).children) {
++                    result->children.push_back(intersect(std::move(child), other->clone(), path));
++                }
++                return result;
+             }
+-            return node;
+         }
+-        if (schema.contains("const")) {
+-            return std::make_unique<common_chat_schema_const>(schema.at("const"));
++        const bool a_listed = a->kind() == K::KIND_ENUM || a->kind() == K::KIND_CONST;
++        const bool b_listed = b->kind() == K::KIND_ENUM || b->kind() == K::KIND_CONST;
++        if (a_listed) {
++            return intersect_values(listed_values(*a), *b, a->path);
+         }
+-        if (schema.contains("enum")) {
+-            const common_json & values = schema.at("enum");
+-            if (!values.is_array() || values.empty()) {
+-                fail(path, "enum must be a non-empty array");
++        if (b_listed) {
++            return intersect_values(listed_values(*b), *a, b->path);
++        }
++        const bool a_numeric = a->kind() == K::KIND_NUMBER || a->kind() == K::KIND_INTEGER;
++        const bool b_numeric = b->kind() == K::KIND_NUMBER || b->kind() == K::KIND_INTEGER;
++        if (a_numeric && b_numeric) {
++            common_chat_schema_numeric bounds = numeric(*a);
++            const auto &               other  = numeric(*b);
++            if (other.minimum) {
++                if (!bounds.minimum) {
++                    bounds.minimum = other.minimum;
++                } else {
++                    int c = common_chat_decimal_compare(other.minimum->value, bounds.minimum->value);
++                    if (c > 0 || (c == 0 && other.minimum->exclusive)) {
++                        bounds.minimum = other.minimum;
++                    }
++                }
+             }
+-            auto node = std::make_unique<common_chat_schema_enum>();
+-            for (const auto & value : values) {
+-                node->values.push_back(value);
++            if (other.maximum) {
++                if (!bounds.maximum) {
++                    bounds.maximum = other.maximum;
++                } else {
++                    int c = common_chat_decimal_compare(other.maximum->value, bounds.maximum->value);
++                    if (c < 0 || (c == 0 && other.maximum->exclusive)) {
++                        bounds.maximum = other.maximum;
++                    }
++                }
++            }
++            const bool integer = a->kind() == K::KIND_INTEGER || b->kind() == K::KIND_INTEGER;
++            if (bounds.bounded() && !json_schema_numeric_range(bounds, integer)) {
++                return never(path, "minimum");
++            }
++            if (integer) {
++                auto node = make<common_chat_schema_integer>(a->path);
++                static_cast<common_chat_schema_numeric &>(*node) = bounds;
++                return node;
+             }
++            auto node = make<common_chat_schema_number>(a->path);
++            static_cast<common_chat_schema_numeric &>(*node) = bounds;
+             return node;
+         }
+-        if (!type.is_null() && !type.is_string()) {
+-            fail(path, "type must be a string or an array of strings");
++        if (a->kind() != b->kind()) {
++            const bool arrays = (a->kind() == K::KIND_ARRAY || a->kind() == K::KIND_TUPLE) &&
++                                (b->kind() == K::KIND_ARRAY || b->kind() == K::KIND_TUPLE);
++            if (!arrays) {
++                return never(path, "type");
++            }
+         }
++        switch (a->kind()) {
++            case K::KIND_NULL:
++            case K::KIND_BOOLEAN:
++                return a;
++            case K::KIND_STRING: {
++                auto &       left  = static_cast<common_chat_schema_string &>(*a);
++                const auto & right = static_cast<const common_chat_schema_string &>(*b);
++                left.min_length    = std::max(left.min_length, right.min_length);
++                if (right.max_length >= 0) {
++                    left.max_length = left.max_length < 0 ? right.max_length : std::min(left.max_length, right.max_length);
++                }
++                if (left.max_length >= 0 && left.min_length > left.max_length) {
++                    return never(path, "minLength");
++                }
++                if (!right.pattern.empty()) {
++                    if (left.pattern.empty()) {
++                        left.pattern = right.pattern;
++                    } else if (left.pattern != right.pattern) {
++                        relax(right.path, "pattern", relaxation::REASON_UNENFORCED);
++                    }
++                }
++                if (!left.pattern.empty() && (left.min_length > 0 || left.max_length >= 0)) {
++                    relax(path, left.min_length > 0 ? "minLength" : "maxLength", relaxation::REASON_UNENFORCED);
++                    left.min_length = 0;
++                    left.max_length = -1;
++                }
++                if (left.format == K::FORMAT_NONE && left.pattern.empty() && left.min_length == 0 && left.max_length < 0) {
++                    left.format = right.format;
++                }
++                if (!left.pattern.empty() || left.min_length > 0 || left.max_length >= 0) {
++                    left.format = K::FORMAT_NONE;
++                }
++                return a;
++            }
++            case K::KIND_ARRAY:
++            case K::KIND_TUPLE:
++                return intersect_arrays(std::move(a), std::move(b), path);
++            case K::KIND_OBJECT:
++                return intersect_objects(std::move(a), std::move(b), path);
++            default:
++                break;
++        }
++        throw std::logic_error("unhandled schema intersection");
++    }
+ 
+-        const std::string type_name = type.is_string() ? type.get<std::string>() : "";
+-        const bool has_properties = schema.contains("properties") ||
+-            (schema.contains("additionalProperties") && schema.at("additionalProperties") != true);
++    common_chat_schema_ptr intersect_arrays(common_chat_schema_ptr a, common_chat_schema_ptr b, const std::string & path) {
++        using K = common_chat_schema;
++        if (a->kind() == K::KIND_ARRAY && b->kind() == K::KIND_TUPLE) {
++            std::swap(a, b);
++        }
++        if (a->kind() == K::KIND_ARRAY) {
++            auto &       left  = static_cast<common_chat_schema_array &>(*a);
++            auto &       right = static_cast<common_chat_schema_array &>(*b);
++            left.items         = intersect(std::move(left.items), std::move(right.items), path);
++            left.min_items     = std::max(left.min_items, right.min_items);
++            if (right.max_items >= 0) {
++                left.max_items = left.max_items < 0 ? right.max_items : std::min(left.max_items, right.max_items);
++            }
++            if (left.max_items >= 0 && left.min_items > left.max_items) {
++                return never(path, "minItems");
++            }
++            return a;
++        }
++        auto & tuple = static_cast<common_chat_schema_tuple &>(*a);
++        if (b->kind() == K::KIND_ARRAY) {
++            auto & array = static_cast<common_chat_schema_array &>(*b);
++            if (tuple.items.size() < (size_t) array.min_items ||
++                (array.max_items >= 0 && tuple.items.size() > (size_t) array.max_items)) {
++                return never(path, "minItems");
++            }
++            for (auto & item : tuple.items) {
++                item = intersect(std::move(item), array.items->clone(), path);
++            }
++            return a;
++        }
++        // Both are prefixes; the longer one's length is kept.
++        auto & other = static_cast<common_chat_schema_tuple &>(*b);
++        if (other.items.size() > tuple.items.size()) {
++            std::swap(tuple.items, other.items);
++        }
++        for (size_t i = 0; i < other.items.size(); i++) {
++            tuple.items[i] = intersect(std::move(tuple.items[i]), std::move(other.items[i]), path);
++        }
++        return a;
++    }
+ 
+-        if (type_name.empty()) {
+-            // without a type the structural keywords decide, in the same order as the converter
+-            if (has_properties) {
+-                return build_object(schema, path);
++    common_chat_schema_ptr intersect_objects(common_chat_schema_ptr a, common_chat_schema_ptr b, const std::string & path) {
++        using object = common_chat_schema_object;
++        auto & left  = static_cast<object &>(*a);
++        auto & right = static_cast<object &>(*b);
++        // The schema a property undeclared on one side must satisfy there, or
++        // null when that side forbids it. Closing unstated objects is this
++        // lowering's policy, not the schema's, so it applies to the result only.
++        auto undeclared = [](const object & side) -> const common_chat_schema * {
++            static const common_chat_schema_any any;
++            return side.undeclared == object::UNDECLARED_STATED ? side.additional_properties.get() : &any;
++        };
++        std::vector<common_chat_schema_property> properties;
++        auto merge_side = [&](object & side, object & other) -> bool {
++            for (auto & property : side.properties) {
++                auto it = std::find_if(properties.begin(), properties.end(),
++                                       [&](const common_chat_schema_property & p) { return p.name == property.name; });
++                if (it != properties.end()) {
++                    continue;  // merged from the other side
++                }
++                auto match = std::find_if(other.properties.begin(), other.properties.end(),
++                                          [&](const common_chat_schema_property & p) { return p.name == property.name; });
++                if (match != other.properties.end()) {
++                    properties.push_back({ property.name,
++                                           intersect(std::move(property.schema), std::move(match->schema), path),
++                                           property.required || match->required });
++                    continue;
++                }
++                const auto * constraint = undeclared(other);
++                if (!constraint) {
++                    if (property.required) {
++                        return false;
++                    }
++                    continue;
++                }
++                properties.push_back({ property.name, intersect(std::move(property.schema), constraint->clone(), path),
++                                       property.required });
+             }
+-            if (schema.contains("allOf")) {
+-                return build_alternatives<common_chat_schema_all_of>(schema.at("allOf"), path + "/allOf");
++            return true;
++        };
++        if (!merge_side(left, right) || !merge_side(right, left)) {
++            return never(path, "additionalProperties");
++        }
++        auto node        = make<object>(left.path);
++        node->properties = std::move(properties);
++        const bool left_stated  = left.undeclared == object::UNDECLARED_STATED;
++        const bool right_stated = right.undeclared == object::UNDECLARED_STATED;
++        if (left_stated || right_stated) {
++            node->undeclared = object::UNDECLARED_STATED;
++            if (left_stated && right_stated) {
++                if (left.additional_properties && right.additional_properties) {
++                    node->additional_properties =
++                        intersect(std::move(left.additional_properties), std::move(right.additional_properties), path);
++                }
++            } else {
++                node->additional_properties = std::move(left_stated ? left.additional_properties : right.additional_properties);
+             }
+-            if (schema.contains("items") || schema.contains("prefixItems")) {
+-                return build_array(schema, path);
++        } else if (left.undeclared == object::UNDECLARED_NONE || right.undeclared == object::UNDECLARED_NONE) {
++            node->undeclared = object::UNDECLARED_NONE;
++        }
++        return node;
++    }
++
++    // The types a node admits, through references built so far; null when a
++    // reference is still being built.
++    std::optional<common_chat_schema::type_set> types_of(const common_chat_schema & node, int depth = 0) {
++        if (depth > 32) {
++            return std::nullopt;
++        }
++        switch (node.kind()) {
++            case common_chat_schema::KIND_REF: {
++                const auto * target = resolve(node);
++                if (!target) {
++                    return std::nullopt;
++                }
++                return types_of(*target, depth + 1);
+             }
+-            if (schema.contains("pattern") || schema.contains("minLength") || schema.contains("maxLength") || get_format(schema, path) != common_chat_schema::FORMAT_NONE) {
+-                return build_string(schema, path);
++            case common_chat_schema::KIND_ANY_OF: {
++                common_chat_schema::type_set types;
++                for (const auto & child : static_cast<const common_chat_schema_any_of &>(node).children) {
++                    auto child_types = types_of(*child, depth + 1);
++                    if (!child_types) {
++                        return std::nullopt;
++                    }
++                    types |= *child_types;
++                }
++                return types;
+             }
+-            return std::make_unique<common_chat_schema_any>();
++            default:
++                return node.value_types();
++        }
++    }
++
++    // Whether no value satisfies two alternatives: different types, different
++    // listed values, or objects that require one property with different values.
++    bool disjoint(const common_chat_schema & a, const common_chat_schema & b) {
++        const auto * left  = resolve(a);
++        const auto * right = resolve(b);
++        if (!left || !right) {
++            return false;
+         }
+-        if (type_name == "object") {
+-            if (!has_properties && schema.contains("allOf")) {
+-                return build_alternatives<common_chat_schema_all_of>(schema.at("allOf"), path + "/allOf");
++        auto left_types  = types_of(*left);
++        auto right_types = types_of(*right);
++        if (!left_types || !right_types) {
++            return false;
++        }
++        auto types = *left_types;
++        types &= *right_types;
++        if (types.empty()) {
++            return true;
++        }
++        auto listed = [](const common_chat_schema & node) {
++            return node.kind() == common_chat_schema::KIND_ENUM || node.kind() == common_chat_schema::KIND_CONST;
++        };
++        if (listed(*left) && listed(*right)) {
++            for (const auto & value : listed_values(*left)) {
++                const auto others = listed_values(*right);
++                if (std::find(others.begin(), others.end(), value) != others.end()) {
++                    return false;
++                }
+             }
+-            return build_object(schema, path);
++            return true;
+         }
+-        if (type_name == "string") {
+-            if (schema.contains("allOf")) {
+-                return build_alternatives<common_chat_schema_all_of>(schema.at("allOf"), path + "/allOf");
++        if (left->kind() == common_chat_schema::KIND_OBJECT && right->kind() == common_chat_schema::KIND_OBJECT) {
++            const auto & lo = static_cast<const common_chat_schema_object &>(*left);
++            const auto & ro = static_cast<const common_chat_schema_object &>(*right);
++            for (const auto & lp : lo.properties) {
++                for (const auto & rp : ro.properties) {
++                    if (lp.name == rp.name && lp.required && rp.required && disjoint(*lp.schema, *rp.schema)) {
++                        return true;
++                    }
++                }
+             }
+-            return build_string(schema, path);
+         }
+-        if (type_name == "array") {
+-            return build_array(schema, path);
++        return false;
++    }
++
++    common_chat_schema_ptr build(const json & schema, const std::string & path) {
++        if (schema.is_boolean()) {
++            if (schema.get<bool>()) {
++                return make<common_chat_schema_any>(path);
++            }
++            return never(path, "false");
++        }
++        if (!schema.is_object()) {
++            malformed(path, "a schema must be an object or a boolean");
++        }
++        std::vector<common_chat_schema_ptr> parts;
++        parts.push_back(build_typed(schema, path));
++        if (schema.contains("enum")) {
++            const auto & values = schema.at("enum");
++            if (!values.is_array() || values.empty()) {
++                malformed(path, "enum must be a nonempty array");
++            }
++            auto node = make<common_chat_schema_enum>(path);
++            for (const auto & value : values) {
++                node->values.push_back(value);
++            }
++            parts.push_back(std::move(node));
++        }
++        if (schema.contains("const")) {
++            parts.push_back(make<common_chat_schema_const>(path, schema.at("const")));
++        }
++        if (schema.contains("$ref")) {
++            parts.push_back(build_ref(schema.at("$ref"), path));
++        }
++        if (schema.contains("allOf")) {
++            const auto & children = schema.at("allOf");
++            if (!children.is_array() || children.empty()) {
++                malformed(path, "allOf must be a nonempty array");
++            }
++            for (size_t i = 0; i < children.size(); i++) {
++                parts.push_back(build(children.at(i), path + "/allOf/" + std::to_string(i)));
++            }
++        }
++        if (schema.contains("anyOf")) {
++            parts.push_back(build_alternatives(schema.at("anyOf"), path + "/anyOf"));
++        }
++        if (schema.contains("oneOf")) {
++            auto alternatives = build_alternatives(schema.at("oneOf"), path + "/oneOf");
++            const auto & children = static_cast<const common_chat_schema_any_of &>(*alternatives).children;
++            bool exclusive = true;
++            for (size_t i = 0; i < children.size() && exclusive; i++) {
++                for (size_t j = i + 1; j < children.size() && exclusive; j++) {
++                    exclusive = disjoint(*children[i], *children[j]);
++                }
++            }
++            if (!exclusive) {
++                // Values matching several alternatives are admitted.
++                relax(path, "oneOf", relaxation::REASON_UNENFORCED);
++            }
++            parts.push_back(std::move(alternatives));
+         }
+-        if (type_name == "integer") {
+-            return build_integer(schema, path);
++        for (const auto * key : { "not", "$dynamicRef", "$recursiveRef" }) {
++            if (schema.contains(key)) {
++                relax(path, key, relaxation::REASON_UNENFORCED);
++            }
+         }
+-        if (type_name == "number") {
+-            return std::make_unique<common_chat_schema_number>();
++        if (schema.contains("if") && (schema.contains("then") || schema.contains("else"))) {
++            relax(path, "if", relaxation::REASON_UNENFORCED);
+         }
+-        if (type_name == "boolean") {
+-            return std::make_unique<common_chat_schema_boolean>();
++        auto node = std::move(parts[0]);
++        for (size_t i = 1; i < parts.size(); i++) {
++            node = intersect(std::move(node), std::move(parts[i]), path);
+         }
+-        if (type_name == "null") {
+-            return std::make_unique<common_chat_schema_null>();
++        return node;
++    }
++
++    // ----- settling
++
++    // Removes every value-less node. A value-less alternative is dropped; a
++    // value-less optional property may not appear; a value-less value that must
++    // appear admits any value instead, and is recorded.
++    common_chat_schema_ptr settle(common_chat_schema_ptr node) {
++        using K = common_chat_schema;
++        switch (node->kind()) {
++            case K::KIND_ANY_OF: {
++                auto & children = static_cast<common_chat_schema_any_of &>(*node).children;
++                std::vector<common_chat_schema_ptr> kept;
++                std::vector<common_chat_schema_ptr> nevers;
++                for (auto & child : children) {
++                    auto settled = settle(std::move(child));
++                    (settled->kind() == K::KIND_NEVER ? nevers : kept).push_back(std::move(settled));
++                }
++                if (kept.empty()) {
++                    return std::move(nevers.front());
++                }
++                if (kept.size() == 1) {
++                    return std::move(kept.front());
++                }
++                children = std::move(kept);
++                return node;
++            }
++            case K::KIND_OBJECT: {
++                auto & object = static_cast<common_chat_schema_object &>(*node);
++                if (object.additional_properties) {
++                    object.additional_properties = settle(std::move(object.additional_properties));
++                    if (object.additional_properties->kind() == K::KIND_NEVER) {
++                        object.additional_properties.reset();
++                    }
++                }
++                std::vector<common_chat_schema_property> kept;
++                for (auto & property : object.properties) {
++                    property.schema = settle(std::move(property.schema));
++                    if (property.schema->kind() != K::KIND_NEVER) {
++                        kept.push_back(std::move(property));
++                    } else if (property.required) {
++                        property.schema = value_position(std::move(property.schema));
++                        kept.push_back(std::move(property));
++                    } else if (object.additional()) {
++                        // Absent from the declared properties, the name may
++                        // still appear as an undeclared property.
++                        relax(property.schema->path, static_cast<const common_chat_schema_never &>(*property.schema).cause,
++                              relaxation::REASON_UNENFORCED);
++                    }
++                }
++                object.properties = std::move(kept);
++                return node;
++            }
++            case K::KIND_ARRAY: {
++                auto & array = static_cast<common_chat_schema_array &>(*node);
++                array.items  = settle(std::move(array.items));
++                if (array.items->kind() == K::KIND_NEVER) {
++                    if (array.min_items == 0) {
++                        array.max_items = 0;
++                        array.items     = make<common_chat_schema_any>(array.items->path);
++                    } else {
++                        array.items = value_position(std::move(array.items));
++                    }
++                }
++                return node;
++            }
++            case K::KIND_TUPLE: {
++                for (auto & item : static_cast<common_chat_schema_tuple &>(*node).items) {
++                    item = value_position(settle(std::move(item)));
++                }
++                return node;
++            }
++            default:
++                return node;
++        }
++    }
++
++    // A settled node where some value must appear: never admits any value instead.
++    common_chat_schema_ptr value_position(common_chat_schema_ptr node) {
++        if (node->kind() != common_chat_schema::KIND_NEVER) {
++            return node;
++        }
++        const auto & never = static_cast<const common_chat_schema_never &>(*node);
++        relax(never.path, never.cause, relaxation::REASON_UNSATISFIABLE);
++        return make<common_chat_schema_any>(never.path);
++    }
++
++    void link(common_chat_schema & node) {
++        using K = common_chat_schema;
++        switch (node.kind()) {
++            case K::KIND_REF: {
++                auto & ref = static_cast<common_chat_schema_ref &>(node);
++                ref.target = doc_.refs.at(ref.ref).get();
++                break;
++            }
++            case K::KIND_ANY_OF:
++                for (auto & child : static_cast<common_chat_schema_any_of &>(node).children) {
++                    link(*child);
++                }
++                break;
++            case K::KIND_ARRAY:
++                link(*static_cast<common_chat_schema_array &>(node).items);
++                break;
++            case K::KIND_TUPLE:
++                for (auto & item : static_cast<common_chat_schema_tuple &>(node).items) {
++                    link(*item);
++                }
++                break;
++            case K::KIND_OBJECT: {
++                auto & object = static_cast<common_chat_schema_object &>(node);
++                for (auto & property : object.properties) {
++                    link(*property.schema);
++                }
++                if (object.additional_properties) {
++                    link(*object.additional_properties);
++                }
++                break;
++            }
++            case K::KIND_NEVER:
++                throw std::logic_error("unsettled schema node");
++            default:
++                break;
+         }
+-        fail(path, "unrecognized type " + type_name);
+     }
+ 
+   public:
+-    common_chat_schema_builder(const common_json & root, common_chat_schema_document & doc) : root_(root), doc_(doc) {}
++    common_chat_schema_builder(const json & root, common_chat_schema_document & doc) : root_(root), doc_(doc) {}
+ 
+-    common_chat_schema_ptr build() {
+-        auto node = build_node(root_, "#");
+-        for (auto & entry : refs_) {
+-            doc_.refs[entry.first] = std::move(entry.second);
++    void build() {
++        auto root = build(root_, "#");
++        doc_.root = value_position(settle(std::move(root)));
++        for (auto & [ref, target] : refs_) {
++            doc_.refs[ref] = value_position(settle(std::move(target)));
+         }
+-        for (auto * ref : pending_) {
+-            ref->target = doc_.refs.at(ref->ref).get();
++        link(*doc_.root);
++        for (auto & [ref, target] : doc_.refs) {
++            link(*target);
+         }
+-        return node;
++        doc_.relaxations.assign(relaxations_.begin(), relaxations_.end());
+     }
+ };
+ 
++}  // namespace
++
+ common_chat_schema_document common_chat_schema_from_json(const common_json & schema) {
+     common_chat_schema_document doc;
+-    doc.root = common_chat_schema_builder(schema, doc).build();
++    common_chat_schema_builder(schema, doc).build();
+     return doc;
+ }
+ 
+@@ -350,7 +1429,8 @@ static common_chat_schema::value_type json_type(const common_json & value) {
+     if (value.is_boolean()) {
+         return common_chat_schema::TYPE_BOOLEAN;
+     }
+-    if (value.is_number_integer()) {
++    // A number with no fractional part is an integer, however it is written.
++    if (value.is_number_integer() || (value.is_number_float() && std::trunc(value.get<double>()) == value.get<double>())) {
+         return common_chat_schema::TYPE_INTEGER;
+     }
+     if (value.is_number()) {
+@@ -369,6 +1449,8 @@ static common_chat_schema::type_set value_types_impl(const common_chat_schema &
+     switch (s.kind()) {
+         case common_chat_schema::KIND_ANY:
+             return common_chat_schema::type_set::all();
++        case common_chat_schema::KIND_NEVER:
++            return {};
+         case common_chat_schema::KIND_NULL:
+             return { common_chat_schema::TYPE_NULL };
+         case common_chat_schema::KIND_BOOLEAN:
+@@ -410,13 +1492,6 @@ static common_chat_schema::type_set value_types_impl(const common_chat_schema &
+             }
+             return types;
+         }
+-        case common_chat_schema::KIND_ALL_OF: {
+-            auto types = common_chat_schema::type_set::all();
+-            for (const auto & child : static_cast<const common_chat_schema_all_of &>(s).children) {
+-                types &= value_types_impl(*child, visited);
+-            }
+-            return types;
+-        }
+     }
+     return {};
+ }
+@@ -456,20 +1531,6 @@ static bool may_be_string_impl(const common_chat_schema & s, std::unordered_set<
+                 }
+             }
+             return false;
+-        case common_chat_schema::KIND_ALL_OF: {
+-            // every child must allow a string, an any child constrains nothing
+-            bool any_string = false;
+-            for (const auto & child : static_cast<const common_chat_schema_all_of &>(s).children) {
+-                if (child->kind() == common_chat_schema::KIND_ANY) {
+-                    continue;
+-                }
+-                if (!may_be_string_impl(*child, visited)) {
+-                    return false;
+-                }
+-                any_string = true;
+-            }
+-            return any_string;
+-        }
+         default:
+             return false;
+     }
+@@ -485,7 +1546,6 @@ const char * common_chat_schema::kind_name(node_kind kind) {
+         case KIND_ANY:     return "any";
+         case KIND_REF:     return "ref";
+         case KIND_ANY_OF:  return "anyOf";
+-        case KIND_ALL_OF:  return "allOf";
+         case KIND_CONST:   return "const";
+         case KIND_ENUM:    return "enum";
+         case KIND_NULL:    return "null";
+@@ -496,6 +1556,7 @@ const char * common_chat_schema::kind_name(node_kind kind) {
+         case KIND_ARRAY:   return "array";
+         case KIND_TUPLE:   return "tuple";
+         case KIND_OBJECT:  return "object";
++        case KIND_NEVER:   return "never";
+     }
+     return "?";
+ }
+--- a/common/json-schema.h
++++ b/common/json-schema.h
+@@ -6,17 +6,22 @@
+ #include <initializer_list>
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+-// JSON schema, covering the subset that json_schema_to_grammar() can convert.
++// A JSON Schema lowered to the constraint that grammars enforce.
++//
++// Lowering is total over valid JSON Schemas. Every keyword is either enforced
++// exactly, loosened to a superset of its values and recorded as a relaxation,
++// or an annotation with no validation meaning. A lowered node never admits a
++// value its source schema rejects unless a relaxation says so.
+ 
+ struct common_chat_schema {
+     enum node_kind {
+         KIND_ANY,
+         KIND_REF,
+         KIND_ANY_OF,
+-        KIND_ALL_OF,
+         KIND_CONST,
+         KIND_ENUM,
+         KIND_NULL,
+@@ -27,6 +32,8 @@ struct common_chat_schema {
+         KIND_ARRAY,
+         KIND_TUPLE,
+         KIND_OBJECT,
++        // Admits no value. Lowering settles it before returning a document.
++        KIND_NEVER,
+     };
+ 
+     enum value_type {
+@@ -39,6 +46,7 @@ struct common_chat_schema {
+         TYPE_OBJECT,
+     };
+ 
++    // Annotation formats the grammar shapes strings to. Formats never assert.
+     enum string_format {
+         FORMAT_NONE,
+         FORMAT_UUID,  // uuid, uuid1 .. uuid5
+@@ -75,8 +83,12 @@ struct common_chat_schema {
+         bool operator!=(const type_set & other) const { return mask_ != other.mask_; }
+     };
+ 
++    // The JSON pointer of the schema this node was lowered from.
++    std::string path;
++
+     virtual ~common_chat_schema() = default;
+     virtual node_kind kind() const = 0;
++    virtual std::unique_ptr<common_chat_schema> clone() const = 0;
+ 
+     type_set value_types() const;
+ 
+@@ -89,12 +101,25 @@ struct common_chat_schema {
+ 
+ using common_chat_schema_ptr = std::unique_ptr<common_chat_schema>;
+ 
+-struct common_chat_schema_any : common_chat_schema {
++template <typename T>
++struct common_chat_schema_node : common_chat_schema {
++    common_chat_schema_ptr clone() const override;
++};
++
++struct common_chat_schema_any : common_chat_schema_node<common_chat_schema_any> {
+     node_kind kind() const override { return KIND_ANY; }
+ };
+ 
+-// {"$ref": "#/..."}, only references into the same document are supported
+-struct common_chat_schema_ref : common_chat_schema {
++struct common_chat_schema_never : common_chat_schema_node<common_chat_schema_never> {
++    std::string cause;  // the keyword that admits no value
++
++    explicit common_chat_schema_never(std::string cause) : cause(std::move(cause)) {}
++
++    node_kind kind() const override { return KIND_NEVER; }
++};
++
++// {"$ref": "#/..."}: a JSON pointer into the same document
++struct common_chat_schema_ref : common_chat_schema_node<common_chat_schema_ref> {
+     std::string                ref;
+     const common_chat_schema * target = nullptr;  // owned by common_chat_schema_document::refs
+ 
+@@ -103,20 +128,18 @@ struct common_chat_schema_ref : common_chat_schema {
+     node_kind kind() const override { return KIND_REF; }
+ };
+ 
+-// oneOf / anyOf, or a "type" array expanded to one alternative per type
+-struct common_chat_schema_any_of : common_chat_schema {
++// anyOf; oneOf (exactly, when its branches are disjoint); or a "type" array
++// expanded to one alternative per type
++struct common_chat_schema_any_of : common_chat_schema_node<common_chat_schema_any_of> {
+     std::vector<common_chat_schema_ptr> children;
+ 
+-    node_kind kind() const override { return KIND_ANY_OF; }
+-};
+-
+-struct common_chat_schema_all_of : common_chat_schema {
+-    std::vector<common_chat_schema_ptr> children;
++    common_chat_schema_any_of() = default;
++    common_chat_schema_any_of(const common_chat_schema_any_of & other);
+ 
+-    node_kind kind() const override { return KIND_ALL_OF; }
++    node_kind kind() const override { return KIND_ANY_OF; }
+ };
+ 
+-struct common_chat_schema_const : common_chat_schema {
++struct common_chat_schema_const : common_chat_schema_node<common_chat_schema_const> {
+     common_json value;
+ 
+     explicit common_chat_schema_const(common_json value) : value(std::move(value)) {}
+@@ -124,34 +147,61 @@ struct common_chat_schema_const : common_chat_schema {
+     node_kind kind() const override { return KIND_CONST; }
+ };
+ 
+-struct common_chat_schema_enum : common_chat_schema {
++struct common_chat_schema_enum : common_chat_schema_node<common_chat_schema_enum> {
+     std::vector<common_json> values;
+ 
+     node_kind kind() const override { return KIND_ENUM; }
+ };
+ 
+-struct common_chat_schema_null : common_chat_schema {
++struct common_chat_schema_null : common_chat_schema_node<common_chat_schema_null> {
+     node_kind kind() const override { return KIND_NULL; }
+ };
+ 
+-struct common_chat_schema_boolean : common_chat_schema {
++struct common_chat_schema_boolean : common_chat_schema_node<common_chat_schema_boolean> {
+     node_kind kind() const override { return KIND_BOOLEAN; }
+ };
+ 
+-struct common_chat_schema_number : common_chat_schema {
+-    node_kind kind() const override { return KIND_NUMBER; }
++// An exact decimal: optional sign, integer digits without leading zeros
++// ("0" for zero) and fraction digits without trailing zeros. Zero is never negative.
++struct common_chat_decimal {
++    bool        negative = false;
++    std::string integer  = "0";
++    std::string fraction;
++
++    // Parses a JSON number, in any notation, into its exact decimal value.
++    static common_chat_decimal from_json(const common_json & value);
++
++    bool        is_zero() const { return integer == "0" && fraction.empty(); }
++    bool        is_integer() const { return fraction.empty(); }
++    std::string to_string() const;
++};
++
++// <0, 0 or >0 as a is less than, equal to or greater than b.
++int common_chat_decimal_compare(const common_chat_decimal & a, const common_chat_decimal & b);
++
++struct common_chat_numeric_bound {
++    common_chat_decimal value;
++    bool                exclusive = false;
+ };
+ 
+-// bounds are inclusive, exclusiveMinimum / exclusiveMaximum are folded in
+-struct common_chat_schema_integer : common_chat_schema {
+-    int64_t minimum = INT64_MIN;  // INT64_MIN for unbounded
+-    int64_t maximum = INT64_MAX;  // INT64_MAX for unbounded
++// Bounds apply to the decimal value, exclusive bounds included.
++struct common_chat_schema_numeric {
++    std::optional<common_chat_numeric_bound> minimum;
++    std::optional<common_chat_numeric_bound> maximum;
+ 
++    bool bounded() const { return minimum || maximum; }
++};
++
++struct common_chat_schema_number : common_chat_schema_node<common_chat_schema_number>, common_chat_schema_numeric {
++    node_kind kind() const override { return KIND_NUMBER; }
++};
++
++struct common_chat_schema_integer : common_chat_schema_node<common_chat_schema_integer>, common_chat_schema_numeric {
+     node_kind kind() const override { return KIND_INTEGER; }
+ };
+ 
+-struct common_chat_schema_string : common_chat_schema {
+-    std::string   pattern;  // empty when absent
++struct common_chat_schema_string : common_chat_schema_node<common_chat_schema_string> {
++    std::string   pattern;  // empty when absent; always a pattern the grammar translates
+     string_format format     = FORMAT_NONE;
+     int           min_length = 0;
+     int           max_length = -1;  // -1 for unbounded
+@@ -159,17 +209,24 @@ struct common_chat_schema_string : common_chat_schema {
+     node_kind kind() const override { return KIND_STRING; }
+ };
+ 
+-struct common_chat_schema_array : common_chat_schema {
+-    common_chat_schema_ptr items;  // a common_chat_schema_any when "items" is absent
++struct common_chat_schema_array : common_chat_schema_node<common_chat_schema_array> {
++    common_chat_schema_ptr items;  // a common_chat_schema_any when items are unconstrained
+     int                    min_items = 0;
+     int                    max_items = -1;  // -1 for unbounded
+ 
++    common_chat_schema_array() = default;
++    common_chat_schema_array(const common_chat_schema_array & other);
++
+     node_kind kind() const override { return KIND_ARRAY; }
+ };
+ 
+-struct common_chat_schema_tuple : common_chat_schema {
++// Exactly these items, in order.
++struct common_chat_schema_tuple : common_chat_schema_node<common_chat_schema_tuple> {
+     std::vector<common_chat_schema_ptr> items;
+ 
++    common_chat_schema_tuple() = default;
++    common_chat_schema_tuple(const common_chat_schema_tuple & other);
++
+     node_kind kind() const override { return KIND_TUPLE; }
+ };
+ 
+@@ -179,20 +236,60 @@ struct common_chat_schema_property {
+     bool                   required = false;
+ };
+ 
+-struct common_chat_schema_object : common_chat_schema {
+-    std::vector<common_chat_schema_property> properties;             // in schema order
+-    common_chat_schema_ptr                   additional_properties;  // null when not allowed
++struct common_chat_schema_object : common_chat_schema_node<common_chat_schema_object> {
++    // Which undeclared properties may appear.
++    enum undeclared_rule {
++        // The schema neither lists properties nor says: any may appear.
++        UNDECLARED_ANY,
++        // The schema lists properties without allowing more: none may appear.
++        UNDECLARED_NONE,
++        // The schema says: those matching `additional_properties`, or none when null.
++        UNDECLARED_STATED,
++    };
++
++    std::vector<common_chat_schema_property> properties;  // in schema order
++    undeclared_rule                          undeclared = UNDECLARED_ANY;
++    common_chat_schema_ptr                   additional_properties;
++
++    common_chat_schema_object() = default;
++    common_chat_schema_object(const common_chat_schema_object & other);
++
++    // The schema undeclared properties must match, or null when none may appear.
++    const common_chat_schema * additional() const;
+ 
+     node_kind kind() const override { return KIND_OBJECT; }
+ };
+ 
++// A keyword of the source schema the lowered constraint does not enforce.
++struct common_chat_schema_relaxation {
++    enum reason_kind {
++        // The constraint admits values the keyword rejects.
++        REASON_UNENFORCED,
++        // Values the output format cannot write are left out.
++        REASON_UNREPRESENTABLE,
++        // The keyword admits no value; the constraint admits values instead.
++        REASON_UNSATISFIABLE,
++    };
++
++    std::string path;
++    std::string keyword;
++    reason_kind reason = REASON_UNENFORCED;
++
++    static const char * reason_name(reason_kind reason);
++
++    bool operator<(const common_chat_schema_relaxation & other) const;
++    bool operator==(const common_chat_schema_relaxation & other) const;
++};
++
+ struct common_chat_schema_document {
+     common_chat_schema_ptr                        root;
+     std::map<std::string, common_chat_schema_ptr> refs;
++    std::vector<common_chat_schema_relaxation>    relaxations;
+ };
+ 
+ // A document shared by the PEG parsers built from its nodes, which it keeps alive
+ using common_chat_schema_document_ptr = std::shared_ptr<const common_chat_schema_document>;
+ 
+-// Throws std::runtime_error when the schema falls outside the supported subset.
++// Lowers a valid JSON Schema. Never fails for a schema that is valid under its
++// draft; a malformed schema is a caller defect (std::logic_error).
+ common_chat_schema_document common_chat_schema_from_json(const common_json & schema);
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -154,6 +154,9 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+                 std::vector<common_peg_parser> optional_parsers;
+                 foreach_parameter(function, [&](const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
+                     bool is_string = param.schema->may_be_string();
++                    if (is_string) {
++                        templates_raw_string_argument(name, *param.schema);
++                    }
+ 
+                     auto arg = p.tool_arg(
+                         p.tool_arg_open(p.literal(PARAM_START + " name=\"") + p.tool_arg_name(p.literal(param.name)) +
+--- a/common/parsers/gemma4.cpp
++++ b/common/parsers/gemma4.cpp
+@@ -157,7 +157,8 @@ namespace {
+ // to JSON, so parsing and the generation grammar come from the same rules.
+ class gemma4_argument_rules {
+   public:
+-    gemma4_argument_rules(common_chat_peg_builder & p, std::string prefix) : p(p), prefix(std::move(prefix)) {}
++    gemma4_argument_rules(common_chat_peg_builder & p, std::string prefix, std::string tool) :
++        p(p), prefix(std::move(prefix)), tool(std::move(tool)) {}
+ 
+     common_peg_parser visit(const common_chat_schema & schema) {
+         switch (schema.kind()) {
+@@ -168,12 +169,10 @@ class gemma4_argument_rules {
+             case common_chat_schema::KIND_BOOLEAN:
+                 return p.ref("gemma4-bool");
+             case common_chat_schema::KIND_NUMBER:
++                bounds(schema, static_cast<const common_chat_schema_number &>(schema));
+                 return p.ref("gemma4-number");
+             case common_chat_schema::KIND_INTEGER: {
+-                const auto & integer = static_cast<const common_chat_schema_integer &>(schema);
+-                if (integer.minimum != INT64_MIN || integer.maximum != INT64_MAX) {
+-                    unsupported("integer bounds");
+-                }
++                bounds(schema, static_cast<const common_chat_schema_integer &>(schema));
+                 return p.rule("gemma4-number--" + path(), p.sequence({
+                     p.optional(p.literal("-")),
+                     p.choice({p.literal("0"), p.chars("[1-9]", 1, 1) + p.chars("[0-9]", 0, -1)}),
+@@ -182,20 +181,24 @@ class gemma4_argument_rules {
+             }
+             case common_chat_schema::KIND_STRING: {
+                 const auto & string = static_cast<const common_chat_schema_string &>(schema);
+-                if (!string.pattern.empty() || string.format != common_chat_schema::FORMAT_NONE ||
+-                    string.min_length != 0 || string.max_length != -1) {
+-                    unsupported("string patterns, formats or lengths");
++                if (!string.pattern.empty()) {
++                    unenforced(schema, "pattern");
++                }
++                if (string.min_length > 0) {
++                    unenforced(schema, "minLength");
++                }
++                if (string.max_length >= 0) {
++                    unenforced(schema, "maxLength");
+                 }
+                 return p.ref("gemma4-string");
+             }
+-            case common_chat_schema::KIND_CONST:
+-                return constant(static_cast<const common_chat_schema_const &>(schema).value);
++            case common_chat_schema::KIND_CONST: {
++                auto rules = literals(schema, { static_cast<const common_chat_schema_const &>(schema).value }, "const");
++                return rules ? rules->front() : p.ref("gemma4-value");
++            }
+             case common_chat_schema::KIND_ENUM: {
+-                std::vector<common_peg_parser> values;
+-                for (const auto & value : static_cast<const common_chat_schema_enum &>(schema).values) {
+-                    values.push_back(constant(value));
+-                }
+-                return alternatives(values);
++                auto rules = literals(schema, static_cast<const common_chat_schema_enum &>(schema).values, "enum");
++                return rules ? alternatives(*rules) : p.ref("gemma4-value");
+             }
+             case common_chat_schema::KIND_ANY_OF: {
+                 std::vector<common_peg_parser> values;
+@@ -206,9 +209,6 @@ class gemma4_argument_rules {
+             }
+             case common_chat_schema::KIND_REF: {
+                 const auto * target = static_cast<const common_chat_schema_ref &>(schema).target;
+-                if (!target) {
+-                    unsupported("unresolved references");
+-                }
+                 // The placeholder rule lets a recursive schema refer to itself.
+                 auto index = references.emplace(target, references.size()).first->second;
+                 return p.rule("gemma4-value--" + prefix + "-ref-" + std::to_string(index),
+@@ -218,34 +218,69 @@ class gemma4_argument_rules {
+                 return array(static_cast<const common_chat_schema_array &>(schema));
+             case common_chat_schema::KIND_OBJECT:
+                 return object(static_cast<const common_chat_schema_object &>(schema));
+-            case common_chat_schema::KIND_ALL_OF:
+-                unsupported("allOf");
+             case common_chat_schema::KIND_TUPLE:
+-                unsupported("tuples");
++                unenforced(schema, "prefixItems");
++                return p.ref("gemma4-array");
++            case common_chat_schema::KIND_NEVER:
++                throw std::logic_error("unsettled schema node");
+         }
+-        unsupported("this schema");
++        throw std::logic_error("unhandled schema node");
+     }
+ 
+   private:
+     common_chat_peg_builder &                     p;
+     std::string                                   prefix;
++    std::string                                   tool;
+     size_t                                        next = 0;
+     std::map<const common_chat_schema *, size_t>  references;
+ 
+-    [[noreturn]] static void unsupported(const std::string & what) {
+-        throw std::invalid_argument("Unsupported JSON schema: Gemma tool arguments cannot enforce " + what);
++    // The dictionary syntax does not enforce this keyword.
++    void unenforced(const common_chat_schema & schema, const std::string & keyword) {
++        templates_native::relax(tool, schema, keyword, common_chat_schema_relaxation::REASON_UNENFORCED);
++    }
++
++    // Numbers are written without bounds.
++    void bounds(const common_chat_schema & schema, const common_chat_schema_numeric & numeric) {
++        if (numeric.minimum) {
++            unenforced(schema, numeric.minimum->exclusive ? "exclusiveMinimum" : "minimum");
++        }
++        if (numeric.maximum) {
++            unenforced(schema, numeric.maximum->exclusive ? "exclusiveMaximum" : "maximum");
++        }
+     }
+ 
+     std::string path() { return prefix + "-" + std::to_string(next++); }
+ 
+-    // A value rendered literally.
++    // The listed values (const or enum) rendered literally, or none when the
++    // list admits any value instead: a structured value is listed (those are
++    // not rendered), or every value contains the string delimiter. Strings
++    // containing the delimiter cannot be written and are left out.
++    std::optional<std::vector<common_peg_parser>> literals(const common_chat_schema & schema, const std::vector<json> & values,
++                                                           const std::string & keyword) {
++        if (std::any_of(values.begin(), values.end(), [](const json & value) { return value.is_object() || value.is_array(); })) {
++            unenforced(schema, keyword);
++            return std::nullopt;
++        }
++        std::vector<common_peg_parser> rules;
++        for (const auto & value : values) {
++            if (value.is_string() && value.get<std::string>().find("<|\"|>") != std::string::npos) {
++                templates_native::relax(tool, schema, keyword, common_chat_schema_relaxation::REASON_UNREPRESENTABLE);
++                continue;
++            }
++            rules.push_back(constant(value));
++        }
++        if (rules.empty()) {
++            unenforced(schema, keyword);
++            return std::nullopt;
++        }
++        return rules;
++    }
++
++    // A scalar rendered literally.
+     common_peg_parser constant(const json & value) {
+         auto at = path();
+         if (value.is_string()) {
+             const auto text = value.get<std::string>();
+-            if (text.find("<|\"|>") != std::string::npos) {
+-                unsupported("strings containing the <|\"|> delimiter");
+-            }
+             return p.rule("gemma4-string--" + at,
+                           p.literal("<|\"|>") + p.rule("gemma4-string-content--" + at, p.literal(text)) + p.literal("<|\"|>"));
+         }
+@@ -255,10 +290,7 @@ class gemma4_argument_rules {
+         if (value.is_null()) {
+             return p.rule("gemma4-null--" + at, p.literal("null"));
+         }
+-        if (value.is_number()) {
+-            return p.rule("gemma4-number--" + at, p.literal(value.dump()));
+-        }
+-        unsupported("object or array constants");
++        return p.rule("gemma4-number--" + at, p.literal(value.dump()));
+     }
+ 
+     // One of several values. A PEG choice commits to the first alternative
+@@ -287,17 +319,22 @@ class gemma4_argument_rules {
+     }
+ 
+     common_peg_parser object(const common_chat_schema_object & object) {
+-        if (object.properties.empty() && object.additional_properties &&
+-            object.additional_properties->kind() == common_chat_schema::KIND_ANY) {
++        const auto * additional = object.additional();
++        if (object.properties.empty() && additional && additional->kind() == common_chat_schema::KIND_ANY) {
+             return p.ref("gemma4-dict");
+         }
+-        if (object.additional_properties) {
+-            unsupported("undeclared properties");
++        if (additional) {
++            // Declared and undeclared members in one sorted dictionary.
++            unenforced(object, "additionalProperties");
++            return p.ref("gemma4-dict");
+         }
+         std::vector<const common_chat_schema_property *> properties;
+         for (const auto & property : object.properties) {
+             if (property.name.empty() || property.name.find_first_of(":}") != std::string::npos) {
+-                unsupported("property names that are not bare dictionary keys");
++                // A dictionary key is bare text without ':' or '}'.
++                templates_native::relax(tool, *property.schema, "properties",
++                                        common_chat_schema_relaxation::REASON_UNREPRESENTABLE);
++                continue;
+             }
+             properties.push_back(&property);
+         }
+@@ -447,7 +484,7 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &
+                 const auto & function = tool.at("function");
+                 std::string  name     = function.at("name");
+                 const auto   schema   = common_chat_schema_from_json(common_chat_tool_parameters(function));
+-                gemma4_argument_rules arguments(p, "tool-" + std::to_string(index++));
++                gemma4_argument_rules arguments(p, "tool-" + std::to_string(index++), name);
+ 
+                 tool_choice |= p.rule("tool-" + name, p.tool(p.sequence({
+                     p.tool_open(p.tool_name(p.literal(name)) + p.peek(p.literal("{"))),
+--- a/common/parsers/minicpm5.cpp
++++ b/common/parsers/minicpm5.cpp
+@@ -76,6 +76,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+                 foreach_parameter(function, [&](const common_chat_schema_property & prop, const common_chat_schema_document_ptr & doc) {
+                     auto value_parser = p.eps();
+                     if (prop.schema->may_be_string()) {
++                        templates_raw_string_argument(name, *prop.schema);
+                         value_parser = string_value;
+                     } else {
+                         value_parser = p.tool_arg_json_value(
+--- a/common/parsers/minimax-m3.cpp
++++ b/common/parsers/minimax-m3.cpp
+@@ -113,7 +113,7 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
+ 
+                 // A string accepts anything, so a union with a string alternative is a string
+                 if (schema.may_be_string()) {
+-                    templates_require_unconstrained_raw_string(schema);
++                    templates_raw_string_argument(name, schema);
+                     return p.ac(p.tool_arg_string_value(p.until(close)) + close_tag, close);
+                 }
+ 
+--- a/common/parsers/muse-glimmer.cpp
++++ b/common/parsers/muse-glimmer.cpp
+@@ -79,6 +79,7 @@ common_chat_params common_chat_params_init_muse_glimmer(const common_chat_templa
+                 foreach_parameter(function, [&](const common_chat_schema_property & prop, const common_chat_schema_document_ptr & doc) {
+                     auto value_parser = p.eps();
+                     if (prop.schema->may_be_string()) {
++                        templates_raw_string_argument(name, *prop.schema);
+                         value_parser = string_value;
+                     } else {
+                         value_parser = p.tool_arg_json_value(
+--- a/common/parsers/parsers.cpp
++++ b/common/parsers/parsers.cpp
+@@ -13,10 +13,17 @@ void foreach_function(const json & tools, const std::function<void(const json &)
+ }
+ 
+ void foreach_parameter(const json & function, const std::function<void(const common_chat_schema_property &, const common_chat_schema_document_ptr &)> & fn) {
+-    auto         params = common_chat_tool_parameters(function);
+-    auto         doc    = std::make_shared<const common_chat_schema_document>(common_chat_schema_from_json(params));
+-    const auto * object = dynamic_cast<const common_chat_schema_object *>(doc->root.get());
++    auto                       params = common_chat_tool_parameters(function);
++    auto                       doc    = std::make_shared<const common_chat_schema_document>(common_chat_schema_from_json(params));
++    const common_chat_schema * root   = doc->root.get();
++    for (size_t hops = 0; root->kind() == common_chat_schema::KIND_REF && hops <= doc->refs.size(); hops++) {
++        root = static_cast<const common_chat_schema_ref *>(root)->target;
++    }
++    const auto * object = dynamic_cast<const common_chat_schema_object *>(root);
+     if (!object) {
++        // Named arguments express one object's properties; under any other
++        // argument schema they are written as none, which it may reject.
++        templates_native::relax(function.at("name"), *doc->root, "type", common_chat_schema_relaxation::REASON_UNENFORCED);
+         return;
+     }
+     for (const auto & prop : object->properties) {
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -111,15 +111,12 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+                     auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param.name)) + ">\n");
+ 
+                     auto types = param.schema->value_types();
+-                    // Raw text is enforceable when strings are unconstrained
+-                    // or drawn from listed values (enum, const).
+-                    auto raw_values = templates_raw_string_values(*param.schema);
++                    // Raw text enforces strings drawn from listed values
++                    // (enum, const); other string constraints are recorded.
++                    auto raw_values = templates_raw_string_values(name, *param.schema, "\n</parameter>\n");
+                     auto raw_value  = p.choice();
+                     if (raw_values) {
+                         for (const auto & value : *raw_values) {
+-                            if (value.find("\n</parameter>\n") != std::string::npos) {
+-                                throw std::invalid_argument("Unsupported JSON schema: a raw string value contains the argument delimiter");
+-                            }
+                             // Each value carries the close, so an ordered choice
+                             // never commits to a value that prefixes another.
+                             raw_value |= p.tool_arg_string_value(p.literal(value)) + arg_close;
+@@ -140,7 +137,12 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+                         arg_value = arg_string;
+                     } else {
+                         // The string alternative accepts any text, so the grammar only keeps the raw string
+-                        // rule. The parser still tries the JSON alternatives first to type the value.
++                        // rule. The parser still tries the JSON alternatives first to type the value,
++                        // so structured and numeric values follow only their JSON type.
++                        if (types.has(common_chat_schema::TYPE_OBJECT) || types.has(common_chat_schema::TYPE_ARRAY) ||
++                            types.has(common_chat_schema::TYPE_NUMBER) || types.has(common_chat_schema::TYPE_INTEGER)) {
++                            templates_native::relax(name, *param.schema, "type", common_chat_schema_relaxation::REASON_UNENFORCED);
++                        }
+                         auto json_value = p.choice();
+                         if (types.has(common_chat_schema::TYPE_OBJECT)) {
+                             json_value |= p.json_object();
+--- a/common/peg-parser.cpp
++++ b/common/peg-parser.cpp
+@@ -1761,8 +1761,10 @@ void common_peg_arena::build_grammar(const common_grammar_builder & builder, boo
+                 }
+                 return result + "{" + std::to_string(p.min_count) + "," + std::to_string(p.max_count) + "}";
+             } else if constexpr (std::is_same_v<T, common_peg_string_parser>) {
++                // Raw control characters and lone surrogates are not string text.
+                 const std::string delim(1, p.delimiter);
+-                return R"(( [^)" + delim + R"(\\] | "\\" ( [)" + delim + R"(\\/ bfnrt] | "u" [0-9a-fA-F]{4} ) )*)";
++                return R"(( [^)" + delim + R"(\\\x00-\x1F] | "\\" ( [)" + delim + R"(\\/bfnrt] | )" +
++                       GBNF_JSON_UNICODE_ESCAPE + R"( ) )*)";
+             } else if constexpr (std::is_same_v<T, common_peg_until_parser>) {
+                 if (p.delimiters.empty()) {
+                     return ".*";

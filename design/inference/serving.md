@@ -30,10 +30,10 @@ exchanges), offered tools with their selection and parallelism, a reasoning
 intent, an output format, caller template arguments and generation controls.
 Rendering that request is the only path to template input, so counting,
 template application and generation see identical prompts and counts agree
-with generation. JSON mode constrains output to a JSON object; a JSON schema or
-caller grammar constrains output to that language. Enforcement accepts exactly the
-grammar's language, admits end of generation only where it accepts, and a schema
-object listing properties is closed unless it explicitly allows more. Image sources are validated
+with generation. JSON mode constrains output to a JSON object; a caller grammar
+constrains output to its language; tool and output JSON schemas constrain output
+best effort, as the schema constraints design defines. Enforcement accepts exactly
+the grammar's language and admits end of generation only where it accepts. Image sources are validated
 and decoded by the protocol layer (base64 data URLs only, bounded); network URLs
 are never fetched. The standalone binary additionally reports readiness identity
 (`/health`: model, served context, vocabulary) and exposes counting at

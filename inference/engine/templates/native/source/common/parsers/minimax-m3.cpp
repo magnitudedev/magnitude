@@ -113,7 +113,7 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
 
                 // A string accepts anything, so a union with a string alternative is a string
                 if (schema.may_be_string()) {
-                    templates_require_unconstrained_raw_string(schema);
+                    templates_raw_string_argument(name, schema);
                     return p.ac(p.tool_arg_string_value(p.until(close)) + close_tag, close);
                 }
 

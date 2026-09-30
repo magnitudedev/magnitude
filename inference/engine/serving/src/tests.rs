@@ -1202,8 +1202,8 @@ fn maps_the_complete_chat_request_contract() {
     assert_eq!(request.input.template_arguments["custom"], json!(7));
     assert!(matches!(
         &request.input.output,
-        OutputFormat::JsonSchema { name, schema, strict: true }
-            if name == "answer" && schema["type"] == "object"
+        OutputFormat::JsonSchema { name, schema }
+            if name == "answer" && schema.source()["type"] == "object"
     ));
     assert_eq!(request.controls.stops, ["END", "STOP"]);
     assert_eq!(request.controls.max_output_tokens.map(|n| n.get()), Some(99));

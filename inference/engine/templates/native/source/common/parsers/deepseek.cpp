@@ -154,6 +154,9 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
                 std::vector<common_peg_parser> optional_parsers;
                 foreach_parameter(function, [&](const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
                     bool is_string = param.schema->may_be_string();
+                    if (is_string) {
+                        templates_raw_string_argument(name, *param.schema);
+                    }
 
                     auto arg = p.tool_arg(
                         p.tool_arg_open(p.literal(PARAM_START + " name=\"") + p.tool_arg_name(p.literal(param.name)) +

@@ -118,6 +118,41 @@ pub struct PreparedDescription {
     pub thinking_start: String,
     pub thinking_ends: Vec<String>,
     pub diagnostics: Vec<String>,
+    /// Schema keywords the grammar does not enforce. Values generated under a
+    /// relaxed schema may violate these keywords; every other keyword holds.
+    pub relaxations: Vec<Relaxation>,
+}
+
+/// What a relaxed schema constrains.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RelaxationSubject {
+    /// A tool's arguments.
+    Tool { name: String },
+    /// The JSON output.
+    Output,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RelaxationReason {
+    /// The grammar admits values the keyword rejects.
+    Unenforced,
+    /// Values the model's output syntax cannot write are left out.
+    Unrepresentable,
+    /// The keyword admits no value; the grammar admits values instead.
+    Unsatisfiable,
+}
+
+/// A keyword of a schema the prepared grammar does not enforce exactly.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct Relaxation {
+    pub subject: RelaxationSubject,
+    /// JSON pointer to the schema holding the keyword.
+    pub path: String,
+    pub keyword: String,
+    pub reason: RelaxationReason,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

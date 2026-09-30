@@ -77,27 +77,100 @@ void templates_native::diagnostic(const char * format, ...) {
     diagnostics.emplace_back(buffer.data(), static_cast<size_t>(size));
 }
 
-#include "json-schema.h"
-void templates_require_unconstrained_raw_string(const common_chat_schema & schema) {
-    if (!schema.may_be_string()) { return; }
-    if (schema.kind() == common_chat_schema::KIND_STRING) {
-        const auto & string = static_cast<const common_chat_schema_string &>(schema);
-        if (string.pattern.empty() && string.format == common_chat_schema::FORMAT_NONE &&
-            string.min_length == 0 && string.max_length == -1) { return; }
-    }
-    throw std::invalid_argument("Unsupported JSON schema: tagged raw strings cannot enforce this constraint");
+thread_local std::vector<templates_native::tool_relaxation> templates_native::relaxations;
+
+void templates_native::relax(const std::string & tool, const common_chat_schema & node, const std::string & keyword,
+                             common_chat_schema_relaxation::reason_kind reason) {
+    relaxations.push_back({ tool, { node.path, keyword, reason } });
 }
 
-std::optional<std::vector<std::string>> templates_raw_string_values(const common_chat_schema & schema) {
+namespace {
+using relaxation = common_chat_schema_relaxation;
+
+// Whether the schema admits every string.
+bool admits_every_string(const common_chat_schema & schema, int depth = 0) {
+    switch (schema.kind()) {
+        case common_chat_schema::KIND_ANY:
+            return true;
+        case common_chat_schema::KIND_STRING: {
+            const auto & string = static_cast<const common_chat_schema_string &>(schema);
+            return string.pattern.empty() && string.min_length == 0 && string.max_length < 0;
+        }
+        case common_chat_schema::KIND_REF: {
+            const auto * target = static_cast<const common_chat_schema_ref &>(schema).target;
+            return depth < 32 && admits_every_string(*target, depth + 1);
+        }
+        case common_chat_schema::KIND_ANY_OF:
+            for (const auto & child : static_cast<const common_chat_schema_any_of &>(schema).children) {
+                if (admits_every_string(*child, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+// The string constraints a schema places, which raw text does not enforce.
+void record_string_constraints(const std::string & tool, const common_chat_schema & schema, int depth = 0) {
+    switch (schema.kind()) {
+        case common_chat_schema::KIND_STRING: {
+            const auto & string = static_cast<const common_chat_schema_string &>(schema);
+            if (!string.pattern.empty()) {
+                templates_native::relax(tool, schema, "pattern", relaxation::REASON_UNENFORCED);
+            }
+            if (string.min_length > 0) {
+                templates_native::relax(tool, schema, "minLength", relaxation::REASON_UNENFORCED);
+            }
+            if (string.max_length >= 0) {
+                templates_native::relax(tool, schema, "maxLength", relaxation::REASON_UNENFORCED);
+            }
+            break;
+        }
+        case common_chat_schema::KIND_CONST:
+            if (static_cast<const common_chat_schema_const &>(schema).value.is_string()) {
+                templates_native::relax(tool, schema, "const", relaxation::REASON_UNENFORCED);
+            }
+            break;
+        case common_chat_schema::KIND_ENUM:
+            if (schema.may_be_string()) {
+                templates_native::relax(tool, schema, "enum", relaxation::REASON_UNENFORCED);
+            }
+            break;
+        case common_chat_schema::KIND_REF:
+            if (depth < 32) {
+                record_string_constraints(tool, *static_cast<const common_chat_schema_ref &>(schema).target, depth + 1);
+            }
+            break;
+        case common_chat_schema::KIND_ANY_OF:
+            for (const auto & child : static_cast<const common_chat_schema_any_of &>(schema).children) {
+                record_string_constraints(tool, *child, depth + 1);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+std::optional<std::vector<std::string>> raw_string_values(const std::string & tool, const common_chat_schema & schema,
+                                                          const std::string & delimiter, int depth) {
+    auto writable = [&](const std::string & value, const char * keyword) {
+        if (value.find(delimiter) == std::string::npos) {
+            return true;
+        }
+        templates_native::relax(tool, schema, keyword, relaxation::REASON_UNREPRESENTABLE);
+        return false;
+    };
     switch (schema.kind()) {
         case common_chat_schema::KIND_ANY:
             return std::nullopt;
         case common_chat_schema::KIND_STRING:
-            templates_require_unconstrained_raw_string(schema);
+            record_string_constraints(tool, schema);
             return std::nullopt;
         case common_chat_schema::KIND_CONST: {
             const auto & value = static_cast<const common_chat_schema_const &>(schema).value;
-            if (value.is_string()) {
+            if (value.is_string() && writable(value.get<std::string>(), "const")) {
                 return std::vector<std::string>{ value.get<std::string>() };
             }
             return std::vector<std::string>{};
@@ -105,7 +178,7 @@ std::optional<std::vector<std::string>> templates_raw_string_values(const common
         case common_chat_schema::KIND_ENUM: {
             std::vector<std::string> values;
             for (const auto & value : static_cast<const common_chat_schema_enum &>(schema).values) {
-                if (value.is_string() &&
+                if (value.is_string() && writable(value.get<std::string>(), "enum") &&
                     std::find(values.begin(), values.end(), value.get<std::string>()) == values.end()) {
                     values.push_back(value.get<std::string>());
                 }
@@ -113,13 +186,18 @@ std::optional<std::vector<std::string>> templates_raw_string_values(const common
             return values;
         }
         case common_chat_schema::KIND_REF:
-            return templates_raw_string_values(*static_cast<const common_chat_schema_ref &>(schema).target);
+            if (depth >= 32) {
+                return std::nullopt;
+            }
+            return raw_string_values(tool, *static_cast<const common_chat_schema_ref &>(schema).target, delimiter, depth + 1);
         case common_chat_schema::KIND_ANY_OF: {
             std::vector<std::string> values;
+            bool                     any_text = false;
             for (const auto & child : static_cast<const common_chat_schema_any_of &>(schema).children) {
-                auto child_values = templates_raw_string_values(*child);
+                auto child_values = raw_string_values(tool, *child, delimiter, depth + 1);
                 if (!child_values) {
-                    return std::nullopt;
+                    any_text = true;
+                    continue;
                 }
                 for (auto & value : *child_values) {
                     if (std::find(values.begin(), values.end(), value) == values.end()) {
@@ -127,10 +205,27 @@ std::optional<std::vector<std::string>> templates_raw_string_values(const common
                     }
                 }
             }
+            if (any_text) {
+                return std::nullopt;
+            }
             return values;
         }
         default:
-            templates_require_unconstrained_raw_string(schema);
             return std::vector<std::string>{};
     }
+}
+}  // namespace
+
+void templates_raw_string_argument(const std::string & tool, const common_chat_schema & schema) {
+    if (!admits_every_string(schema)) {
+        record_string_constraints(tool, schema);
+    }
+}
+
+std::optional<std::vector<std::string>> templates_raw_string_values(const std::string & tool, const common_chat_schema & schema,
+                                                                    const std::string & delimiter) {
+    if (admits_every_string(schema)) {
+        return std::nullopt;
+    }
+    return raw_string_values(tool, schema, delimiter, 0);
 }

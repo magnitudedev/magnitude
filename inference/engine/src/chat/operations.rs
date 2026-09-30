@@ -57,6 +57,10 @@ pub fn prepare(
     if let Some(constraint) = chat.constraint() {
         crate::telemetry::span_grammar(&constraint.report);
     }
+    let relaxations = &chat.native().description().relaxations;
+    if !relaxations.is_empty() {
+        crate::telemetry::span_relaxations(relaxations);
+    }
     let tokens = chat.input().tokens.clone();
     let input = match bound {
         InputBound::Served => host.prepare_input(tokens, &images),
