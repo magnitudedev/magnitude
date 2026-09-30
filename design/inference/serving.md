@@ -77,7 +77,10 @@ Prompt caching allowed retains exact prompt prefixes; disallowed requests are
 transient.
 
 Stream parsing emits semantic text, reasoning and complete validated tool calls
-in one ordered stream that non-streaming responses also assemble from. A
+in one ordered stream that non-streaming responses also assemble from. Each
+tool call's ID is unique across responses, since clients key calls and results
+by ID over a whole conversation: the ID the model wrote when its format carries
+one (templates render it back), otherwise a fresh random one. A
 caller stop sequence ends output with a stop-sequence termination; tool calls
 terminate as tool calls; the output limit or context end is a length
 termination. Terminal usage and timings come from actual engine execution;

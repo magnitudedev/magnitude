@@ -22,7 +22,7 @@ fn request() -> Request {
 struct Transcript {
     content: String,
     reasoning: String,
-    calls: Vec<(String, String, String, bool)>,
+    calls: Vec<(String, Option<String>, String, bool)>,
     finish: Option<TerminalCause>,
 }
 impl Transcript {
@@ -111,6 +111,9 @@ fn real_templates_preserve_tools_reasoning_and_unicode_at_every_byte_split() {
         assert_eq!(expected.reasoning,reasoning);
         assert_eq!(expected.calls.len(),1);
         assert_eq!(expected.calls[0].0,"search");
+        // Neither format writes call IDs; the stream invents none (the host
+        // assigns identities unique across responses).
+        assert_eq!(expected.calls[0].1,None);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&expected.calls[0].2).unwrap(),json!({"query":"héllo 世界"}));
         assert!(expected.calls[0].3);
         for split in 0..=bytes.len() {

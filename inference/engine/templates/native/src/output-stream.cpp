@@ -159,7 +159,8 @@ void output_stream::parse(bool natural, bool baseline) {
         if (!cursor.started) {
             if (has_explicit_ids && current.id.empty() && !complete) { continue; }
             cursor.name = current.name;
-            cursor.id = current.id.empty() ? "call_" + std::to_string(i) : current.id;
+            // Only the model's own ID; the host mints one when the format has none.
+            cursor.id = current.id;
             cursor.started = true;
             values.push_back({TEMPLATES_TOOL_START, static_cast<uint32_t>(i), cursor.name, cursor.id});
         } else if (cursor.name != current.name || (!current.id.empty() && cursor.id != current.id)) {

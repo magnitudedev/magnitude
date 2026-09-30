@@ -357,7 +357,7 @@ impl OutputStream {
                     3 => Event::ToolStart {
                         index: event.index,
                         name: text(event.text, event.text_size)?,
-                        id: text(event.id, event.id_size)?,
+                        id: Some(text(event.id, event.id_size)?).filter(|id| !id.is_empty()),
                     },
                     4 => Event::ToolArguments {
                         index: event.index,

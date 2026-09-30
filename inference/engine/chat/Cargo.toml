@@ -9,6 +9,7 @@ magnitude-artifacts = { path = "../artifacts" }
 magnitude-generation = { path = "../generation" }
 magnitude-grammar = { path = "../grammar" }
 magnitude-templates = { path = "../templates" }
+getrandom.workspace = true
 jsonschema = { version = "=0.58.2", default-features = false }
 serde.workspace = true
 serde_json = "=1.0.151"

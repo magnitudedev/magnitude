@@ -2207,6 +2207,7 @@ dependencies = [
 name = "magnitude-chat"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "jsonschema",
  "magnitude-artifacts",
  "magnitude-generation",

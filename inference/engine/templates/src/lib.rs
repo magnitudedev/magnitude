@@ -178,7 +178,9 @@ pub enum Event {
     ToolStart {
         index: u32,
         name: String,
-        id: String,
+        /// The call ID the model wrote; `None` when its output format carries
+        /// none, and the host assigns the call its identity.
+        id: Option<String>,
     },
     ToolArguments {
         index: u32,

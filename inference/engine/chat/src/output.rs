@@ -14,6 +14,7 @@ pub enum OutputEvent {
     TextDelta(String),
     ToolCallStarted {
         index: usize,
+        /// Unique across responses: see [`tool_call_id`].
         id: String,
         name: String,
     },
@@ -24,6 +25,27 @@ pub enum OutputEvent {
     ToolCallFinished {
         index: usize,
     },
+}
+
+/// A published tool call's identity. Clients key tool calls and results by
+/// ID across a whole conversation, so an ID repeated in a later response names
+/// the earlier call. The ID the model wrote is kept verbatim, since its
+/// template renders it back in history; otherwise the call gets a fresh random
+/// one.
+pub fn tool_call_id(written: Option<String>) -> Result<String, String> {
+    if let Some(id) = written {
+        return Ok(id);
+    }
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("tool call ID randomness is unavailable: {error}"))?;
+    Ok(format!(
+        "call_{}",
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
 }
 
 /// Request progress before output: host preparation, engine admission,
@@ -339,5 +361,25 @@ mod tests {
         let output = journal.finish().unwrap();
         assert_eq!(output.tool_calls[0].id, "first");
         assert_eq!(output.tool_calls[1].id, "second");
+    }
+
+    /// Formats without written IDs once got `call_<index>`, so every
+    /// response's first call was `call_0` and clients treated later calls as
+    /// repeats of the first.
+    #[test]
+    fn unwritten_tool_call_ids_are_unique_across_responses() {
+        let ids = (0..1000)
+            .map(|_| tool_call_id(None).unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), 1000);
+        for id in &ids {
+            let suffix = id.strip_prefix("call_").unwrap();
+            assert_eq!(suffix.len(), 32);
+            assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert_eq!(
+            tool_call_id(Some("functions.search:3".into())).unwrap(),
+            "functions.search:3"
+        );
     }
 }

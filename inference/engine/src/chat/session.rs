@@ -13,8 +13,8 @@ use magnitude_chat::{
     conformance::OutputSchemas,
     generation::{generation_options, ModelLimits},
     output::{
-        Completion, GenerationTimings, OutputEvent, Progress, Termination, TimingSnapshot,
-        TokenUsage,
+        tool_call_id, Completion, GenerationTimings, OutputEvent, Progress, Termination,
+        TimingSnapshot, TokenUsage,
     },
     request::PromptCache,
     ChatError, Event, FinishReason, GenerationRequest, SpecialTokens, TerminalCause,
@@ -481,7 +481,7 @@ impl Semantics {
                     self.calls.insert(index, (name.clone(), String::new()));
                     output.push(OutputEvent::ToolCallStarted {
                         index: index as usize,
-                        id,
+                        id: tool_call_id(id)?,
                         name,
                     });
                 }
