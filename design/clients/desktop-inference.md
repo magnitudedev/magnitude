@@ -95,7 +95,8 @@ children and marks it close-on-exec. The desktop retains package admission until
 service and update-helper children cannot inherit the lease and block their own installation.
 When assessment setup fails, Discover displays the reported failure instead of the assessment
 placeholder; Catalog shows the same failure beside any still-visible models. Background retry
-does not suppress that feedback. Recommendations order fitting assessed configurations using the shared preference. The remaining
+does not suppress that feedback. Recommendations order fitting assessed configurations using the
+shared preference. The remaining
 curated catalog stays discoverable with explicit pending, assessment-failed, or insufficient-memory
 explanations; a fitting model without a speed estimate says "Speed estimate unavailable". Details
 expose catalog license/source links, capabilities, context, and labeled performance estimates.

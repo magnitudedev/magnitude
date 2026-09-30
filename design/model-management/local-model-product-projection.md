@@ -44,7 +44,8 @@ source and assessment snapshots: discovery completion and the discovered-model c
 models are excluded from it), plus assessment completion,
 settled count, total count, and an assessment pool or source failure when one is present. A
 failure remains distinct from progress and is visible to clients while ICN retries; clients do
-not keep showing an indefinite assessment spinner. Assessment totals describe the current target set and may grow when
+not keep showing an indefinite assessment spinner. Assessment totals describe the current target
+set and may grow when
 authoritative discovery contributes additional targets. This summary is the readiness authority for
 onboarding and local provider offerings; clients do not recover global readiness by scanning
 individual product rows.
