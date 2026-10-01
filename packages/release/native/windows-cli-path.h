@@ -179,7 +179,7 @@ __declspec(dllexport) DWORD WINAPI InstallCliLauncher(LPCWSTR source, LPCWSTR pa
   GUID id;
   WCHAR guid[40];
   BOOL moved = FALSE;
-  if (!error) error = open_installation_directory(path, &directory);
+  if (!error) error = open_installation_directory(path, 0, &directory);
   if (!error) error = retire_cli_images(directory);
   if (error) goto done;
   if (FAILED(CoCreateGuid(&id)) || !StringFromGUID2(&id, guid, 40) ||
@@ -233,7 +233,7 @@ done:
 __declspec(dllexport) DWORD WINAPI RemoveCliLauncher(LPCWSTR path) {
   if (!leaseHeld || !path) return ERROR_INVALID_PARAMETER;
   HANDLE directory = INVALID_HANDLE_VALUE, file = INVALID_HANDLE_VALUE;
-  DWORD error = open_installation_directory(path, &directory);
+  DWORD error = open_installation_directory(path, DELETE, &directory);
   if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return ERROR_SUCCESS;
   if (error) return error;
   error = retire_cli_images(directory);

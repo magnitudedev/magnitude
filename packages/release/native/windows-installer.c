@@ -35,6 +35,26 @@ static DWORD open_without_reparse(HANDLE root, LPCWSTR path, ACCESS_MASK access,
     ULONG share, ULONG options, HANDLE *output) {
   return open_file_object(root, path, access, share, options, OBJ_DONT_REPARSE, output);
 }
+/* A drive letter is an object-manager symbolic link, which Windows 10 refuses to
+   traverse under OBJ_DONT_REPARSE. Resolve only the volume root, then reject every
+   file-system reparse point below it. */
+static DWORD open_absolute_without_reparse(LPCWSTR path, size_t length, ACCESS_MASK access,
+    ULONG share, ULONG options, HANDLE *output) {
+  if (!path || length < 4 || length > 32760 || path[1] != L':' || path[2] != L'\\' ||
+      !((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z'))) return ERROR_BAD_PATHNAME;
+  WCHAR volume[] = L"\\??\\X:\\";
+  volume[4] = path[0];
+  HANDLE root = INVALID_HANDLE_VALUE;
+  DWORD error = open_file_object(NULL, volume, FILE_TRAVERSE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    FILE_DIRECTORY_FILE, 0, &root);
+  if (error) return error;
+  WCHAR *relative = calloc(length - 2, sizeof(WCHAR));
+  if (!relative) { CloseHandle(root); return ERROR_NOT_ENOUGH_MEMORY; }
+  wmemcpy(relative, path + 3, length - 3);
+  error = open_without_reparse(root, relative, access, share, options, output);
+  free(relative); CloseHandle(root);
+  return error;
+}
 static BOOL safe_relative_path(LPCWSTR path) {
   if (!path || !path[0]) return FALSE;
   LPCWSTR segment = path;
@@ -211,14 +231,12 @@ static DWORD inspect_inventory(HANDLE directory, installation_inventory *invento
   return error;
 }
 
-static DWORD open_installation_directory(LPCWSTR path, HANDLE *directory) {
-  if (!path || wcslen(path) < 3 || wcslen(path) > 32760 || path[1] != L':' || path[2] != L'\\') return ERROR_BAD_PATHNAME;
-  WCHAR *absolute = calloc(32768, sizeof(WCHAR));
-  if (!absolute) return ERROR_NOT_ENOUGH_MEMORY;
-  wcscpy(absolute, L"\\??\\"); wcscat(absolute, path);
-  DWORD error = open_without_reparse(NULL, absolute, READ_CONTROL | DELETE | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+/* Request DELETE only to rename or remove the directory itself. Windows 10 refuses to
+   rename an entry into a directory while a handle to it holds DELETE. */
+static DWORD open_installation_directory(LPCWSTR path, ACCESS_MASK access, HANDLE *directory) {
+  if (!path) return ERROR_BAD_PATHNAME;
+  DWORD error = open_absolute_without_reparse(path, wcslen(path), READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | access,
     FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, directory);
-  free(absolute);
   if (!error) error = magnitude_validate_private_directory(*directory);
   if (error && *directory != INVALID_HANDLE_VALUE) { CloseHandle(*directory); *directory = INVALID_HANDLE_VALUE; }
   return error;
@@ -227,7 +245,7 @@ static DWORD open_installation_directory(LPCWSTR path, HANDLE *directory) {
 __declspec(dllexport) DWORD WINAPI ValidateOwnedInstallation(LPCWSTR path, LPCWSTR version) {
   if (!version || !version[0]) return ERROR_INVALID_PARAMETER;
   HANDLE directory = INVALID_HANDLE_VALUE;
-  DWORD error = open_installation_directory(path, &directory);
+  DWORD error = open_installation_directory(path, 0, &directory);
   if (error) return error;
   installation_inventory inventory;
   error = read_inventory(directory, &inventory);
@@ -276,14 +294,8 @@ static DWORD retain_installation_parent(LPCWSTR path) {
   if (!path || installationParent != INVALID_HANDLE_VALUE) return ERROR_INVALID_PARAMETER;
   LPCWSTR leaf = wcsrchr(path, L'\\');
   if (!leaf || leaf == path || wcslen(leaf + 1) >= 256 || !safe_relative_path(leaf + 1)) return ERROR_BAD_PATHNAME;
-  WCHAR *parent = calloc(32768, sizeof(WCHAR));
-  if (!parent) return ERROR_NOT_ENOUGH_MEMORY;
-  size_t length = (size_t)(leaf - path);
-  if (length > 32760 || path[1] != L':') { free(parent); return ERROR_BAD_PATHNAME; }
-  wcscpy(parent, L"\\??\\"); wmemcpy(parent + 4, path, length); parent[length + 4] = 0;
-  DWORD error = open_without_reparse(NULL, parent, FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY,
+  DWORD error = open_absolute_without_reparse(path, (size_t)(leaf - path), FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY,
     FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, &installationParent);
-  free(parent);
   if (!error) wcscpy(installationLeaf, leaf + 1);
   return error;
 }
@@ -294,7 +306,7 @@ __declspec(dllexport) DWORD WINAPI BeginReplacement(LPCWSTR path, LPCWSTR oldVer
       !path || !oldVersion || !newVersion) return ERROR_INVALID_PARAMETER;
   DWORD error = retain_installation_parent(path);
   if (!error) error = require_absent_child(stageDirectory, L"previous");
-  if (!error) error = open_installation_directory(path, &previousDirectory);
+  if (!error) error = open_installation_directory(path, DELETE, &previousDirectory);
   if (!error) error = open_without_reparse(stageDirectory, L"payload", READ_CONTROL | DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
     FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, &replacementDirectory);
   if (!error) error = magnitude_validate_private_directory(replacementDirectory);
@@ -407,13 +419,7 @@ __declspec(dllexport) DWORD WINAPI AcquireRemovalExecutable(LPCWSTR executable) 
   LPCWSTR leaf = wcsrchr(executable, L'\\');
   if (!leaf || leaf == executable || executable[1] != L':' || executable[2] != L'\\' ||
       wcscmp(leaf + 1, L"Uninstall Magnitude.exe")) return ERROR_BAD_PATHNAME;
-  WCHAR directoryPath[32768];
-  size_t parentLength = (size_t)(leaf - executable);
-  if (parentLength + 5 >= 32768) return ERROR_BAD_PATHNAME;
-  wcscpy(directoryPath, L"\\??\\");
-  wmemcpy(directoryPath + 4, executable, parentLength);
-  directoryPath[parentLength + 4] = 0;
-  DWORD error = open_without_reparse(NULL, directoryPath, DELETE | FILE_READ_ATTRIBUTES,
+  DWORD error = open_absolute_without_reparse(executable, (size_t)(leaf - executable), DELETE | FILE_READ_ATTRIBUTES,
     FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, &removalDirectory);
   if (!error) {
     BY_HANDLE_FILE_INFORMATION info;
@@ -611,7 +617,7 @@ __declspec(dllexport) DWORD WINAPI RetirePreviousForRemoval(void) {
   DWORD error = stage_paths(parent, container, payload);
   if (error) return error;
   HANDLE stage = INVALID_HANDLE_VALUE, previous = INVALID_HANDLE_VALUE;
-  error = open_installation_directory(container, &stage);
+  error = open_installation_directory(container, DELETE, &stage);
   if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return ERROR_SUCCESS;
   if (error) return error;
   error = open_without_reparse(stage, L"previous", READ_CONTROL | DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
@@ -641,7 +647,7 @@ __declspec(dllexport) DWORD WINAPI RecoverReplacement(LPCWSTR path, LPCWSTR regi
   WCHAR parent[32768], container[32768], payload[32768];
   DWORD error = stage_paths(parent, container, payload);
   if (error) return error;
-  error = open_installation_directory(container, &stageDirectory);
+  error = open_installation_directory(container, 0, &stageDirectory);
   if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return ERROR_SUCCESS;
   if (error) return error;
   error = open_without_reparse(stageDirectory, L"previous", READ_CONTROL | DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
@@ -655,7 +661,7 @@ __declspec(dllexport) DWORD WINAPI RecoverReplacement(LPCWSTR path, LPCWSTR regi
   DWORD previousRead = error ? error : read_inventory(previousDirectory, &previous);
   BOOL currentMissing = FALSE;
   if (!error) {
-    error = open_installation_directory(path, &replacementDirectory);
+    error = open_installation_directory(path, DELETE, &replacementDirectory);
     if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) { currentMissing = TRUE; error = ERROR_SUCCESS; }
   }
   if (!error && !currentMissing) error = read_inventory(replacementDirectory, &current);
