@@ -54,9 +54,9 @@ export function setPhase(value:string) {
  registry.set(service.applicationInfo,result({version:'0.0.14'}))
  registry.set(service.loginStartup,result({_tag:'Disabled'}))
  registry.set(service.machineIdentity,result({_tag:'Identified',manufacturer:'Apple Inc.',model:'Mac16,5',family:Option.none(),version:Option.none(),formFactor:'Unknown'}))
- registry.set(service.connections,result({_tag:'Available',connections}))
+ registry.set(service.connections,result({_tag:'Ready',connections}))
  registry.set(service.updates,result({preference:{_tag:'Known',autoDownload:true},transfer:value==='update-error'?{_tag:'InstallationFailed',version:'0.1.6',message:'private installer diagnostic'}:{_tag:'Idle'},check:{_tag:'Idle'}}))
- registry.set(usage,{result:result({_tag:'Available',dailyActivity:Array.from({length:368},(_,index)=>({date:new Date(Date.UTC(2025,8,14+index)).toISOString().slice(0,10),totalTokens:index%5===0?0:Math.round((Math.sin(index*7)+1)*50000)})),requests:2,inputTokens:100,cachedInputTokens:40,outputTokens:20,cachedInputRequests:2,tokensPerSecond:80,timeToFirstTokenMs:125,incompleteRequests:0,recordingFailures:0,speedSamples:2,latencySamples:2,models:[],since:null})})
+ registry.set(usage,{result:result({_tag:'Available',dailyActivity:Array.from({length:368},(_,index)=>({date:new Date(Date.UTC(2025,8,14+index)).toISOString().slice(0,10),totalTokens:index%5===0?0:Math.round((Math.sin(index*7)+1)*50000)})),requests:2,inputTokens:100,cachedInputTokens:40,outputTokens:20,totalTokens:120,cachedInputRequests:2,tokensPerSecond:80,timeToFirstTokenMs:125,incompleteRequests:0,recordingFailures:0,speedSamples:2,latencySamples:2,models:[],since:null})})
  for (const listener of listeners) listener()
 }
 setPhase(phase)

@@ -628,7 +628,7 @@ const ROOT_BODY = [
   "Anthropic-compatible API:  /inference/anthropic",
   "Available models:          /inference/v1/models",
   "",
-  "Documentation: https://docs.magnitude.dev/integrations/custom-apps",
+  "Documentation: https://docs.magnitude.dev/integrations/other-apps",
   "",
 ].join("\n")
 

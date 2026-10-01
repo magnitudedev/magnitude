@@ -57,6 +57,7 @@ import {
 import { HardwareOverview, ModelRadar, SpeedInfo } from "./discovery-visuals"
 import { MemoryBreakdown } from "./memory-breakdown"
 import { HarnessConnections } from "./harness-connections"
+import { OtherApps } from "./other-apps"
 import { LabLogo, ModelLogo, modelLab, modelLabs, type ModelLab } from "./model-logo"
 import type { DesktopApi, Page } from "./desktop-rpc"
 import "@web-styles/tailwind.css"
@@ -479,8 +480,9 @@ function ConnectionsView({ service, serviceReady, selectedModel }: { service: De
   const models = useLocalModels()
   const canConnect = serviceReady && Result.isSuccess(models) && models.value.models.some(model => Option.isSome(localModelProviderModelId(model)))
   const client = useAgentClient()
-  const discover = useAtomSet(useMemo(() => client.runtime.fn(() => Effect.flatMap(DesktopSession, session => session.navigate("discover"))), [client]))
+  const navigate = useAtomSet(useMemo(() => client.runtime.fn((page: Page) => Effect.flatMap(DesktopSession, session => session.navigate(page))), [client]))
   const hardware = useLocalInferenceHardware()
+  const state = useAtomValue(hostState)
   const available = Result.isSuccess(models) ? models.value.models.filter(model => Option.isSome(localModelProviderModelId(model))) : []
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value))?.model.modelId : undefined
   const ranked = Result.isSuccess(hardware) ? rankedLocalModelOptions(available.map(model => ({ id: model.modelId, kind: "stored" as const, model })), { fastToSmart: 0.5, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, available.length).map(option => option.model) : available
@@ -495,13 +497,14 @@ function ConnectionsView({ service, serviceReady, selectedModel }: { service: De
   const error = !busy && firstFailure([connecting, disconnecting])
   return <>
     {!serviceReady && <p className="mt-5 text-sm text-slate-500">Configuration checks are available. Start the service from Status before connecting a harness.</p>}
-    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service on Status." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => discover()}>Discover models</NoticeAction>} />}
+    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service on Status." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("discover")}>Discover models</NoticeAction>} />}
     {error && Result.isFailure(error) && <ErrorNotice title={Result.isFailure(disconnecting) ? "Couldn’t disconnect this agent" : "Couldn’t connect this agent"} description="Check the agent’s configuration before trying again. Some changes may not have completed." className="mt-5" />}
     {Result.isFailure(rows) ? <ErrorNotice title="Couldn’t check your connections" description="Connection status is unavailable. Magnitude will check again automatically." className="mt-5" />
       : !Result.isSuccess(rows) ? <ConnectionsSkeleton />
       : rows.value._tag === "Unavailable" ? <ErrorNotice title="Couldn’t check your connections" description="Magnitude can’t read the saved connection information. Check that its configuration is accessible." className="mt-5" />
       : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={host.platform}
           onConnect={harness => connect({ harness, model: selectedModel })} onDisconnect={harness => disconnect(harness)} />}
+    {Result.isSuccess(state) && <OtherApps origin={`http://127.0.0.1:${new URL(state.value.endpoint).port}`} model={defaultModel} platform={host.platform} onOpenSettings={() => navigate("settings")} />}
   </>
 }
 /** The model row's status: the load stage in full while loading, the memory in use once loaded. */
@@ -586,8 +589,41 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
       {Result.isFailure(retrying) && !retrying.waiting && service?._tag !== "Failed" && service?._tag !== "Ready" && <ErrorNotice title="Couldn’t retry the service" className="mt-3" />}
     </section>
     <MemoryBreakdown />
-    <section className={pageLayout.card}><div className="flex items-center gap-3"><PlugIcon className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? <SkeletonLine className="h-5 text-sm" width="200px" />}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${tray?._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{tray?._tag === "Registered" ? "Magnitude keeps running when you close the window." : tray?._tag === "Unavailable" ? "Background controls are unavailable. Keep this window open to access Magnitude." : tray?._tag === "Closed" ? "Magnitude is quitting." : <SkeletonLine className="h-5 w-72 text-sm" />}</p></div></div></section>
+    {ready && <StatusOverview />}
+    {tray?._tag === "Unavailable" && <ErrorNotice severity="warning" title="The tray icon isn’t available" description="Closing this window keeps Magnitude running. Open it again from your applications menu." />}
   </div>
+}
+const compact = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 })
+function StatusTile({ label, value, detail, onClick }: { label: string; value: ReactNode; detail: ReactNode; onClick: () => void }) {
+  return <button type="button" onClick={onClick} className="min-w-0 cursor-pointer rounded-lg p-3 text-left transition-colors hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800">
+    <span className="block text-xs text-slate-500">{label}</span>
+    <span className="mt-1 block truncate font-heading text-xl tabular-nums">{value}</span>
+    <span className="mt-0.5 block truncate text-xs text-slate-500">{detail}</span>
+  </button>
+}
+function StatusOverview() {
+  const client = useAgentClient()
+  const navigate = useAtomSet(useMemo(() => client.runtime.fn((page: Page) => Effect.flatMap(DesktopSession, session => session.navigate(page))), [client]))
+  const usage = useAtomValue(client.Models.GetServingUsage({ period: "Today", timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, model: Option.none() })).result
+  const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
+  const rows = useAtomValue(useMemo(() => Atom.make(get => Result.flatMap(get(session), value => get(value.connections))), [session]))
+  const network = useAtomValue(networkAccessSettings)
+  const today = Result.isSuccess(usage) && usage.value._tag === "Available" ? usage.value : null
+  const installed = Result.isSuccess(rows) && rows.value._tag === "Ready" ? rows.value.connections.filter(row => row.installed) : null
+  const connected = installed?.filter(row => row.inspection._tag === "Connected").length
+  const address = Result.isSuccess(network) && network.value.enabled ? network.value.bind ?? "All interfaces" : null
+  const loading = <SkeletonLine className="h-4 text-xs" width="80px" />
+  return <section aria-label="Activity" className={`${pageLayout.card} grid grid-cols-3 gap-2 p-3`}>
+    <StatusTile label="Today" onClick={() => navigate("usage")}
+      value={today ? `${compact.format(today.totalTokens)} tokens` : Result.isInitial(usage) ? loading : "Unavailable"}
+      detail={today ? `${today.requests.toLocaleString()} ${today.requests === 1 ? "request" : "requests"}` : null} />
+    <StatusTile label="Agents" onClick={() => navigate("connections")}
+      value={connected !== undefined ? `${connected} connected` : Result.isInitial(rows) ? loading : "Unavailable"}
+      detail={installed ? `${installed.length} installed` : null} />
+    <StatusTile label="Network access" onClick={() => navigate("settings")}
+      value={Result.isSuccess(network) ? network.value.enabled ? "On" : "Off" : Result.isInitial(network) ? loading : "Unavailable"}
+      detail={Result.isSuccess(network) ? address ?? "This computer only" : null} />
+  </section>
 }
 type UpdateTransfer = (typeof DesktopUpdateState.Type)["transfer"]
 const firstFailure = (results: ReadonlyArray<Result.Result<unknown, unknown>>) => results.find((result): result is Result.Failure<unknown, unknown> => Result.isFailure(result) && !result.waiting)
@@ -698,7 +734,7 @@ function NetworkAccessRows() {
   const failure = firstFailure([updating, regenerating])
   const reachable = current?.enabled ? (current.bind ?? current.interfaces[0]?.address) : undefined
   return <>
-    <SettingsRow label="Network access" hint={current ? "Let other devices on your network use Magnitude for inference." : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
+    <SettingsRow label="Network access" hint={current ? <>Let other devices on your network use Magnitude for inference. <a href="https://docs.magnitude.dev/remote-server" target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300">Remote server guide<ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
       alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current?.warning ? <ErrorNotice severity="warning" title="The saved network address is invalid" description="All interfaces are selected. Choose an address below to save a valid setting." /> : undefined}
       control={<Switch aria-label="Network access" checked={current?.enabled ?? false} disabled={!current || busy} onCheckedChange={checked => update({ enabled: checked })} />} />
     {current?.enabled && <>
