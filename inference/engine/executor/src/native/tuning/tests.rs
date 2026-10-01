@@ -848,6 +848,7 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
             budgets: [(key.clone(), 4)].into_iter().collect(),
             searching: [key].into_iter().collect(),
             measurements: HashMap::new(),
+            deadline: Instant::now() + SAFETY_STOP,
         },
     );
     assert!(matches!(

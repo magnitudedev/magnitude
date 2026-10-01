@@ -667,7 +667,10 @@ pub fn search(
         .into_iter()
         .chain(cheapest)
         .collect::<Vec<_>>();
-    let confirmed = if !finalists.is_empty() {
+    // Confirmation ranks finalists against the defaults; the defaults alone
+    // (every other candidate failed, or the safety stop came first) have
+    // nothing to rank against and remain the choice unconfirmed.
+    let confirmed = if finalists.iter().any(|index| *index != default) {
         let results = evaluator.confirm(&finalists);
         assert_eq!(
             results.len(),

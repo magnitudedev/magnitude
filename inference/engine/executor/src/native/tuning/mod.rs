@@ -249,8 +249,9 @@ pub(crate) fn search_settings(backend: seismic::BackendName, screening: bool) ->
 /// Minimum device time of one sample; device timestamps resolve
 /// microseconds.
 pub const MIN_SAMPLE_SECONDS: f64 = 0.0002;
-/// The safety stop of one preparation's tuning: past it every search ends
-/// with the best found so far, and its result is not stored. It exists for
+/// The safety stop of one preparation's tuning, from the start of its census
+/// through its last search: past it every search ends with the best found so
+/// far, and its result is not stored. It exists for
 /// pathological machines; budgets, not time, bound tuning otherwise.
 pub const SAFETY_STOP: Duration = Duration::from_secs(600);
 
@@ -1229,11 +1230,13 @@ struct CensusUnit {
 }
 
 /// The configurations each tuning unit of a model may evaluate, the units
-/// that search at this load, and the census's measurement of each.
+/// that search at this load, the census's measurement of each, and the
+/// safety stop the census started.
 pub(crate) struct TuningBudgets {
     budgets: HashMap<TuningKey, usize>,
     searching: HashSet<TuningKey>,
     measurements: HashMap<TuningKey, (f64, TuningResult)>,
+    deadline: Instant,
 }
 
 /// A unit's slot in the kernel cache: the cache, the unit's key, and the
@@ -1264,7 +1267,7 @@ pub(crate) struct Tuner<'a> {
     weights: TuningWeights<'a>,
     noise: Noise,
     allocation: Allocation,
-    /// The safety stop of this preparation's tuning.
+    /// The safety stop of this preparation's tuning, census included.
     deadline: Instant,
     tuned: Vec<TunedEntry>,
     chosen: HashMap<TuningKey, NativeSpecialization>,
@@ -1282,7 +1285,8 @@ pub(crate) struct Tuner<'a> {
 }
 
 impl<'a> Tuner<'a> {
-    /// A tuner that only counts tuning units, for [`Tuner::budgets`].
+    /// A tuner that only counts tuning units, for [`Tuner::budgets`]. The
+    /// preparation's safety stop starts with it.
     pub fn census(
         device: &'a Device,
         context: TuningContext<'a>,
@@ -1297,11 +1301,13 @@ impl<'a> Tuner<'a> {
             Allocation::Census(Vec::new()),
             HashSet::new(),
             HashMap::new(),
+            Instant::now() + SAFETY_STOP,
         )
     }
 
-    /// A tuner within `budgets`. It reports tuning progress from the start:
-    /// the budget of the units that search, none searched yet.
+    /// A tuner within `budgets`, under the census's safety stop. It reports
+    /// tuning progress from the start: the budget of the units that search,
+    /// none searched yet.
     pub fn new(
         device: &'a Device,
         context: TuningContext<'a>,
@@ -1317,6 +1323,7 @@ impl<'a> Tuner<'a> {
             Allocation::Budgets(budgets.budgets),
             budgets.searching,
             budgets.measurements,
+            budgets.deadline,
         );
         tuner.report_progress();
         tuner
@@ -1330,6 +1337,7 @@ impl<'a> Tuner<'a> {
         allocation: Allocation,
         searching: HashSet<TuningKey>,
         measurements: HashMap<TuningKey, (f64, TuningResult)>,
+        deadline: Instant,
     ) -> Self {
         let searching_total = match &allocation {
             Allocation::Census(_) => 0,
@@ -1342,7 +1350,7 @@ impl<'a> Tuner<'a> {
             weights,
             noise: Noise::default(),
             allocation,
-            deadline: Instant::now() + SAFETY_STOP,
+            deadline,
             tuned: Vec::new(),
             chosen: HashMap::new(),
             winners: HashMap::new(),
@@ -1428,6 +1436,7 @@ impl<'a> Tuner<'a> {
             budgets,
             searching,
             measurements,
+            deadline: self.deadline,
         }
     }
 

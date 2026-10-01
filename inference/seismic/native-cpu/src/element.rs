@@ -109,16 +109,27 @@ pub fn f32_to_bf16(value: f32) -> u16 {
     (bits.wrapping_add(rounding) >> 16) as u16
 }
 
-/// Exact and branchless, so it vectorizes: the half's exponent and mantissa
-/// placed in an `f32`'s fields denote the half's value times 2^-112 (for
-/// subnormal halves too, as `f32` subnormals), so one exact multiplication by
-/// 2^112 gives the value; infinities and NaNs take the all-ones exponent.
+/// Exact and branchless, so it vectorizes, and no operand or result of its
+/// float arithmetic is subnormal: CPU workers keep denormals, and x86 cores
+/// take a microcode assist on every subnormal operand, which quantized
+/// scales (often subnormal halves) would hit on every block. Rebiasing the
+/// exponent places a normal or special half; a subnormal half's mantissa
+/// placed under the exponent of 2^-14 denotes 2^-14 plus the half's value,
+/// so one exact subtraction of 2^-14 gives it.
 #[inline(always)]
 pub fn f16_to_f32(value: u16) -> f32 {
     let magnitude = u32::from(value & 0x7fff) << 13;
-    let scaled = f32::from_bits(magnitude) * f32::from_bits(0x7780_0000);
-    let special = u32::from(value & 0x7c00 == 0x7c00);
-    let bits = scaled.to_bits() | (special.wrapping_neg() & (0x7f80_0000 | magnitude));
+    let exponent = magnitude & 0x0f80_0000;
+    let normal = magnitude + 0x3800_0000;
+    let special = normal + 0x3800_0000;
+    let subnormal = (f32::from_bits(normal + 0x0080_0000) - f32::from_bits(0x3880_0000)).to_bits();
+    let bits = if exponent == 0x0f80_0000 {
+        special
+    } else if exponent == 0 {
+        subnormal
+    } else {
+        normal
+    };
     f32::from_bits(bits | (u32::from(value & 0x8000) << 16))
 }
 
@@ -163,6 +174,21 @@ pub fn f32_to_f16(value: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn half_widening_is_exact_for_every_half() {
+        for bits in 0..=u16::MAX {
+            let sign = u32::from(bits & 0x8000) << 16;
+            let exponent = i32::from((bits >> 10) & 0x1f);
+            let mantissa = u32::from(bits & 0x03ff);
+            let expected = match exponent {
+                0x1f => 0x7f80_0000 | mantissa << 13 | sign,
+                0 => (mantissa as f32 * 2f32.powi(-24)).to_bits() | sign,
+                _ => ((1024 + mantissa) as f32 * 2f32.powi(exponent - 25)).to_bits() | sign,
+            };
+            assert_eq!(f16_to_f32(bits).to_bits(), expected, "{bits:#06x}");
+        }
+    }
 
     #[test]
     fn half_conversions_round_trip_every_half() {

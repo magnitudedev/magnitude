@@ -62,7 +62,8 @@ restarts found nothing better, or the consumer's safety deadline passes. Configu
 device cannot form or run cost +∞ and consume budget. The K cheapest configurations and the
 defaults are then re-measured with more samples across every original point, alternating round by
 round, and ranked by those full-workload costs; the defaults rank first unless the leader beats
-them by δ. Screening can omit a candidate that would have won on the full workload, so it is an
+them by δ. Defaults with no measured rival have nothing to rank against and are not re-measured.
+Screening can omit a candidate that would have won on the full workload, so it is an
 explicit search policy rather than an exact reduction. The search is a pure function of
 an evaluator's costs, so a recorded evaluator can replay it. Measurement is device time: a
 point's calls are placed once and calibrated so one sample covers a minimum device time. Each
