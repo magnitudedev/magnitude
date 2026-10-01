@@ -96,6 +96,7 @@ fn main() -> Result<(), String> {
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
+            exported_logits_rows: 0,
         },
         context_tokens: Some(8192),
         // The service's default launch bound: images up to 512 merged rows.

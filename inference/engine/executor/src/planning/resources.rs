@@ -13,17 +13,25 @@ use seismic::{DType, Device, Element, SlabLayout, SlabRegion};
 use std::rc::Rc;
 
 /// The service's bounds a load plans for. None is a request-count batch
-/// width: a launch is bounded by its token budget (rows, projected rows and
-/// request slots are compiled shape classes), and every per-request resource
-/// beyond what one request needs grows elastically under heap claims.
+/// width: a launch is bounded by its token budget (rows and request slots
+/// are compiled shape classes), its vocabulary work by the selection bound,
+/// and every per-request resource beyond what one request needs grows
+/// elastically under heap claims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceLimits {
     /// Rows one launch admits: the larger step token budget.
     pub max_launch_rows: usize,
     /// Requests one launch serves: its largest request-slot class.
     pub max_launch_slots: usize,
-    /// Maximum physical rows in one launch that require logits projection.
-    pub max_projected_rows: usize,
+    /// Target rows one launch selects a token for. The selection bound: every
+    /// vocabulary-wide buffer of the target readout is sized by it.
+    pub max_selected_rows: usize,
+    /// Requests one drafter launch drafts for: the selection bound of the
+    /// head and separate draft.
+    pub max_drafting_slots: usize,
+    /// Rows one launch may export full logits for. Zero for a served load,
+    /// which prepares no logits class; diagnostics that read logits set it.
+    pub exported_logits_rows: usize,
     pub max_images_per_request: usize,
     /// Queue each continuable target step's successor before the step
     /// completes (cross-step pipelining): one more target launch in flight
@@ -39,43 +47,50 @@ impl ResourceLimits {
     }
 
     /// The graph slots a load commits at startup: what one request needs to
-    /// run. Workspace slots cover the launches in flight at once, whatever
-    /// the request count. Outputs a request retains after its launch
-    /// completes (readout features, head drafts, encoded images) start at one
-    /// request's need and grow one slot at a time under a heap claim.
+    /// run. Activations cover the launches in flight at once, whatever the
+    /// request count; each holds its own upload regions, and every one binds
+    /// the device's one workspace arena. The target's outputs are its
+    /// residual pair: each block graph reads one and writes the other, and
+    /// the device's submission order lets every launch reuse the same pair.
+    /// Outputs a request retains after its launch completes (readout
+    /// features, head drafts, encoded images) start at one request's need
+    /// and grow one slot at a time under a heap claim.
     pub fn startup_slots(&self) -> StartupSlots {
         let launches = self.target_launches();
         StartupSlots {
             target: GraphSlots {
-                workspace: launches,
-                output: 2 * launches,
+                activations: launches,
+                output: 2,
             },
             readout: GraphSlots {
-                workspace: launches,
+                activations: launches,
                 output: 1 + launches,
             },
             // A prompt chunk's drafter entry rides with each target launch
             // in flight.
             head: GraphSlots {
-                workspace: launches,
+                activations: launches,
                 output: 1 + launches,
             },
+            // Vision holds nothing until an image arrives: a text-only
+            // session never uses it. Its workspace is the shared arena.
             vision: GraphSlots {
-                workspace: 1,
-                output: self.max_images_per_request,
+                activations: 0,
+                output: 0,
             },
             state: GraphSlots {
-                workspace: 1,
+                activations: 1,
                 output: 1,
             },
         }
     }
 }
 
-/// One graph family's slot counts.
+/// One graph family's slot counts: concurrent activations, each with its
+/// upload regions, and output arenas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GraphSlots {
-    pub workspace: usize,
+    pub activations: usize,
     pub output: usize,
 }
 
@@ -120,17 +135,19 @@ pub struct ResourceBytes {
 
 /// A Seismic-derived physical family charge at startup. The engine chooses
 /// the slot counts; Seismic supplies every byte and every tensor layout
-/// within each slot. Each workspace slot holds `upload_regions` upload
-/// regions of `upload_bytes`, allocated with the slot: one per graph run its
-/// lease keeps in flight at once. Output slots beyond `output_slots` are
-/// elastic run-time claims of `output_bytes` each.
+/// within each slot. Each activation holds `upload_regions` upload regions
+/// of `upload_bytes`, allocated with it: one per graph run its lease keeps
+/// in flight at once. Output slots beyond `output_slots` are elastic
+/// run-time claims of `output_bytes` each. `workspace_bytes` is not part of
+/// `committed_bytes`: every family binds the device's one workspace arena,
+/// which the plan charges once at the largest family's workspace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeGraphCharge {
     pub workspace_bytes: u64,
     pub output_bytes: u64,
     pub upload_bytes: u64,
     pub upload_regions: usize,
-    pub workspace_slots: usize,
+    pub activations: usize,
     pub output_slots: usize,
     pub committed_bytes: u64,
 }
@@ -188,17 +205,16 @@ impl NativeGraphCharge {
 
     fn from_footprint(footprint: FamilyFootprint, slots: GraphSlots) -> Result<Self, String> {
         let GraphSlots {
-            workspace: workspace_slots,
+            activations,
             output: output_slots,
         } = slots;
         let count = |value: usize| u64::try_from(value).map_err(|_| "slot count exceeds u64");
-        let per_slot = footprint
+        let per_activation = footprint
             .upload_bytes
             .checked_mul(count(footprint.runs_in_flight)?)
-            .and_then(|uploads| uploads.checked_add(footprint.workspace_bytes))
-            .ok_or("graph slot byte count overflows")?;
-        let committed_bytes = per_slot
-            .checked_mul(count(workspace_slots)?)
+            .ok_or("graph activation byte count overflows")?;
+        let committed_bytes = per_activation
+            .checked_mul(count(activations)?)
             .and_then(|bytes| {
                 footprint
                     .output_bytes
@@ -211,11 +227,31 @@ impl NativeGraphCharge {
             output_bytes: footprint.output_bytes,
             upload_bytes: footprint.upload_bytes,
             upload_regions: footprint.runs_in_flight,
-            workspace_slots,
+            activations,
             output_slots,
             committed_bytes,
         })
     }
+}
+
+/// The device's one workspace arena: the largest workspace of `charges`.
+pub(crate) fn arena_bytes(charges: &[&NativeGraphCharge]) -> u64 {
+    charges
+        .iter()
+        .map(|charge| charge.workspace_bytes)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Every graph byte a load commits: the workspace arena, and each family's
+/// activations and outputs.
+pub(crate) fn graph_scratch_bytes(charges: &[&NativeGraphCharge]) -> Result<u64, String> {
+    charges
+        .iter()
+        .try_fold(arena_bytes(charges), |bytes, charge| {
+            bytes.checked_add(charge.committed_bytes)
+        })
+        .ok_or_else(|| "graph scratch byte count overflows".into())
 }
 
 /// Exact projection used to construct one numerical state arena. The planner
@@ -534,21 +570,27 @@ impl ResourcePlan {
         self.bytes
     }
 
+    /// Every family's charge.
+    fn graph_charges(&self) -> Vec<&NativeGraphCharge> {
+        [
+            Some(&self.target_graph),
+            Some(&self.target_readout_graph),
+            self.head_graph.as_ref(),
+            self.vision_graph.as_ref(),
+            Some(&self.state_graph),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// The device's one workspace arena, which every family binds.
+    pub fn arena_bytes(&self) -> u64 {
+        arena_bytes(&self.graph_charges())
+    }
+
     pub(super) fn validate(mut self) -> Result<Self, String> {
-        if self.bytes.scratch
-            != self
-                .target_graph
-                .committed_bytes
-                .checked_add(self.target_readout_graph.committed_bytes)
-                .and_then(|bytes| {
-                    bytes.checked_add(self.head_graph.map_or(0, |graph| graph.committed_bytes))
-                })
-                .and_then(|bytes| {
-                    bytes.checked_add(self.vision_graph.map_or(0, |graph| graph.committed_bytes))
-                })
-                .and_then(|bytes| bytes.checked_add(self.state_graph.committed_bytes))
-                .ok_or("pooled byte charge overflow")?
-        {
+        if self.bytes.scratch != graph_scratch_bytes(&self.graph_charges())? {
             return Err(
                 "resource plan pooled byte charge differs from admitted Seismic footprints".into(),
             );
@@ -648,6 +690,13 @@ impl StateResourcePlan {
             .ok_or_else(|| "state fit charge overflows".into())
     }
 
+    /// The state slabs a load commits at startup, before any request.
+    pub fn startup_state_bytes(&self) -> Result<u64, String> {
+        self.history_bytes
+            .checked_add(self.recurrent_banks_bytes)
+            .ok_or_else(|| "startup state bytes overflow".into())
+    }
+
     pub fn target_state(&self) -> &StateStorePlan {
         &self.target_state
     }
@@ -669,8 +718,11 @@ impl ResourcePlanner {
         if limits.max_launch_slots == 0
             || limits.max_launch_slots > limits.max_launch_rows
             || limits.max_launch_rows == 0
-            || limits.max_projected_rows == 0
-            || limits.max_projected_rows > limits.max_launch_rows
+            || limits.max_selected_rows == 0
+            || limits.max_selected_rows > limits.max_launch_rows
+            || limits.max_drafting_slots == 0
+            || limits.max_drafting_slots > limits.max_launch_slots
+            || limits.exported_logits_rows > limits.max_launch_rows
             || limits.max_images_per_request == 0
         {
             return Err("resource limits must be positive".into());
@@ -893,17 +945,17 @@ impl ResourcePlanner {
             FamilyFootprint::serial(state_graphs.family()),
             slots.state,
         )?;
-        let scratch = target_graph
-            .committed_bytes
-            .checked_add(target_readout_graph.committed_bytes)
-            .and_then(|bytes| {
-                bytes.checked_add(head_graph.map_or(0, |graph| graph.committed_bytes))
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(vision_graph.map_or(0, |graph| graph.committed_bytes))
-            })
-            .and_then(|bytes| bytes.checked_add(state_graph.committed_bytes))
-            .ok_or("numerical pool byte count overflow")?;
+        let charges = [
+            Some(&target_graph),
+            Some(&target_readout_graph),
+            head_graph.as_ref(),
+            vision_graph.as_ref(),
+            Some(&state_graph),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let scratch = graph_scratch_bytes(&charges)?;
         let prepared_programs = crate::AttestedPrograms::planned_invocation_workspace_bytes(
             &load
                 .program_plan(definition, state.codec)
@@ -939,6 +991,24 @@ impl ResourcePlanner {
                 head_graph.map_or(0, |graph| graph.committed_bytes),
                 vision_graph.map_or(0, |graph| graph.committed_bytes),
                 state_graph.committed_bytes,
+            );
+            // Each family's placed workspace against its liveness floor: a
+            // placement regression shows as placed above floor.
+            let workspace = |family: &seismic::NativeGraphFamily| {
+                format!(
+                    "{}/{}",
+                    family.workspace_bytes(),
+                    family.workspace_floor_bytes()
+                )
+            };
+            eprintln!(
+                "resource plan arena={} workspace placed/floor=[target:{},readout:{},head:{},vision:{},state:{}]",
+                arena_bytes(&charges),
+                workspace(target_graphs.family()),
+                workspace(target_readout_graphs.family()),
+                head_graphs.map_or_else(|| "-".into(), |graphs| workspace(graphs.family())),
+                vision_graphs.map_or_else(|| "-".into(), |graphs| workspace(graphs.family())),
+                workspace(state_graphs.family()),
             );
         }
         if required > capacity_bytes.domain_bytes {

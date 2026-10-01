@@ -150,12 +150,13 @@ pub(crate) fn draft_graph_classes(
             limits.max_launch_rows
         )
     })?;
-    let slot_classes =
-        magnitude_batching::row_classes(limits.max_launch_slots.min(limits.max_launch_rows))
-            .into_iter()
-            .map(|slots| slots as u64)
-            .filter(|slots| slots * block <= max_rows)
-            .collect::<Vec<_>>();
+    // Drafting classes project the draft vocabulary per proposing row: their
+    // slots are bounded by the selection bound.
+    let slot_classes = magnitude_batching::row_classes(limits.max_drafting_slots)
+        .into_iter()
+        .map(|slots| slots as u64)
+        .filter(|slots| slots * block <= max_rows)
+        .collect::<Vec<_>>();
     let mut classes = row_classes
         .iter()
         .flat_map(|&entry_rows| {
@@ -1021,7 +1022,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         ("WS", scale_extent),
     ];
     let head_rows = graph.input_for(entries.head, "out_rows", &head_dims)?;
-    let logits = graph
+    let mut logits = graph
         .enqueue(
             entries.head,
             &head_dims,
@@ -1050,7 +1051,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 entries.shape,
                 entries.sample,
                 readout_vocabulary,
-                (&logits).into(),
+                &mut logits,
                 outputs,
                 class.shaped,
                 (&mut all).into(),
@@ -1121,7 +1122,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                     )?
                     .r0;
                 let absent_scale = absent(&mut graph, &mut constants, &mut absent_scale)?;
-                let biased = graph
+                let mut biased = graph
                     .enqueue(
                         chain.projection,
                         &[
@@ -1148,7 +1149,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                     entries.shape,
                     entries.sample,
                     readout_vocabulary,
-                    (&biased).into(),
+                    &mut biased,
                     slots,
                     class.shaped,
                     (&mut step_result).into(),

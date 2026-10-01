@@ -580,6 +580,7 @@ impl Bench {
                 mtp_proposals: None,
                 kv_codec,
                 lookahead,
+                exported_logits_rows: PREFILL_ROWS,
             },
             context_tokens: Some(context_tokens),
             service: ServiceLimits {

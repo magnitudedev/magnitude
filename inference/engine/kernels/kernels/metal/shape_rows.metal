@@ -2,8 +2,9 @@
 // with each row's vocabulary split into PARTS contiguous partitions.
 //
 // prepare (PARTS x rows): the constraint mask (-inf over each finite or -inf
-//         value a constrained row rejects), penalties and temperature into
-//         `out`; partition maxima and non-finite flags.
+//         value a constrained row rejects), penalties and temperature, in
+//         place over `logits` (each thread reads and rewrites its own
+//         tokens); partition maxima and non-finite flags.
 // count   (PARTS x rows): a radix histogram of the active search's current
 //         digit over the elements matching its prefix: counts for top-k,
 //         counts and fixed-point masses exp(v - max) for top-p.
@@ -122,12 +123,11 @@ inline bool shape_survives(uint key, float value, device const uint *state) {
 }
 
 #define SHAPE_ARGUMENTS                                                                 \
-    device const float *logits [[buffer(SEISMIC_BUFFER_LOGITS)]],                       \
+    device float *logits [[buffer(SEISMIC_BUFFER_LOGITS)]],                             \
     device const uint *mask [[buffer(SEISMIC_BUFFER_MASK)]],                            \
     device const int *constrained [[buffer(SEISMIC_BUFFER_CONSTRAINED)]],               \
     device const float *params [[buffer(SEISMIC_BUFFER_PARAMS)]],                       \
     device const int *history [[buffer(SEISMIC_BUFFER_HISTORY)]],                       \
-    device float *out [[buffer(SEISMIC_BUFFER_OUT)]],                                   \
     device uint *states [[buffer(SEISMIC_BUFFER_SCRATCH_STATE)]],                       \
     device uint *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],                  \
     device uint *histograms [[buffer(SEISMIC_BUFFER_SCRATCH_HISTOGRAM)]],               \
@@ -137,7 +137,7 @@ inline bool shape_survives(uint key, float value, device const uint *state) {
     const uint vocabulary = uint(SEISMIC_DIM_V);                                        \
     const uint span = (vocabulary + SEISMIC_TUNE_PARTS - 1) / SEISMIC_TUNE_PARTS;       \
     const uint begin = min(part * span, vocabulary), end = min(begin + span, vocabulary); \
-    device float *values = out + ulong(row) * SEISMIC_OUT_STRIDE_0;                     \
+    device float *values = logits + ulong(row) * SEISMIC_LOGITS_STRIDE_0;               \
     device uint *state = states + ulong(row) * shape_state_words
 
 kernel void shape_rows_prepare(SHAPE_ARGUMENTS,
@@ -219,7 +219,7 @@ kernel void shape_rows_prepare(SHAPE_ARGUMENTS,
             for (uint h = 0; h < hn; ++h)
                 count += uint(row_history[ulong(h) * SEISMIC_HISTORY_STRIDE_1] == int(token));
         }
-        float value = logits[ulong(row) * SEISMIC_LOGITS_STRIDE_0 + ulong(token) * SEISMIC_LOGITS_STRIDE_1];
+        float value = values[ulong(token) * SEISMIC_LOGITS_STRIDE_1];
         if (count > 0) {
             value = value < 0.0f ? value * repetition : value / repetition;
             value = value - presence - frequency * float(count);
@@ -229,7 +229,7 @@ kernel void shape_rows_prepare(SHAPE_ARGUMENTS,
             value = -INFINITY;
         if (temperature != 0.0f)
             value = value / temperature;
-        values[ulong(token) * SEISMIC_OUT_STRIDE_1] = value;
+        values[ulong(token) * SEISMIC_LOGITS_STRIDE_1] = value;
         maximum = metal::max(maximum, value);
         nonfinite |= uint(metal::isnan(value) || value == INFINITY);
     }
@@ -277,7 +277,7 @@ kernel void shape_rows_count(SHAPE_ARGUMENTS,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint token = begin + thread_index; token < end; token += shape_threads) {
-        float value = values[ulong(token) * SEISMIC_OUT_STRIDE_1];
+        float value = values[ulong(token) * SEISMIC_LOGITS_STRIDE_1];
         uint key = shape_key(value);
         if (!shape_matches(key, level, prefix))
             continue;
@@ -498,7 +498,7 @@ kernel void shape_rows_ties(SHAPE_ARGUMENTS,
     const uint cut = state[word_topp_key];
     uint count = 0;
     for (uint token = begin + thread_index; token < end; token += shape_threads) {
-        float value = values[ulong(token) * SEISMIC_OUT_STRIDE_1];
+        float value = values[ulong(token) * SEISMIC_LOGITS_STRIDE_1];
         uint key = shape_key(value);
         count += uint(key == cut && shape_survives(key, value, state));
     }
@@ -537,7 +537,7 @@ kernel void shape_rows_apply(SHAPE_ARGUMENTS,
     for (uint base = begin; base < end; base += shape_threads) {
         uint token = base + thread_index;
         bool present = token < end;
-        float value = present ? values[ulong(token) * SEISMIC_OUT_STRIDE_1] : 0.0f;
+        float value = present ? values[ulong(token) * SEISMIC_LOGITS_STRIDE_1] : 0.0f;
         uint key = shape_key(value);
         bool kept = present && shape_survives(key, value, state);
         bool tie = false;
@@ -564,6 +564,6 @@ kernel void shape_rows_apply(SHAPE_ARGUMENTS,
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         if (present && !kept)
-            values[ulong(token) * SEISMIC_OUT_STRIDE_1] = -INFINITY;
+            values[ulong(token) * SEISMIC_LOGITS_STRIDE_1] = -INFINITY;
     }
 }

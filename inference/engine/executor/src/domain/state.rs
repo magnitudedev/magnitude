@@ -352,7 +352,45 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Some(Operation::Encode { .. }) => ReservationLane::Vision,
             None => return Ok(()),
         };
+        self.provision_activation(lane)?;
         self.provision_output(lane)
+    }
+
+    /// Grow an on-demand family's activations by one when none is free: a
+    /// family that holds none from startup (vision) claims its upload regions
+    /// when a launch first needs them. The charge is claimed from the heap
+    /// like any growth; a refusal is a demand deficit for the owner's
+    /// release order.
+    fn provision_activation(&mut self, lane: ReservationLane) -> Result<(), DomainError> {
+        let Some(pool) = self.resources.activations_mut(lane) else {
+            return Ok(());
+        };
+        if !pool.activates_on_demand() || pool.available_workspace() > 0 {
+            return Ok(());
+        }
+        let bytes = pool.activation_slot_bytes();
+        let claim = self.claim_device_growth(bytes, 0, HoldingClass::Live)?;
+        let grown = self
+            .resources
+            .activations_mut(lane)
+            .expect("the pool was found above")
+            .grow_activation();
+        self.release_claim(claim);
+        grown.map_err(|error| match error {
+            seismic::WorkflowError::TensorView(seismic::TensorError::Execution(
+                seismic::ExecutionError::AllocationCapacity { .. }
+                | seismic::ExecutionError::AllocationFailed(_),
+            )) => DomainError::Capacity(CapacityError {
+                resource: ResourceKind::DeviceMemory,
+                required: bytes,
+                available: 0,
+            }),
+            other => DomainError::Device(crate::DeviceError::Execution(format!(
+                "graph activation growth: {other}"
+            ))),
+        })?;
+        self.refresh_memory()?;
+        self.sync_static_holding().map_err(DomainError::Input)
     }
 
     /// Grow `lane`'s retained-output pool by one slot when none is free, so
@@ -593,22 +631,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.head_store.is_some() {
             released += self.shrink_store(bindings, true, policy)?;
         }
-        Ok(released + self.release_idle_outputs()?)
+        Ok(released + self.release_idle_graph_slots()?)
     }
 
-    /// Release graph output slots grown beyond the startup count that no
-    /// request or launch holds, crediting only Seismic's measured decrease.
-    fn release_idle_outputs(&mut self) -> Result<u64, DomainError> {
+    /// Release graph activations and output slots grown beyond the startup
+    /// counts that no request or launch holds, crediting only Seismic's
+    /// measured decrease.
+    fn release_idle_graph_slots(&mut self) -> Result<u64, DomainError> {
         let before = self.domain.device().memory_usage().charged;
-        if self.resources.release_idle_outputs() == 0 {
+        if self.resources.release_idle_slots() == 0 {
             return Ok(0);
         }
         self.sync_static_holding().map_err(DomainError::Input)?;
         before
             .checked_sub(self.domain.device().memory_usage().charged)
-            .ok_or_else(|| {
-                DomainError::invariant("graph output release increased Seismic's charge")
-            })
+            .ok_or_else(|| DomainError::invariant("graph slot release increased Seismic's charge"))
     }
 
     /// Free empty slabs and compact into held slabs without a growth claim.

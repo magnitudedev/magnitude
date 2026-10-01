@@ -35,9 +35,13 @@ The composition root prepares complete Seismic workflows for the admitted model 
 finite launch classes, imports the target component, allocates the storage reported by those
 workflows, and publishes readiness only after those steps succeed. The engine does not maintain a
 second numerical tensor-shape description.
-The largest service token allowance bounds a launch's rows, request slots, and projected output
-rows in either phase. Every request consumes at least one row, so prefill can admit more request
-slots and output rows than the decode allowance while still staying within its token budget.
+The largest service token allowance bounds a launch's rows and request slots in either phase.
+Every request consumes at least one row, so prefill can admit more request slots and output rows
+than the decode allowance while still staying within its token budget. The selection bound, the
+decode allowance, bounds the rows a launch selects a token for and the requests a drafter launch
+drafts for; every vocabulary-wide buffer is sized by it. A decode round never meets it, the
+scheduler admits no prefill round beyond it, and execution refuses any launch beyond it or any
+logits demand the load does not export.
 Device assessment uses the allocation domain's total capacity, bounded by
 applicable process limits and Metal's recommended working set, less the domain's planning reserve;
 a dedicated device's load also fits its staged uploads in host RAM less the host's planning
@@ -65,8 +69,8 @@ job that follows a catalog installation: each such entry registers a tuning case
 that supplies static values from model geometry, weighted tuning points over the shape classes that
 entry serves (every row class of its graph path, crossed with served history lengths for attention,
 including the empty history that exercises the fresh-only path;
-projected-row classes for the readout, each retaining its own step-time share), rotations over real
-resident weights of distinct layers for weight-streaming decode rows,
+selection-row classes up to the selection bound for the readout, each retaining its own step-time
+share), rotations over real resident weights of distinct layers for weight-streaming decode rows,
 control tables packed by the batch builder. Every tuned entry uses a bounded precision policy,
 with explicit floating result and writable-state subject limits shared with the compiler policy
 representation. Production tuning uses the declaration default native specialization as its
@@ -160,7 +164,7 @@ bit for bit. Speculative verification is therefore statistically, not exactly, e
 plain decoding; acceptance over the logits a verification produced remains exact.
 
 The resource plan authorizes persistent weights and startup state slabs, including the permanently
-pristine recurrent zero seed, concurrent typed workspaces, outputs that outlive workspaces,
+pristine recurrent zero seed, the device's one workspace arena, outputs that outlive launches,
 structural retention slots, optional component residency, and the
 qualification/startup peak. Persistent allocation follows planning. Qualification scratch is
 released before readiness. Execution receives plan-issued leases and cannot allocate general
@@ -171,8 +175,11 @@ their physical charge when their final owner drops them.
 Seismic composes native checked entries into prepared workflows for decoder blocks and other
 numerical units. Its checked entry contracts derive graph-local mutable scratch, host-uploaded
 inputs, intermediate and result tensors' representations, extents, alias conditions, and lifetimes.
-It reports exact storage charges and owns bounded concurrent execution slots. Compatible launch
-classes share one physical scratch arena per concurrent slot, charged at their maximum footprint.
+It reports exact storage charges and owns bounded concurrent activations. A device executes one
+submission at a time, in submission order, and a graph's workspace holds only its own run's
+values, so every family's graphs bind the device's one workspace arena, charged once at the
+largest family's workspace whatever the families and launches in flight. Workspace is placed by
+liveness: largest buffer first, at the lowest offset no buffer of overlapping lifetime holds.
 Metadata assessment projects a resource schedule from the one parameterized graph program that
 also constructs executable graphs. A regime is the set of admitted classes that select the same
 structure: the row form (the attention-decode, recurrent-chunked and routed-decode predicates the
@@ -185,7 +192,7 @@ regime. A class whose topology or checked size exceeds its certified layout fail
 The family charge takes independent workspace, output, and upload maxima across the certified
 layouts and counts each distinct bound constant once. A checked contract that cannot be evaluated
 fails assessment rather than producing a fit estimate.
-Each slot also holds a fixed set of host-upload regions, allocated and charged with the slot: one
+Each activation holds a fixed set of host-upload regions, allocated and charged with it: one
 per graph run its lease keeps in flight at once (a target step queues its embedding entry and
 every block before any completes). Upload regions are host-visible (CUDA: mapped pinned host
 memory), so writing a step's controls never waits for the device, and they are taken in rotation,
@@ -241,20 +248,22 @@ graph and a specialization only when their scale extents agree. A decode project
 included, is one launch: each workgroup reduces its few rows' norms while staging them. Larger classes
 normalize once per row into entry scratch, never per output tile. A monolithic entry that recomputes normalization,
 projection, routing, or softmax for each output coordinate is not an admissible production program.
-Target readout preserves every demanded feature row, and projects only rows that demand logits:
-the feature and head entries each gather their hidden rows through a row table in their own
-normalization prologue, so no copy or gather node precedes them. Projected rows are ordered with
-the selected rows first, so shaping and sampling read the leading logits rows. Selection graphs
-exist with and without the shaping stage; a step whose selected rows all leave the logits
-unchanged under shaping (greedy or unit temperature without cuts, and no penalties) samples the
-projected logits directly. Each selected row carries a constraint flag; only a step with a
-constrained row uploads vocabulary masks, and an unconstrained row's mask is never read. Shaping
-applies a constrained row's mask before its cuts, so top-k, min-p and top-p rank and renormalize
-only admitted tokens and a row that admits a finite logit never samples an empty distribution;
-sampling applies the same mask to unshaped rows. The projected-row
-capacity follows the selected per-step token and memory allowance; prefill row capacity does
-not imply the same number of logits rows. Features, logits and selection stay inside one checked
-Seismic workflow with one owned output lifetime.
+Target readout preserves every demanded feature row, and projects only rows it selects: the
+feature and head entries each gather their hidden rows through a row table in their own
+normalization prologue, so no copy or gather node precedes them. Logits are graph locals of the
+selection that consumes them; a served readout's outputs are its features and compact
+selections. Selection graphs exist with and without the shaping stage; shaping rewrites the
+logits in place, and a step whose selected rows all leave the logits unchanged under shaping
+(greedy or unit temperature without cuts, and no penalties) samples the projected logits
+directly. Each selected row carries a constraint flag; only a step with a constrained row uploads
+vocabulary masks, and an unconstrained row's mask is never read. Shaping applies a constrained
+row's mask before its cuts, so top-k, min-p and top-p rank and renormalize only admitted tokens
+and a row that admits a finite logit never samples an empty distribution; sampling applies the
+same mask to unshaped rows. Exporting full logits is a load capability that served loads do not
+have: a diagnostic load declares the rows it exports, exports the logits of every projecting
+class, and selects only unshaped, since shaping must not rewrite logits it exports. The head and
+separate draft keep their vocabulary logits as graph locals too, their drafting classes bounded
+by the selection bound.
 A separate draft (DFlash, DSpark, DFlash2) conditions on target taps instead of the final features. A
 tapped block's workflow rounds the residual entering it, entering its feed-forward, or leaving it
 (the exit tap is the last block's output) into that tap's column block of a draft-input buffer
@@ -317,12 +326,15 @@ the exact window and delta state contracts from its checked entries. Each recurr
 the store's bank slabs and, per run, bank tables for its exact active request slots: each slot's
 state entry reads the slot's accepted bank and writes only its successor bank, in place, within
 the block's ordered submission. The engine does not dispatch state transfers around the block,
-copy state between banks, or bind padded request state. Workflow slots cover
-submitted concurrency, and retained outputs cover submitted and live request owners. Encoded
-images belong to their request, so the vision output pool holds every live request's full image
-allowance; retained checkpoints share those features and do not size the pool: an encode that
-finds every output pinned by retention releases retention through the ordinary capacity release
-order. Source-weight upload uses the largest admitted encoded tensor as a one-shot startup
+copy state between banks, or bind padded request state. Workflow activations cover
+submitted concurrency, and retained outputs cover submitted and live request owners. The target's
+residual stream between block graphs is one device pair, returned at the end of each submission:
+every reader of it is queued in that submission and the device runs the next launch after it.
+Vision holds no activation or output until a request encodes an image; it then claims them under
+the heap like any growth and releases them when idle. Encoded images belong to their request, so
+the vision output pool holds every live request's images; retained checkpoints share those
+features and do not size the pool: an encode that finds every output pinned by retention releases
+retention through the ordinary capacity release order. Source-weight upload uses the largest admitted encoded tensor as a one-shot startup
 resource. Qualification holds one weight scope's fixtures at a time, at their resident
 representation: a block's weights, the target's norm and output (the embedding table is
 qualified on one row), or a head block's weights with its draft projection. Qualification and

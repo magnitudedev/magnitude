@@ -101,6 +101,9 @@ pub struct ModelPolicy {
     /// Queue each plain decode step's successor on the device before the
     /// step completes (cross-step pipelining).
     pub lookahead: bool,
+    /// Rows one launch may export full logits for: zero for serving, which
+    /// never reads them; set by diagnostics that do.
+    pub exported_logits_rows: usize,
 }
 
 impl Default for ModelPolicy {
@@ -110,6 +113,7 @@ impl Default for ModelPolicy {
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: true,
+            exported_logits_rows: 0,
         }
     }
 }
@@ -187,6 +191,7 @@ pub struct ResolvedModelPolicy {
     #[serde(with = "KvCodecEncoding")]
     pub kv_codec: KvCodec,
     pub lookahead: bool,
+    pub exported_logits_rows: usize,
 }
 
 impl ModelPolicy {
@@ -199,6 +204,7 @@ impl ModelPolicy {
             // A per-layer entry gathers host-table rows by host tokens, so
             // its steps cannot chain on device-selected tokens.
             lookahead: self.lookahead && definition.decoder.entry.per_layer.is_none(),
+            exported_logits_rows: self.exported_logits_rows,
         })
     }
 }

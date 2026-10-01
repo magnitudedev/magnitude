@@ -269,6 +269,7 @@ fn run() -> Result<(), String> {
             mtp_proposals: options.mtp_proposals,
             kv_codec: options.kv_codec,
             lookahead: options.lookahead,
+            exported_logits_rows: 0,
         },
         context_tokens: options.context_tokens,
         service,

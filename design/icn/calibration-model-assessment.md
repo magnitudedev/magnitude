@@ -134,10 +134,13 @@ profile is an operational failure.
 
 ## Capacity semantics
 
-Fit compares the standard workload's clean-load charge with every domain the load touches: stable
+Fit compares the standard workload's charge with every domain the load touches: stable
 capacity bounded by process limits (and the Metal working set) less that domain's planning
-reserve. Live availability never participates in assessment identity. Load admission always plans
-freshly against current memory; a cached `Fits` never authorizes residency.
+reserve. The charge holds weights and graph memory, plus the larger of two phases that never
+coexist: the workload's state at the fit depth, and the load's startup state with its
+qualification and import peak. Live availability never participates in assessment identity.
+Load admission always plans freshly against current memory; a cached `Fits` never authorizes
+residency.
 
 ## Assessing lifecycle
 

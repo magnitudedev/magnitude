@@ -2,9 +2,10 @@
 // min-p against the row maximum, and top-p over the survivors in
 // (value descending, token ascending) order. The Vulkan form of
 // `cuda/shape_rows.cu` (the 3-launch form), bit for bit the same contract:
-//   shape_rows_prepare (PARTS x Sx): penalized/tempered values into `out`
-//     (-inf where a constrained row's mask rejects a finite value) and the
-//     partition maxima.
+//   shape_rows_prepare (PARTS x Sx): penalized/tempered values in place over
+//     `logits` (-inf where a constrained row's mask rejects a finite value;
+//     each invocation reads and rewrites its own tokens) and the partition
+//     maxima.
 //   shape_rows_select (Sx): the cutoffs. Top-k is a count-weighted radix
 //     select of the k-th largest key; top-p a mass-weighted radix select of the
 //     first token whose inclusive mass reaches ceil(top_p * total), then its
@@ -62,8 +63,8 @@ uint64_t shape_row_scratch(uint64_t row) {
     return SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATE) + row * uint64_t(SEISMIC_TUNE_PARTS + 8u) * 4ul;
 }
 
-uint64_t shape_out_at(uint64_t row, uint token) {
-    return SEISMIC_PTR(SEISMIC_BUFFER_OUT) + (row * SEISMIC_OUT_STRIDE_0 + uint64_t(token) * SEISMIC_OUT_STRIDE_1) * 4ul;
+uint64_t shape_logits_at(uint64_t row, uint token) {
+    return SEISMIC_PTR(SEISMIC_BUFFER_LOGITS) + (row * SEISMIC_LOGITS_STRIDE_0 + uint64_t(token) * SEISMIC_LOGITS_STRIDE_1) * 4ul;
 }
 
 // ---------------------------------------------------------------------------
@@ -71,7 +72,6 @@ uint64_t shape_out_at(uint64_t row, uint token) {
 // subgroup.
 
 void shape_rows_prepare() {
-    const uint64_t logits = SEISMIC_PTR(SEISMIC_BUFFER_LOGITS);
     const uint64_t params = SEISMIC_PTR(SEISMIC_BUFFER_PARAMS);
     const uint64_t history = SEISMIC_PTR(SEISMIC_BUFFER_HISTORY);
     const uint64_t row = gl_WorkGroupID.y;
@@ -94,7 +94,7 @@ void shape_rows_prepare() {
         int count = 0;
         for (uint h = 0u; h < recent_count; ++h)
             count += seismic_shared_i32[h] == int(token) ? 1 : 0;
-        float value = element_f32_at(logits + (row * SEISMIC_LOGITS_STRIDE_0 + uint64_t(token) * SEISMIC_LOGITS_STRIDE_1) * 4ul);
+        float value = element_f32_at(shape_logits_at(row, token));
         // Correctly rounded division, as the portable route and CUDA divide.
         if (count > 0) {
             value = value < 0.0 ? value * repetition : seismic_div_rn(value, repetition);
@@ -105,7 +105,7 @@ void shape_rows_prepare() {
             value = -SHAPE_INF;
         if (temperature != 0.0)
             value = seismic_div_rn(value, temperature);
-        element_f32_put(shape_out_at(row, token), value);
+        element_f32_put(shape_logits_at(row, token), value);
         if (shape_finite(value))
             maximum = max(maximum, shape_ordered_key(value));
         else if (value != -SHAPE_INF)
@@ -176,7 +176,7 @@ struct shape_survivor {
 };
 
 bool shape_survives(shape_survivor survivor, uint token, out float value, out uint key) {
-    value = element_f32_at(shape_out_at(survivor.row, token));
+    value = element_f32_at(shape_logits_at(survivor.row, token));
     key = 0u;
     if (!shape_finite(value))
         return false;
@@ -409,7 +409,7 @@ void shape_rows_apply() {
     const float min_p = shape_parameter(params, row, 3u);
     for (uint token = shape_slice_begin(part) + gl_LocalInvocationIndex; token < shape_slice_end(part);
          token += gl_WorkGroupSize.x) {
-        const uint64_t slot = shape_out_at(row, token);
+        const uint64_t slot = shape_logits_at(row, token);
         const float value = element_f32_at(slot);
         if (!shape_finite(value))
             continue;

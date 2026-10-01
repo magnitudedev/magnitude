@@ -714,7 +714,8 @@ impl AttestedPrograms {
             plan.load(),
             TuningLimits {
                 max_rows: limits.max_launch_rows as u64,
-                max_projected_rows: limits.max_projected_rows as u64,
+                max_projected_rows: crate::programs::graph::readout::max_projected_rows(limits)
+                    as u64,
                 context_tokens: tuning.definition.decoder.context_limit,
             },
             device,

@@ -98,6 +98,14 @@ pub enum WorkflowError {
     UploadRegionsExhausted {
         regions: usize,
     },
+    /// A family's workspace exceeds the shared execution arena it binds.
+    NativeArenaTooSmall {
+        required: u64,
+        capacity: u64,
+    },
+    /// A family that keeps a prewritten port in workspace between runs
+    /// cannot bind a shared execution arena.
+    NativeArenaPrewrittenPort,
     /// The device's backend is native-only (Vulkan): planned workflows are
     /// refused.
     PlannedRouteUnavailable {
@@ -160,6 +168,13 @@ impl fmt::Display for CallError {
             Self::Workflow(WorkflowError::UploadRegionsExhausted { regions }) => write!(
                 f,
                 "all {regions} upload regions of the native graph slot are in flight"
+            ),
+            Self::Workflow(WorkflowError::NativeArenaTooSmall { required, capacity }) => write!(
+                f,
+                "native graph family needs {required} workspace bytes; its execution arena holds {capacity}"
+            ),
+            Self::Workflow(WorkflowError::NativeArenaPrewrittenPort) => f.write_str(
+                "a native graph family with a prewritten port cannot bind a shared execution arena",
             ),
             Self::Workflow(WorkflowError::PlannedRouteUnavailable { backend }) => write!(
                 f,

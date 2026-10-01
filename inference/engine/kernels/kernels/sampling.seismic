@@ -5,11 +5,12 @@
 # the row non-finite), so the cuts rank and renormalize only the admitted
 # tokens and never empty a row that admits a finite token. Equal top-k cutoff
 # values are all retained; top-p ties use ascending token index as the stable
-# order. The portable body is the semantic oracle.
-fn shape_rows[Sx, V, Hn](logits: &tensor[Sx, V] f32,
+# order. Rows are shaped in place: every stage after the first reads only the
+# values the first wrote, so a row's logits are read once, by the stage that
+# replaces them. The portable body is the semantic oracle.
+fn shape_rows[Sx, V, Hn](logits: &mut tensor[Sx, V] f32,
     mask: &tensor[Sx, (V + 31) / 32] u32, constrained: &tensor[Sx] i32,
-    params: &tensor[Sx, 8] f32, history: &tensor[Sx, Hn] i32,
-    out: &mut tensor[Sx, V] f32):
+    params: &tensor[Sx, 8] f32, history: &tensor[Sx, Hn] i32):
     # Sequential staging keeps the reference program executable while each row
     # owns scratch tensors. The attached native implementation dispatches rows
     # independently on Metal.
@@ -44,7 +45,7 @@ fn shape_rows[Sx, V, Hn](logits: &tensor[Sx, V] f32,
             tempered[token] = value
         if temperature == 0.0:
             for token in 0..V:
-                out[row, token] = penalized[token]
+                logits[row, token] = penalized[token]
         else:
             for token in 0..V:
                 tempered[token] = tempered[token] / temperature
@@ -68,9 +69,9 @@ fn shape_rows[Sx, V, Hn](logits: &tensor[Sx, V] f32,
                 for other in 0..V:
                     if minp[other] > minp[token] or (minp[other] == minp[token] and other < token):
                         preceding = preceding + shifted[other] / denominator
-                out[row, token] = minp[token]
+                logits[row, token] = minp[token]
                 if top_p < 1.0 and preceding >= top_p:
-                    out[row, token] = -inf
+                    logits[row, token] = -inf
 
 # Native Metal: the vocabulary of each row is split into PARTS contiguous
 # partitions. prepare applies the constraint mask, penalties and temperature; three count/select

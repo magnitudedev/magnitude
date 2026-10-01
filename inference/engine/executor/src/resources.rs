@@ -189,6 +189,8 @@ impl std::error::Error for AllocationError {}
 /// allocated separately during component materialization.
 pub struct AllocatedResources {
     domain: ResourceDomainId,
+    /// The device's one graph workspace, which every pool's activations bind.
+    arena: seismic::NativeExecutionArena,
     target_graph: NativeGraphPool,
     target_readout_graph: NativeGraphPool,
     head_graph: Option<NativeGraphPool>,
@@ -197,8 +199,8 @@ pub struct AllocatedResources {
 }
 
 impl AllocatedResources {
-    /// Sealed graph arenas remain owned by these pools while their slots are
-    /// lent to launches or output views.
+    /// The workspace arena once, and the arenas these pools own while their
+    /// slots are lent to launches or output views.
     pub fn committed_bytes(&self) -> Result<u64, &'static str> {
         [
             Some(&self.target_graph),
@@ -209,7 +211,7 @@ impl AllocatedResources {
         ]
         .into_iter()
         .flatten()
-        .try_fold(0u64, |bytes, pool| {
+        .try_fold(self.arena.bytes(), |bytes, pool| {
             bytes
                 .checked_add(pool.committed_bytes())
                 .ok_or("graph pool charge overflows")
@@ -250,9 +252,9 @@ impl AllocatedResources {
         }
     }
 
-    /// Release every pool's free output slots beyond its startup count;
-    /// returns how many were released.
-    pub(crate) fn release_idle_outputs(&mut self) -> usize {
+    /// Release every pool's free activations and output slots beyond its
+    /// startup counts; returns how many were released.
+    pub(crate) fn release_idle_slots(&mut self) -> usize {
         [
             Some(&mut self.target_graph),
             Some(&mut self.target_readout_graph),
@@ -262,8 +264,20 @@ impl AllocatedResources {
         ]
         .into_iter()
         .flatten()
-        .map(NativeGraphPool::release_idle_outputs)
+        .map(|pool| pool.release_idle_activations() + pool.release_idle_outputs())
         .sum()
+    }
+
+    /// The pool whose launches `lane` reserves an activation from.
+    pub(crate) fn activations_mut(
+        &mut self,
+        lane: crate::domain::ReservationLane,
+    ) -> Option<&mut NativeGraphPool> {
+        match lane {
+            crate::domain::ReservationLane::Target => Some(&mut self.target_graph),
+            crate::domain::ReservationLane::Head => self.head_graph.as_mut(),
+            crate::domain::ReservationLane::Vision => self.vision_graph.as_mut(),
+        }
     }
 }
 
@@ -378,6 +392,9 @@ impl ResourceAllocator {
                 && family.output_bytes() == charge.output_bytes
                 && family.upload_bytes() == charge.upload_bytes
         };
+        let arena = device
+            .execution_arena(plan.arena_bytes())
+            .map_err(|error| AllocationError::Device(error.to_string()))?;
         let graph_charge = plan.target_graph();
         if !admitted(target_graphs.family(), graph_charge)
             || target_graphs.runs_per_step() != graph_charge.upload_regions
@@ -388,7 +405,7 @@ impl ResourceAllocator {
             }));
         }
         let target_graph =
-            NativeGraphPool::new(domain.clone(), target_graphs.family(), graph_charge)?;
+            NativeGraphPool::new(domain.clone(), target_graphs.family(), graph_charge, &arena)?;
         let readout_charge = plan.target_readout_graph();
         if !admitted(target_readout_graphs.family(), readout_charge) {
             return Err(AllocationError::Plan(InvariantError {
@@ -401,10 +418,11 @@ impl ResourceAllocator {
             domain.clone(),
             target_readout_graphs.family(),
             readout_charge,
+            &arena,
         )?;
         let head_graph = match (head_graphs, plan.head_graph()) {
             (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => Some(
-                NativeGraphPool::new(domain.clone(), graphs.family(), charge)?,
+                NativeGraphPool::new(domain.clone(), graphs.family(), charge, &arena)?,
             ),
             (None, None) => None,
             _ => {
@@ -416,7 +434,7 @@ impl ResourceAllocator {
         };
         let vision_graph = match (vision_graphs, plan.vision_graph()) {
             (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => Some(
-                NativeGraphPool::new(domain.clone(), graphs.family(), charge)?,
+                NativeGraphPool::new(domain.clone(), graphs.family(), charge, &arena)?,
             ),
             (None, None) => None,
             _ => {
@@ -434,9 +452,10 @@ impl ResourceAllocator {
             }));
         }
         let state_graph =
-            NativeGraphPool::new(domain.clone(), state_graphs.family(), state_charge)?;
+            NativeGraphPool::new(domain.clone(), state_graphs.family(), state_charge, &arena)?;
         let allocated = AllocatedResources {
             domain: domain.clone(),
+            arena,
             target_graph,
             target_readout_graph,
             head_graph,

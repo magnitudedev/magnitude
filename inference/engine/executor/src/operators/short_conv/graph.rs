@@ -416,7 +416,9 @@ mod tests {
         let limits = ResourceLimits {
             max_launch_rows: 64,
             max_launch_slots: 8,
-            max_projected_rows: 64,
+            max_selected_rows: 64,
+            max_drafting_slots: 8,
+            exported_logits_rows: 0,
             max_images_per_request: 1,
             lookahead: false,
         };

@@ -287,7 +287,9 @@ pub(crate) mod tests {
         let limits = ResourceLimits {
             max_launch_rows: 2,
             max_launch_slots: 2,
-            max_projected_rows: 2,
+            max_selected_rows: 2,
+            max_drafting_slots: 2,
+            exported_logits_rows: 0,
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
             lookahead: false,
         };
@@ -419,17 +421,24 @@ pub(crate) mod tests {
         let target = plan.target_graph();
         let readout = plan.target_readout_graph();
         let state = plan.state_graph();
-        // One launch per lane in flight, whatever the request count; one
-        // request's retained readout beside it. More outputs are elastic.
-        assert_eq!((target.workspace_slots, target.output_slots), (1, 2));
-        assert_eq!((readout.workspace_slots, readout.output_slots), (1, 2));
-        assert_eq!((state.workspace_slots, state.output_slots), (1, 1));
+        // One launch per lane in flight, whatever the request count; the
+        // target's residual pair; one request's retained readout beside it.
+        // More outputs are elastic.
+        assert_eq!((target.activations, target.output_slots), (1, 2));
+        assert_eq!((readout.activations, readout.output_slots), (1, 2));
+        assert_eq!((state.activations, state.output_slots), (1, 1));
         assert!(target.workspace_bytes > 0);
         assert!(target.output_bytes > 0);
         assert!(readout.output_bytes > 0);
+        // Workspace is the one arena, charged once at the largest family's.
+        let arena = target
+            .workspace_bytes
+            .max(readout.workspace_bytes)
+            .max(state.workspace_bytes);
+        assert_eq!(plan.arena_bytes(), arena);
         assert_eq!(
             plan.bytes().scratch,
-            target.committed_bytes + readout.committed_bytes + state.committed_bytes,
+            arena + target.committed_bytes + readout.committed_bytes + state.committed_bytes,
         );
         assert_eq!(plan.steady_committed_bytes(), plan.bytes().total().unwrap());
         assert_eq!(

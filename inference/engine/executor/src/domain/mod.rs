@@ -3,10 +3,12 @@
 //! proposal until its owner supplies an exact reconciliation decision.
 
 use crate::batching::{
-    Draw, DrawKind, Row, RowHistory, Select, Shaping as RowShaping, Slot, ValidatedTargetBatch,
+    Demand, Draw, DrawKind, Row, RowHistory, Select, Shaping as RowShaping, Slot,
+    ValidatedTargetBatch,
 };
 use crate::memory::{HoldingClass, HoldingId, MemoryHeap};
 use crate::platform::{DomainReading, DomainRole};
+use crate::programs::graph::readout;
 use crate::programs::ProgramSubmission;
 use crate::{
     AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader,
@@ -679,6 +681,100 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.memory.borrow().host_table_bytes()
     }
 
+    /// Refuse a launch whose vocabulary work the load did not plan: more
+    /// selected target rows or drafting requests than the selection bound,
+    /// logits a served load does not export, more exported rows than a
+    /// diagnostic load exports, or shaping in a launch whose logits are
+    /// exported (shaping rewrites the logits in place).
+    fn admit_selection(
+        &self,
+        lane: ReservationLane,
+        operations: &[Operation],
+    ) -> Result<(), DomainError> {
+        let limits = self.execution.policy().limits();
+        match lane {
+            ReservationLane::Target => {
+                let forwards = operations.iter().filter_map(|operation| match operation {
+                    Operation::Forward {
+                        kind,
+                        tokens,
+                        demand,
+                        select,
+                        ..
+                    } => Some((kind, tokens, demand, select)),
+                    Operation::Head { .. } | Operation::Encode { .. } => None,
+                });
+                let selected = forwards
+                    .clone()
+                    .map(|(_, _, _, select)| select.len())
+                    .sum::<usize>();
+                if selected > limits.max_selected_rows {
+                    return Err(DomainError::Input(format!(
+                        "launch selects {selected} rows; the selection bound is {}",
+                        limits.max_selected_rows
+                    )));
+                }
+                if !readout::exports_logits(limits) {
+                    if forwards
+                        .clone()
+                        .any(|(_, _, demand, _)| demand.contains(Demand::LOGITS))
+                    {
+                        return Err(DomainError::Input(
+                            "launch demands logits from a load that exports none".into(),
+                        ));
+                    }
+                    return Ok(());
+                }
+                let mut projected = 0usize;
+                for (kind, tokens, demand, select) in forwards {
+                    projected += if demand.contains(Demand::LOGITS) {
+                        // Decode and verification rows carry the demand;
+                        // a prompt chunk's only on its final row.
+                        match kind {
+                            WorkKind::Decode | WorkKind::Verify => tokens.len(),
+                            WorkKind::Prefill | WorkKind::Replay => 1,
+                        }
+                    } else {
+                        select.len()
+                    };
+                    for spec in select {
+                        let params = target::select_row(spec)
+                            .shaping
+                            .params()
+                            .map_err(|error| DomainError::Input(error.to_string()))?;
+                        if readout::shapes(&params) {
+                            return Err(DomainError::Input(
+                                "a load that exports logits selects unshaped".into(),
+                            ));
+                        }
+                    }
+                }
+                if projected > limits.exported_logits_rows {
+                    return Err(DomainError::Input(format!(
+                        "launch projects {projected} logits rows; the load exports {}",
+                        limits.exported_logits_rows
+                    )));
+                }
+            }
+            ReservationLane::Head => {
+                let drafting = operations
+                    .iter()
+                    .filter(|operation| {
+                        matches!(operation, Operation::Head { proposals, .. } if !proposals.is_empty())
+                    })
+                    .count();
+                if drafting > limits.max_drafting_slots {
+                    return Err(DomainError::Input(format!(
+                        "launch drafts for {drafting} requests; the selection bound is {}",
+                        limits.max_drafting_slots
+                    )));
+                }
+            }
+            ReservationLane::Vision => {}
+        }
+        Ok(())
+    }
+
     pub fn requirements(
         &self,
         bindings: &StateBindings<F>,
@@ -746,7 +842,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let mut rows = 0usize;
                 let mut state_demand = Vec::new();
                 let mut segments = 1usize;
-                let mut demand = crate::batching::Demand::NONE;
+                let mut demand = Demand::NONE;
                 let mut seen = BTreeSet::new();
                 for operation in operations {
                     operation.validate().map_err(|error| error.to_string())?;
@@ -819,6 +915,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         state.span_count()
                     });
                 }
+                self.admit_selection(lane, operations)?;
                 let class_limits = if lane == ReservationLane::Target {
                     self.target_class_limits()
                 } else {

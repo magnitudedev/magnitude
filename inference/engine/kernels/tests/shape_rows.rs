@@ -169,11 +169,6 @@ fn portable_shaping_matches_the_ordered_host_reference() {
         vec![ROWS, HISTORY],
         history.iter().map(|value| f64::from(*value)).collect(),
     ));
-    let out = interpreter.add_tensor(TensorData::dense(
-        DType::F32,
-        vec![ROWS, VOCABULARY],
-        vec![0.0; ROWS * VOCABULARY],
-    ));
     let outcome = interpreter
         .run(&[
             Arg::Tensor(logits),
@@ -181,13 +176,13 @@ fn portable_shaping_matches_the_ordered_host_reference() {
             Arg::Tensor(constrained),
             Arg::Tensor(params),
             Arg::Tensor(history),
-            Arg::Tensor(out),
         ])
         .unwrap();
-    let out_input = outcome.inputs().nth(5).unwrap();
-    let out = out_input.tensor();
-    let actual = (0..out.element_count())
-        .map(|index| out.read(index).unwrap() as f32)
+    // The rows are shaped in place.
+    let logits_input = outcome.inputs().next().unwrap();
+    let shaped = logits_input.tensor();
+    let actual = (0..shaped.element_count())
+        .map(|index| shaped.read(index).unwrap() as f32)
         .collect::<Vec<_>>();
     assert_values(&actual, &expected);
     assert_eq!(&actual[..VOCABULARY], &[3.0, 2.0, 1.0, 0.0, -1.0, -2.0]);
@@ -302,7 +297,7 @@ fn native_shape_constrained(
             .flat_map(|v| v.to_le_bytes())
             .collect::<Vec<_>>()
     };
-    let logits = seismic::Tensor::from_host(
+    let mut logits = seismic::Tensor::from_host(
         device,
         seismic::Element::f32(),
         &[rows as u64, vocabulary as u64],
@@ -346,12 +341,6 @@ fn native_shape_constrained(
             .collect::<Vec<_>>(),
     )
     .unwrap();
-    let mut out = seismic::Tensor::zeros(
-        device,
-        seismic::Element::f32(),
-        &[rows as u64, vocabulary as u64],
-    )
-    .unwrap();
     let specialization = specialization_on(
         device,
         parts,
@@ -360,15 +349,15 @@ fn native_shape_constrained(
     shape_rows::native_for_device(device, &specialization)
         .unwrap()
         .call(shape_rows::Args {
-            logits: &logits,
+            logits: &mut logits,
             mask: &mask,
             constrained: &constrained,
             params: &params,
             history: &history,
-            out: &mut out,
         })
         .unwrap();
-    out.read_to_host()
+    logits
+        .read_to_host()
         .unwrap()
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))

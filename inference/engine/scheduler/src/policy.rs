@@ -14,6 +14,13 @@ pub struct ServiceLimits {
     pub locality_seconds: f64,
 }
 impl ServiceLimits {
+    /// The most rows one launch selects a token for, and the most requests
+    /// one drafter launch drafts for: the decode allowance. A decode round
+    /// never exceeds it; the owner admits no prefill round beyond it.
+    pub fn selection_bound(&self) -> usize {
+        self.decode_tokens
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.prefill_tokens == 0
             || self.decode_tokens == 0

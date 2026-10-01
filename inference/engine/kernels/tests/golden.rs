@@ -1814,7 +1814,8 @@ fn shape_rows(ctx: &Ctx) -> Vec<Variant> {
                     Case {
                         label: format!("s{sx}"),
                         args: vec![
-                            ctx.dense(f32e(), &[sx as u64, v as u64], &logits(&mut rng, sx, v)),
+                            // Shaped in place.
+                            ctx.dense_mut(f32e(), &[sx as u64, v as u64], &logits(&mut rng, sx, v)),
                             Arg::Shared(ctx.tensor(
                                 Element::u32(),
                                 &[sx as u64, words as u64],
@@ -1823,7 +1824,6 @@ fn shape_rows(ctx: &Ctx) -> Vec<Variant> {
                             ctx.ints(&[sx as u64], &constrained),
                             ctx.dense(f32e(), &[sx as u64, 8], &rows),
                             ctx.ints(&[sx as u64, hn as u64], &history),
-                            ctx.dense_mut(f32e(), &[sx as u64, v as u64], &vec![11.0; sx * v]),
                         ],
                     }
                 })

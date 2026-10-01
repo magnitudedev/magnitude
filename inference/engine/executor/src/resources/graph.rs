@@ -2,21 +2,32 @@
 
 use crate::{CapacityError, InvariantError, ResourceDomainId, ResourceKind};
 use seismic::{
-    NativeGraphFamily, NativeGraphFamilyOutputSlot, NativeGraphFamilySlot, NativeGraphOutputs,
-    NativeGraphPlan, Tensor, WorkflowTensor,
+    NativeExecutionArena, NativeGraphFamily, NativeGraphFamilyOutputSlot, NativeGraphFamilySlot,
+    NativeGraphOutputs, NativeGraphPlan, Tensor, WorkflowTensor,
 };
 use std::{cell::RefCell, rc::Rc};
 
-/// One family's graph storage. Workspace slots cover the launches of the
-/// family in flight at once and are fixed at startup. Output slots outlive
-/// their launches (a request retains its last published features), so their
-/// count follows the live requests: the pool starts with what one request
-/// needs and grows one slot at a time under a heap claim, and slots idle
-/// beyond that start are released as surplus.
+/// One family's graph storage. Activations cover the launches of the family
+/// in flight at once; each holds its upload regions and binds the device's
+/// one workspace arena. They are fixed at startup, except for a family that
+/// starts with none (vision), which claims one when a launch first needs it
+/// and releases it at idle. Output slots outlive their
+/// launches (a request retains its last published features), so their count
+/// follows the live requests: the pool starts with what one request needs
+/// and grows one slot at a time under a heap claim, and slots idle beyond
+/// that start are released as surplus.
 pub struct NativeGraphPool {
     domain: ResourceDomainId,
     family: NativeGraphFamily,
-    workspace_bytes: u64,
+    arena: NativeExecutionArena,
+    upload_regions: usize,
+    /// Upload regions of one activation.
+    activation_bytes: u64,
+    /// Startup activations. A family with none (vision) claims its
+    /// activation when a launch first needs it and releases it when idle.
+    minimum_activations: usize,
+    /// Activations allocated now, lent or free.
+    activations: usize,
     output_bytes: u64,
     minimum_outputs: usize,
     /// Output slots allocated now, lent or free.
@@ -26,34 +37,39 @@ pub struct NativeGraphPool {
 }
 
 impl NativeGraphPool {
-    /// The startup slots of `charge`: its workspace slots, each with
+    /// The startup slots of `charge`: its activations in `arena`, each with
     /// `upload_regions` upload regions, and its startup output slots.
     pub(crate) fn new(
         domain: ResourceDomainId,
         family: &NativeGraphFamily,
         charge: crate::NativeGraphCharge,
+        arena: &NativeExecutionArena,
     ) -> Result<Self, super::AllocationError> {
-        let workspace = (0..charge.workspace_slots)
-            .map(|_| family.new_slot(charge.upload_regions))
+        let workspace = (0..charge.activations)
+            .map(|_| family.new_slot_in(arena, charge.upload_regions))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| super::AllocationError::Device(error.to_string()))?;
         let output = (0..charge.output_slots)
             .map(|_| family.new_output_slot())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| super::AllocationError::Device(error.to_string()))?;
-        let workspace_bytes = charge
-            .committed_bytes
-            .checked_sub(charge.output_bytes * charge.output_slots as u64)
+        let activation_bytes = charge
+            .upload_bytes
+            .checked_mul(charge.upload_regions as u64)
             .ok_or_else(|| {
                 super::AllocationError::Plan(crate::InvariantError {
                     context: "graph pool",
-                    detail: "planned charge is below its output slots".into(),
+                    detail: "activation byte count overflows".into(),
                 })
             })?;
         Ok(Self {
             domain,
             family: family.clone(),
-            workspace_bytes,
+            arena: arena.clone(),
+            upload_regions: charge.upload_regions,
+            activation_bytes,
+            minimum_activations: charge.activations,
+            activations: charge.activations,
             output_bytes: charge.output_bytes,
             minimum_outputs: charge.output_slots,
             outputs: charge.output_slots,
@@ -69,12 +85,47 @@ impl NativeGraphPool {
     /// Physical arenas owned by this pool, including slots currently lent
     /// to a submission or a published output view.
     pub fn committed_bytes(&self) -> u64 {
-        self.workspace_bytes + self.output_bytes * self.outputs as u64
+        self.activation_bytes * self.activations as u64 + self.output_bytes * self.outputs as u64
     }
 
     /// The charge of one more output slot.
     pub fn output_slot_bytes(&self) -> u64 {
         self.output_bytes
+    }
+
+    /// Whether the family claims its activation on demand: it holds none
+    /// from startup, so a launch that finds none free grows one.
+    pub fn activates_on_demand(&self) -> bool {
+        self.minimum_activations == 0
+    }
+
+    /// The charge of one more activation: its upload regions. Its workspace
+    /// is the shared arena, already charged.
+    pub fn activation_slot_bytes(&self) -> u64 {
+        self.activation_bytes
+    }
+
+    /// Allocate one more activation in the arena. The caller holds a heap
+    /// claim for [`Self::activation_slot_bytes`] across this call.
+    pub(crate) fn grow_activation(&mut self) -> Result<(), seismic::WorkflowError> {
+        let slot = self.family.new_slot_in(&self.arena, self.upload_regions)?;
+        self.workspace.borrow_mut().push(slot);
+        self.activations += 1;
+        Ok(())
+    }
+
+    /// Release free activations beyond the startup count; returns how many
+    /// were released. A lent activation stays until its launch completes.
+    pub(crate) fn release_idle_activations(&mut self) -> usize {
+        let mut free = self.workspace.borrow_mut();
+        let releasable = self
+            .activations
+            .saturating_sub(self.minimum_activations)
+            .min(free.len());
+        let kept = free.len() - releasable;
+        free.truncate(kept);
+        self.activations -= releasable;
+        releasable
     }
 
     pub fn available_workspace(&self) -> usize {

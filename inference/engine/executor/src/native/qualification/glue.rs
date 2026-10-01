@@ -11,7 +11,7 @@ impl<'a> QualificationView<'a> {
             .collect::<Vec<_>>();
         let params = [1.0_f32, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0];
         let history = [-1_i32; 64];
-        let logits = tensor_f32(device, &[1, vocabulary], &values, "shape_rows", "fixed")?;
+        let mut logits = tensor_f32(device, &[1, vocabulary], &values, "shape_rows", "fixed")?;
         let params = tensor_f32(device, &[1, 8], &params, "shape_rows", "fixed")?;
         let history_bytes = history
             .iter()
@@ -24,21 +24,18 @@ impl<'a> QualificationView<'a> {
             .map_err(|error| qualification("shape_rows", "fixed", error))?;
         let constrained = Tensor::zeros(device, Element::i32(), &[1])
             .map_err(|error| qualification("shape_rows", "fixed", error))?;
-        let mut out = Tensor::zeros(device, Element::f32(), &[1, vocabulary])
-            .map_err(|error| qualification("shape_rows", "fixed", error))?;
         self.programs
             .target
             .shape
             .call(shape_rows::Args {
-                logits: &logits,
+                logits: &mut logits,
                 mask: &mask,
                 constrained: &constrained,
                 params: &params,
                 history: &history,
-                out: &mut out,
             })
             .map_err(|error| qualification("shape_rows", "fixed", error))?;
-        let output = out
+        let output = logits
             .read_to_host()
             .map_err(|error| qualification("shape_rows", "fixed", error))?;
         let expected = values

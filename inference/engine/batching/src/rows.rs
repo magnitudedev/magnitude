@@ -50,6 +50,11 @@ impl Default for Shaping {
 }
 
 impl Shaping {
+    /// The validated control values a selection uploads for `shape_rows`.
+    pub fn params(self) -> Result<[f32; SHAPING_WIDTH], PackError> {
+        Ok(self.words()?.map(f32::from_bits))
+    }
+
     fn words(self) -> Result<[u32; SHAPING_WIDTH], PackError> {
         let finite = [
             self.temperature,
@@ -629,8 +634,7 @@ fn append_select(
     } else {
         packed.mask_rows.push(-1);
     }
-    let words = select.shaping.words()?;
-    packed.shaping.push(words.map(f32::from_bits));
+    packed.shaping.push(select.shaping.params()?);
     if select.history.len() > HISTORY_WIDTH {
         return Err(PackError::HistoryTooLong {
             row,

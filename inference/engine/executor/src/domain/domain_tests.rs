@@ -92,7 +92,9 @@ fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) ->
     let limits = ResourceLimits {
         max_launch_rows: 2,
         max_launch_slots: 2,
-        max_projected_rows: 2,
+        max_selected_rows: 2,
+        max_drafting_slots: 2,
+        exported_logits_rows: 0,
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
         lookahead,
     };

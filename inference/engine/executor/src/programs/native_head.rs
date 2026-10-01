@@ -134,7 +134,12 @@ pub(crate) fn head_graph_classes(
             });
         }
     }
-    for &slots in &slot_classes {
+    // Drafting passes project the draft vocabulary per slot: their slots are
+    // bounded by the selection bound, not the launch's request slots.
+    for &slots in slot_classes
+        .iter()
+        .filter(|slots| **slots <= limits.max_drafting_slots as u64)
+    {
         let entry_bound = row_class(
             (slots as usize)
                 .saturating_mul(proposals + 1)
@@ -646,7 +651,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         constants.extend(chained_rows);
         let selection = match (&projection, selections.as_mut()) {
             (Some(projection), Some(selections)) => {
-                let logits = graph
+                let mut logits = graph
                     .enqueue(
                         entries.logits,
                         &[("O", class.slots), ("V", draft_vocabulary), ("D", hidden)],
@@ -664,7 +669,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     entries.shape,
                     entries.sample,
                     draft_vocabulary,
-                    (&logits).into(),
+                    &mut logits,
                     class.slots,
                     class.shaped,
                     (&mut result).into(),

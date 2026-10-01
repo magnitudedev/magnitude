@@ -1,9 +1,10 @@
 // shape_rows on CPU (contract and portable body in sampling.seismic).
 //
 // `shape_rows_prepare` gives each work item one of PARTS contiguous
-// vocabulary slices of a row: it writes the penalized and tempered values into
-// `out` (-inf where a constrained row's mask rejects a finite value) and keeps
-// the slice maximum and a non-finite flag in scratch.
+// vocabulary slices of a row: it rewrites the slice's logits in place as their
+// penalized and tempered values (-inf where a constrained row's mask rejects a
+// finite value), reading each logit once, and keeps the slice maximum and a
+// non-finite flag in scratch.
 // `shape_rows_filter` gives each work item one row: it finds the top-k
 // threshold (the k-th largest value; every tie of it is kept) by selection,
 // applies min-p, and ranks the top-k and min-p survivors by descending value
@@ -94,15 +95,11 @@ fn shape_rows_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
         return;
     }
     let s = shaping(cx, row);
-    let logits = cx.arg_logits().row([row, 0]);
-    let temper = |value: f32| if s.temperature != 0.0 { value / s.temperature } else { value };
-    // SAFETY: each work item writes its own slice of its row.
-    let values = unsafe { cx.arg_out().span_mut([row, begin], end - begin) };
-    for (target, logit) in values.iter_mut().zip(&logits[begin..end]) {
-        *target = temper(*logit);
-    }
+    // SAFETY: each work item rewrites its own slice of its row.
+    let values = unsafe { cx.arg_logits().span_mut([row, begin], end - begin) };
     // The history tokens of this slice, sorted, so each penalized token
-    // counts its occurrences once.
+    // counts its occurrences once. Penalties apply to the raw logits before
+    // every value of the slice is tempered.
     let history = cx.arg_history().row([row, 0]);
     // SAFETY: every bit pattern is a `u32`; the pool aligns private bytes
     // for any scalar, so the middle part starts at the first byte.
@@ -121,11 +118,15 @@ fn shape_rows_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     while first < recent.len() {
         let token = recent[first] as usize;
         let count = recent[first..].iter().take_while(|other| **other as usize == token).count();
-        let mut value = logits[token];
-        value = if value < 0.0 { value * s.repetition } else { value / s.repetition };
-        value = value - s.presence - s.frequency * count as f32;
-        values[token - begin] = temper(value);
+        let value = &mut values[token - begin];
+        *value = if *value < 0.0 { *value * s.repetition } else { *value / s.repetition };
+        *value = *value - s.presence - s.frequency * count as f32;
         first += count;
+    }
+    if s.temperature != 0.0 {
+        for value in values.iter_mut() {
+            *value /= s.temperature;
+        }
     }
     // A constrained row removes every rejected value but NaN and +inf, which
     // keep the row unfiltered for sampling to report.
@@ -163,7 +164,7 @@ fn shape_rows_filter<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
         return;
     }
     // SAFETY: each work item writes its own row.
-    let values = unsafe { cx.arg_out().row_mut([row, 0]) };
+    let values = unsafe { cx.arg_logits().row_mut([row, 0]) };
     // SAFETY: each work item owns its row's region of the scratch.
     let order = unsafe { cx.scratch_order().slice_mut::<u64>(8 * row * vocabulary, vocabulary) };
 

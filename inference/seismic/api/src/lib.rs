@@ -201,6 +201,12 @@ impl Device {
             inner: seismic_runtime::native::graph::NativeGraphDraft::new(&self.inner),
         }
     }
+    /// The device's shared graph workspace of `bytes`: every family slot
+    /// created in it binds the one allocation.
+    pub fn execution_arena(&self, bytes: u64) -> Result<NativeExecutionArena, TensorError> {
+        seismic_runtime::native::graph::NativeExecutionArena::new(&self.inner, bytes)
+            .map(|inner| NativeExecutionArena { inner })
+    }
     /// Begin an exact graph using a certified Seismic placement.
     pub fn native_graph_with_layout(&self, layout: &NativeGraphLayout) -> NativeGraph {
         NativeGraph {
@@ -2062,6 +2068,10 @@ impl NativeGraphFamily {
     pub fn workspace_bytes(&self) -> u64 {
         self.inner.workspace_bytes()
     }
+    /// The workspace no placement of the family's plans fits in less than.
+    pub fn workspace_floor_bytes(&self) -> u64 {
+        self.inner.workspace_floor_bytes()
+    }
     pub fn output_bytes(&self) -> u64 {
         self.inner.output_bytes()
     }
@@ -2080,6 +2090,29 @@ impl NativeGraphFamily {
         self.inner
             .new_slot(regions)
             .map(|inner| NativeGraphFamilySlot { inner })
+    }
+    /// A slot whose workspace is the shared `arena`, with `regions` upload
+    /// regions of its own.
+    pub fn new_slot_in(
+        &self,
+        arena: &NativeExecutionArena,
+        regions: usize,
+    ) -> Result<NativeGraphFamilySlot, WorkflowError> {
+        self.inner
+            .new_slot_in(&arena.inner, regions)
+            .map(|inner| NativeGraphFamilySlot { inner })
+    }
+}
+
+/// One device's graph workspace, shared by the family slots created in it.
+#[derive(Clone)]
+pub struct NativeExecutionArena {
+    inner: seismic_runtime::native::graph::NativeExecutionArena,
+}
+
+impl NativeExecutionArena {
+    pub fn bytes(&self) -> u64 {
+        self.inner.bytes()
     }
 }
 

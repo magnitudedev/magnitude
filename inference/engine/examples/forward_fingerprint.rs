@@ -280,6 +280,7 @@ fn main() -> Result<(), String> {
             mtp_proposals: options.head.then_some(PROPOSALS as u8),
             kv_codec: options.codec,
             lookahead: false,
+            exported_logits_rows: 64,
         },
         context_tokens: Some(2048),
         service: ServiceLimits {

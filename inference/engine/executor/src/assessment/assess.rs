@@ -129,7 +129,9 @@ pub fn prepare_execution_assessment(
         .and_then(|bounds| {
             state
                 .fit_state_bytes(terms.fit_depth, terms.recurrent_banks)
-                .and_then(|state_bytes| terms.charge(bounds, state_bytes))
+                .and_then(|state_bytes| {
+                    terms.charge(bounds, state_bytes, state.startup_state_bytes()?)
+                })
         })
         .map_err(AssessmentError::Memory)?;
     Ok(PreparedExecutionAssessment {
@@ -245,7 +247,9 @@ mod tests {
             ResourceLimits {
                 max_launch_rows: 512,
                 max_launch_slots: 32,
-                max_projected_rows: 32,
+                max_selected_rows: 32,
+                max_drafting_slots: 32,
+                exported_logits_rows: 0,
                 max_images_per_request: 1,
                 lookahead: true,
             },

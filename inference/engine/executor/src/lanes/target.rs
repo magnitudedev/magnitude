@@ -364,13 +364,15 @@ impl ValidatedTargetLaunch {
     }
 
     /// The reconciliation payload and the device leases the submitted work
-    /// uses; the leases stay held until the submission is finished.
+    /// uses; the leases stay held until the submission is finished. The
+    /// residual pair returns to its pool now: every reader of it was queued
+    /// by this submission, and the device runs the next launch that takes the
+    /// pair after this one.
     pub(crate) fn into_submission_parts(self) -> (TargetLaunchCore, TargetLaunchWorkspace) {
         (
             self.core,
             TargetLaunchWorkspace {
                 _graph_workspace: self.graph_workspace,
-                _graph_outputs: self.graph_outputs,
                 _readout_workspace: self.readout_workspace,
                 _readout_output: self.readout_output,
             },
@@ -382,7 +384,6 @@ impl ValidatedTargetLaunch {
 /// their pools, so it is dropped only after the launch's work completed.
 pub struct TargetLaunchWorkspace {
     _graph_workspace: TargetGraphWorkspaceLease,
-    _graph_outputs: [TargetGraphOutputLease; 2],
     _readout_workspace: NativeGraphWorkspaceLease,
     _readout_output: Option<NativeGraphOutputLease>,
 }

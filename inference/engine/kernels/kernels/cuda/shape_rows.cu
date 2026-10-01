@@ -1,9 +1,10 @@
 // shape_rows: penalties and temperature, then top-k (ties at the cutoff kept),
 // min-p against the row maximum, and top-p over the survivors in
 // (value descending, token ascending) order.
-//   shape_rows_prepare (PARTS x Sx): penalized/tempered values into `out` (-inf
-//     where a constrained row's mask rejects a finite value) and the
-//     partition maxima.
+//   shape_rows_prepare (PARTS x Sx): penalized/tempered values in place over
+//     `logits` (-inf where a constrained row's mask rejects a finite value;
+//     each thread reads and rewrites its own tokens) and the partition
+//     maxima.
 //   shape_rows_select (Sx): the cutoffs. Top-k is a count-weighted radix select of
 //     the k-th largest key; top-p a mass-weighted radix select of the first
 //     token whose inclusive mass reaches ceil(top_p * total), then its rank
@@ -88,10 +89,9 @@ __device__ __forceinline__ u32 *row_scratch(unsigned char *scratch, u64 row) {
 }
 
 extern "C" __global__ void shape_rows_prepare(SEISMIC_KERNEL_PARAMS) {
-    const float *logits = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_LOGITS));
+    float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_LOGITS));
     const float *params = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_PARAMS));
     const int *history = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY));
-    float *out = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT));
     extern __shared__ int recent[];
     __shared__ u32 warp_maximum[32];
     const u64 row = blockIdx.y;
@@ -113,7 +113,8 @@ extern "C" __global__ void shape_rows_prepare(SEISMIC_KERNEL_PARAMS) {
         int count = 0;
         for (u64 h = 0; h < SEISMIC_DIM_HN; ++h)
             count += recent[h] == (int)token ? 1 : 0;
-        float value = logits[row * SEISMIC_LOGITS_STRIDE_0 + token * SEISMIC_LOGITS_STRIDE_1];
+        float *slot = logits + row * SEISMIC_LOGITS_STRIDE_0 + token * SEISMIC_LOGITS_STRIDE_1;
+        float value = *slot;
         if (count > 0) {
             value = value < 0.0f ? value * repetition : value / repetition;
             value = value - presence - frequency * (float)count;
@@ -122,7 +123,7 @@ extern "C" __global__ void shape_rows_prepare(SEISMIC_KERNEL_PARAMS) {
             value = -INF;
         if (temperature != 0.0f)
             value = value / temperature;
-        out[row * SEISMIC_OUT_STRIDE_0 + token * SEISMIC_OUT_STRIDE_1] = value;
+        *slot = value;
         if (finite(value))
             maximum = max(maximum, ordered_key(value));
         else if (value != -INF)
@@ -241,7 +242,7 @@ __device__ bool select_key(const Survivor &survivor, u64 target, u32 &key_out, u
 
 extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
     const float *params = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_PARAMS));
-    const float *out = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT));
+    const float *logits = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_LOGITS));
     __shared__ u64 histogram[BINS];
     __shared__ u64 lane_totals[32];
     __shared__ u64 reduce[32];
@@ -261,7 +262,7 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
             selection->maximum = UNSHAPED;
         return;
     }
-    Survivor survivor{out + row * SEISMIC_OUT_STRIDE_0, SEISMIC_OUT_STRIDE_1, key_value(maximum), 0u, 0.0f};
+    Survivor survivor{logits + row * SEISMIC_LOGITS_STRIDE_0, SEISMIC_LOGITS_STRIDE_1, key_value(maximum), 0u, 0.0f};
     u32 top_k_key = 0u;
     u64 above;
     if (top_k > 0 && (u64)top_k < SEISMIC_DIM_V && maximum != 0u) {
@@ -341,7 +342,7 @@ extern "C" __global__ void shape_rows_select(SEISMIC_KERNEL_PARAMS) {
 
 extern "C" __global__ void shape_rows_apply(SEISMIC_KERNEL_PARAMS) {
     const float *params = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_PARAMS));
-    float *out = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT));
+    float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_LOGITS));
     const u64 row = blockIdx.y;
     const u64 part = blockIdx.x;
     if (parameter(params, row, 0) == 0.0f)
@@ -353,7 +354,7 @@ extern "C" __global__ void shape_rows_apply(SEISMIC_KERNEL_PARAMS) {
     const float maximum = key_value(selection.maximum);
     const float min_p = parameter(params, row, 3);
     for (u64 token = slice_begin(part) + threadIdx.x; token < slice_end(part); token += blockDim.x) {
-        float *slot = out + row * SEISMIC_OUT_STRIDE_0 + token * SEISMIC_OUT_STRIDE_1;
+        float *slot = logits + row * SEISMIC_LOGITS_STRIDE_0 + token * SEISMIC_LOGITS_STRIDE_1;
         const float value = *slot;
         if (!finite(value))
             continue;

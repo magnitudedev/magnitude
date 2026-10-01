@@ -1386,7 +1386,6 @@ fn cuda_shape_rows_match_portable_semantics() {
             }
         })
         .collect();
-    let logits_tensor = f32_tensor(&device, &[sx as u64, v as u64], &logits);
     let params_tensor = f32_tensor(&device, &[sx as u64, 8], &rows.concat());
     let history_tensor = i32_tensor(&device, &[sx as u64, hn as u64], &history);
     // Unconstrained rows: their empty masks are never read.
@@ -1398,7 +1397,8 @@ fn cuda_shape_rows_match_portable_semantics() {
     let constrained_tensor = i32_tensor(&device, &[sx as u64], &vec![0; sx]);
     for parts in [32u64, 64, 128] {
         for width in [256u64, 512] {
-            let mut out = f32_tensor(&device, &[sx as u64, v as u64], &vec![0.0; sx * v]);
+            // Shaped in place: every configuration shapes fresh logits.
+            let mut shaped = f32_tensor(&device, &[sx as u64, v as u64], &logits);
             shape_rows::native_for_device(
                 &device,
                 &NativeSpecialization::new()
@@ -1409,15 +1409,14 @@ fn cuda_shape_rows_match_portable_semantics() {
             )
             .unwrap()
             .call(shape_rows::Args {
-                logits: &logits_tensor,
+                logits: &mut shaped,
                 mask: &mask_tensor,
                 constrained: &constrained_tensor,
                 params: &params_tensor,
                 history: &history_tensor,
-                out: &mut out,
             })
             .unwrap();
-            let actual = read_f32(&out);
+            let actual = read_f32(&shaped);
             for (row, params) in rows.iter().enumerate() {
                 let expected = shape_host(
                     &logits[row * v..(row + 1) * v],

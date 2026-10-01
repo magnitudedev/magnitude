@@ -261,6 +261,7 @@ impl NativeGraphDraft {
             port_placements: storage.port_placements,
             placements: storage.placements,
             scratch_bytes: storage.scratch_bytes,
+            scratch_floor_bytes: storage.scratch_floor_bytes,
             output_bytes: storage.output_bytes,
             upload_bytes: storage.upload_bytes,
         })
@@ -1098,12 +1099,6 @@ impl Placement {
     }
 }
 
-struct ScratchBlock {
-    offset: u64,
-    capacity: u64,
-    live_until: usize,
-}
-
 #[derive(Clone, Copy)]
 enum StorageKey {
     Port(usize),
@@ -1117,6 +1112,8 @@ struct StoragePlan {
     placements: Vec<Vec<Placement>>,
     node_scratch: Vec<Vec<u64>>,
     scratch_bytes: u64,
+    /// The most workspace bytes live at one step: no placement fits in less.
+    scratch_floor_bytes: u64,
     output_bytes: u64,
     upload_bytes: u64,
 }
@@ -1129,16 +1126,89 @@ struct Interval {
     exported: bool,
 }
 
+impl Interval {
+    /// Whether the two buffers are live at a common step. Endpoints count:
+    /// a node's inputs end and its results start at the same step, so they
+    /// never alias.
+    fn overlaps(&self, other: &Interval) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+}
+
 fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
 }
 
+/// The most bytes of `intervals` live at one step: the size no placement of
+/// them can go below.
+fn liveness_floor(intervals: &[&Interval]) -> u64 {
+    let mut events = intervals
+        .iter()
+        .flat_map(|interval| {
+            [
+                (interval.start, interval.bytes as i128),
+                (interval.end + 1, -(interval.bytes as i128)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    events.sort_unstable();
+    let mut live = 0i128;
+    let mut floor = 0i128;
+    let mut index = 0;
+    while index < events.len() {
+        let step = events[index].0;
+        while index < events.len() && events[index].0 == step {
+            live += events[index].1;
+            index += 1;
+        }
+        floor = floor.max(live);
+    }
+    u64::try_from(floor).expect("live workspace bytes fit u64")
+}
+
+/// Offsets of `intervals` in one arena, and the arena's size. Largest first,
+/// each buffer takes the lowest aligned offset that overlaps no placed buffer
+/// whose lifetime overlaps its own. Ties keep the intervals' order, so the
+/// placement is deterministic.
+fn place_by_liveness(intervals: &[&Interval]) -> (Vec<u64>, u64) {
+    let mut order = (0..intervals.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| std::cmp::Reverse(intervals[index].bytes));
+    let mut offsets = vec![0u64; intervals.len()];
+    let mut placed: Vec<usize> = Vec::with_capacity(intervals.len());
+    let mut size = 0u64;
+    for index in order {
+        let interval = intervals[index];
+        let mut occupied = placed
+            .iter()
+            .filter(|&&other| intervals[other].overlaps(interval))
+            .map(|&other| (offsets[other], offsets[other] + intervals[other].bytes))
+            .collect::<Vec<_>>();
+        occupied.sort_unstable();
+        let mut offset = 0u64;
+        for (start, end) in occupied {
+            if offset
+                .checked_add(interval.bytes)
+                .expect("native graph storage overflow")
+                <= start
+            {
+                break;
+            }
+            offset = offset.max(align_up(end, BUFFER_ALIGNMENT));
+        }
+        offsets[index] = offset;
+        size = size.max(offset + interval.bytes);
+        placed.push(index);
+    }
+    (offsets, size)
+}
+
 /// Place graph storage. Results, graph locals and node scratch share one
 /// arena by lifetime (a node's scratch is live across its inputs and
-/// results, so it never aliases them); exports get their own arena; inputs
-/// the host writes go to a per-submission upload region so a later host
-/// write cannot race an earlier submission still reading them. Every buffer
-/// starts at a [`BUFFER_ALIGNMENT`] offset of its region.
+/// results, so it never aliases them), placed by [`place_by_liveness`];
+/// exports get their own arena; inputs the host writes go to a
+/// per-submission upload region so a later host write cannot race an
+/// earlier submission still reading them. Every buffer starts at a
+/// [`BUFFER_ALIGNMENT`] offset of its region.
 fn plan_storage(
     ports: &[PortSpec],
     nodes: &[PlannedNode],
@@ -1224,8 +1294,13 @@ fn plan_storage(
         }
     }
     intervals.sort_by_key(|interval| interval.start);
-    let mut blocks: Vec<ScratchBlock> = Vec::new();
-    let mut cursor = 0u64;
+    let scratch = intervals
+        .iter()
+        .filter(|interval| !interval.exported)
+        .collect::<Vec<_>>();
+    let (scratch_offsets, scratch_bytes) = place_by_liveness(&scratch);
+    let scratch_floor_bytes = liveness_floor(&scratch);
+    let mut scratch_offsets = scratch_offsets.into_iter();
     let mut output_bytes = 0u64;
     let mut placements = results
         .iter()
@@ -1235,7 +1310,7 @@ fn plan_storage(
         .iter()
         .map(|node| vec![0u64; node.scratch.len()])
         .collect::<Vec<_>>();
-    for interval in intervals {
+    for interval in &intervals {
         let placement = if interval.exported {
             let offset = align_up(output_bytes, BUFFER_ALIGNMENT);
             output_bytes = offset
@@ -1243,25 +1318,11 @@ fn plan_storage(
                 .expect("native graph output bytes overflow");
             Placement::Export(offset)
         } else {
-            let reuse = blocks.iter_mut().find(|block| {
-                block.live_until < interval.start && block.capacity >= interval.bytes
-            });
-            let offset = if let Some(block) = reuse {
-                block.live_until = interval.end;
-                block.offset
-            } else {
-                let offset = align_up(cursor, BUFFER_ALIGNMENT);
-                cursor = offset
-                    .checked_add(interval.bytes)
-                    .expect("native graph storage overflow");
-                blocks.push(ScratchBlock {
-                    offset,
-                    capacity: interval.bytes,
-                    live_until: interval.end,
-                });
-                offset
-            };
-            Placement::Scratch(offset)
+            Placement::Scratch(
+                scratch_offsets
+                    .next()
+                    .expect("every scratch interval is placed"),
+            )
         };
         match (interval.key, placement) {
             (StorageKey::Port(ordinal), _) => port_placements[ordinal] = Some(placement),
@@ -1276,7 +1337,8 @@ fn plan_storage(
         port_placements,
         placements,
         node_scratch,
-        scratch_bytes: cursor,
+        scratch_bytes,
+        scratch_floor_bytes,
         output_bytes,
         upload_bytes,
     }
@@ -1292,6 +1354,7 @@ pub struct NativeGraphPlan {
     port_placements: Vec<Option<Placement>>,
     placements: Vec<Vec<Placement>>,
     scratch_bytes: u64,
+    scratch_floor_bytes: u64,
     output_bytes: u64,
     upload_bytes: u64,
 }
@@ -1299,6 +1362,11 @@ pub struct NativeGraphPlan {
 impl NativeGraphPlan {
     pub fn workspace_bytes(&self) -> u64 {
         self.scratch_bytes
+    }
+    /// The most workspace bytes live at one step of the plan's placement:
+    /// no placement fits in less.
+    pub fn workspace_floor_bytes(&self) -> u64 {
+        self.scratch_floor_bytes
     }
     pub fn output_bytes(&self) -> u64 {
         self.output_bytes
@@ -1523,6 +1591,16 @@ impl NativeGraphFamily {
         self.workspace_bytes
     }
 
+    /// The largest liveness floor of the family's plans: the workspace no
+    /// placement of them fits in less than.
+    pub fn workspace_floor_bytes(&self) -> u64 {
+        self.plans
+            .iter()
+            .map(|plan| plan.scratch_floor_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn output_bytes(&self) -> u64 {
         self.output_bytes
     }
@@ -1539,7 +1617,7 @@ impl NativeGraphFamily {
         })
     }
 
-    /// A slot with its scratch arena and `regions` upload regions, all
+    /// A slot with its own scratch arena and `regions` upload regions, all
     /// allocated here: one region per graph run the slot's owner keeps in
     /// flight at once. A family whose plans write no input allocates none.
     pub fn new_slot(
@@ -1555,23 +1633,99 @@ impl NativeGraphFamily {
             write_zeros(allocation.storage(), self.workspace_bytes)?;
             Some(allocation)
         };
-        let uploads = if self.upload_bytes == 0 {
-            Vec::new()
-        } else {
-            (0..regions)
-                .map(|_| {
-                    self.device
-                        .allocate_upload(self.upload_bytes, BUFFER_ALIGNMENT)
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        };
         Ok(NativeGraphFamilySlot {
             family: self.clone(),
             scratch,
-            uploads,
+            uploads: self.upload_regions(regions)?,
             next_upload: 0,
             lent_locals: Vec::new(),
         })
+    }
+
+    /// A slot whose workspace is the shared `arena`, with `regions` upload
+    /// regions of its own. The arena must hold this family's workspace, and
+    /// no plan of the family may keep a value in workspace between runs: a
+    /// prewritten port is refused, since another family's graph rewrites
+    /// the arena before this family's next run.
+    pub fn new_slot_in(
+        self: &Arc<Self>,
+        arena: &NativeExecutionArena,
+        regions: usize,
+    ) -> Result<NativeGraphFamilySlot, WorkflowError> {
+        if !Arc::ptr_eq(&arena.device, &self.device) {
+            return Err(WorkflowError::NativeGraphSlotMismatch);
+        }
+        if self.workspace_bytes > arena.bytes {
+            return Err(WorkflowError::NativeArenaTooSmall {
+                required: self.workspace_bytes,
+                capacity: arena.bytes,
+            });
+        }
+        if self
+            .plans
+            .iter()
+            .any(|plan| plan.ports.iter().any(|port| port.prewritten))
+        {
+            return Err(WorkflowError::NativeArenaPrewrittenPort);
+        }
+        Ok(NativeGraphFamilySlot {
+            family: self.clone(),
+            scratch: (self.workspace_bytes != 0)
+                .then(|| arena.allocation.clone())
+                .flatten(),
+            uploads: self
+                .upload_regions(regions)
+                .map_err(WorkflowError::TensorView)?,
+            next_upload: 0,
+            lent_locals: Vec::new(),
+        })
+    }
+
+    fn upload_regions(&self, regions: usize) -> Result<Vec<Arc<Allocation>>, TensorError> {
+        if self.upload_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        (0..regions)
+            .map(|_| {
+                Ok(self
+                    .device
+                    .allocate_upload(self.upload_bytes, BUFFER_ALIGNMENT)?)
+            })
+            .collect()
+    }
+}
+
+/// One device's graph workspace, shared by every family slot created in it.
+/// A device executes one submission at a time, in submission order, and a
+/// graph's workspace holds only the values of its own run, so graphs bound
+/// to one arena never use it at once: the device needs one workspace the
+/// size of its largest family's, whatever the families and launches in
+/// flight.
+#[derive(Clone)]
+pub struct NativeExecutionArena {
+    device: Arc<DeviceInner>,
+    allocation: Option<Arc<Allocation>>,
+    bytes: u64,
+}
+
+impl NativeExecutionArena {
+    pub fn new(device: &Arc<DeviceInner>, bytes: u64) -> Result<Self, TensorError> {
+        let allocation = if bytes == 0 {
+            None
+        } else {
+            let allocation = device.allocate(bytes, BUFFER_ALIGNMENT)?;
+            write_zeros(allocation.storage(), bytes)?;
+            Some(allocation)
+        };
+        Ok(Self {
+            device: device.clone(),
+            allocation,
+            bytes,
+        })
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
     }
 }
 
@@ -2202,5 +2356,104 @@ mod layout_certificate_tests {
             certified.storage_for(&ports, &nodes, &results, &[]),
             Err(WorkflowError::NativeGraphLayoutMismatch)
         ));
+    }
+}
+
+#[cfg(test)]
+mod liveness_placement_tests {
+    use super::*;
+
+    fn interval(start: usize, end: usize, bytes: u64) -> Interval {
+        Interval {
+            key: StorageKey::Result(0, 0),
+            start,
+            end,
+            bytes,
+            exported: false,
+        }
+    }
+
+    fn place(intervals: &[Interval]) -> (Vec<u64>, u64) {
+        place_by_liveness(&intervals.iter().collect::<Vec<_>>())
+    }
+
+    fn floor(intervals: &[Interval]) -> u64 {
+        liveness_floor(&intervals.iter().collect::<Vec<_>>())
+    }
+
+    fn assert_disjoint(intervals: &[Interval], offsets: &[u64]) {
+        for (a, first) in intervals.iter().enumerate() {
+            for (b, second) in intervals.iter().enumerate().skip(a + 1) {
+                if first.overlaps(second) {
+                    let (x, y) = (offsets[a], offsets[b]);
+                    assert!(
+                        x + first.bytes <= y || y + second.bytes <= x,
+                        "live buffers {a} and {b} alias"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn buffers_with_disjoint_lifetimes_share_storage() {
+        let intervals = [interval(0, 1, 1024), interval(2, 3, 1024)];
+        let (offsets, size) = place(&intervals);
+        assert_eq!(offsets, vec![0, 0]);
+        assert_eq!(size, 1024);
+    }
+
+    #[test]
+    fn a_shared_endpoint_is_an_overlap() {
+        // A node's inputs end where its results start.
+        let intervals = [interval(0, 3, 512), interval(3, 5, 512)];
+        let (offsets, size) = place(&intervals);
+        assert_disjoint(&intervals, &offsets);
+        assert_eq!(size, 1024);
+    }
+
+    #[test]
+    fn freed_neighbours_serve_one_larger_buffer() {
+        // Two small buffers die, then one buffer as large as both together
+        // is born. First-fit block reuse cannot combine the two freed blocks;
+        // placement by liveness reaches the peak of live bytes.
+        let intervals = [
+            interval(0, 1, 2048),
+            interval(0, 1, 2048),
+            interval(2, 3, 4096),
+        ];
+        let (offsets, size) = place(&intervals);
+        assert_disjoint(&intervals, &offsets);
+        assert_eq!(size, 4096);
+        assert_eq!(floor(&intervals), 4096);
+    }
+
+    #[test]
+    fn a_long_lived_buffer_does_not_strand_a_large_block() {
+        // A small long-lived buffer born while a large one is free must not
+        // take the large block's offset ahead of a later large buffer.
+        let intervals = [
+            interval(0, 1, 8192),
+            interval(2, 9, 256),
+            interval(3, 4, 8192),
+        ];
+        let (offsets, size) = place(&intervals);
+        assert_disjoint(&intervals, &offsets);
+        assert_eq!(size, 8192 + 256);
+        assert_eq!(floor(&intervals), 8192 + 256);
+    }
+
+    #[test]
+    fn placement_is_deterministic() {
+        let intervals = [
+            interval(0, 4, 1000),
+            interval(1, 2, 1000),
+            interval(3, 6, 1000),
+            interval(5, 7, 3000),
+        ];
+        assert_eq!(place(&intervals), place(&intervals));
+        let (offsets, _) = place(&intervals);
+        assert_disjoint(&intervals, &offsets);
+        assert!(offsets.iter().all(|offset| offset % BUFFER_ALIGNMENT == 0));
     }
 }

@@ -274,14 +274,20 @@ impl AssessmentGraphResourceBounds {
             .checked_add(head_constant_bytes)
             .and_then(|bytes| bytes.checked_add(vision_constant_bytes))
             .ok_or("checked graph constant charge overflow")?;
-        let total_bytes = target
-            .committed_bytes
-            .checked_add(readout.committed_bytes)
-            .and_then(|bytes| bytes.checked_add(head.map_or(0, |charge| charge.committed_bytes)))
-            .and_then(|bytes| bytes.checked_add(vision.map_or(0, |charge| charge.committed_bytes)))
-            .and_then(|bytes| bytes.checked_add(state.committed_bytes))
-            .and_then(|bytes| bytes.checked_add(binding_constant_bytes))
-            .ok_or("checked graph resource bound overflow")?;
+        let total_bytes = super::resources::graph_scratch_bytes(
+            &[
+                Some(&target),
+                Some(&readout),
+                head.as_ref(),
+                vision.as_ref(),
+                Some(&state),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        )?
+        .checked_add(binding_constant_bytes)
+        .ok_or("checked graph resource bound overflow")?;
         Ok(Self {
             target,
             readout,
@@ -421,18 +427,26 @@ impl AssessmentMemoryTerms {
         })
     }
 
-    /// The clean-load charge of each memory role: the allocation domain holds
-    /// the resident terms, every prepared resource and the startup peak; a
-    /// dedicated device's staging domain holds its host upload window.
+    /// The charge of each memory role. The allocation domain holds the
+    /// weights and every prepared resource, plus the larger of two phases
+    /// that never coexist: the workload's state at the fit depth, which grows
+    /// only after the load is ready, and the load itself, its startup state
+    /// with the qualification/import peak. A dedicated device's staging
+    /// domain holds its host upload window.
     pub fn charge(
         self,
         bounds: AssessmentMemoryBounds,
         state_slab_bytes: u64,
+        startup_state_bytes: u64,
     ) -> Result<AssessmentMemoryCharge, String> {
         let exact_resident_bytes = self.exact_resident_bytes(state_slab_bytes)?;
-        let allocation_bytes = exact_resident_bytes
+        let loading_bytes = startup_state_bytes
+            .checked_add(bounds.startup_additional_bytes)
+            .ok_or("assessment startup charge overflow")?;
+        let allocation_bytes = self
+            .exact_resident_bytes(0)?
             .checked_add(bounds.prepared_resource_bytes)
-            .and_then(|bytes| bytes.checked_add(bounds.startup_additional_bytes))
+            .and_then(|bytes| bytes.checked_add(state_slab_bytes.max(loading_bytes)))
             .ok_or("assessment allocation charge overflow")?;
         Ok(AssessmentMemoryCharge {
             exact_resident_bytes,
@@ -675,7 +689,9 @@ mod tests {
         let limits = crate::ResourceLimits {
             max_launch_rows: 2,
             max_launch_slots: 2,
-            max_projected_rows: 2,
+            max_selected_rows: 2,
+            max_drafting_slots: 2,
+            exported_logits_rows: 0,
             max_images_per_request: 1,
             lookahead: false,
         };
@@ -822,7 +838,9 @@ mod tests {
         let limits = crate::ResourceLimits {
             max_launch_rows: 16,
             max_launch_slots: 2,
-            max_projected_rows: 2,
+            max_selected_rows: 2,
+            max_drafting_slots: 2,
+            exported_logits_rows: 0,
             max_images_per_request: 1,
             lookahead: false,
         };
@@ -1138,7 +1156,6 @@ mod tests {
                 2,
                 1,
                 1,
-                1,
                 shaped,
             )
             .unwrap()
@@ -1167,7 +1184,9 @@ mod tests {
         let limits = crate::ResourceLimits {
             max_launch_rows: 2,
             max_launch_slots: 2,
-            max_projected_rows: 2,
+            max_selected_rows: 2,
+            max_drafting_slots: 2,
+            exported_logits_rows: 0,
             max_images_per_request: 0,
             lookahead: false,
         };
@@ -1344,7 +1363,9 @@ mod tests {
         crate::ResourceLimits {
             max_launch_rows: 2,
             max_launch_slots: 2,
-            max_projected_rows: 2,
+            max_selected_rows: 2,
+            max_drafting_slots: 2,
+            exported_logits_rows: 0,
             max_images_per_request: 1,
             lookahead,
         }
@@ -1465,12 +1486,13 @@ mod tests {
             history_layout.address_table_bytes + history_slabs * history_layout.slab_bytes
         );
         assert!(state_bytes > terms.history_at_fit_depth().unwrap());
-        let charge = terms.charge(bounds, state_bytes).unwrap();
+        let startup_state = state.startup_state_bytes().unwrap();
+        let charge = terms.charge(bounds, state_bytes, startup_state).unwrap();
         assert_eq!(
             charge.allocation_bytes,
-            terms.exact_resident_bytes(state_bytes).unwrap()
+            terms.exact_resident_bytes(0).unwrap()
                 + bounds.prepared_resource_bytes
-                + bounds.startup_additional_bytes
+                + state_bytes.max(startup_state + bounds.startup_additional_bytes)
         );
         assert_eq!(charge.staging_bytes, header.staging_upload_bytes);
 
@@ -1519,20 +1541,22 @@ mod tests {
             host_table_bytes: 30,
         };
         assert_eq!(terms.exact_resident_bytes(50).unwrap(), 100 + 20 + 5 + 50);
-        let charge = terms
-            .charge(
-                AssessmentMemoryBounds {
-                    prepared_resource_bytes: 40,
-                    startup_additional_bytes: 60,
-                    staging_upload_bytes: 7,
-                },
-                50,
-            )
-            .unwrap();
-        assert_eq!(charge.exact_resident_bytes, 175);
-        assert_eq!(charge.allocation_bytes, 275);
+        let bounds = AssessmentMemoryBounds {
+            prepared_resource_bytes: 40,
+            startup_additional_bytes: 60,
+            staging_upload_bytes: 7,
+        };
+        // The workload's state outgrows the load's startup state and peak:
+        // the peak is not charged on top of it.
+        let charge = terms.charge(bounds, 90, 10).unwrap();
+        assert_eq!(charge.exact_resident_bytes, 100 + 20 + 5 + 90);
+        assert_eq!(charge.allocation_bytes, 125 + 40 + 90);
         assert_eq!(charge.staging_bytes, 7);
-        assert!(terms.charge(charge.bounds, u64::MAX).is_err());
+        // The load's startup state and peak exceed the workload's state.
+        let loading = terms.charge(bounds, 50, 10).unwrap();
+        assert_eq!(loading.allocation_bytes, 125 + 40 + (10 + 60));
+        assert!(terms.charge(bounds, u64::MAX, 10).is_err());
+        assert!(terms.charge(bounds, 50, u64::MAX).is_err());
         assert!(AssessmentMemoryTerms {
             history_per_token: u64::MAX,
             ..terms

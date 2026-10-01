@@ -162,9 +162,12 @@ Standalone native calls use the same checked entry without creating a graph. The
 slots and scratch are the prepared kernel's invocation workspace, which reports both.
 A native graph composes checked native entries, owns the shapes and lifetimes of
 its graph-local mutable tensors, host-uploaded input tensors, intermediate results, and exported
-outputs, and reports its exact storage charge. Compatible workflow variants may share a bounded
-physical scratch arena. They are prepared for admitted model dimensions and physical launch
-classes before the engine becomes ready. Request-dependent external state and resident tensors
+outputs, and reports its exact storage charge and the liveness floor its workspace cannot go
+below. Graph-local storage is placed by liveness, largest buffer first at the lowest offset no
+buffer of overlapping lifetime holds. Native graphs are prepared for admitted model dimensions and
+physical launch classes before the engine becomes ready. Workflow families may bind one shared
+execution arena: a device runs one submission at a time in order, so graphs that keep no value in
+workspace between runs share it; a family with a prewritten port owns its workspace. Request-dependent external state and resident tensors
 are joined to checked ports while constructing an owned run, before submission. A submitted run
 does not discover an absent tensor, incompatible shape, representation, or alias.
 The checked entry is also the source of tensor-port and result-leaf extents for

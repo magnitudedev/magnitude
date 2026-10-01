@@ -40,6 +40,7 @@ fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
                 .map(|codec| codec.parse::<KvCodec>().unwrap())
                 .unwrap_or(KvCodec::AffineK8V4),
             lookahead: false,
+            exported_logits_rows: 64,
         },
         context_tokens: Some(8192),
         service: ServiceLimits {

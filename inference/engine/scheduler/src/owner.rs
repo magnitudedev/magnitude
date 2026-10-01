@@ -92,6 +92,19 @@ fn next_stop(record: &Record, generation: &Generation, position: usize) -> Optio
         .min()
 }
 
+/// The selection bound `operations` spend: every selected target row, and one
+/// per drafting request.
+fn selection_charge(operations: &[Operation]) -> usize {
+    operations
+        .iter()
+        .map(|operation| match operation {
+            Operation::Forward { select, .. } => select.len(),
+            Operation::Head { proposals, .. } => usize::from(!proposals.is_empty()),
+            Operation::Encode { .. } => 0,
+        })
+        .sum()
+}
+
 /// Whether `generation` is resident, unfinished, and not yet past `position`.
 fn prefilling_toward(generation: &Generation, position: usize) -> bool {
     generation.is_resident()
@@ -291,6 +304,15 @@ enum Candidate {
 }
 
 impl Candidate {
+    /// The operations already composed for this candidate, which join a
+    /// round as they are.
+    fn composed(&self) -> Option<&[Operation]> {
+        match self {
+            Self::Pending(_, work) | Self::Parked(_, work) => Some(&work.0),
+            Self::NonResident(_) | Self::Ready(_) => None,
+        }
+    }
+
     fn generation(&self) -> &Generation {
         match self {
             Self::NonResident(generation) | Self::Ready(generation) | Self::Pending(generation, _) => {
@@ -1519,6 +1541,11 @@ impl<F: ProgramFamily> Service<F> {
             Phase::Prefill => self.scheduler.limits().prefill_tokens,
             Phase::Decode => self.scheduler.limits().decode_tokens,
         };
+        // The round's vocabulary work: selected target rows and drafting
+        // requests together stay within the selection bound. Every such
+        // charge also takes a row from the decode budget, so only a prefill
+        // round finishing more prompts than the bound meets it.
+        let mut remaining_selections = self.scheduler.limits().selection_bound();
         let mut attempted = 0;
         let mut members = BTreeMap::new();
         let mut operations = Vec::new();
@@ -1532,7 +1559,28 @@ impl<F: ProgramFamily> Service<F> {
             let allowance = remaining_rows.div_ceil(selection.requests().len() - attempted);
             attempted += 1;
             let (record, candidate) = candidates.remove(&id).expect("selected candidate");
-            match self.start(id, record, candidate, allowance, bindings)? {
+            // Work composed before this round joins as it is, or waits.
+            if candidate
+                .composed()
+                .is_some_and(|work| selection_charge(work) > remaining_selections)
+            {
+                self.requests.insert(
+                    id,
+                    Request {
+                        record,
+                        state: candidate.into_state(),
+                    },
+                );
+                continue;
+            }
+            match self.start(
+                id,
+                record,
+                candidate,
+                allowance,
+                remaining_selections,
+                bindings,
+            )? {
                 Start::Joined(member, mut next) => {
                     let rows = next
                         .iter()
@@ -1542,6 +1590,16 @@ impl<F: ProgramFamily> Service<F> {
                         .map(Operation::row_count)
                         .sum::<usize>();
                     remaining_rows = remaining_rows.saturating_sub(rows);
+                    remaining_selections = remaining_selections
+                        .checked_sub(selection_charge(&next))
+                        .ok_or_else(|| {
+                            (
+                                None,
+                                invariant("scheduler")(
+                                    "a started member exceeds the round's selection bound".into(),
+                                ),
+                            )
+                        })?;
                     operations.append(&mut next);
                     members.insert(id, member);
                 }
@@ -1585,6 +1643,7 @@ impl<F: ProgramFamily> Service<F> {
         mut record: Record,
         candidate: Candidate,
         allowance: usize,
+        selections: usize,
         bindings: &mut StateBindings<F>,
     ) -> Result<Start, Fatal> {
         let generation = match candidate {
@@ -1630,7 +1689,7 @@ impl<F: ProgramFamily> Service<F> {
                 }
             }
         };
-        self.start_round(id, record, generation, allowance)
+        self.start_round(id, record, generation, allowance, selections)
             .map_err(|error| (None, error))
     }
 
@@ -1640,6 +1699,7 @@ impl<F: ProgramFamily> Service<F> {
         mut record: Record,
         generation: Generation,
         allowance: usize,
+        selections: usize,
     ) -> Result<Start, RequestError> {
         let fail = |mut record: Record, mut generation: Generation, detail: String| {
             Self::fail_generation(
@@ -1672,6 +1732,26 @@ impl<F: ProgramFamily> Service<F> {
         let resident = generation.resident_position();
         let allowance = next_stop(&record, &generation, resident)
             .map_or(allowance, |stop| allowance.min(stop - resident));
+        // With the round's selection bound spent, a chunk that would reach
+        // the end of the prompt (and select there) stops one row short and
+        // finishes in a later round; with no row left before the end, the
+        // request waits. Decode never gets here with the bound spent.
+        let allowance = if selections == 0 {
+            allowance.min(
+                generation
+                    .resume_bound()
+                    .saturating_sub(1)
+                    .saturating_sub(resident),
+            )
+        } else {
+            allowance
+        };
+        if allowance == 0 {
+            return Ok(Start::Returned(Request {
+                record,
+                state: State::Between(generation, Stage::Ready),
+            }));
+        }
         let bound = match generation.publication_bound(allowance) {
             Ok(bound) => bound,
             Err(detail) => return Ok(fail(record, generation, detail)),

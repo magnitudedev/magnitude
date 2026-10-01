@@ -102,6 +102,11 @@ execution time to decide how many rounds belong between chunks.
 - A decode round advances ready generations in scheduling order until its
   aggregate token allowance is spent. Remaining generations wait for the next
   round. Compatible operations run together; incompatible groups run separately.
+- Every round also spends a selection budget, the decode allowance: a selected
+  row or a drafting request takes one. A decode round never exhausts it before
+  its token allowance. A prompt chunk that would finish its prompt with the
+  budget spent stops one row before the prompt's end and finishes in a later
+  round.
 - A prompt service shares one aggregate token allowance across admitted unfinished
   prompts compatible with the oldest admitted prompt, in FIFO order. Compatibility
   comes from the live generation/model contract; an unbatchable prompt keeps the

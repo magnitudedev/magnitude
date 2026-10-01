@@ -454,12 +454,12 @@ pub(crate) struct ShapeRowsTuning {
 }
 
 pub(crate) struct ShapeRowsCase {
-    logits: Tensor,
+    /// Shaped in place, so every run restores the raw logits.
+    logits: CaseState,
     mask: Tensor,
     constrained: Tensor,
     params: Tensor,
     history: Tensor,
-    out: CaseState,
 }
 
 impl EntryTuning for ShapeRowsTuning {
@@ -498,10 +498,9 @@ impl EntryTuning for ShapeRowsTuning {
                 i32::try_from(index * 7919 % vocabulary).map_err(|_| "vocabulary exceeds i32")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let out = inputs.scratch(Element::f32(), &[rows, vocabulary])?;
         let words = vocabulary.div_ceil(32);
         Ok(vec![ShapeRowsCase {
-            logits: logits(inputs, rows, vocabulary, 1)?,
+            logits: inputs.state(logits(inputs, rows, vocabulary, 1)?, 0..rows)?,
             // Every other row constrained: both the masked and the free
             // path are measured.
             mask: inputs.u32s(&[rows, words], &vec![u32::MAX; (rows * words) as usize])?,
@@ -511,23 +510,21 @@ impl EntryTuning for ShapeRowsTuning {
             )?,
             params: inputs.f32s(&[rows, SHAPING_WIDTH as u64], &params)?,
             history: inputs.i32s(&[rows, HISTORY_WIDTH as u64], &history)?,
-            out: inputs.state(out, 0..rows)?,
         }])
     }
 
     fn args<'a>(case: &'a mut Self::Case) -> shape_rows::Args<'a> {
         shape_rows::Args {
-            logits: &case.logits,
+            logits: case.logits.tensor_mut(),
             mask: &case.mask,
             constrained: &case.constrained,
             params: &case.params,
             history: &case.history,
-            out: case.out.tensor_mut(),
         }
     }
 
     fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
-        vec![("out", &case.out)]
+        vec![("logits", &case.logits)]
     }
 
     generated_entry!(shape_rows);

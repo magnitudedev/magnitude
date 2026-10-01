@@ -13,6 +13,7 @@ use magnitude_chat::{request::ImageInput, ByteBpeTokenizer, SpecialTokens};
 use magnitude_engine::{
     build_native_domain,
     composition::{EngineConfiguration, ResolvedEngineConfiguration},
+    host::HostArtifacts,
     options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_executor::{
@@ -29,7 +30,7 @@ use magnitude_scheduler::{
     prefix_cache::{PrefixCacheCapacity, PrefixRetention, MIN_PREFIX_HIT},
     ServiceLimits,
 };
-use magnitude_state::KvCodec;
+use magnitude_state::{KvCodec, ShrinkPolicy};
 use owner_host::Host;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -58,6 +59,7 @@ fn resolved(projector: bool) -> ResolvedEngineConfiguration {
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
+            exported_logits_rows: 512,
         },
         context_tokens: Some(CONTEXT),
         service: limits(),
@@ -505,15 +507,9 @@ fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
 }
 
-/// A request with an image keeps its input across eviction: replay
-/// re-encodes the image and reaches the same logits as an uninterrupted run.
-/// A request resuming from a cached prefix past the image needs no encode
-/// and reaches them too.
-#[test]
-#[ignore = "requires a Metal or CUDA device, MAGNITUDE_TEST_GGUF and MAGNITUDE_TEST_MMPROJ"]
-fn image_conditioning_survives_eviction_and_cached_resumption() {
-    let resolved = resolved(true);
-    let host = &resolved.host;
+/// A prompt with one image (`VISION_IMAGE`, or llama.cpp's `test-1.jpeg`)
+/// between two sentences.
+fn image_prompt(host: &HostArtifacts) -> PreparedModelInput {
     let placeholder = host.media_placeholder().expect("a model with a projector");
     let image = ImageInput {
         media_type: "image/jpeg".into(),
@@ -535,7 +531,66 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
             SpecialTokens::Recognize,
         )
         .unwrap();
-    let input = host.prepare_input(tokens, &[image]).unwrap();
+    host.prepare_input(tokens, &[image]).unwrap()
+}
+
+/// Vision holds no activation or output until an image arrives: an image
+/// claims them, idle shrink releases them, and every image claims and
+/// releases the same bytes.
+#[test]
+#[ignore = "requires a Metal or CUDA device, MAGNITUDE_TEST_GGUF and MAGNITUDE_TEST_MMPROJ"]
+fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
+    let resolved = resolved(true);
+    let input = image_prompt(&resolved.host);
+    let (mut domain, mut bindings, _) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+    let charged = |domain: &ExecutorDomain| domain.resources().device().memory_usage().charged;
+    let mut cycles = Vec::new();
+    for request in [RequestId(1), RequestId(2)] {
+        domain.install_input(request, input.clone()).unwrap();
+        let encodes = domain.open_state(&mut bindings, request, None).unwrap();
+        assert_eq!(encodes.len(), 1);
+        let opened = charged(&domain);
+        bindings = encode(&mut domain, bindings, encodes);
+        let encoded = charged(&domain);
+        assert!(encoded > opened, "the image claimed no vision storage");
+        domain.close(request).unwrap();
+        let released = domain
+            .shrink_state(&mut bindings, ShrinkPolicy::Idle)
+            .unwrap();
+        let idle = charged(&domain);
+        assert_eq!(encoded - idle, released);
+        assert!(released > 0, "idle released no vision storage");
+        let accounted = domain.reconcile_memory_charge(&[]).unwrap();
+        assert_eq!(accounted.unattributed, 0, "{accounted:?}");
+        eprintln!(
+            "vision cycle: opened={opened} encoded={encoded} idle={idle} released={released}"
+        );
+        cycles.push((encoded - opened, released, idle));
+    }
+    // The first image also loads the vision weights, which stay resident
+    // until optional components are released; the second claims only the
+    // slots, and idle releases exactly them both times.
+    let [(_, first_released, first_idle), (second_claimed, second_released, second_idle)] =
+        cycles[..]
+    else {
+        unreachable!("two cycles")
+    };
+    assert_eq!(second_claimed, second_released, "idle kept vision storage");
+    assert_eq!(first_released, second_released);
+    assert_eq!(first_idle, second_idle);
+}
+
+/// A request with an image keeps its input across eviction: replay
+/// re-encodes the image and reaches the same logits as an uninterrupted run.
+/// A request resuming from a cached prefix past the image needs no encode
+/// and reaches them too.
+#[test]
+#[ignore = "requires a Metal or CUDA device, MAGNITUDE_TEST_GGUF and MAGNITUDE_TEST_MMPROJ"]
+fn image_conditioning_survives_eviction_and_cached_resumption() {
+    let resolved = resolved(true);
+    let host = &resolved.host;
+    let input = image_prompt(host);
     let [span] = input.layout().spans() else {
         panic!("one image span")
     };
