@@ -1272,15 +1272,24 @@ pub fn tune(request: TuneRequest<'_>) -> Result<TuningResult, TuneError> {
     if let Strategy::Survey(plan) = &strategy {
         widen(&mut implementation, &plan.domains)?;
     }
-    let default = implementation
-        .default_specialization(&statics)
-        .map_err(|error| TuneError::Declaration(error.to_string()))?;
     // Every configuration formed below is this one entry at these bindings.
     let logical = Arc::new(
         module
             .entry(entry, &bindings)
             .map_err(|error| TuneError::Declaration(error.to_string()))?,
     );
+    // Held so the reference and the search reuse its formed programs.
+    let (default, _launchable) = launchable_default(
+        device,
+        module,
+        entry,
+        &logical,
+        &bindings,
+        cpu,
+        &implementation,
+        &statics,
+        &points,
+    )?;
     let mutable = mutable_parameters(&logical);
     if let (Some((_, parameter)), Some(point)) = (
         mutable.first(),
@@ -2691,6 +2700,78 @@ fn mutable_parameters(logical: &LogicalEntry) -> Vec<(usize, String)> {
         })
         .map(|(ordinal, parameter)| (ordinal, parameter.name.clone()))
         .collect()
+}
+
+/// The configuration tuning starts from and validates against, formed: the
+/// declared defaults when every launch at every point fits its formed program
+/// on this device, else the admissible configuration nearest them that does.
+/// A program's thread limit is known only once formed (Apple M1/M2 pipelines
+/// under register pressure admit fewer than the device's 1024), so declaration
+/// order alone cannot guarantee the defaults launch.
+#[allow(clippy::too_many_arguments)]
+fn launchable_default(
+    device: &Arc<DeviceInner>,
+    module: &CheckedModule,
+    entry: EntryId,
+    logical: &Arc<LogicalEntry>,
+    bindings: &ElementBindings,
+    cpu: Option<&'static CpuNativeKernels>,
+    implementation: &NativeImplementation,
+    statics: &NativeSpecialization,
+    points: &[TuningPoint<'_>],
+) -> Result<(NativeSpecialization, Arc<NativePrepared>), TuneError> {
+    let launchable = |specialization: &NativeSpecialization| {
+        let kernel = NativePrepared::prepare_implementation(
+            device,
+            module,
+            entry,
+            logical,
+            bindings.clone(),
+            specialization.clone(),
+            cpu,
+            implementation.clone(),
+        )
+        .map_err(|error| Exclusion::Formation(prepare_message(error)))?;
+        for args in points.iter().flat_map(|point| &point.rotation) {
+            kernel
+                .shape(&args.values())
+                .map_err(|error| Exclusion::Execution(error.to_string()))?;
+        }
+        Ok::<_, Exclusion>(kernel)
+    };
+    let declared = implementation
+        .default_specialization(statics)
+        .map_err(|error| TuneError::Declaration(error.to_string()))?;
+    let refusal = match launchable(&declared) {
+        Ok(kernel) => return Ok((declared, kernel)),
+        Err(exclusion) => exclusion,
+    };
+    let mut candidates = implementation
+        .admissible(statics)
+        .map_err(|error| TuneError::Declaration(error.to_string()))?;
+    // Stable: equally distant candidates keep declaration order.
+    candidates.sort_by_key(|candidate| {
+        let params = candidate
+            .params()
+            .iter()
+            .filter(|(name, value)| declared.param(name) != Some(**value))
+            .count();
+        let launch_params = candidate
+            .launch_params()
+            .iter()
+            .filter(|((launch, name), value)| declared.launch_param(*launch, name) != Some(**value))
+            .count();
+        params + launch_params
+    });
+    candidates
+        .into_iter()
+        .filter(|candidate| *candidate != declared)
+        .find_map(|candidate| {
+            launchable(&candidate)
+                .ok()
+                .map(|kernel| (candidate, kernel))
+        })
+        .ok_or(TuneError::DefaultUnusable(refusal))
 }
 
 pub(super) fn prepare_message(error: PrepareError) -> String {
