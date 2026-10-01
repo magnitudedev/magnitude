@@ -2,6 +2,7 @@ import { execFile } from "node:child_process"
 import { realpath } from "node:fs/promises"
 import { join } from "node:path"
 import { Context, Effect, Layer, Schema } from "effect"
+import { launchdGuiDomainIsAbsent } from "./launchd-gui-domain"
 
 export class MacInstallationObservationFailed extends Schema.TaggedError<MacInstallationObservationFailed>()("MacInstallationObservationFailed", {
   message: Schema.String,
@@ -31,7 +32,7 @@ export const macUpdateJobIsActive = (output: string, executable: string) => Effe
 /** A user without a GUI domain cannot have an updater registered in that domain. */
 export const macUpdateLookupIsActive = (result: typeof Result.Type, executable: string, uid: number) => Effect.gen(function* () {
   if (result.code === 113) return false
-  if (result.code === 112 && result.stderr.trim() === `Bad request.\nCould not find domain for user gui: ${uid}`) return false
+  if (launchdGuiDomainIsAbsent(result, uid)) return false
   if (result.code !== 0) return yield* new MacInstallationObservationFailed({ message: "Could not inspect the native Magnitude update job. Retry the command." })
   return yield* macUpdateJobIsActive(result.stdout, executable)
 })

@@ -41,6 +41,13 @@ describe.skipIf(process.platform === "win32")("legacy macOS startup registration
     expect(Option.getOrThrow(await run(f.adapter.inspect)).enabled).toBe(true)
     expect(f.calls.some(call => call.includes("disable") || call.includes("bootout"))).toBe(false)
   })
+  it("finds no registration when the user has no GUI domain", async () => {
+    const commands = LegacyStartupCommands.of({ run: (_executable, args) => Effect.succeed(args[0] === "print"
+      ? { code: 125, stdout: "", stderr: "Could not print domain: 125: Domain does not support specified action\n" }
+      : { code: 1, stdout: "", stderr: `Unexpected startup command: ${args.join(" ")}` }) })
+    const adapter = await run(makeMacLegacyStartup(home).pipe(Effect.provideService(LegacyStartupCommands, commands)))
+    expect(Option.isNone(await run(adapter.inspect))).toBe(true)
+  })
   it("preserves the disabled login preference", async () => {
     const f = await fixture({ disabled: true })
     expect(Option.getOrThrow(await run(f.adapter.inspect)).enabled).toBe(false)

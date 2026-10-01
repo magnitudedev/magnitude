@@ -4,6 +4,7 @@ import { basename, join } from "node:path"
 import { Effect, Option, Schema } from "effect"
 
 import { CommandResult, LegacyStartupCommands, LegacyStartupFailed } from "./legacy-startup-command"
+import { launchdGuiDomainIsAbsent } from "./launchd-gui-domain"
 
 const StartupPid = Schema.Int.pipe(Schema.between(1, Number.MAX_SAFE_INTEGER))
 export const LegacyMacStartup = Schema.TaggedStruct("MacLaunchAgent", {
@@ -39,7 +40,7 @@ export const makeMacLegacyStartup = (home: string, label = "dev.magnitude.acn") 
   }, catch: error => new LegacyStartupFailed({ message: String(error) }) })
   const loaded = Effect.gen(function* () {
     const result = yield* run(["print", target])
-    if (result.code === 113) return { _tag: "Unloaded" as const }
+    if (result.code === 113 || launchdGuiDomainIsAbsent(result, process.getuid!())) return { _tag: "Unloaded" as const }
     const output = yield* requireSuccess(result)
     const registeredPath = output.match(/^\s*path = (.+)$/m)?.[1]?.trim()
     const sourcePath = yield* Effect.tryPromise({ try: () => realpath(path), catch: error => new LegacyStartupFailed({ message: String(error) }) })

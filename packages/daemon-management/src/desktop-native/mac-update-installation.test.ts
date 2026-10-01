@@ -18,7 +18,9 @@ describe("Mac native update launch barrier", () => {
   })
   it("accepts exact GUI-domain absence while preserving unexpected lookup failures", async () => {
     expect(await Effect.runPromise(macUpdateLookupIsActive({ code: 112, stdout: "", stderr: "Bad request.\nCould not find domain for user gui: 501\n" }, executable, 501))).toBe(false)
+    expect(await Effect.runPromise(macUpdateLookupIsActive({ code: 125, stdout: "", stderr: "Could not print domain: 125: Domain does not support specified action\n" }, executable, 501))).toBe(false)
     for (const result of [
+      { code: 125, stdout: "", stderr: "Operation not permitted" },
       { code: 112, stdout: "", stderr: "Operation not permitted" },
       { code: 112, stdout: "", stderr: "Bad request.\nCould not find domain for user gui: 502" },
       { code: 1, stdout: "", stderr: "Bad request.\nCould not find domain for user gui: 501" },
