@@ -40,9 +40,9 @@ pub use seismic_runtime::native::trace::{
 };
 pub use seismic_runtime::native::tune::{
     Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, NumericalEvidence,
-    NumericalMetrics, Outcome, PointMeasurement, PointRecord, SearchPlan, Strategy, SurveyPlan,
-    TuneError, TuningInitializer, TuningMethod, TuningReference, TuningResult, TuningReuse,
-    TuningTime,
+    NumericalMetrics, Outcome, PointInputs, PointMeasurement, PointRecord, PointSpec,
+    PointUnavailable, SearchPlan, Strategy, SurveyPlan, TuneError, TuningInitializer, TuningMethod,
+    TuningReference, TuningResult, TuningTime,
 };
 pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
 
@@ -1102,8 +1102,49 @@ impl NativeTensorBatchCompletion {
     }
 }
 
-/// One workload for native tuning: argument sets used for both measurement
-/// and numerical validation, and the point's share of the objective.
+/// The points of one native tuning unit, whose inputs are built on request.
+pub trait PointSource<'a, E: Entry> {
+    /// Every point, in ascending cost.
+    fn points(&self) -> Vec<PointSpec>;
+    /// Build point `point`'s inputs, refusing before any step predicted not
+    /// to fit within `limit`.
+    fn build(
+        &mut self,
+        point: usize,
+        limit: std::time::Duration,
+    ) -> Result<PointInputs<'a>, PointUnavailable>;
+}
+
+impl<'a, E: Entry, S: PointSource<'a, E> + ?Sized> PointSource<'a, E> for &mut S {
+    fn points(&self) -> Vec<PointSpec> {
+        (**self).points()
+    }
+
+    fn build(
+        &mut self,
+        point: usize,
+        limit: std::time::Duration,
+    ) -> Result<PointInputs<'a>, PointUnavailable> {
+        (**self).build(point, limit)
+    }
+}
+
+/// `rotation`, with `initialize` and `written`, as a point's inputs.
+pub fn point_inputs<'a, E: Entry>(
+    rotation: Vec<E::Args<'_>>,
+    initialize: Option<TuningInitializer<'a>>,
+    written: std::collections::BTreeMap<String, std::ops::Range<u64>>,
+) -> PointInputs<'a> {
+    PointInputs {
+        rotation: rotation.into_iter().map(E::encode).collect(),
+        initialize,
+        written,
+    }
+}
+
+/// One workload for native tuning with its inputs built up front: argument
+/// sets used for both measurement and numerical validation, and the point's
+/// share of the objective.
 pub struct TuningPoint<'a, E: Entry> {
     pub label: String,
     pub weight: f64,
@@ -1111,11 +1152,11 @@ pub struct TuningPoint<'a, E: Entry> {
     /// rows at different history lengths): they split their summed weight by
     /// the defaults' real time at each. `None`: a class of its own.
     pub class: Option<String>,
-    /// The point's cost relative to the unit's other points, estimated by
-    /// the caller: a census predicts a point's time from the previous one's
-    /// by the ratio of their costs.
+    /// The point's cost relative to the unit's other points: points come in
+    /// ascending cost, and the tuner predicts a point's time from the
+    /// previous one's by the ratio of their costs.
     pub cost: f64,
-    /// A census always admits the point, whatever the time.
+    /// A candidate may be chosen only if it was validated here.
     pub required: bool,
     pub rotation: Vec<E::Args<'a>>,
     /// Required when the entry has `&mut` parameters: restores every writable
@@ -1127,6 +1168,33 @@ pub struct TuningPoint<'a, E: Entry> {
     /// validation observes exactly those rows. A `&mut` parameter absent
     /// here is observed whole.
     pub written: std::collections::BTreeMap<String, std::ops::Range<u64>>,
+}
+
+impl<'a, E: Entry> PointSource<'a, E> for Vec<TuningPoint<'a, E>> {
+    fn points(&self) -> Vec<PointSpec> {
+        self.iter()
+            .map(|point| PointSpec {
+                label: point.label.clone(),
+                weight: point.weight,
+                class: point.class.clone(),
+                cost: point.cost,
+                required: point.required,
+            })
+            .collect()
+    }
+
+    fn build(
+        &mut self,
+        point: usize,
+        _limit: std::time::Duration,
+    ) -> Result<PointInputs<'a>, PointUnavailable> {
+        let point = &mut self[point];
+        Ok(point_inputs::<E>(
+            std::mem::take(&mut point.rotation),
+            point.initialize.take(),
+            std::mem::take(&mut point.written),
+        ))
+    }
 }
 
 /// A direct-native graph is assembled from generated entry arguments and
@@ -3324,12 +3392,25 @@ pub mod generated {
         statics: &NativeSpecialization,
         elements: &[(&str, Element)],
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
-        points: Vec<TuningPoint<'_, E>>,
+        points: &mut dyn PointSource<'_, E>,
         validation: PrecisionPolicy,
         strategy: Strategy,
-        reuse: Option<TuningReuse<'_>>,
         reference: TuningReference,
     ) -> Result<TuningResult, TuneError> {
+        /// A typed point source as Seismic's runtime asks it.
+        struct Typed<'s, 'a, E: Entry>(&'s mut dyn PointSource<'a, E>);
+        impl<'a, E: Entry> seismic_runtime::native::tune::PointSource<'a> for Typed<'_, 'a, E> {
+            fn points(&self) -> Vec<PointSpec> {
+                self.0.points()
+            }
+            fn build(
+                &mut self,
+                point: usize,
+                limit: std::time::Duration,
+            ) -> Result<PointInputs<'a>, PointUnavailable> {
+                self.0.build(point, limit)
+            }
+        }
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
         let entry =
             E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
@@ -3340,22 +3421,9 @@ pub mod generated {
             bindings: element_bindings(elements),
             statics: statics.clone(),
             cpu,
-            points: points
-                .into_iter()
-                .map(|point| seismic_runtime::native::tune::TuningPoint {
-                    label: point.label,
-                    weight: point.weight,
-                    class: point.class,
-                    cost: point.cost,
-                    required: point.required,
-                    rotation: point.rotation.into_iter().map(E::encode).collect(),
-                    initialize: point.initialize,
-                    written: point.written,
-                })
-                .collect(),
+            points: &mut Typed(points),
             validation,
             strategy,
-            reuse,
             reference,
         })
     }

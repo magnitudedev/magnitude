@@ -85,7 +85,7 @@ rest is input the entry only reads, so no long history is re-uploaded or read ba
 One case per unit, the one with the least state, restores and compares its state whole, so a
 write outside the declared rows is rejected. Timed passes after a
 candidate's validated invocation are batched and run on the state they leave, the same way for
-every configuration, so timing never pays a host reset per invocation. Matching evidence from the startup census or a prior search can be
+every configuration, so timing never pays a host reset per invocation. Matching evidence from earlier in the same search can be
 reused, but timing equivalence alone is not numerical evidence. Whole-model numerical and raw
 output/parser regressions are development and release qualification, not another startup gate or
 a search over kernel combinations. Local bounded policies do not claim a mathematical bound on
@@ -96,26 +96,32 @@ and static values reuses the load's first tuning result; its rotations already s
 of several layers. Disjoint row-class workloads may prepare distinct configurations of the same
 entry contract; each is tuned and validated on the classes it serves, and the exact graph class
 binds its prepared configuration. Entry-wide
-declarations are tuned within a fixed tuning time (60 s per preparation, on any device), in three
+declarations are tuned within a fixed tuning time (60 s per preparation, on any device), in two
 walks of the program. A count finds the model's tuning units (entry, element bindings, static
 values and served workload), their launches per step and which have a stored result; nothing is
-formed or measured. A census then measures each unit that will search: its first numerically
-passing configuration (the defaults when they pass) at its points in ascending estimated cost,
-admitting a point only while the unit's census time plus the point's predicted time fits a ceiling
-of the tuning time over ten times the searching units, so the census takes about a tenth of the
-tuning time. Every point of at most 8 rows (the decode range, where implementations' row-dependent
-code paths differ) is admitted whatever the time; a point not admitted folds its weight into the
-largest admitted point of its history class. Each row class's share of step time is split among
-the units serving it by launches times the defaults' mean time there. Each unit's search then
-gets the time that remains times its share over the shares of the units not yet searched, so time a
-unit leaves unused goes to the rest: the load spends its search where the step spends its time,
-and a slower device searches less, never longer. A search times the admitted points, validates every
-candidate at them, ends exploration when what remains covers its confirmation and the validation of
-its choice at the points it did not time, and gives way to its census seed (the defaults when they
-pass) if its choice fails there; the seed must pass there too: every chosen configuration passes
-validation at every served point. A unit whose time cannot cover
-that keeps its census seed. A launch-scoped declaration's census measures its defaults alone, and
-its factored search runs within its time the same way.
+formed or measured. The second walk visits each unit that will search once, within its own
+budget: its launches' share of the tuning time, plus its launches' share of what units visited
+earlier left unused. A unit's overrun is never taken from another unit, so one unit's
+misprediction cannot starve the rest. Keeping a unit's defaults costs nothing and is always valid
+(they are the validation reference), so every other piece of work is paid for from the budget and
+starts only when its predicted cost fits. Inside the visit, the unit's points are built and
+measured in ascending estimated cost: a point's inputs are built only when it is admitted (weight
+imports and generated activations each predicted from their size and the rates measured so far,
+and refused when they would not fit), then its reference runs and the defaults are validated and
+measured there. Points are admitted while the visit stays within a tenth of the budget, each
+predicted from the last by cost. Every point of at most 8 rows (the decode range, where
+implementations' row-dependent code paths differ) is required: required points may take half the
+budget, and a unit that cannot afford them keeps its defaults without searching. A point not
+admitted folds its weight into the largest admitted point of its history class. The search then
+times the admitted points and validates every candidate at them, ending exploration when what
+remains covers confirming its finalists (predicted from the defaults' measurement) and validating
+its choice at the points it did not time (predicted from the last admitted point). Those points'
+inputs are built only to validate a choice other than the defaults; a choice that fails there, or
+whose validation there would not fit, gives way to the defaults: every chosen configuration passes
+validation at every served point. Shared history planes live for the whole tuning, so units
+reading the same history build it once. A launch-scoped declaration admits its points the same
+way, and its factored search runs within the same window. A slower device or build tunes fewer
+points, candidates and units, never longer; each unit's report gives its budget and its time.
 The engine owns every cache, under a directory the host names (`--cache-dir`; without one nothing
 is cached). It holds the program artifacts Seismic keeps (CUDA CUBINs, Vulkan SPIR-V), through
 the device's artifact store, one directory per toolchain namespace, and one tuning result per
@@ -123,7 +129,7 @@ tuning key. The key is a digest over what a stored result is valid for: the tuni
 device and toolchain identity (Metal OS build; CUDA driver and NVRTC release), the unit, the
 implementation digest (declaration and rendered source), the precision policy, and the labels of
 the served shapes its choice was validated at. How it was searched is not part of the key (search
-settings, tuning time, census evaluations, workload weights, the points timed), so improving the
+settings, tuning time, budget shares, workload weights, the points timed), so improving the
 search never invalidates a result that is still correct. The tuning version changes only with the
 maintainers' approval, when tuning has improved enough to justify retuning every model, or when
 stored results can no longer be read. Every search that ends is stored, so a hit prepares the
@@ -139,8 +145,8 @@ completed and a later preparation searches only the rest. Writes go through a
 temporary file renamed into place; an entry that cannot be read or parsed, or whose configuration
 the implementation does not admit, is a miss and is rewritten; opening the cache evicts the least
 recently used entries beyond its capacity. Stored results are local measurements; nothing is
-shipped. Tuning progress (milliseconds of the tuning time spent, reported when the census
-begins and after each unit it measures or searches; nothing when every unit is stored), total tuning time and how many units were searched or stored are reported before
+shipped. Tuning progress (milliseconds of the tuning time spent, reported when the search walk
+begins and after each unit it searches; nothing when every unit is stored), total tuning time and how many units were searched or stored are reported before
 readiness, or before a prepare-only job reports that it is prepared. The load also reports its
 target weight import in resident bytes; no tuning or
 preparation occurs after readiness. Two development

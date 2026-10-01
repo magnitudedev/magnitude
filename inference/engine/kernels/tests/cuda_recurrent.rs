@@ -299,6 +299,8 @@ fn cuda_recurrent_scoped_tuning_completes() {
     let search = || {
         seismic::Strategy::Search(seismic::SearchPlan {
             allowance: std::time::Duration::from_secs(600),
+            admission: std::time::Duration::from_secs(600),
+            required: std::time::Duration::from_secs(600),
             settings: seismic::SearchSettings {
                 improvement: 0.01,
                 restarts: 2,
@@ -337,7 +339,6 @@ fn cuda_recurrent_scoped_tuning_completes() {
             ulps: None,
         }),
         search(),
-        None,
         seismic::TuningReference::Portable,
     )
     .unwrap();

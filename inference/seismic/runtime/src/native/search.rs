@@ -392,6 +392,9 @@ pub enum SearchStop {
     Converged,
     /// The time ran out; the result is the best found so far.
     Expired,
+    /// The unit's time could not cover the points every candidate must
+    /// pass; it keeps its defaults without searching.
+    Unaffordable,
 }
 
 /// Everything one search did.

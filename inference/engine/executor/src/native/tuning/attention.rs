@@ -414,16 +414,14 @@ pub(crate) struct AttentionMixCase<H> {
 }
 
 /// The history planes of one codec, as case state: views of the planes
-/// shared by the points of one history length, ending at a point's appended
-/// rows.
+/// shared by every point with the same history rows (one history length, in
+/// any unit of the tuning), ending at a point's appended rows.
 pub(crate) trait MixHistory: Sized {
-    /// Planes of `rows` history rows shared by the points of one history
-    /// length (`context`), each viewed up to `view` rows with `appended`
-    /// written.
+    /// Planes of `rows` history rows, viewed up to `view` rows with
+    /// `appended` written.
     fn build(
         inputs: &mut TuningInputs<'_, '_>,
         mix: &AttentionMix,
-        context: u64,
         rows: u64,
         view: u64,
         appended: Range<u64>,
@@ -443,16 +441,17 @@ impl MixHistory for DenseMixHistory {
     fn build(
         inputs: &mut TuningInputs<'_, '_>,
         mix: &AttentionMix,
-        context: u64,
         rows: u64,
         view: u64,
         appended: Range<u64>,
     ) -> Result<Self, String> {
         let shape = mix.shape;
         let mut plane = |name: &str, seed: u64| {
-            let plane = inputs.shared(format!("{name}-c{context}"), |inputs| {
-                inputs.activation(mix.activation, &[rows, shape.kv_heads, shape.width], seed)
-            })?;
+            let extents = [rows, shape.kv_heads, shape.width];
+            let plane = inputs.shared(
+                format!("{name}-{}-{extents:?}", mix.activation.name()),
+                |inputs| inputs.activation(mix.activation, &extents, seed),
+            )?;
             inputs.slab_state(plane, view, appended.clone())
         };
         Ok(Self {
@@ -485,18 +484,17 @@ pub(crate) struct AffineMixHistory {
 
 impl AffineMixHistory {
     fn codes(inputs: &TuningInputs<'_, '_>, extents: &[u64], seed: u64) -> Result<Tensor, String> {
-        let count = usize::try_from(extents.iter().product::<u64>())
-            .map_err(|_| "tuning code plane exceeds usize")?;
-        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-        let words = (0..count)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                (state >> 32) as u32
-            })
-            .collect::<Vec<_>>();
-        inputs.u32s(extents, &words)
+        inputs.generated(Element::u32(), extents, |count| {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            Ok((0..count)
+                .flat_map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ((state >> 32) as u32).to_le_bytes()
+                })
+                .collect())
+        })
     }
 
     /// Vary each affine group so an incorrect coefficient stride cannot hide.
@@ -505,21 +503,19 @@ impl AffineMixHistory {
         extents: &[u64],
         levels: u32,
     ) -> Result<Tensor, String> {
-        let count = usize::try_from(extents.iter().product::<u64>())
-            .map_err(|_| "tuning coefficient plane exceeds usize")?;
-        let bytes = (0..count / 2)
-            .flat_map(|index| {
-                let magnitude = 0.25 + (index.wrapping_mul(17) % 127) as f32 / 64.0;
-                let offset = -0.75 + (index.wrapping_mul(43) % 97) as f32 / 96.0;
-                [
-                    super::f16_bits(magnitude / levels as f32).to_le_bytes(),
-                    super::f16_bits(offset).to_le_bytes(),
-                ]
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        Tensor::from_host(inputs.device, Element::f16(), extents, &bytes)
-            .map_err(|error| error.to_string())
+        inputs.generated(Element::f16(), extents, |count| {
+            Ok((0..count / 2)
+                .flat_map(|index| {
+                    let magnitude = 0.25 + (index.wrapping_mul(17) % 127) as f32 / 64.0;
+                    let offset = -0.75 + (index.wrapping_mul(43) % 97) as f32 / 96.0;
+                    [
+                        super::f16_bits(magnitude / levels as f32).to_le_bytes(),
+                        super::f16_bits(offset).to_le_bytes(),
+                    ]
+                })
+                .flatten()
+                .collect())
+        })
     }
 }
 
@@ -527,7 +523,6 @@ impl MixHistory for AffineMixHistory {
     fn build(
         inputs: &mut TuningInputs<'_, '_>,
         mix: &AttentionMix,
-        context: u64,
         rows: u64,
         view: u64,
         appended: Range<u64>,
@@ -535,7 +530,10 @@ impl MixHistory for AffineMixHistory {
         let shape = mix.shape;
         let mut plane =
             |name: &str, build: &dyn Fn(&TuningInputs<'_, '_>) -> Result<Tensor, String>| {
-                let plane = inputs.shared(format!("{name}-c{context}"), |inputs| build(inputs))?;
+                let plane = inputs.shared(
+                    format!("{name}-affine-{rows}x{}x{}", shape.kv_heads, shape.width),
+                    |inputs| build(inputs),
+                )?;
                 inputs.slab_state(plane, view, appended.clone())
             };
         let pairs = [rows, shape.kv_heads, affine_coefficients(shape.width)];
@@ -622,7 +620,6 @@ impl AttentionMix {
         let history = H::build(
             inputs,
             self,
-            context,
             Self::history_rows(&points, context),
             view,
             context..view,

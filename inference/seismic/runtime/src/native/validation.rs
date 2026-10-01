@@ -1,10 +1,7 @@
 //! Empirical validation of direct-native entries against an explicit numerical reference.
 //! This does not establish compiler applicability for a native implementation.
 use super::timing::PointTiming;
-use super::tune::{
-    Exclusion, Outcome, TuneError, TuningInitializer, TuningPoint, TuningReference, TuningResult,
-    TuningReuse,
-};
+use super::tune::{Exclusion, TuneError, TuningInitializer, TuningPoint, TuningReference};
 use crate::api::{
     device::DeviceInner,
     kernel::{self, DecodedValue, EncodedArgs},
@@ -245,11 +242,12 @@ impl<'a> PreparedPoint<'a> {
             .and_then(|v| v.as_ref().ok())
             .cloned()
     }
-    pub(super) fn identity(&self) -> &str {
-        &self.case.identity
-    }
     pub(super) fn validation_seconds(&self) -> f64 {
         *self.case.validation_seconds.borrow()
+    }
+    /// Weigh this point by `weight` in the search's objective.
+    pub(super) fn reweigh(&mut self, weight: f64) {
+        self.point.weight = weight;
     }
     /// What candidates are compared with.
     pub(super) fn reference_kind(&self) -> TuningReference {
@@ -270,115 +268,177 @@ struct ReferenceCase<'a> {
     validation_seconds: RefCell<f64>,
 }
 
-pub(super) enum Preparation<'a> {
-    /// The points, whose references execute on first use.
-    Cases(Vec<PreparedPoint<'a>>, Rc<References>),
-    Reused(TuningResult),
+/// Prepares points for validation as their inputs arrive: the policy, the
+/// reference implementation and what every point's case identity covers.
+pub(super) struct Validator {
+    reference_kind: TuningReference,
+    policy: Arc<PrecisionPolicy>,
+    subjects: Vec<String>,
+    mutable: Vec<(usize, String)>,
+    references: Rc<References>,
+    /// What every point's identity starts from.
+    identity: Sha256,
 }
 
-pub(super) fn prepare<'a>(
-    device: &Arc<DeviceInner>,
-    module: &CheckedModule,
-    entry: EntryId,
-    bindings: &ElementBindings,
-    logical: &LogicalEntry,
-    mutable: &[(usize, String)],
-    points: Vec<TuningPoint<'a>>,
-    policy: &PrecisionPolicy,
-    reuse: Option<TuningReuse<'_>>,
-    reference_kind: TuningReference,
-    default: &seismic_lang::checked::NativeSpecialization,
-    cpu: Option<&'static super::cpu::CpuNativeKernels>,
-) -> Result<Preparation<'a>, TuneError> {
-    if matches!(policy, PrecisionPolicy::Unconstrained) {
-        return Err(TuneError::Declaration(
-            "native tuning requires a bounded or exact precision policy".into(),
-        ));
-    }
-    let subjects: Vec<_> = logical
-        .schema()
-        .results()
-        .iter()
-        .map(|result| result_subject(&result.path))
-        .chain(mutable.iter().map(|(i, _)| input_subject(*i)))
-        .collect();
-    if let PrecisionPolicy::Bounded {
-        outputs, inputs, ..
-    } = policy
-    {
-        for subject in outputs.keys() {
-            if !subjects.contains(subject) {
-                return Err(TuneError::Declaration(format!(
-                    "unknown numerical subject {subject}; available: {subjects:?}"
-                )));
-            }
-        }
-        if !inputs.is_empty() {
+impl Validator {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        device: &Arc<DeviceInner>,
+        module: &CheckedModule,
+        entry: EntryId,
+        bindings: &ElementBindings,
+        logical: &LogicalEntry,
+        mutable: &[(usize, String)],
+        policy: &PrecisionPolicy,
+        reference_kind: TuningReference,
+        default: &seismic_lang::checked::NativeSpecialization,
+        cpu: Option<&'static super::cpu::CpuNativeKernels>,
+    ) -> Result<Self, TuneError> {
+        if matches!(policy, PrecisionPolicy::Unconstrained) {
             return Err(TuneError::Declaration(
-                "native tuning cases do not support input-range assumptions".into(),
+                "native tuning requires a bounded or exact precision policy".into(),
             ));
         }
+        let subjects: Vec<_> = logical
+            .schema()
+            .results()
+            .iter()
+            .map(|result| result_subject(&result.path))
+            .chain(mutable.iter().map(|(i, _)| input_subject(*i)))
+            .collect();
+        if let PrecisionPolicy::Bounded {
+            outputs, inputs, ..
+        } = policy
+        {
+            for subject in outputs.keys() {
+                if !subjects.contains(subject) {
+                    return Err(TuneError::Declaration(format!(
+                        "unknown numerical subject {subject}; available: {subjects:?}"
+                    )));
+                }
+            }
+            if !inputs.is_empty() {
+                return Err(TuneError::Declaration(
+                    "native tuning cases do not support input-range assumptions".into(),
+                ));
+            }
+        }
+        // Vulkan currently exposes only the explicit native route. Its portable
+        // semantics execute on the host CPU, with canonical copies of the inputs.
+        let reference_device = if reference_kind == TuningReference::Portable
+            && super::backend_name(&device.kind) == registry::BackendName::Vulkan
+        {
+            crate::devices::Catalog::discover()
+                .map_err(|e| TuneError::Reference(e.to_string()))?
+                .open_backend(registry::BackendName::Cpu)
+                .map_err(|e| TuneError::Reference(e.to_string()))?
+        } else {
+            device.clone()
+        };
+        let native = if reference_kind == TuningReference::NativeDefault {
+            Some(Arc::new(
+                super::NativePrepared::prepare(
+                    device,
+                    module,
+                    entry,
+                    bindings.clone(),
+                    default.clone(),
+                    cpu,
+                )
+                .map_err(|e| TuneError::Reference(super::tune::prepare_message(e)))?,
+            ))
+        } else {
+            None
+        };
+        // Zero search constructs the required source implementation without timing-profile
+        // acquisition or feedback observations. Exact applicability is compiler-derived.
+        let portable = if reference_kind == TuningReference::Portable {
+            Some(Arc::new(
+                kernel::prepare(
+                    module,
+                    entry,
+                    bindings.clone(),
+                    &reference_device,
+                    PreparationOptions::feedback(
+                        PrecisionPolicy::Exact,
+                        FeedbackOptions {
+                            search_time: std::time::Duration::ZERO,
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .map_err(|e| TuneError::Reference(super::tune::prepare_message(e)))?,
+            ))
+        } else {
+            None
+        };
+        let policy = Arc::new(policy.clone());
+        // A case's identity covers its argument structure, not tensor
+        // contents: tuning inputs are generated test data, and the caller's
+        // tuning key names what they are generated from.
+        let mut identity = Sha256::new();
+        identity.update(b"native-validation-v5");
+        identity.update(format!("{reference_kind:?}"));
+        if let Some(reference) = &native {
+            identity.update(&reference.artifact.0);
+        }
+        identity.update(seismic_lang::reference_math::VERSION);
+        identity.update(logical.identity().digest());
+        identity.update(logical.module_hash().digest());
+        identity.update(device.tuning_identity());
+        identity.update(reference_device.tuning_identity());
+        identity.update(PolicyIdentity::of(&policy).0);
+        Ok(Self {
+            reference_kind,
+            policy,
+            subjects,
+            mutable: mutable.to_vec(),
+            references: Rc::new(References {
+                device: device.clone(),
+                reference_device,
+                native,
+                portable,
+                mutable: mutable.to_vec(),
+                pages: RefCell::new(ReferencePages::default()),
+                seconds: RefCell::new(0.),
+            }),
+            identity,
+        })
     }
-    // Vulkan currently exposes only the explicit native route. Its portable
-    // semantics execute on the host CPU, with canonical copies of the inputs.
-    let reference_device = if reference_kind == TuningReference::Portable
-        && super::backend_name(&device.kind) == registry::BackendName::Vulkan
-    {
-        crate::devices::Catalog::discover()
-            .map_err(|e| TuneError::Reference(e.to_string()))?
-            .open_backend(registry::BackendName::Cpu)
-            .map_err(|e| TuneError::Reference(e.to_string()))?
-    } else {
-        device.clone()
-    };
-    let native_reference = if reference_kind == TuningReference::NativeDefault {
-        Some(Arc::new(
-            super::NativePrepared::prepare(
-                device,
-                module,
-                entry,
-                bindings.clone(),
-                default.clone(),
-                cpu,
-            )
-            .map_err(|e| TuneError::Reference(super::tune::prepare_message(e)))?,
-        ))
-    } else {
-        None
-    };
-    let policy = Arc::new(policy.clone());
-    let mut identified = Vec::new();
-    for mut point in points {
+
+    /// Time spent executing references so far.
+    pub(super) fn reference_seconds(&self) -> f64 {
+        self.references.seconds()
+    }
+
+    /// `point` ready for validation; its reference executes on first use.
+    pub(super) fn point<'a>(
+        &self,
+        mut point: TuningPoint<'a>,
+    ) -> Result<PreparedPoint<'a>, TuneError> {
+        if let Some((_, parameter)) = self.mutable.first().filter(|_| point.initialize.is_none()) {
+            return Err(TuneError::SharedMutableState {
+                point: point.label.clone(),
+                parameter: parameter.clone(),
+            });
+        }
         if let Some(name) = point
             .written
             .keys()
-            .find(|name| !mutable.iter().any(|(_, parameter)| parameter == *name))
+            .find(|name| !self.mutable.iter().any(|(_, parameter)| parameter == *name))
         {
             return Err(TuneError::Declaration(format!(
                 "point `{}` declares written rows of `{name}`, which is not a `&mut` parameter",
                 point.label
             )));
         }
-        let observed: Vec<Observed> = mutable
+        let observed: Vec<Observed> = self
+            .mutable
             .iter()
             .map(|(ordinal, name)| (*ordinal, point.written.get(name).cloned()))
             .collect();
         let initialize = point.initialize.take().map(|f| Rc::new(RefCell::new(f)));
-        // The case's identity covers its argument structure, not tensor
-        // contents: tuning inputs are generated test data, and the caller's
-        // tuning key names what they are generated from.
-        let mut digest = Sha256::new();
-        digest.update(b"native-validation-v5");
-        digest.update(format!("{reference_kind:?}"));
-        if let Some(reference) = &native_reference {
-            digest.update(&reference.artifact.0);
-        }
-        digest.update(seismic_lang::reference_math::VERSION);
-        digest.update(logical.identity().digest());
-        digest.update(logical.module_hash().digest());
-        digest.update(device.tuning_identity());
-        digest.update(reference_device.tuning_identity());
-        digest.update(PolicyIdentity::of(&policy).0);
+        let mut digest = self.identity.clone();
         digest.update(point.label.as_bytes());
         digest.update(format!("{observed:?}").as_bytes());
         digest.update((point.rotation.len() as u64).to_le_bytes());
@@ -402,109 +462,20 @@ pub(super) fn prepare<'a>(
                 }
             }
         }
-        identified.push((
-            point,
-            observed,
-            initialize,
-            crate::telemetry::hex(&digest.finalize()),
-        ));
-    }
-    let previous = reuse.map(|reuse| reuse.result().clone());
-    let previous_artifact = previous.as_ref().and_then(|result| {
-        result.configurations.iter().find_map(|record| {
-            if record.configuration != result.overall {
-                return None;
-            }
-            match &record.outcome {
-                Outcome::Measured {
-                    artifact,
-                    validated: true,
-                    ..
-                } => Some(artifact.clone()),
-                _ => None,
-            }
-        })
-    });
-    let evidence = |identity: &str| {
-        previous
-            .as_ref()
-            .and_then(|result| {
-                result.numerical_evidence.iter().find(|evidence| {
-                    evidence.identity == identity
-                        && Some(&evidence.candidate) == previous_artifact.as_ref()
-                })
-            })
-            .cloned()
-    };
-    if matches!(reuse, Some(TuningReuse::Completed(_)))
-        && identified.iter().all(|(point, _, _, identity)| {
-            evidence(identity).is_some()
-                && previous.as_ref().unwrap().points.iter().any(|stored| {
-                    stored.label == point.label
-                        && stored.weight == point.weight
-                        && stored.class == point.class
-                })
-        })
-        && previous
-            .as_ref()
-            .is_some_and(|result| result.points.len() == identified.len())
-    {
-        let mut previous = previous.unwrap();
-        previous.reused = true;
-        return Ok(Preparation::Reused(previous));
-    }
-    // Zero search constructs the required source implementation without timing-profile
-    // acquisition or feedback observations. Exact applicability is compiler-derived.
-    let portable = if reference_kind == TuningReference::Portable {
-        Some(Arc::new(
-            kernel::prepare(
-                module,
-                entry,
-                bindings.clone(),
-                &reference_device,
-                PreparationOptions::feedback(
-                    PrecisionPolicy::Exact,
-                    FeedbackOptions {
-                        search_time: std::time::Duration::ZERO,
-                        ..Default::default()
-                    },
-                ),
-            )
-            .map_err(|e| TuneError::Reference(super::tune::prepare_message(e)))?,
-        ))
-    } else {
-        None
-    };
-    let references = Rc::new(References {
-        device: device.clone(),
-        reference_device,
-        native: native_reference,
-        portable,
-        mutable: mutable.to_vec(),
-        pages: RefCell::new(ReferencePages::default()),
-        seconds: RefCell::new(0.),
-    });
-    let mut prepared = Vec::new();
-    for (point, observed, initialize, identity) in identified {
-        let mut verdicts = BTreeMap::new();
-        if let Some(evidence) = evidence(&identity) {
-            verdicts.insert(evidence.candidate.clone(), Ok(evidence));
-        }
         let case = Rc::new(ReferenceCase {
-            reference_kind,
+            reference_kind: self.reference_kind,
             initialize,
-            policy: policy.clone(),
-            subjects: subjects.clone(),
+            policy: self.policy.clone(),
+            subjects: self.subjects.clone(),
             mutable: observed,
-            references: references.clone(),
+            references: self.references.clone(),
             reference: RefCell::new(None),
-            identity,
-            verdicts: RefCell::new(verdicts),
+            identity: crate::telemetry::hex(&digest.finalize()),
+            verdicts: RefCell::new(BTreeMap::new()),
             validation_seconds: RefCell::new(0.),
         });
-        prepared.push(PreparedPoint { point, case });
+        Ok(PreparedPoint { point, case })
     }
-    Ok(Preparation::Cases(prepared, references))
 }
 
 fn observe(

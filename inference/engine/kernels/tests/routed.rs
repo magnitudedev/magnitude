@@ -1818,7 +1818,7 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
             )
         })
         .collect::<Vec<_>>();
-    let points = rows
+    let points: Vec<_> = rows
         .iter()
         .zip(&inputs)
         .map(|(rows, (normalized, routes))| seismic::TuningPoint {
@@ -1841,6 +1841,8 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
+        admission: std::time::Duration::from_secs(600),
+        required: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
             improvement: 0.01,
             restarts: 2,
@@ -1871,7 +1873,6 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
             ulps: None,
         }),
         search,
-        None,
         seismic::TuningReference::Portable,
     )
     .unwrap();
@@ -1927,7 +1928,7 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
             )
         })
         .collect::<Vec<_>>();
-    let points = rows
+    let points: Vec<_> = rows
         .iter()
         .zip(&inputs)
         .map(|(rows, input)| seismic::TuningPoint {
@@ -1952,6 +1953,8 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
+        admission: std::time::Duration::from_secs(600),
+        required: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
             improvement: 0.01,
             restarts: 2,
@@ -1980,7 +1983,6 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
             ulps: None,
         }),
         search,
-        None,
         seismic::TuningReference::Portable,
     )
     .unwrap();
@@ -2983,6 +2985,8 @@ fn routed_kernel_timings() {
         ) {
             seismic::Strategy::Search(seismic::SearchPlan {
                 allowance: std::time::Duration::from_secs(600),
+                admission: std::time::Duration::from_secs(600),
+                required: std::time::Duration::from_secs(600),
                 settings: seismic::SearchSettings {
                     improvement: 0.01,
                     restarts: 2,
@@ -3031,7 +3035,7 @@ fn routed_kernel_timings() {
         })
         .collect::<Vec<_>>();
     let mut route_inputs = route_inputs;
-    let points = route_rows
+    let points: Vec<_> = route_rows
         .iter()
         .zip(route_inputs.iter_mut())
         .map(|(m, inputs)| seismic::TuningPoint {
@@ -3072,7 +3076,6 @@ fn routed_kernel_timings() {
             points,
             validation.clone(),
             measure.clone(),
-            None,
             seismic::TuningReference::Portable,
         )
         .unwrap(),
@@ -3100,7 +3103,7 @@ fn routed_kernel_timings() {
         })
         .collect::<Vec<_>>();
     let decode_statics = statics(&[("H", h), ("K", k), ("F", f), ("S", s)]);
-    let points = decode_rows
+    let points: Vec<_> = decode_rows
         .iter()
         .zip(&decode)
         .map(|(m, inputs)| seismic::TuningPoint {
@@ -3139,12 +3142,11 @@ fn routed_kernel_timings() {
             points,
             validation.clone(),
             decode_measure(),
-            None,
             seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
-    let points = decode_rows
+    let points: Vec<_> = decode_rows
         .iter()
         .zip(&decode)
         .map(|(m, inputs)| seismic::TuningPoint {
@@ -3183,7 +3185,6 @@ fn routed_kernel_timings() {
             points,
             validation.clone(),
             decode_measure(),
-            None,
             seismic::TuningReference::Portable,
         )
         .unwrap(),
@@ -3223,7 +3224,7 @@ fn routed_kernel_timings() {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let points = grouped_rows
+    let points: Vec<_> = grouped_rows
         .iter()
         .zip(&grouped)
         .map(|(m, inputs)| seismic::TuningPoint {
@@ -3262,12 +3263,11 @@ fn routed_kernel_timings() {
             points,
             validation.clone(),
             measure.clone(),
-            None,
             seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
-    let points = grouped_rows
+    let points: Vec<_> = grouped_rows
         .iter()
         .zip(&grouped)
         .map(|(m, inputs)| seismic::TuningPoint {
@@ -3308,7 +3308,6 @@ fn routed_kernel_timings() {
             points,
             validation,
             measure.clone(),
-            None,
             seismic::TuningReference::Portable,
         )
         .unwrap(),
@@ -3333,7 +3332,7 @@ fn routed_kernel_timings() {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let points = grouped_rows
+    let points: Vec<_> = grouped_rows
         .iter()
         .zip(&grouped)
         .zip(group_tables.iter_mut())
@@ -3367,7 +3366,6 @@ fn routed_kernel_timings() {
             points,
             seismic::PrecisionPolicy::Exact,
             measure,
-            None,
             seismic::TuningReference::Portable,
         )
         .unwrap(),
@@ -3470,6 +3468,8 @@ fn routed_decode_timings() {
     let exhaustive = || {
         seismic::Strategy::Search(seismic::SearchPlan {
             allowance: std::time::Duration::from_secs(600),
+            admission: std::time::Duration::from_secs(600),
+            required: std::time::Duration::from_secs(600),
             settings: seismic::SearchSettings {
                 improvement: 0.0,
                 restarts: 0,
@@ -3499,7 +3499,7 @@ fn routed_decode_timings() {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let points = rows
+    let points: Vec<_> = rows
         .iter()
         .zip(route_inputs.iter_mut())
         .map(|(m, inputs)| seismic::TuningPoint {
@@ -3541,7 +3541,6 @@ fn routed_decode_timings() {
                 points,
                 validation.clone(),
                 survey,
-                None,
                 seismic::TuningReference::Portable,
             )
             .unwrap(),
@@ -3568,7 +3567,7 @@ fn routed_decode_timings() {
         })
         .collect::<Vec<_>>();
     let decode_statics = statics(&[("H", h), ("K", k), ("F", f), ("S", s)]);
-    let points = rows
+    let points: Vec<_> = rows
         .iter()
         .zip(&decode)
         .map(|(m, inputs)| seismic::TuningPoint {
@@ -3608,13 +3607,12 @@ fn routed_decode_timings() {
                 points,
                 validation.clone(),
                 exhaustive(),
-                None,
                 seismic::TuningReference::Portable,
             )
             .unwrap(),
         );
     }
-    let points = rows
+    let points: Vec<_> = rows
         .iter()
         .zip(&decode)
         .map(|(m, inputs)| seismic::TuningPoint {
@@ -3654,7 +3652,6 @@ fn routed_decode_timings() {
                 points,
                 validation.clone(),
                 exhaustive(),
-                None,
                 seismic::TuningReference::Portable,
             )
             .unwrap(),
@@ -3713,7 +3710,7 @@ fn routed_down_timings() {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let points = rows
+    let points: Vec<_> = rows
         .iter()
         .zip(&inputs)
         .map(|(m, inputs)| seismic::TuningPoint {
@@ -3739,6 +3736,8 @@ fn routed_down_timings() {
         .collect();
     let exhaustive = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
+        admission: std::time::Duration::from_secs(600),
+        required: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
             improvement: 0.0,
             restarts: 0,
@@ -3767,7 +3766,6 @@ fn routed_down_timings() {
                 ulps: None,
             }),
             exhaustive,
-            None,
             seismic::TuningReference::Portable,
         )
         .unwrap(),

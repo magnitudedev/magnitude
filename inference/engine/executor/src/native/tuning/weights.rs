@@ -116,6 +116,16 @@ impl<'a> TuningWeights<'a> {
             .ok_or_else(|| format!("weight {role:?} is absent from the load plan"))
     }
 
+    /// Whether the weight of one role is already imported.
+    pub fn resident(&self, scope: WeightScope, kind: WeightKind) -> bool {
+        self.resident.contains_key(&WeightRole { scope, kind })
+    }
+
+    /// The resident bytes of one role's weight: what importing it writes.
+    pub fn bytes(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
+        Ok(self.plan(scope, kind)?.resident_bytes)
+    }
+
     pub fn shape(&self, scope: WeightScope, kind: WeightKind) -> Result<Vec<u64>, String> {
         Ok(self.plan(scope, kind)?.shape.clone())
     }

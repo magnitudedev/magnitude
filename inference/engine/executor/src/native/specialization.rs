@@ -16,9 +16,9 @@ use seismic::{
 
 pub(super) struct Specializer<'a> {
     device: &'a Device,
-    /// A tuning census walks the program to count tuning units; it forms
+    /// A tuning count walks the program to count tuning units; it forms
     /// nothing and every entry comes back `None`.
-    census: bool,
+    counting: bool,
 }
 
 fn failure(entry: &'static str, bindings: &str, outcome: String) -> CatalogFailure {
@@ -75,15 +75,15 @@ impl<'a> Specializer<'a> {
     pub fn new(device: &'a Device) -> Self {
         Self {
             device,
-            census: false,
+            counting: false,
         }
     }
 
-    /// A specializer for the tuning count and census, which form nothing.
-    pub fn census(device: &'a Device) -> Self {
+    /// A specializer for the tuning count, which forms nothing.
+    pub fn count(device: &'a Device) -> Self {
         Self {
             device,
-            census: true,
+            counting: true,
         }
     }
 
@@ -102,14 +102,14 @@ impl<'a> Specializer<'a> {
         }))
     }
 
-    /// Prepare an entry without tuning parameters; `None` during a census.
+    /// Prepare an entry without tuning parameters; `None` during a count.
     pub fn fixed<E: Entry>(
         &mut self,
         bindings: &str,
         values: &[(&str, u64)],
         prepare: impl FnOnce(&NativeSpecialization) -> Result<NativeKernel<E>, LoadError>,
     ) -> Result<Option<NativeKernel<E>>, CatalogFailure> {
-        if self.census {
+        if self.counting {
             return Ok(None);
         }
         let implementation = self.implementation::<E>(bindings)?;
@@ -128,7 +128,7 @@ impl<'a> Specializer<'a> {
 
     /// Prepare an entry through its tuning case: static values from the
     /// case, parameters tuned on the device when the implementation declares
-    /// any. `None` during a tuning census, which forms nothing.
+    /// any. `None` during a tuning count, which forms nothing.
     pub fn tuned<T: EntryTuning>(
         &mut self,
         tuner: &mut Tuner<'_>,
@@ -144,7 +144,7 @@ impl<'a> Specializer<'a> {
         } else {
             tuner.tune(case, &implementation, &fixed)?
         };
-        if self.census {
+        if self.counting {
             return Ok(None);
         }
         case.prepare(self.device, &specialization)

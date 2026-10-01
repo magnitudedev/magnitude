@@ -2273,6 +2273,8 @@ fn gemma_g8_tuning_uses_portable_reference() {
         }),
         seismic::Strategy::Search(seismic::SearchPlan {
             allowance: std::time::Duration::from_secs(600),
+            admission: std::time::Duration::from_secs(600),
+            required: std::time::Duration::from_secs(600),
             settings: seismic::SearchSettings {
                 improvement: 0.01,
                 restarts: 2,
@@ -2290,7 +2292,6 @@ fn gemma_g8_tuning_uses_portable_reference() {
             ]
             .into()],
         }),
-        None,
         seismic::TuningReference::Portable,
     );
     eprintln!("Gemma portable-reference tuning: {result:?}");
@@ -2487,7 +2488,6 @@ fn gemma_fresh_only_with_scale(scale: f64) {
             .map(|(k, v)| (k.into(), v))
             .collect(),
         }),
-        None,
         seismic::TuningReference::NativeDefault,
     )
     .unwrap();

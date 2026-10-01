@@ -433,7 +433,7 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
             )
         })
         .collect::<Vec<_>>();
-    let points = rows
+    let points: Vec<_> = rows
         .iter()
         .zip(&inputs)
         .map(|(rows, (residual, out_rows))| seismic::TuningPoint {
@@ -459,6 +459,8 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
+        admission: std::time::Duration::from_secs(600),
+        required: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
             improvement: 0.01,
             restarts: 2,
@@ -492,7 +494,6 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
             ulps: None,
         }),
         search,
-        None,
         seismic::TuningReference::Portable,
     )
     .unwrap();
@@ -535,7 +536,7 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
             )
         })
         .collect::<Vec<_>>();
-    let points = rows
+    let points: Vec<_> = rows
         .iter()
         .zip(&inputs)
         .map(
@@ -559,6 +560,8 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
+        admission: std::time::Duration::from_secs(600),
+        required: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
             improvement: 0.01,
             restarts: 2,
@@ -589,7 +592,6 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
             ulps: None,
         }),
         search,
-        None,
         seismic::TuningReference::Portable,
     )
     .unwrap();

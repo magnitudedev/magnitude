@@ -16,6 +16,8 @@ use std::time::Duration;
 fn search(samples: usize) -> Strategy {
     Strategy::Search(SearchPlan {
         allowance: Duration::from_secs(3600),
+        admission: Duration::from_secs(3600),
+        required: Duration::from_secs(3600),
         settings: SearchSettings {
             improvement: 0.01,
             restarts: 2,
@@ -172,7 +174,6 @@ fn metal_scoped_tuning_searches_launches_separately() {
         points,
         PrecisionPolicy::Exact,
         search(2),
-        None,
         seismic::TuningReference::Portable,
     )
     .expect("factored Metal tuning");
@@ -240,7 +241,6 @@ fn metal_scoped_tuning_without_time_keeps_defaults_incomplete() {
         points,
         PrecisionPolicy::Exact,
         Strategy::Search(plan),
-        None,
         seismic::TuningReference::Portable,
     )
     .expect("a factored search without time returns its usable defaults");
@@ -470,7 +470,6 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             points(&inputs),
             PrecisionPolicy::Exact,
             search(3),
-            None,
             seismic::TuningReference::Portable,
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
@@ -543,7 +542,6 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
                 min_sample_seconds: 0.0002,
                 domains: Default::default(),
             }),
-            None,
             seismic::TuningReference::Portable,
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
@@ -567,7 +565,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
 }
 
 #[test]
-fn census_admits_points_within_its_ceiling_and_folds_the_rest() {
+fn a_search_times_the_points_its_admission_affords_and_folds_the_rest() {
     let device = DeviceCatalog::discover()
         .unwrap()
         .open_backend(BackendName::Cpu)
@@ -575,7 +573,11 @@ fn census_admits_points_within_its_ceiling_and_folds_the_rest() {
     let n = 4096u64;
     let short = f32_tensor(&device, &[n], &exact_values(n as usize));
     let long = f32_tensor(&device, &[n], &exact_values(n as usize));
-    let census = |required: bool| {
+    let tune = |required: bool| {
+        let Strategy::Search(mut plan) = search(1) else {
+            unreachable!()
+        };
+        plan.admission = Duration::ZERO;
         split_sum::native_tune(
             &device,
             &statics(n),
@@ -602,11 +604,7 @@ fn census_admits_points_within_its_ceiling_and_folds_the_rest() {
                 },
             ],
             PrecisionPolicy::Exact,
-            Strategy::Census {
-                min_sample_seconds: 0.0002,
-                ceiling: Duration::ZERO,
-            },
-            None,
+            Strategy::Search(plan),
             seismic::TuningReference::Portable,
         )
         .unwrap()
@@ -618,30 +616,88 @@ fn census_admits_points_within_its_ceiling_and_folds_the_rest() {
             .map(|point| (point.label.clone(), point.weight))
             .collect::<Vec<_>>()
     };
-    let measured = |result: &seismic::TuningResult| match &result.configurations[0].outcome {
-        Outcome::Measured { points, .. } => points
+    let timed = |result: &seismic::TuningResult| {
+        let defaults = result
+            .configurations
             .iter()
-            .map(|point| point.point.clone())
-            .collect::<Vec<_>>(),
-        Outcome::Excluded(exclusion) => panic!("{exclusion:?}"),
+            .find(|record| record.configuration.params["PARTS"] == 1)
+            .expect("the defaults were evaluated");
+        match &defaults.outcome {
+            Outcome::Measured { points, .. } => points
+                .iter()
+                .map(|point| point.point.clone())
+                .collect::<Vec<_>>(),
+            Outcome::Excluded(exclusion) => panic!("{exclusion:?}"),
+        }
     };
-    // The first point is always measured; the second would exceed a zero
-    // ceiling, so its weight folds into the first.
-    let folded = census(false);
-    assert!(matches!(folded.method, TuningMethod::Census));
-    assert_eq!(measured(&folded), ["short"]);
+    // The first point is always built; the second would exceed a zero
+    // admission, so it is not timed and its weight folds into the first.
+    let folded = tune(false);
+    assert_eq!(timed(&folded), ["short"]);
     assert_eq!(
         weights(&folded),
         [("short".to_owned(), 4.0), ("long".to_owned(), 0.0)]
     );
-    assert_eq!(folded.numerical_evidence.len(), 1);
-    // A required point is measured whatever the time.
-    let required = census(true);
-    assert_eq!(measured(&required), ["short", "long"]);
+    // A required point is timed within the required time, which is ample.
+    let required = tune(true);
+    assert_eq!(timed(&required), ["short", "long"]);
     assert_eq!(
         weights(&required),
         [("short".to_owned(), 1.0), ("long".to_owned(), 3.0)]
     );
+}
+
+#[test]
+fn a_unit_whose_required_points_do_not_fit_keeps_its_defaults_untried() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let n = 4096u64;
+    let x = f32_tensor(&device, &[n], &exact_values(n as usize));
+    let Strategy::Search(mut plan) = search(1) else {
+        unreachable!()
+    };
+    plan.required = Duration::ZERO;
+    let result = split_sum::native_tune(
+        &device,
+        &statics(n),
+        vec![
+            TuningPoint {
+                label: "first".into(),
+                weight: 1.0,
+                class: None,
+                cost: 1.0,
+                required: false,
+                rotation: vec![split_sum::Args { x: &x }],
+                initialize: None,
+                written: Default::default(),
+            },
+            TuningPoint {
+                label: "required".into(),
+                weight: 1.0,
+                class: None,
+                cost: 2.0,
+                required: true,
+                rotation: vec![split_sum::Args { x: &x }],
+                initialize: None,
+                written: Default::default(),
+            },
+        ],
+        PrecisionPolicy::Exact,
+        Strategy::Search(plan),
+        seismic::TuningReference::Portable,
+    )
+    .unwrap();
+    assert!(matches!(
+        result.method,
+        TuningMethod::Search {
+            stop: SearchStop::Unaffordable,
+            ..
+        }
+    ));
+    assert!(result.configurations.is_empty());
+    assert_eq!(result.overall.params["PARTS"], 1);
 }
 
 #[test]
@@ -676,7 +732,7 @@ fn a_search_choice_passes_validation_at_every_point_or_gives_way_to_the_defaults
                 label: "validated".into(),
                 weight: 0.0,
                 class: None,
-                cost: 1.0,
+                cost: 1000.0,
                 required: false,
                 rotation: vec![split_sum::Args { x: &validated }],
                 initialize: None,
@@ -684,12 +740,19 @@ fn a_search_choice_passes_validation_at_every_point_or_gives_way_to_the_defaults
             },
         ],
         PrecisionPolicy::Exact,
-        search(1),
-        None,
+        {
+            // The admission affords only the first point: the second is
+            // not timed, only validated.
+            let Strategy::Search(mut plan) = search(1) else {
+                unreachable!()
+            };
+            plan.admission = Duration::ZERO;
+            Strategy::Search(plan)
+        },
         seismic::TuningReference::NativeDefault,
     )
     .unwrap();
-    // Only the weighted point is timed; both are recorded.
+    // Only the admitted point is timed; both are recorded.
     assert_eq!(result.points.len(), 2);
     assert!(result
         .configurations
@@ -1199,7 +1262,6 @@ fn tuning_rejects_shared_mutable_state_without_an_initializer() {
             points,
             PrecisionPolicy::Exact,
             search(2),
-            None,
             seismic::TuningReference::Portable,
         ) {
             Err(TuneError::SharedMutableState { point, parameter }) => {
@@ -1243,7 +1305,6 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
             points,
             PrecisionPolicy::Exact,
             search(2),
-            None,
             seismic::TuningReference::Portable,
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
@@ -1861,7 +1922,6 @@ fn wrong_default_and_shared_defect_are_rejected_against_portable_source() {
         }],
         PrecisionPolicy::Exact,
         search(3),
-        None,
         seismic::TuningReference::Portable,
     )
     .unwrap();
@@ -1899,14 +1959,13 @@ fn factored_search_finds_a_complete_passing_seed_after_bad_defaults() {
             initialize: None,
             written: Default::default(),
         })
-        .collect();
+        .collect::<Vec<_>>();
     let result = scoped_wrong_default::native_tune(
         &device,
         &NativeSpecialization::new(),
         points,
         PrecisionPolicy::Exact,
         search(3),
-        None,
         seismic::TuningReference::Portable,
     )
     .unwrap();
@@ -1916,24 +1975,19 @@ fn factored_search_finds_a_complete_passing_seed_after_bad_defaults() {
 }
 
 #[test]
-fn complete_evidence_reuses_only_matching_policy_and_reference() {
+fn evidence_identity_covers_policy_and_reference() {
     let device = DeviceCatalog::discover()
         .unwrap()
         .open_backend(BackendName::Metal)
         .unwrap();
     let x = f32_tensor(&device, &[4], &[1.; 4]);
     let mut state = f32_tensor(&device, &[4], &[0.; 4]);
-    let count = std::rc::Rc::new(std::cell::Cell::new(0));
-    let mut run = |initial: f32,
-                   policy: PrecisionPolicy,
-                   previous: Option<&seismic::TuningResult>,
-                   reference: seismic::TuningReference| {
+    let mut run = |policy: PrecisionPolicy, reference: seismic::TuningReference| {
         let mut reset = state.clone();
-        let bytes: Vec<_> = [initial; 4]
+        let bytes: Vec<_> = [0f32; 4]
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        let count = count.clone();
         accumulate::native_tune(
             &device,
             &NativeSpecialization::new(),
@@ -1947,49 +2001,23 @@ fn complete_evidence_reuses_only_matching_policy_and_reference() {
                     state: &mut state,
                     x: &x,
                 }],
-                initialize: Some(Box::new(move || {
-                    count.set(count.get() + 1);
-                    reset.write_from_host(&bytes)
-                })),
+                initialize: Some(Box::new(move || reset.write_from_host(&bytes))),
                 written: Default::default(),
             }],
             policy,
             search(2),
-            previous.map(seismic::TuningReuse::Completed),
             reference,
         )
         .unwrap()
     };
-    let first = run(
-        0.,
-        PrecisionPolicy::Exact,
-        None,
-        seismic::TuningReference::Portable,
-    );
-    count.set(0);
-    let reused = run(
-        0.,
-        PrecisionPolicy::Exact,
-        Some(&first),
-        seismic::TuningReference::Portable,
-    );
-    assert!(reused.reused);
-    assert_eq!(first.numerical_evidence, reused.numerical_evidence);
-    assert_eq!(first.overall, reused.overall);
-    assert_eq!(
-        count.get(),
-        0,
-        "matching evidence neither initializes nor reads the input"
-    );
+    let first = run(PrecisionPolicy::Exact, seismic::TuningReference::Portable);
     let bounded = run(
-        0.,
         PrecisionPolicy::bounded(seismic::precision::Tolerance {
             absolute: seismic::precision::Limit::new(0.001).unwrap(),
             relative: seismic::precision::Limit::ZERO,
             relative_floor: seismic::precision::Limit::ZERO,
             ulps: None,
         }),
-        Some(&first),
         seismic::TuningReference::Portable,
     );
     assert_ne!(
@@ -1997,12 +2025,9 @@ fn complete_evidence_reuses_only_matching_policy_and_reference() {
         bounded.numerical_evidence[0].identity
     );
     let native = run(
-        0.,
         PrecisionPolicy::Exact,
-        Some(&first),
         seismic::TuningReference::NativeDefault,
     );
-    assert!(!native.reused);
     assert_ne!(
         native.numerical_evidence[0].identity,
         first.numerical_evidence[0].identity
@@ -2011,13 +2036,6 @@ fn complete_evidence_reuses_only_matching_policy_and_reference() {
         native.numerical_evidence[0].reference,
         seismic::TuningReference::NativeDefault
     );
-    let reused_native = run(
-        0.,
-        PrecisionPolicy::Exact,
-        Some(&native),
-        seismic::TuningReference::NativeDefault,
-    );
-    assert!(reused_native.reused);
 }
 
 #[test]
@@ -2057,7 +2075,6 @@ fn rejected_candidates_stop_after_the_first_timed_invocation() {
         }],
         PrecisionPolicy::Exact,
         search(3),
-        None,
         seismic::TuningReference::Portable,
     )
     .unwrap();
@@ -2093,7 +2110,6 @@ fn pooled_results_cannot_hide_a_candidates_missing_writes() {
         }],
         PrecisionPolicy::Exact,
         search(2),
-        None,
         seismic::TuningReference::NativeDefault,
     )
     .unwrap();
@@ -2167,10 +2183,9 @@ fn declared_rows_scope_state_observation_and_a_whole_point_rejects_stray_writes(
                     initialize: Some(initialize),
                     written,
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
             PrecisionPolicy::Exact,
             search(2),
-            None,
             seismic::TuningReference::NativeDefault,
         )
         .unwrap();

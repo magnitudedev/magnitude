@@ -193,16 +193,16 @@ impl NativePreparationCache {
                 bindings: "decoder epsilon".into(),
                 outcome,
             })?;
-        // Tuning walks the program three times: a count finds the units
-        // that will search, a census measures their defaults within the
-        // tuning time, and the last walk searches each and prepares it.
+        // Tuning walks the program twice: a count finds the units that will
+        // search and their launches, and the last walk searches each within
+        // its share of the tuning time and prepares it.
         let mut count = Preparation::new(
             device,
             plan,
             tuning,
             limits,
             epsilon,
-            Specializer::census(device),
+            Specializer::count(device),
             Tuner::count(
                 device,
                 tuning,
@@ -211,16 +211,6 @@ impl NativePreparationCache {
             ),
         );
         count.walk(plan)?;
-        let mut census = Preparation::new(
-            device,
-            plan,
-            tuning,
-            limits,
-            epsilon,
-            Specializer::census(device),
-            count.tuner.census(),
-        );
-        census.walk(plan)?;
         let mut preparation = Preparation::new(
             device,
             plan,
@@ -228,7 +218,7 @@ impl NativePreparationCache {
             limits,
             epsilon,
             spec,
-            census.tuner.search(),
+            count.tuner.search(),
         );
         let glue = preparation.walk(plan)?;
         let Preparation {
@@ -1364,7 +1354,7 @@ impl<'a> Preparation<'a> {
             }
             None => None,
         };
-        // `None` anywhere is a tuning census or a missing implementation.
+        // `None` anywhere is a tuning count or a missing implementation.
         Ok(match (select, experts, down, group, scatter) {
             (Some(select), Some(experts), Some(down), Some(group), Some(scatter)) => {
                 let shared = match shared {
@@ -1764,7 +1754,7 @@ impl<'a> Preparation<'a> {
     /// over rows, every unfused projection (per kind, weight and published
     /// element, over every layer sharing it), the two convolution halves,
     /// the gated product, the top-k, both codebook gathers and the path
-    /// step. `None` during a tuning census.
+    /// step. `None` during a tuning count.
     fn dflash2(
         &mut self,
         plan: &crate::DraftProgramPlan,

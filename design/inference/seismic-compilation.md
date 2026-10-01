@@ -45,18 +45,22 @@ Native invocation reuses the checked entry contract and public tensor runtime bu
 `PreparedKernel`, or portable workflow artifacts. It has no solving, duration model, candidate
 selection, retry, or fallback. Its only search is tuning, fast enough to run at program
 preparation. Entry-wide declarations use a time-bounded local search of the author's declared parameter domain, minimizing one
-weighted device-measured cost (`Σ weight × median`) over the consumer's points that carry weight.
-Every candidate must pass numerical validation at those points before repeated timing. A point of
-weight zero is not timed; the search's choice must also pass validation there, and a choice that
-fails gives way to the census seed (the first passing configuration, the defaults when they pass),
-which must pass there too; the defaults compared with themselves (a native-default reference) pass
-by construction. Every chosen configuration passes at every point. A consumer's
-census measures the first passing configuration point by point in the consumer's order (ascending
-cost), admitting a point only while its time so far plus the point's time predicted from the
-previous one by their cost ratio fits the consumer's ceiling; a point the consumer marks required is
-always admitted. A point not admitted gets weight zero and folds its weight into the largest
-admitted point of its class (or the largest admitted point). References execute per point, when a
-point is first validated. A parameter read only by launches inactive at every timed point keeps its
+weighted device-measured cost (`Σ weight × median`) over the points it times. The consumer
+describes its points in ascending estimated cost and supplies their inputs through a source that
+the tuner asks for a point's inputs only when it needs the point, with the time building them may
+take; the source refuses a point whose building is predicted not to fit. One tuning call spends
+the consumer's whole allowance: it builds the points in order, running each point's reference and
+validating and measuring the defaults there, admitting a point while that work stays within the
+plan's admission time, each point predicted from the previous one by their cost ratio. A point
+the consumer marks required may take the plan's required time instead; when the required points
+cannot fit, the tuner keeps the defaults without searching (`Unaffordable`). A point not admitted
+is not timed and folds its weight into the largest admitted point of its class (or the largest
+admitted point). Every candidate must pass numerical validation at the timed points before
+repeated timing. A choice other than the defaults is then validated at the points not timed,
+whose inputs are built only for that; a choice that fails there, or whose validation there would
+not fit the allowance, gives way to the defaults, which must pass there too unless they are
+themselves the reference (a native-default reference, against which they pass by construction).
+Every chosen configuration passes at every point. A parameter read only by launches inactive at every timed point keeps its
 default: nothing measures it, and no validation runs its code.
 Each parameter's values are ordered numerically; neighbours differ by one step in one parameter. The search
 evaluates the defaults, then, as its time allows, one start per other value of each `form` parameter and any
@@ -68,8 +72,9 @@ to the best while it improves by more than ε; a form's own defaults can be far 
 a single descent from the entry's defaults rarely crosses into another form. Then, at each local
 minimum, it restarts from the unvisited configuration farthest from everything visited. It stops when the space is
 exhausted, R consecutive restarts found nothing better, or its exploration time ends: the consumer's
-allowance less what confirming the finalists and validating the choice at the untimed points will
-cost, estimated from the census's measurement of the defaults. Time is checked before each
+allowance less what confirming the finalists (estimated from the defaults' measurement at the timed
+points) and validating the choice at the untimed points (estimated from the last timed point) will
+cost. Time is checked before each
 configuration. Configurations the device cannot form or run cost +∞. The K cheapest configurations and the
 defaults are then re-measured with more samples across every timed point, alternating round by
 round, and ranked by those full-workload costs; the defaults rank first unless the leader beats
@@ -109,12 +114,12 @@ The default receives the same validation as every candidate. The first fully pas
 establishes the timing anchor; if none passes, tuning returns a failure with the observed exclusions.
 A default that failed validation or measurement cannot be selected as an implicit fallback;
 a default that passed both but whose timing re-measurement was unstable remains the choice,
-since timing noise is not a numerical verdict. A startup census finds a
-passing seed and carries its numerical evidence and measurements into subsequent search.
-Complete cache reuse requires matching source, numerical policy, case structure and observation
-scope, native implementation, configuration and device identities; the caller's key names what
-case inputs are generated from, so reuse never reads them back. A timing reuse key alone never
-establishes numerical agreement. Old Boolean-only records cannot authorize selection.
+since timing noise is not a numerical verdict. The defaults' measurement and evidence from
+admitting the points carry into the search.
+Seismic does not reuse stored results: the consumer keys and stores them, by what a result is
+valid for (device, implementation, numerical policy, served shapes), and names what case inputs
+are generated from, so reuse never reads them back. A timing key alone never establishes
+numerical agreement. Old Boolean-only records cannot authorize selection.
 A consumer may tune the same native entry for disjoint served workload classes as separate
 units, then bind each prepared choice into the corresponding exact graph class. Each unit has
 its own search identity, measurement points and validation; the prepared choices share the

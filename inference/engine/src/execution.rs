@@ -150,7 +150,8 @@ pub(crate) fn prepare(
     let tuned = programs.tuned();
     eprintln!(
         "magnitude-engine: prepared programs in {:.2} s, {:.2} s of it tuning {} entries \
-         ({} searched, {} stored; forming {:.2} s, measuring {:.2} s, validating {:.2} s)",
+         ({} searched, {} stored; building inputs {:.2} s, forming {:.2} s, measuring {:.2} s, \
+         validating {:.2} s)",
         preparing.elapsed().as_secs_f64(),
         tuned.iter().map(|tuned| tuned.seconds).sum::<f64>(),
         tuned.len(),
@@ -162,6 +163,10 @@ pub(crate) fn prepare(
             .iter()
             .filter(|tuned| tuned.origin == TuningOrigin::Stored)
             .count(),
+        tuned
+            .iter()
+            .map(|tuned| tuned.time.building_seconds)
+            .sum::<f64>(),
         tuned
             .iter()
             .map(|tuned| tuned.time.forming_seconds)
@@ -627,7 +632,7 @@ impl TuningObserver for TuningReport {
                 let origin = match (tuned.origin, tuned.search) {
                     (TuningOrigin::Stored, _) => "stored".to_owned(),
                     (TuningOrigin::Searched, Some((allowance, stop))) => {
-                        format!("allowance {:.2} s, stop {stop:?}", allowance.as_secs_f64())
+                        format!("budget {:.2} s, stop {stop:?}", allowance.as_secs_f64())
                     }
                     (TuningOrigin::Searched, None) => "surveyed".to_owned(),
                 };
