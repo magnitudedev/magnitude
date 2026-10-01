@@ -11,7 +11,7 @@ const render = (model: string | undefined) => renderToStaticMarkup(
 it("shows the local base URL and a Settings link with the example request collapsed", () => {
   const html = render("qwen3-32b")
   expect(html).toContain(baseUrl)
-  expect(html).toContain("https://docs.magnitude.dev/integrations/other-apps")
+  expect(html).toContain("https://docs.magnitude.dev/integrations/other-agents")
   expect(html).toContain("network access in")
   expect(html).toContain("/inference/anthropic")
   expect(html).toContain('aria-expanded="false"')

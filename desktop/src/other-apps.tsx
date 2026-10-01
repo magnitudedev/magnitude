@@ -26,7 +26,7 @@ export function OtherApps({ origin, model, platform, onOpenSettings }: {
         <span className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-600 dark:bg-slate-800 dark:text-blue-400"><PlugsIcon aria-hidden="true" className="size-5" /></span>
         <div className="min-w-0">
           <h3 className="text-lg font-semibold">OpenAI-compatible API</h3>
-          <p className="mt-1 text-sm text-slate-500">Served on your computer. Any app or agent can use it. <DocsLink path="/integrations/other-apps">Learn more</DocsLink></p>
+          <p className="mt-1 text-sm text-slate-500">Served on your computer. Any app or agent can use it. <DocsLink path="/integrations/other-agents">Learn more</DocsLink></p>
         </div>
       </div>
       <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-750">

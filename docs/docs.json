@@ -86,7 +86,7 @@
           "integrations/claude-code",
           "integrations/oh-my-pi",
           "integrations/cline",
-          "integrations/other-apps"
+          "integrations/other-agents"
         ]
       },
       {
@@ -112,7 +112,7 @@
   "redirects": [
     {
       "source": "/api/other-apps",
-      "destination": "/integrations/other-apps"
+      "destination": "/integrations/other-agents"
     }
   ],
   "styling": {
