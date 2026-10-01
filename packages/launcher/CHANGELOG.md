@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.2.3
+
+### Patch Changes
+
+- [`5b1aba8`](https://github.com/magnitudedev/magnitude/commit/5b1aba81185ac8b07ba363ba2a11427c3447d62a) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix the Windows installer failing on Windows 10 with "An interrupted installation could not be recovered (code 4395)". Setup now installs normally and publishes the `magnitude` command to PATH, which also failed on Windows 10 once installation got past that error.
+
 ## 0.2.2
 
 ### Patch Changes
