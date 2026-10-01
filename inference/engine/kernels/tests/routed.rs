@@ -1825,6 +1825,8 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
             label: format!("rows{rows}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![routed_expand::Args {
                 normalized,
                 routes,
@@ -1838,7 +1840,7 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
         })
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
-        budget: 24,
+        allowance: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
             improvement: 0.01,
             restarts: 2,
@@ -1849,8 +1851,6 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
         },
         min_sample_seconds: 0.001,
         start: Vec::new(),
-        deadline: None,
-        screening: Vec::new(),
     });
     let statics = specialize(&[("H", h), ("K", k), ("F", f), ("S", s)], &[]);
     let result = routed_expand::native_tune_with(
@@ -1880,7 +1880,8 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
         seismic::TuningMethod::Factored {
             groups: 1,
             candidates: 6,
-            complete: true
+            complete: true,
+            ..
         }
     ));
     assert_eq!(result.rejections().count(), 0);
@@ -1933,6 +1934,8 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
             label: format!("rows{rows}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![routed_output::Args {
                 residual: &input.0,
                 expert_product: &input.1,
@@ -1948,7 +1951,7 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
         })
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
-        budget: 24,
+        allowance: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
             improvement: 0.01,
             restarts: 2,
@@ -1959,8 +1962,6 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
         },
         min_sample_seconds: 0.001,
         start: Vec::new(),
-        deadline: None,
-        screening: Vec::new(),
     });
     let statics = specialize(&[("H", h), ("K", k), ("F", f), ("S", s)], &[]);
     let result = routed_output::native_tune_with(
@@ -1988,7 +1989,8 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
         seismic::TuningMethod::Factored {
             groups: 1,
             candidates: 6,
-            complete: true
+            complete: true,
+            ..
         }
     ));
     assert_eq!(result.rejections().count(), 0);
@@ -2980,7 +2982,7 @@ fn routed_kernel_timings() {
             seismic::BackendName::Metal | seismic::BackendName::Cuda
         ) {
             seismic::Strategy::Search(seismic::SearchPlan {
-                budget: 24,
+                allowance: std::time::Duration::from_secs(600),
                 settings: seismic::SearchSettings {
                     improvement: 0.01,
                     restarts: 2,
@@ -2991,8 +2993,6 @@ fn routed_kernel_timings() {
                 },
                 min_sample_seconds: 0.002,
                 start: Vec::new(),
-                deadline: None,
-                screening: Vec::new(),
             })
         } else {
             measure.clone()
@@ -3038,6 +3038,8 @@ fn routed_kernel_timings() {
             label: format!("m{m}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: inputs
                 .iter_mut()
                 .zip(&layers)
@@ -3105,6 +3107,8 @@ fn routed_kernel_timings() {
             label: format!("m{m}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3147,6 +3151,8 @@ fn routed_kernel_timings() {
             label: format!("m{m}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3224,6 +3230,8 @@ fn routed_kernel_timings() {
             label: format!("m{m}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3266,6 +3274,8 @@ fn routed_kernel_timings() {
             label: format!("m{m}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3331,6 +3341,8 @@ fn routed_kernel_timings() {
             label: format!("m{m}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: inputs
                 .iter()
                 .zip(tables.iter_mut())
@@ -3436,7 +3448,12 @@ fn routed_decode_timings() {
             )
         })
         .collect::<Vec<_>>();
-    let validation = seismic::Validation::Relative { error: 0.05 };
+    let validation = seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
+        absolute: seismic::precision::Limit::new(0.01).unwrap(),
+        relative: seismic::precision::Limit::new(0.05).unwrap(),
+        relative_floor: seismic::precision::Limit::ZERO,
+        ulps: None,
+    });
     let statics = |pairs: &[(&str, u64)]| {
         pairs.iter().fold(
             seismic::NativeSpecialization::new(),
@@ -3448,11 +3465,11 @@ fn routed_decode_timings() {
         min_sample_seconds: 0.004,
         domains: Default::default(),
     });
-    // Launch-scoped parameters need the factored search; its budget covers
+    // Launch-scoped parameters need the factored search; its time covers
     // every declared configuration.
     let exhaustive = || {
         seismic::Strategy::Search(seismic::SearchPlan {
-            budget: 256,
+            allowance: std::time::Duration::from_secs(600),
             settings: seismic::SearchSettings {
                 improvement: 0.0,
                 restarts: 0,
@@ -3463,8 +3480,6 @@ fn routed_decode_timings() {
             },
             min_sample_seconds: 0.004,
             start: Vec::new(),
-            deadline: None,
-            screening: Vec::new(),
         })
     };
 
@@ -3491,6 +3506,8 @@ fn routed_decode_timings() {
             label: format!("m{m}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: inputs
                 .iter_mut()
                 .zip(&layers)
@@ -3508,6 +3525,7 @@ fn routed_decode_timings() {
                 })
                 .collect(),
             initialize: Some(Box::new(|| Ok(()))),
+            written: Default::default(),
         })
         .collect();
     if timing_entry("route") {
@@ -3521,8 +3539,10 @@ fn routed_decode_timings() {
                 },
                 &statics(&[("H", h), ("E", e), ("K", k)]),
                 points,
-                validation,
+                validation.clone(),
                 survey,
+                None,
+                seismic::TuningReference::Portable,
             )
             .unwrap(),
         );
@@ -3555,6 +3575,8 @@ fn routed_decode_timings() {
             label: format!("m{m}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3568,6 +3590,7 @@ fn routed_decode_timings() {
                 })
                 .collect(),
             initialize: None,
+            written: Default::default(),
         })
         .collect();
     if timing_entry("expand") {
@@ -3583,8 +3606,10 @@ fn routed_decode_timings() {
                 },
                 &decode_statics,
                 points,
-                validation,
+                validation.clone(),
                 exhaustive(),
+                None,
+                seismic::TuningReference::Portable,
             )
             .unwrap(),
         );
@@ -3596,6 +3621,8 @@ fn routed_decode_timings() {
             label: format!("m{m}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3611,6 +3638,7 @@ fn routed_decode_timings() {
                 })
                 .collect(),
             initialize: None,
+            written: Default::default(),
         })
         .collect();
     if timing_entry("output") {
@@ -3624,8 +3652,10 @@ fn routed_decode_timings() {
                 },
                 &decode_statics,
                 points,
-                validation,
+                validation.clone(),
                 exhaustive(),
+                None,
+                seismic::TuningReference::Portable,
             )
             .unwrap(),
         );
@@ -3690,6 +3720,8 @@ fn routed_down_timings() {
             label: format!("m{m}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3702,10 +3734,11 @@ fn routed_down_timings() {
                 })
                 .collect(),
             initialize: None,
+            written: Default::default(),
         })
         .collect();
     let exhaustive = seismic::Strategy::Search(seismic::SearchPlan {
-        budget: 256,
+        allowance: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
             improvement: 0.0,
             restarts: 0,
@@ -3716,8 +3749,6 @@ fn routed_down_timings() {
         },
         min_sample_seconds: 0.004,
         start: Vec::new(),
-        deadline: None,
-        screening: Vec::new(),
     });
     print_timings(
         &routed_down::native_tune_with(
@@ -3729,8 +3760,15 @@ fn routed_down_timings() {
             },
             &specialize(&[("H", h), ("K", k), ("F", f)], &[]),
             points,
-            seismic::Validation::Relative { error: 0.05 },
+            seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
+                absolute: seismic::precision::Limit::new(0.01).unwrap(),
+                relative: seismic::precision::Limit::new(0.05).unwrap(),
+                relative_floor: seismic::precision::Limit::ZERO,
+                ulps: None,
+            }),
             exhaustive,
+            None,
+            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );

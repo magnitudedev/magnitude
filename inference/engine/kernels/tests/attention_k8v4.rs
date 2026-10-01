@@ -2259,6 +2259,8 @@ fn gemma_g8_tuning_uses_portable_reference() {
             label: "gemma-g8".into(),
             weight: 1.,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![args!(attention_decode_k8v4, bound, encoded.case)],
             initialize: Some(initialize),
             written: Default::default(),
@@ -2270,7 +2272,7 @@ fn gemma_g8_tuning_uses_portable_reference() {
             ulps: None,
         }),
         seismic::Strategy::Search(seismic::SearchPlan {
-            budget: 2,
+            allowance: std::time::Duration::from_secs(600),
             settings: seismic::SearchSettings {
                 improvement: 0.01,
                 restarts: 2,
@@ -2287,8 +2289,6 @@ fn gemma_g8_tuning_uses_portable_reference() {
                 ("SPAN".into(), 32),
             ]
             .into()],
-            deadline: None,
-            screening: Vec::new(),
         }),
         None,
         seismic::TuningReference::Portable,
@@ -2457,6 +2457,8 @@ fn gemma_fresh_only_with_scale(scale: f64) {
             label: "gemma-fresh-only".into(),
             weight: 1.,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![args!(attention_decode_k8v4, bound, encoded.case)],
             initialize: Some(Box::new(move || {
                 for (tensor, bytes) in &mut pristine {

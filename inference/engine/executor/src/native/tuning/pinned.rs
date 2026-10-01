@@ -93,7 +93,7 @@ pub(super) fn lookup(
     let Some(installed) = guard.as_ref() else {
         return Ok(Pinned::Tune);
     };
-    let (entry, bindings, statics, _) = key;
+    let (entry, bindings, statics) = key;
     if installed.defaults {
         let mut fixed = NativeSpecialization::new();
         for (name, value) in statics {
@@ -137,7 +137,7 @@ pub(super) fn record(key: &TuningKey, chosen: &NativeSpecialization) {
     let Some(installed) = guard.as_mut().filter(|installed| !installed.replay) else {
         return;
     };
-    let (entry, bindings, statics, _) = key;
+    let (entry, bindings, statics) = key;
     installed.configurations.push(PinnedConfiguration {
         entry: (*entry).to_owned(),
         bindings: bindings.clone(),

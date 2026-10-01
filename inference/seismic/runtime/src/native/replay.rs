@@ -278,6 +278,8 @@ struct Recorded<'r> {
     /// estimates cheapest so far.
     curve: Vec<f64>,
     cheapest: Option<(f64, usize)>,
+    /// The evaluations a run's time covers.
+    evaluations: usize,
 }
 
 impl Recorded<'_> {
@@ -371,7 +373,10 @@ impl Recorded<'_> {
 impl Evaluator for Recorded<'_> {
     fn evaluate(&mut self, batch: &[usize]) -> Vec<Result<Cost, Exclusion>> {
         let mut measured = std::mem::take(&mut self.measured);
-        let results = batch
+        let answered = batch
+            .len()
+            .min(self.evaluations.saturating_sub(self.curve.len()).max(1));
+        let results = batch[..answered]
             .iter()
             .map(|&index| {
                 let Some(medians) = self.medians(index, self.settings.samples, &mut measured)
@@ -426,7 +431,7 @@ impl Evaluator for Recorded<'_> {
     }
 
     fn expired(&self) -> bool {
-        false
+        self.curve.len() >= self.evaluations
     }
 }
 
@@ -481,13 +486,13 @@ impl Replay {
     }
 }
 
-/// Replay the search `runs` times over `recording` with `budget`
-/// configurations, each run drawing from its own seed. The choice is the
+/// Replay the search `runs` times over `recording`, each run's time
+/// covering `evaluations` configurations and drawing from its own seed. The choice is the
 /// first configuration of the search's ranking (validation always passes on
 /// a survey record, which holds only validated configurations).
 pub fn replay(
     recording: &Recording,
-    budget: usize,
+    evaluations: usize,
     settings: &SearchSettings,
     objective: Objective,
     runs: usize,
@@ -507,8 +512,9 @@ pub fn replay(
             reference: None,
             curve: Vec::new(),
             cheapest: None,
+            evaluations,
         };
-        let trace = search::search(&recording.space, &[], budget, settings, &mut evaluator);
+        let trace = search::search(&recording.space, &[], settings, &mut evaluator);
         replay.chosen.push(recording.excess(trace.ranking[0]));
         replay.evaluated.push(trace.evaluated.len());
         replay.curves.push(evaluator.curve);

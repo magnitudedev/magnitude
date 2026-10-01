@@ -193,8 +193,24 @@ impl NativePreparationCache {
                 bindings: "decoder epsilon".into(),
                 outcome,
             })?;
-        // A census walk counts the program's tuning units, so the model's
-        // budget can be shared before anything is tuned.
+        // Tuning walks the program three times: a count finds the units
+        // that will search, a census measures their defaults within the
+        // tuning time, and the last walk searches each and prepares it.
+        let mut count = Preparation::new(
+            device,
+            plan,
+            tuning,
+            limits,
+            epsilon,
+            Specializer::census(device),
+            Tuner::count(
+                device,
+                tuning,
+                limits,
+                TuningWeights::new(device, load, tuning.weights, &import),
+            ),
+        );
+        count.walk(plan)?;
         let mut census = Preparation::new(
             device,
             plan,
@@ -202,16 +218,9 @@ impl NativePreparationCache {
             limits,
             epsilon,
             Specializer::census(device),
-            Tuner::census(
-                device,
-                tuning,
-                limits,
-                TuningWeights::new(device, load, tuning.weights, &import),
-            ),
+            count.tuner.census(),
         );
         census.walk(plan)?;
-        let budgets = census.tuner.budgets();
-        let weights = TuningWeights::new(device, load, tuning.weights, &import);
         let mut preparation = Preparation::new(
             device,
             plan,
@@ -219,7 +228,7 @@ impl NativePreparationCache {
             limits,
             epsilon,
             spec,
-            Tuner::new(device, tuning, limits, weights, budgets),
+            census.tuner.search(),
         );
         let glue = preparation.walk(plan)?;
         let Preparation {

@@ -6,17 +6,16 @@
 use seismic::{
     Availability, BackendName, CallError, Device, DeviceCatalog, Element, Exclusion,
     InvocationError, MeasureOptions, NativeGraphFamily, NativeSpecialization, Outcome,
-    PrecisionPolicy, ScreeningPoint, SearchPlan, SearchSettings, SearchStop, Strategy, SurveyPlan,
-    Tensor, TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint,
+    PrecisionPolicy, SearchPlan, SearchSettings, SearchStop, Strategy, SurveyPlan, Tensor,
+    TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint,
 };
 use seismic_native_tests::{accumulate, gated_sum, scale_rows, scoped_scale, split_sum};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// A search whose budget covers every configuration of the test entries,
-/// including a CPU device's participant counts and tiers.
+/// A search whose time outlasts its convergence on the test entries.
 fn search(samples: usize) -> Strategy {
     Strategy::Search(SearchPlan {
-        budget: 10_000,
+        allowance: Duration::from_secs(3600),
         settings: SearchSettings {
             improvement: 0.01,
             restarts: 2,
@@ -30,8 +29,6 @@ fn search(samples: usize) -> Strategy {
         // finalist whose samples spread more than 10%.
         min_sample_seconds: 0.005,
         start: Vec::new(),
-        deadline: None,
-        screening: Vec::new(),
     })
 }
 
@@ -152,6 +149,8 @@ fn metal_scoped_tuning_searches_launches_separately() {
             label: "m7".into(),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![scoped_scale::Args { x: &small }],
             initialize: None,
             written: Default::default(),
@@ -160,6 +159,8 @@ fn metal_scoped_tuning_searches_launches_separately() {
             label: "m35".into(),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![scoped_scale::Args { x: &large }],
             initialize: None,
             written: Default::default(),
@@ -180,7 +181,8 @@ fn metal_scoped_tuning_searches_launches_separately() {
         TuningMethod::Factored {
             groups: 2,
             candidates: 8,
-            complete: true
+            complete: true,
+            ..
         }
     ));
     assert_eq!(result.overall.launches.len(), 2);
@@ -199,7 +201,7 @@ fn metal_scoped_tuning_searches_launches_separately() {
 }
 
 #[test]
-fn metal_scoped_tuning_expired_deadline_keeps_defaults_incomplete() {
+fn metal_scoped_tuning_without_time_keeps_defaults_incomplete() {
     let catalog = DeviceCatalog::discover().expect("device discovery");
     let Ok(device) = catalog.open_backend(BackendName::Metal) else {
         return;
@@ -211,6 +213,8 @@ fn metal_scoped_tuning_expired_deadline_keeps_defaults_incomplete() {
             label: "m7".into(),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![scoped_scale::Args { x: &small }],
             initialize: None,
             written: Default::default(),
@@ -219,6 +223,8 @@ fn metal_scoped_tuning_expired_deadline_keeps_defaults_incomplete() {
             label: "m35".into(),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![scoped_scale::Args { x: &large }],
             initialize: None,
             written: Default::default(),
@@ -227,7 +233,7 @@ fn metal_scoped_tuning_expired_deadline_keeps_defaults_incomplete() {
     let Strategy::Search(mut plan) = search(1) else {
         unreachable!()
     };
-    plan.deadline = Some(Instant::now() - Duration::from_secs(1));
+    plan.allowance = Duration::ZERO;
     let result = scoped_scale::native_tune(
         &device,
         &NativeSpecialization::new(),
@@ -237,7 +243,7 @@ fn metal_scoped_tuning_expired_deadline_keeps_defaults_incomplete() {
         None,
         seismic::TuningReference::Portable,
     )
-    .expect("expired factored search returns its usable defaults");
+    .expect("a factored search without time returns its usable defaults");
     assert!(matches!(
         result.method,
         TuningMethod::Factored {
@@ -440,6 +446,8 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
                     label: "short".into(),
                     weight: 1.0,
                     class: None,
+                    cost: 1.0,
+                    required: false,
                     rotation: inputs.iter().map(|x| split_sum::Args { x }).collect(),
                     initialize: None,
                     written: Default::default(),
@@ -448,6 +456,8 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
                     label: "long".into(),
                     weight: 3.0,
                     class: None,
+                    cost: 1.0,
+                    required: false,
                     rotation: inputs.iter().map(|x| split_sum::Args { x }).collect(),
                     initialize: None,
                     written: Default::default(),
@@ -464,21 +474,21 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             seismic::TuningReference::Portable,
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-        // The budget covers the whole domain: the search reaches every
-        // configuration once, starting from the defaults. The domain is the
-        // declared one (three part counts by two widths) and, on a CPU
-        // device, its participant counts per launch and tiers.
+        // With time to spare the search ends on its own, having reached
+        // each configuration at most once, starting from the defaults. The
+        // domain is the declared one (three part counts by two widths) and,
+        // on a CPU device, its participant counts per launch and tiers.
         let domain = result
             .parameters
             .iter()
             .map(|parameter| parameter.values.len())
             .product::<usize>();
         assert_eq!(domain % 6, 0);
-        assert_eq!(result.configurations.len(), domain);
+        assert!(result.configurations.len() <= domain);
         assert!(matches!(
             result.method,
             TuningMethod::Search {
-                stop: SearchStop::Exhausted,
+                stop: SearchStop::Exhausted | SearchStop::Converged,
                 ..
             }
         ));
@@ -493,10 +503,6 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             .params
             .iter()
             .all(|(name, value)| !name.starts_with("cpu.") || *value == 0));
-        assert!(result
-            .configurations
-            .iter()
-            .all(|record| matches!(record.outcome, Outcome::Measured { .. })));
         // The chosen configuration was validated, and the finalists
         // re-measured.
         assert!(result.configurations.iter().any(|record| {
@@ -561,7 +567,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
 }
 
 #[test]
-fn screened_search_confirms_and_validates_the_full_workload() {
+fn census_admits_points_within_its_ceiling_and_folds_the_rest() {
     let device = DeviceCatalog::discover()
         .unwrap()
         .open_backend(BackendName::Cpu)
@@ -569,70 +575,152 @@ fn screened_search_confirms_and_validates_the_full_workload() {
     let n = 4096u64;
     let short = f32_tensor(&device, &[n], &exact_values(n as usize));
     let long = f32_tensor(&device, &[n], &exact_values(n as usize));
-    let points = vec![
-        TuningPoint {
-            label: "short".into(),
-            weight: 1.0,
-            class: None,
-            rotation: vec![split_sum::Args { x: &short }],
-            initialize: None,
-            written: Default::default(),
-        },
-        TuningPoint {
-            label: "long".into(),
-            weight: 3.0,
-            class: None,
-            rotation: vec![split_sum::Args { x: &long }],
-            initialize: None,
-            written: Default::default(),
-        },
-    ];
-    let Strategy::Search(mut plan) = search(1) else {
-        unreachable!()
+    let census = |required: bool| {
+        split_sum::native_tune(
+            &device,
+            &statics(n),
+            vec![
+                TuningPoint {
+                    label: "short".into(),
+                    weight: 1.0,
+                    class: None,
+                    cost: 1.0,
+                    required: false,
+                    rotation: vec![split_sum::Args { x: &short }],
+                    initialize: None,
+                    written: Default::default(),
+                },
+                TuningPoint {
+                    label: "long".into(),
+                    weight: 3.0,
+                    class: None,
+                    cost: 1000.0,
+                    required,
+                    rotation: vec![split_sum::Args { x: &long }],
+                    initialize: None,
+                    written: Default::default(),
+                },
+            ],
+            PrecisionPolicy::Exact,
+            Strategy::Census {
+                min_sample_seconds: 0.0002,
+                ceiling: Duration::ZERO,
+            },
+            None,
+            seismic::TuningReference::Portable,
+        )
+        .unwrap()
     };
-    plan.budget = 3;
-    plan.screening = vec![ScreeningPoint {
-        index: 0,
-        weight: 4.0,
-    }];
+    let weights = |result: &seismic::TuningResult| {
+        result
+            .points
+            .iter()
+            .map(|point| (point.label.clone(), point.weight))
+            .collect::<Vec<_>>()
+    };
+    let measured = |result: &seismic::TuningResult| match &result.configurations[0].outcome {
+        Outcome::Measured { points, .. } => points
+            .iter()
+            .map(|point| point.point.clone())
+            .collect::<Vec<_>>(),
+        Outcome::Excluded(exclusion) => panic!("{exclusion:?}"),
+    };
+    // The first point is always measured; the second would exceed a zero
+    // ceiling, so its weight folds into the first.
+    let folded = census(false);
+    assert!(matches!(folded.method, TuningMethod::Census));
+    assert_eq!(measured(&folded), ["short"]);
+    assert_eq!(
+        weights(&folded),
+        [("short".to_owned(), 4.0), ("long".to_owned(), 0.0)]
+    );
+    assert_eq!(folded.numerical_evidence.len(), 1);
+    // A required point is measured whatever the time.
+    let required = census(true);
+    assert_eq!(measured(&required), ["short", "long"]);
+    assert_eq!(
+        weights(&required),
+        [("short".to_owned(), 1.0), ("long".to_owned(), 3.0)]
+    );
+}
+
+#[test]
+fn a_search_choice_passes_validation_at_every_point_or_gives_way_to_the_defaults() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let n = 4096u64;
+    // Exact values sum exactly in any order; these do not, so a
+    // configuration that reorders the sum fails the exact policy here.
+    let inexact = (0..n)
+        .map(|index| 1.0 + (index as f32) * 1.0e-3 + 1.0 / (index as f32 + 3.0))
+        .collect::<Vec<_>>();
+    let timed = f32_tensor(&device, &[n], &exact_values(n as usize));
+    let validated = f32_tensor(&device, &[n], &inexact);
     let result = split_sum::native_tune(
         &device,
         &statics(n),
-        points,
+        vec![
+            TuningPoint {
+                label: "timed".into(),
+                weight: 1.0,
+                class: None,
+                cost: 1.0,
+                required: false,
+                rotation: vec![split_sum::Args { x: &timed }],
+                initialize: None,
+                written: Default::default(),
+            },
+            TuningPoint {
+                label: "validated".into(),
+                weight: 0.0,
+                class: None,
+                cost: 1.0,
+                required: false,
+                rotation: vec![split_sum::Args { x: &validated }],
+                initialize: None,
+                written: Default::default(),
+            },
+        ],
         PrecisionPolicy::Exact,
-        Strategy::Search(plan),
+        search(1),
         None,
-        seismic::TuningReference::Portable,
+        seismic::TuningReference::NativeDefault,
     )
     .unwrap();
+    // Only the weighted point is timed; both are recorded.
     assert_eq!(result.points.len(), 2);
-    assert!(matches!(
-        &result.method,
-        TuningMethod::Search { screening, .. }
-            if screening == &[ScreeningPoint { index: 0, weight: 4.0 }]
-    ));
-    let measured = result
+    assert!(result
         .configurations
         .iter()
-        .filter_map(|record| match &record.outcome {
-            Outcome::Measured {
-                points, confirmed, ..
-            } => Some((points, confirmed)),
-            Outcome::Excluded(_) => None,
-        })
-        .collect::<Vec<_>>();
-    assert!(measured.iter().all(|(points, _)| points.len() == 1));
-    assert!(measured.iter().any(|(_, confirmed)| confirmed.len() == 2));
-    assert!(measured
-        .iter()
-        .any(|(_, confirmed)| confirmed.iter().any(|point| point.point == "long")));
-    assert!(result.configurations.iter().any(|record| matches!(
-        &record.outcome,
-        Outcome::Measured {
-            validated: true,
-            ..
-        }
-    )));
+        .all(|record| match &record.outcome {
+            Outcome::Measured { points, .. } => points.iter().all(|point| point.point == "timed"),
+            Outcome::Excluded(_) => true,
+        }));
+    let defaults = &result.configurations[0].configuration;
+    if result.overall != *defaults {
+        assert!(
+            result
+                .numerical_evidence
+                .iter()
+                .any(|evidence| evidence.case == "validated"),
+            "a choice other than the defaults passed at every point"
+        );
+    }
+    // The chosen configuration prepares and sums the inexact values as the
+    // reference, the defaults, does.
+    let kernel = split_sum::native_for_device(&device, &result.overall.specialization()).unwrap();
+    let reference = split_sum::native_for_device(&device, &defaults.specialization()).unwrap();
+    let sum = |kernel: &seismic::NativeKernel<split_sum::Entry>| {
+        read_f32(
+            &kernel
+                .call(split_sum::Args { x: &validated })
+                .unwrap()
+                .value,
+        )
+    };
+    assert_eq!(sum(&kernel), sum(&reference));
 }
 
 /// A graph node whose port contradicts the kernel's static dimension is
@@ -1096,6 +1184,8 @@ fn tuning_rejects_shared_mutable_state_without_an_initializer() {
             label: "rows".into(),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![accumulate::Args {
                 state: &mut state,
                 x: &x,
@@ -1138,6 +1228,8 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
             label: "rows".into(),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![accumulate::Args {
                 state: &mut state,
                 x: &x,
@@ -1758,6 +1850,8 @@ fn wrong_default_and_shared_defect_are_rejected_against_portable_source() {
             label: "mutable".into(),
             weight: 1.,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![wrong_default::Args {
                 state: &mut state,
                 x: &x,
@@ -1799,6 +1893,8 @@ fn factored_search_finds_a_complete_passing_seed_after_bad_defaults() {
             label: format!("p{i}"),
             weight: 1.,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![scoped_wrong_default::Args { x }],
             initialize: None,
             written: Default::default(),
@@ -1845,6 +1941,8 @@ fn complete_evidence_reuses_only_matching_policy_and_reference() {
                 label: "state".into(),
                 weight: 1.,
                 class: None,
+                cost: 1.0,
+                required: false,
                 rotation: vec![accumulate::Args {
                     state: &mut state,
                     x: &x,
@@ -1945,6 +2043,8 @@ fn rejected_candidates_stop_after_the_first_timed_invocation() {
             label: "early".into(),
             weight: 1.,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![wrong_default::Args {
                 state: &mut state,
                 x: &x,
@@ -1985,6 +2085,8 @@ fn pooled_results_cannot_hide_a_candidates_missing_writes() {
             label: "missing-write".into(),
             weight: 1.,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![omitted_write::Args { x: &x }],
             initialize: None,
             written: Default::default(),
@@ -2059,6 +2161,8 @@ fn declared_rows_scope_state_observation_and_a_whole_point_rejects_stray_writes(
                     label,
                     weight: 1.,
                     class: None,
+                    cost: 1.0,
+                    required: false,
                     rotation: vec![stray_write::Args { state, x: &x }],
                     initialize: Some(initialize),
                     written,

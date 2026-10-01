@@ -90,8 +90,8 @@ pub enum LoadProgress {
     /// Device selection, planning, opening the device and program preparation.
     Preparing,
     /// Tuning kernels for the device. Reported only when this load searches: `total` is the
-    /// configuration budget of the units without a stored result, `completed` the budget of
-    /// those finished. It starts at zero before any search.
+    /// tuning time in milliseconds and `completed` the milliseconds spent. It starts at zero
+    /// when the census begins; tuning may finish before `total`.
     Tuning { completed: u64, total: u64 },
     /// Target weight import, in resident bytes. It starts at zero before any import.
     ImportingWeights { completed_bytes: u64, total_bytes: u64 },

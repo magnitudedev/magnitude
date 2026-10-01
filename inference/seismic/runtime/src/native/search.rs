@@ -1,5 +1,5 @@
-//! Budgeted local search over a native implementation's declared parameter
-//! space, as a pure function of what an [`Evaluator`] reports.
+//! Time-bounded local search over a native implementation's declared
+//! parameter space, as a pure function of what an [`Evaluator`] reports.
 //!
 //! The search walks the grid of admissible configurations: each parameter's
 //! values in numeric order, neighbors one step apart in one parameter. It
@@ -9,9 +9,9 @@
 //! cheapest form first, it moves to the best neighbor while that improves
 //! the cost by more than `improvement`; then, at each local minimum, it
 //! restarts from the unvisited configuration farthest from everything
-//! visited. It stops when the budget is spent, every configuration was
-//! visited, `restarts` consecutive restarts failed to improve the best cost,
-//! or the evaluator reports its deadline passed. The `confirmed` cheapest
+//! visited. It stops when every configuration was visited, `restarts`
+//! consecutive restarts failed to improve the best cost, or the evaluator's
+//! time ran out. The `confirmed` cheapest
 //! configurations and the defaults are then re-measured, alternating, and
 //! ranked by those costs; a finalist the evaluator cannot confirm (its
 //! re-measurement failed or is not trustworthy) leaves the ranking, and the
@@ -30,9 +30,9 @@
 //! at a point share one measurement of it, and margins are taken relative to
 //! the points that tell two configurations apart.
 //!
-//! Given the evaluator's costs the procedure is deterministic, so a replay of
-//! recorded surveys (tuning spec §E2) can run this same code with a recorded
-//! evaluator.
+//! Given the evaluator's costs and where its time ran out, the procedure is
+//! deterministic, so a replay of recorded surveys (tuning spec §E2) can run
+//! this same code with a recorded evaluator.
 
 use super::tune::Exclusion;
 use serde::{Deserialize, Serialize};
@@ -371,27 +371,26 @@ pub trait Evaluator {
     /// Form and measure a batch; one cost per configuration, in order. A
     /// configuration that cannot be formed or run is excluded. The search's
     /// first batch starts with the defaults, the reference of every
-    /// [`Cost`].
+    /// [`Cost`]. The evaluator answers at least the first configuration and
+    /// stops early, answering a prefix, when its time runs out.
     fn evaluate(&mut self, batch: &[usize]) -> Vec<Result<Cost, Exclusion>>;
     /// Re-measure `finalists` (every one evaluated before; the defaults
     /// first, the reference of the new costs), alternating between them
     /// sample by sample; their new costs, in order.
     fn confirm(&mut self, finalists: &[usize]) -> Vec<Result<Cost, Exclusion>>;
-    /// Whether the safety stop has passed. The search then ends with what it
-    /// has reached.
+    /// Whether the evaluator's time has run out. The search then ends with
+    /// what it has reached.
     fn expired(&self) -> bool;
 }
 
 /// Why the search stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchStop {
-    /// The budget was spent.
-    Budget,
     /// Every admissible configuration was evaluated.
     Exhausted,
     /// The allowed consecutive restarts found nothing better.
     Converged,
-    /// The safety stop passed; the result is the best found so far.
+    /// The time ran out; the result is the best found so far.
     Expired,
 }
 
@@ -410,7 +409,6 @@ pub struct SearchTrace {
 struct State<'s, E> {
     space: &'s SearchSpace,
     evaluator: &'s mut E,
-    budget: usize,
     /// The cost of every evaluated configuration; `None` when excluded.
     costs: HashMap<usize, Option<Cost>>,
     evaluated: Vec<(usize, Result<Cost, Exclusion>)>,
@@ -451,9 +449,9 @@ impl<E: Evaluator> State<'_, E> {
         self.costs.contains_key(&index)
     }
 
-    /// Evaluate the unvisited configurations of `batch` that the budget
-    /// admits, in order. Sets the stop reason when nothing more may be
-    /// evaluated.
+    /// Evaluate the unvisited configurations of `batch` in order, as far as
+    /// the evaluator's time reaches. Sets the stop reason when nothing more
+    /// may be evaluated.
     fn evaluate(&mut self, batch: &[usize]) {
         if self.stop.is_some() {
             return;
@@ -462,30 +460,28 @@ impl<E: Evaluator> State<'_, E> {
             self.stop = Some(SearchStop::Expired);
             return;
         }
-        let remaining = self.budget - self.evaluated.len();
         let mut fresh = Vec::new();
         for &index in batch {
             if !self.visited(index) && !fresh.contains(&index) {
                 fresh.push(index);
             }
         }
-        fresh.truncate(remaining);
         if fresh.is_empty() {
             return;
         }
         let results = self.evaluator.evaluate(&fresh);
-        assert_eq!(
-            results.len(),
-            fresh.len(),
-            "an evaluator answers every configuration"
+        assert!(
+            !results.is_empty() && results.len() <= fresh.len(),
+            "an evaluator answers a nonempty prefix of the batch"
         );
-        for (index, result) in fresh.into_iter().zip(results) {
+        let answered = results.len();
+        for (index, result) in fresh.iter().copied().zip(results) {
             self.record(index, result);
         }
         if self.evaluated.len() == self.space.len() {
             self.stop = Some(SearchStop::Exhausted);
-        } else if self.evaluated.len() == self.budget {
-            self.stop = Some(SearchStop::Budget);
+        } else if answered < fresh.len() {
+            self.stop = Some(SearchStop::Expired);
         }
     }
 
@@ -559,19 +555,18 @@ impl<E: Evaluator> State<'_, E> {
 
 /// Search `space` from the defaults, its form starts and the `start`
 /// configurations. A hint for a structural form replaces that form's usual
-/// nearest-default start, so it uses the same measurement slot. Evaluate at
-/// most `budget` configurations (at least the defaults).
+/// nearest-default start, so it uses the same measurement slot. The defaults
+/// are always evaluated; everything else as far as the evaluator's time
+/// reaches.
 pub fn search(
     space: &SearchSpace,
     start: &[usize],
-    budget: usize,
     settings: &SearchSettings,
     evaluator: &mut impl Evaluator,
 ) -> SearchTrace {
     let mut state = State {
         space,
         evaluator,
-        budget: budget.clamp(1, space.len()),
         costs: HashMap::new(),
         evaluated: Vec::new(),
         nearest: vec![u32::MAX; space.len()],
@@ -582,15 +577,15 @@ pub fn search(
         .chain(space.form_starts_with(start))
         .chain(start.iter().copied().filter(|index| *index < space.len()))
         .collect::<Vec<_>>();
-    // The defaults are the validation reference: evaluated even past the
-    // safety stop.
+    // The defaults are the reference of every cost: evaluated even when the
+    // time has already run out.
     if state.evaluator.expired() {
         state.stop = Some(SearchStop::Expired);
         let results = state.evaluator.evaluate(&[default]);
         let result = results
             .into_iter()
             .next()
-            .expect("an evaluator answers every configuration");
+            .expect("an evaluator answers the first configuration");
         state.record(default, result);
     } else {
         state.evaluate(&starts);
@@ -611,14 +606,6 @@ pub fn search(
         }
     }
     descents.sort_by(|left, right| total(state.cost(*left)).total_cmp(&total(state.cost(*right))));
-    // A budget covering the whole space measures all of it: the walk could
-    // converge on a local minimum while budget is left.
-    if state.stop.is_none() && state.budget == space.len() {
-        let rest = (0..space.len())
-            .filter(|index| !state.visited(*index))
-            .collect::<Vec<_>>();
-        state.evaluate(&rest);
-    }
     for current in descents {
         if state.stop.is_some() {
             break;
@@ -770,11 +757,13 @@ mod tests {
         SearchSpace::new(&declared, &admissible).unwrap()
     }
 
-    /// A deterministic evaluator over a cost function of parameter values.
+    /// A deterministic evaluator over a cost function of parameter values,
+    /// whose time runs out after `limit` evaluations.
     struct Exact<'s, F> {
         space: &'s SearchSpace,
         cost: F,
         evaluations: Vec<usize>,
+        limit: usize,
     }
 
     impl<F: Fn(&ParameterValues) -> f64> Exact<'_, F> {
@@ -794,14 +783,20 @@ mod tests {
 
     impl<F: Fn(&ParameterValues) -> f64> Evaluator for Exact<'_, F> {
         fn evaluate(&mut self, batch: &[usize]) -> Vec<Result<Cost, Exclusion>> {
-            self.evaluations.extend_from_slice(batch);
-            batch.iter().map(|index| self.cost(*index)).collect()
+            let answered = batch
+                .len()
+                .min(self.limit.saturating_sub(self.evaluations.len()).max(1));
+            self.evaluations.extend_from_slice(&batch[..answered]);
+            batch[..answered]
+                .iter()
+                .map(|index| self.cost(*index))
+                .collect()
         }
         fn confirm(&mut self, finalists: &[usize]) -> Vec<Result<Cost, Exclusion>> {
             finalists.iter().map(|index| self.cost(*index)).collect()
         }
         fn expired(&self) -> bool {
-            false
+            self.evaluations.len() >= self.limit
         }
     }
 
@@ -828,8 +823,9 @@ mod tests {
                 1.0 + (product.log2() - 4.0).abs() + 0.01 * values["A"] as f64
             },
             evaluations: Vec::new(),
+            limit: usize::MAX,
         };
-        let trace = search(&space, &[], 25, &settings(), &mut evaluator);
+        let trace = search(&space, &[], &settings(), &mut evaluator);
         let chosen = space.values(trace.ranking[0]);
         assert_eq!(chosen["A"] * chosen["B"], 16, "{chosen:?}");
         assert_eq!(chosen["A"], 1, "{chosen:?}");
@@ -873,20 +869,21 @@ mod tests {
         // point that tells the configurations apart.
         let space = space(&[("A", &[1, 2, 3, 4]), ("B", &[1, 2])]);
         let mut evaluator = Split { space: &space };
-        let trace = search(&space, &[], 8, &settings(), &mut evaluator);
+        let trace = search(&space, &[], &settings(), &mut evaluator);
         let chosen = space.values(trace.ranking[0]);
         assert_eq!((chosen["A"], chosen["B"]), (4, 1), "{chosen:?}");
     }
 
     #[test]
-    fn a_small_space_is_covered_exactly_and_never_past_its_budget() {
+    fn a_small_space_is_covered_exactly_and_never_past_its_time() {
         let space = space(&[("A", &[4, 2, 8])]);
         let mut evaluator = Exact {
             space: &space,
             cost: |values: &ParameterValues| values["A"] as f64,
             evaluations: Vec::new(),
+            limit: usize::MAX,
         };
-        let trace = search(&space, &[], 100, &settings(), &mut evaluator);
+        let trace = search(&space, &[], &settings(), &mut evaluator);
         assert_eq!(trace.stop, SearchStop::Exhausted);
         assert_eq!(trace.evaluated.len(), 3);
         assert_eq!(space.values(trace.ranking[0])["A"], 2);
@@ -896,9 +893,10 @@ mod tests {
             space: &space,
             cost: |values: &ParameterValues| (values["A"] + values["B"]) as f64,
             evaluations: Vec::new(),
+            limit: 5,
         };
-        let trace = search(&space, &[], 5, &settings(), &mut evaluator);
-        assert_eq!(trace.stop, SearchStop::Budget);
+        let trace = search(&space, &[], &settings(), &mut evaluator);
+        assert_eq!(trace.stop, SearchStop::Expired);
         assert_eq!(evaluator.evaluations.len(), 5);
     }
 
@@ -948,7 +946,6 @@ mod tests {
         let trace = search(
             &space,
             &[],
-            10,
             &settings(),
             &mut Unconfirmable { space: &space },
         );
@@ -967,7 +964,6 @@ mod tests {
         let trace = search(
             &space,
             &[],
-            10,
             &settings(),
             &mut Unconfirmable { space: &space },
         );
@@ -976,9 +972,9 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_covering_the_space_measures_all_of_it() {
+    fn a_restart_reaches_an_optimum_past_a_ridge() {
         // The defaults (A 1) are a local minimum; the best (A 8) lies past a
-        // ridge that the walk and its restarts need not reach.
+        // ridge that only a restart from the farthest configuration reaches.
         let space = space(&[("A", &[1, 2, 3, 4, 5, 6, 7, 8])]);
         let mut evaluator = Exact {
             space: &space,
@@ -988,9 +984,9 @@ mod tests {
                 a => 2.0 + a as f64,
             },
             evaluations: Vec::new(),
+            limit: usize::MAX,
         };
-        let trace = search(&space, &[], space.len(), &settings(), &mut evaluator);
-        assert_eq!(trace.stop, SearchStop::Exhausted);
+        let trace = search(&space, &[], &settings(), &mut evaluator);
         assert_eq!(space.values(trace.ranking[0])["A"], 8);
     }
 
@@ -1027,8 +1023,9 @@ mod tests {
             space: &space,
             cost: |values: &ParameterValues| if values["A"] == 1 { 0.99 } else { 1.0 },
             evaluations: Vec::new(),
+            limit: usize::MAX,
         };
-        let trace = search(&space, &[], 10, &settings(), &mut evaluator);
+        let trace = search(&space, &[], &settings(), &mut evaluator);
         assert_eq!(trace.ranking[0], space.default_index());
     }
 
@@ -1042,9 +1039,10 @@ mod tests {
             space: &space,
             cost: |values: &ParameterValues| 10.0 - values["A"] as f64,
             evaluations: Vec::new(),
+            limit: usize::MAX,
         };
-        let trace = search(&space, &[hint], 2, &settings(), &mut evaluator);
-        assert_eq!(evaluator.evaluations, vec![space.default_index(), hint]);
+        let trace = search(&space, &[hint], &settings(), &mut evaluator);
+        assert_eq!(evaluator.evaluations[..2], [space.default_index(), hint]);
         assert_eq!(trace.ranking[0], hint);
     }
 
@@ -1078,8 +1076,9 @@ mod tests {
                 _ => 0.9 + 0.1 * (8 - values["A"]) as f64 + 0.01 * values["K"] as f64,
             },
             evaluations: Vec::new(),
+            limit: usize::MAX,
         };
-        let trace = search(&space, &[], 30, &settings(), &mut evaluator);
+        let trace = search(&space, &[], &settings(), &mut evaluator);
         assert_eq!(evaluator.evaluations[..2], [space.default_index(), start]);
         let chosen = space.values(trace.ranking[0]);
         assert_eq!((chosen["M"], chosen["A"]), (1, 8), "{chosen:?}");
@@ -1118,11 +1117,12 @@ mod tests {
                 }
             },
             evaluations: Vec::new(),
+            limit: usize::MAX,
         };
-        let trace = search(&space, &[hint], 3, &settings(), &mut evaluator);
+        let trace = search(&space, &[hint], &settings(), &mut evaluator);
         assert_eq!(
-            evaluator.evaluations,
-            vec![space.default_index(), matrix, hint]
+            evaluator.evaluations[..3],
+            [space.default_index(), matrix, hint]
         );
         assert_eq!(trace.ranking[0], hint);
     }

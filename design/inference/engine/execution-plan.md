@@ -96,37 +96,37 @@ and static values reuses the load's first tuning result; its rotations already s
 of several layers. Disjoint row-class workloads may prepare distinct configurations of the same
 entry contract; each is tuned and validated on the classes it serves, and the exact graph class
 binds its prepared configuration. Entry-wide
-declarations use a configuration budget: a census counts the model's tuning units (entry,
-element bindings, static values and served workload), their admissible configurations and launches
-per step, finds which units have a stored result, and finds and measures the first numerically passing seed of
-each unit that will search (one configuration of the per-model budget each; a
-stored result supplies the defaults' times of a stored unit). Each row class's
-share of step time is split among the units serving it by launches times the
-defaults' mean time there. The per-model budget is shared by those step-time
-shares, so the load spends its search where the step spends its time. Spaces
-small enough to search completely still are when all of them fit. A unit with
-structural `form` values receives enough of the shared budget to measure its
-defaults and one admissible start per other value, redistributed from units
-with spare slots; if the model budget cannot cover every such start, defaults
-remain guaranteed. A launch-scoped declaration instead searches every
-candidate of each independent launch group; its boundary choices and group
-candidates do not spend that budget, and it takes no share. A safety stop on
-the whole
-preparation's tuning (a wall-clock limit for pathological machines) ends every search early with
-the best completed choice, retaining only a fully validated completed choice; it is reported as a
-warning and its results are not stored.
-On CPU, expensive projection cases screen candidates at a few representative rows with folded
-row shares. The default and shortlisted configurations are still confirmed, ranked and validated
-at every served row; the full workload remains the final objective.
+declarations are tuned within a fixed tuning time (60 s per preparation, on any device), in three
+walks of the program. A count finds the model's tuning units (entry, element bindings, static
+values and served workload), their launches per step and which have a stored result; nothing is
+formed or measured. A census then measures each unit that will search: its first numerically
+passing configuration (the defaults when they pass) at its points in ascending estimated cost,
+admitting a point only while the unit's census time plus the point's predicted time fits a ceiling
+of the tuning time over ten times the searching units, so the census takes about a tenth of the
+tuning time. Every point of at most 8 rows (the decode range, where implementations' row-dependent
+code paths differ) is admitted whatever the time; a point not admitted folds its weight into the
+largest admitted point of its history class. Each row class's share of step time is split among
+the units serving it by launches times the defaults' mean time there. Each unit's search then
+gets the time that remains times its share over the shares of the units not yet searched, so time a
+unit leaves unused goes to the rest: the load spends its search where the step spends its time,
+and a slower device searches less, never longer. A search times the admitted points, validates every
+candidate at them, ends exploration when what remains covers its confirmation and the validation of
+its choice at the points it did not time, and gives way to its census seed (the defaults when they
+pass) if its choice fails there; the seed must pass there too: every chosen configuration passes
+validation at every served point. A unit whose time cannot cover
+that keeps its census seed. A launch-scoped declaration's census measures its defaults alone, and
+its factored search runs within its time the same way.
 The engine owns every cache, under a directory the host names (`--cache-dir`; without one nothing
 is cached). It holds the program artifacts Seismic keeps (CUDA CUBINs, Vulkan SPIR-V), through
 the device's artifact store, one directory per toolchain namespace, and one tuning result per
-tuning key. The key is a digest over the device and toolchain identity (Metal OS
-build; CUDA driver and NVRTC release), the unit, the implementation digest (declaration and
-rendered source), the precision policy, and the search definition (search version, per-model
-budget, settings, point labels and weights, screening points and folded weights, validation rule,
-sample time); a unit's own budget follows the measured shares of the load that searched it and is
-not part of the key. Only a completed, fully validated search is stored, so a hit prepares the
+tuning key. The key is a digest over what a stored result is valid for: the tuning version, the
+device and toolchain identity (Metal OS build; CUDA driver and NVRTC release), the unit, the
+implementation digest (declaration and rendered source), the precision policy, and the labels of
+the served shapes its choice was validated at. How it was searched is not part of the key (search
+settings, tuning time, census evaluations, workload weights, the points timed), so improving the
+search never invalidates a result that is still correct. The tuning version changes only with the
+maintainers' approval, when tuning has improved enough to justify retuning every model, or when
+stored results can no longer be read. Every search that ends is stored, so a hit prepares the
 stored choice with no forming, measuring, validation or input construction: its key pins
 everything that validation depended on. Tuning inputs are generated test data and resident
 weights, not a fixed corpus, so numerical evidence is identified by the case's structure, policy
@@ -139,9 +139,8 @@ completed and a later preparation searches only the rest. Writes go through a
 temporary file renamed into place; an entry that cannot be read or parsed, or whose configuration
 the implementation does not admit, is a miss and is rewritten; opening the cache evicts the least
 recently used entries beyond its capacity. Stored results are local measurements; nothing is
-shipped. Tuning progress (the budget of the units searched so far over that of the units that
-search, reported when tuning begins and after each searched unit; nothing when every unit is
-stored), total tuning time and how many units were searched or stored are reported before
+shipped. Tuning progress (milliseconds of the tuning time spent, reported when the census
+begins and after each unit it measures or searches; nothing when every unit is stored), total tuning time and how many units were searched or stored are reported before
 readiness, or before a prepare-only job reports that it is prepared. The load also reports its
 target weight import in resident bytes; no tuning or
 preparation occurs after readiness. Two development

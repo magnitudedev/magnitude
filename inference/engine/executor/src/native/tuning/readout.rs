@@ -9,8 +9,7 @@
 
 use super::cases::projection_shape;
 use super::{
-    cpu_projection_screening, row_points, served_row_points, CaseState, EntryTuning, PointShape,
-    TuningInputs, TuningLimits,
+    row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs, TuningLimits,
 };
 use crate::native::draft_vocabulary;
 use magnitude_batching::{HISTORY_WIDTH, SHAPING_WIDTH};
@@ -18,7 +17,7 @@ use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
     draft_rows, head_logits_rows, readout_head_rows, readout_selected_rows, sample_rows, shape_rows,
 };
-use seismic::{Device, Element, ScreeningPoint, Tensor};
+use seismic::{Element, Tensor};
 
 /// Candidate tokens of a `readout_selected_rows` tuning point.
 const SELECTED_TOKENS: u64 = 256;
@@ -216,12 +215,6 @@ impl EntryTuning for HeadRowsTuning {
         projected_points(limits)
     }
 
-    /// The vocabulary projection is a step's largest; on CPU searching
-    /// every served point exceeds the search budget.
-    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
-        cpu_projection_screening(device, points)
-    }
-
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
@@ -310,12 +303,6 @@ impl EntryTuning for SelectedRowsTuning {
         projected_points(limits)
     }
 
-    /// The vocabulary projection is a step's largest; on CPU searching
-    /// every served point exceeds the search budget.
-    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
-        cpu_projection_screening(device, points)
-    }
-
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
@@ -401,10 +388,6 @@ impl EntryTuning for HeadLogitsTuning {
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         projected_points(limits)
-    }
-
-    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
-        cpu_projection_screening(device, points)
     }
 
     fn rotation(

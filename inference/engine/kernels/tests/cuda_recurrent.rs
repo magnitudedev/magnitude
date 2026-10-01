@@ -298,7 +298,7 @@ fn cuda_recurrent_scoped_tuning_completes() {
         .with_static("C", geometry.convolution as u64);
     let search = || {
         seismic::Strategy::Search(seismic::SearchPlan {
-            budget: 16,
+            allowance: std::time::Duration::from_secs(600),
             settings: seismic::SearchSettings {
                 improvement: 0.01,
                 restarts: 2,
@@ -309,14 +309,14 @@ fn cuda_recurrent_scoped_tuning_completes() {
             },
             min_sample_seconds: 0.0002,
             start: Vec::new(),
-            deadline: None,
-            screening: Vec::new(),
         })
     };
     let points = vec![seismic::TuningPoint {
         label: "rows32".into(),
         weight: 1.0,
         class: None,
+        cost: 1.0,
+        required: false,
         rotation: vec![tensors.chunk_args(&case)],
         initialize: Some(Box::new(move || {
             window.write_from_host(&initial_window)?;
@@ -346,7 +346,8 @@ fn cuda_recurrent_scoped_tuning_completes() {
         seismic::TuningMethod::Factored {
             groups: 1,
             candidates: 3,
-            complete: true
+            complete: true,
+            ..
         }
     ));
     assert_eq!(result.rejections().count(), 0);

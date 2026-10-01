@@ -626,8 +626,8 @@ impl TuningObserver for TuningReport {
             TuningEvent::Finished(tuned) => {
                 let origin = match (tuned.origin, tuned.search) {
                     (TuningOrigin::Stored, _) => "stored".to_owned(),
-                    (TuningOrigin::Searched, Some((budget, stop))) => {
-                        format!("budget {budget}, stop {stop:?}")
+                    (TuningOrigin::Searched, Some((allowance, stop))) => {
+                        format!("allowance {:.2} s, stop {stop:?}", allowance.as_secs_f64())
                     }
                     (TuningOrigin::Searched, None) => "surveyed".to_owned(),
                 };
@@ -641,12 +641,6 @@ impl TuningObserver for TuningReport {
                     tuned.excluded,
                     tuned.rejections
                 );
-                if tuned.search.is_some_and(|(_, stop)| stop == seismic::SearchStop::Expired) {
-                    eprintln!(
-                        "magnitude-engine: warning: tuning reached its safety stop; {} [{}] keeps the best configuration found and is not stored",
-                        tuned.entry, tuned.bindings
-                    );
-                }
                 if let Some(rejection) = &tuned.first_rejection {
                     eprintln!("magnitude-engine:   first qualification rejection of {}: {rejection}", tuned.entry);
                 }

@@ -3,12 +3,10 @@
 //! no tuning parameters.
 
 use super::cases::{projection_shape, scale_extent};
-use super::{
-    cpu_projection_screening, row_points, EntryTuning, PointShape, TuningInputs, TuningLimits,
-};
+use super::{row_points, EntryTuning, PointShape, TuningInputs, TuningLimits};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::project_rows;
-use seismic::{Device, Element, ScreeningPoint, Tensor};
+use seismic::{Element, Tensor};
 
 /// `project_rows` of one sublayer output projection (`kind`: the attention
 /// output or the dense down projection), activation rows in, F32 rows out.
@@ -67,10 +65,6 @@ impl EntryTuning for ProjectRowsTuning {
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
-    }
-
-    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
-        cpu_projection_screening(device, points)
     }
 
     fn rotation(

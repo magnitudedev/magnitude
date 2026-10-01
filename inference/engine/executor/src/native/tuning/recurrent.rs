@@ -10,15 +10,14 @@
 
 use super::cases::projection_shape;
 use super::{
-    cpu_projection_screening, row_points, served_row_points, CaseState, EntryTuning, PointShape,
-    TuningInputs, TuningLimits,
+    row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs, TuningLimits,
 };
 use crate::operators::gated_delta::graph::CHUNKED_ROWS;
 use magnitude_family_contracts::{Operator, RecurrentHeadMapping, WeightKind, WeightScope};
 use magnitude_kernels::{
     gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
 };
-use seismic::{Device, Element, ScreeningPoint, Tensor};
+use seismic::{Element, Tensor};
 
 /// Banks of a tuning arena: the zero seed, the bank the slot reads and the
 /// bank it publishes to.
@@ -137,10 +136,6 @@ impl EntryTuning for RecurrentProjectTuning {
         row_points(limits)
     }
 
-    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
-        cpu_projection_screening(device, points)
-    }
-
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
@@ -237,10 +232,6 @@ impl EntryTuning for RecurrentOutputTuning {
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
-    }
-
-    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
-        cpu_projection_screening(device, points)
     }
 
     fn rotation(

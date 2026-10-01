@@ -11,9 +11,9 @@
 //! judged. Points are measured once per key, as the search measures them.
 //! [`replay_report`] runs the production search (`seismic::replay`) against
 //! these files (tuning spec §E2) and reports, per entry instance, the choice
-//! quality at the budget the survey's load allocated, the configurations
-//! needed, and the per-point gap of one configuration for all points
-//! (example `tuning_replay`).
+//! quality at the evaluations the survey's load would have allowed its
+//! search, the configurations needed, and the per-point gap of one
+//! configuration for all points (example `tuning_replay`).
 //!
 //! On a shared host the whole surveying process must run under the host's
 //! GPU lock: its model load, the tuning of entries it does not survey and
@@ -66,16 +66,19 @@ pub(super) fn plan(entry: &str) -> Option<SurveyPlan> {
     })
 }
 
-/// Write one entry instance's survey, with the search budget this load
-/// allocated to it.
-pub(super) fn record(key: &TuningKey, budget: usize, result: &TuningResult) -> Result<(), String> {
+/// Write one entry instance's survey, with the search allowance this load
+/// gave it.
+pub(super) fn record(
+    key: &TuningKey,
+    allowance: std::time::Duration,
+    result: &TuningResult,
+) -> Result<(), String> {
     let guard = SURVEY.lock().expect("tuning survey lock poisoned");
     let survey = guard
         .as_ref()
         .expect("a survey result implies an installed survey");
-    let (entry, bindings, statics, scopes) = key;
-    let instance =
-        crate::kernel_cache::TuningCacheKey::of(&format!("{bindings}{statics:?}{scopes:?}"));
+    let (entry, bindings, statics) = key;
+    let instance = crate::kernel_cache::TuningCacheKey::of(&format!("{bindings}{statics:?}"));
     let path = survey
         .directory
         .join(format!("{entry}-{}.json", &instance.as_str()[..12]));
@@ -83,7 +86,7 @@ pub(super) fn record(key: &TuningKey, budget: usize, result: &TuningResult) -> R
         "entry": entry,
         "bindings": bindings,
         "statics": statics,
-        "budget": budget,
+        "allowance_seconds": allowance.as_secs_f64(),
         "result": result,
     });
     std::fs::create_dir_all(&survey.directory)
@@ -102,9 +105,10 @@ pub const REPLAY_RUNS: usize = 1000;
 /// Replay the production search against every survey file in `directory`
 /// ([`REPLAY_RUNS`] runs each, §E2) and report, as Markdown: per entry
 /// instance, the chosen configuration's true cost relative to the true best
-/// at the budget the survey's load allocated, at twice and four times it and
-/// with the whole space as budget, for the production objective and the
-/// previous one, with the search settings of the survey's backend; the
+/// at the evaluations the survey's allowance covers (at the survey's mean
+/// time per configuration), at twice and four times them and with the whole
+/// space, for the production objective and the previous one, with the search
+/// settings of the survey's backend; the
 /// configurations needed for 95% of runs to reach 2% of the best (`n95`);
 /// and per point, the time of the overall best configuration against the
 /// best at that point alone (what a per-size launch could recover).
@@ -136,23 +140,26 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
         };
         let result: TuningResult = serde_json::from_value(field("result")?)
             .map_err(|error| format!("parsing {}: {error}", path.display()))?;
-        let budget = field("budget")?
-            .as_u64()
-            .ok_or_else(|| format!("{}: `budget` is not a count", path.display()))?
-            as usize;
+        let allowance = field("allowance_seconds")?
+            .as_f64()
+            .ok_or_else(|| format!("{}: `allowance_seconds` is not a time", path.display()))?;
+        let time = &result.time;
+        let per_configuration =
+            (time.forming_seconds + time.measuring_seconds + time.validating_seconds)
+                / result.configurations.len().max(1) as f64;
+        let budget =
+            ((allowance / per_configuration.max(f64::MIN_POSITIVE)).floor() as usize).max(1);
         let recording =
             Recording::new(&result).map_err(|error| format!("{}: {error}", path.display()))?;
         let space = recording.space().len();
-        // The settings the recorded entry's search runs with (surveys use no
-        // screening points).
+        // The settings the recorded entry's search runs with.
         let settings = super::search_settings(
             seismic::BackendName::parse(&result.backend)
                 .ok_or_else(|| format!("{}: unknown backend", path.display()))?,
-            false,
         );
         writeln!(
             report,
-            "### {} [{}] {}\n\n{} admissible, {} measured, budget {budget}; true best {:?}\n",
+            "### {} [{}] {}\n\n{} admissible, {} measured, allowance {allowance:.2} s ({budget} evaluations); true best {:?}\n",
             result.entry,
             field("bindings")?.as_str().unwrap_or_default(),
             field("statics")?,
@@ -163,7 +170,7 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
         .expect("writing to a string");
         writeln!(
             report,
-            "| objective | budget | within 1% | within 2% | within 5% | median excess | p95 excess | evaluated | n95 (2%) |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+            "| objective | evaluations | within 1% | within 2% | within 5% | median excess | p95 excess | evaluated | n95 (2%) |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|"
         )
         .expect("writing to a string");
         for (name, objective) in [

@@ -40,9 +40,9 @@ pub use seismic_runtime::native::trace::{
 };
 pub use seismic_runtime::native::tune::{
     Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, NumericalEvidence,
-    NumericalMetrics, Outcome, PointMeasurement, PointRecord, ScreeningPoint, SearchPlan, Strategy,
-    SurveyPlan, TuneError, TuningInitializer, TuningMethod, TuningReference, TuningResult,
-    TuningReuse, TuningTime,
+    NumericalMetrics, Outcome, PointMeasurement, PointRecord, SearchPlan, Strategy, SurveyPlan,
+    TuneError, TuningInitializer, TuningMethod, TuningReference, TuningResult, TuningReuse,
+    TuningTime,
 };
 pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
 
@@ -1111,6 +1111,12 @@ pub struct TuningPoint<'a, E: Entry> {
     /// rows at different history lengths): they split their summed weight by
     /// the defaults' real time at each. `None`: a class of its own.
     pub class: Option<String>,
+    /// The point's cost relative to the unit's other points, estimated by
+    /// the caller: a census predicts a point's time from the previous one's
+    /// by the ratio of their costs.
+    pub cost: f64,
+    /// A census always admits the point, whatever the time.
+    pub required: bool,
     pub rotation: Vec<E::Args<'a>>,
     /// Required when the entry has `&mut` parameters: restores every writable
     /// tensor in every rotation. The caller owns the pristine bytes; the tuner
@@ -3340,6 +3346,8 @@ pub mod generated {
                     label: point.label,
                     weight: point.weight,
                     class: point.class,
+                    cost: point.cost,
+                    required: point.required,
                     rotation: point.rotation.into_iter().map(E::encode).collect(),
                     initialize: point.initialize,
                     written: point.written,

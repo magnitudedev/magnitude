@@ -79,7 +79,7 @@ impl<'a> Specializer<'a> {
         }
     }
 
-    /// A specializer for a tuning census (with [`Tuner::census`]).
+    /// A specializer for the tuning count and census, which form nothing.
     pub fn census(device: &'a Device) -> Self {
         Self {
             device,

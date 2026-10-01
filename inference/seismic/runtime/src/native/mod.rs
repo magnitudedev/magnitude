@@ -109,6 +109,8 @@ pub(crate) const BUFFER_ALIGNMENT: u64 = 256;
 pub(crate) struct NativeQueue {
     /// Held from encoding a submission to recording its allocation fences.
     order: Mutex<()>,
+    /// When the device last completed timed work ([`timing`]).
+    timed: Mutex<Option<std::time::Instant>>,
     /// CUDA graphs of sealed-plan submissions (CUDA devices only).
     cuda_replays: cuda::CudaReplays,
     /// Recorded Vulkan graphs of sealed-plan submissions (Vulkan devices

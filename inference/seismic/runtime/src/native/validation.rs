@@ -106,6 +106,25 @@ pub(super) struct PreparedPoint<'a> {
     point: TuningPoint<'a>,
     case: Rc<ReferenceCase<'a>>,
 }
+
+/// What every point's reference execution shares: the reference
+/// implementation, where it runs, and the observations retained so far.
+pub(super) struct References {
+    device: Arc<DeviceInner>,
+    reference_device: Arc<DeviceInner>,
+    native: Option<Arc<Arc<super::NativePrepared>>>,
+    portable: Option<Arc<kernel::PreparedAny>>,
+    mutable: Vec<(usize, String)>,
+    pages: RefCell<ReferencePages>,
+    seconds: RefCell<f64>,
+}
+
+impl References {
+    /// Time spent executing references so far.
+    pub(super) fn seconds(&self) -> f64 {
+        *self.seconds.borrow()
+    }
+}
 impl<'a> Deref for PreparedPoint<'a> {
     type Target = TuningPoint<'a>;
     fn deref(&self) -> &Self::Target {
@@ -113,18 +132,63 @@ impl<'a> Deref for PreparedPoint<'a> {
     }
 }
 impl<'a> PreparedPoint<'a> {
-    pub(super) fn reweighted(&self, weight: f64) -> Self {
-        Self {
-            point: TuningPoint {
-                label: self.label.clone(),
-                weight,
-                class: self.class.clone(),
-                rotation: self.rotation.clone(),
-                initialize: None,
-                written: self.written.clone(),
-            },
-            case: self.case.clone(),
+    /// Execute this point's reference, once, before its first validation.
+    pub(super) fn ensure_reference(&self) -> Result<(), TuneError> {
+        if self.case.reference.borrow().is_some() {
+            return Ok(());
         }
+        let started = Instant::now();
+        let references = &self.case.references;
+        let mut expected = Vec::new();
+        for args in &self.point.rotation {
+            if let Some(reset) = &self.case.initialize {
+                reset.borrow_mut()().map_err(|e| TuneError::Reference(e.to_string()))?;
+            }
+            // Slab addressing is a native binding detail. Portable state is canonical
+            // and separately owned, so candidate execution cannot corrupt its reference.
+            let reference_args = if references.native.is_some() {
+                args.clone()
+            } else {
+                args.map_tensors(|ordinal, tensor| {
+                    if references.mutable.iter().any(|(i, _)| *i == ordinal)
+                        || tensor.is_slabbed()
+                        || !Arc::ptr_eq(&references.device, &references.reference_device)
+                    {
+                        let bytes = tensor
+                            .read_to_host()
+                            .map_err(|e| TuneError::Reference(e.to_string()))?;
+                        crate::api::tensor::TensorInner::from_host(
+                            &references.reference_device,
+                            tensor.representation(),
+                            tensor.extents(),
+                            &bytes,
+                        )
+                        .map(Arc::new)
+                        .map_err(|e| TuneError::Reference(e.to_string()))
+                    } else {
+                        Ok(tensor.clone())
+                    }
+                })?
+            };
+            let results = match (&references.native, &references.portable) {
+                (Some(native), _) => native.call(reference_args.clone()),
+                (None, Some(portable)) => kernel::call(portable, reference_args.clone()),
+                (None, None) => unreachable!("a reference implementation is prepared"),
+            }
+            .map_err(|e| TuneError::Reference(e.to_string()))?;
+            expected.push(
+                observe(
+                    results.into_values(),
+                    &reference_args,
+                    &self.case.mutable,
+                    Some(&mut *references.pages.borrow_mut()),
+                )
+                .map_err(|e| TuneError::Reference(format!("{e:?}")))?,
+            );
+        }
+        *self.case.reference.borrow_mut() = Some(expected);
+        *references.seconds.borrow_mut() += started.elapsed().as_secs_f64();
+        Ok(())
     }
     pub(super) fn validate(
         &self,
@@ -142,8 +206,11 @@ impl<'a> PreparedPoint<'a> {
                 let started = Instant::now();
                 let result = (|| {
                     let actual = observe(values, args, &self.case.mutable, None)?;
+                    let reference = self.case.reference.borrow();
                     compare(
-                        &self.case.reference[rotation],
+                        &reference
+                            .as_ref()
+                            .expect("a point's reference executes before its validation")[rotation],
                         &actual,
                         &self.case.subjects,
                         &self.case.policy,
@@ -184,6 +251,10 @@ impl<'a> PreparedPoint<'a> {
     pub(super) fn validation_seconds(&self) -> f64 {
         *self.case.validation_seconds.borrow()
     }
+    /// What candidates are compared with.
+    pub(super) fn reference_kind(&self) -> TuningReference {
+        self.case.reference_kind
+    }
 }
 struct ReferenceCase<'a> {
     reference_kind: TuningReference,
@@ -191,14 +262,17 @@ struct ReferenceCase<'a> {
     policy: Arc<PrecisionPolicy>,
     subjects: Vec<String>,
     mutable: Vec<Observed>,
-    reference: Vec<Vec<Observation>>,
+    references: Rc<References>,
+    /// The reference's observations per rotation entry, once executed.
+    reference: RefCell<Option<Vec<Vec<Observation>>>>,
     identity: String,
     verdicts: RefCell<BTreeMap<String, Result<NumericalEvidence, Exclusion>>>,
     validation_seconds: RefCell<f64>,
 }
 
 pub(super) enum Preparation<'a> {
-    Cases(Vec<PreparedPoint<'a>>),
+    /// The points, whose references execute on first use.
+    Cases(Vec<PreparedPoint<'a>>, Rc<References>),
     Reused(TuningResult),
 }
 
@@ -381,7 +455,7 @@ pub(super) fn prepare<'a>(
     }
     // Zero search constructs the required source implementation without timing-profile
     // acquisition or feedback observations. Exact applicability is compiler-derived.
-    let reference = if reference_kind == TuningReference::Portable {
+    let portable = if reference_kind == TuningReference::Portable {
         Some(Arc::new(
             kernel::prepare(
                 module,
@@ -401,55 +475,17 @@ pub(super) fn prepare<'a>(
     } else {
         None
     };
-    let mut pages = ReferencePages::default();
+    let references = Rc::new(References {
+        device: device.clone(),
+        reference_device,
+        native: native_reference,
+        portable,
+        mutable: mutable.to_vec(),
+        pages: RefCell::new(ReferencePages::default()),
+        seconds: RefCell::new(0.),
+    });
     let mut prepared = Vec::new();
     for (point, observed, initialize, identity) in identified {
-        let mut expected = Vec::new();
-        for args in &point.rotation {
-            if let Some(reset) = &initialize {
-                reset.borrow_mut()().map_err(|e| TuneError::Reference(e.to_string()))?;
-            }
-            // Slab addressing is a native binding detail. Portable state is canonical
-            // and separately owned, so candidate execution cannot corrupt its reference.
-            let reference_args = if native_reference.is_some() {
-                args.clone()
-            } else {
-                args.map_tensors(|ordinal, tensor| {
-                    if mutable.iter().any(|(i, _)| *i == ordinal)
-                        || tensor.is_slabbed()
-                        || !Arc::ptr_eq(device, &reference_device)
-                    {
-                        let bytes = tensor
-                            .read_to_host()
-                            .map_err(|e| TuneError::Reference(e.to_string()))?;
-                        crate::api::tensor::TensorInner::from_host(
-                            &reference_device,
-                            tensor.representation(),
-                            tensor.extents(),
-                            &bytes,
-                        )
-                        .map(Arc::new)
-                        .map_err(|e| TuneError::Reference(e.to_string()))
-                    } else {
-                        Ok(tensor.clone())
-                    }
-                })?
-            };
-            let results = if let Some(reference) = &native_reference {
-                reference.call(reference_args.clone())
-            } else {
-                kernel::call(
-                    reference.as_ref().expect("portable reference"),
-                    reference_args.clone(),
-                )
-            }
-            .map_err(|e| TuneError::Reference(e.to_string()))?;
-            let values = results.into_values();
-            expected.push(
-                observe(values, &reference_args, &observed, Some(&mut pages))
-                    .map_err(|e| TuneError::Reference(format!("{e:?}")))?,
-            );
-        }
         let mut verdicts = BTreeMap::new();
         if let Some(evidence) = evidence(&identity) {
             verdicts.insert(evidence.candidate.clone(), Ok(evidence));
@@ -460,14 +496,15 @@ pub(super) fn prepare<'a>(
             policy: policy.clone(),
             subjects: subjects.clone(),
             mutable: observed,
-            reference: expected,
+            references: references.clone(),
+            reference: RefCell::new(None),
             identity,
             verdicts: RefCell::new(verdicts),
             validation_seconds: RefCell::new(0.),
         });
         prepared.push(PreparedPoint { point, case });
     }
-    Ok(Preparation::Cases(prepared))
+    Ok(Preparation::Cases(prepared, references))
 }
 
 fn observe(

@@ -23,8 +23,10 @@
 //! A device that idled (while configurations were formed, for example) runs
 //! at a low clock until it has been busy for a while: on an M4 Pro the first
 //! configuration measured after forming a batch read 2–4× its time for its
-//! first 4–15 samples, and sometimes for all of them. [`warm`] keeps the
-//! device busy until its speed stops changing before measuring.
+//! first 4–15 samples, and sometimes for all of them; a unit of small
+//! kernels on an M4 Max read about 4× its time for every configuration of a
+//! batch. So a device idle for more than [`IDLE`] since its last timed work
+//! is first [`warm`]ed: kept busy until its speed stops changing.
 
 use super::{
     median, median_of, CallError, MeasureOptions, Measurement, NativeBoundCall, NativePrepared,
@@ -32,8 +34,9 @@ use super::{
 };
 use crate::api::kernel::{EncodedArgs, EncodedOutputs};
 use crate::api::tensor::TensorInner;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// One point's calls, placed once and submitted for every sample.
 pub(crate) struct PointTiming<'a> {
@@ -56,16 +59,15 @@ const STEADY_SAMPLE_SECONDS: f64 = 0.002;
 /// that point in one tuning run. Samples complete one at a time, so the
 /// configurations placed at a point can write the same results. Numerical
 /// observation clears that storage before each candidate's first invocation.
+/// Points are named by label, so any subset of a run's points finds its own
+/// storage.
 #[derive(Default)]
-pub(crate) struct OutputPool(Vec<Vec<Vec<Arc<TensorInner>>>>);
+pub(crate) struct OutputPool(HashMap<String, Vec<Vec<Arc<TensorInner>>>>);
 
 impl OutputPool {
-    /// The storage of `point`'s argument sets.
-    pub(crate) fn at(&mut self, point: usize) -> &mut Vec<Vec<Arc<TensorInner>>> {
-        if self.0.len() <= point {
-            self.0.resize_with(point + 1, Vec::new);
-        }
-        &mut self.0[point]
+    /// The storage of the argument sets of the point labeled `point`.
+    pub(crate) fn at(&mut self, point: &str) -> &mut Vec<Vec<Arc<TensorInner>>> {
+        self.0.entry(point.to_owned()).or_default()
     }
 }
 
@@ -326,6 +328,34 @@ impl<'a> PointTiming<'a> {
     }
 }
 
+/// Time without timed device work after which a device is warmed before its
+/// next sample: forming configurations idles it for tens to hundreds of
+/// milliseconds, while a search's consecutive samples follow within a few.
+const IDLE: Duration = Duration::from_millis(20);
+
+/// Record that `point`'s device completed timed work now.
+fn timed(point: &PointTiming) {
+    *point
+        .kernel
+        .public_device
+        .native
+        .timed
+        .lock()
+        .expect("timing lock is never poisoned") = Some(Instant::now());
+}
+
+/// Whether `point`'s device has been idle long enough to need warming.
+fn idle(point: &PointTiming) -> bool {
+    point
+        .kernel
+        .public_device
+        .native
+        .timed
+        .lock()
+        .expect("timing lock is never poisoned")
+        .is_none_or(|timed| timed.elapsed() > IDLE)
+}
+
 /// Continuous device work every warm-up does first: an idle device's clock
 /// rises over tens of milliseconds of load, holding at intermediate levels.
 const WARM_MIN_SECONDS: f64 = 0.05;
@@ -367,6 +397,7 @@ pub(crate) fn warm(point: &PointTiming) -> Result<(), CallError> {
         }
         previous = seconds;
     }
+    timed(point);
     Ok(())
 }
 
@@ -392,17 +423,21 @@ fn collect(
             .seconds()
             .map_err(|error| PointFailure { point, error })?;
         points[point].record(seconds, exercised, min_sample_seconds);
+        timed(&points[point]);
     }
     Ok(())
 }
 
-/// Bring every point to at least `options.samples` samples: an uncalibrated
-/// point first gets its calibrating pass, then samples are taken round by
-/// round (each point once per round).
+/// Bring every point to at least `options.samples` samples, warming an idle
+/// device first: an uncalibrated point first gets its calibrating pass, then
+/// samples are taken round by round (each point once per round).
 pub(crate) fn sample(
     points: &mut [PointTiming],
     options: &MeasureOptions,
 ) -> Result<(), PointFailure> {
+    if let Some(first) = points.first().filter(|first| idle(first)) {
+        warm(first).map_err(|error| PointFailure { point: 0, error })?;
+    }
     let uncalibrated = (0..points.len())
         .filter(|&point| points[point].repetitions.is_none())
         .collect::<Vec<_>>();
@@ -437,7 +472,6 @@ impl NativePrepared {
             return Err(CallError::Workflow(crate::api::WorkflowError::Empty));
         }
         let mut points = [PointTiming::new(self, rotation)?];
-        warm(&points[0])?;
         sample(&mut points, options).map_err(|failure| failure.error)?;
         Ok(points[0].measurement())
     }

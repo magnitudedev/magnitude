@@ -4,13 +4,11 @@
 //! `short_conv_rows` declares no parameters.
 
 use super::cases::projection_shape;
-use super::{
-    cpu_projection_screening, row_points, EntryTuning, PointShape, TuningInputs, TuningLimits,
-};
+use super::{row_points, EntryTuning, PointShape, TuningInputs, TuningLimits};
 use crate::ShortConvBinding;
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project};
-use seismic::{Device, Element, ScreeningPoint, Tensor};
+use seismic::{Element, Tensor};
 
 /// `short_conv_project`: the input RMS and the `B`, `C`, `X` projections.
 pub(crate) struct ShortConvProjectTuning {
@@ -83,10 +81,6 @@ impl EntryTuning for ShortConvProjectTuning {
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
-    }
-
-    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
-        cpu_projection_screening(device, points)
     }
 
     fn rotation(
@@ -177,10 +171,6 @@ impl EntryTuning for ShortConvOutputTuning {
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
-    }
-
-    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
-        cpu_projection_screening(device, points)
     }
 
     fn rotation(

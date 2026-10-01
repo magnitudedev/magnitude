@@ -44,34 +44,48 @@ Native invocation reuses the checked entry contract and public tensor runtime bu
 `RefinedCandidateFamilies`, compiler kernel IR, `CandidateDomain`, `SelectionPolicy`, `ExecutableVariant`,
 `PreparedKernel`, or portable workflow artifacts. It has no solving, duration model, candidate
 selection, retry, or fallback. Its only search is tuning, fast enough to run at program
-preparation. Entry-wide declarations still use a budgeted local search of the author's declared parameter domain, minimizing one
-weighted device-measured cost (`Σ weight × median`) over the consumer's points. A consumer may
-name a cheaper screening subset with folded weights for candidate exploration. The default and
-screened finalists are then measured and ranked with the original points and weights. Every candidate must pass numerical validation on all original points before repeated timing, including points omitted from the screening objective. The result records the screening definition.
+preparation. Entry-wide declarations use a time-bounded local search of the author's declared parameter domain, minimizing one
+weighted device-measured cost (`Σ weight × median`) over the consumer's points that carry weight.
+Every candidate must pass numerical validation at those points before repeated timing. A point of
+weight zero is not timed; the search's choice must also pass validation there, and a choice that
+fails gives way to the census seed (the first passing configuration, the defaults when they pass),
+which must pass there too; the defaults compared with themselves (a native-default reference) pass
+by construction. Every chosen configuration passes at every point. A consumer's
+census measures the first passing configuration point by point in the consumer's order (ascending
+cost), admitting a point only while its time so far plus the point's time predicted from the
+previous one by their cost ratio fits the consumer's ceiling; a point the consumer marks required is
+always admitted. A point not admitted gets weight zero and folds its weight into the largest
+admitted point of its class (or the largest admitted point). References execute per point, when a
+point is first validated. A parameter read only by launches inactive at every timed point keeps its
+default: nothing measures it, and no validation runs its code.
 Each parameter's values are ordered numerically; neighbours differ by one step in one parameter. The search
-evaluates the defaults, then, within the consumer's budget, one start per other value of each `form` parameter and any
+evaluates the defaults, then, as its time allows, one start per other value of each `form` parameter and any
 additional start configurations the consumer names. Each form start is the admissible configuration with that value nearest
 the defaults, unless the consumer supplies an admissible start for that form value; the hint then uses that form's first
 measurement slot. From the cheapest start of each form, cheapest form first, it repeatedly forms every
 unvisited neighbour of the current configuration as one parallel batch, measures each, and moves
 to the best while it improves by more than ε; a form's own defaults can be far from its best, and
 a single descent from the entry's defaults rarely crosses into another form. Then, at each local
-minimum, it restarts from the unvisited configuration farthest from everything visited. It stops when the consumer's budget (a
-configuration count, never a wall-clock limit) is spent, the space is exhausted, R consecutive
-restarts found nothing better, or the consumer's safety deadline passes. Configurations the
-device cannot form or run cost +∞ and consume budget. The K cheapest configurations and the
-defaults are then re-measured with more samples across every original point, alternating round by
+minimum, it restarts from the unvisited configuration farthest from everything visited. It stops when the space is
+exhausted, R consecutive restarts found nothing better, or its exploration time ends: the consumer's
+allowance less what confirming the finalists and validating the choice at the untimed points will
+cost, estimated from the census's measurement of the defaults. Time is checked before each
+configuration. Configurations the device cannot form or run cost +∞. The K cheapest configurations and the
+defaults are then re-measured with more samples across every timed point, alternating round by
 round, and ranked by those full-workload costs; the defaults rank first unless the leader beats
 them by δ. Defaults with no measured rival have nothing to rank against and are not re-measured.
-Screening can omit a candidate that would have won on the full workload, so it is an
-explicit search policy rather than an exact reduction. The search is a pure function of
-an evaluator's costs, so a recorded evaluator can replay it. Measurement is device time: a
+Given an evaluator's costs and where its time ends, the search is deterministic, so a recorded
+evaluator can replay it. Measurement is device time: a
 point's calls are placed once and calibrated so one sample covers a minimum device time. Each
 sample completes before the next is submitted, since a device queue overlaps independent work and
 back-to-back samples would each include the other's. A kernel's first pass pays its first-use costs
 and is never a sample; a later point's calibrating pass of the same kernel is one when it already
 covers a steady sample (2 ms), and a point whose sample is that long takes one sample rather than
 the requested count, because a sample's fixed jitter is then a small fraction of any ranking margin.
+A device idle for more than 20 ms since its last timed work (forming a batch of configurations
+idles it for tens to hundreds of milliseconds) runs at a lowered clock, which read a
+configuration's time up to 4× too long; it is kept busy until its speed stops changing before its
+next sample.
 Partition projects every admissible configuration's parameter values once and decides each point's
 active launches once per distinct value of what the launch conditions read. The consumer then prepares the chosen
 specialization explicitly. The first initialized timed execution also supplies numerical observations,
@@ -115,9 +129,10 @@ points between launches, then confirms each group's shortlisted candidates again
 before assembling one choice per group. An independent launch group outside the consumer's
 served points keeps its declared default. Each launch is formed up front as one program holding
 all its code variants and held for the whole run, so a candidate forms nothing and supplies its
-runtime geometry. A safety deadline leaves unmeasured groups at their defaults and prevents
-that incomplete result from being cached. An interrupted group's already formed candidates are
-measured and ranked; the tuner skips further group confirmation. The assembled choice is
+runtime geometry. The search runs within the consumer's allowance, less what confirming the
+assembled choice and validating it at untimed points will cost; when that time ends, unmeasured
+groups keep their defaults, an interrupted group's already formed candidates are measured and
+ranked, and the tuner skips further group confirmation. The assembled choice is
 remeasured and validated as a complete invocation against the selected reference before selection. If the default fails, a passing seed must first be found; unmeasured group defaults cannot themselves authorize a result. The assembled
 candidate and the passing seed are measured in shared sample rounds, so clock drift
 affects both together.

@@ -13,14 +13,13 @@
 
 use super::cases::projection_shape;
 use super::{
-    cpu_projection_screening, row_points, served_row_points, CaseState, EntryTuning, PointShape,
-    TuningInputs, TuningLimits,
+    row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs, TuningLimits,
 };
 use crate::operators::gated_delta::graph::CHUNKED_ROWS;
 use crate::{StateSpaceBinding, StateSpaceShape};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, attention_project, state_space_chunk, state_space_step};
-use seismic::{Device, Element, ScreeningPoint, Tensor};
+use seismic::{Element, Tensor};
 
 /// Banks of a tuning arena: the zero seed, the bank the slot reads and the
 /// bank it publishes to.
@@ -95,10 +94,6 @@ impl EntryTuning for StateSpaceProjectTuning {
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
-    }
-
-    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
-        cpu_projection_screening(device, points)
     }
 
     fn rotation(
@@ -186,10 +181,6 @@ impl EntryTuning for StateSpaceOutputTuning {
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
-    }
-
-    fn screening(&self, device: &Device, points: &[PointShape]) -> Vec<ScreeningPoint> {
-        cpu_projection_screening(device, points)
     }
 
     fn rotation(

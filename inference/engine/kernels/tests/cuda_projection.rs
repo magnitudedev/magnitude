@@ -440,6 +440,8 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
             label: format!("rows{rows}"),
             weight: 1.0,
             class: None,
+            cost: 1.0,
+            required: false,
             rotation: vec![dense_expand::Args {
                 residual,
                 norm: &norm,
@@ -456,7 +458,7 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
         })
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
-        budget: 24,
+        allowance: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
             improvement: 0.01,
             restarts: 2,
@@ -467,8 +469,6 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
         },
         min_sample_seconds: 0.001,
         start: Vec::new(),
-        deadline: None,
-        screening: Vec::new(),
     });
     let statics = NativeSpecialization::new()
         .with_static("H", h as u64)
@@ -543,6 +543,8 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
                 label: format!("rows{rows}"),
                 weight: 1.0,
                 class: None,
+                cost: 1.0,
+                required: false,
                 rotation: vec![dense_output::Args {
                     residual,
                     product,
@@ -556,7 +558,7 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
         )
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
-        budget: 24,
+        allowance: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
             improvement: 0.01,
             restarts: 2,
@@ -567,8 +569,6 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
         },
         min_sample_seconds: 0.001,
         start: Vec::new(),
-        deadline: None,
-        screening: Vec::new(),
     });
     let statics = NativeSpecialization::new()
         .with_static("H", h as u64)
