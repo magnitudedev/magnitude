@@ -123,6 +123,14 @@ pub struct ApiError {
     pub body: ApiErrorBody,
 }
 
+/// Leads every retryable 503 message. Harnesses that classify errors by their text (Pi, Oh My
+/// Pi, OpenCode) retry on these words, and so do the ones that read the status.
+const TRANSIENT_UNAVAILABLE: &str =
+    "Service unavailable: the server is overloaded; please retry your request.";
+
+/// Seconds a client should wait before retrying a transient 503; memory shortages clear quickly.
+const RETRY_AFTER_SECONDS: &str = "1";
+
 const INVALID: &str = "invalid_request_error";
 const SERVER: &str = "server_error";
 const MODEL: &str = "model_error";
@@ -173,8 +181,17 @@ impl ApiError {
         self
     }
 
+    /// Whether this is a transient 503 that clients should retry after [`RETRY_AFTER_SECONDS`].
+    pub fn is_transient_unavailable(&self) -> bool {
+        self.status == StatusCode::SERVICE_UNAVAILABLE && self.body.retryable
+    }
+
     pub fn response(self) -> Response {
+        let transient = self.is_transient_unavailable();
         let mut response = (self.status, Json(ErrorResponse { error: self.body })).into_response();
+        if transient {
+            insert_retry_after(&mut response);
+        }
         let request_id = format!(
             "req_icn_{}",
             NEXT_HTTP_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
@@ -227,8 +244,21 @@ impl From<ServingError> for ApiError {
             }
             (_, code) => code,
         };
+        let message = if status == StatusCode::SERVICE_UNAVAILABLE && retryable {
+            format!("{TRANSIENT_UNAVAILABLE} {message}")
+        } else {
+            message
+        };
         Self::new(status, kind, code, retryable, message)
     }
+}
+
+/// Ask the client to retry a transient 503 after [`RETRY_AFTER_SECONDS`].
+pub(crate) fn insert_retry_after(response: &mut Response) {
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
+    );
 }
 
 type Class = (StatusCode, &'static str, &'static str, bool);
@@ -343,6 +373,30 @@ fn model_class(error: &ModelUnavailable) -> Class {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_unavailability_asks_clients_to_retry_in_words_and_headers() {
+        let error = ApiError::from(ServingError::Request(RequestError::InsufficientMemory(
+            magnitude_engine::error::InsufficientMemory {
+                required: 2,
+                available: 1,
+            },
+        )));
+        assert_eq!(error.body.code, "insufficient_memory");
+        assert!(error.body.message.starts_with(TRANSIENT_UNAVAILABLE));
+        let response = error.response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], RETRY_AFTER_SECONDS);
+    }
+
+    #[test]
+    fn permanent_failures_carry_no_retry_wording_or_header() {
+        let error = ApiError::from(ServingError::Request(RequestError::InvalidRequest {
+            reason: "bad".into(),
+        }));
+        assert!(!error.body.message.contains(TRANSIENT_UNAVAILABLE));
+        assert!(error.response().headers().get(axum::http::header::RETRY_AFTER).is_none());
+    }
 
     #[test]
     fn stopped_model_instance_has_a_non_retryable_error_contract() {

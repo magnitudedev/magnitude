@@ -242,17 +242,11 @@ impl State {
 
     /// Terminate the request's generation, discarding any started round.
     fn terminate(self, cancel: bool) -> Generation {
-        let generation = match self {
-            Self::Between(generation, _) => generation,
-            Self::Parked(round, ..) => round.cancel(),
-        };
-        let mut generation = generation;
-        if cancel {
-            generation.cancel();
-        } else {
-            generation.fail();
+        match self {
+            Self::Between(generation, _) => terminated(generation, cancel),
+            Self::Parked(round, ..) if cancel => round.cancel(),
+            Self::Parked(round, ..) => round.fail(),
         }
-        generation
     }
 }
 
@@ -277,17 +271,23 @@ impl Membership {
     }
 
     fn terminate(self, cancel: bool) -> Generation {
-        let mut generation = match self {
-            Self::Generation(generation) => generation,
-            Self::Started(round) => round.cancel(),
-        };
-        if cancel {
-            generation.cancel();
-        } else {
-            generation.fail();
+        match self {
+            Self::Generation(generation) => terminated(generation, cancel),
+            Self::Started(round) if cancel => round.cancel(),
+            Self::Started(round) => round.fail(),
         }
-        generation
     }
+}
+
+/// A terminated request's finish: cancelled when withdrawn by its client, failed otherwise, so a
+/// failure always publishes its classified error rather than an empty completion.
+fn terminated(mut generation: Generation, cancel: bool) -> Generation {
+    if cancel {
+        generation.cancel();
+    } else {
+        generation.fail();
+    }
+    generation
 }
 
 struct Member {
@@ -1227,6 +1227,10 @@ impl<F: ProgramFamily> Service<F> {
             }
         }
         if self.memory_condition.should_unload(self.now) {
+            tracing::error!(
+                requests = self.requests.len(),
+                "unloading the model: memory stayed below the reclaim reserve"
+            );
             self.terminalize_all(
                 RequestError::ModelUnloaded {
                     cause: ModelUnloadCause::MemoryPressure,
@@ -1243,6 +1247,9 @@ impl<F: ProgramFamily> Service<F> {
     fn enter_memory_condition(&mut self, next: MemoryCondition) {
         let recovered =
             self.memory_condition != MemoryCondition::Normal && next == MemoryCondition::Normal;
+        if std::mem::discriminant(&self.memory_condition) != std::mem::discriminant(&next) {
+            tracing::warn!(from = ?self.memory_condition, to = ?next, "memory condition changed");
+        }
         self.memory_condition = next;
         if recovered {
             self.epoch.advance();
@@ -2959,5 +2966,65 @@ mod memory_condition_tests {
         assert_eq!(normal.released(11), MemoryCondition::Normal);
         let renewed = normal.observe(MemoryObservation::Reclaim, 11);
         assert_eq!(renewed, MemoryCondition::Reclaim { since: 11 });
+    }
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use super::Membership;
+    use magnitude_generation::{
+        EndOfGeneration, FinishReason, Generation, InputLayout, MethodChoice, Options, RoundStart,
+        Sampling, Shaping, StartedRound, TokenId,
+    };
+    use std::collections::BTreeSet;
+
+    fn generation() -> Generation {
+        let mut generation = Generation::new(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            Options {
+                max_tokens: 8,
+                output_capacity: 4,
+                context_limit: 32,
+                vocabulary: 100,
+                stop_tokens: BTreeSet::from([TokenId(99)]),
+                suppressed_tokens: BTreeSet::new(),
+                sampling: Sampling::Greedy,
+                shaping: Shaping {
+                    temperature: 0.0,
+                    ..Default::default()
+                },
+                seed: 42,
+                forced_quantum: 4,
+                method: MethodChoice::Plain,
+                end_of_generation: EndOfGeneration::Stop,
+                reasoning_budget: None,
+            },
+            None,
+        )
+        .unwrap();
+        generation.resume_at(None).unwrap();
+        generation
+    }
+
+    fn started() -> StartedRound {
+        match generation().start_round(magnitude_generation::RequestId(1), 4) {
+            Ok(RoundStart::Target(round)) => round,
+            _ => panic!("expected a target round"),
+        }
+    }
+
+    #[test]
+    fn a_failed_started_round_finishes_failed_not_cancelled() {
+        let failed = Membership::Started(started()).terminate(false);
+        assert_eq!(failed.finish_reason(), Some(FinishReason::Failed));
+        let cancelled = Membership::Started(started()).terminate(true);
+        assert_eq!(cancelled.finish_reason(), Some(FinishReason::Cancelled));
+    }
+
+    #[test]
+    fn a_failed_waiting_request_finishes_failed() {
+        let failed = Membership::Generation(generation()).terminate(false);
+        assert_eq!(failed.finish_reason(), Some(FinishReason::Failed));
     }
 }

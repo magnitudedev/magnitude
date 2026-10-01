@@ -24,7 +24,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use utoipa::ToSchema;
 
 use crate::chat::{ReasoningEffortRequest, admitted, collect, ended_without_outcome};
-use crate::error::{ApiError, ServingError};
+use crate::error::{ApiError, ServingError, insert_retry_after};
 use crate::source::{GenerationEvent, GenerationStream};
 use crate::{Serving, media};
 
@@ -1053,13 +1053,14 @@ impl StreamProjector {
     }
 
     async fn fail(&self, error: ServingError) {
+        let error = ApiError::from(error);
         let _ = self
             .send(
                 "error",
                 &StreamEvent::Error {
                     error: StreamError {
-                        r#type: "api_error",
-                        message: error.to_string(),
+                        r#type: anthropic_error_type(error.status),
+                        message: error.body.message,
                     },
                     request_id: self.request_id.clone(),
                 },
@@ -1126,15 +1127,22 @@ fn with_anthropic_request_id(mut response: Response, request_id: &str) -> Respon
     response
 }
 
-fn anthropic_error_response(request_id: String, error: ApiError) -> Response {
-    let error_type = match error.status {
+/// The Anthropic error type for a classified failure, before or during a stream. Claude Code
+/// retries `overloaded_error` wherever it appears, including before a stream's first content.
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status {
         StatusCode::BAD_REQUEST => "invalid_request_error",
         StatusCode::NOT_FOUND => "not_found_error",
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
         StatusCode::SERVICE_UNAVAILABLE => "overloaded_error",
         _ => "api_error",
-    };
-    let response = (
+    }
+}
+
+fn anthropic_error_response(request_id: String, error: ApiError) -> Response {
+    let error_type = anthropic_error_type(error.status);
+    let transient = error.is_transient_unavailable();
+    let mut response = (
         error.status,
         Json(ErrorEnvelope {
             r#type: "error",
@@ -1146,6 +1154,9 @@ fn anthropic_error_response(request_id: String, error: ApiError) -> Response {
         }),
     )
         .into_response();
+    if transient {
+        insert_retry_after(&mut response);
+    }
     with_anthropic_request_id(response, &request_id)
 }
 

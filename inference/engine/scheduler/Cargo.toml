@@ -10,3 +10,4 @@ magnitude-family-contracts = { path = "../families/contracts" }
 magnitude-executor = { path = "../executor" }
 magnitude-state = { path = "../state" }
 serde.workspace = true
+tracing.workspace = true

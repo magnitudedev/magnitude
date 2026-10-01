@@ -2265,6 +2265,7 @@ dependencies = [
  "seismic",
  "serde_json",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2426,6 +2427,7 @@ dependencies = [
  "magnitude-generation",
  "magnitude-state",
  "serde",
+ "tracing",
 ]
 
 [[package]]
