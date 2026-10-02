@@ -39,7 +39,7 @@ pub use seismic_runtime::native::trace::{
     host_seconds, SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedSubmission,
 };
 pub use seismic_runtime::native::tune::{
-    Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, NumericalEvidence,
+    CensusPlan, Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, NumericalEvidence,
     NumericalMetrics, Outcome, PointInputs, PointMeasurement, PointRecord, PointSpec,
     PointUnavailable, SearchPlan, Strategy, SurveyPlan, TuneError, TuningInitializer, TuningMethod,
     TuningReference, TuningResult, TuningTime,

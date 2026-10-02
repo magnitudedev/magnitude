@@ -4,7 +4,7 @@
 //! host-written inputs, asynchronous submission, measurement and tuning.
 
 use seismic::{
-    Availability, BackendName, CallError, Device, DeviceCatalog, Element, Exclusion,
+    Availability, BackendName, CallError, CensusPlan, Device, DeviceCatalog, Element, Exclusion,
     InvocationError, MeasureOptions, NativeGraphFamily, NativeSpecialization, Outcome,
     PrecisionPolicy, SearchPlan, SearchSettings, SearchStop, Strategy, SurveyPlan, Tensor,
     TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint,
@@ -645,6 +645,91 @@ fn a_search_times_the_points_its_admission_affords_and_folds_the_rest() {
         weights(&required),
         [("short".to_owned(), 1.0), ("long".to_owned(), 3.0)]
     );
+}
+
+#[test]
+fn a_census_times_the_required_points_and_its_search_admits_the_rest() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let n = 4096u64;
+    let x = f32_tensor(&device, &[n], &exact_values(n as usize));
+    let points = || {
+        [
+            ("short", 1.0, false),
+            ("required", 2.0, true),
+            ("long", 3.0, false),
+        ]
+        .into_iter()
+        .map(|(label, cost, required)| TuningPoint {
+            label: label.into(),
+            weight: 1.0,
+            class: None,
+            cost,
+            required,
+            rotation: vec![split_sum::Args { x: &x }],
+            initialize: None,
+            written: Default::default(),
+        })
+        .collect::<Vec<_>>()
+    };
+    let timed = |result: &seismic::TuningResult| {
+        let defaults = result
+            .configurations
+            .iter()
+            .find(|record| record.configuration.params["PARTS"] == 1)
+            .expect("the defaults were evaluated");
+        match &defaults.outcome {
+            Outcome::Measured { points, .. } => points.clone(),
+            Outcome::Excluded(exclusion) => panic!("{exclusion:?}"),
+        }
+    };
+    // The census times the cheapest point and the required one.
+    let census = split_sum::native_tune(
+        &device,
+        &statics(n),
+        points(),
+        PrecisionPolicy::Exact,
+        Strategy::Census(CensusPlan {
+            limit: Duration::from_secs(3600),
+            min_sample_seconds: 0.005,
+        }),
+        seismic::TuningReference::Portable,
+    )
+    .unwrap();
+    assert!(matches!(census.method, TuningMethod::Census));
+    let censused = timed(&census);
+    assert_eq!(
+        censused
+            .iter()
+            .map(|point| point.point.as_str())
+            .collect::<Vec<_>>(),
+        ["short", "required"]
+    );
+    // Its search reuses those measurements and admits the remaining point
+    // within its admission.
+    let Strategy::Search(plan) = search(1) else {
+        unreachable!()
+    };
+    let searched = split_sum::native_tune(
+        &device,
+        &statics(n),
+        points(),
+        PrecisionPolicy::Exact,
+        Strategy::Censused { plan, census },
+        seismic::TuningReference::Portable,
+    )
+    .unwrap();
+    let measured = timed(&searched);
+    assert_eq!(
+        measured
+            .iter()
+            .map(|point| point.point.as_str())
+            .collect::<Vec<_>>(),
+        ["short", "required", "long"]
+    );
+    assert_eq!(measured[..2], censused[..]);
 }
 
 #[test]

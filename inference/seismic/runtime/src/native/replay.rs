@@ -585,7 +585,6 @@ mod tests {
                 .collect(),
             validation: seismic_lang::precision::PrecisionPolicy::Exact,
             numerical_evidence: Vec::new(),
-            reused: false,
             implementation_identity: String::new(),
             parameters: vec![
                 DeclaredParameter {

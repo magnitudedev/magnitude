@@ -96,30 +96,37 @@ and static values reuses the load's first tuning result; its rotations already s
 of several layers. Disjoint row-class workloads may prepare distinct configurations of the same
 entry contract; each is tuned and validated on the classes it serves, and the exact graph class
 binds its prepared configuration. Entry-wide
-declarations are tuned within a fixed tuning time (60 s per preparation, on any device), in two
+declarations are tuned within a fixed tuning time (60 s per preparation, on any device), in three
 walks of the program. A count finds the model's tuning units (entry, element bindings, static
 values and served workload), their launches per step and which have a stored result; nothing is
-formed or measured. The second walk visits each unit that will search once, within its own
-budget: its launches' share of the tuning time, plus its launches' share of what units visited
-earlier left unused. A unit's overrun is never taken from another unit, so one unit's
-misprediction cannot starve the rest. Keeping a unit's defaults costs nothing and is always valid
-(they are the validation reference), so every other piece of work is paid for from the budget and
-starts only when its predicted cost fits. Inside the visit, the unit's points are built and
-measured in ascending estimated cost: a point's inputs are built only when it is admitted (weight
-imports and generated activations each predicted from their size and the rates measured so far,
-and refused when they would not fit), then its reference runs and the defaults are validated and
-measured there. Points are admitted while the visit stays within a tenth of the budget, each
-predicted from the last by cost. Every point of at most 8 rows (the decode range, where
-implementations' row-dependent code paths differ) is required: required points may take half the
-budget, and a unit that cannot afford them keeps its defaults without searching. A point not
-admitted folds its weight into the largest admitted point of its history class. The search then
-times the admitted points and validates every candidate at them, ending exploration when what
-remains covers confirming its finalists (predicted from the defaults' measurement) and validating
-its choice at the points it did not time (predicted from the last admitted point). Those points'
-inputs are built only to validate a choice other than the defaults; a choice that fails there, or
-whose validation there would not fit, gives way to the defaults: every chosen configuration passes
-validation at every served point. Shared history planes live for the whole tuning, so units
-reading the same history build it once. A launch-scoped declaration admits its points the same
+formed or measured. The tuning time starts with the census, which measures each unit that will
+search at the points every candidate must pass (its cheapest point when none must), the fixed
+cost of searching it, within the tuning time left. Keeping a unit's defaults costs nothing and is
+always valid (they are the validation reference), so every other piece of work starts only when
+its predicted cost fits. The unit's points are built and measured in ascending estimated cost
+(rows, and for attention each row's rows plus visible history): a point's inputs are built only
+when it is admitted (weight imports and generated activations each predicted from their size and
+the rates measured so far, and refused when they would not fit), then its reference runs and the
+defaults are validated and measured there. Each point is predicted from the last admitted one:
+its building and validation as measured, its invocations at the defaults' measured device time
+scaled by cost. Every point of at most 8 rows (the decode range, where implementations'
+row-dependent code paths differ) is required: a unit whose required points do not fit keeps its
+defaults without searching. The census keeps the inputs it built for the unit's search. Its
+measurements give each unit's share of step time: every row class it measured holds its share of
+the step, split among the units serving it by launches per step times the defaults' mean time
+there. Each unit's budget is its share's part of the tuning time left among the units still to
+search, so time a unit leaves goes to the units after it and an overrun is taken from them, and
+tuning ends within the tuning time. The search reuses the census's measurements of the defaults
+and admits further points while they fit a tenth of its budget; a point not admitted is not
+timed and folds its weight into the largest admitted point of its history class. It validates
+every candidate at the timed points,
+ending exploration when what remains covers confirming its finalists (the defaults and the
+cheapest candidates within noise of the leader, each predicted from its own measured samples)
+and validating its choice at the points it did not time (predicted from the last admitted
+point). Those points' inputs are built only to validate a choice other than the defaults; a
+choice that fails there, or whose validation there would not fit, gives way to the defaults:
+every chosen configuration passes validation at every served point. Shared history planes live
+for the whole tuning, so units reading the same history build it once. A launch-scoped declaration admits its points the same
 way, and its factored search runs within the same window. A slower device or build tunes fewer
 points, candidates and units, never longer; each unit's report gives its budget and its time.
 The engine owns every cache, under a directory the host names (`--cache-dir`; without one nothing

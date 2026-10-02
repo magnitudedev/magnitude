@@ -152,7 +152,7 @@ use crate::kernel_cache::{KernelCache, TuningCacheKey};
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
 use magnitude_family_contracts::{ModelDefinition, Operator, WeightKind, WeightScope};
 use seismic::{
-    Configuration, DType, Device, Element, NativeImplementation, NativeKernel,
+    CensusPlan, Configuration, DType, Device, Element, NativeImplementation, NativeKernel,
     NativeSpecialization, ParameterValues, PrecisionPolicy, SearchPlan, SearchSettings, SearchStop,
     Strategy, Tensor, TensorError, TuneError, TuningInitializer, TuningMethod, TuningResult,
     TuningTime,
@@ -218,14 +218,11 @@ pub const STREAMING_ROWS: u64 = 8;
 pub const SEARCH_VERSION: u32 = 16;
 /// The time one preparation spends tuning, on any device.
 pub const TUNING_TIME: Duration = Duration::from_secs(60);
-/// A unit's timed points may take `1 / ADMISSION_SHARE` of its budget to
-/// build and measure the defaults at, leaving the rest to search: about as
-/// many evaluations of those points as this share.
+/// A unit's search may take `1 / ADMISSION_SHARE` of its budget to admit
+/// points beyond its census's, building them and measuring the defaults
+/// there, leaving the rest to search: about as many evaluations of its
+/// points as this share.
 pub const ADMISSION_SHARE: u32 = 10;
-/// The points every candidate must pass may take `1 / REQUIRED_SHARE` of a
-/// unit's budget; a unit that cannot afford them keeps its defaults, since
-/// what remained could not search.
-pub const REQUIRED_SHARE: u32 = 2;
 /// The search's constants (§D2).
 pub const SEARCH_SETTINGS: SearchSettings = SearchSettings {
     improvement: 0.01,
@@ -273,7 +270,10 @@ impl PointShape {
     /// The point's cost relative to its unit's other points: its rows, and
     /// for attention each row's visible history.
     pub fn cost(&self) -> f64 {
-        (self.rows * (self.rows + self.context.unwrap_or(0))) as f64
+        match self.context {
+            Some(context) => (self.rows * (self.rows + context)) as f64,
+            None => self.rows as f64,
+        }
     }
 }
 
@@ -468,8 +468,9 @@ pub(crate) trait EntryTuning {
     type Entry: seismic::Entry;
     fn precision(&self) -> Result<PrecisionPolicy, TuneError>;
     /// One argument set: every tensor its arguments borrow, owned, including
-    /// the [`CaseState`]s its `&mut` parameters bind.
-    type Case;
+    /// the [`CaseState`]s its `&mut` parameters bind. Kept from a unit's
+    /// census for its search.
+    type Case: 'static;
 
     /// The semantic bindings, for reports.
     fn bindings(&self) -> String;
@@ -1043,19 +1044,120 @@ enum Phase {
         launches: HashMap<TuningKey, usize>,
         searching: Vec<TuningKey>,
     },
-    /// Visiting each searching unit once, within its budget: its launches'
-    /// share of [`TUNING_TIME`], plus its launches' share of what units
-    /// finished early left.
-    Search {
-        /// The launches per step of the units not yet searched.
-        unsearched: HashMap<TuningKey, usize>,
-        /// Their launches, summed.
-        remaining: usize,
-        /// Every searching unit's launches, summed.
-        total: usize,
-        /// Time units finished early left for the units still to search.
-        spare: Duration,
+    /// Measuring each searching unit's defaults at the points every
+    /// candidate must pass within the tuning time left, keeping the inputs
+    /// built for its search.
+    Census {
+        launches: HashMap<TuningKey, usize>,
+        censused: HashMap<TuningKey, Censused>,
     },
+    /// Searching each censused unit within its budget: its share of step
+    /// time's part of the tuning time left, among the units still to search.
+    /// Time a unit leaves goes to the units after it, and an overrun is
+    /// taken from them, so tuning ends within the tuning time.
+    Search {
+        searching: HashMap<TuningKey, Searching>,
+        /// The shares of the units not yet searched, summed.
+        unsearched: f64,
+    },
+}
+
+/// A unit as its census left it.
+struct Censused {
+    launches: usize,
+    /// The unit's points, ascending in cost.
+    shapes: Vec<PointShape>,
+    /// The census's wall time.
+    seconds: f64,
+    result: TuningResult,
+}
+
+/// A unit at the search: its census and its share of step time.
+struct Searching {
+    census: TuningResult,
+    /// The census's wall time.
+    seconds: f64,
+    share: f64,
+}
+
+/// One tuning unit's step time as its census measured it: its launches per
+/// step, its timed points and its defaults' time at each.
+#[derive(Clone, Copy)]
+struct UnitTime<'u> {
+    launches: usize,
+    shapes: &'u [PointShape],
+    seconds: &'u [f64],
+}
+
+/// Each unit's share of expected step time (§D3). Every row class holds its
+/// share of step time ([`row_share`]), split among the units serving it by
+/// their time there: launches per step times the defaults' mean time over
+/// the class's points (its history lengths, equally likely). The defaults'
+/// time is also what tuning can recover: a unit far from its best spends
+/// more of the step and gets more of the time.
+fn step_shares(units: &[UnitTime<'_>]) -> Vec<f64> {
+    let time = |unit: &UnitTime<'_>, rows: u64| {
+        let class = unit
+            .shapes
+            .iter()
+            .zip(unit.seconds)
+            .filter(|(shape, _)| shape.rows == rows)
+            .map(|(_, seconds)| *seconds)
+            .collect::<Vec<_>>();
+        if class.is_empty() {
+            0.0
+        } else {
+            unit.launches as f64 * class.iter().sum::<f64>() / class.len() as f64
+        }
+    };
+    let class_time = TUNING_ROWS
+        .iter()
+        .map(|rows| units.iter().map(|unit| time(unit, *rows)).sum::<f64>())
+        .collect::<Vec<_>>();
+    units
+        .iter()
+        .map(|unit| {
+            TUNING_ROWS
+                .iter()
+                .zip(&class_time)
+                .filter(|(_, total)| **total > 0.0)
+                .map(|(rows, total)| row_share(*rows) * time(unit, *rows) / total)
+                .sum()
+        })
+        .collect()
+}
+
+/// The defaults' time a census measured at each of its timed points, with
+/// those points' shapes.
+fn censused_times(shapes: &[PointShape], census: &TuningResult) -> (Vec<PointShape>, Vec<f64>) {
+    let Some(measured) = census
+        .configurations
+        .iter()
+        .find(|record| record.configuration == census.overall)
+        .and_then(|record| match &record.outcome {
+            seismic::Outcome::Measured { points, .. } => Some(points),
+            seismic::Outcome::Excluded(_) => None,
+        })
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    shapes
+        .iter()
+        .filter_map(|shape| {
+            measured
+                .iter()
+                .find(|point| point.point == shape.label)
+                .map(|point| (shape.clone(), point.median_seconds))
+        })
+        .unzip()
+}
+
+/// One unit's built cases by point, kept from its census for its search,
+/// and the point whose states are observed whole: the first built with
+/// states, the cheapest, so the guard costs a short history.
+struct UnitCases<C> {
+    points: Vec<Option<Vec<C>>>,
+    guard: Option<usize>,
 }
 
 /// A unit's slot in the kernel cache: the cache, the unit's key, and the
@@ -1064,9 +1166,11 @@ type StoredSlot<'c> = (&'c KernelCache, TuningCacheKey, Option<TuningResult>);
 
 /// Resolves every native entry's specialization for the opened device:
 /// static values, tuned parameters, and missing implementations. Tuning
-/// spends about [`TUNING_TIME`] from the start of the search walk: each unit
-/// within its own budget, overrunning by at most a misprediction, never
-/// taking another unit's time.
+/// spends about [`TUNING_TIME`] from the start of the census. The census
+/// measures each unit's defaults at the points every candidate must pass,
+/// within the tuning time left (a unit whose required points do not fit
+/// keeps its defaults); each unit then searches within its share of step
+/// time's part of the time left among the units still to search.
 pub(crate) struct Tuner<'a> {
     device: &'a Device,
     context: TuningContext<'a>,
@@ -1077,8 +1181,11 @@ pub(crate) struct Tuner<'a> {
     shared: HashMap<String, Tensor>,
     /// What building inputs costs on this machine, as measured so far.
     building: RefCell<BuildBudget>,
+    /// Each censused unit's built cases ([`UnitCases`] of its case type),
+    /// kept for its search.
+    built: HashMap<TuningKey, Box<dyn std::any::Any>>,
     phase: Phase,
-    /// When the search walk began: the start of the tuning time.
+    /// When the census began: the start of the tuning time.
     started: Instant,
     tuned: Vec<TunedEntry>,
     chosen: HashMap<TuningKey, NativeSpecialization>,
@@ -1103,6 +1210,7 @@ impl<'a> Tuner<'a> {
             noise: Noise::default(),
             shared: HashMap::new(),
             building: RefCell::new(BuildBudget::default()),
+            built: HashMap::new(),
             phase: Phase::Count {
                 launches: HashMap::new(),
                 searching: Vec::new(),
@@ -1114,34 +1222,76 @@ impl<'a> Tuner<'a> {
         }
     }
 
-    /// Begin searching the counted units that will search: the tuning time
-    /// starts.
-    pub fn search(mut self) -> Self {
+    /// Begin the census of the counted units that will search: the tuning
+    /// time starts.
+    pub fn census(mut self) -> Self {
         let Phase::Count {
             launches,
             searching,
         } = self.phase
         else {
-            unreachable!("a search follows the count");
+            unreachable!("a census follows the count");
         };
-        let unsearched = searching
+        let launches = searching
             .into_iter()
             .map(|key| {
                 let count = launches[&key];
                 (key, count)
             })
             .collect::<HashMap<_, _>>();
-        let total = unsearched.values().sum();
-        self.phase = Phase::Search {
-            unsearched,
-            remaining: total,
-            total,
-            spare: Duration::ZERO,
+        let searches = !launches.is_empty();
+        self.phase = Phase::Census {
+            launches,
+            censused: HashMap::new(),
         };
         self.started = Instant::now();
-        if total > 0 {
+        if searches {
             self.report_progress();
         }
+        self
+    }
+
+    /// Begin the search: each censused unit's share of step time decides its
+    /// part of the tuning time left.
+    pub fn search(mut self) -> Self {
+        let Phase::Census { censused, .. } = self.phase else {
+            unreachable!("a search follows the census");
+        };
+        let units = censused.into_iter().collect::<Vec<_>>();
+        let times = units
+            .iter()
+            .map(|(_, unit)| censused_times(&unit.shapes, &unit.result))
+            .collect::<Vec<_>>();
+        let shares = step_shares(
+            &units
+                .iter()
+                .zip(&times)
+                .map(|((_, unit), (shapes, seconds))| UnitTime {
+                    launches: unit.launches,
+                    shapes,
+                    seconds,
+                })
+                .collect::<Vec<_>>(),
+        );
+        let searching = units
+            .into_iter()
+            .zip(shares)
+            .map(|((key, unit), share)| {
+                (
+                    key,
+                    Searching {
+                        census: unit.result,
+                        seconds: unit.seconds,
+                        share,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let unsearched = searching.values().map(|unit| unit.share).sum();
+        self.phase = Phase::Search {
+            searching,
+            unsearched,
+        };
         self
     }
 
@@ -1193,6 +1343,7 @@ impl<'a> Tuner<'a> {
         }
         match self.phase {
             Phase::Count { .. } => self.count_unit(case, implementation, statics, key, &shapes),
+            Phase::Census { .. } => self.census_unit(case, implementation, statics, key, shapes),
             Phase::Search { .. } => self
                 .search_unit(case, implementation, statics, key, shapes)
                 .map(Some),
@@ -1241,6 +1392,61 @@ impl<'a> Tuner<'a> {
         Ok(None)
     }
 
+    /// Measure one searching unit's defaults at the points every candidate
+    /// must pass, within the tuning time left, keeping the inputs built for
+    /// its search.
+    fn census_unit<T: EntryTuning>(
+        &mut self,
+        case: &T,
+        implementation: &NativeImplementation,
+        statics: &NativeSpecialization,
+        key: TuningKey,
+        shapes: Vec<PointShape>,
+    ) -> Result<Option<NativeSpecialization>, CatalogFailure> {
+        let failure = |outcome: String| CatalogFailure::Tuning {
+            entry: key.0,
+            bindings: key.1.clone(),
+            outcome,
+        };
+        let Phase::Census { launches, censused } = &self.phase else {
+            unreachable!("the phase is the census");
+        };
+        let Some(&count) = launches.get(&key) else {
+            return Ok(None);
+        };
+        if censused.contains_key(&key) {
+            return Ok(None);
+        }
+        let plan = CensusPlan {
+            limit: TUNING_TIME.saturating_sub(self.started.elapsed()),
+            min_sample_seconds: MIN_SAMPLE_SECONDS,
+        };
+        #[cfg(feature = "pinned-tuning")]
+        if let pinned::Pinned::Chosen(_) = pinned::lookup(&key, implementation).map_err(failure)? {
+            return Ok(None);
+        }
+        #[cfg(not(feature = "pinned-tuning"))]
+        let _ = implementation;
+        let began = Instant::now();
+        let result = self
+            .run(case, statics, &key, &shapes, Strategy::Census(plan))
+            .map_err(failure)?;
+        let Phase::Census { censused, .. } = &mut self.phase else {
+            unreachable!("the phase is the census");
+        };
+        censused.insert(
+            key,
+            Censused {
+                launches: count,
+                shapes,
+                seconds: began.elapsed().as_secs_f64(),
+                result,
+            },
+        );
+        self.report_progress();
+        Ok(None)
+    }
+
     /// Search one unit within its budget.
     fn search_unit<T: EntryTuning>(
         &mut self,
@@ -1276,25 +1482,23 @@ impl<'a> Tuner<'a> {
             return Ok(self.finish(key, declaration, tuned));
         }
         let Phase::Search {
+            searching,
             unsearched,
-            remaining,
-            total,
-            spare,
         } = &mut self.phase
         else {
             unreachable!("the phase is the search");
         };
-        let launches = unsearched
+        let unit = searching
             .remove(&key)
-            .ok_or_else(|| failure("the tuning count did not record this unit".into()))?;
-        let extra = if *remaining > 0 {
-            spare.mul_f64(launches as f64 / *remaining as f64)
+            .ok_or_else(|| failure("the tuning census did not measure this unit".into()))?;
+        let budget = if *unsearched > 0. {
+            TUNING_TIME
+                .saturating_sub(self.started.elapsed())
+                .mul_f64((unit.share / *unsearched).min(1.))
         } else {
             Duration::ZERO
         };
-        *spare -= extra;
-        *remaining -= launches;
-        let budget = TUNING_TIME.mul_f64(launches as f64 / (*total).max(1) as f64) + extra;
+        *unsearched -= unit.share;
         self.context.observer.event(&TuningEvent::Started {
             entry,
             bindings: bindings.clone(),
@@ -1305,24 +1509,41 @@ impl<'a> Tuner<'a> {
             points: shapes.len(),
         });
         let surveyed = survey.is_some();
-        let strategy = match survey {
-            Some(plan) => Strategy::Survey(plan),
-            None => Strategy::Search(SearchPlan {
-                allowance: budget,
-                admission: budget / ADMISSION_SHARE,
-                required: budget / REQUIRED_SHARE,
-                settings: search_settings(self.device.backend()),
-                min_sample_seconds: MIN_SAMPLE_SECONDS,
-                start: case
-                    .search_starts(self.device, implementation, statics, self.limits)
-                    .into_iter()
-                    .chain(self.winners.get(&declaration).cloned())
-                    .collect(),
-            }),
+        // A census that could not fit the unit's required points in the
+        // tuning time kept its defaults: there is nothing to search.
+        let affordable = !unit.census.configurations.is_empty();
+        let result = match survey {
+            Some(plan) => self
+                .run(case, statics, &key, &shapes, Strategy::Survey(plan))
+                .map_err(failure)?,
+            None if !affordable => unit.census.clone(),
+            None => {
+                let plan = SearchPlan {
+                    allowance: budget,
+                    admission: budget / ADMISSION_SHARE,
+                    // The census timed the required points.
+                    required: budget,
+                    settings: search_settings(self.device.backend()),
+                    min_sample_seconds: MIN_SAMPLE_SECONDS,
+                    start: case
+                        .search_starts(self.device, implementation, statics, self.limits)
+                        .into_iter()
+                        .chain(self.winners.get(&declaration).cloned())
+                        .collect(),
+                };
+                self.run(
+                    case,
+                    statics,
+                    &key,
+                    &shapes,
+                    Strategy::Censused {
+                        plan,
+                        census: unit.census.clone(),
+                    },
+                )
+                .map_err(failure)?
+            }
         };
-        let result = self
-            .run(case, statics, &shapes, strategy)
-            .map_err(failure)?;
         #[cfg(feature = "tuning-survey")]
         if surveyed {
             survey::record(&key, budget, &result).map_err(failure)?;
@@ -1332,10 +1553,16 @@ impl<'a> Tuner<'a> {
                 cache.store_tuning(key, &result);
             }
         }
-        if let Phase::Search { spare, .. } = &mut self.phase {
-            *spare += budget.saturating_sub(began.elapsed());
-        }
-        let tuned = tuned_entry(entry, bindings, &result, TuningOrigin::Searched, began);
+        let mut tuned = tuned_entry(entry, bindings, &result, TuningOrigin::Searched, began);
+        // The census's measurement of the defaults is part of the unit's
+        // tuning.
+        let census = &unit.census.time;
+        tuned.seconds += unit.seconds;
+        tuned.time.building_seconds += census.building_seconds;
+        tuned.time.reference_seconds += census.reference_seconds;
+        tuned.time.forming_seconds += census.forming_seconds;
+        tuned.time.measuring_seconds += census.measuring_seconds;
+        tuned.time.validating_seconds += census.validating_seconds;
         let chosen = self.finish(key, declaration, tuned);
         self.report_progress();
         Ok(chosen)
@@ -1374,15 +1601,30 @@ impl<'a> Tuner<'a> {
     }
 
     /// Tune `case` at `statics` at `shapes`, building each point's inputs
-    /// only when Seismic admits it; they are released afterwards.
+    /// only when Seismic admits it. A census keeps the inputs it built for
+    /// the unit's search, which releases them.
     fn run<T: EntryTuning>(
         &mut self,
         case: &T,
         statics: &NativeSpecialization,
+        key: &TuningKey,
         shapes: &[PointShape],
         strategy: Strategy,
     ) -> Result<TuningResult, String> {
         let precision = case.precision().map_err(|error| error.to_string())?;
+        let keep = matches!(strategy, Strategy::Census(_));
+        let mut cases = self
+            .built
+            .remove(key)
+            .map(|built| {
+                *built
+                    .downcast::<UnitCases<T::Case>>()
+                    .expect("a unit's cases are its case type's")
+            })
+            .unwrap_or_else(|| UnitCases {
+                points: shapes.iter().map(|_| None).collect(),
+                guard: None,
+            });
         let mut points = UnitPoints {
             case,
             shapes,
@@ -1395,12 +1637,15 @@ impl<'a> Tuner<'a> {
                 shared: &mut self.shared,
                 building: &self.building,
             },
-            guarded: false,
+            cases: &mut cases,
         };
         let result = case
             .tune(self.device, statics, &mut points, precision, strategy)
             .map_err(|error| error.to_string());
         drop(points);
+        if keep {
+            self.built.insert(key.clone(), Box::new(cases));
+        }
         self.weights.release();
         result
     }
@@ -1449,15 +1694,13 @@ impl<'a> Tuner<'a> {
     }
 }
 
-/// One unit's points, whose inputs are built when Seismic admits them.
-struct UnitPoints<'u, 'w, 'a, T> {
+/// One unit's points, whose inputs are built when Seismic admits them, once
+/// for the unit's census and search.
+struct UnitPoints<'u, 'w, 'a, T: EntryTuning> {
     case: &'u T,
     shapes: &'u [PointShape],
     inputs: TuningInputs<'w, 'a>,
-    /// Whether a point with states was built: the first is the guard, whose
-    /// states are observed whole, and the cheapest, so the guard costs a
-    /// short history.
-    guarded: bool,
+    cases: &'u mut UnitCases<T::Case>,
 }
 
 impl<T: EntryTuning> seismic::PointSource<'static, T::Entry> for UnitPoints<'_, '_, '_, T> {
@@ -1479,23 +1722,32 @@ impl<T: EntryTuning> seismic::PointSource<'static, T::Entry> for UnitPoints<'_, 
         point: usize,
         limit: Duration,
     ) -> Result<seismic::PointInputs<'static>, seismic::PointUnavailable> {
-        self.inputs.building.borrow_mut().limit(limit);
-        let built = self.case.rotation(&mut self.inputs, &self.shapes[point]);
-        let refused = self.inputs.building.borrow().refused();
-        let mut cases = built.map_err(|error| {
-            if refused {
-                seismic::PointUnavailable::Unaffordable
-            } else {
-                seismic::PointUnavailable::Failed(error)
+        if self.cases.points[point].is_none() {
+            self.inputs.building.borrow_mut().limit(limit);
+            let built = self.case.rotation(&mut self.inputs, &self.shapes[point]);
+            let refused = self.inputs.building.borrow().refused();
+            let built = built.map_err(|error| {
+                if refused {
+                    seismic::PointUnavailable::Unaffordable
+                } else {
+                    seismic::PointUnavailable::Failed(error)
+                }
+            })?;
+            if self.cases.guard.is_none()
+                && built.first().is_some_and(|case| {
+                    T::state(case)
+                        .iter()
+                        .any(|(_, state)| state.backing.byte_len() > 0)
+                })
+            {
+                self.cases.guard = Some(point);
             }
-        })?;
-        let guard = !self.guarded
-            && cases.first().is_some_and(|case| {
-                T::state(case)
-                    .iter()
-                    .any(|(_, state)| state.backing.byte_len() > 0)
-            });
-        self.guarded |= guard;
+            self.cases.points[point] = Some(built);
+        }
+        let guard = self.cases.guard == Some(point);
+        let cases = self.cases.points[point]
+            .as_mut()
+            .expect("the point's cases were built above");
         let initialize = initializer(
             cases
                 .iter()
@@ -1674,7 +1926,7 @@ fn tuned_entry(
                         SearchStop::Expired
                     },
                 )),
-                TuningMethod::Survey { .. } => None,
+                TuningMethod::Survey { .. } | TuningMethod::Census => None,
             },
         ),
     };

@@ -51,7 +51,12 @@ the tuner asks for a point's inputs only when it needs the point, with the time 
 take; the source refuses a point whose building is predicted not to fit. One tuning call spends
 the consumer's whole allowance: it builds the points in order, running each point's reference and
 validating and measuring the defaults there, admitting a point while that work stays within the
-plan's admission time, each point predicted from the previous one by their cost ratio. A point
+plan's admission time, each point predicted from the previous one: its building and validation as
+measured, its invocations at the defaults' measured device time scaled by their cost ratio. A
+census (`Strategy::Census`) admits only the required points (the cheapest point when none is)
+and returns the defaults' measurements, from which the consumer divides its time among units; a
+later search of the unit given that census (`Strategy::Censused`) reuses those measurements and
+admits further points within its admission. A point
 the consumer marks required may take the plan's required time instead; when the required points
 cannot fit, the tuner keeps the defaults without searching (`Unaffordable`). A point not admitted
 is not timed and folds its weight into the largest admitted point of its class (or the largest
@@ -72,11 +77,13 @@ to the best while it improves by more than ε; a form's own defaults can be far 
 a single descent from the entry's defaults rarely crosses into another form. Then, at each local
 minimum, it restarts from the unvisited configuration farthest from everything visited. It stops when the space is
 exhausted, R consecutive restarts found nothing better, or its exploration time ends: the consumer's
-allowance less what confirming the finalists (estimated from the defaults' measurement at the timed
-points) and validating the choice at the untimed points (estimated from the last timed point) will
+allowance less what confirming the finalists found so far (each estimated from its own measured
+samples at the timed points) and validating the choice at the untimed points (estimated from the last timed point) will
 cost. Time is checked before each
-configuration. Configurations the device cannot form or run cost +∞. The K cheapest configurations and the
-defaults are then re-measured with more samples across every timed point, alternating round by
+configuration. Configurations the device cannot form or run cost +∞. Of the K cheapest
+configurations, those within 10% of the leader's cost (the spread at which confirmation already
+rejects a configuration's samples as unstable; farther behind, noise cannot reverse the ranking)
+and the defaults, the reference of the confirmed costs, are then re-measured with more samples across every timed point, alternating round by
 round, and ranked by those full-workload costs; the defaults rank first unless the leader beats
 them by δ. Defaults with no measured rival have nothing to rank against and are not re-measured.
 Given an evaluator's costs and where its time ends, the search is deterministic, so a recorded

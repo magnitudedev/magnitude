@@ -193,9 +193,12 @@ impl NativePreparationCache {
                 bindings: "decoder epsilon".into(),
                 outcome,
             })?;
-        // Tuning walks the program twice: a count finds the units that will
-        // search and their launches, and the last walk searches each within
-        // its share of the tuning time and prepares it.
+        // Tuning walks the program three times: a count finds the units that
+        // will search and their launches, a census measures their defaults
+        // at their points within the tuning time left (keeping the inputs it
+        // builds), and
+        // the last walk searches each within its share of step time and
+        // prepares it.
         let mut count = Preparation::new(
             device,
             plan,
@@ -211,6 +214,16 @@ impl NativePreparationCache {
             ),
         );
         count.walk(plan)?;
+        let mut census = Preparation::new(
+            device,
+            plan,
+            tuning,
+            limits,
+            epsilon,
+            Specializer::count(device),
+            count.tuner.census(),
+        );
+        census.walk(plan)?;
         let mut preparation = Preparation::new(
             device,
             plan,
@@ -218,7 +231,7 @@ impl NativePreparationCache {
             limits,
             epsilon,
             spec,
-            count.tuner.search(),
+            census.tuner.search(),
         );
         let glue = preparation.walk(plan)?;
         let Preparation {

@@ -237,6 +237,8 @@ pub enum TuningMethod {
         settings: SearchSettings,
         stop: SearchStop,
     },
+    /// The defaults measured at the points a census admitted.
+    Census,
     /// Every admissible configuration, `samples` per point.
     Survey { samples: usize },
     /// A factored search of each independent launch group; `complete` when
@@ -403,9 +405,29 @@ pub struct SurveyPlan {
     pub domains: BTreeMap<String, Vec<u64>>,
 }
 
+/// Measuring the defaults at the points every candidate must pass (the
+/// cheapest point when none must): the fixed cost of searching the unit, and
+/// the defaults' time there, from which the consumer divides its tuning time
+/// among units.
+#[derive(Clone, Debug)]
+pub struct CensusPlan {
+    /// The tuning time left. When the required points cannot fit it, the
+    /// unit keeps its defaults.
+    pub limit: Duration,
+    pub min_sample_seconds: f64,
+}
+
 #[derive(Clone, Debug)]
 pub enum Strategy {
     Search(SearchPlan),
+    Census(CensusPlan),
+    /// A search after the unit's census: it times the points the census
+    /// measured, reusing its measurement of the defaults there, and admits
+    /// further points within the plan's admission.
+    Censused {
+        plan: SearchPlan,
+        census: TuningResult,
+    },
     Survey(SurveyPlan),
 }
 
@@ -925,6 +947,14 @@ impl Measurer {
         }
     }
 
+    /// Record `measurement`, taken earlier, as its point's and key's.
+    fn seed(&mut self, measurement: PointMeasurement) {
+        self.measured.insert(
+            (measurement.point.clone(), measurement.key.clone()),
+            measurement,
+        );
+    }
+
     /// The measurement of `kernel` at every point: points whose key was
     /// measured before reuse that measurement, the others are sampled.
     fn measure(
@@ -1061,8 +1091,11 @@ struct Live<'s, 'a> {
     measurer: Measurer,
     search: MeasureOptions,
     confirmation: MeasureOptions,
-    /// When exploration ends: the allowance less what confirmation needs.
-    deadline: Instant,
+    /// When the search's time ends, confirmation included. Exploration ends
+    /// when what remains only covers confirming the finalists found so far.
+    window: Instant,
+    /// Finalists confirmed besides the defaults.
+    confirmed: usize,
     evaluated: HashMap<usize, Evaluated>,
     anchor: Option<usize>,
     time: TuningTime,
@@ -1234,7 +1267,38 @@ impl Evaluator for Live<'_, '_> {
     }
 
     fn expired(&self) -> bool {
-        Instant::now() >= self.deadline
+        // Confirmation re-measures the defaults with the cheapest rivals
+        // found so far within noise of the leader, each sample costing what
+        // that configuration's measured samples did; the defaults alone are
+        // not re-measured.
+        let sample = |evaluated: &Evaluated| {
+            evaluated
+                .points
+                .iter()
+                .map(|point| point.median_seconds * point.repetitions as f64)
+                .sum::<f64>()
+        };
+        let default = self.space.default_index();
+        let mut rivals = self
+            .evaluated
+            .iter()
+            .filter(|(index, _)| **index != default)
+            .map(|(_, evaluated)| sample(evaluated))
+            .collect::<Vec<_>>();
+        rivals.sort_by(f64::total_cmp);
+        rivals.truncate(self.confirmed);
+        let reserve = match rivals.first() {
+            Some(leader) => {
+                let contending = rivals
+                    .iter()
+                    .filter(|sample| **sample <= leader * (1. + search::CONTENDING))
+                    .sum::<f64>();
+                let defaults = self.evaluated.get(&default).map_or(0., sample);
+                (contending + defaults) * (self.confirmation.samples + 1) as f64
+            }
+            None => 0.,
+        };
+        Instant::now() + Duration::from_secs_f64(reserve) >= self.window
     }
 }
 
@@ -1243,6 +1307,8 @@ struct Inputs<'r, 'a> {
     source: &'r mut dyn PointSource<'a>,
     specs: &'r [PointSpec],
     seconds: f64,
+    /// The last point's building time.
+    last: f64,
 }
 
 impl<'a> Inputs<'_, 'a> {
@@ -1255,7 +1321,8 @@ impl<'a> Inputs<'_, 'a> {
     ) -> Result<Option<TuningPoint<'a>>, TuneError> {
         let started = Instant::now();
         let built = self.source.build(index, limit);
-        self.seconds += started.elapsed().as_secs_f64();
+        self.last = started.elapsed().as_secs_f64();
+        self.seconds += self.last;
         match built {
             Ok(inputs) => TuningPoint::new(&self.specs[index], inputs).map(Some),
             Err(PointUnavailable::Unaffordable) => Ok(None),
@@ -1263,6 +1330,55 @@ impl<'a> Inputs<'_, 'a> {
                 point: self.specs[index].label.clone(),
                 detail,
             }),
+        }
+    }
+}
+
+/// The last admitted point, from which later points' times are predicted.
+/// Only a point's invocations scale with its cost: building its inputs and
+/// the floor a calibrated sample measures do not.
+struct Admitted {
+    cost: f64,
+    /// Building the point, running its reference, validating and measuring
+    /// the defaults there.
+    step: f64,
+    /// Building the point's inputs.
+    build: f64,
+    /// The defaults' device time of one invocation there, when measured.
+    kernel: Option<f64>,
+    /// Argument sets in the point's rotation.
+    rotation: usize,
+}
+
+/// Invocations of each argument set while admitting a point: the
+/// reference, the validated invocation and a sampled pass.
+const ADMISSION_INVOCATIONS: f64 = 3.;
+
+impl Admitted {
+    /// One invocation's device time at a point of `cost`.
+    fn kernel_at(&self, cost: f64) -> Option<f64> {
+        self.kernel
+            .map(|kernel| kernel * cost / self.cost.max(f64::MIN_POSITIVE))
+    }
+
+    /// Admitting a point of `cost`: this point's time with its invocations
+    /// at the other point's cost. Without a measurement of the defaults,
+    /// this point's time scaled by cost.
+    fn step_at(&self, cost: f64) -> f64 {
+        match (self.kernel, self.kernel_at(cost)) {
+            (Some(here), Some(there)) => {
+                self.step + ADMISSION_INVOCATIONS * self.rotation as f64 * (there - here).max(0.)
+            }
+            _ => self.step * cost / self.cost.max(f64::MIN_POSITIVE),
+        }
+    }
+
+    /// Validating a choice at a point of `cost`: building it, and a reference
+    /// and a candidate invocation of each argument set.
+    fn validation_at(&self, cost: f64) -> f64 {
+        match self.kernel_at(cost) {
+            Some(kernel) => self.build + 2. * self.rotation as f64 * kernel,
+            None => self.step * cost / self.cost.max(f64::MIN_POSITIVE),
         }
     }
 }
@@ -1278,7 +1394,8 @@ fn before(instant: Instant, duration: Duration) -> Instant {
 /// Tune one unit within its time. A search builds its points' inputs in
 /// ascending cost, measuring the defaults at each, while the points fit
 /// the plan's admission (the required points its `required` time; when
-/// they cannot fit, the unit keeps its defaults). It then searches at those
+/// they cannot fit, the unit keeps its defaults). A census stops after the
+/// required points; a search after it begins from them. It then searches at those
 /// points within what remains of the allowance, less confirming the
 /// finalists and validating the choice at the points it did not time, and
 /// builds those points only to validate a choice other than the defaults.
@@ -1336,13 +1453,25 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     };
     // A survey (development) builds and times every point.
     let (admission, required, min_sample_seconds) = match &strategy {
-        Strategy::Search(plan) => (plan.admission, plan.required, plan.min_sample_seconds),
+        Strategy::Search(plan) | Strategy::Censused { plan, .. } => {
+            (plan.admission, plan.required, plan.min_sample_seconds)
+        }
+        Strategy::Census(plan) => (plan.limit, plan.limit, plan.min_sample_seconds),
         Strategy::Survey(plan) => (Duration::MAX, Duration::MAX, plan.min_sample_seconds),
     };
+    // A census times only the points every candidate must pass. A search
+    // after it reuses its measurement of the defaults there.
+    let census_only = matches!(strategy, Strategy::Census(_));
+    let census = match &strategy {
+        Strategy::Censused { census, .. } => Some(census),
+        Strategy::Search(_) | Strategy::Census(_) | Strategy::Survey(_) => None,
+    };
+    let censused = census.and_then(|census| measured_points(census, &census.overall));
     let mut inputs = Inputs {
         source,
         specs: &specs,
         seconds: 0.,
+        last: 0.,
     };
     let limit = |spec: &PointSpec| {
         if spec.required { required } else { admission }.saturating_sub(began.elapsed())
@@ -1377,7 +1506,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         &default,
         cpu,
     )?;
-    let search = matches!(strategy, Strategy::Search(_));
+    let search = !matches!(strategy, Strategy::Survey(_));
     let mut measurer = Measurer::new(&implementation);
     let options = MeasureOptions {
         samples: 1,
@@ -1388,21 +1517,30 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     let mut untimed = Vec::new();
     let mut defaults: Result<Vec<PointMeasurement>, Exclusion> = Ok(Vec::new());
     let mut measuring = 0.;
-    let mut last: Option<(f64, f64)> = None;
+    let mut last: Option<Admitted> = None;
     let mut closed = false;
+    let first_build = inputs.last;
     let mut first = Some(first);
     for (index, spec) in specs.iter().enumerate() {
-        let available = limit(spec);
-        let predicted_fits = last.is_none_or(|(cost, seconds)| {
-            seconds * spec.cost / cost.max(f64::MIN_POSITIVE) <= available.as_secs_f64()
+        let reused = censused.and_then(|measured| {
+            measured
+                .iter()
+                .find(|measurement| measurement.point == spec.label)
         });
+        let available = limit(spec);
+        let predicted_fits = last
+            .as_ref()
+            .is_none_or(|last| last.step_at(spec.cost) <= available.as_secs_f64());
         let step = Instant::now();
-        let point = match first.take() {
-            Some(point) => Some(point),
+        let (point, built) = match first.take() {
+            Some(point) => (Some(point), first_build),
+            // The census built it.
+            None if reused.is_some() => (inputs.build(index, Duration::MAX)?, 0.),
+            None if census_only && !spec.required => (None, 0.),
             None if (spec.required || !closed) && predicted_fits && !available.is_zero() => {
-                inputs.build(index, available)?
+                (inputs.build(index, available)?, 0.)
             }
-            None => None,
+            None => (None, 0.),
         };
         let Some(point) = point else {
             if spec.required {
@@ -1424,7 +1562,10 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         }
         let point = validator.point(point)?;
         point.ensure_reference()?;
-        if search {
+        if let (Some(measurement), Ok(measured)) = (reused, &mut defaults) {
+            measurer.seed(measurement.clone());
+            measured.push(measurement.clone());
+        } else if search {
             if let Ok(measured) = &mut defaults {
                 let started = Instant::now();
                 match measurer.measure(
@@ -1439,7 +1580,18 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
                 measuring += started.elapsed().as_secs_f64();
             }
         }
-        last = Some((spec.cost, step.elapsed().as_secs_f64()));
+        last = Some(Admitted {
+            cost: spec.cost,
+            step: built + step.elapsed().as_secs_f64(),
+            build: if index == 0 { first_build } else { inputs.last },
+            kernel: defaults
+                .as_ref()
+                .ok()
+                .and_then(|measured| measured.last())
+                .filter(|_| search)
+                .map(|measured| measured.median_seconds),
+            rotation: point.rotation.len(),
+        });
         admitted.push(index);
         points.push(point);
     }
@@ -1447,6 +1599,19 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     for (point, index) in points.iter_mut().zip(&admitted) {
         point.reweigh(records[*index].weight);
     }
+    if matches!(strategy, Strategy::Census(_)) {
+        let time = TuningTime {
+            building_seconds: inputs.seconds,
+            reference_seconds: validator.reference_seconds(),
+            measuring_seconds: measuring,
+            ..TuningTime::default()
+        };
+        return unit.census(&points, records, &default, &default_kernel, defaults, time);
+    }
+    let strategy = match strategy {
+        Strategy::Censused { plan, .. } => Strategy::Search(plan),
+        other => other,
+    };
     let formation = Formation {
         device,
         module,
@@ -1456,13 +1621,13 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         cpu,
         implementation: &implementation,
     };
-    // Validating a choice at the points not timed: each predicted from the
-    // last admitted point by cost.
-    let untimed_reserve = last.map_or(Duration::ZERO, |(cost, seconds)| {
+    // Validating a choice at the points not timed, each predicted from the
+    // last admitted point.
+    let untimed_reserve = last.map_or(Duration::ZERO, |last| {
         Duration::from_secs_f64(
             untimed
                 .iter()
-                .map(|index| seconds * specs[*index].cost / cost.max(f64::MIN_POSITIVE))
+                .map(|index| last.validation_at(specs[*index].cost))
                 .sum(),
         )
     });
@@ -1510,9 +1675,8 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
                     space: &space,
                     statics: &statics,
                 };
-                let defaults = defaults.as_deref().unwrap_or_default();
                 let (configurations, overall, method, time) =
-                    tuned.search(&points, plan, window, defaults, measurer)?;
+                    tuned.search(&points, plan, window, measurer)?;
                 unit.result(configurations, &overall, method, time)
             }
         }
@@ -1541,6 +1705,11 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
             let (configurations, overall, method, time) = tuned.survey(&points, plan)?;
             unit.result(configurations, &overall, method, time)
         }
+        Strategy::Census(_) | Strategy::Censused { .. } => {
+            unreachable!(
+                "a census returns once its points are admitted; a censused search is a search"
+            )
+        }
     };
     result.points = records;
     if !untimed.is_empty() {
@@ -1554,7 +1723,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
                 | TuningMethod::Factored {
                     allowance_seconds, ..
                 } => Duration::from_secs_f64(*allowance_seconds),
-                TuningMethod::Survey { .. } => Duration::MAX,
+                TuningMethod::Survey { .. } | TuningMethod::Census => Duration::MAX,
             };
             let mut built = Vec::with_capacity(untimed.len());
             for index in &untimed {
@@ -1636,8 +1805,14 @@ impl Unit {
         inputs: &Inputs<'_, '_>,
         began: Instant,
     ) -> TuningResult {
-        let Strategy::Search(plan) = strategy else {
-            unreachable!("a survey builds every point whatever it costs");
+        let method = match strategy {
+            Strategy::Search(plan) | Strategy::Censused { plan, .. } => TuningMethod::Search {
+                allowance_seconds: plan.allowance.as_secs_f64(),
+                settings: plan.settings.clone(),
+                stop: SearchStop::Unaffordable,
+            },
+            Strategy::Census(_) => TuningMethod::Census,
+            Strategy::Survey(_) => unreachable!("a survey builds every point whatever it costs"),
         };
         let mut result = self.result(
             Records {
@@ -1646,17 +1821,71 @@ impl Unit {
                 records: Vec::new(),
             },
             default,
-            TuningMethod::Search {
-                allowance_seconds: plan.allowance.as_secs_f64(),
-                settings: plan.settings.clone(),
-                stop: SearchStop::Unaffordable,
-            },
+            method,
             TuningTime::default(),
         );
         result.time.building_seconds = inputs.seconds;
         result.time.measuring_seconds = began.elapsed().as_secs_f64() - inputs.seconds;
         result
     }
+
+    /// A census: the defaults measured at the points it admitted, with their
+    /// evidence there; a later search of the unit times those points and
+    /// reuses this measurement.
+    fn census(
+        &self,
+        points: &[PreparedPoint<'_>],
+        records: Vec<PointRecord>,
+        default: &NativeSpecialization,
+        kernel: &NativePrepared,
+        defaults: Result<Vec<PointMeasurement>, Exclusion>,
+        time: TuningTime,
+    ) -> Result<TuningResult, TuneError> {
+        let configuration = Configuration::of(default);
+        let measured = defaults.is_ok();
+        let configurations = vec![ConfigurationRecord {
+            configuration: configuration.clone(),
+            outcome: match defaults {
+                Ok(points) => Outcome::Measured {
+                    artifact: kernel.artifact().0.clone(),
+                    points,
+                    confirmed: Vec::new(),
+                    validated: true,
+                },
+                Err(exclusion) => Outcome::Excluded(exclusion),
+            },
+        }];
+        let evidence = if measured {
+            winner_evidence(points, &configurations, &configuration)?
+        } else {
+            Vec::new()
+        };
+        Ok(self.result(
+            Records {
+                points: records,
+                evidence,
+                records: configurations,
+            },
+            default,
+            TuningMethod::Census,
+            time,
+        ))
+    }
+}
+
+/// The measurement of `configuration` in `result`, when measured.
+fn measured_points<'r>(
+    result: &'r TuningResult,
+    configuration: &Configuration,
+) -> Option<&'r [PointMeasurement]> {
+    result
+        .configurations
+        .iter()
+        .find(|record| record.configuration == *configuration)
+        .and_then(|record| match &record.outcome {
+            Outcome::Measured { points, .. } => Some(points.as_slice()),
+            Outcome::Excluded(_) => None,
+        })
 }
 
 /// The entry-wide parameters of `implementation`, as recorded.
@@ -2670,21 +2899,14 @@ type Tuning = (Records, NativeSpecialization, TuningMethod, TuningTime);
 
 impl Tuned<'_> {
     /// Search at `points` until `window` less what confirming the finalists
-    /// needs, predicted from the `defaults`' measurement there; `measurer`
-    /// holds that measurement.
+    /// found so far needs; `measurer` holds the defaults' measurement there.
     fn search(
         &self,
         points: &[PreparedPoint<'_>],
         plan: SearchPlan,
         window: Instant,
-        defaults: &[PointMeasurement],
         measurer: Measurer,
     ) -> Result<Tuning, TuneError> {
-        let reserve = confirmation_time(
-            defaults,
-            plan.settings.confirmed + 1,
-            plan.settings.confirmation_samples,
-        );
         let start = plan
             .start
             .iter()
@@ -2704,7 +2926,8 @@ impl Tuned<'_> {
                 samples: plan.settings.confirmation_samples,
                 min_sample_seconds: plan.min_sample_seconds,
             },
-            deadline: before(window, reserve),
+            window,
+            confirmed: plan.settings.confirmed,
             evaluated: HashMap::new(),
             anchor: None,
             time: TuningTime::default(),

@@ -143,7 +143,8 @@ fn point_cost_grows_with_rows_and_history() {
         class: None,
     };
     assert_eq!(point(1, None).cost(), 1.0);
-    assert_eq!(point(8, None).cost(), 64.0);
+    // Without history, a point's work grows with its rows alone.
+    assert_eq!(point(8, None).cost(), 8.0);
     assert_eq!(point(1, Some(4096)).cost(), 4097.0);
     assert!(point(8, Some(0)).cost() < point(1, Some(256)).cost());
 }
@@ -374,10 +375,6 @@ impl EntryTuning for FakeCase {
         validation: PrecisionPolicy,
         strategy: Strategy,
     ) -> Result<TuningResult, TuneError> {
-        let Strategy::Search(plan) = strategy else {
-            panic!("the fake case searches");
-        };
-        self.allowances.borrow_mut().push(plan.allowance);
         let specs = points.points();
         for (index, spec) in specs.iter().enumerate() {
             let built = points
@@ -388,6 +385,60 @@ impl EntryTuning for FakeCase {
                 .push((spec.label.clone(), spec.weight, built.rotation.len()));
         }
         assert_eq!(&self.chosen.statics, statics.statics());
+        let record = |label: &str| seismic::PointRecord {
+            label: label.to_owned(),
+            weight: 1.0,
+            class: None,
+        };
+        let plan = match strategy {
+            // A census measures the defaults at every point, a millisecond
+            // each.
+            Strategy::Census(_) => {
+                let defaults = Configuration {
+                    launches: vec![[("ROWS".to_owned(), 8)].into_iter().collect()],
+                    ..self.chosen.clone()
+                };
+                return Ok(TuningResult {
+                    tuning_identity: "fake-device".into(),
+                    entry: "dense_output".into(),
+                    backend: "metal".into(),
+                    points: specs.iter().map(|spec| record(&spec.label)).collect(),
+                    validation,
+                    numerical_evidence: Vec::new(),
+                    implementation_identity: String::new(),
+                    parameters: Vec::new(),
+                    configurations: vec![ConfigurationRecord {
+                        configuration: defaults.clone(),
+                        outcome: Outcome::Measured {
+                            artifact: "a".into(),
+                            points: specs
+                                .iter()
+                                .map(|spec| seismic::PointMeasurement {
+                                    point: spec.label.clone(),
+                                    key: seismic::PointKey {
+                                        launches: vec![0],
+                                        values: Default::default(),
+                                    },
+                                    median_seconds: 1e-3,
+                                    deviation_seconds: 0.0,
+                                    samples: vec![1e-3],
+                                    repetitions: 1,
+                                    rotation_bytes: 0,
+                                })
+                                .collect(),
+                            confirmed: Vec::new(),
+                            validated: true,
+                        },
+                    }],
+                    overall: defaults,
+                    method: TuningMethod::Census,
+                    time: TuningTime::default(),
+                });
+            }
+            Strategy::Censused { plan, .. } => plan,
+            other => panic!("the fake case censuses and searches, not {other:?}"),
+        };
+        self.allowances.borrow_mut().push(plan.allowance);
         let mut rejected = self.chosen.clone();
         rejected.launches[0].insert("ROWS".into(), 4);
         Ok(TuningResult {
@@ -511,27 +562,37 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         defaults
     );
     assert!(case.seen.borrow().is_empty() && recorder.0.borrow().is_empty());
-    // The search builds the unit's points as Seismic asks, cheapest first.
-    let mut tuner = tuner.search();
-    let chosen = tuner.tune(&case, &implementation, &statics).unwrap();
-    assert_eq!(chosen.launch_param(0, "ROWS"), Some(2));
+    // The census builds the unit's points, cheapest first, and returns the
+    // defaults.
+    let mut tuner = tuner.census();
+    assert_eq!(
+        tuner.tune(&case, &implementation, &statics).unwrap(),
+        defaults
+    );
+    let labels = ["m1", "m2", "m4", "m8", "m16", "m32", "m64"];
     assert_eq!(
         case.seen
             .borrow()
             .iter()
             .map(|(label, _, _)| label.clone())
             .collect::<Vec<_>>(),
-        ["m1", "m2", "m4", "m8", "m16", "m32", "m64"]
+        labels
     );
+    // The search gets the points again, built once: from the census.
+    let mut tuner = tuner.search();
+    let chosen = tuner.tune(&case, &implementation, &statics).unwrap();
+    assert_eq!(chosen.launch_param(0, "ROWS"), Some(2));
+    assert_eq!(case.seen.borrow().len(), 2 * labels.len());
     assert!(case
         .seen
         .borrow()
         .iter()
         .all(|(_, _, rotation)| *rotation == ROTATION_LAYERS));
-    // The only unit gets the whole tuning time.
-    assert_eq!(*case.allowances.borrow(), [TUNING_TIME]);
+    // The only unit gets all the time the census left.
+    let allowance = case.allowances.borrow()[0];
+    assert!(allowance <= TUNING_TIME && allowance > TUNING_TIME - Duration::from_secs(5));
     let events = recorder.0.borrow();
-    // Progress counts milliseconds of the tuning time from the search walk.
+    // Progress counts milliseconds of the tuning time from the census.
     let total = TUNING_TIME.as_millis() as usize;
     assert_eq!(
         events[0],
@@ -540,8 +601,9 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
             total
         }
     );
+    assert!(matches!(events[1], TuningEvent::Progress { .. }));
     assert!(matches!(
-        &events[1],
+        &events[2],
         TuningEvent::Started {
             entry: "dense_output",
             configurations: count,
@@ -549,10 +611,10 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
             ..
         } if *count == configurations
     ));
-    let TuningEvent::Finished(tuned) = &events[2] else {
+    let TuningEvent::Finished(tuned) = &events[3] else {
         panic!("tuning reports completion");
     };
-    assert!(matches!(events[3], TuningEvent::Progress { .. }));
+    assert!(matches!(events[4], TuningEvent::Progress { .. }));
     assert_eq!(
         (tuned.measured, tuned.excluded, tuned.rejections),
         (1, 1, 1)
@@ -600,7 +662,7 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
         max_projected_rows: 8,
         context_tokens: 256,
     };
-    // One load: a count and a search. Returns the unit's outcome,
+    // One load: a count, a census and a search. Returns the unit's outcome,
     // whether its search started, and whether tuning reported progress.
     let load_once = |case: &FakeCase, limits: TuningLimits| -> (TunedEntry, bool, bool) {
         let recorder = Recorder::default();
@@ -612,6 +674,8 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
         };
         let weights = || TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
         let mut tuner = Tuner::count(&device, context, limits, weights());
+        tuner.tune(case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.census();
         tuner.tune(case, &implementation, &statics).unwrap();
         let mut tuner = tuner.search();
         let chosen = tuner.tune(case, &implementation, &statics).unwrap();
@@ -718,8 +782,8 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
         TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
     );
     tuner.tune(&case, &implementation, &statics).unwrap();
-    // The search builds the unit's inputs, its weights among them.
-    let mut tuner = tuner.search();
+    // The census builds the unit's inputs, its weights among them.
+    let mut tuner = tuner.census();
     assert!(matches!(
         tuner.tune(&case, &implementation, &statics),
         Err(CatalogFailure::Tuning {
@@ -853,10 +917,10 @@ fn building_predicted_not_to_fit_is_refused() {
     assert!(budget.admit(Building::Generation, 1 << 30).is_ok());
 }
 
-/// Each unit's budget is its launches' share of the tuning time, plus its
-/// launches' share of what earlier units left.
+/// Each unit's budget is its share of step time's share of the time the
+/// census left, plus its share of what earlier units left.
 #[test]
-fn units_share_the_tuning_time_by_launches_and_pass_on_what_they_leave() {
+fn units_share_the_tuning_time_by_step_time_and_pass_on_what_they_leave() {
     let Some(device) = metal() else {
         return;
     };
@@ -907,13 +971,20 @@ fn units_share_the_tuning_time_by_launches_and_pass_on_what_they_leave() {
     );
     tuner.tune(&small, &implementation, &statics).unwrap();
     tuner.tune(&large, &implementation, &statics).unwrap();
+    let mut tuner = tuner.census();
+    tuner.tune(&small, &implementation, &statics).unwrap();
+    tuner.tune(&large, &implementation, &statics).unwrap();
     let mut tuner = tuner.search();
     tuner.tune(&small, &implementation, &statics).unwrap();
     tuner.tune(&large, &implementation, &statics).unwrap();
-    assert_eq!(*small.allowances.borrow(), [TUNING_TIME / 4]);
+    // Equal times at every point: the shares of step time follow launches,
+    // a quarter and three quarters of what the census left.
+    let small_allowance = small.allowances.borrow()[0];
+    let slack = Duration::from_secs(5);
+    assert!(small_allowance <= TUNING_TIME / 4 && small_allowance > TUNING_TIME / 4 - slack);
     // The small unit finished almost at once: nearly all its quarter passes
     // to the large unit, after its own three quarters.
     let large_allowance = large.allowances.borrow()[0];
-    assert!(large_allowance > TUNING_TIME * 3 / 4 + TUNING_TIME / 5);
+    assert!(large_allowance > TUNING_TIME * 3 / 4 + TUNING_TIME / 5 - slack);
     assert!(large_allowance <= TUNING_TIME);
 }

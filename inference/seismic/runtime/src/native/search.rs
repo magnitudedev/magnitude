@@ -383,6 +383,12 @@ pub trait Evaluator {
     fn expired(&self) -> bool;
 }
 
+/// How far behind the leader a configuration's search cost may be and still
+/// be confirmed: past this, timing noise cannot reverse the ranking. It is
+/// the spread at which confirmation already rejects a configuration's
+/// samples as unstable.
+pub(super) const CONTENDING: f64 = 0.10;
+
 /// Why the search stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchStop {
@@ -650,6 +656,14 @@ pub fn search(
         total(costs[left].as_ref()).total_cmp(&total(costs[right].as_ref()))
     });
     cheapest.truncate(settings.confirmed);
+    // Only configurations within noise of the leader can change the ranking
+    // when re-measured; the rest are not confirmed. The defaults always are:
+    // they are the reference of the confirmed costs.
+    let leader = cheapest.first().map(|index| total(costs[index].as_ref()));
+    let contends = |index: &usize| {
+        leader.is_none_or(|leader| total(costs[index].as_ref()) <= leader * (1. + CONTENDING))
+    };
+    cheapest.retain(contends);
     let finalists = costs
         .get(&default)
         .and_then(|cost| cost.as_ref())
@@ -657,9 +671,9 @@ pub fn search(
         .into_iter()
         .chain(cheapest)
         .collect::<Vec<_>>();
-    // Confirmation ranks finalists against the defaults; the defaults alone
-    // (every other candidate failed, or the safety stop came first) have
-    // nothing to rank against and remain the choice unconfirmed.
+    // Confirmation ranks the finalists against the defaults; the defaults
+    // alone (every other candidate failed, or the safety stop came first)
+    // have nothing to rank against and remain the choice unconfirmed.
     let confirmed = if finalists.iter().any(|index| *index != default) {
         let results = evaluator.confirm(&finalists);
         assert_eq!(
@@ -677,18 +691,24 @@ pub fn search(
             .find(|(candidate, _)| *candidate == index)
             .and_then(|(_, result)| result.as_ref().ok())
     };
+    let ranked = || {
+        let mut ranked: Vec<_> = finalists
+            .iter()
+            .copied()
+            .filter(|index| confirmed_cost(*index).is_some())
+            .collect();
+        ranked.sort_by(|left, right| {
+            total(confirmed_cost(*left)).total_cmp(&total(confirmed_cost(*right)))
+        });
+        ranked
+    };
     let ranking = match confirmed_cost(default) {
         Some(reference) => {
-            let mut ranked = finalists
-                .iter()
-                .copied()
-                .filter(|index| confirmed_cost(*index).is_some())
-                .collect::<Vec<_>>();
-            ranked.sort_by(|left, right| {
-                total(confirmed_cost(*left)).total_cmp(&total(confirmed_cost(*right)))
-            });
+            let mut ranked = ranked();
             let leader = ranked[0];
             let leader_cost = confirmed_cost(leader).expect("ranked finalists were confirmed");
+            // A leader that does not improve on the defaults by the margin
+            // gives way to them.
             if leader != default && !leader_cost.improves_on(reference, settings.default_margin) {
                 ranked.retain(|index| *index != default);
                 ranked.insert(0, default);
@@ -700,17 +720,7 @@ pub fn search(
         // verdict, so the defaults are the choice.
         None if finalists.contains(&default) => vec![default],
         // The defaults themselves failed: only confirmed finalists can rank.
-        None => {
-            let mut ranked: Vec<_> = finalists
-                .iter()
-                .copied()
-                .filter(|index| confirmed_cost(*index).is_some())
-                .collect();
-            ranked.sort_by(|left, right| {
-                total(confirmed_cost(*left)).total_cmp(&total(confirmed_cost(*right)))
-            });
-            ranked
-        }
+        None => ranked(),
     };
     SearchTrace {
         evaluated,
@@ -945,6 +955,8 @@ mod tests {
 
     #[test]
     fn a_finalist_that_cannot_be_confirmed_leaves_the_ranking() {
+        // A 1 leads beyond noise of the rest, so only it and the defaults
+        // (A 4) are confirmed; it cannot be, and the defaults are the choice.
         let space = space(&[("A", &[4, 1, 2, 3])]);
         let trace = search(
             &space,
@@ -957,7 +969,7 @@ mod tests {
             .iter()
             .map(|index| space.values(*index)["A"])
             .collect::<Vec<_>>();
-        assert_eq!(ranked, vec![2, 3, 4]);
+        assert_eq!(ranked, vec![4]);
     }
 
     #[test]
