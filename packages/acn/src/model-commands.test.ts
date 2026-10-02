@@ -73,3 +73,33 @@ it("retries active and slot Stop against the exact stopping instance", async () 
   ))
   expect(stopped).toEqual(["retained-instance", "retained-instance"])
 })
+
+it("stops a running model before removing it, and removes an idle model without stopping", async () => {
+  const { Effect, Schema } = await import("effect")
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+  const { ModelInstancesSnapshot } = await import("@magnitudedev/icn-protocol/schemas")
+  const { CatalogFormModelIdSchema } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovals } = await import("./local-model-removals")
+  const calls: string[] = []
+  const snapshot = Schema.decodeUnknownSync(ModelInstancesSnapshot)({ revision: 1, instances: [{
+    id: "loaded-instance", modelId: "model-a:gguf:test",
+    lifecycle: { _tag: "Loading", fraction: 0.5, stage: "loading_weights" },
+  }] })
+  const remove = (model: string) => Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    yield* commands.remove(Schema.decodeUnknownSync(CatalogFormModelIdSchema)(model))
+  }).pipe(
+    Effect.provide(ModelCommandsLive),
+    Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
+    Effect.provideService(IcnClient, { models: { stopModelInstance: ({ path }: { path: { instance_id: string } }) => Effect.sync(() => { calls.push(`stop ${path.instance_id}`); return {} }) } } as never),
+    Effect.provideService(LocalModelRemovals, { remove: (modelId: string) => Effect.sync(() => { calls.push(`remove ${modelId}`); return {} }) } as never),
+    Effect.provideService(ModelSlotController, {} as never),
+    Effect.provideService(IcnCatalog, {} as never),
+    Effect.provideService(IcnCatalogInstallations, {} as never),
+  )
+  await Effect.runPromise(remove("model-a:gguf:test"))
+  await Effect.runPromise(remove("model-b:gguf:test"))
+  expect(calls).toEqual(["stop loaded-instance", "remove model-a:gguf:test", "remove model-b:gguf:test"])
+})

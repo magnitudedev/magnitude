@@ -90,7 +90,7 @@ export const ModelCommandsLive: Layer.Layer<
             Effect.tap(() => installations.refresh.pipe(Effect.ignore)), Effect.as({}),
           )),
     ),
-    remove: removals.remove,
+    remove: (modelId) => stopModel(modelId).pipe(Effect.zipRight(removals.remove(modelId))),
     loadSlot: (slotId) => selectedLocalModel(slotId).pipe(
       Effect.flatMap((modelId) => client.models.ensureModelInstance({ payload: { modelId } })),
       Effect.tap(() => slots.refresh), Effect.as({}),
