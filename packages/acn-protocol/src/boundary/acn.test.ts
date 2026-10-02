@@ -37,6 +37,7 @@ describe("ACN boundary lifecycle policy", () => {
       "StreamChanges",
       "StreamDisplayView",
       "WatchFile",
+      "WatchHarnessConnections",
       "WatchProjectFiles",
     ])
   })

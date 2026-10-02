@@ -1,18 +1,7 @@
-import { Context, Option, Schema, type Effect, type Stream } from "effect"
-import type {
-  AppearancePreference,
-  ApplicationMemoryObservation,
-  ApplicationSnapshot,
-  LoginStartupState,
-  MachineIdentityObservation,
-  ModelStorageSettings,
-  NetworkAccessChange,
-  NetworkAccessSettings,
-} from "@magnitudedev/sdk/desktop-host"
-import type { HarnessId } from "../harness-connections/service"
-import type { DesktopConnectRequest, DesktopConnectionsSnapshot } from "./connections"
+import { Context, Schema, type Effect, type Option, type Stream } from "effect"
+import type { AppearancePreference, ApplicationSnapshot, LoginStartupState } from "@magnitudedev/sdk/desktop-host"
 import type { DesktopUpdateState } from "./update"
-import type { ApplicationInfo, HostAction, ModelTrayPresentation, QuitFailureDecision } from "./contracts"
+import type { HostAction, ModelTrayPresentation, QuitFailureDecision } from "./contracts"
 
 export class ApplicationHostFailed extends Schema.TaggedError<ApplicationHostFailed>()("ApplicationHostFailed", {
   message: Schema.String,
@@ -37,13 +26,9 @@ export interface HostShell {
   readonly retryService: Effect.Effect<void, ApplicationHostFailed>
 }
 
-/** Server and owner capabilities that Electron main still serves for the machine it runs on. */
+/** Owner capabilities that Electron main serves for the application it owns. */
 export interface DesktopControls {
-  readonly platform: string
   readonly application: Stream.Stream<ApplicationSnapshot, ApplicationHostFailed>
-  readonly applicationInfo: Effect.Effect<typeof ApplicationInfo.Type, ApplicationHostFailed>
-  readonly machineIdentity: Effect.Effect<MachineIdentityObservation, ApplicationHostFailed>
-  readonly memory: Stream.Stream<ApplicationMemoryObservation, ApplicationHostFailed>
   readonly updates: Stream.Stream<DesktopUpdateState, ApplicationHostFailed>
   readonly setAutoDownload: (enabled: boolean) => Effect.Effect<void, ApplicationHostFailed>
   readonly checkUpdate: Effect.Effect<void, ApplicationHostFailed>
@@ -52,15 +37,6 @@ export interface DesktopControls {
   readonly restartUpdate: Effect.Effect<void, ApplicationHostFailed>
   readonly loginStartup: Stream.Stream<LoginStartupState, ApplicationHostFailed>
   readonly setLoginStartup: (enabled: boolean) => Effect.Effect<void, ApplicationHostFailed>
-  readonly connections: Stream.Stream<DesktopConnectionsSnapshot, ApplicationHostFailed>
-  readonly connect: (input: DesktopConnectRequest) => Effect.Effect<void, ApplicationHostFailed>
-  readonly disconnect: (harness: HarnessId) => Effect.Effect<void, ApplicationHostFailed>
-  readonly modelStorage: Effect.Effect<ModelStorageSettings, ApplicationHostFailed>
-  readonly setModelStorage: (path: Option.Option<string>) => Effect.Effect<void, ApplicationHostFailed>
-  readonly chooseModelStorageDirectory: Effect.Effect<Option.Option<string>, ApplicationHostFailed>
-  readonly networkAccess: Effect.Effect<NetworkAccessSettings, ApplicationHostFailed>
-  readonly setNetworkAccess: (change: NetworkAccessChange) => Effect.Effect<void, ApplicationHostFailed>
-  readonly regenerateNetworkApiKey: Effect.Effect<void, ApplicationHostFailed>
   readonly relaunch: Effect.Effect<void, ApplicationHostFailed>
 }
 

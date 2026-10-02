@@ -1,20 +1,20 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { expect, it } from "vitest"
 import { Option, Schema } from "effect"
-import { DesktopHarnessConnection } from "@magnitudedev/client-common"
+import { HarnessConnectionStatus } from "@magnitudedev/sdk"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { TooltipProvider } from "./ui/tooltip"
 import { HarnessConnections, HarnessCommand } from "./harness-connections"
 
-const missing = Schema.decodeUnknownSync(DesktopHarnessConnection)({
+const missing = Schema.decodeUnknownSync(HarnessConnectionStatus)({
   id: "openclaw", name: "OpenClaw", installed: false, managed: true,
   inspection: { _tag: "Disconnected", reason: "Old configuration is missing" },
   configurationFiles: ["/private/old-config.json"], plugin: { name: "old plugin", source: "old-source" },
 })
-const installed: DesktopHarnessConnection = {
-  ...missing, id: Schema.decodeUnknownSync(DesktopHarnessConnection.fields.id)("pi"), name: "Pi", installed: true, managed: false, plugin: Option.none(),
+const installed: HarnessConnectionStatus = {
+  ...missing, id: Schema.decodeUnknownSync(HarnessConnectionStatus.fields.id)("pi"), name: "Pi", installed: true, managed: false, plugin: Option.none(),
 }
-const render = (connections: readonly DesktopHarnessConnection[], busy = false) => renderToStaticMarkup(
+const render = (connections: readonly HarnessConnectionStatus[], busy = false) => renderToStaticMarkup(
   <HarnessConnections connections={connections} busy={busy} canConnect={true} onConnect={() => {}} onDisconnect={() => {}} models={[]} defaultModel={undefined} platform="darwin" />,
 )
 it("puts installed harnesses first without changing the observed array", () => {
@@ -38,7 +38,7 @@ it("keeps connected and unverifiable states distinct from installation without r
   for (const text of ["Status unavailable", "configuration could not be read or validated", "Connect", 'disabled=""']) expect(html).toContain(text)
 })
 it("sorts connected installations first and only shows verified configuration paths", () => {
-  const connected: DesktopHarnessConnection = { ...installed, id: Schema.decodeUnknownSync(DesktopHarnessConnection.fields.id)("codex"), name: "Codex", inspection: { _tag: "Connected" } }
+  const connected: HarnessConnectionStatus = { ...installed, id: Schema.decodeUnknownSync(HarnessConnectionStatus.fields.id)("codex"), name: "Codex", inspection: { _tag: "Connected" } }
   const rows = [installed, missing, connected]
   const html = render(rows)
   expect(html.indexOf('aria-label="Codex"')).toBeLessThan(html.indexOf('aria-label="Pi"'))

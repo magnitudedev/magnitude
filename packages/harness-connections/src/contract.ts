@@ -1,11 +1,8 @@
 import type * as FileSystem from "@effect/platform/FileSystem"
 import type * as Path from "@effect/platform/Path"
 import type * as CommandExecutor from "@effect/platform/CommandExecutor"
-import type {
-  HarnessCompanionConnectionResult,
-  HarnessCompanionDescription,
-  HarnessId,
-} from "@magnitudedev/client-common"
+import type { HarnessCompanionConnectionResult, HarnessCompanionDescription } from "./types"
+import type { HarnessId } from "@magnitudedev/sdk"
 import {
   ProviderModelIdSchema,
   ReasoningEffortSchema,

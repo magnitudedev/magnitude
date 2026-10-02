@@ -1,7 +1,6 @@
 import { createContext, useContext, useMemo, type ReactNode } from "react"
-import { Atom, useAtomSet } from "@effect-atom/atom-react"
-import { Option } from "effect"
-import type { ApplicationPage, ApplicationSession } from "@magnitudedev/client-common"
+import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { useAgentClient, type ApplicationPage, type ApplicationSession } from "@magnitudedev/client-common"
 
 const SessionContext = createContext<ApplicationSession | null>(null)
 
@@ -21,8 +20,9 @@ export const useNavigate = () => {
   return useAtomSet(useMemo(() => Atom.fn((page: ApplicationPage) => session.navigate(page)), [session]))
 }
 
-/** The OS of the machine running Magnitude, for commands the user runs there. */
+/** The OS of the machine running Magnitude, for commands the user runs there; `linux` until it is known. */
 export const useServerPlatform = (): string => {
-  const session = useSession()
-  return Option.getOrElse(session.serverPlatform, () => "linux")
+  const client = useAgentClient()
+  const machine = useAtomValue(client.Configuration.GetServerMachine({})).result
+  return Result.isSuccess(machine) ? machine.value.platform : "linux"
 }

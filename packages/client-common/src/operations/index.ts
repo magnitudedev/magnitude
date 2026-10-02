@@ -3,6 +3,7 @@ import { Agent } from "./agent";
 import { Changes } from "./changes";
 import { Configuration } from "./configuration";
 import { Connection } from "./connection";
+import { Connections } from "./connections";
 import { Display } from "./display";
 import { Files } from "./files";
 import { Git } from "./git";
@@ -17,6 +18,7 @@ export const AcnQueries = Group.make({
   Projects,
   Agent,
   Connection,
+  Connections,
   Display,
   Shell,
   ProjectFiles,
@@ -33,6 +35,7 @@ export {
   Changes,
   Configuration,
   Connection,
+  Connections,
   Display,
   Files,
   Git,

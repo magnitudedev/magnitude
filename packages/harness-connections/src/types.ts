@@ -1,31 +1,8 @@
 import { Context, Data, Effect, Option, Schema } from "effect"
 import type { ProviderModelId } from "@magnitudedev/sdk"
+import { HarnessIdSchema, type HarnessId } from "@magnitudedev/sdk"
 
-export const HarnessIdSchema = Schema.Literal(
-  "pi",
-  "opencode",
-  "hermes",
-  "openclaw",
-  "codex",
-  "claude-code",
-  "oh-my-pi",
-  "cline",
-).pipe(Schema.brand("HarnessId"))
-export type HarnessId = typeof HarnessIdSchema.Type
-
-const harnessPriorityValues = [
-  "pi",
-  "opencode",
-  "hermes",
-  "openclaw",
-  "codex",
-  "claude-code",
-  "oh-my-pi",
-  "cline",
-] as const
-export const HARNESS_PRIORITY: ReadonlyArray<HarnessId> = harnessPriorityValues.map(
-  (value) => HarnessIdSchema.make(value),
-)
+export { HarnessIdSchema, HARNESS_PRIORITY, type HarnessId } from "@magnitudedev/sdk"
 
 export const HarnessAvailabilitySchema = Schema.Literal("Installed", "Not installed")
 export type HarnessAvailability = typeof HarnessAvailabilitySchema.Type
@@ -86,17 +63,4 @@ export interface HarnessConnection {
   readonly disconnect: (harness: HarnessId) => Effect.Effect<void, HarnessConnectionError>
   readonly installSkill: (harness: HarnessId) => Effect.Effect<void, HarnessConnectionError>
   readonly installStartup: Effect.Effect<void, HarnessConnectionError>
-}
-
-export const HarnessConnection = Context.GenericTag<HarnessConnection>(
-  "client/HarnessConnection",
-)
-
-export const UnavailableHarnessConnection: HarnessConnection = {
-  list: Effect.succeed([]),
-  connect: (harness) => Effect.fail(new HarnessConnectionError({ operation: "connect", harness, message: "External harness connections are unavailable in this client" })),
-  sync: (harness) => Effect.fail(new HarnessConnectionError({ operation: "sync", ...(harness === undefined ? {} : { harness }), message: "External harness connections are unavailable in this client" })),
-  disconnect: (harness) => Effect.fail(new HarnessConnectionError({ operation: "disconnect", harness, message: "Harness connections are unavailable in this client" })),
-  installSkill: (harness) => Effect.fail(new HarnessConnectionError({ operation: "skill", harness, message: "Skill installation is unavailable in this client" })),
-  installStartup: Effect.fail(new HarnessConnectionError({ operation: "startup", message: "Startup installation is unavailable in this client" })),
 }

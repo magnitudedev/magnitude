@@ -1,12 +1,11 @@
 import { ErrorNotice } from "./error-notice"
-import { useSession } from "../session"
 import { HardwarePending } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
 import { Option } from "effect"
 import { useMemo } from "react"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { MemoryIcon, CircuitryIcon, CpuIcon, InfoIcon } from "@phosphor-icons/react"
-import { localModelRadarAxes, localModelSpeedTooltip, useLocalInferenceHardware } from "@magnitudedev/client-common"
+import { useAgentClient, localModelRadarAxes, localModelSpeedTooltip, useLocalInferenceHardware } from "@magnitudedev/client-common"
 import { ActionTooltip } from "./ui/tooltip"
 import { type HardwarePhoto } from "./hardware-photos"
 import { hardwareDetails } from "./hardware-details"
@@ -51,7 +50,9 @@ export function ModelRadar({ model }: { model: CatalogLocalModel }) {
 }
 
 export function HardwareOverview() {
-  const identity = useAtomValue(useSession().machineIdentity)
+  const client = useAgentClient()
+  const machine = useAtomValue(client.Configuration.GetServerMachine({})).result
+  const identity = Result.map(machine, value => value.identity)
   if (Result.isInitial(identity)) return <HardwarePending identifying />
   return <HardwareCard identity={Result.isSuccess(identity) ? identity.value : null} />
 }

@@ -4,7 +4,6 @@ applies_to:
   - cli/src/index.ts
   - cli/src/server/application.ts
   - cli/src/agent-docs/**
-  - packages/client-common/src/harness-connections/**
   - packages/harness-connections/**
   - packages/sdk/**
 ---

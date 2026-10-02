@@ -1,19 +1,19 @@
 /// <reference path="./assets.d.ts" />
 import { inspectHarnessConnection } from "./inspection"
-import { SqliteDriver } from "@magnitudedev/daemon-management/sqlite-driver"
+import { SqliteDriver } from "@magnitudedev/storage/sqlite"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as Path from "@effect/platform/Path"
 import {
-  type DesktopHarnessConnection,
   HarnessConnectionError,
   HarnessIdSchema,
   type HarnessConnection,
   type HarnessConnectOptions,
   type HarnessDestination,
   type HarnessId,
-} from "@magnitudedev/client-common"
+} from "./types"
+import type { HarnessConnectionStatus } from "@magnitudedev/sdk"
 import {
   makeInferenceClient,
   ProviderModelIdSchema,
@@ -68,6 +68,8 @@ export {
   piProviderConfig,
 } from "./connectors/pi"
 export { makeHarnessConnectorRegistry } from "./registry"
+export { resolveHarnessEnvironment, harnessCommandExecutor } from "./shell-env"
+export * from "./types"
 export { harnessConnectionPaths, resolveHarnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
 export type { HarnessConnectionSpec, HarnessConnector, HarnessInstallation, HarnessModel } from "./contract"
 
@@ -231,7 +233,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
         inspection,
         configurationFiles: connector.configurationFiles,
         plugin: Option.fromNullable(connector.companion).pipe(Option.map(({ description }) => ({ name: description.name, source: description.source }))),
-      } satisfies DesktopHarnessConnection
+      } satisfies HarnessConnectionStatus
     }))
   })).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError ? error : failure("list", String(error))))
 

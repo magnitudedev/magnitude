@@ -133,7 +133,7 @@ export default defineConfig({
           "@magnitudedev/daemon-management/desktop-native",
           "@magnitudedev/utils",
           "@magnitudedev/harness-connections",
-          "@magnitudedev/daemon-management/node",
+          "@magnitudedev/storage/sqlite/node",
           "@magnitudedev/storage",
           "@magnitudedev/release",
         "@magnitudedev/client-common",

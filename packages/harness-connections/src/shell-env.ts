@@ -1,5 +1,5 @@
 import { Command, CommandExecutor } from "@effect/platform"
-import { GuardedCommand } from "@magnitudedev/daemon-management/desktop-native"
+import { GuardedCommand } from "@magnitudedev/utils/guarded-command"
 import { Effect, HashMap, Option, Schema } from "effect"
 import { randomUUID } from "node:crypto"
 import { userInfo } from "node:os"

@@ -4,9 +4,8 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import * as BunContext from "@effect/platform-bun/BunContext"
 import * as BunRuntime from "@effect/platform-bun/BunRuntime"
 import { ProviderModelIdSchema, localModelIsInstalled, type ModelCatalogState, type LocalModel, formatConnectionError } from "@magnitudedev/sdk"
-import { HarnessIdSchema } from "@magnitudedev/client-common"
-import { harnessExecutableSearchPath, makeHarnessConnectionService } from "@magnitudedev/harness-connections"
-import { piDevelopmentConnectionOptions } from "../cli/src/server/harness-connections"
+import { HarnessIdSchema } from "@magnitudedev/sdk"
+import { harnessConnectionPaths, harnessExecutableSearchPath, makeHarnessConnectionService, makeHarnessConnectorRegistry, type HarnessConnectionOptions, type HarnessConnectionPaths } from "@magnitudedev/harness-connections"
 import {
   interactiveProcessExitCode,
   runInteractiveProcess,
@@ -18,7 +17,26 @@ import { fileURLToPath } from "node:url"
 import { buildLocalInference } from "../inference/scripts/build-local"
 import { existingAcnConnection } from "../cli/src/server/acn-connection"
 import { desktopServiceOrigin, startDesktopApplication } from "../cli/src/server/application"
-import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
+
+/** One development scope for the Pi connection this script creates. */
+const piDevelopmentConnectionOptions = (root: string): HarnessConnectionOptions & { paths: HarnessConnectionPaths } => {
+  const defaults = harnessConnectionPaths(root)
+  const paths = {
+    ...defaults,
+    manifest: resolve(root, "connections.json"),
+    piModels: resolve(root, "pi/models.json"),
+    piSettings: resolve(root, "pi/settings.json"),
+    skillInstallations: { ...defaults.skillInstallations, "shared-agents": { skillFile: resolve(root, "skills/magnitude/SKILL.md") } },
+  }
+  return {
+    paths,
+    registry: makeHarnessConnectorRegistry(paths, { piCompanionSource: resolve(dirname(fileURLToPath(import.meta.url)), "../integrations/pi"), serviceEndpoint: desktopServiceOrigin }),
+    serviceEndpoint: desktopServiceOrigin,
+    // Never register a development binary as the user's login service.
+    installStartup: Effect.void,
+  }
+}
+import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const cliEntrypoint = resolve(projectRoot, "cli/src/index.ts")
@@ -145,7 +163,6 @@ const program = Effect.scoped(Effect.gen(function* () {
       ...process.env,
       MAGNITUDE_CLI: magnitudeExecutable,
       PI_CODING_AGENT_DIR: piDirectory,
-      MAGNITUDE_PI_DEVELOPMENT_ROOT: temporaryDirectory,
       MAGNITUDE_PI_DEVELOPMENT_ORIGIN: desktopServiceOrigin,
     },
   })

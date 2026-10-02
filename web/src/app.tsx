@@ -43,6 +43,8 @@ import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-at
 import { Effect, Option } from "effect"
 import { localModelDeprecation, type ProviderModelId, type CatalogLocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
 import type { ApplicationSnapshot, AppearancePreference } from "@magnitudedev/sdk/desktop-host"
+import type { NetworkAccessChange, NetworkBind } from "@magnitudedev/sdk"
+import { FolderPicker } from "./components/folder-picker"
 import {
   activeLocalModel, useAgentClient, type ApplicationPage, type HostNotice, type DesktopUpdateState,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
@@ -464,11 +466,12 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const ranked = Result.isSuccess(hardware) ? rankedLocalModelOptions(available.map(model => ({ id: model.modelId, kind: "stored" as const, model })), { fastToSmart: 0.5, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, available.length).map(option => option.model) : available
   const commandModels = ranked.map(model => ({ id: model.modelId, label: formatLocalModelDisplayName(model) }))
   const defaultModel = commandModels.find(model => model.id === active)?.id ?? commandModels[0]?.id
-  const rows = useAtomValue(service.connections)
-  const connect = useAtomSet(service.connect)
-  const disconnect = useAtomSet(service.disconnect)
-  const connecting = useAtomValue(service.connect)
-  const disconnecting = useAtomValue(service.disconnect)
+  const client = useAgentClient()
+  const rows = useAtomValue(client.Connections.WatchHarnessConnections({})).result
+  const connect = useAtomSet(client.Connections.ConnectHarness)
+  const disconnect = useAtomSet(client.Connections.DisconnectHarness)
+  const connecting = useAtomValue(client.Connections.ConnectHarness)
+  const disconnecting = useAtomValue(client.Connections.DisconnectHarness)
   const busy = connecting.waiting || disconnecting.waiting
   const error = !busy && firstFailure([connecting, disconnecting])
   return <>
@@ -479,7 +482,7 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
       : !Result.isSuccess(rows) ? <ConnectionsSkeleton />
       : rows.value._tag === "Unavailable" ? <ErrorNotice title="Couldn’t check your connections" description="Magnitude can’t read the saved connection information. Check that its configuration is accessible." className="mt-5" />
       : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform}
-          onConnect={harness => connect({ harness, model: selectedModel })} onDisconnect={harness => disconnect(harness)} />}
+          onConnect={harness => connect({ harness, model: selectedModel, installSkill: true })} onDisconnect={harness => disconnect({ harness })} />}
     {Result.isSuccess(state) && <OtherApps origin={`http://127.0.0.1:${new URL(state.value.endpoint).port}`} model={defaultModel} platform={platform} onOpenSettings={() => navigate("settings")} />}
   </>
 }
@@ -583,12 +586,12 @@ function StatusOverview() {
   const session = useSession()
   const navigate = useNavigate()
   const usage = useAtomValue(client.Models.GetServingUsage({ period: "Today", timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, model: Option.none() })).result
-  const rows = useAtomValue(session.connections)
-  const network = useAtomValue(session.networkAccess)
+  const rows = useAtomValue(client.Connections.WatchHarnessConnections({})).result
+  const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
   const today = Result.isSuccess(usage) && usage.value._tag === "Available" ? usage.value : null
   const installed = Result.isSuccess(rows) && rows.value._tag === "Ready" ? rows.value.connections.filter(row => row.installed) : null
   const connected = installed?.filter(row => row.inspection._tag === "Connected").length
-  const address = Result.isSuccess(network) && network.value.enabled ? network.value.bind ?? "All interfaces" : null
+  const address = Result.isSuccess(network) && network.value.enabled ? Option.getOrElse(network.value.bind, () => "All interfaces") : null
   const loading = <SkeletonLine className="h-4 text-xs" width="80px" />
   return <section aria-label="Activity" className={`${pageLayout.card} grid grid-cols-3 gap-2 p-3`}>
     <StatusTile label="Today" onClick={() => navigate("usage")}
@@ -652,29 +655,32 @@ function LaunchAtLoginRow() {
     control={<Switch aria-label="Launch at login" checked={enabled} disabled={!current || current._tag === "Unavailable" || change.waiting} onCheckedChange={checked => set(checked)} />} />
 }
 function ModelStorageRow() {
-  const session = useSession()
-  const settings = useAtomValue(session.modelStorage)
-  const choose = useAtomSet(session.chooseModelStorage)
-  const choosing = useAtomValue(session.chooseModelStorage)
-  const reset = useAtomSet(session.resetModelStorage)
-  const resetting = useAtomValue(session.resetModelStorage)
-  const busy = choosing.waiting || resetting.waiting
+  const client = useAgentClient()
+  const settings = useAtomValue(client.Configuration.GetModelStorage({})).result
+  const save = useAtomSet(client.Configuration.SetModelStorage)
+  const saving = useAtomValue(client.Configuration.SetModelStorage)
+  const [choosing, setChoosing] = useState(false)
+  const busy = saving.waiting
   const current = Result.isSuccess(settings) ? settings.value : null
-  const failure = firstFailure([choosing, resetting])
+  const failure = firstFailure([saving])
   return <>
-    <SettingsRow label="Model storage" alert={!busy && failure ? <ErrorNotice title={Result.isFailure(choosing) ? "Couldn’t choose the model folder" : "The model folder wasn’t saved"} description="Check that the folder is available and writable, then try again." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read the model folder setting" description="The folder used by the running service has not been changed." /> : current?.warning ? <ErrorNotice severity="warning" title="The saved model folder is invalid" description="The default folder is selected. Choose a different folder to save a valid location." /> : undefined}
+    <FolderPicker open={choosing} onOpenChange={setChoosing} initialPath={current ? Option.some(current.path) : Option.none()}
+      title="Choose a folder for downloaded models" description="Folders on the computer running Magnitude." confirmLabel="Use this folder"
+      onChoose={path => save({ path: Option.some(path) })} />
+    <SettingsRow label="Model storage" alert={!busy && failure ? <ErrorNotice title="The model folder wasn’t saved" description="Check that the folder is available and writable, then try again." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read the model folder setting" description="The folder used by the running service has not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved model folder is invalid" description="The default folder is selected. Choose a different folder to save a valid location." /> : undefined}
       hint={current ? <span className="block truncate" title={current.path}>Current path is <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === "Default" && " (default)"}</span>  : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="220px" /> : undefined}
       control={<>
-        {current?.source === "Configured" && <Button size="sm" variant="ghost" disabled={busy} onClick={() => { reset(); }}>Use default</Button>}
-        <Button size="sm" variant="outline" disabled={!current || busy} onClick={() => { choose(); }}><FolderOpenIcon />Change…</Button>
+        {current?.source === "Configured" && <Button size="sm" variant="ghost" disabled={busy} onClick={() => save({ path: Option.none() })}>Use default</Button>}
+        <Button size="sm" variant="outline" disabled={!current || busy} onClick={() => setChoosing(true)}><FolderOpenIcon />Change…</Button>
       </>} />
   </>
 }
 function RestartRequiredToast() {
   const session = useSession()
+  const client = useAgentClient()
   const platform = useServerPlatform()
-  const storage = useAtomValue(session.modelStorage)
-  const network = useAtomValue(session.networkAccess)
+  const storage = useAtomValue(client.Configuration.GetModelStorage({})).result
+  const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
   const relaunch = useAtomSet(session.relaunch)
   const relaunching = useAtomValue(session.relaunch)
   const storageValue = Result.isSuccess(storage) ? storage.value : null
@@ -697,30 +703,31 @@ function RestartRequiredToast() {
 }
 
 function NetworkAccessRows() {
-  const session = useSession()
-  const settings = useAtomValue(session.networkAccess)
-  const update = useAtomSet(session.updateNetworkAccess)
-  const updating = useAtomValue(session.updateNetworkAccess)
-  const regenerate = useAtomSet(session.regenerateNetworkApiKey)
-  const regenerating = useAtomValue(session.regenerateNetworkApiKey)
+  const client = useAgentClient()
+  const settings = useAtomValue(client.Configuration.GetNetworkAccess({})).result
+  const save = useAtomSet(client.Configuration.SetNetworkAccess)
+  const update = (change: Partial<NetworkAccessChange>) => save({ enabled: Option.none(), bind: Option.none(), requireApiKey: Option.none(), ...change })
+  const updating = useAtomValue(client.Configuration.SetNetworkAccess)
+  const regenerate = useAtomSet(client.Configuration.RegenerateNetworkApiKey)
+  const regenerating = useAtomValue(client.Configuration.RegenerateNetworkApiKey)
   const busy = updating.waiting || regenerating.waiting
   const current = Result.isSuccess(settings) ? settings.value : null
   const failure = firstFailure([updating, regenerating])
-  const reachable = current?.enabled ? (current.bind ?? current.interfaces[0]?.address) : undefined
+  const reachable = current?.enabled ? Option.getOrElse(current.bind, () => current.interfaces[0]?.address) : undefined
   return <>
     <SettingsRow label="Network access" hint={current ? <>Let other devices on your network use Magnitude for inference. <a href="https://docs.magnitude.dev/remote-server" target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300">Remote server guide<ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
-      alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current?.warning ? <ErrorNotice severity="warning" title="The saved network address is invalid" description="All interfaces are selected. Choose an address below to save a valid setting." /> : undefined}
-      control={<Switch aria-label="Network access" checked={current?.enabled ?? false} disabled={!current || busy} onCheckedChange={checked => update({ enabled: checked })} />} />
+      alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved network address is invalid" description="All interfaces are selected. Choose an address below to save a valid setting." /> : undefined}
+      control={<Switch aria-label="Network access" checked={current?.enabled ?? false} disabled={!current || busy} onCheckedChange={checked => update({ enabled: Option.some(checked) })} />} />
     {current?.enabled && <>
       <SettingsRow nested label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
         control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
-          value={current.bind ?? ALL_INTERFACES} onValueChange={value => update({ bind: value === ALL_INTERFACES || value === null ? null : value })}>
+          value={Option.getOrElse(current.bind, () => ALL_INTERFACES)} onValueChange={value => update({ bind: Option.some<NetworkBind>(value === ALL_INTERFACES || value === null ? { _tag: "AllInterfaces" } : { _tag: "Address", address: String(value) }) })}>
           <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
           <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}>All interfaces</SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
         </Select>} />
       <SettingsRow nested label="API key" hint={current.requireApiKey ? "Other devices must send this key as a Bearer token." : "Other devices can connect without a key. Only do this on a network you trust."}
-        control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => { regenerate(); }}>Regenerate</Button><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => update({ requireApiKey: checked })} /></>}>
-        {current.apiKey && current.requireApiKey && <div className="mt-2"><CopyCommand command={current.apiKey} label="Copy API key" /></div>}
+        control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => regenerate({})}>Regenerate</Button><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => update({ requireApiKey: Option.some(checked) })} /></>}>
+        {Option.isSome(current.apiKey) && current.requireApiKey && <div className="mt-2"><CopyCommand command={current.apiKey.value} label="Copy API key" /></div>}
       </SettingsRow>
       {reachable && <SettingsRow nested label="Reachable at" hint={`Use this as the OpenAI-compatible base URL on other devices${current.requireApiKey ? ", with the API key above" : ""}. Anthropic-compatible apps use /inference/anthropic on the same address.`}>
         <div className="mt-2"><CopyCommand command={inferenceUrl(reachable, current.port)} label="Copy base URL" /></div>
@@ -743,8 +750,9 @@ function AutomaticUpdatesRow() {
 }
 function AboutRow() {
   const service = useSession()
-  const info = useAtomValue(service.applicationInfo)
-  const version = Result.isSuccess(info) ? `Magnitude ${info.value.version}` : Result.isFailure(info) ? "Magnitude" : <SkeletonLine className="h-5 text-sm" width="120px" />
+  const client = useAgentClient()
+  const health = useAtomValue(client.Connection.Health({})).result
+  const version = Result.isSuccess(health) ? `Magnitude ${health.value.version}` : Result.isFailure(health) ? "Magnitude" : <SkeletonLine className="h-5 text-sm" width="120px" />
   const observation = useAtomValue(service.updates)
   const check = useAtomSet(service.checkUpdate)
   const discard = useAtomSet(service.discardUpdate)
@@ -790,8 +798,8 @@ function AboutRow() {
 }
 function SettingsPage() {
   // A fresh mount observes hand edits; writes refresh in their own Effect actions.
-  const session = useSession()
-  useAtomMount(useMemo(() => Atom.make(session.refreshSettings), [session]))
+  const client = useAgentClient()
+  useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({}))], { discard: true })), [client]))
   return <>
     <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
     <SettingsGroup label="About"><AboutRow /></SettingsGroup>

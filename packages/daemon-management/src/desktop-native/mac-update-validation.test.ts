@@ -11,7 +11,7 @@ import { MacUpdateFilesystem, nativeMacUpdateFilesystem } from "./mac-update-fil
 import { exchangeMacUpdate } from "./mac-update-transaction"
 import { retireMacUpdateBundle } from "./mac-update-recovery"
 import { makeMacUpdateArchiveStager } from "./mac-update-staging"
-import { guardedCommandLayer } from "./guarded-command"
+import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { signUpdateRelease } from "../../../release/src/hosted-update/release"
 
 const addon = fileURLToPath(new URL(`../../dist/native/darwin-${process.arch}/desktop-host.node`, import.meta.url))

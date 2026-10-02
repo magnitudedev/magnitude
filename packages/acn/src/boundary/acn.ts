@@ -35,6 +35,8 @@ import { ProjectInspector } from "../project-inspector";
 import { ProjectManager } from "../project-manager";
 import { ProjectStore } from "../project-store";
 import { SessionInspector } from "../session-inspector";
+import { ServerSettings } from "../server-settings";
+import { AcnHarnessConnections } from "../harness-connections";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -67,6 +69,8 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const modelCatalog = yield* ModelCatalog;
     const modelCommands = yield* ModelCommands;
     const localInferenceHardware = yield* LocalInferenceHardware;
+    const serverSettings = yield* ServerSettings;
+    const harnessConnections = yield* AcnHarnessConnections;
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -313,6 +317,19 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
         observeRpcDefects("GetModelCatalog", modelCatalog.state),
 
       GetServingUsage: request => servingUsage.read(request),
+
+      GetModelStorage: () => observeRpcDefects("GetModelStorage", serverSettings.modelStorage),
+      SetModelStorage: ({ path }) => observeRpcDefects("SetModelStorage", serverSettings.setModelStorage(path).pipe(Effect.as({}))),
+      BrowseDirectories: ({ path }) => observeRpcDefects("BrowseDirectories", serverSettings.browseDirectories(path)),
+      GetNetworkAccess: () => observeRpcDefects("GetNetworkAccess", serverSettings.networkAccess),
+      SetNetworkAccess: change => observeRpcDefects("SetNetworkAccess", serverSettings.setNetworkAccess(change).pipe(Effect.as({}))),
+      RegenerateNetworkApiKey: () => observeRpcDefects("RegenerateNetworkApiKey", serverSettings.regenerateNetworkApiKey.pipe(Effect.as({}))),
+      GetServerMachine: () => observeRpcDefects("GetServerMachine", serverSettings.machine),
+
+      WatchHarnessConnections: () => observeRpcStreamDefects("WatchHarnessConnections", harnessConnections.watch),
+      ConnectHarness: request => observeRpcDefects("ConnectHarness", harnessConnections.connect(request)),
+      SyncHarnessConnections: ({ harness }) => observeRpcDefects("SyncHarnessConnections", harnessConnections.sync(harness).pipe(Effect.as({}))),
+      DisconnectHarness: ({ harness }) => observeRpcDefects("DisconnectHarness", harnessConnections.disconnect(harness).pipe(Effect.as({}))),
       GetLocalInferenceEnvironment: () =>
         observeRpcDefects("GetLocalInferenceEnvironment", localInferenceHardware.state),
 

@@ -4,9 +4,9 @@ import { fileURLToPath } from "node:url"
 import type { Duplex } from "node:stream"
 import { Effect } from "effect"
 import { describe, expect, it } from "vitest"
-import { GuardedCommand, guardedCommandLayer } from "./guarded-command"
+import { GuardedCommand, guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 
-const helper = fileURLToPath(new URL(`../../dist/native/${process.platform}-${process.arch}/magnitude-command`, import.meta.url))
+const helper = fileURLToPath(new URL(`../../daemon-management/dist/native/${process.platform}-${process.arch}/magnitude-command`, import.meta.url))
 
 describe.skipIf(process.platform === "win32")("Protected command lifetime", () => {
   it("returns the command status and both output streams", async () => {

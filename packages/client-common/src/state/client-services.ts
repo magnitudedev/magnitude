@@ -8,10 +8,6 @@ import { ModelSlots, ModelSlotsLive } from "../model-slots/service"
 import { ProjectFiles, ProjectFilesLive } from "../project-files/service"
 import { ChangesLive } from "./changes"
 import { ClientEffectQuery } from "./client-effect-query"
-import {
-  HarnessConnection,
-  UnavailableHarnessConnection,
-} from "../harness-connections/service"
 
 export type ClientServices =
   | ApplicationSession
@@ -21,12 +17,10 @@ export type ClientServices =
   | LocalModels
   | ModelSlots
   | ProjectFiles
-  | HarnessConnection
 
 export interface ClientServicesOptions {
   readonly host?: ApplicationHost
   readonly navigation?: "memory" | "location"
-  readonly harnessConnection?: HarnessConnection
 }
 
 export const clientServicesLayer = (
@@ -34,10 +28,6 @@ export const clientServicesLayer = (
   options: ClientServicesOptions = {},
 ) => {
   const infrastructure = Layer.succeed(ClientEffectQuery, effectQuery)
-  const harnessConnection = Layer.succeed(
-    HarnessConnection,
-    options.harnessConnection ?? UnavailableHarnessConnection,
-  )
   // Establish the ACN change drain before any domain service performs its first
   // Query. This closes the read-before-watch startup race while retaining one
   // connection-scoped Effect Query runtime.
@@ -49,7 +39,6 @@ export const clientServicesLayer = (
     LocalModelsLive,
     ModelSlotsLive,
     ProjectFilesLive,
-    harnessConnection,
   ).pipe(
     Layer.provideMerge(observedInfrastructure),
   )

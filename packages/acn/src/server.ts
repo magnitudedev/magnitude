@@ -103,6 +103,8 @@ import {
   ACN_INSTANCE_ID,
   makeHealthResponse,
 } from "./identity"
+import { AcnHost, ServerSettingsLive, type AcnHostApi } from "./server-settings"
+import { AcnHarnessConnectionsLive } from "./harness-connections"
 import { AcnChangesLive, AcnStorageChangesLive } from "./changes"
 import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
 import { makeAcnSubscriptionProtocol } from "./acn-subscription-protocol"
@@ -417,6 +419,13 @@ const AcnDebugServicesLayer = (dataDir: string) => {
  * The listener binds once, so network access is read from config.json here at startup; a change
  * applies at the next service start. Anything unreadable means loopback only.
  */
+/** Services that answer for the machine running this ACN: its settings and its harness configuration. */
+const withServerOwnedServices = <A, E, R>(base: Layer.Layer<A, E, R>, host: AcnHostApi) =>
+  Layer.mergeAll(ServerSettingsLive, AcnHarnessConnectionsLive).pipe(
+    Layer.provideMerge(base),
+    Layer.provide(Layer.succeed(AcnHost, host)),
+  )
+
 export const readNetworkAccess = (dataDir: string) =>
   readStructuredFile(makeGlobalStorage({ root: dataDir }).paths.configFile, MagnitudeConfigSchema.pick("network")).pipe(
     Effect.map((result) => result._tag === "Invalid" || result._tag === "Missing" ? LOOPBACK_ONLY : resolveNetworkAccess(result.value.network)),
@@ -759,14 +768,14 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     yield* lifecycle.reportStarting("Resolving", Option.none())
     const application = Effect.gen(function* () {
       const builtServices = yield* debug
-        ? Layer.buildWithScope(AcnDebugServicesLayer(dataDir), applicationScope).pipe(
+        ? Layer.buildWithScope(withServerOwnedServices(AcnDebugServicesLayer(dataDir), { dataDir, port: options.port ?? ACN_PUBLIC_PORT, activeNetwork: network }), applicationScope).pipe(
             Effect.provide(infrastructure),
             Effect.map((context) => ({
               context,
               introspector: Option.some(Context.get(context, AcnIntrospector)),
             })),
           )
-        : Layer.buildWithScope(AcnBaseServicesLayer(dataDir), applicationScope).pipe(
+        : Layer.buildWithScope(withServerOwnedServices(AcnBaseServicesLayer(dataDir), { dataDir, port: options.port ?? ACN_PUBLIC_PORT, activeNetwork: network }), applicationScope).pipe(
             Effect.provide(infrastructure),
             Effect.map((context) => ({
               context,

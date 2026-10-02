@@ -26,7 +26,6 @@ export * from './local-models/failure-messages'
 export * from './local-models/service'
 export * from './files/service'
 export * from './project-files/service'
-export * from './harness-connections/service'
 
 // Hooks
 export * from './hooks/use-local-inference-state'
@@ -36,5 +35,4 @@ export * from "./application/session"
 export * from "./application/host"
 export * from "./application/router"
 export * from "./application/update"
-export { DesktopConnectRequest, ConnectionInspection, DesktopHarnessConnection, DesktopConnectionsSnapshot } from "./application/connections"
 export { hostlessApplication } from "./state/client-services"

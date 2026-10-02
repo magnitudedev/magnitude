@@ -21,7 +21,7 @@ describe("dialogs", () => {
   it("uses Electron's native dialogs only where no window can show the app's own", () => {
     const main = readFileSync(join(root, "desktop/src/main.ts"), "utf8")
     const calls = [...main.matchAll(/dialog\.(show\w+)\(/g)].map(match => match[1])
-    expect(calls.sort()).toEqual(["showErrorBox", "showErrorBox", "showErrorBox", "showMessageBox", "showOpenDialog", "showOpenDialog"].sort())
+    expect(calls.sort()).toEqual(["showErrorBox", "showErrorBox", "showErrorBox", "showMessageBox"].sort())
     expect(files.filter(file => !file.endsWith("main.ts") && /\bdialog\.show\w+\(/.test(readFileSync(file, "utf8")))).toEqual([])
   })
 })

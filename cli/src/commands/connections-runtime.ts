@@ -1,18 +1,12 @@
-import { FetchHttpClient } from "@effect/platform"
-import type * as CommandExecutor from "@effect/platform/CommandExecutor"
-import type * as FileSystem from "@effect/platform/FileSystem"
-import type * as HttpClient from "@effect/platform/HttpClient"
-import type * as Path from "@effect/platform/Path"
-import { BunContext } from "@effect/platform-bun"
 import {
   HarnessIdSchema,
-  type DesktopHarnessConnection,
-  type HarnessConnectResult,
+  ProviderModelIdSchema,
+  type HarnessConnectOutcome,
+  type HarnessConnectionStatus,
   type HarnessId,
-} from "@magnitudedev/client-common"
-import { ProviderModelIdSchema } from "@magnitudedev/sdk"
-import { Data, Effect, Option, Schema } from "effect"
-import { makeHarnessConnection } from "../server/harness-connections"
+  type MagnitudeClient,
+} from "@magnitudedev/sdk"
+import { Data, Effect, Option, Schema, Stream } from "effect"
 import { existingAcnConnection } from "../server/acn-connection"
 import { renderFields, renderTable, runCommand } from "./output"
 
@@ -31,20 +25,23 @@ const parseModel = (input: string | undefined) => input === undefined
       Effect.mapError(() => new ConnectionsCommandError({ message: `Invalid model ID: ${input}` })),
     )
 
-const requireRunningService = Effect.gen(function* () {
-  const connection = yield* existingAcnConnection
-  yield* connection.startup.awaitReady
-})
-
-type CommandRequirements = FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | HttpClient.HttpClient
-
-const withService = <A>(use: (service: Effect.Effect.Success<typeof makeHarnessConnection>) => Effect.Effect<A, unknown, CommandRequirements>) =>
+/** Harness connections belong to the running service, which configures harnesses on its own machine. */
+const withClient = <A>(use: (client: Pick<MagnitudeClient, "connections">) => Effect.Effect<A, unknown>) =>
   Effect.scoped(Effect.gen(function* () {
-    const service = yield* makeHarnessConnection
-    return yield* use(service)
-  })).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer]))
+    const connection = yield* existingAcnConnection
+    yield* connection.startup.awaitReady
+    return yield* use(connection.client)
+  }))
 
-export const renderConnections = (rows: readonly DesktopHarnessConnection[]): string => {
+const readConnections = (client: Pick<MagnitudeClient, "connections">) => client.connections.watchHarnessConnections({}).pipe(
+  Stream.runHead,
+  Effect.flatMap(Option.match({
+    onNone: () => Effect.fail(new ConnectionsCommandError({ message: "Magnitude did not report harness connections." })),
+    onSome: snapshot => snapshot._tag === "Ready" ? Effect.succeed(snapshot.connections) : Effect.fail(new ConnectionsCommandError({ message: snapshot.message })),
+  })),
+)
+
+export const renderConnections = (rows: readonly HarnessConnectionStatus[]): string => {
   if (rows.length === 0) return "No supported harnesses are available.\n"
   return renderTable(rows, [
     { heading: "HARNESS", value: ({ name }) => name },
@@ -56,7 +53,7 @@ export const renderConnections = (rows: readonly DesktopHarnessConnection[]): st
 }
 
 export const listConnections = () => runCommand({
-  effect: withService((service) => service.inspect),
+  effect: withClient(readConnections),
   render: renderConnections,
 })
 
@@ -67,7 +64,7 @@ export const renderAddedConnection = ({
 }: {
   readonly harness: HarnessId
   readonly model: Option.Option<typeof ProviderModelIdSchema.Type>
-  readonly connection: HarnessConnectResult
+  readonly connection: HarnessConnectOutcome
 }): string => {
   const heading = `Connected ${harness} to Magnitude.`
   const fields: (readonly [string, string])[] = [
@@ -98,37 +95,28 @@ export const addConnection = (
   modelInput: string | undefined,
   installSkill: boolean,
 ) => runCommand({
-  effect: withService((service) => Effect.gen(function* () {
+  effect: Effect.gen(function* () {
     const harness = yield* parseHarness(harnessInput)
     const model = yield* parseModel(modelInput)
-    yield* Effect.scoped(requireRunningService)
-    const connection = yield* service.connect(harness, {
-      model,
-      installSkill,
-      launchOnStartup: false,
-    })
+    const connection = yield* withClient(client => client.connections.connectHarness({ harness, model, installSkill }))
     return { harness, model, connection }
-  })),
+  }),
   render: renderAddedConnection,
 })
 
 export const syncConnections = (harnessInput: string | undefined) => runCommand({
-  effect: withService((service) => Effect.gen(function* () {
-    const harness: HarnessId | undefined = harnessInput === undefined
-      ? undefined
-      : yield* parseHarness(harnessInput)
-    yield* Effect.scoped(requireRunningService)
-    yield* service.sync(harness)
-    return yield* service.inspect
-  })),
+  effect: Effect.gen(function* () {
+    const harness: Option.Option<HarnessId> = harnessInput === undefined ? Option.none() : Option.some(yield* parseHarness(harnessInput))
+    return yield* withClient(client => client.connections.syncHarnessConnections({ harness }).pipe(Effect.zipRight(readConnections(client))))
+  }),
   render: renderConnections,
 })
 
 export const removeConnection = (harnessInput: string) => runCommand({
-  effect: withService((service) => Effect.gen(function* () {
+  effect: Effect.gen(function* () {
     const harness = yield* parseHarness(harnessInput)
-    yield* service.disconnect(harness)
+    yield* withClient(client => client.connections.disconnectHarness({ harness }))
     return harness
-  })),
+  }),
   render: (harness) => `Disconnected ${harness} from Magnitude.\n`,
 })

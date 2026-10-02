@@ -4,7 +4,7 @@ import { createHash, type KeyObject } from "node:crypto"
 import { join } from "node:path"
 import { LINUX_DESKTOP_PACKAGE_NAME } from "@magnitudedev/release/executables"
 import { acceptsUpdateRelease, UpdateRelease, verifyUpdateRelease } from "@magnitudedev/release/hosted-update"
-import { GuardedCommand } from "./guarded-command"
+import { GuardedCommand } from "@magnitudedev/utils/guarded-command"
 
 export const LinuxPackageUpdate = Schema.Struct({
   release: UpdateRelease,

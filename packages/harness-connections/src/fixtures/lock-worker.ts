@@ -1,4 +1,4 @@
-import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
+import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import * as FileSystem from "@effect/platform/FileSystem"
 import { Console, Effect } from "effect"

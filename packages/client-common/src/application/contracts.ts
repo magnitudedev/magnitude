@@ -1,8 +1,5 @@
 import { Schema } from "effect"
 
-export { DesktopConnectRequest, DesktopConnectionsSnapshot } from "./connections"
-export { HarnessIdSchema } from "../harness-connections/service"
-
 export const ApplicationPage = Schema.Literal("discover", "catalog", "models", "connections", "usage", "status", "settings")
 export type ApplicationPage = typeof ApplicationPage.Type
 /** A message raised outside the renderer, shown in the app while its window exists. */
@@ -35,4 +32,3 @@ export const ModelTrayPresentation = Schema.Struct({
   status: Schema.optionalWith(ModelTrayStatus, { as: "Option", exact: true }),
   canStop: Schema.Boolean,
 })
-export const ApplicationInfo = Schema.Struct({ version: Schema.String })

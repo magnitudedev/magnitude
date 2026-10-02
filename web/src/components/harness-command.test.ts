@@ -1,6 +1,6 @@
 import { expect, it } from "vitest"
 import { Effect, Schema } from "effect"
-import { HarnessIdSchema } from "@magnitudedev/client-common"
+import { HarnessIdSchema } from "@magnitudedev/sdk"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { Command } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"

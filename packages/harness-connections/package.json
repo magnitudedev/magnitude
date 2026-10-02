@@ -13,8 +13,6 @@
   },
   "dependencies": {
     "@effect/platform": "^0.96.1",
-    "@magnitudedev/client-common": "workspace:*",
-    "@magnitudedev/daemon-management": "workspace:*",
     "@magnitudedev/release": "workspace:*",
     "@magnitudedev/sdk": "workspace:*",
     "@magnitudedev/storage": "workspace:*",

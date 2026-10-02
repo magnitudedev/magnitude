@@ -1,16 +1,13 @@
 import { Rpc, RpcGroup, type RpcClient, type RpcClientError } from "@effect/rpc"
 import { atMostOnce, replaySafe } from "@magnitudedev/sdk"
-import { AppearancePreference, ApplicationSnapshot, LoginStartupState, ApplicationMemoryObservation, MachineIdentityObservation, ModelStorageSettings, NetworkAccessSettings, NetworkAccessChange, DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
-import { ApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, HarnessIdSchema, ModelTrayPresentation, HostAction as ApplicationAction, QuitFailureDecision } from "@magnitudedev/client-common/application/contracts"
+import { AppearancePreference, ApplicationSnapshot, LoginStartupState, DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
+import { ModelTrayPresentation, HostAction as ApplicationAction, QuitFailureDecision } from "@magnitudedev/client-common/application/contracts"
 import { Schema } from "effect"
 
 export { ApplicationPage as Page, ModelTrayPresentation, HostAction as ApplicationAction, HostNotice } from "@magnitudedev/client-common/application/contracts"
 export class HostError extends Schema.TaggedError<HostError>()("HostError", { message: Schema.String }) {}
 const Unit = Schema.Struct({})
 export const InferenceHostRpcs = RpcGroup.make(
-  Rpc.make("ApplicationInfo", { payload: Unit, success: ApplicationInfo, error: HostError }).pipe(replaySafe),
-  Rpc.make("MachineIdentity", { payload: Unit, success: MachineIdentityObservation, error: HostError }).pipe(replaySafe),
-  Rpc.make("Memory", { payload: Unit, success: ApplicationMemoryObservation, error: HostError, stream: true }),
   Rpc.make("Updates", { payload: Unit, success: DesktopUpdateState, error: HostError, stream: true }),
   Rpc.make("SetAutoDownload", { payload: Schema.Struct({ enabled: Schema.Boolean }), success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("CheckUpdate", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
@@ -22,27 +19,15 @@ export const InferenceHostRpcs = RpcGroup.make(
   Rpc.make("PresentModel", { payload: ModelTrayPresentation, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("GetAppearance", { payload: Unit, success: AppearancePreference, error: HostError }).pipe(replaySafe),
   Rpc.make("SetAppearance", { payload: Schema.Struct({ preference: AppearancePreference }), success: Unit, error: HostError }).pipe(atMostOnce),
-  Rpc.make("GetModelStorage", { payload: Unit, success: ModelStorageSettings, error: HostError }).pipe(replaySafe),
-  Rpc.make("SetModelStorage", { payload: Schema.Struct({ path: Schema.NullOr(Schema.String) }), success: Unit, error: HostError }).pipe(atMostOnce),
-  Rpc.make("ChooseModelStorageDirectory", { payload: Unit, success: Schema.Struct({ path: Schema.NullOr(Schema.String) }), error: HostError }).pipe(atMostOnce),
   Rpc.make("Relaunch", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
-  Rpc.make("GetNetworkAccess", { payload: Unit, success: NetworkAccessSettings, error: HostError }).pipe(replaySafe),
-  Rpc.make("SetNetworkAccess", { payload: NetworkAccessChange, success: Unit, error: HostError }).pipe(atMostOnce),
-  Rpc.make("RegenerateNetworkApiKey", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("LoginStartup", { payload: Unit, success: LoginStartupState, error: HostError, stream: true }),
   Rpc.make("SetLoginStartup", { payload: Schema.Struct({ enabled: Schema.Boolean }), success: Unit, error: HostError }).pipe(atMostOnce),
-  Rpc.make("Connections", { payload: Unit, success: DesktopConnectionsSnapshot, error: HostError, stream: true }),
-  Rpc.make("Connect", { payload: DesktopConnectRequest, success: Unit, error: HostError }).pipe(atMostOnce),
-  Rpc.make("Disconnect", { payload: Schema.Struct({ harness: HarnessIdSchema }), success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("Retry", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("Quit", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("ResolveQuitFailure", { payload: Schema.Struct({ decision: QuitFailureDecision }), success: Unit, error: HostError }).pipe(atMostOnce),
 )
 export type InferenceHostClient = RpcClient.FromGroup<typeof InferenceHostRpcs, RpcClientError.RpcClientError>
 export interface DesktopApi {
-  readonly machineIdentity: () => Promise<MachineIdentityObservation>
-  readonly memory: (value: (state: ApplicationMemoryObservation) => void, error: (message: string) => void) => () => void
-  readonly applicationInfo: () => Promise<typeof ApplicationInfo.Type>
   readonly updates: (value: (state: typeof DesktopUpdateState.Type) => void, error: (message: string) => void) => () => void
   readonly setAutoDownload: (enabled: boolean) => Promise<void>
   readonly checkUpdate: () => Promise<void>
@@ -55,18 +40,9 @@ export interface DesktopApi {
   readonly presentModel: (value: typeof ModelTrayPresentation.Encoded) => Promise<void>
   readonly getAppearance: () => Promise<AppearancePreference>
   readonly setAppearance: (preference: AppearancePreference) => Promise<void>
-  readonly getModelStorage: () => Promise<ModelStorageSettings>
-  readonly setModelStorage: (path: string | null) => Promise<void>
-  readonly chooseModelStorageDirectory: () => Promise<string | null>
   readonly relaunch: () => Promise<void>
-  readonly getNetworkAccess: () => Promise<NetworkAccessSettings>
-  readonly setNetworkAccess: (change: NetworkAccessChange) => Promise<void>
-  readonly regenerateNetworkApiKey: () => Promise<void>
   readonly loginStartup: (value: (state: typeof LoginStartupState.Type) => void, error: (message: string) => void) => () => void
   readonly setLoginStartup: (enabled: boolean) => Promise<void>
-  readonly connections: (value: (rows: typeof DesktopConnectionsSnapshot.Encoded) => void, error: (message: string) => void) => () => void
-  readonly connect: (input: typeof DesktopConnectRequest.Encoded) => Promise<void>
-  readonly disconnect: (harness: typeof HarnessIdSchema.Type) => Promise<void>
   readonly retry: () => Promise<void>
   readonly quit: () => Promise<void>
   readonly resolveQuitFailure: (decision: QuitFailureDecision) => Promise<void>

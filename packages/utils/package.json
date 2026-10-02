@@ -16,7 +16,8 @@
     "./patch": "./src/patch/index.ts",
     "./canonical-key": "./src/canonical-key.ts",
     "./json-line-channel": "./src/json-line-channel.ts",
-    "./atomic-file": "./src/atomic-file.ts"
+    "./atomic-file": "./src/atomic-file.ts",
+    "./guarded-command": "./src/guarded-command.ts"
   },
   "scripts": {
     "test": "bun test",

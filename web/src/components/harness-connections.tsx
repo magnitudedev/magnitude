@@ -1,6 +1,6 @@
 import { ErrorNotice } from "./error-notice"
 import { pageLayout } from "./page-layout"
-import type { DesktopHarnessConnection, HarnessId } from "@magnitudedev/client-common"
+import type { HarnessConnectionStatus, HarnessId } from "@magnitudedev/sdk"
 import { Brand } from "effect"
 import { useMemo, useState } from "react"
 import type { ProviderModelId } from "@magnitudedev/sdk"
@@ -24,7 +24,7 @@ const installationDocs: Record<Brand.Brand.Unbranded<HarnessId>, string> = {
 }
 
 type Props = {
-  connections: readonly DesktopHarnessConnection[]
+  connections: readonly HarnessConnectionStatus[]
   busy: boolean
   canConnect: boolean
   onConnect: (id: HarnessId) => void

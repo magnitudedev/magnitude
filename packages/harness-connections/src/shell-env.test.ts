@@ -1,4 +1,4 @@
-import { GuardedCommand, guardedCommandLayer } from "@magnitudedev/daemon-management/desktop-native"
+import { GuardedCommand, guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { Command } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"
 import { Effect, Fiber } from "effect"
@@ -15,7 +15,7 @@ const fixture = async (source: string, test: (shell: string, root: string) => Pr
   try { await writeFile(shell, `#!/bin/sh\n${source}\n`); await chmod(shell, 0o700); await test(shell, root) }
   finally { await rm(root, { recursive: true, force: true }) }
 }
-const guard = guardedCommandLayer(fileURLToPath(new URL(`../../packages/daemon-management/dist/native/${process.platform}-${process.arch}/magnitude-command`, import.meta.url)))
+const guard = guardedCommandLayer(fileURLToPath(new URL(`../../daemon-management/dist/native/${process.platform}-${process.arch}/magnitude-command`, import.meta.url)))
 const run = <A, E>(effect: Effect.Effect<A, E, import("@effect/platform/CommandExecutor").CommandExecutor | GuardedCommand>) => Effect.runPromise(effect.pipe(Effect.provide([NodeContext.layer, guard])))
 const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch { return false } }
 

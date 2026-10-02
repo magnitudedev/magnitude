@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import type { Duplex, Readable } from "node:stream"
-import { FSM } from "@magnitudedev/utils"
+import * as FSM from "./fsm"
 import { Context, Effect, Layer, Option, Schema } from "effect"
 
 export class GuardedCommandFailed extends Schema.TaggedError<GuardedCommandFailed>()("GuardedCommandFailed", { message: Schema.String }) {}
@@ -8,7 +8,7 @@ export const GuardedCommandResult = Schema.Struct({ code: Schema.Int, stdout: Sc
 export interface GuardedCommand {
   readonly run: (executable: string, args: readonly string[], environment: Readonly<Record<string, string>>) => Effect.Effect<typeof GuardedCommandResult.Type, GuardedCommandFailed>
 }
-export const GuardedCommand = Context.GenericTag<GuardedCommand>("@magnitudedev/daemon-management/GuardedCommand")
+export const GuardedCommand = Context.GenericTag<GuardedCommand>("@magnitudedev/utils/GuardedCommand")
 
 class Running extends Schema.TaggedClass<Running>()("Running", {}) {}
 class Retiring extends Schema.TaggedClass<Retiring>()("Retiring", {

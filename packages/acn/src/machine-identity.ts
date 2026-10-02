@@ -1,5 +1,5 @@
 import { createRequire } from "node:module"
-import { MachineIdentity, type MachineIdentityObservation, type MachineFormFactor } from "@magnitudedev/sdk/desktop-host"
+import { MachineIdentity, type MachineIdentityObservation, type MachineFormFactor } from "@magnitudedev/acn-protocol"
 import { Effect, Option, Schema } from "effect"
 
 const FirmwareIdentity = Schema.Struct({

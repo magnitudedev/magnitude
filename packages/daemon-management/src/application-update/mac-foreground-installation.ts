@@ -7,7 +7,7 @@ import { nativeMacUpdateFilesystem } from "../desktop-native/mac-update-filesyst
 import { nativeMacBundleVerifier } from "../desktop-native/mac-update-validation"
 import { MacApplicationInstallation, NativeMacApplicationInstallation } from "../desktop-native/mac-update-installation"
 import { MacUpdateInstallationBusy } from "../desktop-native/mac-update-workspace"
-import { guardedCommandLayer } from "../desktop-native/guarded-command"
+import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 
 /** Caller retains application admission and establishes prior-version exclusion before entering. */
 export const startMacForegroundInstallation = (options: {

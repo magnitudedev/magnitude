@@ -23,6 +23,6 @@ it("tolerates unavailable native bindings", async () => {
   expect(await Effect.runPromise(readMachineIdentity(() => { throw new Error("Not supported") }))).toEqual({ _tag: "Unavailable", formFactor: "Unknown" })
 })
 it.skipIf(process.platform !== "darwin")("reads the actual Mac through the packaged boundary", async () => {
-  const addon = fileURLToPath(new URL("../../dist/native/darwin-arm64/desktop-host.node", import.meta.url))
+  const addon = fileURLToPath(new URL("../../daemon-management/dist/native/darwin-arm64/desktop-host.node", import.meta.url))
   expect(await Effect.runPromise(readMachineIdentity(() => createRequire(import.meta.url)(addon)))).toMatchObject({ _tag: "Identified", manufacturer: "Apple", model: expect.stringMatching(/^(Mac|iMac)/), formFactor: "Unknown" })
 })

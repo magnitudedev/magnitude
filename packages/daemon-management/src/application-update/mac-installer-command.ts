@@ -13,7 +13,7 @@ import { nativeMacBundleVerifier } from "../desktop-native/mac-update-validation
 import { nativeHostLayer } from "../desktop-native/index"
 import { unixPrivateFilePermissions } from "../desktop-native/private-files"
 import { NativeMacApplicationInstallation } from "../desktop-native/mac-update-installation"
-import { guardedCommandLayer } from "../desktop-native/guarded-command"
+import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { MacUpdateArchiveStager, makeMacUpdateArchiveStager } from "../desktop-native/mac-update-staging"
 import { makeUnixProcessContinuation } from "../desktop-native/unix-continuation"
 

@@ -14,6 +14,7 @@ describe("ACN subscription protocol", () => {
       "StreamChanges",
       "StreamDisplayView",
       "WatchFile",
+      "WatchHarnessConnections",
       "WatchProjectFiles",
     ])
     expect(acnSubscriptionProtocol.isStream("CheckFileExists")).toBe(false)

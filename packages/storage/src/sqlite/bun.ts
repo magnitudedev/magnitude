@@ -1,13 +1,13 @@
 import { Database, SQLiteError, type SQLQueryBindings } from "bun:sqlite"
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
 import {
+  SqliteDriver,
   SqliteDriverBusy,
   type SqliteBinding,
   type SqliteConnection,
-  type SqliteDriver,
   type SqliteDriverError,
   SqliteDriverFailure,
-} from "./sqlite-driver"
+} from "./driver"
 
 const message = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause)
@@ -46,3 +46,5 @@ export const BunSqliteDriver: SqliteDriver = {
     (database) => Effect.sync(() => database.close()),
   ).pipe(Effect.map(connection)),
 }
+
+export const BunSqliteDriverLayer = Layer.succeed(SqliteDriver, BunSqliteDriver)

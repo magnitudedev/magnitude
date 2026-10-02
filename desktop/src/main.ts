@@ -11,13 +11,12 @@ import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate
 import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate, type UpdateInstallationIntent } from "@magnitudedev/daemon-management/application-update"
 import { isNewerVersion } from "@magnitudedev/release"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
-import { makeAppearancePreferences, makeModelStoragePreferences, makeNetworkPreferences, listNetworkInterfaces, networkAccessEquals, LOOPBACK_ONLY, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
+import { makeAppearancePreferences, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
 import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
 import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive, type TrayMenu } from "./tray-owner"
 import { CommandExecutor, FetchHttpClient } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"
-import { NodeSqliteDriverLayer } from "@magnitudedev/daemon-management/node"
-import { makeHarnessConnectionService, resolveHarnessConnectionPaths, harnessExecutableSearchPath } from "@magnitudedev/harness-connections"
+import { NodeSqliteDriverLayer } from "@magnitudedev/storage/sqlite/node"
 import { HttpsUrlSchema } from "@magnitudedev/sdk"
 import { slate } from "@magnitudedev/client-common"
 import { DESKTOP_APP_ORIGIN, handleAppProtocol, resolveRendererDir } from "./app-protocol"
@@ -32,11 +31,11 @@ import {
   acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, NativeHost, nativeHostLayer,
   resolveApplicationProfile, applicationNativeHostPath, makeApplicationService, type ApplicationRuntime,
   serveApplicationControl, serveWindowsApplicationControl, type ApplicationControlOptions,
-  LinuxTrayHost, linuxTrayHostLayer, guardedCommandLayer,
+  LinuxTrayHost, linuxTrayHostLayer,
   unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory,
   nativeWindowsInstallerVerifier,
   adoptLinuxInstallationLease, acquireMacApplicationInstallationLease, nativeMacUpdateAdmission,
-  acquireApplicationMaintenance, acquireUpdateInstallationLease, MacApplicationInstallation, PreparedUpdateStore, makePreparedUpdateStore, NativeMacApplicationInstallation, nativeMachineIdentity, ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory,
+  acquireApplicationMaintenance, acquireUpdateInstallationLease, MacApplicationInstallation, PreparedUpdateStore, makePreparedUpdateStore, NativeMacApplicationInstallation,
 } from "@magnitudedev/daemon-management/desktop-native"
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
@@ -45,7 +44,8 @@ import { type ApplicationSnapshot, type OwnedServiceState } from "@magnitudedev/
 import { HostError, ApplicationAction, InferenceHostRpcs, ModelTrayPresentation, type HostNotice, type Page } from "./desktop-rpc"
 import type { QuitFailureDecision } from "@magnitudedev/client-common/application/contracts"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
-import { resolveHarnessEnvironment, harnessCommandExecutor } from "./shell-env"
+import { resolveHarnessEnvironment } from "@magnitudedev/harness-connections"
+import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { MAGNITUDE_VERSION } from "@magnitudedev/version"
 
 app.setName("Magnitude")
@@ -106,14 +106,6 @@ const program = Effect.scoped(Effect.gen(function* () {
   const initialAppearance = yield* appearance.read.pipe(Effect.catchAll(error =>
     Effect.logWarning(error.message).pipe(Effect.as("system" as const))))
   nativeTheme.themeSource = initialAppearance
-  const modelStorage = yield* makeModelStoragePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
-  // The service reads the same setting when it spawns the engine; this is what the running service uses.
-  const activeModelStorage = yield* modelStorage.read.pipe(Effect.map(settings => settings.path), Effect.catchAll(error =>
-    Effect.logWarning(error.message).pipe(Effect.as(modelStorage.defaultPath))))
-  const networkPreferences = yield* makeNetworkPreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
-  // The service resolves the same setting when it binds; this is what the running service listens on.
-  const activeNetwork = yield* networkPreferences.read.pipe(Effect.map(settings => settings.resolved), Effect.catchAll(error =>
-    Effect.logWarning(error.message).pipe(Effect.as(LOOPBACK_ONLY))))
   // A system shutdown can end our process before asynchronous cleanup finishes.
   // Never veto it; native lifetime containment remains the hard fallback.
   if (process.platform !== "win32") {
@@ -325,24 +317,8 @@ const program = Effect.scoped(Effect.gen(function* () {
     const name = yield* Schema.decodeUnknown(WindowsPipeName)(owner.socketPath)
     yield* serveWindowsApplicationControl(name, control).pipe(Effect.provide(nativeWindowsPrivatePipesLayer(addonPath)))
   } else yield* serveApplicationControl(owner.socketPath, control)
-  const connections = yield* Effect.cached(Effect.gen(function* () {
-    const environment = yield* Fiber.join(harnessEnvironment)
-    const executor = yield* harnessCommandExecutor(environment)
-    return yield* makeHarnessConnectionService({
-      paths: yield* resolveHarnessConnectionPaths(isolatedProfile ? join(dataDir, "harness-home") : undefined, environment),
-      serviceEndpoint: endpoint,
-      detect: connector => connector.detect(harnessExecutableSearchPath(environment.PATH)),
-    }).pipe(Effect.provideService(CommandExecutor.CommandExecutor, executor))
-  }).pipe(Effect.provide([NodeContext.layer, FetchHttpClient.layer, NodeSqliteDriverLayer])))
-  const connectionChanges = yield* PubSub.sliding<void>(1)
   const connectionError = (error: { readonly message: string }) => new HostError({ message: error.message })
-  const memory = Context.get(yield* Layer.build(nativeApplicationMemoryLayer(addonPath)), ApplicationMemory)
-  const machineIdentity = yield* Effect.cached(nativeMachineIdentity(addonPath))
   const handlers = InferenceHostRpcs.toLayer({
-    MachineIdentity: () => machineIdentity,
-    Memory: () => observeApplicationMemory(memory, () => !!window && !window.isDestroyed() && window.isVisible()),
-    // Unpackaged runs report Electron's own version; the generated Magnitude version is the truth there.
-    ApplicationInfo: () => Effect.sync(() => ({ version: app.isPackaged ? app.getVersion() : MAGNITUDE_VERSION })),
     Updates: () => updates.changes,
     SetAutoDownload: ({ enabled }) => preferenceWrites.withPermits(1)(updates.setAutoDownload(enabled)).pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.as({})),
     CheckUpdate: () => updateSchedule.check.pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.as({})),
@@ -363,33 +339,9 @@ const program = Effect.scoped(Effect.gen(function* () {
       Effect.sync(() => { nativeTheme.themeSource = preference }))),
     SetAppearance: ({ preference }) => preferenceWrites.withPermits(1)(appearance.write(preference)).pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError),
       Effect.tap(() => Effect.sync(() => { nativeTheme.themeSource = preference })), Effect.as({})),
-    GetModelStorage: () => modelStorage.read.pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.map(settings =>
-      ({ active: activeModelStorage, path: settings.path, source: settings.source, defaultPath: settings.defaultPath, warning: Option.getOrNull(settings.warning) }))),
-    SetModelStorage: ({ path }) => preferenceWrites.withPermits(1)(modelStorage.write(Option.fromNullable(path))).pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.as({})),
-    ChooseModelStorageDirectory: () => Effect.tryPromise({
-      try: () => window && !window.isDestroyed()
-        ? dialog.showOpenDialog(window, { title: "Choose a folder for downloaded models", buttonLabel: "Choose", properties: ["openDirectory", "createDirectory"] })
-        : dialog.showOpenDialog({ title: "Choose a folder for downloaded models", buttonLabel: "Choose", properties: ["openDirectory", "createDirectory"] }),
-      catch: () => new HostError({ message: "The folder chooser could not be opened." }),
-    }).pipe(Effect.map(result => ({ path: result.canceled ? null : result.filePaths[0] ?? null }))),
     Relaunch: () => Queue.offer(quit, "Relaunch").pipe(Effect.as({})),
-    GetNetworkAccess: () => networkPreferences.read.pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.map(({ saved, resolved }) => ({
-      enabled: resolved.enabled,
-      bind: Option.isSome(saved) && saved.value.bind !== undefined ? saved.value.bind : null,
-      requireApiKey: Option.isSome(saved) ? saved.value.requireApiKey : true,
-      apiKey: Option.isSome(saved) ? saved.value.apiKey ?? null : null,
-      interfaces: listNetworkInterfaces(),
-      port,
-      pending: !networkAccessEquals(resolved, activeNetwork),
-      warning: Option.getOrNull(resolved.warning),
-    }))),
-    SetNetworkAccess: change => preferenceWrites.withPermits(1)(networkPreferences.update(change)).pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.as({})),
-    RegenerateNetworkApiKey: () => preferenceWrites.withPermits(1)(networkPreferences.regenerateApiKey).pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.as({})),
     LoginStartup: () => Stream.repeatEffectWithSchedule(loginStartup.read.pipe(Effect.map(state => state._tag === "Unavailable" ? { ...state, message: isolatedProfile || !app.isPackaged ? "Launch at login isn’t available in this development or test build. Install Magnitude to enable it." : "Launch at login needs attention. Check Magnitude in your system startup settings." } : state), Effect.tapError(Effect.logError), Effect.catchAll(() => Effect.succeed({ _tag: "Unavailable" as const, message: "Couldn’t check launch at login. Check Magnitude in your system startup settings." }))), Schedule.spaced("2 seconds")).pipe(Stream.mapError(connectionError)),
     SetLoginStartup: ({ enabled }) => loginStartup.set(enabled).pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.as({})),
-    Connections: () => Stream.concat(Stream.succeed(undefined), Stream.merge(Stream.fromPubSub(connectionChanges), Stream.fromSchedule(Schedule.spaced("2 seconds")))).pipe(Stream.mapEffect(() => connections.pipe(Effect.flatMap(service => service.inspect), Effect.map(connections => ({ _tag: "Ready" as const, connections })), Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message }))))),
-    Connect: ({ harness, model }) => connections.pipe(Effect.flatMap(service => service.connect(harness, { model, installSkill: true })), Effect.mapError(connectionError), Effect.tap(() => PubSub.publish(connectionChanges, undefined)), Effect.as({})),
-    Disconnect: ({ harness }) => connections.pipe(Effect.flatMap(service => service.disconnect(harness)), Effect.mapError(connectionError), Effect.tap(() => PubSub.publish(connectionChanges, undefined)), Effect.as({})),
     Retry: () => service.retry.pipe(Effect.as({})),
     Quit: () => Queue.offer(quit, "Quit").pipe(Effect.as({})),
     ResolveQuitFailure: ({ decision }) => Ref.getAndSet(pendingQuitDecision, Option.none()).pipe(

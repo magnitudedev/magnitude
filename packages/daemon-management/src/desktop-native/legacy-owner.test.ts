@@ -4,9 +4,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Option } from "effect"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
-import { BunSqliteDriverLayer, BunSqliteDriver } from "../bun"
+import { BunSqliteDriverLayer, BunSqliteDriver } from "@magnitudedev/storage/sqlite/bun"
 import { readLegacyOwner } from "./legacy-owner"
-import { SqliteDriver, SqliteDriverFailure } from "../sqlite-driver"
+import { SqliteDriver, SqliteDriverFailure } from "@magnitudedev/storage/sqlite"
 
 let root: string
 let path: string

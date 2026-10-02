@@ -1,11 +1,3 @@
-import { Layer } from "effect"
-import { BunSqliteDriver } from "./bun-sqlite-driver"
-import { SqliteDriver } from "./sqlite-driver"
-
-export { BunSqliteDriver }
-
-export const BunSqliteDriverLayer = Layer.succeed(SqliteDriver, BunSqliteDriver)
-
 // Static path expression is intentional: Bun embeds the target's native addon at compilation.
 // Loading stays lazy so passive CLI help/version commands do not initialize native adapters.
 import { nativeHostLayerFromLoader } from "./desktop-native/index"

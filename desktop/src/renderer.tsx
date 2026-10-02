@@ -1,9 +1,6 @@
 import { Effect, Option, Schema, Stream } from "effect"
 import { ApplicationSnapshot, LoginStartupState, DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
-import {
-  ApplicationHostFailed, ApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, ModelTrayPresentation,
-  type ApplicationHost,
-} from "@magnitudedev/client-common"
+import { ApplicationHostFailed, ModelTrayPresentation, type ApplicationHost } from "@magnitudedev/client-common"
 import { renderApplication } from "@magnitudedev/web/run"
 import type { DesktopApi } from "./desktop-rpc"
 
@@ -38,11 +35,7 @@ const host: ApplicationHost = {
     retryService: call(() => bridge.retry()),
   }),
   desktop: Option.some({
-    platform: bridge.platform,
     application: observe(ApplicationSnapshot, bridge.observe),
-    applicationInfo: call(() => bridge.applicationInfo()).pipe(Effect.flatMap(info => Schema.decodeUnknown(ApplicationInfo)(info).pipe(Effect.mapError(failure)))),
-    machineIdentity: call(() => bridge.machineIdentity()),
-    memory: Stream.asyncPush(emit => Effect.acquireRelease(Effect.sync(() => bridge.memory(value => emit.single(value), message => emit.fail(new ApplicationHostFailed({ message })))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
     updates: observe(DesktopUpdateState, bridge.updates),
     setAutoDownload: enabled => call(() => bridge.setAutoDownload(enabled)),
     checkUpdate: call(() => bridge.checkUpdate()),
@@ -51,15 +44,6 @@ const host: ApplicationHost = {
     restartUpdate: call(() => bridge.restartUpdate()),
     loginStartup: observe(LoginStartupState, bridge.loginStartup),
     setLoginStartup: enabled => call(() => bridge.setLoginStartup(enabled)),
-    connections: observe(DesktopConnectionsSnapshot, bridge.connections),
-    connect: input => call(() => bridge.connect(Schema.encodeSync(DesktopConnectRequest)(input))),
-    disconnect: harness => call(() => bridge.disconnect(harness)),
-    modelStorage: call(() => bridge.getModelStorage()),
-    setModelStorage: path => call(() => bridge.setModelStorage(Option.getOrNull(path))),
-    chooseModelStorageDirectory: call(() => bridge.chooseModelStorageDirectory()).pipe(Effect.map(Option.fromNullable)),
-    networkAccess: call(() => bridge.getNetworkAccess()),
-    setNetworkAccess: change => call(() => bridge.setNetworkAccess(change)),
-    regenerateNetworkApiKey: call(() => bridge.regenerateNetworkApiKey()),
     relaunch: call(() => bridge.relaunch()),
   }),
 }

@@ -2,7 +2,7 @@ import { lstat } from "node:fs/promises"
 import { join } from "node:path"
 import { Effect, Option, Schema } from "effect"
 import { ExactProcessSchema } from "@magnitudedev/utils/process-groups"
-import { SqliteDriver } from "../sqlite-driver"
+import { SqliteDriver } from "@magnitudedev/storage/sqlite"
 
 /** Frozen migration input, independent of the removed runtime election contract. */
 export const LegacyOwner = Schema.Struct({

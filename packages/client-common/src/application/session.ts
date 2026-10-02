@@ -1,9 +1,7 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Context, Effect, Layer, Option, Stream } from "effect"
 import { ModelLoadStageSchema, type LocalModelsState, type ModelResidency } from "@magnitudedev/sdk"
-import type { AppearancePreference, NetworkAccessChange } from "@magnitudedev/sdk/desktop-host"
-import type { DesktopConnectRequest } from "./connections"
-import type { HarnessId } from "../harness-connections/service"
+import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { LocalModels } from "../local-models/service"
 import { LOCAL_MODEL_RANKING_SCALE_VALUES } from "../local-models/options"
 import { formatLocalModelDisplayName } from "../utils/model-presentation"
@@ -13,7 +11,7 @@ import { ApplicationRouter } from "./router"
 import type { HostNotice, QuitFailureDecision } from "./contracts"
 import { ModelTrayPresentation, ModelTrayStatus } from "./contracts"
 
-export { ApplicationPage, HostAction, HostNotice, QuitFailureDecision, ModelTrayPresentation, ModelTrayStatus, ApplicationInfo } from "./contracts"
+export { ApplicationPage, HostAction, HostNotice, QuitFailureDecision, ModelTrayPresentation, ModelTrayStatus } from "./contracts"
 
 export const activeLocalModel = (models: LocalModelsState) => {
   for (const model of models.models) {
@@ -117,9 +115,6 @@ const makeApplicationSession = Effect.gen(function* () {
 
   const application = Atom.keepAlive(Atom.make(streamFromDesktop(controls => controls.application)))
   const loginStartup = Atom.make(Option.isSome(desktop) ? desktop.value.loginStartup : Stream.succeed({ _tag: "Unavailable" as const, message: "Launch at login isn't available here." }))
-  const machineIdentity = Atom.keepAlive(Atom.make(Option.isSome(desktop) ? desktop.value.machineIdentity : Effect.succeed({ _tag: "Unavailable" as const, formFactor: "Unknown" as const })))
-  const memory = Atom.make(Option.isSome(desktop) ? desktop.value.memory : Stream.succeed({ _tag: "Unavailable" as const, message: "Memory isn't available here." }))
-  const applicationInfo = Atom.make(fromDesktop(controls => controls.applicationInfo))
   const updates = Atom.make(Option.isSome(desktop) ? desktop.value.updates : Stream.succeed({ transfer: { _tag: "Unavailable" as const, message: "Updates aren't available here." }, check: { _tag: "Idle" as const }, preference: { _tag: "Unavailable" as const, message: "Updates aren't available here." } }))
   const setAutoDownload = Atom.fn((enabled: boolean) => fromDesktop(controls => controls.setAutoDownload(enabled)))
   const checkUpdate = Atom.fn((_: void) => fromDesktop(controls => controls.checkUpdate))
@@ -127,19 +122,7 @@ const makeApplicationSession = Effect.gen(function* () {
   const downloadUpdate = Atom.fn((_: void) => fromDesktop(controls => controls.downloadUpdate))
   const restartUpdate = Atom.fn((_: void) => fromDesktop(controls => controls.restartUpdate))
   const setLoginStartup = Atom.fn((enabled: boolean) => fromDesktop(controls => controls.setLoginStartup(enabled)))
-  const connections = Atom.make(Option.isSome(desktop) ? desktop.value.connections : Stream.succeed({ _tag: "Ready" as const, connections: [] }))
-  const connect = Atom.fn((input: DesktopConnectRequest) => fromDesktop(controls => controls.connect(input)))
-  const disconnect = Atom.fn((harness: HarnessId) => fromDesktop(controls => controls.disconnect(harness)))
-  const modelStorage = Atom.keepAlive(Atom.make(fromDesktop(controls => controls.modelStorage)))
-  const chooseModelStorage = Atom.fn((_: void) => fromDesktop(controls => controls.chooseModelStorageDirectory.pipe(
-    Effect.flatMap(path => Option.isNone(path) ? Effect.void : controls.setModelStorage(path)),
-  )).pipe(Effect.ensuring(Atom.refresh(modelStorage))))
-  const resetModelStorage = Atom.fn((_: void) => fromDesktop(controls => controls.setModelStorage(Option.none())).pipe(Effect.ensuring(Atom.refresh(modelStorage))))
-  const networkAccess = Atom.keepAlive(Atom.make(fromDesktop(controls => controls.networkAccess)))
-  const updateNetworkAccess = Atom.fn((change: NetworkAccessChange) => fromDesktop(controls => controls.setNetworkAccess(change)).pipe(Effect.ensuring(Atom.refresh(networkAccess))))
-  const regenerateNetworkApiKey = Atom.fn((_: void) => fromDesktop(controls => controls.regenerateNetworkApiKey).pipe(Effect.ensuring(Atom.refresh(networkAccess))))
   const relaunch = Atom.fn((_: void) => fromDesktop(controls => controls.relaunch))
-  const refreshSettings = Effect.sync(() => { registry.refresh(modelStorage); registry.refresh(networkAccess) })
 
   return {
     page: router.page,
@@ -154,11 +137,7 @@ const makeApplicationSession = Effect.gen(function* () {
     readAppearance: host.appearance.read,
     saveAppearance: (preference: AppearancePreference) => host.appearance.save(preference),
     clientWindow: host.window,
-    serverPlatform: Option.map(desktop, controls => controls.platform),
     application,
-    machineIdentity,
-    memory,
-    applicationInfo,
     updates,
     setAutoDownload,
     checkUpdate,
@@ -167,17 +146,7 @@ const makeApplicationSession = Effect.gen(function* () {
     restartUpdate,
     loginStartup,
     setLoginStartup,
-    connections,
-    connect,
-    disconnect,
-    modelStorage,
-    chooseModelStorage,
-    resetModelStorage,
-    networkAccess,
-    updateNetworkAccess,
-    regenerateNetworkApiKey,
     relaunch,
-    refreshSettings,
   }
 })
 export interface ApplicationSession extends Effect.Effect.Success<typeof makeApplicationSession> {}

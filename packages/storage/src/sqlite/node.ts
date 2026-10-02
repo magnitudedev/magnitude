@@ -1,7 +1,7 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite"
 import { pathToFileURL } from "node:url"
 import { Effect, Layer } from "effect"
-import { SqliteDriver, SqliteDriverBusy, SqliteDriverFailure, type SqliteBinding, type SqliteConnection, type SqliteDriverError } from "./sqlite-driver"
+import { SqliteDriver, SqliteDriverBusy, SqliteDriverFailure, type SqliteBinding, type SqliteConnection, type SqliteDriverError } from "./driver"
 
 const failure = (cause: unknown): SqliteDriverError => {
   // SQLite extended result codes retain the primary code in the low byte.

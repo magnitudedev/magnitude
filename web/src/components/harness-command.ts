@@ -1,5 +1,5 @@
 import { Brand } from "effect"
-import type { HarnessId } from "@magnitudedev/client-common"
+import type { HarnessId } from "@magnitudedev/sdk"
 import type { ProviderModelId } from "@magnitudedev/sdk"
 
 /** Commands are pasted into a POSIX shell on macOS/Linux or PowerShell on Windows. */

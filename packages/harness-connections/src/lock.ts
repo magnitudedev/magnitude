@@ -1,6 +1,6 @@
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
-import { SqliteDriver } from "@magnitudedev/daemon-management/sqlite-driver"
+import { SqliteDriver } from "@magnitudedev/storage/sqlite"
 import { Duration, Effect, Schedule, Schema } from "effect"
 
 export class HarnessConnectionLockTimedOut extends Schema.TaggedError<HarnessConnectionLockTimedOut>()(
