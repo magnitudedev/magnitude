@@ -57,6 +57,7 @@ import { appearanceReadError } from "./appearance"
 import { useNavigate, useServerPlatform, useSession } from "./session"
 import { useServiceConnection, useServiceObservation, type ServiceObservation } from "./service-view"
 import { ConfirmDialog } from "./components/confirm-dialog"
+import { signOut, useCheckSignInOnMount, useDisconnectWarning, useRemoteAccess, useSignInRecheck, viewerPlatform } from "./remote-access"
 import { useNarrowViewport } from "./lib/viewport"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "./components/ui/alert-dialog"
 import { HardwareOverview, ModelRadar, SpeedInfo } from "./components/discovery-visuals"
@@ -467,6 +468,7 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
     ? (Result.isSuccess(state) ? Option.some(`http://127.0.0.1:${new URL(state.value.endpoint).port}`) : Option.none<string>())
     : Option.some(window.location.origin)
   const platform = useServerPlatform()
+  const { remote } = useRemoteAccess()
   const available = Result.isSuccess(models) ? models.value.models.filter(model => Option.isSome(localModelProviderModelId(model))) : []
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value))?.model.modelId : undefined
   const ranked = Result.isSuccess(hardware) ? rankedLocalModelOptions(available.map(model => ({ id: model.modelId, kind: "stored" as const, model })), { fastToSmart: 0.5, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, available.length).map(option => option.model) : available
@@ -487,9 +489,9 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
     {Result.isFailure(rows) ? <ErrorNotice title="Couldn’t check your connections" description="Connection status is unavailable. Magnitude will check again automatically." className="mt-5" />
       : !Result.isSuccess(rows) ? <ConnectionsSkeleton />
       : rows.value._tag === "Unavailable" ? <ErrorNotice title="Couldn’t check your connections" description="Magnitude can’t read the saved connection information. Check that its configuration is accessible." className="mt-5" />
-      : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform}
+      : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform} remote={remote}
           onConnect={harness => connect({ harness, model: selectedModel, installSkill: true })} onDisconnect={harness => disconnect({ harness })} />}
-    {Option.isSome(apiOrigin) && <OtherApps origin={apiOrigin.value} model={defaultModel} platform={platform} onOpenSettings={() => navigate("settings")} />}
+    {Option.isSome(apiOrigin) && <OtherApps origin={apiOrigin.value} model={defaultModel} platform={remote ? viewerPlatform() : platform} remote={remote} onOpenSettings={() => navigate("settings")} />}
   </>
 }
 /** The model row's status: the load stage in full while loading, the memory in use once loaded. */
@@ -700,7 +702,8 @@ function RestartRequiredToast() {
   const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
   const { supports } = useApplicationOwner()
   const restartApplication = useAtomSet(client.Application.RestartApplication)
-  const relaunch = () => restartApplication({})
+  const disconnect = useDisconnectWarning()
+  const relaunch = () => disconnect.warn("Restart", () => restartApplication({}))
   const relaunching = useAtomValue(client.Application.RestartApplication)
   const storageValue = Result.isSuccess(storage) ? storage.value : null
   const storagePending = storageValue !== null && storageValue.path !== storageValue.active
@@ -709,6 +712,7 @@ function RestartRequiredToast() {
   const reason = storagePending && networkPending ? "Magnitude is still using the previous model folder and network settings."
     : storagePending ? "Magnitude is still using the previous model folder." : "Magnitude is still using the previous network settings."
   return <div className="fixed bottom-4 right-4 z-50 w-96 max-w-[calc(100vw-2rem)] rounded-lg bg-white shadow-md dark:bg-slate-850">
+    {disconnect.dialog}
     <ErrorNotice severity={Result.isFailure(relaunching) && !relaunching.waiting ? "error" : "info"}
       title={Result.isFailure(relaunching) && !relaunching.waiting ? "Magnitude couldn’t restart" : "Restart to apply your changes"}
       description={supports("RestartService") ? reason : `${reason} Restart the Magnitude server to apply them.`}
@@ -727,6 +731,7 @@ function NetworkAccessRows() {
   const settings = useAtomValue(client.Configuration.GetNetworkAccess({})).result
   const save = useAtomSet(client.Configuration.SetNetworkAccess)
   const update = (change: Partial<NetworkAccessChange>) => save({ enabled: Option.none(), bind: Option.none(), requireApiKey: Option.none(), ...change })
+  const disconnect = useDisconnectWarning()
   const updating = useAtomValue(client.Configuration.SetNetworkAccess)
   const regenerate = useAtomSet(client.Configuration.RegenerateNetworkApiKey)
   const regenerating = useAtomValue(client.Configuration.RegenerateNetworkApiKey)
@@ -735,18 +740,19 @@ function NetworkAccessRows() {
   const failure = firstFailure([updating, regenerating])
   const reachable = current?.enabled ? Option.getOrElse(current.bind, () => current.interfaces[0]?.address) : undefined
   return <>
+    {disconnect.dialog}
     <SettingsRow label="Network access" hint={current ? <>Let other devices on your network use Magnitude for inference. <a href="https://docs.magnitude.dev/remote-server" target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300">Remote server guide<ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
       alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved network address is invalid" description="All interfaces are selected. Choose an address below to save a valid setting." /> : undefined}
-      control={<Switch aria-label="Network access" checked={current?.enabled ?? false} disabled={!current || busy} onCheckedChange={checked => update({ enabled: Option.some(checked) })} />} />
+      control={<Switch aria-label="Network access" checked={current?.enabled ?? false} disabled={!current || busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />} />
     {current?.enabled && <>
       <SettingsRow nested label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
         control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
-          value={Option.getOrElse(current.bind, () => ALL_INTERFACES)} onValueChange={value => update({ bind: Option.some<NetworkBind>(value === ALL_INTERFACES || value === null ? { _tag: "AllInterfaces" } : { _tag: "Address", address: String(value) }) })}>
+          value={Option.getOrElse(current.bind, () => ALL_INTERFACES)} onValueChange={value => disconnect.warn("ChangeAddress", () => update({ bind: Option.some<NetworkBind>(value === ALL_INTERFACES || value === null ? { _tag: "AllInterfaces" } : { _tag: "Address", address: String(value) }) }))}>
           <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
           <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}>All interfaces</SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
         </Select>} />
       <SettingsRow nested label="API key" hint={current.requireApiKey ? "Other devices must send this key as a Bearer token." : "Other devices can connect without a key. Only do this on a network you trust."}
-        control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => regenerate({})}>Regenerate</Button><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => update({ requireApiKey: Option.some(checked) })} /></>}>
+        control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => disconnect.warn("RegenerateKey", () => regenerate({}))}>Regenerate</Button><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => update({ requireApiKey: Option.some(checked) })} /></>}>
         {Option.isSome(current.apiKey) && current.requireApiKey && <div className="mt-2"><CopyCommand command={current.apiKey.value} label="Copy API key" /></div>}
       </SettingsRow>
       {reachable && <SettingsRow nested label="Reachable at" hint={`Use this as the OpenAI-compatible base URL on other devices${current.requireApiKey ? ", with the API key above" : ""}. Anthropic-compatible apps use /inference/anthropic on the same address.`}>
@@ -786,7 +792,8 @@ function AboutRow() {
   const downloadUpdate = useAtomSet(client.Application.DownloadApplicationUpdate)
   const download = () => downloadUpdate({})
   const installUpdate = useAtomSet(client.Application.InstallApplicationUpdate)
-  const restart = () => installUpdate({})
+  const disconnect = useDisconnectWarning()
+  const restart = () => disconnect.warn("Restart", () => installUpdate({}))
   const checking = useAtomValue(client.Application.CheckApplicationUpdate)
   const downloading = useAtomValue(client.Application.DownloadApplicationUpdate)
   const restarting = useAtomValue(client.Application.InstallApplicationUpdate)
@@ -811,7 +818,7 @@ function AboutRow() {
       : current?._tag === "Available" ? <NoticeAction disabled={busy} onClick={() => download()}>Download update</NoticeAction>
       : current && !["Unavailable", "Closed"].includes(current._tag) ? <NoticeAction disabled={busy} onClick={() => check()}>Check for updates</NoticeAction> : null}
   </>
-  return <SettingsRow label={version} hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : message}
+  return <>{disconnect.dialog}<SettingsRow label={version} hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : message}
     alert={hasFailure && !busy ? <ErrorNotice
       title={Result.isFailure(discarding) && !discarding.waiting ? "Couldn’t discard the update" : current?._tag === "InstallationFailed" ? "The update wasn’t completed" : checkFailed ? "Couldn’t check for updates" : "The update couldn’t finish"}
       description={installable ? "The prepared update is still available. Retry it, or discard its download." : "Check your connection before trying again."}
@@ -822,15 +829,26 @@ function AboutRow() {
         : current?._tag === "Available" ? <Button size="sm" disabled={pending} onClick={() => download()}>Download update</Button>
         : current && !["Unavailable", "Closed"].includes(current._tag) ? <Button size="sm" variant="outline" disabled={busy} onClick={() => check()}>{busy ? "Checking…" : "Check for updates"}</Button>
         : null}
-    </>} />
+    </>} /></>
+}
+function SignOutRow() {
+  const { origin } = useRemoteAccess()
+  const action = useMemo(() => Atom.fn((_: void) => signOut(origin)), [origin])
+  const run = useAtomSet(action)
+  const signingOut = useAtomValue(action)
+  return <SettingsRow label="Signed in from another device" hint={`This browser controls Magnitude at ${new URL(origin).host}.`}
+    alert={Result.isFailure(signingOut) && !signingOut.waiting ? <ErrorNotice title="Couldn’t sign out" description="Check that this device can still reach Magnitude, then try again." /> : undefined}
+    control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>Sign out</Button>} />
 }
 function SettingsPage() {
   // A fresh mount observes hand edits; writes refresh in their own Effect actions.
   const client = useAgentClient()
+  const { remote } = useRemoteAccess()
   useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({}))], { discard: true })), [client]))
   return <>
     <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
     <SettingsGroup label="About"><AboutRow /></SettingsGroup>
+    {remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}
   </>
 }
 export function App() {
@@ -854,7 +872,9 @@ export function App() {
 /** A browser cannot restart the service; it can only try to reach it again. */
 function CannotReachMagnitude() {
   const connection = useServiceConnection()
-  const reconnectAction = useMemo(() => Atom.fn((_: void) => connection.connect), [connection])
+  const recheck = useSignInRecheck()
+  useCheckSignInOnMount()
+  const reconnectAction = useMemo(() => Atom.fn((_: void) => recheck.pipe(Effect.flatMap(required => required ? Effect.void : connection.connect))), [connection, recheck])
   const reconnect = useAtomSet(reconnectAction)
   const reconnecting = useAtomValue(reconnectAction)
   return <ErrorNotice className="mt-8" title="Can’t reach Magnitude"

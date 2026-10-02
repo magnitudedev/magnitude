@@ -11,7 +11,7 @@ On the same computer, `ADDRESS` is `127.0.0.1` and no API key is needed. Send an
 
 ## From another device
 
-Enable Network access in Magnitude Settings, or set `network.enabled`, `network.bind`, and `network.apiKey` in `~/.magnitude/config.json` on the server. Use an IP address assigned to the server and a long, randomly generated key. Restart Magnitude after changes. The address can be on a local network or a private network such as Tailscale. Send the key as `Authorization: Bearer KEY` or `x-api-key: KEY`. Only inference is available from other devices; model management and `/rpc` are not.
+Enable Network access in Magnitude Settings, or set `network.enabled`, `network.bind`, and `network.apiKey` in `~/.magnitude/config.json` on the server. Use an IP address assigned to the server and a long, randomly generated key. Restart Magnitude after changes. The address can be on a local network or a private network such as Tailscale. Send the key as `Authorization: Bearer KEY` or `x-api-key: KEY`. A person can also open `http://ADDRESS:10100` in a browser on another device and sign in with the same key to use the Magnitude app there; that browser session never authorizes inference requests, and `/rpc` refuses other devices that have not signed in.
 
 Check the connection:
 

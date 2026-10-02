@@ -256,12 +256,23 @@ Require key switch that is on by default), and Reachable at (one OpenAI-compatib
 chosen address, or the first physical address when all interfaces are selected). ACN reads and writes
 these settings and compares them with what it bound at startup; when the saved settings resolve
 differently the same restart toast appears, naming network settings. Its hint links the remote server guide.
+A browser on another device opens the app at the server's address and signs in with this key on the
+app's own Sign in page, which says when the server has no key. While signed in remotely, Settings
+adds a This browser group with Sign out, and turning network access off, regenerating the key,
+changing the address, and restarting Magnitude (to apply settings or an update) first ask in an
+AlertDialog, because they disconnect that browser once the service restarts. If a signed-in browser
+loses the service, it checks whether the service now asks for the key, as after a restart, and
+returns to Sign in instead of showing that the service is unreachable.
 Below the harnesses, Connections presents one card for other apps and agents. It states that an
 OpenAI-compatible API runs on this computer that any app or agent can use. The base URL has a copy
 control, captioned that any API key works, with a note for the Anthropic path beneath it. An Example
 request toggle pinned right on the note's row, wrapping beneath it in narrow windows, reveals a request for the active or best downloaded model in the
 user's shell. A divided footer links to Settings for network
-access. Network addresses and controls stay in Settings.
+access. Network addresses and controls stay in Settings. Viewed from another device, the card
+describes the server's API at the address the browser used: the caption asks for the Network access
+key, the example request is in the viewer's shell and sends the key as a placeholder Bearer header,
+and the footer points to the key in Settings. Harness rows say they are installed on the computer
+running Magnitude, since connecting one changes that computer's configuration.
 The initializer installs the canonical client-common palette variables; importing Tailwind alone
 does not initialize that palette. Native window appearance follows the same selected preference. macOS integrates native traffic
 lights beside the collapse toggle in the sidebar’s top row, with branding below and no separate title bar. The sidebar border and main content extend to the window’s top edge. Collapsing slides the sidebar fully away while retaining the native controls and a background-free expand toggle. Content keeps the same width in both states and is centered in the remaining area; closing the sidebar adds margins instead of reflowing content. Reduced-motion settings disable the transition, and hidden navigation is inert. The toggle is pinned to the sidebar’s right edge when expanded and uses the same sidebar icon in both states. Windows integrates native caption controls

@@ -3,7 +3,7 @@ title: "Network access"
 description: "Connect to Magnitude over your network or an SSH tunnel."
 ---
 
-By default the API is available only on the computer running Magnitude. Network access makes it available to other devices for inference. The app and model management stay on this computer.
+By default the API is available only on the computer running Magnitude. Network access makes it available to other devices for inference, and lets you open the Magnitude app in a browser on another device.
 
 For a complete server setup, see [Remote server](/remote-server).
 
@@ -30,6 +30,17 @@ Without Desktop, use the [configuration example](/remote-server#configure-networ
 
 Select that address in Settings or use it as `network.bind`. Use `http://ADDRESS:10100/inference/v1` as the base URL. A private network can make the server reachable when you are away from home.
 
+## Open the app from another device
+
+With network access on, open `http://ADDRESS:10100` in a browser on the other device, using the same address as the base URL. Sign in with the **API key**. The app works as it does on the server: download and load models, connect agents installed on the server, and change Settings.
+
+- A browser stays signed in until it goes 30 days unused. **Settings → This browser → Sign out** ends it sooner.
+- Restarting Magnitude signs every browser out. Changes to network settings apply when Magnitude restarts, so a regenerated key also takes effect then.
+- Turning network access off, regenerating the key, changing the address, or restarting from that browser asks first, because it disconnects the browser.
+- After five wrong keys, each further attempt waits longer, up to one minute.
+
+The connection is plain HTTP. Use it on a network you trust or a private network such as Tailscale, or put an HTTPS reverse proxy in front of Magnitude and add its name to [`network.allowedHosts`](#custom-hostnames).
+
 ## SSH tunnel
 
 Keep Magnitude running on the server. On your own computer, run:
@@ -38,7 +49,7 @@ Keep Magnitude running on the server. On your own computer, run:
 ssh -N -L 10101:127.0.0.1:10100 user@server
 ```
 
-Use `http://127.0.0.1:10101/inference/v1` in your client. SSH forwards that local port to Magnitude on the server. Network access can stay off, and no Magnitude API key is required through the tunnel. If your client requires a key, any value works.
+Use `http://127.0.0.1:10101/inference/v1` in your client. SSH forwards that local port to Magnitude on the server. Network access can stay off, and no Magnitude API key is required through the tunnel. If your client requires a key, any value works. Through the tunnel, `http://127.0.0.1:10101` also opens the app without signing in, because Magnitude sees the connection as coming from the server itself.
 
 Keep the tunnel running while using inference. You must be able to reach the server over SSH, for example through your local network or Tailscale.
 
@@ -88,5 +99,6 @@ Magnitude accepts requests addressed to its IP addresses, `localhost`, `host.doc
 | Connection refused | Network access is off, Magnitude is not running, or the chosen address does not include the network you are on. |
 | Connection timed out | Check that the server is reachable and its firewall allows TCP port `10100`. |
 | `401` | The request did not include the API key, or the key changed. Check the key in Settings or the server configuration. |
-| `403` on `/rpc` | Application control is never available from other devices. Only inference is. |
+| Sign in says no key is set | Network access has no API key. On the server, choose **Regenerate** in Settings, or set `network.apiKey`, then restart Magnitude. |
+| Asked to sign in again | Magnitude restarted, or this browser went 30 days unused. |
 | `421 Invalid Host header` | The request used a hostname Magnitude does not accept. Use an IP address or add the name to `network.allowedHosts`. |

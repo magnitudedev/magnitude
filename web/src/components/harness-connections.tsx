@@ -31,15 +31,16 @@ type Props = {
   models: readonly CommandModel[]
   defaultModel: ProviderModelId | undefined
   platform: string
+  remote?: boolean
   onDisconnect: (id: HarnessId) => void
 }
 
-export function HarnessConnections({ connections, busy, canConnect, onConnect, onDisconnect, models, defaultModel, platform }: Props) {
+export function HarnessConnections({ connections, busy, canConnect, onConnect, onDisconnect, models, defaultModel, platform, remote = false }: Props) {
   return <TooltipProvider><div className="mt-7 space-y-8">{[true, false].map(installed => {
     const rows = connections.filter(row => row.installed === installed)
       .sort((a, b) => Number(b.inspection._tag === "Connected") - Number(a.inspection._tag === "Connected"))
     if (rows.length === 0) return null
-    const title = installed ? "Installed on your machine" : "Not installed"
+    const title = installed ? remote ? "Installed on the computer running Magnitude" : "Installed on your machine" : "Not installed"
     return <section key={title} aria-label={title}>
       <h2 className="mb-4 text-sm font-medium text-slate-500">{title}</h2>
       <div className={pageLayout.harnessGrid}>{rows.map(row => {

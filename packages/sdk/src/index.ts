@@ -1,6 +1,7 @@
 export { MagnitudeClient, ConnectionStateSchema, ServiceInfoSchema, type MagnitudeClientError, type MagnitudeConnection, type ConnectionState, type ServiceInfo } from "./client"
 export { MagnitudeServiceStarter } from "./service-starter"
 export * from "./connection-errors"
+export { readRemoteAccess, signInRemotely, signOutRemotely } from "./remote-access"
 export * from "./inference-progress"
 export {
   makeInferenceClient,

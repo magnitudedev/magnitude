@@ -36,15 +36,19 @@ The folder must be on a volume that supports symbolic links and file permissions
 
 ## Network access
 
-Off by default. When on, other devices can use Magnitude for inference. Nothing else is exposed: model management and the app stay on this computer.
+Off by default. When on, other devices can use Magnitude for inference, and a browser on another device can open this app after signing in with the API key.
 
 | Setting | Meaning |
 | --- | --- |
 | Address | **All interfaces** accepts connections on every address this computer has. Choosing one address, such as a Tailscale address, accepts connections only on that network. |
-| API key | Generated once. Other devices send it with every request. Turn off **Require key** only on a network you trust. **Regenerate** replaces it. |
+| API key | Generated once. Other devices send it with every request and sign in to the app with it. Turn off **Require key** only on a network you trust; the app always requires it. **Regenerate** replaces it. |
 | Reachable at | The base URL to use on other devices. |
 
-These settings also apply to `magnitude serve`. Changes apply after Magnitude restarts. For how to connect from another computer, a tailnet, a container, or WSL, see [Network access](/api/network-access).
+These settings also apply to `magnitude serve`. Changes apply after Magnitude restarts, which also signs out browsers on other devices.
+
+## This browser
+
+Appears only when the app is open in a browser on another device. **Sign out** ends this browser's session. For how to connect from another computer, a tailnet, a container, or WSL, see [Network access](/api/network-access).
 
 ## Automatic updates
 
