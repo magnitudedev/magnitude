@@ -6,7 +6,9 @@
 // online-softmax absorb (dense and corrected affine), the fixed-order merge of
 // partial states, the decode partition publication and gated merge, the K/V
 // append, the affine codec (encode on append, per-lane code access) and the
-// prefill bodies. Each kernel keeps its own loop structure and calls these.
+// prefill bodies (on simdgroup matrices, or on Metal 4 tensor operations where
+// the device has them and the tile fits). Each kernel keeps its own loop
+// structure and calls these.
 //
 // Every entry defines its form before including this library: ATTENTION_I
 // interleaved gate columns after each query head's W columns (0 or W),
@@ -924,41 +926,570 @@ inline void prefill_prepare(History history, device const Scalar *query,
     history.append(destination, uint(kv_head), lane, x, v);
 }
 
-// L2: threadgroup (QT-row tile, kv head, key partition). Simdgroup s owns 8
-// rows: tokens tile * QT + (s % (QT / 8)) * 8 + [0, 8) of query head
-// kv * G + s / (QT / 8). The tile's key tiles (each span's union interval in
+// The per-simdgroup arithmetic of one L2 output window: 8 query rows of one
+// head against each staged key tile, the online softmax in the exp2 domain,
+// and the F32 output from activation-dtype probabilities. `scores` forms a
+// key tile's probabilities and rescales the output (K staged); `accumulate`
+// adds their product with the staged V; `store` publishes the window.
+struct prefill_rows {
+    device const int *visible;
+    device const int *fresh;
+    ulong R;
+    ulong index;
+    bool historical;
+    // The [lo, hi) key bounds of token `token` in this span.
+    inline int2 at(ulong token) const {
+        device const int *bounds = historical ? visible + (token * R + index) * 2 : fresh + token * 2;
+        return int2(bounds[0], bounds[1]);
+    }
+};
+
+// The fragment form: lane (fm, fn) holds row fm, columns fn, fn + 1 of every
+// 8x8 fragment; each row's statistics are replicated over its lanes. The
+// state is one `prefill_fragments` value.
+template <uint QT, class History>
+struct prefill_fragments {
+    typedef typename History::Operand Operand;
+    static constant constexpr uint ROWS = 8;
+    static constant constexpr uint W = ATTENTION_W;
+    static constant constexpr uint KEYS = PREFILL_KEYS;
+    static constant constexpr uint DB = W / 8;
+    static constant constexpr uint KB = KEYS / 8;
+    static constant constexpr uint WINDOW = W < PREFILL_WINDOW ? W : PREFILL_WINDOW;
+    static constant constexpr uint WB = WINDOW / 8;
+    static constant constexpr uint PITCH = PREFILL_PITCH;
+    uint fm, fn;
+    simdgroup_matrix<float, 8, 8> output[WB];
+    simdgroup_matrix<Operand, 8, 8> probabilities[KB];
+    float maximum;
+    float denominator;
+
+    prefill_fragments(uint lane) {
+        const uint quad = lane / 4;
+        fm = (quad & 4) + ((lane / 2) % 4);
+        fn = (quad & 2) * 2 + (lane % 2) * 2;
+    }
+
+    static inline void reset(thread prefill_fragments &self) {
+        ATTENTION_UNROLL
+        for (uint d = 0; d < WB; ++d)
+            self.output[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        self.maximum = -INFINITY;
+        self.denominator = 0.0f;
+    }
+
+    static inline void scores(device const Operand *query_rows, threadgroup const Operand *staged, int first,
+        bool common, prefill_rows rows, ulong first_token, ulong M, float scale, thread prefill_fragments &self) {
+        const ulong token = first_token + self.fm;
+        simdgroup_matrix<float, 8, 8> scores[KB];
+        ATTENTION_UNROLL
+        for (uint j = 0; j < KB; ++j)
+            scores[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        ATTENTION_UNROLL
+        for (uint d = 0; d < DB; ++d) {
+            simdgroup_matrix<Operand, 8, 8> q;
+            simdgroup_load(q, query_rows + d * 8, SEISMIC_DIM_KV * SEISMIC_DIM_G * W);
+            ATTENTION_UNROLL
+            for (uint j = 0; j < KB; ++j) {
+                simdgroup_matrix<Operand, 8, 8> k;
+                simdgroup_load(k, staged + j * 8 * PITCH + d * 8, PITCH, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(scores[j], q, k, scores[j]);
+            }
+        }
+
+        // Rows' bounds are read only for a tile outside the common
+        // interval, so they hold no registers across the key loop.
+        int row_lo = 0;
+        int row_hi = 0;
+        if (!common && token < M) {
+            const int2 bounds = rows.at(token);
+            row_lo = bounds.x;
+            row_hi = bounds.y;
+        }
+        float tile_maximum = -INFINITY;
+        ATTENTION_UNROLL
+        for (uint j = 0; j < KB; ++j) {
+            ATTENTION_UNROLL
+            for (uint e = 0; e < 2; ++e) {
+                float s = scores[j].thread_elements()[e] * scale;
+                if (!common) {
+                    const int t = first + int(j * 8 + self.fn + e);
+                    if (!(t >= row_lo && t < row_hi))
+                        s = -INFINITY;
+                }
+                scores[j].thread_elements()[e] = s;
+                tile_maximum = metal::max(tile_maximum, s);
+            }
+        }
+        tile_maximum = metal::max(tile_maximum, simd_shuffle_xor(tile_maximum, ushort(1)));
+        tile_maximum = metal::max(tile_maximum, simd_shuffle_xor(tile_maximum, ushort(8)));
+        const float next = metal::max(self.maximum, tile_maximum);
+        const bool seen = next > -INFINITY;
+        const float carry = seen ? metal::fast::exp2(self.maximum - next) : 1.0f;
+        // Probabilities enter the PV product as operands; the
+        // denominator sums them in F32.
+        float tile_sum = 0.0f;
+        ATTENTION_UNROLL
+        for (uint j = 0; j < KB; ++j) {
+            ATTENTION_UNROLL
+            for (uint e = 0; e < 2; ++e) {
+                const float p = seen ? metal::fast::exp2(scores[j].thread_elements()[e] - next) : 0.0f;
+                self.probabilities[j].thread_elements()[e] = Operand(p);
+                tile_sum += p;
+            }
+        }
+        tile_sum += simd_shuffle_xor(tile_sum, ushort(1));
+        tile_sum += simd_shuffle_xor(tile_sum, ushort(8));
+        self.denominator = metal::fma(self.denominator, carry, tile_sum);
+        self.maximum = next;
+        ATTENTION_UNROLL
+        for (uint d = 0; d < WB; ++d) {
+            self.output[d].thread_elements()[0] *= carry;
+            self.output[d].thread_elements()[1] *= carry;
+        }
+    }
+
+    static inline void accumulate(threadgroup const Operand *staged, uint window_first,
+        thread prefill_fragments &self) {
+        ATTENTION_UNROLL
+        for (uint d = 0; d < WB; ++d) {
+            ATTENTION_UNROLL
+            for (uint j = 0; j < KB; ++j) {
+                simdgroup_matrix<Operand, 8, 8> v;
+                simdgroup_load(v, staged + j * 8 * PITCH + window_first + d * 8, PITCH);
+                simdgroup_multiply_accumulate(self.output[d], self.probabilities[j], v, self.output[d]);
+            }
+        }
+    }
+
+    // A split tile stores (partial output, maximum, denominator) per row and
+    // partition; an unsplit one its gated output.
+    static inline void store(device const Scalar *query, device const Scalar *gate, device Scalar *result,
+        device float *partials, device float *statistics, ulong first_token, ulong M, uint head, uint partition,
+        uint active, uint window_first, bool softplus, thread prefill_fragments &self) {
+        constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
+        const ulong token = first_token + self.fm;
+        if (token >= M)
+            return;
+        if (active > 1) {
+            const ulong slot = (ulong(partition) * M + token) * H + head;
+            ATTENTION_UNROLL
+            for (uint d = 0; d < WB; ++d)
+                ATTENTION_UNROLL
+                for (uint e = 0; e < 2; ++e)
+                    partials[slot * W + window_first + d * 8 + self.fn + e] = self.output[d].thread_elements()[e];
+            if (self.fn == 0) {
+                statistics[slot * 2] = self.maximum;
+                statistics[slot * 2 + 1] = self.denominator;
+            }
+            return;
+        }
+        const float inverse = 1.0f / metal::max(self.denominator, 1e-30f);
+        ATTENTION_UNROLL
+        for (uint d = 0; d < WB; ++d) {
+            ATTENTION_UNROLL
+            for (uint e = 0; e < 2; ++e) {
+                const uint column = window_first + d * 8 + self.fn + e;
+                result[(token * H + head) * W + column] = gate_output(query, gate, token, head, column,
+                    self.output[d].thread_elements()[e] * inverse, softplus);
+            }
+        }
+    }
+};
+
+#if SEISMIC_HAS_TENSOR_OPS
+// The tensor-operation form: the first QT G / 16 simdgroups own 16 rows each
+// (`prefill_owner`) and multiply, while every simdgroup stages. Per key tile:
+// computing simdgroups form S = Q K^T (`matmul2d`, execution_simdgroup scope)
+// from the staged K; after a threadgroup barrier (no simdgroup still reads K)
+// each stores S over the K tile, ROWS x KEYS floats per simdgroup, where
+// lanes own rows (2 lanes per row, KEYS / 2 columns each, as the fragment
+// form's lanes do) for the online softmax; the operand-rounded probabilities go to
+// the simdgroup's `exchange` slot as the P V left operand, and once V is
+// staged (over K) the output accumulates P V. The output is a cooperative
+// tensor; per-row carries and inverses reach its rows through the slot's 16
+// row floats. The form applies when 16 <= QT and every S fits over the tile
+// (QT G F32 rows within a tile row's bytes).
+constexpr bool prefill_tensors_fit(uint QT) {
+    return QT >= 16 && QT * SEISMIC_DIM_G * 4 <= PREFILL_PITCH * 2;
+}
+
+template <uint QT, class History>
+struct prefill_tensors {
+    typedef typename History::Operand Operand;
+    static constant constexpr uint ROWS = 16;
+    static constant constexpr uint KEYS = PREFILL_KEYS;
+    static constant constexpr uint W = ATTENTION_W;
+    static constant constexpr uint WINDOW = W < PREFILL_WINDOW ? W : PREFILL_WINDOW;
+    static constant constexpr int32_t PITCH = PREFILL_PITCH;
+    static constant constexpr uint LANES = 32 / ROWS;
+    static constant constexpr uint COLUMNS = KEYS / LANES;
+    static constant constexpr uint THREADS = QT * SEISMIC_DIM_G * 4;
+    // Floats of one simdgroup's exchange slot: P, then one value per row.
+    static constant constexpr uint PUBLISHED = ROWS * KEYS * sizeof(Operand) / 4;
+    static constant constexpr uint EXCHANGE = PUBLISHED + ROWS;
+    typedef metal::extents<int32_t, W, ROWS> q_extents;
+    typedef metal::extents<int32_t, W, KEYS> k_extents;
+    typedef metal::extents<int32_t, WINDOW, KEYS> v_extents;
+    typedef metal::extents<int32_t, KEYS, ROWS> s_extents;
+    typedef metal::tensor<device Operand, q_extents, metal::tensor_inline> q_tensor;
+    typedef metal::tensor<threadgroup Operand, k_extents, metal::tensor_inline> k_tensor;
+    typedef metal::tensor<threadgroup Operand, v_extents, metal::tensor_inline> v_tensor;
+    typedef metal::tensor<threadgroup float, s_extents, metal::tensor_inline> s_tensor;
+    typedef metal::tensor<threadgroup Operand, s_extents, metal::tensor_inline> p_tensor;
+    typedef mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(ROWS, KEYS, W, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        metal::execution_simdgroup> score_op;
+    typedef mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(ROWS, WINDOW, KEYS, false, false, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        metal::execution_simdgroup> output_op;
+    typedef typename output_op::template cooperative_tensor_row_reduction_destination_t<p_tensor, v_tensor, float>
+        output_rows;
+
+    // Each lane's row value (published by the row's first lane) as the
+    // output's row tensor.
+    static inline output_rows load_rows(threadgroup float *exchange, uint lane, float value) {
+        threadgroup float *published = exchange + PUBLISHED;
+        if (lane % LANES == 0)
+            published[lane / LANES] = value;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        output_op op;
+        output_rows rows = op.template get_row_reduction_destination_cooperative_tensor<p_tensor, v_tensor, float>();
+        ATTENTION_UNROLL
+        for (uint16_t i = 0; i < rows.get_capacity(); ++i)
+            if (rows.is_valid_element(i))
+                rows[i] = published[rows.get_multidimensional_index(i)[0]];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        return rows;
+    }
+
+    static inline void windows(History history, device const Scalar *query, device const Scalar *gate,
+        device const int *visible, device const int *fresh, device Scalar *result, device const Operand *keys,
+        device const Operand *values, device float *partials, device float *statistics, ulong M, ulong R,
+        float scale, bool softplus, threadgroup Operand *staged, threadgroup const prefill_interval *intervals,
+        threadgroup float *exchange, uint kv_head, uint partition, uint active, uint tiles_lo, uint tiles_hi,
+        device const Operand *query_rows, uint head, ulong first_token, bool computes, uint owner,
+        uint thread_index, uint lane) {
+        constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
+        q_tensor q(const_cast<device Operand *>(query_rows), q_extents(),
+            metal::array<int32_t, 2>{1, int32_t(H * W)});
+        k_tensor k(staged, k_extents(), metal::array<int32_t, 2>{1, PITCH});
+        threadgroup float *slot = reinterpret_cast<threadgroup float *>(staged) + owner * ROWS * KEYS;
+        s_tensor s(slot, s_extents(), metal::array<int32_t, 2>{1, int32_t(KEYS)});
+        threadgroup Operand *probabilities = reinterpret_cast<threadgroup Operand *>(exchange);
+        p_tensor p(probabilities, s_extents(), metal::array<int32_t, 2>{1, int32_t(KEYS)});
+        score_op score;
+        output_op product;
+        auto scores = score.template get_destination_cooperative_tensor<q_tensor, k_tensor, float>();
+        auto output = product.template get_destination_cooperative_tensor<p_tensor, v_tensor, float>();
+        const uint row = lane / LANES;
+        const uint column0 = (lane % LANES) * COLUMNS;
+        const ulong token = first_token + row;
+        for (uint window = 0; window < W / WINDOW; ++window) {
+            const uint window_first = window * WINDOW;
+            v_tensor v(staged + window_first, v_extents(), metal::array<int32_t, 2>{1, PITCH});
+            ATTENTION_UNROLL
+            for (uint16_t i = 0; i < output.get_capacity(); ++i)
+                if (output.is_valid_element(i))
+                    output[i] = 0.0f;
+            float maximum = -INFINITY;
+            float denominator = 0.0f;
+
+            uint tiles_before = 0;
+            for (ulong index = 0; index <= R; ++index) {
+                const prefill_interval interval = intervals[index];
+                if (interval.hi <= interval.lo)
+                    continue;
+                const uint span_tiles = uint(interval.hi - interval.lo + int(KEYS) - 1) / KEYS;
+                const uint span_first = tiles_before;
+                tiles_before += span_tiles;
+                if (span_first + span_tiles <= tiles_lo || span_first >= tiles_hi)
+                    continue;
+                const uint own_lo = metal::max(tiles_lo, span_first) - span_first;
+                const uint own_hi = metal::min(tiles_hi, span_first + span_tiles) - span_first;
+                const bool historical = index < R;
+                const prefill_rows rows{visible, fresh, R, index, historical};
+                for (uint own = own_lo; own < own_hi; ++own) {
+                    const int first = interval.lo + int(own * KEYS);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (historical)
+                        history.template stage_key<THREADS>(staged, first, interval.hi, kv_head, thread_index);
+                    else
+                        prefill_stage<THREADS>(staged, keys, first, interval.hi, kv_head, thread_index);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (computes)
+                        score.run(q, k, scores);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (computes) {
+                        scores.store(s);
+                        simdgroup_barrier(mem_flags::mem_threadgroup);
+                        const bool common = first >= interval.common_lo
+                            && first + int(KEYS) <= interval.common_hi;
+                        // Rows' bounds are read only for a tile outside the
+                        // common interval.
+                        int row_lo = 0;
+                        int row_hi = 0;
+                        if (!common && token < M) {
+                            const int2 bounds = rows.at(token);
+                            row_lo = bounds.x;
+                            row_hi = bounds.y;
+                        }
+                        float x[COLUMNS];
+                        float tile_maximum = -INFINITY;
+                        ATTENTION_UNROLL
+                        for (uint j = 0; j < COLUMNS; ++j) {
+                            float value = slot[row * KEYS + column0 + j] * scale;
+                            if (!common) {
+                                const int t = first + int(column0 + j);
+                                if (!(t >= row_lo && t < row_hi))
+                                    value = -INFINITY;
+                            }
+                            x[j] = value;
+                            tile_maximum = metal::max(tile_maximum, value);
+                        }
+                        ATTENTION_UNROLL
+                        for (ushort offset = 1; offset < LANES; offset <<= 1)
+                            tile_maximum = metal::max(tile_maximum, simd_shuffle_xor(tile_maximum, offset));
+                        const float next = metal::max(maximum, tile_maximum);
+                        const bool seen = next > -INFINITY;
+                        const float carry = seen ? metal::fast::exp2(maximum - next) : 1.0f;
+                        // Probabilities enter the PV product as operands; the
+                        // denominator sums them in F32.
+                        float tile_sum = 0.0f;
+                        ATTENTION_UNROLL
+                        for (uint j = 0; j < COLUMNS; ++j) {
+                            const float probability = seen ? metal::fast::exp2(x[j] - next) : 0.0f;
+                            probabilities[row * KEYS + column0 + j] = Operand(probability);
+                            tile_sum += probability;
+                        }
+                        ATTENTION_UNROLL
+                        for (ushort offset = 1; offset < LANES; offset <<= 1)
+                            tile_sum += simd_shuffle_xor(tile_sum, offset);
+                        denominator = metal::fma(denominator, carry, tile_sum);
+                        maximum = next;
+                        // A tile that raises no row's maximum leaves the
+                        // output as is.
+                        if (!simd_all(carry == 1.0f)) {
+                            output_rows carries = load_rows(exchange, lane, carry);
+                            ATTENTION_UNROLL
+                            for (uint16_t i = 0; i < output.get_capacity(); ++i)
+                                if (output.is_valid_element(i))
+                                    output[i] *= *carries.map_iterator(output.get_iterator(i));
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (historical)
+                        history.template stage_value<THREADS>(staged, first, interval.hi, kv_head, thread_index);
+                    else
+                        prefill_stage<THREADS>(staged, values, first, interval.hi, kv_head, thread_index);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (computes)
+                        product.run(p, v, output);
+                }
+            }
+            if (!computes)
+                continue;
+            // A split tile stores (partial output, maximum, denominator) per
+            // row and partition; an unsplit one its gated output.
+            if (active > 1) {
+                if (lane % LANES == 0 && token < M) {
+                    const ulong slot_index = (ulong(partition) * M + token) * H + head;
+                    statistics[slot_index * 2] = maximum;
+                    statistics[slot_index * 2 + 1] = denominator;
+                }
+                ATTENTION_UNROLL
+                for (uint16_t i = 0; i < output.get_capacity(); ++i) {
+                    if (!output.is_valid_element(i))
+                        continue;
+                    const auto index = output.get_multidimensional_index(i);
+                    const ulong row_token = first_token + index[1];
+                    if (row_token < M)
+                        partials[((ulong(partition) * M + row_token) * H + head) * W + window_first + index[0]]
+                            = output[i];
+                }
+                continue;
+            }
+            output_rows inverse = load_rows(exchange, lane, 1.0f / metal::max(denominator, 1e-30f));
+            ATTENTION_UNROLL
+            for (uint16_t i = 0; i < output.get_capacity(); ++i) {
+                if (!output.is_valid_element(i))
+                    continue;
+                const auto index = output.get_multidimensional_index(i);
+                const ulong row_token = first_token + index[1];
+                const uint column = window_first + index[0];
+                if (row_token < M)
+                    result[(row_token * H + head) * W + column] = gate_output(query, gate, row_token, head, column,
+                        output[i] * *inverse.map_iterator(output.get_iterator(i)), softplus);
+            }
+        }
+    }
+};
+
+// The L2 kernel's exchange memory: the tensor form's slot per computing
+// simdgroup (every element type is two bytes), when the form fits.
+#define PREFILL_EXCHANGE(name, QT) \
+    threadgroup float name[attention::prefill_tensors_fit(QT) ? (QT) * SEISMIC_DIM_G / 16 * (16 * PREFILL_KEYS / 2 + 16) : 1]
+#else
+#define PREFILL_EXCHANGE(name, QT) threadgroup float *name = nullptr
+#endif
+
+// The output windows of one simdgroup's rows over its partition's key tiles
+// (L2's loop) on the fragment form. Every simdgroup owns rows, but the
+// arithmetic stays guarded by `computes`: the guarded form measured 1.5x
+// faster on Apple GPU family 10 (the staging and the fragment arithmetic are
+// scheduled apart).
+template <uint QT, class History>
+inline void prefill_windows(History history, device const Scalar *query, device const Scalar *gate,
+    device const int *visible, device const int *fresh, device Scalar *result,
+    device const typename History::Operand *keys, device const typename History::Operand *values,
+    device float *partials, device float *statistics, ulong M, ulong R, float scale, bool softplus,
+    threadgroup typename History::Operand *staged, threadgroup const prefill_interval *intervals,
+    uint kv_head, uint partition, uint active, uint tiles_lo, uint tiles_hi,
+    device const typename History::Operand *query_rows, uint head, ulong first_token, bool computes,
+    uint thread_index, thread prefill_fragments<QT, History> &state) {
+    typedef prefill_fragments<QT, History> Form;
+    constexpr uint W = ATTENTION_W;
+    constexpr uint G = SEISMIC_DIM_G;
+    constexpr uint KEYS = PREFILL_KEYS;
+    constexpr uint THREADS = QT * G * 4;
+    constexpr uint WINDOW = W < PREFILL_WINDOW ? W : PREFILL_WINDOW;
+    for (uint window = 0; window < W / WINDOW; ++window) {
+        const uint window_first = window * WINDOW;
+        if (computes)
+            Form::reset(state);
+
+        uint tiles_before = 0;
+        for (ulong index = 0; index <= R; ++index) {
+            const prefill_interval interval = intervals[index];
+            if (interval.hi <= interval.lo)
+                continue;
+            const uint span_tiles = uint(interval.hi - interval.lo + int(KEYS) - 1) / KEYS;
+            const uint span_first = tiles_before;
+            tiles_before += span_tiles;
+            if (span_first + span_tiles <= tiles_lo || span_first >= tiles_hi)
+                continue;
+            const uint own_lo = metal::max(tiles_lo, span_first) - span_first;
+            const uint own_hi = metal::min(tiles_hi, span_first + span_tiles) - span_first;
+            const bool historical = index < R;
+            const prefill_rows rows{visible, fresh, R, index, historical};
+            for (uint own = own_lo; own < own_hi; ++own) {
+                const int first = interval.lo + int(own * KEYS);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (historical)
+                    history.template stage_key<THREADS>(staged, first, interval.hi, kv_head, thread_index);
+                else
+                    prefill_stage<THREADS>(staged, keys, first, interval.hi, kv_head, thread_index);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const bool common = first >= interval.common_lo
+                    && first + int(KEYS) <= interval.common_hi;
+                if (computes)
+                    Form::scores(query_rows, staged, first, common, rows, first_token, M, scale, state);
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (historical)
+                    history.template stage_value<THREADS>(staged, first, interval.hi, kv_head, thread_index);
+                else
+                    prefill_stage<THREADS>(staged, values, first, interval.hi, kv_head, thread_index);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (computes)
+                    Form::accumulate(staged, window_first, state);
+            }
+        }
+
+        // Invalid rows keep running the later windows' barriers.
+        if (computes)
+            Form::store(query, gate, result, partials, statistics, first_token, M, head, partition, active,
+                window_first, softplus, state);
+    }
+}
+
+// The rows a simdgroup owns in a form of ROWS rows per simdgroup: simdgroup
+// s < QT G / ROWS owns rows tile * QT + (s % SPAN) * ROWS .. of query head
+// kv * G + s / SPAN (SPAN = QT / ROWS); the others only stage.
+template <uint QT, uint ROWS>
+struct prefill_owner {
+    bool computes;
+    uint owner;
+    uint head;
+    ulong first_token;
+    prefill_owner(uint tile, uint kv_head, uint simd) {
+        constexpr uint SPAN = QT / ROWS;
+        computes = simd < QT * SEISMIC_DIM_G / ROWS;
+        owner = computes ? simd : 0;
+        head = kv_head * SEISMIC_DIM_G + owner / SPAN;
+        first_token = ulong(tile) * QT + (owner % SPAN) * ROWS;
+    }
+};
+
+// L2's arguments shared by both forms' entries.
+#define PREFILL_OWNED_PARAMETERS                                                                          \
+    History history, device const Scalar *query, device const Scalar *gate, device const int *visible,     \
+    device const int *fresh, device Scalar *result, device const typename History::Operand *queries,       \
+    device const typename History::Operand *keys, device const typename History::Operand *values,          \
+    device float *partials, device float *statistics, ulong M, ulong R, float scale, bool softplus,        \
+    threadgroup typename History::Operand *staged, threadgroup const prefill_interval *intervals,          \
+    threadgroup float *exchange, uint tile, uint kv_head, uint partition, uint active, uint tiles_lo,      \
+    uint tiles_hi, uint thread_index, uint simd, uint lane
+#define PREFILL_OWNED_ARGUMENTS                                                                           \
+    history, query, gate, visible, fresh, result, queries, keys, values, partials, statistics, M, R, scale, \
+    softplus, staged, intervals, exchange, tile, kv_head, partition, active, tiles_lo, tiles_hi,           \
+    thread_index, simd, lane
+
+template <uint QT, class History>
+inline void prefill_owned_fragments(PREFILL_OWNED_PARAMETERS) {
+    typedef prefill_fragments<QT, History> Form;
+    const prefill_owner<QT, Form::ROWS> own(tile, kv_head, simd);
+    Form state(lane);
+    prefill_windows<QT, History>(history, query, gate, visible, fresh, result, keys, values, partials,
+        statistics, M, R, scale, softplus, staged, intervals, kv_head, partition, active, tiles_lo, tiles_hi,
+        queries + (own.first_token * SEISMIC_DIM_KV * SEISMIC_DIM_G + own.head) * ATTENTION_W, own.head,
+        own.first_token, own.computes, thread_index, state);
+}
+
+#if SEISMIC_HAS_TENSOR_OPS
+template <uint QT, class History>
+inline void prefill_owned_tensors(PREFILL_OWNED_PARAMETERS) {
+    typedef prefill_tensors<QT, History> Form;
+    const prefill_owner<QT, Form::ROWS> own(tile, kv_head, simd);
+    Form::windows(history, query, gate, visible, fresh, result, keys, values, partials, statistics, M, R, scale,
+        softplus, staged, intervals, exchange + own.owner * Form::EXCHANGE, kv_head, partition, active, tiles_lo,
+        tiles_hi, queries + (own.first_token * SEISMIC_DIM_KV * SEISMIC_DIM_G + own.head) * ATTENTION_W, own.head,
+        own.first_token, own.computes, own.owner, thread_index, lane);
+}
+#endif
+
+// L2: threadgroup (QT-row tile, kv head, key partition). A simdgroup owns
+// ROWS rows of one query head (8 in the fragment form, every simdgroup; 16 in
+// the tensor form, the first half of the simdgroups). The tile's key tiles (each span's union interval in
 // PREFILL_KEYS steps, spans then fresh) split into consecutive runs of at
 // least PREFILL_MIN_TILES over the partitions. Per key tile: K staged
 // (history through the policy, fresh rows from scratch), scores = Q K^T with
-// Q's 8x8 fragments read from scratch (L1-resident; holding them in
-// registers costs more occupancy than the loads), scaled into the exp2
-// domain in F32, the online softmax, then V staged (aliasing K) and the F32
-// output accumulated from activation-dtype probabilities. A head wider than
-// PREFILL_WINDOW repeats this per output window. Every fragment
-// array is fully unrolled so it stays in registers. Query tiles dispatch
-// last-first. A tile served by one partition stores its gated output
-// directly; otherwise each partition stores (partial output, maximum,
-// denominator) and the merge launch combines them. Operands (queries, staged
-// tiles, probabilities) are the history policy's.
+// Q read from scratch (L1-resident; holding it in registers costs more
+// occupancy than the loads), scaled into the exp2 domain in F32, the online
+// softmax, then V staged (aliasing K) and the F32 output accumulated from
+// activation-dtype probabilities (`prefill_windows`, on the fragment or the
+// tensor-operation form). A head wider than PREFILL_WINDOW repeats this per
+// output window. Query tiles dispatch last-first. A tile served by one
+// partition stores its gated output directly; otherwise each partition
+// stores (partial output, maximum, denominator) and the merge launch
+// combines them. Operands (queries, staged tiles, probabilities) are the
+// history policy's. `exchange` is PREFILL_EXCHANGE memory.
 template <uint QT, class History>
 inline void prefill_attend(History history, device const Scalar *query, device const Scalar *gate,
     device const int *visible, device const int *fresh, device Scalar *result,
     device const typename History::Operand *queries, device const typename History::Operand *keys,
     device const typename History::Operand *values, device float *partials,
     device float *statistics, device uint *counts, ulong M, ulong R, float scale, bool softplus,
-    threadgroup uchar *shared, uint3 group, uint3 groups, uint thread_index, uint simd, uint lane) {
+    threadgroup uchar *shared, threadgroup float *exchange, uint3 group, uint3 groups, uint thread_index,
+    uint simd, uint lane) {
     typedef typename History::Operand Operand;
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
     constexpr uint G = SEISMIC_DIM_G;
     constexpr uint KEYS = PREFILL_KEYS;
-    constexpr uint BLOCKS = QT / 8;
-    constexpr uint THREADS = QT * G * 4;
-    constexpr uint PITCH = PREFILL_PITCH;
-    constexpr uint DB = W / 8;
-    constexpr uint KB = KEYS / 8;
     constexpr uint WINDOW = W < PREFILL_WINDOW ? W : PREFILL_WINDOW;
-    constexpr uint WB = WINDOW / 8;
     static_assert(W % WINDOW == 0, "output windows tile the head");
     static_assert(QT % 8 == 0 && QT <= 32, "query tiles are 8-row blocks within one simdgroup's lanes");
     // Query tiles dispatch last-first: in a causal chunk the last tiles see
@@ -968,7 +1499,7 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     const uint partition = group.z;
     threadgroup Operand *staged = reinterpret_cast<threadgroup Operand *>(shared);
     threadgroup prefill_interval *intervals = reinterpret_cast<threadgroup prefill_interval *>(
-        shared + KEYS * PITCH * sizeof(Operand));
+        shared + KEYS * PREFILL_PITCH * sizeof(Operand));
 
     if (simd == 0) {
         const ulong tile_row = ulong(tile) * QT + lane;
@@ -1006,162 +1537,13 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     const uint tiles_lo = partition * per;
     const uint tiles_hi = metal::min(tiles_lo + per, total_tiles);
 
-    // Fragment coordinates: this lane holds row `fm`, columns `fn`, `fn + 1`.
-    const uint quad = lane / 4;
-    const uint fm = (quad & 4) + ((lane / 2) % 4);
-    const uint fn = (quad & 2) * 2 + (lane % 2) * 2;
-    const uint head = kv_head * G + simd / BLOCKS;
-    const ulong first_token = ulong(tile) * QT + (simd % BLOCKS) * 8;
-    const ulong token = first_token + fm;
-    const bool valid = token < M;
-    device const Operand *query_rows = queries + (first_token * KV * G + head) * W;
-
-    for (uint window = 0; window < W / WINDOW; ++window) {
-        const uint window_first = window * WINDOW;
-        simdgroup_matrix<float, 8, 8> output[WB];
-        ATTENTION_UNROLL
-        for (uint d = 0; d < WB; ++d)
-            output[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-        float maximum = -INFINITY;
-        float denominator = 0.0f;
-
-        uint tiles_before = 0;
-        for (ulong index = 0; index <= R; ++index) {
-            const prefill_interval interval = intervals[index];
-            if (interval.hi <= interval.lo)
-                continue;
-            const uint span_tiles = uint(interval.hi - interval.lo + int(KEYS) - 1) / KEYS;
-            const uint span_first = tiles_before;
-            tiles_before += span_tiles;
-            if (span_first + span_tiles <= tiles_lo || span_first >= tiles_hi)
-                continue;
-            const uint own_lo = metal::max(tiles_lo, span_first) - span_first;
-            const uint own_hi = metal::min(tiles_hi, span_first + span_tiles) - span_first;
-            const bool historical = index < R;
-            device const int *bounds = historical ? visible + (token * R + index) * 2 : fresh + token * 2;
-            for (uint own = own_lo; own < own_hi; ++own) {
-                const int first = interval.lo + int(own * KEYS);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (historical)
-                    history.template stage_key<THREADS>(staged, first, interval.hi, kv_head, thread_index);
-                else
-                    prefill_stage<THREADS>(staged, keys, first, interval.hi, kv_head, thread_index);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                simdgroup_matrix<float, 8, 8> scores[KB];
-                ATTENTION_UNROLL
-                for (uint j = 0; j < KB; ++j)
-                    scores[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                ATTENTION_UNROLL
-                for (uint d = 0; d < DB; ++d) {
-                    simdgroup_matrix<Operand, 8, 8> q;
-                    simdgroup_load(q, query_rows + d * 8, KV * G * W);
-                    ATTENTION_UNROLL
-                    for (uint j = 0; j < KB; ++j) {
-                        simdgroup_matrix<Operand, 8, 8> k;
-                        simdgroup_load(k, staged + j * 8 * PITCH + d * 8, PITCH, ulong2(0, 0), true);
-                        simdgroup_multiply_accumulate(scores[j], q, k, scores[j]);
-                    }
-                }
-
-                // Rows' bounds are read only for a tile outside the common
-                // interval, so they hold no registers across the key loop.
-                const bool common = first >= interval.common_lo
-                    && first + int(KEYS) <= interval.common_hi;
-                int row_lo = 0;
-                int row_hi = 0;
-                if (!common && valid) {
-                    row_lo = bounds[0];
-                    row_hi = bounds[1];
-                }
-                float tile_maximum = -INFINITY;
-                ATTENTION_UNROLL
-                for (uint j = 0; j < KB; ++j) {
-                    ATTENTION_UNROLL
-                    for (uint e = 0; e < 2; ++e) {
-                        float s = scores[j].thread_elements()[e] * scale;
-                        if (!common) {
-                            const int t = first + int(j * 8 + fn + e);
-                            if (!(t >= row_lo && t < row_hi))
-                                s = -INFINITY;
-                        }
-                        scores[j].thread_elements()[e] = s;
-                        tile_maximum = metal::max(tile_maximum, s);
-                    }
-                }
-                tile_maximum = metal::max(tile_maximum, simd_shuffle_xor(tile_maximum, ushort(1)));
-                tile_maximum = metal::max(tile_maximum, simd_shuffle_xor(tile_maximum, ushort(8)));
-                const float next = metal::max(maximum, tile_maximum);
-                const bool seen = next > -INFINITY;
-                const float carry = seen ? metal::fast::exp2(maximum - next) : 1.0f;
-                // Probabilities enter the PV product as operands; the
-                // denominator sums them in F32.
-                simdgroup_matrix<Operand, 8, 8> probabilities[KB];
-                float tile_sum = 0.0f;
-                ATTENTION_UNROLL
-                for (uint j = 0; j < KB; ++j) {
-                    ATTENTION_UNROLL
-                    for (uint e = 0; e < 2; ++e) {
-                        const float p = seen ? metal::fast::exp2(scores[j].thread_elements()[e] - next) : 0.0f;
-                        probabilities[j].thread_elements()[e] = Operand(p);
-                        tile_sum += p;
-                    }
-                }
-                tile_sum += simd_shuffle_xor(tile_sum, ushort(1));
-                tile_sum += simd_shuffle_xor(tile_sum, ushort(8));
-                denominator = metal::fma(denominator, carry, tile_sum);
-                maximum = next;
-                ATTENTION_UNROLL
-                for (uint d = 0; d < WB; ++d) {
-                    output[d].thread_elements()[0] *= carry;
-                    output[d].thread_elements()[1] *= carry;
-                }
-
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (historical)
-                    history.template stage_value<THREADS>(staged, first, interval.hi, kv_head, thread_index);
-                else
-                    prefill_stage<THREADS>(staged, values, first, interval.hi, kv_head, thread_index);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                ATTENTION_UNROLL
-                for (uint d = 0; d < WB; ++d) {
-                    ATTENTION_UNROLL
-                    for (uint j = 0; j < KB; ++j) {
-                        simdgroup_matrix<Operand, 8, 8> v;
-                        simdgroup_load(v, staged + j * 8 * PITCH + window_first + d * 8, PITCH);
-                        simdgroup_multiply_accumulate(output[d], probabilities[j], v, output[d]);
-                    }
-                }
-            }
-        }
-
-        // Invalid rows keep running the later windows' barriers.
-        if (!valid)
-            continue;
-        if (active > 1) {
-            const ulong slot = (ulong(partition) * M + token) * (KV * G) + head;
-            ATTENTION_UNROLL
-            for (uint d = 0; d < WB; ++d)
-                ATTENTION_UNROLL
-                for (uint e = 0; e < 2; ++e)
-                    partials[slot * W + window_first + d * 8 + fn + e] = output[d].thread_elements()[e];
-            if (fn == 0) {
-                statistics[slot * 2] = maximum;
-                statistics[slot * 2 + 1] = denominator;
-            }
-            continue;
-        }
-        const float inverse = 1.0f / metal::max(denominator, 1e-30f);
-        ATTENTION_UNROLL
-        for (uint d = 0; d < WB; ++d) {
-            ATTENTION_UNROLL
-            for (uint e = 0; e < 2; ++e) {
-                const uint column = window_first + d * 8 + fn + e;
-                result[(token * KV * G + head) * W + column] = gate_output(query, gate, token, head, column,
-                    output[d].thread_elements()[e] * inverse, softplus);
-            }
-        }
-    }
+    // The tensor form where its rows fit, else the fragment form.
+#if SEISMIC_HAS_TENSOR_OPS
+    if constexpr (prefill_tensors_fit(QT))
+        prefill_owned_tensors<QT, History>(PREFILL_OWNED_ARGUMENTS);
+    else
+#endif
+        prefill_owned_fragments<QT, History>(PREFILL_OWNED_ARGUMENTS);
 }
 
 // L3: threadgroup (QT-row tile, query head), one thread per column. A tile

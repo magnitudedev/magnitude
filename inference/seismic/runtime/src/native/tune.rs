@@ -2806,7 +2806,7 @@ pub fn implementation_digest(
             None
         }
         #[cfg(target_os = "macos")]
-        crate::backends::OpenedKind::Metal(_) => Some(super::abi::Dialect::Metal),
+        crate::backends::OpenedKind::Metal(opened) => Some(super::metal_dialect(opened)),
         crate::backends::OpenedKind::Cuda(_) => Some(super::abi::Dialect::Cuda),
         #[cfg(not(target_os = "macos"))]
         crate::backends::OpenedKind::Vulkan(opened) => {

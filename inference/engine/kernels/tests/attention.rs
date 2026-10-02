@@ -887,7 +887,7 @@ fn prefill_timing_on(device: &Device) {
             .sum::<f64>();
         let flop = pairs * (QWEN.kv * QWEN.g * QWEN.w() * 4) as f64;
         let case = Case::new(QWEN, history as usize + rows.len(), 1, &rows, 9);
-        let configs = [(16, 1), (16, 128), (16, 256), (16, 512), (8, 1), (8, 256)];
+        let configs = [(16, 1), (16, 128), (16, 256), (16, 512), (8, 1), (8, 256), (32, 1), (32, 256), (32, 512)];
         for (config, specialization) in prefill_specializations_on(device, QWEN, &configs) {
             let kernel = prefill_kernel(device, &specialization);
             let mut bound = Bound::new(device, &case);

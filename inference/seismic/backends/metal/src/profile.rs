@@ -111,6 +111,8 @@ fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, Tar
         bfloat_arithmetic: probe_bfloat_arithmetic(raw, language),
         matrix_dtypes: probe_matrix_dtypes(raw, language),
         matrix_combinations: probe_matrix_combinations(raw, language),
+        tensor_ops: raw.supportsFamily(MTLGPUFamily::Apple10)
+            && probe_tensor_ops(raw, language),
         argument_table_entries: ARGUMENT_TABLE_ENTRIES,
         reserved_argument_entries: RESERVED_ARGUMENT_ENTRIES,
         backend_revision: BACKEND_REVISION,
@@ -642,6 +644,30 @@ fn probe_matrix_combinations(
         }
     }
     combinations
+}
+
+/// Whether a `matmul2d` over a device and a threadgroup tensor into a
+/// cooperative F32 destination forms a pipeline: the tensor-operation
+/// facilities native sources use under `SEISMIC_HAS_TENSOR_OPS`.
+fn probe_tensor_ops(device: &ProtocolObject<dyn MTLDevice>, language: LanguageVersion) -> bool {
+    language >= LanguageVersion::V4_0
+        && probe_pipeline(
+            device,
+            language,
+            "seismic_tensor_probe",
+            "#include <metal_tensor>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n\
+             kernel void seismic_tensor_probe(device bfloat* a [[buffer(0)]], device float* c [[buffer(1)]], uint t [[thread_index_in_threadgroup]]) { \
+             threadgroup half b[256]; b[t % 256] = half(t); threadgroup_barrier(mem_flags::mem_threadgroup); \
+             auto ta = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(a, dextents<int32_t, 2>(16, 16)); \
+             auto tb = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(b, dextents<int32_t, 2>(16, 16)); \
+             auto tc = tensor<device float, dextents<int32_t, 2>, tensor_inline>(c, dextents<int32_t, 2>(16, 16)); \
+             constexpr auto d = mpp::tensor_ops::matmul2d_descriptor(16, 16, 16, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate); \
+             mpp::tensor_ops::matmul2d<d, execution_simdgroups<1>> op; \
+             auto acc = op.get_destination_cooperative_tensor<decltype(ta), decltype(tb), float>(); \
+             for (uint16_t i = 0; i < acc.get_capacity(); ++i) if (acc.is_valid_element(i)) acc[i] = 0.0f; \
+             op.run(ta, tb, acc); acc.store(tc); }\n",
+        )
+        .is_some()
 }
 
 /// Pure target assembly from a complete immutable description. No device

@@ -661,12 +661,12 @@ fn attention_prefill[M, T, KV, G, P, S, I, U, F, N, NV, R](
         rotary_components, rotary_frequencies, rotary_amplitudes, coordinates, visible,
         fresh, destinations, history_key, history_value, epsilon, scale, gate_function)
 
-# Metal: simdgroup-matrix tiles of 32 keys (16 for heads wider than 256, whose
-# output accumulates in 256-column windows), a `merge` launch when a tile is
-# split (3 launches).
+# Metal: tiles of 32 keys (16 for heads wider than 256, whose output
+# accumulates in 256-column windows) on simdgroup matrices or tensor
+# operations, a `merge` launch when a tile is split (3 launches).
 native attention_prefill for metal from "metal/attention_prefill.metal":
     static (KV, G, P, S, I, U, F, N, NV)
-    params (arithmetic QT in [16, 8], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
+    params (arithmetic QT in [16, 8, 32], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
     where (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and (32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + 64 * 16 <= 32768
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
@@ -1021,7 +1021,7 @@ native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
 
 native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal":
     static (KV, G, P, S, I, U, F, N, NV)
-    params (arithmetic QT in [16, 8], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
+    params (arithmetic QT in [16, 8, 32], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
     where (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)

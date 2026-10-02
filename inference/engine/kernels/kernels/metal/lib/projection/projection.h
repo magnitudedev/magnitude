@@ -44,7 +44,9 @@
 // - GEMM (M > 16): TM x TN output tiles over simdgroups of 32 x 32 (16 x 32
 //   when TM = 32), stepping K by 32. Activations are staged as stored (bf16
 //   or f16), weights decoded to half once per tile, and simdgroup_matrix
-//   multiplies them into F32 accumulators; small-N outputs may split K.
+//   multiplies them into F32 accumulators (on a device with Metal 4 tensor
+//   operations, one `matmul2d` per step over the whole tile, into
+//   cooperative accumulators); small-N outputs may split K.
 //
 // This file is independent of any entry ABI.
 
@@ -859,13 +861,133 @@ inline void gemm_multiply_live(gemm_buffer<TM, TN, E> buffer, gemm_fragments<TM,
     }
 }
 
-// The K loop over one TM x TN tile: `U` is the second weight of a paired
-// tile (its rows interleave with W's) or the same type for a plain tile.
-template <typename W, typename U, bool PAIRED, uint TM, uint TN, typename In>
+// The fragment chain as GEMM accumulators: the simdgroup's fm x fn F32
+// fragments, multiplied over its live fragment rows. `emit(f)` calls
+// f(m, n, first, second) for each of the lane's outputs at tile row m: a
+// plain tile's column n (`second` unused), a paired tile's feature n (gate
+// `first`, up `second`, a fragment pair holding one feature).
+template <uint TM, uint TN, typename E, bool PAIRED>
+struct gemm_fragment_engine {
+    typedef gemm_tile<TM, TN> tile;
+    gemm_fragments<TM, TN> at;
+    uint live;
+    gemm_accumulators<TM, TN> acc;
+    gemm_fragment_engine(uint sg, uint lane, uint m0, uint m_rows) : at(sg, lane) {
+        live = gemm_live_fragments<TM, TN>(at, m0, m_rows);
+        PROJECTION_UNROLL
+        for (uint i = 0; i < tile::fm; ++i)
+            PROJECTION_UNROLL
+            for (uint j = 0; j < tile::fn; ++j)
+                acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    template <typename F>
+    void emit(thread const F &f) {
+        PROJECTION_UNROLL
+        for (uint i = 0; i < tile::fm; ++i) {
+            PROJECTION_UNROLL
+            for (uint j = 0; j < tile::fn; ++j) {
+                float2 c = reinterpret_cast<thread float2 &>(acc[i][j].thread_elements());
+                if (PAIRED) {
+                    f(at.row(i), at.column(j) / 2u, c.x, c.y);
+                } else {
+                    f(at.row(i), at.column(j), c.x, 0.0f);
+                    f(at.row(i), at.column(j) + 1u, c.y, 0.0f);
+                }
+            }
+        }
+    }
+};
+
+template <uint TM, uint TN, typename E, bool PAIRED>
+inline void gemm_step(gemm_buffer<TM, TN, E> buffer, thread gemm_fragment_engine<TM, TN, E, PAIRED> &engine) {
+    gemm_multiply_live<TM, TN, E>(buffer, engine.at, engine.live, engine.acc);
+}
+
+#if SEISMIC_HAS_TENSOR_OPS
+// The tensor operation as GEMM accumulators: one `matmul2d` over all the
+// tile's simdgroups multiplies the staged step (A rows and B weight rows at
+// pitch gemm_lda) into a cooperative F32 destination. A paired tile runs one
+// product per stream over its interleaved B rows (row stride 2 gemm_lda), so
+// both destinations share one layout and element i of each is the same
+// (row, feature). Live rows are not distinguished: padding rows multiply
+// their staged zeros. Cooperative tensors live in the caller's frame.
+template <uint TM, uint TN, typename E, bool PAIRED>
+struct gemm_tensor {
+    typedef gemm_tile<TM, TN> tile;
+    static constant constexpr uint columns = PAIRED ? TN / 2u : TN;
+    static constant constexpr int32_t pitch = int32_t(gemm_lda) * (PAIRED ? 2 : 1);
+    typedef metal::extents<int32_t, gemm_k, TM> a_extents;
+    typedef metal::extents<int32_t, gemm_k, columns> b_extents;
+    typedef metal::tensor<threadgroup E, a_extents, metal::tensor_inline> a_tensor;
+    typedef metal::tensor<threadgroup half, b_extents, metal::tensor_inline> b_tensor;
+    typedef mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(TM, columns, gemm_k, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        metal::execution_simdgroups<tile::threads / 32u>> operation;
+    typedef typename operation::template cooperative_tensor_destination_t<a_tensor, b_tensor, float> destination;
+
+    static destination zero() {
+        operation op;
+        destination acc = op.template get_destination_cooperative_tensor<a_tensor, b_tensor, float>();
+        PROJECTION_UNROLL
+        for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+            if (acc.is_valid_element(i))
+                acc[i] = 0.0f;
+        return acc;
+    }
+
+    // B rows from `row` (0 or 1) at the tile's B row pitch.
+    static b_tensor weights(gemm_buffer<TM, TN, E> buffer, uint row) {
+        return b_tensor(buffer.b + row * gemm_lda, b_extents(), metal::array<int32_t, 2>{1, pitch});
+    }
+
+    static a_tensor activations(gemm_buffer<TM, TN, E> buffer) {
+        return a_tensor(buffer.a, a_extents(), metal::array<int32_t, 2>{1, int32_t(gemm_lda)});
+    }
+
+    template <typename F>
+    static void emit(thread const destination &acc, thread const destination &acc2, thread const F &f) {
+        PROJECTION_UNROLL
+        for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+            if (acc.is_valid_element(i)) {
+                auto index = acc.get_multidimensional_index(i);
+                f(uint(index[1]), uint(index[0]), acc[i], PAIRED ? acc2[i] : 0.0f);
+            }
+        }
+    }
+};
+
+// A plain tile's step (one destination), and a paired tile's (one per stream).
+template <uint TM, uint TN, typename E, typename D>
+inline void gemm_step(gemm_buffer<TM, TN, E> buffer, thread D &acc) {
+    typedef gemm_tensor<TM, TN, E, false> T;
+    typename T::operation op;
+    auto a = T::activations(buffer);
+    auto b = T::weights(buffer, 0);
+    op.run(a, b, acc);
+}
+
+template <uint TM, uint TN, typename E, typename D>
+inline void gemm_step(gemm_buffer<TM, TN, E> buffer, thread D &gate, thread D &up) {
+    typedef gemm_tensor<TM, TN, E, true> T;
+    typename T::operation op;
+    auto a = T::activations(buffer);
+    auto g = T::weights(buffer, 0);
+    auto u = T::weights(buffer, 1);
+    op.run(a, g, gate);
+    op.run(a, u, up);
+}
+#endif
+
+// The K loop over one TM x TN tile, steps [step_begin, step_end): `U` is the
+// second weight of a paired tile (its rows interleave with W's) or the same
+// type for a plain tile; `gemm_step` multiplies each staged step into the
+// accumulators `acc`.
+template <typename W, typename U, bool PAIRED, uint TM, uint TN, typename In, typename... Acc>
 inline void gemm_accumulate(thread const In &in, thread const Weights<W> &w,
     thread const Weights<U> &u, uint first, uint rows, uint m0, uint m_rows, uint k,
     uint step_begin, uint step_end, threadgroup uchar *shared, uint sg, uint lane,
-    thread gemm_accumulators<TM, TN> &acc, uint live_rows) {
+    thread Acc &... acc) {
     typedef gemm_tile<TM, TN> tile;
     typedef typename In::activation::native E;
     constexpr uint count = PAIRED ? TN / 2u : TN;
@@ -873,13 +995,6 @@ inline void gemm_accumulate(thread const In &in, thread const Weights<W> &w,
     constexpr uint items = (count * gemm_halves + tile::threads - 1) / tile::threads;
     uint thread_index = sg * 32u + lane;
     gemm_buffer<TM, TN, E> buffer = gemm_buffer<TM, TN, E>::at(shared);
-    gemm_fragments<TM, TN> at(sg, lane);
-    uint live = gemm_live_fragments<TM, TN>(at, m0, min(m_rows, live_rows));
-    PROJECTION_UNROLL
-    for (uint i = 0; i < tile::fm; ++i)
-        PROJECTION_UNROLL
-        for (uint j = 0; j < tile::fn; ++j)
-            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     if (step_begin >= step_end)
         return;
     gemm_a_registers<tile::a_items> a_regs;
@@ -904,7 +1019,7 @@ inline void gemm_accumulate(thread const In &in, thread const Weights<W> &w,
             if (PAIRED)
                 gemm_load_b<U, tile::threads, items>(u, first, count, rows, k1, k, thread_index, u_regs);
         }
-        gemm_multiply_live<TM, TN, E>(buffer, at, live, acc);
+        gemm_step(buffer, acc...);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (more) {
             gemm_store_a<TM, tile::threads, tile::a_items>(a_regs, buffer.a, thread_index);
@@ -916,34 +1031,76 @@ inline void gemm_accumulate(thread const In &in, thread const Weights<W> &w,
     }
 }
 
+// One tile's K steps [step_begin, step_end) on the device's matrix facility,
+// then `emit(m, n, first, second)` per output (gemm_fragment_engine::emit).
+// Rows at or past `live_rows` are known zero.
+template <typename W, typename U, bool PAIRED, uint TM, uint TN, typename In, typename F>
+inline void gemm_run(thread const In &in, thread const Weights<W> &w, thread const Weights<U> &u,
+    uint first, uint rows, uint m0, uint m_rows, uint k, uint step_begin, uint step_end, uint live_rows,
+    threadgroup uchar *shared, uint sg, uint lane, thread const F &emit) {
+    typedef typename In::activation::native E;
+#if SEISMIC_HAS_TENSOR_OPS
+    typedef gemm_tensor<TM, TN, E, PAIRED> T;
+    typename T::destination acc = T::zero();
+    if constexpr (PAIRED) {
+        typename T::destination acc2 = T::zero();
+        gemm_accumulate<W, U, PAIRED, TM, TN>(in, w, u, first, rows, m0, m_rows, k, step_begin, step_end,
+            shared, sg, lane, acc, acc2);
+        T::emit(acc, acc2, emit);
+    } else {
+        gemm_accumulate<W, U, PAIRED, TM, TN>(in, w, u, first, rows, m0, m_rows, k, step_begin, step_end,
+            shared, sg, lane, acc);
+        T::emit(acc, acc, emit);
+    }
+#else
+    gemm_fragment_engine<TM, TN, E, PAIRED> engine(sg, lane, m0, min(m_rows, live_rows));
+    gemm_accumulate<W, U, PAIRED, TM, TN>(in, w, u, first, rows, m0, m_rows, k, step_begin, step_end,
+        shared, sg, lane, engine);
+    engine.emit(emit);
+#endif
+}
+
+// Emitters of a finished tile (tile row m, column or feature n, from m0 and
+// first): the epilogue of a plain or paired tile, or a split part's raw sums.
+template <typename Out>
+struct gemm_store {
+    Out out;
+    uint m0, m_rows, first, rows;
+    void operator()(uint m, uint n, float value, float) const {
+        if (m0 + m < m_rows && first + n < rows)
+            out.store(m0 + m, first + n, value);
+    }
+};
+
+template <typename Out>
+struct gemm_store_pair {
+    Out out;
+    uint m0, m_rows, first, rows;
+    void operator()(uint m, uint n, float gate, float up) const {
+        if (m0 + m < m_rows && first + n < rows)
+            out.store_pair(m0 + m, first + n, gate, up);
+    }
+};
+
+struct gemm_store_part {
+    device float *own;
+    uint m0, m_rows, first, rows;
+    void operator()(uint m, uint n, float value, float) const {
+        if (m0 + m < m_rows && first + n < rows)
+            own[ulong(m0 + m) * rows + first + n] = value;
+    }
+};
+
 // One GEMM tile of a plain (unpaired) projection: output rows tm * TM .. of
 // the activations, weight rows tn * TN .. of `w`. Rows at or past `live_rows`
-// are known zero (padding): their products are skipped, and they store the
-// epilogue of 0.
+// are known zero (padding): the fragment chain skips their products, and
+// they store the epilogue of 0.
 template <typename W, uint TM, uint TN, typename In, typename Out>
 inline void gemm(thread const In &in, thread const Out &out, thread const Weights<W> &w, uint m_rows,
     uint rows, uint k, uint tm, uint tn, threadgroup uchar *shared, uint sg, uint lane, uint live_rows = ~0u) {
-    typedef gemm_tile<TM, TN> tile;
-    uint first = tn * TN;
-    gemm_accumulators<TM, TN> acc;
-    gemm_accumulate<W, W, false, TM, TN>(in, w, w, first, rows, tm * TM, m_rows, k, 0, (k + gemm_k - 1) / gemm_k,
-        shared, sg, lane, acc, live_rows);
-    gemm_fragments<TM, TN> at(sg, lane);
-    PROJECTION_UNROLL
-    for (uint i = 0; i < tile::fm; ++i) {
-        uint m = tm * TM + at.row(i);
-        if (m >= m_rows)
-            continue;
-        PROJECTION_UNROLL
-        for (uint j = 0; j < tile::fn; ++j) {
-            float2 c = reinterpret_cast<thread float2 &>(acc[i][j].thread_elements());
-            uint n = first + at.column(j);
-            if (n + 1u < rows)
-                out.store2(m, n, c.x, c.y);
-            else if (n < rows)
-                out.store(m, n, c.x);
-        }
-    }
+    uint first = tn * TN, m0 = tm * TM;
+    gemm_run<W, W, false, TM, TN>(in, w, w, first, rows, m0, m_rows, k, 0, (k + gemm_k - 1) / gemm_k, live_rows,
+        shared, sg, lane, gemm_store<Out>{out, m0, m_rows, first, rows});
 }
 
 // Split-K. Part `part` of `split` runs the K steps
@@ -953,29 +1110,11 @@ inline void gemm(thread const In &in, thread const Out &out, thread const Weight
 template <typename W, uint TM, uint TN, typename In>
 inline void gemm_part(thread const In &in, device float *partials, thread const Weights<W> &w, uint m_rows,
     uint rows, uint k, uint split, uint part, uint tm, uint tn, threadgroup uchar *shared, uint sg, uint lane) {
-    typedef gemm_tile<TM, TN> tile;
-    uint first = tn * TN;
+    uint first = tn * TN, m0 = tm * TM;
     uint steps = (k + gemm_k - 1) / gemm_k;
-    gemm_accumulators<TM, TN> acc;
-    gemm_accumulate<W, W, false, TM, TN>(in, w, w, first, rows, tm * TM, m_rows, k, part * steps / split,
-        (part + 1) * steps / split, shared, sg, lane, acc, m_rows);
-    gemm_fragments<TM, TN> at(sg, lane);
-    device float *own = partials + ulong(part) * m_rows * rows;
-    PROJECTION_UNROLL
-    for (uint i = 0; i < tile::fm; ++i) {
-        uint m = tm * TM + at.row(i);
-        if (m >= m_rows)
-            continue;
-        PROJECTION_UNROLL
-        for (uint j = 0; j < tile::fn; ++j) {
-            float2 c = reinterpret_cast<thread float2 &>(acc[i][j].thread_elements());
-            uint n = first + at.column(j);
-            if (n < rows)
-                own[ulong(m) * rows + n] = c.x;
-            if (n + 1u < rows)
-                own[ulong(m) * rows + n + 1u] = c.y;
-        }
-    }
+    gemm_run<W, W, false, TM, TN>(in, w, w, first, rows, m0, m_rows, k, part * steps / split,
+        (part + 1) * steps / split, m_rows, shared, sg, lane,
+        gemm_store_part{partials + ulong(part) * m_rows * rows, m0, m_rows, first, rows});
 }
 
 // The split-K reduction: output `index` = m * rows + n sums its parts in
@@ -992,31 +1131,14 @@ inline void gemm_reduce(thread const Out &out, device const float *partials, uin
 }
 
 // One GEMM tile of a paired projection: TN / 2 features of gate and up, the
-// tile's rows interleaved (gate, up) so a lane's element pair is one feature.
-// `live_rows` as for `gemm`.
+// tile's rows interleaved (gate, up). `live_rows` as for `gemm`.
 template <typename G, typename U, uint TM, uint TN, typename In, typename Out>
 inline void gemm_paired(thread const In &in, thread const Out &out, thread const Weights<G> &gate,
     thread const Weights<U> &up, uint m_rows, uint rows, uint k, uint tm, uint tn,
     threadgroup uchar *shared, uint sg, uint lane, uint live_rows = ~0u) {
-    typedef gemm_tile<TM, TN> tile;
-    uint first = tn * (TN / 2u);
-    gemm_accumulators<TM, TN> acc;
-    gemm_accumulate<G, U, true, TM, TN>(in, gate, up, first, rows, tm * TM, m_rows, k, 0, (k + gemm_k - 1) / gemm_k,
-        shared, sg, lane, acc, live_rows);
-    gemm_fragments<TM, TN> at(sg, lane);
-    PROJECTION_UNROLL
-    for (uint i = 0; i < tile::fm; ++i) {
-        uint m = tm * TM + at.row(i);
-        if (m >= m_rows)
-            continue;
-        PROJECTION_UNROLL
-        for (uint j = 0; j < tile::fn; ++j) {
-            float2 c = reinterpret_cast<thread float2 &>(acc[i][j].thread_elements());
-            uint n = first + at.column(j) / 2u;
-            if (n < rows)
-                out.store_pair(m, n, c.x, c.y);
-        }
-    }
+    uint first = tn * (TN / 2u), m0 = tm * TM;
+    gemm_run<G, U, true, TM, TN>(in, gate, up, first, rows, m0, m_rows, k, 0, (k + gemm_k - 1) / gemm_k,
+        live_rows, shared, sg, lane, gemm_store_pair<Out>{out, m0, m_rows, first, rows});
 }
 
 // ---------------------------------------------------------------------------

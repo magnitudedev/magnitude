@@ -810,7 +810,11 @@ mod internals {
                     symbols.insert(format!("SEISMIC_STATIC_{}", native_macro(dimension)));
                 }
             }
-            BackendName::Cpu | BackendName::Metal => {
+            BackendName::Metal => {
+                symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
+                symbols.insert("SEISMIC_HAS_TENSOR_OPS".to_owned());
+            }
+            BackendName::Cpu => {
                 symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
             }
         }

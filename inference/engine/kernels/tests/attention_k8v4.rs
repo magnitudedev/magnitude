@@ -749,8 +749,11 @@ fn prefill_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'stati
             .into_iter()
             .map(|split| vec![("ROWS", 64), ("SPLIT_GROUPS", split)])
             .collect(),
-        _ => [(16, 1), (8, 1), (16, 256), (8, 256)]
+        // QT = 32 where its 32 G rows fit the device's threadgroup memory
+        // with the tensor-operation form (32 G <= 128).
+        _ => [(16, 1), (8, 1), (16, 256), (8, 256), (32, 1), (32, 256)]
             .into_iter()
+            .filter(|&(qt, _)| qt < 32 || qt as usize * geometry.g <= 128)
             .map(|(qt, split)| vec![("QT", qt), ("SPLIT_GROUPS", split)])
             .collect(),
     }

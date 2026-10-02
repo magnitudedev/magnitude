@@ -648,6 +648,77 @@ fn attention_matches_its_portable_body() {
     }
 }
 
+/// Attend timing on each device: 4096 rows of 16 heads of 80 columns (P = 20),
+/// whole-image and 1024-row windows. Run explicitly.
+#[test]
+#[ignore]
+fn attention_timing() {
+    let rows = 4096usize;
+    let (heads, quarter) = (16usize, 20usize);
+    let width = 4 * quarter;
+    for device in devices() {
+        for ws in [0usize, 1] {
+            let mut rng = Rng::new(27);
+            let shape = [rows, heads, width];
+            let query = Host::random(DType::F16, &shape, 2.0, &mut rng);
+            let key = Host::random(DType::F16, &shape, 2.0, &mut rng);
+            let value = Host::random(DType::F16, &shape, 1.0, &mut rng);
+            let query_norm = Host::rows(DType::F32, 0, &[width], 0.3, 1.0, &mut rng);
+            let key_norm = Host::rows(DType::F32, 0, &[width], 0.3, 1.0, &mut rng);
+            let value_norm = Host::new(DType::F32, &[0, width], vec![]);
+            let side = 64;
+            let coordinates = Host::ints(&[rows, 2], (0..rows).flat_map(|row| [row / side + 1, row % side + 1]));
+            let spans = Host::ints(
+                &[ws, rows, 2],
+                (0..ws * rows).flat_map(|row| [row / 1024 * 1024, (row / 1024 * 1024 + 1024).min(rows)]),
+            );
+            let kernel = vision_attention::native_for_device_with(
+                &device,
+                vision_attention::Elements { A: Element::f16() },
+                &specialization_on(&device, &[("H", heads), ("P", quarter), ("NQ", 0), ("NV", 0), ("WS", ws)]),
+            )
+            .unwrap();
+            let t = |host: &Host| host.tensor(&device);
+            let (q, k, v, qn, kn, vn, c, sp) = (
+                t(&query),
+                t(&key),
+                t(&value),
+                t(&query_norm),
+                t(&key_norm),
+                t(&value_norm),
+                t(&coordinates),
+                t(&spans),
+            );
+            let measurement = kernel
+                .measure(
+                    vec![vision_attention::Args {
+                        query: &q,
+                        key: &k,
+                        value: &v,
+                        query_norm: &qn,
+                        key_norm: &kn,
+                        value_norm: &vn,
+                        coordinates: &c,
+                        spans: &sp,
+                        log_base: 100f32.ln(),
+                        epsilon: EPSILON,
+                        unit_scale: 0,
+                    }],
+                    &seismic::MeasureOptions { samples: 15, min_sample_seconds: 0.005 },
+                )
+                .unwrap();
+            let keys = if ws == 1 { 1024 } else { rows };
+            let flop = (rows * keys * heads * width * 4) as f64;
+            eprintln!(
+                "vision attention {:?} {rows} rows windows {ws}: {:.1} us ({:.2} TFLOP/s)",
+                device.backend(),
+                measurement.median * 1e6,
+                flop / measurement.median / 1e12
+            );
+        }
+    }
+}
+
 #[test]
 fn pool_matches_its_portable_body() {
     let module = module();

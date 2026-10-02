@@ -78,7 +78,11 @@ geometry and plane encoding. These are compile-time macros. Static dimensions re
 constants, as do the extents they fix and the row geometry of a row-layout tensor with a static
 packing axis; a tensor whose every extent is static also renders its canonical strides as
 constants and must be bound canonically. Other dimensions, extents, strides, and scalars remain
-invocation words. Native assets do
+invocation words. The Metal prefix includes the Metal 4 tensor-operation headers and defines
+`SEISMIC_HAS_TENSOR_OPS` as 1 only when device discovery establishes that the GPU executes tensor
+operations on its matrix hardware (Apple GPU family 10 or later, and a `matmul2d` probe forms a
+pipeline); otherwise it is 0. The capability enters the device facts and, through the rendered
+source, formation identity. Native assets do
 not infer representations from byte lengths or reproduce registry layout tables. A Metal, CUDA or
 Vulkan asset may include library files written for its backend (`.h`, `.cuh`, `.glsl`) with
 `#include "<relative path>"`, resolved relative to the including file; the canonical target must lie

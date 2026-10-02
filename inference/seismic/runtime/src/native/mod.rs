@@ -442,6 +442,15 @@ fn template_instance(kernel: &str, values: &[u64]) -> ProgramEntry {
     })
 }
 
+/// The dialect of an opened Metal device's native sources: MSL with its
+/// feature macros.
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_dialect(opened: &crate::backends::MetalOpened) -> abi::Dialect {
+    abi::Dialect::Metal(abi::MetalFeatures {
+        tensor_ops: opened.device_description().facts().tensor_ops(),
+    })
+}
+
 /// One launch's program with `variants` as its entries. Every variant of a
 /// launch shares its source, so tuning forms all of them in one compile and
 /// preparation's single variant is served from that program.
@@ -517,9 +526,10 @@ impl NativePrepared {
         sources: &[plan::LaunchSource],
     ) -> Result<HeldPrograms, PrepareError> {
         let backend = backend_name(&device.kind);
-        let dialect = match backend {
-            BackendName::Metal => abi::Dialect::Metal,
-            BackendName::Cuda => abi::Dialect::Cuda,
+        let dialect = match &device.kind {
+            #[cfg(target_os = "macos")]
+            OpenedKind::Metal(opened) => metal_dialect(opened),
+            OpenedKind::Cuda(_) => abi::Dialect::Cuda,
             _ => return Ok(HeldPrograms(Box::new(()))),
         };
         let logical = module
@@ -767,7 +777,7 @@ impl NativePrepared {
                         words * 8
                     )));
                 }
-                let (sources, requests) = programs(abi::Dialect::Metal, asset(BackendName::Metal)?);
+                let (sources, requests) = programs(metal_dialect(opened), asset(BackendName::Metal)?);
                 let former = device.programs.metal();
                 let launches = form_launches(former, &sources, &requests)?;
                 launches.identify(&mut digest);
