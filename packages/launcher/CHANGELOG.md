@@ -1,5 +1,24 @@
 # @magnitudedev/cli
 
+## 0.2.4
+
+### Patch Changes
+
+- [`f0498ce`](https://github.com/magnitudedev/magnitude/commit/f0498ce285e4e97815ba16dd74044ce5efebb63a) Thanks [@anerli](https://github.com/anerli)! - - Keep first-load kernel tuning within its minute for large models too, such as Gemma 4 26B: preparing each kernel's test data now counts against the same time, is done once instead of twice, and is skipped for kernels whose share of the minute cannot cover it, which keep their default configuration.
+
+- [`e38af0e`](https://github.com/magnitudedev/magnitude/commit/e38af0e9a232293dca12c5bad3a91b96e58ca12e) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix models failing to load on M1 and M2 Macs when a kernel's default configuration needs more threads than the chip allows for it. Tuning now starts from the nearest configuration that runs.
+
+- [`cef7f3b`](https://github.com/magnitudedev/magnitude/commit/cef7f3bb9c2dd06d96aeb59dde8039b6f83386a5) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix requests that fail partway through, for example when memory runs short during a long conversation, returning an empty reply that looked like success. They now return a 503 with `Retry-After` and a message agent harnesses recognize, so Pi, OpenCode, Claude Code and others retry them automatically.
+
+  - Log memory pressure and request failures from the inference engine, which previously failed silently.
+
+- [`4713d97`](https://github.com/magnitudedev/magnitude/commit/4713d97b4b913a3ed2194f53826ae01658600839) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix `magnitude serve` failing to start on a Mac reached over SSH with nobody logged in at the console.
+
+- [`7eabf99`](https://github.com/magnitudedev/magnitude/commit/7eabf993ebbd96a4ab2c067d2c7f2e7d3e4ff8f8) Thanks [@anerli](https://github.com/anerli)! - - Reduce the memory a model needs beyond its weights, so larger models and longer contexts fit: Qwen3.5-4B's working memory fell from 3.7 GB to 120 MB, and the memory reserved to run it from 10.0 GB to 5.9 GB, at the same speed. Image-processing memory is now claimed on the first image and released when idle.
+
+- [`7eabf99`](https://github.com/magnitudedev/magnitude/commit/7eabf993ebbd96a4ab2c067d2c7f2e7d3e4ff8f8) Thanks [@anerli](https://github.com/anerli)! - - Fix the first load of a model taking 20–50 minutes and appearing to hang on CPU-only machines. Kernel tuning now takes at most about a minute on any device, instead of a fixed number of configurations whose time grew with the device's slowness, and its progress reports that minute. On an M4 Max, a first load of Qwen3.5-4B now tunes in about 50 seconds (previously 149 on the GPU and 279 on the CPU) with the same speed afterwards.
+  - Speed up CPU inference on x86 for models with Q6_K weights by converting their half-precision scales without a slow processor path.
+
 ## 0.2.3
 
 ### Patch Changes
