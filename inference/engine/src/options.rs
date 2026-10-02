@@ -10,10 +10,10 @@ use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     ExecutionPath, ResourcePlan, MAX_DRAFT_PROPOSALS,
 };
-use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, Operator};
+use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily};
 use magnitude_generation::{DFlash, Method, Mtp, Plain};
 
-/// Dense-target MTP width when none is requested.
+/// MTP width when none is requested.
 const DEFAULT_PROPOSALS: u8 = 3;
 use crate::census::AllocationCensus;
 use magnitude_scheduler::ServiceLimits;
@@ -412,18 +412,12 @@ fn resolve_method(
         return Ok(ResolvedMethod::Plain);
     }
     head.ok_or("MTP was requested but the artifact has no draft head")?;
-    let routed = definition
-        .decoder
-        .sublayers()
-        .any(|(_, sublayer)| matches!(sublayer.op, Operator::RoutedFfn(_)));
     let (greedy_proposals, sampled_proposals) = match override_width {
         Some(0) => return Err("mtp_proposals must be positive".into()),
         Some(width) if width > MAX_DRAFT_PROPOSALS => {
             return Err(format!("mtp_proposals exceeds {MAX_DRAFT_PROPOSALS}"))
         }
         Some(width) => (width, width),
-        // Every verify row of a routed target streams more experts.
-        None if routed => (1, 1),
         None => (DEFAULT_PROPOSALS, DEFAULT_PROPOSALS),
     };
     Ok(ResolvedMethod::Mtp {
@@ -440,7 +434,7 @@ mod tests {
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, Head,
         HeadBlock, HeadNorm, HistoryDomain, HistoryReads, InputNorm, KeyValue, MediaRowAttention,
-        OutputForm, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource,
+        Operator, OutputForm, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource,
         WeightDescriptor,
     };
 
