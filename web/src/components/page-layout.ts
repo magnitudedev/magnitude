@@ -1,7 +1,7 @@
 // Shared geometry for content and its loading presentation. Keep responsive changes here.
 export const pageLayout = {
-  hardwarePhoto: "min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900",
-  hardwareGrid: "grid-cols-[140px_minmax(0,1fr)] min-[1000px]:grid-cols-[220px_minmax(0,1fr)]",
+  hardwarePhoto: "min-w-0 max-w-[200px] md:max-w-none overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900",
+  hardwareGrid: "grid-cols-[140px_minmax(0,1fr)] max-md:grid-cols-1 min-[1000px]:grid-cols-[220px_minmax(0,1fr)]",
   recommendationRow: "flex min-h-16 min-w-0 w-full items-center gap-3 rounded-xl border px-3 py-4 text-left",
   modelCard: "rounded-2xl border border-slate-200 bg-white p-5 dark:border-slate-750 dark:bg-slate-850",
   modelRow: "grid items-center gap-4 lg:grid-cols-[minmax(0,1fr)_auto]",
@@ -14,7 +14,7 @@ export const pageLayout = {
   statusHero: "rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850",
   card: "rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850",
   settingsCard: "mt-6 rounded-lg border border-slate-300 bg-white px-5 py-5 dark:border-slate-750 dark:bg-slate-850",
-  pageTitle: "shrink-0 font-heading text-[28px] font-semibold tracking-tight",
+  pageTitle: "shrink-0 font-heading text-[24px] font-semibold tracking-tight md:text-[28px]",
   modelHeader: "mb-5 flex flex-wrap items-center justify-between gap-x-4 gap-y-2",
   modelSearch: "min-w-40 flex-1 sm:max-w-xs",
   catalogToolbar: "mb-5 flex flex-wrap items-center justify-between gap-3",

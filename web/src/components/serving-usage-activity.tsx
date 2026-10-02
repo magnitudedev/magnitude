@@ -52,9 +52,9 @@ export function UsageActivity({ days }: { days: Activity | null }) {
         {summary ? <p className="text-slate-500"><strong className="font-medium tabular-nums text-slate-900 dark:text-slate-100">{summary.totalTokens.toLocaleString()}</strong> tokens · Past year</p> : <Skeleton className="h-5 w-40" />}
       </div>
     </div>
-    <div className="overflow-x-auto pb-2">
+    <div className="overflow-x-auto pb-2 [direction:rtl] md:[direction:ltr]">
       <TooltipProvider>
-        <table ref={table} aria-label="Daily token activity, Sunday through Saturday; use arrow keys to navigate" className="w-full min-w-[640px] table-fixed border-separate border-spacing-[3px]">
+        <table ref={table} aria-label="Daily token activity, Sunday through Saturday; use arrow keys to navigate" className="w-full min-w-[640px] table-fixed border-separate border-spacing-[3px] [direction:ltr]">
           <thead><tr><td className="w-8" />{weeks.map((week, column) => {
             const month = week.find(day => day.date.endsWith("-01"))
             return <th key={column} scope="col" className="h-6 overflow-visible whitespace-nowrap text-left text-xs font-normal text-slate-500">{month && new Date(`${month.date}T12:00:00Z`).toLocaleDateString(undefined, { timeZone: "UTC", month: "short" })}</th>

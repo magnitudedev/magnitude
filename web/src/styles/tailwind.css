@@ -319,3 +319,8 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+@keyframes slide-in-left {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}

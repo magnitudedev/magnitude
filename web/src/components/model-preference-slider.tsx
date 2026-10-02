@@ -15,5 +15,5 @@ export function ModelPreferenceSlider({ value, onChange }: { value: number; onCh
 }
 
 export function RecommendationPreference({ value = 2, onChange }: { value?: number; onChange?: (value: number) => void }) {
-  return <section aria-label="Recommendation preference" className="my-6"><div className="flex items-end justify-between gap-4"><div><h2 className="font-heading text-xl">Find your balance</h2><p className="mt-2 text-sm text-slate-500">Quick responses or deeper thinking. Choose what matters to you.</p></div><span className="rounded-full bg-blue-50 px-4 py-2 text-sm font-medium text-blue-700 dark:bg-slate-800 dark:text-blue-400">{LOCAL_MODEL_RANKING_SCALE_LABELS[value]}</span></div><ModelPreferenceSlider value={value} onChange={onChange} /></section>
+  return <section aria-label="Recommendation preference" className="my-6"><div className="flex flex-wrap items-end justify-between gap-4 md:flex-nowrap"><div><h2 className="font-heading text-xl">Find your balance</h2><p className="mt-2 text-sm text-slate-500">Quick responses or deeper thinking. Choose what matters to you.</p></div><span className="rounded-full bg-blue-50 px-4 py-2 text-sm font-medium text-blue-700 dark:bg-slate-800 dark:text-blue-400">{LOCAL_MODEL_RANKING_SCALE_LABELS[value]}</span></div><ModelPreferenceSlider value={value} onChange={onChange} /></section>
 }

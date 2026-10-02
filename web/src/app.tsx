@@ -57,6 +57,7 @@ import { appearanceReadError } from "./appearance"
 import { useNavigate, useServerPlatform, useSession } from "./session"
 import { useServiceConnection, useServiceObservation, type ServiceObservation } from "./service-view"
 import { ConfirmDialog } from "./components/confirm-dialog"
+import { useNarrowViewport } from "./lib/viewport"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "./components/ui/alert-dialog"
 import { HardwareOverview, ModelRadar, SpeedInfo } from "./components/discovery-visuals"
 import { MemoryBreakdown } from "./components/memory-breakdown"
@@ -599,7 +600,7 @@ function StatusOverview() {
   const connected = installed?.filter(row => row.inspection._tag === "Connected").length
   const address = Result.isSuccess(network) && network.value.enabled ? Option.getOrElse(network.value.bind, () => "All interfaces") : null
   const loading = <SkeletonLine className="h-4 text-xs" width="80px" />
-  return <section aria-label="Activity" className={`${pageLayout.card} grid grid-cols-3 gap-2 p-3`}>
+  return <section aria-label="Activity" className={`${pageLayout.card} grid grid-cols-1 gap-2 p-3 md:grid-cols-3`}>
     <StatusTile label="Today" onClick={() => navigate("usage")}
       value={today ? `${compact.format(today.totalTokens)} tokens` : Result.isInitial(usage) ? loading : "Unavailable"}
       detail={today ? `${today.requests.toLocaleString()} ${today.requests === 1 ? "request" : "requests"}` : null} />
@@ -620,13 +621,13 @@ function SettingsGroup({ label, children }: { label: string; children: ReactNode
   </section>
 }
 function SettingsRow({ label, hint, alert, control, children, nested = false }: { label: ReactNode; hint?: ReactNode; alert?: ReactNode; control?: ReactNode; children?: ReactNode; nested?: boolean }) {
-  return <div className={nested ? "bg-slate-50 py-2.5 pl-10 pr-4 dark:bg-slate-900/40" : "px-4 py-3"}>
-    <div className="flex items-center justify-between gap-6">
+  return <div className={nested ? "bg-slate-50 py-2.5 pl-6 pr-4 dark:bg-slate-900/40 md:pl-10" : "px-4 py-3"}>
+    <div className="flex flex-col items-start gap-2 md:flex-row md:items-center md:justify-between md:gap-6">
       <div className="min-w-0"><p className={nested ? "text-[13px] font-medium" : "text-sm font-medium"}>{label}</p>
         {hint && <div className="mt-0.5 text-xs text-slate-500">{hint}</div>}
 
       </div>
-      {control && <div className="flex shrink-0 items-center gap-2">{control}</div>}
+      {control && <div className="flex shrink-0 flex-wrap items-center gap-2 md:flex-nowrap">{control}</div>}
     </div>
     {alert && <div className="mt-2">{alert}</div>}
     {children}
@@ -892,7 +893,48 @@ function QuitFailureDialog() {
     </AlertDialogContent>
   </AlertDialog>
 }
-export function AppShell({ page, navigate, platform, children }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
+export function AppShell(props: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
+  return useNarrowViewport() ? <NarrowShell {...props} /> : <DockedShell {...props} />
+}
+function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
+  return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
+    {(Object.keys(pageNames) as ApplicationPage[]).map(key => {
+      const Icon = pageIcons[key]
+      return <Button variant="ghost" key={key} disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={page === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+        <Icon className="size-4 shrink-0" />{pageNames[key]}
+      </Button>
+    })}
+  </nav>
+}
+/** Below `md`: a top bar and a navigation drawer over the page, closed by default. */
+function NarrowShell({ page, navigate, children }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
+  const [open, setOpen] = useState(false)
+  return <div className="relative flex h-screen flex-col bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
+    <header className="flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 px-4 dark:border-slate-750" inert={open}>
+      <button type="button" className="inline-flex size-10 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 dark:hover:bg-slate-800" aria-label="Open navigation" aria-expanded={open} aria-controls="desktop-navigation" onClick={() => setOpen(true)}>
+        <SidebarSimpleIcon className="size-5" />
+      </button>
+      <span className="flex items-center gap-2 font-heading text-base font-semibold"><MagnitudeMark className="h-7 w-7 shrink-0" />Magnitude</span>
+    </header>
+    <main key={page} className="min-w-0 flex-1 overflow-y-auto" inert={open}>
+      <div data-page-content className="mx-auto w-full max-w-6xl px-4 pb-8 pt-5">
+        {page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
+        {children}
+      </div>
+    </main>
+    {open && <div className="fixed inset-0 z-50 flex" onKeyDown={event => { if (event.key === "Escape") setOpen(false) }}>
+      <button type="button" aria-label="Close navigation" className="absolute inset-0 cursor-default bg-black/45 dark:bg-black/70" onClick={() => setOpen(false)} />
+      <aside aria-label="Navigation" className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-6 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
+        <div className="mb-6 flex h-10 items-center justify-between px-4">
+          <span className="flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude</span>
+          <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label="Close navigation" onClick={() => setOpen(false)}><XIcon className="size-5" /></button>
+        </div>
+        <Navigation page={page} navigate={navigate} onNavigate={() => setOpen(false)} />
+      </aside>
+    </div>}
+  </div>
+}
+function DockedShell({ page, navigate, platform, children }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
   const [collapsed, setCollapsed] = useState(false)
   const integratedControls = platform === "darwin" || platform === "win32"
   const sidebarWidth = collapsed ? 0 : 224

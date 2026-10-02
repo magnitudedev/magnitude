@@ -22,7 +22,7 @@ export function MemoryFigures({ allocation }: { readonly allocation: Option.Opti
       {allocation === null && <Skeleton className="h-full w-full" />}
       {segments.map(segment => <span key={segment.label} className={segment.color} style={{ width: `${total > 0 ? segment.bytes / total * 100 : 0}%` }} />)}
     </div>
-    <dl className="mt-4 grid grid-cols-3 gap-4">
+    <dl className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3">
       {segments.map(segment => <div key={segment.label}>
         <dt className="flex items-center gap-2 text-xs text-slate-500"><span className={`size-2 shrink-0 rounded-sm ${segment.color}`} />{segment.label}</dt>
         <dd className="mt-1 text-sm tabular-nums" data-memory-category={segment.label} data-bytes={allocation === null ? undefined : segment.bytes}>{allocation === null ? <SkeletonLine className="h-5 text-sm" width="60px" /> : formatMemorySize(segment.bytes)}</dd>

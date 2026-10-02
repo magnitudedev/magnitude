@@ -45,7 +45,7 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
       <div className={pageLayout.harnessGrid}>{rows.map(row => {
         const needsAttention = row.managed && row.inspection._tag === "Disconnected"
         return <article key={row.id} aria-label={row.name} className={pageLayout.harnessCard}>
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex flex-wrap items-center justify-between gap-4 md:flex-nowrap">
           <div className="flex min-w-0 items-center gap-3">
             <HarnessLogo id={row.id} name={row.name} />
             <div><h3 className="text-lg font-semibold">{row.name}</h3>
@@ -64,7 +64,7 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
           </div>
         </div>
               {installed && row.inspection._tag === "Unavailable" && <ErrorNotice title="Couldn’t verify this connection" description="The agent’s configuration could not be read or validated. Check it before reconnecting." className="mt-2" />}
-        {installed && row.inspection._tag === "Connected" && <div className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750"><HarnessCommand harness={row.id} name={row.name} models={models} defaultModel={defaultModel} platform={platform} /><div className="relative mt-3 text-xs"><details className="group"><summary className="w-fit cursor-pointer list-none hover:text-slate-700 dark:hover:text-slate-300 [&::-webkit-details-marker]:hidden"><span aria-hidden="true" className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>Configuration files</summary><ul className="mt-2 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono text-xs">{file}</li>)}</ul></details>{models.length > 0 && <span className="absolute right-0 top-0 max-w-[calc(100%-9rem)] truncate text-right text-slate-500">Run this in {platform === "win32" ? "PowerShell" : "your terminal"} from your project folder.</span>}</div></div>}
+        {installed && row.inspection._tag === "Connected" && <div className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750"><HarnessCommand harness={row.id} name={row.name} models={models} defaultModel={defaultModel} platform={platform} /><div className="relative mt-3 text-xs"><details className="group"><summary className="w-fit cursor-pointer list-none hover:text-slate-700 dark:hover:text-slate-300 [&::-webkit-details-marker]:hidden"><span aria-hidden="true" className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>Configuration files</summary><ul className="mt-2 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono text-xs">{file}</li>)}</ul></details>{models.length > 0 && <span className="mt-2 block text-slate-500 md:absolute md:right-0 md:top-0 md:mt-0 md:max-w-[calc(100%-9rem)] md:truncate md:text-right">Run this in {platform === "win32" ? "PowerShell" : "your terminal"} from your project folder.</span>}</div></div>}
 
       </article>})}</div>
     </section>
@@ -80,7 +80,7 @@ export function HarnessCommand({ harness, name, models, defaultModel, platform }
   if (!selected) return <p>Download a compatible model to get a command for this agent.</p>
   const command = harnessCommand(harness, selected.id, platform)
   return <div className="space-y-2">
-    <div className="flex min-w-0 items-center gap-3"><div className="flex min-w-0 max-w-[45%] shrink-0 items-center gap-2"><Select items={models.map(model => ({ value: model.id, label: model.label }))} value={selected.id} onValueChange={setSelection}><SelectTrigger variant="inline" aria-label={`${name} model`} className="min-w-0 max-w-full py-1 text-slate-800 dark:text-slate-200"><SelectValue className="min-w-0 truncate" /></SelectTrigger><SelectContent className="w-max min-w-64 max-w-[calc(100vw-2rem)]">{models.map(model => <SelectItem key={model.id} value={model.id}>{model.label}</SelectItem>)}</SelectContent></Select></div>
+    <div className="flex min-w-0 flex-col items-stretch gap-2 md:flex-row md:items-center md:gap-3"><div className="flex min-w-0 max-w-full shrink-0 items-center gap-2 md:max-w-[45%]"><Select items={models.map(model => ({ value: model.id, label: model.label }))} value={selected.id} onValueChange={setSelection}><SelectTrigger variant="inline" aria-label={`${name} model`} className="min-w-0 max-w-full py-1 text-slate-800 dark:text-slate-200"><SelectValue className="min-w-0 truncate" /></SelectTrigger><SelectContent className="w-max min-w-64 max-w-[calc(100vw-2rem)]">{models.map(model => <SelectItem key={model.id} value={model.id}>{model.label}</SelectItem>)}</SelectContent></Select></div>
     <CopyCommand key={command} command={command} label={`Copy ${name} command`} />
     </div>
     {harness === "openclaw" && <><p className="text-xs">With your gateway running, open the TUI, then enter this inside it to select the model for the current session:</p><CopyCommand key={selected.id} command={`/model magnitude/${selected.id}`} label="Copy OpenClaw model command" /></>}

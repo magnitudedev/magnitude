@@ -5,11 +5,11 @@ const output=process.env.FIXTURE_OUTPUT ?? new URL('../../../specs/26-09-15/page
 await mkdir(output,{recursive:true})
 const browser=await chromium.launch({headless:true})
 const errors=[];const results=[]
-for(const theme of ['light','dark']) for(const width of [800,1120,1600]) {
+for(const theme of ['light','dark']) for(const width of (process.env.FIXTURE_WIDTHS ? process.env.FIXTURE_WIDTHS.split(',').map(Number) : [800,1120,1600])) {
  const page=await browser.newPage({viewport:{width,height:900},reducedMotion:'reduce'})
  page.on('pageerror',e=>errors.push(e.message))
  await page.goto('http://127.0.0.1:6091/loading.html'+(process.env.FIXTURE_QUERY ?? ''))
- await page.getByRole('navigation').waitFor()
+ await page.locator('main').waitFor()
  await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme)
  for(const name of (process.argv.length>2 ? process.argv.slice(2) : ['discover','catalog','models','connections','usage','status','settings'])) {
   await page.evaluate(name=>{window.loadingFixture.setPhase('loading');window.loadingFixture.navigate(name)},name)
@@ -41,6 +41,8 @@ for(const theme of ['light','dark']) for(const width of [800,1120,1600]) {
   for(let i=0;i<before.length;i++) for(const dimension of ['x','y','width','height']) {
    // Discover content height depends on specifications unavailable during loading.
    if(name === "discover" && (dimension === "height" || dimension === "y")) continue
+   // Below md, wrapped model names make loaded heights content-dependent.
+   if(width < 768 && (dimension === "height" || dimension === "y")) continue
    const tolerance=1
    assert.ok(Math.abs(before[i][dimension]-after[i][dimension])<=tolerance,`${name} ${width} frame ${i} ${dimension}: ${before[i][dimension]} -> ${after[i][dimension]}`)
   }
