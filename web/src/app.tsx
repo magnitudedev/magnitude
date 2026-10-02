@@ -43,10 +43,10 @@ import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-at
 import { Effect, Option } from "effect"
 import { localModelDeprecation, type ProviderModelId, type CatalogLocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
 import type { ApplicationSnapshot, AppearancePreference } from "@magnitudedev/sdk/desktop-host"
-import type { NetworkAccessChange, NetworkBind } from "@magnitudedev/sdk"
+import type { ApplicationUpdateState, NetworkAccessChange, NetworkBind, OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker } from "./components/folder-picker"
 import {
-  activeLocalModel, useAgentClient, type ApplicationPage, type HostNotice, type DesktopUpdateState,
+  activeLocalModel, useAgentClient, type ApplicationPage, type HostNotice,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
   formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
@@ -605,7 +605,7 @@ function StatusOverview() {
       detail={Result.isSuccess(network) ? address ?? "This computer only" : null} />
   </section>
 }
-type UpdateTransfer = (typeof DesktopUpdateState.Type)["transfer"]
+type UpdateTransfer = (typeof ApplicationUpdateState.Type)["transfer"]
 const firstFailure = (results: ReadonlyArray<Result.Result<unknown, unknown>>) => results.find((result): result is Result.Failure<unknown, unknown> => Result.isFailure(result) && !result.waiting)
 function SettingsGroup({ label, children }: { label: string; children: ReactNode }) {
   return <section aria-label={label} className="mt-7">
@@ -640,11 +640,21 @@ function ThemeRow() {
         return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}
     </div>} />
 }
+/** The application that owns the service, and whether it supports a request. */
+function useApplicationOwner() {
+  const client = useAgentClient()
+  const owner = useAtomValue(client.Application.WatchApplicationOwner({})).result
+  const supports = (capability: OwnerCapability) => Result.isSuccess(owner) && owner.value.capabilities.includes(capability)
+  return { owner, supports }
+}
 function LaunchAtLoginRow() {
-  const service = useSession()
-  const state = useAtomValue(service.loginStartup)
-  const set = useAtomSet(service.setLoginStartup)
-  const change = useAtomValue(service.setLoginStartup)
+  const client = useAgentClient()
+  const { owner, supports } = useApplicationOwner()
+  const state = Result.flatMap(owner, value => Option.match(value.loginStartup, { onNone: () => Result.initial(), onSome: login => Result.success(login) }))
+  const setLaunchAtLogin = useAtomSet(client.Application.SetLaunchAtLogin)
+  const set = (enabled: boolean) => setLaunchAtLogin({ enabled })
+  const change = useAtomValue(client.Application.SetLaunchAtLogin)
+  if (Result.isSuccess(owner) && !supports("LaunchAtLogin")) return null
   const current = Result.isSuccess(state) ? state.value : null
   const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
   const hint = current?._tag === "Unavailable" ? current.message
@@ -681,8 +691,10 @@ function RestartRequiredToast() {
   const platform = useServerPlatform()
   const storage = useAtomValue(client.Configuration.GetModelStorage({})).result
   const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
-  const relaunch = useAtomSet(session.relaunch)
-  const relaunching = useAtomValue(session.relaunch)
+  const { supports } = useApplicationOwner()
+  const restartApplication = useAtomSet(client.Application.RestartApplication)
+  const relaunch = () => restartApplication({})
+  const relaunching = useAtomValue(client.Application.RestartApplication)
   const storageValue = Result.isSuccess(storage) ? storage.value : null
   const storagePending = storageValue !== null && storageValue.path !== storageValue.active
   const networkPending = Result.isSuccess(network) && network.value.pending
@@ -692,7 +704,8 @@ function RestartRequiredToast() {
   return <div className="fixed bottom-4 right-4 z-50 w-96 max-w-[calc(100vw-2rem)] rounded-lg bg-white shadow-md dark:bg-slate-850">
     <ErrorNotice severity={Result.isFailure(relaunching) && !relaunching.waiting ? "error" : "info"}
       title={Result.isFailure(relaunching) && !relaunching.waiting ? "Magnitude couldn’t restart" : "Restart to apply your changes"}
-      description={reason} actions={<NoticeAction disabled={relaunching.waiting} onClick={() => relaunch()}>Restart Magnitude</NoticeAction>}>
+      description={supports("RestartService") ? reason : `${reason} Restart the Magnitude server to apply them.`}
+      actions={supports("RestartService") ? <NoticeAction disabled={relaunching.waiting} onClick={() => relaunch()}>Restart Magnitude</NoticeAction> : undefined}>
       {storagePending && storageValue && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
         <summary className="w-fit cursor-pointer rounded py-0.5 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500">Moving existing models</summary>
         <p className="my-2">Existing downloads stay in the previous folder. To move them, quit Magnitude, run this command, then open Magnitude again.</p>
@@ -736,10 +749,13 @@ function NetworkAccessRows() {
   </>
 }
 function AutomaticUpdatesRow() {
-  const service = useSession()
-  const observation = useAtomValue(service.updates)
-  const setAutoDownload = useAtomSet(service.setAutoDownload)
-  const saving = useAtomValue(service.setAutoDownload)
+  const client = useAgentClient()
+  const { owner, supports } = useApplicationOwner()
+  const observation = Result.flatMap(owner, value => Option.match(value.updates, { onNone: () => Result.initial(), onSome: updates => Result.success(updates) }))
+  const saveAutoDownload = useAtomSet(client.Application.SetApplicationAutoDownload)
+  const setAutoDownload = (enabled: boolean) => saveAutoDownload({ enabled })
+  const saving = useAtomValue(client.Application.SetApplicationAutoDownload)
+  if (Result.isSuccess(owner) && !supports("Updates")) return null
   const snapshot = Result.isSuccess(observation) ? observation.value : null
   const preference = snapshot?.preference
   const closed = snapshot?.transfer._tag === "Closed"
@@ -753,15 +769,20 @@ function AboutRow() {
   const client = useAgentClient()
   const health = useAtomValue(client.Connection.Health({})).result
   const version = Result.isSuccess(health) ? `Magnitude ${health.value.version}` : Result.isFailure(health) ? "Magnitude" : <SkeletonLine className="h-5 text-sm" width="120px" />
-  const observation = useAtomValue(service.updates)
-  const check = useAtomSet(service.checkUpdate)
-  const discard = useAtomSet(service.discardUpdate)
-  const discarding = useAtomValue(service.discardUpdate)
-  const download = useAtomSet(service.downloadUpdate)
-  const restart = useAtomSet(service.restartUpdate)
-  const checking = useAtomValue(service.checkUpdate)
-  const downloading = useAtomValue(service.downloadUpdate)
-  const restarting = useAtomValue(service.restartUpdate)
+  const { owner, supports } = useApplicationOwner()
+  const observation = Result.flatMap(owner, value => Option.match(value.updates, { onNone: () => Result.initial(), onSome: updates => Result.success(updates) }))
+  const checkUpdate = useAtomSet(client.Application.CheckApplicationUpdate)
+  const check = () => checkUpdate({})
+  const discardUpdate = useAtomSet(client.Application.DiscardApplicationUpdate)
+  const discard = () => discardUpdate({})
+  const discarding = useAtomValue(client.Application.DiscardApplicationUpdate)
+  const downloadUpdate = useAtomSet(client.Application.DownloadApplicationUpdate)
+  const download = () => downloadUpdate({})
+  const installUpdate = useAtomSet(client.Application.InstallApplicationUpdate)
+  const restart = () => installUpdate({})
+  const checking = useAtomValue(client.Application.CheckApplicationUpdate)
+  const downloading = useAtomValue(client.Application.DownloadApplicationUpdate)
+  const restarting = useAtomValue(client.Application.InstallApplicationUpdate)
   const snapshot = Result.isSuccess(observation) ? observation.value : null
   const current: UpdateTransfer | undefined = snapshot?.transfer
   const pending = downloading.waiting || restarting.waiting || discarding.waiting

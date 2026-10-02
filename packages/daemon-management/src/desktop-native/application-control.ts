@@ -4,7 +4,7 @@ import { lstat, unlink, chmod } from "node:fs/promises"
 import { Deferred, Effect, Option, Schema, Stream } from "effect"
 import { receiveJsonLines, sendJsonLine } from "@magnitudedev/utils/json-line-channel"
 import { ApplicationIntent, ApplicationRequest, ApplicationSnapshot, ApplicationLoginRequest, ApplicationLoginReply, LoginStartupFailed, type LoginStartupAction, type LoginStartupState } from "@magnitudedev/sdk/desktop-host"
-import { ApplicationUpdateRequest, ApplicationUpdateReply, type ApplicationUpdateAction, type ApplicationUpdateControlFailed, type DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationUpdateRequest, ApplicationUpdateReply, type ApplicationUpdateAction, type ApplicationUpdateControlFailed, type ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 export { ApplicationIntent, ApplicationRequest, ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
 
 export class ApplicationControlFailed extends Schema.TaggedError<ApplicationControlFailed>()("ApplicationControlFailed", { message: Schema.String }) {}
@@ -28,7 +28,7 @@ export interface ApplicationControlOptions {
   readonly snapshot: Effect.Effect<ApplicationSnapshot>
   readonly dispatch: (intent: ApplicationIntent) => Effect.Effect<void>
   readonly login: (action: LoginStartupAction) => Effect.Effect<LoginStartupState, LoginStartupFailed>
-  readonly update: (action: ApplicationUpdateAction) => Effect.Effect<{ readonly state: DesktopUpdateState; readonly afterReply: Effect.Effect<void> }, ApplicationUpdateControlFailed>
+  readonly update: (action: ApplicationUpdateAction) => Effect.Effect<{ readonly state: ApplicationUpdateState; readonly afterReply: Effect.Effect<void> }, ApplicationUpdateControlFailed>
 }
 
 export const serveApplicationControl = (path: string, options: ApplicationControlOptions) => Effect.gen(function* () {

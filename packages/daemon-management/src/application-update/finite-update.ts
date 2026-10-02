@@ -1,13 +1,13 @@
 import { Clock, Effect, Option, Schema } from "effect"
 import { UpdateRelease } from "@magnitudedev/release/hosted-update"
-import type { DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
+import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { PreparedUpdateStore, type PreparedUpdate } from "../desktop-native/prepared-update"
 import { UpdatePreferences } from "../desktop-native/update-preferences"
 import { ApplicationUpdateFailed, ApplicationUpdateSource } from "./application-update"
 import { acquireApplicationMaintenance } from "../desktop-native/application-owner"
 import { preparedUpdateFailure } from "./prepared-update-installation"
 
-const presentPrepared = (pending: Option.Option<PreparedUpdate>): DesktopUpdateState["transfer"] => Option.match(pending, {
+const presentPrepared = (pending: Option.Option<PreparedUpdate>): ApplicationUpdateState["transfer"] => Option.match(pending, {
   onNone: () => ({ _tag: "Idle" }),
   onSome: record => Option.match(preparedUpdateFailure(record), {
     onNone: () => ({ _tag: "Ready", version: record.release.version }),
@@ -24,7 +24,7 @@ export const readPreparedUpdateState = Effect.gen(function* () {
     onSuccess: autoDownload => ({ _tag: "Known", autoDownload }) as const,
     onFailure: error => ({ _tag: "Unavailable", message: error.message }) as const,
   }))
-  return { transfer: presentPrepared(pending), check: { _tag: "Idle" }, preference } satisfies DesktopUpdateState
+  return { transfer: presentPrepared(pending), check: { _tag: "Idle" }, preference } satisfies ApplicationUpdateState
 }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
 
 export const discardPreparedUpdate = Effect.gen(function* () {
@@ -34,7 +34,7 @@ export const discardPreparedUpdate = Effect.gen(function* () {
     return yield* new ApplicationUpdateFailed({ message: "There is no prepared update to discard." })
   }
   yield* store.discard
-  return { ...initial, transfer: { _tag: "Idle" } } satisfies DesktopUpdateState
+  return { ...initial, transfer: { _tag: "Idle" } } satisfies ApplicationUpdateState
 }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
 
 /** Caller retains maintenance ownership. All transfer work ends before this finite command returns. */
@@ -49,7 +49,7 @@ export const runFiniteUpdatePreparation = (action: "check" | "download" | "disca
   if (initial.transfer._tag !== "Idle") return { ...initial, check }
   if (Option.isNone(candidate)) return { ...initial, check }
   if (action === "check") return { ...initial, check,
-    transfer: { _tag: "Available", version: candidate.value.version, bytes: candidate.value.bytes } } satisfies DesktopUpdateState
+    transfer: { _tag: "Available", version: candidate.value.version, bytes: candidate.value.bytes } } satisfies ApplicationUpdateState
   yield* store.removeAbandonedTransfers
   const archive = yield* source.download(candidate.value, () => Effect.void)
   yield* source.stage(archive, candidate.value)
@@ -57,7 +57,7 @@ export const runFiniteUpdatePreparation = (action: "check" | "download" | "disca
   if (Option.isNone(saved) || !Schema.equivalence(UpdateRelease)(saved.value.release, candidate.value) || saved.value.installation._tag !== "Unattempted") {
     return yield* new ApplicationUpdateFailed({ message: "The update download did not publish a complete prepared installer." })
   }
-  return { ...initial, check, transfer: presentPrepared(saved) } satisfies DesktopUpdateState
+  return { ...initial, check, transfer: presentPrepared(saved) } satisfies ApplicationUpdateState
 })).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
 
 /** Admission is nonblocking and rechecks installation after acquiring the application lock. */

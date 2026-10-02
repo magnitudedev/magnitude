@@ -1,5 +1,5 @@
 import { Effect, Option, Schema, Stream } from "effect"
-import { ApplicationSnapshot, LoginStartupState, DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
 import { ApplicationHostFailed, ModelTrayPresentation, type ApplicationHost } from "@magnitudedev/client-common"
 import { renderApplication } from "@magnitudedev/web/run"
 import type { DesktopApi } from "./desktop-rpc"
@@ -33,18 +33,7 @@ const host: ApplicationHost = {
     presentModel: value => call(() => bridge.presentModel(Schema.encodeSync(ModelTrayPresentation)(value))),
     resolveQuitFailure: decision => call(() => bridge.resolveQuitFailure(decision)),
     retryService: call(() => bridge.retry()),
-  }),
-  desktop: Option.some({
     application: observe(ApplicationSnapshot, bridge.observe),
-    updates: observe(DesktopUpdateState, bridge.updates),
-    setAutoDownload: enabled => call(() => bridge.setAutoDownload(enabled)),
-    checkUpdate: call(() => bridge.checkUpdate()),
-    discardUpdate: call(() => bridge.discardUpdate()),
-    downloadUpdate: call(() => bridge.downloadUpdate()),
-    restartUpdate: call(() => bridge.restartUpdate()),
-    loginStartup: observe(LoginStartupState, bridge.loginStartup),
-    setLoginStartup: enabled => call(() => bridge.setLoginStartup(enabled)),
-    relaunch: call(() => bridge.relaunch()),
   }),
 }
 

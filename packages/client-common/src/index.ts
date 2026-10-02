@@ -34,5 +34,4 @@ export * from './hooks/use-local-inference-state'
 export * from "./application/session"
 export * from "./application/host"
 export * from "./application/router"
-export * from "./application/update"
 export { hostlessApplication } from "./state/client-services"

@@ -37,6 +37,7 @@ import { ProjectStore } from "../project-store";
 import { SessionInspector } from "../session-inspector";
 import { ServerSettings } from "../server-settings";
 import { AcnHarnessConnections } from "../harness-connections";
+import { AcnOwner, requestOwner, watchApplicationOwner } from "../application-owner";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -71,6 +72,8 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const localInferenceHardware = yield* LocalInferenceHardware;
     const serverSettings = yield* ServerSettings;
     const harnessConnections = yield* AcnHarnessConnections;
+    const owner = yield* AcnOwner;
+    const ownerRequest = (name: string, request: Parameters<typeof requestOwner>[0]) => observeRpcDefects(name, requestOwner(request).pipe(Effect.provideService(AcnOwner, owner)));
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -330,6 +333,16 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       ConnectHarness: request => observeRpcDefects("ConnectHarness", harnessConnections.connect(request)),
       SyncHarnessConnections: ({ harness }) => observeRpcDefects("SyncHarnessConnections", harnessConnections.sync(harness).pipe(Effect.as({}))),
       DisconnectHarness: ({ harness }) => observeRpcDefects("DisconnectHarness", harnessConnections.disconnect(harness).pipe(Effect.as({}))),
+
+      WatchApplicationOwner: () => observeRpcStreamDefects("WatchApplicationOwner", watchApplicationOwner.pipe(Stream.provideService(AcnOwner, owner))),
+      CheckApplicationUpdate: () => ownerRequest("CheckApplicationUpdate", { _tag: "CheckUpdate" }),
+      DownloadApplicationUpdate: () => ownerRequest("DownloadApplicationUpdate", { _tag: "DownloadUpdate" }),
+      DiscardApplicationUpdate: () => ownerRequest("DiscardApplicationUpdate", { _tag: "DiscardUpdate" }),
+      InstallApplicationUpdate: () => ownerRequest("InstallApplicationUpdate", { _tag: "InstallUpdate" }),
+      SetApplicationAutoDownload: ({ enabled }) => ownerRequest("SetApplicationAutoDownload", { _tag: "SetAutoDownload", enabled }),
+      SetLaunchAtLogin: ({ enabled }) => ownerRequest("SetLaunchAtLogin", { _tag: "SetLoginStartup", enabled }),
+      RestartApplication: () => ownerRequest("RestartApplication", { _tag: "RestartService" }),
+      QuitApplication: () => ownerRequest("QuitApplication", { _tag: "Quit" }),
       GetLocalInferenceEnvironment: () =>
         observeRpcDefects("GetLocalInferenceEnvironment", localInferenceHardware.state),
 

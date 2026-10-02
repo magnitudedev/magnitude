@@ -59,5 +59,4 @@ export const hostlessApplication: ApplicationHost = {
     save: () => Effect.fail(new ApplicationHostFailed({ message: "Appearance can't be saved here." })),
   },
   shell: Option.none(),
-  desktop: Option.none(),
 }

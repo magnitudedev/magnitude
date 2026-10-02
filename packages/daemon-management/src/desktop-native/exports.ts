@@ -40,3 +40,5 @@ export { ApplicationRuntime, ApplicationProfile, ApplicationRuntimeUnavailable, 
 export { makeUnixProcessContinuation, ForegroundContinuationFailed } from "./unix-continuation"
 
 export { acquireMacApplicationInstallationLease, nativeMacUpdateAdmission } from "./mac-update-lease"
+export type { OwnerAgent } from "./owned-service"
+export { ownerDone, ownerResult, ownerUnsupported } from "./owner-agent"

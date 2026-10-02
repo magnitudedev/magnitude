@@ -9,6 +9,8 @@ import { acquireApplicationOwner } from "./application-owner"
 import { serveApplicationControl, type ApplicationControlOptions } from "./application-control"
 import { serveWindowsApplicationControl } from "./windows-control"
 import { applicationNativeHostPath, makeApplicationService, type ApplicationRuntime, type ApplicationProfile } from "./application-bootstrap"
+import type { OwnerAgent } from "./owned-service"
+import { ownerDone, ownerResult, ownerUnsupported } from "./owner-agent"
 import { acquireLinuxInstallationLease } from "./linux-installation-lease"
 import { isUpdateInstallationActive } from "./update-installation-lease"
 import { acquireMacApplicationInstallationLease, nativeMacUpdateAdmission } from "./mac-update-lease"
@@ -59,7 +61,22 @@ export const runHeadlessApplication = (options: {
       a._tag === "Ready" && b._tag === "Ready" && a.version === b.version),
       Stream.runForEach(state => state._tag === "Ready" ? notify(state.version) : Effect.void), Effect.forkScoped)
   }
-  const service = yield* makeApplicationService({ ...options, output: "Foreground", admission: "Immediate" })
+  const ownerAgent: OwnerAgent = {
+    state: updates.changes.pipe(Stream.map(state => ({ owner: "Headless" as const, capabilities: ["Updates" as const, "Quit" as const], updates: Option.some(state), loginStartup: Option.none() }))),
+    handle: request => {
+      switch (request._tag) {
+        case "CheckUpdate": return ownerResult(update("check"))
+        case "DownloadUpdate": return ownerResult(update("download"))
+        case "DiscardUpdate": return ownerResult(update("discard"))
+        case "InstallUpdate": return ownerResult(update("install"))
+        case "SetAutoDownload": return ownerResult(updates.setAutoDownload(request.enabled))
+        case "Quit": return Effect.succeed(ownerDone(Deferred.succeed(stop, "Requested").pipe(Effect.asVoid)))
+        case "SetLoginStartup":
+        case "RestartService": return ownerUnsupported
+      }
+    },
+  }
+  const service = yield* makeApplicationService({ ...options, output: "Foreground", admission: "Immediate", owner: ownerAgent })
   const control: ApplicationControlOptions = {
     snapshot: service.state.pipe(Effect.map(state => ({ version: 1 as const, pid: process.pid, endpoint: options.profile.endpoint, owner: { _tag: "Headless" as const }, service: state }))),
     dispatch: intent => intent === "Yield" || intent === "Quit" ? Deferred.succeed(stop, intent === "Yield" ? "DesktopTakeover" : "Requested").pipe(Effect.asVoid) : Effect.void,

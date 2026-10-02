@@ -25,7 +25,7 @@ const run = Effect.acquireUseRelease(
     let terminal = false
     yield* child.events.pipe(Stream.runForEach(event => Effect.gen(function* () {
       if (event._tag === "Booted") return yield* child.send({ _tag: "Start" })
-      if (event.health.state._tag !== "Stopping") return
+      if (event._tag !== "Health" || event.health.state._tag !== "Stopping") return
       const state = event.health.state
       assert.equal(state.reason, "startup-failed")
       assert.ok(Option.isSome(state.safeDetail))

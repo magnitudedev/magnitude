@@ -107,22 +107,7 @@ const makeApplicationSession = Effect.gen(function* () {
   const retryService = Atom.fn((_: void) => Option.match(host.shell, { onNone: () => Effect.fail(unavailable), onSome: shell => shell.retryService }))
 
 
-  const desktop = host.desktop
-  const fromDesktop = <A, E>(select: (controls: NonNullable<Option.Option.Value<typeof desktop>>) => Effect.Effect<A, E>) =>
-    Option.match(desktop, { onNone: () => Effect.fail(unavailable), onSome: select })
-  const streamFromDesktop = <A>(select: (controls: NonNullable<Option.Option.Value<typeof desktop>>) => Stream.Stream<A, ApplicationHostFailed>) =>
-    Option.match(desktop, { onNone: () => Stream.fail(unavailable), onSome: select })
-
-  const application = Atom.keepAlive(Atom.make(streamFromDesktop(controls => controls.application)))
-  const loginStartup = Atom.make(Option.isSome(desktop) ? desktop.value.loginStartup : Stream.succeed({ _tag: "Unavailable" as const, message: "Launch at login isn't available here." }))
-  const updates = Atom.make(Option.isSome(desktop) ? desktop.value.updates : Stream.succeed({ transfer: { _tag: "Unavailable" as const, message: "Updates aren't available here." }, check: { _tag: "Idle" as const }, preference: { _tag: "Unavailable" as const, message: "Updates aren't available here." } }))
-  const setAutoDownload = Atom.fn((enabled: boolean) => fromDesktop(controls => controls.setAutoDownload(enabled)))
-  const checkUpdate = Atom.fn((_: void) => fromDesktop(controls => controls.checkUpdate))
-  const discardUpdate = Atom.fn((_: void) => fromDesktop(controls => controls.discardUpdate))
-  const downloadUpdate = Atom.fn((_: void) => fromDesktop(controls => controls.downloadUpdate))
-  const restartUpdate = Atom.fn((_: void) => fromDesktop(controls => controls.restartUpdate))
-  const setLoginStartup = Atom.fn((enabled: boolean) => fromDesktop(controls => controls.setLoginStartup(enabled)))
-  const relaunch = Atom.fn((_: void) => fromDesktop(controls => controls.relaunch))
+  const application = Atom.keepAlive(Atom.make(Option.match(host.shell, { onNone: () => Stream.fail(unavailable), onSome: shell => shell.application })))
 
   return {
     page: router.page,
@@ -138,15 +123,6 @@ const makeApplicationSession = Effect.gen(function* () {
     saveAppearance: (preference: AppearancePreference) => host.appearance.save(preference),
     clientWindow: host.window,
     application,
-    updates,
-    setAutoDownload,
-    checkUpdate,
-    downloadUpdate,
-    discardUpdate,
-    restartUpdate,
-    loginStartup,
-    setLoginStartup,
-    relaunch,
   }
 })
 export interface ApplicationSession extends Effect.Effect.Success<typeof makeApplicationSession> {}

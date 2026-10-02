@@ -1,6 +1,6 @@
 import { Clock, Context, Effect, ExecutionStrategy, Exit, Fiber, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
 import { UpdateRelease, type UpdateCheckReason } from "@magnitudedev/release/hosted-update"
-import type { DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
+import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { UpdatePreferences } from "../desktop-native/update-preferences"
 import { PreparedUpdateStore, type PreparedUpdate } from "../desktop-native/prepared-update"
 
@@ -27,8 +27,8 @@ const Transfer = Schema.Union(
   Schema.TaggedStruct("Closed", {}),
 )
 type Transfer = typeof Transfer.Type
-type State = { readonly transfer: Transfer; readonly check: DesktopUpdateState["check"]; readonly preference: DesktopUpdateState["preference"] }
-const present = (state: State): DesktopUpdateState => {
+type State = { readonly transfer: Transfer; readonly check: ApplicationUpdateState["check"]; readonly preference: ApplicationUpdateState["preference"] }
+const present = (state: State): ApplicationUpdateState => {
   const transfer = state.transfer
   switch (transfer._tag) {
     case "Available": return { ...state, transfer: { _tag: "Available", version: transfer.candidate.version, bytes: transfer.candidate.bytes } }
@@ -39,8 +39,8 @@ const present = (state: State): DesktopUpdateState => {
   }
 }
 export interface ApplicationUpdate {
-  readonly state: Effect.Effect<DesktopUpdateState>
-  readonly changes: Stream.Stream<DesktopUpdateState>
+  readonly state: Effect.Effect<ApplicationUpdateState>
+  readonly changes: Stream.Stream<ApplicationUpdateState>
   readonly check: (reason: UpdateCheckReason) => Effect.Effect<void, ApplicationUpdateFailed>
   readonly download: Effect.Effect<void, ApplicationUpdateFailed>
   readonly discard: Effect.Effect<void, ApplicationUpdateFailed>
@@ -161,7 +161,7 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
 })
 
 export const unavailableApplicationUpdate = (message: string): ApplicationUpdate => {
-  const state: DesktopUpdateState = { transfer: { _tag: "Unavailable", message }, check: { _tag: "Idle" }, preference: { _tag: "Unavailable", message } }
+  const state: ApplicationUpdateState = { transfer: { _tag: "Unavailable", message }, check: { _tag: "Idle" }, preference: { _tag: "Unavailable", message } }
   return { state: Effect.succeed(state), changes: Stream.succeed(state), check: () => new ApplicationUpdateFailed({ message }),
     download: new ApplicationUpdateFailed({ message }), discard: new ApplicationUpdateFailed({ message }), setAutoDownload: () => new ApplicationUpdateFailed({ message }),
     requireReady: new ApplicationUpdateFailed({ message }), close: Effect.void }

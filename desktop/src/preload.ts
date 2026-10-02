@@ -32,23 +32,13 @@ const query = <A>(select: (client: InferenceHostClient) => Effect.Effect<A, unkn
   },
 }))
 const api: DesktopApi = {
-  updates: (value, error) => observe(client => client.Updates({}), value, error),
-  setAutoDownload: enabled => command(client => client.SetAutoDownload({ enabled })),
-  checkUpdate: () => command(client => client.CheckUpdate({})),
-  discardUpdate: () => command(client => client.DiscardUpdate({})),
-  downloadUpdate: () => command(client => client.DownloadUpdate({})),
-  restartUpdate: () => command(client => client.RestartUpdate({})),
   platform: process.platform,
   observe: (value, error) => observe(client => client.Observe({}), state => value(Schema.encodeSync(ApplicationSnapshot)(state)), error),
   actions: value => observe(client => client.Actions({}), value, message => console.error(message)),
   presentModel: value => command(client => client.PresentModel(Schema.decodeUnknownSync(ModelTrayPresentation)(value))),
   getAppearance: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.GetAppearance({}))),
   setAppearance: preference => command(client => client.SetAppearance({ preference })),
-  relaunch: () => command(client => client.Relaunch({})),
-  loginStartup: (value, error) => observe(client => client.LoginStartup({}), value, error),
-  setLoginStartup: enabled => command(client => client.SetLoginStartup({ enabled })),
   retry: () => command(client => client.Retry({})),
-  quit: () => command(client => client.Quit({})),
   resolveQuitFailure: decision => command(client => client.ResolveQuitFailure({ decision })),
 }
 contextBridge.exposeInMainWorld("__magnitudeDesktop", api)

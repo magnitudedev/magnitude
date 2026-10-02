@@ -22,7 +22,7 @@ describe("ACN startup failure presentation", () => {
     vi.stubEnv("MAGNITUDE_ICN_PATH", join(root, "absent-installation.json"))
     try {
       const result = await Effect.runPromise(launchAcnServer({ dataDir: root, port: 0 }, {
-        awaitStart: Effect.void, awaitShutdown: Effect.never,
+        awaitStart: Effect.void, awaitShutdown: Effect.never, ownerState: Stream.never, request: () => Effect.never,
         reportHealth: health => Effect.sleep(health.state._tag === "Stopping" ? "25 millis" : "0 millis").pipe(
           Effect.zipRight(Effect.sync(() => { delivered.push(health) })),
         ),

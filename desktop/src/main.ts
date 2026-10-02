@@ -29,7 +29,7 @@ import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, PubSub, Q
 import { RpcServer } from "@effect/rpc"
 import {
   acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, NativeHost, nativeHostLayer,
-  resolveApplicationProfile, applicationNativeHostPath, makeApplicationService, type ApplicationRuntime,
+  resolveApplicationProfile, applicationNativeHostPath, makeApplicationService, type ApplicationRuntime, type OwnerAgent, ownerDone, ownerResult,
   serveApplicationControl, serveWindowsApplicationControl, type ApplicationControlOptions,
   LinuxTrayHost, linuxTrayHostLayer,
   unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory,
@@ -301,7 +301,32 @@ const program = Effect.scoped(Effect.gen(function* () {
     yield* trayHost.changes.pipe(Stream.runForEach(tray.observeHost), Effect.forkScoped)
   }
   const harnessEnvironment = yield* resolveHarnessEnvironment().pipe(Effect.provide(guardedCommandLayer(join(dirname(addonPath), "magnitude-command"))), Effect.forkScoped)
-  const service = yield* makeApplicationService({ output: "DiagnosticTail", admission: "Supervised", runtime: applicationRuntime, profile,
+  const loginStartupObservation = Stream.repeatEffectWithSchedule(loginStartup.read.pipe(
+    Effect.map(state => state._tag === "Unavailable" ? { ...state, message: isolatedProfile || !app.isPackaged ? "Launch at login isn’t available in this development or test build. Install Magnitude to enable it." : "Launch at login needs attention. Check Magnitude in your system startup settings." } : state),
+    Effect.tapError(Effect.logError),
+    Effect.catchAll(() => Effect.succeed({ _tag: "Unavailable" as const, message: "Couldn’t check launch at login. Check Magnitude in your system startup settings." }))), Schedule.spaced("2 seconds"))
+  /** Requests from any client, relayed by ACN; replies precede restarts and quits. */
+  const ownerAgent: OwnerAgent = {
+    state: Stream.zipLatest(updates.changes, loginStartupObservation.pipe(Stream.changesWith((a, b) => a._tag === b._tag))).pipe(Stream.map(([update, login]) => ({
+      owner: "Desktop" as const,
+      capabilities: ["Updates" as const, "LaunchAtLogin" as const, "RestartService" as const, "Quit" as const],
+      updates: Option.some(update),
+      loginStartup: Option.some(login),
+    }))),
+    handle: request => {
+      switch (request._tag) {
+        case "CheckUpdate": return ownerResult(updateSchedule.check)
+        case "DownloadUpdate": return ownerResult(updates.download)
+        case "DiscardUpdate": return ownerResult(updates.discard)
+        case "InstallUpdate": return ownerResult(updates.requireReady, Queue.offer(quit, "RestartUpdate").pipe(Effect.asVoid))
+        case "SetAutoDownload": return ownerResult(preferenceWrites.withPermits(1)(updates.setAutoDownload(request.enabled)))
+        case "SetLoginStartup": return ownerResult(loginStartup.set(request.enabled))
+        case "RestartService": return Effect.succeed(ownerDone(Queue.offer(quit, "Relaunch").pipe(Effect.asVoid)))
+        case "Quit": return Effect.succeed(ownerDone(Queue.offer(quit, "Quit").pipe(Effect.asVoid)))
+      }
+    },
+  }
+  const service = yield* makeApplicationService({ owner: ownerAgent, output: "DiagnosticTail", admission: "Supervised", runtime: applicationRuntime, profile,
     stateDirectory: stateDir, home: homedir(), environment: process.env }).pipe(Effect.provide(NodeSqliteDriverLayer))
   const snapshot = Effect.all({ service: service.state, tray: tray.state }).pipe(Effect.map(value => ({ version: 1 as const, pid: process.pid, endpoint, service: value.service, owner: { _tag: "Desktop" as const, tray: value.tray } })))
   const snapshots = Stream.zipLatest(service.changes, tray.changes).pipe(Stream.map(([service, tray]) => ({ version: 1 as const, pid: process.pid, endpoint, service, owner: { _tag: "Desktop" as const, tray } })))
@@ -319,18 +344,6 @@ const program = Effect.scoped(Effect.gen(function* () {
   } else yield* serveApplicationControl(owner.socketPath, control)
   const connectionError = (error: { readonly message: string }) => new HostError({ message: error.message })
   const handlers = InferenceHostRpcs.toLayer({
-    Updates: () => updates.changes,
-    SetAutoDownload: ({ enabled }) => preferenceWrites.withPermits(1)(updates.setAutoDownload(enabled)).pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.as({})),
-    CheckUpdate: () => updateSchedule.check.pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.as({})),
-    DownloadUpdate: () => updates.download.pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.as({})),
-    DiscardUpdate: () => updates.discard.pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.as({})),
-    RestartUpdate: () => updates.requireReady.pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.zipRight(Effect.gen(function* () {
-      if (!window || window.isDestroyed() || !window.isVisible() || window.isMinimized() || systemShutdownRequested) {
-        return yield* new HostError({ message: "Open Magnitude before choosing Restart to update." })
-      }
-      yield* Queue.offer(quit, "RestartUpdate")
-      return {}
-    }))),
     Observe: () => snapshots,
     Actions: () => Stream.concat(Stream.succeed({ _tag: "Navigate" as const, page: pendingPage }), Stream.fromPubSub(actions)),
     PresentModel: value => Ref.set(model, value).pipe(Effect.zipRight(refreshTray), Effect.as({})),
@@ -339,11 +352,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       Effect.sync(() => { nativeTheme.themeSource = preference }))),
     SetAppearance: ({ preference }) => preferenceWrites.withPermits(1)(appearance.write(preference)).pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError),
       Effect.tap(() => Effect.sync(() => { nativeTheme.themeSource = preference })), Effect.as({})),
-    Relaunch: () => Queue.offer(quit, "Relaunch").pipe(Effect.as({})),
-    LoginStartup: () => Stream.repeatEffectWithSchedule(loginStartup.read.pipe(Effect.map(state => state._tag === "Unavailable" ? { ...state, message: isolatedProfile || !app.isPackaged ? "Launch at login isn’t available in this development or test build. Install Magnitude to enable it." : "Launch at login needs attention. Check Magnitude in your system startup settings." } : state), Effect.tapError(Effect.logError), Effect.catchAll(() => Effect.succeed({ _tag: "Unavailable" as const, message: "Couldn’t check launch at login. Check Magnitude in your system startup settings." }))), Schedule.spaced("2 seconds")).pipe(Stream.mapError(connectionError)),
-    SetLoginStartup: ({ enabled }) => loginStartup.set(enabled).pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError), Effect.as({})),
     Retry: () => service.retry.pipe(Effect.as({})),
-    Quit: () => Queue.offer(quit, "Quit").pipe(Effect.as({})),
     ResolveQuitFailure: ({ decision }) => Ref.getAndSet(pendingQuitDecision, Option.none()).pipe(
       Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: pending => Deferred.succeed(pending, decision) })), Effect.as({})),
   })

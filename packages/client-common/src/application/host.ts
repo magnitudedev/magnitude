@@ -1,6 +1,5 @@
 import { Context, Schema, type Effect, type Option, type Stream } from "effect"
-import type { AppearancePreference, ApplicationSnapshot, LoginStartupState } from "@magnitudedev/sdk/desktop-host"
-import type { DesktopUpdateState } from "./update"
+import type { AppearancePreference, ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
 import type { HostAction, ModelTrayPresentation, QuitFailureDecision } from "./contracts"
 
 export class ApplicationHostFailed extends Schema.TaggedError<ApplicationHostFailed>()("ApplicationHostFailed", {
@@ -24,30 +23,18 @@ export interface HostShell {
   readonly presentModel: (value: typeof ModelTrayPresentation.Type) => Effect.Effect<void, ApplicationHostFailed>
   readonly resolveQuitFailure: (decision: QuitFailureDecision) => Effect.Effect<void, ApplicationHostFailed>
   readonly retryService: Effect.Effect<void, ApplicationHostFailed>
-}
-
-/** Owner capabilities that Electron main serves for the application it owns. */
-export interface DesktopControls {
+  /** The desktop owner's own view of the service and tray, available even when ACN is down. */
   readonly application: Stream.Stream<ApplicationSnapshot, ApplicationHostFailed>
-  readonly updates: Stream.Stream<DesktopUpdateState, ApplicationHostFailed>
-  readonly setAutoDownload: (enabled: boolean) => Effect.Effect<void, ApplicationHostFailed>
-  readonly checkUpdate: Effect.Effect<void, ApplicationHostFailed>
-  readonly discardUpdate: Effect.Effect<void, ApplicationHostFailed>
-  readonly downloadUpdate: Effect.Effect<void, ApplicationHostFailed>
-  readonly restartUpdate: Effect.Effect<void, ApplicationHostFailed>
-  readonly loginStartup: Stream.Stream<LoginStartupState, ApplicationHostFailed>
-  readonly setLoginStartup: (enabled: boolean) => Effect.Effect<void, ApplicationHostFailed>
-  readonly relaunch: Effect.Effect<void, ApplicationHostFailed>
 }
 
 /**
  * What the machine showing the UI provides. Electron provides every group; a browser provides only
- * appearance. Pages show a control when its capability is present.
+ * appearance. Pages show a control when its capability is present. Everything about the machine
+ * running Magnitude, including its owner, comes from ACN instead.
  */
 export interface ApplicationHost {
   readonly window: Option.Option<HostWindow>
   readonly appearance: HostAppearance
   readonly shell: Option.Option<HostShell>
-  readonly desktop: Option.Option<DesktopControls>
 }
 export const ApplicationHost = Context.GenericTag<ApplicationHost>("client/ApplicationHost")

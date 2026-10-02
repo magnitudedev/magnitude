@@ -1,8 +1,8 @@
 import { MagnitudeHealthResponseSchema } from "@magnitudedev/acn-protocol"
 export { MachineFormFactor, MachineIdentity, MachineIdentityObservation } from "@magnitudedev/acn-protocol"
 import { Schema } from "effect"
-import { DesktopUpdateState } from "./desktop-update"
-export { DesktopUpdateState } from "./desktop-update"
+import { ApplicationUpdateState, LoginStartupState } from "@magnitudedev/acn-protocol"
+export { ApplicationUpdateState, LoginStartupState } from "@magnitudedev/acn-protocol"
 
 export const AppearancePreference = Schema.Literal("system", "light", "dark")
 export type AppearancePreference = typeof AppearancePreference.Type
@@ -11,7 +11,7 @@ export const ApplicationUpdateAction = Schema.Literal("status", "check", "downlo
 export type ApplicationUpdateAction = typeof ApplicationUpdateAction.Type
 export class ApplicationUpdateControlFailed extends Schema.TaggedError<ApplicationUpdateControlFailed>()("ApplicationUpdateControlFailed", { message: Schema.String }) {}
 export const ApplicationUpdateRequest = Schema.Struct({ version: Schema.Literal(1), update: ApplicationUpdateAction })
-export const ApplicationUpdateReply = Schema.Union(Schema.TaggedStruct("Update", { state: DesktopUpdateState }), ApplicationUpdateControlFailed)
+export const ApplicationUpdateReply = Schema.Union(Schema.TaggedStruct("Update", { state: ApplicationUpdateState }), ApplicationUpdateControlFailed)
 
 export class Starting extends Schema.TaggedClass<Starting>()("Starting", {
   attempt: Schema.Int,
@@ -45,13 +45,6 @@ export const ApplicationSnapshot = Schema.Struct({
 })
 export type ApplicationSnapshot = typeof ApplicationSnapshot.Type
 
-export const LoginStartupState = Schema.Union(
-  Schema.TaggedStruct("Enabled", {}),
-  Schema.TaggedStruct("Disabled", {}),
-  Schema.TaggedStruct("RequiresApproval", {}),
-  Schema.TaggedStruct("Unavailable", { message: Schema.String }),
-)
-export type LoginStartupState = typeof LoginStartupState.Type
 export const LoginStartupAction = Schema.Literal("read", "enable", "disable")
 export type LoginStartupAction = typeof LoginStartupAction.Type
 export class LoginStartupFailed extends Schema.TaggedError<LoginStartupFailed>()("LoginStartupFailed", { message: Schema.String }) {}

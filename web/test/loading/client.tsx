@@ -41,15 +41,20 @@ export const service: any = {
  notices:Atom.keepAlive(Atom.make([])),dismissNotice:()=>Effect.void,quitFailed:Atom.keepAlive(Atom.make(false)),resolveQuitFailure:action(),retryService:action(),
  readAppearance:Effect.succeed('system'),saveAppearance:()=>Effect.void,clientWindow:Option.some({platform:'darwin'}),serverPlatform:Option.some('darwin'),
  application:Atom.keepAlive(Atom.make(Result.success({version:1,pid:1,endpoint:'http://127.0.0.1:1',service:{_tag:'Ready',health:{service:'magnitude-acn',version:'0.0.14',revision:1,id:'fixture',pid:1,state:{_tag:'Ready'},rpcVersion:1}},owner:{_tag:'Desktop',tray:{_tag:'Registered'}}}))),
- applicationInfo:idle(), updates:idle(), loginStartup:idle(), connections:idle(),machineIdentity:idle(),memory:idle(),
- modelStorage:fixtureSettings({active:'/models',path:errorPhase === 'restart-error' ? '/new-models' : '/models',source:'Default',defaultPath:'/models',warning:null}),
- networkAccess:fixtureSettings({enabled:false,bind:null,requireApiKey:true,apiKey:null,interfaces:[],port:10100,pending:false,warning:null}),
- relaunch:Atom.fn(()=>Effect.fail('PRIVATE host diagnostics')),chooseModelStorage:action(),resetModelStorage:action(),updateNetworkAccess:action(),regenerateNetworkApiKey:action(),refreshSettings:Effect.void,
- connect:action(),disconnect:action(),checkUpdate:action(),discardUpdate:action(),downloadUpdate:action(),restartUpdate:action(),setAutoDownload:action(),setLoginStartup:action(),
+ 
 }
 const session = Atom.make(Result.success(service))
 const usage = Atom.keepAlive(Atom.make({result:Result.initial()}))
-const client = {runtime:{atom:()=>session,fn:(f:any)=>Atom.fn((input:any)=>f(input))},Models:{GetServingUsage:()=>usage}}
+// Each query reads a writable source, so a refresh recomputes the current fixture value as a refetch would.
+const querySource = () => Atom.keepAlive(Atom.make<any>({result:Result.initial()}))
+const sources = { modelStorage: querySource(), networkAccess: querySource(), machine: querySource(), connections: querySource(), owner: querySource(), health: querySource(), folders: querySource() }
+const derived = (source: Atom.Writable<any>) => Atom.keepAlive(Atom.make(get => get(source)))
+const queries = Object.fromEntries(Object.entries(sources).map(([key, source]) => [key, derived(source)])) as Record<keyof typeof sources, Atom.Atom<any>>
+const client = {runtime:{atom:()=>session,fn:(f:any)=>Atom.fn((input:any)=>f(input))},Models:{GetServingUsage:()=>usage},
+ Configuration:{GetModelStorage:()=>queries.modelStorage,GetNetworkAccess:()=>queries.networkAccess,GetServerMachine:()=>queries.machine,BrowseDirectories:()=>queries.folders,SetModelStorage:action(),SetNetworkAccess:action(),RegenerateNetworkApiKey:action()},
+ Connections:{WatchHarnessConnections:()=>queries.connections,ConnectHarness:action(),DisconnectHarness:action(),SyncHarnessConnections:action()},
+ Application:{WatchApplicationOwner:()=>queries.owner,CheckApplicationUpdate:action(),DownloadApplicationUpdate:action(),DiscardApplicationUpdate:action(),InstallApplicationUpdate:action(),SetApplicationAutoDownload:action(),SetLaunchAtLogin:action(),RestartApplication:Atom.fn(()=>Effect.fail('PRIVATE host diagnostics')),QuitApplication:action()},
+ Connection:{Health:()=>queries.health}}
 export const useAgentClient = () => client
 export const AgentClientProvider = ({children}:any) => children
 // Renderer has its own provider; use this same registry for controlled fixture transitions.
@@ -58,11 +63,13 @@ const connections = ['pi','opencode','hermes','openclaw','codex','claude-code','
 export function setPhase(value:string) {
  phase=value
  const result=(data:any)=>value==='loading'?Result.initial():value==='error'?Result.fail('offline'):Result.success(data,{waiting:value==="refreshing"})
- registry.set(service.applicationInfo,result({version:'0.0.14'}))
- registry.set(service.loginStartup,result({_tag:'Disabled'}))
- registry.set(service.machineIdentity,result({_tag:'Identified',manufacturer:'Apple Inc.',model:'Mac16,5',family:Option.none(),version:Option.none(),formFactor:'Unknown'}))
- registry.set(service.connections,result({_tag:'Ready',connections}))
- registry.set(service.updates,result({preference:{_tag:'Known',autoDownload:true},transfer:value==='update-error'?{_tag:'InstallationFailed',version:'0.1.6',message:'private installer diagnostic'}:{_tag:'Idle'},check:{_tag:'Idle'}}))
+ const settingsResult=(data:any)=>errorPhase === 'error' ? Result.fail('PRIVATE host diagnostics') : Result.success(data)
+ registry.set(sources.health,{result:result({service:'magnitude-acn',version:'0.0.14',revision:1,id:'fixture',pid:1,state:{_tag:'Ready'},rpcVersion:1})})
+ registry.set(sources.machine,{result:result({platform:'darwin',identity:{_tag:'Identified',manufacturer:'Apple Inc.',model:'Mac16,5',family:Option.none(),version:Option.none(),formFactor:'Unknown'}})})
+ registry.set(sources.connections,{result:result({_tag:'Ready',connections})})
+ registry.set(sources.owner,{result:result({owner:'Desktop',capabilities:['Updates','LaunchAtLogin','RestartService','Quit'],loginStartup:Option.some({_tag:'Disabled'}),updates:Option.some({preference:{_tag:'Known',autoDownload:true},transfer:value==='update-error'?{_tag:'InstallationFailed',version:'0.1.6',message:'private installer diagnostic'}:{_tag:'Idle'},check:{_tag:'Idle'}})})})
+ registry.set(sources.modelStorage,{result:settingsResult({active:'/models',path:errorPhase === 'restart-error' ? '/new-models' : '/models',source:'Default',defaultPath:'/models',warning:Option.none()})})
+ registry.set(sources.networkAccess,{result:settingsResult({enabled:false,bind:Option.none(),requireApiKey:true,apiKey:Option.none(),interfaces:[],port:10100,pending:false,warning:Option.none()})})
  registry.set(usage,{result:result({_tag:'Available',dailyActivity:Array.from({length:368},(_,index)=>({date:new Date(Date.UTC(2025,8,14+index)).toISOString().slice(0,10),totalTokens:index%5===0?0:Math.round((Math.sin(index*7)+1)*50000)})),requests:2,inputTokens:100,cachedInputTokens:40,outputTokens:20,totalTokens:120,cachedInputRequests:2,tokensPerSecond:80,timeToFirstTokenMs:125,incompleteRequests:0,recordingFailures:0,speedSamples:2,latencySamples:2,models:[],since:null})})
  for (const listener of listeners) listener()
 }
