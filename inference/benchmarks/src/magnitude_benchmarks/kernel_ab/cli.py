@@ -1,6 +1,7 @@
 """kernel-ab: compare two engine builds' kernel speed and output on this host.
 
-    kernel-ab run --baseline origin/main --candidate working-tree [--models a,b] [--rounds 5]
+    kernel-ab run --baseline origin/main --candidate working-tree [--models a,b] [--rounds 3]
+        [--own-tuning]
     kernel-ab report RUN_DIRECTORY [--bar 0.03]
     kernel-ab build --baseline origin/main --candidate working-tree
     kernel-ab models
@@ -51,8 +52,12 @@ def main(argv=None) -> int:
     run.add_argument("--baseline", default="origin/main")
     run.add_argument("--candidate", default=builds.WORKING_TREE)
     run.add_argument("--models", help="comma-separated names from `kernel-ab models`; default all")
-    run.add_argument("--tunes", type=int, default=2, help="fresh tunes per build and model")
-    run.add_argument("--rounds", type=int, default=5, help="measured rounds per build and model")
+    run.add_argument("--rounds", type=int, default=3, help="measured rounds per build and model")
+    run.add_argument(
+        "--own-tuning",
+        action="store_true",
+        help="also tune the candidate and measure each build on its own choice",
+    )
     run.add_argument("--device", default="auto")
     run.add_argument("--kv-codec", default="affine-k8v4", choices=("affine-k8v4", "dense"))
     run.add_argument("--histories", default=",".join(map(str, runner.HISTORIES)))
@@ -84,8 +89,8 @@ def main(argv=None) -> int:
         for side, spec in (("baseline", args.baseline), ("candidate", args.candidate)):
             print(side, builds.build(repository, spec, root, log)[1])
         return 0
-    if args.rounds < 1 or args.tunes < 1:
-        parser.error("--rounds and --tunes must be positive")
+    if args.rounds < 1:
+        parser.error("--rounds must be positive")
     built = {
         side: builds.build(repository, spec, root, log)
         for side, spec in (("baseline", args.baseline), ("candidate", args.candidate))
@@ -96,7 +101,7 @@ def main(argv=None) -> int:
         root,
         built,
         model_set.select(args.models),
-        args.tunes,
+        args.own_tuning,
         args.rounds,
         args.device,
         args.kv_codec,

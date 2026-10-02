@@ -115,15 +115,41 @@ pub(super) fn lookup(
             Ok(Pinned::Tune)
         };
     };
+    // A parameter the pin does not name (one the implementation gained after
+    // the pin was recorded) takes its declared default, so another build's
+    // configurations replay unchanged.
     let mut specialization = NativeSpecialization::new();
     for (name, value) in &pinned.statics {
         specialization = specialization.with_static(name.clone(), *value);
     }
-    for (name, value) in &pinned.params {
-        specialization = specialization.with_param(name.clone(), *value);
+    for parameter in &implementation.params {
+        let value = pinned.params.get(&parameter.name).unwrap_or(&parameter.values[0]);
+        specialization = specialization.with_param(parameter.name.clone(), *value);
     }
-    for ((launch, name), value) in &pinned.launch_params {
-        specialization = specialization.with_launch_param(*launch, name.clone(), *value);
+    for (launch, declaration) in implementation.launches.iter().enumerate() {
+        for parameter in &declaration.params {
+            let value = pinned
+                .launch_params
+                .get(&(launch, parameter.name.clone()))
+                .unwrap_or(&parameter.values[0]);
+            specialization = specialization.with_launch_param(launch, parameter.name.clone(), *value);
+        }
+    }
+    let declared = |name: &String| implementation.params.iter().any(|parameter| &parameter.name == name);
+    let declared_in = |launch: usize, name: &String| {
+        implementation.launches.get(launch).is_some_and(|declaration| {
+            declaration.params.iter().any(|parameter| &parameter.name == name)
+        })
+    };
+    if let Some(name) = pinned.params.keys().find(|name| !declared(name)) {
+        return Err(format!("pinned parameter `{name}` is not a native parameter of {entry}"));
+    }
+    if let Some((launch, name)) = pinned
+        .launch_params
+        .keys()
+        .find(|(launch, name)| !declared_in(*launch, name))
+    {
+        return Err(format!("pinned parameter `{name}` is not a parameter of launch {launch} of {entry}"));
     }
     implementation
         .validate(&specialization)

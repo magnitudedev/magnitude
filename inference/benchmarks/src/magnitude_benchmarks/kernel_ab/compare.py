@@ -1,7 +1,7 @@
 """The baseline/candidate report of one run directory.
 
 A cell is one measurement (a prefill size at a history, or a decode context) of one model, from
-the run's measure phase, where each build replays its first tune's configurations. Its value per
+the run's measure phase, where both builds replay fixed configurations. Its value per
 side is the median over rounds of each round's median step time. Noise is the spread of
 a side's round medians relative to their median. A cell regresses when the candidate is slower
 than the baseline by more than the bar or by more than either side's noise, whichever is larger,
@@ -102,7 +102,7 @@ def analyze(directory: Path, bar: float = DEFAULT_BAR) -> dict:
     tuning = defaultdict(lambda: defaultdict(list))
     failures = []
     for result in run["results"]:
-        if result["status"] != "ok":
+        if result["status"] not in ("ok", "kept"):
             failures.append(result)
             continue
         if result["phase"] == "tune":
@@ -211,7 +211,8 @@ def markdown(analysis: dict) -> str:
         f"# Kernel A/B: {'PASS' if analysis['pass'] else 'FAIL'}",
         "",
         f"Host `{run['host']}` ({run['platform']}), device `{run['device']}`, "
-        f"KV `{run['kv_codec']}`, {run['tunes']} tunes, {run['rounds']} measured rounds, "
+        f"KV `{run['kv_codec']}`, {run['rounds']} measured rounds"
+        f"{', own tuning' if run.get('own_tuning') else ''}, "
         f"bar {analysis['bar'] * 100:.0f}%.",
         "",
         "| Side | Spec | Commit | Uncommitted |",
@@ -293,16 +294,22 @@ def markdown(analysis: dict) -> str:
                 f"| {model} | {result['status']} | {result['same_top']}/{result['rows']} | "
                 f"{result['max_kl']:.2e} |"
             )
-    lines += [
-        "",
-        "## Tuning choices that differ between builds",
-        "",
-        "Each list holds one build's choice per fresh tune. An entry marked unstable chose",
-        "differently between tunes of the same build, so its difference is tuning noise.",
-        "",
-    ]
+    if not run.get("own_tuning", True):
+        lines += ["", "The candidate was not tuned: both builds ran the baseline's configurations."]
+    lines += (
+        []
+        if not run.get("own_tuning", True)
+        else [
+            "",
+            "## Tuning choices that differ between builds",
+            "",
+            "Each list holds one build's choice per fresh tune. An entry marked unstable chose",
+            "differently between tunes of the same build, so its difference is tuning noise.",
+            "",
+        ]
+    )
     differing = {model: keys for model, keys in analysis["tuning"].items() if keys}
-    if not differing:
+    if run.get("own_tuning", True) and not differing:
         lines.append("None: every entry chose the same configuration in every tune.")
     for model, keys in differing.items():
         lines.append(f"**{model}**")
@@ -318,7 +325,7 @@ def markdown(analysis: dict) -> str:
         lines += ["", "## Failed invocations", ""]
         for failure in analysis["failures"]:
             lines.append(
-                f"- {failure['model']} {failure['side']} {failure['invocation']}"
+                f"- {failure['model']} {failure['side']} {failure['phase']}"
                 f"{' round ' + str(failure['round'] + 1) if 'round' in failure else ''}: "
                 f"{failure['status']} (`{failure['log']}`)"
             )

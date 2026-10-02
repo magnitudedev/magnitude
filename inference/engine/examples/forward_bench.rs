@@ -8,8 +8,10 @@
 //! - `decode`: one sequence with `--context` tokens of history, then 16 warm
 //!   and 32 measured greedy decode steps (median reported);
 //! - `prefill`: fresh sequences of 32/128/512 tokens, one cold and three warm
-//!   (median of warm); with `--prefill-history H`, the chunks instead follow
-//!   H tokens of history on one sequence, back to back;
+//!   (median of warm); `--prefill-history H,..` runs each cell at every
+//!   listed history (default 0), where for H > 0 the chunks follow H tokens of
+//!   history on one sequence, back to back (a prompt longer than one prefill
+//!   runs fresh only);
 //! - `concurrent`: `--sequences N` sequences with `--context` history each,
 //!   decoding together; aggregate tokens per second.
 //!
@@ -26,7 +28,7 @@
 //! ```text
 //! forward_bench bench --model M.gguf --output out.json [--path native]
 //!     [--cells decode,prefill,concurrent]
-//!     [--context 256,4096,16384] [--prefill 32,128,512] [--prefill-history 0]
+//!     [--context 256,4096,16384] [--prefill 32,128,512] [--prefill-history 0,4096]
 //!     [--prefill-samples 4]
 //!     [--sequences 1,2,4,8]
 //!     [--warm 16] [--steps 32] [--attribution-steps 4]
@@ -203,8 +205,8 @@ pub(crate) struct Options {
     cells: Vec<String>,
     contexts: Vec<usize>,
     prefills: Vec<usize>,
-    /// History tokens before each prefill cell's chunks (0 = fresh sequences).
-    prefill_history: usize,
+    /// History lengths each prefill cell runs at (0 = fresh sequences).
+    prefill_histories: Vec<usize>,
     /// Full-prompt samples, including one cold run (minimum two).
     prefill_samples: usize,
     sequences: Vec<usize>,
@@ -257,7 +259,7 @@ impl Options {
             cells: vec!["decode".into(), "prefill".into(), "concurrent".into()],
             contexts: vec![256, 4096, 16384],
             prefills: vec![32, 128, 512],
-            prefill_history: 0,
+            prefill_histories: vec![0],
             prefill_samples: 4,
             sequences: vec![1, 2, 4, 8],
             widths: vec![1, 2, 3, 4, 5, 6, 8],
@@ -291,11 +293,7 @@ impl Options {
                 "--prefill" => options.prefills = list(&value()?)?,
                 "--sequences" => options.sequences = list(&value()?)?,
                 "--widths" => options.widths = list(&value()?)?,
-                "--prefill-history" => {
-                    options.prefill_history = value()?
-                        .parse()
-                        .map_err(|_| "--prefill-history requires a count")?
-                }
+                "--prefill-history" => options.prefill_histories = list(&value()?)?,
                 "--prefill-samples" => {
                     options.prefill_samples = value()?
                         .parse()
@@ -987,7 +985,6 @@ fn prefill_prompt_cell(
     let mut samples = Vec::with_capacity(options.prefill_samples);
     for _ in 0..options.prefill_samples {
         let mut sequence = bench.open_sequence(&mut bindings)?;
-        bindings = bench.history(bindings, &mut sequence, options.prefill_history, None)?;
         let start = host_seconds();
         let mut remaining = rows;
         while remaining > 0 {
@@ -1016,7 +1013,7 @@ fn prefill_prompt_cell(
     let median_ms = median(&mut warm);
     let result = json!({
         "rows": rows,
-        "history": options.prefill_history,
+        "history": 0,
         "chunks": rows.div_ceil(PREFILL_ROWS),
         "sample_count": options.prefill_samples,
         "median_ms": median_ms,
@@ -1028,18 +1025,18 @@ fn prefill_prompt_cell(
 }
 
 /// Without history, every chunk is a fresh sequence at position 0. With
-/// `--prefill-history H`, one sequence first accepts H tokens of history and
-/// the chunks follow each other on it, so chunk `i` starts at H + i * rows.
+/// `history` H, one sequence first accepts H tokens of history and the chunks
+/// follow each other on it, so chunk `i` starts at H + i * rows.
 fn prefill_cell(
     bench: &mut Bench,
     mut bindings: StateBindings,
     options: &Options,
     rows: usize,
+    history: usize,
 ) -> Result<(Value, StateBindings), String> {
     if rows > PREFILL_ROWS {
         return prefill_prompt_cell(bench, bindings, options, rows);
     }
-    let history = options.prefill_history;
     let mut shared = if history == 0 {
         None
     } else {
@@ -1135,10 +1132,18 @@ fn bench(options: &Options) -> Result<(), String> {
     };
     let steps = (options.warm + options.steps + options.attribution_steps + 1) * widest;
     let widest_prefill = options.prefills.iter().copied().max().unwrap_or(0);
-    let longest_prefill = match (prefill, options.prefill_history) {
-        (false, _) => 0,
-        (true, 0) => widest_prefill,
-        (true, history) => history + PREFILL_CHUNKS * widest_prefill,
+    let longest_prefill = if prefill {
+        options
+            .prefill_histories
+            .iter()
+            .map(|&history| match history {
+                0 => widest_prefill,
+                history => history + PREFILL_CHUNKS * widest_prefill.min(PREFILL_ROWS),
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
     };
     let context_tokens = (longest + steps).max(longest_prefill);
     let concurrent_sequences = if concurrent {
@@ -1199,9 +1204,17 @@ fn bench(options: &Options) -> Result<(), String> {
         }
     }
     if prefill {
-        for &rows in &options.prefills {
-            eprintln!("prefill rows={rows}");
-            let (cell, next) = prefill_cell(&mut bench, bindings, options, rows)?;
+        // A whole prompt (more rows than one prefill) is measured fresh only.
+        let cells = options.prefill_histories.iter().flat_map(|&history| {
+            options
+                .prefills
+                .iter()
+                .filter(move |&&rows| history == 0 || rows <= PREFILL_ROWS)
+                .map(move |&rows| (rows, history))
+        });
+        for (rows, history) in cells {
+            eprintln!("prefill rows={rows} history={history}");
+            let (cell, next) = prefill_cell(&mut bench, bindings, options, rows, history)?;
             bindings = next;
             eprintln!(
                 "  median {:.3} ms",
