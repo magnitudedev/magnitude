@@ -3,9 +3,9 @@
 //! position-by-position comparison with a family reference's `logits`
 //! output.
 //!
-//! The first `--prefill` tokens are one prefill, whose last row's logits are
-//! the first written; the rest are one-row decodes, as a served request runs
-//! them.
+//! The first `--prefill` tokens are prefilled in chunks of at most 512 rows,
+//! and the last chunk's last row's logits are the first written; the rest are
+//! one-row decodes, as a served request runs them.
 //!
 //! ```text
 //! token_logits --model M.gguf --tokens 1,2,3 --output logits.f32 [--prefill N]
@@ -27,6 +27,9 @@ use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
 use std::io::Write;
 use std::path::PathBuf;
+
+/// Rows of one prefill forward.
+const PREFILL_TOKENS: usize = 512;
 
 struct Options {
     model: PathBuf,
@@ -166,7 +169,7 @@ fn main() -> Result<(), String> {
         },
         context_tokens: Some(options.tokens.len().next_power_of_two().max(256)),
         service: ServiceLimits {
-            prefill_tokens: 512,
+            prefill_tokens: PREFILL_TOKENS,
             decode_tokens: 16,
             decode_share: 0.5,
             locality_seconds: 1.0,
@@ -188,15 +191,20 @@ fn main() -> Result<(), String> {
         .map_err(text)?;
     let mut logits = Vec::new();
     let (prefill, decode) = options.tokens.split_at(options.prefill);
-    bindings = forward(
-        &mut domain,
-        bindings,
-        request,
-        WorkKind::Prefill,
-        prefill.to_vec(),
-        0,
-        &mut logits,
-    )?;
+    // A prompt longer than one prefill runs as consecutive chunks, as the
+    // service runs it; only the last chunk's row is written.
+    for (index, chunk) in prefill.chunks(PREFILL_TOKENS).enumerate() {
+        logits.clear();
+        bindings = forward(
+            &mut domain,
+            bindings,
+            request,
+            WorkKind::Prefill,
+            chunk.to_vec(),
+            index * PREFILL_TOKENS,
+            &mut logits,
+        )?;
+    }
     for (offset, token) in decode.iter().enumerate() {
         bindings = forward(
             &mut domain,

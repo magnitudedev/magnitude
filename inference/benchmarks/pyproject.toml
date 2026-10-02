@@ -23,6 +23,7 @@ dev = [
 
 [project.scripts]
 session-bench = "magnitude_benchmarks.session_bench.cli:main"
+kernel-ab = "magnitude_benchmarks.kernel_ab.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/magnitude_benchmarks"]
