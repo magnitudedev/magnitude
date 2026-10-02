@@ -17,7 +17,9 @@ use crate::api::device::DeviceInner;
 use crate::api::kernel::{EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
 use seismic_compiler::prepared::{validate_invocation, InvocationContract};
-use seismic_lang::checked::{CheckedModule, NativeImplementation, NativeSpecialization};
+use seismic_lang::checked::{
+    CheckedModule, NativeImplementation, NativeSpecialization, NativeSpecializationError,
+};
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::EntryId;
@@ -323,6 +325,9 @@ pub enum TuneError {
     /// The all-defaults configuration could not be formed, run or measured;
     /// it is the search's start and the validation reference.
     DefaultUnusable(Exclusion),
+    /// Configurations lie in the implementation's domain, but none fits the
+    /// device's launch limits.
+    ExceedsDevice(String),
     /// The entry writes `parameter` in place, and `point` binds the same
     /// tensor for every configuration without an initializer to restore it.
     SharedMutableState {
@@ -345,6 +350,9 @@ impl std::fmt::Display for TuneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Declaration(message) | Self::Domain(message) | Self::Reference(message) => write!(f, "{message}"),
+            Self::ExceedsDevice(refusal) => {
+                write!(f, "no configuration fits this device: {refusal}")
+            }
             Self::NoValidatedCandidate(failures) => write!(f, "no candidate passed numerical validation and measurement: {failures:?}"),
             Self::NoPoints => f.write_str("tuning needs at least one point"),
             Self::Space(error) => write!(f, "{error}"),
@@ -369,6 +377,17 @@ impl std::fmt::Display for TuneError {
 }
 
 impl std::error::Error for TuneError {}
+
+/// An admission failure: a device refusal of every configuration, or a
+/// declaration error.
+fn admission_error(error: NativeSpecializationError) -> TuneError {
+    match error {
+        NativeSpecializationError::ExceedsDevice { .. } => {
+            TuneError::ExceedsDevice(error.to_string())
+        }
+        error => TuneError::Declaration(error.to_string()),
+    }
+}
 
 /// A time-bounded search (production).
 #[derive(Clone, Debug)]
@@ -1480,7 +1499,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     let Some(first) = inputs.build(0, limit(&specs[0]))? else {
         let default = implementation
             .default_specialization(&statics)
-            .map_err(|error| TuneError::Declaration(error.to_string()))?;
+            .map_err(admission_error)?;
         return Ok(unit.kept_defaults(&specs, &default, &strategy, &inputs, began));
     };
     let (default, default_kernel) = launchable_default(
@@ -1691,7 +1710,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
                 &declared,
                 &implementation
                     .admissible(&statics)
-                    .map_err(|error| TuneError::Declaration(error.to_string()))?
+                    .map_err(admission_error)?
                     .iter()
                     .map(|specialization| specialization.params().clone())
                     .collect::<Vec<_>>(),
@@ -1934,7 +1953,7 @@ fn search_space(
     )?;
     let admissible = implementation
         .admissible(statics)
-        .map_err(|error| TuneError::Declaration(error.to_string()))?
+        .map_err(admission_error)?
         .into_iter()
         .filter(|candidate| {
             unserved
@@ -2793,7 +2812,7 @@ pub fn implementation_digest(
         })?;
     let default = implementation
         .default_specialization(statics)
-        .map_err(|error| TuneError::Declaration(error.to_string()))?;
+        .map_err(admission_error)?;
     let mut digest = Sha256::new();
     update_declaration_digest(&mut digest, &entry_name, implementation);
     // Backends whose implementations are rendered source; CPU implementations
@@ -3300,14 +3319,14 @@ fn launchable_default(
     };
     let declared = implementation
         .default_specialization(statics)
-        .map_err(|error| TuneError::Declaration(error.to_string()))?;
+        .map_err(admission_error)?;
     let refusal = match launchable(&declared) {
         Ok(kernel) => return Ok((declared, kernel)),
         Err(exclusion) => exclusion,
     };
     let mut candidates = implementation
         .admissible(statics)
-        .map_err(|error| TuneError::Declaration(error.to_string()))?;
+        .map_err(admission_error)?;
     // Stable: equally distant candidates keep declaration order.
     candidates.sort_by_key(|candidate| {
         let params = candidate

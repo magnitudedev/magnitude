@@ -1427,6 +1427,7 @@ fn check_native(
         constraint,
         scratch,
         launches,
+        device: None,
     })
 }
 

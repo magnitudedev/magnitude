@@ -229,7 +229,8 @@ pub fn resolve_failure(error: ResolveError) -> InventoryError {
         ResolveError::Unsupported(UnsupportedModel::Family { .. })
         | ResolveError::Unsupported(UnsupportedModel::Representation { .. })
         | ResolveError::Unsupported(UnsupportedModel::Backend { .. })
-        | ResolveError::Unsupported(UnsupportedModel::KernelDomain { .. }) => "unsupported_model",
+        | ResolveError::Unsupported(UnsupportedModel::KernelDomain { .. })
+        | ResolveError::Unsupported(UnsupportedModel::Device { .. }) => "unsupported_model",
         ResolveError::Artifact(_) => "invalid_model_package",
         ResolveError::InvalidConfiguration { .. } => "invalid_model_configuration",
     };

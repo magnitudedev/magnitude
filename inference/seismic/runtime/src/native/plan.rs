@@ -89,8 +89,18 @@ pub struct Group {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchSource {
     pub ordinal: usize,
-    /// Distinct assignments of the code parameters this launch owns.
-    pub code_variants: Vec<Vec<u64>>,
+    /// Distinct instances of this launch across the admissible
+    /// configurations.
+    pub variants: Vec<LaunchVariant>,
+}
+
+/// One instance of a launch: the values of the code parameters it owns and,
+/// when its group size reads only static dimensions and parameters, that
+/// size, which a Metal pipeline is formed to admit.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LaunchVariant {
+    pub code: Vec<u64>,
+    pub group_size: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -473,15 +483,15 @@ pub fn partition(
                 )
                 .collect::<Vec<_>>();
             let selected = columns(&code);
-            let code_variants = (0..admissible.len())
-                .map(|configuration| project(configuration, &selected))
+            let variants = (0..admissible.len())
+                .map(|configuration| LaunchVariant {
+                    code: project(configuration, &selected),
+                    group_size: super::group_size(implementation, &admissible[configuration], ordinal),
+                })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            LaunchSource {
-                ordinal,
-                code_variants,
-            }
+            LaunchSource { ordinal, variants }
         })
         .collect();
     let mut measurements = 0usize;
@@ -597,9 +607,11 @@ mod tests {
         assert_eq!(
             plan.sources
                 .iter()
-                .map(|source| source.code_variants.len())
+                .map(|source| source.variants.len())
                 .collect::<Vec<_>>(),
-            [2, 2, 2]
+            // Two code instances each; the first two launches' group sizes
+            // read a launch parameter, so each instance has two sizes.
+            [4, 4, 2]
         );
         assert_eq!(plan.measurements, 22);
         assert_eq!(plan.points[1].active_sets, [vec![0], vec![1]]);

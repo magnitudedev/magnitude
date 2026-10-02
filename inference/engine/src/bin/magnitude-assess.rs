@@ -207,6 +207,7 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
                 UnsupportedModel::Representation { .. } => "unsupported_representation",
                 UnsupportedModel::Backend { .. } => "unsupported_backend",
                 UnsupportedModel::KernelDomain { .. } => "unsupported_kernel_domain",
+                UnsupportedModel::Device { .. } => "unsupported_device",
             };
             return json!({
                 "_tag": "Unsupported",

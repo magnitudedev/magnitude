@@ -404,6 +404,7 @@ fn model_assessment(
                 UnsupportedModel::Representation { .. } => "unsupported_representation",
                 UnsupportedModel::Backend { .. } => "unsupported_backend",
                 UnsupportedModel::KernelDomain { .. } => "unsupported_kernel_domain",
+                UnsupportedModel::Device { .. } => "unsupported_device",
             };
             return Ok(unsupported_model(requested, code, unsupported.to_string()));
         }

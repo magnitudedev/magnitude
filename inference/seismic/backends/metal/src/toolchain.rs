@@ -8,8 +8,10 @@
 use crate::direct::DirectPipeline;
 use crate::facts::MetalFacts;
 use crate::MetalDevice;
-use objc2_foundation::NSString;
-use objc2_metal::{MTLDevice, MTLLibrary};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::{NSError, NSString};
+use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary};
 use seismic_native_target::{
     NativeCompilationError, ProgramCache, ProgramSource, Toolchain, ToolchainIdentity,
 };
@@ -62,8 +64,12 @@ impl Toolchain for MetalToolchain {
         _cache: Option<&dyn ProgramCache>,
     ) -> Result<Vec<DirectPipeline>, NativeCompilationError> {
         let mut text = source.text.clone();
+        let mut instantiated = Vec::new();
         for entry in &source.entries {
-            if entry.symbol.contains('<') {
+            // Entries of one template instance that differ only in group size
+            // share its instantiation.
+            if entry.symbol.contains('<') && !instantiated.contains(&&entry.symbol) {
+                instantiated.push(&entry.symbol);
                 text.push_str(&format!(
                     "\ntemplate [[host_name(\"{}\")]] [[kernel]] decltype({symbol}) {symbol};\n",
                     host_name(&entry.symbol),
@@ -78,24 +84,54 @@ impl Toolchain for MetalToolchain {
         let library = device
             .newLibraryWithSource_options_error(&NSString::from_str(&text), Some(&options))
             .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))?;
-        source
-            .entries
-            .iter()
-            .map(|entry| {
-                let name = host_name(&entry.symbol);
-                let function = library
-                    .newFunctionWithName(&NSString::from_str(&name))
-                    .ok_or_else(|| {
-                        NativeCompilationError::MalformedToolchainOutput(format!(
-                            "Metal library does not define kernel `{name}`"
-                        ))
-                    })?;
-                device
-                    .newComputePipelineStateWithFunction_error(&function)
-                    .map(DirectPipeline::from_state)
-                    .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))
-            })
-            .collect()
+        let failure =
+            |error: Retained<NSError>| NativeCompilationError::ToolchainFailure(error.to_string());
+        // Each symbol's pipeline is formed once. An entry's constant is the
+        // group size its launch declares: when register allocation left that
+        // pipeline admitting fewer threads, the entry gets a pipeline formed
+        // to admit them; otherwise it shares the symbol's.
+        let mut formed: Vec<(&str, Retained<ProtocolObject<dyn MTLComputePipelineState>>)> =
+            Vec::new();
+        let mut pipelines = Vec::with_capacity(source.entries.len());
+        for entry in &source.entries {
+            let name = host_name(&entry.symbol);
+            let function = library
+                .newFunctionWithName(&NSString::from_str(&name))
+                .ok_or_else(|| {
+                    NativeCompilationError::MalformedToolchainOutput(format!(
+                        "Metal library does not define kernel `{name}`"
+                    ))
+                })?;
+            let natural = match formed.iter().find(|(symbol, _)| *symbol == entry.symbol) {
+                Some((_, state)) => state.clone(),
+                None => {
+                    let state = device
+                        .newComputePipelineStateWithFunction_error(&function)
+                        .map_err(failure)?;
+                    formed.push((&entry.symbol, state.clone()));
+                    state
+                }
+            };
+            let state = match entry.constants.first() {
+                Some(&threads)
+                    if (natural.maxTotalThreadsPerThreadgroup() as u64) < u64::from(threads) =>
+                {
+                    let descriptor = objc2_metal::MTLComputePipelineDescriptor::new();
+                    descriptor.setComputeFunction(Some(&function));
+                    descriptor.setMaxTotalThreadsPerThreadgroup(threads as usize);
+                    device
+                        .newComputePipelineStateWithDescriptor_options_reflection_error(
+                            &descriptor,
+                            objc2_metal::MTLPipelineOption::empty(),
+                            None,
+                        )
+                        .map_err(failure)?
+                }
+                _ => natural,
+            };
+            pipelines.push(DirectPipeline::from_state(state));
+        }
+        Ok(pipelines)
     }
 }
 
@@ -109,6 +145,45 @@ mod tests {
         assert_eq!(host_name("probe"), "probe");
         assert_eq!(host_name("probe<4>"), "probe$4");
         assert_eq!(host_name("probe<16, 2>"), "probe$16_2");
+    }
+
+    /// An entry's constant is its launch's group size, which its pipeline
+    /// admits; entries of one template instance share its instantiation.
+    #[test]
+    fn an_entry_constant_bounds_its_pipeline() {
+        let device = crate::test_support::metal_device();
+        let facts = crate::profile::open_device(&device)
+            .unwrap()
+            .facts()
+            .clone();
+        let toolchain = MetalToolchain::new(device, &facts);
+        let source = ProgramSource {
+            text: "#include <metal_stdlib>\nusing namespace metal;\n\
+                   kernel void plain(device float* x [[buffer(0)]], uint i [[thread_position_in_grid]]) { x[i] += 1; }\n\
+                   template <uint TILE> kernel void probe(device float* x [[buffer(0)]], uint i [[thread_position_in_grid]]) { x[i] *= TILE; }\n"
+                .into(),
+            entries: vec![
+                ProgramEntry {
+                    symbol: "plain".into(),
+                    constants: vec![256],
+                },
+                ProgramEntry::named("plain"),
+                ProgramEntry {
+                    symbol: "probe<4>".into(),
+                    constants: vec![128],
+                },
+                ProgramEntry {
+                    symbol: "probe<4>".into(),
+                    constants: vec![512],
+                },
+            ],
+        };
+        let pipelines = toolchain.compile(&source, None).unwrap();
+        assert_eq!(pipelines.len(), 4);
+        for (pipeline, entry) in pipelines.iter().zip(&source.entries) {
+            let declared = entry.constants.first().copied().unwrap_or(1);
+            assert!(pipeline.max_threads_per_threadgroup() >= u64::from(declared));
+        }
     }
 
     /// One compile forms every requested instance of a templated kernel.

@@ -40,7 +40,6 @@ kernel void attention_prefill_prepare(
         group, simd, lane);
 }
 
-[[max_total_threads_per_threadgroup(SEISMIC_TUNE_QT * SEISMIC_DIM_G * 4)]]
 kernel void attention_prefill_attend(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],

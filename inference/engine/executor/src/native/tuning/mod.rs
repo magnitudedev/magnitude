@@ -1035,6 +1035,22 @@ fn f16_bits(value: f32) -> u16 {
 /// result applies to (a tuning unit).
 type TuningKey = (&'static str, String, BTreeMap<String, u64>);
 
+/// A unit's tuning failure as the catalog reports it: a device on which no
+/// configuration fits is a property of the model there, not an engine defect.
+fn tuning_failure(key: &TuningKey, error: TuneError) -> CatalogFailure {
+    match error {
+        TuneError::ExceedsDevice(reason) => CatalogFailure::Device {
+            entry: key.0,
+            reason,
+        },
+        error => CatalogFailure::Tuning {
+            entry: key.0,
+            bindings: key.1.clone(),
+            outcome: error.to_string(),
+        },
+    }
+}
+
 /// Where a preparation's tuning is. One [`Tuner`] walks the program once per
 /// phase.
 enum Phase {
@@ -1430,7 +1446,7 @@ impl<'a> Tuner<'a> {
         let began = Instant::now();
         let result = self
             .run(case, statics, &key, &shapes, Strategy::Census(plan))
-            .map_err(failure)?;
+            .map_err(|error| tuning_failure(&key, error))?;
         let Phase::Census { censused, .. } = &mut self.phase else {
             unreachable!("the phase is the census");
         };
@@ -1515,7 +1531,7 @@ impl<'a> Tuner<'a> {
         let result = match survey {
             Some(plan) => self
                 .run(case, statics, &key, &shapes, Strategy::Survey(plan))
-                .map_err(failure)?,
+                .map_err(|error| tuning_failure(&key, error))?,
             None if !affordable => unit.census.clone(),
             None => {
                 let plan = SearchPlan {
@@ -1541,7 +1557,7 @@ impl<'a> Tuner<'a> {
                         census: unit.census.clone(),
                     },
                 )
-                .map_err(failure)?
+                .map_err(|error| tuning_failure(&key, error))?
             }
         };
         #[cfg(feature = "tuning-survey")]
@@ -1610,8 +1626,8 @@ impl<'a> Tuner<'a> {
         key: &TuningKey,
         shapes: &[PointShape],
         strategy: Strategy,
-    ) -> Result<TuningResult, String> {
-        let precision = case.precision().map_err(|error| error.to_string())?;
+    ) -> Result<TuningResult, TuneError> {
+        let precision = case.precision()?;
         let keep = matches!(strategy, Strategy::Census(_));
         let mut cases = self
             .built
@@ -1639,9 +1655,7 @@ impl<'a> Tuner<'a> {
             },
             cases: &mut cases,
         };
-        let result = case
-            .tune(self.device, statics, &mut points, precision, strategy)
-            .map_err(|error| error.to_string());
+        let result = case.tune(self.device, statics, &mut points, precision, strategy);
         drop(points);
         if keep {
             self.built.insert(key.clone(), Box::new(cases));

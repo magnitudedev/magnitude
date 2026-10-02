@@ -88,6 +88,13 @@ pub enum UnsupportedModel {
         /// The call's static dimensions, by name.
         statics: Vec<(String, u64)>,
     },
+    /// A kernel call of the model's program lies in its kernel's domain, but
+    /// no configuration fits the opened device's launch limits.
+    Device {
+        backend: String,
+        entry: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for UnsupportedModel {
@@ -115,6 +122,14 @@ impl fmt::Display for UnsupportedModel {
                     "`{entry}` has no admissible {backend} configuration at {statics}"
                 )
             }
+            Self::Device {
+                backend,
+                entry,
+                reason,
+            } => write!(
+                formatter,
+                "`{entry}` cannot run on this {backend} device: {reason}"
+            ),
         }
     }
 }
@@ -531,6 +546,13 @@ pub(crate) fn classify_catalog(error: CatalogError) -> PlanOutcome {
                 backend: error.backend.as_str().to_owned(),
                 entry: entry.to_owned(),
                 statics,
+            })
+        }
+        CatalogFailure::Device { entry, reason } => {
+            PlanOutcome::Unsupported(UnsupportedModel::Device {
+                backend: error.backend.as_str().to_owned(),
+                entry: entry.to_owned(),
+                reason,
             })
         }
         CatalogFailure::Preparation { .. }

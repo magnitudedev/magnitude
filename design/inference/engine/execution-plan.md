@@ -26,7 +26,9 @@ Those exact model terms alone do not establish fit: prepared graph resources, wo
 transients and the device's stable fit capacity are added as upper bounds derived from the same
 header-only program plan, so a fit result never undercounts. The graph-resource bound builds every
 graph the load prepares, so a kernel call outside its kernel's domain fails the assessment exactly
-as the load's kernel preparation fails, and both classify it `Unsupported`. Assessment results
+as the load's kernel preparation fails, and both classify it `Unsupported`. A call whose every
+configuration exceeds the opened device's launch limits is also `Unsupported`, as a device
+refusal; assessment opens no device, so only the load observes it. Assessment results
 are complete: Fits, DoesNotFit or Unsupported; there is no unconfirmed fit.
 Speed assessment runs nothing on the device: each model's decode speed at each requested depth is
 computed from its header-derived byte, history and launch demand over the device's memory
