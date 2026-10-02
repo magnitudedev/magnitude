@@ -1696,6 +1696,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
                     .map(|specialization| specialization.params().clone())
                     .collect::<Vec<_>>(),
             )
+            .and_then(|space| space.with_default(default.params()))
             .map_err(TuneError::Space)?;
             let tuned = Tuned {
                 formation: &formation,
@@ -1942,7 +1943,9 @@ fn search_space(
         })
         .map(|specialization| specialization.params().clone())
         .collect::<Vec<_>>();
-    SearchSpace::new(&search_parameters(implementation), &admissible).map_err(TuneError::Space)
+    SearchSpace::new(&search_parameters(implementation), &admissible)
+        .and_then(|space| space.with_default(default.params()))
+        .map_err(TuneError::Space)
 }
 
 /// Validate a search's choice at the points it was not timed at, so every

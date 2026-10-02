@@ -280,6 +280,17 @@ impl SearchSpace {
         })
     }
 
+    /// This space with `values` as its defaults: the configuration every search
+    /// evaluates first and every cost is relative to. Tuning passes the
+    /// defaults it chose to launch on the device, which may not be the declared
+    /// ones (a declared default can exceed a pipeline's thread limit).
+    pub fn with_default(mut self, values: &ParameterValues) -> Result<Self, SearchSpaceError> {
+        self.default = self
+            .index_of(values)
+            .ok_or(SearchSpaceError::DefaultInadmissible)?;
+        Ok(self)
+    }
+
     pub fn len(&self) -> usize {
         self.configurations.len()
     }
@@ -822,6 +833,46 @@ mod tests {
             samples: 3,
             confirmation_samples: 7,
         }
+    }
+
+    /// Out of time from the start, and unable to launch the declared default
+    /// (QT 16): only the defaults are evaluated.
+    struct Unlaunchable<'s> {
+        space: &'s SearchSpace,
+    }
+
+    impl Evaluator for Unlaunchable<'_> {
+        fn evaluate(&mut self, batch: &[usize]) -> Vec<Result<Cost, Exclusion>> {
+            batch
+                .iter()
+                .map(|index| {
+                    let values = self.space.values(*index);
+                    if values["QT"] == 16 {
+                        return Err(Exclusion::Execution("requests 512 threads; the pipeline allows 384".into()));
+                    }
+                    Ok(Cost::new(vec![(PointKey { launches: vec![0], values }, 1.0)]))
+                })
+                .collect()
+        }
+        fn confirm(&mut self, finalists: &[usize]) -> Vec<Result<Cost, Exclusion>> {
+            self.evaluate(finalists)
+        }
+        fn expired(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn an_expired_search_keeps_the_launchable_default_rather_than_the_declared_one() {
+        let declared = space(&[("QT", &[16, 8])]);
+        let trace = search(&declared, &[], &settings(), &mut Unlaunchable { space: &declared });
+        assert!(trace.ranking.is_empty(), "the declared default cannot launch");
+
+        let launchable = space(&[("QT", &[16, 8])])
+            .with_default(&[("QT".to_string(), 8)].into_iter().collect())
+            .unwrap();
+        let trace = search(&launchable, &[], &settings(), &mut Unlaunchable { space: &launchable });
+        assert_eq!(launchable.values(trace.ranking[0])["QT"], 8);
     }
 
     #[test]
