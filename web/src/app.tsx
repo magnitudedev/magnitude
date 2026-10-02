@@ -55,6 +55,7 @@ import {
 } from "@magnitudedev/client-common"
 import { appearanceReadError } from "./appearance"
 import { useNavigate, useServerPlatform, useSession } from "./session"
+import { useServiceConnection, useServiceObservation, type ServiceObservation } from "./service-view"
 import { ConfirmDialog } from "./components/confirm-dialog"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "./components/ui/alert-dialog"
 import { HardwareOverview, ModelRadar, SpeedInfo } from "./components/discovery-visuals"
@@ -460,6 +461,10 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const navigate = useNavigate()
   const hardware = useLocalInferenceHardware()
   const state = useAtomValue(service.application)
+  // A desktop window serves its own loopback endpoint; a browser reaches the service at its own origin.
+  const apiOrigin = Option.isSome(service.clientWindow)
+    ? (Result.isSuccess(state) ? Option.some(`http://127.0.0.1:${new URL(state.value.endpoint).port}`) : Option.none<string>())
+    : Option.some(window.location.origin)
   const platform = useServerPlatform()
   const available = Result.isSuccess(models) ? models.value.models.filter(model => Option.isSome(localModelProviderModelId(model))) : []
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value))?.model.modelId : undefined
@@ -483,7 +488,7 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
       : rows.value._tag === "Unavailable" ? <ErrorNotice title="Couldn’t check your connections" description="Magnitude can’t read the saved connection information. Check that its configuration is accessible." className="mt-5" />
       : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform}
           onConnect={harness => connect({ harness, model: selectedModel, installSkill: true })} onDisconnect={harness => disconnect({ harness })} />}
-    {Result.isSuccess(state) && <OtherApps origin={`http://127.0.0.1:${new URL(state.value.endpoint).port}`} model={defaultModel} platform={platform} onOpenSettings={() => navigate("settings")} />}
+    {Option.isSome(apiOrigin) && <OtherApps origin={apiOrigin.value} model={defaultModel} platform={platform} onOpenSettings={() => navigate("settings")} />}
   </>
 }
 /** The model row's status: the load stage in full while loading, the memory in use once loaded. */
@@ -545,12 +550,13 @@ function DownloadActivity() {
     {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Optimizing" ? "Optimizing" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} /></li>)}</ul>}
   </div>
 }
-function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null }) {
+function Status({ observation }: { observation: ServiceObservation }) {
   const session = useSession()
   const retry = useAtomSet(session.retryService)
   const retrying = useAtomValue(session.retryService)
-  const service = snapshot?.service
-  const tray = snapshot?.owner._tag === "Desktop" ? snapshot.owner.tray : undefined
+  const snapshot = Result.isSuccess(observation.service) ? observation.service.value : null
+  const service = snapshot ?? undefined
+  const tray = Option.getOrUndefined(observation.tray)
   const ready=service?._tag === "Ready"
   return <div className={pageLayout.statusStack}>
     <section aria-busy={!snapshot} aria-label={!snapshot ? "Loading service status" : undefined} className={pageLayout.statusHero}>
@@ -565,7 +571,7 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
       {ready && <DownloadActivity />}
       {service && "message" in service && <ErrorNotice className="mt-5" title={service._tag === "CleanupFailed" ? "Couldn’t confirm the service has stopped" : "The service couldn’t start"}
         description={service._tag === "CleanupFailed" ? "Some background work may still be running. Quit Magnitude to retry cleanup." : "Check that another copy of Magnitude isn’t running, then retry the service."}
-        actions={service._tag === "Failed" ? <NoticeAction disabled={retrying.waiting} onClick={() => retry()}>Retry service</NoticeAction> : undefined} />}
+        actions={service._tag === "Failed" && observation.canRetry ? <NoticeAction disabled={retrying.waiting} onClick={() => retry()}>Retry service</NoticeAction> : undefined} />}
       {Result.isFailure(retrying) && !retrying.waiting && service?._tag !== "Failed" && service?._tag !== "Ready" && <ErrorNotice title="Couldn’t retry the service" className="mt-3" />}
     </section>
     <MemoryBreakdown />
@@ -828,20 +834,31 @@ function SettingsPage() {
 }
 export function App() {
   const session = useSession()
-  const state = useAtomValue(session.application)
+  const observation = useServiceObservation()
   const page = useAtomValue(session.page)
   const navigate = useNavigate()
-  const service = Result.isSuccess(state) ? state.value.service : null
+  const service = Result.isSuccess(observation.service) ? observation.service.value : null
   const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
   return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><AppShell page={page} navigate={navigate} platform={platform}>
-      {page === "status" ? Result.isFailure(state) ? <ErrorNotice title="Couldn’t read service status" description="Magnitude can’t confirm the service’s current state." className="mt-7" /> : <Status snapshot={Result.isSuccess(state) ? state.value : null} />
+      {service?._tag === "Unreachable" ? <CannotReachMagnitude />
+      : page === "status" ? Result.isFailure(observation.service) ? <ErrorNotice title="Couldn’t read service status" description="Magnitude can’t confirm the service’s current state." className="mt-7" /> : <Status observation={observation} />
       : page === "usage" ? <ServingUsage />
       : page === "settings" ? <SettingsPage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
-      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(state) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}>Open Status</NoticeAction>} /></> : <ModelsSkeleton page={page} />)
+      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}>Open Status</NoticeAction>} /></> : <ModelsSkeleton page={page} />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
   </AppShell></>
+}
+/** A browser cannot restart the service; it can only try to reach it again. */
+function CannotReachMagnitude() {
+  const connection = useServiceConnection()
+  const reconnectAction = useMemo(() => Atom.fn((_: void) => connection.connect), [connection])
+  const reconnect = useAtomSet(reconnectAction)
+  const reconnecting = useAtomValue(reconnectAction)
+  return <ErrorNotice className="mt-8" title="Can’t reach Magnitude"
+    description="This page can’t connect to the Magnitude service. Check that Magnitude is running on that computer and that this device can reach it."
+    actions={<NoticeAction disabled={reconnecting.waiting} onClick={() => reconnect()}>Reconnect</NoticeAction>} />
 }
 /** Messages raised by Electron main while this window exists, such as a link that couldn't open. */
 function HostNotices() {

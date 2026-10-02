@@ -84,6 +84,12 @@ does not inspect installation phases to decide when to tick.
 CLI updates are explicit headless commands. Desktop renderer construction is independent of service
 readiness, so startup and failure remain visible. Logging and appearance retain their host ownership.
 
+The browser entry is served by the ACN it manages and connects to its own origin without a
+starter, so it never acquires or starts a service. Its service presentation is the SDK connection
+state alone: it can show Ready, starting or recovering, and an unreachable service with a reconnect
+action, but never a restart, because only the owning application can restart the service. A
+desktop window instead presents its owner's view of the service, which survives ACN being down.
+
 Electron progress and errors are schema-encoded before structured cloning and decoded afterward.
 Live Effect Option values and class instances never cross the bridge. Cancellation closes the
 host observation, not an admitted daemon.

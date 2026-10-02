@@ -4,7 +4,7 @@ import {
   BunPath,
   BunCommandExecutor,
 } from "@effect/platform-bun"
-import { FetchHttpClient, HttpServerResponse, Socket as PlatformSocket } from "@effect/platform"
+import { FetchHttpClient, FileSystem, HttpServerResponse, Socket as PlatformSocket } from "@effect/platform"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import * as HttpServer from "@effect/platform/HttpServer"
 import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
@@ -106,6 +106,7 @@ import {
 import { AcnHost, ServerSettingsLive, type AcnHostApi } from "./server-settings"
 import { AcnHarnessConnectionsLive } from "./harness-connections"
 import { AcnOwner } from "./application-owner"
+import { resolveWebAppSource, serveWebApp } from "./web-app"
 import { AcnChangesLive, AcnStorageChangesLive } from "./changes"
 import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
 import { makeAcnSubscriptionProtocol } from "./acn-subscription-protocol"
@@ -665,7 +666,12 @@ export const installAcnHealthRoutes = (
     return withCors(yield* responseEffect, request)
   }))
   yield* router.add("OPTIONS", "/*", OptionsRouteHandler)
-  yield* router.add("GET", "/", Effect.succeed(HttpServerResponse.text(ROOT_BODY)))
+  // The browser app is served even while the service starts, so it can show that state.
+  const fs = yield* FileSystem.FileSystem
+  const webApp = yield* resolveWebAppSource
+  yield* router.add("GET", "/", serveWebApp(webApp, fs))
+  yield* router.add("GET", "/*", serveWebApp(webApp, fs))
+  yield* router.add("GET", "/inference", Effect.succeed(HttpServerResponse.text(ROOT_BODY)))
   yield* router.add("GET", "/health", Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
     const state = yield* lifecycle.state
@@ -745,7 +751,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     )
     const router = Context.get(infrastructure, HttpLayerRouter.HttpRouter)
     const server = Context.get(infrastructure, HttpServer.HttpServer)
-    yield* installAcnHealthRoutes(router, lifecycle, network)
+    yield* installAcnHealthRoutes(router, lifecycle, network).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
     if (network.enabled && network.bind !== primaryBind) {
       const additional = yield* Layer.buildWithScope(BunHttpServer.layer({

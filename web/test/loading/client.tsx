@@ -39,7 +39,7 @@ export const service: any = {
  navigate:(value:string)=>Effect.sync(()=>{page=value;registry.set(service.page,value)}),
  setRankingPreference:(value:number)=>Effect.sync(()=>registry.set(service.rankingPreference,value)),
  notices:Atom.keepAlive(Atom.make([])),dismissNotice:()=>Effect.void,quitFailed:Atom.keepAlive(Atom.make(false)),resolveQuitFailure:action(),retryService:action(),
- readAppearance:Effect.succeed('system'),saveAppearance:()=>Effect.void,clientWindow:Option.some({platform:'darwin'}),serverPlatform:Option.some('darwin'),
+ readAppearance:Effect.succeed('system'),saveAppearance:()=>Effect.void,clientWindow:params.get('entry') === 'browser' ? Option.none() : Option.some({platform:'darwin'}),serverPlatform:Option.some('darwin'),
  application:Atom.keepAlive(Atom.make(Result.success({version:1,pid:1,endpoint:'http://127.0.0.1:1',service:{_tag:'Ready',health:{service:'magnitude-acn',version:'0.0.14',revision:1,id:'fixture',pid:1,state:{_tag:'Ready'},rpcVersion:1}},owner:{_tag:'Desktop',tray:{_tag:'Registered'}}}))),
  
 }

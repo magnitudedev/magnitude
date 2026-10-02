@@ -8,7 +8,7 @@ const errors=[]
 for (const theme of ['light','dark']) for (const width of [800,1120,1600]) {
  const page=await browser.newPage({viewport:{width,height:1000},reducedMotion:'reduce'})
  page.on('pageerror', e=>errors.push(e.message))
- await page.goto('http://127.0.0.1:6091/loading.html')
+ await page.goto('http://127.0.0.1:6091/loading.html'+(process.env.FIXTURE_QUERY ?? ''))
  await page.getByRole('navigation').waitFor()
  await page.evaluate(theme=>{document.documentElement.dataset.theme=theme;window.loadingFixture.setPhase('assessing')},theme)
  const loading=page.getByLabel('Loading recommendations')

@@ -12,6 +12,7 @@ import {
 import { initializeAppearance } from "./stores/appearance-store"
 import { appearanceReadError } from "./appearance"
 import { SessionProvider } from "./session"
+import { ServiceConnectionProvider } from "./service-view"
 import { App, AppShell } from "./app"
 import { ModelsSkeleton } from "./components/page-skeletons"
 import { ErrorNotice } from "./components/error-notice"
@@ -47,7 +48,7 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
     const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
     const client = createAgentClient(connection.client, { host: entry.host, navigation: entry.navigation })
     const readError = Either.isLeft(appearance) ? "The saved appearance could not be read. Using System appearance." : null
-    root.render(<RegistryProvider initialValues={[[appearanceReadError, readError]]}><AgentClientProvider tag={client}><SessionGate /></AgentClientProvider></RegistryProvider>)
+    root.render(<RegistryProvider initialValues={[[appearanceReadError, readError]]}><AgentClientProvider tag={client}><ServiceConnectionProvider connection={connection.client.connection}><SessionGate /></ServiceConnectionProvider></AgentClientProvider></RegistryProvider>)
   })
   Effect.runPromise(boot).catch(error => {
     console.error(error)

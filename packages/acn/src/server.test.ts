@@ -92,7 +92,7 @@ describe("ACN public HTTP listener", () => {
       })
       const origin = loopbackOrigin(yield* listen(publicRouter, 0))
       expect(ACN_PUBLIC_PORT).toBe(10100)
-      expect(yield* (yield* http.get(`${origin}/`)).text).toContain("/inference/v1")
+      expect(yield* (yield* http.get(`${origin}/inference`)).text).toContain("/inference/v1")
 
       const rpc = (base: string, id: string | undefined, tag = "Ping") => http.execute(
         HttpClientRequest.post(`${base}/rpc`, {
@@ -144,7 +144,7 @@ describe("ACN public HTTP listener", () => {
       expect((yield* http.get(`${origin}/health`)).status).toBe(503)
       expect((yield* rpc(origin, ACN_INSTANCE_ID)).status).toBe(503)
       expect(dispatched).toBe(1)
-    })).pipe(Effect.provide(FetchHttpClient.layer)))
+    })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
   })
 })
 
@@ -204,7 +204,7 @@ describe("ACN network access", () => {
       expect((yield* get(`${remote}/health`, { host: "my-mac.local:1" })).status).toBe(200)
       expect((yield* get(`${remote}/health`, { host: "host.docker.internal:1" })).status).toBe(200)
       expect((yield* get(`${remote}/health`, { host: "mac.tail1234.ts.net" })).status).toBe(200)
-    })).pipe(Effect.provide(FetchHttpClient.layer)))
+    })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
   })
   it("refuses non-local hosts and never gates while loopback only", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
@@ -217,6 +217,6 @@ describe("ACN network access", () => {
       expect((yield* get({ host: "192.168.1.2:1" })).status).toBe(421)
       expect((yield* get({ host: "host.docker.internal" })).status).toBe(421)
       expect((yield* get({ host: "localhost:1" })).status).toBe(503)
-    })).pipe(Effect.provide(FetchHttpClient.layer)))
+    })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
   })
 })

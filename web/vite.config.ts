@@ -31,6 +31,10 @@ export default defineConfig({
       "@magnitudedev/generate-id",
     ],
   },
+  // `bun run dev` serves the browser app against the development service started by the desktop dev app or `magnitude serve`.
+  server: {
+    proxy: Object.fromEntries(["/rpc", "/health", "/inference", "/auth"].map(path => [path, { target: process.env.MAGNITUDE_DEV_SERVICE ?? "http://127.0.0.1:11101", changeOrigin: false }])),
+  },
   build: {
     outDir: "dist",
     target: "esnext",

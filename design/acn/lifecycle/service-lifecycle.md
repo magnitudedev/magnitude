@@ -61,6 +61,14 @@ may supply another explicit port. Health is available during startup. RPC dispat
 at Ready and fenced by the selected instance ID. Inference paths remain unchanged. The inherited
 control channel carries startup health and shutdown; there is no discoverable coordination listener.
 
+ACN serves the browser app at `/`, even while it starts, so a browser can show that state. Release
+executables embed the app's files; a service run from source serves the `web` build directory and
+otherwise answers `/` with build instructions. Hashed assets are cached indefinitely and `index.html`
+never; a path without a file extension is an app page and receives `index.html`; paths under the
+service's own routes are never answered with the app; nothing outside the app's files is served.
+HTML carries a same-origin Content-Security-Policy. The plain-text summary of the inference API is
+served at `/inference`.
+
 Network access is off by default and read once from `network` in `config.json` when ACN starts.
 When enabled, ACN also listens on all interfaces, or on one configured address beside loopback, so
 local clients are never displaced. Reachability from another address never widens what a remote
