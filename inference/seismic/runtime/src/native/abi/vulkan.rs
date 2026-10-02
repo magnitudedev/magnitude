@@ -245,7 +245,8 @@ void main() {
                     text: source,
                     entries: vec![ProgramEntry {
                         symbol: "numerics".into(),
-                        constants: vec![64, 1, 1],
+                        group_size: Some([64, 1, 1]),
+                        constants: Vec::new(),
                     }],
                 },
                 None,
@@ -444,7 +445,8 @@ void main() {
                     text: source,
                     entries: vec![ProgramEntry {
                         symbol: "halves".into(),
-                        constants: vec![64, 1, 1],
+                        group_size: Some([64, 1, 1]),
+                        constants: Vec::new(),
                     }],
                 },
                 None,

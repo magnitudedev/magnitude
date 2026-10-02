@@ -117,9 +117,6 @@ batched without re-initialization, identically for every configuration. A case m
 leading rows each writable parameter's entry writes; validation then observes exactly those rows
 of it, and observes an undeclared writable parameter whole. Callers keep at least one case per
 tuned entry whole so writes outside the declared rows are rejected.
-The defaults are the first configuration in declaration order that the device admits and can
-launch; when the domain holds configurations but none fits the device, tuning fails as a device
-refusal, distinct from a declaration error.
 The default receives the same validation as every candidate. The first fully passing candidate
 establishes the timing anchor; if none passes, tuning returns a failure with the observed exclusions.
 A default that failed validation or measurement cannot be selected as an implicit fallback;

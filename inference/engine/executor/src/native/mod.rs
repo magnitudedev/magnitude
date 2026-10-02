@@ -107,12 +107,6 @@ pub enum CatalogFailure {
         entry: &'static str,
         statics: Vec<(String, u64)>,
     },
-    /// Configurations of the entry's implementation execute the model's
-    /// statics, but none fits the opened device's launch limits.
-    Device {
-        entry: &'static str,
-        reason: String,
-    },
 }
 
 impl fmt::Display for CatalogError {
@@ -153,12 +147,6 @@ impl fmt::Display for CatalogError {
                 write!(
                     formatter,
                     "{entry} has no admissible {backend} configuration at {statics}"
-                )
-            }
-            CatalogFailure::Device { entry, reason } => {
-                write!(
-                    formatter,
-                    "{entry} cannot run on this {backend} device: {reason}"
                 )
             }
         }

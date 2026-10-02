@@ -86,8 +86,8 @@ impl Toolchain for MetalToolchain {
             .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))?;
         let failure =
             |error: Retained<NSError>| NativeCompilationError::ToolchainFailure(error.to_string());
-        // Each symbol's pipeline is formed once. An entry's constant is the
-        // group size its launch declares: when register allocation left that
+        // Each symbol's pipeline is formed once. An entry's group size is the
+        // one its launch declares: when register allocation left that
         // pipeline admitting fewer threads, the entry gets a pipeline formed
         // to admit them; otherwise it shares the symbol's.
         let mut formed: Vec<(&str, Retained<ProtocolObject<dyn MTLComputePipelineState>>)> =
@@ -112,9 +112,12 @@ impl Toolchain for MetalToolchain {
                     state
                 }
             };
-            let state = match entry.constants.first() {
-                Some(&threads)
-                    if (natural.maxTotalThreadsPerThreadgroup() as u64) < u64::from(threads) =>
+            let threads = entry
+                .group_size
+                .map(|size| size.iter().map(|&axis| u64::from(axis)).product::<u64>());
+            let state = match threads {
+                Some(threads)
+                    if (natural.maxTotalThreadsPerThreadgroup() as u64) < threads =>
                 {
                     let descriptor = objc2_metal::MTLComputePipelineDescriptor::new();
                     descriptor.setComputeFunction(Some(&function));
@@ -147,10 +150,10 @@ mod tests {
         assert_eq!(host_name("probe<16, 2>"), "probe$16_2");
     }
 
-    /// An entry's constant is its launch's group size, which its pipeline
-    /// admits; entries of one template instance share its instantiation.
+    /// An entry's group size is its launch's, which its pipeline admits;
+    /// entries of one template instance share its instantiation.
     #[test]
-    fn an_entry_constant_bounds_its_pipeline() {
+    fn an_entry_group_size_bounds_its_pipeline() {
         let device = crate::test_support::metal_device();
         let facts = crate::profile::open_device(&device)
             .unwrap()
@@ -165,23 +168,26 @@ mod tests {
             entries: vec![
                 ProgramEntry {
                     symbol: "plain".into(),
-                    constants: vec![256],
+                    group_size: Some([256, 1, 1]),
+                    constants: Vec::new(),
                 },
                 ProgramEntry::named("plain"),
                 ProgramEntry {
                     symbol: "probe<4>".into(),
-                    constants: vec![128],
+                    group_size: Some([128, 1, 1]),
+                    constants: Vec::new(),
                 },
                 ProgramEntry {
                     symbol: "probe<4>".into(),
-                    constants: vec![512],
+                    group_size: Some([512, 1, 1]),
+                    constants: Vec::new(),
                 },
             ],
         };
         let pipelines = toolchain.compile(&source, None).unwrap();
         assert_eq!(pipelines.len(), 4);
         for (pipeline, entry) in pipelines.iter().zip(&source.entries) {
-            let declared = entry.constants.first().copied().unwrap_or(1);
+            let declared = entry.group_size.map_or(1, |size| size.iter().product::<u32>());
             assert!(pipeline.max_threads_per_threadgroup() >= u64::from(declared));
         }
     }

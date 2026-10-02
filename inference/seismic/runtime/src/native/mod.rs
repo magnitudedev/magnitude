@@ -47,8 +47,7 @@ use seismic_compiler::prepared::{
     validate_invocation, ArgumentValue, DeviceIdentity, InvocationContract,
 };
 use seismic_lang::checked::{
-    CheckedModule, NativeCondition, NativeDeviceLimits, NativeImplementation, NativeNatExpr,
-    NativeSpecialization,
+    CheckedModule, NativeCondition, NativeImplementation, NativeNatExpr, NativeSpecialization,
 };
 use seismic_lang::entry::{
     CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess,
@@ -282,17 +281,15 @@ fn vulkan_geometry(
         .collect()
 }
 
-/// `implementation` as `device` offers it: carrying the device's launch
-/// limits, which admission then checks, and on a CPU device with the
+/// `implementation` as `device` offers it: on a CPU device, with the
 /// Seismic-owned participant count of each launch and the tier appended, their
 /// domains exact for the device (its pool size, the tiers below its detected
-/// one). Both are idempotent.
+/// one). Appending is idempotent.
 pub(crate) fn on_device(
     device: &DeviceInner,
     mut implementation: NativeImplementation,
 ) -> NativeImplementation {
     use seismic_lang::checked::{NativeParameter, NativeParameterRole};
-    implementation.device = device_limits(device);
     let OpenedKind::Cpu(opened) = &device.kind else {
         return implementation;
     };
@@ -320,42 +317,6 @@ pub(crate) fn on_device(
             &lower,
         ));
     implementation
-}
-
-/// The launch limits of `device` that admission checks. A CPU launch is the
-/// pool's work items and has none.
-fn device_limits(device: &DeviceInner) -> Option<NativeDeviceLimits> {
-    match &device.kind {
-        OpenedKind::Cpu(_) => None,
-        #[cfg(target_os = "macos")]
-        OpenedKind::Metal(opened) => {
-            let limits = opened.device_description().limits();
-            // Metal reports per-axis maxima, and an Apple GPU bounds a
-            // threadgroup's total by the same value.
-            Some(NativeDeviceLimits {
-                group_extent: limits.max_workgroup_size,
-                group_threads: limits.max_workgroup_size.into_iter().max().unwrap_or(0),
-                shared_bytes: limits.max_workgroup_bytes,
-            })
-        }
-        OpenedKind::Cuda(opened) => {
-            let limits = opened.device_description().limits();
-            Some(NativeDeviceLimits {
-                group_extent: limits.max_workgroup_size,
-                group_threads: limits.max_workgroup_threads,
-                shared_bytes: limits.max_workgroup_bytes,
-            })
-        }
-        #[cfg(not(target_os = "macos"))]
-        OpenedKind::Vulkan(opened) => {
-            let limits = opened.service().facts().limits;
-            Some(NativeDeviceLimits {
-                group_extent: limits.max_group_size,
-                group_threads: limits.max_invocations,
-                shared_bytes: limits.max_shared_bytes,
-            })
-        }
-    }
 }
 
 /// Check a cached choice against the implementation as it exists on this
@@ -464,41 +425,18 @@ fn compilation(error: seismic_native_target::NativeCompilationError) -> PrepareE
     PrepareError::Preparation(PreparationError::NativeCompilation(error))
 }
 
-/// The group size of launch `ordinal` under `specialization`, when the size
-/// reads only static dimensions and parameters.
-pub(crate) fn group_size(
-    implementation: &NativeImplementation,
-    specialization: &NativeSpecialization,
-    ordinal: usize,
-) -> Option<u64> {
-    implementation.launches[ordinal]
-        .group_extent
-        .iter()
-        .try_fold(1u64, |total, extent| {
-            let mut dimensions = Vec::new();
-            extent.dimensions(&mut dimensions);
-            if dimensions.iter().any(|name| !implementation.statics.contains(name)) {
-                return None;
-            }
-            let extent = extent
-                .evaluate(&|name| specialization.static_value(name), &|name| {
-                    specialization
-                        .launch_param(ordinal, name)
-                        .or_else(|| specialization.param(name))
-                })
-                .ok()?;
-            total.checked_mul(extent)
-        })
-}
-
 /// `entry` with the group size its launch runs, on Metal: the pipeline is
 /// formed to admit that many threads, so its register allocation never lowers
 /// the limit below the declared size.
-fn bounded(dialect: abi::Dialect, mut entry: ProgramEntry, group_size: Option<u64>) -> ProgramEntry {
+fn bounded(dialect: abi::Dialect, mut entry: ProgramEntry, group_size: Option<[u64; 3]>) -> ProgramEntry {
     if matches!(dialect, abi::Dialect::Metal(_)) {
-        entry
-            .constants
-            .extend(group_size.and_then(|threads| u32::try_from(threads).ok()));
+        entry.group_size = group_size.and_then(|size| {
+            Some([
+                u32::try_from(size[0]).ok()?,
+                u32::try_from(size[1]).ok()?,
+                u32::try_from(size[2]).ok()?,
+            ])
+        });
     }
     entry
 }
@@ -789,7 +727,7 @@ impl NativePrepared {
                             ordinal,
                             &[plan::LaunchVariant {
                                 code: plan::code_values(&implementation, &specialization, ordinal),
-                                group_size: group_size(&implementation, &specialization, ordinal),
+                                group_size: implementation.static_group_size(&specialization, ordinal),
                             }],
                         )
                     })
@@ -808,7 +746,7 @@ impl NativePrepared {
                         bounded(
                             dialect,
                             ProgramEntry::named(*kernel),
-                            group_size(&implementation, &specialization, ordinal),
+                            implementation.static_group_size(&specialization, ordinal),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -920,7 +858,8 @@ impl NativePrepared {
                         .zip(&geometry)
                         .map(|(kernel, (threads, views))| ProgramEntry {
                             symbol: (*kernel).to_owned(),
-                            constants: threads.iter().chain(views).copied().collect(),
+                            group_size: Some(*threads),
+                            constants: views.clone(),
                         })
                         .collect(),
                 };

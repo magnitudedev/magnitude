@@ -17,9 +17,7 @@ use crate::api::device::DeviceInner;
 use crate::api::kernel::{EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
 use seismic_compiler::prepared::{validate_invocation, InvocationContract};
-use seismic_lang::checked::{
-    CheckedModule, NativeImplementation, NativeSpecialization, NativeSpecializationError,
-};
+use seismic_lang::checked::{CheckedModule, NativeImplementation, NativeSpecialization};
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::EntryId;
@@ -325,9 +323,6 @@ pub enum TuneError {
     /// The all-defaults configuration could not be formed, run or measured;
     /// it is the search's start and the validation reference.
     DefaultUnusable(Exclusion),
-    /// Configurations lie in the implementation's domain, but none fits the
-    /// device's launch limits.
-    ExceedsDevice(String),
     /// The entry writes `parameter` in place, and `point` binds the same
     /// tensor for every configuration without an initializer to restore it.
     SharedMutableState {
@@ -350,9 +345,6 @@ impl std::fmt::Display for TuneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Declaration(message) | Self::Domain(message) | Self::Reference(message) => write!(f, "{message}"),
-            Self::ExceedsDevice(refusal) => {
-                write!(f, "no configuration fits this device: {refusal}")
-            }
             Self::NoValidatedCandidate(failures) => write!(f, "no candidate passed numerical validation and measurement: {failures:?}"),
             Self::NoPoints => f.write_str("tuning needs at least one point"),
             Self::Space(error) => write!(f, "{error}"),
@@ -377,17 +369,6 @@ impl std::fmt::Display for TuneError {
 }
 
 impl std::error::Error for TuneError {}
-
-/// An admission failure: a device refusal of every configuration, or a
-/// declaration error.
-fn admission_error(error: NativeSpecializationError) -> TuneError {
-    match error {
-        NativeSpecializationError::ExceedsDevice { .. } => {
-            TuneError::ExceedsDevice(error.to_string())
-        }
-        error => TuneError::Declaration(error.to_string()),
-    }
-}
 
 /// A time-bounded search (production).
 #[derive(Clone, Debug)]
@@ -1499,20 +1480,23 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     let Some(first) = inputs.build(0, limit(&specs[0]))? else {
         let default = implementation
             .default_specialization(&statics)
-            .map_err(admission_error)?;
+            .map_err(|error| TuneError::Declaration(error.to_string()))?;
         return Ok(unit.kept_defaults(&specs, &default, &strategy, &inputs, began));
     };
-    let (default, default_kernel) = launchable_default(
+    let default = implementation
+        .default_specialization(&statics)
+        .map_err(|error| TuneError::Declaration(error.to_string()))?;
+    let default_kernel = NativePrepared::prepare_implementation(
         device,
         module,
         entry,
         &logical,
-        &bindings,
+        bindings.clone(),
+        default.clone(),
         cpu,
-        &implementation,
-        &statics,
-        std::slice::from_ref(&first),
-    )?;
+        implementation.clone(),
+    )
+    .map_err(|error| TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error))))?;
     let validator = Validator::new(
         device,
         module,
@@ -1569,8 +1553,8 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
             untimed.push(index);
             continue;
         };
-        // The defaults were chosen to launch at the first point; serving runs
-        // them at every point, so one they cannot launch at is an error.
+        // Serving runs the defaults at every point, so one they cannot launch
+        // at is an error.
         for args in &point.rotation {
             default_kernel.shape(&args.values()).map_err(|error| {
                 TuneError::DefaultUnusable(Exclusion::Execution(format!(
@@ -1710,12 +1694,11 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
                 &declared,
                 &implementation
                     .admissible(&statics)
-                    .map_err(admission_error)?
+                    .map_err(|error| TuneError::Declaration(error.to_string()))?
                     .iter()
                     .map(|specialization| specialization.params().clone())
                     .collect::<Vec<_>>(),
             )
-            .and_then(|space| space.with_default(default.params()))
             .map_err(TuneError::Space)?;
             let tuned = Tuned {
                 formation: &formation,
@@ -1953,7 +1936,7 @@ fn search_space(
     )?;
     let admissible = implementation
         .admissible(statics)
-        .map_err(admission_error)?
+        .map_err(|error| TuneError::Declaration(error.to_string()))?
         .into_iter()
         .filter(|candidate| {
             unserved
@@ -1962,9 +1945,7 @@ fn search_space(
         })
         .map(|specialization| specialization.params().clone())
         .collect::<Vec<_>>();
-    SearchSpace::new(&search_parameters(implementation), &admissible)
-        .and_then(|space| space.with_default(default.params()))
-        .map_err(TuneError::Space)
+    SearchSpace::new(&search_parameters(implementation), &admissible).map_err(TuneError::Space)
 }
 
 /// Validate a search's choice at the points it was not timed at, so every
@@ -2812,7 +2793,7 @@ pub fn implementation_digest(
         })?;
     let default = implementation
         .default_specialization(statics)
-        .map_err(admission_error)?;
+        .map_err(|error| TuneError::Declaration(error.to_string()))?;
     let mut digest = Sha256::new();
     update_declaration_digest(&mut digest, &entry_name, implementation);
     // Backends whose implementations are rendered source; CPU implementations
@@ -3278,78 +3259,6 @@ fn mutable_parameters(logical: &LogicalEntry) -> Vec<(usize, String)> {
         })
         .map(|(ordinal, parameter)| (ordinal, parameter.name.clone()))
         .collect()
-}
-
-/// The configuration tuning starts from and validates against, formed: the
-/// declared defaults when every launch at every point fits its formed program
-/// on this device, else the admissible configuration nearest them that does.
-/// A program's thread limit is known only once formed (Apple M1/M2 pipelines
-/// under register pressure admit fewer than the device's 1024), so declaration
-/// order alone cannot guarantee the defaults launch.
-#[allow(clippy::too_many_arguments)]
-fn launchable_default(
-    device: &Arc<DeviceInner>,
-    module: &CheckedModule,
-    entry: EntryId,
-    logical: &Arc<LogicalEntry>,
-    bindings: &ElementBindings,
-    cpu: Option<&'static CpuNativeKernels>,
-    implementation: &NativeImplementation,
-    statics: &NativeSpecialization,
-    points: &[TuningPoint<'_>],
-) -> Result<(NativeSpecialization, Arc<NativePrepared>), TuneError> {
-    let launchable = |specialization: &NativeSpecialization| {
-        let kernel = NativePrepared::prepare_implementation(
-            device,
-            module,
-            entry,
-            logical,
-            bindings.clone(),
-            specialization.clone(),
-            cpu,
-            implementation.clone(),
-        )
-        .map_err(|error| Exclusion::Formation(prepare_message(error)))?;
-        for args in points.iter().flat_map(|point| &point.rotation) {
-            kernel
-                .shape(&args.values())
-                .map_err(|error| Exclusion::Execution(error.to_string()))?;
-        }
-        Ok::<_, Exclusion>(kernel)
-    };
-    let declared = implementation
-        .default_specialization(statics)
-        .map_err(admission_error)?;
-    let refusal = match launchable(&declared) {
-        Ok(kernel) => return Ok((declared, kernel)),
-        Err(exclusion) => exclusion,
-    };
-    let mut candidates = implementation
-        .admissible(statics)
-        .map_err(admission_error)?;
-    // Stable: equally distant candidates keep declaration order.
-    candidates.sort_by_key(|candidate| {
-        let params = candidate
-            .params()
-            .iter()
-            .filter(|(name, value)| declared.param(name) != Some(**value))
-            .count();
-        let launch_params = candidate
-            .launch_params()
-            .iter()
-            .filter(|((launch, name), value)| declared.launch_param(*launch, name) != Some(**value))
-            .count();
-        params + launch_params
-    });
-    candidates
-        .into_iter()
-        .filter(|candidate| *candidate != declared)
-        .find_map(|candidate| {
-            launchable(&candidate)
-                .ok()
-                .map(|kernel| (candidate, kernel))
-        })
-        .ok_or(TuneError::DefaultUnusable(refusal))
 }
 
 pub(super) fn prepare_message(error: PrepareError) -> String {

@@ -308,8 +308,7 @@ fn load_class(error: &LoadError) -> Class {
         LoadError::Unsupported(UnsupportedModel::Family { .. })
         | LoadError::Unsupported(UnsupportedModel::Representation { .. })
         | LoadError::Unsupported(UnsupportedModel::Backend { .. })
-        | LoadError::Unsupported(UnsupportedModel::KernelDomain { .. })
-        | LoadError::Unsupported(UnsupportedModel::Device { .. }) => {
+        | LoadError::Unsupported(UnsupportedModel::KernelDomain { .. }) => {
             (StatusCode::CONFLICT, MODEL, "unsupported_model", false)
         }
         LoadError::Artifact(_) => (

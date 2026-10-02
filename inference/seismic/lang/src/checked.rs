@@ -668,20 +668,6 @@ pub struct NativeImplementation {
     pub scratch: Vec<NativeScratch>,
     /// Ordered dispatches of one call. Never empty.
     pub launches: Vec<NativeLaunch>,
-    #[serde(default)]
-    pub device: Option<NativeDeviceLimits>,
-}
-
-/// The launch limits of the device an implementation is offered on, which the runtime attaches
-/// when it offers the implementation on an opened device. Admission then rejects a configuration
-/// whose launch geometry exceeds them wherever that geometry reads only static dimensions and
-/// parameters; geometry that reads a call-time dimension is checked when a call's launches are
-/// computed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeDeviceLimits {
-    pub group_extent: [u64; 3],
-    pub group_threads: u64,
-    pub shared_bytes: u64,
 }
 
 /// The dense element types a build-time compiled native form binds one
@@ -1256,11 +1242,6 @@ pub enum NativeSpecializationError {
     /// The configuration violates the `where` condition.
     Inadmissible,
     Evaluation(NativeEvalError),
-    /// A launch of the configuration exceeds the device's limits.
-    ExceedsDevice {
-        kernel: String,
-        requirement: String,
-    },
 }
 
 impl std::fmt::Display for NativeSpecializationError {
@@ -1293,10 +1274,6 @@ impl std::fmt::Display for NativeSpecializationError {
                 f.write_str("configuration violates the native `where` condition")
             }
             Self::Evaluation(error) => write!(f, "{error}"),
-            Self::ExceedsDevice {
-                kernel,
-                requirement,
-            } => write!(f, "launch `{kernel}` needs {requirement}"),
         }
     }
 }
@@ -1404,118 +1381,74 @@ impl NativeImplementation {
                 return Err(NativeSpecializationError::Inadmissible);
             }
         }
-        match self.device {
-            Some(limits) => self.within_device(specialization, limits),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
-    /// Check every launch's geometry that reads only static dimensions and
-    /// parameters against the device's limits. Inactive launches are checked
-    /// too: whether a launch runs can depend on a call-time dimension.
-    fn within_device(
+    /// The group size of launch `launch` under `specialization`, when every
+    /// axis reads only static dimensions and parameters (none when one reads
+    /// a call-time dimension).
+    pub fn static_group_size(
         &self,
         specialization: &NativeSpecialization,
-        limits: NativeDeviceLimits,
-    ) -> Result<(), NativeSpecializationError> {
-        for (launch, declaration) in self.launches.iter().enumerate() {
-            let parameter = |name: &str| {
-                specialization
-                    .launch_param(launch, name)
-                    .or_else(|| specialization.param(name))
-            };
-            let value = |expression: &NativeNatExpr| {
-                let mut dimensions = Vec::new();
-                expression.dimensions(&mut dimensions);
-                if dimensions.iter().any(|name| !self.statics.contains(name)) {
-                    return Ok(None);
-                }
-                expression
-                    .evaluate(&|name| specialization.static_value(name), &parameter)
-                    .map(Some)
-                    .map_err(NativeSpecializationError::Evaluation)
-            };
-            let exceeds = |requirement: String| NativeSpecializationError::ExceedsDevice {
-                kernel: declaration.kernel.clone(),
-                requirement,
-            };
-            let mut threads = Some(1u64);
-            for (axis, extent) in declaration.group_extent.iter().enumerate() {
-                let extent = value(extent)?;
-                if let Some(extent) = extent.filter(|extent| *extent > limits.group_extent[axis]) {
-                    return Err(exceeds(format!(
-                        "{extent} threads on axis {axis}; the device allows {}",
-                        limits.group_extent[axis]
-                    )));
-                }
-                threads = threads
-                    .zip(extent)
-                    .map(|(total, extent)| total.saturating_mul(extent));
+        launch: usize,
+    ) -> Option<[u64; 3]> {
+        let declaration = &self.launches[launch];
+        let mut size = [0u64; 3];
+        for (axis, extent) in declaration.group_extent.iter().enumerate() {
+            let mut dimensions = Vec::new();
+            extent.dimensions(&mut dimensions);
+            if dimensions.iter().any(|name| !self.statics.contains(name)) {
+                return None;
             }
-            if let Some(threads) = threads.filter(|threads| *threads > limits.group_threads) {
-                return Err(exceeds(format!(
-                    "{threads} threads per group; the device allows {}",
-                    limits.group_threads
-                )));
-            }
-            if let Some(bytes) =
-                value(&declaration.shared_bytes)?.filter(|bytes| *bytes > limits.shared_bytes)
-            {
-                return Err(exceeds(format!(
-                    "{bytes} bytes of group-shared memory; the device allows {}",
-                    limits.shared_bytes
-                )));
-            }
+            size[axis] = extent
+                .evaluate(&|name| specialization.static_value(name), &|name| {
+                    specialization
+                        .launch_param(launch, name)
+                        .or_else(|| specialization.param(name))
+                })
+                .ok()?;
         }
-        Ok(())
+        Some(size)
     }
 
     /// Every admissible specialization for the given static values: the
     /// cartesian product of the parameter domains in declaration order,
-    /// filtered by the `where` condition and the device's limits. When the
-    /// `where` condition admits configurations but none fits the device, the
-    /// error is the first configuration's device refusal.
+    /// filtered by the `where` condition.
     pub fn admissible(
         &self,
         statics: &NativeSpecialization,
     ) -> Result<Vec<NativeSpecialization>, NativeSpecializationError> {
         let mut admissible = Vec::new();
-        let refusal = self.walk_admissible(statics, |configuration| {
+        self.walk_admissible(statics, |configuration| {
             admissible.push(configuration.clone());
             true
         })?;
-        match refusal {
-            Some(refusal) if admissible.is_empty() => Err(refusal),
-            _ => Ok(admissible),
-        }
+        Ok(admissible)
     }
 
     /// The default configuration at the given static values: the first
     /// admissible specialization in declaration order, which is the declared
-    /// defaults (`values[0]`) whenever they satisfy `where` and fit the
-    /// device. `Inadmissible` exactly when the statics lie outside the
-    /// implementation's domain; `ExceedsDevice` when configurations lie in it
-    /// but none fits the device.
+    /// defaults (`values[0]`) whenever they satisfy `where`. `Inadmissible`
+    /// exactly when the statics lie outside the implementation's domain.
     pub fn default_specialization(
         &self,
         statics: &NativeSpecialization,
     ) -> Result<NativeSpecialization, NativeSpecializationError> {
         let mut first = None;
-        let refusal = self.walk_admissible(statics, |configuration| {
+        self.walk_admissible(statics, |configuration| {
             first = Some(configuration.clone());
             false
         })?;
-        first.ok_or(refusal.unwrap_or(NativeSpecializationError::Inadmissible))
+        first.ok_or(NativeSpecializationError::Inadmissible)
     }
 
     /// Visit the admissible specializations at `statics` in declaration
-    /// order until `visit` returns false. Returns the first device refusal
-    /// met on the way.
+    /// order until `visit` returns false.
     fn walk_admissible(
         &self,
         statics: &NativeSpecialization,
         mut visit: impl FnMut(&NativeSpecialization) -> bool,
-    ) -> Result<Option<NativeSpecializationError>, NativeSpecializationError> {
+    ) -> Result<(), NativeSpecializationError> {
         let mut base = NativeSpecialization::new();
         for name in &self.statics {
             let value = statics
@@ -1560,25 +1493,21 @@ impl NativeImplementation {
             };
         }
         let mut steps = vec![0usize; domains.len()];
-        let mut refusal = None;
         loop {
             match self.validate(&configuration) {
                 Ok(()) => {
                     if !visit(&configuration) {
-                        return Ok(refusal);
+                        return Ok(());
                     }
                 }
                 Err(NativeSpecializationError::Inadmissible) => {}
-                Err(error @ NativeSpecializationError::ExceedsDevice { .. }) => {
-                    refusal.get_or_insert(error);
-                }
                 Err(error) => return Err(error),
             }
             let Some(position) = (0..domains.len())
                 .rev()
                 .find(|&position| steps[position] + 1 < domains[position].1.values.len())
             else {
-                return Ok(refusal);
+                return Ok(());
             };
             let next = steps[position] + 1;
             let mut set = |position: usize, step: usize| {
@@ -1986,81 +1915,6 @@ mod native_tests {
             native.default_specialization(&at(65_536)),
             Err(NativeSpecializationError::Inadmissible)
         ));
-    }
-
-    /// On a device, admission also rejects configurations whose launch
-    /// geometry exceeds the device's limits, wherever the geometry reads only
-    /// static dimensions and parameters; the default is then the first
-    /// configuration that fits, and a device on which none fits is told apart
-    /// from statics outside the domain.
-    #[test]
-    fn device_limits_restrict_admission() {
-        let declaration = |statics: &str| {
-            let module = check_source(source(&format!(
-                "native scale for metal from \"scale.metal\":\n{statics}    params (QT in [16, 8], SPLIT in [1, 2])\n    launch scale:\n        threadgroups (QT, SPLIT, 1)\n        threads_per_threadgroup (QT * N * 4, 1, 1)\n        shared_bytes (QT * 1024)\n"
-            )))
-            .expect("declaration checks");
-            module
-                .native_implementation(module.entries()[0].id, BackendName::Metal)
-                .unwrap()
-                .clone()
-        };
-        let on_device =
-            |declared: &NativeImplementation, group_threads, shared_bytes| NativeImplementation {
-                device: Some(NativeDeviceLimits {
-                    group_extent: [1024, 1024, 1024],
-                    group_threads,
-                    shared_bytes,
-                }),
-                ..declared.clone()
-            };
-        let declared = declaration("    static (N)\n");
-        let at = |n| NativeSpecialization::new().with_static("N", n);
-        // N = 16: QT 16 needs 1024 threads, QT 8 needs 512.
-        assert_eq!(declared.admissible(&at(16)).unwrap().len(), 4);
-        let narrow = on_device(&declared, 512, 32_768);
-        assert_eq!(narrow.admissible(&at(16)).unwrap().len(), 2);
-        let default = narrow.default_specialization(&at(16)).unwrap();
-        assert_eq!(
-            (default.param("QT"), default.param("SPLIT")),
-            (Some(8), Some(1))
-        );
-        assert!(matches!(
-            narrow.validate(&default.clone().with_param("QT", 16)),
-            Err(NativeSpecializationError::ExceedsDevice { .. })
-        ));
-        // Shared memory: QT 16 needs 16 KiB.
-        let small = on_device(&declared, 1024, 8192);
-        let admitted = small.admissible(&at(4)).unwrap();
-        assert!(admitted
-            .iter()
-            .all(|configuration| configuration.param("QT") == Some(8)));
-        // No configuration fits: a device refusal, not a domain violation.
-        let tiny = on_device(&declared, 256, 32_768);
-        let refusal = tiny.default_specialization(&at(16)).unwrap_err();
-        assert!(matches!(
-            refusal,
-            NativeSpecializationError::ExceedsDevice { .. }
-        ));
-        assert!(
-            refusal
-                .to_string()
-                .contains("1024 threads per group; the device allows 256"),
-            "{refusal}"
-        );
-        assert!(matches!(
-            tiny.admissible(&at(16)),
-            Err(NativeSpecializationError::ExceedsDevice { .. })
-        ));
-        // A size that reads a call-time dimension is checked per call.
-        let dynamic = on_device(&declaration(""), 256, 32_768);
-        assert_eq!(
-            dynamic
-                .admissible(&NativeSpecialization::new())
-                .unwrap()
-                .len(),
-            4
-        );
     }
 
     #[test]

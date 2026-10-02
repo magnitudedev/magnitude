@@ -154,7 +154,7 @@ impl DirectModule {
         words: &[u32],
         entry: &ProgramEntry,
     ) -> Result<vk::Pipeline, NativeCompilationError> {
-        let threads = entry.constants.get(..3).ok_or_else(|| {
+        let threads = entry.group_size.ok_or_else(|| {
             NativeCompilationError::MalformedToolchainOutput(format!(
                 "`{}` carries no workgroup size",
                 entry.symbol
@@ -171,7 +171,7 @@ impl DirectModule {
                 entry.symbol
             ))
         })?;
-        let values = &entry.constants;
+        let values = threads.iter().chain(&entry.constants).collect::<Vec<_>>();
         let entries = (0..values.len() as u32)
             .map(|id| vk::SpecializationMapEntry {
                 constant_id: id,

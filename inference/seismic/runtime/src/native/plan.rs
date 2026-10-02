@@ -100,7 +100,7 @@ pub struct LaunchSource {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LaunchVariant {
     pub code: Vec<u64>,
-    pub group_size: Option<u64>,
+    pub group_size: Option<[u64; 3]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -486,7 +486,7 @@ pub fn partition(
             let variants = (0..admissible.len())
                 .map(|configuration| LaunchVariant {
                     code: project(configuration, &selected),
-                    group_size: super::group_size(implementation, &admissible[configuration], ordinal),
+                    group_size: implementation.static_group_size(&admissible[configuration], ordinal),
                 })
                 .collect::<BTreeSet<_>>()
                 .into_iter()

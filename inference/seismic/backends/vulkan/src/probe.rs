@@ -51,7 +51,8 @@ fn run(
                 text: source,
                 entries: vec![ProgramEntry {
                     symbol: "probe".into(),
-                    constants: vec![threads, 1, 1],
+                    group_size: Some([threads, 1, 1]),
+                    constants: Vec::new(),
                 }],
             },
             None,

@@ -116,23 +116,34 @@ pub(super) fn lookup(
         };
     };
     // A parameter the pin does not name (one the implementation gained after
-    // the pin was recorded) takes its declared default, so another build's
-    // configurations replay unchanged.
-    let mut specialization = NativeSpecialization::new();
+    // the pin was recorded) takes its value in the default configuration at
+    // these statics, so another build's configurations replay unchanged.
+    let mut statics_only = NativeSpecialization::new();
     for (name, value) in &pinned.statics {
-        specialization = specialization.with_static(name.clone(), *value);
+        statics_only = statics_only.with_static(name.clone(), *value);
     }
+    let defaults = implementation
+        .default_specialization(&statics_only)
+        .map_err(|error| format!("default configuration of {entry}: {error}"))?;
+    let mut specialization = statics_only;
     for parameter in &implementation.params {
-        let value = pinned.params.get(&parameter.name).unwrap_or(&parameter.values[0]);
-        specialization = specialization.with_param(parameter.name.clone(), *value);
+        let value = pinned
+            .params
+            .get(&parameter.name)
+            .copied()
+            .or_else(|| defaults.param(&parameter.name))
+            .expect("the default configuration values every parameter");
+        specialization = specialization.with_param(parameter.name.clone(), value);
     }
     for (launch, declaration) in implementation.launches.iter().enumerate() {
         for parameter in &declaration.params {
             let value = pinned
                 .launch_params
                 .get(&(launch, parameter.name.clone()))
-                .unwrap_or(&parameter.values[0]);
-            specialization = specialization.with_launch_param(launch, parameter.name.clone(), *value);
+                .copied()
+                .or_else(|| defaults.launch_param(launch, &parameter.name))
+                .expect("the default configuration values every launch parameter");
+            specialization = specialization.with_launch_param(launch, parameter.name.clone(), value);
         }
     }
     let declared = |name: &String| implementation.params.iter().any(|parameter| &parameter.name == name);

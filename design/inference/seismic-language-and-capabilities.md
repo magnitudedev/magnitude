@@ -287,12 +287,8 @@ Each backend gathers device, driver, toolchain, and backend-revision facts and t
 one immutable device legality description: supported intrinsic signatures, device-wide
 limits, dtype and atomic support, numerical environment, and a canonical identity.
 Candidate-specific native reflection completes admission during preparation.
-A native implementation is admitted against the opened device: a configuration whose launch group
-size or group-shared memory, where they read only static dimensions and tuning parameters, exceeds
-the device-wide limits is inadmissible there, so no default, search or stored choice uses it;
-geometry that reads a call-time dimension is checked per call. A Metal pipeline whose launch fixes
-its group size is formed to admit that size, so register allocation cannot lower its thread limit
-below the declared size.
+A Metal pipeline whose launch fixes its group size is formed to admit that size, so register
+allocation cannot lower its thread limit below the declared size.
 Unknown is distinct from unsupported.
 
 For an intrinsic signature, availability is the intersection of:
