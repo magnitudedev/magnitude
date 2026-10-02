@@ -439,7 +439,7 @@
     },
     "packages/launcher": {
       "name": "@magnitudedev/cli",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "bin": {
         "magnitude": "bin/magnitude.js",
       },
