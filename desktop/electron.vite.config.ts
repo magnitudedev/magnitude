@@ -103,10 +103,6 @@ export default defineConfig({
           replacement: resolve(__dirname, "../web/src"),
         },
         {
-          find: "@magnitudedev/web",
-          replacement: resolve(__dirname, "../web/src/index.tsx"),
-        },
-        {
           find: /^@magnitudedev\/sdk$/,
           replacement: resolve(__dirname, "../packages/sdk/src/index.ts"),
         },
@@ -142,7 +138,6 @@ export default defineConfig({
           "@magnitudedev/release",
         "@magnitudedev/client-common",
         "@magnitudedev/generate-id",
-        "@magnitudedev/web",
       ],
     },
   },

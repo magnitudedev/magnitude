@@ -6,7 +6,6 @@ applies_to:
   - packages/acn/src/session-*.ts
   - packages/acn/src/agent-*.ts
   - packages/client-common/src/**
-  - web/src/**
 ---
 
 # Web Projects

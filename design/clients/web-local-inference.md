@@ -1,10 +1,6 @@
 ---
 applies_to:
-  - web/src/app.tsx
-  - web/src/commands/**
   - web/src/components/**
-  - web/src/hooks/use-menu-actions.ts
-  - web/src/state/web-atoms.ts
   - web/src/stores/**
   - web/src/styles/**
   - desktop/src/renderer.tsx

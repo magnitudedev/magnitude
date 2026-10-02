@@ -3,11 +3,6 @@ applies_to:
   - packages/acn-protocol/src/schemas/display.ts
   - packages/agent/src/display/**
   - packages/agent/src/display-view/**
-  - packages/client-common/src/utils/root-detail.ts
-  - web/src/components/chat-timeline.tsx
-  - web/src/components/messages/**
-  - web/src/components/inline-work-activity.tsx
-  - web/src/components/general-settings.tsx
 ---
 
 # Conversation timeline presentation

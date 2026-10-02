@@ -8,7 +8,6 @@ applies_to:
   - packages/acn/src/local-model-**
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/local-models/**
-  - web/src/components/model-center.tsx
 ---
 
 # Local-model product projection

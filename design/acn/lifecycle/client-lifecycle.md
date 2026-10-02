@@ -5,11 +5,8 @@ applies_to:
   - packages/sdk/src/connection-errors.ts
   - packages/sdk/src/jit-rpc/**
   - packages/client-common/src/connection/**
-  - packages/client-common/src/state/service-startup.ts
-  - packages/client-common/src/state/service-recovery.ts
   - cli/src/server/acn-connection.ts
   - desktop/src/*.ts
-  - web/src/platform/**
 ---
 
 # SDK connection and first-party presentation

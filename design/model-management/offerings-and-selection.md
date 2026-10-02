@@ -10,7 +10,6 @@ applies_to:
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/model-state.ts
   - packages/client-common/src/**/local-model*
-  - web/src/components/model-center.tsx
 ---
 
 # Model offerings and selection

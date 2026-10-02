@@ -12,10 +12,6 @@ export default defineConfig({
         replacement: resolve(__dirname, "src"),
       },
       {
-        find: "@magnitudedev/web",
-        replacement: resolve(__dirname, "src/index.tsx"),
-      },
-      {
         find: /^@magnitudedev\/sdk$/,
         replacement: resolve(__dirname, "../packages/sdk/src/index.ts"),
       },

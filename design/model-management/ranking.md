@@ -6,7 +6,6 @@ applies_to:
   - cli/src/commands/inference-runtime.ts
   - packages/client-common/src/desktop/service.ts
   - desktop/src/renderer.tsx
-  - web/src/components/model-center.tsx
 ---
 
 # Local model ranking

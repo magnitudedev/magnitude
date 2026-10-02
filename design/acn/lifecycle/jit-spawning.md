@@ -9,7 +9,6 @@ applies_to:
   - packages/release/release-plan.json
   - packages/release/src/release-plan.ts
   - desktop/src/main.ts
-  - web/scripts/dev-server.ts
 ---
 
 # Desktop-owned service supervision

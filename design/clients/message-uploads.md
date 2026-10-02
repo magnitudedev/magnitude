@@ -4,10 +4,6 @@ applies_to:
   - packages/acn/src/attachments/**
   - packages/acn/src/session-*.ts
   - packages/client-common/src/**
-  - web/src/components/composer.tsx
-  - web/src/lib/message-uploads.ts
-  - web/src/app.tsx
-  - web/src/components/messages/**
   - packages/agent/src/display/timeline-projection.ts
 ---
 
