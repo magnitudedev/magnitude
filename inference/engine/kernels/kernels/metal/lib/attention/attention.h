@@ -469,6 +469,13 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
 #define PREFILL_MIN_TILES 16
 // Row pitch of a staged tile, in elements.
 #define PREFILL_PITCH (ATTENTION_W + 8)
+// The query heads of one attend threadgroup: a kv head's G query heads split
+// into PREFILL_HEAD_GROUPS groups of PREFILL_HEADS (the last may be smaller),
+// so the threadgroup's size follows the group, not G.
+#ifndef PREFILL_HEAD_GROUPS
+#define PREFILL_HEAD_GROUPS 1
+#endif
+#define PREFILL_HEADS ((SEISMIC_DIM_G + PREFILL_HEAD_GROUPS - 1) / PREFILL_HEAD_GROUPS)
 
 // The interval union [lo, hi) of a tile's non-empty row intervals and the
 // intersection [common_lo, common_hi) of all its row intervals, for one span.
@@ -1111,7 +1118,7 @@ struct prefill_fragments {
 // row floats. The form applies when 16 <= QT and every S fits over the tile
 // (QT G F32 rows within a tile row's bytes).
 constexpr bool prefill_tensors_fit(uint QT) {
-    return QT >= 16 && QT * SEISMIC_DIM_G * 4 <= PREFILL_PITCH * 2;
+    return QT >= 16 && QT * PREFILL_HEADS * 4 <= PREFILL_PITCH * 2;
 }
 
 template <uint QT, class History>
@@ -1124,7 +1131,7 @@ struct prefill_tensors {
     static constant constexpr int32_t PITCH = PREFILL_PITCH;
     static constant constexpr uint LANES = 32 / ROWS;
     static constant constexpr uint COLUMNS = KEYS / LANES;
-    static constant constexpr uint THREADS = QT * SEISMIC_DIM_G * 4;
+    static constant constexpr uint THREADS = QT * PREFILL_HEADS * 4;
     // Floats of one simdgroup's exchange slot: P, then one value per row.
     static constant constexpr uint PUBLISHED = ROWS * KEYS * sizeof(Operand) / 4;
     static constant constexpr uint EXCHANGE = PUBLISHED + ROWS;
@@ -1330,7 +1337,7 @@ struct prefill_tensors {
 // The L2 kernel's exchange memory: the tensor form's slot per computing
 // simdgroup (every element type is two bytes), when the form fits.
 #define PREFILL_EXCHANGE(name, QT) \
-    threadgroup float name[attention::prefill_tensors_fit(QT) ? (QT) * SEISMIC_DIM_G / 16 * (16 * PREFILL_KEYS / 2 + 16) : 1]
+    threadgroup float name[attention::prefill_tensors_fit(QT) ? (QT) * PREFILL_HEADS / 16 * (16 * PREFILL_KEYS / 2 + 16) : 1]
 #else
 #define PREFILL_EXCHANGE(name, QT) threadgroup float *name = nullptr
 #endif
@@ -1351,9 +1358,8 @@ inline void prefill_windows(History history, device const Scalar *query, device 
     uint thread_index, thread prefill_fragments<QT, History> &state) {
     typedef prefill_fragments<QT, History> Form;
     constexpr uint W = ATTENTION_W;
-    constexpr uint G = SEISMIC_DIM_G;
     constexpr uint KEYS = PREFILL_KEYS;
-    constexpr uint THREADS = QT * G * 4;
+    constexpr uint THREADS = QT * PREFILL_HEADS * 4;
     constexpr uint WINDOW = W < PREFILL_WINDOW ? W : PREFILL_WINDOW;
     for (uint window = 0; window < W / WINDOW; ++window) {
         const uint window_first = window * WINDOW;
@@ -1406,19 +1412,21 @@ inline void prefill_windows(History history, device const Scalar *query, device 
 }
 
 // The rows a simdgroup owns in a form of ROWS rows per simdgroup: simdgroup
-// s < QT G / ROWS owns rows tile * QT + (s % SPAN) * ROWS .. of query head
-// kv * G + s / SPAN (SPAN = QT / ROWS); the others only stage.
+// s owns rows tile * QT + (s % SPAN) * ROWS .. of query head kv * G + group *
+// PREFILL_HEADS + s / SPAN (SPAN = QT / ROWS) when that head is in the group;
+// the others only stage.
 template <uint QT, uint ROWS>
 struct prefill_owner {
     bool computes;
     uint owner;
     uint head;
     ulong first_token;
-    prefill_owner(uint tile, uint kv_head, uint simd) {
+    prefill_owner(uint tile, uint kv_head, uint head_group, uint simd) {
         constexpr uint SPAN = QT / ROWS;
-        computes = simd < QT * SEISMIC_DIM_G / ROWS;
+        const uint first_head = head_group * PREFILL_HEADS;
+        computes = simd < QT * PREFILL_HEADS / ROWS && first_head + simd / SPAN < SEISMIC_DIM_G;
         owner = computes ? simd : 0;
-        head = kv_head * SEISMIC_DIM_G + owner / SPAN;
+        head = kv_head * SEISMIC_DIM_G + first_head + owner / SPAN;
         first_token = ulong(tile) * QT + (owner % SPAN) * ROWS;
     }
 };
@@ -1430,17 +1438,17 @@ struct prefill_owner {
     device const typename History::Operand *keys, device const typename History::Operand *values,          \
     device float *partials, device float *statistics, ulong M, ulong R, float scale, bool softplus,        \
     threadgroup typename History::Operand *staged, threadgroup const prefill_interval *intervals,          \
-    threadgroup float *exchange, uint tile, uint kv_head, uint partition, uint active, uint tiles_lo,      \
-    uint tiles_hi, uint thread_index, uint simd, uint lane
+    threadgroup float *exchange, uint tile, uint kv_head, uint head_group, uint partition, uint active,    \
+    uint tiles_lo, uint tiles_hi, uint thread_index, uint simd, uint lane
 #define PREFILL_OWNED_ARGUMENTS                                                                           \
     history, query, gate, visible, fresh, result, queries, keys, values, partials, statistics, M, R, scale, \
-    softplus, staged, intervals, exchange, tile, kv_head, partition, active, tiles_lo, tiles_hi,           \
-    thread_index, simd, lane
+    softplus, staged, intervals, exchange, tile, kv_head, head_group, partition, active, tiles_lo,         \
+    tiles_hi, thread_index, simd, lane
 
 template <uint QT, class History>
 inline void prefill_owned_fragments(PREFILL_OWNED_PARAMETERS) {
     typedef prefill_fragments<QT, History> Form;
-    const prefill_owner<QT, Form::ROWS> own(tile, kv_head, simd);
+    const prefill_owner<QT, Form::ROWS> own(tile, kv_head, head_group, simd);
     Form state(lane);
     prefill_windows<QT, History>(history, query, gate, visible, fresh, result, keys, values, partials,
         statistics, M, R, scale, softplus, staged, intervals, kv_head, partition, active, tiles_lo, tiles_hi,
@@ -1452,7 +1460,7 @@ inline void prefill_owned_fragments(PREFILL_OWNED_PARAMETERS) {
 template <uint QT, class History>
 inline void prefill_owned_tensors(PREFILL_OWNED_PARAMETERS) {
     typedef prefill_tensors<QT, History> Form;
-    const prefill_owner<QT, Form::ROWS> own(tile, kv_head, simd);
+    const prefill_owner<QT, Form::ROWS> own(tile, kv_head, head_group, simd);
     Form::windows(history, query, gate, visible, fresh, result, keys, values, partials, statistics, M, R, scale,
         softplus, staged, intervals, exchange + own.owner * Form::EXCHANGE, kv_head, partition, active, tiles_lo,
         tiles_hi, queries + (own.first_token * SEISMIC_DIM_KV * SEISMIC_DIM_G + own.head) * ATTENTION_W, own.head,
@@ -1460,9 +1468,11 @@ inline void prefill_owned_tensors(PREFILL_OWNED_PARAMETERS) {
 }
 #endif
 
-// L2: threadgroup (QT-row tile, kv head, key partition). A simdgroup owns
-// ROWS rows of one query head (8 in the fragment form, every simdgroup; 16 in
-// the tensor form, the first half of the simdgroups). The tile's key tiles (each span's union interval in
+// L2: threadgroup (QT-row tile, kv head and head group, key partition). A
+// simdgroup owns ROWS rows of one query head of the group (8 in the fragment
+// form, every simdgroup; 16 in the tensor form, the first half of the
+// simdgroups); each staged K/V tile serves every head of the group, so the
+// group's size trades K/V reuse against the threadgroup's size. The tile's key tiles (each span's union interval in
 // PREFILL_KEYS steps, spans then fresh) split into consecutive runs of at
 // least PREFILL_MIN_TILES over the partitions. Per key tile: K staged
 // (history through the policy, fresh rows from scratch), scores = Q K^T with
@@ -1495,7 +1505,8 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     // Query tiles dispatch last-first: in a causal chunk the last tiles see
     // the most keys, and starting them first shortens the grid's tail.
     const uint tile = groups.x - 1 - group.x;
-    const uint kv_head = group.y;
+    const uint kv_head = group.y / PREFILL_HEAD_GROUPS;
+    const uint head_group = group.y % PREFILL_HEAD_GROUPS;
     const uint partition = group.z;
     threadgroup Operand *staged = reinterpret_cast<threadgroup Operand *>(shared);
     threadgroup prefill_interval *intervals = reinterpret_cast<threadgroup prefill_interval *>(
@@ -1532,7 +1543,7 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     const uint active = metal::max(1u, (total_tiles + per - 1) / per);
     if (partition >= active)
         return;
-    if (partition == 0 && kv_head == 0 && thread_index == 0)
+    if (partition == 0 && group.y == 0 && thread_index == 0)
         counts[tile] = active;
     const uint tiles_lo = partition * per;
     const uint tiles_hi = metal::min(tiles_lo + per, total_tiles);
