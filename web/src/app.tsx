@@ -913,8 +913,20 @@ function QuitFailureDialog() {
     </AlertDialogContent>
   </AlertDialog>
 }
-export function AppShell(props: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
-  return useNarrowViewport() ? <NarrowShell {...props} /> : <DockedShell {...props} />
+export function AppShell({ page, navigate, platform, children }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
+  const narrow = useNarrowViewport()
+  const [open, setOpen] = useState(false)
+  // Only the navigation chrome changes across `md`; the page stays mounted, so resizing keeps its state.
+  return <div className={narrow ? "relative flex h-screen flex-col bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200" : "relative flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200"}>
+    {narrow ? <NarrowBar open={open} onOpen={() => setOpen(true)} /> : <DockedSidebar page={page} navigate={navigate} platform={platform} />}
+    <main key={page} className="min-w-0 flex-1 overflow-y-auto" inert={narrow && open}>
+      <div data-page-content className={narrow ? "mx-auto w-full max-w-6xl px-4 pb-8 pt-5" : `mx-auto w-[calc(100vw-224px)] max-w-6xl px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
+        {page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
+        {children}
+      </div>
+    </main>
+    {narrow && open && <NavigationDrawer page={page} navigate={navigate} onClose={() => setOpen(false)} />}
+  </div>
 }
 function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
   return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
@@ -926,39 +938,33 @@ function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; nav
     })}
   </nav>
 }
-/** Below `md`: a top bar and a navigation drawer over the page, closed by default. */
-function NarrowShell({ page, navigate, children }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
-  const [open, setOpen] = useState(false)
-  return <div className="relative flex h-screen flex-col bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
-    <header className="flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 px-4 dark:border-slate-750" inert={open}>
-      <button type="button" className="inline-flex size-10 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 dark:hover:bg-slate-800" aria-label="Open navigation" aria-expanded={open} aria-controls="desktop-navigation" onClick={() => setOpen(true)}>
-        <SidebarSimpleIcon className="size-5" />
-      </button>
-      <span className="flex items-center gap-2 font-heading text-base font-semibold"><MagnitudeMark className="h-7 w-7 shrink-0" />Magnitude</span>
-    </header>
-    <main key={page} className="min-w-0 flex-1 overflow-y-auto" inert={open}>
-      <div data-page-content className="mx-auto w-full max-w-6xl px-4 pb-8 pt-5">
-        {page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
-        {children}
+/** Below `md`: a top bar that opens a navigation drawer over the page, closed by default. */
+function NarrowBar({ open, onOpen }: { open: boolean; onOpen: () => void }) {
+  return <header className="flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 px-4 dark:border-slate-750" inert={open}>
+    <button type="button" className="inline-flex size-10 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 dark:hover:bg-slate-800" aria-label="Open navigation" aria-expanded={open} aria-controls="desktop-navigation" onClick={onOpen}>
+      <SidebarSimpleIcon className="size-5" />
+    </button>
+    <span className="flex items-center gap-2 font-heading text-base font-semibold"><MagnitudeMark className="h-7 w-7 shrink-0" />Magnitude</span>
+  </header>
+}
+function NavigationDrawer({ page, navigate, onClose }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onClose: () => void }) {
+  return <div className="fixed inset-0 z-50 flex" onKeyDown={event => { if (event.key === "Escape") onClose() }}>
+    <button type="button" aria-label="Close navigation" className="absolute inset-0 cursor-default bg-black/45 dark:bg-black/70" onClick={onClose} />
+    <aside aria-label="Navigation" className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-6 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
+      <div className="mb-6 flex h-10 items-center justify-between px-4">
+        <span className="flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude</span>
+        <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label="Close navigation" onClick={onClose}><XIcon className="size-5" /></button>
       </div>
-    </main>
-    {open && <div className="fixed inset-0 z-50 flex" onKeyDown={event => { if (event.key === "Escape") setOpen(false) }}>
-      <button type="button" aria-label="Close navigation" className="absolute inset-0 cursor-default bg-black/45 dark:bg-black/70" onClick={() => setOpen(false)} />
-      <aside aria-label="Navigation" className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-6 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
-        <div className="mb-6 flex h-10 items-center justify-between px-4">
-          <span className="flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude</span>
-          <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label="Close navigation" onClick={() => setOpen(false)}><XIcon className="size-5" /></button>
-        </div>
-        <Navigation page={page} navigate={navigate} onNavigate={() => setOpen(false)} />
-      </aside>
-    </div>}
+      <Navigation page={page} navigate={navigate} onNavigate={onClose} />
+    </aside>
   </div>
 }
-function DockedShell({ page, navigate, platform, children }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
+/** From `md` up: the collapsible sidebar with the window's integrated controls and drag regions. */
+function DockedSidebar({ page, navigate, platform }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined }) {
   const [collapsed, setCollapsed] = useState(false)
   const integratedControls = platform === "darwin" || platform === "win32"
   const sidebarWidth = collapsed ? 0 : 224
-  return <div className="relative flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
+  return <>
     {integratedControls && <div aria-hidden="true" data-window-drag-region style={{ left: sidebarWidth }} className="absolute right-0 top-0 z-50 h-8 select-none transition-[left] duration-250 ease-in-out motion-reduce:transition-none [-webkit-app-region:drag]" />}
     <div data-window-drag-region={integratedControls ? "" : undefined} style={{ width: collapsed ? (platform === "darwin" ? 128 : 64) : sidebarWidth }} className={`absolute left-0 top-0 z-50 flex h-[42px] items-center justify-end px-4 transition-[width] duration-250 ease-in-out motion-reduce:transition-none ${integratedControls ? "select-none [-webkit-app-region:drag]" : ""}`}>
       <button type="button" className="inline-flex size-6 items-center justify-center rounded-sm text-slate-500 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-100 [-webkit-app-region:no-drag]" aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!collapsed} aria-controls="desktop-navigation" onClick={() => setCollapsed(value => !value)}>
@@ -970,22 +976,9 @@ function DockedShell({ page, navigate, platform, children }: { page: Application
       <div className="mb-10 mt-4 flex h-8 shrink-0 items-center gap-3 px-7 font-heading text-base font-semibold">
         <MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude
       </div>
-      <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
-        {(Object.keys(pageNames) as ApplicationPage[]).map(key => {
-          const Icon = pageIcons[key]
-          return <Button variant="ghost" key={key} disabled={!navigate} onClick={() => navigate?.(key)} aria-label={pageNames[key]} aria-current={page === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
-            <Icon className="size-4 shrink-0" />{pageNames[key]}
-          </Button>
-        })}
-      </nav>
+      <Navigation page={page} navigate={navigate} />
       </div>
     </aside>
-    <main key={page} className="min-w-0 flex-1 overflow-y-auto">
-      <div data-page-content className={`mx-auto w-[calc(100vw-224px)] max-w-6xl px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
-        {page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
-        {children}
-      </div>
-    </main>
-  </div>
+  </>
 }
 
