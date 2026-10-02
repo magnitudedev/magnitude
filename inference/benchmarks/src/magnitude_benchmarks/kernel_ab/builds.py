@@ -32,7 +32,8 @@ def executable(name: str) -> str:
 
 
 def tool_sources(repository: Path) -> list[Path]:
-    return [repository / "inference" / "engine" / "examples" / f"{tool}.rs" for tool in TOOLS]
+    examples = repository / "inference" / "engine" / "examples"
+    return [examples / f"{tool}.rs" for tool in TOOLS] + sorted((examples / "support").glob("*.rs"))
 
 
 def tools_digest(repository: Path) -> str:
@@ -94,7 +95,9 @@ def build(repository: Path, spec: str, root: Path, log) -> tuple[dict, Path]:
         else:
             git(source, "checkout", "--detach", "--force", built["commit"])
         for path in tool_sources(repository):
-            shutil.copy2(path, source / path.relative_to(repository))
+            destination = source / path.relative_to(repository)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
     log(f"building {spec} ({build_name(built)})")
     command = ["cargo", "build", "--release", "-p", "magnitude-engine", "--features", FEATURES]
     for tool in TOOLS:

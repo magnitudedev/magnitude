@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .runner import LOGITS_DECODES
 
-DEFAULT_BAR = 0.03
+DEFAULT_BAR = 0.0
 ENTRY_SHARE = 0.02
 LOGITS_KL_LIMIT = 1e-3
 BUSY_CORES = 0.5
@@ -112,12 +112,12 @@ def analyze(directory: Path, bar: float = DEFAULT_BAR) -> dict:
             continue
         report = json.loads((directory / result["output"]).read_text())
         for key, cell in cells(report).items():
-            name = (result["model"], key)
+            name = (result.get("mode", "own"), result["model"], key)
             samples[name][result["side"]].append(cell["median_ms"])
             for entry, ms in entry_times(cell).items():
                 entries[name][entry][result["side"]].append(ms)
     rows = []
-    for (model, key), sides in sorted(samples.items()):
+    for (mode, model, key), sides in sorted(samples.items()):
         if not sides["baseline"] or not sides["candidate"]:
             continue
         baseline = statistics.median(sides["baseline"])
@@ -127,7 +127,7 @@ def analyze(directory: Path, bar: float = DEFAULT_BAR) -> dict:
         tolerance = max(bar, noise)
         verdict = "slower" if delta > tolerance else "faster" if delta < -tolerance else "same"
         moved = []
-        for entry, per_side in entries[(model, key)].items():
+        for entry, per_side in entries[(mode, model, key)].items():
             if not per_side["baseline"] or not per_side["candidate"]:
                 moved.append(
                     {"entry": entry, "only": "baseline" if per_side["baseline"] else "candidate"}
@@ -147,6 +147,7 @@ def analyze(directory: Path, bar: float = DEFAULT_BAR) -> dict:
         moved.sort(key=lambda row: -abs(row.get("delta", 0)))
         rows.append(
             {
+                "mode": mode,
                 "model": model,
                 "cell": key,
                 "baseline_ms": baseline,
@@ -184,7 +185,8 @@ def analyze(directory: Path, bar: float = DEFAULT_BAR) -> dict:
         for result in run["results"]
         if result.get("phase") == "measure" and result.get("foreign_cores") is not None
     ]
-    regressions = [row for row in rows if row["verdict"] == "slower"]
+    # Own tuning differs by tuning luck as well as code; only same-configuration cells gate.
+    regressions = [row for row in rows if row["verdict"] == "slower" and row["mode"] == "same"]
     wrong = [model for model, result in logits.items() if result["status"] == "fail"]
     return {
         "run": run,
@@ -228,37 +230,54 @@ def markdown(analysis: dict) -> str:
             "",
             f"Other processes kept up to {busy:.2f} cores busy during a measurement ({quiet}).",
         ]
-    lines += [
-        "",
-        "## Speed",
-        "",
-        "Times are median step milliseconds; lower is better.",
-        "",
-        "| Model | Cell | Baseline ms | Candidate ms | Change | Noise | Verdict |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    for row in analysis["cells"]:
-        flag = " (noisy)" if row["noisy"] else ""
-        lines.append(
-            f"| {row['model']} | {row['cell']} | {row['baseline_ms']:.2f} | "
-            f"{row['candidate_ms']:.2f} | {percent(row['delta'])} | "
-            f"{row['noise'] * 100:.1f}% | {row['verdict']}{flag} |"
-        )
-    changed = [row for row in analysis["cells"] if row["verdict"] != "same"]
-    if changed:
-        lines += ["", "## Kernels behind changed cells", ""]
-        for row in changed:
-            lines.append(f"**{row['model']} {row['cell']}** ({percent(row['delta'])})")
-            lines.append("")
-            for entry in row["entries"]:
-                if "only" in entry:
-                    lines.append(f"- `{entry['entry']}`: only in {entry['only']}")
-                else:
-                    lines.append(
-                        f"- `{entry['entry']}`: {entry['baseline_ms']:.3f} → "
-                        f"{entry['candidate_ms']:.3f} ms ({percent(entry['delta'])})"
-                    )
-            lines.append("")
+    titles = {
+        "same": (
+            "## Speed on the same configurations",
+            "Both builds replay the baseline's tuned configurations, so a difference is the code's."
+            " These cells decide the verdict.",
+        ),
+        "own": (
+            "## Speed with each build's own tuning",
+            "Each build replays its own first tune: what a fresh load runs. Differences include"
+            " tuning luck; see the tuning section.",
+        ),
+    }
+    for mode in ("same", "own"):
+        mode_rows = [row for row in analysis["cells"] if row["mode"] == mode]
+        if not mode_rows:
+            continue
+        title, explanation = titles[mode]
+        lines += [
+            "",
+            title,
+            "",
+            explanation + " Times are median step milliseconds; lower is better.",
+            "",
+            "| Model | Cell | Baseline ms | Candidate ms | Change | Noise | Verdict |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for row in mode_rows:
+            flag = " (noisy)" if row["noisy"] else ""
+            lines.append(
+                f"| {row['model']} | {row['cell']} | {row['baseline_ms']:.2f} | "
+                f"{row['candidate_ms']:.2f} | {percent(row['delta'])} | "
+                f"{row['noise'] * 100:.1f}% | {row['verdict']}{flag} |"
+            )
+        changed = [row for row in mode_rows if row["verdict"] != "same"]
+        if changed:
+            lines += ["", "Kernels behind the changed cells:", ""]
+            for row in changed:
+                lines.append(f"**{row['model']} {row['cell']}** ({percent(row['delta'])})")
+                lines.append("")
+                for entry in row["entries"]:
+                    if "only" in entry:
+                        lines.append(f"- `{entry['entry']}`: only in {entry['only']}")
+                    else:
+                        lines.append(
+                            f"- `{entry['entry']}`: {entry['baseline_ms']:.3f} → "
+                            f"{entry['candidate_ms']:.3f} ms ({percent(entry['delta'])})"
+                        )
+                lines.append("")
     lines += [
         "",
         "## Correctness",

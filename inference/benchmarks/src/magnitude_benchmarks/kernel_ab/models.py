@@ -72,6 +72,23 @@ MODELS = (
         "mixture of experts (256 experts, top 8), G=8",
     ),
     BenchModel(
+        "qwen3.8-27b-slice",
+        "qwen3.8-27b",
+        "unsloth/Qwen3.8-27B-GGUF",
+        "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+        "first 4 layers of Qwen3.8 27B: G=6, attention projection at width 5120",
+        slice_layers="0,1,2,3",
+    ),
+    BenchModel(
+        "nemotron-3-super-slice",
+        "nemotron-3-super-120b-a12b",
+        "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
+        "UD-Q4_K_XL/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_XL-00001-of-00003.gguf",
+        "one Mamba, one mixture-of-experts (512 experts, top 22) and one attention layer"
+        " (G=16) of Nemotron 3 Super",
+        slice_layers="0,1,7",
+    ),
+    BenchModel(
         "muse-glimmer-30b",
         "muse-glimmer-30b",
         "unsloth/Muse-Glimmer-30B-GGUF",

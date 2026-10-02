@@ -10,6 +10,7 @@
 //! ```text
 //! token_logits --model M.gguf --tokens 1,2,3 --output logits.f32 [--prefill N]
 //!     [--cache-dir DIR] [--kv-codec dense|affine-k8v4] [--device auto|cuda|...]
+//!     [--tuning-record FILE | --tuning-replay FILE]   (with `--features pinned-tuning`)
 //! ```
 
 use magnitude_engine::{
@@ -41,8 +42,8 @@ struct Options {
     device: DeviceRequest,
 }
 
-fn options() -> Result<Options, String> {
-    let mut args = std::env::args().skip(1);
+fn options(args: Vec<String>) -> Result<Options, String> {
+    let mut args = args.into_iter();
     let (mut model, mut output, mut tokens) = (None, None, None);
     let mut options = Options {
         model: PathBuf::new(),
@@ -152,8 +153,17 @@ fn forward(
     Ok(bindings)
 }
 
+/// `--tuning-record FILE` / `--tuning-replay FILE` (`support/tuning_pin.rs`).
+#[cfg(feature = "pinned-tuning")]
+#[path = "support/tuning_pin.rs"]
+mod tuning_pin;
+
 fn main() -> Result<(), String> {
-    let options = options()?;
+    #[cfg_attr(not(feature = "pinned-tuning"), allow(unused_mut))]
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(feature = "pinned-tuning")]
+    let pin = tuning_pin::Pin::extract(&mut args)?;
+    let options = options(args)?;
     let resolved = EngineConfiguration {
         package: PackageOptions {
             target: options.model.clone(),
@@ -221,5 +231,7 @@ fn main() -> Result<(), String> {
         file.write_all(&value.to_le_bytes())
             .map_err(|error| error.to_string())?;
     }
+    #[cfg(feature = "pinned-tuning")]
+    pin.finish()?;
     Ok(())
 }
