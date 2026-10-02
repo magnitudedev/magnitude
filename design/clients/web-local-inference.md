@@ -3,7 +3,7 @@ applies_to:
   - web/src/components/**
   - web/src/stores/**
   - web/src/styles/**
-  - desktop/src/renderer.tsx
+  - web/src/app.tsx
   - packages/client-common/src/hooks/use-local-inference-state.ts
   - packages/client-common/src/local-models/**
   - packages/client-common/src/model-slots/**

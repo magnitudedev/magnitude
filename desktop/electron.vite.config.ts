@@ -107,8 +107,8 @@ export default defineConfig({
           replacement: resolve(__dirname, "../packages/sdk/src/index.ts"),
         },
         {
-          find: "@web-styles",
-          replacement: resolve(__dirname, "../web/src/styles"),
+          find: /^@magnitudedev\/web\/(.*)$/,
+          replacement: resolve(__dirname, "../web/src/$1"),
         },
       ],
     },

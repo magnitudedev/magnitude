@@ -31,7 +31,10 @@ export * from './harness-connections/service'
 // Hooks
 export * from './hooks/use-local-inference-state'
 
-// Desktop
-export * from "./desktop/service"
-export * from "./desktop/update"
-export { DesktopConnectRequest, ConnectionInspection, DesktopHarnessConnection, DesktopConnectionsSnapshot } from "./desktop/connections"
+// Application
+export * from "./application/session"
+export * from "./application/host"
+export * from "./application/router"
+export * from "./application/update"
+export { DesktopConnectRequest, ConnectionInspection, DesktopHarnessConnection, DesktopConnectionsSnapshot } from "./application/connections"
+export { hostlessApplication } from "./state/client-services"

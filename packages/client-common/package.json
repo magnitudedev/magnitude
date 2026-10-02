@@ -10,9 +10,9 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts"
     },
-    "./desktop/contracts": {
-      "types": "./src/desktop/contracts.ts",
-      "import": "./src/desktop/contracts.ts"
+    "./application/contracts": {
+      "types": "./src/application/contracts.ts",
+      "import": "./src/application/contracts.ts"
     }
   },
   "scripts": {

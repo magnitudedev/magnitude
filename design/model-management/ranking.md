@@ -4,8 +4,8 @@ applies_to:
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/local-models/options.ts
   - cli/src/commands/inference-runtime.ts
-  - packages/client-common/src/desktop/service.ts
-  - desktop/src/renderer.tsx
+  - packages/client-common/src/application/session.ts
+  - web/src/app.tsx
 ---
 
 # Local model ranking

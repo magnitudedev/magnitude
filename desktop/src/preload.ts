@@ -1,4 +1,4 @@
-import { DesktopConnectRequest, DesktopConnectionsSnapshot, ModelTrayPresentation } from "@magnitudedev/client-common/desktop/contracts"
+import { DesktopConnectRequest, DesktopConnectionsSnapshot, ModelTrayPresentation } from "@magnitudedev/client-common/application/contracts"
 import { contextBridge, ipcRenderer } from "electron"
 import { RpcClient } from "@effect/rpc"
 import { Cause, Context, Effect, Exit, Fiber, Layer, ManagedRuntime, Option, Schema, Stream } from "effect"
@@ -61,5 +61,6 @@ const api: DesktopApi = {
   disconnect: harness => command(client => client.Disconnect({ harness })),
   retry: () => command(client => client.Retry({})),
   quit: () => command(client => client.Quit({})),
+  resolveQuitFailure: decision => command(client => client.ResolveQuitFailure({ decision })),
 }
 contextBridge.exposeInMainWorld("__magnitudeDesktop", api)

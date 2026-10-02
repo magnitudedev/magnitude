@@ -1,8 +1,8 @@
 ---
 applies_to:
-  - packages/client-common/src/desktop/**
+  - packages/client-common/src/application/**
   - packages/client-common/src/state/client-services.ts
-  - desktop/src/renderer.tsx
+  - web/src/app.tsx
 ---
 
 # Getting started in the desktop

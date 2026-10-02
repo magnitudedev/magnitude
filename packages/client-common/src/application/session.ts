@@ -1,0 +1,185 @@
+import { Atom, Registry, Result } from "@effect-atom/atom-react"
+import { Context, Effect, Layer, Option, Stream } from "effect"
+import { ModelLoadStageSchema, type LocalModelsState, type ModelResidency } from "@magnitudedev/sdk"
+import type { AppearancePreference, NetworkAccessChange } from "@magnitudedev/sdk/desktop-host"
+import type { DesktopConnectRequest } from "./connections"
+import type { HarnessId } from "../harness-connections/service"
+import { LocalModels } from "../local-models/service"
+import { LOCAL_MODEL_RANKING_SCALE_VALUES } from "../local-models/options"
+import { formatLocalModelDisplayName } from "../utils/model-presentation"
+import { formatModelLoadPercentage, formatModelLoadStage, formatModelMemory, isMeasuredModelLoadStage } from "../utils/model-load"
+import { ApplicationHost, ApplicationHostFailed } from "./host"
+import { ApplicationRouter } from "./router"
+import type { HostNotice, QuitFailureDecision } from "./contracts"
+import { ModelTrayPresentation, ModelTrayStatus } from "./contracts"
+
+export { ApplicationPage, HostAction, HostNotice, QuitFailureDecision, ModelTrayPresentation, ModelTrayStatus, ApplicationInfo } from "./contracts"
+
+export const activeLocalModel = (models: LocalModelsState) => {
+  for (const model of models.models) {
+    const residency = model._tag === "Catalog" ? ("residencyState" in model.acquisitionState ? model.acquisitionState.residencyState : undefined) : model.state._tag === "Ready" ? model.state.residencyState : undefined
+    if (residency && residency._tag !== "Unloaded" && residency._tag !== "Failed") {
+      return Option.some({ model, residency })
+    }
+  }
+  return Option.none()
+}
+/** Every phase word the tray's model row shows, so it can hold room for the widest. */
+export const MODEL_TRAY_PHASES: ReadonlyArray<string> = [
+  ...ModelLoadStageSchema.literals.map(formatModelLoadStage),
+  "Loaded",
+  "Stopping",
+]
+const modelTrayStatus = (
+  model: string,
+  residency: Exclude<ModelResidency, { readonly _tag: "Unloaded" | "Failed" }>,
+): typeof ModelTrayStatus.Type => {
+  switch (residency._tag) {
+    case "Requested": return { model, phase: formatModelLoadStage("preparing"), detail: { _tag: "Working" } }
+    case "Loading": return {
+      model,
+      phase: formatModelLoadStage(residency.stage),
+      detail: isMeasuredModelLoadStage(residency.stage)
+        ? { _tag: "Progress", fraction: residency.fraction }
+        : { _tag: "Working" },
+    }
+    case "Ready": return { model, phase: "Loaded", detail: { _tag: "Memory", text: formatModelMemory(residency.allocation) } }
+    case "Stopping": return { model, phase: "Stopping", detail: { _tag: "Working" } }
+  }
+}
+const modelTrayLabel = (status: typeof ModelTrayStatus.Type): string => {
+  switch (status.detail._tag) {
+    case "Working": return `${status.model} · ${status.phase}`
+    case "Progress": return `${status.model} · ${status.phase} ${formatModelLoadPercentage(status.detail.fraction)}`
+    case "Memory": return `${status.model} · ${status.phase} · ${status.detail.text}`
+  }
+}
+export const modelTrayPresentation = (models: LocalModelsState): typeof ModelTrayPresentation.Type => {
+  const active = activeLocalModel(models)
+  if (Option.isSome(active)) {
+    const status = modelTrayStatus(formatLocalModelDisplayName(active.value.model), active.value.residency)
+    return { label: modelTrayLabel(status), status: Option.some(status), canStop: true }
+  }
+  return {
+    label: models.models.length === 0 && !models.preparation.assessment.complete ? "Reading model status…" : "No model loaded",
+    status: Option.none(),
+    canStop: false,
+  }
+}
+
+const unavailable = new ApplicationHostFailed({ message: "This action isn't available here." })
+
+const makeApplicationSession = Effect.gen(function* () {
+  const registry = yield* Registry.AtomRegistry
+  const host = yield* ApplicationHost
+  const router = yield* ApplicationRouter
+  const models = yield* LocalModels
+  const rankingPreference = Atom.keepAlive(Atom.make(2))
+  const setRankingPreference = (index: number) => Effect.sync(() => {
+    if (Number.isInteger(index) && index >= 0 && index < LOCAL_MODEL_RANKING_SCALE_VALUES.length) registry.set(rankingPreference, index)
+  })
+  const notices = Atom.keepAlive(Atom.make<ReadonlyArray<HostNotice>>([]))
+  const dismissNotice = (notice: HostNotice) => Effect.sync(() => registry.set(notices, registry.get(notices).filter(entry => entry !== notice)))
+  const quitFailed = Atom.keepAlive(Atom.make(false))
+
+  if (Option.isSome(host.shell)) {
+    const shell = host.shell.value
+    yield* shell.actions.pipe(
+      Stream.runForEach(action => {
+        switch (action._tag) {
+          case "Navigate": return router.navigate(action.page)
+          case "StopModel": return models.stop.pipe(Effect.asVoid, Effect.catchAll(Effect.logError))
+          case "ShowNotice": return Effect.sync(() => registry.set(notices, [...registry.get(notices), action.notice]))
+          case "QuitFailed": return Effect.sync(() => registry.set(quitFailed, true))
+        }
+      }),
+      Effect.catchAll(Effect.logError),
+      Effect.forkScoped,
+    )
+    yield* Registry.toStream(registry, models.state).pipe(
+      Stream.map(result => Result.isSuccess(result) ? modelTrayPresentation(result.value) : { label: "Model status unavailable", status: Option.none(), canStop: false }),
+      Stream.changesWith((a, b) => a.label === b.label && a.canStop === b.canStop),
+      Stream.runForEach(value => shell.presentModel(value).pipe(Effect.catchAll(Effect.logError))), Effect.forkScoped,
+    )
+  }
+  const resolveQuitFailure = Atom.fn((decision: QuitFailureDecision) => Option.match(host.shell, {
+    onNone: () => Effect.fail(unavailable),
+    onSome: shell => shell.resolveQuitFailure(decision).pipe(Effect.ensuring(Effect.sync(() => registry.set(quitFailed, false)))),
+  }))
+  const retryService = Atom.fn((_: void) => Option.match(host.shell, { onNone: () => Effect.fail(unavailable), onSome: shell => shell.retryService }))
+
+
+  const desktop = host.desktop
+  const fromDesktop = <A, E>(select: (controls: NonNullable<Option.Option.Value<typeof desktop>>) => Effect.Effect<A, E>) =>
+    Option.match(desktop, { onNone: () => Effect.fail(unavailable), onSome: select })
+  const streamFromDesktop = <A>(select: (controls: NonNullable<Option.Option.Value<typeof desktop>>) => Stream.Stream<A, ApplicationHostFailed>) =>
+    Option.match(desktop, { onNone: () => Stream.fail(unavailable), onSome: select })
+
+  const application = Atom.keepAlive(Atom.make(streamFromDesktop(controls => controls.application)))
+  const loginStartup = Atom.make(Option.isSome(desktop) ? desktop.value.loginStartup : Stream.succeed({ _tag: "Unavailable" as const, message: "Launch at login isn't available here." }))
+  const machineIdentity = Atom.keepAlive(Atom.make(Option.isSome(desktop) ? desktop.value.machineIdentity : Effect.succeed({ _tag: "Unavailable" as const, formFactor: "Unknown" as const })))
+  const memory = Atom.make(Option.isSome(desktop) ? desktop.value.memory : Stream.succeed({ _tag: "Unavailable" as const, message: "Memory isn't available here." }))
+  const applicationInfo = Atom.make(fromDesktop(controls => controls.applicationInfo))
+  const updates = Atom.make(Option.isSome(desktop) ? desktop.value.updates : Stream.succeed({ transfer: { _tag: "Unavailable" as const, message: "Updates aren't available here." }, check: { _tag: "Idle" as const }, preference: { _tag: "Unavailable" as const, message: "Updates aren't available here." } }))
+  const setAutoDownload = Atom.fn((enabled: boolean) => fromDesktop(controls => controls.setAutoDownload(enabled)))
+  const checkUpdate = Atom.fn((_: void) => fromDesktop(controls => controls.checkUpdate))
+  const discardUpdate = Atom.fn((_: void) => fromDesktop(controls => controls.discardUpdate))
+  const downloadUpdate = Atom.fn((_: void) => fromDesktop(controls => controls.downloadUpdate))
+  const restartUpdate = Atom.fn((_: void) => fromDesktop(controls => controls.restartUpdate))
+  const setLoginStartup = Atom.fn((enabled: boolean) => fromDesktop(controls => controls.setLoginStartup(enabled)))
+  const connections = Atom.make(Option.isSome(desktop) ? desktop.value.connections : Stream.succeed({ _tag: "Ready" as const, connections: [] }))
+  const connect = Atom.fn((input: DesktopConnectRequest) => fromDesktop(controls => controls.connect(input)))
+  const disconnect = Atom.fn((harness: HarnessId) => fromDesktop(controls => controls.disconnect(harness)))
+  const modelStorage = Atom.keepAlive(Atom.make(fromDesktop(controls => controls.modelStorage)))
+  const chooseModelStorage = Atom.fn((_: void) => fromDesktop(controls => controls.chooseModelStorageDirectory.pipe(
+    Effect.flatMap(path => Option.isNone(path) ? Effect.void : controls.setModelStorage(path)),
+  )).pipe(Effect.ensuring(Atom.refresh(modelStorage))))
+  const resetModelStorage = Atom.fn((_: void) => fromDesktop(controls => controls.setModelStorage(Option.none())).pipe(Effect.ensuring(Atom.refresh(modelStorage))))
+  const networkAccess = Atom.keepAlive(Atom.make(fromDesktop(controls => controls.networkAccess)))
+  const updateNetworkAccess = Atom.fn((change: NetworkAccessChange) => fromDesktop(controls => controls.setNetworkAccess(change)).pipe(Effect.ensuring(Atom.refresh(networkAccess))))
+  const regenerateNetworkApiKey = Atom.fn((_: void) => fromDesktop(controls => controls.regenerateNetworkApiKey).pipe(Effect.ensuring(Atom.refresh(networkAccess))))
+  const relaunch = Atom.fn((_: void) => fromDesktop(controls => controls.relaunch))
+  const refreshSettings = Effect.sync(() => { registry.refresh(modelStorage); registry.refresh(networkAccess) })
+
+  return {
+    page: router.page,
+    navigate: router.navigate,
+    rankingPreference: rankingPreference as Atom.Atom<number>,
+    setRankingPreference,
+    notices: notices as Atom.Atom<ReadonlyArray<HostNotice>>,
+    dismissNotice,
+    quitFailed: quitFailed as Atom.Atom<boolean>,
+    resolveQuitFailure,
+    retryService,
+    readAppearance: host.appearance.read,
+    saveAppearance: (preference: AppearancePreference) => host.appearance.save(preference),
+    clientWindow: host.window,
+    serverPlatform: Option.map(desktop, controls => controls.platform),
+    application,
+    machineIdentity,
+    memory,
+    applicationInfo,
+    updates,
+    setAutoDownload,
+    checkUpdate,
+    downloadUpdate,
+    discardUpdate,
+    restartUpdate,
+    loginStartup,
+    setLoginStartup,
+    connections,
+    connect,
+    disconnect,
+    modelStorage,
+    chooseModelStorage,
+    resetModelStorage,
+    networkAccess,
+    updateNetworkAccess,
+    regenerateNetworkApiKey,
+    relaunch,
+    refreshSettings,
+  }
+})
+export interface ApplicationSession extends Effect.Effect.Success<typeof makeApplicationSession> {}
+export const ApplicationSession = Context.GenericTag<ApplicationSession>("client/ApplicationSession")
+export const ApplicationSessionLive = Layer.scoped(ApplicationSession, makeApplicationSession)

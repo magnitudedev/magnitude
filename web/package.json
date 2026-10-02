@@ -8,6 +8,8 @@
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
+    "@effect-atom/atom-react": "^0.5.0",
+    "@effect/platform": "^0.96.0",
     "@fontsource-variable/inter": "^5.3.0",
     "@fontsource-variable/martian-mono": "^5.3.0",
     "@magnitudedev/client-common": "workspace:*",
@@ -15,6 +17,7 @@
     "@phosphor-icons/react": "^2.1.10",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "effect": "^3.21.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "shadcn": "^4.18.0",
@@ -29,5 +32,11 @@
     "tailwindcss": "^4.3.3",
     "typescript": "^5.7.0",
     "vite": "^6.0.0"
+  },
+  "exports": {
+    "./run": {
+      "types": "./src/run.tsx",
+      "import": "./src/run.tsx"
+    }
   }
 }

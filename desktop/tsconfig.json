@@ -11,6 +11,9 @@
       "@magnitudedev/sdk/*": [
         "../packages/sdk/src/*"
       ],
+      "@magnitudedev/web/*": [
+        "../web/src/*"
+      ],
       "@/*": [
         "../web/src/*"
       ]

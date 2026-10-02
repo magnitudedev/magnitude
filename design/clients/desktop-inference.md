@@ -1,16 +1,16 @@
 ---
 applies_to:
   - assets/hardware/**
-  - desktop/test/hardware/**
+  - web/test/hardware/**
   - desktop/src/*.ts
-  - desktop/src/*.tsx
+  - web/src/**
   - packages/daemon-management/src/desktop-native/*-preferences.ts
   - desktop/native/**
   - desktop/scripts/build-native.ts
   - desktop/scripts/dev.ts
   - packages/storage/src/types/config.ts
   - packages/sdk/src/desktop-host.ts
-  - packages/client-common/src/desktop/**
+  - packages/client-common/src/application/**
   - packages/harness-connections/**
 ---
 

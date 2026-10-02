@@ -2,7 +2,7 @@ import { windowChrome, windowControlColors } from "./window-chrome"
 import { makeMacCliRegistration } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
-import { resolveQuitFailure } from "./quit-failure"
+import { nativeQuitFailureDecision, resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
 import { buildTrayMenu, MODEL_STATUS_ITEM } from "./tray-menu"
 import { loadTrayStatusRow } from "./tray-status"
@@ -42,7 +42,8 @@ import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
 import { nativeWindowsPrivatePipesLayer, WindowsPipeName } from "@magnitudedev/utils/windows-native"
 import { type ApplicationSnapshot, type OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
-import { HostError, ApplicationAction, InferenceHostRpcs, ModelTrayPresentation, type Page } from "./desktop-rpc"
+import { HostError, ApplicationAction, InferenceHostRpcs, ModelTrayPresentation, type HostNotice, type Page } from "./desktop-rpc"
+import type { QuitFailureDecision } from "@magnitudedev/client-common/application/contracts"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
 import { resolveHarnessEnvironment, harnessCommandExecutor } from "./shell-env"
 import { MAGNITUDE_VERSION } from "@magnitudedev/version"
@@ -252,6 +253,20 @@ const program = Effect.scoped(Effect.gen(function* () {
     }) })),
   ) })
   let window: BrowserWindow
+  const windowShown = () => window !== undefined && !window.isDestroyed() && window.isVisible()
+  /** Errors raised while the window is shown appear in the app; native dialogs only when there is no window. */
+  const showNotice = (notice: HostNotice) => windowShown()
+    ? PubSub.publish(actions, { _tag: "ShowNotice", notice }).pipe(Effect.asVoid)
+    : Effect.sync(() => dialog.showErrorBox(notice.title, notice.description))
+  const pendingQuitDecision = yield* Ref.make(Option.none<Deferred.Deferred<QuitFailureDecision>>())
+  const decideQuitFailure: Effect.Effect<QuitFailureDecision, unknown> = Effect.suspend(() => windowShown()
+    ? Effect.gen(function* () {
+      const decision = yield* Deferred.make<QuitFailureDecision>()
+      yield* Ref.set(pendingQuitDecision, Option.some(decision))
+      yield* PubSub.publish(actions, { _tag: "QuitFailed" })
+      return yield* Deferred.await(decision)
+    })
+    : nativeQuitFailureDecision(options => dialog.showMessageBox(options)))
   let pendingPage: Page = "discover"
   let wantsWindow = !background
   const loadRenderer = () => Effect.tryPromise(() => process.env.ELECTRON_RENDERER_URL
@@ -377,6 +392,8 @@ const program = Effect.scoped(Effect.gen(function* () {
     Disconnect: ({ harness }) => connections.pipe(Effect.flatMap(service => service.disconnect(harness)), Effect.mapError(connectionError), Effect.tap(() => PubSub.publish(connectionChanges, undefined)), Effect.as({})),
     Retry: () => service.retry.pipe(Effect.as({})),
     Quit: () => Queue.offer(quit, "Quit").pipe(Effect.as({})),
+    ResolveQuitFailure: ({ decision }) => Ref.getAndSet(pendingQuitDecision, Option.none()).pipe(
+      Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: pending => Deferred.succeed(pending, decision) })), Effect.as({})),
   })
   yield* RpcServer.layer(InferenceHostRpcs).pipe(Layer.provide(handlers), Layer.provide(makeElectronRpcServerLayer(ipcMain)), Layer.build)
   window = yield* Effect.acquireRelease(Effect.sync(() => {
@@ -412,7 +429,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     value.webContents.setWindowOpenHandler(({ url }) => {
       const source = Schema.decodeUnknownEither(HttpsUrlSchema)(url)
       if (source._tag === "Right") run(Effect.tryPromise(() => shell.openExternal(source.right)).pipe(
-        Effect.catchAll(() => Effect.sync(() => dialog.showErrorBox("Could not open model source", "Open your browser and try the source link again."))),
+        Effect.catchAll(() => showNotice({ title: "Could not open model source", description: "Open your browser and try the source link again." })),
       ))
       return { action: "deny" }
     })
@@ -428,7 +445,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   const installCli = cliLink?.install ?? Effect.void
   const cliResult = (operation: typeof installCli) => operation.pipe(
     Effect.tapError(Effect.logError),
-    Effect.catchAll(() => Effect.sync(() => dialog.showErrorBox("Couldn’t install the command-line tool", "Magnitude couldn’t register its terminal command. Check that your application is installed in a writable location."))),
+    Effect.catchAll(() => showNotice({ title: "Couldn’t install the command-line tool", description: "Magnitude couldn’t register its terminal command. Check that your application is installed in a writable location." })),
   )
   Menu.setApplicationMenu(Menu.buildFromTemplate(buildApplicationMenu(process.platform, {
     open: page => run(show(page)), quit: requestQuit,
@@ -462,7 +479,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     if (systemShutdownRequested) yield* Effect.logError(stopped.left.message)
     else {
       const retry = yield* resolveQuitFailure(stopped.left.message, {
-        showDialog: options => dialog.showMessageBox(options),
+        decide: decideQuitFailure,
         forceQuit: () => { exiting = true; app.exit(1) },
       })
       if (retry) yield* Queue.offer(quit, "Quit")

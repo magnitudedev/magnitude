@@ -1,11 +1,11 @@
 import type { OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
-import type { DesktopPage, ModelTrayPresentation } from "@magnitudedev/client-common"
+import type { ApplicationPage, ModelTrayPresentation } from "@magnitudedev/client-common"
 
 /** The id of the model line when it shows an active model: the item a native row replaces. */
 export const MODEL_STATUS_ITEM = "model-status"
 
 interface TrayActions {
-  readonly open: (page?: DesktopPage) => void
+  readonly open: (page?: ApplicationPage) => void
   readonly stopModel: () => void
   readonly quit: () => void
   readonly restartUpdate: () => void

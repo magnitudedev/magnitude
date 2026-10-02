@@ -1,14 +1,14 @@
 import { Rpc, RpcGroup, type RpcClient, type RpcClientError } from "@effect/rpc"
 import { atMostOnce, replaySafe } from "@magnitudedev/sdk"
 import { AppearancePreference, ApplicationSnapshot, LoginStartupState, ApplicationMemoryObservation, MachineIdentityObservation, ModelStorageSettings, NetworkAccessSettings, NetworkAccessChange, DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
-import { DesktopApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, HarnessIdSchema, DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common/desktop/contracts"
+import { ApplicationInfo, DesktopConnectRequest, DesktopConnectionsSnapshot, HarnessIdSchema, ModelTrayPresentation, HostAction as ApplicationAction, QuitFailureDecision } from "@magnitudedev/client-common/application/contracts"
 import { Schema } from "effect"
 
-export { DesktopPage as Page, ModelTrayPresentation, DesktopAction as ApplicationAction } from "@magnitudedev/client-common/desktop/contracts"
+export { ApplicationPage as Page, ModelTrayPresentation, HostAction as ApplicationAction, HostNotice } from "@magnitudedev/client-common/application/contracts"
 export class HostError extends Schema.TaggedError<HostError>()("HostError", { message: Schema.String }) {}
 const Unit = Schema.Struct({})
 export const InferenceHostRpcs = RpcGroup.make(
-  Rpc.make("ApplicationInfo", { payload: Unit, success: DesktopApplicationInfo, error: HostError }).pipe(replaySafe),
+  Rpc.make("ApplicationInfo", { payload: Unit, success: ApplicationInfo, error: HostError }).pipe(replaySafe),
   Rpc.make("MachineIdentity", { payload: Unit, success: MachineIdentityObservation, error: HostError }).pipe(replaySafe),
   Rpc.make("Memory", { payload: Unit, success: ApplicationMemoryObservation, error: HostError, stream: true }),
   Rpc.make("Updates", { payload: Unit, success: DesktopUpdateState, error: HostError, stream: true }),
@@ -36,12 +36,13 @@ export const InferenceHostRpcs = RpcGroup.make(
   Rpc.make("Disconnect", { payload: Schema.Struct({ harness: HarnessIdSchema }), success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("Retry", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("Quit", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("ResolveQuitFailure", { payload: Schema.Struct({ decision: QuitFailureDecision }), success: Unit, error: HostError }).pipe(atMostOnce),
 )
 export type InferenceHostClient = RpcClient.FromGroup<typeof InferenceHostRpcs, RpcClientError.RpcClientError>
 export interface DesktopApi {
   readonly machineIdentity: () => Promise<MachineIdentityObservation>
   readonly memory: (value: (state: ApplicationMemoryObservation) => void, error: (message: string) => void) => () => void
-  readonly applicationInfo: () => Promise<typeof DesktopApplicationInfo.Type>
+  readonly applicationInfo: () => Promise<typeof ApplicationInfo.Type>
   readonly updates: (value: (state: typeof DesktopUpdateState.Type) => void, error: (message: string) => void) => () => void
   readonly setAutoDownload: (enabled: boolean) => Promise<void>
   readonly checkUpdate: () => Promise<void>
@@ -68,6 +69,7 @@ export interface DesktopApi {
   readonly disconnect: (harness: typeof HarnessIdSchema.Type) => Promise<void>
   readonly retry: () => Promise<void>
   readonly quit: () => Promise<void>
+  readonly resolveQuitFailure: (decision: QuitFailureDecision) => Promise<void>
 }
 
 export const DesktopRpcChannel = { request: "__magnitude:desktop-rpc:request", response: "__magnitude:desktop-rpc:response" } as const

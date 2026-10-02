@@ -2,7 +2,7 @@ import { Cause, FiberId, Option } from "effect"
 import { CatalogFormModelIdSchema, LocalModelMutationFailed } from "@magnitudedev/sdk"
 import { describe, expect, it } from "vitest"
 import { localModelCommandStatus, localModelCommandFailure, type LocalModelCommand } from "./service"
-import { makeSetupModel } from "../desktop/fixtures/model"
+import { makeSetupModel } from "../application/fixtures/model"
 const first = CatalogFormModelIdSchema.make("first:gguf:q4")
 const second = CatalogFormModelIdSchema.make("second:gguf:q4")
 const failure = (operation: LocalModelCommand, code = "low_memory") => localModelCommandFailure(operation, Cause.fail(new LocalModelMutationFailed({ code, message: "private diagnostics", retryable: true })))

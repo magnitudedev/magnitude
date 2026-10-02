@@ -1,5 +1,7 @@
-import { DesktopBridge, DesktopSession, DesktopSessionLive } from "../desktop/service"
-import { Context, Layer, Option } from "effect"
+import { ApplicationSession, ApplicationSessionLive } from "../application/session"
+import { ApplicationHost, ApplicationHostFailed } from "../application/host"
+import { ApplicationRouter, ApplicationRouterLocation, ApplicationRouterMemory } from "../application/router"
+import { Context, Effect, Layer, Option } from "effect"
 import { Files, FilesLive } from "../files/service"
 import { LocalModels, LocalModelsLive } from "../local-models/service"
 import { ModelSlots, ModelSlotsLive } from "../model-slots/service"
@@ -12,7 +14,8 @@ import {
 } from "../harness-connections/service"
 
 export type ClientServices =
-  | DesktopSession
+  | ApplicationSession
+  | ApplicationRouter
   | ClientEffectQuery
   | Files
   | LocalModels
@@ -21,7 +24,8 @@ export type ClientServices =
   | HarnessConnection
 
 export interface ClientServicesOptions {
-  readonly desktopBridge?: DesktopBridge
+  readonly host?: ApplicationHost
+  readonly navigation?: "memory" | "location"
   readonly harnessConnection?: HarnessConnection
 }
 
@@ -50,8 +54,21 @@ export const clientServicesLayer = (
     Layer.provideMerge(observedInfrastructure),
   )
 
-  return DesktopSessionLive.pipe(
+  const router = options.navigation === "location" ? ApplicationRouterLocation : ApplicationRouterMemory
+  return ApplicationSessionLive.pipe(
+    Layer.provideMerge(router),
     Layer.provideMerge(domains),
-    Layer.provide(Layer.succeed(DesktopBridge, Option.fromNullable(options.desktopBridge))),
+    Layer.provide(Layer.succeed(ApplicationHost, options.host ?? hostlessApplication)),
   )
+}
+
+/** A client with no application host, such as the CLI: no window, shell, or desktop controls. */
+export const hostlessApplication: ApplicationHost = {
+  window: Option.none(),
+  appearance: {
+    read: Effect.succeed("system"),
+    save: () => Effect.fail(new ApplicationHostFailed({ message: "Appearance can't be saved here." })),
+  },
+  shell: Option.none(),
+  desktop: Option.none(),
 }
