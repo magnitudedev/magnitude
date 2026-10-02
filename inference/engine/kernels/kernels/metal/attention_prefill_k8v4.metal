@@ -3,7 +3,7 @@
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
-#define PREFILL_HEAD_GROUPS SEISMIC_TUNE_HEAD_GROUPS
+#define PREFILL_HEADS_PER_GROUP SEISMIC_TUNE_HEADS
 #include "lib/attention/attention.h"
 
 // The three launches over affine K8/V4 history (bodies in lib/attention/attention.h):

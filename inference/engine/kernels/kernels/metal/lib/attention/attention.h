@@ -470,12 +470,13 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
 // Row pitch of a staged tile, in elements.
 #define PREFILL_PITCH (ATTENTION_W + 8)
 // The query heads of one attend threadgroup: a kv head's G query heads split
-// into PREFILL_HEAD_GROUPS groups of PREFILL_HEADS (the last may be smaller),
-// so the threadgroup's size follows the group, not G.
-#ifndef PREFILL_HEAD_GROUPS
-#define PREFILL_HEAD_GROUPS 1
+// into groups of PREFILL_HEADS (the last may be smaller), PREFILL_HEAD_GROUPS
+// of them, so the threadgroup's size follows the group, not G.
+#ifndef PREFILL_HEADS_PER_GROUP
+#define PREFILL_HEADS_PER_GROUP SEISMIC_DIM_G
 #endif
-#define PREFILL_HEADS ((SEISMIC_DIM_G + PREFILL_HEAD_GROUPS - 1) / PREFILL_HEAD_GROUPS)
+#define PREFILL_HEADS (PREFILL_HEADS_PER_GROUP < SEISMIC_DIM_G ? PREFILL_HEADS_PER_GROUP : SEISMIC_DIM_G)
+#define PREFILL_HEAD_GROUPS ((SEISMIC_DIM_G + PREFILL_HEADS - 1) / PREFILL_HEADS)
 
 // The interval union [lo, hi) of a tile's non-empty row intervals and the
 // intersection [common_lo, common_hi) of all its row intervals, for one span.
