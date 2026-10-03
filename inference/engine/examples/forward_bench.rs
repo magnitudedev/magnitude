@@ -32,12 +32,21 @@
 //!     [--prefill-samples 4]
 //!     [--sequences 1,2,4,8]
 //!     [--warm 16] [--steps 32] [--attribution-steps 4]
+//!     [--context-tokens FILE] [--temperature T] [--diagnostic]
 //! forward_bench qualify --model M.gguf --reference REF_DIR --output out.json
 //!     [--chunks N] [--label NAME] [--verify-width W] [--batch B]
 //! ```
 //!
 //! `qualify` decodes up to B chunks (across categories) together in each
 //! step and compares their rows against the reference in parallel.
+//!
+//! `--context-tokens FILE` forces the token ids in FILE (whitespace-separated,
+//! repeated to length) instead of the pseudo-random spread, so history and
+//! forced decode tokens are real text and the readout sees real logit
+//! distributions. `--temperature T` samples each decode selection at T
+//! (seeded per position) instead of taking the greedy token. `--diagnostic`
+//! benches a diagnostic load (it exports logits, so every selection reads
+//! the full readout rather than a certified selection's levels).
 //!
 //! Either mode takes `--cache-dir DIR`, the engine's kernel cache (compiled
 //! kernels and tuning results); without it every load forms and tunes every
@@ -225,6 +234,8 @@ pub(crate) struct Options {
     label: Option<String>,
     /// The kernel cache directory (`--cache-dir`); none caches nothing.
     kernel_cache: Option<PathBuf>,
+    /// `bench`: a diagnostic load (`--diagnostic`) rather than a served one.
+    diagnostic: bool,
     /// The target history codec (`--kv-codec`).
     kv_codec: KvCodec,
     /// The device to run on (`--device auto|metal|cuda|vulkan|cpu|SELECTOR`).
@@ -236,6 +247,12 @@ pub(crate) struct Options {
     /// Decode input tokens (`--decode-tokens forced|selected`, default
     /// forced): the forced stream, or each step's greedy selection fed back.
     feedback: bool,
+    /// Forced tokens from a file of token ids (`--context-tokens`); empty
+    /// forces the pseudo-random spread.
+    context_tokens: Vec<TokenId>,
+    /// Decode selections sample at this temperature (`--temperature`);
+    /// greedy when absent.
+    temperature: Option<f32>,
 }
 
 fn list(value: &str) -> Result<Vec<usize>, String> {
@@ -272,10 +289,13 @@ impl Options {
             batch: 32,
             label: None,
             kernel_cache: None,
+            diagnostic: false,
             kv_codec: KvCodec::AffineK8V4,
             device: magnitude_executor::platform::DeviceRequest::Automatic,
             lookahead: false,
             feedback: false,
+            context_tokens: Vec::new(),
+            temperature: None,
         };
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or(format!("{flag} requires a value"));
@@ -353,6 +373,32 @@ impl Options {
                         }
                     }
                 }
+                "--context-tokens" => {
+                    let path = value()?;
+                    options.context_tokens = std::fs::read_to_string(&path)
+                        .map_err(|error| format!("--context-tokens {path}: {error}"))?
+                        .split_whitespace()
+                        .map(|token| {
+                            token
+                                .parse()
+                                .map(TokenId)
+                                .map_err(|_| format!("{token:?} is not a token id"))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    if options.context_tokens.is_empty() {
+                        return Err(format!("--context-tokens {path} holds no tokens"));
+                    }
+                }
+                "--diagnostic" => options.diagnostic = true,
+                "--temperature" => {
+                    options.temperature = Some(
+                        value()?
+                            .parse()
+                            .ok()
+                            .filter(|temperature: &f32| *temperature > 0.0)
+                            .ok_or("--temperature requires a positive value")?,
+                    )
+                }
                 other => return Err(format!("unknown flag {other}")),
             }
         }
@@ -394,6 +440,10 @@ pub(crate) struct Bench {
     lookahead: bool,
     /// Decode feeds back each step's selection instead of forced tokens.
     feedback: bool,
+    /// Forced tokens (`Options::context_tokens`); empty forces the spread.
+    context: Vec<TokenId>,
+    /// Selections sample at this temperature; greedy when absent.
+    temperature: Option<f32>,
 }
 
 /// One open request and its accepted position.
@@ -424,6 +474,7 @@ impl Bench {
         kv_codec: KvCodec,
         device: magnitude_executor::platform::DeviceRequest,
         lookahead: bool,
+        exported_logits_rows: usize,
     ) -> Result<(Self, StateBindings), String> {
         let resolved = EngineConfiguration {
             package: PackageOptions {
@@ -436,7 +487,7 @@ impl Bench {
                 mtp_proposals: None,
                 kv_codec,
                 lookahead,
-                exported_logits_rows: PREFILL_ROWS,
+                exported_logits_rows,
             },
             context_tokens: Some(context_tokens),
             service: ServiceLimits {
@@ -467,6 +518,8 @@ impl Bench {
             next_request: 1,
             lookahead,
             feedback: false,
+            context: Vec::new(),
+            temperature: None,
         };
         Ok((bench, bindings))
     }
@@ -506,9 +559,13 @@ impl Bench {
         self.domain.close(sequence.request)
     }
 
-    /// The forced token at a position: a fixed spread over ordinary
-    /// vocabulary rows, away from the special tokens at the top.
+    /// The forced token at a position: the context's, repeated to length,
+    /// or a fixed spread over ordinary vocabulary rows, away from the special
+    /// tokens at the top.
     fn token(&self, position: usize) -> TokenId {
+        if !self.context.is_empty() {
+            return self.context[position % self.context.len()];
+        }
         let span = (self.vocabulary - 1024) as u64;
         TokenId(((position as u64 * 2_654_435_761 + 12_345) % span + 512) as u32)
     }
@@ -531,10 +588,28 @@ impl Bench {
         }
     }
 
+    /// The selection at a position: greedy, or sampled at the bench's
+    /// temperature.
+    fn select(&self, position: usize) -> SelectSpec {
+        match self.temperature {
+            None => Self::greedy(position),
+            Some(temperature) => SelectSpec {
+                sampling: Sampling::Categorical,
+                seed: 1,
+                shaping: Shaping {
+                    temperature,
+                    ..Shaping::default()
+                },
+                ..Self::greedy(position)
+            },
+        }
+    }
+
     /// A forward of `tokens` at the sequence's position. `demand` decides the
-    /// readout: `SELECT` samples greedily from the last row (a decode, or a
-    /// finishing prefill), `LOGITS` exports the last row's logits.
+    /// readout: `SELECT` selects from the last row (a decode, or a finishing
+    /// prefill), `LOGITS` exports the last row's logits.
     pub(crate) fn forward(
+        &self,
         sequence: &Sequence,
         kind: WorkKind,
         tokens: Vec<TokenId>,
@@ -542,7 +617,7 @@ impl Bench {
     ) -> Operation {
         let last = sequence.position + tokens.len() - 1;
         let select = if demand.contains(Demand::SELECT) {
-            vec![Self::greedy(last)]
+            vec![self.select(last)]
         } else {
             Vec::new()
         };
@@ -645,7 +720,7 @@ impl Bench {
         while sequence.position < target {
             let chunk = (target - sequence.position).min(PREFILL_ROWS);
             let tokens = self.forced(sequence.position, chunk);
-            let operation = Self::forward(sequence, WorkKind::Prefill, tokens, Demand::NONE);
+            let operation = self.forward(sequence, WorkKind::Prefill, tokens, Demand::NONE);
             bindings = self.step(bindings, vec![operation], &mut [sequence], trace)?.2;
             if rows >= 32 * PREFILL_ROWS && sequence.position >= next_progress {
                 eprintln!(
@@ -929,7 +1004,7 @@ fn decode_operations(bench: &Bench, sequences: &[Sequence]) -> Vec<Operation> {
     sequences
         .iter()
         .map(|sequence| {
-            Bench::forward(
+            bench.forward(
                 sequence,
                 WorkKind::Decode,
                 vec![bench.decode_token(sequence)],
@@ -994,7 +1069,7 @@ fn prefill_prompt_cell(
             } else {
                 Demand::NONE
             };
-            let operation = Bench::forward(
+            let operation = bench.forward(
                 &sequence,
                 WorkKind::Prefill,
                 bench.forced(sequence.position, chunk),
@@ -1054,7 +1129,7 @@ fn prefill_cell(
             None => Some(bench.open_sequence(&mut bindings)?),
         };
         let sequence = shared.as_mut().or(fresh.as_mut()).expect("a sequence");
-        let operation = Bench::forward(
+        let operation = bench.forward(
             sequence,
             WorkKind::Prefill,
             bench.forced(sequence.position, rows),
@@ -1161,8 +1236,13 @@ fn bench(options: &Options) -> Result<(), String> {
         options.kv_codec,
         options.device,
         options.lookahead,
+        // A served load: the bench reads selections only, so the readout
+        // runs as it serves (no logits are exported).
+        if options.diagnostic { PREFILL_ROWS } else { 0 },
     )?;
     bench.feedback = options.feedback;
+    bench.context = options.context_tokens.clone();
+    bench.temperature = options.temperature;
     let load_seconds = host_seconds() - loaded;
     let mut report = json!({
         "tool": "engine/examples/forward_bench.rs",
@@ -1811,6 +1891,8 @@ mod qualify {
             options.kv_codec,
             options.device,
             false,
+            // A diagnostic load: qualification reads every scored row's logits.
+            super::PREFILL_ROWS,
         )?;
         let limits = limits(&bench.geometry)?;
         for (name, base) in &bases {
@@ -1914,9 +1996,9 @@ mod qualify {
 
     /// The teacher-forced step of `forced` rows: a single-row decode, or above
     /// one row a verification forward (the MTP verify shapes).
-    fn scored(sequence: &Sequence, forced: Vec<TokenId>) -> Operation {
+    fn scored(bench: &Bench, sequence: &Sequence, forced: Vec<TokenId>) -> Operation {
         if forced.len() == 1 {
-            return Bench::forward(sequence, WorkKind::Decode, forced, Demand::LOGITS);
+            return bench.forward(sequence, WorkKind::Decode, forced, Demand::LOGITS);
         }
         Operation::Forward {
             request: sequence.request,
@@ -1953,7 +2035,7 @@ mod qualify {
                 }
                 budget -= rows;
                 let piece = tokens[sequence.position..sequence.position + rows].to_vec();
-                operations.push(Bench::forward(
+                operations.push(bench.forward(
                     sequence,
                     WorkKind::Prefill,
                     piece,
@@ -1999,7 +2081,7 @@ mod qualify {
                 .iter()
                 .zip(&tokens)
                 .map(|(sequence, tokens)| {
-                    scored(sequence, tokens[first + row..first + row + group].to_vec())
+                    scored(bench, sequence, tokens[first + row..first + row + group].to_vec())
                 })
                 .collect();
             let mut advancing: Vec<&mut Sequence> = sequences.iter_mut().collect();
