@@ -82,15 +82,18 @@ native routed_route for metal from "metal/routed_route.metal":
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CUDA: the GEMM accumulates scalar FMAs over 32 x 32 shared tiles (256
-# threads), split over the hidden axis into SPLIT partial planes that the
-# selection sums in order (SPLIT changes the logit summation order, so it is
-# arithmetic). (Metal: F32 simdgroup matrices, unsplit.)
+# CUDA: decode rows (M <= 8) form the logits in one GEMV launch whose last
+# block to arrive selects. Larger classes run the GEMM: scalar FMAs over
+# 32 x 32 shared tiles (256 threads), split over the hidden axis into SPLIT
+# partial planes that the selection launch sums in order (SPLIT changes the
+# logit summation order, so it is arithmetic). (Metal: F32 simdgroup
+# matrices, unsplit.)
 native routed_route for cuda from "cuda/routed_route.cu":
     static (H, E, K)
     params (SIMDGROUPS in [8, 4, 2], arithmetic SPLIT in [8, 4, 16])
     where H % 32 == 0 and E % 32 == 0 and E <= 1024
     scratch logits bytes (SPLIT * M * (E + 1) * 4)
+    scratch arrivals bytes (4) sync
     launch routed_route_stage when M > 8:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -100,7 +103,7 @@ native routed_route for cuda from "cuda/routed_route.cu":
     launch routed_route_gemm when M > 8:
         threadgroups (ceil_div(E + 1, 32), ceil_div(M, 32), SPLIT)
         threads_per_threadgroup (256, 1, 1)
-    launch routed_route_select:
+    launch routed_route_select when M > 8:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 

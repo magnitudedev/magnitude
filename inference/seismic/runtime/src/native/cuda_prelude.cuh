@@ -135,6 +135,43 @@ __device__ __forceinline__ void seismic_prefetch_l2(const void* global) {
     asm volatile("prefetch.global.L2 [%0];" ::"l"(global));
 }
 
+// Programmatic dependent launch (sm_90 and later). In a replayed submission,
+// a launch of a module that declares SEISMIC_PROGRAMMATIC_DEPENDENCY may start
+// while the launch before it is still running. Before `seismic_dependency_wait`
+// returns it may read only weights (which no launch of a submission writes)
+// and what launches before its predecessor wrote, and may write nothing; the
+// call returns once its predecessor has completed with its writes visible.
+// A declaring module calls it unconditionally in every block of every one of
+// its kernels, typically after issuing its first weight loads, which then
+// overlap the predecessor's tail. Without a programmatic predecessor (another
+// module, a launch-by-launch submission, an older device) it returns at once.
+//
+// `seismic_dependents_launch` lets the next launch start once every block of
+// this launch has called it (or exited). A kernel calls it only after its own
+// wait, so at most two launches run at once and a launch's predecessor's
+// predecessor has always completed when it starts.
+__device__ __forceinline__ void seismic_dependency_wait() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void seismic_dependents_launch() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+// Both, for a kernel with nothing to issue before its wait.
+__device__ __forceinline__ void seismic_dependency_start() {
+    seismic_dependency_wait();
+    seismic_dependents_launch();
+}
+// The module-level declaration the loader reads (`cuModuleGetGlobal`).
+#if __CUDA_ARCH__ >= 900
+#define SEISMIC_PROGRAMMATIC_DEPENDENCY extern "C" __device__ unsigned seismic_programmatic_dependency = 1u;
+#else
+#define SEISMIC_PROGRAMMATIC_DEPENDENCY
+#endif
+
 // Asynchronous 16-byte global-to-shared copies (L2 only, bypassing L1). Both
 // addresses are 16-byte aligned. `_zfill` copies `source_bytes` (0..16) bytes
 // and writes zeros for the rest; `global` must still be a valid address.

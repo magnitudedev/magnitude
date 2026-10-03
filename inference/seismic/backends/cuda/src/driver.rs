@@ -109,6 +109,7 @@ driver! {
     module_load: unsafe extern "system" fn(*mut Handle, *const c_void, c_uint, *mut c_int, *mut *mut c_void) -> ResultCode => "cuModuleLoadDataEx",
     module_unload: unsafe extern "system" fn(Handle) -> ResultCode => "cuModuleUnload",
     module_function: unsafe extern "system" fn(*mut Handle, Handle, *const c_char) -> ResultCode => "cuModuleGetFunction",
+    module_global: unsafe extern "system" fn(*mut u64, *mut usize, Handle, *const c_char) -> ResultCode => "cuModuleGetGlobal_v2",
     link_create: unsafe extern "system" fn(c_uint, *mut c_int, *mut *mut c_void, *mut Handle) -> ResultCode => "cuLinkCreate_v2",
     link_add_data: unsafe extern "system" fn(Handle, c_int, *mut c_void, usize, *const c_char, c_uint, *mut c_int, *mut *mut c_void) -> ResultCode => "cuLinkAddData_v2",
     link_complete: unsafe extern "system" fn(Handle, *mut *mut c_void, *mut usize) -> ResultCode => "cuLinkComplete",
@@ -130,6 +131,8 @@ driver! {
         graph_launch: unsafe extern "system" fn(Handle, Handle) -> ResultCode => "cuGraphLaunch",
         graph_exec_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuGraphExecDestroy",
         graph_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuGraphDestroy",
+        // Driver API 12.3+: typed graph edges (programmatic dependent launch).
+        graph_add_dependencies: unsafe extern "system" fn(Handle, *const Handle, *const Handle, *const EdgeData, usize) -> ResultCode => "cuGraphAddDependencies_v2",
         // Driver API 10.2+: virtual memory management (reserved address ranges).
         memory_granularity: unsafe extern "system" fn(*mut usize, *const AllocationProperties, c_uint) -> ResultCode => "cuMemGetAllocationGranularity",
         address_reserve: unsafe extern "system" fn(*mut u64, usize, usize, u64, u64) -> ResultCode => "cuMemAddressReserve",
@@ -866,6 +869,27 @@ pub(crate) struct KernelNodeParams {
     pub context: Handle,
 }
 
+/// `CUgraphEdgeData`.
+#[repr(C)]
+pub(crate) struct EdgeData {
+    from_port: c_uchar,
+    to_port: c_uchar,
+    kind: c_uchar,
+    reserved: [c_uchar; 5],
+}
+
+/// How a graph node depends on the node before it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Edge {
+    /// The node starts after its predecessor completes.
+    Complete,
+    /// The node may start once every block of its predecessor has triggered
+    /// (`griddepcontrol.launch_dependents`) or exited; its kernel waits for
+    /// the predecessor's completion itself (`griddepcontrol.wait`) before
+    /// touching memory the predecessor may write.
+    Programmatic,
+}
+
 fn graph_symbol<F: Copy>(symbol: Option<F>) -> Result<F, DriverError> {
     symbol.ok_or(DriverError {
         operation: "kernel graph",
@@ -899,13 +923,19 @@ impl Graph {
         })
     }
 
-    /// Append a kernel node after every node added before it. The driver
-    /// copies the parameter values the node's `parameters` point to.
-    pub fn push_kernel(&mut self, node: &KernelNodeParams) -> Result<(), DriverError> {
+    /// Append a kernel node after every node added before it, by `edge`
+    /// from the node before it. The driver copies the parameter values the
+    /// node's `parameters` point to.
+    pub fn push_kernel(&mut self, node: &KernelNodeParams, edge: Edge) -> Result<(), DriverError> {
         let add = graph_symbol(self.context.driver.graph_add_kernel_node)?;
         let _current = self.context.enter()?;
         let mut raw = std::ptr::null_mut();
-        let dependencies = self.last.as_slice();
+        let programmatic = edge == Edge::Programmatic && self.last.is_some();
+        let dependencies = if programmatic {
+            &[][..]
+        } else {
+            self.last.as_slice()
+        };
         unsafe {
             self.context.driver.check(
                 add(
@@ -917,6 +947,26 @@ impl Graph {
                 ),
                 "kernel graph node",
             )?;
+        }
+        if let (true, Some(last)) = (programmatic, self.last) {
+            let connect = self.context.driver.graph_add_dependencies.ok_or(DriverError {
+                operation: "kernel graph edge",
+                code: 0,
+                description: "the CUDA driver predates driver API 12.3 typed graph edges".into(),
+            })?;
+            // CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC out of the predecessor,
+            // CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC.
+            let data = EdgeData {
+                from_port: 1,
+                to_port: 0,
+                kind: 1,
+                reserved: [0; 5],
+            };
+            unsafe {
+                self.context
+                    .driver
+                    .check(connect(self.raw, &last, &raw, &data, 1), "kernel graph edge")?;
+            }
         }
         self.last = Some(raw);
         Ok(())
@@ -1360,6 +1410,25 @@ pub(crate) fn module_function(module: &Module, entry: &str) -> Result<Handle, Ji
             .map_err(JitError::Driver)?;
     }
     Ok(function)
+}
+
+/// Whether the module defines the global variable `name`.
+pub(crate) fn module_defines(module: &Module, name: &str) -> Result<bool, DriverError> {
+    // CUDA_ERROR_NOT_FOUND
+    const NOT_FOUND: ResultCode = 500;
+    let _current = module.context.enter()?;
+    let name = std::ffi::CString::new(name)
+        .expect("module global precondition: names contain no NUL byte");
+    let mut pointer = 0u64;
+    let mut bytes = 0usize;
+    let status = unsafe {
+        (module.context.driver.module_global)(&mut pointer, &mut bytes, module.raw, name.as_ptr())
+    };
+    if status == NOT_FOUND {
+        return Ok(false);
+    }
+    module.context.driver.check(status, "module global lookup")?;
+    Ok(true)
 }
 
 /// Authoritative `cuFuncGetAttribute` reflection on one loaded function.

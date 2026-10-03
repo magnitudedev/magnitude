@@ -7,6 +7,8 @@
 #define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
 #include "lib/projection/projection.cuh"
 
+SEISMIC_PROGRAMMATIC_DEPENDENCY
+
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 using Epi = projection::Residual<projection::AllRows>;
 
@@ -29,14 +31,14 @@ __device__ __forceinline__ void output_gemv(const Pro &heads, unsigned M, unsign
                                             const packets::W0 &output, const Epi &epi) {
     using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
     __shared__ projection::GemvShared<Shape, Pro> shared;
-    const unsigned long long group = Shape::tile_group();
-    if (group < projection::gemv_groups<Shape>(D))
-        projection::gemv_segment<Shape>(shared, heads, M, K / 64, group, D, output, projection::NoWeight{}, epi);
+    projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(heads), M, K / 64, Shape::tile_group(),
+                                          D, output, projection::NoWeight{}, epi);
 }
 
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_STAGE_S8
 template <unsigned INT8>
 __global__ void attention_output_stage_s8(SEISMIC_KERNEL_PARAMS) {
+    seismic_dependency_start();
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     static_assert(!Pro::STAGED, "the 16-bit path reads the heads in place");
     projection::stage_row<S8>(GATED_ROWS, blockIdx.x, HEADS, STAGING, GROUPS);
@@ -60,6 +62,7 @@ __global__ void attention_output_gemv16(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMM_SMALL
 template <unsigned INT8>
 __global__ void attention_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
+    seismic_dependency_start();
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
@@ -74,6 +77,7 @@ __global__ void attention_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMM
 template <unsigned ROTATE>
 __global__ void attention_output_gemm(SEISMIC_KERNEL_PARAMS) {
+    seismic_dependency_start();
     using Shape = projection::LargeGemm<ROTATE>;
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<Shape>();
@@ -87,6 +91,7 @@ __global__ void attention_output_gemm(SEISMIC_KERNEL_PARAMS) {
 
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_FINALIZE
 extern "C" __global__ void attention_output_finalize(SEISMIC_KERNEL_PARAMS) {
+    seismic_dependency_start();
     const Epi epi = EPILOGUE;
     projection::split_finalize<1>(PARTIALS, projection::SPLIT, SEISMIC_DIM_M, SEISMIC_DIM_D,
                                   [&](unsigned m, unsigned long long n, float value, float) { epi(m, n, value, 0.0f); });

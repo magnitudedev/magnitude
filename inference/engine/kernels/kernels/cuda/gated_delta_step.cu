@@ -32,6 +32,10 @@ __global__ void gated_delta_step(SEISMIC_KERNEL_PARAMS) {
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int first_row = block_row + warp * ROWS;  // this warp's state rows
+    // Let a programmatic dependent start (its first weight loads overlap this
+    // launch; it still waits for this launch's completion).
+    seismic_dependents_launch();
+
     if (slot_index == SEISMIC_DIM_B) {
         const int covered = recurrent::covered_end(in);
         for (u64 row = covered; row < SEISMIC_DIM_M; ++row)

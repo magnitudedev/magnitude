@@ -243,7 +243,14 @@ storage rather than its tensor handles, so output leases it reads can be recycle
 later runs of the same sequence. On CUDA a submission's launches are fully determined by its
 plans and the addresses it binds: the device keeps the instantiated CUDA graph of each (plans,
 bound addresses) key (least recently used dropped beyond a bound) and a submission with a known
-key is one graph launch. Standalone calls and launch-detail traces launch individually. Graph
+key is one graph launch. A launch of a module that declares a programmatic dependency
+(`SEISMIC_PROGRAMMATIC_DEPENDENCY`, compute capability 9.0 and later) follows the node before it
+by a programmatic edge: it starts once every block of that node has triggered
+(`griddepcontrol.launch_dependents`, which a kernel issues only after its own wait) or exited, and
+each of its kernels waits (`griddepcontrol.wait`) before it reads anything but weights or what
+launches before its predecessor wrote, and before it writes anything, so at most two launches run
+at once and a kernel's first weight loads overlap its predecessor's tail. Standalone calls and
+launch-detail traces launch individually. Graph
 nodes publish no scalar results and never touch a kernel's scalar slots. A submission holds all
 referenced storage through its completion. An allocation's host access orders after only the
 newest submitted device use (host writes) or write (host reads): a device's native submissions

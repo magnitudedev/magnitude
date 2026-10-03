@@ -11,6 +11,8 @@
 #define KERNEL_W1 SEISMIC_SHARED_DOWN
 #include "lib/routed/routed.cuh"
 
+SEISMIC_PROGRAMMATIC_DEPENDENCY
+
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 
 struct PublishEpi {
@@ -42,16 +44,20 @@ __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
             const Pro pro{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_PRODUCT)
                               + (m * SEISMIC_EXPERT_PRODUCT_STRIDE_0 + slot * SEISMIC_EXPERT_PRODUCT_STRIDE_1) * 2,
                           0, projection::AllRows{}};
-            projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_F / 64, group, H,
+            projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), 1u, SEISMIC_DIM_F / 64, group, H,
                                             KERNEL_W0_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), expert),
                                             projection::NoWeight{}, epi);
         } else {
             const Pro pro{SEISMIC_PTR(SEISMIC_BUFFER_SHARED_PRODUCT) + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * 2, 0,
                           projection::AllRows{}};
-            projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_S / 64, group, H,
+            projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), 1u, SEISMIC_DIM_S / 64, group, H,
                                             KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN)),
                                             projection::NoWeight{}, epi);
         }
+    } else {
+        // Wait before arriving: the arrival and the combine follow the
+        // launch before.
+        seismic_dependency_start();
     }
 
     // Arrive (sync scratch: zero when the launch starts, restored by the last).

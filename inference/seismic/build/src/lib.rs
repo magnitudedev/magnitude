@@ -776,6 +776,8 @@ mod internals {
                     "SEISMIC_PTR",
                     "SEISMIC_PTR_",
                     "SEISMIC_SCALAR_RESULTS",
+                    // Device library (`cuda_prelude.cuh`).
+                    "SEISMIC_PROGRAMMATIC_DEPENDENCY",
                 ] {
                     symbols.insert(symbol.to_owned());
                 }

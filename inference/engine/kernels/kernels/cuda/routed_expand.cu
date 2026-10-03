@@ -8,6 +8,8 @@
 #define KERNEL_W3 SEISMIC_SHARED_UP
 #include "lib/routed/routed.cuh"
 
+SEISMIC_PROGRAMMATIC_DEPENDENCY
+
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 using Epi = projection::SiluMul<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
@@ -21,7 +23,10 @@ __global__ void routed_expand(SEISMIC_KERNEL_PARAMS) {
     const projection::u64 group = Shape::tile_group();
     const projection::u64 choices = SEISMIC_DIM_M * SEISMIC_DIM_K;
 
+    // A choice's expert comes from the launch before, so its blocks wait
+    // first; the shared expert's issue their first weight loads before.
     if (blockIdx.y < choices) {
+        seismic_dependency_start();
         if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_F))
             return;
         const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;
@@ -37,11 +42,9 @@ __global__ void routed_expand(SEISMIC_KERNEL_PARAMS) {
         return;
     }
 
-    if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_S))
-        return;
     const Pro pro{normalized, SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}};
     const Epi epi{SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER), SEISMIC_RESULT_1_STRIDE_0};
-    projection::gemv_segment<Shape>(shared, pro, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_S,
+    projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_S,
                             KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),
                             KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP)), epi);
 }

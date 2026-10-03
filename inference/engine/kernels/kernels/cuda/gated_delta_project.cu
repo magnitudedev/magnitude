@@ -11,6 +11,8 @@
 #define KERNEL_W3 SEISMIC_BETA_WEIGHT
 #include "lib/projection/projection.cuh"
 
+SEISMIC_PROGRAMMATIC_DEPENDENCY
+
 using Pro = projection::Rms<ELEMENT_OF(SEISMIC_INPUT_NORM), projection::AllRows>;
 using Source = projection::GemvSource<Pro>;
 using Out = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
@@ -37,23 +39,32 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
                                              const packets::W3 &w3, const Out (&out)[4]) {
     using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
     __shared__ projection::GemvShared<Shape, Source::type> shared;
-    const Source::type x = Source::make(pro, row, M, H, staged);
+    // Every warp runs `x` (block-collective at M = 1), including a group
+    // past the last segment, which has no rows.
+    const auto x = projection::source_after_dependency(pro, row, M, H, staged);
     const unsigned long long kblocks = H / 64;
     unsigned long long group = Shape::tile_group();
     const unsigned long long groups[4] = {projection::gemv_groups<Shape>(rows[0]), projection::gemv_groups<Shape>(rows[1]),
                                           projection::gemv_groups<Shape>(rows[2]), projection::gemv_groups<Shape>(rows[3])};
     switch (projection::locate_segment(group, groups)) {
     case 0:
-        projection::gemv_segment<Shape>(shared, x, M, kblocks, group, rows[0], w0, projection::NoWeight{}, out[0]);
+        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, rows[0], w0, projection::NoWeight{},
+                                              out[0]);
         break;
     case 1:
-        projection::gemv_segment<Shape>(shared, x, M, kblocks, group, rows[1], w1, projection::NoWeight{}, out[1]);
+        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, rows[1], w1, projection::NoWeight{},
+                                              out[1]);
         break;
     case 2:
-        projection::gemv_segment<Shape>(shared, x, M, kblocks, group, rows[2], w2, projection::NoWeight{}, out[2]);
+        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, rows[2], w2, projection::NoWeight{},
+                                              out[2]);
         break;
     case 3:
-        projection::gemv_segment<Shape>(shared, x, M, kblocks, group, rows[3], w3, projection::NoWeight{}, out[3]);
+        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, rows[3], w3, projection::NoWeight{},
+                                              out[3]);
+        break;
+    default:
+        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, 0, 0, w3, projection::NoWeight{}, out[3]);
         break;
     }
 }
@@ -72,6 +83,7 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
                                              const packets::W0 &w0, const packets::W1 &w1, const packets::W2 &w2,
                                              const packets::W3 &w3, const Out (&out)[4]) {
     extern __shared__ uint4 dynamic_shared[];
+    seismic_dependency_start();
     projection::u8 *shared = reinterpret_cast<projection::u8 *>(dynamic_shared);
     unsigned long long column = projection::gemm_column<Shape>();
     const unsigned long long columns[4] = {projection::gemm_columns(rows[0]), projection::gemm_columns(rows[1]),
@@ -99,6 +111,7 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_STAGE
 template <unsigned INT8>
 __global__ void gated_delta_project_stage(SEISMIC_KERNEL_PARAMS) {
+    seismic_dependency_start();
     projection::stage_row<false>(PROLOGUE, blockIdx.x, SEISMIC_DIM_H, STAGING, GROUPS);
 }
 #endif
@@ -106,6 +119,7 @@ __global__ void gated_delta_project_stage(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_STAGE_S8
 template <unsigned INT8>
 __global__ void gated_delta_project_stage_s8(SEISMIC_KERNEL_PARAMS) {
+    seismic_dependency_start();
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
     projection::stage_row<S8>(PROLOGUE, blockIdx.x, SEISMIC_DIM_H, STAGING, GROUPS);
 }
