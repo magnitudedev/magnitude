@@ -555,6 +555,11 @@ impl OwnedStateAdvance {
         })
     }
 
+    /// Crate-local read-only source for composing validated joint ownership.
+    pub(crate) fn source(&self) -> &SequenceState {
+        &self.state
+    }
+
     pub fn position(&self) -> usize {
         self.state.position
     }
@@ -617,40 +622,71 @@ impl OwnedStateAdvance {
     /// shorter than the committed rows has no recurrent version and is
     /// refused. Stores without recurrent state commit any prefix.
     pub fn commit(self, accepted: usize) -> Result<OwnedAdvanceResolution, (SequenceState, Error)> {
-        let Self {
-            mut state,
-            count,
-            committed,
-            claims,
-            mut following,
-            ..
-        } = self;
-        if accepted > count {
-            return Err((
-                state,
+        self.prepare_commit(accepted)
+            .map(PreparedStateCommit::publish)
+            .map_err(|refusal| *refusal)
+    }
+
+    /// Validate publication without changing accepted state. This lets a
+    /// joint owner validate all local prefixes before publishing any of them.
+    /// The caller must already have observed physical completion.
+    pub(crate) fn prepare_commit(
+        self,
+        accepted: usize,
+    ) -> Result<PreparedStateCommit, PreparedCommitRefusal> {
+        if accepted > self.count {
+            return Err(Box::new((
+                self.abort(),
                 Error::from("accepted prefix exceeds advance row count"),
-            ));
+            )));
         }
-        if accepted == 0 {
-            return Ok(OwnedAdvanceResolution::Aborted(state));
-        }
-        let tape = if state.store.has_recurrent_components() {
-            let Some(tape) = accepted.checked_sub(committed) else {
-                return Err((
-                    state,
+        let tape = if accepted == 0 || !self.state.store.has_recurrent_components() {
+            0
+        } else {
+            let Some(tape) = accepted.checked_sub(self.committed) else {
+                return Err(Box::new((
+                    self.abort(),
                     Error::from("accepted prefix ends before the published recurrent state"),
-                ));
+                )));
             };
             tape
-        } else {
-            0
         };
-        let mut kept = claims;
-        for claims in &mut kept {
-            drop(claims.split_off(accepted));
+        Ok(PreparedStateCommit {
+            advance: self,
+            accepted,
+            tape,
+        })
+    }
+}
+
+/// A prevalidated state publication. No accepted state changes until publish;
+/// abort recovers the original source. No recoverable failure remains at publish.
+pub(crate) type PreparedCommitRefusal = Box<(SequenceState, Error)>;
+
+pub(crate) struct PreparedStateCommit {
+    advance: OwnedStateAdvance,
+    accepted: usize,
+    tape: usize,
+}
+impl PreparedStateCommit {
+    pub(crate) fn abort(self) -> SequenceState {
+        self.advance.abort()
+    }
+    pub(crate) fn publish(self) -> OwnedAdvanceResolution {
+        if self.accepted == 0 {
+            return OwnedAdvanceResolution::Aborted(self.advance.abort());
         }
-        install_commit(&mut state, kept, &mut following, tape, accepted);
-        Ok(OwnedAdvanceResolution::Committed(state))
+        let OwnedStateAdvance {
+            mut state,
+            mut claims,
+            mut following,
+            ..
+        } = self.advance;
+        for claim in &mut claims {
+            drop(claim.split_off(self.accepted));
+        }
+        install_commit(&mut state, claims, &mut following, self.tape, self.accepted);
+        OwnedAdvanceResolution::Committed(state)
     }
 }
 

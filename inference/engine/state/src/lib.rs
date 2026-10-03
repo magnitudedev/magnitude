@@ -6,6 +6,8 @@ mod bank;
 mod codec;
 mod domain;
 mod layout;
+mod pipeline;
+mod stage;
 pub mod placement;
 
 pub use advance::{
@@ -13,6 +15,8 @@ pub use advance::{
     OwnedCodecBindings, OwnedStateAdvance, OwnedSuccessorAdvance, OwnedTailRelocation,
     TentativeAdvance,
 };
+pub use pipeline::{PipelineSequenceState, PipelineStateAdvance, PipelineStateRefusal};
+pub use stage::{GlobalLayerId, StageLayerOrdinal, StageModelView};
 pub use bank::{recurrent_bank_bytes, BankComponent};
 pub use domain::{
     HistoryDomainId, HistoryDomainKind, HistoryDomainLayout, HistoryDomainPlan, HistorySource,
@@ -1449,6 +1453,11 @@ pub enum GrowthChoice {
 }
 
 impl StateStore {
+    /// The store backing belongs to this exact opened execution device.
+    pub fn belongs_to_device(&self, device: &Device) -> bool {
+        self.device.same_device(device)
+    }
+
     /// A store of the given history domains and recurrent bank components.
     /// Every domain's reserved rows cover its row limit: the context for
     /// Token, `n` plus one advance of at most `max_advance` rows for

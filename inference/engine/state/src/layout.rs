@@ -1,5 +1,6 @@
 use crate::{
     BankComponent, ComponentDescriptor, ComponentSpec, HistoryDomainLayout, KvCodec, LayerRef,
+    StageModelView,
 };
 use magnitude_family_contracts::{
     ActivationDType, Attention, Block, Decoder, GatedDelta, HistoryDomain, KeyValue, Operator,
@@ -124,11 +125,37 @@ impl ModelStateLayout {
         target_codec: KvCodec,
         tape_rows: usize,
     ) -> Result<Self, String> {
+        Self::derive_view(decoder, None, drafter, target_codec, tape_rows)
+    }
+
+    /// Derive only the selected target blocks, preserving original KV keys.
+    /// Shared history cannot cross the stage's ownership boundary. Recurrent
+    /// components remain ordered within this stage; a global block index must
+    /// never be used to address that local component list.
+    pub fn derive_stage(
+        stage: &StageModelView<'_>,
+        target_codec: KvCodec,
+        tape_rows: usize,
+    ) -> Result<Self, String> {
+        Self::derive_view(stage.decoder(), Some(stage), &[], target_codec, tape_rows)
+    }
+
+    fn derive_view(
+        decoder: &Decoder,
+        stage: Option<&StageModelView<'_>>,
+        drafter: &[&Block],
+        target_codec: KvCodec,
+        tape_rows: usize,
+    ) -> Result<Self, String> {
         let activation = activation_dtype(decoder.activation_dtype);
         let mut target_history = HistoryDomains::default();
         let mut target_banks = Vec::new();
         for (index, block) in decoder.blocks.iter().enumerate() {
-            let layer = LayerRef::Target(layer(index)?);
+            let global = layer(index)?;
+            if stage.is_some_and(|view| !view.contains(global)) {
+                continue;
+            }
+            let layer = LayerRef::Target(global);
             match block_state(block)? {
                 None => {}
                 Some(Stateful::History(attention, domain)) => target_history.own(
@@ -136,6 +163,9 @@ impl ModelStateLayout {
                     history_component(attention, layer, target_codec, activation)?,
                 )?,
                 Some(Stateful::Shared(source)) => {
+                    if stage.is_some_and(|view| !view.contains(source.block)) {
+                        return Err("shared KV source is outside the stage".into());
+                    }
                     target_history.share(LayerRef::Target(source.block), layer)
                 }
                 Some(Stateful::GatedDelta(delta)) => {
@@ -595,6 +625,163 @@ mod tests {
     }
 
     #[test]
+    fn stage_projection_preserves_global_kv_and_unsliced_layout() {
+        let decoder = decoder(
+            ActivationDType::F16,
+            (0..5).map(|_| block(attention())).collect(),
+        );
+        let full = ModelStateLayout::derive(&decoder, &[], KvCodec::Dense, 0).unwrap();
+        let whole = StageModelView::new(&decoder, 0..5).unwrap();
+        assert_eq!(
+            full,
+            ModelStateLayout::derive_stage(&whole, KvCodec::Dense, 0).unwrap()
+        );
+        let prefix = StageModelView::new(&decoder, 0..3).unwrap();
+        let suffix = StageModelView::new(&decoder, 3..5).unwrap();
+        assert!(std::ptr::eq(suffix.decoder(), &decoder));
+        assert!(std::ptr::eq(prefix.decoder(), &decoder));
+        let (local, global, block) = suffix.layers().next().unwrap();
+        assert_eq!(local.index(), 0);
+        assert_eq!(global.index(), 3);
+        assert!(std::ptr::eq(block, &decoder.blocks[3]));
+        assert_eq!(global.kv_layer(), LayerRef::Target(3));
+        let prefix = ModelStateLayout::derive_stage(&prefix, KvCodec::Dense, 0).unwrap();
+        let suffix = ModelStateLayout::derive_stage(&suffix, KvCodec::Dense, 0).unwrap();
+        let keys = |layout: &ModelStateLayout| {
+            layout.target_history[0]
+                .components()
+                .iter()
+                .map(|component| component.layer)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(&prefix),
+            vec![
+                LayerRef::Target(0),
+                LayerRef::Target(1),
+                LayerRef::Target(2)
+            ]
+        );
+        assert_eq!(
+            keys(&suffix),
+            vec![LayerRef::Target(3), LayerRef::Target(4)]
+        );
+        assert_eq!(
+            suffix.target_history[0].components(),
+            &full.target_history[0].components()[3..]
+        );
+        assert!(StageModelView::new(&decoder, 3..3).is_err());
+        assert!(StageModelView::new(&decoder, 4..6).is_err());
+    }
+
+    #[test]
+    fn stage_projection_refuses_empty_reversed_and_out_of_bounds_ranges() {
+        let decoder = decoder(
+            ActivationDType::F16,
+            (0..5).map(|_| block(attention())).collect(),
+        );
+        for (start, end) in [
+            (0, 0),
+            (3, 3),
+            (4, 2),
+            (5, 6),
+            (0, 6),
+            (usize::MAX, usize::MAX),
+        ] {
+            assert!(StageModelView::new(&decoder, start..end).is_err());
+        }
+        let empty = self::decoder(ActivationDType::F16, vec![]);
+        assert!(StageModelView::new(&empty, 0..1).is_err());
+    }
+
+    #[test]
+    fn projected_recurrent_components_keep_original_block_order_and_semantics() {
+        let short = |channels, width| {
+            block(Operator::ShortConv(Box::new(ShortConv {
+                channels,
+                width,
+                input_gate: weight(&[channels, 32]),
+                value: weight(&[channels, 32]),
+                output_gate: weight(&[channels, 32]),
+                convolution: weight(&[channels, width]),
+                output: weight(&[32, channels]),
+            })))
+        };
+        // Interleave history with deliberately distinct recurrent geometries.
+        let decoder = decoder(
+            ActivationDType::BF16,
+            vec![
+                short(16, 3),
+                block(attention()),
+                short(24, 4),
+                short(32, 5),
+                block(window_attention(8)),
+            ],
+        );
+        let full = ModelStateLayout::derive(&decoder, &[], KvCodec::Dense, 2).unwrap();
+        let prefix_view = StageModelView::new(&decoder, 0..2).unwrap();
+        let suffix_view = StageModelView::new(&decoder, 2..5).unwrap();
+        let prefix = ModelStateLayout::derive_stage(&prefix_view, KvCodec::Dense, 2).unwrap();
+        let suffix = ModelStateLayout::derive_stage(&suffix_view, KvCodec::Dense, 2).unwrap();
+        assert_eq!(
+            suffix_view
+                .layers()
+                .map(|(local, global, _)| (local.index(), global.index()))
+                .collect::<Vec<_>>(),
+            [(0, 2), (1, 3), (2, 4)]
+        );
+        assert_eq!(prefix.target_banks, full.target_banks[..1]);
+        assert_eq!(suffix.target_banks, full.target_banks[1..]);
+        assert_eq!(prefix.target_recurrent, full.target_recurrent[..1]);
+        assert_eq!(suffix.target_recurrent, full.target_recurrent[1..]);
+        assert_eq!(
+            prefix.target_history[0].components(),
+            full.target_history[0].components()
+        );
+        assert_eq!(
+            suffix.target_history[0].components(),
+            full.target_history[1].components()
+        );
+        assert_eq!(
+            suffix.target_history[0].components()[0].layer,
+            LayerRef::Target(4)
+        );
+        assert_eq!(
+            suffix.target_history[0].kind(),
+            crate::HistoryDomainKind::Window { rows: 8 }
+        );
+        assert_eq!(suffix.target_recurrent[0].shape, [5, 24]);
+        assert_eq!(suffix.target_recurrent[1].shape, [6, 32]);
+        assert!(prefix.head_history.is_empty() && suffix.head_history.is_empty());
+    }
+
+    #[test]
+    fn stage_projection_refuses_external_shared_history() {
+        let decoder = decoder(
+            ActivationDType::F16,
+            vec![
+                block(attention()),
+                block(attention_in(KeyValue::Shared {
+                    source: SublayerIndex {
+                        block: 0,
+                        sublayer: 0,
+                    },
+                })),
+            ],
+        );
+        let suffix = StageModelView::new(&decoder, 1..2).unwrap();
+        assert_eq!(
+            ModelStateLayout::derive_stage(&suffix, KvCodec::Dense, 0).unwrap_err(),
+            "shared KV source is outside the stage"
+        );
+        let whole = StageModelView::new(&decoder, 0..2).unwrap();
+        assert_eq!(
+            ModelStateLayout::derive_stage(&whole, KvCodec::Dense, 0).unwrap(),
+            ModelStateLayout::derive(&decoder, &[], KvCodec::Dense, 0).unwrap()
+        );
+    }
+
+    #[test]
     fn dense_target_history_preserves_head_and_width_axes() {
         let decoder = decoder(ActivationDType::F16, vec![block(attention())]);
         let layout = ModelStateLayout::derive(&decoder, &[], KvCodec::Dense, 0).unwrap();
@@ -714,5 +901,15 @@ mod tests {
         assert_eq!(layout.target_recurrent[0].shape, [2 + 2, 16]);
         assert_eq!(layout.target_recurrent[3].shape, [2, 32 + 32 + 4]);
         assert!(layout.head_history.is_empty());
+        // One original state-space block owns three local bank components,
+        // even when that block is stage-local ordinal zero.
+        let view = StageModelView::new(&decoder, 8..9).unwrap();
+        let (local, global, original) = view.layers().next().unwrap();
+        assert_eq!((local.index(), global.index()), (0, 8));
+        assert!(std::ptr::eq(original, &decoder.blocks[8]));
+        let projected = ModelStateLayout::derive_stage(&view, KvCodec::Dense, 2).unwrap();
+        assert_eq!(projected.target_banks, layout.target_banks[1..]);
+        assert_eq!(projected.target_recurrent, layout.target_recurrent[1..]);
+        assert!(projected.target_history.is_empty());
     }
 }
