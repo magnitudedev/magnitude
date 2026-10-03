@@ -8,10 +8,11 @@
 // is read from version (previous_bank, previous_tape)[slot] and published to
 // following_bank[slot] after the slot's first stop[slot] rows, with the window
 // and the tape of the rows after it. The raw outputs go to the `mixed`
-// scratch; grid z = B zeroes the raw rows no slot covers.
-// `gated_delta_step_gate` then gates each row (`recurrent::gate_row`, one block
-// per row). ROWS and WARPS never change result bits, and `gated_delta_chunk`
-// gives its short slots the same bits.
+// scratch; grid z = B zeroes the raw rows no slot covers. The last of a value
+// head's blocks to arrive (`arrivals`, one counter per head) gates the head's
+// rows (`recurrent::gate_head`: `gate_row`'s arithmetic). ROWS and WARPS never
+// change result bits, and `gated_delta_chunk` gives its short slots the same
+// bits.
 
 #include "lib/recurrent/recurrent.cuh"
 
@@ -31,29 +32,38 @@ __global__ void gated_delta_step(SEISMIC_KERNEL_PARAMS) {
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int first_row = block_row + warp * ROWS;  // this warp's state rows
-
     if (slot_index == SEISMIC_DIM_B) {
         const int covered = recurrent::covered_end(in);
         for (u64 row = covered; row < SEISMIC_DIM_M; ++row)
             if (lane < ROWS) element::put<Act>(mixed, recurrent::raw_index(row, head, first_row + lane), 0.0f);
-        return;
+    } else {
+        const recurrent::Slot slot = recurrent::slot_of(in, slot_index);
+        recurrent::WarpRows<ROWS> state;
+        recurrent::load_version<ROWS>(in, slot, head, first_row, state);
+        recurrent::publish_window(in, slot, head * gridDim.y + blockIdx.y, recurrent::NV * gridDim.y);
+        __shared__ __align__(16) recurrent::SequentialShared<BLOCK_ROWS> shared;
+        recurrent::advance_rows<ROWS, BLOCK_ROWS>(in, slot, slot.lo, head, block_row, true, first_row, state, mixed,
+                                                  shared);
     }
 
-    const recurrent::Slot slot = recurrent::slot_of(in, slot_index);
-    recurrent::WarpRows<ROWS> state;
-    recurrent::load_version<ROWS>(in, slot, head, first_row, state);
-    recurrent::publish_window(in, slot, head * gridDim.y + blockIdx.y, recurrent::NV * gridDim.y);
-    __shared__ __align__(16) recurrent::SequentialShared<BLOCK_ROWS> shared;
-    recurrent::advance_rows<ROWS, BLOCK_ROWS>(in, slot, slot.lo, head, block_row, true, first_row, state, mixed,
-                                              shared);
-}
-#endif
-
-#ifdef SEISMIC_FORMING_GATED_DELTA_STEP_GATE
-extern "C" __global__ void gated_delta_step_gate(SEISMIC_KERNEL_PARAMS) {
-    const recurrent::Inputs in = RECURRENT_INPUTS();
-    recurrent::gate_row<ELEMENT_OF(SEISMIC_RECURRENT_NORM)>(
-        in, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_MIXED), SEISMIC_PTR(SEISMIC_BUFFER_RECURRENT_NORM),
-        element::word_f32(SEISMIC_PARAM_EPSILON), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), blockIdx.x);
+    // Arrive (sync scratch: zero when the launch starts, restored by the last).
+    __shared__ unsigned last;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        unsigned *counter = reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS)) + head;
+        const bool is_last = atomicAdd(counter, 1u) == gridDim.y * gridDim.z - 1;
+        if (is_last) {
+            __threadfence();
+            atomicExch(counter, 0u);
+        }
+        last = is_last;
+    }
+    __syncthreads();
+    if (!last)
+        return;
+    recurrent::gate_head<ELEMENT_OF(SEISMIC_RECURRENT_NORM)>(
+        in, mixed, SEISMIC_PTR(SEISMIC_BUFFER_RECURRENT_NORM), element::word_f32(SEISMIC_PARAM_EPSILON),
+        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), head);
 }
 #endif

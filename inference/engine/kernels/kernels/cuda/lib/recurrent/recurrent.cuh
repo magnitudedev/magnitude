@@ -431,4 +431,36 @@ __device__ __forceinline__ void gate_row(const Inputs &in, const u8 *mixed, cons
     }
 }
 
+// `gate_row`'s arithmetic for one value head over every row, one warp per
+// row, by the last of the head's step blocks to arrive: the raw outputs the
+// other blocks published are read from L2.
+template <class NORM>
+__device__ __forceinline__ void gate_head(const Inputs &in, const u8 *mixed, const u8 *norm, float eps, u8 *gated,
+                                          int head) {
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+    const typename Act::storage *raw = reinterpret_cast<const typename Act::storage *>(mixed);
+    const int lane = threadIdx.x % 32;
+    for (int row = threadIdx.x / 32; row < static_cast<int>(SEISMIC_DIM_M); row += blockDim.x / 32) {
+        float total = 0.0f;
+        for (int i = lane; i < W; i += 32) {
+            const float v = Act::load(__ldcg(raw + raw_index(row, head, i)));
+            total = __fmaf_rn(v, v, total);
+        }
+        // The butterfly leaves every lane the same sum.
+        total = seismic_warp_sum_f32(total);
+        const float inverse = rsqrtf(total / static_cast<float>(W) + eps);
+        for (int i = lane; i < W; i += 32) {
+            const float v = Act::load(__ldcg(raw + raw_index(row, head, i)));
+            const float normalized = Act::round(v * inverse * element::at<NORM>(norm, i));
+            const float z = projection(in, row, CH + head * W + i);
+            const float activated = Act::round(z / (1.0f + expf(-z)));
+            element::put<Act>(gated,
+                              static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 +
+                                  static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
+                                  static_cast<u64>(i) * SEISMIC_RESULT_0_STRIDE_2,
+                              Act::round(normalized * activated));
+        }
+    }
+}
+
 }  // namespace recurrent

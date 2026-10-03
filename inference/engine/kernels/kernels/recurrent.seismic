@@ -418,21 +418,19 @@ native gated_delta_step for metal from "metal/gated_delta_step.metal":
 
 # CUDA: warp per state row, each warp owning ROWS state rows (W / 32 float
 # columns per lane) for the whole slot; grid z adds one layer that zeroes the
-# raw rows no slot covers. `gate` then forms each row (one block per row, one
-# warp per head: lanes stride the head's columns, then a warp sum). (Metal:
-# lanes advance four rows in flight; the uncovered rows are zeroed by the slot
-# layer, and the last threadgroup of a head gates it.)
+# raw rows no slot covers. The last block of a value head to arrive
+# (`arrivals`, one counter per head) gates the head's rows (one warp per row:
+# lanes stride the head's columns, then a warp sum). (Metal: lanes advance
+# four rows in flight; the uncovered rows are zeroed by the slot layer.)
 native gated_delta_step for cuda from "cuda/gated_delta_step.cu":
     static (NK, NV, W, C)
     where W % 32 == 0
     scratch mixed bytes (M * NV * W * 4)
+    scratch arrivals bytes (NV * 4) sync
     launch gated_delta_step:
         params (code ROWS in [2, 4], code WARPS in [4, 8])
         threadgroups (NV, W / (ROWS * WARPS), B + 1)
         threads_per_threadgroup (WARPS * 32, 1, 1)
-    launch gated_delta_step_gate:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
 
 # Vulkan: the CUDA step. Workgroup (value head, state-row block, slot), grid
 # z = B zeroes the raw rows no slot covers; each subgroup holds ROWS state
