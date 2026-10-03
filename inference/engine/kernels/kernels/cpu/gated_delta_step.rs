@@ -3,8 +3,10 @@
 // fused (`recurrent::Fused`). A work item owns (value head, ROWS state rows,
 // slot) and advances its private state rows over every row of the slot; the
 // head's first work item publishes the head's share of the successor window.
-// Grid z = B zeroes the mixed rows no slot covers. ROWS never changes result
-// bits, and `gated_delta_chunk` computes the same bits.
+// The raw outputs go to the `mixed` scratch, and grid z = B zeroes the raw
+// rows no slot covers. `gated_delta_step_gate` then gates each row (one work
+// item per row). ROWS never changes result bits, and `gated_delta_chunk`
+// computes the same bits.
 
 use lib::recurrent::recurrent::{self, Recurrence};
 use seismic::cpu::slab::SlabTensor;
@@ -23,7 +25,7 @@ fn recurrence<'a, E: Elements>(cx: &Context<'a, E>) -> Recurrence<'a, E::A> {
         window: SlabTensor::from_bound(cx.arg_window(), cx.arg_slab_banks() as usize),
         delta: SlabTensor::from_bound(cx.arg_delta(), cx.arg_slab_banks() as usize),
         tape: SlabTensor::from_bound(cx.arg_tape(), cx.arg_slab_banks() as usize),
-        mixed: cx.result_0(),
+        mixed: cx.scratch_mixed(),
         rows: cx.dim_m() as usize,
         slots: cx.dim_b() as usize,
         key_heads: cx.dim_nk() as usize,
@@ -52,4 +54,11 @@ fn gated_delta_step<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64
     let (state, buffers) = floats.split_at_mut(rows.len() * r.width);
     let mut prologue = recurrent::Fused::new(&r, slot, head, rows.clone(), buffers);
     r.advance(&slot, head, rows, state, &mut prologue);
+}
+
+fn gated_delta_step_gate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
+    let r = recurrence(cx);
+    let (norm, values) = seismic::cpu::tensor::floats(shared, 2 * r.width).split_at_mut(r.width);
+    cx.arg_recurrent_norm().decode_row(0, norm);
+    r.gate_row(group[0] as usize, norm, cx.arg_epsilon(), &cx.result_0(), values);
 }

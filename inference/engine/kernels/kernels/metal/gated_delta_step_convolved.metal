@@ -1,28 +1,22 @@
-// Row-sequential gated delta step (`recurrent::advance_rows`). A threadgroup
-// of four simdgroups owns (value head, block of ROWS state rows, slot); each
-// simdgroup keeps ROWS / 4 state rows in registers, W / 32 contiguous key
-// columns per lane. State is read from version (previous_bank,
-// previous_tape)[slot] and written only to bank following_bank[slot] after the
-// slot's stop row, with the tape of the rows after it. The first row block of
-// a head publishes its window channels before the state work, so that copy
-// overlaps the state traffic. The raw outputs go to the `mixed` scratch; the
-// last of a head's threadgroups to arrive (`arrivals[head]`, over every row
-// block and slot) gates the head's rows into the result
-// (`recurrent::gate_head`). ROWS never changes bits, and `gated_delta_chunk`
-// gives its short slots the same raw outputs. Channels of the projection and
-// window rows and the columns of the delta arena's rows must be contiguous
-// (unit stride).
+// `gated_delta_step` over the convolved channels `gated_delta_project_convolved`
+// publishes: the same threadgroups (value head, block of ROWS state rows,
+// slot), arithmetic and gating (`recurrent::advance_rows`,
+// `recurrent::gate_head`), with a prologue that loads each row's convolved
+// q, k and v channels instead of convolving them. The projection launch
+// published the successor windows, so no threadgroup touches a window. ROWS
+// never changes bits. Channels of the projection and convolved rows and the
+// columns of the delta arena's rows must be contiguous (unit stride).
 // State rows per simdgroup.
 #define RST_LANE_ROWS (SEISMIC_TUNE_ROWS / 4)
 // Rows whose prologue is staged at once: 8 KiB each of q and k.
 #define RST_BLOCK (2048 / SEISMIC_DIM_W)
 
-#include "lib/recurrent/convolution.h"
+#include "lib/recurrent/recurrent.h"
 #include "lib/core/arrive.h"
 
-kernel void gated_delta_step(
+kernel void gated_delta_step_convolved(
     device const recurrent::Storage *projection [[buffer(SEISMIC_BUFFER_PROJECTION)]],
-    device const float *convolution [[buffer(SEISMIC_BUFFER_CONVOLUTION)]],
+    device const float *convolved [[buffer(SEISMIC_BUFFER_CONVOLVED)]],
     device const float *rate [[buffer(SEISMIC_BUFFER_RATE)]],
     device const float *time_bias [[buffer(SEISMIC_BUFFER_TIME_BIAS)]],
     device const uchar *recurrent_norm [[buffer(SEISMIC_BUFFER_RECURRENT_NORM)]],
@@ -31,7 +25,6 @@ kernel void gated_delta_step(
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],
     device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],
-    device const ulong *window [[buffer(SEISMIC_BUFFER_WINDOW)]],
     device const ulong *delta [[buffer(SEISMIC_BUFFER_DELTA)]],
     device const ulong *tape [[buffer(SEISMIC_BUFFER_TAPE)]],
     device recurrent::Storage *gated [[buffer(SEISMIC_RESULT_0_BUFFER)]],
@@ -55,13 +48,10 @@ kernel void gated_delta_step(
     const ulong row0 = block_row0 + ulong(simdgroup) * RST_LANE_ROWS;
     const recurrent::Slot slot = recurrent::slot_of(segments, stop, previous_bank, previous_tape, following_bank,
         group.z, seismic_words);
-    // The successor bank's window is no slot's source, so it is written first.
-    if (group.y == 0)
-        recurrent::publish_window(projection, window, slot, head, thread_index, threads, seismic_words);
     recurrent::advance_rows<RST_LANE_ROWS, SEISMIC_TUNE_ROWS, RST_BLOCK, SEISMIC_DIM_W, SEISMIC_TUNE_ROWS>(
-        projection, recurrent::Convolving{projection, window, convolution, slot}, rate, time_bias, delta, tape,
-        mixed, slot, slot.lo, head, block_row0, row0, query_block, key_block, value_block, beta_block,
-        decay_block, thread_index, threads, simdgroup, lane, seismic_words);
+        projection, recurrent::Convolved{convolved, SEISMIC_CONVOLVED_STRIDE_0}, rate, time_bias, delta, tape, mixed, slot, slot.lo, head,
+        block_row0, row0, query_block, key_block, value_block, beta_block, decay_block, thread_index, threads,
+        simdgroup, lane, seismic_words);
     // Rows after the last slot belong to no sequence; their raw output is zero.
     if (group.z + 1 == SEISMIC_DIM_B && lane < RST_LANE_ROWS) {
         for (ulong row = ulong(slot.hi); row < SEISMIC_DIM_M; ++row)

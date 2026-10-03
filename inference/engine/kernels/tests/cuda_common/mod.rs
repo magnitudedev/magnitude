@@ -371,8 +371,8 @@ impl Mapping {
             .with_launch_param(3, "KSPLIT", self.ksplit)
             .with_launch_param(5, "ROTATE", self.rotate)
     }
-    /// Recurrent projection and output entries share the GEMV and GEMM launch
-    /// indices.
+    /// The recurrent projection shares the attention projection's GEMV and
+    /// GEMM launch indices.
     pub fn recurrent_params(
         self,
         spec: seismic::NativeSpecialization,

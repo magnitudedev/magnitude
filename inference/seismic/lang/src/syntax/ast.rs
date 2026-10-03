@@ -154,7 +154,7 @@ impl Decl {
 ///     params ([code] [arithmetic] NAME in [V, ..], ..)
 ///     elements (ELEMENT in [DTYPE, ..], ..)
 ///     where CONDITION
-///     scratch NAME bytes (EXPR) [when CONDITION]
+///     scratch NAME bytes (EXPR) [sync] [when CONDITION]
 ///     launch KERNEL [when CONDITION]:
 ///         params ([code] [arithmetic] NAME in [V, ..], ..)
 ///         threadgroups (X, Y, Z)
@@ -211,6 +211,9 @@ pub struct NativeElementsDecl {
 pub struct NativeScratchDecl {
     pub name: Ident,
     pub bytes: Expr,
+    /// Arrival counters: every buffer of this kind is zero when a launch
+    /// starts, and the call's kernels restore it to zero before it ends.
+    pub sync: bool,
     /// The buffer is sized only when this condition holds.
     pub when: Option<Expr>,
     pub span: Span,

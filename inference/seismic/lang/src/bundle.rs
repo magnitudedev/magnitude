@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Format version of the bundle wire schema. Bumped on any wire change.
-pub const BUNDLE_FORMAT_VERSION: u32 = 4;
+pub const BUNDLE_FORMAT_VERSION: u32 = 5;
 
 /// Semantic version of the checker whose output this crate can decode.
 /// Bundles produced under a different semantic version are incompatible.

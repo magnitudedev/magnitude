@@ -12,6 +12,10 @@ use seismic::{
 use seismic_native_tests::{accumulate, gated_sum, scale_rows, scoped_scale, split_sum};
 use std::time::Duration;
 
+/// The range every non-empty scratch arena reserves at its start for `sync`
+/// scratch (the runtime's `SYNC_SCRATCH_BYTES`).
+const SYNC_RESERVE: u64 = 64 * 1024;
+
 /// A search whose time outlasts its convergence on the test entries.
 fn search(samples: usize) -> Strategy {
     Strategy::Search(SearchPlan {
@@ -1305,10 +1309,11 @@ fn standalone_scratch_is_charged_to_the_invocation_workspace() {
         for _ in 0..2 {
             let value = kernel.call(split_sum::Args { x: &x }).unwrap().value;
             assert_eq!(read_f32(&value), [exact_values(64).iter().sum::<f32>()]);
-            // Four f32 partials, reused by the second call.
+            // The reserved sync range, then four f32 partials, reused by the
+            // second call.
             assert_eq!(
                 kernel.invocation_workspace_bytes(),
-                before + 16,
+                before + SYNC_RESERVE + 16,
                 "{:?}",
                 device.backend()
             );
@@ -1736,14 +1741,14 @@ fn inactive_scratch_is_charged_the_minimum() {
         call(10);
         assert_eq!(
             kernel.invocation_workspace_bytes(),
-            before + 1,
+            before + SYNC_RESERVE + 1,
             "{:?}",
             device.backend()
         );
         call(200);
         assert_eq!(
             kernel.invocation_workspace_bytes(),
-            before + 800,
+            before + SYNC_RESERVE + 800,
             "{:?}",
             device.backend()
         );
@@ -1763,8 +1768,8 @@ fn inactive_scratch_is_charged_the_minimum() {
             graph.export(&sum).unwrap();
             graph.seal().unwrap().workspace_bytes()
         };
-        assert!(workspace(10) < 800, "{:?}", device.backend());
-        assert!(workspace(200) >= 800, "{:?}", device.backend());
+        assert!(workspace(10) < SYNC_RESERVE + 800, "{:?}", device.backend());
+        assert!(workspace(200) >= SYNC_RESERVE + 800, "{:?}", device.backend());
     }
 }
 

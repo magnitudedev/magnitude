@@ -5,9 +5,6 @@
 // activation type A exactly as the entry's portable body publishes it:
 //   Plain      x = A[row(m), k]
 //   Rms        x = round_A(r[row(m), k] * inverse(m) * norm[k])
-//   GatedRms   per value head h = k / W:
-//              x = round_A(round_A(mixed * inverse(m, h) * norm[k % W])
-//                          * round_A(silu(z[row(m), k])))
 // `row(m)` is the identity (`AllRows`) or an `out_rows` gather
 // (`SelectedRows`). A prologue with a norm
 // declares `groups()` inverses per row over `width()` inputs each. In the
@@ -27,6 +24,8 @@
 //   ActivatedMul y = round_A(round_A(act(round_A(acc))) * external[m, n])
 //   Logits     y = acc, or cap * tanh(acc / cap) when cap > 0          (F32)
 // (`functions::` in `../core/functions.h` holds the activation codes.)
+// A column epilogue (GEMV classes, `gemv_emit<true>`) receives every row's
+// sum of an output together, for work along the rows.
 //
 // A segmented projection is one launch over several weight tensors (each
 // with its own packet type and destination). Every threadgroup belongs to
@@ -316,10 +315,8 @@ inline void device_normalize(thread const In &in, uint item, device uchar *x, ui
 //
 // A decode projection is one launch: every GEMV threadgroup reduces the norm
 // groups of its (at most 16) activation rows itself and applies the prologue
-// while staging. A norm group of at most 256 columns (the gated per-head
-// norm) is reduced by the staging lanes that load it (LaneNorm). A wider one
-// (the RMS row norm, SharedNorm) is reduced first: its square sum is split
-// into `In::parts` fixed parts
+// while staging. The RMS row norm (SharedNorm) is reduced first: its square
+// sum is split into `In::parts` fixed parts
 // (`In::squares`: each lane sums its share in order, then one simd_sum);
 // simdgroup (item % SG) reduces part `item`, and the staging adds a group's
 // parts in a fixed tree. The inverses (and hence every rounded activation)
@@ -371,18 +368,6 @@ struct SharedNorm {
         uint group = min(k / in.width(), in.groups() - 1u);
         float sum = sum_parts<In::parts>(squares + (m * in.groups() + group) * In::parts);
         in.load8(m, k, metal::rsqrt(sum / float(in.width()) + in.epsilon()), even, odd);
-    }
-};
-
-// A normed prologue whose norm groups are reduced across the staging lanes
-// that load them (`In::load8_across_lanes`), read by the GEMV staging as a
-// plain operand.
-template <typename In>
-struct LaneNorm {
-    typedef typename In::activation activation;
-    In in;
-    void load8(uint m, uint k, float, thread float4 &even, thread float4 &odd) const {
-        in.load8_across_lanes(m, k, even, odd);
     }
 };
 
@@ -524,6 +509,51 @@ inline float gemv_group_sum(float value) {
     return value;
 }
 
+// Publishes a GEMV lane group's sums. Plain and paired epilogues get (m, n)
+// from the lane that owns it. A column epilogue (`store_column(m, n, sums)`,
+// plain only) gets from that lane every activation row's sum of output n,
+// which each lane of the group holds after the group sums: the convolution
+// along the rows of `gated_delta_project_convolved`.
+template <bool COLUMNS>
+struct gemv_emit;
+template <>
+struct gemv_emit<false> {
+    template <bool PAIRED, uint R, uint MAXM, uint LANES, typename Out>
+    static void run(thread const Out &out, thread float (&acc)[R][MAXM], thread float (&acc2)[R][MAXM],
+        uint m_rows, uint rows, uint first_row, uint sub) {
+        for (uint r = 0; r < R; ++r) {
+            for (uint m = 0; m < MAXM; ++m) {
+                if (m < m_rows) {
+                    float total = gemv_group_sum<LANES>(acc[r][m]);
+                    float total2 = PAIRED ? gemv_group_sum<LANES>(acc2[r][m]) : 0.0f;
+                    if (sub == (r * MAXM + m) % LANES && first_row + r < rows)
+                        emit<PAIRED>::run(out, m, first_row + r, total, total2);
+                }
+            }
+        }
+    }
+};
+template <>
+struct gemv_emit<true> {
+    template <bool PAIRED, uint R, uint MAXM, uint LANES, typename Out>
+    static void run(thread const Out &out, thread float (&acc)[R][MAXM], thread float (&)[R][MAXM],
+        uint m_rows, uint rows, uint first_row, uint sub) {
+        static_assert(!PAIRED, "a column epilogue is plain");
+        for (uint r = 0; r < R; ++r) {
+            float column[MAXM];
+            for (uint m = 0; m < MAXM; ++m) {
+                column[m] = 0.0f;
+                if (m < m_rows)
+                    column[m] = gemv_group_sum<LANES>(acc[r][m]);
+            }
+            for (uint m = 0; m < MAXM; ++m) {
+                if (m < m_rows && sub == (r * MAXM + m) % LANES && first_row + r < rows)
+                    out.store_column(m, first_row + r, column);
+            }
+        }
+    }
+};
+
 // One GEMV threadgroup of SG simdgroups. A simdgroup is 32 / LANES lane
 // groups; lane group g of simdgroup sg owns the R weight rows from
 // ((tile * SG + sg) * (32 / LANES) + g) * R, and its lanes own the packets
@@ -532,7 +562,7 @@ inline float gemv_group_sum(float value) {
 // (a multiple of LANES). Weight packets are double-buffered in registers: a
 // lane loads its next packet before accumulating the current one, and its
 // first packet before the staging, so the weight stream never waits on it.
-template <typename W, typename U, bool PAIRED, uint R, uint MAXM, uint LANES, typename In,
+template <typename W, typename U, bool PAIRED, uint R, uint MAXM, uint LANES, bool COLUMNS = false, typename In,
     typename Out>
 inline void gemv_body(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile,
@@ -569,16 +599,7 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
             }
         }
     }
-    for (uint r = 0; r < R; ++r) {
-        for (uint m = 0; m < MAXM; ++m) {
-            if (m < m_rows) {
-                float total = gemv_group_sum<LANES>(acc[r][m]);
-                float total2 = PAIRED ? gemv_group_sum<LANES>(acc2[r][m]) : 0.0f;
-                if (sub == (r * MAXM + m) % LANES && first_row + r < rows)
-                    emit<PAIRED>::run(out, m, first_row + r, total, total2);
-            }
-        }
-    }
+    gemv_emit<COLUMNS>::template run<PAIRED, R, MAXM, LANES>(out, acc, acc2, m_rows, rows, first_row, sub);
 }
 
 template <typename W, uint SG, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
@@ -592,6 +613,15 @@ inline void gemv_runtime(thread const In &in, thread const Out &out, thread cons
     uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
     uint simdgroups, uint sg, uint lane) {
     gemv_body<W, W, false, R, MAXM, LANES>(in, out, w, w, m_rows, rows, k, tile, shared,
+        simdgroups, sg, lane);
+}
+
+// `gemv_runtime` with a column epilogue (`gemv_emit<true>`).
+template <typename W, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
+inline void gemv_columns_runtime(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
+    uint simdgroups, uint sg, uint lane) {
+    gemv_body<W, W, false, R, MAXM, LANES, true>(in, out, w, w, m_rows, rows, k, tile, shared,
         simdgroups, sg, lane);
 }
 
@@ -785,6 +815,13 @@ inline ushort2 fragment_coordinate(uint lane) {
     ushort row = (q & 4u) + ((lane / 2u) % 4u);
     ushort column = (q & 2u) * 2u + (lane % 2u) * 2u;
     return ushort2(column, row);
+}
+
+// The lane holding elements (row, column) and (row, column + 1) of an 8x8
+// fragment, for even `column`: the inverse of `fragment_coordinate`.
+inline ushort fragment_lane(ushort column, ushort row) {
+    return ((column >> 1) & 1u) | ((row & 1u) << 1) | ((row & 2u) << 1) | ((column & 4u) << 1)
+        | ((row & 4u) << 2);
 }
 
 // The fragments a simdgroup owns: fm x fn fragments of the sub-tile at tile
@@ -1189,7 +1226,65 @@ inline void gemv_batch_packet(thread simdgroup_float8x8 (&acc)[NB], thread const
     }
 }
 
-template <typename W, typename U, bool PAIRED, uint R, uint NB, uint BYTES, typename In, typename Out>
+// Publishes a batched GEMV simdgroup's sums: lane (y, x) owns rows
+// 8 b + x, 8 b + x + 1 of output first_row + 8 r + y. A column epilogue
+// (`gemv_emit<true>`) gets every row's sum of that output, gathered from the
+// four lanes of fragment row y; all lanes gather, so the shuffles are uniform.
+template <bool COLUMNS>
+struct gemv_batch_emit;
+template <>
+struct gemv_batch_emit<false> {
+    template <bool PAIRED, uint R, uint NB, typename Out>
+    static void run(thread const Out &out, thread simdgroup_float8x8 (&acc)[R][NB],
+        thread simdgroup_float8x8 (&acc2)[R][NB], uint m_rows, uint rows, uint first_row, ushort2 at) {
+        for (uint r = 0; r < R; ++r) {
+            uint n = first_row + 8u * r + at.y;
+            if (n >= rows)
+                continue;
+            for (uint bb = 0; bb < NB; ++bb) {
+                float2 c = reinterpret_cast<thread float2 &>(acc[r][bb].thread_elements());
+                float2 c2 = reinterpret_cast<thread float2 &>(acc2[r][bb].thread_elements());
+                uint m = 8u * bb + at.x;
+                if (m < m_rows)
+                    emit<PAIRED>::run(out, m, n, c.x, c2.x);
+                if (m + 1u < m_rows)
+                    emit<PAIRED>::run(out, m + 1u, n, c.y, c2.y);
+            }
+        }
+    }
+};
+template <>
+struct gemv_batch_emit<true> {
+    template <bool PAIRED, uint R, uint NB, typename Out>
+    static void run(thread const Out &out, thread simdgroup_float8x8 (&acc)[R][NB],
+        thread simdgroup_float8x8 (&)[R][NB], uint m_rows, uint rows, uint first_row, ushort2 at) {
+        static_assert(!PAIRED, "a column epilogue is plain");
+        for (uint r = 0; r < R; ++r) {
+            float column[8 * NB];
+            for (uint bb = 0; bb < NB; ++bb) {
+                float2 c = reinterpret_cast<thread float2 &>(acc[r][bb].thread_elements());
+                for (ushort x = 0; x < 8; x += 2) {
+                    float2 pair = simd_shuffle(c, fragment_lane(x, at.y));
+                    column[8u * bb + x] = pair.x;
+                    column[8u * bb + x + 1u] = pair.y;
+                }
+            }
+            uint n = first_row + 8u * r + at.y;
+            if (n >= rows)
+                continue;
+            for (uint bb = 0; bb < NB; ++bb) {
+                uint m = 8u * bb + at.x;
+                if (m < m_rows)
+                    out.store_column(m, n, column);
+                if (m + 1u < m_rows)
+                    out.store_column(m + 1u, n, column);
+            }
+        }
+    }
+};
+
+template <typename W, typename U, bool PAIRED, uint R, uint NB, uint BYTES, bool COLUMNS = false, typename In,
+    typename Out>
 inline void gemv_batch_body(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
     uint simdgroups, uint sg, uint lane) {
@@ -1263,20 +1358,7 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
             }
         }
     }
-    for (uint r = 0; r < R; ++r) {
-        uint n = first_row + 8u * r + at.y;
-        if (n >= rows)
-            continue;
-        for (uint bb = 0; bb < NB; ++bb) {
-            float2 c = reinterpret_cast<thread float2 &>(acc[r][bb].thread_elements());
-            float2 c2 = reinterpret_cast<thread float2 &>(acc2[r][bb].thread_elements());
-            uint m = 8u * bb + at.x;
-            if (m < m_rows)
-                emit<PAIRED>::run(out, m, n, c.x, c2.x);
-            if (m + 1u < m_rows)
-                emit<PAIRED>::run(out, m + 1u, n, c.y, c2.y);
-        }
-    }
+    gemv_batch_emit<COLUMNS>::template run<PAIRED, R, NB>(out, acc, acc2, m_rows, rows, first_row, at);
 }
 
 // BYTES: the threadgroup staging `shared` provides (gemv_batch_shared_bytes
@@ -1299,6 +1381,19 @@ inline void gemv_batch_runtime(thread const In &in, thread const Out &out, threa
             simdgroups, sg, lane);
     else
         gemv_batch_body<W, W, false, R, 2, BYTES>(in, out, w, w, m_rows, rows, k, tile, shared,
+            simdgroups, sg, lane);
+}
+
+// `gemv_batch_runtime` with a column epilogue (`gemv_emit<true>`).
+template <typename W, uint R, uint BYTES = gemv_batch_shared_bytes, typename In, typename Out>
+inline void gemv_batch_columns_runtime(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared, uint simdgroups,
+    uint sg, uint lane) {
+    if (m_rows <= 8)
+        gemv_batch_body<W, W, false, R, 1, BYTES, true>(in, out, w, w, m_rows, rows, k, tile, shared,
+            simdgroups, sg, lane);
+    else
+        gemv_batch_body<W, W, false, R, 2, BYTES, true>(in, out, w, w, m_rows, rows, k, tile, shared,
             simdgroups, sg, lane);
 }
 

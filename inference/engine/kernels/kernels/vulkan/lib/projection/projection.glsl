@@ -5,13 +5,11 @@
 //
 // Row maps: AllRows (table 0) or SelectedRows (an `out_rows` i32 table).
 //
-// Prologues (`projection_prologue`, kind PROJECTION_{PLAIN,RMS,GATED_RMS,
-// GROUPED}) produce one activation value x[m, k], already rounded to the
-// activation type A exactly as the entry's portable body publishes it:
+// Prologues (`projection_prologue`, kind PROJECTION_{PLAIN,RMS,GROUPED})
+// produce one activation value x[m, k], already rounded to the activation
+// type A exactly as the entry's portable body publishes it:
 //   Plain     x = A[row(m), k]
 //   Rms       x = round_A(r[row(m), k] * inverse(m) * norm[k])
-//   GatedRms  per value head h = k / W:
-//             x = round_A(round_A(mixed * inverse(m, h) * norm[k % W]) * round_A(silu(z[row(m), k])))
 //   Grouped   x = A[order[m], k], zero for a padding row (order -1)
 // In the GEMV row class (M <= 8) every workgroup computes its rows' norm
 // inverses and applies the prologue while staging, so a decode projection is
@@ -235,32 +233,29 @@ packets_packet projection_packet(const int kind, projection_weights w, uint n, u
 // ---------------------------------------------------------------------------
 // The stage pre-pass of the GEMM class.
 
-// Workgroup `item` normalizes one (row, group) of a normed prologue and
-// stores that group's prologue output, in A, at x[m * columns + group * width
-// ..]. The GEMM launches then read `x` as a Plain operand. Shared: one float
-// per subgroup at float 0.
-void projection_stage(projection_prologue in_, uint item, uint64_t x, uint columns) {
+// Workgroup `m` normalizes row m of an Rms prologue and stores the row's
+// prologue output, in A, at x[m * columns ..]. The GEMM launches then read
+// `x` as a Plain operand. Shared: one float per subgroup at float 0.
+void projection_stage(projection_prologue in_, uint m, uint64_t x, uint columns) {
     const uint thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
-    const uint groups = projection_groups(in_), width = projection_width(in_);
-    const uint m = item / groups, group = item % groups;
+    const uint width = in_.columns;
     float squares = 0.0;
     for (uint i = thread; i < width; i += threads) {
-        const float v = projection_norm_input(in_, m, group, i);
+        const float v = projection_norm_input(in_, m, i);
         squares = seismic_fma_rn(v, v, squares);
     }
     squares = reduce_group_sum(squares, 0u);
     const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + in_.eps);
-    const uint first = group * width;
     const uint64_t row = uint64_t(m) * columns;
-    const bool vector = (columns & 7u) == 0u && (first & 7u) == 0u;
+    const bool vector = (columns & 7u) == 0u;
     for (uint i = 8u * thread; i < width; i += 8u * threads) {
         vec4 even, odd;
-        projection_load8(in_, m, first + i, inverse, even, odd);
+        projection_load8(in_, m, i, inverse, even, odd);
         if (vector && i + 8u <= width) {
-            element_uvec4_put(x + (row + first + i) * 2ul, element_pack8(in_.act, even, odd));
+            element_uvec4_put(x + (row + i) * 2ul, element_pack8(in_.act, even, odd));
         } else {
             for (uint j = 0u; j < 8u && i + j < width; ++j)
-                element_put(in_.act, x, row + first + i + j, (j & 1u) != 0u ? odd[j >> 1] : even[j >> 1]);
+                element_put(in_.act, x, row + i + j, (j & 1u) != 0u ? odd[j >> 1] : even[j >> 1]);
         }
     }
 }
@@ -281,12 +276,10 @@ void projection_stage(projection_prologue in_, uint item, uint64_t x, uint colum
 // Norms: PROJECTION_NORM_NONE (Plain), PROJECTION_NORM_SHARED (Rms: the rows'
 // square sums are reduced first into PROJECTION_RMS_PARTS parts in the shared
 // region, each by one subgroup, and summed in a fixed tree, so the inverses do
-// not depend on the workgroup shape), PROJECTION_NORM_LANES (GatedRms: each
-// head's square sum is reduced across the head_width / 8 lanes that stage it).
+// not depend on the workgroup shape).
 
 #define PROJECTION_NORM_NONE 0
 #define PROJECTION_NORM_SHARED 1
-#define PROJECTION_NORM_LANES 2
 
 #define PROJECTION_GEMV_STAGE_PACKETS 288u
 // Row-norm partial squares at float 0: 8 rows x PROJECTION_RMS_PARTS.
@@ -333,19 +326,6 @@ float projection_gemv_inverse(projection_prologue in_, uint m) {
 void projection_gemv_prologue8(projection_prologue in_, const int norm, uint m, uint k, out vec4 even, out vec4 odd) {
     if (norm == PROJECTION_NORM_SHARED) {
         projection_load8(in_, m, k, projection_gemv_inverse(in_, m), even, odd);
-    } else if (norm == PROJECTION_NORM_LANES) {
-        // head_width / 8 adjacent lanes load one head's columns in order: each
-        // lane sums its eight values' squares, a butterfly over the group
-        // gives every lane the head's square sum.
-        const projection_gated8 v = projection_gated_inputs8(in_, m, k);
-        float squares = 0.0;
-        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-            squares = seismic_fma_rn(v.me[j], v.me[j], squares);
-            squares = seismic_fma_rn(v.mo[j], v.mo[j], squares);
-        }
-        for (uint offset = 1u; offset < in_.head_width / 8u; offset <<= 1)
-            squares += subgroupShuffleXor(squares, offset);
-        projection_gated_finish8(in_, v, inversesqrt(seismic_div_rn(squares, float(in_.head_width)) + in_.eps), even, odd);
     } else {
         projection_load8(in_, m, k, 0.0, even, odd);
     }

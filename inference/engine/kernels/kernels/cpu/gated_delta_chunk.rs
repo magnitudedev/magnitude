@@ -5,10 +5,11 @@
 // row. `gated_delta_chunk_scan` advances the state row-sequentially from the
 // staged rows (`recurrent::Staged`): a work item owns (value head, ROWS state
 // rows, slot), the head's first publishes the head's share of the successor
-// window, and grid z = B zeroes the mixed rows no slot covers. The staged
-// values are the step's, so every slot gets `gated_delta_step`'s bits (the
-// CPU needs no WY form: the row-sequential rule is its cheapest schedule);
-// ROWS never changes result bits.
+// window, and grid z = B zeroes the raw rows no slot covers.
+// `gated_delta_chunk_gate` then gates each row as the step's gate does. The
+// staged values are the step's, so every slot gets `gated_delta_step`'s bits
+// (the CPU needs no WY form: the row-sequential rule is its cheapest
+// schedule); ROWS never changes result bits.
 
 use lib::recurrent::recurrent::{self, Recurrence};
 use seismic::cpu::slab::SlabTensor;
@@ -27,7 +28,7 @@ fn recurrence<'a, E: Elements>(cx: &Context<'a, E>) -> Recurrence<'a, E::A> {
         window: SlabTensor::from_bound(cx.arg_window(), cx.arg_slab_banks() as usize),
         delta: SlabTensor::from_bound(cx.arg_delta(), cx.arg_slab_banks() as usize),
         tape: SlabTensor::from_bound(cx.arg_tape(), cx.arg_slab_banks() as usize),
-        mixed: cx.result_0(),
+        mixed: cx.scratch_mixed(),
         rows: cx.dim_m() as usize,
         slots: cx.dim_b() as usize,
         key_heads: cx.dim_nk() as usize,
@@ -69,4 +70,11 @@ fn gated_delta_chunk_scan<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
     let state = seismic::cpu::tensor::floats(shared, rows.len() * r.width);
     let mut prologue = recurrent::Staged::new(&r, staged, head, rows.clone());
     r.advance(&slot, head, rows, state, &mut prologue);
+}
+
+fn gated_delta_chunk_gate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
+    let r = recurrence(cx);
+    let (norm, values) = seismic::cpu::tensor::floats(shared, 2 * r.width).split_at_mut(r.width);
+    cx.arg_recurrent_norm().decode_row(0, norm);
+    r.gate_row(group[0] as usize, norm, cx.arg_epsilon(), &cx.result_0(), values);
 }

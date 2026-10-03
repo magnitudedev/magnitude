@@ -46,7 +46,8 @@ use magnitude_family_contracts::{
 };
 use magnitude_state::LayerRef;
 use seismic::{
-    Element, NativeGraph, NativeGraphClassSlice, NativeGraphMetadata, NativePort, WorkflowTensor,
+    BackendName, Element, NativeGraph, NativeGraphClassSlice, NativeGraphMetadata, NativePort,
+    WorkflowTensor,
 };
 
 /// A block's state ports, by the state its mixer keeps.
@@ -125,13 +126,14 @@ pub(crate) enum CheckedMixerEntries {
 }
 
 impl CheckedMixerEntries {
-    pub(crate) fn new(slot: MixerProgramSlot) -> Self {
-        match slot {
+    /// The entries of `slot` on `backend`.
+    pub(crate) fn new(slot: MixerProgramSlot, backend: BackendName) -> Result<Self, String> {
+        Ok(match slot {
             MixerProgramSlot::Attention(binding) => {
                 Self::Attention(CheckedAttentionEntries::new(binding))
             }
             MixerProgramSlot::Recurrent(binding) => {
-                Self::Recurrent(CheckedRecurrentEntries::new(binding))
+                Self::Recurrent(CheckedRecurrentEntries::new(binding, backend)?)
             }
             MixerProgramSlot::StateSpace(binding) => {
                 Self::StateSpace(CheckedStateSpaceEntries::new(binding))
@@ -139,7 +141,7 @@ impl CheckedMixerEntries {
             MixerProgramSlot::ShortConv(binding) => {
                 Self::ShortConv(CheckedShortConvEntries::new(binding))
             }
-        }
+        })
     }
 
     pub(crate) fn entries(&self) -> Result<MixerEntries<'_, NativeGraphMetadata>, String> {
@@ -161,13 +163,14 @@ pub(crate) enum CheckedFeedForwardEntries {
 }
 
 impl CheckedFeedForwardEntries {
-    pub(crate) fn new(slot: FeedForwardProgramSlot) -> Self {
-        match slot {
+    /// The entries of `slot` on `backend`.
+    pub(crate) fn new(slot: FeedForwardProgramSlot, backend: BackendName) -> Result<Self, String> {
+        Ok(match slot {
             FeedForwardProgramSlot::Dense(binding) => {
                 Self::Dense(CheckedDenseEntries::new(binding))
             }
             FeedForwardProgramSlot::Routed(binding) => {
-                Self::Routed(CheckedRoutedEntries::new(binding))
+                Self::Routed(CheckedRoutedEntries::new(binding, backend)?)
             }
             FeedForwardProgramSlot::GeneralRouted(binding) => {
                 Self::GeneralRouted(CheckedGeneralRoutedEntries::new(binding))
@@ -175,7 +178,7 @@ impl CheckedFeedForwardEntries {
             FeedForwardProgramSlot::Parallel(binding) => {
                 Self::Parallel(CheckedParallelEntries::new(binding))
             }
-        }
+        })
     }
 
     pub(crate) fn entries(&self) -> FeedForwardEntries<'_, NativeGraphMetadata> {

@@ -825,12 +825,13 @@ fn recurrent_project(ctx: &Ctx) -> Vec<Variant> {
         .collect()
 }
 
+/// The recurrent output projection: `attention_output` over the gated rows
+/// [M, NV, W] the recurrent state entries publish.
 fn recurrent_output(ctx: &Ctx) -> Vec<Variant> {
     projection_variants()
         .into_iter()
-        .map(|(label, a, nw, dense, every)| {
+        .map(|(label, a, _, dense, every)| {
             let (weight, wf) = ctx.real("blk.0.ssm_out.weight", HIDDEN, dense);
-            let norm = ctx.norm("blk.0.ssm_norm.weight", nw);
             let mut rng = Rng::new(6);
             let cases = rows_only()
                 .into_iter()
@@ -845,27 +846,20 @@ fn recurrent_output(ctx: &Ctx) -> Vec<Variant> {
                         ctx.dense(
                             a,
                             &[m as u64, VALUE_HEADS as u64, STATE as u64],
-                            &activations(&mut rng, m, VALUE_HEADS * STATE, 0.2),
+                            &activations(&mut rng, m, VALUE_HEADS * STATE, 1.0),
                         ),
-                        ctx.dense(
-                            a,
-                            &[m as u64, recurrent_width() as u64],
-                            &activations(&mut rng, m, recurrent_width(), 1.0),
-                        ),
-                        norm.clone(),
                         Arg::Shared(weight.clone()),
-                        f32s(1e-6),
                     ],
                 })
                 .collect();
             Variant {
                 label: label.into(),
-                elements: vec![
-                    ("RN", nw),
-                    ("OW", dense.unwrap_or_else(|| ctx.resident(wf))),
-                    ("A", a),
+                elements: vec![("OW", dense.unwrap_or_else(|| ctx.resident(wf))), ("A", a)],
+                statics: vec![
+                    ("D", HIDDEN as u64),
+                    ("Q", VALUE_HEADS as u64),
+                    ("W", STATE as u64),
                 ],
-                statics: recurrent_statics_projection(),
                 every_configuration: every,
                 cases,
             }
@@ -945,6 +939,7 @@ fn recurrent_case(
                 &[VALUE_HEADS as u64],
                 &gguf.f32s("blk.0.ssm_dt.bias"),
             ),
+            ctx.norm("blk.0.ssm_norm.weight", f32e()),
             ctx.ints(&[b + 1, 2], &segments),
             ctx.ints(
                 &[b],
@@ -975,7 +970,9 @@ fn recurrent_case(
             ),
             ctx.dense_mut(f32e(), &[banks as u64, TAPE as u64, tape_row as u64], &tape),
             f32s(1e-6 * STATE as f32),
+            f32s(1e-6),
             Arg::Scalar(Scalar::Bool(grouped)),
+            Arg::Scalar(Scalar::U32(banks as u32)),
         ],
     }
 }
@@ -1037,7 +1034,7 @@ fn recurrent_state(ctx: &Ctx) -> Vec<Variant> {
             ));
             Variant {
                 label: label.into(),
-                elements: vec![("A", a)],
+                elements: vec![("RN", f32e()), ("A", a)],
                 statics: vec![
                     ("NK", KEY_HEADS as u64),
                     ("NV", VALUE_HEADS as u64),
@@ -2325,7 +2322,7 @@ const ENTRIES: &[EntrySpec] = &[
     },
     EntrySpec {
         id: "recurrent_output",
-        names: &["gated_delta_output"],
+        names: &["attention_output"],
         family: "recurrent",
         library: true,
         build: recurrent_output,

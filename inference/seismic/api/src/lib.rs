@@ -1556,7 +1556,7 @@ impl NativeGraphResourceTemplate {
         // contract at the same dimensions has the same buffer maxima.
         let mut certified = std::collections::HashMap::<
             (usize, Option<&'static str>, &[(String, u64)]),
-            (Vec<u64>, Vec<u64>),
+            (Vec<u64>, Vec<seismic_runtime::native::ScratchNeed>),
         >::new();
         for source in &self.recorder.nodes {
             // Every class calls the node's entry at the statics it was
@@ -1629,6 +1629,10 @@ impl NativeGraphResourceTemplate {
                                 })
                                 .map_err(|error| format!("scratch `{}`: {error}", buffer.name))
                         })
+                        .map(|bytes| seismic_runtime::native::ScratchNeed {
+                            bytes,
+                            sync: buffer.sync,
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             );
@@ -1653,16 +1657,21 @@ fn checked_native_scratch_bound(
     scratch_buffers: &[NativeScratch],
     tuning_parameters: &[NativeParameter],
     dimensions: &[(&str, u64)],
-) -> Result<Vec<u64>, String> {
+) -> Result<Vec<seismic_runtime::native::ScratchNeed>, String> {
     scratch_buffers
         .iter()
         .map(|scratch| {
-            scratch.maximum_bytes(tuning_parameters, &|name| {
-                dimensions
-                    .iter()
-                    .find(|(candidate, _)| *candidate == name)
-                    .map(|(_, value)| *value)
-            })
+            scratch
+                .maximum_bytes(tuning_parameters, &|name| {
+                    dimensions
+                        .iter()
+                        .find(|(candidate, _)| *candidate == name)
+                        .map(|(_, value)| *value)
+                })
+                .map(|bytes| seismic_runtime::native::ScratchNeed {
+                    bytes,
+                    sync: scratch.sync,
+                })
         })
         .collect::<Result<_, _>>()
         .map_err(|error| error.to_string())
@@ -1689,6 +1698,7 @@ mod metadata_scratch_tests {
                 Box::new(NativeNatExpr::Dimension("D".into())),
                 Box::new(NativeNatExpr::Parameter("tile".into())),
             ),
+            sync: false,
             when: Some(NativeCondition::Compare {
                 comparison: NativeComparison::Gt,
                 left: NativeNatExpr::Parameter("tile".into()),
@@ -1697,7 +1707,10 @@ mod metadata_scratch_tests {
         };
         assert_eq!(
             checked_native_scratch_bound(&[scratch], &[parameter], &[("D", 4)]).unwrap(),
-            vec![16]
+            vec![seismic_runtime::native::ScratchNeed {
+                bytes: 16,
+                sync: false
+            }]
         );
     }
 }
@@ -1722,6 +1735,11 @@ impl NativeGraphMetadata {
             }),
             class_scope: None,
         }
+    }
+
+    /// The backend whose native declarations the graph checks.
+    pub fn backend(&self) -> BackendName {
+        self.backend
     }
 
     /// Tag following checked ports and nodes with a semantic class extent

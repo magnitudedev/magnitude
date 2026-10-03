@@ -74,7 +74,6 @@ gated_delta_rows[A=f32]: f32[3,28]=rand(376) ; f32[16,3]=rand(377) ; f32[2]=-0.5
 gated_delta_rows[A=f32]: f32[3,28]=rand(381) ; f32[16,3]=rand(382) ; f32[2]=-0.5,-1 ; f32[2]=rand(383) ; i32[3,2]=0,2,2,3,3,3 ; i32[2]=1,1 ; i32[2]=1,2 ; i32[2]=3,4 ; f32[5,2,16]=rand(384) ; f32[5,2,4,4]=rand(385) ; f32:0.000001 ; bool:true
 gated_delta_step[A=f32]: f32[3,196]=rand(386) ; f32[128,3]=rand(387) ; f32[2]=-0.5,-1 ; f32[2]=rand(388) ; i32[2,2]=0,3,3,3 ; i32[1]=2 ; i32[1]=1 ; i32[1]=2 ; f32[3,2,128]=rand(389) ; f32[3,2,32,32]=rand(390) ; f32:0.000001 ; bool:false
 gated_delta_chunk[A=f32]: f32[3,196]=rand(391) ; f32[128,3]=rand(392) ; f32[2]=-0.5,-1 ; f32[2]=rand(393) ; i32[3,2]=0,1,1,3,3,3 ; i32[2]=1,2 ; i32[2]=1,2 ; i32[2]=3,4 ; f32[5,2,128]=rand(394) ; f32[5,2,32,32]=rand(395) ; f32:0.000001 ; bool:true
-gated_delta_output[A=f32,RN=f32,OW=f32]: f32[3,4]=rand(188) ; f32[3,2,4]=rand(186) ; f32[3,28]=rand(185) ; f32[4]=rand(187) ; f32[4,8]=rand(190) ; f32:0.000001
 
 # routed.seismic: M = 3, H = 4, E = 4, K = 2, F = 3, S = 2 (shared width). Grouping: T = 2 tile
 # rows, B = ceil((M * K + E * (T - 1)) / T) = 5 blocks; the expert and combine lines use the

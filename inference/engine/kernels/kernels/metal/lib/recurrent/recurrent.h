@@ -1,11 +1,12 @@
 // Shared pieces of the Metal gated-delta entries (`gated_delta_step`,
-// `gated_delta_chunk`; contracts in recurrent.seismic): slot, version and
-// tape lookup, the convolution taps and the causal convolution with SiLU,
-// the gates, piece splitting, the successor window publication, and the
-// row-sequential advance both entries run for slots of at most
-// RECURRENT_SEQUENTIAL_ROWS rows and for the rows after a stop row. Channels
-// of the projection and window rows and tape rows are contiguous (unit
-// stride).
+// `gated_delta_chunk`, `gated_delta_step_convolved`; contracts in
+// recurrent.seismic): slot, version and tape lookup, the gates, piece
+// splitting, the row-sequential advance the entries run for slots of at most
+// RECURRENT_SEQUENTIAL_ROWS rows and for the rows after a stop row, and the
+// gating of the raw outputs into the entries' result. The convolution and the
+// window publication, which only the entries binding the window use, are in
+// `convolution.h`. Channels of the projection and convolved rows and tape
+// rows are contiguous (unit stride).
 
 #include "../core/activation.h"
 #include <seismic/slab.h>
@@ -14,7 +15,6 @@ namespace recurrent {
 
 typedef element::Act::storage Storage;
 
-#define RECURRENT_TAPS SEISMIC_DIM_C
 #define RECURRENT_UNROLL _Pragma("clang loop unroll(full)")
 
 // A tape row: the innovations u [NV, W], the normalized keys k [NK, W], the
@@ -76,48 +76,24 @@ inline ulong key_head(ulong head, constant ulong *seismic_words) {
     return SEISMIC_PARAM_GROUPED != 0 ? head * SEISMIC_DIM_NK / SEISMIC_DIM_NV : head % SEISMIC_DIM_NK;
 }
 
-// The raw input row at slot-local `position`: the source version's window rows
-// before the slot, the projection after.
-inline device const Storage *raw_row(device const Storage *projection, device const ulong *window, Slot slot,
-    long position, constant ulong *seismic_words) {
-    return position < 0
-        ? bank<Storage>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words)
-            + ulong(slot.taped + long(RECURRENT_TAPS) - 1 + position) * SEISMIC_WINDOW_STRIDE_1
-        : projection + ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0;
-}
-
-// The convolution input rows of slot-local row `local` for taps 0..C.
-inline void taps(device const Storage *projection, device const ulong *window, Slot slot, long local,
-    thread device const Storage *(&rows)[RECURRENT_TAPS], constant ulong *seismic_words) {
-    RECURRENT_UNROLL for (uint tap = 0; tap < RECURRENT_TAPS; ++tap) {
-        rows[tap] = raw_row(projection, window, slot, local + long(tap) - long(RECURRENT_TAPS - 1), seismic_words);
+// A row's q | k | v channels after the convolution and SiLU, the prologue
+// input of `advance_rows`: `Convolved` loads them (rows `stride` apart) as
+// `gated_delta_project_convolved` published them; `Convolving`
+// (`convolution.h`) forms the same F32 values from the projection and the
+// source window.
+struct Convolved {
+    device const float *convolved;
+    ulong stride;
+    struct Row {
+        device const float *values;
+        float at(ulong channel, constant ulong *) const { return values[channel]; }
+    };
+    Row row(long row, constant ulong *) const {
+        Row result;
+        result.values = convolved + ulong(row) * stride;
+        return result;
     }
-}
-
-// SiLU of the causal depthwise convolution of `channel` over `rows`.
-inline float convolve(device const float *convolution, thread device const Storage *const (&rows)[RECURRENT_TAPS],
-    ulong channel, constant ulong *seismic_words) {
-    float sum = 0.0f;
-    RECURRENT_UNROLL for (uint tap = 0; tap < RECURRENT_TAPS; ++tap) {
-        sum = metal::fma(convolution[channel * SEISMIC_CONVOLUTION_STRIDE_0 + tap * SEISMIC_CONVOLUTION_STRIDE_1],
-            element::Act::load(rows[tap][channel]), sum);
-    }
-    return sum / (1.0f + metal::exp(-sum));
-}
-
-// The same for the four channels `channel`..`channel + 3`.
-inline float4 convolve4(device const float *convolution, thread device const Storage *const (&rows)[RECURRENT_TAPS],
-    ulong channel, constant ulong *seismic_words) {
-    float4 sum = 0.0f;
-    RECURRENT_UNROLL for (uint tap = 0; tap < RECURRENT_TAPS; ++tap) {
-        float4 weights;
-        RECURRENT_UNROLL for (uint e = 0; e < 4; ++e) {
-            weights[e] = convolution[(channel + e) * SEISMIC_CONVOLUTION_STRIDE_0 + tap * SEISMIC_CONVOLUTION_STRIDE_1];
-        }
-        sum = metal::fma(weights, element::Act::load4(rows[tap] + channel), sum);
-    }
-    return sum / (1.0f + metal::exp(-sum));
-}
+};
 
 // beta = sigmoid(b) and the log decay rate * softplus(alpha + time_bias).
 struct Gates {
@@ -148,41 +124,10 @@ inline void piece_of(Slot slot, ulong piece, thread long &first, thread long &le
     length = metal::min(PIECE, slot.stop - long(piece) * PIECE);
 }
 
-// Publishes value head `head`'s share of the slot's successor window (the
-// C - 1 raw rows before the publication row, then the raw rows of its tape):
-// its value channels and the q/k channels of the key heads congruent to it.
-// Thread `thread_index` of `threads` copies an even share.
-inline void publish_window(device const Storage *projection, device const ulong *window, Slot slot, ulong head,
-    uint thread_index, uint threads, constant ulong *seismic_words) {
-    const ulong width = SEISMIC_DIM_W;
-    const ulong key_heads = SEISMIC_DIM_NK;
-    const ulong value_heads = SEISMIC_DIM_NV;
-    const long taps = long(RECURRENT_TAPS) - 1;
-    const long rows = taps + tape_rows(slot, seismic_words);
-    device Storage *target_window = bank<Storage>(window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
-    device const Storage *source_window = bank<Storage>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
-    const ulong owned = key_heads > head ? (key_heads - head - 1) / value_heads + 1 : 0;
-    const ulong per_tap = width + 2 * width * owned;
-    for (ulong item = thread_index; item < ulong(rows) * per_tap; item += threads) {
-        const long tap = long(item / per_tap);
-        const ulong offset = item % per_tap;
-        ulong channel;
-        if (offset < width) {
-            channel = (2 * key_heads + head) * width + offset;
-        } else {
-            const ulong key_offset = offset - width;
-            const ulong owner = head + (key_offset / (2 * width)) * value_heads;
-            const ulong within = key_offset % (2 * width);
-            channel = within < width ? owner * width + within : (key_heads + owner) * width + within - width;
-        }
-        const long position = slot.stop + tap - taps;
-        target_window[ulong(tap) * SEISMIC_WINDOW_STRIDE_1
-            + channel * SEISMIC_WINDOW_STRIDE_2] = position < 0
-            ? source_window[ulong(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1
-                + channel * SEISMIC_WINDOW_STRIDE_2]
-            : projection[ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0
-                + channel * SEISMIC_PROJECTION_STRIDE_1];
-    }
+// Element (row, value head, state row) of the raw outputs `mixed`, an
+// [M, NV, W] scratch in A.
+inline ulong raw_index(ulong row, ulong head, ulong state_row, constant ulong *seismic_words) {
+    return (row * SEISMIC_DIM_NV + head) * SEISMIC_DIM_W + state_row;
 }
 
 // Slots of at most this many rows advance row-sequentially in either entry,
@@ -192,8 +137,9 @@ inline void publish_window(device const Storage *projection, device const ulong 
 
 // The row-sequential gated delta rule over the slot's rows [begin, hi), the
 // arithmetic of `gated_delta_step` (a threadgroup's shape never changes
-// bits). Every thread of the threadgroup calls it. The threadgroup owns state
-// rows [block_row0, block_row0 + BLOCK_ROWS) of value head `head`; simdgroup
+// bits), storing the raw outputs to `mixed` (`raw_index`). Every thread of
+// the threadgroup calls it. The threadgroup owns state rows
+// [block_row0, block_row0 + BLOCK_ROWS) of value head `head`; simdgroup
 // `simdgroup` owns LANE_ROWS of them from `row0`, W / 32 contiguous key columns
 // per lane. From `begin` = lo it reads them from the slot's source version
 // (the bank's state advanced by its tape rows with the step's update) and
@@ -202,12 +148,12 @@ inline void publish_window(device const Storage *projection, device const ulong 
 // recorded in the successor's tape. For each span of up to SPAN rows the
 // threadgroup computes the prologue into threadgroup memory (q and k rows of
 // QK_STRIDE floats, v rows of V_STRIDE floats, the gates): a simdgroup
-// convolves (causal convolution over the window, SiLU) and L2-normalizes a
-// whole q or k row with one simd_sum, threads convolve the value channels of
-// its state rows; after one barrier the rows advance in order.
-template <uint LANE_ROWS, uint BLOCK_ROWS, uint SPAN, uint QK_STRIDE, uint V_STRIDE>
-inline void advance_rows(device const Storage *projection, device const float *convolution,
-    device const float *rate, device const float *time_bias, device const ulong *window,
+// forms a whole q or k row's convolved channels (`Inputs`) and L2-normalizes
+// it with one simd_sum, threads form the value channels of its state rows;
+// after one barrier the rows advance in order.
+template <uint LANE_ROWS, uint BLOCK_ROWS, uint SPAN, uint QK_STRIDE, uint V_STRIDE, typename Inputs>
+inline void advance_rows(device const Storage *projection, Inputs inputs,
+    device const float *rate, device const float *time_bias,
     device const ulong *delta, device const ulong *tape, device Storage *mixed, Slot slot, long begin, ulong head,
     ulong block_row0, ulong row0, threadgroup float *query_block, threadgroup float *key_block,
     threadgroup float *value_block, threadgroup float *beta_block, threadgroup float *decay_block,
@@ -269,18 +215,17 @@ inline void advance_rows(device const Storage *projection, device const float *c
     const ulong value_channel = (2 * key_heads + head) * width + block_row0;
     for (long first = begin; first < hi; first += SPAN) {
         const ulong rows = ulong(metal::min(long(SPAN), hi - first));
-        // A simdgroup convolves and L2-normalizes a whole q or k row.
+        // A simdgroup forms and L2-normalizes a whole q or k row.
         for (ulong task = simdgroup; task < rows * 2; task += simdgroups) {
             const ulong i = task / 2;
             const bool is_key = task % 2 != 0;
             const long row = first + long(i);
-            device const Storage *row_taps[RECURRENT_TAPS];
-            taps(projection, window, slot, row - lo, row_taps, seismic_words);
+            const typename Inputs::Row channels = inputs.row(row, seismic_words);
             const ulong channel0 = (is_key ? key_heads + key : key) * width + first_column;
             float values[COLUMNS];
             float squares = 0.0f;
             RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                values[j] = convolve(convolution, row_taps, channel0 + j, seismic_words);
+                values[j] = channels.at(channel0 + j, seismic_words);
                 squares = metal::fma(values[j], values[j], squares);
             }
             const float inverse = metal::rsqrt(simd_sum(squares) + epsilon)
@@ -295,9 +240,7 @@ inline void advance_rows(device const Storage *projection, device const float *c
         for (ulong item = threads - 1 - thread_index; item < rows * BLOCK_ROWS; item += threads) {
             const ulong i = item / BLOCK_ROWS;
             const long row = first + long(i);
-            device const Storage *row_taps[RECURRENT_TAPS];
-            taps(projection, window, slot, row - lo, row_taps, seismic_words);
-            value_block[i * V_STRIDE + item % BLOCK_ROWS] = convolve(convolution, row_taps,
+            value_block[i * V_STRIDE + item % BLOCK_ROWS] = inputs.row(row, seismic_words).at(
                 value_channel + item % BLOCK_ROWS, seismic_words);
         }
         for (ulong i = thread_index; i < rows; i += threads) {
@@ -357,8 +300,7 @@ inline void advance_rows(device const Storage *projection, device const float *c
                 RECURRENT_UNROLL for (uint r = 1; r < LANE_ROWS; ++r) {
                     mine = lane == r ? output[r] : mine;
                 }
-                mixed[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
-                    + (row0 + lane) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(mine);
+                mixed[raw_index(ulong(row), head, row0 + lane, seismic_words)] = element::Act::store(mine);
             }
             if (row + 1 == publish) {
                 RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
@@ -370,6 +312,102 @@ inline void advance_rows(device const Storage *projection, device const float *c
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Gating: the result's value (row, head, i) is
+//   round_A(round_A(raw * inverse * norm[i]) * round_A(silu(z)))
+// with raw the stored raw output, z column CH + head * W + i of the
+// projection row and inverse = rsqrt(sum_head raw^2 / W + epsilon). The
+// entries differ only in how a head's square sum is reduced.
+
+typedef ELEMENT_OF(SEISMIC_RECURRENT_NORM) Norm;
+
+// The inputs of columns i..i+7 of (row, head) as (even, odd): raw outputs,
+// z and the norm weights.
+struct Gated8 {
+    float4 raw_even, raw_odd, z_even, z_odd, norm_even, norm_odd;
+};
+
+inline Gated8 gated_inputs8(device const Storage *mixed, device const Storage *projection,
+    device const uchar *norm, ulong row, ulong head, uint i, constant ulong *seismic_words) {
+    device const Storage *raw = mixed + raw_index(row, head, i, seismic_words);
+    device const Storage *z = projection + row * SEISMIC_PROJECTION_STRIDE_0
+        + (2 * SEISMIC_DIM_NK + SEISMIC_DIM_NV + head) * SEISMIC_DIM_W + i;
+    Gated8 v;
+    RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
+        v.raw_even[j] = element::Act::load(raw[2 * j]);
+        v.raw_odd[j] = element::Act::load(raw[2 * j + 1]);
+        v.z_even[j] = element::Act::load(z[2 * j]);
+        v.z_odd[j] = element::Act::load(z[2 * j + 1]);
+        v.norm_even[j] = element::at<Norm>(norm, ulong(i + 2 * j) * SEISMIC_RECURRENT_NORM_STRIDE_0);
+        v.norm_odd[j] = element::at<Norm>(norm, ulong(i + 2 * j + 1) * SEISMIC_RECURRENT_NORM_STRIDE_0);
+    }
+    return v;
+}
+
+// Stores the gated columns i..i+7 of (row, head) given the head's inverse.
+inline void store_gated8(thread const Gated8 &v, float inverse, device Storage *gated, ulong row, ulong head,
+    uint i, constant ulong *seismic_words) {
+    const float4 e = v.raw_even * inverse * v.norm_even, o = v.raw_odd * inverse * v.norm_odd;
+    const float4 ae = v.z_even / (1.0f + metal::exp(-v.z_even)), ao = v.z_odd / (1.0f + metal::exp(-v.z_odd));
+    device Storage *out = gated + row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1;
+    RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
+        out[(i + 2 * j) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(
+            element::Act::round(element::Act::round(e[j]) * element::Act::round(ae[j])));
+        out[(i + 2 * j + 1) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(
+            element::Act::round(element::Act::round(o[j]) * element::Act::round(ao[j])));
+    }
+}
+
+// Gates every row of value head `head` (the step): W / 8 adjacent lanes per
+// row, lane j owning columns 8j..8j+7, each sum the squares of their eight
+// raw values in column order, and a butterfly over the lanes gives each the
+// head's square sum. This is the lane grouping of the projection GEMV
+// staging. All threads of the threadgroup (whole simdgroups) call it.
+inline void gate_head(device const Storage *mixed, device const Storage *projection, device const uchar *norm,
+    device Storage *gated, ulong head, uint thread_index, uint threads, constant ulong *seismic_words) {
+    constexpr uint LANES = SEISMIC_DIM_W / 8;
+    static_assert(SEISMIC_DIM_W % 8 == 0 && LANES <= 32 && (LANES & (LANES - 1)) == 0,
+        "a head is gated over W / 8 lanes, a power of two up to 32");
+    const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
+    const uint items = uint(SEISMIC_DIM_M) * LANES;
+    for (uint first = 0; first < items; first += threads) {
+        const uint item = first + thread_index;
+        // Lanes past the rows repeat the last row, so every lane of a
+        // butterfly group takes part; they store nothing.
+        const ulong row = metal::min(ulong(item / LANES), ulong(SEISMIC_DIM_M) - 1);
+        const uint i = 8 * (item % LANES);
+        const Gated8 v = gated_inputs8(mixed, projection, norm, row, head, i, seismic_words);
+        float squares = 0.0f;
+        RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
+            squares = metal::fma(v.raw_even[j], v.raw_even[j], squares);
+            squares = metal::fma(v.raw_odd[j], v.raw_odd[j], squares);
+        }
+        for (ushort offset = 1; offset < LANES; offset <<= 1)
+            squares += simd_shuffle_xor(squares, offset);
+        if (item < items)
+            store_gated8(v, metal::rsqrt(squares / float(SEISMIC_DIM_W) + epsilon), gated, row, head, i,
+                seismic_words);
+    }
+}
+
+// Gates (row, head) with one simdgroup (the chunk): lane l sums the squares
+// of columns l, l + 32, ... in order, then one simd_sum. This is the
+// projection family's normalizing pre-pass order.
+inline void gate_row(device const Storage *mixed, device const Storage *projection, device const uchar *norm,
+    device Storage *gated, ulong row, ulong head, uint lane, constant ulong *seismic_words) {
+    const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
+    device const Storage *raw = mixed + raw_index(row, head, 0, seismic_words);
+    float squares = 0.0f;
+    for (uint i = lane; i < SEISMIC_DIM_W; i += 32) {
+        const float value = element::Act::load(raw[i]);
+        squares = metal::fma(value, value, squares);
+    }
+    const float inverse = metal::rsqrt(simd_sum(squares) / float(SEISMIC_DIM_W) + epsilon);
+    for (uint i = 8 * lane; i < SEISMIC_DIM_W; i += 8 * 32)
+        store_gated8(gated_inputs8(mixed, projection, norm, row, head, i, seismic_words), inverse, gated, row,
+            head, i, seismic_words);
 }
 
 } // namespace recurrent

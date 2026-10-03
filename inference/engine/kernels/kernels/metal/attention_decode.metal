@@ -223,10 +223,11 @@ kernel void attention_decode_merge(
     device const float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
-    uint column [[thread_index_in_threadgroup]]) {
+    uint lane [[thread_index_in_threadgroup]]) {
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
+    threadgroup float weights[2 * SEISMIC_TUNE_PARTS];
     attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS>(query, gate, visible, fresh, result,
-        partials, statistics, SEISMIC_DIM_R, SEISMIC_DIM_M, group.x, group.y, column,
+        partials, statistics, weights, SEISMIC_DIM_R, SEISMIC_DIM_M, group.x, group.y, group.z * 32 + lane, lane,
         SEISMIC_PARAM_GATE_FUNCTION != 0);
 }

@@ -6,8 +6,8 @@
 
 use magnitude_kernels::{
     attention_output, attention_project, dense_expand, dense_output, embedding_rows,
-    gated_delta_output, gated_delta_project, head_logits_rows, project_rows, readout_features_rows,
-    readout_head_rows, readout_selected_rows,
+    gated_delta_project, head_logits_rows, project_rows, readout_features_rows, readout_head_rows,
+    readout_selected_rows,
 };
 use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
@@ -856,24 +856,6 @@ fn dense_output_specialization_on(
         true,
     )
     .with_static("DS", 0)
-}
-
-fn gated_delta_output_specialization_on(
-    device: &Device,
-    statics: &[(&str, usize)],
-    mapping: Mapping,
-) -> NativeSpecialization {
-    scoped_projection_specialization_on(
-        device,
-        statics,
-        mapping,
-        ProjectionLaunches {
-            gemv: 1,
-            batch: 2,
-            gemm: 5,
-        },
-        true,
-    )
 }
 
 fn attention_output_specialization_on(
@@ -2021,6 +2003,8 @@ fn recurrent_project_cases_on(device: &Device, scoped: bool) {
     }
 }
 
+/// The recurrent output projection: `attention_output` over the gated rows
+/// [M, NV, W] the recurrent state entries publish.
 #[test]
 fn recurrent_output_matches_its_portable_body_and_the_host_reference() {
     for device in devices() {
@@ -2029,7 +2013,7 @@ fn recurrent_output_matches_its_portable_body_and_the_host_reference() {
 }
 
 #[test]
-fn metal_gated_delta_output_scoped_launches_match_the_host() {
+fn metal_recurrent_output_scoped_launches_match_the_host() {
     let Some(device) = devices()
         .into_iter()
         .find(|device| device.backend() == BackendName::Metal)
@@ -2049,17 +2033,12 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
     // A small geometry over every representation and mapping, then the pinned
     // 4B geometry (q5k) over the decode and verify rows.
     let geometries = if scoped {
-        vec![(300usize, 1usize, 2usize, 128usize, false)]
+        vec![(300usize, 2usize, 128usize, false)]
     } else {
-        vec![
-            (300usize, 1usize, 2usize, 128usize, false),
-            (2560, 16, 32, 128, true),
-        ]
+        vec![(300usize, 2usize, 128usize, false), (2560, 32, 128, true)]
     };
-    for (h, nk, nv, w, four_b) in geometries {
+    for (h, nv, w, four_b) in geometries {
         let k = nv * w;
-        let total = (2 * nk + nv) * w + nv * w + 2 * nv;
-        let z0 = (2 * nk + nv) * w;
         let (row_classes, mappings) = if scoped {
             (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
         } else {
@@ -2072,80 +2051,45 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
         };
         for &repr in reprs {
             let out_weight = weight(repr, h, k, 50, 1.0);
-            let norm = norm_values(w, 6);
             let case = |rows: usize| {
                 let mut rng = Rng::new(rows as u64 + 11);
                 let hidden = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
-                let projection = (0..rows * total)
-                    .map(|_| act.round(rng.symmetric() * 3.0))
+                let gated = (0..rows * k)
+                    .map(|_| act.round(rng.symmetric()))
                     .collect::<Vec<_>>();
-                let mixed = (0..rows * k)
-                    .map(|_| act.round(rng.symmetric() * 0.3))
-                    .collect::<Vec<_>>();
-                (hidden, projection, mixed)
+                (hidden, gated)
             };
-            let reference = |hidden: &[f32], projection: &[f32], mixed: &[f32], rows: usize| {
+            let reference = |hidden: &[f32], gated: &[f32], rows: usize| {
                 let mut expected = Vec::new();
                 let mut bound = Vec::new();
                 for r in 0..rows {
-                    let mut gated = vec![0f32; k];
-                    let mut slack = vec![0f32; k];
-                    for head in 0..nv {
-                        let values = &mixed[r * k + head * w..r * k + (head + 1) * w];
-                        let squares = values.iter().fold(0f32, |s, v| v.mul_add(*v, s));
-                        let inverse = 1.0 / (squares / w as f32 + 1e-6).sqrt();
-                        for c in 0..w {
-                            let exact = values[c] * inverse * norm[c];
-                            let normalized = act.round(exact);
-                            let activated =
-                                act.round(silu(projection[r * total + z0 + head * w + c]));
-                            gated[head * w + c] = act.round(normalized * activated);
-                            let flip = (act.round(exact * (1.0 + 1e-5))
-                                - act.round(exact * (1.0 - 1e-5)))
-                            .abs();
-                            slack[head * w + c] = (flip * activated.abs()
-                                + gated[head * w + c].abs() * act.ulp())
-                                * 1.01;
-                        }
-                    }
                     for n in 0..h {
-                        let (acc, magnitude) = dot(&gated, out_weight.row(n));
+                        let (acc, magnitude) = dot(&gated[r * k..(r + 1) * k], out_weight.row(n));
                         expected.push(hidden[r * h + n] + act.round(acc));
-                        bound.push(
-                            rounded_bound(act, acc, magnitude)
-                                + slack_dot(&slack, out_weight.row(n)) * 0.25,
-                        );
+                        bound.push(rounded_bound(act, acc, magnitude));
                     }
                 }
                 (expected, bound)
             };
-            let native = |hidden: &[f32],
-                          projection: &[f32],
-                          mixed: &[f32],
-                          rows: usize,
-                          mapping: Mapping| {
-                let kernel = gated_delta_output::native_for_device_with(
+            let native = |hidden: &[f32], gated: &[f32], rows: usize, mapping: Mapping| {
+                let kernel = attention_output::native_for_device_with(
                     &device,
-                    gated_delta_output::Elements {
-                        RN: Element::bf16(),
+                    attention_output::Elements {
                         OW: repr.element(),
                         A: act.element(),
                     },
-                    &gated_delta_output_specialization_on(
+                    &attention_output_specialization_on(
                         device,
-                        &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
+                        &[("D", h), ("Q", nv), ("W", w)],
                         mapping,
                     ),
                 )
                 .unwrap();
                 let out = kernel
-                    .call(gated_delta_output::Args {
+                    .call(attention_output::Args {
                         hidden: &f32_tensor(&device, &[rows, h], hidden),
-                        mixed: &act_tensor(&device, act, &[rows, nv, w], mixed),
-                        projection: &act_tensor(&device, act, &[rows, total], projection),
-                        recurrent_norm: &bf16_norm(&device, &norm),
+                        gated: &act_tensor(&device, act, &[rows, nv, w], gated),
                         output_weight: &out_weight.tensor(&device),
-                        epsilon: 1e-6,
                     })
                     .unwrap()
                     .value;
@@ -2153,43 +2097,35 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
             };
             let portable_rows: &[usize] = if four_b || scoped { &[] } else { &[2, 12] };
             for &rows in portable_rows {
-                let (hidden, projection, mixed) = case(rows);
+                let (hidden, gated) = case(rows);
                 let outcome = interpret(
                     &module,
-                    "gated_delta_output",
-                    &[
-                        ("RN", registry::dense(DType::BF16)),
-                        ("OW", repr.storage()),
-                        ("A", registry::dense(DType::BF16)),
-                    ],
+                    "attention_output",
+                    &[("OW", repr.storage()), ("A", registry::dense(DType::BF16))],
                     vec![
                         floats(&[rows, h], &hidden),
-                        activations(act, &[rows, nv, w], &mixed),
-                        activations(act, &[rows, total], &projection),
-                        activations(Act::Bf16, &[w], &norm),
+                        activations(act, &[rows, nv, w], &gated),
                         Input::Data(out_weight.oracle()),
-                        Input::F32(1e-6),
                     ],
                 );
                 let oracle = result(&outcome, 0);
                 for mapping in MAPPINGS {
-                    let (_, bound) = under(rows, || reference(&hidden, &projection, &mixed, rows));
+                    let (_, bound) = under(rows, || reference(&hidden, &gated, rows));
                     assert_within(
                         &format!("recurrent_output portable {repr:?} rows {rows} {mapping:?}"),
-                        &native(&hidden, &projection, &mixed, rows, mapping),
+                        &native(&hidden, &gated, rows, mapping),
                         &oracle,
                         &bound,
                     );
                 }
             }
             for &rows in &row_classes {
-                let (hidden, projection, mixed) = case(rows);
+                let (hidden, gated) = case(rows);
                 for &mapping in &mappings {
-                    let (expected, bound) =
-                        under(rows, || reference(&hidden, &projection, &mixed, rows));
+                    let (expected, bound) = under(rows, || reference(&hidden, &gated, rows));
                     assert_within(
                         &format!("recurrent_output {repr:?} H {h} M {rows} {mapping:?}"),
-                        &native(&hidden, &projection, &mixed, rows, mapping),
+                        &native(&hidden, &gated, rows, mapping),
                         &expected,
                         &bound,
                     );
@@ -3257,67 +3193,47 @@ fn timing_on(device: &Device) {
     }
 
     // Gated per-head RMS·SiLU(z) prologue, residual epilogue.
-    for (label, repr, h, nk, nv, w) in [
+    for (label, repr, h, nv, w) in [
         (
             "recurrent_output 4b q5k 2560x4096",
             Repr::Q5k,
             2560usize,
-            16usize,
             32usize,
             128usize,
         ),
-        (
-            "recurrent_output 35b q8 2048x4096",
-            Repr::Q8,
-            2048,
-            16,
-            32,
-            128,
-        ),
+        ("recurrent_output 35b q8 2048x4096", Repr::Q8, 2048, 32, 128),
     ] {
         if !timing_selected(label.split(' ').next().unwrap()) {
             continue;
         }
         let k = nv * w;
-        let total = (2 * nk + nv) * w + nv * w + 2 * nv;
         let bytes = weight_bytes(repr, h, k);
         let weights = (0..copies(bytes))
             .map(|i| noise_weight(&device, repr, h, k, i as u64 + 5))
             .collect::<Vec<_>>();
-        let norm = bf16_norm(&device, &norm_values(w, 5));
         for &m in &rows_list {
             let hidden = f32_tensor(&device, &[m, h], &uniform_values(m * h, 5, 1.0));
-            let mixed = act_tensor(&device, act, &[m, nv, w], &uniform_values(m * k, 6, 0.3));
-            let projection = act_tensor(
-                &device,
-                act,
-                &[m, total],
-                &uniform_values(m * total, 7, 2.0),
-            );
+            let gated = act_tensor(&device, act, &[m, nv, w], &uniform_values(m * k, 6, 1.0));
             for mapping in split_mappings(m) {
-                let kernel = gated_delta_output::native_for_device_with(
+                let kernel = attention_output::native_for_device_with(
                     &device,
-                    gated_delta_output::Elements {
-                        RN: Element::bf16(),
+                    attention_output::Elements {
                         OW: repr.element(),
                         A: a,
                     },
-                    &gated_delta_output_specialization_on(
+                    &attention_output_specialization_on(
                         device,
-                        &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
+                        &[("D", h), ("Q", nv), ("W", w)],
                         mapping,
                     ),
                 )
                 .unwrap();
                 let rotation = weights
                     .iter()
-                    .map(|weight| gated_delta_output::Args {
+                    .map(|weight| attention_output::Args {
                         hidden: &hidden,
-                        mixed: &mixed,
-                        projection: &projection,
-                        recurrent_norm: &norm,
+                        gated: &gated,
                         output_weight: weight,
-                        epsilon: 1e-6,
                     })
                     .collect();
                 let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();

@@ -187,6 +187,14 @@ is a tuning axis. The measured interval of a CPU submission starts when it holds
 submission never measures another's work.
 Standalone native calls use the same checked entry without creating a graph. Their scalar-result
 slots and scratch are the prepared kernel's invocation workspace, which reports both.
+Every non-empty scratch arena (the standalone arena and every graph workspace that places
+anything) reserves a fixed range at its start for `sync` scratch. Nothing else is placed there;
+within one graph each node's sync buffers are disjoint from every other node's, and never
+lifetime-aliased. Arenas are zeroed when allocated and kernels restore their counters, so the
+range is zero whenever a launch starts, whichever call or graph used it last. Reserving it in
+every non-empty workspace, not only in graphs that declare sync scratch, is required: graphs of
+one family share a workspace arena, and a graph without sync scratch placing ordinary buffers in
+the range would leave counters nonzero for the next graph that uses them.
 A native graph composes checked native entries, owns the shapes and lifetimes of
 its graph-local mutable tensors, host-uploaded input tensors, intermediate results, and exported
 outputs, and reports its exact storage charge and the liveness floor its workspace cannot go

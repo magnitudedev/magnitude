@@ -1268,6 +1268,7 @@ fn check_native(
             scratch.push(NativeScratch {
                 name: buffer.name.name.clone(),
                 bytes,
+                sync: buffer.sync,
                 when,
             });
         }

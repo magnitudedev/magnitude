@@ -1,6 +1,7 @@
 // Chunked gated delta rule (WY form) over pieces of at most 8 rows, in two
-// launches that share the `inputs` scratch (f32, the chunked rows only). The
-// chunked rows of a slot are those before its stop row, starting from the
+// launches that share the `inputs` scratch (f32, the chunked rows only), then
+// a third that gates the raw outputs the scan stores in the `mixed` scratch.
+// The chunked rows of a slot are those before its stop row, starting from the
 // slot's source version (the bank's state advanced by its tape rows); the rows
 // after the stop row advance row-sequentially from the published state with
 // the step's arithmetic (`recurrent::advance_rows`), recording the tape. A slot
@@ -29,6 +30,10 @@
 //        T = (I + A)^-1 = (I - A)(I + A^2)(I + A^4)   (A strictly lower, A^8 = 0),
 //        U = T diag(beta) (V - diag(gamma) X),  out = diag(gamma) Y + D U,
 //        S^T <- gamma_last S^T + K^T diag(gamma_last / gamma) U.
+//
+// `gated_delta_chunk_gate`: one simdgroup per (row, value head) gates the
+// row's raw outputs into the result (`recurrent::gate_row`).
+//
 // Threadgroup row strides are 8 or 24 floats modulo 32 banks, so 8x8 loads
 // are conflict-free. Decay products are exponentials of differences of
 // cumulative log decays, never ratios. Channels of the projection and window
@@ -52,7 +57,7 @@
 #define RCH_INPUT_STRIDE RCH_PADDED(RCH_WIDTH)
 #define RCH_VALUE_STRIDE RCH_PADDED(RCH_ROWS)
 
-#include "lib/recurrent/recurrent.h"
+#include "lib/recurrent/convolution.h"
 
 // The regions of the `inputs` scratch.
 struct RchScratch {
@@ -90,7 +95,7 @@ inline bool rch_row_slot(device const int *segments, device const int *stop, dev
 }
 
 // Rows after the last slot belong to no sequence: this simdgroup's 16 state
-// rows of their output are zero.
+// rows of their raw output are zero.
 inline void rch_zero_tail(device recurrent::Storage *mixed, ulong slot, long hi, ulong head, ulong row0,
     ushort lane, constant ulong *seismic_words) {
     if (slot + 1 != SEISMIC_DIM_B) {
@@ -98,8 +103,8 @@ inline void rch_zero_tail(device recurrent::Storage *mixed, ulong slot, long hi,
     }
     const ulong rows = SEISMIC_DIM_M - ulong(hi);
     for (ulong index = lane; index < rows * 16; index += 32) {
-        mixed[(ulong(hi) + index / 16) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
-            + (row0 + index % 16) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(0.0f);
+        mixed[recurrent::raw_index(ulong(hi) + index / 16, head, row0 + index % 16, seismic_words)]
+            = element::Act::store(0.0f);
     }
 }
 
@@ -191,7 +196,7 @@ kernel void gated_delta_chunk_scan(
     device const ulong *delta [[buffer(SEISMIC_BUFFER_DELTA)]],
     device const ulong *tape [[buffer(SEISMIC_BUFFER_TAPE)]],
     device float *inputs [[buffer(SEISMIC_BUFFER_SCRATCH_INPUTS)]],
-    device recurrent::Storage *mixed [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    device recurrent::Storage *mixed [[buffer(SEISMIC_BUFFER_SCRATCH_MIXED)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -226,9 +231,9 @@ kernel void gated_delta_chunk_scan(
     // piece buffers.
 #define RCH_SEQUENTIAL(begin)                                                                               \
     recurrent::advance_rows<16, RCH_ROWS, RCH_PIECE, RCH_INPUT_STRIDE, RCH_VALUE_STRIDE>(projection,         \
-        convolution, rate, time_bias, window, delta, tape, mixed, geometry, begin, head, block_row0, row0,   \
-        queries, keys, values, gates, gates + RCH_PIECE, thread_index, RCH_THREADS, simdgroup, lane_index,   \
-        seismic_words)
+        recurrent::Convolving{projection, window, convolution, geometry}, rate, time_bias, delta, tape,      \
+        mixed, geometry, begin, head, block_row0, row0, queries, keys, values, gates, gates + RCH_PIECE,     \
+        thread_index, RCH_THREADS, simdgroup, lane_index, seismic_words)
     if (geometry.hi - geometry.lo <= RECURRENT_SEQUENTIAL_ROWS) {
         // A short slot (an MTP verify) is not chunked.
         RCH_SEQUENTIAL(geometry.lo);
@@ -408,11 +413,10 @@ kernel void gated_delta_chunk_scan(
             simdgroup_multiply(update[h], inverse, removed[h]);
             simdgroup_multiply_accumulate(output[h], attention, update[h], output[h]);
             if (long(row) < length) {
-                device recurrent::Storage *destination = mixed + ulong(first + long(row))
-                    * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1;
+                device recurrent::Storage *destination = mixed
+                    + recurrent::raw_index(ulong(first + long(row)), head, row0 + 8 * h + column, seismic_words);
                 RECURRENT_UNROLL for (ushort e = 0; e < 2; ++e) {
-                    destination[(row0 + 8 * h + column + e) * SEISMIC_RESULT_0_STRIDE_2]
-                        = element::Act::store(output[h].thread_elements()[e]);
+                    destination[e] = element::Act::store(output[h].thread_elements()[e]);
                 }
             }
             update[h].thread_elements()[0] *= row_tail;
@@ -446,4 +450,16 @@ kernel void gated_delta_chunk_scan(
         RCH_SEQUENTIAL(geometry.lo + geometry.stop);
     }
     rch_zero_tail(mixed, slot, geometry.hi, head, row0, lane, seismic_words);
+}
+
+kernel void gated_delta_chunk_gate(
+    device const recurrent::Storage *projection [[buffer(SEISMIC_BUFFER_PROJECTION)]],
+    device const uchar *recurrent_norm [[buffer(SEISMIC_BUFFER_RECURRENT_NORM)]],
+    device recurrent::Storage *gated [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    device const recurrent::Storage *mixed [[buffer(SEISMIC_BUFFER_SCRATCH_MIXED)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint item [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    recurrent::gate_row(mixed, projection, recurrent_norm, gated, item / RCH_VALUE_HEADS, item % RCH_VALUE_HEADS,
+        lane, seismic_words);
 }

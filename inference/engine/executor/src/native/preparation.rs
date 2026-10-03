@@ -16,12 +16,14 @@ use super::tuning::{
         ShapeRowsTuning,
     },
     recurrent::{
-        RecurrentChunkTuning, RecurrentOutputTuning, RecurrentProjectTuning, RecurrentShape,
-        RecurrentState, RecurrentStepTuning,
+        RecurrentChunkTuning, RecurrentOutputTuning, RecurrentProjectConvolvedTuning,
+        RecurrentProjectTuning, RecurrentShape, RecurrentState, RecurrentStepConvolvedTuning,
+        RecurrentStepTuning,
     },
     routed::{
-        RoutedCombineTuning, RoutedExpandTuning, RoutedExpertsTuning, RoutedGroupTuning,
-        RoutedOutputTuning, RoutedRouteTuning, RoutedShape,
+        RoutedChoicesTuning, RoutedCombineTuning, RoutedExpandTuning, RoutedExpertsTuning,
+        RoutedGroupTuning, RoutedOutputTuning, RoutedRouteSharedTuning, RoutedRouteTuning,
+        RoutedShape,
     },
     short_conv::{ShortConvOutputTuning, ShortConvProjectTuning},
     state_space::{
@@ -31,6 +33,8 @@ use super::tuning::{
     TunedEntry, Tuner, TuningContext, TuningLimits, TuningWeights,
 };
 use super::*;
+use crate::operators::gated_delta::graph::StepForm;
+use crate::operators::routed::fused_graph::DecodeForm;
 use crate::{
     DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ShortConvBinding, StateSpaceBinding,
     SublayerTail,
@@ -896,37 +900,56 @@ impl<'a> Preparation<'a> {
             scopes,
         };
         let state = || RecurrentState {
+            recurrent_norm: b.recurrent_norm,
             activation: b.activation,
             shape: shape.clone(),
             epsilon: self.epsilon,
         };
-        let step = self
-            .spec
-            .tuned(&mut self.tuner, &RecurrentStepTuning(state()))?;
+        let form = StepForm::of(self.device.backend()).map_err(|outcome| {
+            CatalogFailure::Preparation {
+                entry: "gated_delta_step_convolved",
+                bindings: format!("{b:?}"),
+                outcome,
+            }
+        })?;
+        let project_tuning = || RecurrentProjectTuning {
+            norm: b.norm,
+            qkv: b.qkv,
+            gate: b.gate,
+            alpha: b.alpha,
+            beta: b.beta,
+            activation: b.activation,
+            shape: shape.clone(),
+            epsilon: self.epsilon,
+        };
+        let step = match form {
+            StepForm::Step => self
+                .spec
+                .tuned(&mut self.tuner, &RecurrentStepTuning(state()))?
+                .map(RecurrentStepKernels::Step),
+            StepForm::Convolved => {
+                let project = self.spec.tuned(
+                    &mut self.tuner,
+                    &RecurrentProjectConvolvedTuning(project_tuning()),
+                )?;
+                let step = self
+                    .spec
+                    .tuned(&mut self.tuner, &RecurrentStepConvolvedTuning(state()))?;
+                project
+                    .zip(step)
+                    .map(|(project, step)| RecurrentStepKernels::Convolved { project, step })
+            }
+        };
         let chunk = self
             .spec
             .tuned(&mut self.tuner, &RecurrentChunkTuning(state()))?;
-        let project = self.spec.tuned(
-            &mut self.tuner,
-            &RecurrentProjectTuning {
-                norm: b.norm,
-                qkv: b.qkv,
-                gate: b.gate,
-                alpha: b.alpha,
-                beta: b.beta,
-                activation: b.activation,
-                shape: shape.clone(),
-                epsilon: self.epsilon,
-            },
-        )?;
+        let project = self.spec.tuned(&mut self.tuner, &project_tuning())?;
         let output = self.spec.tuned(
             &mut self.tuner,
             &RecurrentOutputTuning {
-                recurrent_norm: b.recurrent_norm,
                 output: b.output,
                 activation: b.activation,
                 shape,
-                epsilon: self.epsilon,
             },
         )?;
         Ok(match (project, step, chunk, output) {
@@ -1406,17 +1429,23 @@ impl<'a> Preparation<'a> {
             features: b.features,
             shared: b.shared,
         };
-        let route = self.spec.tuned(
-            &mut self.tuner,
-            &RoutedRouteTuning {
-                norm: b.norm,
-                router: b.router,
-                activation: b.activation,
-                shape,
-                scopes: scopes.clone(),
-                epsilon: self.epsilon,
-            },
-        )?;
+        let form = DecodeForm::of(self.device.backend()).map_err(|outcome| {
+            CatalogFailure::Preparation {
+                entry: "routed_route_shared",
+                bindings: format!("{b:?}"),
+                outcome,
+            }
+        })?;
+        let route_tuning = RoutedRouteTuning {
+            norm: b.norm,
+            router: b.router,
+            activation: b.activation,
+            shape,
+            scopes: scopes.clone(),
+            epsilon: self.epsilon,
+            decode: form == DecodeForm::Expand,
+        };
+        let route = self.spec.tuned(&mut self.tuner, &route_tuning)?;
         let group = self.spec.tuned(
             &mut self.tuner,
             &RoutedGroupTuning {
@@ -1424,18 +1453,46 @@ impl<'a> Preparation<'a> {
                 layers: scopes.len(),
             },
         )?;
-        let expand = self.spec.tuned(
-            &mut self.tuner,
-            &RoutedExpandTuning {
-                expert_gate: b.expert_gate,
-                expert_up: b.expert_up,
-                shared_gate: b.shared_gate,
-                shared_up: b.shared_up,
-                activation: b.activation,
-                shape,
-                scopes: scopes.clone(),
-            },
-        )?;
+        let decode = match form {
+            DecodeForm::Expand => self
+                .spec
+                .tuned(
+                    &mut self.tuner,
+                    &RoutedExpandTuning {
+                        expert_gate: b.expert_gate,
+                        expert_up: b.expert_up,
+                        shared_gate: b.shared_gate,
+                        shared_up: b.shared_up,
+                        activation: b.activation,
+                        shape,
+                        scopes: scopes.clone(),
+                    },
+                )?
+                .map(RoutedDecodeKernels::Expand),
+            DecodeForm::SharedRoute => {
+                let route = self.spec.tuned(
+                    &mut self.tuner,
+                    &RoutedRouteSharedTuning {
+                        route: route_tuning,
+                        shared_gate: b.shared_gate,
+                        shared_up: b.shared_up,
+                    },
+                )?;
+                let choices = self.spec.tuned(
+                    &mut self.tuner,
+                    &RoutedChoicesTuning {
+                        expert_gate: b.expert_gate,
+                        expert_up: b.expert_up,
+                        activation: b.activation,
+                        shape,
+                        scopes: scopes.clone(),
+                    },
+                )?;
+                route
+                    .zip(choices)
+                    .map(|(route, choices)| RoutedDecodeKernels::SharedRoute { route, choices })
+            }
+        };
         let output = self.spec.tuned(
             &mut self.tuner,
             &RoutedOutputTuning {
@@ -1468,17 +1525,17 @@ impl<'a> Preparation<'a> {
                 scopes,
             },
         )?;
-        Ok(match (route, expand, output, group, experts, combine) {
+        Ok(match (route, decode, output, group, experts, combine) {
             (
                 Some(route),
-                Some(expand),
+                Some(decode),
                 Some(output),
                 Some(group),
                 Some(experts),
                 Some(combine),
             ) => Some(RoutedKernels {
                 route,
-                expand,
+                decode,
                 output,
                 group,
                 experts,

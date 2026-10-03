@@ -802,6 +802,10 @@ pub enum NativeCondition {
 pub struct NativeScratch {
     pub name: String,
     pub bytes: NativeNatExpr,
+    /// Arrival counters, placed apart from every other buffer: zero when a
+    /// launch starts, restored to zero by the call's kernels before it ends
+    /// (so one zeroed region serves every call and graph that uses it).
+    pub sync: bool,
     /// The buffer is sized by `bytes` only when this holds; otherwise it
     /// keeps its ABI slot at the minimum charge and `bytes` is not
     /// evaluated. `None` is always active.
@@ -1658,6 +1662,7 @@ mod native_tests {
         let scratch = NativeScratch {
             name: "groups".into(),
             bytes: NativeNatExpr::Mul(Box::new(rows()), Box::new(NativeNatExpr::Constant(4))),
+            sync: false,
             when: Some(NativeCondition::And(
                 Box::new(NativeCondition::Compare {
                     comparison: NativeComparison::Gt,
@@ -1684,6 +1689,7 @@ mod native_tests {
                 Box::new(rows()),
                 Box::new(NativeNatExpr::Constant(u64::MAX)),
             ),
+            sync: false,
             when: None,
         };
         assert_eq!(

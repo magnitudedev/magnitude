@@ -1280,9 +1280,12 @@ fn checked_block_graph_draft(
         0,
         "M",
     )?;
-    let checked_mixer = block::CheckedMixerEntries::new(slot.mixer());
+    let checked_mixer = block::CheckedMixerEntries::new(slot.mixer(), graph.backend())?;
     let mixer = checked_mixer.entries()?;
-    let checked_feed_forward = slot.feed_forward().map(block::CheckedFeedForwardEntries::new);
+    let checked_feed_forward = slot
+        .feed_forward()
+        .map(|slot| block::CheckedFeedForwardEntries::new(slot, graph.backend()))
+        .transpose()?;
     let feed_forward = checked_feed_forward.as_ref().map(|checked| checked.entries());
     let checked_per_layer = block::checked_per_layer(slot.per_layer())?;
     let per_layer = checked_per_layer

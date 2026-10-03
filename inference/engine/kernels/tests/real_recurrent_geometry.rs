@@ -1,9 +1,7 @@
 //! One actual Qwen3.5-4B block-zero recurrent path, independent CPU GGUF fixture.
 //! Run only with MAGNITUDE_REAL_RECURRENT_FIXTURE set to its generated directory.
 
-use magnitude_kernels::{
-    gated_delta_output, gated_delta_project, gated_delta_step, repack_weight,
-};
+use magnitude_kernels::{attention_output, gated_delta_project, gated_delta_step, repack_weight};
 use seismic::{BackendName, Device, DeviceCatalog, Element, SlabRegion, SlabTensor, Tensor};
 use std::{fs, path::Path};
 
@@ -124,7 +122,6 @@ fn report(path: &Path, label: &str, actual: Vec<f32>) {
             // rounding boundary; the oracle bounds that effect at each stage.
             let (max_limit, rms_limit) = match label {
                 "projection" => (0.0625, 0.0010),
-                "mixed" => (0.00025, 0.000005),
                 "delta" => (0.003, 0.00001),
                 "output" => (0.001, 0.00015),
                 _ => panic!("unexpected recurrent stage {label}"),
@@ -248,9 +245,10 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
     .value;
     report(path, "projection", read_bf16(&projection));
 
-    let mixed = gated_delta_step::native_for_device_with(
+    // The step publishes the gated rows; its raw outputs are internal.
+    let gated = gated_delta_step::native_for_device_with(
         &device,
-        gated_delta_step::Elements { A: bf16 },
+        gated_delta_step::Elements { RN: f32e, A: bf16 },
         &step_specialization(device),
     )
     .unwrap()
@@ -259,6 +257,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         convolution: &convolution,
         rate: &rate,
         time_bias: &time_bias,
+        recurrent_norm: &recurrent_norm,
         segments: &segments,
         stop: &indices(&[1], &[1]),
         previous_bank: &indices(&[1], &[0]),
@@ -268,30 +267,23 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         delta: &mut delta,
         tape: &mut tape,
         norm_epsilon: 128e-6,
+        epsilon: 1e-6,
         grouped: false,
         slab_banks: 2,
     })
     .unwrap()
     .value;
-    report(path, "mixed", read_bf16(&mixed));
     report(path, "delta", read_f32(&delta.slice_leading(1, 2).unwrap()));
-    let projected = gated_delta_output::native_for_device_with(
+    let projected = attention_output::native_for_device_with(
         &device,
-        gated_delta_output::Elements {
-            RN: f32e,
-            OW: q5,
-            A: bf16,
-        },
+        attention_output::Elements { OW: q5, A: bf16 },
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
-    .call(gated_delta_output::Args {
+    .call(attention_output::Args {
         hidden: &hidden,
-        mixed: &mixed,
-        projection: &projection,
-        recurrent_norm: &recurrent_norm,
+        gated: &gated,
         output_weight: &output,
-        epsilon: 1e-6,
     })
     .unwrap()
     .value;

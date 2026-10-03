@@ -125,7 +125,11 @@ fn decode_starts(
                     let (tokens, target_parts, keys, simds, span) = if packed_g8 {
                         (4, history_parts.max(32).next_power_of_two(), 16, 4, 32)
                     } else if wide_group {
-                        (1, history_parts.max(32), 8, 2, 128)
+                        // One row: about 256 KiB of encoded history per
+                        // partition. Fewer, larger partitions leave cores idle
+                        // on the wider Apple GPUs (M4 Max Qwen35B 65k: P64
+                        // 330 us, P128 235 us).
+                        (1, history_parts.saturating_mul(2).max(32), 8, 2, 128)
                     } else {
                         (4, history_parts, 8, 4, 128)
                     };

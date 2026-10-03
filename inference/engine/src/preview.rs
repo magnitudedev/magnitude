@@ -84,9 +84,10 @@ impl ExecutionManifest {
             backend,
         )
         .map_err(|error| PreviewError::from(classify_graph(error)))?;
-        let bounds = AssessmentHeaderBounds::derive(definition, draft.load(), policy.codec())
-            .and_then(|header| header.with_graph_resource_bound(&graph))
-            .map_err(internal)?;
+        let bounds =
+            AssessmentHeaderBounds::derive(definition, draft.load(), policy.codec(), backend)
+                .and_then(|header| header.with_graph_resource_bound(&graph))
+                .map_err(internal)?;
         let initial_state = state
             .target_state()
             .initial_committed_bytes()

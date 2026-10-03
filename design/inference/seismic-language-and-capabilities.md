@@ -253,6 +253,10 @@ An inactive launch is neither encoded nor checked against pipeline or device lim
 evaluated, and it keeps its ordinal (formed functions and trace entries stay in declaration order;
 a trace records it as an empty launch). An inactive scratch buffer keeps its ABI slot at the minimum
 charge without evaluating its size. A call whose launches are all inactive is legal and does nothing.
+A scratch buffer declared `sync` (`scratch S bytes (E) sync`) holds arrival counters: it is zero
+whenever one of the call's launches starts, and the call's kernels restore every counter they use
+to zero before the call ends. Kernels use it for "the last threadgroup to arrive finishes the
+work", in which no threadgroup waits for another, so it needs no co-residency.
 
 ## Backend capabilities
 

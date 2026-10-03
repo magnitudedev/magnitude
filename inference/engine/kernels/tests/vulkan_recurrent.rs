@@ -1,9 +1,10 @@
 //! The Vulkan `gated_delta_step` / `gated_delta_chunk` against the same
 //! cases, portable-body oracle and host model as the Metal tests (included
 //! verbatim; their Metal tests skip without a Metal device). The step and the
-//! chunk's row-sequential slots (at most 16 rows, zero stop) share their bits;
-//! the chunk's scanned rows are held to the oracle and host model, and no
-//! mapping changes their bits.
+//! chunk's row-sequential slots (at most 16 rows, zero stop) share their state
+//! bits, and their gated bits beyond 8 rows (to 8 rows the step gates in the
+//! GEMV staging's lane order); the chunk's scanned rows are held to the oracle
+//! and host model, and no mapping changes their bits.
 
 include!("recurrent_stages.rs");
 
@@ -60,10 +61,13 @@ impl Case {
     ) -> Outcome {
         let specialization = self.specialization(device, rows).with_param("WARPS", warps);
         let mut t = self.tensors_with_reused_slab(device, activation, reused);
-        let mixed = if chunk {
+        let gated = if chunk {
             gated_delta_chunk::native_for_device_with(
                 device,
-                gated_delta_chunk::Elements { A: activation },
+                gated_delta_chunk::Elements {
+                    RN: Element::f32(),
+                    A: activation,
+                },
                 &specialization,
             )
             .unwrap()
@@ -73,7 +77,10 @@ impl Case {
         } else {
             gated_delta_step::native_for_device_with(
                 device,
-                gated_delta_step::Elements { A: activation },
+                gated_delta_step::Elements {
+                    RN: Element::f32(),
+                    A: activation,
+                },
                 &specialization,
             )
             .unwrap()
@@ -82,7 +89,7 @@ impl Case {
             .value
         };
         Outcome {
-            mixed: read(&mixed),
+            gated: read(&gated),
             window: read(&t.window),
             delta: read(&t.delta),
             tape: read(&t.tape),
@@ -97,9 +104,15 @@ impl Case {
     }
 }
 
-fn same_bits(a: &Outcome, b: &Outcome) -> bool {
+/// Whether `a` and `b` carry the same state and window bits and, with
+/// `gated`, the same gated bits. The step gates a class of at most 8 rows in
+/// the GEMV staging's lane order, the chunk in its stage order, so their
+/// gated bits are compared only beyond 8 rows.
+fn same_bits(a: &Outcome, b: &Outcome, gated: bool) -> bool {
     let equal = |x: &[f32], y: &[f32]| x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits());
-    equal(&a.mixed, &b.mixed) && equal(&a.delta, &b.delta) && equal(&a.window, &b.window)
+    (!gated || equal(&a.gated, &b.gated))
+        && equal(&a.delta, &b.delta)
+        && equal(&a.window, &b.window)
 }
 
 #[test]
@@ -133,14 +146,14 @@ fn vulkan_step_and_chunk_match_the_portable_body() {
             );
             if case.sequential_in_chunk() {
                 assert!(
-                    same_bits(&step, &chunk),
+                    same_bits(&step, &chunk, case.rows > 8),
                     "{label}: vulkan chunk {mapping:?} differs from the step"
                 );
             }
             match &reference {
                 Some(reference) => {
                     assert!(
-                        same_bits(reference, &chunk),
+                        same_bits(reference, &chunk, true),
                         "{label}: vulkan chunk {mapping:?} changed result bits"
                     )
                 }
@@ -168,7 +181,7 @@ fn vulkan_mapping_never_changes_bits_and_stop_equals_a_shorter_run() {
         for chunk in [false, true] {
             let outcome = full.vulkan(&device, Element::f32(), chunk, mapping);
             assert!(
-                same_bits(&reference, &outcome),
+                same_bits(&reference, &outcome, !chunk),
                 "{} {mapping:?} changed result bits",
                 if chunk { "chunk" } else { "step" }
             );
@@ -238,7 +251,7 @@ fn vulkan_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
             let chunk = case.vulkan(&device, Element::bf16(), true, mapping);
             if case.sequential_in_chunk() {
                 assert!(
-                    same_bits(&step, &chunk),
+                    same_bits(&step, &chunk, case.rows > 8),
                     "4B {label}: vulkan chunk {mapping:?} differs from the step"
                 );
                 continue;
@@ -250,15 +263,32 @@ fn vulkan_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
                 &host,
                 (1.5e-2, 3e-3),
             );
-            let (max, rms) = errors(&chunk.mixed, &step.mixed);
+            let (max, rms) = errors(&chunk.gated, &step.gated);
             println!("4B {label}: vulkan chunk {mapping:?} vs step: max {max:.3e} rms {rms:.3e}");
-            // Both are within one BF16 ulp of the host model per element, so
-            // they may differ by two ulps of the largest output.
-            assert!(max <= 4e-2 && rms <= 3e-3);
+            // Both are within two BF16 ulps of the host model per element plus
+            // their relative bounds, so they differ by at most four ulps of
+            // the host value plus both bounds.
+            let scale = (host.gated.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
+                / host.gated.len() as f64)
+                .sqrt();
+            for (index, ((c, s), e)) in chunk
+                .gated
+                .iter()
+                .zip(&step.gated)
+                .zip(&host.gated)
+                .enumerate()
+            {
+                let allowed = (*e as f64).abs() * 2f64.powi(-5) + 2.0 * 1.5e-2 * scale;
+                assert!(
+                    (*c as f64 - *s as f64).abs() <= allowed,
+                    "4B {label}: vulkan chunk {mapping:?} gated[{index}] {c} vs step {s}"
+                );
+            }
+            assert!(rms <= 3e-3);
             match &reference {
                 Some(reference) => {
                     assert!(
-                        same_bits(reference, &chunk),
+                        same_bits(reference, &chunk, true),
                         "4B {label}: vulkan chunk {mapping:?} changed result bits"
                     )
                 }
@@ -304,9 +334,9 @@ fn vulkan_chunk_short_slots_get_the_step_bits() {
             let bank =
                 s.following * geometry.delta_bank()..(s.following + 1) * geometry.delta_bank();
             assert!(
-                step.mixed[range.clone()]
+                step.gated[range.clone()]
                     .iter()
-                    .zip(&chunk.mixed[range])
+                    .zip(&chunk.gated[range])
                     .all(|(a, b)| a.to_bits() == b.to_bits())
                     && step.delta[bank.clone()]
                         .iter()

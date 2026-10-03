@@ -1,8 +1,9 @@
 // Shared device code of the CUDA gated-delta entries (`gated_delta_step`,
 // `gated_delta_chunk`; contracts in recurrent.seismic): slot and
 // bank lookup, tensor addressing, the per-head gates, piece splitting, the
-// state-arena window publication, and the row-sequential advance both entries
-// run for slots of at most SEQUENTIAL_ROWS rows.
+// state-arena window publication, the row-sequential advance both entries
+// run for slots of at most SEQUENTIAL_ROWS rows, and the gating of the raw
+// outputs into the entries' result.
 // Activation tensors are canonical in their last axis.
 
 #include "../core/activation.cuh"
@@ -106,6 +107,12 @@ __device__ __forceinline__ int covered_end(const Inputs &in) {
     const u64 slots = SEISMIC_DIM_B;
     return slots == 0 ? 0 : in.segments[(slots - 1) * SEISMIC_SEGMENTS_STRIDE_0 +
                                         SEISMIC_SEGMENTS_STRIDE_1];
+}
+
+// Element (row, value head, state row) of the raw outputs, an [M, NV, W]
+// scratch in A.
+__device__ __forceinline__ u64 raw_index(int row, int head, int state_row) {
+    return (static_cast<u64>(row) * NV + head) * W + state_row;
 }
 
 __device__ __forceinline__ float projection(const Inputs &in, u64 row, u64 column) {
@@ -286,9 +293,10 @@ __device__ __forceinline__ void load_version(const Inputs &in, const Slot &slot,
 // Every thread of the block calls it. The block owns state rows [block_row,
 // block_row + BLOCK_ROWS) of value head `head`; a warp with `owns` holds its
 // ROWS rows from `first_row` in `state` (the state before row `begin`),
-// advances them, writes their mixed outputs, publishes them after the slot's
-// first `stop` rows (before any row when `begin` = lo and stop = 0) and
-// records the rows after the stop row in the successor's tape. Per row the
+// advances them, writes their raw outputs to `mixed` (`raw_index`), publishes
+// them after the slot's first `stop` rows (before any row when `begin` = lo
+// and stop = 0) and records the rows after the stop row in the successor's
+// tape. Per row the
 // block convolves (causal depthwise conv + SiLU) the key head's q and k
 // channels and the block's v channels into a buffer double-buffered by row
 // parity; each warp then L2-normalizes q (scaled by W^-1/2) and k and
@@ -303,11 +311,6 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const Slot &slot,
     constexpr int PREPARED = 2 * W + BLOCK_ROWS;
     const int lane = threadIdx.x % 32;
     const int key_row = key_head(in, head);
-    auto mixed_at = [&](int row, int state_row) {
-        return static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 +
-               static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
-               static_cast<u64>(state_row) * SEISMIC_RESULT_0_STRIDE_2;
-    };
     const int publish = slot.lo + slot.stop;
     const int taped = tape_rows(in, slot);
     // The warp that owns state row 0 records the head's decay, and the key
@@ -385,9 +388,46 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const Slot &slot,
 #pragma unroll
             for (int s = 1; s < ROWS; ++s)
                 if (lane == s) value = output[s];
-            element::put<Act>(mixed, mixed_at(row, first_row + lane), value);
+            element::put<Act>(mixed, raw_index(row, head, first_row + lane), value);
         }
         if (row + 1 == publish) store_rows<ROWS>(in, slot.target, head, first_row, state);
+    }
+}
+
+// The `gate` launch of both entries: block `row` forms the row's gated result
+// from its raw outputs `mixed`. Per value head (one warp each, lanes striding
+// the head's columns, then a warp sum),
+//   gated = round_A(round_A(raw * rsqrt(sum_head raw^2 / W + eps) * norm[i])
+//                   * round_A(silu(z)))
+// with z column CH + head * W + i of the projection row.
+template <class NORM>
+__device__ __forceinline__ void gate_row(const Inputs &in, const u8 *mixed, const u8 *norm, float eps,
+                                         u8 *gated, int row) {
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+    __shared__ float inverses[NV];
+    const int warps = blockDim.x / 32;
+    for (int head = threadIdx.x / 32; head < NV; head += warps) {
+        float total = 0.0f;
+        for (int i = threadIdx.x % 32; i < W; i += 32) {
+            const float v = element::at<Act>(mixed, raw_index(row, head, i));
+            total = __fmaf_rn(v, v, total);
+        }
+        total = seismic_warp_sum_f32(total);
+        const float inverse = rsqrtf(total / static_cast<float>(W) + eps);
+        if (threadIdx.x % 32 == 0) inverses[head] = inverse;
+    }
+    __syncthreads();
+    for (int k = threadIdx.x; k < NV * W; k += blockDim.x) {
+        const int head = k / W, i = k % W;
+        const float v = element::at<Act>(mixed, raw_index(row, head, i));
+        const float normalized = Act::round(v * inverses[head] * element::at<NORM>(norm, i));
+        const float z = projection(in, row, CH + k);
+        const float activated = Act::round(z / (1.0f + expf(-z)));
+        element::put<Act>(gated,
+                          static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 +
+                              static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
+                              static_cast<u64>(i) * SEISMIC_RESULT_0_STRIDE_2,
+                          Act::round(normalized * activated));
     }
 }
 

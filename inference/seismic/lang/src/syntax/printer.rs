@@ -104,6 +104,9 @@ impl Printer {
                     let _ = write!(self.out, "scratch {} bytes (", scratch.name.name);
                     self.expr(&scratch.bytes, 0);
                     self.out.push(')');
+                    if scratch.sync {
+                        self.out.push_str(" sync");
+                    }
                     if let Some(when) = &scratch.when {
                         self.out.push_str(" when ");
                         self.expr(when, 0);

@@ -1,7 +1,9 @@
 //! Tuning cases of the recurrent block: the normed segmented input
-//! projection, the in-place state advance (`gated_delta_step` below
-//! [`CHUNKED_ROWS`] rows, `gated_delta_chunk` from there), and the gated
-//! output projection.
+//! projection, the in-place state advance publishing the gated rows
+//! (`gated_delta_step` below [`CHUNKED_ROWS`] rows, `gated_delta_chunk` from
+//! there), and the plain residual output projection (`attention_output`); on
+//! a backend of the convolved step form, `gated_delta_project_convolved` and
+//! `gated_delta_step_convolved` below [`CHUNKED_ROWS`] rows.
 //!
 //! The state entries write the layer's window and delta arenas in place. Each
 //! argument set owns small arenas of three banks (the zero seed, the bank the
@@ -15,7 +17,8 @@ use super::{
 use crate::operators::gated_delta::graph::CHUNKED_ROWS;
 use magnitude_family_contracts::{Operator, RecurrentHeadMapping, WeightKind, WeightScope};
 use magnitude_kernels::{
-    gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
+    attention_output, gated_delta_chunk, gated_delta_project, gated_delta_project_convolved,
+    gated_delta_step, gated_delta_step_convolved,
 };
 use seismic::{Element, Tensor};
 
@@ -45,15 +48,13 @@ impl RecurrentShape {
     }
 
     /// `H`, `NK`, `NV`, `W`, with the hidden width read from every layer's
-    /// `kind` weight (`[rows, H]` or `[H, columns]` per `hidden_axis`).
+    /// qkv weight (`[rows, H]`).
     fn projection_statics(
         &self,
         inputs: &TuningInputs<'_, '_>,
-        kind: WeightKind,
-        hidden_axis: usize,
     ) -> Result<Vec<(&'static str, u64)>, String> {
-        let (rows, columns) = projection_shape(inputs, &self.scopes, kind)?;
-        let hidden = if hidden_axis == 0 { rows } else { columns };
+        let (_, hidden) =
+            projection_shape(inputs, &self.scopes, WeightKind::RecurrentQueryKeyValue)?;
         Ok(vec![
             ("H", hidden),
             ("NK", self.key_heads),
@@ -128,8 +129,7 @@ impl EntryTuning for RecurrentProjectTuning {
     }
 
     fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
-        self.shape
-            .projection_statics(inputs, WeightKind::RecurrentQueryKeyValue, 1)
+        self.shape.projection_statics(inputs)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -179,29 +179,23 @@ impl EntryTuning for RecurrentProjectTuning {
     generated_entry!(gated_delta_project, this => this.elements());
 }
 
-/// `gated_delta_output`: gated per-head RMS · SiLU(z) prologue, output
-/// projection, residual.
+/// The recurrent output projection: `attention_output` over the gated rows
+/// [M, NV, W] the state entries publish, plus the residual.
 pub(crate) struct RecurrentOutputTuning {
-    pub recurrent_norm: Element,
     pub output: Element,
     pub activation: Element,
     pub shape: RecurrentShape,
-    pub epsilon: f32,
 }
 
 pub(crate) struct RecurrentOutputCase {
     hidden: Tensor,
-    mixed: Tensor,
-    projection: Tensor,
-    recurrent_norm: Tensor,
+    gated: Tensor,
     output: Tensor,
-    epsilon: f32,
 }
 
 impl RecurrentOutputTuning {
-    fn elements(&self) -> gated_delta_output::Elements {
-        gated_delta_output::Elements {
-            RN: self.recurrent_norm,
+    fn elements(&self) -> attention_output::Elements {
+        attention_output::Elements {
             OW: self.output,
             A: self.activation,
         }
@@ -209,7 +203,7 @@ impl RecurrentOutputTuning {
 }
 
 impl EntryTuning for RecurrentOutputTuning {
-    type Entry = gated_delta_output::Entry;
+    type Entry = attention_output::Entry;
     type Case = RecurrentOutputCase;
 
     fn launches(&self) -> usize {
@@ -217,17 +211,20 @@ impl EntryTuning for RecurrentOutputTuning {
     }
 
     fn bindings(&self) -> String {
-        format!(
-            "RN={},OW={},A={}",
-            self.recurrent_norm.name(),
-            self.output.name(),
-            self.activation.name()
-        )
+        format!("OW={},A={}", self.output.name(), self.activation.name())
     }
 
     fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
-        self.shape
-            .projection_statics(inputs, WeightKind::RecurrentOutput, 0)
+        let (hidden, columns) =
+            projection_shape(inputs, &self.shape.scopes, WeightKind::RecurrentOutput)?;
+        if columns != self.shape.value_heads * self.shape.width {
+            return Err("the recurrent output projection disagrees with the binding".into());
+        }
+        Ok(vec![
+            ("D", hidden),
+            ("Q", self.shape.value_heads),
+            ("W", self.shape.width),
+        ])
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -245,44 +242,36 @@ impl EntryTuning for RecurrentOutputTuning {
             .map(|(index, scope)| {
                 let output = inputs.weight(scope, WeightKind::RecurrentOutput)?;
                 let hidden = output.extents()[0];
-                let seed = 3 * index as u64;
+                let seed = 2 * index as u64;
                 Ok(RecurrentOutputCase {
                     hidden: inputs.activation(Element::f32(), &[point.rows, hidden], seed + 1)?,
-                    mixed: inputs.activation(
+                    gated: inputs.activation(
                         self.activation,
                         &[point.rows, self.shape.value_heads, self.shape.width],
                         seed + 2,
                     )?,
-                    projection: inputs.activation(
-                        self.activation,
-                        &[point.rows, self.shape.projection_width()],
-                        seed + 3,
-                    )?,
-                    recurrent_norm: inputs.weight(scope, WeightKind::RecurrentNorm)?,
                     output,
-                    epsilon: self.epsilon,
                 })
             })
             .collect()
     }
 
-    fn args<'a>(case: &'a mut Self::Case) -> gated_delta_output::Args<'a> {
-        gated_delta_output::Args {
+    fn args<'a>(case: &'a mut Self::Case) -> attention_output::Args<'a> {
+        attention_output::Args {
             hidden: &case.hidden,
-            mixed: &case.mixed,
-            projection: &case.projection,
-            recurrent_norm: &case.recurrent_norm,
+            gated: &case.gated,
             output_weight: &case.output,
-            epsilon: case.epsilon,
         }
     }
 
-    generated_entry!(gated_delta_output, this => this.elements());
+    generated_entry!(attention_output, this => this.elements());
 }
 
 /// What both state entries tune over: the gated delta advance of one
-/// request's rows from the bank it reads to the bank it publishes.
+/// request's rows from the bank it reads to the bank it publishes, and the
+/// gating of its outputs.
 pub(crate) struct RecurrentState {
+    pub recurrent_norm: Element,
     pub activation: Element,
     pub shape: RecurrentShape,
     pub epsilon: f32,
@@ -295,22 +284,101 @@ pub(crate) struct RecurrentStepTuning(pub RecurrentState);
 /// `gated_delta_chunk`, for row classes of [`CHUNKED_ROWS`] and more.
 pub(crate) struct RecurrentChunkTuning(pub RecurrentState);
 
+/// One request slot's tables for a case of `rows` rows: it reads bank 1 with
+/// no tape rows and publishes to the case's published bank after every row.
+pub(crate) struct SlotTables {
+    segments: Tensor,
+    stop: Tensor,
+    previous_bank: Tensor,
+    previous_tape: Tensor,
+    following_bank: Tensor,
+}
+
+impl SlotTables {
+    fn new(inputs: &mut TuningInputs<'_, '_>, rows: u64) -> Result<Self, String> {
+        let tables = inputs.batch(rows, 0, 1, 0)?;
+        let slots = tables.actual_slots;
+        let segments = tables.segments[..=slots]
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let stop = tables.segments[..slots]
+            .iter()
+            .map(|[start, end]| end - start)
+            .collect::<Vec<_>>();
+        let banks = slots as u64;
+        Ok(Self {
+            segments: inputs.i32s(&[banks + 1, 2], &segments)?,
+            stop: inputs.i32s(&[banks], &stop)?,
+            previous_bank: inputs.i32s(&[banks], &tables.bank[..slots])?,
+            previous_tape: inputs.i32s(&[banks], &vec![0; slots])?,
+            following_bank: inputs.i32s(&[banks], &tables.following_bank[..slots])?,
+        })
+    }
+}
+
+/// A tuning arena's window banks of pseudo-random activations.
+fn window_state(
+    inputs: &mut TuningInputs<'_, '_>,
+    shape: &RecurrentShape,
+    activation: Element,
+    seed: u64,
+) -> Result<CaseState, String> {
+    let window = inputs.activation(
+        activation,
+        &[
+            TUNING_BANKS,
+            shape.convolution_width - 1 + TUNING_TAPE_ROWS,
+            shape.channels(),
+        ],
+        seed,
+    )?;
+    inputs.slab_state(window, TUNING_BANKS, PUBLISHED_BANK..PUBLISHED_BANK + 1)
+}
+
+/// A tuning arena's delta and tape banks of pseudo-random state (seeds
+/// `seed + 3` and `seed + 4`).
+fn delta_tape_states(
+    inputs: &mut TuningInputs<'_, '_>,
+    shape: &RecurrentShape,
+    seed: u64,
+) -> Result<(CaseState, CaseState), String> {
+    let delta = inputs.activation(
+        Element::f32(),
+        &[TUNING_BANKS, shape.value_heads, shape.width, shape.width],
+        seed + 3,
+    )?;
+    let tape = inputs.activation(
+        Element::f32(),
+        &[
+            TUNING_BANKS,
+            TUNING_TAPE_ROWS,
+            (shape.value_heads + shape.key_heads) * shape.width + shape.value_heads,
+        ],
+        seed + 4,
+    )?;
+    let published = PUBLISHED_BANK..PUBLISHED_BANK + 1;
+    Ok((
+        inputs.slab_state(delta, TUNING_BANKS, published.clone())?,
+        inputs.slab_state(tape, TUNING_BANKS, published)?,
+    ))
+}
+
 /// One argument set of either state entry; they share one contract.
 pub(crate) struct RecurrentStateCase {
     projection: Tensor,
     convolution: Tensor,
     rate: Tensor,
     time_bias: Tensor,
-    segments: Tensor,
-    stop: Tensor,
-    previous_bank: Tensor,
-    previous_tape: Tensor,
-    following_bank: Tensor,
+    recurrent_norm: Tensor,
+    tables: SlotTables,
     window: CaseState,
     delta: CaseState,
     tape: CaseState,
     slab_banks: u32,
     norm_epsilon: f32,
+    epsilon: f32,
     grouped: bool,
 }
 
@@ -321,7 +389,11 @@ const TUNING_TAPE_ROWS: u64 = 1;
 
 impl RecurrentState {
     fn bindings(&self) -> String {
-        format!("A={}", self.activation.name())
+        format!(
+            "RN={},A={}",
+            self.recurrent_norm.name(),
+            self.activation.name()
+        )
     }
 
     fn rotation(
@@ -356,42 +428,9 @@ impl RecurrentState {
         grouped: bool,
     ) -> Result<RecurrentStateCase, String> {
         let shape = &self.shape;
-        let tables = inputs.batch(rows, 0, 1, 0)?;
-        let slots = tables.actual_slots;
-        let segments = tables.segments[..=slots]
-            .iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-        let stop = tables.segments[..slots]
-            .iter()
-            .map(|[start, end]| end - start)
-            .collect::<Vec<_>>();
-        let banks = slots as u64;
-        let window = inputs.activation(
-            self.activation,
-            &[
-                TUNING_BANKS,
-                shape.convolution_width - 1 + TUNING_TAPE_ROWS,
-                shape.channels(),
-            ],
-            seed + 2,
-        )?;
-        let delta = inputs.activation(
-            Element::f32(),
-            &[TUNING_BANKS, shape.value_heads, shape.width, shape.width],
-            seed + 3,
-        )?;
-        let tape = inputs.activation(
-            Element::f32(),
-            &[
-                TUNING_BANKS,
-                TUNING_TAPE_ROWS,
-                (shape.value_heads + shape.key_heads) * shape.width + shape.value_heads,
-            ],
-            seed + 4,
-        )?;
-        let published = PUBLISHED_BANK..PUBLISHED_BANK + 1;
+        let tables = SlotTables::new(inputs, rows)?;
+        let window = window_state(inputs, shape, self.activation, seed + 2)?;
+        let (delta, tape) = delta_tape_states(inputs, shape, seed)?;
         Ok(RecurrentStateCase {
             projection: inputs.activation(
                 self.activation,
@@ -401,16 +440,14 @@ impl RecurrentState {
             convolution: inputs.weight(scope, WeightKind::RecurrentConvolution)?,
             rate: inputs.weight(scope, WeightKind::RecurrentDecay)?,
             time_bias: inputs.weight(scope, WeightKind::RecurrentTimeBias)?,
-            segments: inputs.i32s(&[banks + 1, 2], &segments)?,
-            stop: inputs.i32s(&[banks], &stop)?,
-            previous_bank: inputs.i32s(&[banks], &tables.bank[..slots])?,
-            previous_tape: inputs.i32s(&[banks], &vec![0; slots])?,
-            following_bank: inputs.i32s(&[banks], &tables.following_bank[..slots])?,
-            window: inputs.slab_state(window, TUNING_BANKS, published.clone())?,
-            delta: inputs.slab_state(delta, TUNING_BANKS, published.clone())?,
-            tape: inputs.slab_state(tape, TUNING_BANKS, published)?,
+            recurrent_norm: inputs.weight(scope, WeightKind::RecurrentNorm)?,
+            tables,
+            window,
+            delta,
+            tape,
             slab_banks: TUNING_BANKS as u32,
             norm_epsilon: self.epsilon * shape.width as f32,
+            epsilon: self.epsilon,
             grouped,
         })
     }
@@ -457,16 +494,18 @@ macro_rules! state_entry {
                     convolution: &case.convolution,
                     rate: &case.rate,
                     time_bias: &case.time_bias,
-                    segments: &case.segments,
-                    stop: &case.stop,
-                    previous_bank: &case.previous_bank,
-                    previous_tape: &case.previous_tape,
-                    following_bank: &case.following_bank,
+                    recurrent_norm: &case.recurrent_norm,
+                    segments: &case.tables.segments,
+                    stop: &case.tables.stop,
+                    previous_bank: &case.tables.previous_bank,
+                    previous_tape: &case.tables.previous_tape,
+                    following_bank: &case.tables.following_bank,
                     window: case.window.tensor_mut(),
                     delta: case.delta.tensor_mut(),
                     tape: case.tape.tensor_mut(),
                     slab_banks: case.slab_banks,
                     norm_epsilon: case.norm_epsilon,
+                    epsilon: case.epsilon,
                     grouped: case.grouped,
                 }
             }
@@ -479,7 +518,10 @@ macro_rules! state_entry {
                 ]
             }
 
-            generated_entry!($module, this => $module::Elements { A: this.0.activation });
+            generated_entry!($module, this => $module::Elements {
+                RN: this.0.recurrent_norm,
+                A: this.0.activation,
+            });
         }
     };
 }
@@ -488,3 +530,211 @@ state_entry!(RecurrentStepTuning, gated_delta_step, |rows| rows
     < CHUNKED_ROWS);
 state_entry!(RecurrentChunkTuning, gated_delta_chunk, |rows| rows
     >= CHUNKED_ROWS);
+
+/// `gated_delta_project_convolved`, the convolved step form's projection,
+/// for row classes below [`CHUNKED_ROWS`]: `gated_delta_project`'s
+/// parameters, and the windows its launch publishes.
+pub(crate) struct RecurrentProjectConvolvedTuning(pub RecurrentProjectTuning);
+
+pub(crate) struct RecurrentProjectConvolvedCase {
+    project: RecurrentProjectCase,
+    convolution: Tensor,
+    tables: SlotTables,
+    window: CaseState,
+    slab_banks: u32,
+}
+
+impl EntryTuning for RecurrentProjectConvolvedTuning {
+    type Entry = gated_delta_project_convolved::Entry;
+    type Case = RecurrentProjectConvolvedCase;
+
+    fn launches(&self) -> usize {
+        self.0.shape.scopes.len()
+    }
+
+    fn bindings(&self) -> String {
+        self.0.bindings()
+    }
+
+    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let mut statics = self.0.shape.projection_statics(inputs)?;
+        statics.push(("C", self.0.shape.convolution_width));
+        Ok(statics)
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        served_row_points(limits.max_rows, |rows| rows < CHUNKED_ROWS)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, String> {
+        let shape = &self.0.shape;
+        let projections = self.0.rotation(inputs, point)?;
+        TuningInputs::rotation_scopes(&shape.scopes, point)
+            .into_iter()
+            .zip(projections)
+            .enumerate()
+            .map(|(index, (scope, project))| {
+                Ok(RecurrentProjectConvolvedCase {
+                    project,
+                    convolution: inputs.weight(scope, WeightKind::RecurrentConvolution)?,
+                    tables: SlotTables::new(inputs, point.rows)?,
+                    window: window_state(inputs, shape, self.0.activation, 4 * index as u64 + 2)?,
+                    slab_banks: TUNING_BANKS as u32,
+                })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> gated_delta_project_convolved::Args<'a> {
+        gated_delta_project_convolved::Args {
+            hidden: &case.project.hidden,
+            input_norm: &case.project.norm,
+            qkv_weight: &case.project.qkv,
+            gate_weight: &case.project.gate,
+            alpha_weight: &case.project.alpha,
+            beta_weight: &case.project.beta,
+            convolution: &case.convolution,
+            segments: &case.tables.segments,
+            stop: &case.tables.stop,
+            previous_bank: &case.tables.previous_bank,
+            previous_tape: &case.tables.previous_tape,
+            following_bank: &case.tables.following_bank,
+            window: case.window.tensor_mut(),
+            epsilon: case.project.epsilon,
+            slab_banks: case.slab_banks,
+        }
+    }
+
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![("window", &case.window)]
+    }
+
+    generated_entry!(gated_delta_project_convolved, this => gated_delta_project_convolved::Elements {
+        NW: this.0.norm,
+        QW: this.0.qkv,
+        GW: this.0.gate,
+        AW: this.0.alpha,
+        BW: this.0.beta,
+        A: this.0.activation,
+    });
+}
+
+/// `gated_delta_step_convolved`, the convolved step form's state advance,
+/// for row classes below [`CHUNKED_ROWS`]. Its parameters are mappings:
+/// every configuration is bit-exact.
+pub(crate) struct RecurrentStepConvolvedTuning(pub RecurrentState);
+
+pub(crate) struct RecurrentStepConvolvedCase {
+    projection: Tensor,
+    convolved: Tensor,
+    rate: Tensor,
+    time_bias: Tensor,
+    recurrent_norm: Tensor,
+    tables: SlotTables,
+    delta: CaseState,
+    tape: CaseState,
+    slab_banks: u32,
+    norm_epsilon: f32,
+    epsilon: f32,
+    grouped: bool,
+}
+
+impl EntryTuning for RecurrentStepConvolvedTuning {
+    type Entry = gated_delta_step_convolved::Entry;
+    type Case = RecurrentStepConvolvedCase;
+
+    fn launches(&self) -> usize {
+        self.0.shape.scopes.len()
+    }
+
+    fn bindings(&self) -> String {
+        self.0.bindings()
+    }
+
+    fn statics(&self, _inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let shape = &self.0.shape;
+        Ok(vec![
+            ("NK", shape.key_heads),
+            ("NV", shape.value_heads),
+            ("W", shape.width),
+        ])
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        served_row_points(limits.max_rows, |rows| rows < CHUNKED_ROWS)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, String> {
+        let state = &self.0;
+        let shape = &state.shape;
+        let grouped = state.grouped(inputs)?;
+        TuningInputs::rotation_scopes(&shape.scopes, point)
+            .into_iter()
+            .enumerate()
+            .map(|(index, scope)| {
+                let seed = 4 * index as u64;
+                let (delta, tape) = delta_tape_states(inputs, shape, seed)?;
+                Ok(RecurrentStepConvolvedCase {
+                    projection: inputs.activation(
+                        state.activation,
+                        &[point.rows, shape.projection_width()],
+                        seed + 1,
+                    )?,
+                    convolved: inputs.activation(
+                        Element::f32(),
+                        &[point.rows, shape.channels()],
+                        seed + 2,
+                    )?,
+                    rate: inputs.weight(scope, WeightKind::RecurrentDecay)?,
+                    time_bias: inputs.weight(scope, WeightKind::RecurrentTimeBias)?,
+                    recurrent_norm: inputs.weight(scope, WeightKind::RecurrentNorm)?,
+                    tables: SlotTables::new(inputs, point.rows)?,
+                    delta,
+                    tape,
+                    slab_banks: TUNING_BANKS as u32,
+                    norm_epsilon: state.epsilon * shape.width as f32,
+                    epsilon: state.epsilon,
+                    grouped,
+                })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> gated_delta_step_convolved::Args<'a> {
+        gated_delta_step_convolved::Args {
+            projection: &case.projection,
+            convolved: &case.convolved,
+            rate: &case.rate,
+            time_bias: &case.time_bias,
+            recurrent_norm: &case.recurrent_norm,
+            segments: &case.tables.segments,
+            stop: &case.tables.stop,
+            previous_bank: &case.tables.previous_bank,
+            previous_tape: &case.tables.previous_tape,
+            following_bank: &case.tables.following_bank,
+            delta: case.delta.tensor_mut(),
+            tape: case.tape.tensor_mut(),
+            slab_banks: case.slab_banks,
+            norm_epsilon: case.norm_epsilon,
+            epsilon: case.epsilon,
+            grouped: case.grouped,
+        }
+    }
+
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![("delta", &case.delta), ("tape", &case.tape)]
+    }
+
+    generated_entry!(gated_delta_step_convolved, this => gated_delta_step_convolved::Elements {
+        RN: this.0.recurrent_norm,
+        A: this.0.activation,
+    });
+}

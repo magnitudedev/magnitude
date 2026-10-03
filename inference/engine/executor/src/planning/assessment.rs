@@ -305,12 +305,13 @@ impl AssessmentHeaderBounds {
         definition: &ModelDefinition,
         load: &ModelLoadPlan,
         codec: KvCodec,
+        backend: BackendName,
     ) -> Result<Self, String> {
         let programs = load
             .program_plan(definition, codec)
             .map_err(|error| error.to_string())?;
         let prepared_program_bytes =
-            AttestedPrograms::planned_invocation_workspace_bytes(&programs)
+            AttestedPrograms::planned_invocation_workspace_bytes(&programs, backend)
                 .map_err(|error| error.to_string())?;
         let largest_source = load
             .weights()
@@ -1427,11 +1428,14 @@ mod tests {
         )
         .is_err());
 
-        let header = AssessmentHeaderBounds::derive(&definition, &load, KvCodec::Dense).unwrap();
+        let header =
+            AssessmentHeaderBounds::derive(&definition, &load, KvCodec::Dense, BackendName::Cpu)
+                .unwrap();
         assert_eq!(
             header.prepared_program_bytes,
             AttestedPrograms::planned_invocation_workspace_bytes(
-                &load.program_plan(&definition, KvCodec::Dense).unwrap()
+                &load.program_plan(&definition, KvCodec::Dense).unwrap(),
+                BackendName::Cpu
             )
             .unwrap()
         );

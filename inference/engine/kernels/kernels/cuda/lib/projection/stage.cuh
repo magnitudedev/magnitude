@@ -65,48 +65,6 @@ template <class NORM, class Rows> struct Rms {
     }
 };
 
-// Per-head RMS of `mixed` gated by SiLU(z), heads of HEAD columns:
-// x = round_A(round_A(v * rsqrt(sum_head v^2 / HEAD + eps) * w[k % HEAD]) * round_A(silu(z))).
-template <class MIXED, class Z, class NORM, u32 HEAD, u32 HEADS, class Rows> struct GatedRms {
-    const u8 *mixed;
-    u64 mixed_stride;
-    const u8 *z;
-    u64 z_stride;
-    const u8 *norm;
-    float eps;
-    Rows rows;
-    static constexpr bool STAGED = true;
-    static constexpr int FACTORS = HEADS;
-    __device__ __forceinline__ float inverse(u32 m, u32 head) const {
-        const u64 base = rows(m) * mixed_stride + (u64)head * HEAD;
-        float total = 0.0f;
-        for (u32 k = threadIdx.x % 32; k < HEAD; k += 32) {
-            const float v = element::at<MIXED>(mixed, base + k);
-            total = seismic_fma_rn(v, v, total);
-        }
-        total = seismic_warp_sum_f32(total);
-        return rsqrtf(total / (float)HEAD + eps);
-    }
-    __device__ __forceinline__ void prepare_row(float *shared, u32 m, float *) const {
-        const u32 warps = blockDim.x / 32;
-        for (u32 head = threadIdx.x / 32; head < HEADS; head += warps) {
-            const float value = inverse(m, head);
-            if (threadIdx.x % 32 == 0)
-                shared[head] = value;
-        }
-    }
-    // The gated value with the head's inverse RMS `inv`.
-    __device__ __forceinline__ float gated(float inv, u32 m, u64 k) const {
-        const float v = element::at<MIXED>(mixed, rows(m) * mixed_stride + k);
-        const float normalized = Act::round(v * inv * element::at<NORM>(norm, k % HEAD));
-        const float activated = Act::round(silu(element::at<Z>(z, rows(m) * z_stride + k)));
-        return normalized * activated;
-    }
-    __device__ __forceinline__ float value(const float *factors, u32 m, u64 k) const {
-        return Act::round(gated(factors[k / HEAD], m, k));
-    }
-};
-
 // The prologue's row m as A into out[m * K .. m * K + K), formed by the whole
 // block: the staging launch (one block per row, global scratch) and a GEMV
 // block at M = 1 (its shared memory) both form rows with it.

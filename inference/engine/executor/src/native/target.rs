@@ -5,10 +5,11 @@ use crate::{
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project, dense_expand, dense_output, embedding_rows,
-    gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
+    gated_delta_chunk, gated_delta_project, gated_delta_project_convolved, gated_delta_step,
+    gated_delta_step_convolved,
     post_norm_residual, project_rows, readout_features_rows, readout_head_rows,
     readout_selected_rows, routed_combine, routed_expand, routed_experts, routed_group,
-    routed_output, routed_route,
+    routed_output, routed_route, routed_route_shared,
 };
 use magnitude_kernels::{
     dense_up, feature_rows, routed_down, routed_experts_up, routed_gate_up, routed_scatter,
@@ -103,14 +104,29 @@ pub struct ReadoutKernels {
 
 #[derive(Clone, Debug)]
 pub struct RoutedKernels {
+    /// Every row class of the expand form; the grouped row classes of the
+    /// shared-route form.
     pub route: NativeKernel<routed_route::Entry>,
     /// Decode form (row classes up to the GEMV bound).
-    pub expand: NativeKernel<routed_expand::Entry>,
+    pub decode: RoutedDecodeKernels,
     pub output: NativeKernel<routed_output::Entry>,
     /// Grouped form (larger row classes).
     pub group: NativeKernel<routed_group::Entry>,
     pub experts: NativeKernel<routed_experts::Entry>,
     pub combine: NativeKernel<routed_combine::Entry>,
+}
+
+/// The decode rows' routing and expansions, by the backend's
+/// `DecodeForm`.
+#[derive(Clone, Debug)]
+pub enum RoutedDecodeKernels {
+    /// `routed_route`, then the choices' and the shared expert's gate/up.
+    Expand(NativeKernel<routed_expand::Entry>),
+    /// The routing with the shared expert's gate/up, then the choices'.
+    SharedRoute {
+        route: NativeKernel<routed_route_shared::Entry>,
+        choices: NativeKernel<routed_gate_up::Entry>,
+    },
 }
 
 /// An attention block: normed query/gate/key/value projection, the fused
@@ -221,14 +237,30 @@ pub struct DenseKernels {
     pub output: SublayerOutput<NativeKernel<dense_output::Entry>>,
 }
 
-/// A recurrent block: normed projection, the state advance (row-sequential
-/// `step` for small row classes, chunked for the rest), gated output.
+/// A recurrent block: normed projection, the state advance publishing the
+/// gated rows (row-sequential `step` for small row classes, chunked for the
+/// rest), and the plain residual output projection.
 #[derive(Clone, Debug)]
 pub struct RecurrentKernels {
+    /// The chunked row classes' projection, and every row class's in the
+    /// step form.
     pub project: NativeKernel<gated_delta_project::Entry>,
-    pub step: NativeKernel<gated_delta_step::Entry>,
+    /// The step row classes, by the backend's `StepForm`.
+    pub step: RecurrentStepKernels,
     pub chunk: NativeKernel<gated_delta_chunk::Entry>,
-    pub output: NativeKernel<gated_delta_output::Entry>,
+    pub output: NativeKernel<attention_output::Entry>,
+}
+
+/// The step row classes' entries, by the backend's `StepForm`.
+#[derive(Clone, Debug)]
+pub enum RecurrentStepKernels {
+    /// `gated_delta_project`, then the step that convolves.
+    Step(NativeKernel<gated_delta_step::Entry>),
+    /// The projection that also convolves, then the step over its channels.
+    Convolved {
+        project: NativeKernel<gated_delta_project_convolved::Entry>,
+        step: NativeKernel<gated_delta_step_convolved::Entry>,
+    },
 }
 
 /// A general routed feed-forward (`operators::routed`).

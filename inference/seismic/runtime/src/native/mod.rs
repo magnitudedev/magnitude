@@ -123,6 +123,44 @@ pub(crate) struct NativeQueue {
 /// its ABI slot.
 const MINIMUM_SCRATCH_BYTES: u64 = 1;
 
+/// Bytes at the start of every non-empty scratch arena (the standalone arena
+/// and every graph workspace that places anything) reserved for `sync`
+/// scratch; a graph that places nothing needs no workspace. Nothing else is ever placed
+/// there, arenas are zeroed when allocated, and every call restores its sync
+/// buffers to zero before it ends, so the range is zero whenever a launch
+/// starts, whichever call or graph used it last.
+pub(crate) const SYNC_SCRATCH_BYTES: u64 = 64 * 1024;
+
+/// One call-private scratch buffer: its bytes, and whether it holds arrival
+/// counters (`sync`), which live in the reserved range of their arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScratchNeed {
+    pub bytes: u64,
+    pub sync: bool,
+}
+
+/// Place one standalone call's scratch buffers: `sync` buffers in the
+/// reserved range, the rest after it. Returns the offsets in declaration
+/// order and the end of the placed range.
+fn place_scratch(needs: &[ScratchNeed]) -> (Vec<u64>, u64) {
+    let mut sync_end = 0u64;
+    let mut end = SYNC_SCRATCH_BYTES;
+    let offsets = needs
+        .iter()
+        .map(|need| {
+            let cursor = if need.sync { &mut sync_end } else { &mut end };
+            let offset = cursor.next_multiple_of(BUFFER_ALIGNMENT);
+            *cursor = offset + need.bytes;
+            offset
+        })
+        .collect();
+    assert!(
+        sync_end <= SYNC_SCRATCH_BYTES,
+        "sync scratch of one call exceeds the reserved {SYNC_SCRATCH_BYTES} bytes"
+    );
+    (offsets, end)
+}
+
 enum NativeRoute {
     Cpu(cpu::CpuRoute),
     #[cfg(target_os = "macos")]
@@ -1141,18 +1179,22 @@ impl NativePrepared {
         Ok(geometry)
     }
 
-    /// Bytes of every scratch buffer for one invocation. An inactive buffer
-    /// is charged the minimum without evaluating its size.
-    pub(crate) fn scratch_bytes(&self, values: &InvocationValues) -> Result<Vec<u64>, CallError> {
+    /// Every scratch buffer of one invocation. An inactive buffer is charged
+    /// the minimum without evaluating its size.
+    pub(crate) fn scratch_needs(&self, values: &InvocationValues) -> Result<Vec<ScratchNeed>, CallError> {
         self.implementation
             .scratch
             .iter()
             .map(|scratch| {
-                if !self.active(&scratch.when, values, None)? {
-                    return Ok(MINIMUM_SCRATCH_BYTES);
-                }
-                self.evaluate(&scratch.bytes, values, None)
-                    .map(|bytes| bytes.max(MINIMUM_SCRATCH_BYTES))
+                let bytes = if self.active(&scratch.when, values, None)? {
+                    self.evaluate(&scratch.bytes, values, None)?.max(MINIMUM_SCRATCH_BYTES)
+                } else {
+                    MINIMUM_SCRATCH_BYTES
+                };
+                Ok(ScratchNeed {
+                    bytes,
+                    sync: scratch.sync,
+                })
             })
             .collect()
     }
@@ -1212,7 +1254,7 @@ impl NativePrepared {
             &values,
         )?;
         Ok(CallShape {
-            scratch: self.scratch_bytes(&values)?,
+            scratch: self.scratch_needs(&values)?,
             results,
             words,
             launches,
@@ -1337,13 +1379,11 @@ impl NativePrepared {
             };
             results.push(tensor);
         }
-        let mut scratch = Vec::with_capacity(shape.scratch.len());
-        let mut scratch_end = 0u64;
-        for bytes in &shape.scratch {
-            let offset = scratch_end.next_multiple_of(BUFFER_ALIGNMENT);
-            scratch.push(offset);
-            scratch_end = offset + bytes;
-        }
+        let (scratch, scratch_end) = if shape.scratch.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            place_scratch(&shape.scratch)
+        };
         let arena = standalone.scratch(&self.public_device, scratch_end)?;
 
         let schema = self.schema();
@@ -1508,8 +1548,8 @@ impl Standalone {
 pub(crate) struct CallShape {
     /// Per result ordinal; `None` for a scalar result.
     pub(crate) results: Vec<Option<NativeTensorSpec>>,
-    /// Bytes of each scratch buffer.
-    pub(crate) scratch: Vec<u64>,
+    /// Each scratch buffer, in declaration order.
+    pub(crate) scratch: Vec<ScratchNeed>,
     pub(crate) words: Vec<u64>,
     pub(crate) launches: CallLaunches,
 }

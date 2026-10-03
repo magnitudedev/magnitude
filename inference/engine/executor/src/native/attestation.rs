@@ -15,8 +15,32 @@ use magnitude_kernels::{
     draft_path_step, draft_top_k, feature_rows, import_dense, post_norm_residual, project_rows,
     repack_weight, tap_rows, widen_rows,
 };
+use crate::operators::gated_delta::graph::StepForm;
+use crate::operators::routed::fused_graph::DecodeForm;
 use magnitude_state::KvCodec;
 use std::{collections::HashSet, rc::Rc};
+
+/// Invocation workspace of the fused routed form's decode kernels.
+fn routed_decode_bytes(decode: &RoutedDecodeKernels) -> u128 {
+    match decode {
+        RoutedDecodeKernels::Expand(expand) => u128::from(expand.invocation_workspace_bytes()),
+        RoutedDecodeKernels::SharedRoute { route, choices } => {
+            u128::from(route.invocation_workspace_bytes())
+                + u128::from(choices.invocation_workspace_bytes())
+        }
+    }
+}
+
+/// Invocation workspace of the recurrent step row classes' kernels.
+fn recurrent_step_bytes(step: &RecurrentStepKernels) -> u128 {
+    match step {
+        RecurrentStepKernels::Step(step) => u128::from(step.invocation_workspace_bytes()),
+        RecurrentStepKernels::Convolved { project, step } => {
+            u128::from(project.invocation_workspace_bytes())
+                + u128::from(step.invocation_workspace_bytes())
+        }
+    }
+}
 
 pub struct AttestedPrograms {
     backend: BackendName,
@@ -437,14 +461,29 @@ impl AttestedPrograms {
     }
 
     /// Device bytes reserved by the exact native specializations before
-    /// construction. Duplicate bindings share one prepared handle, matching
-    /// the native factory's preparation and the actual measured charge.
-    pub fn planned_invocation_workspace_bytes(plan: &ProgramPlan) -> Result<u64, PlanError> {
+    /// construction on `backend`. Duplicate bindings share one prepared
+    /// handle, matching the native factory's preparation and the actual
+    /// measured charge.
+    pub fn planned_invocation_workspace_bytes(
+        plan: &ProgramPlan,
+        backend: BackendName,
+    ) -> Result<u64, PlanError> {
         macro_rules! bytes {
             ($entry:ident) => {
                 u128::from(NativeKernel::<$entry::Entry>::planned_invocation_workspace_bytes())
             };
         }
+        // The fused routed form's entries: the decode ones by the backend's
+        // form.
+        let routed_bytes = bytes!(routed_route)
+            + match DecodeForm::of(backend).map_err(PlanError::ResourcePlanning)? {
+                DecodeForm::Expand => bytes!(routed_expand),
+                DecodeForm::SharedRoute => bytes!(routed_route_shared) + bytes!(routed_gate_up),
+            }
+            + bytes!(routed_output)
+            + bytes!(routed_group)
+            + bytes!(routed_experts)
+            + bytes!(routed_combine);
         fn general_routed_bytes(shape: crate::GeneralRoutedShape) -> u128 {
             let mut bytes = bytes!(routed_select)
                 + bytes!(routed_down)
@@ -519,9 +558,15 @@ impl AttestedPrograms {
                     if charged_mixers.insert(MixerProgramSlot::Recurrent(binding)) =>
                 {
                     bytes += bytes!(gated_delta_project)
-                        + bytes!(gated_delta_step)
+                        + match StepForm::of(backend).map_err(PlanError::ResourcePlanning)? {
+                            StepForm::Step => bytes!(gated_delta_step),
+                            StepForm::Convolved => {
+                                bytes!(gated_delta_project_convolved)
+                                    + bytes!(gated_delta_step_convolved)
+                            }
+                        }
                         + bytes!(gated_delta_chunk)
-                        + bytes!(gated_delta_output)
+                        + bytes!(attention_output)
                 }
                 MixerProgramSlot::StateSpace(binding)
                     if charged_mixers.insert(MixerProgramSlot::StateSpace(binding)) =>
@@ -556,12 +601,7 @@ impl AttestedPrograms {
                 Some(FeedForwardProgramSlot::Routed(binding))
                     if charged_feed_forward.insert(FeedForwardProgramSlot::Routed(binding)) =>
                 {
-                    bytes += bytes!(routed_route)
-                        + bytes!(routed_expand)
-                        + bytes!(routed_output)
-                        + bytes!(routed_group)
-                        + bytes!(routed_experts)
-                        + bytes!(routed_combine)
+                    bytes += routed_bytes
                 }
                 Some(FeedForwardProgramSlot::GeneralRouted(binding))
                     if charged_feed_forward
@@ -617,14 +657,7 @@ impl AttestedPrograms {
                         FeedForwardProgramSlot::Dense(_) => {
                             bytes += bytes!(dense_expand) + bytes!(dense_output)
                         }
-                        FeedForwardProgramSlot::Routed(_) => {
-                            bytes += bytes!(routed_route)
-                                + bytes!(routed_expand)
-                                + bytes!(routed_output)
-                                + bytes!(routed_group)
-                                + bytes!(routed_experts)
-                                + bytes!(routed_combine)
-                        }
+                        FeedForwardProgramSlot::Routed(_) => bytes += routed_bytes,
                         // `operators::admit` keeps draft heads on the fused
                         // form.
                         FeedForwardProgramSlot::GeneralRouted(_)
@@ -1178,13 +1211,11 @@ impl AttestedPrograms {
             imports.push((binding, handle));
         }
         let invocation_workspace_bytes = Self::sum_invocation_workspace_bytes(&prepared)?;
-        let planned_bytes =
-            Self::planned_invocation_workspace_bytes(topology).map_err(|error| {
-                CatalogFailure::Preparation {
-                    entry: "program_factory",
-                    bindings: "native invocation workspace".into(),
-                    outcome: error.to_string(),
-                }
+        let planned_bytes = Self::planned_invocation_workspace_bytes(topology, device.backend())
+            .map_err(|error| CatalogFailure::Preparation {
+                entry: "program_factory",
+                bindings: "native invocation workspace".into(),
+                outcome: error.to_string(),
             })?;
         if invocation_workspace_bytes != planned_bytes {
             return Err(CatalogFailure::Qualification {
@@ -1245,7 +1276,7 @@ impl AttestedPrograms {
         }
         for handles in prepared.target.recurrent.values() {
             bytes += u128::from(handles.project.invocation_workspace_bytes())
-                + u128::from(handles.step.invocation_workspace_bytes())
+                + recurrent_step_bytes(&handles.step)
                 + u128::from(handles.chunk.invocation_workspace_bytes())
                 + u128::from(handles.output.invocation_workspace_bytes());
         }
@@ -1329,7 +1360,7 @@ impl AttestedPrograms {
         }
         for handles in prepared.target.routed.values() {
             bytes += u128::from(handles.route.invocation_workspace_bytes())
-                + u128::from(handles.expand.invocation_workspace_bytes())
+                + routed_decode_bytes(&handles.decode)
                 + u128::from(handles.output.invocation_workspace_bytes())
                 + u128::from(handles.group.invocation_workspace_bytes())
                 + u128::from(handles.experts.invocation_workspace_bytes())
@@ -1359,7 +1390,7 @@ impl AttestedPrograms {
             }
             for handles in head.routed.values() {
                 bytes += u128::from(handles.route.invocation_workspace_bytes())
-                    + u128::from(handles.expand.invocation_workspace_bytes())
+                    + routed_decode_bytes(&handles.decode)
                     + u128::from(handles.output.invocation_workspace_bytes())
                     + u128::from(handles.group.invocation_workspace_bytes())
                     + u128::from(handles.experts.invocation_workspace_bytes())
@@ -1796,7 +1827,13 @@ impl AttestedPrograms {
                     AttestedFeedForward::Dense(handles) => dense!(handles),
                     AttestedFeedForward::Routed(handles) => {
                         charge!(&handles.route);
-                        charge!(&handles.expand);
+                        match &handles.decode {
+                            RoutedDecodeKernels::Expand(expand) => charge!(expand),
+                            RoutedDecodeKernels::SharedRoute { route, choices } => {
+                                charge!(route);
+                                charge!(choices);
+                            }
+                        }
                         charge!(&handles.output);
                         charge!(&handles.group);
                         charge!(&handles.experts);
@@ -1818,7 +1855,13 @@ impl AttestedPrograms {
                 AttestedMixer::Attention(handles) => attention!(handles),
                 AttestedMixer::Recurrent(handles) => {
                     charge!(&handles.project);
-                    charge!(&handles.step);
+                    match &handles.step {
+                        RecurrentStepKernels::Step(step) => charge!(step),
+                        RecurrentStepKernels::Convolved { project, step } => {
+                            charge!(project);
+                            charge!(step);
+                        }
+                    }
                     charge!(&handles.chunk);
                     charge!(&handles.output);
                 }

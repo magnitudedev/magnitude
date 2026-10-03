@@ -19,9 +19,11 @@
 // the state rows (`S k`, `S q`) and the q/k squares summed in the defined
 // order of `reduce`. The decayed state `S * decay` is rounded before the
 // dot and the update `fma(residual, k, S * decay)`, as the body computes it.
+// The raw outputs `S q` go to the `mixed` scratch (F32 values rounded to A,
+// [M, NV, W]); a `gate` launch then forms each row's gated result.
 
 use super::super::core::{activation, reduce};
-use seismic::cpu::{math, Dense, Scalars, Tensor, F32};
+use seismic::cpu::{math, Dense, Scalars, Scratch, Tensor, F32};
 use seismic::cpu::slab::SlabTensor;
 use std::ops::Range;
 
@@ -39,7 +41,8 @@ pub struct Recurrence<'a, A: Dense> {
     pub window: SlabTensor<'a, A, 3>,
     pub delta: SlabTensor<'a, F32, 4>,
     pub tape: SlabTensor<'a, F32, 3>,
-    pub mixed: Tensor<'a, A, 3>,
+    /// The raw outputs, [M, NV, W] F32 values rounded to A.
+    pub mixed: Scratch<'a>,
     /// M.
     pub rows: usize,
     /// B.
@@ -292,13 +295,47 @@ impl<'a, A: Dense> Recurrence<'a, A> {
         }
     }
 
-    /// Zeroes state rows `rows` of value head `head` in the mixed rows no
-    /// slot covers.
+    /// The raw outputs of state rows `rows` of value head `head` at `row`.
+    ///
+    /// # Safety
+    /// Each work item writes only its own state rows of its head.
+    #[allow(clippy::mut_from_ref)]
+    #[inline(always)]
+    unsafe fn raw_mut(&self, row: usize, head: usize, rows: &Range<usize>) -> &'a mut [f32] {
+        let at = (row * self.value_heads + head) * self.width + rows.start;
+        unsafe { self.mixed.slice_mut::<f32>(4 * at, rows.len()) }
+    }
+
+    /// Zeroes state rows `rows` of value head `head` in the raw rows no slot
+    /// covers.
     pub fn zero_uncovered(&self, head: usize, rows: Range<usize>) {
         for row in self.covered_end()..self.rows {
             // SAFETY: each work item writes its own state rows of the head.
-            let out = unsafe { self.mixed.span_mut([row, head, rows.start], rows.len()) };
-            out.fill(A::narrow(0.0));
+            unsafe { self.raw_mut(row, head, &rows) }.fill(0.0);
+        }
+    }
+
+    /// The `gate` launch of both entries: row `row`'s raw outputs, per value
+    /// head RMS-normalized over W with `epsilon` and scaled by the recurrent
+    /// norm (`norm`, decoded; A), times SiLU(z) (A), published to A in
+    /// `gated`. `values` holds W floats.
+    pub fn gate_row(&self, row: usize, norm: &[f32], epsilon: f32, gated: &Tensor<'a, A, 3>, values: &mut [f32]) {
+        let (w, nv) = (self.width, self.value_heads);
+        let z = self.channels();
+        // SAFETY: the advance launch wrote every raw row before this launch;
+        // this one only reads them.
+        let raw = unsafe { self.mixed.slice::<f32>(4 * row * nv * w, nv * w) };
+        for head in 0..nv {
+            values.copy_from_slice(&raw[head * w..(head + 1) * w]);
+            let inverse = reduce::rms_inverse(values, epsilon);
+            let gates = self.projection.span([row, z + head * w], w);
+            // SAFETY: each work item writes its own row.
+            let out = unsafe { gated.span_mut([row, head, 0], w) };
+            for (((target, value), weight), gate) in out.iter_mut().zip(values.iter()).zip(norm).zip(gates) {
+                let normalized = activation::publish::<A>(value * inverse * weight);
+                let activated = activation::publish::<A>(activation::silu(A::widen(*gate)));
+                *target = A::narrow(normalized * activated);
+            }
         }
     }
 
@@ -363,7 +400,7 @@ impl<'a, A: Dense> Recurrence<'a, A> {
                 }
             }
             // SAFETY: each work item writes its own state rows of the head.
-            let mixed = unsafe { self.mixed.span_mut([row, head, rows.start], rows.len()) };
+            let mixed = unsafe { self.raw_mut(row, head, &rows) };
             // SAFETY: as above, this work item's innovations of the entry.
             let mut innovations =
                 entry.map(|entry| unsafe { self.tape.span_mut([slot.target, entry, head * w + rows.start], rows.len()) });
@@ -377,7 +414,7 @@ impl<'a, A: Dense> Recurrence<'a, A> {
                 for (value, key) in values.iter_mut().zip(inputs.key) {
                     *value = residual.mul_add(*key, *value);
                 }
-                mixed[index] = A::narrow(reduce::dot(values, inputs.query));
+                mixed[index] = activation::publish::<A>(reduce::dot(values, inputs.query));
                 if let Some(innovations) = &mut innovations {
                     innovations[index] = residual;
                 }

@@ -13,7 +13,7 @@
 
 use super::{
     merge_access, submit, word_bytes, CallLaunches, Dispatch, DispatchList, NativePrepared,
-    NativeSubmission, NativeTensorSpec, BUFFER_ALIGNMENT,
+    NativeSubmission, NativeTensorSpec, ScratchNeed, BUFFER_ALIGNMENT, SYNC_SCRATCH_BYTES,
 };
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{
@@ -286,7 +286,7 @@ pub struct NativeGraphLayout {
     signature: StorageSignature,
     port_capacity: Vec<u64>,
     result_capacity: Vec<Vec<Option<u64>>>,
-    scratch_capacity: Vec<Vec<u64>>,
+    scratch_capacity: Vec<Vec<ScratchNeed>>,
 }
 
 impl NativeGraphLayout {
@@ -335,7 +335,9 @@ impl NativeGraphLayout {
                             .scratch
                             .iter()
                             .zip(capacities)
-                            .all(|(bytes, capacity)| bytes <= capacity)
+                            .all(|(need, capacity)| {
+                                need.sync == capacity.sync && need.bytes <= capacity.bytes
+                            })
                 });
         if !valid {
             return Err(WorkflowError::NativeGraphLayoutMismatch);
@@ -452,7 +454,7 @@ impl NativeGraphMetadataDraft {
         args: EncodedWorkflowArgs,
         parameter_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
         result_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
-        scratch: Vec<u64>,
+        scratch: Vec<ScratchNeed>,
     ) -> Result<PendingWorkflowResults, CallError> {
         let node = u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
         validate_node_references(self.identity, self.ports.len(), node, &args)
@@ -541,7 +543,7 @@ impl NativeGraphMetadataDraft {
         &self,
         ports: &[u64],
         results: &[Vec<u64>],
-        scratch: Vec<Vec<u64>>,
+        scratch: Vec<Vec<ScratchNeed>>,
     ) -> Result<NativeGraphLayout, WorkflowError> {
         self.validate_topology()?;
         let shaped = ports.len() == self.ports.len()
@@ -916,8 +918,8 @@ fn describe_reference(
 /// A node as storage planning sees it.
 struct PlannedNode {
     args: EncodedWorkflowArgs,
-    /// Bytes of each of the node's call-private scratch buffers.
-    scratch: Vec<u64>,
+    /// Each of the node's call-private scratch buffers.
+    scratch: Vec<ScratchNeed>,
 }
 
 /// Where a node's buffer lives. Only an external port's tensor is bound
@@ -1282,13 +1284,33 @@ fn plan_storage(
             });
         }
     }
+    // Sync scratch lives in the reserved range at the workspace's start,
+    // each node's buffers disjoint from every other node's; the rest of the
+    // workspace begins after the range (`cursor` below). Graphs of one
+    // family share an arena, so every graph that places anything reserves
+    // the range; a graph that places nothing needs no workspace at all.
+    let mut sync_cursor = 0u64;
+    let mut node_scratch = nodes
+        .iter()
+        .map(|node| vec![0u64; node.scratch.len()])
+        .collect::<Vec<_>>();
     for (node, planned) in nodes.iter().enumerate() {
-        for (ordinal, bytes) in planned.scratch.iter().enumerate() {
+        for (ordinal, need) in planned.scratch.iter().enumerate() {
+            if need.sync {
+                let offset = sync_cursor.next_multiple_of(BUFFER_ALIGNMENT);
+                sync_cursor = offset + need.bytes;
+                assert!(
+                    sync_cursor <= SYNC_SCRATCH_BYTES,
+                    "sync scratch of one graph exceeds the reserved {SYNC_SCRATCH_BYTES} bytes"
+                );
+                node_scratch[node][ordinal] = offset;
+                continue;
+            }
             intervals.push(Interval {
                 key: StorageKey::NodeScratch(node, ordinal),
                 start: node * 2,
                 end: node * 2 + 1,
-                bytes: *bytes,
+                bytes: need.bytes,
                 exported: false,
             });
         }
@@ -1298,17 +1320,21 @@ fn plan_storage(
         .iter()
         .filter(|interval| !interval.exported)
         .collect::<Vec<_>>();
-    let (scratch_offsets, scratch_bytes) = place_by_liveness(&scratch);
-    let scratch_floor_bytes = liveness_floor(&scratch);
-    let mut scratch_offsets = scratch_offsets.into_iter();
+    let (scratch_offsets, placed_bytes) = place_by_liveness(&scratch);
+    // The placed buffers follow the reserved sync range, which a graph
+    // reserves whenever it places anything.
+    let reserved = if sync_cursor == 0 && placed_bytes == 0 {
+        0
+    } else {
+        SYNC_SCRATCH_BYTES
+    };
+    let scratch_bytes = reserved + placed_bytes;
+    let scratch_floor_bytes = reserved + liveness_floor(&scratch);
+    let mut scratch_offsets = scratch_offsets.into_iter().map(|offset| reserved + offset);
     let mut output_bytes = 0u64;
     let mut placements = results
         .iter()
         .map(|row| vec![Placement::Scalar; row.len()])
-        .collect::<Vec<_>>();
-    let mut node_scratch = nodes
-        .iter()
-        .map(|node| vec![0u64; node.scratch.len()])
         .collect::<Vec<_>>();
     for interval in &intervals {
         let placement = if interval.exported {
@@ -2330,7 +2356,10 @@ mod layout_certificate_tests {
         });
         let node = PlannedNode {
             args,
-            scratch: vec![rows * 4],
+            scratch: vec![ScratchNeed {
+                bytes: rows * 4,
+                sync: false,
+            }],
         };
         let result = NativeTensorSpec {
             representation,

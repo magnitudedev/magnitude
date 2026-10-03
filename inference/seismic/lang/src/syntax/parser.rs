@@ -349,10 +349,15 @@ impl Parser {
             self.expect_op(Op::LParen)?;
             let bytes = self.expr()?;
             self.expect_op(Op::RParen)?;
+            let sync = self.at_word("sync");
+            if sync {
+                self.bump();
+            }
             let when = self.native_when()?;
             scratch.push(NativeScratchDecl {
                 name,
                 bytes,
+                sync,
                 when,
                 span: begin.to(self.prev_span()),
             });

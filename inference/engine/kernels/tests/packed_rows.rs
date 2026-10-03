@@ -1,5 +1,5 @@
 use magnitude_kernels::{
-    gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step, repack_weight,
+    attention_output, gated_delta_chunk, gated_delta_project, gated_delta_step, repack_weight,
 };
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -45,8 +45,8 @@ fn packed_stages_on(device: &seismic::Device) {
             seismic::NativeSpecialization::new(),
             |statics, name| {
                 let value = match name.as_str() {
-                    "H" | "W" => 32,
-                    "NK" | "NV" => 1,
+                    "H" | "D" | "W" => 32,
+                    "NK" | "NV" | "Q" => 1,
                     _ => panic!("unexpected static {name}"),
                 };
                 statics.with_static(name.clone(), value)
@@ -165,9 +165,9 @@ fn packed_stages_on(device: &seismic::Device) {
     let step_specialization = step_implementation
         .default_specialization(&step_statics)
         .unwrap();
-    let mixed = gated_delta_step::native_for_device_with(
+    let gated = gated_delta_step::native_for_device_with(
         &device,
-        gated_delta_step::Elements { A: bf16 },
+        gated_delta_step::Elements { RN: bf16, A: bf16 },
         &step_specialization,
     )
     .unwrap()
@@ -176,6 +176,7 @@ fn packed_stages_on(device: &seismic::Device) {
         convolution: &convolution,
         rate: &rate,
         time_bias: &time_bias,
+        recurrent_norm: &norm,
         segments: &segments,
         stop: &stop,
         previous_bank: &previous_bank,
@@ -185,28 +186,22 @@ fn packed_stages_on(device: &seismic::Device) {
         delta: &mut delta,
         tape: &mut tape,
         norm_epsilon: epsilon,
+        epsilon,
         grouped: true,
         slab_banks: 2,
     })
     .unwrap()
     .value;
-    let recurrent = gated_delta_output::native_for_device_with(
+    let recurrent = attention_output::native_for_device_with(
         &device,
-        gated_delta_output::Elements {
-            RN: bf16,
-            OW: q8,
-            A: bf16,
-        },
-        &declared_defaults::<gated_delta_output::Entry>(&device),
+        attention_output::Elements { OW: q8, A: bf16 },
+        &declared_defaults::<attention_output::Entry>(&device),
     )
     .unwrap()
-    .call(gated_delta_output::Args {
+    .call(attention_output::Args {
         hidden: &hidden,
-        mixed: &mixed,
-        projection: &projection,
-        recurrent_norm: &norm,
+        gated: &gated,
         output_weight: &zero_weight,
-        epsilon,
     })
     .unwrap()
     .value;
@@ -255,8 +250,6 @@ fn packed_entries_are_the_only_generated_target_surface() {
     let _ = gated_delta_step::native_for_device_with;
     let _ = gated_delta_chunk::for_device_with;
     let _ = gated_delta_chunk::native_for_device_with;
-    let _ = gated_delta_output::for_device_with;
-    let _ = gated_delta_output::native_for_device_with;
     let sources = [
         include_str!("../kernels/target.seismic"),
         include_str!("../kernels/dense_rows.seismic"),

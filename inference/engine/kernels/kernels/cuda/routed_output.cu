@@ -1,40 +1,22 @@
 // Decode output (M <= 8); the CUDA form of `metal/routed_output.metal`.
-// Block (x, m) owns the output channels of tile group x for row m: the K1
-// GEMV of each choice's down projection in slot order, each published
-// (A-rounded) projection weighted by its score, then the shared expert's
-// down projection; the channel is residual + selected + round_A(shared) * c.
-// The GEMV hands every channel to one fixed lane, which carries the channel's
-// running sum in registers across the choices.
+// Block (x, y) projects one of row m's K + 1 down projections (y = m * (K + 1)
+// + slot: slot < K is choice slot, slot K the shared expert) over the output
+// channels of tile group x, and publishes each channel A-rounded into
+// scratch. The last of a (x, m)'s K + 1 blocks to arrive combines its
+// channels: each published choice projection weighted by its score in slot
+// order, then residual + selected + shared * c, the arithmetic of one block
+// carrying every slot in turn. Running the slots side by side keeps enough
+// weight streams in flight to reach bandwidth.
 #define KERNEL_W0 SEISMIC_EXPERT_DOWN
 #define KERNEL_W1 SEISMIC_SHARED_DOWN
 #include "lib/routed/routed.cuh"
 
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 
-// The carried slot of channel n: its tile within the group and its row half.
-__device__ __forceinline__ unsigned routed_slot(projection::u64 n, projection::u64 first) {
-    const projection::u64 local = n - first;
-    return (unsigned)((local / 16) * 2 + (local % 16) / 8);
-}
-
-struct SelectEpi {
-    float *selected;
-    projection::u64 first;
-    float score;
+struct PublishEpi {
+    float *published;
     __device__ __forceinline__ void operator()(unsigned, projection::u64 n, float value, float) const {
-        float &carried = selected[routed_slot(n, first)];
-        carried = __fmaf_rn(score, element::Act::round(value), carried);
-    }
-};
-
-struct FinalEpi {
-    const float *selected;
-    projection::u64 first;
-    float *out;
-    const float *residual;
-    float coefficient;
-    __device__ __forceinline__ void operator()(unsigned, projection::u64 n, float value, float) const {
-        out[n] = residual[n] + selected[routed_slot(n, first)] + element::Act::round(value) * coefficient;
+        published[n] = element::Act::round(value);
     }
 };
 
@@ -42,43 +24,65 @@ struct FinalEpi {
 template <int TPW, int KSPLIT>
 __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
     using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
-    constexpr int CARRIED = 2 * TPW;
+    constexpr projection::u64 CHANNELS = Shape::GROUPS * TPW * 16;
     __shared__ projection::GemvShared<Shape, Pro> shared;
+    __shared__ unsigned last;
+    const projection::u64 H = SEISMIC_DIM_H, K = SEISMIC_DIM_K;
+    const projection::u64 m = blockIdx.y / (K + 1), slot = blockIdx.y % (K + 1);
     const projection::u64 group = Shape::tile_group();
-    if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_H))
-        return;
-    const projection::u64 m = blockIdx.y;
-    const projection::u64 first = group * Shape::TPW * 16;
-    const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
-    const float *scores = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCORES));
-    float selected[CARRIED];
-#pragma unroll
-    for (int slot = 0; slot < CARRIED; ++slot)
-        selected[slot] = 0.0f;
+    float *published = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PUBLISHED)) + m * (K + 1) * H;
+    unsigned *arrivals = reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS));
 
-    for (projection::u64 k = 0; k < SEISMIC_DIM_K; ++k) {
-        // The K-split reduction area is reused by every choice.
-        if (Shape::KSPLIT > 1)
-            projection::named_barrier(1 + Shape::group(), Shape::KSPLIT * 32);
-        const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
-        const Pro pro{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_PRODUCT)
-                          + (m * SEISMIC_EXPERT_PRODUCT_STRIDE_0 + k * SEISMIC_EXPERT_PRODUCT_STRIDE_1) * 2,
-                      0, projection::AllRows{}};
-        const SelectEpi epi{selected, first, scores[m * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1]};
-        projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_F / 64, group, SEISMIC_DIM_H,
-                                KERNEL_W0_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), expert),
-                                projection::NoWeight{}, epi);
+    if (group < projection::gemv_groups<Shape>(H)) {
+        const PublishEpi epi{published + slot * H};
+        if (slot < K) {
+            const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
+            const projection::u64 expert =
+                (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1];
+            const Pro pro{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_PRODUCT)
+                              + (m * SEISMIC_EXPERT_PRODUCT_STRIDE_0 + slot * SEISMIC_EXPERT_PRODUCT_STRIDE_1) * 2,
+                          0, projection::AllRows{}};
+            projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_F / 64, group, H,
+                                            KERNEL_W0_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), expert),
+                                            projection::NoWeight{}, epi);
+        } else {
+            const Pro pro{SEISMIC_PTR(SEISMIC_BUFFER_SHARED_PRODUCT) + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * 2, 0,
+                          projection::AllRows{}};
+            projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_S / 64, group, H,
+                                            KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN)),
+                                            projection::NoWeight{}, epi);
+        }
     }
 
-    if (Shape::KSPLIT > 1)
-        projection::named_barrier(1 + Shape::group(), Shape::KSPLIT * 32);
-    const Pro pro{SEISMIC_PTR(SEISMIC_BUFFER_SHARED_PRODUCT) + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * 2, 0,
-                  projection::AllRows{}};
-    const FinalEpi epi{selected, first,
-                       reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)) + m * SEISMIC_RESULT_0_STRIDE_0,
-                       reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)) + m * SEISMIC_RESIDUAL_STRIDE_0,
-                       reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT))[m * SEISMIC_COEFFICIENT_STRIDE_0]};
-    projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_S / 64, group, SEISMIC_DIM_H,
-                            KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN)), projection::NoWeight{}, epi);
+    // Arrive (sync scratch: zero when the launch starts, restored by the last).
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        unsigned *counter = arrivals + m * gridDim.x + blockIdx.x;
+        const bool is_last = atomicAdd(counter, 1u) == K;
+        if (is_last) {
+            __threadfence();
+            atomicExch(counter, 0u);
+        }
+        last = is_last;
+    }
+    __syncthreads();
+    if (!last)
+        return;
+
+    const float *scores = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCORES));
+    const float *residual =
+        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)) + m * SEISMIC_RESIDUAL_STRIDE_0;
+    float *out = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)) + m * SEISMIC_RESULT_0_STRIDE_0;
+    const float coefficient =
+        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT))[m * SEISMIC_COEFFICIENT_STRIDE_0];
+    const projection::u64 first = blockIdx.x * CHANNELS;
+    for (projection::u64 n = first + threadIdx.x; n < first + CHANNELS && n < H; n += blockDim.x) {
+        float selected = 0.0f;
+        for (projection::u64 k = 0; k < K; ++k)
+            selected = __fmaf_rn(scores[m * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1],
+                                 __ldcg(published + k * H + n), selected);
+        out[n] = residual[n] + selected + __ldcg(published + K * H + n) * coefficient;
+    }
 }
 #endif

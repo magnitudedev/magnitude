@@ -234,7 +234,7 @@ enum CheckedHeadFeedForwardEntries {
 }
 
 impl CheckedHeadEntries {
-    fn new(binding: HeadBinding) -> Result<Self, String> {
+    fn new(binding: HeadBinding, backend: BackendName) -> Result<Self, String> {
         Ok(Self {
             input: [
                 ("EW", binding.embedding_table),
@@ -248,9 +248,9 @@ impl CheckedHeadEntries {
                 FeedForwardProgramSlot::Dense(binding) => {
                     CheckedHeadFeedForwardEntries::Dense(CheckedDenseEntries::new(binding))
                 }
-                FeedForwardProgramSlot::Routed(binding) => {
-                    CheckedHeadFeedForwardEntries::Routed(CheckedRoutedEntries::new(binding))
-                }
+                FeedForwardProgramSlot::Routed(binding) => CheckedHeadFeedForwardEntries::Routed(
+                    CheckedRoutedEntries::new(binding, backend)?,
+                ),
                 // `operators::admit` keeps draft heads on the fused form.
                 FeedForwardProgramSlot::GeneralRouted(_) | FeedForwardProgramSlot::Parallel(_) => {
                     return Err("draft head routed feed-forward form".into())
@@ -609,7 +609,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     &mut graph,
                     RoutedGraphEntries {
                         route: entries.route,
-                        expand: entries.expand,
+                        decode: entries.decode,
                         output: entries.output,
                         group: entries.group,
                         experts: entries.experts,
@@ -735,7 +735,7 @@ fn certify_head_family(
     ),
     GraphError,
 > {
-    let checked = CheckedHeadEntries::new(binding)?;
+    let checked = CheckedHeadEntries::new(binding, backend)?;
     let mut family = CheckedGraphFamilyResources::new();
     let mut layouts = BTreeMap::new();
     // Every field but the entry row count fixes the graph's structure; the
@@ -836,7 +836,7 @@ pub(crate) fn verify_head_family_certificates(
     classes: &[HeadGraphClass],
 ) -> Result<(), GraphError> {
     let (_, layouts) = certify_head_family(backend, load, geometry, head, binding, classes)?;
-    let checked = CheckedHeadEntries::new(binding)?;
+    let checked = CheckedHeadEntries::new(binding, backend)?;
     for &class in classes {
         let exact = head_graph_draft(
             NativeGraphMetadata::new(backend),

@@ -1,37 +1,94 @@
 //! Routed (mixture-of-experts) feed-forward graph construction (program spec
 //! K6, E8).
 //!
-//! Row classes up to [`DECODE_ROWS`] run the decode form: route, expand,
-//! output. Larger classes run the grouped form: route, group, experts,
-//! combine. The grouping tables and grouped intermediates are graph locals
-//! sized from the class, the selected-expert count and [`TILE_ROWS`], so the
-//! graph plan charges them to the workspace; nothing is uploaded per step.
+//! Row classes up to [`DECODE_ROWS`] run the decode form ([`DecodeForm`]):
+//! route, expand, output; or, on a backend that declares
+//! `routed_route_shared`, the route with the shared expert's gate/up, the
+//! choices' gate/up, output. Larger classes run the grouped form: route,
+//! group, experts, combine. The grouping tables and grouped intermediates
+//! are graph locals sized from the class, the selected-expert count and
+//! [`TILE_ROWS`], so the graph plan charges them to the workspace; nothing is
+//! uploaded per step.
 
 use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_target_graph::{weight, WeightPort};
-use crate::{native::RoutedKernels, ModelLoadPlan, RoutedBinding};
+use crate::{
+    native::{RoutedDecodeKernels, RoutedKernels},
+    ModelLoadPlan, RoutedBinding,
+};
 use magnitude_family_contracts::{
     RouteNormalization, RoutedFfn, WeightKind, WeightScope,
 };
 use magnitude_kernels::{
-    routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
+    routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
+    routed_route, routed_route_shared,
 };
-use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{BackendName, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+
+/// How a backend runs the decode rows' expansions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecodeForm {
+    /// `routed_route`, then `routed_expand` over the choices and the shared
+    /// expert.
+    Expand,
+    /// `routed_route_shared`, whose launch also expands the shared expert
+    /// (it does not depend on the routes), then `routed_gate_up` (SiLU) over
+    /// the choices.
+    SharedRoute,
+}
+
+impl DecodeForm {
+    /// The shared-route form wherever the checked bundle declares
+    /// `routed_route_shared` for `backend`, else the expand form.
+    pub(crate) fn of(backend: BackendName) -> Result<Self, String> {
+        Ok(
+            match seismic::generated::native_implementation_for_backend::<
+                routed_route_shared::Entry,
+            >(backend)
+            .map_err(|error| error.to_string())?
+            {
+                Some(_) => Self::SharedRoute,
+                None => Self::Expand,
+            },
+        )
+    }
+}
 
 pub(crate) struct RoutedGraphEntries<'a, G: GraphDraft + 'a> {
     pub route: G::Binding<'a, routed_route::Entry>,
-    pub expand: G::Binding<'a, routed_expand::Entry>,
+    pub decode: RoutedDecodeEntries<'a, G>,
     pub output: G::Binding<'a, routed_output::Entry>,
     pub group: G::Binding<'a, routed_group::Entry>,
     pub experts: G::Binding<'a, routed_experts::Entry>,
     pub combine: G::Binding<'a, routed_combine::Entry>,
 }
 
+/// The decode rows' routing and expansion entries of a [`DecodeForm`].
+pub(crate) enum RoutedDecodeEntries<'a, G: GraphDraft + 'a> {
+    Expand(G::Binding<'a, routed_expand::Entry>),
+    SharedRoute {
+        route: G::Binding<'a, routed_route_shared::Entry>,
+        choices: G::Binding<'a, routed_gate_up::Entry>,
+    },
+}
+
+impl<'a, G: GraphDraft + 'a> Copy for RoutedDecodeEntries<'a, G> {}
+impl<'a, G: GraphDraft + 'a> Clone for RoutedDecodeEntries<'a, G> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
 impl<'a> From<&'a RoutedKernels> for RoutedGraphEntries<'a, NativeGraph> {
     fn from(kernels: &'a RoutedKernels) -> Self {
         Self {
             route: &kernels.route,
-            expand: &kernels.expand,
+            decode: match &kernels.decode {
+                RoutedDecodeKernels::Expand(expand) => RoutedDecodeEntries::Expand(expand),
+                RoutedDecodeKernels::SharedRoute { route, choices } => {
+                    RoutedDecodeEntries::SharedRoute { route, choices }
+                }
+            },
             output: &kernels.output,
             group: &kernels.group,
             experts: &kernels.experts,
@@ -42,28 +99,53 @@ impl<'a> From<&'a RoutedKernels> for RoutedGraphEntries<'a, NativeGraph> {
 
 pub(crate) struct CheckedRoutedEntries {
     route: [(&'static str, Element); 3],
-    expand: [(&'static str, Element); 5],
+    decode: CheckedDecodeEntries,
     output: [(&'static str, Element); 3],
     group: [(&'static str, Element); 0],
     experts: [(&'static str, Element); 4],
     combine: [(&'static str, Element); 4],
 }
 
+enum CheckedDecodeEntries {
+    Expand([(&'static str, Element); 5]),
+    SharedRoute {
+        route: [(&'static str, Element); 5],
+        choices: [(&'static str, Element); 3],
+    },
+}
+
 impl CheckedRoutedEntries {
-    pub(crate) fn new(binding: RoutedBinding) -> Self {
-        Self {
+    /// The entries of `binding` on `backend` (its [`DecodeForm`]).
+    pub(crate) fn new(binding: RoutedBinding, backend: BackendName) -> Result<Self, String> {
+        Ok(Self {
             route: [
                 ("NW", binding.norm),
                 ("RW", binding.router),
                 ("A", binding.activation),
             ],
-            expand: [
-                ("EGW", binding.expert_gate),
-                ("EUW", binding.expert_up),
-                ("SGW", binding.shared_gate),
-                ("SUW", binding.shared_up),
-                ("A", binding.activation),
-            ],
+            decode: match DecodeForm::of(backend)? {
+                DecodeForm::Expand => CheckedDecodeEntries::Expand([
+                    ("EGW", binding.expert_gate),
+                    ("EUW", binding.expert_up),
+                    ("SGW", binding.shared_gate),
+                    ("SUW", binding.shared_up),
+                    ("A", binding.activation),
+                ]),
+                DecodeForm::SharedRoute => CheckedDecodeEntries::SharedRoute {
+                    route: [
+                        ("NW", binding.norm),
+                        ("RW", binding.router),
+                        ("SGW", binding.shared_gate),
+                        ("SUW", binding.shared_up),
+                        ("A", binding.activation),
+                    ],
+                    choices: [
+                        ("EGW", binding.expert_gate),
+                        ("EUW", binding.expert_up),
+                        ("A", binding.activation),
+                    ],
+                },
+            },
             output: [
                 ("EDW", binding.expert_down),
                 ("SDW", binding.shared_down),
@@ -82,13 +164,21 @@ impl CheckedRoutedEntries {
                 ("SDW", binding.shared_down),
                 ("A", binding.activation),
             ],
-        }
+        })
     }
 
     pub(crate) fn entries(&self) -> RoutedGraphEntries<'_, NativeGraphMetadata> {
         RoutedGraphEntries {
             route: &self.route,
-            expand: &self.expand,
+            decode: match &self.decode {
+                CheckedDecodeEntries::Expand(expand) => RoutedDecodeEntries::Expand(&expand[..]),
+                CheckedDecodeEntries::SharedRoute { route, choices } => {
+                    RoutedDecodeEntries::SharedRoute {
+                        route: &route[..],
+                        choices: &choices[..],
+                    }
+                }
+            },
             output: &self.output,
             group: &self.group,
             experts: &self.experts,
@@ -203,6 +293,106 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     ];
     let mut routes = graph.local_for(handle.route, "routes", &choices)?;
     let mut scores = graph.local_for(handle.route, "scores", &choices)?;
+    let normalize = i32::from(shape.normalize_selected);
+
+    if decodes(rows) {
+        let (expert_product, shared_product, coefficient) = match handle.decode {
+            RoutedDecodeEntries::Expand(expand) => {
+                let routed = graph.enqueue(
+                    handle.route,
+                    &choices,
+                    routed_route::WorkflowArgs {
+                        residual: residual.into(),
+                        norm: (&norm).into(),
+                        router: (&router).into(),
+                        shared_router: (&shared_router).into(),
+                        routes: routes.tensor_mut().into(),
+                        scores: scores.tensor_mut().into(),
+                        eps: epsilon,
+                        normalize,
+                    },
+                )?;
+                let expanded = graph.enqueue(
+                    expand,
+                    &experts_dims,
+                    routed_expand::WorkflowArgs {
+                        normalized: (&routed.r0).into(),
+                        routes: routes.tensor().into(),
+                        expert_gate: (&expert_gate).into(),
+                        expert_up: (&expert_up).into(),
+                        shared_gate: (&shared_gate).into(),
+                        shared_up: (&shared_up).into(),
+                    },
+                )?;
+                (expanded.r0, expanded.r1, routed.r1)
+            }
+            RoutedDecodeEntries::SharedRoute {
+                route,
+                choices: gate_up,
+            } => {
+                let routed = graph.enqueue(
+                    route,
+                    &[
+                        ("M", rows),
+                        ("H", hidden),
+                        ("E", shape.count),
+                        ("K", shape.selected),
+                        ("S", shape.shared_intermediate),
+                    ],
+                    routed_route_shared::WorkflowArgs {
+                        residual: residual.into(),
+                        norm: (&norm).into(),
+                        router: (&router).into(),
+                        shared_router: (&shared_router).into(),
+                        shared_gate: (&shared_gate).into(),
+                        shared_up: (&shared_up).into(),
+                        routes: routes.tensor_mut().into(),
+                        scores: scores.tensor_mut().into(),
+                        eps: epsilon,
+                        normalize,
+                    },
+                )?;
+                let expert_product = graph
+                    .enqueue(
+                        gate_up,
+                        &[
+                            ("M", rows),
+                            ("H", hidden),
+                            ("E", shape.count),
+                            ("K", shape.selected),
+                            ("F", shape.intermediate),
+                        ],
+                        routed_gate_up::WorkflowArgs {
+                            normalized: (&routed.r0).into(),
+                            routes: routes.tensor().into(),
+                            expert_gate: (&expert_gate).into(),
+                            expert_up: (&expert_up).into(),
+                            // SiLU: the fused Qwen form's experts.
+                            activation: 0,
+                        },
+                    )?
+                    .value;
+                (expert_product, routed.r2, routed.r1)
+            }
+        };
+        return Ok(graph
+            .enqueue(
+                handle.output,
+                &experts_dims,
+                routed_output::WorkflowArgs {
+                    residual: residual.into(),
+                    expert_product: (&expert_product).into(),
+                    shared_product: (&shared_product).into(),
+                    routes: routes.tensor().into(),
+                    scores: scores.tensor().into(),
+                    coefficient: (&coefficient).into(),
+                    expert_down: (&expert_down).into(),
+                    shared_down: (&shared_down).into(),
+                },
+            )?
+            .value);
+    }
+
     let routed = graph.enqueue(
         handle.route,
         &choices,
@@ -214,42 +404,10 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             routes: routes.tensor_mut().into(),
             scores: scores.tensor_mut().into(),
             eps: epsilon,
-            normalize: i32::from(shape.normalize_selected),
+            normalize,
         },
     )?;
     let (normalized, coefficient) = (routed.r0, routed.r1);
-
-    if decodes(rows) {
-        let expanded = graph.enqueue(
-            handle.expand,
-            &experts_dims,
-            routed_expand::WorkflowArgs {
-                normalized: (&normalized).into(),
-                routes: routes.tensor().into(),
-                expert_gate: (&expert_gate).into(),
-                expert_up: (&expert_up).into(),
-                shared_gate: (&shared_gate).into(),
-                shared_up: (&shared_up).into(),
-            },
-        )?;
-        return Ok(graph
-            .enqueue(
-                handle.output,
-                &experts_dims,
-                routed_output::WorkflowArgs {
-                    residual: residual.into(),
-                    expert_product: (&expanded.r0).into(),
-                    shared_product: (&expanded.r1).into(),
-                    routes: routes.tensor().into(),
-                    scores: scores.tensor().into(),
-                    coefficient: (&coefficient).into(),
-                    expert_down: (&expert_down).into(),
-                    shared_down: (&shared_down).into(),
-                },
-            )?
-            .value);
-    }
-
     let blocks = grouped_blocks(rows, shape.count, shape.selected)?;
     let tables = [
         ("M", rows),

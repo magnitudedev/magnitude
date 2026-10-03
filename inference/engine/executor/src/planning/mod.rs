@@ -390,8 +390,16 @@ pub(crate) mod tests {
             )
             .unwrap();
         let copy = programs.state_graphs().unwrap();
-        let plan =
-            ResourcePlanner::plan_with_state(state, &target, &readout, None, None, copy).unwrap();
+        let plan = ResourcePlanner::plan_with_state(
+            device.backend(),
+            state,
+            &target,
+            &readout,
+            None,
+            None,
+            copy,
+        )
+        .unwrap();
         assert_eq!(
             plan.target_graph().workspace_bytes,
             target.workspace_bytes()

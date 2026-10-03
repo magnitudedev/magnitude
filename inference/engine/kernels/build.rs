@@ -3,12 +3,36 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Every entry is implemented on each of these backends, one asset per
-/// backend at `kernels/<backend>/<entry>.<extension>`.
+/// backend at `kernels/<backend>/<entry>.<extension>`, apart from
+/// `ENTRY_EXCEPTIONS`.
 const BACKENDS: [BackendName; 4] = [
     BackendName::Cpu,
     BackendName::Metal,
     BackendName::Cuda,
     BackendName::Vulkan,
+];
+
+/// Entries implemented on only some backends: (entry; the backends that
+/// implement it; why). The executor selects such an entry only where the
+/// checked bundle declares it. An exception whose actual coverage differs,
+/// including one now on every backend, fails the build so this list cannot go
+/// stale; its assets are exempt from `tree_parity` alike.
+const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
+    (
+        "routed_route_shared",
+        &[BackendName::Metal],
+        "decode routing that also expands the shared expert in the router launch; the other backends run `routed_route`, then `routed_expand`, until the form is measured there",
+    ),
+    (
+        "gated_delta_project_convolved",
+        &[BackendName::Metal],
+        "the convolved recurrent decode form's projection, which also convolves and publishes the windows; the other backends run `gated_delta_project`, then `gated_delta_step`, until the form is measured there",
+    ),
+    (
+        "gated_delta_step_convolved",
+        &[BackendName::Metal],
+        "the convolved recurrent decode form's step over the projection's convolved channels; the other backends convolve in `gated_delta_step`",
+    ),
 ];
 
 /// Files of the per-backend trees that exist on only some backends: (path
@@ -27,6 +51,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "lib/attention/flash",
         &[BackendName::Vulkan],
         "cooperative-matrix tile pieces shared by the prefill and vision attention bodies",
+    ),
+    (
+        "lib/core/arrive",
+        &[BackendName::Metal],
+        "last-threadgroup arrival over `sync` scratch; only Metal natives declare sync scratch so far",
     ),
     (
         "lib/core/precise",
@@ -54,9 +83,19 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "representation ladder of `expert_down` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
     ),
     (
+        "lib/recurrent/convolution",
+        &[BackendName::Metal],
+        "the gated-delta convolution and window publication, apart from `recurrent.h` because the Metal-only `gated_delta_step_convolved` binds no window; the other backends keep them in their recurrent library",
+    ),
+    (
         "lib/routed/router",
         &[BackendName::Metal],
         "decode router logits shared by the Metal route and select GEMVs over the projection GEMV body (any activation element, unlike `routed.h`); CUDA and Vulkan keep their router GEMVs inline",
+    ),
+    (
+        "lib/routed/route",
+        &[BackendName::Metal],
+        "decode router threadgroups of the `routed_route` contract, shared by `routed_route` and the Metal-only `routed_route_shared`",
     ),
 ];
 
@@ -110,8 +149,9 @@ const fn library_extension(backend: BackendName) -> &'static str {
     }
 }
 
-/// Every entry with a native implementation has one on each of `BACKENDS`,
-/// at the path named after the entry.
+/// Every entry with a native implementation has one on each of `BACKENDS`
+/// (on exactly its listed backends, for an `ENTRY_EXCEPTIONS` entry), at the
+/// path named after the entry.
 fn entry_parity(kernels: &Path, natives: &[NativeCoverage]) -> Vec<String> {
     let mut by_entry = BTreeMap::<&str, BTreeMap<BackendName, &Path>>::new();
     for native in natives {
@@ -121,8 +161,32 @@ fn entry_parity(kernels: &Path, natives: &[NativeCoverage]) -> Vec<String> {
             .insert(native.backend, &native.asset);
     }
     let mut violations = Vec::new();
+    for (entry, _, _) in ENTRY_EXCEPTIONS {
+        if !by_entry.contains_key(entry) {
+            violations.push(format!(
+                "ENTRY_EXCEPTIONS lists `{entry}`, but no backend implements it; remove the exception"
+            ));
+        }
+    }
     for (entry, assets) in by_entry {
+        let exception = ENTRY_EXCEPTIONS
+            .iter()
+            .find(|(candidate, _, _)| *candidate == entry);
+        if let Some((_, declared, _)) = exception {
+            let declared = declared.iter().copied().collect::<BTreeSet<_>>();
+            let actual = assets.keys().copied().collect::<BTreeSet<_>>();
+            if declared != actual {
+                violations.push(format!(
+                    "ENTRY_EXCEPTIONS lists `{entry}` on {}, but it is implemented on {}; update or remove the exception",
+                    names(&declared),
+                    names(&actual)
+                ));
+            }
+        }
         for backend in BACKENDS {
+            if exception.is_some() && !assets.contains_key(&backend) {
+                continue;
+            }
             let expected = kernels
                 .join(backend.as_str())
                 .join(format!("{entry}.{}", entry_extension(backend)));
@@ -176,6 +240,7 @@ fn tree_parity(kernels: &Path) -> Vec<String> {
     }
     let exceptions: BTreeMap<&str, (BTreeSet<BackendName>, &str)> = TREE_EXCEPTIONS
         .iter()
+        .chain(ENTRY_EXCEPTIONS)
         .map(|(stem, backends, reason)| (*stem, (backends.iter().copied().collect(), *reason)))
         .collect();
     for (stem, backends) in &presence {

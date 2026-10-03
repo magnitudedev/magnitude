@@ -9,7 +9,7 @@ use magnitude_state::{
     HistoryDomainLayout, HistoryDomainPlan, HistoryDomainTrace, KvCodec, LayerRef,
     ModelStateLayout, StateStore, StoreBindings,
 };
-use seismic::{DType, Device, Element, SlabLayout, SlabRegion};
+use seismic::{BackendName, DType, Device, Element, SlabLayout, SlabRegion};
 use std::rc::Rc;
 
 /// The service's bounds a load plans for. None is a request-count batch
@@ -897,6 +897,7 @@ impl ResourcePlanner {
     }
 
     pub fn plan_with_state(
+        backend: BackendName,
         state: StateResourcePlan,
         target_graphs: &PreparedTargetGraphs,
         target_readout_graphs: &PreparedTargetReadoutGraphs,
@@ -960,6 +961,7 @@ impl ResourcePlanner {
             &load
                 .program_plan(definition, state.codec)
                 .map_err(|error| error.to_string())?,
+            backend,
         )
         .map_err(|error| error.to_string())?;
         let [target_weights, head_weights, vision_weights] = weight_bytes_by_component(load)?;

@@ -248,6 +248,7 @@ pub(crate) fn build(
         )
         .map_err(internal)?;
     let resources = ResourcePlanner::plan_with_state(
+        opened.device().backend(),
         state,
         &target_graphs,
         &target_readout_graphs,

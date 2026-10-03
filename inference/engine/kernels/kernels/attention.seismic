@@ -544,8 +544,8 @@ native attention_decode for metal from "metal/attention_decode.metal":
         threads_per_threadgroup (SIMDS * 32, 1, 1)
         shared_bytes ((1 - MATRIX) * (SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2)) + MATRIX * (ceil_div(TOKENS * G, 8) * 8 * (2 * P + S) * 2 + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) + 8) * 2 + min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * ceil_div(TOKENS * G, 8) * 8 * KEYS * 4, ceil_div(TOKENS * G, 8) * 8 * (2 * P + S) * 4) + SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) * ceil_div(TOKENS * G, 8) * 8 * 8))
     launch attention_decode_merge:
-        threadgroups (KV * G, M, 1)
-        threads_per_threadgroup (2 * P + S, 1, 1)
+        threadgroups (KV * G, M, (2 * P + S) / 32)
+        threads_per_threadgroup (32, 1, 1)
 
 # CUDA: split-KV decode over PARTS equal partitions per (kv head, row); WARPS
 # warps per block scan contiguous slices of the partition, a warp holding one
@@ -939,8 +939,8 @@ native attention_decode_k8v4 for metal from "metal/attention_decode_k8v4.metal":
         threads_per_threadgroup (SIMDS * 32, 1, 1)
         shared_bytes ((1 - MATRIX) * (SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2)) + MATRIX * ((1 - (min(TOKENS / 4, 4 / TOKENS) * min(G / 8, 8 / G) * min((2 * P + S) / 128, 256 / (2 * P + S)) * min(SIMDS / TOKENS, TOKENS / SIMDS) * min(1, 32768 / (max(TOKENS * G * (2 * P + S) * 2, max(KEYS * (2 * P + S) * 4, G * (2 * P + S) * 4)) + G * 8)))) * ((2 - min(2, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)))) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max(SIMDS * KEYS * ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) * 2, (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4))) + min(1, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) - 1) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) + 8) * 2 + (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4), (ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 4) + (SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) * (ceil_div(TOKENS * G, 8) * 8) * 8)))) + (min(TOKENS / 4, 4 / TOKENS) * min(G / 8, 8 / G) * min((2 * P + S) / 128, 256 / (2 * P + S)) * min(SIMDS / TOKENS, TOKENS / SIMDS) * min(1, 32768 / (max(TOKENS * G * (2 * P + S) * 2, max(KEYS * (2 * P + S) * 4, G * (2 * P + S) * 4)) + G * 8))) * (max(TOKENS * G * (2 * P + S) * 2, max(KEYS * (2 * P + S) * 4, G * (2 * P + S) * 4)) + G * 8))
     launch attention_decode_k8v4_merge:
-        threadgroups (KV * G, M, 1)
-        threads_per_threadgroup (2 * P + S, 1, 1)
+        threadgroups (KV * G, M, (2 * P + S) / 32)
+        threads_per_threadgroup (32, 1, 1)
 
 # CUDA: `attention_decode`'s equal split-KV partitioning; history keys score
 # against raw codes (per group scale * (q . code) + zero * sum(q)) and values

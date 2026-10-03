@@ -1,10 +1,12 @@
-// Routing for M rows in four launches.
+// Routing for M rows: one launch at M <= 8 (gemv), three above (stage, gemm,
+// select).
 //   routed_route_stage (one threadgroup per row): the row's RMS and its
 //     normalized values (rounded to the activation dtype), published once.
-//   routed_route_gemv (M <= 8): the router logits (`lib/routed/router.h`),
-//     one simdgroup per logit column over the normalized rows each
-//     threadgroup forms from RMS partials of its own; one more threadgroup
-//     forms the shared-expert gate column.
+//   routed_route_gemv (M <= 8): the router logits (`lib/routed/router.h`,
+//     `lib/routed/route.h`), one simdgroup per logit column over the
+//     normalized rows each threadgroup forms from RMS partials of its own;
+//     one more threadgroup forms the shared-expert gate column; the last
+//     threadgroup to arrive selects.
 //   routed_route_gemm (M > 8): 32 rows x 32 columns per threadgroup on
 //     8x8 F32 simdgroup matrices over staged tiles.
 //   Logits are [M, E + 1]: column E is the shared-expert gate.
@@ -16,16 +18,7 @@
 // expert, so experts with equal router rows tie exactly.
 
 #define KERNEL_W0 SEISMIC_ROUTER
-#include "lib/routed/router.h"
-#include "lib/core/reduce.h"
-
-typedef element::Act Act;
-// The norm is dense; router rows may be dense or packed rows16.
-typedef ELEMENT_OF(SEISMIC_NORM) Norm;
-typedef routing::Packets<packets::W0>::type Router;
-
-constant constexpr uint route_threads = routing::stage_threads;
-constant constexpr uint route_simdgroups = routing::stage_simdgroups;
+#include "lib/routed/route.h"
 
 kernel void routed_route_stage(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
@@ -53,62 +46,30 @@ kernel void routed_route_stage(
     }
 }
 
-// The router logits scratch is [M, E + 1]: column E holds the shared-expert
-// gate logit (normalized . shared_router), formed like an expert's logit.
-inline ulong logit_index(ulong row, ulong expert) {
-    return row * (SEISMIC_DIM_E + 1) + expert;
-}
-
-// The shared-expert gate row: one dense, contiguous F32 row of H values (a
-// weight, like the router rows).
-typedef routing::EagerDense<element::F32> SharedGate;
-
-// M <= 8, one launch before the selection: the threadgroup computes its rows'
-// RMS inverses (in the normalize launch's order); threadgroup 0 publishes the
-// normalized rows. Every threadgroup but the last then forms the logits of
-// SIMDGROUPS router rows; the last forms the shared-expert gate column.
+// M <= 8, the only launch: the router threadgroups of `lib/routed/route.h`.
 kernel void routed_route_gemv(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
     device const uchar *router [[buffer(SEISMIC_BUFFER_ROUTER)]],
     device const float *shared_router [[buffer(SEISMIC_BUFFER_SHARED_ROUTER)]],
+    device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
+    device float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
     device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    device float *coefficient [[buffer(SEISMIC_RESULT_1_BUFFER)]],
     device float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
+    device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
     uint group [[threadgroup_position_in_grid]],
-    uint groups [[threadgroups_per_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float parts[8 * route_simdgroups];
     threadgroup float inverses[8];
-    const uint rows = uint(SEISMIC_DIM_M);
-    const uint k = uint(SEISMIC_DIM_H);
-    routing::inverses(residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, k,
-        as_type<float>(uint(SEISMIC_PARAM_EPS)), rows, parts, inverses, SEISMIC_TUNE_SIMDGROUPS, simd, lane, tid);
-    if (group == 0) {
-        for (uint item = tid; item < rows * uint(SEISMIC_DIM_H); item += 32 * SEISMIC_TUNE_SIMDGROUPS) {
-            const ulong row = item / SEISMIC_DIM_H, source = item % SEISMIC_DIM_H;
-            const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-            element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-                Act::round(value * inverses[row] * element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0)));
-        }
-    }
-    const routing::Rows<Norm> in{residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm,
-        SEISMIC_NORM_STRIDE_0, inverses, k};
-    if (group + 1 < groups) {
-        const projection::Weights<Router> weights{router, KERNEL_W0_LAYOUT(k), k, nullptr};
-        const routing::Logits out{logits, SEISMIC_DIM_E + 1, 0};
-        routing::Gemv<Act::bytes>::columns(in, weights, out, rows, uint(SEISMIC_DIM_E), group, shared,
-            SEISMIC_TUNE_SIMDGROUPS, simd, lane);
-    } else {
-        const projection::Weights<SharedGate> gate{reinterpret_cast<device const uchar *>(shared_router),
-            PACKETS_ROWS16_DENSE(element::F32, k), k, nullptr};
-        const routing::Logits out{logits, SEISMIC_DIM_E + 1, SEISMIC_DIM_E};
-        routing::Gemv<Act::bytes>::columns(in, gate, out, rows, 1, 0, shared, SEISMIC_TUNE_SIMDGROUPS, simd,
-            lane);
-    }
+    threadgroup uint last;
+    const routing::Rows<Norm> in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
+    route_group(in, router, shared_router, routes, scores, normalized, coefficient, logits, arrivals, seismic_words,
+        shared, &last, group, tid, simd, lane);
 }
 
 // Rows and logit columns per GEMM threadgroup, and hidden coordinates per
@@ -193,14 +154,8 @@ kernel void routed_route_gemm(
     }
 }
 
-// Descending probability, ties to the higher expert index.
-inline bool precedes(float probability, int expert, float best, int best_expert) {
-    return probability > best || (probability == best && expert > best_expert);
-}
-
-// Every register array is indexed by unrolled loops only: a dynamically
-// indexed one lives in stack memory, and its K dependent rounds then dominate
-// the routing.
+// M > 8: one simdgroup per row, after the GEMM. (M <= 8 selects in the last
+// GEMV threadgroup to arrive.)
 kernel void routed_route_select(
     device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
     device float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
@@ -210,69 +165,8 @@ kernel void routed_route_select(
     uint group [[threadgroup_position_in_grid]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint per_lane = SEISMIC_DIM_E / 32;
-    constexpr uint K = SEISMIC_DIM_K;
     const ulong row = ulong(group) * route_simdgroups + simd;
     if (row >= SEISMIC_DIM_M)
         return;
-    device const float *values = logits + logit_index(row, 0);
-    // Lane `lane` holds experts lane + 32 i.
-    float probability[per_lane];
-    float maximum = -INFINITY;
-    PROJECTION_UNROLL
-    for (uint i = 0; i < per_lane; ++i) {
-        probability[i] = values[lane + 32 * i];
-        maximum = metal::max(maximum, probability[i]);
-    }
-    maximum = simd_max(maximum);
-    float total = 0.0f;
-    PROJECTION_UNROLL
-    for (uint i = 0; i < per_lane; ++i) {
-        probability[i] = metal::exp(probability[i] - maximum);
-        total += probability[i];
-    }
-    total = simd_sum(total);
-    PROJECTION_UNROLL
-    for (uint i = 0; i < per_lane; ++i)
-        probability[i] = probability[i] / total;
-
-    float chosen[K];
-    int winners[K];
-    PROJECTION_UNROLL
-    for (uint rank = 0; rank < K; ++rank) {
-        float best = -INFINITY;
-        int best_expert = -1;
-        PROJECTION_UNROLL
-        for (uint i = 0; i < per_lane; ++i) {
-            const int expert = int(lane + 32 * i);
-            if (precedes(probability[i], expert, best, best_expert)) {
-                best = probability[i];
-                best_expert = expert;
-            }
-        }
-        float winner_probability;
-        const int winner = reduce::argmax<reduce::HigherIndex>(best, best_expert, winner_probability);
-        PROJECTION_UNROLL
-        for (uint i = 0; i < per_lane; ++i)
-            if (winner == int(lane + 32 * i))
-                probability[i] = -INFINITY;
-        chosen[rank] = winner_probability;
-        winners[rank] = winner;
-    }
-    // Slot s holds rank K - 1 - s; the renormalization divides by the
-    // slot-order sum.
-    float denominator = 0.0f;
-    PROJECTION_UNROLL
-    for (uint slot = 0; slot < K; ++slot)
-        denominator += chosen[K - 1 - slot];
-    if (lane == 0) {
-        PROJECTION_UNROLL
-        for (uint slot = 0; slot < K; ++slot) {
-            const float probability = chosen[K - 1 - slot];
-            routes[row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1] = winners[K - 1 - slot];
-            scores[row * SEISMIC_SCORES_STRIDE_0 + slot * SEISMIC_SCORES_STRIDE_1] =
-                SEISMIC_PARAM_NORMALIZE != 0 ? probability / denominator : probability;
-        }
-        coefficient[row * SEISMIC_RESULT_1_STRIDE_0] = 1.0f / (1.0f + metal::exp(-values[SEISMIC_DIM_E]));
-    }
+    select_row(row, [&](ulong at) { return logits[at]; }, routes, scores, coefficient, seismic_words, lane);
 }

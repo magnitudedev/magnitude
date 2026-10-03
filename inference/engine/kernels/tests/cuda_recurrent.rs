@@ -47,7 +47,10 @@ impl Case {
     ) -> seismic::NativeKernel<gated_delta_step::Entry> {
         gated_delta_step::native_for_device_with(
             device,
-            gated_delta_step::Elements { A: activation },
+            gated_delta_step::Elements {
+                RN: Element::f32(),
+                A: activation,
+            },
             &NativeSpecialization::new()
                 .with_static("NK", self.geometry.key_heads as u64)
                 .with_static("NV", self.geometry.value_heads as u64)
@@ -67,7 +70,10 @@ impl Case {
     ) -> seismic::NativeKernel<gated_delta_chunk::Entry> {
         gated_delta_chunk::native_for_device_with(
             device,
-            gated_delta_chunk::Elements { A: activation },
+            gated_delta_chunk::Elements {
+                RN: Element::f32(),
+                A: activation,
+            },
             &NativeSpecialization::new()
                 .with_static("NK", self.geometry.key_heads as u64)
                 .with_static("NV", self.geometry.value_heads as u64)
@@ -90,7 +96,7 @@ impl Case {
         reused: bool,
     ) -> Outcome {
         let mut t = self.tensors_with_reused_slab(device, activation, reused);
-        let mixed = match mapping {
+        let gated = match mapping {
             Mapping::Step(rows, warps) => {
                 self.cuda_step(device, activation, (rows, warps))
                     .call(t.step_args(self))
@@ -105,7 +111,7 @@ impl Case {
             }
         };
         Outcome {
-            mixed: read(&mixed),
+            gated: read(&gated),
             window: read(&t.window),
             delta: read(&t.delta),
             tape: read(&t.tape),
@@ -158,9 +164,9 @@ fn cuda_mapping_never_changes_bits_and_stop_equals_a_shorter_run() {
         let outcome = full.cuda(&device, Element::f32(), Mapping::Step(mapping.0, mapping.1));
         assert!(
             reference
-                .mixed
+                .gated
                 .iter()
-                .zip(&outcome.mixed)
+                .zip(&outcome.gated)
                 .all(|(a, b)| a.to_bits() == b.to_bits())
                 && reference
                     .delta
@@ -185,9 +191,9 @@ fn cuda_mapping_never_changes_bits_and_stop_equals_a_shorter_run() {
         let other = long.cuda(&device, Element::f32(), Mapping::Chunk(*rows));
         assert!(
             first
-                .mixed
+                .gated
                 .iter()
-                .zip(&other.mixed)
+                .zip(&other.gated)
                 .all(|(a, b)| a.to_bits() == b.to_bits())
                 && first
                     .delta
@@ -253,9 +259,9 @@ fn cuda_chunk_short_slots_get_the_step_bits() {
             }
             let bank = s.following * g.delta_bank()..(s.following + 1) * g.delta_bank();
             assert!(
-                step.mixed[range.clone()]
+                step.gated[range.clone()]
                     .iter()
-                    .zip(&chunk.mixed[range])
+                    .zip(&chunk.gated[range])
                     .all(|(a, b)| a.to_bits() == b.to_bits())
                     && step.delta[bank.clone()]
                         .iter()
@@ -329,7 +335,10 @@ fn cuda_recurrent_scoped_tuning_completes() {
     }];
     let result = gated_delta_chunk::native_tune_with(
         &device,
-        gated_delta_chunk::Elements { A: Element::bf16() },
+        gated_delta_chunk::Elements {
+            RN: Element::f32(),
+            A: Element::bf16(),
+        },
         &statics,
         points,
         seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {

@@ -4,7 +4,7 @@
 // `gated_delta_step` and `gated_delta_chunk` share one portable body
 // (`gated_delta_rows`). Small geometries run that body in the Seismic
 // interpreter; the real 4B geometry uses an independent f64 host model of the
-// same contract. Every case checks the mixed outputs, the published window
+// same contract. Every case checks the gated outputs, the published window
 // (bit-exact: it is a copy) and state, and that no bank other than each
 // slot's successor changes: accepted banks, the zero seed, and unrelated
 // banks keep their exact bytes.
@@ -82,17 +82,21 @@ struct Case {
     slots: Vec<SlotCase>,
     grouped: bool,
     epsilon: f32,
+    /// The gating's RMS epsilon.
+    rms_epsilon: f32,
     projection: Vec<f32>,
     convolution: Vec<f32>,
     rate: Vec<f32>,
     time_bias: Vec<f32>,
+    /// The recurrent norm weights (W).
+    norm: Vec<f32>,
     window: Vec<f32>,
     delta: Vec<f32>,
     tape: Vec<f32>,
 }
 
 struct Outcome {
-    mixed: Vec<f32>,
+    gated: Vec<f32>,
     window: Vec<f32>,
     delta: Vec<f32>,
     tape: Vec<f32>,
@@ -104,6 +108,7 @@ struct Tensors {
     convolution: Tensor,
     rate: Tensor,
     time_bias: Tensor,
+    norm: Tensor,
     segments: Tensor,
     stop: Tensor,
     previous: Tensor,
@@ -123,6 +128,7 @@ impl Tensors {
             convolution: &self.convolution,
             rate: &self.rate,
             time_bias: &self.time_bias,
+            recurrent_norm: &self.norm,
             segments: &self.segments,
             stop: &self.stop,
             previous_bank: &self.previous,
@@ -132,6 +138,7 @@ impl Tensors {
             delta: &mut self.delta,
             tape: &mut self.tape,
             norm_epsilon: case.epsilon,
+            epsilon: case.rms_epsilon,
             grouped: case.grouped,
             slab_banks: self.slab_banks,
         }
@@ -143,6 +150,7 @@ impl Tensors {
             convolution: &self.convolution,
             rate: &self.rate,
             time_bias: &self.time_bias,
+            recurrent_norm: &self.norm,
             segments: &self.segments,
             stop: &self.stop,
             previous_bank: &self.previous,
@@ -152,6 +160,7 @@ impl Tensors {
             delta: &mut self.delta,
             tape: &mut self.tape,
             norm_epsilon: case.epsilon,
+            epsilon: case.rms_epsilon,
             grouped: case.grouped,
             slab_banks: self.slab_banks,
         }
@@ -204,6 +213,9 @@ impl Case {
         let time_bias = (0..geometry.value_heads)
             .map(|_| random.next() * 0.5)
             .collect();
+        let norm = (0..geometry.width)
+            .map(|_| 1.0 + 0.5 * random.next())
+            .collect();
         let accepted = slots.iter().map(|slot| slot.previous).collect::<Vec<_>>();
         let mut window = vec![SENTINEL; geometry.banks * geometry.window_bank()];
         let mut delta = vec![SENTINEL; geometry.banks * geometry.delta_bank()];
@@ -246,10 +258,12 @@ impl Case {
             slots,
             grouped,
             epsilon: 1.0e-6 * geometry.width as f32,
+            rms_epsilon: 1.0e-6,
             projection,
             convolution,
             rate,
             time_bias,
+            norm,
             window,
             delta,
             tape,
@@ -273,6 +287,7 @@ impl Case {
             convolution: self.convolution.clone(),
             rate: self.rate.clone(),
             time_bias: self.time_bias.clone(),
+            norm: self.norm.clone(),
             window: outcome.window.clone(),
             delta: outcome.delta.clone(),
             tape: outcome.tape.clone(),
@@ -461,11 +476,46 @@ impl Case {
             first += slot.rows;
         }
         Outcome {
-            mixed,
+            gated: self.gate(&mixed),
             window,
             delta,
             tape,
         }
+    }
+
+    /// The contract's gating of raw outputs `mixed` [M, NV, W] (f64 math,
+    /// each rounding point of the body rounded to the case's activation).
+    fn gate(&self, mixed: &[f32]) -> Vec<f32> {
+        let g = self.geometry;
+        let (nv, w) = (g.value_heads, g.width);
+        let round = |value: f64| {
+            if self.bf16 {
+                bf16_round(value as f32)
+            } else {
+                value as f32
+            }
+        };
+        let z = g.channels();
+        let mut gated = vec![0.0f32; mixed.len()];
+        for row in 0..self.rows {
+            for head in 0..nv {
+                let raw = &mixed[(row * nv + head) * w..][..w];
+                let raw = raw
+                    .iter()
+                    .map(|value| round(*value as f64) as f64)
+                    .collect::<Vec<_>>();
+                let squares = raw.iter().map(|value| value * value).sum::<f64>();
+                let inverse = 1.0 / (squares / w as f64 + self.rms_epsilon as f64).sqrt();
+                for column in 0..w {
+                    let gate =
+                        self.projection[row * g.projection_width() + z + head * w + column] as f64;
+                    let normalized = round(raw[column] * inverse * self.norm[column] as f64) as f64;
+                    let activated = round(gate / (1.0 + (-gate).exp())) as f64;
+                    gated[(row * nv + head) * w + column] = round(normalized * activated);
+                }
+            }
+        }
+        gated
     }
 
     /// The portable body executed by the Seismic interpreter.
@@ -485,7 +535,9 @@ impl Case {
             text: include_str!("../kernels/recurrent.seismic").into(),
         });
         let module = check_source(sources).unwrap();
-        let elements = ElementBindings::new().bind("A", registry::dense(DType::F32));
+        let elements = ElementBindings::new()
+            .bind("A", registry::dense(DType::F32))
+            .bind("RN", registry::dense(DType::F32));
         let logical = module
             .entry(module.entry_named("gated_delta_step").unwrap(), &elements)
             .unwrap();
@@ -510,6 +562,7 @@ impl Case {
             floats(vec![g.channels(), g.convolution], &self.convolution),
             floats(vec![g.value_heads], &self.rate),
             floats(vec![g.value_heads], &self.time_bias),
+            floats(vec![g.width], &self.norm),
             TensorData::dense(
                 DType::I32,
                 vec![self.slots.len() + 1, 2],
@@ -533,6 +586,9 @@ impl Case {
             .map(|tensor| Arg::Tensor(interpreter.add_tensor(tensor)))
             .collect::<Vec<_>>();
         arguments.push(Arg::Scalar(ReferenceScalar::F32(self.epsilon.to_bits())));
+        arguments.push(Arg::Scalar(ReferenceScalar::F32(
+            self.rms_epsilon.to_bits(),
+        )));
         arguments.push(Arg::Scalar(ReferenceScalar::Bool(self.grouped)));
         arguments.push(Arg::Scalar(ReferenceScalar::U32(2)));
         let outcome = interpreter.run_bounded(&arguments, u64::MAX).unwrap();
@@ -544,23 +600,23 @@ impl Case {
                 .map(|index| reader.read(index).unwrap() as f32)
                 .collect::<Vec<_>>()
         };
-        let mixed = match outcome.results().next().unwrap().value() {
+        let gated = match outcome.results().next().unwrap().value() {
             OutcomeValue::Tensor(reader) => read(reader),
-            _ => panic!("mixed output is a tensor"),
+            _ => panic!("gated output is a tensor"),
         };
         let mut window = None;
         let mut delta = None;
         let mut tape = None;
         for input in outcome.inputs() {
             match input.ordinal() {
-                9 => window = Some(read(input.tensor())),
-                10 => delta = Some(read(input.tensor())),
-                11 => tape = Some(read(input.tensor())),
+                10 => window = Some(read(input.tensor())),
+                11 => delta = Some(read(input.tensor())),
+                12 => tape = Some(read(input.tensor())),
                 _ => {}
             }
         }
         Outcome {
-            mixed,
+            gated,
             window: window.expect("window is a mutable input"),
             delta: delta.expect("delta is a mutable input"),
             tape: tape.expect("tape is a mutable input"),
@@ -705,6 +761,7 @@ impl Case {
             ),
             rate: from_f32(&[g.value_heads as u64], &self.rate),
             time_bias: from_f32(&[g.value_heads as u64], &self.time_bias),
+            norm: from_f32(&[g.width as u64], &self.norm),
             segments: ints(&[slots + 1, 2], self.segments()),
             stop: ints(
                 &[slots],
@@ -757,7 +814,10 @@ impl Case {
     ) -> seismic::NativeKernel<gated_delta_step::Entry> {
         gated_delta_step::native_for_device_with(
             device,
-            gated_delta_step::Elements { A: activation },
+            gated_delta_step::Elements {
+                RN: Element::f32(),
+                A: activation,
+            },
             &self.specialization(device, rows),
         )
         .unwrap()
@@ -772,7 +832,10 @@ impl Case {
     ) -> seismic::NativeKernel<gated_delta_chunk::Entry> {
         gated_delta_chunk::native_for_device_with(
             device,
-            gated_delta_chunk::Elements { A: activation },
+            gated_delta_chunk::Elements {
+                RN: Element::f32(),
+                A: activation,
+            },
             &self.specialization(device, rows),
         )
         .unwrap()
@@ -791,7 +854,7 @@ impl Case {
         reuse: bool,
     ) -> Outcome {
         let mut t = self.tensors_with_reused_slab(device, activation, reuse);
-        let mixed = match chunk {
+        let gated = match chunk {
             None => {
                 self.native_step(device, activation, 32.min(self.geometry.width as u64))
                     .call(t.step_args(self))
@@ -806,7 +869,7 @@ impl Case {
             }
         };
         Outcome {
-            mixed: read(&mixed),
+            gated: read(&gated),
             window: read(&t.window),
             delta: read(&t.delta),
             tape: read(&t.tape),
@@ -849,36 +912,38 @@ fn errors(actual: &[f32], expected: &[f32]) -> (f64, f64) {
     (max / scale, (squares / actual.len() as f64).sqrt() / scale)
 }
 
-/// Compare one outcome with the reference. Mixed outputs and successor state
+/// Compare one outcome with the reference. Gated outputs and successor state
 /// are held to `(max, rms)` relative tolerances; windows are copies and must
-/// be bit-exact; every non-successor bank must be untouched. BF16 mixed
-/// outputs are compared with the reference rounded to BF16, each within one
-/// BF16 unit in the last place of its magnitude (plus the relative bound).
+/// be bit-exact; every non-successor bank must be untouched. BF16 gated
+/// outputs are compared with the reference (whose gating rounds to BF16 where
+/// the body does), each within two BF16 units in the last place of its
+/// magnitude (plus the relative bound): a raw output within tolerance can
+/// still round its normalized value, and then the product, one unit apart.
 fn check(label: &str, case: &Case, actual: &Outcome, expected: &Outcome, tolerance: (f64, f64)) {
     let g = case.geometry;
-    let (max, rms) = errors(&actual.mixed, &expected.mixed);
-    println!("{label} mixed: max/rms {max:.3e} rms/rms {rms:.3e}");
+    let (max, rms) = errors(&actual.gated, &expected.gated);
+    println!("{label} gated: max/rms {max:.3e} rms/rms {rms:.3e}");
     if case.bf16 {
         let scale = (expected
-            .mixed
+            .gated
             .iter()
             .map(|v| (*v as f64).powi(2))
             .sum::<f64>()
-            / expected.mixed.len() as f64)
+            / expected.gated.len() as f64)
             .sqrt();
-        for (index, (a, e)) in actual.mixed.iter().zip(&expected.mixed).enumerate() {
+        for (index, (a, e)) in actual.gated.iter().zip(&expected.gated).enumerate() {
             let rounded = bf16_round(*e) as f64;
-            let allowed = rounded.abs() * 2f64.powi(-7) + tolerance.0 * scale;
+            let allowed = rounded.abs() * 2f64.powi(-6) + tolerance.0 * scale;
             assert!(
                 (*a as f64 - rounded).abs() <= allowed,
-                "{label} mixed[{index}] {a} vs {rounded}"
+                "{label} gated[{index}] {a} vs {rounded}"
             );
         }
-        assert!(rms <= tolerance.1, "{label} mixed rms error {rms}");
+        assert!(rms <= tolerance.1, "{label} gated rms error {rms}");
     } else {
         assert!(
             max <= tolerance.0 && rms <= tolerance.1,
-            "{label} mixed error {max} {rms}"
+            "{label} gated error {max} {rms}"
         );
     }
     for bank in 0..g.banks {
@@ -1199,9 +1264,9 @@ fn tape_versions_equal_stopped_runs(
         let bank = |values: &[f32], size: usize| values[3 * size..4 * size].to_vec();
         assert!(
             from_tape
-                .mixed
+                .gated
                 .iter()
-                .zip(&expected.mixed)
+                .zip(&expected.gated)
                 .all(|(a, b)| a.to_bits() == b.to_bits())
                 && bank(&from_tape.delta, g.delta_bank()) == bank(&expected.delta, g.delta_bank())
                 && bank(&from_tape.window, g.window_bank())
@@ -1299,12 +1364,12 @@ fn step_row_block_never_changes_bits_and_stop_equals_a_shorter_run_on(device: &D
     let mut reference = None;
     for rows in [16u64, 32] {
         let mut t = full.tensors(device, Element::f32());
-        let mixed = full
+        let gated = full
             .native_step(device, Element::f32(), rows)
             .call(t.step_args(&full))
             .unwrap()
             .value;
-        let outcome = (read(&mixed), read(&t.window), read(&t.delta));
+        let outcome = (read(&gated), read(&t.window), read(&t.delta));
         match &reference {
             None => reference = Some(outcome),
             Some(reference) => assert!(
@@ -1357,15 +1422,30 @@ fn real_4b_geometry_step_and_chunk_agree_with_the_host_model_on(device: &Device)
         value_heads: 32,
         width: 128,
         convolution: 4,
-        banks: 5,
+        banks: 9,
         tape: 0,
     };
     for (label, rows, slots) in [
         ("decode, one slot", 1, vec![slot(1, 1, 1, 3)]),
         (
+            "decode, four one-row slots",
+            4,
+            vec![
+                slot(1, 1, 1, 5),
+                slot(1, 1, 2, 6),
+                slot(1, 1, 3, 7),
+                slot(1, 1, 4, 8),
+            ],
+        ),
+        (
             "verify, two slots",
             8,
             vec![slot(4, 2, 1, 3), slot(3, 3, 0, 4)],
+        ),
+        (
+            "eight rows, three slots and a padded row",
+            8,
+            vec![slot(3, 1, 1, 5), slot(2, 2, 2, 6), slot(2, 0, 0, 7)],
         ),
         ("prefill 128", 128, vec![slot(128, 128, 1, 3)]),
         (
@@ -1396,19 +1476,35 @@ fn real_4b_geometry_step_and_chunk_agree_with_the_host_model_on(device: &Device)
                     &host,
                     (1e-3, 3e-3),
                 );
-                let (max, rms) = errors(&chunked.mixed, &step.mixed);
+                let (max, rms) = errors(&chunked.gated, &step.gated);
                 println!("4B {label}: chunk ROWS {rows} vs step: max {max:.3e} rms {rms:.3e}");
-                // Both are within one BF16 ulp of the host model per element
-                // (checked above), so they may differ by two ulps of the
-                // largest output (~8x the RMS at 512 rows).
-                assert!(max <= 4e-2 && rms <= 3e-3);
+                // Both are within two BF16 ulps of the host model per element
+                // plus their relative bounds (checked above), so they differ
+                // by at most four ulps of the host value plus both bounds.
+                let scale = (host.gated.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
+                    / host.gated.len() as f64)
+                    .sqrt();
+                for (index, ((c, s), e)) in chunked
+                    .gated
+                    .iter()
+                    .zip(&step.gated)
+                    .zip(&host.gated)
+                    .enumerate()
+                {
+                    let allowed = (*e as f64).abs() * 2f64.powi(-5) + (1e-3 + 1e-4) * scale;
+                    assert!(
+                        (*c as f64 - *s as f64).abs() <= allowed,
+                        "4B {label}: chunk ROWS {rows} gated[{index}] {c} vs step {s}"
+                    );
+                }
+                assert!(rms <= 3e-3);
                 // ROWS never changes result bits.
                 match &reference {
                     Some(reference) => assert!(
                         reference
-                            .mixed
+                            .gated
                             .iter()
-                            .zip(&chunked.mixed)
+                            .zip(&chunked.gated)
                             .all(|(a, b)| a.to_bits() == b.to_bits())
                             && reference
                                 .delta
@@ -1424,9 +1520,12 @@ fn real_4b_geometry_step_and_chunk_agree_with_the_host_model_on(device: &Device)
     }
 }
 
-/// MTP verify: a slot of at most 16 rows gets the step's bits from the chunk
-/// entry too, whatever its peers (here a 40-row slot on the chunked path), so
-/// a request's verify rows never depend on the class.
+/// MTP verify: a slot of at most 16 rows gets the step's state bits from the
+/// chunk entry too, whatever its peers (here a 40-row slot on the chunked
+/// path), so a request's verify rows never depend on the class. The gating
+/// reduces each head's squares in its class's order (Metal: the step's lane
+/// butterfly, the chunk's strided simd sum; the CPU: one order), so the gated
+/// rows agree to two BF16 ulps, and bit for bit where the orders agree.
 #[test]
 fn chunk_short_slots_get_the_step_bits() {
     for device in devices() {
@@ -1467,17 +1566,29 @@ fn chunk_short_slots_get_the_step_bits_on(device: &Device) {
             let bank =
                 s.following * geometry.delta_bank()..(s.following + 1) * geometry.delta_bank();
             assert!(
-                step.mixed[range.clone()]
+                step.delta[bank.clone()]
                     .iter()
-                    .zip(&chunk.mixed[range])
-                    .all(|(a, b)| a.to_bits() == b.to_bits())
-                    && step.delta[bank.clone()]
-                        .iter()
-                        .zip(&chunk.delta[bank])
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "{backend} chunk ROWS {rows}: a {}-row slot differs from the step",
+                    .zip(&chunk.delta[bank])
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{backend} chunk ROWS {rows}: a {}-row slot's state differs from the step",
                 s.rows
             );
+            for (index, (a, b)) in step.gated[range.clone()]
+                .iter()
+                .zip(&chunk.gated[range])
+                .enumerate()
+            {
+                let allowed = if is_cpu(device) {
+                    0.0
+                } else {
+                    (*a as f64).abs() * 2f64.powi(-6)
+                };
+                assert!(
+                    (*a as f64 - *b as f64).abs() <= allowed,
+                    "{backend} chunk ROWS {rows}: a {}-row slot's gated[{index}] {b} differs from the step's {a}",
+                    s.rows
+                );
+            }
         }
         check(
             &format!("{backend} 4B verify mix: chunk ROWS {rows}"),
@@ -1487,6 +1598,422 @@ fn chunk_short_slots_get_the_step_bits_on(device: &Device) {
             (1e-3, 3e-3),
         );
     }
+}
+
+/// BF16 values of `count` pseudo-random numbers in [-scale, scale].
+fn bf16_values(count: usize, scale: f32, seed: u64) -> Vec<f32> {
+    let mut random = Random(seed);
+    (0..count)
+        .map(|_| bf16_round(random.next() * scale))
+        .collect()
+}
+
+fn bf16_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
+    let bytes = values
+        .iter()
+        .flat_map(|value| ((bf16_round(*value).to_bits() >> 16) as u16).to_le_bytes())
+        .collect::<Vec<_>>();
+    Tensor::from_host(device, Element::bf16(), shape, &bytes).unwrap()
+}
+
+/// The inputs of the recurrent projection of a case: F32 hidden rows, BF16
+/// norm and qkv | z | alpha | beta weights.
+struct ProjectionInputs {
+    hidden: Tensor,
+    norm: Tensor,
+    weights: [Tensor; 4],
+}
+
+impl ProjectionInputs {
+    fn new(device: &Device, case: &Case, hidden: usize, seed: u64) -> Self {
+        let g = case.geometry;
+        let mut random = Random(seed);
+        let values = (0..case.rows * hidden)
+            .map(|_| random.next() * 2.0)
+            .collect::<Vec<_>>();
+        let norm = (0..hidden)
+            .map(|_| 1.0 + 0.5 * random.next())
+            .collect::<Vec<_>>();
+        let rows = [
+            g.channels(),
+            g.value_heads * g.width,
+            g.value_heads,
+            g.value_heads,
+        ];
+        let scale = 2.0 / (hidden as f32).sqrt();
+        let weights = std::array::from_fn(|segment| {
+            bf16_tensor(
+                device,
+                &[rows[segment] as u64, hidden as u64],
+                &bf16_values(rows[segment] * hidden, scale, seed + 1 + segment as u64),
+            )
+        });
+        Self {
+            hidden: Tensor::from_host(
+                device,
+                Element::f32(),
+                &[case.rows as u64, hidden as u64],
+                &values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            norm: bf16_tensor(device, &[hidden as u64], &norm),
+            weights,
+        }
+    }
+}
+
+/// One projection mapping of the GEMV and batched GEMV launches.
+#[derive(Clone, Copy, Debug)]
+struct ProjectionMapping {
+    batch_from: u64,
+    simdgroups: u64,
+    rows: u64,
+    lanes: u64,
+    batch_simdgroups: u64,
+    batch_rows: u64,
+}
+
+/// The convolved step form (`gated_delta_project_convolved`, then
+/// `gated_delta_step_convolved`) against `gated_delta_project`, then
+/// `gated_delta_step`, at equal mappings on Metal: the projection, the gated
+/// rows and every bank's window, state and tape are bit-identical. Cases
+/// cover 1..16 rows in the GEMV and batched classes, slots shorter and longer
+/// than the window, interior stop rows, tape versions, grouped heads, and
+/// the 35B geometry.
+#[test]
+fn convolved_step_form_gives_the_step_bits() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let big = Geometry {
+        key_heads: 16,
+        value_heads: 32,
+        width: 128,
+        convolution: 4,
+        banks: 11,
+        tape: 3,
+    };
+    let small = Geometry {
+        banks: 11,
+        tape: 3,
+        ..SMALL
+    };
+    let version = |rows, stop, previous, following, taped| SlotCase {
+        rows,
+        stop,
+        previous,
+        following,
+        taped,
+    };
+    let cases = vec![
+        ("one row", small, 1, vec![slot(1, 1, 1, 6)], false, 512),
+        (
+            "two rows, one slot",
+            small,
+            2,
+            vec![version(2, 1, 2, 6, 1)],
+            true,
+            512,
+        ),
+        (
+            "three one-row slots",
+            small,
+            3,
+            (0..3).map(|s| slot(1, 1, 1 + s, 6 + s)).collect(),
+            false,
+            512,
+        ),
+        (
+            "four rows from a tape version, stop inside",
+            small,
+            4,
+            vec![version(4, 1, 3, 7, 3)],
+            true,
+            512,
+        ),
+        (
+            "five rows over two slots",
+            small,
+            5,
+            vec![version(2, 2, 1, 6, 0), version(3, 1, 2, 7, 2)],
+            false,
+            512,
+        ),
+        (
+            "eight rows, padded",
+            small,
+            8,
+            vec![version(3, 3, 1, 6, 1), version(4, 2, 2, 8, 0)],
+            true,
+            512,
+        ),
+        (
+            "nine rows, one slot",
+            small,
+            9,
+            vec![version(9, 5, 4, 9, 2)],
+            false,
+            512,
+        ),
+        (
+            "sixteen rows over five slots",
+            small,
+            16,
+            vec![
+                version(4, 1, 1, 6, 1),
+                version(1, 1, 2, 7, 0),
+                version(6, 6, 3, 8, 3),
+                version(3, 2, 4, 9, 0),
+                version(2, 1, 5, 10, 2),
+            ],
+            true,
+            512,
+        ),
+        ("35B one row", big, 1, vec![slot(1, 1, 1, 6)], true, 2048),
+        (
+            "35B four-row verify",
+            big,
+            4,
+            vec![version(4, 1, 2, 6, 2)],
+            true,
+            2048,
+        ),
+        (
+            "35B five one-row slots, padded to eight rows",
+            big,
+            8,
+            (0..5).map(|s| slot(1, 1, 1 + s, 6 + s)).collect(),
+            true,
+            2048,
+        ),
+        (
+            "35B sixteen rows over two slots",
+            big,
+            16,
+            vec![version(8, 3, 1, 6, 1), version(7, 7, 2, 7, 0)],
+            true,
+            2048,
+        ),
+    ];
+    let mappings = [
+        ProjectionMapping {
+            batch_from: 5,
+            simdgroups: 16,
+            rows: 1,
+            lanes: 16,
+            batch_simdgroups: 8,
+            batch_rows: 2,
+        },
+        ProjectionMapping {
+            batch_from: 3,
+            simdgroups: 4,
+            rows: 4,
+            lanes: 32,
+            batch_simdgroups: 4,
+            batch_rows: 1,
+        },
+        ProjectionMapping {
+            batch_from: 9,
+            simdgroups: 2,
+            rows: 2,
+            lanes: 16,
+            batch_simdgroups: 16,
+            batch_rows: 4,
+        },
+    ];
+    for (index, (label, geometry, rows, slots, grouped, hidden)) in cases.into_iter().enumerate()
+    {
+        let case = Case::new(geometry, rows, slots, grouped, 70 + index as u64)
+            .with_bf16_activations();
+        let inputs = ProjectionInputs::new(&device, &case, hidden, 90 + index as u64);
+        for mapping in mappings {
+            let (old_projection, old) = step_form(&device, &case, &inputs, hidden, mapping);
+            let (new_projection, new) = convolved_form(&device, &case, &inputs, hidden, mapping);
+            let label = format!("{label} {mapping:?}");
+            let same = |what: &str, a: &[f32], b: &[f32]| {
+                assert_eq!(a.len(), b.len(), "{label}: {what} length");
+                if let Some(index) = a.iter().zip(b).position(|(a, b)| a.to_bits() != b.to_bits()) {
+                    panic!("{label}: {what}[{index}] {} differs from {}", b[index], a[index]);
+                }
+            };
+            same("projection", &old_projection, &new_projection);
+            same("gated", &old.gated, &new.gated);
+            same("window", &old.window, &new.window);
+            same("delta", &old.delta, &new.delta);
+            same("tape", &old.tape, &new.tape);
+        }
+    }
+}
+
+/// `gated_delta_project`, then `gated_delta_step` (ROWS 32): the projection
+/// and the outcome.
+fn step_form(
+    device: &Device,
+    case: &Case,
+    inputs: &ProjectionInputs,
+    hidden: usize,
+    mapping: ProjectionMapping,
+) -> (Vec<f32>, Outcome) {
+    use magnitude_kernels::gated_delta_project;
+    let g = case.geometry;
+    // gated_delta_project's launches: stage, gemv, batch, gemm_small, gemm.
+    let specialization = NativeSpecialization::new()
+        .with_static("H", hidden as u64)
+        .with_static("NK", g.key_heads as u64)
+        .with_static("NV", g.value_heads as u64)
+        .with_static("W", g.width as u64)
+        .with_param("BATCH_FROM", mapping.batch_from)
+        .with_launch_param(1, "SIMDGROUPS", mapping.simdgroups)
+        .with_launch_param(1, "ROWS", mapping.rows)
+        .with_launch_param(1, "LANES", mapping.lanes)
+        .with_launch_param(2, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
+        .with_launch_param(2, "BATCH_ROWS", mapping.batch_rows)
+        .with_launch_param(4, "TILE_M", 64)
+        .with_launch_param(4, "TILE_N", 64);
+    let projection = gated_delta_project::native_for_device_with(
+        device,
+        gated_delta_project::Elements {
+            NW: Element::bf16(),
+            QW: Element::bf16(),
+            GW: Element::bf16(),
+            AW: Element::bf16(),
+            BW: Element::bf16(),
+            A: Element::bf16(),
+        },
+        &specialization,
+    )
+    .unwrap()
+    .call(gated_delta_project::Args {
+        hidden: &inputs.hidden,
+        input_norm: &inputs.norm,
+        qkv_weight: &inputs.weights[0],
+        gate_weight: &inputs.weights[1],
+        alpha_weight: &inputs.weights[2],
+        beta_weight: &inputs.weights[3],
+        epsilon: 1e-6,
+    })
+    .unwrap()
+    .value;
+    let mut t = case.tensors(device, Element::bf16());
+    t.projection = projection;
+    let gated = case
+        .native_step(device, Element::bf16(), 32)
+        .call(t.step_args(case))
+        .unwrap()
+        .value;
+    (
+        read(&t.projection),
+        Outcome {
+            gated: read(&gated),
+            window: read(&t.window),
+            delta: read(&t.delta),
+            tape: read(&t.tape),
+        },
+    )
+}
+
+/// `gated_delta_project_convolved`, then `gated_delta_step_convolved` (ROWS
+/// 32): the projection and the outcome.
+fn convolved_form(
+    device: &Device,
+    case: &Case,
+    inputs: &ProjectionInputs,
+    hidden: usize,
+    mapping: ProjectionMapping,
+) -> (Vec<f32>, Outcome) {
+    use magnitude_kernels::{gated_delta_project_convolved, gated_delta_step_convolved};
+    let g = case.geometry;
+    // Launches: gemv, batch.
+    let specialization = NativeSpecialization::new()
+        .with_static("H", hidden as u64)
+        .with_static("NK", g.key_heads as u64)
+        .with_static("NV", g.value_heads as u64)
+        .with_static("W", g.width as u64)
+        .with_static("C", g.convolution as u64)
+        .with_param("BATCH_FROM", mapping.batch_from)
+        .with_launch_param(0, "SIMDGROUPS", mapping.simdgroups)
+        .with_launch_param(0, "ROWS", mapping.rows)
+        .with_launch_param(0, "LANES", mapping.lanes)
+        .with_launch_param(1, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
+        .with_launch_param(1, "BATCH_ROWS", mapping.batch_rows);
+    let mut t = case.tensors(device, Element::bf16());
+    let projected = gated_delta_project_convolved::native_for_device_with(
+        device,
+        gated_delta_project_convolved::Elements {
+            NW: Element::bf16(),
+            QW: Element::bf16(),
+            GW: Element::bf16(),
+            AW: Element::bf16(),
+            BW: Element::bf16(),
+            A: Element::bf16(),
+        },
+        &specialization,
+    )
+    .unwrap()
+    .call(gated_delta_project_convolved::Args {
+        hidden: &inputs.hidden,
+        input_norm: &inputs.norm,
+        qkv_weight: &inputs.weights[0],
+        gate_weight: &inputs.weights[1],
+        alpha_weight: &inputs.weights[2],
+        beta_weight: &inputs.weights[3],
+        convolution: &t.convolution,
+        segments: &t.segments,
+        stop: &t.stop,
+        previous_bank: &t.previous,
+        previous_tape: &t.previous_tape,
+        following_bank: &t.following,
+        window: &mut t.window,
+        epsilon: 1e-6,
+        slab_banks: t.slab_banks,
+    })
+    .unwrap();
+    let step = NativeSpecialization::new()
+        .with_static("NK", g.key_heads as u64)
+        .with_static("NV", g.value_heads as u64)
+        .with_static("W", g.width as u64)
+        .with_param("ROWS", 32);
+    let gated = gated_delta_step_convolved::native_for_device_with(
+        device,
+        gated_delta_step_convolved::Elements {
+            RN: Element::f32(),
+            A: Element::bf16(),
+        },
+        &step,
+    )
+    .unwrap()
+    .call(gated_delta_step_convolved::Args {
+        projection: &projected.r0,
+        convolved: &projected.r1,
+        rate: &t.rate,
+        time_bias: &t.time_bias,
+        recurrent_norm: &t.norm,
+        segments: &t.segments,
+        stop: &t.stop,
+        previous_bank: &t.previous,
+        previous_tape: &t.previous_tape,
+        following_bank: &t.following,
+        delta: &mut t.delta,
+        tape: &mut t.tape,
+        norm_epsilon: case.epsilon,
+        epsilon: case.rms_epsilon,
+        grouped: case.grouped,
+        slab_banks: t.slab_banks,
+    })
+    .unwrap()
+    .value;
+    (
+        read(&projected.r0),
+        Outcome {
+            gated: read(&gated),
+            window: read(&t.window),
+            delta: read(&t.delta),
+            tape: read(&t.tape),
+        },
+    )
 }
 
 /// The median device time (µs) of each launch of the calls `run` makes, each

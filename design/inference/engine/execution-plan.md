@@ -228,6 +228,13 @@ pipelines share projection results through checked Seismic result edges. Dense f
 its activation product; attention owns the normed Q/K/V projection and one fused entry that prepares
 queries and keys (norms, rotary) in place, accumulates the stable softmax and gates the values
 (decode row classes use the partitioned decode entry, larger classes the streaming prefill entry);
+a gated delta mixer owns its normed segmented projection, then one state entry (row-sequential for
+decode row classes, chunked above) that advances its bank in place and publishes the gated rows
+(each head's recurrent output RMS-normalized, scaled by the recurrent norm and gated by SiLU(z),
+formed once per row and head), then a plain residual output projection that repeats no prologue;
+on a backend that declares the convolved step form, the decode row classes' projection launch also
+convolves each channel once and publishes the successor windows, and the state entry advances from
+those convolved channels with the same bits;
 a state-space (Mamba-2) mixer owns its normed projected row (gate, convolved channels and time
 steps together) and runs the checked step entry for decode row classes or the chunked entry
 above them over its bank's window and state slabs, then its gated group norm and output
@@ -237,7 +244,9 @@ component, whose rows are also its tape), gates, and publishes the successor win
 output projection; a block may hold a lone mixer with no feed-forward, and its output is the mixer's
 residual row; routed feed-forward owns normalized input, routes and scores (ranked once by probability), and the
 shared coefficient, then either the per-choice expert and shared products (row classes within the
-GEMV bound) or, for larger classes, grouped tables and grouped expert outputs: choices grouped by
+GEMV bound; a backend that declares the shared-route entry forms the shared product, which does not
+depend on the routes, in the routing launch with the separate expansion's bits, and expands the
+choices alone) or, for larger classes, grouped tables and grouped expert outputs: choices grouped by
 expert into tile-aligned blocks whose capacity derives from the class, the selected-expert count and
 the tile rows, so no table is uploaded per step and no host readback sizes a launch. The general
 routed form (every family without that gated shared expert) owns the normalized input, routes and
@@ -335,9 +344,10 @@ composes (patch stem, row norms, projections with their epilogues, rotary attent
 or concatenation); a form a backend's operators do not run is refused when the program is
 prepared, never approximated. Seismic's recurrent workflow derives
 the exact window and delta state contracts from its checked entries. Each recurrent block binds
-the store's bank slabs and, per run, bank tables for its exact active request slots: each slot's
-state entry reads the slot's accepted bank and writes only its successor bank, in place, within
-the block's ordered submission. The engine does not dispatch state transfers around the block,
+the store's bank slabs and, per run, bank tables for its exact active request slots: each entry
+that binds them (the state entry, and the convolved step form's projection for the windows) reads
+the slot's accepted bank and writes only its successor bank, in place, within the block's ordered
+submission. The engine does not dispatch state transfers around the block,
 copy state between banks, or bind padded request state. Workflow activations cover
 submitted concurrency, and retained outputs cover submitted and live request owners. The target's
 residual stream between block graphs is one device pair, returned at the end of each submission:
@@ -394,9 +404,8 @@ generation transitions, or publication.
 - No independent kernel requirement set, semantic class set, or runtime handle query remains.
 - No independent numerical tensor recipe or request-time role lookup remains; Seismic owns each
   prepared workflow's complete tensor contracts and reports its exact storage charge.
-- Recurrent state is read and published in place by the block's checked state entry for the
-  exact active request slots; no bank is copied, and no entry writes an accepted bank or the zero
-  seed.
+- Recurrent state is read and published in place by the block's checked entries for the exact
+  active request slots; no bank is copied, and no entry writes an accepted bank or the zero seed.
 - Every persistent, workspace, output, retention, and startup-peak byte traces to the plan.
 - Ready and pending submissions drive one executor lifecycle, and no round is submitted before
   its predecessor's output is reconciled.

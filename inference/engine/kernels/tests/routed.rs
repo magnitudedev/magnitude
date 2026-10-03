@@ -2,8 +2,8 @@
 //! contract; native implementations are checked against them.
 
 use magnitude_kernels::{
-    routed_combine, routed_down, routed_expand, routed_experts, routed_group, routed_output,
-    routed_route,
+    routed_combine, routed_down, routed_expand, routed_experts, routed_gate_up, routed_group,
+    routed_output, routed_route, routed_route_shared,
 };
 use seismic_lang::{
     checked::{check_source, CheckedModule, SourceFile},
@@ -863,6 +863,88 @@ fn portable_grouped_prefill_equals_decode_form() {
         .iter()
         .zip(&block.residual)
         .any(|(out, residual)| (out - residual).abs() > 1e-3));
+}
+
+/// `routed_route_shared` is `routed_route` followed by `routed_expand`'s
+/// shared rows: with F32 activations every result and table agrees bit for
+/// bit.
+#[test]
+fn portable_shared_route_equals_route_then_expand() {
+    let module = module();
+    let block = Block::new(6);
+    let (m, h, e, k, f, s) = (
+        block.rows,
+        block.hidden,
+        block.experts,
+        block.choices,
+        block.features,
+        block.shared,
+    );
+    let (normalized, coefficient, routes, scores) = block.route(&module);
+    let expanded = interpret(
+        &module,
+        "routed_expand",
+        &[
+            ("A", DType::F32),
+            ("EGW", DType::F32),
+            ("EUW", DType::F32),
+            ("SGW", DType::F32),
+            ("SUW", DType::F32),
+        ],
+        vec![
+            floats(&[m, h], &normalized),
+            ints(&[m, k], &routes),
+            floats(&[e, f, h], &block.expert_gate),
+            floats(&[e, f, h], &block.expert_up),
+            floats(&[s, h], &block.shared_gate),
+            floats(&[s, h], &block.shared_up),
+        ],
+    );
+    let shared = interpret(
+        &module,
+        "routed_route_shared",
+        &[
+            ("NW", DType::F32),
+            ("RW", DType::F32),
+            ("A", DType::F32),
+            ("SGW", DType::F32),
+            ("SUW", DType::F32),
+        ],
+        vec![
+            floats(&[m, h], &block.residual),
+            floats(&[h], &block.norm),
+            floats(&[e, h], &block.router),
+            floats(&[h], &block.shared_router),
+            floats(&[s, h], &block.shared_gate),
+            floats(&[s, h], &block.shared_up),
+            ints(&[m, k], &vec![0; m * k]),
+            floats(&[m, k], &vec![0.0; m * k]),
+            Input::F32(1e-6),
+            Input::I32(1),
+        ],
+    );
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let tensor = |values: Vec<f64>| bits(&Block::values(&values));
+    assert_eq!(tensor(result(&shared, 0)), bits(&normalized), "normalized");
+    assert_eq!(
+        tensor(result(&shared, 1)),
+        bits(&coefficient),
+        "coefficient"
+    );
+    assert_eq!(
+        tensor(result(&shared, 2)),
+        tensor(result(&expanded, 1)),
+        "shared product"
+    );
+    assert_eq!(
+        input(&shared, 6)
+            .into_iter()
+            .map(|v| v as i32)
+            .collect::<Vec<_>>(),
+        routes,
+        "routes"
+    );
+    assert_eq!(tensor(input(&shared, 7)), bits(&scores), "scores");
 }
 
 // ---------------------------------------------------------------------------
@@ -2761,6 +2843,161 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
                 })
                 .collect::<Vec<_>>();
             assert_near(&format!("{label} output"), &sampled, &reference, 2e-2, 4e-3);
+        }
+    }
+}
+
+/// Metal's decode form over the 35B geometry: `routed_route_shared` and
+/// `routed_gate_up` (SiLU) keep every bit of `routed_route` and
+/// `routed_expand` for every decode row count and mapping: the routes,
+/// scores, normalized rows and coefficient; the shared product for equal
+/// LANES; the choices' product.
+#[test]
+fn metal_35b_shared_route_keeps_every_bit() {
+    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let Ok(device) = catalog.open_backend(seismic::BackendName::Metal) else {
+        return;
+    };
+    let block = Qwen35b::new(&device);
+    let (h, e, k, f, s) = (
+        Qwen35b::HIDDEN as u64,
+        Qwen35b::EXPERTS as u64,
+        Qwen35b::CHOICES as u64,
+        Qwen35b::FEATURES as u64,
+        Qwen35b::SHARED as u64,
+    );
+    let bf16 = seismic::Element::bf16();
+    let (q4k, q8) = (element(&device, "q4k"), element(&device, "q8g32s"));
+    let norm = bf16_tensor(&device, &[h], &block.norm);
+    let router = bf16_tensor(&device, &[e, h], &block.router);
+    let shared_router = f32_tensor(&device, &[h], &block.shared_router);
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for rows in 1..=8usize {
+        let m = rows as u64;
+        let residual = Qwen35b::residual(rows);
+        let routing = block.route(&device, &residual);
+        let residual_tensor = f32_tensor(&device, &[m, h], &residual);
+        for lanes in [32u64, 16] {
+            let expanded = routed_expand::native_for_device_with(
+                &device,
+                routed_expand::Elements {
+                    A: bf16,
+                    EGW: q4k,
+                    EUW: q4k,
+                    SGW: q8,
+                    SUW: q8,
+                },
+                &decode_specialization(
+                    &device,
+                    &[("H", h), ("K", k), ("F", f), ("S", s)],
+                    &[("SIMDGROUPS", 4), ("ROWS", 2), ("LANES", lanes)],
+                ),
+            )
+            .unwrap()
+            .call(routed_expand::Args {
+                normalized: &routing.normalized,
+                routes: &routing.routes,
+                expert_gate: &block.expert_gate,
+                expert_up: &block.expert_up,
+                shared_gate: &block.shared_gate,
+                shared_up: &block.shared_up,
+            })
+            .unwrap();
+            let (expert_product, shared_product) =
+                (read_bf16(&expanded.r0), read_bf16(&expanded.r1));
+            for simdgroups in [8u64, 16, 4, 2] {
+                for rows_per_group in [1u64, 2, 4] {
+                    let label = format!(
+                        "rows {rows} SIMDGROUPS {simdgroups} ROWS {rows_per_group} LANES {lanes}"
+                    );
+                    let mut routes =
+                        i32_tensor(&device, &[m, k], &vec![-7; rows * Qwen35b::CHOICES]);
+                    let mut scores =
+                        f32_tensor(&device, &[m, k], &vec![-7.0; rows * Qwen35b::CHOICES]);
+                    let shared = routed_route_shared::native_for_device_with(
+                        &device,
+                        routed_route_shared::Elements {
+                            NW: bf16,
+                            RW: bf16,
+                            A: bf16,
+                            SGW: q8,
+                            SUW: q8,
+                        },
+                        &specialize(
+                            &[("H", h), ("E", e), ("K", k), ("S", s)],
+                            &[
+                                ("SIMDGROUPS", simdgroups),
+                                ("ROWS", rows_per_group),
+                                ("LANES", lanes),
+                            ],
+                        ),
+                    )
+                    .unwrap()
+                    .call(routed_route_shared::Args {
+                        residual: &residual_tensor,
+                        norm: &norm,
+                        router: &router,
+                        shared_router: &shared_router,
+                        shared_gate: &block.shared_gate,
+                        shared_up: &block.shared_up,
+                        routes: &mut routes,
+                        scores: &mut scores,
+                        eps: 1e-6,
+                        normalize: 1,
+                    })
+                    .unwrap();
+                    assert_eq!(read_i32(&routes), routing.routes_values, "{label} routes");
+                    assert_eq!(
+                        bits(&read_f32(&scores)),
+                        bits(&routing.scores_values),
+                        "{label} scores"
+                    );
+                    assert_eq!(
+                        bits(&read_bf16(&shared.r0)),
+                        bits(&routing.normalized_values),
+                        "{label} normalized"
+                    );
+                    assert_eq!(
+                        bits(&read_f32(&shared.r1)),
+                        bits(&routing.coefficient_values),
+                        "{label} coefficient"
+                    );
+                    assert_eq!(
+                        bits(&read_bf16(&shared.r2)),
+                        bits(&shared_product),
+                        "{label} shared product"
+                    );
+                }
+            }
+            for mapping in [
+                [("SIMDGROUPS", 4), ("ROWS", 2), ("LANES", lanes)],
+                [("SIMDGROUPS", 16), ("ROWS", 1), ("LANES", lanes)],
+            ] {
+                let choices = routed_gate_up::native_for_device_with(
+                    &device,
+                    routed_gate_up::Elements {
+                        A: bf16,
+                        EGW: q4k,
+                        EUW: q4k,
+                    },
+                    &decode_specialization(&device, &[("H", h), ("K", k), ("F", f)], &mapping),
+                )
+                .unwrap()
+                .call(routed_gate_up::Args {
+                    normalized: &routing.normalized,
+                    routes: &routing.routes,
+                    expert_gate: &block.expert_gate,
+                    expert_up: &block.expert_up,
+                    activation: 0,
+                })
+                .unwrap()
+                .value;
+                assert_eq!(
+                    bits(&read_bf16(&choices)),
+                    bits(&expert_product),
+                    "rows {rows} gate_up {mapping:?} choices' product"
+                );
+            }
         }
     }
 }

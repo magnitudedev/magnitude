@@ -427,14 +427,18 @@ inline Scalar gate_output(device const Scalar *query, device const Scalar *gate,
                            : attended / (1.0f + metal::exp(-g)));
 }
 
-// The decode merge of one (query head, row) column: the row's non-empty
-// partitions in partition order, then its gate. A row that sees no key
-// attends to zero.
+// The decode merge of one (query head, row) over 32 of its columns, one
+// simdgroup per threadgroup and one lane per column: the row's non-empty
+// partitions in partition order, then the gate. The partition weights
+// exp2(maximum_p - maximum) are formed once per threadgroup in `weights`
+// (2 * PARTS floats: weight, denominator); every lane then carries `merge`'s
+// ordered chains for its column, so the result is `merge`'s. A row that sees
+// no key attends to zero.
 template <uint SPAN, uint PARTS, uint TOKENS>
 inline void decode_output(device const Scalar *query, device const Scalar *gate, device const int *visible,
     device const int *fresh, device Scalar *result, device const float *partials,
-    device const float *statistics, ulong spans, ulong rows, ulong head, ulong row, uint column,
-    bool softplus) {
+    device const float *statistics, threadgroup float *weights, ulong spans, ulong rows, ulong head, ulong row,
+    uint column, uint lane, bool softplus) {
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
     constexpr uint G = SEISMIC_DIM_G;
@@ -444,7 +448,41 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
     const uint total = tile_total(visible, fresh, row0, TOKENS, rows, spans);
     const uint span_keys = partition_span(total, SPAN, PARTS);
     const uint active = (total + span_keys - 1) / span_keys;
-    const float attended = merge(partials, statistics, (row * KV * G + head) * PARTS, 1, active, column);
+    const ulong first = (row * KV * G + head) * PARTS;
+    float maximum = -INFINITY;
+    for (uint p = lane; p < active; p += 32) {
+        if (statistics[(first + p) * 2 + 1] > 0.0f)
+            maximum = metal::max(maximum, statistics[(first + p) * 2]);
+    }
+    maximum = simd_max(maximum);
+    for (uint p = lane; p < active; p += 32) {
+        const float d = statistics[(first + p) * 2 + 1];
+        weights[2 * p] = d > 0.0f ? metal::fast::exp2(statistics[(first + p) * 2] - maximum) : 0.0f;
+        weights[2 * p + 1] = d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Each batch issues all its partial loads before its chains consume
+    // them: few threads cover a whole launch, so a load at a time would
+    // leave every partition a memory round trip.
+    constexpr uint BATCH = 32;
+    float denominator = 0.0f;
+    float accumulated = 0.0f;
+    for (uint p0 = 0; p0 < active; p0 += BATCH) {
+        float values[BATCH];
+        ATTENTION_UNROLL
+        for (uint i = 0; i < BATCH; ++i)
+            values[i] = p0 + i < active ? partials[(first + p0 + i) * W + column] : 0.0f;
+        ATTENTION_UNROLL
+        for (uint i = 0; i < BATCH; ++i) {
+            const uint p = p0 + i;
+            if (p < active && weights[2 * p + 1] > 0.0f) {
+                const float weight = weights[2 * p];
+                denominator = metal::fma(weights[2 * p + 1], weight, denominator);
+                accumulated = metal::fma(values[i], weight, accumulated);
+            }
+        }
+    }
+    const float attended = accumulated / metal::max(denominator, 1e-30f);
     result[(row * KV * G + head) * W + column] = gate_output(query, gate, row, head, column, attended, softplus);
 }
 
