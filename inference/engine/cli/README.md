@@ -1,5 +1,7 @@
 # Standalone engine: explicit experimental pipeline
 
+See the [review guide, audited qualification and self-contained reproduction](PIPELINE-REVIEW.md).
+
 The default build and invocation remain single-device. To explicitly select the
 experimental two-CUDA executor, build with:
 

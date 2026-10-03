@@ -16,6 +16,9 @@ applies_to:
 
 # Explicit pipeline execution
 
+The [review and qualification note](../../../inference/engine/cli/PIPELINE-REVIEW.md)
+records evidence provenance and reproduction separately from this contract.
+
 Placement intent is backend-neutral metadata over one original model. It names
 ordered execution groups, each containing device-assigned partitions. A region
 can identify original decoder blocks or a semantic tensor role, decoded axis and
