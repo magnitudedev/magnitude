@@ -1,5 +1,8 @@
 """The baseline/candidate report of one run directory.
 
+Noise also counts the spread of each run's own measured steps, so a single round is judged
+against its sampling noise rather than against zero.
+
 A cell is one measurement (a prefill size at a history, or a decode context) of one model, from
 the run's measure phase, where both builds replay fixed configurations. Its value per
 side is the median over rounds of each round's median step time. Noise is the spread of
@@ -45,6 +48,18 @@ def entry_times(cell: dict) -> dict[str, float]:
 def spread(values: list[float]) -> float:
     middle = statistics.median(values)
     return (max(values) - min(values)) / middle if len(values) > 1 and middle else 0.0
+
+
+def sample_spread(cell: dict) -> float:
+    """The interquartile range of a cell's measured steps relative to their median (their full
+    range when there are fewer than four): the noise of one run, which a single round has no
+    other estimate of."""
+    steps = [step["wall_ms"] for step in cell.get("steps", []) if "wall_ms" in step]
+    steps = steps or cell.get("samples_ms", [])
+    if len(steps) < 4:
+        return spread(steps) if steps else 0.0
+    quartiles = statistics.quantiles(steps, n=4)
+    return (quartiles[2] - quartiles[0]) / statistics.median(steps)
 
 
 def pins(path: Path) -> dict[str, dict]:
@@ -98,6 +113,7 @@ def compare_logits(baseline: Path, candidate: Path, rows: int) -> dict:
 def analyze(directory: Path, bar: float = DEFAULT_BAR) -> dict:
     run = json.loads((directory / "run.json").read_text())
     samples = defaultdict(lambda: defaultdict(list))
+    within = defaultdict(lambda: defaultdict(list))
     entries = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     tuning = defaultdict(lambda: defaultdict(list))
     failures = []
@@ -114,6 +130,7 @@ def analyze(directory: Path, bar: float = DEFAULT_BAR) -> dict:
         for key, cell in cells(report).items():
             name = (result.get("mode", "own"), result["model"], key)
             samples[name][result["side"]].append(cell["median_ms"])
+            within[name][result["side"]].append(sample_spread(cell))
             for entry, ms in entry_times(cell).items():
                 entries[name][entry][result["side"]].append(ms)
     rows = []
@@ -122,7 +139,12 @@ def analyze(directory: Path, bar: float = DEFAULT_BAR) -> dict:
             continue
         baseline = statistics.median(sides["baseline"])
         candidate = statistics.median(sides["candidate"])
-        noise = max(spread(sides["baseline"]), spread(sides["candidate"]))
+        noise = max(
+            spread(sides["baseline"]),
+            spread(sides["candidate"]),
+            *within[(mode, model, key)]["baseline"],
+            *within[(mode, model, key)]["candidate"],
+        )
         delta = (candidate - baseline) / baseline
         tolerance = max(bar, noise)
         verdict = "slower" if delta > tolerance else "faster" if delta < -tolerance else "same"

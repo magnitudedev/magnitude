@@ -1,6 +1,6 @@
 """kernel-ab: compare two engine builds' kernel speed and output on this host.
 
-    kernel-ab run --baseline origin/main --candidate working-tree [--models a,b] [--rounds 3]
+    kernel-ab run --baseline origin/main --candidate working-tree [--models a,b] [--contexts 16384]
         [--own-tuning]
     kernel-ab report RUN_DIRECTORY [--bar 0.03]
     kernel-ab build --baseline origin/main --candidate working-tree
@@ -52,7 +52,7 @@ def main(argv=None) -> int:
     run.add_argument("--baseline", default="origin/main")
     run.add_argument("--candidate", default=builds.WORKING_TREE)
     run.add_argument("--models", help="comma-separated names from `kernel-ab models`; default all")
-    run.add_argument("--rounds", type=int, default=3, help="measured rounds per build and model")
+    run.add_argument("--rounds", type=int, default=1, help="measured rounds per build and model")
     run.add_argument(
         "--own-tuning",
         action="store_true",
@@ -60,7 +60,11 @@ def main(argv=None) -> int:
     )
     run.add_argument("--device", default="auto")
     run.add_argument("--kv-codec", default="affine-k8v4", choices=("affine-k8v4", "dense"))
-    run.add_argument("--histories", default=",".join(map(str, runner.HISTORIES)))
+    run.add_argument(
+        "--contexts",
+        default=",".join(map(str, runner.CONTEXTS)),
+        help="context lengths each cell runs at",
+    )
     run.add_argument("--bar", type=float, default=compare.DEFAULT_BAR)
     show = commands.add_parser("report")
     show.add_argument("directory", type=Path)
@@ -95,7 +99,7 @@ def main(argv=None) -> int:
         side: builds.build(repository, spec, root, log)
         for side, spec in (("baseline", args.baseline), ("candidate", args.candidate))
     }
-    histories = tuple(int(value) for value in args.histories.split(",") if value)
+    contexts = tuple(int(value) for value in args.contexts.split(",") if value)
     directory = runner.run(
         inference,
         root,
@@ -105,7 +109,7 @@ def main(argv=None) -> int:
         args.rounds,
         args.device,
         args.kv_codec,
-        histories,
+        contexts,
         log,
     )
     log(f"results in {directory}")

@@ -41,27 +41,29 @@ from ..host.thermals import ThermalRecorder
 from . import models as model_set
 from .builds import executable
 
-PREFILL_ROWS = (512, 4096)
-DECODE_CONTEXTS = (256, 4096, 16384)
-HISTORIES = (4096, 16384)
+CONTEXTS = (16384,)
+# The tuning load only records configurations; a short context keeps it quick.
+TUNE_CONTEXT = 256
 LOGITS_PREFILL = 2048
 LOGITS_DECODES = 16
 TOKEN_RANGE = (100, 20_000)
 RUN_TIMEOUT_SECONDS = 3600
 SIDES = ("baseline", "candidate")
+PREFILL_ROWS = 512
 
 
-def cells(histories: tuple[int, ...]) -> list[str]:
-    """forward_bench arguments measuring every cell in one process."""
+def cells(contexts: tuple[int, ...]) -> list[str]:
+    """forward_bench arguments measuring every cell in one process: a prefill of 512 rows and a
+    decode step after each context length."""
     return [
         "--cells",
         "prefill,decode",
         "--prefill",
-        ",".join(map(str, PREFILL_ROWS)),
+        str(PREFILL_ROWS),
         "--prefill-history",
-        ",".join(map(str, (0, *histories))),
+        ",".join(map(str, contexts)),
         "--context",
-        ",".join(map(str, DECODE_CONTEXTS)),
+        ",".join(map(str, contexts)),
     ]
 
 
@@ -109,7 +111,7 @@ class Run:
     models: dict[str, Path]
     device: str
     kv_codec: str
-    histories: tuple[int, ...]
+    contexts: tuple[int, ...]
     log: object
     plan: dict = field(default_factory=dict)
 
@@ -171,7 +173,7 @@ class Run:
                 command[command.index("--cache-dir") + 1] = str(scratch)
                 self.invoke(
                     command
-                    + ["--output", str(self.directory / f"{name}.json"), *cells(())]
+                    + ["--output", str(self.directory / f"{name}.json"), *cells((TUNE_CONTEXT,))]
                     + ["--tuning-record", str(pins)],
                     name,
                     phase="tune",
@@ -193,7 +195,7 @@ class Run:
                         self.invoke(
                             [self.tool(side, "forward_bench"), "bench", *self.common(side, model)]
                             + ["--output", str(self.directory / f"{name}.json")]
-                            + cells(self.histories)
+                            + cells(self.contexts)
                             + ["--tuning-replay", str(pins)],
                             name,
                             phase="measure",
@@ -234,7 +236,7 @@ def run(
     rounds: int,
     device: str,
     kv_codec: str,
-    histories: tuple[int, ...],
+    contexts: tuple[int, ...],
     log,
 ) -> Path:
     host = platform.node().split(".")[0]
@@ -250,7 +252,7 @@ def run(
         "kv_codec": kv_codec,
         "own_tuning": own_tuning,
         "rounds": rounds,
-        "histories": histories,
+        "contexts": contexts,
         "builds": {side: built for side, (built, _) in builds.items()},
         "models": [model.name for model in selected],
         "results": [],
@@ -263,7 +265,7 @@ def run(
             model.name: model_set.fetch(workspace, root / "models", model, log)
             for model in selected
         }
-        session = Run(directory, store, builds, models, device, kv_codec, histories, log, plan)
+        session = Run(directory, store, builds, models, device, kv_codec, contexts, log, plan)
         session.tune(SIDES if own_tuning else ("baseline",))
         session.measure(rounds, ("same", "own") if own_tuning else ("same",))
         session.logits()
