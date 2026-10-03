@@ -4,6 +4,7 @@ applies_to:
   - inference/engine/kernels/**
   - inference/engine/state/**
   - inference/engine/src/execution.rs
+  - inference/engine/src/execution/**
   - inference/engine/src/planning.rs
 ---
 

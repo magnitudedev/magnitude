@@ -83,6 +83,23 @@ that seed with other new sequences; the first and every later advance reserves a
 successor. Returned successor banks never become the initial state of another sequence. The zero
 seed is included in the planned persistent state charge.
 
+An ordered pipeline state group owns distinct stores with the same accepted position and
+anticipated extent. Local stage ordinals do not renumber original target layer identities;
+a projected layout refuses shared history whose source belongs to another stage. This is
+state composition, not device placement or N-device execution qualification. The view
+borrows the original decoder; global layer indices are meaningful within that decoder,
+not cross-model identifiers. Recurrent components retain the original selected blocks'
+semantics and order; their stage-local component offsets are not global layer keys.
+State grouping checks distinct store ownership and logical extents, not whether the
+stores implement one admitted model. That remains the future caller's responsibility.
+For an ordinary group advance, reservation refusal unwinds earlier tentative claims.
+After every participating physical stage completes, reconciliation preflights **all** local
+commits before publishing **any** accepted state. Prevalidated publications are infallible
+and have no intervening callbacks. A refused preflight recovers unchanged logical sources;
+this does not undo completed physical writes. Physical failure may require terminal whole-
+request discard rather than recovery. Ordinary single-store commit uses the same preflight
+and publication rules without changing its accepted-prefix behavior.
+
 Submission does not make successor state visible. Physical completion produces an outcome that
 still owns the advance. Generation prepares a logical acceptance decision without mutating its
 live record. Reconciliation consumes the physical outcome and commits exactly the accepted prefix
@@ -131,6 +148,10 @@ layer widths and recurrent layout, and the selected stores. Abort returns both u
 Commit publishes the destination position and history only after the state program finishes.
 
 ## Acceptance criteria
+
+- Ordered multi-store preflight refuses empty groups, duplicate stores and differing logical
+  extents. A refusal at any preflight, including the middle or last stage, publishes none.
+- Pipeline state ownership tests on CPU do not qualify N-device execution.
 
 - No in-flight state transaction borrows sequence storage.
 - Interleaved advances of concurrent sequences add no history span while the following rows in

@@ -3,9 +3,11 @@ applies_to:
   - inference/engine/executor/**
   - inference/engine/state/**
   - inference/engine/scheduler/**
+  - inference/engine/src/census.rs
   - inference/engine/src/execution.rs
+  - inference/engine/src/execution/**
   - inference/engine/src/options.rs
-  - inference/engine/src/worker/execution.rs
+  - inference/engine/src/worker/**
   - inference/seismic/runtime/src/**
   - inference/seismic/api/src/**
   - inference/seismic/backends/cuda/src/driver.rs
@@ -14,7 +16,12 @@ applies_to:
 
 # Engine memory
 
-One loaded engine owns one heap in the physical memory domain of its selected device. The
+Ordinary single-device execution owns one heap in the physical memory domain of its selected
+device. An explicitly selected pipeline retains one independent heap per participating
+device; its budgets are never pooled (see [explicit pipeline execution](pipeline-execution.md)).
+Local pipeline admission charges assigned resident weights, projected state, prepared programs,
+constants, graph pools, the shared workspace maximum and a separately counted activation
+transfer buffer. The ordinary single-device transfer term is zero. The
 domain is host RAM for a CPU or unified-memory device and device-local memory for a dedicated
 GPU. Seismic identifies the domain, measures its capacity and live availability, charges every
 allocation to it, and enforces the latest limit the heap grants. The heap owns the engine's
@@ -99,7 +106,8 @@ Every charged byte belongs to exactly one release class:
 
 The engine's allocation census reports the charge from its reconciliation against every holder
 (requests, cached prefixes and submitted work), each byte once: context is surplus, retained, live
-and in-flight state and request media; compute is the committed graph pools and prepared programs,
+and in-flight state and request media; compute is the committed graph pools, prepared programs
+and preallocated activation transfer storage,
 plus any charge not attributed to a holder; auxiliary is optional component weights; model is
 target weights, bound constants and the pristine recurrent seed.
 
@@ -150,6 +158,13 @@ completion. A release that changes slab bindings needs the binding right
 ([state transactions](state-transactions.md)), so during a flight it runs at that flight's
 completion. Removed index entries do not count as released bytes until Seismic's charge actually
 falls. After unloading, the engine does not reload itself.
+
+A loaded owner with multiple explicitly assigned allocation domains reports each
+local reconciliation separately. Readiness retains each local plan; periodic
+observations label headroom by the actual memory pool identity, never by assuming
+all allocation readings belong to the primary domain. Missing domain identity or
+an incomplete domain count fails observation rather than underreporting storage.
+No summed capacity authorizes a claim on either device.
 
 The engine reports its standing and typed outcomes. Its hosting service decides whether to
 queue or report failed requests and when to reload an unloaded model. The service's emergency
@@ -232,3 +247,8 @@ least recently used victim, and the heap observes what dropping it released);
 native resource preclaims enter the same
 heap; and process supervision chooses no release, reacting only to the heap's
 typed unload outcome or to headroom at or below the emergency reserve.
+
+Complete resource-plan admission checks the startup peak, including transient
+assigned-weight import demand, against that allocation domain before allocation.
+An insufficient domain retains a typed required/available capacity cause through
+model loading; arithmetic or footprint inconsistencies remain internal errors.

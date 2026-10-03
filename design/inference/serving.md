@@ -78,7 +78,13 @@ tokens is spent without the model closing reasoning, selection is restricted to
 the template's reasoning end tag. No budget is ever derived from an effort.
 Ignoring end of generation removes the model's stop tokens from every selection.
 Prompt caching allowed retains exact prompt prefixes; disallowed requests are
-transient.
+transient. Explicit experimental paired serving requires disallowed prompt caching;
+unsupported retention and overlapping requests are refused rather than silently
+serialized or shared. The standalone engine accepts two exact CUDA selectors and
+an explicit decoder split only in a feature-enabled build; it selects no devices
+or placement automatically. Its default remains single-device execution. Graceful
+server termination drains HTTP requests and closes the worker; worker shutdown
+acknowledgement follows execution drain and resource release.
 
 Stream parsing emits semantic text, reasoning and complete validated tool calls
 in one ordered stream that non-streaming responses also assemble from. Each

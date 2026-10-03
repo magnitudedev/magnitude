@@ -25,7 +25,7 @@ Worker: one loaded model
   Execution owner          device, weights, numerical state and release policy
   Scheduler                admission, batching, time-shared prefill and decode, retention
   Generation               plain or proposal / verify / accept, sampling, constraint masks
-    Executor               family program over state storage on one Seismic device
+    Executor               family program over device-local state storage
 ```
 
 ## Construction
@@ -43,6 +43,10 @@ EngineConfiguration -> resolve -> ResolvedEngineConfiguration { host, manifest }
 - **Host artifacts** own chat semantics: tokenizer, templates and their inspection, input adapter
   and media placeholder policy. They stay on the host.
 - **The execution manifest** is owned and serializable; it is the only value a worker needs.
+  It may carry explicitly supplied experimental two-CUDA placement. Without it the ordinary
+  single-device path is unchanged. A build without that feature refuses the selected strategy,
+  never falls back. Single-device preview and prepare-only refuse paired selection rather than
+  misrepresenting it as one-device capacity or preparation.
 - **Preview** plans against current devices without opening or allocating anything.
 - **Load** runs the same worker either in-process over a channel transport (engine CLI, tests) or
   in a worker process over framed standard streams (the service). The worker protocol and the
@@ -52,6 +56,11 @@ EngineConfiguration -> resolve -> ResolvedEngineConfiguration { host, manifest }
   reports preparation and tuning progress as a load does, and exits once prepared. Tuning imports
   only the weights of the few layers its cases rotate over; a prepared worker never allocates
   serving state, imports the whole model or serves.
+- **Paired load** uses the same generic execution owner, worker and session, retaining both
+  prepared local allocation domains and paired request state. Readiness carries separate stage
+  plans and both actual physical allocation censuses; the legacy primary plan describes only
+  the readout domain. Observations map each actual memory pool to its own physical device.
+  VRAM capacities are not pooled. See [explicit pipeline execution](engine/pipeline-execution.md).
 - **Readiness** binds host artifacts to the connected worker only when the worker loaded exactly
   the package the host resolved, with the same template fingerprint and input modalities; any
   mismatch is a typed failure, never a partial engine.

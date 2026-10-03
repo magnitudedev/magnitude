@@ -49,7 +49,10 @@ One thread owns execution. Each piece has one job:
 **The worker is an event pump.** Its events are a flight's completion, a publication wake, and a
 request's cancellation (by its host, or by a dropped admission reply). It applies events and
 controls in arrival order, runs every possible owner transition, then sleeps until the next event
-or the next memory observation. A control executes at once; nothing is deferred or refused for
+or the next memory observation. An explicitly synchronous execution strategy yields
+between bounded physical steps with an immediate continuation; the same mailbox
+processes pending controls before the next step, without relying on output backpressure.
+The completed flight retains its rights until ordinary reconciliation. A control executes at once; nothing is deferred or refused for
 "not now". A completion exists only for a flight in the air. There is no periodic re-drive.
 
 **Lifecycle.** Close and memory escalation (persistent Reclaim) move Serving to Draining: every
@@ -85,7 +88,10 @@ with a capacity wait at the current epoch, or a memory wait in Blind or Reclaim.
 
 **The availability epoch advances exactly when capacity is freed:** a reconciled completion, a
 request ending or being evicted, a release or shrink, memory returning to Normal, or memory freed
-elsewhere covering a recorded deficit. Rounds finishing, admissions and prefix releases free
+elsewhere covering a recorded deficit. If a refusal identifies only a memory role
+shared by multiple allocation domains, a retry requires every matching domain to
+cover it: spare memory on another GPU cannot establish recovery of the refused one.
+This is a conservative retry guard, not pooled capacity. Rounds finishing, admissions and prefix releases free
 nothing and don't advance it.
 
 **Capacity rule.** In Idle, when memory is Normal and no request awaits host credit or memory or
@@ -170,6 +176,9 @@ The service owner is generic over the numerical program family; it observes the 
 completion and reconciliation lifecycle whether that family returns ready or pending submissions.
 The root closes the family type at worker construction, leaving the host command interface
 non-generic.
+A selected execution contract may forbid retained-prefix/resume requests. In that
+case the Owner rejects non-disabled prefix-cache capacity and requested retention
+before residency; it never silently treats a retaining request as transient.
 Prompt processing exposes ordinary causal model operations too. Shared device
 completion precedes each request's prompt-feature publication and checkpointing.
 Phase feedback counts physical service once; per-request metrics include the
