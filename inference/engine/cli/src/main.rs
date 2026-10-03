@@ -13,7 +13,8 @@ use magnitude_engine::chat::SessionLimits;
 use magnitude_engine::composition::{EngineConfiguration, start_in_process};
 use magnitude_engine::invocation::{InvocationSource, SingleEngine};
 use magnitude_engine::options::{
-    ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits,
+    ExplicitPipeline, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
+    standard_service_limits,
 };
 use magnitude_engine::telemetry::{DEFAULT_TRACES_ENDPOINT, Telemetry};
 use magnitude_engine::worker::EngineClient;
@@ -46,13 +47,15 @@ struct Options {
     telemetry_endpoint: String,
     device: DeviceRequest,
     kernel_cache: Option<PathBuf>,
+    pipeline: Option<ExplicitPipeline>,
 }
 
 const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
 [--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
 [--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2] [--mtp-proposals N] \
 [--kv-codec dense|affine-k8v4] [--lookahead on|off] [--telemetry URL] \
-[--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR]";
+[--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR] \
+[--experimental-pipeline CUDA_SELECTOR,CUDA_SELECTOR,SPLIT]";
 
 /// `on` or `off`.
 fn switch(flag: &str, value: &str) -> Result<bool, String> {
@@ -81,6 +84,43 @@ where
 }
 
 fn parse() -> Result<Options, String> {
+    parse_args(std::env::args().skip(1))
+}
+
+/// Only explicit physical identities are accepted; no ordinal or cut search.
+fn pipeline(value: &str) -> Result<ExplicitPipeline, String> {
+    let fields = value.split(',').collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return Err("--experimental-pipeline requires CUDA_SELECTOR,CUDA_SELECTOR,SPLIT".into());
+    }
+    let a = fields[0]
+        .parse::<seismic::DeviceSelector>()
+        .map_err(|e| e.to_string())?;
+    let b = fields[1]
+        .parse::<seismic::DeviceSelector>()
+        .map_err(|e| e.to_string())?;
+    let split = fields[2].parse::<usize>().map_err(|e| e.to_string())?;
+    if !matches!(
+        (a, b),
+        (
+            seismic::DeviceSelector::Cuda { .. },
+            seismic::DeviceSelector::Cuda { .. }
+        )
+    ) || a == b
+        || split == 0
+    {
+        return Err(
+            "experimental pipeline requires two distinct exact CUDA selectors and a positive split"
+                .into(),
+        );
+    }
+    Ok(ExplicitPipeline {
+        devices: [a, b],
+        split,
+    })
+}
+
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
     let defaults = ModelPolicy::default();
     let mut target = None;
     let mut projector = ProjectorSelection::Discover;
@@ -98,7 +138,8 @@ fn parse() -> Result<Options, String> {
     let mut telemetry_endpoint = DEFAULT_TRACES_ENDPOINT.to_owned();
     let mut device = DeviceRequest::Automatic;
     let mut kernel_cache = None;
-    let mut args = std::env::args().skip(1);
+    let mut selected_pipeline = None;
+    let mut device_explicit = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--model" => target = Some(PathBuf::from(value(&flag, &mut args)?)),
@@ -128,7 +169,17 @@ fn parse() -> Result<Options, String> {
             "--kv-codec" => kv_codec = value(&flag, &mut args)?.parse()?,
             "--lookahead" => lookahead = switch(&flag, &value(&flag, &mut args)?)?,
             "--telemetry" => telemetry_endpoint = value(&flag, &mut args)?,
+            "--experimental-pipeline" => {
+                if !cfg!(feature = "experimental-pipeline-cuda") {
+                    return Err("this build does not enable experimental-pipeline-cuda".into());
+                }
+                if selected_pipeline.is_some() {
+                    return Err("--experimental-pipeline may only be supplied once".into());
+                }
+                selected_pipeline = Some(pipeline(&value(&flag, &mut args)?)?);
+            }
             "--device" => {
+                device_explicit = true;
                 device = value(&flag, &mut args)?
                     .parse()
                     .map_err(|error| format!("--device: {error}"))?
@@ -152,6 +203,9 @@ fn parse() -> Result<Options, String> {
     if context_tokens == Some(0) || output_capacity == 0 || prefill_tokens == 0 {
         return Err("context, output capacity, and prefill tokens must be positive".into());
     }
+    if selected_pipeline.is_some() && device_explicit {
+        return Err("--device and --experimental-pipeline are mutually exclusive".into());
+    }
     Ok(Options {
         target,
         projector,
@@ -169,6 +223,7 @@ fn parse() -> Result<Options, String> {
         telemetry_endpoint,
         device,
         kernel_cache,
+        pipeline: selected_pipeline,
     })
 }
 
@@ -252,6 +307,21 @@ fn main() {
     }
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut terminate) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+            return;
+        }
+        Err(error) => eprintln!("magnitude-engine: termination signal: {error}"),
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 fn run() -> Result<(), String> {
     let load_started = Instant::now();
     let options = parse()?;
@@ -266,7 +336,12 @@ fn run() -> Result<(), String> {
         .init();
     let mut service = standard_service_limits();
     service.prefill_tokens = options.prefill_tokens;
-    let resolved = EngineConfiguration {
+    // The explicitly selected experimental executor has one active decode row.
+    // This does not change the ordinary service's batching policy.
+    if options.pipeline.is_some() {
+        service.decode_tokens = 1;
+    }
+    let mut resolved = EngineConfiguration {
         package: PackageOptions {
             target: options.target,
             projector: options.projector,
@@ -288,6 +363,7 @@ fn run() -> Result<(), String> {
     }
     .resolve()
     .map_err(|error| error.to_string())?;
+    resolved.manifest.pipeline = options.pipeline;
     eprintln!(
         "magnitude-engine: host resolution in {:.2} s",
         load_started.elapsed().as_secs_f64()
@@ -310,6 +386,9 @@ fn run() -> Result<(), String> {
         worker_started.elapsed().as_secs_f64()
     );
     let backend = ready.ready_info().backend;
+    if let Some(pipeline) = &ready.ready_info().pipeline {
+        eprintln!("magnitude-engine: experimental pipeline {:?}", pipeline);
+    }
     let (host, engine, _) = ready.into_parts();
     let identity = Identity {
         model: options.served_model.clone(),
@@ -317,6 +396,7 @@ fn run() -> Result<(), String> {
         vocabulary,
         engine: engine.clone(),
     };
+    let shutdown_engine = engine.clone();
     let serving = Serving::new(Arc::new(Standalone {
         engine: SingleEngine::new(options.served_model.clone(), host, engine),
         limits: SessionLimits {
@@ -359,8 +439,82 @@ fn run() -> Result<(), String> {
             "magnitude-engine: load to serving in {:.2} s",
             load_started.elapsed().as_secs_f64()
         );
-        axum::serve(listener, app)
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string());
+        shutdown_engine
+            .shutdown()
+            .map_err(|error| error.to_string())?;
+        while shutdown_engine.check().is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        result
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const PAIR: &str =
+        "cuda:01010101-0101-0101-0101-010101010101,cuda:02020202-0202-0202-0202-020202020202,7";
+    fn args(flags: &[&str]) -> impl Iterator<Item = String> {
+        flags
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+    #[test]
+    fn ordinary_cli_does_not_select_pipeline() {
+        let options = parse_args(args(&["--model", "model.gguf"])).unwrap();
+        assert!(options.pipeline.is_none());
+        assert_eq!(options.device, DeviceRequest::Automatic);
+    }
+    #[test]
+    fn explicit_pipeline_geometry_is_validated_without_devices() {
+        let selected = pipeline(PAIR).unwrap();
+        assert_eq!(selected.split, 7);
+        for bad in [
+            "cuda,cuda,7",
+            "host-cpu,host-cpu,7",
+            "cuda:01,cuda:02,7",
+            "",
+            "cuda:01010101010101010101010101010101,cuda:01010101010101010101010101010101,7",
+            "cuda:01010101010101010101010101010101,cuda:02020202020202020202020202020202,0",
+        ] {
+            assert!(pipeline(bad).is_err(), "{bad}");
+        }
+    }
+    #[test]
+    fn opt_in_is_feature_gated_and_never_overrides_device() {
+        let selected = parse_args(args(&[
+            "--model",
+            "model.gguf",
+            "--experimental-pipeline",
+            PAIR,
+        ]));
+        assert_eq!(
+            selected.is_ok(),
+            cfg!(feature = "experimental-pipeline-cuda")
+        );
+        assert!(parse_args(args(&[
+            "--model",
+            "model.gguf",
+            "--device",
+            "cuda",
+            "--experimental-pipeline",
+            PAIR
+        ]))
+        .is_err());
+        assert!(parse_args(args(&[
+            "--model",
+            "model.gguf",
+            "--experimental-pipeline",
+            PAIR,
+            "--experimental-pipeline",
+            PAIR
+        ]))
+        .is_err());
+    }
 }

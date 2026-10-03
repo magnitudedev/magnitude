@@ -10,6 +10,12 @@ license.workspace = true
 name = "magnitude-engine"
 path = "src/main.rs"
 
+[features]
+default = []
+experimental-pipeline-cuda = ["magnitude-engine/experimental-pipeline-cuda"]
+# Development-only partial-step lifecycle qualification; absent from normal builds.
+pipeline-fault-injection = ["experimental-pipeline-cuda", "magnitude-engine/pipeline-fault-injection"]
+
 [dependencies]
 axum = "0.8.9"
 futures-util.workspace = true
