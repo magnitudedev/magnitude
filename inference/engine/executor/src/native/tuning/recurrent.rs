@@ -12,7 +12,8 @@
 
 use super::cases::projection_shape;
 use super::{
-    row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs, TuningLimits,
+    row_points, served_row_points, CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs,
+    TuningLimits,
 };
 use crate::operators::gated_delta::graph::CHUNKED_ROWS;
 use magnitude_family_contracts::{Operator, RecurrentHeadMapping, WeightKind, WeightScope};
@@ -51,7 +52,7 @@ impl RecurrentShape {
     /// qkv weight (`[rows, H]`).
     fn projection_statics(
         &self,
-        inputs: &TuningInputs<'_, '_>,
+        inputs: &ModelInputs<'_>,
     ) -> Result<Vec<(&'static str, u64)>, String> {
         let (_, hidden) =
             projection_shape(inputs, &self.scopes, WeightKind::RecurrentQueryKeyValue)?;
@@ -128,7 +129,7 @@ impl EntryTuning for RecurrentProjectTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         self.shape.projection_statics(inputs)
     }
 
@@ -214,7 +215,7 @@ impl EntryTuning for RecurrentOutputTuning {
         format!("OW={},A={}", self.output.name(), self.activation.name())
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (hidden, columns) =
             projection_shape(inputs, &self.shape.scopes, WeightKind::RecurrentOutput)?;
         if columns != self.shape.value_heads * self.shape.width {
@@ -471,7 +472,7 @@ macro_rules! state_entry {
 
             fn statics(
                 &self,
-                _inputs: &TuningInputs<'_, '_>,
+                _inputs: &ModelInputs<'_>,
             ) -> Result<Vec<(&'static str, u64)>, String> {
                 Ok(self.0.shape.state_statics())
             }
@@ -556,7 +557,7 @@ impl EntryTuning for RecurrentProjectConvolvedTuning {
         self.0.bindings()
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let mut statics = self.0.shape.projection_statics(inputs)?;
         statics.push(("C", self.0.shape.convolution_width));
         Ok(statics)
@@ -655,7 +656,7 @@ impl EntryTuning for RecurrentStepConvolvedTuning {
         self.0.bindings()
     }
 
-    fn statics(&self, _inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = &self.0.shape;
         Ok(vec![
             ("NK", shape.key_heads),

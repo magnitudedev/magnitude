@@ -951,9 +951,55 @@ impl NativeNatExpr {
             }
         }
     }
+
+    /// Every integer literal the expression contains.
+    pub fn constants(&self, out: &mut std::collections::BTreeSet<u64>) {
+        match self {
+            Self::Constant(value) => {
+                out.insert(*value);
+            }
+            Self::Dimension(_) | Self::Parameter(_) => {}
+            Self::Add(left, right)
+            | Self::Sub(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Rem(left, right)
+            | Self::CeilDiv(left, right)
+            | Self::Min(left, right)
+            | Self::Max(left, right) => {
+                left.constants(out);
+                right.constants(out);
+            }
+        }
+    }
 }
 
 impl NativeCondition {
+    /// The top-level `and` operands, in order.
+    pub fn conjuncts<'c>(&'c self, out: &mut Vec<&'c Self>) {
+        match self {
+            Self::And(left, right) => {
+                left.conjuncts(out);
+                right.conjuncts(out);
+            }
+            Self::Compare { .. } | Self::Or(..) => out.push(self),
+        }
+    }
+
+    /// Every integer literal the condition contains.
+    pub fn constants(&self, out: &mut std::collections::BTreeSet<u64>) {
+        match self {
+            Self::Compare { left, right, .. } => {
+                left.constants(out);
+                right.constants(out);
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.constants(out);
+                right.constants(out);
+            }
+        }
+    }
+
     /// Evaluate with `dimension` and `parameter` supplying named values.
     /// `and` and `or` evaluate their right side only when the left side
     /// does not decide the result.
@@ -1444,6 +1490,81 @@ impl NativeImplementation {
             false
         })?;
         first.ok_or(NativeSpecializationError::Inadmissible)
+    }
+
+    /// The values a static search tries, most preferred first: powers of two
+    /// up to 4096, then the `where` condition's other literals above one,
+    /// then one and zero.
+    pub fn static_candidates(&self) -> Vec<u64> {
+        let mut literals = std::collections::BTreeSet::new();
+        if let Some(constraint) = &self.constraint {
+            constraint.constants(&mut literals);
+        }
+        let powers = (1..=12).map(|exponent| 1u64 << exponent);
+        let mut candidates: Vec<u64> = powers.clone().collect();
+        candidates.extend(
+            literals
+                .into_iter()
+                .filter(|value| *value > 1 && !powers.clone().any(|power| power == *value)),
+        );
+        candidates.extend([1, 0]);
+        candidates
+    }
+
+    /// The first static values, in [`Self::static_candidates`] order, at
+    /// which every specialization walk succeeds and admits at least one
+    /// configuration, with `fixed` holding the statics it names. A
+    /// depth-first search over the statics in declaration order: every
+    /// top-level conjunct of `where` that reads only assigned statics prunes
+    /// a partial assignment. `None` when no assignment over the candidates is
+    /// admitted.
+    pub fn search_statics(&self, fixed: &[(&str, u64)]) -> Option<NativeSpecialization> {
+        let mut conjuncts = Vec::new();
+        if let Some(constraint) = &self.constraint {
+            constraint.conjuncts(&mut conjuncts);
+        }
+        let candidates = self.static_candidates();
+        let mut assigned = std::collections::BTreeMap::new();
+        self.search_from(0, fixed, &conjuncts, &candidates, &mut assigned)
+    }
+
+    fn search_from(
+        &self,
+        depth: usize,
+        fixed: &[(&str, u64)],
+        conjuncts: &[&NativeCondition],
+        candidates: &[u64],
+        assigned: &mut std::collections::BTreeMap<String, u64>,
+    ) -> Option<NativeSpecialization> {
+        let Some(name) = self.statics.get(depth) else {
+            let statics = assigned
+                .iter()
+                .fold(NativeSpecialization::new(), |statics, (name, value)| {
+                    statics.with_static(name.clone(), *value)
+                });
+            return match self.admissible(&statics) {
+                Ok(admissible) if !admissible.is_empty() => Some(statics),
+                Ok(_) | Err(_) => None,
+            };
+        };
+        let values = match fixed.iter().find(|(candidate, _)| *candidate == name) {
+            Some((_, value)) => vec![*value],
+            None => candidates.to_vec(),
+        };
+        for value in values {
+            assigned.insert(name.clone(), value);
+            let dimension = |dimension: &str| assigned.get(dimension).copied();
+            let refuted = conjuncts
+                .iter()
+                .any(|conjunct| matches!(conjunct.holds(&dimension, &|_| None), Ok(false)));
+            if !refuted {
+                if let Some(found) = self.search_from(depth + 1, fixed, conjuncts, candidates, assigned) {
+                    return Some(found);
+                }
+            }
+        }
+        assigned.remove(name);
+        None
     }
 
     /// Visit the admissible specializations at `statics` in declaration

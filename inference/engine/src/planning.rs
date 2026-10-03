@@ -10,8 +10,8 @@
 use crate::options::{ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
 use magnitude_batching::MAX_CLASS_ROWS;
 use magnitude_executor::{
-    platform::SelectedDevice, ComponentSelection, ExecutionPlanDraft, ExecutionPlanner, PlanError,
-    PlannedMethod, ResourceLimits,
+    platform::SelectedDevice, BackendPlan, ComponentSelection, ExecutionPlanDraft,
+    ExecutionPlanner, PlanError, PlannedMethod, ResourceLimits,
 };
 use magnitude_scheduler::ServiceLimits;
 use std::fmt;
@@ -51,6 +51,46 @@ pub fn plan_execution(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
 ) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
+    let (selection, method, limits) = planner_inputs(manifest, selected.info.backend)?;
+    ExecutionPlanner::prepare(
+        selected,
+        &manifest.package,
+        &manifest.definition,
+        selection,
+        manifest.path,
+        method,
+        manifest.model.kv_codec,
+        limits,
+    )
+    .map_err(ExecutionPlanningError::Plan)
+}
+
+/// Plan the manifest's model on `backend`, which is all planning reads of a
+/// device: the plan a load on any device of that backend executes.
+pub fn plan_backend(
+    manifest: &ExecutionManifest,
+    backend: seismic::BackendName,
+) -> Result<BackendPlan, ExecutionPlanningError> {
+    let (selection, method, limits) = planner_inputs(manifest, backend)?;
+    ExecutionPlanner::backend_plan(
+        backend,
+        &manifest.package,
+        &manifest.definition,
+        selection,
+        manifest.path,
+        method,
+        manifest.model.kv_codec,
+        limits,
+    )
+    .map_err(ExecutionPlanningError::Plan)
+}
+
+/// The component selection, planned method and resource limits the
+/// manifest resolves on `backend`.
+fn planner_inputs(
+    manifest: &ExecutionManifest,
+    backend: seismic::BackendName,
+) -> Result<(ComponentSelection, PlannedMethod, ResourceLimits), ExecutionPlanningError> {
     let selection = ComponentSelection {
         head: !matches!(manifest.model.method, ResolvedMethod::Plain),
         vision: manifest.definition.vision.is_some(),
@@ -66,18 +106,8 @@ pub fn plan_execution(
         },
         ResolvedMethod::DFlash { proposals } => PlannedMethod::DFlash { proposals },
     };
-    let limits = resource_limits(&manifest.service, &manifest.model, selected.info.backend)?;
-    ExecutionPlanner::prepare(
-        selected,
-        &manifest.package,
-        &manifest.definition,
-        selection,
-        manifest.path,
-        method,
-        manifest.model.kv_codec,
-        limits,
-    )
-    .map_err(ExecutionPlanningError::Plan)
+    let limits = resource_limits(&manifest.service, &manifest.model, backend)?;
+    Ok((selection, method, limits))
 }
 
 /// The resource limits a load of this manifest plans for.

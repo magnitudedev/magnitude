@@ -3,7 +3,7 @@
 //! shapes and model geometry, and builds every argument set from real
 //! resident weights of distinct layers plus case-owned activations.
 
-use super::{row_points, EntryTuning, PointShape, TuningInputs, TuningLimits};
+use super::{row_points, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{dense_expand, dense_output, dense_up};
 use seismic::{Element, Tensor};
@@ -11,7 +11,7 @@ use seismic::{Element, Tensor};
 /// The static dimensions `[rows, columns]` a projection weight fixes, checked
 /// to agree across every layer that shares the specialization.
 pub(crate) fn projection_shape(
-    inputs: &TuningInputs<'_, '_>,
+    inputs: &ModelInputs<'_>,
     scopes: &[WeightScope],
     kind: WeightKind,
 ) -> Result<(u64, u64), String> {
@@ -37,7 +37,7 @@ pub(crate) fn projection_shape(
 /// The extent of a projection weight's accumulator-scale port, checked to
 /// agree across every layer that shares the specialization.
 pub(crate) fn scale_extent(
-    inputs: &TuningInputs<'_, '_>,
+    inputs: &ModelInputs<'_>,
     scopes: &[WeightScope],
     kind: WeightKind,
 ) -> Result<u64, String> {
@@ -113,7 +113,7 @@ impl EntryTuning for DenseExpandTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (features, hidden) = projection_shape(inputs, &self.scopes, self.gate_kind)?;
         if projection_shape(inputs, &self.scopes, self.up_kind)? != (features, hidden) {
             return Err("dense gate and up shapes differ".into());
@@ -218,7 +218,7 @@ impl EntryTuning for DenseUpTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (features, hidden) = projection_shape(inputs, &self.scopes, self.up_kind)?;
         Ok(vec![
             ("H", hidden),
@@ -316,7 +316,7 @@ impl EntryTuning for DenseOutputTuning {
         format!("DW={},A={}", self.down.name(), self.activation.name())
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (hidden, features) = projection_shape(inputs, &self.scopes, self.down_kind)?;
         Ok(vec![
             ("H", hidden),

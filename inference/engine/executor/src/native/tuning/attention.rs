@@ -16,7 +16,8 @@
 
 use super::cases::projection_shape;
 use super::{
-    row_points, served_row_points, with_contexts, CaseState, EntryTuning, PointShape, TuningInputs,
+    row_points, served_row_points, with_contexts, CaseState, EntryTuning, ModelInputs, PointShape,
+    TuningInputs,
     TuningLimits,
 };
 use crate::operators;
@@ -183,7 +184,7 @@ impl AttentionProjectTuning {
 
 /// The attention operator of the layers a case binds.
 fn operator<'i>(
-    inputs: &'i TuningInputs<'_, '_>,
+    inputs: &'i ModelInputs<'_>,
     scopes: &[WeightScope],
 ) -> Result<&'i Attention, String> {
     match inputs.operator(scopes)? {
@@ -213,7 +214,7 @@ impl EntryTuning for AttentionProjectTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.binding.shape;
         let query = operators::attention::query_kind(operator(inputs, &self.scopes)?);
         if projection_shape(inputs, &self.scopes, query)? != (shape.query_rows(), shape.hidden) {
@@ -315,7 +316,7 @@ impl EntryTuning for AttentionOutputTuning {
         format!("OW={},A={}", self.output.name(), self.activation.name())
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
         let heads = shape.kv_heads * shape.group;
         if projection_shape(inputs, &self.scopes, WeightKind::AttentionOutput)?
@@ -757,7 +758,7 @@ macro_rules! mix_entry {
 
             fn statics(
                 &self,
-                _inputs: &TuningInputs<'_, '_>,
+                _inputs: &ModelInputs<'_>,
             ) -> Result<Vec<(&'static str, u64)>, String> {
                 Ok(self.0.statics())
             }

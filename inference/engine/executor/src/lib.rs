@@ -9,6 +9,7 @@ mod execution_path;
 mod host_tables;
 mod progressive;
 mod import_transforms;
+mod inventory;
 mod kernel_cache;
 mod lanes;
 pub mod memory;
@@ -42,6 +43,7 @@ pub use domain::{
 };
 pub use error::{CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError};
 pub use execution_path::ExecutionPath;
+pub use inventory::kernel_inventory;
 pub use kernel_cache::{KernelCache, KernelCacheError, TuningCacheKey, DEFAULT_KERNEL_CACHE_BYTES};
 pub use lanes::ConditioningSlice;
 pub use lanes::{
@@ -82,7 +84,7 @@ pub use planning::{
     resident_element, resident_layout, source_element, ArtifactComponent, ArtifactComponentKind,
     AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding,
-    AttentionShape, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
+    AttentionShape, BackendPlan, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
     DenseBranchBinding, DenseScales, Dflash2Binding, DraftBlockBinding, DraftProgramPlan,
     EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
     FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HeadProjection, HostTablePlan,

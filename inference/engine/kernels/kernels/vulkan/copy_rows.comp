@@ -41,8 +41,7 @@ void copy_rows() {
 #elif SEISMIC_ROWS_PACKET_SIZE == 1
         element_u8_put(destination, element_u8_at(source));
 #else
-        for (uint byte = 0u; byte < SEISMIC_ROWS_PACKET_SIZE; ++byte)
-            element_u8_put(destination + byte, element_u8_at(source + byte));
+#error "copy_rows moves 1-, 2- and 4-byte dense elements"
 #endif
     }
 }

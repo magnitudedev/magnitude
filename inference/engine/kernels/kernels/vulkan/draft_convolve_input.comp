@@ -5,7 +5,7 @@
 #include "lib/core/activation.glsl"
 
 void draft_convolve_input() {
-    const uint64_t input = SEISMIC_PTR(SEISMIC_BUFFER_INPUT);
+    const uint64_t normed = SEISMIC_PTR(SEISMIC_BUFFER_INPUT);
     const uint64_t dynamic = SEISMIC_PTR(SEISMIC_BUFFER_DYNAMIC);
     const uint64_t base = SEISMIC_PTR(SEISMIC_BUFFER_BASE);
     const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
@@ -22,7 +22,7 @@ void draft_convolve_input() {
                 + element_f32_at(dynamic + (row * SEISMIC_DYNAMIC_STRIDE_0 + offset * SEISMIC_DYNAMIC_STRIDE_2
                     + group * SEISMIC_DYNAMIC_STRIDE_3) * 4ul);
             sum = seismic_fma_rn(coefficient,
-                element_at(ELEMENT_ACT, input, (row - offset) * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1),
+                element_at(ELEMENT_ACT, normed, (row - offset) * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1),
                 sum);
         }
         element_put(ELEMENT_ACT, result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, sum);

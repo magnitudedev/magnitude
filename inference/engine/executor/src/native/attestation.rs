@@ -756,18 +756,12 @@ impl AttestedPrograms {
         device: &Device,
         tuning: TuningContext<'_>,
     ) -> Result<Self, CatalogError> {
-        let limits = plan.policy().limits();
         Self::prepare_for(
             plan.policy().path(),
             plan.device(),
             plan.programs(),
             plan.load(),
-            TuningLimits {
-                max_rows: limits.max_launch_rows as u64,
-                max_projected_rows: crate::programs::graph::readout::max_projected_rows(limits)
-                    as u64,
-                context_tokens: tuning.definition.decoder.context_limit,
-            },
+            TuningLimits::of(plan.policy().limits(), tuning.definition),
             device,
             tuning,
         )

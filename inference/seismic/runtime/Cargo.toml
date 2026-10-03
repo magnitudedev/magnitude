@@ -13,13 +13,19 @@ seismic-metal.workspace = true
 seismic-cpu.workspace = true
 seismic-native-cpu.workspace = true
 seismic-cuda.workspace = true
+# Offline formation coverage forms Vulkan sources on every host.
+seismic-vulkan = { workspace = true, optional = true }
 opentelemetry = "0.33.0"
 serde.workspace = true
 sha2 = "=0.11.0"
 
+[features]
+# The offline formation coverage suite (`native::coverage`).
+coverage = ["dep:seismic-vulkan"]
+
 [dev-dependencies]
 seismic-std.workspace = true
-# Vulkan formation (glslang, SPIRV-Tools) is tested offline on every host.
+# The Vulkan prefix's formation tests run on every host.
 seismic-vulkan.workspace = true
 serde_json = "1"
 

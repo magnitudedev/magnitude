@@ -78,6 +78,18 @@ fn logical_count(shape: &[u64]) -> Result<u64, String> {
         .ok_or_else(|| "weight element count overflows".to_owned())
 }
 
+/// The load plan's weight of one role.
+pub(crate) fn weight_plan(
+    load: &ModelLoadPlan,
+    scope: WeightScope,
+    kind: WeightKind,
+) -> Result<&WeightPlan, String> {
+    let role = WeightRole { scope, kind };
+    load.weights()
+        .find(|weight| weight.role == role)
+        .ok_or_else(|| format!("weight {role:?} is absent from the load plan"))
+}
+
 pub(crate) struct TuningWeights<'a> {
     device: &'a Device,
     load: &'a ModelLoadPlan,
@@ -107,12 +119,12 @@ impl<'a> TuningWeights<'a> {
         self.resident.clear();
     }
 
-    fn plan(&self, scope: WeightScope, kind: WeightKind) -> Result<&'a WeightPlan, String> {
-        let role = WeightRole { scope, kind };
+    pub fn load(&self) -> &'a ModelLoadPlan {
         self.load
-            .weights()
-            .find(|weight| weight.role == role)
-            .ok_or_else(|| format!("weight {role:?} is absent from the load plan"))
+    }
+
+    fn plan(&self, scope: WeightScope, kind: WeightKind) -> Result<&'a WeightPlan, String> {
+        weight_plan(self.load, scope, kind)
     }
 
     /// Whether the weight of one role is already imported.
@@ -125,14 +137,6 @@ impl<'a> TuningWeights<'a> {
         Ok(self.plan(scope, kind)?.resident_bytes)
     }
 
-    pub fn shape(&self, scope: WeightScope, kind: WeightKind) -> Result<Vec<u64>, String> {
-        Ok(self.plan(scope, kind)?.shape.clone())
-    }
-
-    /// The planned extent of one weight role's accumulator-scale port.
-    pub fn scale_extent(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
-        Ok(self.plan(scope, kind)?.scale_extent())
-    }
 
     pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
         let role = WeightRole { scope, kind };

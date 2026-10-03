@@ -18,7 +18,7 @@ pub use assessment::{
 pub use capabilities::{CapabilityPlan, PlannedMethod, MAX_DRAFT_PROPOSALS};
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
 pub use execution_plan::{
-    ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,
+    BackendPlan, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,
 };
 pub use programs::{
     Dflash2Binding, DraftBlockBinding, DraftProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
@@ -266,6 +266,93 @@ pub(crate) mod tests {
             projector: None,
             draft: None,
         }
+    }
+
+    /// The kernel inventory, derived without a device, names exactly the
+    /// kernels a load prepares on the selected device.
+    #[test]
+    fn kernel_inventory_names_every_kernel_a_load_prepares() {
+        let Ok(catalog) = seismic::DeviceCatalog::discover() else {
+            return;
+        };
+        let Ok(selected) = crate::platform::select_device(
+            &catalog,
+            crate::ExecutionPath::Native,
+            crate::platform::DeviceRequest::Automatic,
+            &crate::platform::MemoryReserves::standard(),
+        ) else {
+            return;
+        };
+        let device = catalog
+            .open(catalog.resolve(selected.info.selector).unwrap())
+            .unwrap();
+        let definition = fixture_definition();
+        let manifest = fixture_manifest(&definition);
+        let limits = ResourceLimits {
+            max_launch_rows: 2,
+            max_launch_slots: 2,
+            max_selected_rows: 2,
+            max_drafting_slots: 2,
+            exported_logits_rows: 0,
+            max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+            lookahead: false,
+        };
+        let selection = ComponentSelection {
+            head: false,
+            vision: false,
+        };
+        let draft = ExecutionPlanner::prepare(
+            &selected,
+            &manifest,
+            &definition,
+            selection,
+            crate::ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            limits,
+        )
+        .unwrap();
+        let (_, recorded) = seismic::record_kernel_requests(|| {
+            crate::AttestedPrograms::prepare_draft(
+                &draft,
+                &device,
+                crate::TuningContext {
+                    definition: &definition,
+                    weights: &crate::ZeroTuningWeights,
+                    observer: &crate::UnreportedTuning,
+                    cache: None,
+                },
+            )
+            .unwrap()
+        });
+        let plan = ExecutionPlanner::backend_plan(
+            device.backend(),
+            &manifest,
+            &definition,
+            selection,
+            crate::ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            limits,
+        )
+        .unwrap();
+        let inventory = crate::kernel_inventory(&definition, &plan)
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let prepared = recorded
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert!(!prepared.is_empty());
+        let named = |requests: std::collections::hash_set::Difference<'_, _, _>| {
+            requests.map(ToString::to_string).collect::<Vec<_>>().join("\n")
+        };
+        assert!(
+            inventory == prepared,
+            "prepared kernels the inventory omits:\n{}\nlisted kernels the load does not prepare:\n{}",
+            named(prepared.difference(&inventory)),
+            named(inventory.difference(&prepared)),
+        );
     }
 
     /// Build actual checked Seismic graph families. The engine may choose how

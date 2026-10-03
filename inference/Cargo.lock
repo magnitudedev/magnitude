@@ -2516,6 +2516,7 @@ dependencies = [
  "libc",
  "magnitude-engine",
  "magnitude-executor",
+ "magnitude-kernels",
  "magnitude-service-api",
  "magnitude-service-contracts",
  "magnitude-service-models",

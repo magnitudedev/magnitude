@@ -26,6 +26,7 @@ pub(crate) use head::draft_vocabulary;
 use head::HeadKernels;
 pub use head::HeadLogitsKernels;
 pub(crate) use import::ImportKernels;
+pub(crate) use preparation::kernel_requests;
 use preparation::NativePreparationCache;
 use qualification::QualificationView;
 use target::TargetKernels;

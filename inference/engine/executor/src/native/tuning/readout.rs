@@ -9,7 +9,8 @@
 
 use super::cases::projection_shape;
 use super::{
-    row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs, TuningLimits,
+    row_points, served_row_points, CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs,
+    TuningLimits,
 };
 use crate::native::draft_vocabulary;
 use magnitude_batching::{HISTORY_WIDTH, SHAPING_WIDTH};
@@ -63,7 +64,7 @@ impl EntryTuning for DraftRowsTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (hidden, joined) = projection_shape(inputs, &self.scopes, WeightKind::HeadCombine)?;
         if joined != 2 * hidden {
             return Err("the draft combine weight does not have two hidden inputs".into());
@@ -145,7 +146,7 @@ fn projected_points(limits: TuningLimits) -> Vec<PointShape> {
 }
 
 /// `[V, D]` of the output projection.
-fn vocabulary_shape(inputs: &TuningInputs<'_, '_>) -> Result<(u64, u64), String> {
+fn vocabulary_shape(inputs: &ModelInputs<'_>) -> Result<(u64, u64), String> {
     projection_shape(inputs, &[WeightScope::Target], WeightKind::Output)
 }
 
@@ -197,7 +198,7 @@ impl EntryTuning for HeadRowsTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = vocabulary_shape(inputs)?;
         Ok(vec![
             (
@@ -276,7 +277,7 @@ pub(crate) struct ProgressiveTuning {
 
 impl ProgressiveTuning {
     /// `[V, D]` it projects onto.
-    fn shape(&self, inputs: &TuningInputs<'_, '_>) -> Result<(u64, u64), String> {
+    fn shape(&self, inputs: &ModelInputs<'_>) -> Result<(u64, u64), String> {
         let (vocabulary, hidden) = planes_shape(inputs)?;
         Ok((self.rows.map_or(vocabulary, |rows| rows.min(vocabulary)), hidden))
     }
@@ -295,7 +296,7 @@ impl ProgressiveTuning {
 }
 
 /// `[V, D]` of a progressive head, from its top plane (`[V, D / 8]`).
-fn planes_shape(inputs: &TuningInputs<'_, '_>) -> Result<(u64, u64), String> {
+fn planes_shape(inputs: &ModelInputs<'_>) -> Result<(u64, u64), String> {
     let [vocabulary, words] = inputs.weight_shape(
         WeightScope::Target,
         WeightKind::OutputPlane(ProgressivePlane::Top),
@@ -376,7 +377,7 @@ impl EntryTuning for TopRowsTuning {
         format!("NW={},A={}", self.0.norm.name(), self.0.activation.name())
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = self.0.shape(inputs)?;
         Ok(vec![("V", vocabulary), ("D", hidden)])
     }
@@ -496,7 +497,7 @@ impl EntryTuning for RefineRowsTuning {
         format!("A={}", self.0.activation.name())
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = self.0.shape(inputs)?;
         Ok(vec![("V", vocabulary), ("D", hidden)])
     }
@@ -558,7 +559,7 @@ impl EntryTuning for ExactRowsTuning {
         format!("A={}", self.0.activation.name())
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = self.0.shape(inputs)?;
         Ok(vec![("V", vocabulary), ("D", hidden)])
     }
@@ -628,7 +629,7 @@ impl EntryTuning for PlanesRowsTuning {
         format!("NW={},A={}", self.0.norm.name(), self.0.activation.name())
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = self.0.shape(inputs)?;
         Ok(vec![("V", vocabulary), ("D", hidden)])
     }
@@ -713,7 +714,7 @@ impl EntryTuning for SelectedRowsTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = vocabulary_shape(inputs)?;
         Ok(vec![("V", vocabulary), ("D", hidden)])
     }
@@ -800,7 +801,7 @@ impl EntryTuning for HeadLogitsTuning {
         format!("OW={},A={}", self.weight.name(), self.activation.name())
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = vocabulary_shape(inputs)?;
         Ok(vec![("V", draft_vocabulary(vocabulary)), ("D", hidden)])
     }
@@ -876,7 +877,7 @@ impl EntryTuning for ShapeRowsTuning {
         "fixed".into()
     }
 
-    fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         Ok(vec![("V", self.vocabulary), ("Hn", HISTORY_WIDTH as u64)])
     }
 
@@ -959,7 +960,7 @@ impl EntryTuning for SampleRowsTuning {
         "fixed".into()
     }
 
-    fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         Ok(vec![("V", self.vocabulary)])
     }
 

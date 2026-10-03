@@ -7,11 +7,11 @@
 
 use crate::direct::DirectPipeline;
 use crate::facts::MetalFacts;
-use crate::MetalDevice;
+use crate::{DeviceHandle, MetalDevice};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
-use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary};
+use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary};
 use seismic_native_target::{
     NativeCompilationError, ProgramCache, ProgramSource, Toolchain, ToolchainIdentity,
 };
@@ -63,27 +63,8 @@ impl Toolchain for MetalToolchain {
         source: &ProgramSource,
         _cache: Option<&dyn ProgramCache>,
     ) -> Result<Vec<DirectPipeline>, NativeCompilationError> {
-        let mut text = source.text.clone();
-        let mut instantiated = Vec::new();
-        for entry in &source.entries {
-            // Entries of one template instance that differ only in group size
-            // share its instantiation.
-            if entry.symbol.contains('<') && !instantiated.contains(&&entry.symbol) {
-                instantiated.push(&entry.symbol);
-                text.push_str(&format!(
-                    "\ntemplate [[host_name(\"{}\")]] [[kernel]] decltype({symbol}) {symbol};\n",
-                    host_name(&entry.symbol),
-                    symbol = entry.symbol
-                ));
-            }
-        }
-        let options = objc2_metal::MTLCompileOptions::new();
-        options.setMathMode(objc2_metal::MTLMathMode::Safe);
-        options.setMathFloatingPointFunctions(objc2_metal::MTLMathFloatingPointFunctions::Precise);
         let device = self.device.handle().raw();
-        let library = device
-            .newLibraryWithSource_options_error(&NSString::from_str(&text), Some(&options))
-            .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))?;
+        let functions = form_functions(self.device.handle(), source)?;
         let failure =
             |error: Retained<NSError>| NativeCompilationError::ToolchainFailure(error.to_string());
         // Each symbol's pipeline is formed once. An entry's group size is the
@@ -93,20 +74,12 @@ impl Toolchain for MetalToolchain {
         let mut formed: Vec<(&str, Retained<ProtocolObject<dyn MTLComputePipelineState>>)> =
             Vec::new();
         let mut pipelines = Vec::with_capacity(source.entries.len());
-        for entry in &source.entries {
-            let name = host_name(&entry.symbol);
-            let function = library
-                .newFunctionWithName(&NSString::from_str(&name))
-                .ok_or_else(|| {
-                    NativeCompilationError::MalformedToolchainOutput(format!(
-                        "Metal library does not define kernel `{name}`"
-                    ))
-                })?;
+        for (entry, function) in source.entries.iter().zip(&functions) {
             let natural = match formed.iter().find(|(symbol, _)| *symbol == entry.symbol) {
                 Some((_, state)) => state.clone(),
                 None => {
                     let state = device
-                        .newComputePipelineStateWithFunction_error(&function)
+                        .newComputePipelineStateWithFunction_error(function)
                         .map_err(failure)?;
                     formed.push((&entry.symbol, state.clone()));
                     state
@@ -120,7 +93,7 @@ impl Toolchain for MetalToolchain {
                     if (natural.maxTotalThreadsPerThreadgroup() as u64) < threads =>
                 {
                     let descriptor = objc2_metal::MTLComputePipelineDescriptor::new();
-                    descriptor.setComputeFunction(Some(&function));
+                    descriptor.setComputeFunction(Some(function));
                     descriptor.setMaxTotalThreadsPerThreadgroup(threads as usize);
                     device
                         .newComputePipelineStateWithDescriptor_options_reflection_error(
@@ -136,6 +109,64 @@ impl Toolchain for MetalToolchain {
         }
         Ok(pipelines)
     }
+}
+
+/// `source`'s library, compiled with an explicit instantiation for each
+/// entry that names a template instance, and each entry's function in entry
+/// order: everything a Metal program is formed from before its pipelines.
+pub fn form_functions(
+    device: &DeviceHandle,
+    source: &ProgramSource,
+) -> Result<Vec<Retained<ProtocolObject<dyn MTLFunction>>>, NativeCompilationError> {
+    let mut text = source.text.clone();
+    let mut instantiated = Vec::new();
+    for entry in &source.entries {
+        // Entries of one template instance that differ only in group size
+        // share its instantiation.
+        if entry.symbol.contains('<') && !instantiated.contains(&&entry.symbol) {
+            instantiated.push(&entry.symbol);
+            text.push_str(&format!(
+                "\ntemplate [[host_name(\"{}\")]] [[kernel]] decltype({symbol}) {symbol};\n",
+                host_name(&entry.symbol),
+                symbol = entry.symbol
+            ));
+        }
+    }
+    let options = objc2_metal::MTLCompileOptions::new();
+    options.setMathMode(objc2_metal::MTLMathMode::Safe);
+    options.setMathFloatingPointFunctions(objc2_metal::MTLMathFloatingPointFunctions::Precise);
+    let library = device
+        .raw()
+        .newLibraryWithSource_options_error(&NSString::from_str(&text), Some(&options))
+        .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))?;
+    source
+        .entries
+        .iter()
+        .map(|entry| {
+            let name = host_name(&entry.symbol);
+            library
+                .newFunctionWithName(&NSString::from_str(&name))
+                .ok_or_else(|| {
+                    NativeCompilationError::MalformedToolchainOutput(format!(
+                        "Metal library does not define kernel `{name}`"
+                    ))
+                })
+        })
+        .collect()
+}
+
+/// Whether this host's Metal compiler forms a source that includes the
+/// tensor-operation headers (Metal 4), whatever the GPU executes: what
+/// forming a `SEISMIC_HAS_TENSOR_OPS` source needs.
+pub fn forms_tensor_operations(device: &DeviceHandle) -> bool {
+    let source = ProgramSource {
+        text: "#include <metal_stdlib>\n#include <metal_tensor>\n\
+               #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n\
+               kernel void seismic_tensor_headers(device float* out [[buffer(0)]]) { out[0] = 0.0f; }\n"
+            .to_owned(),
+        entries: vec![seismic_native_target::ProgramEntry::named("seismic_tensor_headers")],
+    };
+    form_functions(device, &source).is_ok()
 }
 
 #[cfg(test)]

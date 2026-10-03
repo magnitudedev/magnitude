@@ -18,7 +18,7 @@ use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
 pub(crate) mod vulkan;
 
 /// Source dialects with a generated prefix. CPU implementations are Rust and
@@ -30,7 +30,7 @@ pub(crate) enum Dialect {
     Cuda,
     /// GLSL 4.60 compute for Vulkan 1.3, with the device's feature macros.
     /// Vulkan is not built on macOS; its prefix still renders in tests there.
-    #[cfg(any(not(target_os = "macos"), test))]
+    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     Vulkan(vulkan::VulkanFeatures),
 }
 
@@ -65,7 +65,7 @@ fn literal(dialect: Dialect, value: u64) -> String {
     match dialect {
         Dialect::Metal(_) => format!("((ulong){value})"),
         Dialect::Cuda => format!("((unsigned long long){value})"),
-        #[cfg(any(not(target_os = "macos"), test))]
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         Dialect::Vulkan(_) => format!("uint64_t({value}ul)"),
     }
 }
@@ -311,7 +311,7 @@ fn render_source_with(
     let mut prefix = match dialect {
         Dialect::Metal(features) => metal_header(features),
         Dialect::Cuda => String::from(CUDA_HELPERS),
-        #[cfg(any(not(target_os = "macos"), test))]
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         Dialect::Vulkan(features) => vulkan::header(features),
     };
     for (name, representation) in bindings.iter() {
@@ -346,7 +346,7 @@ fn render_source_with(
                 ));
                 // GLSL's preprocessor evaluates no typed literal: an `#if`
                 // guard on a static extent reads it as a plain integer.
-                #[cfg(any(not(target_os = "macos"), test))]
+                #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
                 if matches!(dialect, Dialect::Vulkan(_)) {
                     prefix.push_str(&format!("#define SEISMIC_STATIC_{name} {value}\n"));
                 }
@@ -502,7 +502,7 @@ fn render_source_with(
         })
         .chain(std::iter::repeat(false))
         .take(buffer);
-    #[cfg(any(not(target_os = "macos"), test))]
+    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     if let Dialect::Vulkan(_) = dialect {
         prefix.push_str(&vulkan::tail(buffer, read_only));
         debug_assert_eq!(word, word_count(schema) + runtime_parameters.len());

@@ -18,7 +18,8 @@ pub mod toolchain;
 
 pub use device::{Device, MemoryBudget, OpenError, Rounded};
 pub use facts::{
-    Calibration, Description, DeviceType, Facts, Limits, SubgroupWidth, SUBGROUP_WIDTH,
+    Calibration, Description, DeviceType, Facts, FormationFacts, Limits, SubgroupWidth,
+    SUBGROUP_WIDTH,
 };
 pub use instance::LoaderError;
 pub use memory::Buffer;

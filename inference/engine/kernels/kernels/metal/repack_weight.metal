@@ -15,6 +15,11 @@
 #error "repack_weight converts an external GGUF source into packed resident storage"
 #endif
 
+#if !defined(SEISMIC_ELEMENT_U_LAYOUT_PACKET) && !defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS16) && \
+    !defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
+#error "repack_weight writes packet, rows16 or mma16 storage"
+#endif
+
 #if defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q3_K) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q6K)
 #define REPACK_Q3K 1
 #define REPACK_CODE_BITS 6u

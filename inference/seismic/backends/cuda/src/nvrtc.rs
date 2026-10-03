@@ -331,6 +331,13 @@ pub fn formation(architecture: u32) -> Result<Formation, NvrtcError> {
     })
 }
 
+/// The architectures the NVRTC of the resolved directory compiles for.
+pub fn supported_architectures() -> Result<Vec<u32>, NvrtcError> {
+    Nvrtc::get()
+        .map_err(NvrtcError::Unavailable)?
+        .supported_architectures()
+}
+
 /// The `(major, minor)` release of the NVRTC of the resolved directory.
 pub fn release() -> Result<(u32, u32), NvrtcError> {
     Nvrtc::get()

@@ -79,6 +79,7 @@ struct norm8<element::F16> {
 
 template <typename A, typename Rows>
 struct Plain {
+    static_assert(A::bytes == 2, "the Metal projection family requires a bf16 or f16 activation element");
     typedef A activation;
     device const uchar *x;
     ulong stride0, stride1;
@@ -102,6 +103,7 @@ struct Plain {
 
 template <typename A, typename N, typename Rows>
 struct Rms {
+    static_assert(A::bytes == 2, "the Metal projection family requires a bf16 or f16 activation element");
     typedef A activation;
     device const float *x;
     ulong stride0, stride1;

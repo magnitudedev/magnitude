@@ -84,10 +84,7 @@ impl Toolchain for CudaToolchain {
             .iter()
             .map(|entry| entry.symbol.as_str())
             .collect::<Vec<_>>();
-        let name = format!("{}.cu", expressions.first().copied().unwrap_or("program"));
-        let cubin =
-            nvrtc::compile_cubin_named(&source.text, &name, self.architecture, &expressions)
-                .map_err(formation_error)?;
+        let cubin = form_cubin(source, self.architecture)?;
         if let Some(cache) = cache {
             cache.put(&pack(&expressions, &cubin.lowered_names, &cubin.image));
         }
@@ -98,6 +95,23 @@ impl Toolchain for CudaToolchain {
             .collect::<Vec<_>>();
         DirectModule::load(&self.device, &cubin.image, &kernels)
     }
+}
+
+/// `source`'s CUBIN for `sm_<architecture>`, each entry requested by its
+/// name expression: everything a CUDA program is formed from before the
+/// driver loads it.
+pub fn form_cubin(
+    source: &ProgramSource,
+    architecture: u32,
+) -> Result<nvrtc::Cubin, NativeCompilationError> {
+    let expressions = source
+        .entries
+        .iter()
+        .map(|entry| entry.symbol.as_str())
+        .collect::<Vec<_>>();
+    let name = format!("{}.cu", expressions.first().copied().unwrap_or("program"));
+    nvrtc::compile_cubin_named(&source.text, &name, architecture, &expressions)
+        .map_err(formation_error)
 }
 
 const MAGIC: &[u8; 8] = b"SCUNAM02";

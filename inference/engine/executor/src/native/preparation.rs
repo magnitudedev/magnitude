@@ -1,4 +1,4 @@
-use super::specialization::Specializer;
+use super::specialization::{Specializer, Tuning};
 use super::tuning::{
     attention::{
         AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
@@ -31,7 +31,7 @@ use super::tuning::{
         StateSpaceChunkTuning, StateSpaceOutputTuning, StateSpaceProjectTuning, StateSpaceState,
         StateSpaceStepTuning,
     },
-    TunedEntry, Tuner, TuningContext, TuningLimits, TuningWeights,
+    ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights,
 };
 use super::*;
 use crate::operators::gated_delta::graph::StepForm;
@@ -40,13 +40,15 @@ use crate::{
     DenseBinding, GeneralRoutedBinding, HeadProjection, ModelLoadPlan, ReadoutHead, ShortConvBinding,
     StateSpaceBinding, SublayerTail,
 };
-use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightScope};
+use magnitude_family_contracts::{ModelDefinition, SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{
     conditioning_overlay, draft_confidence, draft_convolve_input, draft_convolve_residual,
     draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, moe_tail,
     per_layer_inputs, post_norm_residual, repack_weight, tap_rows, widen_rows,
 };
 use magnitude_state::KvCodec;
+use seismic::KernelRequest;
+use std::collections::HashSet;
 
 /// The phase-one catalog. Every handle is prepared before qualification and
 /// retained for warm calls; this type has no API capable of preparing again.
@@ -72,20 +74,16 @@ pub(super) struct PreparationInputs<'a> {
 }
 
 /// Prepare one entry that has no tuning case. Evaluates to `Option`: `None`
-/// when the backend has no implementation, which the specializer records.
+/// during a count or a listing.
 macro_rules! fixed {
-    ($spec:expr, $device:expr, $module:ident, $bindings:expr, $elements:expr) => {
-        fixed!($spec, $device, $module, $bindings, $elements, statics & [])
+    ($spec:expr, $module:ident, $bindings:expr, $elements:expr) => {
+        fixed!($spec, $module, $bindings, $elements, statics & [])
     };
-    ($spec:expr, $device:expr, $module:ident, $bindings:expr, $elements:expr, statics $statics:expr) => {
-        $spec.fixed::<$module::Entry>(&$bindings, $statics, |specialization| {
-            $module::native_for_device_with($device, $elements, specialization)
-        })?
+    ($spec:expr, $module:ident, $bindings:expr, $elements:expr, statics $statics:expr) => {
+        $spec.fixed(&$bindings, $statics, $module::native_entry_with($elements))?
     };
-    ($spec:expr, $device:expr, $module:ident, $bindings:expr) => {
-        $spec.fixed::<$module::Entry>(&$bindings, &[], |specialization| {
-            $module::native_for_device($device, specialization)
-        })?
+    ($spec:expr, $module:ident, $bindings:expr) => {
+        $spec.fixed(&$bindings, &[], $module::native_entry())?
     };
 }
 
@@ -138,51 +136,9 @@ impl NativePreparationCache {
             limits,
             tuning,
         } = inputs;
+        let backend = device.backend();
         let mut spec = Specializer::new(device);
-        let mut import = ImportKernels {
-            import_dense: HashMap::new(),
-            repack_weight: HashMap::new(),
-        };
-        for slot in plan.imports() {
-            match *slot {
-                ImportProgramSlot::Dense { source, resident } => {
-                    if import.import_dense.contains_key(&(source, resident)) {
-                        continue;
-                    }
-                    let bindings = dense_binding_name(source, resident);
-                    if let Some(kernel) = fixed!(
-                        spec,
-                        device,
-                        import_dense,
-                        bindings,
-                        import_dense::Elements {
-                            E: Element::dense(source),
-                            U: Element::dense(resident),
-                        }
-                    ) {
-                        import.import_dense.insert((source, resident), kernel);
-                    }
-                }
-                ImportProgramSlot::Repack { source, resident } => {
-                    if import.repack_weight.contains_key(&(source, resident)) {
-                        continue;
-                    }
-                    let bindings = element_binding_name(source, resident);
-                    if let Some(kernel) = fixed!(
-                        spec,
-                        device,
-                        repack_weight,
-                        bindings,
-                        repack_weight::Elements {
-                            E: source,
-                            U: resident,
-                        }
-                    ) {
-                        import.repack_weight.insert((source, resident), kernel);
-                    }
-                }
-            }
-        }
+        let import = imports(&mut spec, plan)?;
         let owner = Tensor::zeros(device, Element::u32(), &[1]).map_err(|error| {
             CatalogFailure::Preparation {
                 entry: "catalog_owner",
@@ -190,14 +146,7 @@ impl NativePreparationCache {
                 outcome: error.to_string(),
             }
         })?;
-        // Every admitted definition normalizes with one epsilon, which the
-        // readout's final norm states.
-        let epsilon = crate::programs::graph::readout::readout_epsilon(&tuning.definition.decoder)
-            .map_err(|outcome| CatalogFailure::Preparation {
-                entry: "normalization",
-                bindings: "decoder epsilon".into(),
-                outcome,
-            })?;
+        let epsilon = epsilon(tuning.definition)?;
         // Tuning walks the program three times: a count finds the units that
         // will search and their launches, a census measures their defaults
         // at their points within the tuning time left (keeping the inputs it
@@ -205,49 +154,46 @@ impl NativePreparationCache {
         // the last walk searches each within its share of step time and
         // prepares it.
         let mut count = Preparation::new(
-            device,
             plan,
-            tuning,
+            tuning.definition,
             limits,
             epsilon,
-            Specializer::count(device),
-            Tuner::count(
+            Specializer::count(backend),
+            Tuning::Tuner(Tuner::count(
                 device,
                 tuning,
                 limits,
                 TuningWeights::new(device, load, tuning.weights, &import),
-            ),
+            )),
         );
         count.walk(plan)?;
         let mut census = Preparation::new(
-            device,
             plan,
-            tuning,
+            tuning.definition,
             limits,
             epsilon,
-            Specializer::count(device),
-            count.tuner.census(),
+            Specializer::count(backend),
+            Tuning::Tuner(count.tuning.into_tuner().census()),
         );
         census.walk(plan)?;
         let mut preparation = Preparation::new(
-            device,
             plan,
-            tuning,
+            tuning.definition,
             limits,
             epsilon,
             spec,
-            census.tuner.search(),
+            Tuning::Tuner(census.tuning.into_tuner().search()),
         );
         let glue = preparation.walk(plan)?;
         let Preparation {
-            tuner,
+            tuning,
             target,
             head,
             draft,
             vision,
             ..
         } = preparation;
-        let tuned = tuner.tuned();
+        let tuned = tuning.into_tuner().tuned();
         Ok(Self {
             owner,
             import,
@@ -261,11 +207,103 @@ impl NativePreparationCache {
     }
 }
 
+/// The requests of the native kernels preparing `plan` on `backend` prepares,
+/// named without a device: the weight-import entries and the entries the
+/// program walk prepares, each once, in walk order.
+pub(crate) fn kernel_requests(
+    backend: BackendName,
+    plan: &ProgramPlan,
+    definition: &ModelDefinition,
+    load: &ModelLoadPlan,
+    limits: TuningLimits,
+) -> Result<Vec<KernelRequest>, CatalogFailure> {
+    let mut spec = Specializer::list(backend);
+    imports(&mut spec, plan)?;
+    let mut listing = Preparation::new(
+        plan,
+        definition,
+        limits,
+        epsilon(definition)?,
+        spec,
+        Tuning::Listing(ModelInputs {
+            definition,
+            limits,
+            load,
+        }),
+    );
+    listing.walk(plan)?;
+    let mut seen = HashSet::new();
+    Ok(listing
+        .spec
+        .into_requests()
+        .into_iter()
+        .filter(|request| seen.insert(request.clone()))
+        .collect())
+}
+
+/// Every admitted definition normalizes with one epsilon, which the
+/// readout's final norm states.
+fn epsilon(definition: &ModelDefinition) -> Result<f32, CatalogFailure> {
+    crate::programs::graph::readout::readout_epsilon(&definition.decoder).map_err(|outcome| {
+        CatalogFailure::Preparation {
+            entry: "normalization",
+            bindings: "decoder epsilon".into(),
+            outcome,
+        }
+    })
+}
+
+/// Prepare the weight-import entries of `plan`'s import slots.
+fn imports(spec: &mut Specializer<'_>, plan: &ProgramPlan) -> Result<ImportKernels, CatalogFailure> {
+    let mut import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+    };
+    for slot in plan.imports() {
+        match *slot {
+            ImportProgramSlot::Dense { source, resident } => {
+                if import.import_dense.contains_key(&(source, resident)) {
+                    continue;
+                }
+                let bindings = dense_binding_name(source, resident);
+                if let Some(kernel) = fixed!(
+                    spec,
+                    import_dense,
+                    bindings,
+                    import_dense::Elements {
+                        E: Element::dense(source),
+                        U: Element::dense(resident),
+                    }
+                ) {
+                    import.import_dense.insert((source, resident), kernel);
+                }
+            }
+            ImportProgramSlot::Repack { source, resident } => {
+                if import.repack_weight.contains_key(&(source, resident)) {
+                    continue;
+                }
+                let bindings = element_binding_name(source, resident);
+                if let Some(kernel) = fixed!(
+                    spec,
+                    repack_weight,
+                    bindings,
+                    repack_weight::Elements {
+                        E: source,
+                        U: resident,
+                    }
+                ) {
+                    import.repack_weight.insert((source, resident), kernel);
+                }
+            }
+        }
+    }
+    Ok(import)
+}
+
 struct Preparation<'a> {
-    device: &'a Device,
     limits: TuningLimits,
     spec: Specializer<'a>,
-    tuner: Tuner<'a>,
+    tuning: Tuning<'a>,
     epsilon: f32,
     /// Model width: the static dimension of the feature readout.
     hidden: u64,
@@ -279,22 +317,20 @@ struct Preparation<'a> {
 
 impl<'a> Preparation<'a> {
     fn new(
-        device: &'a Device,
         plan: &ProgramPlan,
-        tuning: TuningContext<'a>,
+        definition: &ModelDefinition,
         limits: TuningLimits,
         epsilon: f32,
         spec: Specializer<'a>,
-        tuner: Tuner<'a>,
+        tuning: Tuning<'a>,
     ) -> Self {
         Self {
-            device,
             limits,
             spec,
-            tuner,
+            tuning,
             epsilon,
-            hidden: tuning.definition.decoder.hidden,
-            vocabulary: tuning.definition.decoder.vocabulary,
+            hidden: definition.decoder.hidden,
+            vocabulary: definition.decoder.vocabulary,
             target: TargetKernels::default(),
             head: plan.head().map(|_| HeadKernels::default()),
             draft: plan.draft().map(|_| DraftKernels::default()),
@@ -314,7 +350,6 @@ impl<'a> Preparation<'a> {
 
     /// Token selection, the conditioning overlay and the state row copies.
     fn glue(&mut self, plan: &ProgramPlan) -> Result<GlueKernels, CatalogFailure> {
-        let device = self.device;
         let copies = plan.state().copies();
         let copy = |spec: &mut Specializer<'_>, element: Element, bindings: &'static str| {
             if !copies.contains(&element) {
@@ -322,7 +357,6 @@ impl<'a> Preparation<'a> {
             }
             Ok::<_, CatalogFailure>(fixed!(
                 spec,
-                device,
                 copy_rows,
                 bindings,
                 copy_rows::Elements { A: element }
@@ -330,18 +364,18 @@ impl<'a> Preparation<'a> {
         };
         Ok(GlueKernels {
             shape_rows: self.spec.tuned(
-                &mut self.tuner,
+                &mut self.tuning,
                 &ShapeRowsTuning {
                     vocabulary: self.vocabulary,
                 },
             )?,
             sample_rows: self.spec.tuned(
-                &mut self.tuner,
+                &mut self.tuning,
                 &SampleRowsTuning {
                     vocabulary: self.vocabulary,
                 },
             )?,
-            conditioning_overlay: fixed!(self.spec, device, conditioning_overlay, "fixed"),
+            conditioning_overlay: fixed!(self.spec, conditioning_overlay, "fixed"),
             copy_rows_f32: copy(&mut self.spec, Element::f32(), "A=f32")?,
             copy_rows_f16: copy(&mut self.spec, Element::f16(), "A=f16")?,
             copy_rows_bf16: copy(&mut self.spec, Element::bf16(), "A=bf16")?,
@@ -350,23 +384,16 @@ impl<'a> Preparation<'a> {
     }
 
     fn target(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
-        let device = self.device;
         let spec = &mut self.spec;
         let target = plan.target();
         let b = target.embedding();
-        if let Some(kernel) = spec.fixed::<embedding_rows::Entry>(
+        if let Some(kernel) = spec.fixed(
             &format!("{b:?}"),
             &[("D", self.hidden)],
-            |specialization| {
-                embedding_rows::native_for_device_with(
-                    device,
-                    embedding_rows::Elements {
-                        EW: b.table,
-                        A: b.activation,
-                    },
-                    specialization,
-                )
-            },
+            embedding_rows::native_entry_with(embedding_rows::Elements {
+                EW: b.table,
+                A: b.activation,
+            }),
         )? {
             self.target.embedding.insert(b, kernel);
         }
@@ -524,7 +551,7 @@ impl<'a> Preparation<'a> {
         let head = match b.head {
             ReadoutHead::Packed { weight, .. } => {
                 let head = self.spec.tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &HeadRowsTuning {
                         norm: b.norm,
                         weight,
@@ -534,7 +561,7 @@ impl<'a> Preparation<'a> {
                     },
                 )?;
                 let selected = self.spec.tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &SelectedRowsTuning {
                         norm: b.norm,
                         weight,
@@ -568,18 +595,16 @@ impl<'a> Preparation<'a> {
     /// A separate draft's target taps: the tap, the fusion projection of the
     /// taps (`project_rows` into F32) and the conditioning feature rows.
     fn taps(&mut self, taps: &crate::TapProgramPlan) -> Result<(), CatalogFailure> {
-        let device = self.device;
         let activation = taps.activation;
         let bindings = format!("A={}", activation.name());
         let tap = fixed!(
             self.spec,
-            device,
             tap_rows,
             bindings,
             tap_rows::Elements { A: activation }
         );
         let fusion = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &ProjectRowsTuning {
                 weight: taps.fusion,
                 activation,
@@ -590,7 +615,6 @@ impl<'a> Preparation<'a> {
         )?;
         let features = fixed!(
             self.spec,
-            device,
             feature_rows,
             bindings,
             feature_rows::Elements { A: activation }
@@ -617,13 +641,13 @@ impl<'a> Preparation<'a> {
             norm,
             activation,
             epsilon: self.epsilon,
-            certified_rows: crate::programs::graph::readout::certified_rows(self.device.backend()),
+            certified_rows: crate::programs::graph::readout::certified_rows(self.spec.backend()),
             rows,
         };
-        let top = self.spec.tuned(&mut self.tuner, &TopRowsTuning(tuning))?;
-        let refine = self.spec.tuned(&mut self.tuner, &RefineRowsTuning(tuning))?;
-        let exact = self.spec.tuned(&mut self.tuner, &ExactRowsTuning(tuning))?;
-        let planes = self.spec.tuned(&mut self.tuner, &PlanesRowsTuning(tuning))?;
+        let top = self.spec.tuned(&mut self.tuning, &TopRowsTuning(tuning))?;
+        let refine = self.spec.tuned(&mut self.tuning, &RefineRowsTuning(tuning))?;
+        let exact = self.spec.tuned(&mut self.tuning, &ExactRowsTuning(tuning))?;
+        let planes = self.spec.tuned(&mut self.tuning, &PlanesRowsTuning(tuning))?;
         Ok(match (top, refine, exact, planes) {
             (Some(top), Some(refine), Some(exact), Some(planes)) => Some(ProgressiveReadoutKernels {
                 top,
@@ -642,20 +666,13 @@ impl<'a> Preparation<'a> {
         norm: Element,
         activation: Element,
     ) -> Result<Option<NativeKernel<readout_features_rows::Entry>>, CatalogFailure> {
-        let device = self.device;
-        self.spec.fixed::<readout_features_rows::Entry>(
+        self.spec.fixed(
             bindings,
             &[("D", self.hidden)],
-            |specialization| {
-                readout_features_rows::native_for_device_with(
-                    device,
-                    readout_features_rows::Elements {
-                        NW: norm,
-                        A: activation,
-                    },
-                    specialization,
-                )
-            },
+            readout_features_rows::native_entry_with(readout_features_rows::Elements {
+                NW: norm,
+                A: activation,
+            }),
         )
     }
 
@@ -671,7 +688,7 @@ impl<'a> Preparation<'a> {
             ..
         } = binding;
         let project = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &AttentionProjectTuning {
                 binding,
                 scopes: scopes.clone(),
@@ -691,7 +708,7 @@ impl<'a> Preparation<'a> {
                 // verification) get their own tuning identity, so their
                 // grouped form is not displaced by the single-row one.
                 let split_decode = matches!(
-                    self.device.backend(),
+                    self.spec.backend(),
                     seismic::BackendName::Metal | seismic::BackendName::Vulkan
                 ) && self.limits.max_rows >= 2;
                 let mut single = mix();
@@ -700,19 +717,19 @@ impl<'a> Preparation<'a> {
                 }
                 let decode = self
                     .spec
-                    .tuned(&mut self.tuner, &AttentionDecodeTuning(single))?;
+                    .tuned(&mut self.tuning, &AttentionDecodeTuning(single))?;
                 let verify = if split_decode {
                     let mut selected = mix();
                     selected.decode_rows =
                         Some(2..crate::operators::attention::graph::DECODE_ROWS + 1);
                     self.spec
-                        .tuned(&mut self.tuner, &AttentionDecodeTuning(selected))?
+                        .tuned(&mut self.tuning, &AttentionDecodeTuning(selected))?
                 } else {
                     None
                 };
                 let prefill = self
                     .spec
-                    .tuned(&mut self.tuner, &AttentionPrefillTuning(mix()))?;
+                    .tuned(&mut self.tuning, &AttentionPrefillTuning(mix()))?;
                 decode
                     .zip(prefill)
                     .map(|(decode, prefill)| AttentionHistoryKernels::Dense {
@@ -723,18 +740,18 @@ impl<'a> Preparation<'a> {
             }
             KvCodec::AffineK8V4 => {
                 let split_decode = matches!(
-                    self.device.backend(),
+                    self.spec.backend(),
                     seismic::BackendName::Metal | seismic::BackendName::Vulkan
                 ) && self.limits.max_rows >= 2;
                 let mut single = mix();
-                if self.device.backend() == seismic::BackendName::Vulkan && split_decode {
+                if self.spec.backend() == seismic::BackendName::Vulkan && split_decode {
                     single.decode_rows = Some(1..2);
                 }
                 let decode = self
                     .spec
-                    .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(single))?;
+                    .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(single))?;
                 let specialized_m4 = split_decode
-                    && self.device.backend() == seismic::BackendName::Metal
+                    && self.spec.backend() == seismic::BackendName::Metal
                     && shape.group == 8
                     && shape.width == 256
                     && self.limits.max_rows >= 4;
@@ -748,7 +765,7 @@ impl<'a> Preparation<'a> {
                         },
                     );
                     self.spec
-                        .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(selected))?
+                        .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(selected))?
                 } else {
                     None
                 };
@@ -759,7 +776,7 @@ impl<'a> Preparation<'a> {
                     let mut selected = mix();
                     selected.decode_rows = Some(4..5);
                     self.spec
-                        .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(selected))?
+                        .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(selected))?
                 } else {
                     None
                 };
@@ -768,13 +785,13 @@ impl<'a> Preparation<'a> {
                     selected.decode_rows =
                         Some(5..crate::operators::attention::graph::DECODE_ROWS + 1);
                     self.spec
-                        .tuned(&mut self.tuner, &AttentionDecodeK8V4Tuning(selected))?
+                        .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(selected))?
                 } else {
                     None
                 };
                 let prefill = self
                     .spec
-                    .tuned(&mut self.tuner, &AttentionPrefillK8V4Tuning(mix()))?;
+                    .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(mix()))?;
                 decode
                     .zip(prefill)
                     .map(|(decode, prefill)| AttentionHistoryKernels::AffineK8V4 {
@@ -797,7 +814,7 @@ impl<'a> Preparation<'a> {
             SublayerTail::Residual => self
                 .spec
                 .tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &AttentionOutputTuning {
                         output,
                         activation,
@@ -833,9 +850,8 @@ impl<'a> Preparation<'a> {
         binding: StateSpaceBinding,
         scopes: Vec<WeightScope>,
     ) -> Result<Option<StateSpaceKernels>, CatalogFailure> {
-        let device = self.device;
         let project = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &StateSpaceProjectTuning {
                 binding,
                 scopes: scopes.clone(),
@@ -849,14 +865,13 @@ impl<'a> Preparation<'a> {
         };
         let step = self
             .spec
-            .tuned(&mut self.tuner, &StateSpaceStepTuning(state()))?;
+            .tuned(&mut self.tuning, &StateSpaceStepTuning(state()))?;
         let chunk = self
             .spec
-            .tuned(&mut self.tuner, &StateSpaceChunkTuning(state()))?;
+            .tuned(&mut self.tuning, &StateSpaceChunkTuning(state()))?;
         let shape = binding.shape;
         let gate = fixed!(
             self.spec,
-            device,
             state_space_gate,
             format!("{binding:?}"),
             state_space_gate::Elements {
@@ -871,7 +886,7 @@ impl<'a> Preparation<'a> {
         );
         let output = self
             .spec
-            .tuned(&mut self.tuner, &StateSpaceOutputTuning { binding, scopes })?;
+            .tuned(&mut self.tuning, &StateSpaceOutputTuning { binding, scopes })?;
         Ok(match (project, step, chunk, gate, output) {
             (Some(project), Some(step), Some(chunk), Some(gate), Some(output)) => {
                 Some(StateSpaceKernels {
@@ -893,9 +908,8 @@ impl<'a> Preparation<'a> {
         binding: ShortConvBinding,
         scopes: Vec<WeightScope>,
     ) -> Result<Option<ShortConvKernels>, CatalogFailure> {
-        let device = self.device;
         let project = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &ShortConvProjectTuning {
                 binding,
                 scopes: scopes.clone(),
@@ -904,7 +918,6 @@ impl<'a> Preparation<'a> {
         )?;
         let rows = fixed!(
             self.spec,
-            device,
             short_conv_rows,
             format!("{binding:?}"),
             short_conv_rows::Elements {
@@ -913,7 +926,7 @@ impl<'a> Preparation<'a> {
         );
         let output = self
             .spec
-            .tuned(&mut self.tuner, &ShortConvOutputTuning { binding, scopes })?;
+            .tuned(&mut self.tuning, &ShortConvOutputTuning { binding, scopes })?;
         Ok(match (project, rows, output) {
             (Some(project), Some(rows), Some(output)) => Some(ShortConvKernels {
                 project,
@@ -943,7 +956,7 @@ impl<'a> Preparation<'a> {
             epsilon: self.epsilon,
         };
         let form =
-            StepForm::of(self.device.backend()).map_err(|outcome| CatalogFailure::Preparation {
+            StepForm::of(self.spec.backend()).map_err(|outcome| CatalogFailure::Preparation {
                 entry: "gated_delta_step_convolved",
                 bindings: format!("{b:?}"),
                 outcome,
@@ -961,16 +974,16 @@ impl<'a> Preparation<'a> {
         let step = match form {
             StepForm::Step => self
                 .spec
-                .tuned(&mut self.tuner, &RecurrentStepTuning(state()))?
+                .tuned(&mut self.tuning, &RecurrentStepTuning(state()))?
                 .map(RecurrentStepKernels::Step),
             StepForm::Convolved => {
                 let project = self.spec.tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &RecurrentProjectConvolvedTuning(project_tuning()),
                 )?;
                 let step = self
                     .spec
-                    .tuned(&mut self.tuner, &RecurrentStepConvolvedTuning(state()))?;
+                    .tuned(&mut self.tuning, &RecurrentStepConvolvedTuning(state()))?;
                 project
                     .zip(step)
                     .map(|(project, step)| RecurrentStepKernels::Convolved { project, step })
@@ -978,10 +991,10 @@ impl<'a> Preparation<'a> {
         };
         let chunk = self
             .spec
-            .tuned(&mut self.tuner, &RecurrentChunkTuning(state()))?;
-        let project = self.spec.tuned(&mut self.tuner, &project_tuning())?;
+            .tuned(&mut self.tuning, &RecurrentChunkTuning(state()))?;
+        let project = self.spec.tuned(&mut self.tuning, &project_tuning())?;
         let output = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &RecurrentOutputTuning {
                 output: b.output,
                 activation: b.activation,
@@ -1016,7 +1029,7 @@ impl<'a> Preparation<'a> {
             scales: _,
         } = binding;
         let expand = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &DenseExpandTuning {
                 norm,
                 gate,
@@ -1034,7 +1047,7 @@ impl<'a> Preparation<'a> {
             SublayerTail::Residual => self
                 .spec
                 .tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &DenseOutputTuning {
                         down,
                         activation,
@@ -1068,7 +1081,7 @@ impl<'a> Preparation<'a> {
             });
         };
         let gate = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &super::tuning::per_layer::PerLayerGateTuning {
                 binding,
                 scopes: scopes.clone(),
@@ -1093,7 +1106,7 @@ impl<'a> Preparation<'a> {
         binding: crate::PerLayerEntryBinding,
     ) -> Result<Option<PerLayerEntryKernels>, CatalogFailure> {
         let project = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &ProjectRowsTuning {
                 weight: binding.projection,
                 activation: binding.activation,
@@ -1102,7 +1115,6 @@ impl<'a> Preparation<'a> {
                 scopes: vec![WeightScope::Target],
             },
         )?;
-        let device = self.device;
         let spec = &mut self.spec;
         let activation = binding
             .activation
@@ -1114,7 +1126,6 @@ impl<'a> Preparation<'a> {
             })?;
         let round = fixed!(
             spec,
-            device,
             import_dense,
             dense_binding_name(seismic::DType::F32, activation),
             import_dense::Elements {
@@ -1125,7 +1136,6 @@ impl<'a> Preparation<'a> {
         let table = match (binding.table_source.dtype(), binding.table.dtype()) {
             (Some(source), Some(resident)) => fixed!(
                 spec,
-                device,
                 import_dense,
                 dense_binding_name(source, resident),
                 import_dense::Elements {
@@ -1136,7 +1146,6 @@ impl<'a> Preparation<'a> {
             .map(TableConversion::Dense),
             _ => fixed!(
                 spec,
-                device,
                 repack_weight,
                 element_binding_name(binding.table_source, binding.table),
                 repack_weight::Elements {
@@ -1146,20 +1155,14 @@ impl<'a> Preparation<'a> {
             )
             .map(TableConversion::Repack),
         };
-        let copy = fixed!(spec, device, conditioning_overlay, "fixed");
-        let inputs = self.spec.fixed::<per_layer_inputs::Entry>(
+        let copy = fixed!(spec, conditioning_overlay, "fixed");
+        let inputs = self.spec.fixed(
             &format!("TW={},NW={}", binding.table.name(), binding.norm.name()),
             &[("L", binding.layers), ("P", binding.width)],
-            |specialization| {
-                per_layer_inputs::native_for_device_with(
-                    device,
-                    per_layer_inputs::Elements {
-                        TW: binding.table,
-                        NW: binding.norm,
-                    },
-                    specialization,
-                )
-            },
+            per_layer_inputs::native_entry_with(per_layer_inputs::Elements {
+                TW: binding.table,
+                NW: binding.norm,
+            }),
         )?;
         Ok(match (round, project, table, inputs, copy) {
             (Some(round), Some(project), Some(table), Some(inputs), Some(copy)) => {
@@ -1200,7 +1203,7 @@ impl<'a> Preparation<'a> {
         let (dense_scopes, routed_scopes) = (branch_scopes(0)?, branch_scopes(1)?);
         let dense = binding.dense;
         let expand = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &DenseExpandTuning {
                 norm: dense.norm,
                 gate: dense.gate,
@@ -1214,7 +1217,7 @@ impl<'a> Preparation<'a> {
             },
         )?;
         let down = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &ProjectRowsTuning {
                 weight: dense.down,
                 activation: dense.activation,
@@ -1224,10 +1227,8 @@ impl<'a> Preparation<'a> {
             },
         )?;
         let routed = self.general_routed(binding.routed, routed_scopes)?;
-        let device = self.device;
         let tail = fixed!(
             self.spec,
-            device,
             moe_tail,
             format!("NW={}", binding.norm.name()),
             moe_tail::Elements { NW: binding.norm }
@@ -1254,7 +1255,7 @@ impl<'a> Preparation<'a> {
         scopes: Vec<WeightScope>,
     ) -> Result<Option<PostNormKernels>, CatalogFailure> {
         let project = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &ProjectRowsTuning {
                 weight,
                 activation,
@@ -1263,10 +1264,8 @@ impl<'a> Preparation<'a> {
                 scopes,
             },
         )?;
-        let device = self.device;
         let residual = fixed!(
             self.spec,
-            device,
             post_norm_residual,
             format!("NW={}", norm.name()),
             post_norm_residual::Elements { NW: norm }
@@ -1288,7 +1287,7 @@ impl<'a> Preparation<'a> {
         let activation = binding.activation;
         let epsilon = self.epsilon;
         let select = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &RoutedSelectTuning {
                 binding,
                 scopes: scopes.clone(),
@@ -1306,40 +1305,40 @@ impl<'a> Preparation<'a> {
         let experts = if shape.experts_expansion.gated {
             let decode = self
                 .spec
-                .tuned(&mut self.tuner, &RoutedGateUpTuning(decode()))?;
+                .tuned(&mut self.tuning, &RoutedGateUpTuning(decode()))?;
             let grouped = self
                 .spec
-                .tuned(&mut self.tuner, &RoutedGatedTilesTuning(tiles()))?;
+                .tuned(&mut self.tuning, &RoutedGatedTilesTuning(tiles()))?;
             decode
                 .zip(grouped)
                 .map(|(decode, grouped)| ExpertKernels::Gated { decode, grouped })
         } else {
             let decode = self
                 .spec
-                .tuned(&mut self.tuner, &RoutedUpTuning(decode()))?;
+                .tuned(&mut self.tuning, &RoutedUpTuning(decode()))?;
             let grouped = self
                 .spec
-                .tuned(&mut self.tuner, &RoutedUpTilesTuning(tiles()))?;
+                .tuned(&mut self.tuning, &RoutedUpTilesTuning(tiles()))?;
             decode
                 .zip(grouped)
                 .map(|(decode, grouped)| ExpertKernels::Plain { decode, grouped })
         };
         let down = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &RoutedDownTuning {
                 binding,
                 scopes: scopes.clone(),
             },
         )?;
         let group = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &RoutedGroupTuning {
                 shape: routing_shape(&binding),
                 layers: scopes.len(),
             },
         )?;
         let scatter = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &RoutedScatterTuning {
                 binding,
                 layers: scopes.len(),
@@ -1351,7 +1350,7 @@ impl<'a> Preparation<'a> {
                     Some(gate) => self
                         .spec
                         .tuned(
-                            &mut self.tuner,
+                            &mut self.tuning,
                             &DenseExpandTuning {
                                 norm: binding.norm,
                                 gate,
@@ -1368,7 +1367,7 @@ impl<'a> Preparation<'a> {
                     None => self
                         .spec
                         .tuned(
-                            &mut self.tuner,
+                            &mut self.tuning,
                             &DenseUpTuning {
                                 norm: binding.norm,
                                 up,
@@ -1382,7 +1381,7 @@ impl<'a> Preparation<'a> {
                         .map(DenseExpansionKernel::Plain),
                 };
                 let output = self.spec.tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &DenseOutputTuning {
                         down,
                         activation,
@@ -1404,7 +1403,7 @@ impl<'a> Preparation<'a> {
         let latent = match binding.latent {
             Some((down, up)) => {
                 let project = self.spec.tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &ProjectRowsTuning {
                         weight: down,
                         activation,
@@ -1414,7 +1413,7 @@ impl<'a> Preparation<'a> {
                     },
                 )?;
                 let output = self.spec.tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &DenseOutputTuning {
                         down: up,
                         activation,
@@ -1465,7 +1464,7 @@ impl<'a> Preparation<'a> {
             features: b.features,
             shared: b.shared,
         };
-        let form = DecodeForm::of(self.device.backend()).map_err(|outcome| {
+        let form = DecodeForm::of(self.spec.backend()).map_err(|outcome| {
             CatalogFailure::Preparation {
                 entry: "routed_route_shared",
                 bindings: format!("{b:?}"),
@@ -1481,9 +1480,9 @@ impl<'a> Preparation<'a> {
             epsilon: self.epsilon,
             decode: form == DecodeForm::Expand,
         };
-        let route = self.spec.tuned(&mut self.tuner, &route_tuning)?;
+        let route = self.spec.tuned(&mut self.tuning, &route_tuning)?;
         let group = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &RoutedGroupTuning {
                 shape,
                 layers: scopes.len(),
@@ -1493,7 +1492,7 @@ impl<'a> Preparation<'a> {
             DecodeForm::Expand => self
                 .spec
                 .tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &RoutedExpandTuning {
                         expert_gate: b.expert_gate,
                         expert_up: b.expert_up,
@@ -1507,7 +1506,7 @@ impl<'a> Preparation<'a> {
                 .map(RoutedDecodeKernels::Expand),
             DecodeForm::SharedRoute => {
                 let route = self.spec.tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &RoutedRouteSharedTuning {
                         route: route_tuning,
                         shared_gate: b.shared_gate,
@@ -1515,7 +1514,7 @@ impl<'a> Preparation<'a> {
                     },
                 )?;
                 let choices = self.spec.tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &RoutedChoicesTuning {
                         expert_gate: b.expert_gate,
                         expert_up: b.expert_up,
@@ -1530,7 +1529,7 @@ impl<'a> Preparation<'a> {
             }
         };
         let output = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &RoutedOutputTuning {
                 expert_down: b.expert_down,
                 shared_down: b.shared_down,
@@ -1540,7 +1539,7 @@ impl<'a> Preparation<'a> {
             },
         )?;
         let experts = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &RoutedExpertsTuning {
                 expert_gate: b.expert_gate,
                 expert_up: b.expert_up,
@@ -1551,7 +1550,7 @@ impl<'a> Preparation<'a> {
             },
         )?;
         let combine = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &RoutedCombineTuning {
                 shared_gate: b.shared_gate,
                 shared_up: b.shared_up,
@@ -1607,7 +1606,7 @@ impl<'a> Preparation<'a> {
             }
             let bindings = format!("{b:?}");
             let input = self.spec.tuned(
-                &mut self.tuner,
+                &mut self.tuning,
                 &DraftRowsTuning {
                     embedding: b.embedding_table,
                     embedding_norm: b.embedding_norm,
@@ -1641,7 +1640,7 @@ impl<'a> Preparation<'a> {
                 HeadProjection::Packed(weight) => self
                     .spec
                     .tuned(
-                        &mut self.tuner,
+                        &mut self.tuning,
                         &HeadLogitsTuning {
                             weight,
                             activation: b.activation,
@@ -1693,10 +1692,10 @@ impl<'a> Preparation<'a> {
         let vocabulary = draft_vocabulary(self.vocabulary);
         let shape = self
             .spec
-            .tuned(&mut self.tuner, &ShapeRowsTuning { vocabulary })?;
+            .tuned(&mut self.tuning, &ShapeRowsTuning { vocabulary })?;
         let sample = self
             .spec
-            .tuned(&mut self.tuner, &SampleRowsTuning { vocabulary })?;
+            .tuned(&mut self.tuning, &SampleRowsTuning { vocabulary })?;
         let head = self
             .head
             .as_mut()
@@ -1713,7 +1712,6 @@ impl<'a> Preparation<'a> {
         let Some(draft_plan) = plan.draft() else {
             return Ok(());
         };
-        let device = self.device;
         let draft_scope = |index: usize, sublayer: u32| {
             WeightScope::DraftSublayer(SublayerIndex {
                 block: u32::try_from(index).expect("draft block count fits u32"),
@@ -1755,24 +1753,18 @@ impl<'a> Preparation<'a> {
             }
         }
         let b = draft_plan.embedding();
-        let embedding = self.spec.fixed::<embedding_rows::Entry>(
+        let embedding = self.spec.fixed(
             &format!("{b:?}"),
             &[("D", self.hidden)],
-            |specialization| {
-                embedding_rows::native_for_device_with(
-                    device,
-                    embedding_rows::Elements {
-                        EW: b.table,
-                        A: b.activation,
-                    },
-                    specialization,
-                )
-            },
+            embedding_rows::native_entry_with(embedding_rows::Elements {
+                EW: b.table,
+                A: b.activation,
+            }),
         )?;
         let readout_vocabulary =
             draft_readout_vocabulary(draft_plan.markov().is_some(), self.vocabulary);
         let head = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &HeadRowsTuning {
                 norm: draft_plan.output_norm(),
                 weight: draft_plan.projection(),
@@ -1782,20 +1774,19 @@ impl<'a> Preparation<'a> {
             },
         )?;
         let shape = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &ShapeRowsTuning {
                 vocabulary: readout_vocabulary,
             },
         )?;
         let sample = self.spec.tuned(
-            &mut self.tuner,
+            &mut self.tuning,
             &SampleRowsTuning {
                 vocabulary: readout_vocabulary,
             },
         )?;
         let widen = fixed!(
             self.spec,
-            device,
             widen_rows,
             format!("A={}", draft_plan.activation().name()),
             widen_rows::Elements {
@@ -1808,22 +1799,16 @@ impl<'a> Preparation<'a> {
                 let activation = draft_plan.activation();
                 let bindings = format!("{markov:?}");
                 let rank = markov.rank;
-                let embedding = self.spec.fixed::<embedding_rows::Entry>(
+                let embedding = self.spec.fixed(
                     &bindings,
                     &[("D", rank)],
-                    |specialization| {
-                        embedding_rows::native_for_device_with(
-                            device,
-                            embedding_rows::Elements {
-                                EW: markov.embedding,
-                                A: activation,
-                            },
-                            specialization,
-                        )
-                    },
+                    embedding_rows::native_entry_with(embedding_rows::Elements {
+                        EW: markov.embedding,
+                        A: activation,
+                    }),
                 )?;
                 let projection = self.spec.tuned(
-                    &mut self.tuner,
+                    &mut self.tuning,
                     &DenseOutputTuning {
                         down: markov.projection,
                         activation,
@@ -1834,7 +1819,6 @@ impl<'a> Preparation<'a> {
                 let features = self.features(&bindings, draft_plan.output_norm(), activation)?;
                 let confidence = fixed!(
                     self.spec,
-                    device,
                     draft_confidence,
                     bindings,
                     draft_confidence::Elements { A: activation },
@@ -1878,7 +1862,6 @@ impl<'a> Preparation<'a> {
         plan: &crate::DraftProgramPlan,
         binding: &crate::Dflash2Binding,
     ) -> Result<Option<Dflash2Kernels>, CatalogFailure> {
-        let device = self.device;
         let activation = plan.activation();
         let selector = binding.selector;
         let (projections, norm_elements) = super::draft::dflash2_entries(plan, binding);
@@ -1886,7 +1869,7 @@ impl<'a> Preparation<'a> {
         let mut complete = true;
         for ((kind, weight, output), scopes) in projections {
             match self.spec.tuned(
-                &mut self.tuner,
+                &mut self.tuning,
                 &ProjectRowsTuning {
                     weight,
                     activation,
@@ -1913,41 +1896,32 @@ impl<'a> Preparation<'a> {
         let bindings = format!("A={}", activation.name());
         let convolve_input = fixed!(
             self.spec,
-            device,
             draft_convolve_input,
             bindings,
             draft_convolve_input::Elements { A: activation }
         );
-        let convolve_residual = fixed!(self.spec, device, draft_convolve_residual, "");
+        let convolve_residual = fixed!(self.spec, draft_convolve_residual, "");
         let gated = fixed!(
             self.spec,
-            device,
             draft_gated_rows,
             bindings,
             draft_gated_rows::Elements { A: activation }
         );
-        let top_k = fixed!(self.spec, device, draft_top_k, "");
+        let top_k = fixed!(self.spec, draft_top_k, "");
         let path = fixed!(
             self.spec,
-            device,
             draft_path_step,
             bindings,
             draft_path_step::Elements { A: activation }
         );
         let codebook = |spec: &mut Specializer, table: Element| {
-            spec.fixed::<embedding_rows::Entry>(
+            spec.fixed(
                 &format!("dflash2 EW={}", table.name()),
                 &[("D", selector.rank)],
-                |specialization| {
-                    embedding_rows::native_for_device_with(
-                        device,
-                        embedding_rows::Elements {
-                            EW: table,
-                            A: activation,
-                        },
-                        specialization,
-                    )
-                },
+                embedding_rows::native_entry_with(embedding_rows::Elements {
+                    EW: table,
+                    A: activation,
+                }),
             )
         };
         let predecessor = codebook(&mut self.spec, selector.predecessor)?;
@@ -1998,7 +1972,7 @@ impl<'a> Preparation<'a> {
         let Some(vision_plan) = plan.vision() else {
             return Ok(());
         };
-        let (device, spec) = (self.device, &mut self.spec);
+        let spec = &mut self.spec;
         let vision = self
             .vision
             .as_mut()
@@ -2015,7 +1989,7 @@ impl<'a> Preparation<'a> {
                 ($module:ident, $map:ident, $elements:expr) => {{
                     let elements = $elements;
                     if let Some(native) =
-                        fixed!(spec, device, $module, label, elements, statics & statics)
+                        fixed!(spec, $module, label, elements, statics & statics)
                     {
                         vision.$map.insert(kernel.clone(), native);
                     }

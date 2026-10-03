@@ -14,6 +14,8 @@
 
 pub(crate) mod abi;
 mod batch;
+#[cfg(feature = "coverage")]
+pub mod coverage;
 pub(crate) use batch::{NativeTensorBatch, NativeTensorBatchCompletion};
 #[cfg(test)]
 mod bundle_identity_tests;
@@ -30,8 +32,6 @@ pub mod tune;
 mod validation;
 #[cfg(not(target_os = "macos"))]
 mod vulkan;
-#[cfg(test)]
-mod vulkan_formation_tests;
 
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{DecodedResults, DecodedValue, EncodedArgs, EncodedOutputs, PrepareError};
@@ -541,6 +541,59 @@ fn launch_program(
     }
 }
 
+/// The programs of a Metal or CUDA implementation at `specialization`: one
+/// per launch for launch-scoped parameters, holding `variants[launch]` as its
+/// entries, else the entry's whole source with one entry per launch.
+pub(crate) fn implementation_programs(
+    dialect: abi::Dialect,
+    logical: &LogicalEntry,
+    bindings: &ElementBindings,
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+    asset: &str,
+    variants: &[Vec<plan::LaunchVariant>],
+) -> Vec<ProgramSource> {
+    if implementation.launch_scoped() {
+        return (0..implementation.launches.len())
+            .map(|ordinal| {
+                launch_program(
+                    dialect,
+                    logical,
+                    bindings,
+                    implementation,
+                    specialization,
+                    asset,
+                    ordinal,
+                    &variants[ordinal],
+                )
+            })
+            .collect();
+    }
+    let entries = implementation
+        .launches
+        .iter()
+        .enumerate()
+        .map(|(ordinal, launch)| {
+            bounded(
+                dialect,
+                ProgramEntry::named(launch.kernel.as_str()),
+                implementation.static_group_size(specialization, ordinal),
+            )
+        })
+        .collect();
+    vec![ProgramSource {
+        text: abi::render_source(
+            dialect,
+            logical,
+            bindings,
+            implementation,
+            specialization,
+            asset,
+        ),
+        entries,
+    }]
+}
+
 /// Form `sources` and place each launch at its entry: `requests` names, by
 /// launch ordinal, the source and entry it runs.
 fn form_launches<T: Toolchain>(
@@ -735,11 +788,6 @@ impl NativePrepared {
             .collect::<Vec<_>>();
         let words = abi::native_word_count(schema, &implementation);
         let scalar_words = abi::scalar_word_count(schema);
-        let kernels = implementation
-            .launches
-            .iter()
-            .map(|launch| launch.kernel.as_str())
-            .collect::<Vec<_>>();
         let asset = |backend| {
             module.native_asset(entry, backend).ok_or_else(|| {
                 preparation(format!(
@@ -748,60 +796,40 @@ impl NativePrepared {
             })
         };
         let launches = implementation.launches.len();
-        // The implementation's programs: one per launch for launch-scoped
-        // parameters, else the whole entry's source with one entry per
-        // launch.
+        // Each launch runs its single variant: the specialization's code
+        // values and static group size.
+        let variants = (0..launches)
+            .map(|ordinal| {
+                vec![plan::LaunchVariant {
+                    code: plan::code_values(&implementation, &specialization, ordinal),
+                    group_size: implementation.static_group_size(&specialization, ordinal),
+                }]
+            })
+            .collect::<Vec<_>>();
         let programs = |dialect: abi::Dialect, asset: &str| {
-            if scoped {
-                let sources = (0..launches)
-                    .map(|ordinal| {
-                        launch_program(
-                            dialect,
-                            &logical,
-                            &bindings,
-                            &implementation,
-                            &specialization,
-                            asset,
-                            ordinal,
-                            &[plan::LaunchVariant {
-                                code: plan::code_values(&implementation, &specialization, ordinal),
-                                group_size: implementation.static_group_size(&specialization, ordinal),
-                            }],
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let requests = sources
+            let sources = implementation_programs(
+                dialect,
+                &logical,
+                &bindings,
+                &implementation,
+                &specialization,
+                asset,
+                &variants,
+            );
+            let requests = if scoped {
+                sources
                     .iter()
                     .enumerate()
                     .map(|(ordinal, source)| (ordinal, source.entries[0].clone()))
-                    .collect::<Vec<_>>();
-                (sources, requests)
+                    .collect::<Vec<_>>()
             } else {
-                let entries = kernels
+                sources[0]
+                    .entries
                     .iter()
-                    .enumerate()
-                    .map(|(ordinal, kernel)| {
-                        bounded(
-                            dialect,
-                            ProgramEntry::named(*kernel),
-                            implementation.static_group_size(&specialization, ordinal),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let requests = entries.iter().map(|entry| (0, entry.clone())).collect();
-                let source = ProgramSource {
-                    text: abi::render_source(
-                        dialect,
-                        &logical,
-                        &bindings,
-                        &implementation,
-                        &specialization,
-                        asset,
-                    ),
-                    entries,
-                };
-                (vec![source], requests)
-            }
+                    .map(|entry| (0, entry.clone()))
+                    .collect()
+            };
+            (sources, requests)
         };
         let mut digest = Sha256::new();
         let (route, toolchain) = match &device.kind {
@@ -891,11 +919,12 @@ impl NativePrepared {
                         &specialization,
                         asset(BackendName::Vulkan)?,
                     ),
-                    entries: kernels
+                    entries: implementation
+                        .launches
                         .iter()
                         .zip(&geometry)
-                        .map(|(kernel, (threads, views))| ProgramEntry {
-                            symbol: (*kernel).to_owned(),
+                        .map(|(launch, (threads, views))| ProgramEntry {
+                            symbol: launch.kernel.clone(),
                             group_size: Some(*threads),
                             constants: views.clone(),
                         })

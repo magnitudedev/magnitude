@@ -12,7 +12,8 @@
 //! argument set owns those tables as case state.
 
 use super::{
-    row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs, TuningLimits,
+    row_points, served_row_points, CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs,
+    TuningLimits,
 };
 use crate::operators::routed::fused_graph::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
 use magnitude_family_contracts::{Operator, RouteNormalization, WeightKind, WeightScope};
@@ -193,7 +194,7 @@ impl EntryTuning for RoutedRouteTuning {
         )
     }
 
-    fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
         Ok(vec![
             ("H", shape.hidden),
@@ -296,7 +297,7 @@ impl EntryTuning for RoutedRouteSharedTuning {
         )
     }
 
-    fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.route.shape;
         Ok(vec![
             ("H", shape.hidden),
@@ -387,7 +388,7 @@ impl EntryTuning for RoutedGroupTuning {
         "fixed".into()
     }
 
-    fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         Ok(vec![("E", self.shape.experts), ("K", self.shape.selected)])
     }
 
@@ -491,7 +492,7 @@ impl EntryTuning for RoutedExpandTuning {
         )
     }
 
-    fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
         Ok(vec![
             ("H", shape.hidden),
@@ -580,7 +581,7 @@ impl EntryTuning for RoutedChoicesTuning {
         )
     }
 
-    fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
         Ok(vec![
             ("H", shape.hidden),
@@ -684,7 +685,7 @@ impl EntryTuning for RoutedOutputTuning {
         )
     }
 
-    fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
         Ok(vec![
             ("H", shape.hidden),
@@ -795,7 +796,7 @@ impl EntryTuning for RoutedExpertsTuning {
         )
     }
 
-    fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         Ok(vec![("H", self.shape.hidden), ("F", self.shape.features)])
     }
 
@@ -898,7 +899,7 @@ impl EntryTuning for RoutedCombineTuning {
         )
     }
 
-    fn statics(&self, _: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
         Ok(vec![
             ("H", shape.hidden),

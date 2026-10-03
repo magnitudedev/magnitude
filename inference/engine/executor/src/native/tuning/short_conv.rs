@@ -4,7 +4,7 @@
 //! `short_conv_rows` declares no parameters.
 
 use super::cases::projection_shape;
-use super::{row_points, EntryTuning, PointShape, TuningInputs, TuningLimits};
+use super::{row_points, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits};
 use crate::ShortConvBinding;
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project};
@@ -60,7 +60,7 @@ impl EntryTuning for ShortConvProjectTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.binding.shape;
         for kind in [
             WeightKind::ShortConvInputGate,
@@ -156,7 +156,7 @@ impl EntryTuning for ShortConvOutputTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.binding.shape;
         if projection_shape(inputs, &self.scopes, WeightKind::RecurrentOutput)?
             != (shape.hidden, shape.channels)

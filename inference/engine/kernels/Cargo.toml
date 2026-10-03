@@ -13,3 +13,5 @@ seismic-build.workspace = true
 [dev-dependencies]
 seismic-lang.workspace = true
 seismic-std.workspace = true
+# Offline formation coverage of this crate's kernels (`tests/formation.rs`).
+seismic = { workspace = true, features = ["coverage"] }

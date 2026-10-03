@@ -8,6 +8,9 @@
 // [B * T, F].
 // L2 (`routed_experts_up_down`): K1 GEMM of the block's products against the
 // expert's down rows, published in A.
+// Every expert's up rows carry their `up_scale` entry; the down epilogue's
+// scale stays one.
+#define PROJECTION_SCALED
 #include "lib/core/activation.glsl"
 #include "lib/routed/routed.glsl"
 #include "lib/routed/expert_up.glsl"
@@ -38,10 +41,12 @@ void routed_experts_up_expand() {
         SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, order, SEISMIC_ORDER_STRIDE_1);
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), EU_GEOMETRY,
         routed_expert_row(uint64_t(expert), SEISMIC_DIM_F), hidden);
-    const projection_epilogue out_ = projection_activated(ROUTED_ACT,
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + block * tile_rows * SEISMIC_DIM_F * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
-        SEISMIC_DIM_F, 1ul, int(SEISMIC_PARAM_ACTIVATION),
-        element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE) + uint64_t(expert) * SEISMIC_UP_SCALE_STRIDE_0 * 4ul), 1.0);
+    const projection_epilogue out_ = projection_scaled(projection_activated(ROUTED_ACT,
+            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + block * tile_rows * SEISMIC_DIM_F * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
+            SEISMIC_DIM_F, 1ul, int(SEISMIC_PARAM_ACTIVATION)),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_E, SEISMIC_UP_SCALE_STRIDE_0,
+            uint64_t(expert)),
+        1.0);
     const uint live = routed_block_rows(order, SEISMIC_ORDER_STRIDE_1, uint(tile_rows));
     projection_gemm(EU_KIND, EXPERTS_TM, EXPERTS_TN, EXPERTS_WM, EXPERTS_WN, x, out_, up, uint(tile_rows),
         uint(SEISMIC_DIM_F), hidden, tm_index, gl_WorkGroupID.x, live);

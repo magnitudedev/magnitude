@@ -366,6 +366,13 @@ Metal compilation or execution errors are reported directly.
   scratch sizes, tuning domains and conditions (`where`, `when`).
 - An inactive native launch does no device work and is exempt from limit checks; its geometry and
   an inactive scratch buffer's size are never evaluated.
+- Before a release is built, every native implementation of a shipped module forms with each GPU
+  backend's pinned toolchain, as preparation forms it, under configurations (element bindings,
+  specializations, device facts) that together compile every preprocessor group of its authored
+  sources; a group no admitted configuration reaches is rejected with `#error` or removed. Every
+  kernel request of every supported catalog model on every GPU backend its assessment accepts is
+  admissible, implemented and forms at its default specialization. For a backend whose toolchain
+  the operating system supplies, this holds for the verifying host's toolchain.
 - Ownership and bounded iteration determine legal reads, writes, moves, and parallel effects.
 - Every accepted write to storage shared across parallel participants carries
   an exclusive or atomic capability for those participants. Iteration-local

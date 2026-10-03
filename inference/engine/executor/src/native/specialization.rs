@@ -7,18 +7,51 @@
 //! can have: the kernels crate's build proves it, so preparation never meets
 //! a missing one.
 
-use super::tuning::{EntryTuning, Tuner};
+use super::tuning::{EntryTuning, ModelInputs, Tuner};
 use super::CatalogFailure;
 use seismic::{
-    Device, Entry, LoadError, NativeImplementation, NativeKernel, NativeSpecialization,
-    NativeSpecializationError,
+    BackendName, BoundEntry, Device, Entry, KernelRequest, NativeImplementation, NativeKernel,
+    NativeSpecialization, NativeSpecializationError,
 };
 
 pub(super) struct Specializer<'a> {
-    device: &'a Device,
-    /// A tuning count walks the program to count tuning units; it forms
-    /// nothing and every entry comes back `None`.
-    counting: bool,
+    backend: BackendName,
+    mode: Mode<'a>,
+}
+
+enum Mode<'a> {
+    /// Prepare each entry on the device.
+    Prepare(&'a Device),
+    /// A tuning count or census walks the program through its tuner; it
+    /// forms nothing and every entry comes back `None`.
+    Count,
+    /// A listing names the request of every entry the walk would prepare,
+    /// without a device; every entry comes back `None`.
+    List(Vec<KernelRequest>),
+}
+
+/// What a walk consults for its tuned entries.
+pub(super) enum Tuning<'a> {
+    /// A preparation's tuner, in its count, census or search phase.
+    Tuner(Tuner<'a>),
+    /// A listing's model: its entries' static values, and nothing to tune.
+    Listing(ModelInputs<'a>),
+}
+
+impl<'a> Tuning<'a> {
+    fn model(&self) -> ModelInputs<'a> {
+        match self {
+            Self::Tuner(tuner) => tuner.model(),
+            Self::Listing(model) => *model,
+        }
+    }
+
+    pub fn into_tuner(self) -> Tuner<'a> {
+        match self {
+            Self::Tuner(tuner) => tuner,
+            Self::Listing(_) => panic!("a listing walk has no tuner"),
+        }
+    }
 }
 
 fn failure(entry: &'static str, bindings: &str, outcome: String) -> CatalogFailure {
@@ -74,16 +107,37 @@ fn domain_statics(
 impl<'a> Specializer<'a> {
     pub fn new(device: &'a Device) -> Self {
         Self {
-            device,
-            counting: false,
+            backend: device.backend(),
+            mode: Mode::Prepare(device),
         }
     }
 
-    /// A specializer for the tuning count, which forms nothing.
-    pub fn count(device: &'a Device) -> Self {
+    /// A specializer for a tuning count or census, which forms nothing.
+    pub fn count(backend: BackendName) -> Self {
         Self {
-            device,
-            counting: true,
+            backend,
+            mode: Mode::Count,
+        }
+    }
+
+    /// A specializer that lists the request of every entry, without a
+    /// device.
+    pub fn list(backend: BackendName) -> Self {
+        Self {
+            backend,
+            mode: Mode::List(Vec::new()),
+        }
+    }
+
+    pub fn backend(&self) -> BackendName {
+        self.backend
+    }
+
+    /// The requests a listing named, in walk order.
+    pub fn into_requests(self) -> Vec<KernelRequest> {
+        match self.mode {
+            Mode::List(requests) => requests,
+            Mode::Prepare(_) | Mode::Count => panic!("only a listing names requests"),
         }
     }
 
@@ -91,27 +145,46 @@ impl<'a> Specializer<'a> {
         &self,
         bindings: &str,
     ) -> Result<NativeImplementation, CatalogFailure> {
-        let implementation = seismic::generated::native_implementation::<E>(self.device)
-            .map_err(|error| failure(E::NAME, bindings, error.to_string()))?;
+        let implementation =
+            seismic::generated::native_implementation_for_backend::<E>(self.backend)
+                .map_err(|error| failure(E::NAME, bindings, error.to_string()))?;
         Ok(implementation.unwrap_or_else(|| {
             panic!(
                 "`{}` has no {} implementation, which the kernels crate's build rules out",
                 E::NAME,
-                self.device.backend().as_str()
+                self.backend.as_str()
             )
         }))
     }
 
-    /// Prepare an entry without tuning parameters; `None` during a count.
+    /// Prepare `entry` at `specialization`, or list it.
+    fn form<E: Entry>(
+        &mut self,
+        entry: BoundEntry<E>,
+        bindings: &str,
+        specialization: &NativeSpecialization,
+    ) -> Result<Option<NativeKernel<E>>, CatalogFailure> {
+        match &mut self.mode {
+            Mode::Prepare(device) => entry
+                .prepare(device, specialization)
+                .map(Some)
+                .map_err(|error| failure(E::NAME, bindings, error.to_string())),
+            Mode::Count => Ok(None),
+            Mode::List(requests) => {
+                requests.push(entry.request(self.backend, specialization));
+                Ok(None)
+            }
+        }
+    }
+
+    /// Prepare an entry without tuning parameters; `None` during a count or
+    /// a listing.
     pub fn fixed<E: Entry>(
         &mut self,
         bindings: &str,
         values: &[(&str, u64)],
-        prepare: impl FnOnce(&NativeSpecialization) -> Result<NativeKernel<E>, LoadError>,
+        entry: BoundEntry<E>,
     ) -> Result<Option<NativeKernel<E>>, CatalogFailure> {
-        if self.counting {
-            return Ok(None);
-        }
         let implementation = self.implementation::<E>(bindings)?;
         if implementation.has_tuning_parameters() {
             return Err(failure(
@@ -121,35 +194,32 @@ impl<'a> Specializer<'a> {
             ));
         }
         let specialization = domain_statics(&implementation, E::NAME, bindings, values)?;
-        prepare(&specialization)
-            .map(Some)
-            .map_err(|error| failure(E::NAME, bindings, error.to_string()))
+        self.form(entry, bindings, &specialization)
     }
 
     /// Prepare an entry through its tuning case: static values from the
     /// case, parameters tuned on the device when the implementation declares
-    /// any. `None` during a tuning count, which forms nothing.
+    /// any. `None` during a tuning count, which forms nothing, or a listing,
+    /// which tunes nothing.
     pub fn tuned<T: EntryTuning>(
         &mut self,
-        tuner: &mut Tuner<'_>,
+        tuning: &mut Tuning<'_>,
         case: &T,
     ) -> Result<Option<NativeKernel<T::Entry>>, CatalogFailure> {
         let entry = <T::Entry as Entry>::NAME;
         let bindings = case.bindings();
         let implementation = self.implementation::<T::Entry>(&bindings)?;
-        let values = tuner.statics(case)?;
+        let values = case
+            .statics(&tuning.model())
+            .map_err(|outcome| failure(entry, &bindings, outcome))?;
         let fixed = domain_statics(&implementation, entry, &bindings, &values)?;
-        let specialization = if !implementation.has_tuning_parameters() {
-            fixed
-        } else {
-            tuner.tune(case, &implementation, &fixed)?
+        let specialization = match tuning {
+            Tuning::Tuner(tuner) if implementation.has_tuning_parameters() => {
+                tuner.tune(case, &implementation, &fixed)?
+            }
+            Tuning::Tuner(_) | Tuning::Listing(_) => fixed,
         };
-        if self.counting {
-            return Ok(None);
-        }
-        case.prepare(self.device, &specialization)
-            .map(Some)
-            .map_err(|error| failure(entry, &bindings, error.to_string()))
+        self.form(case.entry(), &bindings, &specialization)
     }
 }
 

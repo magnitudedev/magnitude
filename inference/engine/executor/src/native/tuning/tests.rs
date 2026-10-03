@@ -4,7 +4,7 @@ use crate::native::import::ImportKernels;
 use crate::planning::tests::{fixture_definition, fixture_manifest};
 use crate::{ComponentSelection, ModelLoadPlan};
 use magnitude_kernels::{dense_output, shape_rows};
-use seismic::{BackendName, ConfigurationRecord, DeviceCatalog, Exclusion, LoadError, Outcome};
+use seismic::{BackendName, ConfigurationRecord, DeviceCatalog, Exclusion, Outcome};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -334,7 +334,7 @@ impl EntryTuning for FakeCase {
     fn bindings(&self) -> String {
         self.bindings.clone()
     }
-    fn statics(&self, _inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         Ok(vec![("H", 8), ("F", 16), ("DS", 0)])
     }
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -491,19 +491,11 @@ impl EntryTuning for FakeCase {
     ) -> Result<String, TuneError> {
         Ok(self.digest.clone())
     }
-    fn prepare(
-        &self,
-        device: &Device,
-        specialization: &NativeSpecialization,
-    ) -> Result<NativeKernel<Self::Entry>, LoadError> {
-        dense_output::native_for_device_with(
-            device,
-            dense_output::Elements {
-                DW: Element::bf16(),
-                A: Element::bf16(),
-            },
-            specialization,
-        )
+    fn entry(&self) -> seismic::BoundEntry<Self::Entry> {
+        dense_output::native_entry_with(dense_output::Elements {
+            DW: Element::bf16(),
+            A: Element::bf16(),
+        })
     }
 }
 
@@ -808,9 +800,12 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     let noise = Noise::default();
     let building = RefCell::new(BuildBudget::default());
     let mut inputs = TuningInputs {
+        model: ModelInputs {
+            definition: &definition,
+            limits: LIMITS,
+            load: &load,
+        },
         device: &device,
-        definition: &definition,
-        limits: LIMITS,
         weights: &mut weights,
         noise: &noise,
         shared: &mut shared,
@@ -860,9 +855,12 @@ fn case_state_restores_its_written_rows() {
     let noise = Noise::default();
     let building = RefCell::new(BuildBudget::default());
     let inputs = TuningInputs {
+        model: ModelInputs {
+            definition: &definition,
+            limits: LIMITS,
+            load: &load,
+        },
         device: &device,
-        definition: &definition,
-        limits: LIMITS,
         weights: &mut weights,
         noise: &noise,
         shared: &mut shared,

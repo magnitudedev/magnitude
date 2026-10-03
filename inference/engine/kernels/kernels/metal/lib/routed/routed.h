@@ -9,6 +9,7 @@
 namespace routed {
 
 typedef element::Act Act;
+static_assert(Act::bytes == 2, "the Metal routed family requires a bf16 or f16 activation element");
 
 // First row of expert `expert` in an [E, N, K] rows16 tensor of N rows per
 // expert.

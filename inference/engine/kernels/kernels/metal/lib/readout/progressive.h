@@ -134,6 +134,7 @@ struct Weights<packets::ProgressiveExact> {
 namespace progressive {
 
 typedef element::Act activation;
+static_assert(activation::bytes == 2, "the progressive readout requires a bf16 or f16 activation element");
 
 // Order-preserving key of an F32 (larger float, larger key; every key of a
 // non-NaN float is nonzero, so zero is below every key), and back.

@@ -18,7 +18,7 @@
 //! ```text
 //! static __BUNDLE: &[u8] = include_bytes!("<OUT_DIR>/<module>.seismicbundle");
 //! static __MODULE: seismic::generated::OnceLock<Result<seismic::generated::Module, seismic::CheckedBundleError>> = ...;
-//! fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError>;
+//! pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError>;
 //! pub const IDENTITY: &str = "<hex digest of sources + compiler semantic version>";
 //!
 //! pub mod <entry> {                       // one per exported entry (every portable family)
@@ -1147,7 +1147,8 @@ mod internals {
             format!("{name}.seismicbundle")
         ));
         out.push_str("static __MODULE: seismic::generated::OnceLock<Result<seismic::generated::Module, seismic::CheckedBundleError>> = seismic::generated::OnceLock::new();\n");
-        out.push_str("fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
+        out.push_str("/// The checked module, an opaque token for Seismic's module-wide services.\n");
+        out.push_str("pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
         out.push_str(&format!("pub const IDENTITY: &str = {:?};\n", identity));
         if let Some(library) = cpu_library {
             render_cpu_library(&mut out, library);
@@ -1498,6 +1499,10 @@ mod internals {
             );
             element_list(out);
             out.push_str(&format!("    ], {cpu})\n  }}\n"));
+            out.push_str("  pub fn native_entry_with(elements: Elements) -> seismic::BoundEntry<Entry> {\n");
+            out.push_str("    seismic::generated::bound_entry::<Entry>(&[\n");
+            element_list(out);
+            out.push_str(&format!("    ], {cpu})\n  }}\n"));
             out.push_str("  pub fn native_tune_with<'a>(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::PrecisionPolicy, strategy: seismic::Strategy, reference: seismic::TuningReference) -> Result<seismic::TuningResult, seismic::TuneError> {\n");
             out.push_str("    seismic::generated::tune_native::<Entry>(device, statics, &[\n");
             element_list(out);
@@ -1510,6 +1515,7 @@ mod internals {
             out.push_str(&format!("    ], {cpu})\n  }}\n"));
         } else {
             out.push_str(&format!("  pub fn native_for_device(device: &seismic::Device, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {{ seismic::generated::prepare_native::<Entry>(device, specialization, &[], {cpu}) }}\n"));
+            out.push_str(&format!("  pub fn native_entry() -> seismic::BoundEntry<Entry> {{ seismic::generated::bound_entry::<Entry>(&[], {cpu}) }}\n"));
             out.push_str(&format!("  pub fn native_tune<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::PrecisionPolicy, strategy: seismic::Strategy, reference: seismic::TuningReference) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(device, statics, &[], {cpu}, &mut points, validation, strategy, reference) }}\n"));
             out.push_str(&format!("  pub fn native_digest(device: &seismic::Device, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {{ seismic::generated::digest_native::<Entry>(device, statics, &[], {cpu}) }}\n"));
         }

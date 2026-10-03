@@ -29,6 +29,77 @@ pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
+/// Offline formation coverage of a generated module's native
+/// implementations, and offline formation of the kernels a program requests.
+#[cfg(feature = "coverage")]
+pub mod coverage {
+    use crate::{generated::Module, BackendName, KernelRequest, NativeSpecialization};
+    pub use seismic_runtime::native::coverage::{
+        Configuration, Coverage, CoverageError, FormationFailure, GroupSite, RequestFailure,
+    };
+
+    /// Form every native implementation of `module` for `backend` until
+    /// every preprocessor group of its sources has been formed under some
+    /// configuration.
+    pub fn cover(module: &Module, backend: BackendName) -> Result<Coverage, CoverageError> {
+        seismic_runtime::native::coverage::cover(module.checked(), backend)
+    }
+
+    /// Forms kernel requests at their default specialization on one
+    /// backend's base configuration.
+    pub struct RequestFormer {
+        inner: seismic_runtime::native::coverage::RequestFormer,
+    }
+
+    impl RequestFormer {
+        pub fn open(backend: BackendName) -> Result<Self, CoverageError> {
+            Ok(Self {
+                inner: seismic_runtime::native::coverage::RequestFormer::open(backend)?,
+            })
+        }
+
+        /// Form every request, in parallel; results in request order.
+        pub fn form_all(
+            &self,
+            module: &Module,
+            requests: &[KernelRequest],
+        ) -> Vec<Result<(), RequestFailure>> {
+            let requests = requests
+                .iter()
+                .map(|request| self.request(module, request))
+                .collect::<Vec<_>>();
+            self.inner.form_all(module.checked(), &requests)
+        }
+
+        fn request(
+            &self,
+            module: &Module,
+            request: &KernelRequest,
+        ) -> seismic_runtime::native::coverage::Request {
+            assert_eq!(
+                request.backend,
+                self.inner.backend(),
+                "a request forms on its own backend"
+            );
+            seismic_runtime::native::coverage::Request {
+                entry: module
+                    .checked()
+                    .entry_named(request.entry)
+                    .expect("a request names an entry of its module"),
+                bindings: request.elements.iter().fold(
+                    seismic_lang::entry::ElementBindings::new(),
+                    |bindings, (name, element)| bindings.bind(name, element.id()),
+                ),
+                statics: request
+                    .statics
+                    .iter()
+                    .fold(NativeSpecialization::new(), |statics, (name, value)| {
+                        statics.with_static(name.clone(), *value)
+                    }),
+            }
+        }
+    }
+}
 /// Replay of the tuning search against recorded surveys (development).
 pub use seismic_runtime::native::replay;
 pub use seismic_runtime::native::search::{
@@ -1715,6 +1786,117 @@ mod metadata_scratch_tests {
     }
 }
 
+/// A native kernel a program needs on a backend: an entry at element
+/// bindings and static values. Every specialization of it (its tuning
+/// choices) shares the request.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct KernelRequest {
+    pub backend: BackendName,
+    pub entry: &'static str,
+    pub elements: std::collections::BTreeMap<String, Element>,
+    pub statics: std::collections::BTreeMap<String, u64>,
+}
+
+impl KernelRequest {
+    fn new(
+        backend: BackendName,
+        entry: &'static str,
+        elements: &[(&str, Element)],
+        statics: &NativeSpecialization,
+    ) -> Self {
+        Self {
+            backend,
+            entry,
+            elements: elements
+                .iter()
+                .map(|(name, element)| ((*name).to_owned(), *element))
+                .collect(),
+            statics: statics.statics().clone(),
+        }
+    }
+}
+
+impl fmt::Display for KernelRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let elements = self
+            .elements
+            .iter()
+            .map(|(name, element)| format!("{name}={}", element.name()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let statics = self
+            .statics
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        write!(f, "{} `{}` [{elements}] {{{statics}}}", self.backend.as_str(), self.entry)
+    }
+}
+
+/// An entry bound to its element bindings: prepared on a device, or named,
+/// without one, as the request preparing it makes.
+pub struct BoundEntry<E> {
+    elements: Vec<(&'static str, Element)>,
+    cpu: Option<&'static native_cpu::CpuNativeKernels>,
+    entry: std::marker::PhantomData<fn() -> E>,
+}
+
+impl<E: Entry> BoundEntry<E> {
+    pub fn prepare(
+        &self,
+        device: &Device,
+        specialization: &NativeSpecialization,
+    ) -> Result<NativeKernel<E>, LoadError> {
+        generated::prepare_native::<E>(device, specialization, &self.elements, self.cpu)
+    }
+
+    pub fn request(
+        &self,
+        backend: BackendName,
+        specialization: &NativeSpecialization,
+    ) -> KernelRequest {
+        KernelRequest::new(backend, E::NAME, &self.elements, specialization)
+    }
+}
+
+thread_local! {
+    static RECORDING: std::cell::RefCell<Option<Vec<KernelRequest>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `run`, recording the request of every kernel this thread prepares
+/// meanwhile. Recordings do not nest.
+pub fn record_kernel_requests<R>(run: impl FnOnce() -> R) -> (R, Vec<KernelRequest>) {
+    /// Ends the recording however `run` exits.
+    struct Recording;
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            RECORDING.with(|recording| recording.borrow_mut().take());
+        }
+    }
+    RECORDING.with(|recording| {
+        let mut recording = recording.borrow_mut();
+        assert!(recording.is_none(), "kernel request recordings do not nest");
+        *recording = Some(Vec::new());
+    });
+    let guard = Recording;
+    let result = run();
+    let requests = RECORDING
+        .with(|recording| recording.borrow_mut().take())
+        .expect("the recording is active until its guard drops");
+    drop(guard);
+    (result, requests)
+}
+
+fn record(request: impl FnOnce() -> KernelRequest) {
+    RECORDING.with(|recording| {
+        if let Some(requests) = recording.borrow_mut().as_mut() {
+            requests.push(request());
+        }
+    });
+}
+
 impl NativeGraphMetadata {
     pub fn new(backend: BackendName) -> Self {
         Self {
@@ -2957,12 +3139,26 @@ pub mod generated {
         )
     }
 
+    pub fn bound_entry<E: Entry>(
+        elements: &[(&'static str, Element)],
+        cpu: Option<&'static native_cpu::CpuNativeKernels>,
+    ) -> super::BoundEntry<E> {
+        super::BoundEntry {
+            elements: elements.to_vec(),
+            cpu,
+            entry: std::marker::PhantomData,
+        }
+    }
+
     pub fn prepare_native<E: Entry>(
         device: &Device,
         specialization: &NativeSpecialization,
         elements: &[(&str, Element)],
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
     ) -> Result<NativeKernel<E>, LoadError> {
+        super::record(|| {
+            super::KernelRequest::new(device.backend(), E::NAME, elements, specialization)
+        });
         NativeKernel::prepare(
             device,
             specialization.clone(),

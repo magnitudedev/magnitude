@@ -424,7 +424,7 @@ native gated_delta_step for metal from "metal/gated_delta_step.metal":
 # four rows in flight; the uncovered rows are zeroed by the slot layer.)
 native gated_delta_step for cuda from "cuda/gated_delta_step.cu":
     static (NK, NV, W, C)
-    where W % 32 == 0
+    where W % 32 == 0 and NV % 4 == 0
     scratch mixed bytes (M * NV * W * 4)
     scratch arrivals bytes (NV * 4) sync
     launch gated_delta_step:
@@ -605,11 +605,11 @@ native gated_delta_chunk for metal from "metal/gated_delta_chunk.metal":
 # at most 16 rows have no pieces, and the rows after a stop row none either:
 # they advance row-sequentially in the scan with the step's bits. The scan
 # stores the raw outputs to `mixed`, and `gate` forms each row as the step's
-# does. (Metal: an `inputs` convolution launch; the systems are built in its
-# scan.)
+# does. Every scan ROWS divides W. (Metal: an `inputs` convolution launch; the
+# systems are built in its scan.)
 native gated_delta_chunk for cuda from "cuda/gated_delta_chunk.cu":
     static (NK, NV, W, C)
-    where W % 32 == 0 and W <= 256 and NV % NK == 0 and NV / NK <= 8
+    where W % 128 == 0 and W <= 256 and NV % NK == 0 and NV / NK <= 8 and NV % 4 == 0
     scratch pieces bytes ((ceil_div(M, 16) + B) * (NK * 96 * W + NV * (32 * W + 1168)))
     scratch mixed bytes (M * NV * W * 4)
     launch gated_delta_chunk_prepare:

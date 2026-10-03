@@ -13,7 +13,8 @@
 
 use super::cases::projection_shape;
 use super::{
-    row_points, served_row_points, CaseState, EntryTuning, PointShape, TuningInputs, TuningLimits,
+    row_points, served_row_points, CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs,
+    TuningLimits,
 };
 use crate::operators::gated_delta::graph::CHUNKED_ROWS;
 use crate::{StateSpaceBinding, StateSpaceShape};
@@ -81,7 +82,7 @@ impl EntryTuning for StateSpaceProjectTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.binding.shape;
         if projection_shape(inputs, &self.scopes, WeightKind::StateSpaceProjection)?
             != (shape.projection_width(), shape.hidden)
@@ -168,7 +169,7 @@ impl EntryTuning for StateSpaceOutputTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.binding.shape;
         if projection_shape(inputs, &self.scopes, WeightKind::RecurrentOutput)?
             != (shape.hidden, shape.inner())
@@ -342,7 +343,7 @@ macro_rules! state_entry {
 
             fn statics(
                 &self,
-                _inputs: &TuningInputs<'_, '_>,
+                _inputs: &ModelInputs<'_>,
             ) -> Result<Vec<(&'static str, u64)>, String> {
                 Ok(self.0.shape.state_statics().to_vec())
             }
