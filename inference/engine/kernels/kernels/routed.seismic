@@ -263,10 +263,18 @@ native routed_expand for metal from "metal/routed_expand.metal":
         shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
 
 # CUDA: the swap-AB GEMV (TPW tiles per warp group; KSPLIT splits K across
-# the warps of a group and reduces in part order). (Metal: the rows16 GEMV.)
+# the warps of a group and reduces in part order). Several rows run the
+# gathered form: a choice's blocks run only for its expert's first choice,
+# over the rows of every choice of that expert, so a step streams each chosen
+# expert once; one row has nothing to share and runs the per-choice form.
+# (Metal: the rows16 GEMV.)
 native routed_expand for cuda from "cuda/routed_expand.cu":
     static (H, K, F, S)
-    launch routed_expand:
+    launch routed_expand when M == 1:
+        params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+        threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch routed_expand_gathered when M > 1:
         params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
         threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
         threads_per_threadgroup (128, 1, 1)
@@ -339,15 +347,21 @@ native routed_output for metal from "metal/routed_output.metal":
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * (K + 1), 1, 1)
 
-# CUDA: the swap-AB GEMV (TPW, KSPLIT as in the expansion) per slot, the K
-# choices and the shared expert in separate blocks publishing A-rounded
-# channels; the last block of a channel tile to arrive combines them in slot
-# order. (Metal: the side-by-side form.)
+# CUDA: the swap-AB GEMV (TPW, KSPLIT as in the expansion), the choices and
+# the shared expert in separate blocks publishing A-rounded channels per
+# (row, slot); the last block of a channel tile to arrive combines them in
+# slot order. Several rows run the gathered form: each chosen expert once
+# over the rows of its choices and the shared expert once over every row;
+# one row runs one block per slot. (Metal: the side-by-side form.)
 native routed_output for cuda from "cuda/routed_output.cu":
     static (H, K, F, S)
     scratch published bytes (M * (K + 1) * H * 4)
-    scratch arrivals bytes (M * ceil_div(H, 16) * 4) sync
-    launch routed_output:
+    scratch arrivals bytes (ceil_div(H, 16) * 4) sync
+    launch routed_output when M == 1:
+        params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch routed_output_gathered when M > 1:
         params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
         threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
         threads_per_threadgroup (128, 1, 1)

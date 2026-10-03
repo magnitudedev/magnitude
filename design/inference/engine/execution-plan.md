@@ -246,7 +246,11 @@ residual row; routed feed-forward owns normalized input, routes and scores (rank
 shared coefficient, then either the per-choice expert and shared products (row classes within the
 GEMV bound; a backend that declares the shared-route entry forms the shared product, which does not
 depend on the routes, in the routing launch with the separate expansion's bits, and expands the
-choices alone) or, for larger classes, grouped tables and grouped expert outputs: choices grouped by
+choices alone; every choice's product has its own one-row GEMV's bits, so a backend may stream an
+expert that several rows choose once for all of them, as CUDA does for classes of two or more rows;
+Metal keeps the per-choice form, whose repeated expert reads its cache already serves and whose
+one-row GEMVs outrun a gathered multi-row one)
+or, for larger classes, grouped tables and grouped expert outputs: choices grouped by
 expert into tile-aligned blocks whose capacity derives from the class, the selected-expert count and
 the tile rows, so no table is uploaded per step and no host readback sizes a launch. The general
 routed form (every family without that gated shared expert) owns the normalized input, routes and

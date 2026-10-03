@@ -1615,23 +1615,47 @@ fn output_mapping(
     }
 }
 
-/// Metal and CUDA decode projections own their parameters on their sole launch.
-fn decode_specialization(
+/// `mapping` where entry `E` declares each name on `device`'s backend: as an
+/// entry parameter, or in every launch that scopes it.
+fn decode_specialization<E: seismic::Entry>(
     device: &seismic::Device,
     statics: &[(&str, u64)],
     mapping: &[(&'static str, u64)],
 ) -> seismic::NativeSpecialization {
-    if matches!(
-        device.backend(),
-        seismic::BackendName::Metal | seismic::BackendName::Cuda
-    ) {
-        return mapping
-            .iter()
-            .fold(specialize(statics, &[]), |choice, (name, value)| {
-                choice.with_launch_param(0, *name, *value)
-            });
-    }
-    specialization_on(device, statics, mapping)
+    let implementation = seismic::generated::native_implementation::<E>(device)
+        .unwrap()
+        .unwrap();
+    mapping.iter().fold(
+        specialization_on(device, statics, &[]),
+        |choice, (name, value)| {
+            if implementation
+                .params
+                .iter()
+                .any(|parameter| parameter.name == *name)
+            {
+                return choice.with_param(*name, *value);
+            }
+            let launches = implementation
+                .launches
+                .iter()
+                .enumerate()
+                .filter(|(_, launch)| {
+                    launch
+                        .params
+                        .iter()
+                        .any(|parameter| parameter.name == *name)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert!(
+                !launches.is_empty(),
+                "`{name}` is not a parameter of the entry"
+            );
+            launches.into_iter().fold(choice, |choice, launch| {
+                choice.with_launch_param(launch, *name, *value)
+            })
+        },
+    )
 }
 
 /// Mapping parameters of the grouped entries on the device's backend.
@@ -1769,9 +1793,10 @@ fn native_decode_expand_and_output_match_reference_rows(
             let label =
                 format!("rows {rows} mapping {mapping:?} output {output_mapping:?} INT8 {int8}");
             let statics = [("H", h), ("K", k), ("F", f), ("S", s)];
-            let mut specialization = decode_specialization(device, &statics, mapping);
+            let mut specialization =
+                decode_specialization::<routed_expand::Entry>(device, &statics, mapping);
             let mut output_specialization =
-                decode_specialization(device, &statics, &output_mapping);
+                decode_specialization::<routed_output::Entry>(device, &statics, &output_mapping);
             if is_cpu(device) {
                 specialization = specialization.with_param("INT8", u64::from(int8));
                 output_specialization = output_specialization.with_param("INT8", u64::from(int8));
@@ -2655,9 +2680,10 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
             let label =
                 format!("35B decode rows {rows} mapping {mapping:?} output {output_mapping:?}");
             let statics = [("H", h), ("K", k), ("F", f), ("S", s)];
-            let mut specialization = decode_specialization(device, &statics, &mapping);
+            let mut specialization =
+                decode_specialization::<routed_expand::Entry>(device, &statics, &mapping);
             let mut output_specialization =
-                decode_specialization(device, &statics, &output_mapping);
+                decode_specialization::<routed_output::Entry>(device, &statics, &output_mapping);
             if is_cpu(device) {
                 specialization = specialization.with_param("INT8", 0);
                 output_specialization = output_specialization.with_param("INT8", 0);
@@ -2887,7 +2913,7 @@ fn metal_35b_shared_route_keeps_every_bit() {
                     SGW: q8,
                     SUW: q8,
                 },
-                &decode_specialization(
+                &decode_specialization::<routed_expand::Entry>(
                     &device,
                     &[("H", h), ("K", k), ("F", f), ("S", s)],
                     &[("SIMDGROUPS", 4), ("ROWS", 2), ("LANES", lanes)],
@@ -2980,7 +3006,11 @@ fn metal_35b_shared_route_keeps_every_bit() {
                         EGW: q4k,
                         EUW: q4k,
                     },
-                    &decode_specialization(&device, &[("H", h), ("K", k), ("F", f)], &mapping),
+                    &decode_specialization::<routed_gate_up::Entry>(
+                        &device,
+                        &[("H", h), ("K", k), ("F", f)],
+                        &mapping,
+                    ),
                 )
                 .unwrap()
                 .call(routed_gate_up::Args {
@@ -4071,7 +4101,7 @@ fn routed_decode_trace() {
             SGW: element(&device, "q8g32s"),
             SUW: element(&device, "q8g32s"),
         },
-        &decode_specialization(
+        &decode_specialization::<routed_expand::Entry>(
             &device,
             &decode_statics,
             &[("SIMDGROUPS", 8), ("ROWS", 1), ("LANES", 16)],
