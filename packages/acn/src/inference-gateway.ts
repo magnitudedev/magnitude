@@ -594,6 +594,7 @@ export const codexWebSocketTarget = (
     return { _tag: "Invalid", message: "Local model alias is missing its canonical model ID" }
   }
   localAuthorization(headers, icn)
+  headers.delete("content-encoding")
   return {
     _tag: "Target",
     route: "local",
