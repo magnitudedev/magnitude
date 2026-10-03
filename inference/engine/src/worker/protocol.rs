@@ -196,6 +196,22 @@ mod tests {
         postcard::from_bytes(&postcard::to_allocvec(value).unwrap()).unwrap()
     }
 
+    #[test]
+    fn explicit_pipeline_placement_survives_worker_encoding() {
+        let placement = crate::options::ExplicitPipeline {
+            devices: [
+                DeviceSelector::Cuda { uuid: [1; 16] },
+                DeviceSelector::Cuda { uuid: [2; 16] },
+            ],
+            split: 7,
+        };
+        assert_eq!(round_trip(&Some(placement)), Some(placement));
+        assert_eq!(
+            round_trip(&Option::<crate::options::ExplicitPipeline>::None),
+            None
+        );
+    }
+
     /// Memory observations, their failure and a domain-qualified load
     /// refusal survive the process encoding.
     #[test]

@@ -451,7 +451,7 @@ impl From<DomainError> for AdmissionError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ran {
     /// When the owner must run again without an event: its next memory
-    /// observation.
+    /// observation, or an immediate cooperative step continuation.
     pub due: u64,
     /// Whether a group is on the device.
     pub in_flight: bool,
@@ -566,6 +566,23 @@ struct MemoryDeficit {
     role: DomainRole,
     required: u64,
 }
+impl MemoryDeficit {
+    /// Capacity refusals currently identify a role, not the originating pool.
+    /// With several pools of that role, only all covering the deficit is safe
+    /// evidence for an availability retry; another GPU's headroom is not enough.
+    fn covered_by(self, readings: impl IntoIterator<Item = (DomainRole, u64)>) -> bool {
+        let mut found = false;
+        for (role, ceiling) in readings {
+            if role == self.role {
+                found = true;
+                if ceiling < self.required {
+                    return false;
+                }
+            }
+        }
+        found
+    }
+}
 
 /// Everything the owner holds except its pipeline.
 struct Service<F: ProgramFamily> {
@@ -616,6 +633,9 @@ impl<F: ProgramFamily> Owner<F> {
         capacity: PrefixCacheCapacity,
         wakes: Arc<dyn Wakes>,
     ) -> Result<Self, String> {
+        if domain.requires_transient_requests() && capacity != PrefixCacheCapacity::disabled() {
+            return Err("execution profile does not support retained prefixes".into());
+        }
         Ok(Self {
             service: Service {
                 domain,
@@ -737,6 +757,7 @@ impl<F: ProgramFamily> Owner<F> {
                 .refresh_memory()
                 .map_err(|error| error.to_string())?,
             reconciliation: self.reconcile_memory_charge()?,
+            additional_reconciliations: self.service.domain.additional_memory_charges()?,
         })
     }
 
@@ -791,8 +812,8 @@ impl<F: ProgramFamily> Owner<F> {
         self.service.terminalize_all(error, members);
     }
 
-    /// Run every transition that is possible now. An error is fatal: every
-    /// request has been terminated with it and execution must stop.
+    /// Run available transitions until waiting or an explicit step yield.
+    /// An error is fatal: every request has been terminated and execution stops.
     pub fn run(self, now: u64) -> Result<(Self, Ran), RequestError> {
         let Owner {
             mut service,
@@ -842,6 +863,11 @@ impl<F: ProgramFamily> Service<F> {
         members: Option<&mut BTreeMap<RequestId, Member>>,
     ) -> Result<(RequestId, PublicationReceiver), AdmissionError> {
         self.time(now).map_err(AdmissionError::Refused)?;
+        if self.domain.requires_transient_requests() && retention != PrefixRetention::Transient {
+            return Err(AdmissionError::Refused(RequestError::Input(
+                "execution profile does not support retained prefixes or resume".into(),
+            )));
+        }
         if matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
             return Err(AdmissionError::MemoryReclaim);
         }
@@ -1186,6 +1212,20 @@ impl<F: ProgramFamily> Service<F> {
                     }
                 }
             };
+            // A synchronous paired flight is already physically complete here.
+            // Let the existing worker process controls before reconciliation and
+            // the next step, independent of output-buffer backpressure. No state
+            // is published early and the flight retains all completion ownership.
+            if self.domain.requires_step_yield() && matches!(pipeline, Pipeline::InFlight(..)) {
+                return Ok((
+                    pipeline,
+                    Ran {
+                        due: now,
+                        in_flight: true,
+                        unload,
+                    },
+                ));
+            }
         }
     }
 
@@ -1272,9 +1312,11 @@ impl<F: ProgramFamily> Service<F> {
         };
         let before = self.memory_deficits.len();
         self.memory_deficits.retain(|deficit| {
-            !readings.iter().any(|reading| {
-                reading.role == deficit.role && reading.ceiling_bytes >= deficit.required
-            })
+            !deficit.covered_by(
+                readings
+                    .iter()
+                    .map(|reading| (reading.role, reading.ceiling_bytes)),
+            )
         });
         if self.memory_deficits.len() != before {
             self.epoch.advance();
@@ -2913,7 +2955,27 @@ mod branch_plan_tests {
 
 #[cfg(test)]
 mod memory_condition_tests {
-    use super::{MEMORY_ESCALATION_NS, MemoryCondition, MemoryObservation};
+    use super::{MEMORY_ESCALATION_NS, MemoryCondition, MemoryObservation, MemoryDeficit};
+    use magnitude_executor::platform::DomainRole;
+
+    #[test]
+    fn another_allocation_domain_cannot_reopen_a_deficit() {
+        let deficit = MemoryDeficit {
+            role: DomainRole::Allocation,
+            required: 20,
+        };
+        let a = DomainRole::Allocation;
+        let h = DomainRole::Staging;
+        // Single-domain behavior remains unchanged; absent identity is not proof.
+        assert!(deficit.covered_by([(a, 20)]));
+        assert!(!deficit.covered_by([(a, 19)]));
+        assert!(!deficit.covered_by([]));
+        assert!(!deficit.covered_by([(h, 100)]));
+        assert!(!deficit.covered_by([(a, 24), (a, 12), (h, 100)]));
+        assert!(!deficit.covered_by([(a, 12), (a, 24)]));
+        assert!(deficit.covered_by([(a, 24), (a, 20), (h, 0)]));
+        assert!(!deficit.covered_by([(a, 10), (a, 10)])); // not a pooled 20
+    }
 
     #[test]
     fn continuous_blind_escalates_to_immediately_eligible_reclaim() {

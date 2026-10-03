@@ -26,7 +26,8 @@ pub struct DomainAllocation {
     /// are live, retained for reuse, in flight or committed headroom, and
     /// request media.
     pub context_bytes: u64,
-    /// Prepared programs and graph pools, as committed, and any charge the
+    /// Prepared programs, graph pools and activation handoff storage, as
+    /// committed, and any charge the
     /// reconciliation has not attributed to a holder.
     pub compute_bytes: u64,
     /// Optional components (MTP head, vision), resident or dormant.
@@ -89,6 +90,7 @@ impl AllocationCensus {
         .ok_or_else(overflow)?;
         let compute_bytes = [
             charge.graph_pools,
+            charge.activation_transfer,
             charge.prepared_programs,
             charge.unattributed,
         ]
@@ -132,5 +134,55 @@ impl AllocationCensus {
             ],
         };
         Ok(Self { domains })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn charge(transfer: u64) -> MemoryChargeReconciliation {
+        MemoryChargeReconciliation {
+            charged: 100 + transfer,
+            target_state: magnitude_state::StateHoldingCensus::default(),
+            head_state: None,
+            graph_pools: 20,
+            activation_transfer: transfer,
+            owned_media: 0,
+            target_weights: 60,
+            optional_weights: 0,
+            prepared_programs: 10,
+            bound_constants: 10,
+            external_pins: 0,
+            unattributed: 0,
+        }
+    }
+
+    #[test]
+    fn activation_transfer_is_classified_once_as_compute() {
+        let ordinary = AllocationCensus::classify(&charge(0), 0, MemoryDomain::HostRam).unwrap();
+        let paired = AllocationCensus::classify(&charge(32), 0, MemoryDomain::HostRam).unwrap();
+        let ordinary = ordinary.domains[0];
+        let paired = paired.domains[0];
+        assert_eq!(ordinary.model_bytes, 70);
+        assert_eq!(ordinary.compute_bytes, 30);
+        assert_eq!(paired.model_bytes, ordinary.model_bytes);
+        assert_eq!(paired.context_bytes, ordinary.context_bytes);
+        assert_eq!(paired.auxiliary_bytes, ordinary.auxiliary_bytes);
+        assert_eq!(paired.compute_bytes, ordinary.compute_bytes + 32);
+        assert_eq!(
+            paired.model_bytes
+                + paired.context_bytes
+                + paired.compute_bytes
+                + paired.auxiliary_bytes,
+            charge(32).charged
+        );
+    }
+
+    #[test]
+    fn activation_transfer_classification_rejects_overflow() {
+        let mut charge = charge(0);
+        charge.activation_transfer = u64::MAX;
+        assert!(AllocationCensus::classify(&charge, 0, MemoryDomain::HostRam).is_err());
     }
 }

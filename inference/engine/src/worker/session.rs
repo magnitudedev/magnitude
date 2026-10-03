@@ -128,6 +128,8 @@ pub(crate) struct Loaded {
     /// Bytes of the model's host-resident tables held in host RAM.
     pub host_table_bytes: u64,
     pub domain: MemoryDomain,
+    pub additional_domains: Vec<MemoryDomain>,
+    pub allocation_domains: Vec<(seismic::MemoryPoolId, MemoryDomain)>,
 }
 
 pub(crate) struct Session {
@@ -211,6 +213,15 @@ impl Session {
         self.statuses.clear();
         self.observations.clear();
         self.loaded.execution.close();
+        // Shutdown acknowledgement means device work has drained and the owned
+        // execution resources have been released, not merely that close began.
+        if matches!(&exit, WorkerExit::Shutdown) {
+            if let Err(error) = self.send(WorkerMessage::Unloaded {
+                cause: UnloadCause::Shutdown,
+            }) {
+                return WorkerExit::TransportFailed(error.to_string());
+            }
+        }
         exit
     }
 
@@ -284,12 +295,7 @@ impl Session {
                     self.observations.push(call);
                 }
             }
-            HostMessage::Shutdown => {
-                self.send(WorkerMessage::Unloaded {
-                    cause: UnloadCause::Shutdown,
-                })?;
-                return Ok(Flow::Exit(WorkerExit::Shutdown));
-            }
+            HostMessage::Shutdown => return Ok(Flow::Exit(WorkerExit::Shutdown)),
         }
         Ok(Flow::Continue)
     }
@@ -428,27 +434,22 @@ impl Session {
             match reply {
                 Ok(WorkerReply::Observed {
                     reconciliation,
+                    additional_reconciliations,
                     readings,
-                }) => match AllocationCensus::classify(
+                }) => match classify_census(
                     &reconciliation,
+                    &additional_reconciliations,
                     self.loaded.host_table_bytes,
                     self.loaded.domain,
-                ) {
-                    Ok(census) => {
-                        let domains = readings
-                            .iter()
-                            .map(|reading| DomainHeadroom {
-                                domain: match reading.role {
-                                    DomainRole::Allocation => self.loaded.domain,
-                                    DomainRole::Staging => MemoryDomain::HostRam,
-                                },
-                                headroom_bytes: reading.headroom_bytes,
-                            })
-                            .collect();
-                        self.send(WorkerMessage::Observed {
-                            observation: Ok(MemoryObservation { census, domains }),
-                        })?
-                    }
+                    &self.loaded.additional_domains,
+                )
+                .and_then(|census| {
+                    classify_headroom(&readings, &self.loaded.allocation_domains)
+                        .map(|domains| (census, domains))
+                }) {
+                    Ok((census, domains)) => self.send(WorkerMessage::Observed {
+                        observation: Ok(MemoryObservation { census, domains }),
+                    })?,
                     Err(reason) => {
                         return Ok(Flow::Exit(WorkerExit::Unloaded(UnloadCause::Internal {
                             reason,
@@ -623,5 +624,89 @@ fn progress(snapshot: RequestSnapshot) -> RequestProgress {
         cached_tokens: snapshot.cached_tokens,
         resident_tokens: snapshot.resident_position,
         output_tokens: snapshot.output_tokens,
+    }
+}
+
+/// Keep every opened allocation domain independently classified, never turn
+/// two GPU charges into one anonymous capacity or label both as the primary.
+pub(super) fn classify_census(
+    primary: &magnitude_executor::MemoryChargeReconciliation,
+    additional: &[magnitude_executor::MemoryChargeReconciliation],
+    host_tables: u64,
+    domain: MemoryDomain,
+    additional_domains: &[MemoryDomain],
+) -> Result<AllocationCensus, String> {
+    if additional.len() != additional_domains.len() {
+        return Err("allocation census domain count differs from the owned stages".into());
+    }
+    let mut census = AllocationCensus::classify(primary, host_tables, domain)?;
+    for (charge, domain) in additional.iter().zip(additional_domains) {
+        census
+            .domains
+            .extend(AllocationCensus::classify(charge, 0, *domain)?.domains);
+    }
+    Ok(census)
+}
+
+fn classify_headroom(
+    readings: &[magnitude_executor::platform::DomainReading],
+    allocations: &[(seismic::MemoryPoolId, MemoryDomain)],
+) -> Result<Vec<DomainHeadroom>, String> {
+    readings
+        .iter()
+        .map(|reading| {
+            let domain = match reading.role {
+                DomainRole::Allocation => allocations
+                    .iter()
+                    .find(|(pool, _)| *pool == reading.domain)
+                    .map(|(_, domain)| *domain)
+                    .ok_or_else(|| "unrecognized allocation pool in observation".to_owned())?,
+                DomainRole::Staging => MemoryDomain::HostRam,
+            };
+            Ok(DomainHeadroom {
+                domain,
+                headroom_bytes: reading.headroom_bytes,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    #[test]
+    fn additional_census_keeps_two_devices_and_refuses_missing_identity() {
+        let domains = [
+            MemoryDomain::DeviceLocal {
+                device: seismic::DeviceSelector::Cuda { uuid: [1; 16] },
+            },
+            MemoryDomain::DeviceLocal {
+                device: seismic::DeviceSelector::Cuda { uuid: [2; 16] },
+            },
+        ];
+        let charge = magnitude_executor::MemoryChargeReconciliation {
+            charged: 42,
+            target_state: magnitude_state::StateHoldingCensus::default(),
+            head_state: None,
+            graph_pools: 0,
+            activation_transfer: 0,
+            owned_media: 0,
+            target_weights: 42,
+            optional_weights: 0,
+            prepared_programs: 0,
+            bound_constants: 0,
+            external_pins: 0,
+            unattributed: 0,
+        };
+        let census =
+            classify_census(&charge, &[charge.clone()], 0, domains[0], &domains[1..]).unwrap();
+        assert_eq!(census.domains.len(), 2);
+        assert_eq!(
+            census.domains.iter().map(|d| d.domain).collect::<Vec<_>>(),
+            domains
+        );
+        assert!(census.domains.iter().all(|d| d.model_bytes == 42));
+        assert!(classify_census(&charge, &[charge.clone()], 0, domains[0], &[]).is_err());
+        assert!(classify_census(&charge, &[], 0, domains[0], &domains[1..]).is_err());
     }
 }

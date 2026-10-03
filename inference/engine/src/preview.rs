@@ -40,6 +40,15 @@ impl ExecutionManifest {
     /// shares its host artifacts elsewhere can still preview.
     pub fn preview(&self, catalog: &DeviceCatalog) -> Result<LoadPreview, PreviewError> {
         let manifest = self;
+        if manifest.pipeline.is_some() {
+            return Err(
+                PlanOutcome::Unsupported(crate::error::UnsupportedModel::Representation {
+                    reason: "single-device preview cannot assess an explicitly selected pipeline"
+                        .into(),
+                })
+                .into(),
+            );
+        }
         let selected = platform::select_device(
             catalog,
             manifest.path,

@@ -39,6 +39,10 @@ sha2 = "=0.11.0"
 libc = "=0.2.189"
 
 [features]
+# Explicit two-CUDA execution only; never selected by default or catalog fit.
+experimental-pipeline-cuda = ["magnitude-executor/experimental-pipeline-cuda"]
+# Development-only partial-step lifecycle qualification; absent from normal builds.
+pipeline-fault-injection = ["experimental-pipeline-cuda", "magnitude-executor/pipeline-fault-injection"]
 # Development-only bounded precision calibration; production uses fixed limits.
 tuning-precision-experiment = ["magnitude-executor/tuning-precision-experiment"]
 # Development-only: lets the `forward_bench` example record tuned

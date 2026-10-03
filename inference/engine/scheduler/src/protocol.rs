@@ -52,6 +52,7 @@ pub enum WorkerReply {
     Observed {
         /// Seismic's charge classified by every holder the owner keeps.
         reconciliation: MemoryChargeReconciliation,
+        additional_reconciliations: Vec<MemoryChargeReconciliation>,
         /// A fresh reading of every memory domain the device uses.
         readings: Vec<DomainReading>,
     },

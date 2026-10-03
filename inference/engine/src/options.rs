@@ -209,8 +209,23 @@ impl ModelPolicy {
     }
 }
 
+/// Explicit experimental placement, not an automatic selection policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplicitPipeline {
+    pub devices: [seismic::DeviceSelector; 2],
+    pub split: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PipelineReadiness {
+    pub placement: ExplicitPipeline,
+    pub stages: [ResourcePlanSummary; 2],
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionManifest {
+    #[serde(default)]
+    pub pipeline: Option<ExplicitPipeline>,
     pub package: PackageManifest,
     pub definition: ModelDefinition,
     pub model: ResolvedModelPolicy,
@@ -290,6 +305,9 @@ impl InputModalities {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReadyInfo {
+    /// Separate local plans when the caller explicitly selected a pipeline.
+    #[serde(default)]
+    pub pipeline: Option<PipelineReadiness>,
     pub package: PackageIdentity,
     /// [`magnitude_chat::TemplateInspection::fingerprint`] of the chat
     /// templates the worker read from its own opened package.
@@ -300,9 +318,10 @@ pub struct ReadyInfo {
     pub model: ResolvedModelPolicy,
     #[serde(with = "ServiceLimitsEncoding")]
     pub service: ServiceLimits,
+    /// The primary allocation domain's plan; paired readiness keeps both local plans above.
     pub resources: ResourcePlanSummary,
     pub path: ExecutionPath,
-    /// The device the worker resolved and opened.
+    /// The primary (readout) device. Paired readiness names both devices.
     pub device: seismic::DeviceSelector,
     /// The backend of the opened device the native path executes on.
     pub backend: seismic::BackendName,
@@ -347,6 +366,7 @@ impl ExecutionManifest {
             return Err("package manifest and model definition identities differ".into());
         }
         Ok(Self {
+            pipeline: None,
             package,
             definition,
             model,

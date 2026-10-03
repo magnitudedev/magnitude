@@ -51,6 +51,37 @@ pub fn plan_execution(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
 ) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
+    let limits = resource_limits(&manifest.service, &manifest.model, selected.info.backend)?;
+    plan_with_limits(manifest, selected, limits)
+}
+
+#[cfg(feature = "experimental-pipeline-cuda")]
+pub(crate) fn plan_pipeline_execution(
+    manifest: &ExecutionManifest,
+    selected: &SelectedDevice,
+) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
+    let limits = pipeline_limits(&manifest.service, &manifest.model, selected.info.backend)?;
+    plan_with_limits(manifest, selected, limits)
+}
+
+#[cfg(feature = "experimental-pipeline-cuda")]
+fn pipeline_limits(
+    service: &ServiceLimits,
+    model: &ResolvedModelPolicy,
+    backend: seismic::BackendName,
+) -> Result<ResourceLimits, ExecutionPlanningError> {
+    let mut limits = resource_limits(service, model, backend)?;
+    // An explicitly qualified pipeline has one active request, not one
+    // request per prefill row. This is its actual graph/store contract.
+    limits.max_launch_slots = 1;
+    Ok(limits)
+}
+
+fn plan_with_limits(
+    manifest: &ExecutionManifest,
+    selected: &SelectedDevice,
+    limits: ResourceLimits,
+) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
     let selection = ComponentSelection {
         head: !matches!(manifest.model.method, ResolvedMethod::Plain),
         vision: manifest.definition.vision.is_some(),
@@ -66,7 +97,6 @@ pub fn plan_execution(
         },
         ResolvedMethod::DFlash { proposals } => PlannedMethod::DFlash { proposals },
     };
-    let limits = resource_limits(&manifest.service, &manifest.model, selected.info.backend)?;
     ExecutionPlanner::prepare(
         selected,
         &manifest.package,
@@ -141,6 +171,20 @@ mod tests {
             decode_share: 0.5,
             locality_seconds: 1.0,
         }
+    }
+
+    #[cfg(feature = "experimental-pipeline-cuda")]
+    #[test]
+    fn paired_prefill_has_two_rows_but_one_request_without_changing_ordinary_limits() {
+        let ordinary =
+            resource_limits(&service(2, 1), &model(1), seismic::BackendName::Cuda).unwrap();
+        assert_eq!(ordinary.max_launch_rows, 2);
+        assert_eq!(ordinary.max_launch_slots, 2);
+        let paired =
+            pipeline_limits(&service(2, 1), &model(1), seismic::BackendName::Cuda).unwrap();
+        let mut expected = ordinary;
+        expected.max_launch_slots = 1;
+        assert_eq!(paired, expected);
     }
 
     #[test]

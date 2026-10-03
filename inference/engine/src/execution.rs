@@ -2,6 +2,9 @@
 //! executor domain. Every device-bound value is created inside the numerical
 //! worker that runs this.
 
+#[cfg(feature = "experimental-pipeline-cuda")]
+pub mod pipeline;
+
 use crate::census::MemoryDomain;
 use crate::error::{
     classify_catalog, classify_plan, classify_platform, ArtifactError, InsufficientMemory,
@@ -42,6 +45,29 @@ fn internal(reason: impl Into<String>) -> LoadError {
     }
 }
 
+fn classify_resource_plan(
+    error: magnitude_executor::PlanError,
+    domain: MemoryDomain,
+    backend: BackendName,
+    purpose: &str,
+) -> LoadError {
+    match error {
+        magnitude_executor::PlanError::Resource(capacity)
+            if capacity.resource == magnitude_executor::ResourceKind::DeviceMemory =>
+        {
+            LoadError::InsufficientMemory {
+                purpose: purpose.into(),
+                domain,
+                memory: InsufficientMemory {
+                    required: capacity.required,
+                    available: capacity.available,
+                },
+            }
+        }
+        error => classify_plan(error, backend).into(),
+    }
+}
+
 fn platform_error(error: PlatformError) -> LoadError {
     classify_platform(error).into()
 }
@@ -79,6 +105,34 @@ pub(crate) fn prepare(
     package: &Package,
     progress: Rc<dyn Fn(LoadProgress)>,
 ) -> Result<PreparedPrograms, LoadError> {
+    if manifest.pipeline.is_some() {
+        return Err(LoadError::Unsupported(
+            crate::error::UnsupportedModel::Representation {
+                reason:
+                    "explicit pipeline requires paired construction, not single-device preparation"
+                        .into(),
+            },
+        ));
+    }
+    prepare_with_plan(
+        catalog,
+        manifest,
+        package,
+        progress,
+        crate::planning::plan_execution,
+    )
+}
+
+fn prepare_with_plan(
+    catalog: &DeviceCatalog,
+    manifest: &ExecutionManifest,
+    package: &Package,
+    progress: Rc<dyn Fn(LoadProgress)>,
+    planner: impl FnOnce(
+        &ExecutionManifest,
+        &platform::SelectedDevice,
+    ) -> Result<ExecutionPlanDraft, crate::planning::ExecutionPlanningError>,
+) -> Result<PreparedPrograms, LoadError> {
     let mut phase_started = Instant::now();
     if package.manifest() != manifest.package {
         return Err(LoadError::Artifact(ArtifactError::Invalid {
@@ -108,13 +162,12 @@ pub(crate) fn prepare(
         domain_bytes: selected.assessment_capacity_bytes,
     };
     // The same derivation metadata-only assessment and preview plan through.
-    let draft =
-        crate::planning::plan_execution(manifest, &selected).map_err(|error| match error {
-            crate::planning::ExecutionPlanningError::Plan(error) => {
-                classify_plan(error, backend).into()
-            }
-            error => internal(error.to_string()),
-        })?;
+    let draft = planner(manifest, &selected).map_err(|error| match error {
+        crate::planning::ExecutionPlanningError::Plan(error) => {
+            classify_plan(error, backend).into()
+        }
+        error => internal(error.to_string()),
+    })?;
     let kernel_cache = manifest
         .kernel_cache
         .clone()
@@ -258,7 +311,14 @@ pub(crate) fn build(
             .ok_or_else(|| internal("prepared program set has no state graphs"))?
             .as_ref(),
     )
-    .map_err(internal)?;
+    .map_err(|error| {
+        classify_resource_plan(
+            error,
+            MemoryDomain::of(opened.selector(), pool),
+            backend,
+            "resource plan",
+        )
+    })?;
     let seal = target_graphs.seal_report();
     eprintln!(
         "magnitude-engine: sealed {} target graph classes ({} graphs) in {:.2} s",
@@ -497,37 +557,7 @@ impl StartupClaims {
         refusal: ClaimRefusal,
         required: impl Fn(DomainRole) -> u64,
     ) -> LoadError {
-        let domain = |role: DomainRole| match role {
-            DomainRole::Allocation => self.allocation_domain,
-            DomainRole::Staging => MemoryDomain::HostRam,
-        };
-        match refusal {
-            ClaimRefusal::Blind(error) => platform_error(PlatformError::Memory(error)),
-            ClaimRefusal::Reclaim { role } => LoadError::InsufficientMemory {
-                purpose: format!("{purpose} (memory at or below the planning reserve)"),
-                domain: domain(role),
-                memory: InsufficientMemory {
-                    required: required(role),
-                    available: 0,
-                },
-            },
-            ClaimRefusal::Deficit {
-                role,
-                constraint,
-                required,
-                available,
-            } => LoadError::InsufficientMemory {
-                purpose: format!("{purpose} ({constraint})"),
-                domain: domain(role),
-                memory: InsufficientMemory {
-                    required,
-                    available,
-                },
-            },
-            ClaimRefusal::Accounting(error) => {
-                internal(format!("{purpose}: memory accounting: {error:?}"))
-            }
-        }
+        classify_claim(self.allocation_domain, purpose, refusal, required)
     }
 
     /// The heap with every startup claim released, for the loaded domain.
@@ -539,16 +569,56 @@ impl StartupClaims {
     }
 }
 
+/// Share the ordinary local claim classification with explicitly staged loads.
+fn classify_claim(
+    allocation_domain: MemoryDomain,
+    purpose: &str,
+    refusal: ClaimRefusal,
+    required: impl Fn(DomainRole) -> u64,
+) -> LoadError {
+    let domain = |role: DomainRole| match role {
+        DomainRole::Allocation => allocation_domain,
+        DomainRole::Staging => MemoryDomain::HostRam,
+    };
+    match refusal {
+        ClaimRefusal::Blind(error) => platform_error(PlatformError::Memory(error)),
+        ClaimRefusal::Reclaim { role } => LoadError::InsufficientMemory {
+            purpose: format!("{purpose} (memory at or below the planning reserve)"),
+            domain: domain(role),
+            memory: InsufficientMemory {
+                required: required(role),
+                available: 0,
+            },
+        },
+        ClaimRefusal::Deficit {
+            role,
+            constraint,
+            required,
+            available,
+        } => LoadError::InsufficientMemory {
+            purpose: format!("{purpose} ({constraint})"),
+            domain: domain(role),
+            memory: InsufficientMemory {
+                required,
+                available,
+            },
+        },
+        ClaimRefusal::Accounting(error) => {
+            internal(format!("{purpose}: memory accounting: {error:?}"))
+        }
+    }
+}
+
 /// Run one throwaway single-row forward before readiness, so a broken device
 /// path fails the load instead of the first request, and the process's
 /// one-time first-forward cost is paid here. Tuning has already executed every
 /// kernel, and no row class carries its own first-use cost, so one row
 /// suffices. The request's state advance is aborted, so no state survives it.
 /// The bindings travel with the forward and return with it.
-fn warm_up(
-    domain: &mut ExecutorDomain,
-    mut bindings: StateBindings,
-) -> Result<StateBindings, LoadError> {
+fn warm_up<F: magnitude_executor::ProgramFamily>(
+    domain: &mut ExecutorDomain<F>,
+    mut bindings: StateBindings<F>,
+) -> Result<StateBindings<F>, LoadError> {
     let began = std::time::Instant::now();
     let request = RequestId(u64::MAX);
     let failed = |error: String| internal(format!("load warm-up forward: {error}"));
@@ -651,5 +721,38 @@ impl TuningObserver for TuningReport {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod resource_capacity_tests {
+    use super::*;
+    #[test]
+    fn startup_capacity_retains_required_available_and_actual_device() {
+        let domain = MemoryDomain::DeviceLocal {
+            device: DeviceSelector::Cuda { uuid: [7; 16] },
+        };
+        let error = classify_resource_plan(
+            magnitude_executor::PlanError::Resource(magnitude_executor::CapacityError {
+                resource: magnitude_executor::ResourceKind::DeviceMemory,
+                required: 30,
+                available: 24,
+            }),
+            domain,
+            BackendName::Cuda,
+            "resource plan",
+        );
+        assert!(
+            matches!(error, LoadError::InsufficientMemory { domain: got, memory: InsufficientMemory { required: 30, available: 24 }, .. } if got == domain)
+        );
+        assert!(matches!(
+            classify_resource_plan(
+                magnitude_executor::PlanError::ResourcePlanning("bad footprint".into()),
+                domain,
+                BackendName::Cuda,
+                "resource plan"
+            ),
+            LoadError::Internal { .. }
+        ));
     }
 }

@@ -208,6 +208,9 @@ struct ExecutionReady {
     device: seismic::DeviceSelector,
     backend: seismic::BackendName,
     census: AllocationCensus,
+    pipeline: Option<crate::options::PipelineReadiness>,
+    additional_domains: Vec<MemoryDomain>,
+    allocation_domains: Vec<(seismic::MemoryPoolId, MemoryDomain)>,
 }
 
 /// The chat semantics the worker reads from its own opened package.
@@ -247,6 +250,81 @@ fn load(
         (Box<dyn Driven<Stopped = UnloadCause>>, Built),
         LoadError,
     > {
+        #[cfg(not(feature = "experimental-pipeline-cuda"))]
+        if manifest.pipeline.is_some() {
+            return Err(LoadError::Unsupported(
+                crate::error::UnsupportedModel::Representation {
+                    reason: "experimental pipeline execution was not enabled in this build".into(),
+                },
+            ));
+        }
+        #[cfg(feature = "experimental-pipeline-cuda")]
+        if let Some(placement) = manifest.pipeline {
+            let built = crate::execution::pipeline::build(
+                &manifest,
+                package,
+                placement,
+                Rc::new(move |progress| {
+                    let _ = progress_outbound
+                        .lock()
+                        .unwrap()
+                        .send(WorkerMessage::LoadProgress { progress });
+                }),
+            )?;
+            let stage_domains = built
+                .devices
+                .into_iter()
+                .zip(built.pools)
+                .map(|(device, pool)| MemoryDomain::of(device, pool))
+                .collect::<Vec<_>>();
+            let domain = stage_domains[1];
+            let additional_domains = vec![stage_domains[0]];
+            let allocation_domains = built
+                .allocation_pools
+                .into_iter()
+                .zip(stage_domains)
+                .collect();
+            let stages = built.plans.each_ref().map(ResourcePlanSummary::from_plan);
+            let [a, b] = stages;
+            let stages = [a.map_err(internal)?, b.map_err(internal)?];
+            let resources = stages[1].clone();
+            let owner = Owner::new(
+                built.domain,
+                built.bindings,
+                manifest.service.clone(),
+                Arc::new(wakes) as Arc<dyn Wakes>,
+            )
+            .map_err(internal)?;
+            let magnitude_scheduler::protocol::WorkerReply::Observed {
+                reconciliation,
+                additional_reconciliations,
+                ..
+            } = owner.observe().map_err(internal)?
+            else {
+                unreachable!("Owner observation")
+            };
+            let census = session::classify_census(
+                &reconciliation,
+                &additional_reconciliations,
+                0,
+                domain,
+                &additional_domains,
+            )
+            .map_err(internal)?;
+            let ready = ExecutionReady {
+                resources,
+                device: built.devices[1],
+                backend: seismic::BackendName::Cuda,
+                census,
+                pipeline: Some(crate::options::PipelineReadiness { placement, stages }),
+                additional_domains,
+                allocation_domains,
+            };
+            return Ok((
+                Box::new(ExecutionOwner::new(owner, method)),
+                (ready, 0, domain),
+            ));
+        }
         let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
         let built = crate::execution::build(
             catalog,
@@ -266,6 +344,10 @@ fn load(
         let backend = built.domain.execution_backend();
         let host_table_bytes = built.domain.host_table_bytes();
         let domain = MemoryDomain::of(built.device, built.pool);
+        let seismic::DeviceMemory::Established(memory) = &built.domain.resources().device().info().memory else {
+            return Err(internal("constructed device has no allocation pool identity"));
+        };
+        let allocation_domains = vec![(memory.allocation_pool, domain)];
         let resources = ResourcePlanSummary::from_plan(&built.plan).map_err(internal)?;
         let owner = Owner::with_resource_plan(
             built.domain,
@@ -284,6 +366,9 @@ fn load(
             device: built.device,
             backend,
             census,
+            pipeline: None,
+            additional_domains: Vec::new(),
+            allocation_domains,
         };
         Ok((
             Box::new(ExecutionOwner::new(owner, method)) as Box<dyn Driven<Stopped = UnloadCause>>,
@@ -331,6 +416,7 @@ fn load(
             }
         })?;
     let ready = ReadyInfo {
+        pipeline: execution_ready.pipeline,
         package: manifest_identity,
         template_fingerprint: chat.template_fingerprint,
         modalities: chat.modalities,
@@ -349,6 +435,8 @@ fn load(
             definition: session_definition,
             host_table_bytes,
             domain,
+            additional_domains: execution_ready.additional_domains,
+            allocation_domains: execution_ready.allocation_domains,
         },
         ready,
     ))
