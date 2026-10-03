@@ -8,9 +8,11 @@ use super::AssessmentError;
 use crate::operators::parallel::DenseBesideRouted;
 use crate::{
     FeedForwardProgramSlot, GeneralRoutedBinding, MixerProgramSlot, ModelLoadPlan,
-    PerLayerEntryBinding, SublayerTail, WeightPlan,
+    PerLayerEntryBinding, ReadoutHead, SublayerTail, WeightPlan,
 };
-use magnitude_family_contracts::{ModelDefinition, SublayerIndex, WeightKind, WeightScope};
+use magnitude_family_contracts::{
+    ModelDefinition, ProgressivePlane, SublayerIndex, WeightKind, WeightScope,
+};
 use magnitude_state::{HistoryDomainLayout, KvCodec, LayerRef, ModelStateLayout};
 use seismic::Element;
 
@@ -551,12 +553,29 @@ impl DecodeDemand {
             )?
             .resident_bytes,
         )?;
-        step.project(&[planned(
-            load,
-            WeightScope::Target,
-            WeightKind::Output,
-            readout.weight,
-        )?])?;
+        match readout.head {
+            ReadoutHead::Packed { weight, .. } => step.project(&[planned(
+                load,
+                WeightScope::Target,
+                WeightKind::Output,
+                weight,
+            )?])?,
+            // A certified selection streams the top plane, the scales and
+            // the radii; its later levels read too few rows to plan.
+            ReadoutHead::Progressive => step.project(
+                &[ProgressivePlane::Top, ProgressivePlane::Scales, ProgressivePlane::Radius]
+                    .map(|plane| {
+                        planned(
+                            load,
+                            WeightScope::Target,
+                            WeightKind::OutputPlane(plane),
+                            crate::progressive::element(plane),
+                        )
+                    })
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?,
+        }
         step.launch(
             vocabulary
                 .checked_mul(4)

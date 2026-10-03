@@ -17,7 +17,9 @@ use magnitude_artifacts::{
     gguf::{Encoding, GgufArtifact},
     Error as ArtifactError, FileSource,
 };
-use magnitude_family_contracts::WeightDescriptor;
+use magnitude_family_contracts::{
+    WeightDescriptor, WeightKind, WeightRole, WeightScope,
+};
 use seismic::{DType, Device, Element, NativeTensorBatch, Tensor, TraceDetail, TracedSubmission};
 use std::{
     cell::RefCell,
@@ -376,6 +378,77 @@ impl ResidencyStore {
         self.mapped_import
     }
 
+    /// The admitted plan of the target weight with `kind`, when the plan has one.
+    pub(crate) fn planned_target(&self, kind: WeightKind) -> Option<&WeightPlan> {
+        self.execution.load().target().iter().find(|weight| {
+            weight.role
+                == WeightRole {
+                    scope: WeightScope::Target,
+                    kind,
+                }
+        })
+    }
+
+    /// Imports a plane of a progressive weight (`ImportTransform::Progressive`):
+    /// the host places it from the stored Q8_0 rows, and the device holds the
+    /// placed bytes as they are.
+    pub(crate) fn import_progressive(
+        &mut self,
+        artifact: &GgufArtifact,
+        descriptor: &WeightDescriptor,
+    ) -> Result<ResidentWeight, WeightImportError> {
+        let planned = self
+            .execution
+            .weights()
+            .find(|weight| {
+                weight.component.identity == artifact.identity() && weight.descriptor == *descriptor
+            })
+            .cloned()
+            .ok_or_else(|| {
+                invalid(format!(
+                    "weight {:?} is absent from the admitted WeightPlan",
+                    descriptor.name
+                ))
+            })?;
+        if !planned.placed_on_host() || planned.upload != planned.resident {
+            return Err(invalid(format!(
+                "weight {:?} is not a progressive plane",
+                descriptor.name
+            )));
+        }
+        let key = ResidencyKey {
+            artifact: artifact.identity(),
+            name: descriptor.name.clone(),
+            transforms: descriptor.transforms.clone(),
+            resident: planned.resident,
+        };
+        if let Some(weight) = self.resident.get(&key) {
+            return Ok(weight.clone());
+        }
+        let source = ImportArtifactTensor::from_gguf(artifact, descriptor)?;
+        let stored = source.stored();
+        let bytes = crate::programs::native_import::stored_source_bytes(stored)
+            .map_err(|error| invalid(error.to_string()))?;
+        let bytes = crate::import_transforms::upload_bytes(
+            descriptor,
+            stored.shape(),
+            planned.source,
+            stored.packed_encoding(),
+            planned.upload,
+            bytes,
+        )
+        .map_err(invalid)?;
+        let tensor = Tensor::from_host(&self.device, planned.resident, &planned.shape, &bytes)
+            .map_err(|error| WeightImportError::Device(error.to_string()))?;
+        let weight = ResidentWeight {
+            descriptor: descriptor.clone(),
+            tensor,
+            scale: None,
+        };
+        self.publish(key, weight.clone());
+        Ok(weight)
+    }
+
     /// Imports a dense weight into the element its admitted plan chose.
     pub(crate) fn import_gguf_planned(
         &mut self,
@@ -631,7 +704,8 @@ impl ResidencyStore {
         }
         let mut seen = HashSet::<WeightStorageIdentity>::new();
         let mut ordered = Vec::new();
-        for plan in weights {
+        // A host-placed weight takes no import entry (`import_progressive`).
+        for plan in weights.iter().filter(|plan| !plan.placed_on_host()) {
             if !seen.insert(plan.storage_identity()) {
                 continue;
             }

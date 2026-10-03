@@ -149,6 +149,21 @@ impl WeightDescriptor {
                         )));
                     }
                 }
+                ImportTransform::Progressive(plane) => {
+                    let [rows, columns] = shape[..] else {
+                        return Err(DefinitionError::new(format!(
+                            "{:?} is not a matrix of whole 32-value groups",
+                            self.name
+                        )));
+                    };
+                    if !columns.is_multiple_of(32) {
+                        return Err(DefinitionError::new(format!(
+                            "{:?} is not a matrix of whole 32-value groups",
+                            self.name
+                        )));
+                    }
+                    shape = plane.shape(rows, columns);
+                }
             }
         }
         Ok(shape)
@@ -184,6 +199,43 @@ pub enum ImportTransform {
     /// (NVFP4) stays a separate factor of the resident weight, so it is exact
     /// for block encodings too.
     ScaleByTensor { tensor: String },
+    /// One plane of the progressive placement of a Q8_0 matrix (the last
+    /// transform; `ProgressivePlane`).
+    Progressive(ProgressivePlane),
+}
+
+/// The progressive placement of a Q8_0 matrix `[rows, columns]`: its
+/// offset-binary codes `u = c + 128` in significance-ordered bit planes, so a
+/// reader of the top bits reads only them (`readout.seismic`, the progressive
+/// head readout). The planes hold the matrix's values bit for bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProgressivePlane {
+    /// Bits 7..4, eight codes per u32 (`[rows, columns / 8]`).
+    Top,
+    /// Bit 3, a u32 per 32-value group (`[rows, columns / 32]`).
+    Bit3,
+    /// Bits 2..0, three u32 per group (`[rows, columns / 32, 3]`).
+    Rest,
+    /// The f16 scale of every group (`[rows, columns / 32]`).
+    Scales,
+    /// Per row, bounds on how far a dot product moves from the 4- and 5-bit
+    /// views to the exact row, per unit Euclidean length of the activation
+    /// row, F32 rounding included (`[2, rows]` F32).
+    Radius,
+}
+
+impl ProgressivePlane {
+    pub const ALL: [Self; 5] = [Self::Top, Self::Bit3, Self::Rest, Self::Scales, Self::Radius];
+
+    /// The plane's shape for a `[rows, columns]` matrix.
+    pub fn shape(self, rows: u64, columns: u64) -> Vec<u64> {
+        match self {
+            Self::Top => vec![rows, columns / 8],
+            Self::Bit3 | Self::Scales => vec![rows, columns / 32],
+            Self::Rest => vec![rows, columns / 32, 3],
+            Self::Radius => vec![rows, 2],
+        }
+    }
 }
 
 // A transform's factor is finite and nonzero (`transformed_shape` rejects
@@ -200,6 +252,7 @@ impl std::hash::Hash for ImportTransform {
             Self::Scale { factor } => factor.to_bits().hash(state),
             Self::Flatten => {}
             Self::ScaleByTensor { tensor } => tensor.hash(state),
+            Self::Progressive(plane) => plane.hash(state),
         }
     }
 }
@@ -297,6 +350,9 @@ pub enum WeightKind {
     RotaryDivisors,
     OutputNorm,
     Output,
+    /// A plane of the output projection's progressive placement
+    /// (`ImportTransform::Progressive`), which then replaces `Output`.
+    OutputPlane(ProgressivePlane),
     HeadEmbeddingNorm,
     HeadHiddenNorm,
     HeadCombine,

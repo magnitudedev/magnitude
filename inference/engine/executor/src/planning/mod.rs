@@ -32,8 +32,8 @@ pub use resources::{
 };
 pub use weights::{
     resident_element, resident_layout, source_element, AttentionBinding, AttentionShape,
-    DenseBinding, DenseBranchBinding, EmbeddingBinding, FeaturesBinding, HeadBinding,
-    HostTablePlan, ModelLoadPlan, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding,
+    DenseBinding, DenseBranchBinding, EmbeddingBinding, FeaturesBinding, HeadBinding, HeadProjection,
+    HostTablePlan, ModelLoadPlan, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding, ReadoutHead,
     DenseScales, RecurrentBinding, RoutedBinding, ScalableWeight, SublayerTail, WeightPlan, WeightScalePlan,
     WeightStorageIdentity,
 };

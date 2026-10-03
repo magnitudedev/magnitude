@@ -1,5 +1,7 @@
 use super::super::*;
 use super::*;
+use crate::ReadoutHead;
+use magnitude_family_contracts::ProgressivePlane;
 use crate::operators::routed::fused_graph::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
 
 impl<'a> QualificationView<'a> {
@@ -495,13 +497,6 @@ impl<'a> QualificationView<'a> {
         for binding in [self.plan.target().readout()] {
             let label = format!("{binding:?}");
             let norm = semantic_ones(device, binding.norm, &[hidden], "target_readout", &label)?;
-            let weight = semantic_zeros(
-                device,
-                binding.weight,
-                &[self.geometry.vocabulary, hidden],
-                "target_readout",
-                &label,
-            )?;
             let features = self
                 .programs
                 .target
@@ -516,46 +511,73 @@ impl<'a> QualificationView<'a> {
                 .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
                 .value;
             require_finite_nonzero(&features, "readout_features_rows", &label)?;
-            let logits = self
-                .programs
-                .target
-                .readout
-                .head
-                .call(readout_head_rows::Args {
-                    hidden: &hidden_residual,
-                    norm: &norm,
-                    weight: &weight,
-                    out_rows: &out_rows,
-                    epsilon: 1.0e-5,
-                    softcap: 0.0,
-                    weight_scale: &semantic_ones(
+            let vocabulary = self.geometry.vocabulary;
+            match (&self.programs.target.readout.head, binding.head) {
+                (
+                    ReadoutHeadKernels::Packed { head, selected },
+                    ReadoutHead::Packed {
+                        weight: element,
+                        weight_scale,
+                    },
+                ) => {
+                    let weight =
+                        semantic_zeros(device, element, &[vocabulary, hidden], "target_readout", &label)?;
+                    let logits = head
+                        .call(readout_head_rows::Args {
+                            hidden: &hidden_residual,
+                            norm: &norm,
+                            weight: &weight,
+                            out_rows: &out_rows,
+                            epsilon: 1.0e-5,
+                            softcap: 0.0,
+                            weight_scale: &semantic_ones(
+                                device,
+                                Element::f32(),
+                                &[weight_scale],
+                                "target_readout",
+                                &label,
+                            )?,
+                        })
+                        .map_err(|error| qualification_dynamic("readout_head_rows", &label, error))?
+                        .value;
+                    require_zero_result(&logits, "readout_head_rows", &label)?;
+                    let rows = semantic_i32(device, &[1], &[0], "readout_selected_rows", &label)?;
+                    let selected_result = selected
+                        .call(readout_selected_rows::Args {
+                            hidden: &hidden_residual,
+                            norm: &norm,
+                            weight: &weight,
+                            out_rows: &out_rows,
+                            selected: &rows,
+                            epsilon: 1.0e-5,
+                            softcap: 0.0,
+                        })
+                        .map_err(|error| {
+                            qualification_dynamic("readout_selected_rows", &label, error)
+                        })?
+                        .value;
+                    require_zero_result(&selected_result, "readout_selected_rows", &label)?;
+                }
+                (ReadoutHeadKernels::Progressive(kernels), ReadoutHead::Progressive) => {
+                    qualify_progressive(
                         device,
-                        Element::f32(),
-                        &[binding.weight_scale],
+                        kernels,
+                        &hidden_residual,
+                        &norm,
+                        &out_rows,
+                        (vocabulary, hidden),
                         "target_readout",
                         &label,
-                    )?,
-                })
-                .map_err(|error| qualification_dynamic("readout_head_rows", &label, error))?
-                .value;
-            require_zero_result(&logits, "readout_head_rows", &label)?;
-            let selected = semantic_i32(device, &[1], &[0], "readout_selected_rows", &label)?;
-            let selected_result = self
-                .programs
-                .target
-                .selected
-                .call(readout_selected_rows::Args {
-                    hidden: &hidden_residual,
-                    norm: &norm,
-                    weight: &weight,
-                    out_rows: &out_rows,
-                    selected: &selected,
-                    epsilon: 1.0e-5,
-                    softcap: 0.0,
-                })
-                .map_err(|error| qualification_dynamic("readout_selected_rows", &label, error))?
-                .value;
-            require_zero_result(&selected_result, "readout_selected_rows", &label)?;
+                    )?;
+                }
+                _ => {
+                    return Err(qualification_dynamic(
+                        "target_readout",
+                        &label,
+                        "the prepared head differs from the planned head",
+                    ))
+                }
+            }
         }
 
         if let (Some(binding), Some(kernel)) = (
@@ -1428,4 +1450,123 @@ impl QualificationView<'_> {
         }
         Ok(())
     }
+}
+
+/// A progressive head's levels and full exact pass over zero planes of
+/// `[vocabulary, hidden]`: every logit of every level is zero, every row
+/// reaches the zero threshold, and the exact level keeps them.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn qualify_progressive(
+    device: &Device,
+    kernels: &ProgressiveReadoutKernels,
+    hidden_residual: &Tensor,
+    norm: &Tensor,
+    out_rows: &Tensor,
+    (vocabulary, hidden): (u64, u64),
+    context: &'static str,
+    label: &str,
+) -> Result<(), CatalogFailure> {
+    let label = label.to_owned();
+    let plane = |plane: ProgressivePlane| {
+        semantic_zeros(
+            device,
+            crate::progressive::element(plane),
+            &plane.shape(vocabulary, hidden),
+            context,
+            &label,
+        )
+    };
+    let top = plane(ProgressivePlane::Top)?;
+    let bit3 = plane(ProgressivePlane::Bit3)?;
+    let rest = plane(ProgressivePlane::Rest)?;
+    let scales = plane(ProgressivePlane::Scales)?;
+    let radius = plane(ProgressivePlane::Radius)?;
+    let draws = semantic_zeros(device, Element::u32(), &[1, 6], context, &label)?;
+    let temperature =
+        semantic_ones(device, Element::f32(), &[1], context, &label)?;
+    let mask = semantic_zeros(
+        device,
+        Element::u32(),
+        &[1, vocabulary.div_ceil(32)],
+        context,
+        &label,
+    )?;
+    let constrained =
+        semantic_i32(device, &[1], &[0], context, &label)?;
+    let first = kernels
+        .top
+        .call(readout_top_rows::Args {
+            hidden: hidden_residual,
+            norm,
+            top: &top,
+            bit3: &bit3,
+            rest: &rest,
+            scales: &scales,
+            radius: &radius,
+            out_rows,
+            draws: &draws,
+            temperature: &temperature,
+            mask: &mask,
+            constrained: &constrained,
+            epsilon: 1.0e-5,
+        })
+        .map_err(|error| qualification_dynamic("readout_top_rows", &label, error))?;
+    require_zero_result(&first.r0, "readout_top_rows", &label)?;
+    let second = kernels
+        .refine
+        .call(readout_refine_rows::Args {
+            features: &first.r2,
+            top: &top,
+            bit3: &bit3,
+            rest: &rest,
+            scales: &scales,
+            radius: &radius,
+            coarse: &first.r0,
+            floor: &first.r1,
+            length: &first.r3,
+            draws: &draws,
+            temperature: &temperature,
+            mask: &mask,
+            constrained: &constrained,
+        })
+        .map_err(|error| {
+            qualification_dynamic("readout_refine_rows", &label, error)
+        })?;
+    require_zero_result(&second.r0, "readout_refine_rows", &label)?;
+    let exact = kernels
+        .exact
+        .call(readout_exact_rows::Args {
+            features: &first.r2,
+            top: &top,
+            bit3: &bit3,
+            rest: &rest,
+            scales: &scales,
+            radius: &radius,
+            fine: &second.r0,
+            floor: &second.r1,
+            length: &first.r3,
+            draws: &draws,
+            temperature: &temperature,
+            mask: &mask,
+            constrained: &constrained,
+        })
+        .map_err(|error| qualification_dynamic("readout_exact_rows", &label, error))?
+        .value;
+    require_zero_result(&exact, "readout_exact_rows", &label)?;
+    let planes = kernels
+        .planes
+        .call(readout_planes_rows::Args {
+            hidden: hidden_residual,
+            norm,
+            top: &top,
+            bit3: &bit3,
+            rest: &rest,
+            scales: &scales,
+            out_rows,
+            epsilon: 1.0e-5,
+        })
+        .map_err(|error| qualification_dynamic("readout_planes_rows", &label, error))?
+        .value;
+    require_zero_result(&planes, "readout_planes_rows", &label)?;
+    Ok(())
 }

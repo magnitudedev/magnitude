@@ -95,18 +95,15 @@ fn fill_staged_source(
         let bytes = source
             .read(offset, length)
             .map_err(|error| transfer(error.to_string()))?;
-        let bytes =
-            crate::import_transforms::apply(&plan.descriptor, stored.shape(), plan.source, bytes)
-                .map_err(transfer)?;
-        let bytes = if plan.upload == plan.source {
-            bytes
-        } else {
-            let encoding = stored
-                .packed_encoding()
-                .ok_or_else(|| transfer("a dequantized weight is stored dense".into()))?;
-            crate::import_transforms::dequantize(encoding, plan.source, &plan.shape, &bytes)
-                .map_err(transfer)?
-        };
+        let bytes = crate::import_transforms::upload_bytes(
+            &plan.descriptor,
+            stored.shape(),
+            plan.source,
+            stored.packed_encoding(),
+            plan.upload,
+            bytes,
+        )
+        .map_err(transfer)?;
         if upload.byte_len() != bytes.len() as u64 {
             return Err(transfer(
                 "transformed source byte length differs from its tensor".into(),

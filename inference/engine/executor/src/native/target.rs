@@ -6,10 +6,10 @@ use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project, dense_expand, dense_output, embedding_rows,
     gated_delta_chunk, gated_delta_project, gated_delta_project_convolved, gated_delta_step,
-    gated_delta_step_convolved,
-    post_norm_residual, project_rows, readout_features_rows, readout_head_rows,
-    readout_selected_rows, routed_combine, routed_expand, routed_experts, routed_group,
-    routed_output, routed_route, routed_route_shared,
+    gated_delta_step_convolved, post_norm_residual, project_rows, readout_exact_rows,
+    readout_features_rows, readout_head_rows, readout_planes_rows, readout_refine_rows,
+    readout_selected_rows, readout_top_rows, routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
+    routed_route_shared,
 };
 use magnitude_kernels::{
     dense_up, feature_rows, routed_down, routed_experts_up, routed_gate_up, routed_scatter,
@@ -32,7 +32,6 @@ pub struct TargetKernels {
     pub(super) routed: HashMap<RoutedBinding, RoutedKernels>,
     pub(super) readout: HashMap<ReadoutBinding, ReadoutKernels>,
     pub(super) features: HashMap<FeaturesBinding, NativeKernel<readout_features_rows::Entry>>,
-    pub(super) selected: HashMap<ReadoutBinding, NativeKernel<readout_selected_rows::Entry>>,
     pub(super) taps: Option<TapKernels>,
     pub(super) per_layer_entry: HashMap<crate::PerLayerEntryBinding, PerLayerEntryKernels>,
     pub(super) per_layer: HashMap<crate::PerLayerBinding, PerLayerKernels>,
@@ -94,12 +93,32 @@ pub struct TapKernels {
     pub features: NativeKernel<feature_rows::Entry>,
 }
 
-/// The target readout: final-norm features, and the head projection that
-/// normalizes its own rows.
+/// The target readout: final-norm features, and the vocabulary projection
+/// that normalizes its own rows, by the plan's head placement.
 #[derive(Clone, Debug)]
 pub struct ReadoutKernels {
     pub features: NativeKernel<readout_features_rows::Entry>,
-    pub head: NativeKernel<readout_head_rows::Entry>,
+    pub head: ReadoutHeadKernels,
+}
+
+/// The vocabulary projection's entries (`ReadoutHead`).
+#[derive(Clone, Debug)]
+pub enum ReadoutHeadKernels {
+    /// The head GEMV, and its projection of selected vocabulary rows.
+    Packed {
+        head: NativeKernel<readout_head_rows::Entry>,
+        selected: NativeKernel<readout_selected_rows::Entry>,
+    },
+    Progressive(ProgressiveReadoutKernels),
+}
+
+/// A progressive head's certified levels and its full exact pass.
+#[derive(Clone, Debug)]
+pub struct ProgressiveReadoutKernels {
+    pub top: NativeKernel<readout_top_rows::Entry>,
+    pub refine: NativeKernel<readout_refine_rows::Entry>,
+    pub exact: NativeKernel<readout_exact_rows::Entry>,
+    pub planes: NativeKernel<readout_planes_rows::Entry>,
 }
 
 #[derive(Clone, Debug)]

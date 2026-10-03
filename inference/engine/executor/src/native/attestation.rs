@@ -4,19 +4,20 @@
 use super::preparation::PreparationInputs;
 use super::tuning::{TunedEntry, TuningContext, TuningLimits};
 use super::*;
+use crate::operators::gated_delta::graph::StepForm;
+use crate::operators::routed::fused_graph::DecodeForm;
 use crate::SublayerTail;
 use crate::{
-    ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, ImportProgramSlot, MixerProgramSlot,
-    PlanError, PlannedDevice, ProgramPlan,
+    ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, HeadProjection, ImportProgramSlot,
+    MixerProgramSlot,
+    PlanError, PlannedDevice, ProgramPlan, ReadoutHead,
 };
-use magnitude_family_contracts::SublayerIndex;
+use magnitude_family_contracts::{ProgressivePlane, SublayerIndex};
 use magnitude_kernels::{
     draft_confidence, draft_convolve_input, draft_convolve_residual, draft_gated_rows,
     draft_path_step, draft_top_k, feature_rows, import_dense, post_norm_residual, project_rows,
     repack_weight, tap_rows, widen_rows,
 };
-use crate::operators::gated_delta::graph::StepForm;
-use crate::operators::routed::fused_graph::DecodeForm;
 use magnitude_state::KvCodec;
 use std::{collections::HashSet, rc::Rc};
 
@@ -67,7 +68,6 @@ pub(crate) struct AttestedTarget {
     pub blocks: Vec<AttestedTargetBlock>,
     pub readout: ReadoutKernels,
     pub features: Option<NativeKernel<readout_features_rows::Entry>>,
-    pub selected: NativeKernel<readout_selected_rows::Entry>,
     pub shape: NativeKernel<shape_rows::Entry>,
     pub sample: NativeKernel<sample_rows::Entry>,
     /// A separate draft's taps, when one drafts.
@@ -217,7 +217,7 @@ pub(crate) struct AttestedHeadBlock {
     pub attention: AttentionKernels,
     pub feed_forward: AttestedFeedForward,
     pub features: NativeKernel<readout_features_rows::Entry>,
-    pub logits: NativeKernel<head_logits_rows::Entry>,
+    pub logits: HeadLogitsKernels,
 }
 
 /// A separate draft's entries: per layer in draft order, then the block
@@ -633,8 +633,17 @@ impl AttestedPrograms {
                 + bytes!(per_layer_inputs);
         }
         bytes += bytes!(readout_features_rows)
-            + bytes!(readout_head_rows)
-            + bytes!(readout_selected_rows);
+            + match target.readout().head {
+                ReadoutHead::Packed { .. } => {
+                    bytes!(readout_head_rows) + bytes!(readout_selected_rows)
+                }
+                ReadoutHead::Progressive => {
+                    bytes!(readout_top_rows)
+                        + bytes!(readout_refine_rows)
+                        + bytes!(readout_exact_rows)
+                        + bytes!(readout_planes_rows)
+                }
+            };
         if target.features().is_some() {
             bytes += bytes!(readout_features_rows);
         }
@@ -651,8 +660,16 @@ impl AttestedPrograms {
                         + bytes!(attention_decode)
                         + bytes!(attention_prefill)
                         + bytes!(attention_output)
-                        + bytes!(readout_features_rows)
-                        + bytes!(head_logits_rows);
+                        + bytes!(readout_features_rows);
+                    bytes += match binding.projection {
+                        HeadProjection::Packed(_) => bytes!(head_logits_rows),
+                        HeadProjection::Progressive => {
+                            bytes!(readout_top_rows)
+                                + bytes!(readout_refine_rows)
+                                + bytes!(readout_exact_rows)
+                                + bytes!(readout_planes_rows)
+                        }
+                    };
                     match binding.feed_forward {
                         FeedForwardProgramSlot::Dense(_) => {
                             bytes += bytes!(dense_expand) + bytes!(dense_output)
@@ -979,11 +996,6 @@ impl AttestedPrograms {
                 .features()
                 .map(|binding| slot(&prepared.target.features, binding, "readout_features_rows"))
                 .transpose()?,
-            selected: slot(
-                &prepared.target.selected,
-                target_plan.readout(),
-                "readout_selected_rows",
-            )?,
             shape: prepared
                 .glue
                 .shape_rows
@@ -1060,7 +1072,11 @@ impl AttestedPrograms {
                             }
                         },
                         features: slot(&handles.features, binding, "readout_features_rows")?,
-                        logits: slot(&handles.logits, binding, "head_logits_rows")?,
+                        logits: handles
+                            .logits
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("head_logits", binding))?,
                     });
                 }
                 Ok::<_, CatalogFailure>(AttestedHead {
@@ -1368,10 +1384,20 @@ impl AttestedPrograms {
         }
         for handles in prepared.target.readout.values() {
             bytes += u128::from(handles.features.invocation_workspace_bytes())
-                + u128::from(handles.head.invocation_workspace_bytes());
+                + match &handles.head {
+                    ReadoutHeadKernels::Packed { head, selected } => {
+                        u128::from(head.invocation_workspace_bytes())
+                            + u128::from(selected.invocation_workspace_bytes())
+                    }
+                    ReadoutHeadKernels::Progressive(kernels) => {
+                        u128::from(kernels.top.invocation_workspace_bytes())
+                            + u128::from(kernels.refine.invocation_workspace_bytes())
+                            + u128::from(kernels.exact.invocation_workspace_bytes())
+                            + u128::from(kernels.planes.invocation_workspace_bytes())
+                    }
+                };
         }
         charge!(prepared.target.features.values());
-        charge!(prepared.target.selected.values());
         if let Some(taps) = &prepared.target.taps {
             bytes += u128::from(taps.tap.invocation_workspace_bytes())
                 + u128::from(taps.fusion.invocation_workspace_bytes())
@@ -1397,7 +1423,17 @@ impl AttestedPrograms {
                     + u128::from(handles.combine.invocation_workspace_bytes());
             }
             charge!(head.features.values());
-            charge!(head.logits.values());
+            for logits in head.logits.values() {
+                match logits {
+                    HeadLogitsKernels::Packed(kernel) => charge!([kernel]),
+                    HeadLogitsKernels::Progressive(kernels) => {
+                        charge!([&kernels.top]);
+                        charge!([&kernels.refine]);
+                        charge!([&kernels.exact]);
+                        charge!([&kernels.planes]);
+                    }
+                }
+            }
             charge!(head.shape.iter());
             charge!(head.sample.iter());
         }
@@ -1516,21 +1552,41 @@ impl AttestedPrograms {
                 .ok_or("qualification scope byte count overflows")?;
         }
         if load.head().is_some() {
-            let output = load
-                .target()
-                .iter()
-                .find(|weight| {
-                    weight.role.scope == WeightScope::Target
-                        && weight.role.kind == WeightKind::Output
+            // The draft projection fixture: the output projection's (or its
+            // planes') draft-vocabulary rows.
+            let target = |kind| {
+                load.target().iter().find(|weight| {
+                    weight.role.scope == WeightScope::Target && weight.role.kind == kind
                 })
-                .ok_or("head qualification requires the target output")?;
-            let [vocabulary, hidden] = output.shape[..] else {
-                return Err("target output is not a matrix".into());
             };
-            let projection = output
-                .resident
-                .canonical_byte_len(&[draft_vocabulary(vocabulary), hidden])
-                .map_err(|error| format!("draft projection fixture: {error}"))?;
+            let fixture = |element: Element, shape: &[u64]| {
+                element
+                    .canonical_byte_len(shape)
+                    .map_err(|error| format!("draft projection fixture: {error}"))
+            };
+            let projection = match target(WeightKind::Output) {
+                Some(output) => {
+                    let [vocabulary, hidden] = output.shape[..] else {
+                        return Err("target output is not a matrix".into());
+                    };
+                    fixture(output.resident, &[draft_vocabulary(vocabulary), hidden])?
+                }
+                None => {
+                    let top = target(WeightKind::OutputPlane(ProgressivePlane::Top))
+                        .ok_or("head qualification requires the target output")?;
+                    let [vocabulary, words] = top.shape[..] else {
+                        return Err("target top plane is not a matrix".into());
+                    };
+                    ProgressivePlane::ALL.into_iter().try_fold(0u64, |bytes, plane| {
+                        let element = crate::progressive::element(plane);
+                        let plane_bytes =
+                            fixture(element, &plane.shape(draft_vocabulary(vocabulary), words * 8))?;
+                        bytes
+                            .checked_add(plane_bytes)
+                            .ok_or_else(|| "draft projection fixture overflows".to_owned())
+                    })?
+                }
+            };
             for (scope, bytes) in &mut scopes {
                 if matches!(scope, FixtureScope::Head(_)) {
                     *bytes = bytes
@@ -1898,7 +1954,18 @@ impl AttestedPrograms {
             charge!(&entry.copy);
         }
         charge!(&self.target.readout.features);
-        charge!(&self.target.readout.head);
+        match &self.target.readout.head {
+            ReadoutHeadKernels::Packed { head, selected } => {
+                charge!(head);
+                charge!(selected);
+            }
+            ReadoutHeadKernels::Progressive(kernels) => {
+                charge!(&kernels.top);
+                charge!(&kernels.refine);
+                charge!(&kernels.exact);
+                charge!(&kernels.planes);
+            }
+        }
         if let Some(features) = &self.target.features {
             charge!(features);
         }
@@ -1907,7 +1974,6 @@ impl AttestedPrograms {
             charge!(&taps.fusion);
             charge!(&taps.features);
         }
-        charge!(&self.target.selected);
         charge!(&self.target.shape);
         charge!(&self.target.sample);
         if let Some(head) = &self.head {
@@ -1916,7 +1982,15 @@ impl AttestedPrograms {
                 attention!(&block.attention);
                 feed_forward!(&block.feed_forward);
                 charge!(&block.features);
-                charge!(&block.logits);
+                match &block.logits {
+                    HeadLogitsKernels::Packed(kernel) => charge!(kernel),
+                    HeadLogitsKernels::Progressive(kernels) => {
+                        charge!(&kernels.top);
+                        charge!(&kernels.refine);
+                        charge!(&kernels.exact);
+                        charge!(&kernels.planes);
+                    }
+                }
             }
             charge!(&head.shape);
             charge!(&head.sample);

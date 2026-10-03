@@ -59,6 +59,14 @@ pub(crate) fn admit(
                     descriptor.name
                 ))
             }
+            ImportTransform::Progressive(_)
+                if encoding != Encoding::Q8_0 || descriptor.transforms.len() != 1 =>
+            {
+                return Err(format!(
+                    "{:?}: a progressive plane is the only transform of a Q8_0 matrix",
+                    descriptor.name
+                ))
+            }
             _ => {}
         }
         shape = WeightDescriptor {
@@ -126,9 +134,43 @@ pub(crate) fn apply(
             }
             // Resident beside the weight, not applied to its bytes.
             ImportTransform::ScaleByTensor { .. } => {}
+            ImportTransform::Progressive(_) => {
+                return Err(format!(
+                    "{:?}: a progressive plane is placed by `upload_bytes`",
+                    descriptor.name
+                ))
+            }
         }
     }
     Ok(bytes)
+}
+
+/// The bytes the importer uploads for a weight stored as `source` (packed as
+/// `encoding`, or dense) with `stored` shape: the transformed bytes in
+/// `upload`, the plan's upload representation. A packed weight whose upload
+/// differs from its source is dequantized exactly to F32; a progressive
+/// plane is placed from the stored Q8_0 rows (`crate::progressive`).
+pub(crate) fn upload_bytes(
+    descriptor: &WeightDescriptor,
+    stored: &[u64],
+    source: Element,
+    encoding: Option<Encoding>,
+    upload: Element,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    if let [ImportTransform::Progressive(plane)] = descriptor.transforms[..] {
+        let (&[rows, columns], Some(Encoding::Q8_0)) = (stored, encoding) else {
+            return Err(format!("{:?}: a progressive plane places a Q8_0 matrix", descriptor.name));
+        };
+        return Ok(crate::progressive::plane(plane, &bytes, to_usize(rows)?, to_usize(columns)?));
+    }
+    let transformed = apply(descriptor, stored, source, bytes)?;
+    if upload == source {
+        return Ok(transformed);
+    }
+    let encoding = encoding
+        .ok_or_else(|| format!("{:?}: a dequantized weight is stored dense", descriptor.name))?;
+    dequantize(encoding, source, &descriptor.shape, &transformed)
 }
 
 /// The stored tensor holding `descriptor`'s second-level scale, when it has

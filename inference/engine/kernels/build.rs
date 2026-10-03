@@ -32,6 +32,25 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "gated_delta_step_convolved",
         &[BackendName::Metal],
         "the convolved recurrent decode form's step over the projection's convolved channels; the other backends convolve in `gated_delta_step`",
+    ),    (
+        "readout_top_rows",
+        &[BackendName::Metal, BackendName::Cuda],
+        "level one of the progressive head's certified selection (decode rows)",
+    ),
+    (
+        "readout_refine_rows",
+        &[BackendName::Metal, BackendName::Cuda],
+        "level two of the progressive head's certified selection (decode rows)",
+    ),
+    (
+        "readout_exact_rows",
+        &[BackendName::Metal, BackendName::Cuda],
+        "level three of the progressive head's certified selection (decode rows)",
+    ),
+    (
+        "readout_planes_rows",
+        &[BackendName::Metal, BackendName::Cuda],
+        "the full exact readout over the progressive head's planes (decode rows)",
     ),
 ];
 
@@ -56,6 +75,16 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "lib/core/arrive",
         &[BackendName::Metal],
         "last-threadgroup arrival over `sync` scratch; only Metal natives declare sync scratch so far",
+    ),
+    (
+        "lib/core/gumbel",
+        &[BackendName::Metal, BackendName::Cuda],
+        "the sampler's Gumbel noise, shared by `sample_rows` and the certified selection's bounds",
+    ),
+    (
+        "lib/readout/progressive",
+        &[BackendName::Metal, BackendName::Cuda],
+        "the progressive head's plane decoding and certified levels",
     ),
     (
         "lib/core/precise",

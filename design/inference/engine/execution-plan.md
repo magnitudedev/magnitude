@@ -285,6 +285,26 @@ have: a diagnostic load declares the rows it exports, exports the logits of ever
 class, and selects only unshaped, since shaping must not rewrite logits it exports. The head and
 separate draft keep their vocabulary logits as graph locals too, their drafting classes bounded
 by the selection bound.
+On a backend that declares the progressive head readout
+(Metal, CUDA), a plan whose head admits it (a transform-free Q8_0 matrix of whole 32-value groups
+without a second-level scale, under no logit softcap, with no separate draft) holds the head in
+progressive planes (residency): every projecting class reads the head through the planes
+(`readout_planes_rows`, the exact logits), and served loads also have certified selection
+graphs, which serve every step whose selected rows, up to the backend's certified bound (one on
+Metal, whose batched projection is arithmetic-bound, four on CUDA), are all unpenalized and uncut
+(a temperature at most). Their levels score a row as the sampler does (`logit / temperature`
+plus the row's own Gumbel noise, masks applied): `readout_top_rows` projects every vocabulary row
+onto the codes' top four bits and keeps per row the largest lower-bound score as its threshold;
+`readout_refine_rows` adds bit 3 to the rows whose upper-bound score reaches it and raises the
+threshold; `readout_exact_rows` projects the remaining rows exactly and writes −∞ elsewhere (Metal's
+top level and full pass are the projection library's GEMV, batched GEMV and GEMM over the
+views' packets). Every row whose exact score can be the largest survives
+each level, so the selection is the full readout's, while the head's low bits are read only for
+the survivors (about 54% of the head's bytes on real text). An MTP draft head projects the planes'
+leading draft-vocabulary rows: its drafting classes up to the certified bound run the certified
+levels over them and the rest the full pass; a certified class serves every drafting row whatever
+its shaping, since only verification decides what is emitted. MTP verification rows select
+through the target's certified classes like any other step.
 A separate draft (DFlash, DSpark, DFlash2) conditions on target taps instead of the final features. A
 tapped block's workflow rounds the residual entering it, entering its feed-forward, or leaving it
 (the exit tap is the last block's output) into that tap's column block of a draft-input buffer

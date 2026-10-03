@@ -920,6 +920,71 @@ mod tests {
             target.binding_constant_bytes + family.binding_constant_bytes
         );
 
+        // A Q8_0 output head a backend reads progressively: the head projects
+        // the planes' leading draft-vocabulary rows, certifying the drafting
+        // slots the backend's bound covers (Metal's one of the two here, so
+        // both forms seal).
+        let output = manifest
+            .target
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == definition.decoder.exit.output.name)
+            .unwrap();
+        let packed = (output.encoding, output.nbytes);
+        output.encoding = Encoding::Q8_0;
+        output.nbytes = output.shape.iter().product::<u64>() / 32 * 34;
+        for backend in [BackendName::Metal, BackendName::Cuda] {
+            let load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                ComponentSelection {
+                    head: true,
+                    vision: false,
+                },
+                crate::planning::resident_layout(crate::ExecutionPath::Native, backend),
+            )
+            .unwrap()
+            .with_progressive_head(&definition)
+            .unwrap();
+            let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+            let binding = plan.head().unwrap().blocks()[0];
+            assert_eq!(binding.projection, crate::HeadProjection::Progressive);
+            let classes = crate::programs::native_head::head_graph_classes(
+                limits,
+                head_history.rows as u64,
+                head_history.slab_rows,
+                head_state.span_limit(),
+                method.draft_rows(),
+            )
+            .unwrap();
+            let family = crate::programs::native_head::checked_head_family_storage(
+                backend,
+                &load,
+                &definition.decoder,
+                &head_block,
+                binding,
+                classes.clone(),
+            )
+            .unwrap();
+            assert!(family.storage.workspace > 0, "{backend:?}");
+            crate::programs::native_head::verify_head_family_certificates(
+                backend,
+                &load,
+                &definition.decoder,
+                &head_block,
+                binding,
+                &classes,
+            )
+            .unwrap();
+        }
+        let output = manifest
+            .target
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == definition.decoder.exit.output.name)
+            .unwrap();
+        (output.encoding, output.nbytes) = packed;
+
         let descriptor = |name: &str, shape: &[u64]| {
             WeightDescriptor::stored(format!("routed_head_{name}"), shape)
         };

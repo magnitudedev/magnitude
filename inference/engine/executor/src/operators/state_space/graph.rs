@@ -630,7 +630,10 @@ mod tests {
                     latent: (1, 1),
                 }
             );
-            assert_eq!(plan.target().readout().weight_scale, 1);
+            assert!(matches!(
+                plan.target().readout().head,
+                crate::ReadoutHead::Packed { weight_scale: 1, .. }
+            ));
 
             let state = ResourcePlanner::state_plan(
                 &definition,

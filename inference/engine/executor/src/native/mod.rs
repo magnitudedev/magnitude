@@ -24,6 +24,7 @@ pub(crate) use draft::{
 use glue::GlueKernels;
 pub(crate) use head::draft_vocabulary;
 use head::HeadKernels;
+pub use head::HeadLogitsKernels;
 pub(crate) use import::ImportKernels;
 use preparation::NativePreparationCache;
 use qualification::QualificationView;
@@ -31,8 +32,9 @@ use target::TargetKernels;
 pub(crate) use target::{
     AttentionHistoryKernels, AttentionKernels, DenseExpansionKernel, DenseKernels, ExpertKernels,
     GeneralRoutedKernels, ParallelKernels, PerLayerEntryKernels, PerLayerKernels, PostNormKernels,
-    ReadoutKernels, RecurrentKernels, RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels,
-    ShortConvKernels, StateSpaceKernels, SublayerOutput, TableConversion, TapKernels,
+    ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels, RecurrentKernels,
+    RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels, ShortConvKernels, StateSpaceKernels,
+    SublayerOutput, TableConversion, TapKernels,
 };
 #[cfg(feature = "pinned-tuning")]
 pub use tuning::pinned as pinned_tuning;
@@ -55,8 +57,9 @@ use magnitude_kernels::{
     dense_output, dense_up, draft_rows, embedding_rows, gated_delta_chunk, gated_delta_project,
     gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, head_logits_rows,
     import_dense, moe_tail,
-    per_layer_gate, per_layer_inputs, post_norm_residual, project_rows, readout_features_rows,
-    readout_head_rows, readout_selected_rows, repack_weight, routed_combine, routed_down,
+    per_layer_gate, per_layer_inputs, post_norm_residual, project_rows, readout_exact_rows,
+    readout_features_rows, readout_head_rows, readout_planes_rows, readout_refine_rows,
+    readout_selected_rows, readout_top_rows, repack_weight, routed_combine, routed_down,
     routed_expand, routed_experts, routed_experts_up, routed_gate_up, routed_group, routed_output,
     routed_route, routed_route_shared, routed_scatter, routed_select, routed_up, sample_rows,
     shape_rows,

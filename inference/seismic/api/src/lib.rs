@@ -86,7 +86,7 @@ pub mod native_cpu {
 }
 
 pub use seismic_lang::expr::{BigInt, BigUint};
-pub use seismic_lang::registry::{BackendName, Layout};
+pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;

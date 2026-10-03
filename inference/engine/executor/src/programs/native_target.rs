@@ -4,7 +4,7 @@
 
 use super::{
     graph::readout::{
-        shapes, write_selection, BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind,
+        certifies, shapes, write_selection, BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind,
     },
     native_target_graph::{BoundTargetGraphs, EntryTokens},
     DeviceSubmission, TargetProgram,
@@ -283,6 +283,8 @@ impl NativeTargetProgram {
         // Projected outputs, the selected ones first and in selection order:
         // shaping and sampling read the leading selected logits rows.
         let mut projected_output_rows = Vec::new();
+        // Whether a selected row also reads its logits on the host.
+        let mut selection_reads_logits = false;
         for &output_index in batch.select_rows {
             projected_output_rows.push(
                 usize::try_from(output_index)
@@ -297,6 +299,7 @@ impl NativeTargetProgram {
                 .and_then(|bits| Demand::from_bits(*bits))
                 .ok_or_else(|| invalid("readout demand is absent or invalid"))?;
             let selected = projected_output_rows[..actual_selected].contains(&output_index);
+            selection_reads_logits |= selected && demand.contains(Demand::LOGITS);
             if demand.computes_logits() && !selected {
                 projected_output_rows.push(output_index);
             } else if selected && !demand.computes_logits() {
@@ -316,9 +319,17 @@ impl NativeTargetProgram {
             magnitude_batching::row_class(actual_projected)
                 .ok_or_else(|| invalid("readout projected rows have no class"))?
         };
+        // A selection the certified readout serves: every selected row
+        // samples or takes its largest admitted logit at a temperature at
+        // most, none reads its logits, and nothing else projects.
+        let certified = actual_projected == actual_selected
+            && projected_class as u64 <= self.readout_graphs.prepared.certified_rows()
+            && !selection_reads_logits
+            && batch.shaping[..actual_selected].iter().all(certifies);
         let kind = if actual_selected > 0 {
             ReadoutKind::Selection {
                 shaped: batch.shaping[..actual_selected].iter().any(shapes),
+                certified,
             }
         } else if actual_projected > 0 {
             ReadoutKind::Logits

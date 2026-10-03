@@ -12,8 +12,9 @@ use super::tuning::{
     },
     post_norm::ProjectRowsTuning,
     readout::{
-        DraftRowsTuning, HeadLogitsTuning, HeadRowsTuning, SampleRowsTuning, SelectedRowsTuning,
-        ShapeRowsTuning,
+        DraftRowsTuning, ExactRowsTuning, HeadLogitsTuning, HeadRowsTuning, PlanesRowsTuning,
+        ProgressiveTuning, RefineRowsTuning, SampleRowsTuning, SelectedRowsTuning, ShapeRowsTuning,
+        TopRowsTuning,
     },
     recurrent::{
         RecurrentChunkTuning, RecurrentOutputTuning, RecurrentProjectConvolvedTuning,
@@ -36,8 +37,8 @@ use super::*;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::fused_graph::DecodeForm;
 use crate::{
-    DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ShortConvBinding, StateSpaceBinding,
-    SublayerTail,
+    DenseBinding, GeneralRoutedBinding, HeadProjection, ModelLoadPlan, ReadoutHead, ShortConvBinding,
+    StateSpaceBinding, SublayerTail,
 };
 use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{
@@ -520,32 +521,38 @@ impl<'a> Preparation<'a> {
         let b = target.readout();
         let bindings = format!("{b:?}");
         let features = self.features(&bindings, b.norm, b.activation)?;
-        let head = self.spec.tuned(
-            &mut self.tuner,
-            &HeadRowsTuning {
-                norm: b.norm,
-                weight: b.weight,
-                activation: b.activation,
-                epsilon: self.epsilon,
-                rows: None,
-            },
-        )?;
-        let selected = self.spec.tuned(
-            &mut self.tuner,
-            &SelectedRowsTuning {
-                norm: b.norm,
-                weight: b.weight,
-                activation: b.activation,
-                epsilon: self.epsilon,
-            },
-        )?;
+        let head = match b.head {
+            ReadoutHead::Packed { weight, .. } => {
+                let head = self.spec.tuned(
+                    &mut self.tuner,
+                    &HeadRowsTuning {
+                        norm: b.norm,
+                        weight,
+                        activation: b.activation,
+                        epsilon: self.epsilon,
+                        rows: None,
+                    },
+                )?;
+                let selected = self.spec.tuned(
+                    &mut self.tuner,
+                    &SelectedRowsTuning {
+                        norm: b.norm,
+                        weight,
+                        activation: b.activation,
+                        epsilon: self.epsilon,
+                    },
+                )?;
+                head.zip(selected)
+                    .map(|(head, selected)| ReadoutHeadKernels::Packed { head, selected })
+            }
+            ReadoutHead::Progressive => self
+                .progressive(b.norm, b.activation, None)?
+                .map(ReadoutHeadKernels::Progressive),
+        };
         if let (Some(features), Some(head)) = (features, head) {
             self.target
                 .readout
                 .insert(b, ReadoutKernels { features, head });
-        }
-        if let Some(selected) = selected {
-            self.target.selected.insert(b, selected);
         }
         if let Some(b) = target.features() {
             if let Some(kernel) = self.features(&format!("{b:?}"), b.norm, b.activation)? {
@@ -596,6 +603,36 @@ impl<'a> Preparation<'a> {
             });
         }
         Ok(())
+    }
+
+    /// A progressive head's certified levels and full exact pass over its
+    /// planes' leading `rows` (every row when `None`).
+    fn progressive(
+        &mut self,
+        norm: Element,
+        activation: Element,
+        rows: Option<u64>,
+    ) -> Result<Option<ProgressiveReadoutKernels>, CatalogFailure> {
+        let tuning = ProgressiveTuning {
+            norm,
+            activation,
+            epsilon: self.epsilon,
+            certified_rows: crate::programs::graph::readout::certified_rows(self.device.backend()),
+            rows,
+        };
+        let top = self.spec.tuned(&mut self.tuner, &TopRowsTuning(tuning))?;
+        let refine = self.spec.tuned(&mut self.tuner, &RefineRowsTuning(tuning))?;
+        let exact = self.spec.tuned(&mut self.tuner, &ExactRowsTuning(tuning))?;
+        let planes = self.spec.tuned(&mut self.tuner, &PlanesRowsTuning(tuning))?;
+        Ok(match (top, refine, exact, planes) {
+            (Some(top), Some(refine), Some(exact), Some(planes)) => Some(ProgressiveReadoutKernels {
+                top,
+                refine,
+                exact,
+                planes,
+            }),
+            _ => None,
+        })
     }
 
     /// `readout_features_rows` at this model's width.
@@ -905,13 +942,12 @@ impl<'a> Preparation<'a> {
             shape: shape.clone(),
             epsilon: self.epsilon,
         };
-        let form = StepForm::of(self.device.backend()).map_err(|outcome| {
-            CatalogFailure::Preparation {
+        let form =
+            StepForm::of(self.device.backend()).map_err(|outcome| CatalogFailure::Preparation {
                 entry: "gated_delta_step_convolved",
                 bindings: format!("{b:?}"),
                 outcome,
-            }
-        })?;
+            })?;
         let project_tuning = || RecurrentProjectTuning {
             norm: b.norm,
             qkv: b.qkv,
@@ -1601,13 +1637,25 @@ impl<'a> Preparation<'a> {
                 }
             };
             let features = self.features(&bindings, b.output_norm, b.activation)?;
-            let logits = self.spec.tuned(
-                &mut self.tuner,
-                &HeadLogitsTuning {
-                    weight: b.projection,
-                    activation: b.activation,
-                },
-            )?;
+            let logits = match b.projection {
+                HeadProjection::Packed(weight) => self
+                    .spec
+                    .tuned(
+                        &mut self.tuner,
+                        &HeadLogitsTuning {
+                            weight,
+                            activation: b.activation,
+                        },
+                    )?
+                    .map(HeadLogitsKernels::Packed),
+                HeadProjection::Progressive => self
+                    .progressive(
+                        b.output_norm,
+                        b.activation,
+                        Some(draft_vocabulary(self.vocabulary)),
+                    )?
+                    .map(HeadLogitsKernels::Progressive),
+            };
             let head = self
                 .head
                 .as_mut()

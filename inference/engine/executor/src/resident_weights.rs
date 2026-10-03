@@ -9,7 +9,7 @@ use crate::operators;
 use crate::{ResidencyStore, ResidentWeight, WeightImportError};
 use magnitude_artifacts::{gguf::GgufArtifact, Package};
 use magnitude_family_contracts::{
-    ActivationDType, ModelDefinition, VisionDescription, WeightKind, WeightRole,
+    ActivationDType, ModelDefinition, ProgressivePlane, VisionDescription, WeightKind, WeightRole,
 };
 use seismic::DType;
 use std::collections::HashMap;
@@ -94,7 +94,7 @@ pub struct ResidentHead {
     pub depth: usize,
     pub weights: ResidentRoles,
     /// Tied target vocabulary projection; cloned from the sole ResidencyStore cache.
-    pub output: ResidentWeight,
+    pub output: ResidentOutput,
 }
 
 /// Every projector weight, keyed by its vision role.
@@ -114,12 +114,44 @@ pub struct ResidentTarget {
     pub blocks: usize,
     pub sublayers: ResidentRoles,
     pub output_norm: ResidentWeight,
-    pub output: ResidentWeight,
+    pub output: ResidentOutput,
     /// A separate draft's fusion of the target taps, which the target
     /// readout applies; imported from the draft component.
     pub fusion: Option<ResidentFusion>,
     /// The per-layer entry, when the model has per-layer inputs.
     pub per_layer: Option<ResidentPerLayer>,
+}
+
+/// The target's vocabulary projection, as its plan places it.
+#[derive(Clone)]
+pub enum ResidentOutput {
+    /// The output projection in its resident representation.
+    Packed(ResidentWeight),
+    /// Its progressive planes (`ModelLoadPlan::with_progressive_head`), which
+    /// replace it.
+    Progressive(ResidentPlanes),
+}
+
+/// The planes of a progressive head (`ProgressivePlane`).
+#[derive(Clone)]
+pub struct ResidentPlanes {
+    pub top: ResidentWeight,
+    pub bit3: ResidentWeight,
+    pub rest: ResidentWeight,
+    pub scales: ResidentWeight,
+    pub radius: ResidentWeight,
+}
+
+impl ResidentPlanes {
+    pub(crate) fn plane(&self, plane: ProgressivePlane) -> &ResidentWeight {
+        match plane {
+            ProgressivePlane::Top => &self.top,
+            ProgressivePlane::Bit3 => &self.bit3,
+            ProgressivePlane::Rest => &self.rest,
+            ProgressivePlane::Scales => &self.scales,
+            ProgressivePlane::Radius => &self.radius,
+        }
+    }
 }
 
 /// The per-layer entry's device weights and its host-resident table.
@@ -145,7 +177,12 @@ impl ResidentTarget {
         visit(&self.embedding);
         self.sublayers.values().for_each(&mut visit);
         visit(&self.output_norm);
-        visit(&self.output);
+        match &self.output {
+            ResidentOutput::Packed(output) => visit(output),
+            ResidentOutput::Progressive(planes) => {
+                ProgressivePlane::ALL.into_iter().for_each(|plane| visit(planes.plane(plane)))
+            }
+        }
         if let Some(fusion) = &self.fusion {
             visit(&fusion.projection);
             visit(&fusion.norm);
@@ -188,7 +225,7 @@ pub(crate) fn import_target(
         activation,
     )?;
     let output_norm = residency.import_gguf(target, decoder.exit.norm.weight(), activation)?;
-    let output = residency.import_gguf(target, &decoder.exit.output, activation)?;
+    let output = import_output(decoder, target, residency, activation)?;
     let fusion = definition
         .draft
         .as_ref()
@@ -239,6 +276,43 @@ pub(crate) fn import_target(
     })
 }
 
+/// The target's output head as the plan places it: its progressive planes
+/// (imported once; the residency cache returns them again) or the packed
+/// projection.
+fn import_output(
+    decoder: &magnitude_family_contracts::Decoder,
+    target: &GgufArtifact,
+    residency: &mut ResidencyStore,
+    activation: DType,
+) -> Result<ResidentOutput, ResidencyError> {
+    let planes = ProgressivePlane::ALL
+        .into_iter()
+        .map(|plane| {
+            residency
+                .planned_target(WeightKind::OutputPlane(plane))
+                .map(|weight| weight.descriptor.clone())
+        })
+        .collect::<Option<Vec<_>>>();
+    Ok(match planes {
+        Some(planes) => {
+            let [top, bit3, rest, scales, radius] = planes
+                .iter()
+                .map(|plane| residency.import_progressive(target, plane))
+                .collect::<Result<Vec<_>, _>>()?
+                .try_into()
+                .map_err(|_| invalid("a progressive head has five planes"))?;
+            ResidentOutput::Progressive(ResidentPlanes {
+                top,
+                bit3,
+                rest,
+                scales,
+                radius,
+            })
+        }
+        None => ResidentOutput::Packed(residency.import_gguf(target, &decoder.exit.output, activation)?),
+    })
+}
+
 pub(crate) fn import_optional_head(
     definition: &ModelDefinition,
     package: &Package,
@@ -256,7 +330,7 @@ pub(crate) fn import_optional_head(
         .map(|head| {
             let embedding =
                 residency.import_gguf(package.target(), &decoder.entry.embedding, activation)?;
-            let output = residency.import_gguf(package.target(), &decoder.exit.output, activation)?;
+            let output = import_output(decoder, package.target(), residency, activation)?;
             let weights = operators::head_weights(head)
                 .map_err(|error| invalid(error.to_string()))?;
             Ok(ResidentHead {
@@ -295,7 +369,9 @@ fn import_draft(
             operators::resident_dtype(WeightKind::Embedding, activation),
         )?,
     };
-    let output = residency.import_gguf(target, &decoder.exit.output, activation)?;
+    // A separate draft's readouts read the packed projection (it admits no
+    // progressive head).
+    let output = ResidentOutput::Packed(residency.import_gguf(target, &decoder.exit.output, activation)?);
     let mut weights = operators::draft::draft_weights(draft)
         .map_err(|error| invalid(error.to_string()))?;
     // The embedding is bound as `embedding`, not by role.

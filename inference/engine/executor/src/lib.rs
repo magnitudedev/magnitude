@@ -7,6 +7,7 @@ mod domain;
 mod error;
 mod execution_path;
 mod host_tables;
+mod progressive;
 mod import_transforms;
 mod kernel_cache;
 mod lanes;
@@ -84,10 +85,10 @@ pub use planning::{
     AttentionShape, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
     DenseBranchBinding, DenseScales, Dflash2Binding, DraftBlockBinding, DraftProgramPlan,
     EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
-    FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HostTablePlan,
+    FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HeadProjection, HostTablePlan,
     ImportProgramSlot, MarkovBinding, MixerProgramSlot, ModelLoadPlan, NativeGraphCharge,
     ParallelBinding, PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod,
-    ProgramPlan, ReadoutBinding, RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity,
+    ProgramPlan, ReadoutBinding, ReadoutHead, RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity,
     ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding, ScalableWeight, SelectorBinding,
     StartupSlots, StateCapacityPlan, StateProgramPlan, StateResourcePlan, StateStorePlan,
     SublayerTail, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan,
@@ -103,7 +104,8 @@ pub use residency::{
 };
 pub use residency::{MappedImportReport, ResidencyStore};
 pub use resident_weights::{
-    ResidencyError, ResidentHead, ResidentRoles, ResidentTarget, ResidentVision,
+    ResidencyError, ResidentHead, ResidentOutput, ResidentPlanes, ResidentRoles, ResidentTarget,
+    ResidentVision,
 };
 pub use resources::{
     AllocatedResources, AllocationError, GraphOutputOwner, GraphOutputTensor, ImportWorkspaceLease,

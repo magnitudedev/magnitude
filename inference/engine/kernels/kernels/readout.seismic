@@ -277,3 +277,318 @@ native readout_selected_rows for cpu from "cpu/readout_selected_rows.rs":
     launch readout_selected_rows_rows:
         threadgroups (ceil_div(Sv, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)
+
+# Progressive head readout. The head is stored once in significance-ordered
+# bit planes of its Q8_0 codes, offset to `u = c + 128` (value `s · (u − 128)`,
+# `s` the f16 scale of each 32 values):
+#   top[v, w]       bits 7..4 of codes 8w..8w+7, code 8w + i in bits 4i..4i+3;
+#   bit3[v, g]      bit 3 of codes 32g..32g+31, code 32g + 8q + e in bit 4e + q;
+#   rest[v, g, j]   bit 2 − j of the same codes, placed as in bit3;
+#   scales[v, g]    the f16 scale of codes 32g..32g+31.
+# (A plane word shifted right by q and masked to 0x11111111 holds the bits of
+# codes 32g + 8q..8q+7 in the nibbles `top` holds their high bits in.)
+# A view of the top b bits takes each code's missing low bits at their
+# midpoint: the 4-bit view is `s · (16·H − 120.5)`, the 5-bit view
+# `s · (16·H + 8·b3 − 124.5)`. `radius[v, 0]` and `radius[v, 1]` bound
+# |exact − view| of row v per unit length of the normalized row, F32 rounding
+# of both products included.
+#
+# A certified selection runs the views in turn. A selection row scores a
+# vocabulary row as `logit / temperature + noise` (`gumbel_rows`: the
+# sampler's own noise, zero for greedy rows); a row competes when its row is
+# unconstrained or its mask bit is set. Each level bounds every surviving
+# score, keeps the rows whose upper bound reaches the row's threshold (the
+# largest lower bound so far), and hands them to the next view; the last level
+# is exact. Every row whose exact score can be the largest survives every
+# level, so sampling the exact level's logits (−inf elsewhere) draws what
+# sampling the full readout draws.
+
+# The sampler's Gumbel noise of every (row, token): Philox4x32-10 on counter
+# (token, draws[3], draws[4], draws[5]) and key (draws[1], draws[2]),
+# `−log(−log u)` with `u = ((x >> 9) + 0.5) · 2⁻²³`; zero where draws[0] != 1
+# (`sample_rows`).
+fn gumbel_rows[O, V](draws: &tensor[O, 6] u32, noise: &mut tensor[O, V] f32):
+    parallel for row in 0..O:
+        parallel for token in 0..V:
+            let mut value = f32(0.0)
+            if draws[row, 0] == 1:
+                let mut c0 = u32(token)
+                let mut c1 = draws[row, 3]
+                let mut c2 = draws[row, 4]
+                let mut c3 = draws[row, 5]
+                let mut k0 = draws[row, 1]
+                let mut k1 = draws[row, 2]
+                for round in 0..10:
+                    let a0 = u32(3528531795)
+                    let a1 = u32(3449720151)
+                    let p00 = (a0 & 65535) * (c0 & 65535)
+                    let p01 = (a0 >> 16) * (c0 & 65535)
+                    let p02 = (a0 & 65535) * (c0 >> 16)
+                    let p03 = (a0 >> 16) * (c0 >> 16)
+                    let middle0 = (p00 >> 16) + (p01 & 65535) + (p02 & 65535)
+                    let hi0 = p03 + (p01 >> 16) + (p02 >> 16) + (middle0 >> 16)
+                    let lo0 = (middle0 << 16) | (p00 & 65535)
+                    let p10 = (a1 & 65535) * (c2 & 65535)
+                    let p11 = (a1 >> 16) * (c2 & 65535)
+                    let p12 = (a1 & 65535) * (c2 >> 16)
+                    let p13 = (a1 >> 16) * (c2 >> 16)
+                    let middle1 = (p10 >> 16) + (p11 & 65535) + (p12 & 65535)
+                    let hi1 = p13 + (p11 >> 16) + (p12 >> 16) + (middle1 >> 16)
+                    let lo1 = (middle1 << 16) | (p10 & 65535)
+                    let next0 = hi1 ^ c1 ^ k0
+                    let next2 = hi0 ^ c3 ^ k1
+                    c0 = next0
+                    c1 = lo1
+                    c2 = next2
+                    c3 = lo0
+                    k0 = k0 + u32(2654435769)
+                    k1 = k1 + u32(3144134277)
+                let uniform = (f32(c0 >> 9) + 0.5) * 0.00000011920928955078125
+                value = -log(-log(uniform))
+            noise[row, token] = value
+
+# The head rows of the view of the top `bits` bits (4, 5 or 8) as F32 values.
+fn progressive_view[V, D](top: &tensor[V, (D + 7) / 8] u32, bit3: &tensor[V, (D + 31) / 32] u32,
+    rest: &tensor[V, (D + 31) / 32, 3] u32, scales: &tensor[V, (D + 31) / 32] f16, bits: i32,
+    view: &mut tensor[V, D] f32) where D % 32 == 0:
+    parallel for v in 0..V:
+        parallel for k in 0..D:
+            let shift = u32(4 * (k % 8) + (k % 32) / 8)
+            let mut code = f32((top[v, k / 8] >> u32(4 * (k % 8))) & 15) * 16.0 + 7.5
+            if bits >= 5:
+                code = code - 4.0 + f32((bit3[v, k / 32] >> shift) & 1) * 8.0
+            if bits == 8:
+                let low = ((rest[v, k / 32, 0] >> shift) & 1) * 4 + ((rest[v, k / 32, 1] >> shift) & 1) * 2 + ((rest[v, k / 32, 2] >> shift) & 1)
+                code = code - 3.5 + f32(low)
+            view[v, k] = f32(scales[v, k / 32]) * (code - 128.0)
+
+# One certified level: each competing row's score bounds from its `view`
+# logits and `radius`, the rows whose upper bound reaches the threshold (the
+# largest of `floor` and the lower bounds), and their logits; −inf elsewhere.
+fn certify_level[O, V](view: &tensor[O, V] f32, radius: &tensor[V] f32, length: &tensor[O] f32,
+    temperature: &tensor[O] f32, noise: &tensor[O, V] f32, mask: &tensor[O, (V + 31) / 32] u32,
+    constrained: &tensor[O] i32, floor: &tensor[O] f32, kept: &mut tensor[O, V] f32,
+    threshold: &mut tensor[O] f32):
+    for row in 0..O:
+        let mut lowest = tensor[V] f32
+        for token in 0..V:
+            let competes = (constrained[row] == 0 or ((mask[row, token / 32] >> u32(token % 32)) & 1) != 0) and view[row, token] > -inf
+            lowest[token] = -inf
+            if competes:
+                lowest[token] = (view[row, token] - radius[token] * length[row]) / temperature[row] + noise[row, token]
+        threshold[row] = max(floor[row], reduce(lowest, 0, max))
+        if length[row] == inf or length[row] != length[row]:
+            threshold[row] = -inf
+        for token in 0..V:
+            let competes = (constrained[row] == 0 or ((mask[row, token / 32] >> u32(token % 32)) & 1) != 0) and view[row, token] > -inf
+            kept[row, token] = -inf
+            if competes and (view[row, token] + radius[token] * length[row]) / temperature[row] + noise[row, token] >= threshold[row]:
+                kept[row, token] = view[row, token]
+
+# Level one: the final norm of the `out_rows` rows (`features`, in A, and their
+# Euclidean lengths), their 4-bit-view logits of every vocabulary row, and
+# each row's threshold. `temperature` divides scores (1 for greedy rows).
+fn readout_top_rows[M, O, V, D](hidden: &tensor[M, D] f32, norm: &tensor[D] NW,
+    top: &tensor[V, (D + 7) / 8] u32, bit3: &tensor[V, (D + 31) / 32] u32, rest: &tensor[V, (D + 31) / 32, 3] u32,
+    scales: &tensor[V, (D + 31) / 32] f16, radius: &tensor[V, 2] f32, out_rows: &tensor[O] i32,
+    draws: &tensor[O, 6] u32, temperature: &tensor[O] f32, mask: &tensor[O, (V + 31) / 32] u32,
+    constrained: &tensor[O] i32, epsilon: f32)
+    -> (tensor[O, V] f32, tensor[O] f32, tensor[O, D] A, tensor[O] f32) where D % 32 == 0:
+    let mut selected = tensor[O, D] f32
+    let mut features = tensor[O, D] A
+    let mut view = tensor[V, D] f32
+    let mut logits = tensor[O, V] f32
+    let mut length = tensor[O] f32
+    let mut noise = tensor[O, V] f32
+    let mut floor = tensor[O] f32
+    let mut radius4 = tensor[V] f32
+    let mut kept = tensor[O, V] f32
+    let mut threshold = tensor[O] f32
+    parallel for row in 0..O:
+        parallel for col in 0..D:
+            selected[row, col] = hidden[out_rows[row], col]
+    rms_norm(selected, norm, features, epsilon)
+    progressive_view(top, bit3, rest, scales, 4, view)
+    linear(features, view, logits)
+    for row in 0..O:
+        let values = f32(features[row])
+        length[row] = sqrt(reduce(values * values, 0, sum))
+        floor[row] = -inf
+    parallel for token in 0..V:
+        radius4[token] = radius[token, 0]
+    gumbel_rows(draws, noise)
+    certify_level(logits, radius4, length, temperature, noise, mask, constrained, floor, kept, threshold)
+    return (logits, threshold, features, length)
+
+# Level two: the 5-bit-view logits of the rows level one keeps (`top`'s logits
+# and threshold), −inf elsewhere, and the raised threshold.
+fn readout_refine_rows[O, V, D](features: &tensor[O, D] A, top: &tensor[V, (D + 7) / 8] u32,
+    bit3: &tensor[V, (D + 31) / 32] u32, rest: &tensor[V, (D + 31) / 32, 3] u32, scales: &tensor[V, (D + 31) / 32] f16,
+    radius: &tensor[V, 2] f32, coarse: &tensor[O, V] f32, floor: &tensor[O] f32,
+    length: &tensor[O] f32, draws: &tensor[O, 6] u32, temperature: &tensor[O] f32,
+    mask: &tensor[O, (V + 31) / 32] u32, constrained: &tensor[O] i32) -> (tensor[O, V] f32, tensor[O] f32) where D % 32 == 0:
+    let mut noise = tensor[O, V] f32
+    let mut radius4 = tensor[V] f32
+    let mut radius5 = tensor[V] f32
+    let mut survivors = tensor[O, V] f32
+    let mut unused = tensor[O] f32
+    let mut view = tensor[V, D] f32
+    let mut finer = tensor[O, V] f32
+    let mut kept = tensor[O, V] f32
+    let mut threshold = tensor[O] f32
+    parallel for token in 0..V:
+        radius4[token] = radius[token, 0]
+        radius5[token] = radius[token, 1]
+    gumbel_rows(draws, noise)
+    certify_level(coarse, radius4, length, temperature, noise, mask, constrained, floor, survivors, unused)
+    progressive_view(top, bit3, rest, scales, 5, view)
+    linear(features, view, finer)
+    parallel for row in 0..O:
+        parallel for token in 0..V:
+            if survivors[row, token] == -inf:
+                finer[row, token] = -inf
+    certify_level(finer, radius5, length, temperature, noise, mask, constrained, floor, kept, threshold)
+    return (finer, threshold)
+
+# Level three: the exact logits of the rows level two keeps (`refine`'s logits
+# and threshold), −inf elsewhere: the selection's logits.
+fn readout_exact_rows[O, V, D](features: &tensor[O, D] A, top: &tensor[V, (D + 7) / 8] u32,
+    bit3: &tensor[V, (D + 31) / 32] u32, rest: &tensor[V, (D + 31) / 32, 3] u32, scales: &tensor[V, (D + 31) / 32] f16,
+    radius: &tensor[V, 2] f32, fine: &tensor[O, V] f32, floor: &tensor[O] f32,
+    length: &tensor[O] f32, draws: &tensor[O, 6] u32, temperature: &tensor[O] f32,
+    mask: &tensor[O, (V + 31) / 32] u32, constrained: &tensor[O] i32) -> tensor[O, V] f32 where D % 32 == 0:
+    let mut noise = tensor[O, V] f32
+    let mut radius5 = tensor[V] f32
+    let mut survivors = tensor[O, V] f32
+    let mut unused = tensor[O] f32
+    let mut view = tensor[V, D] f32
+    let mut logits = tensor[O, V] f32
+    parallel for token in 0..V:
+        radius5[token] = radius[token, 1]
+    gumbel_rows(draws, noise)
+    certify_level(fine, radius5, length, temperature, noise, mask, constrained, floor, survivors, unused)
+    progressive_view(top, bit3, rest, scales, 8, view)
+    linear(features, view, logits)
+    parallel for row in 0..O:
+        parallel for token in 0..V:
+            if survivors[row, token] == -inf:
+                logits[row, token] = -inf
+    return logits
+
+# The exact head logits of the `out_rows` rows from the planes (the readout of
+# rows that read every logit: `readout_head_rows` of the progressive head).
+fn readout_planes_rows[M, O, V, D](hidden: &tensor[M, D] f32, norm: &tensor[D] NW,
+    top: &tensor[V, (D + 7) / 8] u32, bit3: &tensor[V, (D + 31) / 32] u32, rest: &tensor[V, (D + 31) / 32, 3] u32,
+    scales: &tensor[V, (D + 31) / 32] f16, out_rows: &tensor[O] i32, epsilon: f32) -> tensor[O, V] f32 where D % 32 == 0:
+    let mut selected = tensor[O, D] f32
+    let mut features = tensor[O, D] A
+    let mut view = tensor[V, D] f32
+    let mut logits = tensor[O, V] f32
+    parallel for row in 0..O:
+        parallel for col in 0..D:
+            selected[row, col] = hidden[out_rows[row], col]
+    rms_norm(selected, norm, features, epsilon)
+    progressive_view(top, bit3, rest, scales, 8, view)
+    linear(features, view, logits)
+    return logits
+
+# Metal, selection rows O <= 8: the projection library's head GEMV (rows
+# below BATCH_FROM) or batched GEMV over the 4-bit view's packets, each
+# threadgroup normalizing its rows in place, with the bound epilogue: each
+# row's threshold rises over `bounds` (sync scratch: eight keys, then the
+# arrival counter).
+native readout_top_rows for metal from "metal/readout_top_rows.metal":
+    static (V, D)
+    params (arithmetic BATCH_FROM in [5, 3, 9, 2])
+    scratch bounds bytes (36) sync
+    launch readout_top_rows_gemv when O < BATCH_FROM and O <= 8:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+        threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(D, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
+    launch readout_top_rows_batch when O >= BATCH_FROM and O <= 8:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
+        threadgroups (ceil_div(V, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16640)
+
+# Metal, O <= 8: one simdgroup per 32 vocabulary rows; only the survivors'
+# bit-3 words are read.
+native readout_refine_rows for metal from "metal/readout_refine_rows.metal":
+    static (V, D)
+    scratch bounds bytes (36) sync
+    launch readout_refine_rows_gather when O <= 8:
+        params (SIMDGROUPS in [8, 4, 16])
+        threadgroups (ceil_div(V, SIMDGROUPS * 32), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+
+# Metal, O <= 8: as `readout_refine_rows`, over every plane of the survivors.
+native readout_exact_rows for metal from "metal/readout_exact_rows.metal":
+    static (V, D)
+    launch readout_exact_rows_gather when O <= 8:
+        params (SIMDGROUPS in [8, 4, 16])
+        threadgroups (ceil_div(V, SIMDGROUPS * 32), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+
+# Metal: `readout_head_rows`' row classes (GEMV, batched GEMV, staged GEMM)
+# over the projection library's packets of the exact view.
+native readout_planes_rows for metal from "metal/readout_planes_rows.metal":
+    static (V, D)
+    params (arithmetic BATCH_FROM in [5, 3, 9, 2])
+    scratch normalized bytes (O * D * 2) when O > 16
+    launch readout_planes_rows_stage when O > 16:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch readout_planes_rows_gemv when O < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+        threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(D, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
+    launch readout_planes_rows_batch when O >= BATCH_FROM and O <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
+        threadgroups (ceil_div(V, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16640)
+    launch readout_planes_rows_gemm when O > 16:
+        params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
+        threadgroups (ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+
+# CUDA, selection rows O <= 8: as the Metal entries, warps for simdgroups.
+native readout_top_rows for cuda from "cuda/readout_top_rows.cu":
+    static (V, D)
+    scratch groups bytes (O * D / 8)
+    scratch bounds bytes (36) sync
+    launch readout_top_rows_form when O <= 8:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch readout_top_rows_scan when O <= 8:
+        params (WARPS in [8, 4, 2], code ROWS in [1, 2, 4])
+        threadgroups (ceil_div(V, WARPS * ROWS), 1, 1)
+        threads_per_threadgroup (WARPS * 32, 1, 1)
+
+native readout_refine_rows for cuda from "cuda/readout_refine_rows.cu":
+    static (V, D)
+    scratch bounds bytes (36) sync
+    launch readout_refine_rows_gather when O <= 8:
+        params (WARPS in [8, 4, 2])
+        threadgroups (ceil_div(V, WARPS * 32), 1, 1)
+        threads_per_threadgroup (WARPS * 32, 1, 1)
+
+native readout_exact_rows for cuda from "cuda/readout_exact_rows.cu":
+    static (V, D)
+    launch readout_exact_rows_gather when O <= 8:
+        params (WARPS in [8, 4, 2])
+        threadgroups (ceil_div(V, WARPS * 32), 1, 1)
+        threads_per_threadgroup (WARPS * 32, 1, 1)
+
+native readout_planes_rows for cuda from "cuda/readout_planes_rows.cu":
+    static (V, D)
+    scratch features bytes (O * D * 2)
+    launch readout_planes_rows_form:
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch readout_planes_rows_scan:
+        params (WARPS in [8, 4, 2], code ROWS in [2, 1, 4])
+        threadgroups (ceil_div(V, WARPS * ROWS), ceil_div(O, 8), 1)
+        threads_per_threadgroup (WARPS * 32, 1, 1)

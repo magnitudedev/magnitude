@@ -26,15 +26,14 @@ impl TuningWeightSource for Package {
             Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
         let bytes = crate::programs::native_import::stored_source_bytes(&stored)
             .map_err(|error| error.to_string())?;
-        let bytes =
-            crate::import_transforms::apply(&weight.descriptor, stored.shape(), weight.source, bytes)?;
-        if weight.upload == weight.source {
-            return Ok(bytes);
-        }
-        let encoding = stored
-            .packed_encoding()
-            .ok_or("a dequantized weight is stored dense")?;
-        crate::import_transforms::dequantize(encoding, weight.source, &weight.shape, &bytes)
+        crate::import_transforms::upload_bytes(
+            &weight.descriptor,
+            stored.shape(),
+            weight.source,
+            stored.packed_encoding(),
+            weight.upload,
+            bytes,
+        )
     }
 }
 
@@ -142,6 +141,12 @@ impl<'a> TuningWeights<'a> {
         }
         let plan = self.plan(scope, kind)?;
         let bytes = self.source.source_bytes(plan)?;
+        if plan.placed_on_host() {
+            let tensor = Tensor::from_host(self.device, plan.resident, &plan.shape, &bytes)
+                .map_err(|error| error.to_string())?;
+            self.resident.insert(role, tensor.clone());
+            return Ok(tensor);
+        }
         let logical = logical_count(&plan.shape)?;
         let source = Tensor::from_host(self.device, plan.upload, &[logical], &bytes)
             .map_err(|error| error.to_string())?;

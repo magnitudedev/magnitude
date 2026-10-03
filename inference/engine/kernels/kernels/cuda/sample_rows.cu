@@ -15,27 +15,7 @@ typedef unsigned long long u64;
 
 #define NO_TOKEN 0xFFFFFFFFu
 
-__device__ __forceinline__ float gumbel_score(float value, u32 token, const u32 *draw, u64 stride) {
-    if (draw[0] != 1u)
-        return value;
-    u32 c0 = token, c1 = draw[3 * stride], c2 = draw[4 * stride], c3 = draw[5 * stride];
-    u32 k0 = draw[stride], k1 = draw[2 * stride];
-#pragma unroll
-    for (int round = 0; round < 10; ++round) {
-        const u32 hi0 = __umulhi(3528531795u, c0), lo0 = 3528531795u * c0;
-        const u32 hi1 = __umulhi(3449720151u, c2), lo1 = 3449720151u * c2;
-        const u32 next0 = hi1 ^ c1 ^ k0;
-        const u32 next2 = hi0 ^ c3 ^ k1;
-        c0 = next0;
-        c1 = lo1;
-        c2 = next2;
-        c3 = lo0;
-        k0 += 2654435769u;
-        k1 += 3144134277u;
-    }
-    const float uniform = ((float)(c0 >> 9) + 0.5f) * 0.00000011920928955078125f;
-    return value - logf(-logf(uniform));
-}
+#include "lib/core/gumbel.cuh"
 
 struct Best {
     float score;
@@ -90,7 +70,7 @@ extern "C" __global__ void sample_rows_partition(SEISMIC_KERNEL_PARAMS) {
             continue;
         if (masked && ((bits[(token / 32) * SEISMIC_MASK_STRIDE_1] >> (token % 32)) & 1u) == 0u)
             continue;
-        const float score = gumbel_score(value, (u32)token, draw, SEISMIC_DRAWS_STRIDE_1);
+        const float score = value + gumbel::noise((u32)token, draw, SEISMIC_DRAWS_STRIDE_1);
         if (better(score, (u32)token, best.score, best.token)) {
             best.score = score;
             best.token = (u32)token;

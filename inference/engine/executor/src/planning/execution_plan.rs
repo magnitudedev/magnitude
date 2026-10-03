@@ -204,13 +204,19 @@ impl ExecutionPlanner {
             }
             _ => {}
         }
-        let load = ModelLoadPlan::derive(
-            manifest,
-            definition,
-            selection,
-            super::resident_layout(path, device.info.backend),
-        )
-        .map_err(PlanError::InvalidDefinition)?;
+        let layout = super::resident_layout(path, device.info.backend);
+        let load = ModelLoadPlan::derive(manifest, definition, selection, layout)
+            .map_err(PlanError::InvalidDefinition)?;
+        // The head in progressive planes, where the backend reads them.
+        let load = if path == ExecutionPath::Native
+            && crate::programs::graph::readout::reads_progressive_heads(device.info.backend)
+                .map_err(PlanError::ResourcePlanning)?
+        {
+            load.with_progressive_head(definition)
+                .map_err(PlanError::InvalidDefinition)?
+        } else {
+            load
+        };
         let programs = load.program_plan(definition, codec)?;
         let target = ArtifactComponent {
             kind: ArtifactComponentKind::Target,
