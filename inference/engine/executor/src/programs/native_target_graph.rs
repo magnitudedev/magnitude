@@ -435,7 +435,7 @@ impl PreparedTargetGraphs {
                     let block = PreparedTargetBlockGraph::prepare(device, handle, tap,
                         plan.blocks()[index].per_layer(),
                         load, geometry, state, index, rows, segments, slots,
-                        &certificate.blocks[index][&RowForm::of(rows)])
+                        &certificate.blocks[index][&RowForm::of(rows)], None)
                         .map_err(|error| format!(
                             "target graph row class {rows}, history segments {segments}, request slots {slots}, block {index}: {error}"
                         ))?;
@@ -541,31 +541,21 @@ impl PreparedTargetGraphs {
         for (index, graphs) in self.blocks_by_class.iter().enumerate() {
             let mut block_bound = BTreeMap::new();
             for (class, graph) in graphs {
-                let constant_tensors = graph
-                    .constants
-                    .iter()
-                    .map(|constant| Ok((constant.port(), constants.tensor(constant)?)))
-                    .collect::<Result<Vec<_>, String>>()?;
-                let fixed = graph
+                let fixed_weights = graph
                     .weights
                     .iter()
-                    .map(|(weight, port)| {
-                        // A graph shared by equal-shape blocks names the
-                        // roles of the block it was prepared for; each block
-                        // binds its own.
+                    .map(|(weight, _)| {
+                        // Equal-shape blocks share a graph but bind their own roles.
                         let role = block_role(weight.role, index)?;
-                        Ok((port, weight.part.of(resident.sublayers.get(role)?)?))
+                        weight.part.of(resident.sublayers.get(role)?).cloned()
                     })
-                    .chain(
-                        constant_tensors
-                            .iter()
-                            .map(|(port, tensor)| Ok((*port, tensor))),
-                    )
                     .collect::<Result<Vec<_>, String>>()?;
                 block_bound.insert(
                     *class,
-                    graph.plan.bind_static(&fixed).map_err(|error| {
-                        format!(
+                    graph
+                        .bind_resolved_weights(&fixed_weights, &mut constants)
+                        .map_err(|error| {
+                            format!(
                             "target graph static binding class {class:?} block {index}: {error}"
                         )
                     })?,
@@ -816,7 +806,7 @@ pub(crate) struct PreparedTargetEntryGraph {
 }
 
 impl PreparedTargetEntryGraph {
-    fn prepare(
+    pub(crate) fn prepare(
         device: &Device,
         embedding: &seismic::NativeKernel<embedding_rows::Entry>,
         load: &ModelLoadPlan,
@@ -843,6 +833,36 @@ impl PreparedTargetEntryGraph {
             hidden,
         })
     }
+}
+
+/// Certify the same entry topology for ordinary and projected stage families.
+pub(crate) fn certify_entry_layout(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &Decoder,
+    row_classes: &[u64],
+    source: EntryTokens,
+) -> Result<NativeGraphLayout, GraphError> {
+    let largest_rows = *row_classes.last().ok_or("entry row classes are empty")?;
+    let weight = embedding_weight(load)?;
+    let elements = [("EW", weight.resident), ("A", activation(geometry))];
+    let (graph, _, _, _) = entry_graph_topology(
+        NativeGraphMetadata::new_template(backend),
+        &elements,
+        weight,
+        geometry,
+        largest_rows,
+        source,
+    )?;
+    let layout = graph
+        .seal_template()
+        .and_then(|template| {
+            template.certify(&[
+                NativeGraphClassSlice::new().dimension("M", row_classes.iter().copied())
+            ])
+        })
+        .map_err(|error| format!("target entry graph: {error}"))?;
+    Ok(layout)
 }
 
 fn embedding_weight(load: &ModelLoadPlan) -> Result<&crate::WeightPlan, String> {
@@ -1093,6 +1113,38 @@ pub(crate) fn activation(geometry: &Decoder) -> Element {
 }
 
 impl PreparedTargetBlockGraph {
+    /// Bind resolved local weights and the graph's shared constant cache through
+    /// one static-binding path for ordinary and projected decoder graphs.
+    pub(crate) fn bind_resolved_weights(
+        &self,
+        weights: &[seismic::Tensor],
+        constants: &mut ConstantTensors,
+    ) -> Result<BoundNativeGraphPlan, String> {
+        if weights.len() != self.weights.len() {
+            return Err("resolved weights differ from graph ports".into());
+        }
+        let fixed_constants = self
+            .constants
+            .iter()
+            .map(|constant| constants.tensor(constant))
+            .collect::<Result<Vec<_>, _>>()?;
+        let fixed = self
+            .weights
+            .iter()
+            .zip(weights)
+            .map(|((_, port), tensor)| (port, tensor))
+            .chain(
+                self.constants
+                    .iter()
+                    .zip(&fixed_constants)
+                    .map(|(constant, tensor)| (constant.port(), tensor)),
+            )
+            .collect::<Vec<_>>();
+        self.plan
+            .bind_static(&fixed)
+            .map_err(|error| error.to_string())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn prepare<'a>(
         device: &Device,
@@ -1107,6 +1159,7 @@ impl PreparedTargetBlockGraph {
         segments: u64,
         slots: u64,
         layout: &NativeGraphLayout,
+        stage: Option<&magnitude_state::StageModelView<'_>>,
     ) -> Result<Self, String> {
         let mut graph = device.native_graph_with_layout(layout);
         let mut weights = Vec::new();
@@ -1133,6 +1186,7 @@ impl PreparedTargetBlockGraph {
                 geometry,
                 state,
                 block_index,
+                stage,
                 rows,
                 segments,
                 slots,
@@ -1164,6 +1218,7 @@ struct BlockGraphInputs<'a> {
     geometry: &'a Decoder,
     state: &'a StateResourcePlan,
     block_index: usize,
+    stage: Option<&'a magnitude_state::StageModelView<'a>>,
     rows: u64,
     segments: u64,
     slots: u64,
@@ -1199,6 +1254,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         geometry,
         state,
         block_index,
+        stage,
         rows,
         segments,
         slots,
@@ -1209,12 +1265,30 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         .get(block_index)
         .ok_or("target block geometry is absent")?;
     let paired = paired_block(block).map_err(|error| error.to_string())?;
+    let component_index = match stage {
+        Some(view) => {
+            if !state.matches_stage(view, load) {
+                return Err("stage state projection differs from execution view".into());
+            }
+            if !std::ptr::eq(view.decoder(), geometry) {
+                return Err("stage references a different decoder".into());
+            }
+            let (local, _, _) = view
+                .layers()
+                .find(|(_, global, _)| global.index() as usize == block_index)
+                .ok_or("global block is outside the stage")?;
+            operators::bank_component_index(view.blocks(), local.index())
+        }
+        None => operators::bank_component_index(&geometry.blocks, block_index),
+    }
+    .map_err(|error| error.to_string())?;
     let sublayers = block::BlockSublayers {
         paired: &paired,
         load,
         geometry,
         state,
         block_index,
+        component_index,
         rows,
         segments,
         slots,
@@ -1254,6 +1328,33 @@ fn block_graph<'a, G: GraphDraft + 'a>(
 /// without forming kernels or allocating device storage.
 #[allow(clippy::too_many_arguments)]
 fn checked_block_graph_draft(
+    graph: NativeGraphMetadata,
+    load: &ModelLoadPlan,
+    geometry: &Decoder,
+    state: &StateResourcePlan,
+    slot: TargetBlockProgramSlot,
+    tap: Option<(u64, TapPositions)>,
+    block_index: usize,
+    rows: u64,
+    segments: u64,
+    slots: u64,
+) -> Result<(NativeGraphMetadata, Vec<GraphConstant>), GraphError> {
+    checked_block_graph_draft_with_stage(
+        graph,
+        load,
+        geometry,
+        state,
+        slot,
+        tap,
+        block_index,
+        rows,
+        segments,
+        slots,
+        None,
+    )
+}
+
+fn checked_block_graph_draft_with_stage(
     mut graph: NativeGraphMetadata,
     load: &ModelLoadPlan,
     geometry: &Decoder,
@@ -1264,6 +1365,7 @@ fn checked_block_graph_draft(
     rows: u64,
     segments: u64,
     slots: u64,
+    stage: Option<&magnitude_state::StageModelView<'_>>,
 ) -> Result<(NativeGraphMetadata, Vec<GraphConstant>), GraphError> {
     let mut weights = Vec::new();
     let mut constants = Vec::new();
@@ -1300,6 +1402,7 @@ fn checked_block_graph_draft(
             geometry,
             state,
             block_index,
+            stage,
             rows,
             segments,
             slots,
@@ -1405,24 +1508,7 @@ fn certify_target_family(
     let mut entries = BTreeMap::new();
     let largest_rows = *row_classes.last().expect("row classes are nonempty");
     for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
-        let weight = embedding_weight(load)?;
-        let elements = [("EW", weight.resident), ("A", activation(geometry))];
-        let (graph, _, _, _) = entry_graph_topology(
-            NativeGraphMetadata::new_template(backend),
-            &elements,
-            weight,
-            geometry,
-            largest_rows,
-            source,
-        )?;
-        let layout = graph
-            .seal_template()
-            .and_then(|template| {
-                template.certify(&[
-                    NativeGraphClassSlice::new().dimension("M", row_classes.iter().copied())
-                ])
-            })
-            .map_err(|error| format!("target entry graph: {error}"))?;
+        let layout = certify_entry_layout(backend, load, geometry, &row_classes, source)?;
         family.include(layout.storage_bytes(), []);
         entries.insert(source, layout);
     }
@@ -1532,9 +1618,275 @@ fn tap_buffer_bytes(width: Option<u64>, rows: u64, geometry: &Decoder) -> Result
     })
 }
 
+// Checked original-role graph projection. No partition search, residency
+// or physical completion is certified by this metadata value.
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+pub(crate) struct StageBlockCertificate {
+    pub(crate) local: magnitude_state::StageLayerOrdinal,
+    pub(crate) global: magnitude_state::GlobalLayerId,
+    pub(crate) layouts: BTreeMap<RowForm, NativeGraphLayout>,
+}
+
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+pub(crate) struct StageBlocksCertificate {
+    pub(crate) blocks: Vec<StageBlockCertificate>,
+    pub(crate) resources: CheckedGraphResources,
+}
+
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+pub(crate) fn certify_stage_blocks(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    view: &magnitude_state::StageModelView<'_>,
+    state: &StateResourcePlan,
+    plan: &TargetProgramPlan,
+    limits: ResourceLimits,
+) -> Result<StageBlocksCertificate, GraphError> {
+    if plan.blocks().len() != view.decoder().blocks.len() {
+        return Err("stage requires the original whole-model slot plan".into());
+    }
+    if !state.matches_stage(view, load) {
+        return Err("stage state projection differs from execution view".into());
+    }
+    if plan.taps().is_some() || plan.per_layer().is_some() || limits.lookahead {
+        return Err("pipeline execution excludes taps, per-layer inputs and lookahead".into());
+    }
+    let rows = magnitude_batching::row_classes(limits.max_launch_rows);
+    if rows.is_empty() || limits.max_launch_slots == 0 {
+        return Err("stage has no positive launch class".into());
+    }
+    let max_slots = limits.max_launch_slots as u64;
+    let max_segments = state
+        .target_state()
+        .span_limit()
+        .checked_next_power_of_two()
+        .ok_or("stage history class overflows")? as u64;
+    let mut family = CheckedGraphFamilyResources::new();
+    let mut blocks = Vec::new();
+    for (local, global, block) in view.layers() {
+        let paired = paired_block(block).map_err(|error| error.to_string())?;
+        let mut regimes = BTreeMap::<RowForm, Vec<u64>>::new();
+        for &row in &rows {
+            regimes
+                .entry(RowForm::of(row as u64))
+                .or_default()
+                .push(row as u64);
+        }
+        let mut layouts = BTreeMap::new();
+        for (form, classes) in regimes {
+            let (graph, constants) = checked_block_graph_draft_with_stage(
+                NativeGraphMetadata::new_template(backend),
+                load,
+                view.decoder(),
+                state,
+                plan.blocks()[global.index() as usize],
+                None,
+                global.index() as usize,
+                *classes.last().expect("regime is nonempty"),
+                1,
+                1,
+                Some(view),
+            )?;
+            let slices = classes
+                .iter()
+                .map(|&row| block_class_slice(&paired, row, max_slots, max_segments))
+                .collect::<Result<Vec<_>, _>>()?;
+            let layout = graph.seal_template()?.certify(&slices)?;
+            family.include(layout.storage_bytes(), constants);
+            layouts.insert(form, layout);
+        }
+        for &row in &rows {
+            family.include(
+                NativeGraphStorageBytes {
+                    workspace: 0,
+                    output: 0,
+                    upload: 0,
+                },
+                block::class_constants_of(&paired, view.decoder().hidden, row as u64)?,
+            );
+        }
+        blocks.push(StageBlockCertificate {
+            local,
+            global,
+            layouts,
+        });
+    }
+    Ok(StageBlocksCertificate {
+        blocks,
+        resources: family.finish()?,
+    })
+}
+
 #[cfg(test)]
 mod resource_template_tests {
     use super::*;
+    #[test]
+    fn shared_entry_certificate_covers_uploaded_and_selected_row_classes() {
+        let (definition, manifest) = crate::assessment::fixtures::declared_model(
+            &crate::assessment::fixtures::QWEN35_CONFIGURATIONS[0],
+        );
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            crate::ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            crate::resident_layout(crate::ExecutionPath::Native, BackendName::Cuda),
+        )
+        .unwrap();
+        assert!(certify_entry_layout(
+            BackendName::Cuda,
+            &load,
+            &definition.decoder,
+            &[],
+            EntryTokens::Uploaded
+        )
+        .is_err());
+        for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
+            let layout = certify_entry_layout(
+                BackendName::Cuda,
+                &load,
+                &definition.decoder,
+                &[1, 2],
+                source,
+            )
+            .unwrap();
+            for rows in [1, 2] {
+                let exact = checked_entry_graph_storage(
+                    BackendName::Cuda,
+                    &load,
+                    &definition.decoder,
+                    rows,
+                    source == EntryTokens::Uploaded,
+                )
+                .unwrap();
+                let bound = layout.storage_bytes();
+                assert!(exact.workspace <= bound.workspace);
+                assert!(exact.output <= bound.output);
+                assert!(exact.upload <= bound.upload);
+                assert!(exact.output > 0);
+                assert_eq!(exact.upload > 0, source == EntryTokens::Uploaded);
+            }
+        }
+    }
+
+    #[test]
+    fn projected_graph_certificates_preserve_global_roles_and_local_state() {
+        let mut configuration = crate::assessment::fixtures::QWEN35_CONFIGURATIONS[0];
+        configuration.blocks = 2 * configuration.attention_interval;
+        let (definition, manifest) = crate::assessment::fixtures::declared_model(&configuration);
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            crate::ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            crate::resident_layout(crate::ExecutionPath::Native, BackendName::Cuda),
+        )
+        .unwrap();
+        let limits = ResourceLimits {
+            max_launch_rows: 2,
+            max_launch_slots: 1,
+            max_selected_rows: 1,
+            max_drafting_slots: 1,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            lookahead: false,
+        };
+        let capacity = crate::ResourceCapacity {
+            domain_bytes: 64 * 1024 * 1024 * 1024,
+        };
+        let slots = load
+            .program_plan(&definition, magnitude_state::KvCodec::Dense)
+            .unwrap();
+        let mut states = Vec::new();
+        for range in [0..3, 3..8] {
+            let view =
+                magnitude_state::StageModelView::new(&definition.decoder, range.clone()).unwrap();
+            let state = crate::ResourcePlanner::stage_state_plan(
+                &definition,
+                &load,
+                magnitude_state::KvCodec::Dense,
+                limits,
+                capacity,
+                range,
+            )
+            .unwrap();
+            let certificate = certify_stage_blocks(
+                BackendName::Cuda,
+                &load,
+                &view,
+                &state,
+                slots.target(),
+                limits,
+            )
+            .unwrap();
+            assert_eq!(certificate.blocks.len(), view.blocks().len());
+            assert!(certificate.resources.storage.workspace > 0);
+            for (entry, (local, global, _)) in certificate.blocks.iter().zip(view.layers()) {
+                assert_eq!((entry.local, entry.global), (local, global));
+                for rows in [1, 2] {
+                    assert!(entry.layouts.contains_key(&RowForm::of(rows)));
+                    let (graph, _) = checked_block_graph_draft_with_stage(
+                        NativeGraphMetadata::new(BackendName::Cuda),
+                        &load,
+                        &definition.decoder,
+                        &state,
+                        slots.target().blocks()[global.index() as usize],
+                        None,
+                        global.index() as usize,
+                        rows,
+                        1,
+                        1,
+                        Some(&view),
+                    )
+                    .unwrap();
+                    GraphDraft::seal(graph).unwrap();
+                }
+            }
+            for global in [3, 7] {
+                assert_eq!(
+                    state
+                        .target_state()
+                        .layer_history(LayerRef::Target(global))
+                        .is_some(),
+                    view.contains(global)
+                );
+            }
+            states.push(state);
+        }
+        let suffix = magnitude_state::StageModelView::new(&definition.decoder, 3..8).unwrap();
+        assert!(certify_stage_blocks(
+            BackendName::Cuda,
+            &load,
+            &suffix,
+            &states[0],
+            slots.target(),
+            limits
+        )
+        .is_err());
+        let ordinary = crate::ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            crate::PlannedMethod::Plain,
+            magnitude_state::KvCodec::Dense,
+            limits,
+            capacity,
+        )
+        .unwrap();
+        assert!(certify_stage_blocks(
+            BackendName::Cuda,
+            &load,
+            &suffix,
+            &ordinary,
+            slots.target(),
+            limits
+        )
+        .is_err());
+    }
+
     use crate::{
         assessment::fixtures::{declared_model, QWEN35_CONFIGURATIONS},
         resident_layout, ComponentSelection, ExecutionPath, PlannedMethod, ResourceCapacity,

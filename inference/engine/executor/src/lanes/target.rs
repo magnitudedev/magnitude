@@ -337,6 +337,11 @@ impl ValidatedTargetLaunch {
         })
     }
 
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pub(crate) fn core(&self) -> &TargetLaunchCore {
+        &self.core
+    }
+
     pub fn class(&self) -> PoolClass {
         PoolClass::Target(self.core.batch.class())
     }

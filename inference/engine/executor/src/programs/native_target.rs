@@ -2,6 +2,9 @@
 //! queues one run per graph without waiting; the device queue orders them,
 //! and the returned submission owns the launch until completion is observed.
 
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+pub(crate) mod pipeline;
+
 use super::{
     graph::readout::{
         shapes, write_selection, BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind,
@@ -264,146 +267,18 @@ impl NativeTargetProgram {
         batch: &TargetBatchUpload<'_>,
         hidden: &Tensor,
         workspace: &mut NativeGraphWorkspaceLease,
-        mut output: NativeGraphOutputLease,
+        output: NativeGraphOutputLease,
         submitter: &mut StepSubmitter,
     ) -> Result<Option<TargetReadoutGraphResult>, SubmitError> {
-        let actual_outputs = batch.out_rows.len();
-        if actual_outputs == 0 {
-            return Ok(None);
-        }
-        let output_class = magnitude_batching::row_class(actual_outputs)
-            .ok_or_else(|| invalid("readout output rows have no class"))?;
-        let actual_selected = batch.select_rows.len();
-        let selected_class = if actual_selected == 0 {
-            0
-        } else {
-            magnitude_batching::row_class(actual_selected)
-                .ok_or_else(|| invalid("readout selected rows have no class"))?
-        };
-        // Projected outputs, the selected ones first and in selection order:
-        // shaping and sampling read the leading selected logits rows.
-        let mut projected_output_rows = Vec::new();
-        for &output_index in batch.select_rows {
-            projected_output_rows.push(
-                usize::try_from(output_index)
-                    .map_err(|_| invalid("negative selection output row"))?,
-            );
-        }
-        for (output_index, &row) in batch.out_rows.iter().enumerate() {
-            let row = usize::try_from(row).map_err(|_| invalid("negative readout row"))?;
-            let demand = batch
-                .demand
-                .get(row)
-                .and_then(|bits| Demand::from_bits(*bits))
-                .ok_or_else(|| invalid("readout demand is absent or invalid"))?;
-            let selected = projected_output_rows[..actual_selected].contains(&output_index);
-            if demand.computes_logits() && !selected {
-                projected_output_rows.push(output_index);
-            } else if selected && !demand.computes_logits() {
-                return Err(invalid("selection row has no projected logits"));
-            }
-        }
-        let actual_projected = projected_output_rows.len();
-        if actual_projected > self.readout_graphs.prepared.max_projected_rows() {
-            return Err(invalid(format!(
-                "readout requests {actual_projected} logits rows; admitted maximum is {}",
-                self.readout_graphs.prepared.max_projected_rows()
-            )));
-        }
-        let projected_class = if actual_projected == 0 {
-            0
-        } else {
-            magnitude_batching::row_class(actual_projected)
-                .ok_or_else(|| invalid("readout projected rows have no class"))?
-        };
-        let kind = if actual_selected > 0 {
-            ReadoutKind::Selection {
-                shaped: batch.shaping[..actual_selected].iter().any(shapes),
-            }
-        } else if actual_projected > 0 {
-            ReadoutKind::Logits
-        } else {
-            ReadoutKind::Features
-        };
-        let class = ReadoutClass {
-            rows: batch.class.rows() as u64,
-            outputs: output_class as u64,
-            projected: projected_class as u64,
-            selected: selected_class as u64,
-            kind,
-        };
-        let (graph, bound) = self.readout_graphs.class(class).map_err(invalid)?;
-        let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
-        let tap_rows = graph
-            .taps
-            .as_ref()
-            .map(|_| self.tap_rows(class.rows))
-            .transpose()?;
-        let mut bindings = bound.bindings();
-        if let Some(rows) = &graph.final_rows {
-            bindings.set(&rows.hidden, hidden).map_err(device)?;
-        }
-        if let (Some(ports), Some(tap_rows)) = (&graph.taps, &tap_rows) {
-            bindings.set(&ports.taps, tap_rows).map_err(device)?;
-        }
-        let mut out_rows = vec![0_i32; output_class];
-        out_rows[..actual_outputs].copy_from_slice(batch.out_rows);
-        active
-            .write_input(&graph.out_rows, &i32_bytes(&out_rows))
-            .map_err(device)?;
-        if let Some(port) = &graph.logit_rows {
-            // The head gathers the hidden rows of the projected outputs.
-            let mut rows = vec![0_i32; projected_class];
-            for (index, &output_index) in projected_output_rows.iter().enumerate() {
-                rows[index] = *batch
-                    .out_rows
-                    .get(output_index)
-                    .ok_or_else(|| invalid("projected output row exceeds output rows"))?;
-            }
-            active
-                .write_input(port, &i32_bytes(&rows))
-                .map_err(device)?;
-        }
-        if let Some(ports) = &graph.selection {
-            write_selection(batch, &mut active, ports, selected_class, batch.mask_words)?;
-        }
-        let ready = active
-            .attach(
-                bindings,
-                output
-                    .activate(&graph.plan)
-                    .map_err(SubmitError::Invariant)?,
-            )
-            .map_err(device)?;
-        let outputs = submitter.queue(ready)?;
-        let owner = output.publish(outputs);
-        let features = owner
-            .tensor(&graph.features)
-            .ok_or_else(|| invalid("readout features were not exported"))?;
-        let logits = graph
-            .logits
-            .as_ref()
-            .map(|edge| {
-                owner
-                    .tensor(edge)
-                    .ok_or_else(|| invalid("readout logits were not exported"))
-            })
-            .transpose()?;
-        let selected = graph
-            .selected
-            .as_ref()
-            .map(|edge| {
-                owner
-                    .tensor(edge)
-                    .ok_or_else(|| invalid("readout selection was not exported"))
-            })
-            .transpose()?;
-        Ok(Some(TargetReadoutGraphResult {
-            features,
-            logits,
-            selected,
-            projected_output_rows,
-        }))
+        queue_readout(
+            &self.readout_graphs,
+            |rows| self.tap_rows(rows),
+            batch,
+            hidden,
+            workspace,
+            output,
+            submitter,
+        )
     }
 
     /// The leading `rows` draft input rows of a tapped target.
@@ -762,72 +637,16 @@ impl NativeTargetProgram {
                     }
                 }
             }
-            match (&graph.state, &graph.controls) {
-                (
-                    BlockStatePorts::Attention(ports),
-                    BlockControlPorts::Attention {
-                        coordinates,
-                        visible,
-                        fresh,
-                        destinations,
-                    },
-                ) => {
-                    let (read, history) = state.history(LayerRef::Target(index as u32))?;
-                    if history.len() != ports.len() {
-                        return Err(invalid(
-                            "the layer's history planes disagree with its attention entry",
-                        ));
-                    }
-                    for (port, plane) in ports.iter().zip(history) {
-                        bindings.set(port, plane).map_err(device)?;
-                    }
-                    let history_controls = controls
-                        .histories
-                        .get(read)
-                        .ok_or_else(|| invalid("the batch lacks the layer's history read"))?;
-                    active
-                        .write_input(coordinates, &controls.coordinates)
-                        .map_err(device)?;
-                    active
-                        .write_input(visible, &history_controls.visible)
-                        .map_err(device)?;
-                    active
-                        .write_input(fresh, &history_controls.fresh)
-                        .map_err(device)?;
-                    active
-                        .write_input(destinations, &history_controls.destinations)
-                        .map_err(device)?;
-                }
-                (BlockStatePorts::Recurrent(ports), BlockControlPorts::Recurrent(recurrent)) => {
-                    let arenas = state.recurrent_arenas()?;
-                    for (offset, port) in ports.iter().enumerate() {
-                        bindings
-                            .set(
-                                port,
-                                arenas
-                                    .get(recurrent_component + offset)
-                                    .ok_or_else(|| invalid("recurrent bank arena is absent"))?,
-                            )
-                            .map_err(device)?;
-                    }
-                    active
-                        .write_input(&recurrent.segments, &controls.segments)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.stop, &controls.stop)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.previous_bank, &controls.previous_bank)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.previous_tape, &controls.previous_tape)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.following_bank, &controls.following_bank)
-                        .map_err(device)?;
-                }
-                _ => return Err(invalid("sealed graph block state and controls disagree")),
-            }
+            bind_block_state(
+                state,
+                &controls,
+                LayerRef::Target(index as u32),
+                recurrent_component,
+                &graph.state,
+                &graph.controls,
+                &mut active,
+                &mut bindings,
+            )?;
             let ready = active
                 .attach(
                     bindings,
@@ -886,6 +705,238 @@ impl NativeTargetProgram {
             },
         ))
     }
+}
+
+/// Shared ordinary readout and sampling semantics. A stage supplies its
+/// bound endpoint family; no alternative numerical or selection path exists.
+fn queue_readout(
+    readout_graphs: &BoundTargetReadoutGraphs,
+    tap_rows: impl Fn(u64) -> Result<Tensor, SubmitError>,
+    batch: &TargetBatchUpload<'_>,
+    hidden: &Tensor,
+    workspace: &mut NativeGraphWorkspaceLease,
+    mut output: NativeGraphOutputLease,
+    submitter: &mut StepSubmitter,
+) -> Result<Option<TargetReadoutGraphResult>, SubmitError> {
+    let actual_outputs = batch.out_rows.len();
+    if actual_outputs == 0 {
+        return Ok(None);
+    }
+    let output_class = magnitude_batching::row_class(actual_outputs)
+        .ok_or_else(|| invalid("readout output rows have no class"))?;
+    let actual_selected = batch.select_rows.len();
+    let selected_class = if actual_selected == 0 {
+        0
+    } else {
+        magnitude_batching::row_class(actual_selected)
+            .ok_or_else(|| invalid("readout selected rows have no class"))?
+    };
+    // Projected outputs, the selected ones first and in selection order:
+    // shaping and sampling read the leading selected logits rows.
+    let mut projected_output_rows = Vec::new();
+    for &output_index in batch.select_rows {
+        projected_output_rows.push(
+            usize::try_from(output_index).map_err(|_| invalid("negative selection output row"))?,
+        );
+    }
+    for (output_index, &row) in batch.out_rows.iter().enumerate() {
+        let row = usize::try_from(row).map_err(|_| invalid("negative readout row"))?;
+        let demand = batch
+            .demand
+            .get(row)
+            .and_then(|bits| Demand::from_bits(*bits))
+            .ok_or_else(|| invalid("readout demand is absent or invalid"))?;
+        let selected = projected_output_rows[..actual_selected].contains(&output_index);
+        if demand.computes_logits() && !selected {
+            projected_output_rows.push(output_index);
+        } else if selected && !demand.computes_logits() {
+            return Err(invalid("selection row has no projected logits"));
+        }
+    }
+    let actual_projected = projected_output_rows.len();
+    if actual_projected > readout_graphs.prepared.max_projected_rows() {
+        return Err(invalid(format!(
+            "readout requests {actual_projected} logits rows; admitted maximum is {}",
+            readout_graphs.prepared.max_projected_rows()
+        )));
+    }
+    let projected_class = if actual_projected == 0 {
+        0
+    } else {
+        magnitude_batching::row_class(actual_projected)
+            .ok_or_else(|| invalid("readout projected rows have no class"))?
+    };
+    let kind = if actual_selected > 0 {
+        ReadoutKind::Selection {
+            shaped: batch.shaping[..actual_selected].iter().any(shapes),
+        }
+    } else if actual_projected > 0 {
+        ReadoutKind::Logits
+    } else {
+        ReadoutKind::Features
+    };
+    let class = ReadoutClass {
+        rows: batch.class.rows() as u64,
+        outputs: output_class as u64,
+        projected: projected_class as u64,
+        selected: selected_class as u64,
+        kind,
+    };
+    let (graph, bound) = readout_graphs.class(class).map_err(invalid)?;
+    let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
+    let tap_rows = graph
+        .taps
+        .as_ref()
+        .map(|_| tap_rows(class.rows))
+        .transpose()?;
+    let mut bindings = bound.bindings();
+    if let Some(rows) = &graph.final_rows {
+        bindings.set(&rows.hidden, hidden).map_err(device)?;
+    }
+    if let (Some(ports), Some(tap_rows)) = (&graph.taps, &tap_rows) {
+        bindings.set(&ports.taps, tap_rows).map_err(device)?;
+    }
+    let mut out_rows = vec![0_i32; output_class];
+    out_rows[..actual_outputs].copy_from_slice(batch.out_rows);
+    active
+        .write_input(&graph.out_rows, &i32_bytes(&out_rows))
+        .map_err(device)?;
+    if let Some(port) = &graph.logit_rows {
+        // The head gathers the hidden rows of the projected outputs.
+        let mut rows = vec![0_i32; projected_class];
+        for (index, &output_index) in projected_output_rows.iter().enumerate() {
+            rows[index] = *batch
+                .out_rows
+                .get(output_index)
+                .ok_or_else(|| invalid("projected output row exceeds output rows"))?;
+        }
+        active
+            .write_input(port, &i32_bytes(&rows))
+            .map_err(device)?;
+    }
+    if let Some(ports) = &graph.selection {
+        write_selection(batch, &mut active, ports, selected_class, batch.mask_words)?;
+    }
+    let ready = active
+        .attach(
+            bindings,
+            output
+                .activate(&graph.plan)
+                .map_err(SubmitError::Invariant)?,
+        )
+        .map_err(device)?;
+    let outputs = submitter.queue(ready)?;
+    let owner = output.publish(outputs);
+    let features = owner
+        .tensor(&graph.features)
+        .ok_or_else(|| invalid("readout features were not exported"))?;
+    let logits = graph
+        .logits
+        .as_ref()
+        .map(|edge| {
+            owner
+                .tensor(edge)
+                .ok_or_else(|| invalid("readout logits were not exported"))
+        })
+        .transpose()?;
+    let selected = graph
+        .selected
+        .as_ref()
+        .map(|edge| {
+            owner
+                .tensor(edge)
+                .ok_or_else(|| invalid("readout selection was not exported"))
+        })
+        .transpose()?;
+    Ok(Some(TargetReadoutGraphResult {
+        features,
+        logits,
+        selected,
+        projected_output_rows,
+    }))
+}
+
+/// Common state/control binding: global layer identity selects KV, while the
+/// caller's component offset selects local recurrent storage. Both ordinary
+/// and projected graphs consume the same checked launch tables here.
+#[allow(clippy::too_many_arguments)]
+fn bind_block_state(
+    state: &RowState<'_>,
+    controls: &GraphControls,
+    layer: LayerRef,
+    recurrent_component: usize,
+    ports: &BlockStatePorts,
+    control_ports: &BlockControlPorts,
+    active: &mut seismic::NativeGraphFamilyActive<'_>,
+    bindings: &mut seismic::NativeGraphBindings,
+) -> Result<(), SubmitError> {
+    match (ports, control_ports) {
+        (
+            BlockStatePorts::Attention(ports),
+            BlockControlPorts::Attention {
+                coordinates,
+                visible,
+                fresh,
+                destinations,
+            },
+        ) => {
+            let (read, history) = state.history(layer)?;
+            if history.len() != ports.len() {
+                return Err(invalid(
+                    "the layer's history planes disagree with its attention entry",
+                ));
+            }
+            for (port, plane) in ports.iter().zip(history) {
+                bindings.set(port, plane).map_err(device)?;
+            }
+            let history_controls = controls
+                .histories
+                .get(read)
+                .ok_or_else(|| invalid("the batch lacks the layer's history read"))?;
+            active
+                .write_input(coordinates, &controls.coordinates)
+                .map_err(device)?;
+            active
+                .write_input(visible, &history_controls.visible)
+                .map_err(device)?;
+            active
+                .write_input(fresh, &history_controls.fresh)
+                .map_err(device)?;
+            active
+                .write_input(destinations, &history_controls.destinations)
+                .map_err(device)?;
+        }
+        (BlockStatePorts::Recurrent(ports), BlockControlPorts::Recurrent(recurrent)) => {
+            let arenas = state.recurrent_arenas()?;
+            for (offset, port) in ports.iter().enumerate() {
+                bindings
+                    .set(
+                        port,
+                        arenas
+                            .get(recurrent_component + offset)
+                            .ok_or_else(|| invalid("recurrent bank arena is absent"))?,
+                    )
+                    .map_err(device)?;
+            }
+            active
+                .write_input(&recurrent.segments, &controls.segments)
+                .map_err(device)?;
+            active
+                .write_input(&recurrent.stop, &controls.stop)
+                .map_err(device)?;
+            active
+                .write_input(&recurrent.previous_bank, &controls.previous_bank)
+                .map_err(device)?;
+            active
+                .write_input(&recurrent.previous_tape, &controls.previous_tape)
+                .map_err(device)?;
+            active
+                .write_input(&recurrent.following_bank, &controls.following_bank)
+                .map_err(device)?;
+        }
+        _ => return Err(invalid("sealed graph block state and controls disagree")),
+    }
+    Ok(())
 }
 
 struct GraphControls {

@@ -51,6 +51,12 @@ pub trait ProgramFamily: 'static {
         Ok(0)
     }
 
+    /// Preallocated device-local activation handoff storage, not weights or
+    /// graph constants. Ordinary single-device families require none.
+    fn activation_transfer_bytes(&self) -> u64 {
+        0
+    }
+
     fn optional_constant_bytes(&self) -> Result<u64, &'static str> {
         Ok(0)
     }
@@ -59,6 +65,18 @@ pub trait ProgramFamily: 'static {
         self.target_constant_bytes()?
             .checked_add(self.optional_constant_bytes()?)
             .ok_or("bound graph constant charge overflows")
+    }
+
+    /// Explicit paired submission is never a fallback for ordinary target work.
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    fn submit_pipeline_target(
+        &mut self,
+        _launch: crate::pipeline::ValidatedPipelineLaunch,
+    ) -> Result<(Self::TargetSubmission, magnitude_state::OwnedStateAdvance), SubmitError> {
+        Err(SubmitError::Invariant(crate::InvariantError {
+            context: "pipeline program family",
+            detail: "this family does not support explicit two-stage submission".into(),
+        }))
     }
 
     fn submit_target(

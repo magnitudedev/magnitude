@@ -1964,6 +1964,25 @@ impl AttestedPrograms {
     pub fn qualification(&self) -> &QualificationReport {
         &self.report
     }
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pub(crate) fn stage_state(&self) -> &AttestedState {
+        &self.state
+    }
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pub(crate) fn stage_target(&self) -> &AttestedTarget {
+        &self.target
+    }
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pub(crate) fn stage_block(
+        &self,
+        global: magnitude_state::GlobalLayerId,
+    ) -> Result<&AttestedTargetBlock, String> {
+        self.target
+            .blocks
+            .get(global.index() as usize)
+            .ok_or_else(|| "original attested target block is absent".into())
+    }
+
     pub fn belongs_to(&self, device: &Device) -> bool {
         self.owner.belongs_to(device)
     }

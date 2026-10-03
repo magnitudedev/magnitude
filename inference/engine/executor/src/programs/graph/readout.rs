@@ -303,24 +303,36 @@ impl PreparedTargetReadoutGraphs {
         self,
         resident: &ResidentTarget,
     ) -> Result<BoundTargetReadoutGraphs, String> {
+        self.bind_parts(
+            &resident.output_norm,
+            &resident.output,
+            resident.fusion.as_ref(),
+        )
+    }
+
+    /// Endpoint binding also serves a projected final stage, which must not
+    /// manufacture an unrelated full-model resident owner.
+    pub(crate) fn bind_parts(
+        self,
+        norm: &crate::ResidentWeight,
+        output: &crate::ResidentWeight,
+        fusion: Option<&crate::resident_weights::ResidentFusion>,
+    ) -> Result<BoundTargetReadoutGraphs, String> {
         let mut bound = BTreeMap::new();
         for (class, graph) in &self.classes {
             let mut fixed = Vec::new();
-            let absent_scale = seismic::Tensor::from_host(
-                &resident.output.tensor().device(), Element::f32(), &[0], &[],
-            ).map_err(|error| error.to_string())?;
+            let absent_scale =
+                seismic::Tensor::from_host(&output.tensor().device(), Element::f32(), &[0], &[])
+                    .map_err(|error| error.to_string())?;
             if let Some(rows) = &graph.final_rows {
-                fixed.push((&rows.norm, resident.output_norm.tensor()));
+                fixed.push((&rows.norm, norm.tensor()));
             }
             if let Some((weight, scale)) = &graph.weight {
-                fixed.push((weight, resident.output.tensor()));
-                fixed.push((scale, resident.output.scale().unwrap_or(&absent_scale)));
+                fixed.push((weight, output.tensor()));
+                fixed.push((scale, output.scale().unwrap_or(&absent_scale)));
             }
             if let Some(taps) = &graph.taps {
-                let fusion = resident
-                    .fusion
-                    .as_ref()
-                    .ok_or("a tapped readout has no resident draft fusion")?;
+                let fusion = fusion.ok_or("a tapped readout has no resident draft fusion")?;
                 fixed.push((&taps.fusion, fusion.projection.tensor()));
                 fixed.push((
                     &taps.fusion_scale,

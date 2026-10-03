@@ -454,7 +454,14 @@ pub(crate) mod tests {
         };
         let mut below = plan.clone();
         below.domain_capacity_bytes = plan.startup_peak_bytes() - 1;
-        assert!(below.validate().unwrap_err().contains("startup peak"));
+        assert_eq!(
+            below.validate().unwrap_err(),
+            crate::PlanError::Resource(crate::CapacityError {
+                resource: crate::ResourceKind::DeviceMemory,
+                required: plan.startup_peak_bytes(),
+                available: plan.startup_peak_bytes() - 1,
+            })
+        );
         let mut exact = plan;
         exact.domain_capacity_bytes = exact.startup_peak_bytes();
         let admitted_bytes = exact.domain_capacity_bytes;
@@ -464,3 +471,6 @@ pub(crate) mod tests {
         );
     }
 }
+
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+pub(crate) use resources::StageResourceCharges;

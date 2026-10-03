@@ -11,6 +11,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         mut pending: PendingOperationOutcome,
         decision: PhysicalDecision,
     ) -> Result<(), DomainError> {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if self.pipeline_owner.is_some() && pending.pipeline_prefix.is_none() {
+            return Err(DomainError::invariant(
+                "paired domain cannot publish suffix-only state",
+            ));
+        }
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if pending.pipeline_prefix.is_some()
+            && (!matches!(pending.outcome, Outcome::Forward { .. }) || pending.primed.is_some())
+        {
+            return Err(DomainError::invariant(
+                "pipeline state cannot publish through a head, vision or primed result",
+            ));
+        }
         if matches!(pending.outcome, Outcome::Head { .. }) {
             // A head commits exactly its entry rows; its chained proposal
             // rows never become visible.
@@ -83,6 +97,37 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 "target outcome has no owned target advance",
             ));
         };
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(prefix) = pending.pipeline_prefix.take() {
+            if pending.primed.is_some() || self.pipeline_prefix.contains_key(&request) {
+                return Err(DomainError::invariant(
+                    "pipeline result has another state owner or primed work",
+                ));
+            }
+            let transaction = magnitude_state::PipelineStateAdvance::new(vec![prefix, advance])
+                .map_err(|failure| {
+                    let (advances, error) = *failure;
+                    self.restore_pipeline_sources(
+                        request,
+                        advances.into_iter().map(OwnedStateAdvance::abort).collect(),
+                    );
+                    DomainError::from(error)
+                })?;
+            // The complete physical pair must already have finished. Preflight
+            // both stores before either publication; releasing claims does not
+            // undo GPU writes. An error returns unchanged logical source states.
+            return match transaction.commit(decision.accepted_rows) {
+                Ok(state) => {
+                    self.restore_pipeline_sources(request, state.into_stages());
+                    Ok(())
+                }
+                Err(failure) => {
+                    let (state, error) = *failure;
+                    self.restore_pipeline_sources(request, state.into_stages());
+                    Err(error.into())
+                }
+            };
+        }
         // A prompt chunk commits whole, and its drafter entry with it.
         if let Some(primed) = pending.primed.take() {
             let rows = primed.rows();
@@ -117,6 +162,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Cancellation while completion is already available makes no physical
     /// successor visible and returns the original accepted sequence.
     pub fn abort(&mut self, pending: PendingOperationOutcome) -> Result<(), DomainError> {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        let mut pending = pending;
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(prefix) = pending.pipeline_prefix.take() {
+            if !matches!(pending.outcome, Outcome::Forward { .. })
+                || pending.primed.is_some()
+                || self.pipeline_prefix.contains_key(&pending.request)
+                || self.target.contains_key(&pending.request)
+            {
+                return Err(DomainError::invariant(
+                    "pipeline abort has incompatible output or another owner",
+                ));
+            }
+            let suffix = pending
+                .advance
+                .take()
+                .ok_or_else(|| DomainError::invariant("pipeline abort has no suffix advance"))?;
+            self.restore_pipeline_sources(pending.request, vec![prefix.abort(), suffix.abort()]);
+            return Ok(());
+        }
         let conflicting_owner = match &pending.outcome {
             Outcome::Head { .. } => self.head.contains_key(&pending.request),
             Outcome::Forward { .. } => {
@@ -149,5 +214,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         Ok(())
+    }
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pub(super) fn restore_pipeline_sources(
+        &mut self,
+        request: RequestId,
+        stages: Vec<SequenceState>,
+    ) {
+        let [prefix, suffix]: [SequenceState; 2] = stages
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("two-stage transaction retains exactly two sources"));
+        self.pipeline_prefix.insert(request, prefix);
+        self.target.insert(request, suffix);
     }
 }

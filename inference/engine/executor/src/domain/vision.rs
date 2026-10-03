@@ -108,6 +108,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .publish_graph_features(view)
             .map_err(|error| DomainError::invariant(error.to_string()))?;
         let pending = PendingOperationOutcome {
+            #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+            pipeline_prefix: None,
             request,
             outcome: Outcome::Encode { features },
             advance: None,

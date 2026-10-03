@@ -1,7 +1,7 @@
 use super::{source_import_peak_bytes, weight_bytes_by_component, ModelLoadPlan, PlannedMethod};
 use crate::{
-    PreparedDrafterGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs,
-    PreparedTargetReadoutGraphs, PreparedVisionGraphs,
+    PlanError, CapacityError, ResourceKind, PreparedDrafterGraphs, PreparedStateCopyGraphs,
+    PreparedTargetGraphs, PreparedTargetReadoutGraphs, PreparedVisionGraphs,
 };
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_state::{
@@ -131,6 +131,8 @@ pub struct ResourceBytes {
     /// Fixed native argument/result buffers owned by every attested entry.
     pub prepared_programs: u64,
     pub scratch: u64,
+    /// Preallocated device-local activation transport, never model weights.
+    pub activation_transfer: u64,
 }
 
 /// A Seismic-derived physical family charge at startup. The engine chooses
@@ -520,6 +522,7 @@ impl ResourceBytes {
             self.recurrent_banks,
             self.prepared_programs,
             self.scratch,
+            self.activation_transfer,
         ]
         .into_iter()
         .try_fold(0u64, |total, bytes| total.checked_add(bytes))
@@ -589,22 +592,24 @@ impl ResourcePlan {
         arena_bytes(&self.graph_charges())
     }
 
-    pub(super) fn validate(mut self) -> Result<Self, String> {
-        if self.bytes.scratch != graph_scratch_bytes(&self.graph_charges())? {
-            return Err(
+    pub(super) fn validate(mut self) -> Result<Self, PlanError> {
+        let planning = PlanError::ResourcePlanning;
+        if self.bytes.scratch != graph_scratch_bytes(&self.graph_charges()).map_err(planning)? {
+            return Err(planning(
                 "resource plan pooled byte charge differs from admitted Seismic footprints".into(),
-            );
+            ));
         }
-        self.steady_committed_bytes = self.bytes.total()?;
+        self.steady_committed_bytes = self.bytes.total().map_err(planning)?;
         self.startup_peak_bytes = self
             .steady_committed_bytes
             .checked_add(self.qualification_peak_bytes)
-            .ok_or("startup peak byte count overflow")?;
+            .ok_or_else(|| planning("startup peak byte count overflow".into()))?;
         if self.startup_peak_bytes > self.domain_capacity_bytes {
-            return Err(format!(
-                "resource plan startup peak {} exceeds {} bytes",
-                self.startup_peak_bytes, self.domain_capacity_bytes
-            ));
+            return Err(PlanError::Resource(CapacityError {
+                resource: ResourceKind::DeviceMemory,
+                required: self.startup_peak_bytes,
+                available: self.domain_capacity_bytes,
+            }));
         }
         Ok(self)
     }
@@ -661,12 +666,38 @@ pub struct StateResourcePlan {
     capacity: StateCapacityPlan,
     target_state: StateStorePlan,
     head_state: Option<StateStorePlan>,
+    target_layer_range: std::ops::Range<usize>,
     retained_entry_bytes: u64,
     history_bytes: u64,
     recurrent_banks_bytes: u64,
 }
 
 impl StateResourcePlan {
+    pub(crate) fn matches_stage(
+        &self,
+        view: &magnitude_state::StageModelView<'_>,
+        load: &ModelLoadPlan,
+    ) -> bool {
+        self.definition.decoder == *view.decoder()
+            && self.target_layer_range == view.global_range()
+            && self.load == *load
+    }
+
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pub(crate) fn is_for_stage(
+        &self,
+        definition: &ModelDefinition,
+        range: std::ops::Range<usize>,
+        load: &ModelLoadPlan,
+    ) -> bool {
+        self.definition == *definition && self.target_layer_range == range && self.load == *load
+    }
+
+    /// Original decoder range; component offsets remain local to this plan.
+    pub fn target_layer_range(&self) -> std::ops::Range<usize> {
+        self.target_layer_range.clone()
+    }
+
     pub fn limits(&self) -> ResourceLimits {
         self.limits
     }
@@ -706,6 +737,16 @@ impl StateResourcePlan {
     }
 }
 
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+pub(crate) struct StageResourceCharges {
+    pub target: NativeGraphCharge,
+    pub readout: NativeGraphCharge,
+    pub state: NativeGraphCharge,
+    pub constant_bytes: u64,
+    pub program_bytes: u64,
+    pub activation_bytes: u64,
+}
+
 impl ResourcePlanner {
     pub fn state_plan(
         definition: &ModelDefinition,
@@ -714,6 +755,57 @@ impl ResourcePlanner {
         codec: KvCodec,
         limits: ResourceLimits,
         capacity_bytes: ResourceCapacity,
+    ) -> Result<StateResourcePlan, String> {
+        Self::state_plan_with_stage(
+            definition,
+            load,
+            method,
+            codec,
+            limits,
+            capacity_bytes,
+            None,
+        )
+    }
+
+    /// Local storage geometry for an explicitly selected original block range.
+    /// This neither chooses a partition nor authorizes aggregate-memory fit.
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pub fn stage_state_plan(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        codec: KvCodec,
+        limits: ResourceLimits,
+        capacity_bytes: ResourceCapacity,
+        range: std::ops::Range<usize>,
+    ) -> Result<StateResourcePlan, String> {
+        let view = magnitude_state::StageModelView::new(&definition.decoder, range)?;
+        if load.head.is_some()
+            || load.vision.is_some()
+            || definition.draft.is_some()
+            || limits.lookahead
+        {
+            return Err("pipeline state excludes drafting, vision and lookahead".into());
+        }
+        Self::state_plan_with_stage(
+            definition,
+            load,
+            PlannedMethod::Plain,
+            codec,
+            limits,
+            capacity_bytes,
+            Some(&view),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn state_plan_with_stage(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        method: PlannedMethod,
+        codec: KvCodec,
+        limits: ResourceLimits,
+        capacity_bytes: ResourceCapacity,
+        stage: Option<&magnitude_state::StageModelView<'_>>,
     ) -> Result<StateResourcePlan, String> {
         if limits.max_launch_slots == 0
             || limits.max_launch_slots > limits.max_launch_rows
@@ -738,8 +830,12 @@ impl ResourcePlanner {
         } else {
             Vec::new()
         };
-        let layout =
-            ModelStateLayout::derive(&definition.decoder, &drafter, codec, method.draft_rows())?;
+        let layout = match stage {
+            Some(view) => ModelStateLayout::derive_stage(view, codec, method.draft_rows())?,
+            None => {
+                ModelStateLayout::derive(&definition.decoder, &drafter, codec, method.draft_rows())?
+            }
+        };
         let history_domains = || layout.target_history.iter().chain(&layout.head_history);
         let checkpoint_history_row_bytes = history_row_bytes(&layout.target_history)?
             .checked_add(history_row_bytes(&layout.head_history)?)
@@ -882,6 +978,9 @@ impl ResourcePlanner {
             )
             .ok_or("startup bank slab charge overflows")?;
         Ok(StateResourcePlan {
+            target_layer_range: stage.map_or(0..definition.decoder.blocks.len(), |view| {
+                view.global_range()
+            }),
             definition: definition.clone(),
             load: load.clone(),
             codec,
@@ -896,7 +995,97 @@ impl ResourcePlanner {
         })
     }
 
+    /// Admit an explicitly assigned stage against its own capacity. Original
+    /// roles remain in the load/program topology; only assigned physical storage
+    /// appears in this local plan. This neither searches nor pools capacity.
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pub(crate) fn stage_plan_with_state(
+        state: StateResourcePlan,
+        assignment: &crate::pipeline::StageAssignment,
+        charges: StageResourceCharges,
+    ) -> Result<ResourcePlan, PlanError> {
+        Self::derive_stage_plan(state, assignment, charges)
+            .map_err(PlanError::ResourcePlanning)?
+            .validate()
+    }
+
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    fn derive_stage_plan(
+        state: StateResourcePlan,
+        assignment: &crate::pipeline::StageAssignment,
+        charges: StageResourceCharges,
+    ) -> Result<ResourcePlan, String> {
+        if !state.is_for_stage(
+            assignment.definition(),
+            assignment.view().global_range(),
+            &state.load,
+        ) {
+            return Err("stage resource plan differs from original model projection".into());
+        }
+        let assigned = assignment.weights(&state.load).map_err(|e| e.to_string())?;
+        let target_weights = assignment
+            .resident_bytes(&state.load)
+            .map_err(|e| e.to_string())?;
+        let qualification_peak_bytes = source_import_peak_bytes(
+            assigned
+                .iter()
+                .map(|weight| weight.source_bytes)
+                .max()
+                .unwrap_or(0),
+        )?;
+        let graph_charges = [&charges.target, &charges.readout, &charges.state];
+        let bytes = ResourceBytes {
+            target_weights,
+            head_weights: 0,
+            vision_weights: 0,
+            history: state.history_bytes,
+            recurrent_banks: state.recurrent_banks_bytes,
+            prepared_programs: charges
+                .program_bytes
+                .checked_add(charges.constant_bytes)
+                .ok_or("local prepared byte count overflows")?,
+            scratch: graph_scratch_bytes(&graph_charges)?,
+            activation_transfer: charges.activation_bytes,
+        };
+        Ok(ResourcePlan {
+            domain_capacity_bytes: state.capacity_bytes.domain_bytes,
+            capacity: state.capacity,
+            target_state: state.target_state,
+            head_state: None,
+            retained_entry_bytes: state.retained_entry_bytes,
+            bytes,
+            qualification_peak_bytes,
+            target_graph: charges.target,
+            target_readout_graph: charges.readout,
+            head_graph: None,
+            vision_graph: None,
+            state_graph: charges.state,
+            steady_committed_bytes: 0,
+            startup_peak_bytes: 0,
+        })
+    }
+
     pub fn plan_with_state(
+        state: StateResourcePlan,
+        target_graphs: &PreparedTargetGraphs,
+        target_readout_graphs: &PreparedTargetReadoutGraphs,
+        head_graphs: Option<&PreparedDrafterGraphs>,
+        vision_graphs: Option<&PreparedVisionGraphs>,
+        state_graphs: &PreparedStateCopyGraphs,
+    ) -> Result<ResourcePlan, PlanError> {
+        Self::derive_plan_with_state(
+            state,
+            target_graphs,
+            target_readout_graphs,
+            head_graphs,
+            vision_graphs,
+            state_graphs,
+        )
+        .map_err(PlanError::ResourcePlanning)?
+        .validate()
+    }
+
+    fn derive_plan_with_state(
         state: StateResourcePlan,
         target_graphs: &PreparedTargetGraphs,
         target_readout_graphs: &PreparedTargetReadoutGraphs,
@@ -971,6 +1160,7 @@ impl ResourcePlanner {
             recurrent_banks: state.recurrent_banks_bytes,
             prepared_programs,
             scratch,
+            activation_transfer: 0,
         };
         let required = bytes.total()?;
         if std::env::var_os("MAGNITUDE_TRACE_RESOURCES").is_some() {
@@ -1011,13 +1201,7 @@ impl ResourcePlanner {
                 workspace(state_graphs.family()),
             );
         }
-        if required > capacity_bytes.domain_bytes {
-            return Err(format!(
-                "resource plan requires {required} bytes but the device domain has {}",
-                capacity_bytes.domain_bytes
-            ));
-        }
-        ResourcePlan {
+        Ok(ResourcePlan {
             domain_capacity_bytes: capacity_bytes.domain_bytes,
             capacity: state.capacity,
             target_state: state.target_state,
@@ -1032,8 +1216,7 @@ impl ResourcePlanner {
             state_graph,
             steady_committed_bytes: 0,
             startup_peak_bytes: 0,
-        }
-        .validate()
+        })
     }
 }
 
@@ -1249,4 +1432,97 @@ pub(super) fn recurrent_bank_bytes(components: &[ComponentSpec]) -> Result<u64, 
             .checked_add(bytes)
             .ok_or_else(|| "recurrent bank byte count overflow".into())
     })
+}
+
+#[cfg(test)]
+mod stage_admission_tests {
+    use super::*;
+    #[test]
+    fn explicit_stage_admission_counts_only_owned_storage_and_checks_local_peak() {
+        let configuration = crate::assessment::fixtures::QWEN35_CONFIGURATIONS[0];
+        let (definition, manifest) = crate::assessment::fixtures::declared_model(&configuration);
+        let definition = Rc::new(definition);
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            super::super::ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            crate::resident_layout(crate::ExecutionPath::Native, seismic::BackendName::Cuda),
+        )
+        .unwrap();
+        let model = crate::pipeline::PipelineModel::new(
+            definition.clone(),
+            vec![0..1, 1..definition.decoder.blocks.len()],
+        )
+        .unwrap();
+        let limits = ResourceLimits {
+            max_launch_rows: 2,
+            max_launch_slots: 1,
+            max_selected_rows: 1,
+            max_drafting_slots: 1,
+            exported_logits_rows: 1,
+            max_images_per_request: 1,
+            lookahead: false,
+        };
+        let graph = NativeGraphCharge::from_checked(
+            seismic::NativeGraphStorageBytes {
+                workspace: 100,
+                output: 20,
+                upload: 7,
+            },
+            1,
+            GraphSlots {
+                activations: 1,
+                output: 2,
+            },
+        )
+        .unwrap();
+        let charges = || StageResourceCharges {
+            target: graph,
+            readout: graph,
+            state: graph,
+            constant_bytes: 11,
+            program_bytes: 13,
+            activation_bytes: 32,
+        };
+        for assignment in model.stages() {
+            let state = ResourcePlanner::stage_state_plan(
+                &definition,
+                &load,
+                KvCodec::Dense,
+                limits,
+                ResourceCapacity {
+                    domain_bytes: 64 * 1024 * 1024 * 1024,
+                },
+                assignment.view().global_range(),
+            )
+            .unwrap();
+            let plan =
+                ResourcePlanner::stage_plan_with_state(state.clone(), &assignment, charges())
+                    .unwrap();
+            assert_eq!(
+                plan.bytes.target_weights,
+                assignment.resident_bytes(&load).unwrap()
+            );
+            assert_eq!(plan.bytes.prepared_programs, 24);
+            assert_eq!(plan.bytes.activation_transfer, 32);
+            assert_eq!(plan.bytes.scratch, 100 + 3 * graph.committed_bytes);
+            assert_eq!(plan.steady_committed_bytes(), plan.bytes.total().unwrap());
+            assert!(plan.startup_peak_bytes() > plan.steady_committed_bytes());
+            let mut too_small = state;
+            too_small.capacity_bytes.domain_bytes = plan.startup_peak_bytes() - 1;
+            assert_eq!(
+                ResourcePlanner::stage_plan_with_state(too_small, &assignment, charges())
+                    .err()
+                    .unwrap(),
+                PlanError::Resource(CapacityError {
+                    resource: ResourceKind::DeviceMemory,
+                    required: plan.startup_peak_bytes(),
+                    available: plan.startup_peak_bytes() - 1,
+                })
+            );
+        }
+    }
 }

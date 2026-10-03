@@ -30,8 +30,7 @@ use super::state_space::graph::{
     state_space, CheckedStateSpaceEntries, StateSpaceBlock, StateSpaceGraphEntries,
 };
 use super::{
-    attention as attention_operator, bank_component_index, dense_ffn, post_norm_epsilon,
-    FeedForward, Mixer, PairedBlock,
+    attention as attention_operator, dense_ffn, post_norm_epsilon, FeedForward, Mixer, PairedBlock,
 };
 use crate::native::{AttestedFeedForward, AttestedMixer, OutputScales};
 use crate::programs::graph::{draft::GraphDraft, GraphError};
@@ -207,6 +206,7 @@ pub(crate) struct BlockSublayers<'a> {
     pub geometry: &'a Decoder,
     pub state: &'a StateResourcePlan,
     pub block_index: usize,
+    pub component_index: usize,
     pub rows: u64,
     pub segments: u64,
     pub slots: u64,
@@ -240,7 +240,8 @@ impl BlockSublayers<'_> {
             load,
             geometry,
             state,
-            block_index,
+            block_index: _,
+            component_index,
             rows,
             segments,
             slots,
@@ -248,8 +249,6 @@ impl BlockSublayers<'_> {
         } = *self;
         let scope = self.scope(0)?;
         let epsilon = paired.epsilon() as f32;
-        let component_index = bank_component_index(&geometry.blocks, block_index)
-            .map_err(|error| error.to_string())?;
         Ok(match (paired.mixer, entries) {
             (Mixer::Attention(operator), MixerEntries::Attention(entries)) => {
                 let shape = attention_operator::shape(geometry.hidden, operator)

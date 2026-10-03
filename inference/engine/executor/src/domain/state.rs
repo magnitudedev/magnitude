@@ -14,6 +14,7 @@ pub struct MemoryChargeReconciliation {
     pub target_state: StateHoldingCensus,
     pub head_state: Option<StateHoldingCensus>,
     pub graph_pools: u64,
+    pub activation_transfer: u64,
     pub owned_media: u64,
     pub target_weights: u64,
     pub optional_weights: u64,
@@ -80,6 +81,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .checked_add(head_state.map_or(0, StateHoldingCensus::total))
             .ok_or("state charge sum overflows")?;
         let graph_pools = self.resources.committed_bytes()?;
+        let activation_transfer = self.family.activation_transfer_bytes();
         let owned_media = self.owned_media_bytes(retained)?;
         let target_weights = self.family.target_weight_bytes()?;
         // The head loader inherits the target cache so tied weights are
@@ -121,6 +123,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .ok_or("external pin charge overflows")?;
         let classified = state
             .checked_add(graph_pools)
+            .and_then(|bytes| bytes.checked_add(activation_transfer))
             .and_then(|bytes| bytes.checked_add(owned_media))
             .and_then(|bytes| bytes.checked_add(target_weights))
             .and_then(|bytes| bytes.checked_add(optional_weights))
@@ -137,6 +140,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             target_state,
             head_state,
             graph_pools,
+            activation_transfer,
             owned_media,
             target_weights,
             optional_weights,
@@ -271,6 +275,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         bindings: &mut StateBindings<F>,
         operations: &[Operation],
     ) -> Result<(), DomainError> {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(demands) = self.pipeline_requirements(operations)? {
+            let prefix = self.pipeline_owner.as_ref().expect("paired requirements");
+            let store = bindings.pipeline_prefix.as_mut().ok_or_else(|| {
+                DomainError::invariant("paired provisioning lost prefix binding right")
+            })?;
+            prefix.provision(store, &demands, 1)?;
+        }
         fn primed(operation: &Operation) -> Option<&Priming> {
             match operation {
                 Operation::Forward { prime, .. } => prime.as_ref(),
@@ -442,65 +454,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         demands: &[RowDemand],
         banks: usize,
     ) -> Result<(), DomainError> {
-        // No backing changes when neither plan adds a slab. Reservation
-        // observes memory again before launching the selected group.
-        let claim = bindings.store(head)?.growth_claim(demands, banks)?;
-        if claim.minimum_bytes == 0 && claim.preferred_bytes == 0 {
-            return Ok(());
+        if grant_store_growth(&self.memory, bindings.store(head)?, demands, banks)? {
+            self.refresh_memory()?;
+            self.sync_static_holding().map_err(DomainError::Input)?;
         }
-        let store = bindings.store(head)?;
-        for choice in [GrowthChoice::Preferred, GrowthChoice::Minimum] {
-            let claim = store.growth_claim(demands, banks)?;
-            let required = match choice {
-                GrowthChoice::Preferred => claim.preferred_bytes,
-                GrowthChoice::Minimum => claim.minimum_bytes,
-            };
-            // Keep the peak claimed while the store performs its fallible
-            // physical operation. Seismic measures the resulting charge; the
-            // existing static holding is then resized from committed backing
-            // instead of creating another holding for the same bytes.
-            let claim = if required == 0 {
-                None
-            } else {
-                match self.claim_device_growth(required, 0, HoldingClass::Live) {
-                    Ok(claim) => Some(claim),
-                    Err(_) if choice == GrowthChoice::Preferred => continue,
-                    Err(error) => return Err(error),
-                }
-            };
-            let provisioned = store.provision_with_growth(demands, banks, choice);
-            if let Some(claim) = claim {
-                self.release_claim(claim);
-            }
-            match provisioned {
-                Ok(()) => {
-                    self.refresh_memory()?;
-                    self.sync_static_holding().map_err(DomainError::Input)?;
-                    return Ok(());
-                }
-                Err(error)
-                    if choice == GrowthChoice::Preferred
-                        && matches!(
-                            error,
-                            magnitude_state::Error::Tensor(seismic::TensorError::Execution(
-                                seismic::ExecutionError::AllocationCapacity { .. }
-                                    | seismic::ExecutionError::AllocationFailed(_)
-                            ))
-                        ) =>
-                {
-                    continue
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        unreachable!("minimum state growth either succeeds or returns a deficit")
+        Ok(())
     }
 
     /// Observe every domain the device uses and refresh the Seismic
     /// allocation ceiling: `Reclaim` while any domain's headroom is at or
     /// below its planning reserve, `Blind` when an observation fails.
     pub fn probe_memory(&mut self) -> Result<(), DomainError> {
-        self.decide_device_growth(0, 0)
+        self.decide_device_growth(0, 0)?;
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(prefix) = &self.pipeline_owner {
+            prefix.memory.borrow_mut().check(0, 0)?;
+        }
+        Ok(())
     }
 
     /// Claim the peak new charge of one physical operation from the heap:
@@ -609,6 +579,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn provision_open(&mut self, bindings: &mut StateBindings<F>) -> Result<(), DomainError> {
         self.orphan_lookahead(bindings)?;
         let requirements = self.open_requirements();
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(prefix) = &self.pipeline_owner {
+            let store = bindings.pipeline_prefix.as_mut().ok_or_else(|| {
+                DomainError::invariant("paired admission lost prefix binding right")
+            })?;
+            prefix.provision(store, &[], requirements.target_banks())?;
+        }
         self.grant_state_growth(bindings, false, &[], requirements.target_banks())?;
         if self.head_store.is_some() {
             self.grant_state_growth(bindings, true, &[], requirements.head_banks())?;
@@ -697,4 +674,56 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         Ok(())
     }
+}
+
+/// The same claim/provision protocol for either local state store. A physical
+/// growth changes backing, not accepted logical state; callers reconcile the
+/// measured static holding after success.
+pub(super) fn grant_store_growth(
+    memory: &RefCell<DeviceHeap>,
+    store: &mut StoreBindings,
+    demands: &[RowDemand],
+    banks: usize,
+) -> Result<bool, DomainError> {
+    let claim = store.growth_claim(demands, banks)?;
+    if claim.minimum_bytes == 0 && claim.preferred_bytes == 0 {
+        return Ok(false);
+    }
+    for choice in [GrowthChoice::Preferred, GrowthChoice::Minimum] {
+        let claim = store.growth_claim(demands, banks)?;
+        let required = match choice {
+            GrowthChoice::Preferred => claim.preferred_bytes,
+            GrowthChoice::Minimum => claim.minimum_bytes,
+        };
+        let claim = if required == 0 {
+            None
+        } else {
+            match memory.borrow_mut().claim(required, 0, HoldingClass::Live) {
+                Ok(claim) => Some(claim),
+                Err(_) if choice == GrowthChoice::Preferred => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let provisioned = store.provision_with_growth(demands, banks, choice);
+        if let Some(claim) = claim {
+            memory.borrow_mut().release(claim);
+        }
+        match provisioned {
+            Ok(()) => return Ok(true),
+            Err(error)
+                if choice == GrowthChoice::Preferred
+                    && matches!(
+                        error,
+                        magnitude_state::Error::Tensor(seismic::TensorError::Execution(
+                            seismic::ExecutionError::AllocationCapacity { .. }
+                                | seismic::ExecutionError::AllocationFailed(_)
+                        ))
+                    ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("minimum state growth either succeeds or returns a deficit")
 }

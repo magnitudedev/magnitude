@@ -501,6 +501,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .enumerate()
             .map(
                 |(slot, ((request, rows, proposals), advance))| PendingOperationOutcome {
+                    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+                    pipeline_prefix: None,
                     request,
                     outcome: Outcome::Head {
                         proposals: (0..proposals)

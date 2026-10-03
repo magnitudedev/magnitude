@@ -28,6 +28,12 @@ use magnitude_state::{
 use seismic::Tensor;
 mod draft;
 mod family;
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+mod pipeline_family;
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+mod pipeline_resources;
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+mod pipeline_target;
 mod features;
 mod head;
 mod heap;
@@ -44,6 +50,8 @@ mod vision;
 mod domain_tests;
 
 pub use family::{NativeFamily, ProgramFamily};
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+pub use pipeline_family::PipelineNativeFamily;
 pub use heap::{ClaimRefusal, DeviceHeap};
 use in_flight::{decode_selected, PrimingFlight, TargetWork};
 pub use in_flight::{HeadFlight, TargetFlight, VisionFlight};
@@ -199,6 +207,8 @@ impl From<magnitude_state::Error> for DomainError {
 /// work is on the device.
 pub struct StateBindings<F: ProgramFamily = NativeFamily> {
     target: StoreBindings,
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pipeline_prefix: Option<StoreBindings>,
     head: Option<StoreBindings>,
     /// The step queued behind the last flight, with its drafter priming. It
     /// is the only work that holds bindings between flights, so it lives
@@ -280,6 +290,9 @@ pub struct PendingOperationOutcome {
     request: RequestId,
     outcome: Outcome,
     advance: Option<OwnedStateAdvance>,
+    /// Retained after both physical stages finish, until joint reconcile/abort.
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pipeline_prefix: Option<OwnedStateAdvance>,
     /// A prompt chunk's drafter entry, committed whole with the chunk.
     primed: Option<OwnedStateAdvance>,
     rows: usize,
@@ -292,6 +305,15 @@ pub struct PendingOperationOutcome {
 impl PendingOperationOutcome {
     pub fn request(&self) -> RequestId {
         self.request
+    }
+    #[cfg(test)]
+    pub(crate) fn pipeline_advances(&self) -> [&OwnedStateAdvance; 2] {
+        [
+            self.pipeline_prefix
+                .as_ref()
+                .expect("paired pending prefix"),
+            self.advance.as_ref().expect("paired pending suffix"),
+        ]
     }
     pub fn outcome(&self) -> &Outcome {
         &self.outcome
@@ -321,6 +343,8 @@ pub struct DomainRequirements {
     /// Each advance's page demand in its store (see
     /// `SequenceState::demands`): rows a history appends in place need none.
     state_demand: Vec<RowDemand>,
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pipeline: Option<Vec<RowDemand>>,
     successor_banks: usize,
     /// Head page demand (and one successor bank each) of the drafter entries
     /// the target group's prompt chunks prime.
@@ -369,6 +393,8 @@ pub enum TargetGraphReservation {
 }
 
 pub struct TargetLaunchReservation {
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pipeline: Option<pipeline_target::PrefixLaunchReservation>,
     advances: Vec<OwnedStateAdvance>,
     graph_workspace: NativeGraphWorkspaceLease,
     graph_outputs: [NativeGraphOutputLease; 2],
@@ -441,6 +467,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     head_loader: Option<ComponentLoader<ResidentHead>>,
     vision_loader: Option<ComponentLoader<ResidentVision>>,
     target: BTreeMap<RequestId, SequenceState>,
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pipeline_prefix: BTreeMap<RequestId, SequenceState>,
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pipeline_owner: Option<pipeline_resources::PipelinePrefixOwner>,
     head: BTreeMap<RequestId, SequenceState>,
     input: BTreeMap<RequestId, RequestInput>,
     /// Group identities of the target, head and encoder executables.
@@ -460,7 +490,7 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     trace_lookahead: bool,
 }
 
-impl ExecutorDomain<NativeFamily> {
+impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Classify the allocations that are already physically committed before
     /// any request reservation begins. The byte total comes from the actual
     /// graph pools and state stores; Seismic remains the charge authority.
@@ -477,6 +507,9 @@ impl ExecutorDomain<NativeFamily> {
         Ok(holding)
     }
 
+}
+
+impl ExecutorDomain<NativeFamily> {
     pub fn new(
         execution: Rc<ExecutionPlan>,
         definition: Rc<ModelDefinition>,
@@ -574,6 +607,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.family.target_weight_bytes()?,
             self.family.prepared_program_bytes()?,
             self.family.target_constant_bytes()?,
+            self.family.activation_transfer_bytes(),
         ] {
             bytes = bytes
                 .checked_add(charge)
@@ -668,6 +702,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .map_err(|error| {
                     DomainError::Input(format!("static memory holding update rejected: {error:?}"))
                 })?;
+        }
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(prefix) = &self.pipeline_owner {
+            let mut readings = readings;
+            readings.extend(prefix.refresh()?);
+            return Ok(readings);
         }
         Ok(readings)
     }
@@ -780,11 +820,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         bindings: &StateBindings<F>,
         operations: &[Operation],
     ) -> Result<DomainRequirements, DomainError> {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        let pipeline = self.pipeline_requirements(operations)?;
         if let Some(class) = self.claim_class(bindings, operations) {
             return Ok(DomainRequirements {
                 lane: ReservationLane::Target,
                 pool: PoolClass::Target(class),
                 state_demand: Vec::new(),
+                #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+                pipeline: None,
                 successor_banks: 0,
                 priming_demand: Vec::new(),
                 priming_banks: 0,
@@ -968,6 +1012,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             successor_banks,
             priming_demand,
             priming_banks,
+            #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+            pipeline,
             claim: false,
         })
     }
@@ -975,6 +1021,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn can_reserve(&self, requirements: &DomainRequirements) -> Result<(), CapacityError> {
         if requirements.claim {
             return Ok(());
+        }
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(demands) = &requirements.pipeline {
+            self.can_reserve_pipeline(demands)?;
         }
         let available = |workspace: Option<usize>, output: Option<usize>| {
             if workspace.unwrap_or(0) == 0 {
@@ -1126,6 +1176,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         bindings: &mut StateBindings<F>,
         operations: &[Operation],
     ) -> Result<DomainReservation, DomainError> {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if self.pipeline_owner.is_some() {
+            return self.reserve_pipeline(bindings, operations);
+        }
         self.refresh_memory()?;
         let requirements = self.requirements(bindings, operations)?;
         if requirements.claim {
@@ -1193,6 +1247,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .map_err(|error| invariant("target readout output", error))?;
                 ReservedResources::Target(TargetGraphReservation::Launch(TargetLaunchReservation {
                     advances: Vec::with_capacity(operations.len()),
+                    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+                    pipeline: None,
                     graph_workspace,
                     graph_outputs,
                     readout_workspace,
@@ -1355,6 +1411,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             head_loader,
             vision_loader,
             target: BTreeMap::new(),
+            #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+            pipeline_prefix: BTreeMap::new(),
+            #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+            pipeline_owner: None,
             head: BTreeMap::new(),
             input: BTreeMap::new(),
             lane_identities,
@@ -1367,10 +1427,51 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let bindings = StateBindings {
             target: target_state,
+            #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+            pipeline_prefix: None,
             head: head_state,
             lookahead: None,
         };
         (domain, bindings)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pipeline_positions(&self, request: RequestId) -> [Option<usize>; 2] {
+        [
+            self.pipeline_prefix
+                .get(&request)
+                .map(SequenceState::position),
+            self.target.get(&request).map(SequenceState::position),
+        ]
+    }
+
+    /// This execution contract forbids retained-prefix/resume requests.
+    pub fn requires_transient_requests(&self) -> bool {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if self.pipeline_owner.is_some() {
+            return true;
+        }
+        false
+    }
+
+    /// Synchronous paired submission must return to the normal control mailbox
+    /// between physical steps, rather than draining a whole generation at once.
+    pub fn requires_step_yield(&self) -> bool {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if self.pipeline_owner.is_some() {
+            return true;
+        }
+        false
+    }
+
+    /// Additional independently owned physical allocation domains. The ordinary
+    /// single-device owner has none; capacities and charges are never pooled.
+    pub fn additional_memory_charges(&self) -> Result<Vec<MemoryChargeReconciliation>, String> {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(charge) = self.pipeline_prefix_memory_charge()? {
+            return Ok(vec![charge]);
+        }
+        Ok(Vec::new())
     }
 
     pub fn resource_identity(&self) -> &ResourceDomainId {

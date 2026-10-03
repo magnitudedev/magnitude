@@ -73,15 +73,19 @@ fn spare_head_store(device: Rc<seismic::Device>) -> StoreBindings {
 }
 
 fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) -> Option<Fixture> {
+    fixture_on(control, lookahead, head, platform::DeviceRequest::Automatic)
+}
+
+fn fixture_on(
+    control: Option<PendingControl>,
+    lookahead: bool,
+    head: bool,
+    request: platform::DeviceRequest,
+) -> Option<Fixture> {
     let catalog = seismic::DeviceCatalog::discover().ok()?;
     let reserves = platform::MemoryReserves::standard();
-    let selected = platform::select_device(
-        &catalog,
-        ExecutionPath::Native,
-        platform::DeviceRequest::Automatic,
-        &reserves,
-    )
-    .ok()?;
+    let selected =
+        platform::select_device(&catalog, ExecutionPath::Native, request, &reserves).ok()?;
     let device = Rc::new(
         catalog
             .open(catalog.resolve(selected.info.selector).unwrap())
@@ -685,6 +689,7 @@ fn pending_target_state_is_classified_as_in_flight() {
     open(&mut domain, &mut bindings, request);
     let before = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(before.unattributed, 0, "{before:?}");
+    assert_eq!(before.activation_transfer, 0);
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
     let pending = domain.reconcile_memory_charge(&[]).unwrap();
     assert!(pending.target_state.in_flight > before.target_state.in_flight);
@@ -782,6 +787,8 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
     let head_advance = OwnedStateAdvance::begin(head_source, 1).ok().unwrap();
     domain
         .abort(PendingOperationOutcome {
+            #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+            pipeline_prefix: None,
             request,
             outcome: Outcome::Head {
                 proposals: Vec::new(),
@@ -809,6 +816,8 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
     .unwrap();
     domain
         .abort(PendingOperationOutcome {
+            #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+            pipeline_prefix: None,
             request,
             outcome: Outcome::Encode {
                 features: vision_features,
@@ -967,6 +976,8 @@ fn reconcile_encode<F: ProgramFamily>(
     domain
         .reconcile(
             PendingOperationOutcome {
+                #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+                pipeline_prefix: None,
                 request,
                 outcome: Outcome::Encode {
                     features: features.clone(),
@@ -1115,4 +1126,182 @@ fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() 
     };
     assert_eq!((*row, *start, *count), (1, 0, 1));
     assert!(*source == features);
+}
+
+// Logical paired publication through the real domain, using explicit CPU-only
+// preparation and no numerical model execution. These do not qualify CUDA serving.
+fn pipeline_pending_fixture(
+    prefix_rows: usize,
+    suffix_rows: usize,
+) -> (Fixture, PendingOperationOutcome) {
+    let (domain, bindings) = fixture_on(
+        None,
+        false,
+        false,
+        platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+    )
+    .expect("CPU domain fixture");
+    let cpu = Rc::new(domain.domain.device().clone());
+    let prefix_store = domain
+        .execution
+        .resources()
+        .target_state()
+        .allocate(cpu)
+        .unwrap();
+    let prefix = OwnedStateAdvance::begin(prefix_store.create().unwrap(), prefix_rows)
+        .ok()
+        .unwrap();
+    let suffix = OwnedStateAdvance::begin(domain.target_store.create().unwrap(), suffix_rows)
+        .ok()
+        .unwrap();
+    let request = RequestId(901);
+    // Physical output is already complete but neither logical source is published.
+    assert!(domain.target.is_empty());
+    assert!(domain.pipeline_prefix.is_empty());
+    let pending = PendingOperationOutcome {
+        request,
+        outcome: Outcome::Forward { rows: Vec::new() },
+        advance: Some(suffix),
+        pipeline_prefix: Some(prefix),
+        primed: None,
+        rows: suffix_rows,
+        committed_rows: suffix_rows,
+        kind: WorkKind::Prefill,
+        physical_duration: Duration::ZERO,
+        image: None,
+    };
+    ((domain, bindings), pending)
+}
+#[test]
+fn pipeline_domain_joint_publication_and_subsequent_state_reuse() {
+    let ((mut domain, _bindings), pending) = pipeline_pending_fixture(2, 2);
+    let request = pending.request;
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .unwrap();
+    assert_eq!(domain.target[&request].position(), 2);
+    assert_eq!(domain.pipeline_prefix[&request].position(), 2);
+    let prefix = domain.pipeline_prefix.remove(&request).unwrap();
+    let suffix = domain.target.remove(&request).unwrap();
+    let pending = PendingOperationOutcome {
+        request,
+        outcome: Outcome::Forward { rows: Vec::new() },
+        advance: Some(OwnedStateAdvance::begin(suffix, 1).ok().unwrap()),
+        pipeline_prefix: Some(OwnedStateAdvance::begin(prefix, 1).ok().unwrap()),
+        primed: None,
+        rows: 1,
+        committed_rows: 1,
+        kind: WorkKind::Decode,
+        physical_duration: Duration::ZERO,
+        image: None,
+    };
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    assert_eq!(domain.target[&request].position(), 3);
+    assert_eq!(domain.pipeline_prefix[&request].position(), 3);
+}
+#[test]
+fn pipeline_domain_mismatched_stage_extents_publish_neither() {
+    let ((mut domain, _bindings), pending) = pipeline_pending_fixture(1, 2);
+    let request = pending.request;
+    assert!(domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .is_err());
+    assert_eq!(domain.target[&request].position(), 0);
+    assert_eq!(domain.pipeline_prefix[&request].position(), 0);
+}
+#[test]
+fn pipeline_domain_completed_cancellation_aborts_both_sources() {
+    let ((mut domain, _bindings), pending) = pipeline_pending_fixture(2, 2);
+    let request = pending.request;
+    domain.abort(pending).unwrap();
+    assert_eq!(domain.target[&request].position(), 0);
+    assert_eq!(domain.pipeline_prefix[&request].position(), 0);
+    assert!(OwnedStateAdvance::begin(domain.target[&request].checkpoint().fork(), 2).is_ok());
+}
+#[test]
+fn pipeline_domain_invalid_decision_restores_both_without_acceptance() {
+    let ((mut domain, _bindings), pending) = pipeline_pending_fixture(2, 2);
+    let request = pending.request;
+    assert!(domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .is_err());
+    assert_eq!(domain.target[&request].position(), 0);
+    assert_eq!(domain.pipeline_prefix[&request].position(), 0);
+}
+
+#[test]
+fn pipeline_domain_state_cannot_publish_as_head_or_stateless_output() {
+    for head in [true, false] {
+        let ((mut domain, _bindings), mut pending) = pipeline_pending_fixture(2, 2);
+        pending.outcome = if head {
+            Outcome::Head {
+                proposals: Vec::new(),
+            }
+        } else {
+            Outcome::Encode {
+                features: FeatureRef::logical(
+                    domain.resource_identity().clone(),
+                    1,
+                    domain.definition.decoder.hidden as usize,
+                )
+                .unwrap(),
+            }
+        };
+        assert!(domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+            .is_err());
+        assert!(domain.target.is_empty());
+        assert!(domain.pipeline_prefix.is_empty());
+        assert!(domain.head.is_empty());
+        // A malformed result was terminally discarded, not published or returned
+        // to the wrong lane. New owned advances can still reserve their banks.
+        let state = domain.target_store.create().unwrap();
+        assert_eq!(state.position(), 0);
+        assert!(OwnedStateAdvance::begin(state, 2).is_ok());
+    }
+}
+
+#[test]
+fn pipeline_binding_adoption_requires_exact_store_and_opened_device() {
+    let (domain, bindings) = fixture_on(
+        None,
+        false,
+        false,
+        platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+    )
+    .expect("CPU fixture");
+    let device = domain.domain.device();
+    assert!(super::pipeline_resources::validate_binding_owner(
+        device,
+        &domain.target_store,
+        &bindings.target
+    )
+    .is_ok());
+    let other_store = domain
+        .execution
+        .resources()
+        .target_state()
+        .allocate(Rc::new(device.clone()))
+        .unwrap();
+    assert!(super::pipeline_resources::validate_binding_owner(
+        device,
+        &domain.target_store,
+        &other_store
+    )
+    .is_err());
+    let foreign = seismic::DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(seismic::BackendName::Cpu)
+        .unwrap();
+    assert!(super::pipeline_resources::validate_binding_owner(
+        &foreign,
+        &domain.target_store,
+        &bindings.target
+    )
+    .is_err());
+    assert!(domain.pipeline_owner.is_none());
+    assert!(bindings.pipeline_prefix.is_none());
+    assert!(domain.pipeline_prefix_memory_charge().unwrap().is_none());
 }

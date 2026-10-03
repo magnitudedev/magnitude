@@ -316,6 +316,7 @@ impl ResidencyStore {
         domain: ResourceDomainId,
     ) -> Result<Self, WeightImportError> {
         if !programs.belongs_to(&device)
+            || execution.device().selector() != device.info().selector
             || execution.device().backend() != device.backend()
             || execution.device().name() != device.info().name
         {
@@ -352,7 +353,7 @@ impl ResidencyStore {
         &self.device
     }
     pub fn belongs_to(&self, device: &Device) -> bool {
-        self.device.info().id == device.info().id
+        self.device.same_device(device) && self.programs.belongs_to(device)
     }
     pub fn len(&self) -> usize {
         self.resident.len()

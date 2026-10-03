@@ -578,6 +578,45 @@ impl std::error::Error for ResourceError {}
 mod tests {
     use super::*;
     #[test]
+    fn equal_shape_or_same_selector_does_not_authorize_foreign_device_storage() {
+        let catalog = seismic::DeviceCatalog::discover().unwrap();
+        let a = Rc::new(catalog.open_backend(seismic::BackendName::Cpu).unwrap());
+        let b = Rc::new(
+            seismic::DeviceCatalog::discover()
+                .unwrap()
+                .open_backend(seismic::BackendName::Cpu)
+                .unwrap(),
+        );
+        assert_eq!(a.info().selector, b.info().selector);
+        assert!(!a.same_device(&b));
+        let domain = ResourceDomain::new(
+            ResourceDomainId::new("foreign-opened-device").unwrap(),
+            a.clone(),
+        );
+        let foreign = Tensor::zeros(&b, seismic::Element::f32(), &[2, 4]).unwrap();
+        assert!(matches!(
+            domain.publish_features(foreign),
+            Err(ResourceError::ForeignDevice)
+        ));
+        let local = Tensor::zeros(&a, seismic::Element::f32(), &[2, 4]).unwrap();
+        assert!(domain.publish_features(local).is_ok());
+        let (store, _) = magnitude_state::StateStore::new(
+            a.clone(),
+            8,
+            2,
+            vec![],
+            vec![],
+            magnitude_state::BankCapacity {
+                active: 1,
+                in_flight: 1,
+                retained: 0,
+            },
+        )
+        .unwrap();
+        assert!(store.belongs_to_device(&a));
+        assert!(!store.belongs_to_device(&b));
+    }
+    #[test]
     fn logical_leases_are_raii_and_domain_checked() {
         let domain = ResourceDomainId::new("a").unwrap();
         let a = FeatureRef::logical(domain.clone(), 2, 4).unwrap();

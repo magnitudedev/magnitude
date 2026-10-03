@@ -15,6 +15,9 @@ mod native;
 mod operation;
 mod operators;
 mod planning;
+pub mod placement;
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+pub mod pipeline;
 pub mod programs;
 pub use programs::{
     CommitSpan, CompletedHeadWork, CompletedImportWork, CompletedStateWork, CompletedTargetWork,
@@ -33,6 +36,8 @@ pub use device_resources::{
     ConditioningRange, ConditioningRef, FeatureRef, ImageRef, LogitsRef, ResourceDomain,
     ResourceError,
 };
+#[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+pub use domain::PipelineNativeFamily;
 pub use domain::{
     ClaimRefusal, DeviceHeap, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
     HeadFlight, MemoryChargeReconciliation, NativeFamily, OpenRequirements,

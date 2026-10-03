@@ -199,6 +199,52 @@ pub struct AllocatedResources {
 }
 
 impl AllocatedResources {
+    /// Transfer a sealed stage's existing pools into the ordinary domain. This
+    /// path allocates nothing; the stage preparation created all three pools in
+    /// this arena under its local startup claim.
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pub(crate) fn adopt_stage_pools(
+        device: &Device,
+        plan: &crate::ResourcePlan,
+        arena: seismic::NativeExecutionArena,
+        target_graph: NativeGraphPool,
+        target_readout_graph: NativeGraphPool,
+        state_graph: NativeGraphPool,
+    ) -> Result<Self, String> {
+        let domain = target_graph.domain().clone();
+        for (pool, charge) in [
+            (&target_graph, plan.target_graph()),
+            (&target_readout_graph, plan.target_readout_graph()),
+            (&state_graph, plan.state_graph()),
+        ] {
+            if pool.domain() != &domain
+                || !pool.belongs_to(device)
+                || !pool.uses_arena(&arena)
+                || pool.committed_bytes() != charge.committed_bytes
+            {
+                return Err(
+                    "stage pool differs from its admitted device, domain, arena or footprint"
+                        .into(),
+                );
+            }
+        }
+        if arena.bytes() != plan.arena_bytes()
+            || plan.head_graph().is_some()
+            || plan.vision_graph().is_some()
+        {
+            return Err("stage adoption requires the admitted plain local arena".into());
+        }
+        Ok(Self {
+            domain,
+            arena,
+            target_graph,
+            target_readout_graph,
+            state_graph,
+            head_graph: None,
+            vision_graph: None,
+        })
+    }
+
     /// The workspace arena once, and the arenas these pools own while their
     /// slots are lent to launches or output views.
     pub fn committed_bytes(&self) -> Result<u64, &'static str> {

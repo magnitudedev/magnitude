@@ -10,6 +10,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         request: RequestId,
         input: PreparedModelInput,
     ) -> Result<(), String> {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if self.pipeline_owner.is_some() {
+            if !self.input.is_empty() {
+                return Err(
+                    "explicit pipeline supports one active request; concurrency is unsupported"
+                        .into(),
+                );
+            }
+            if !input.vision().is_empty() {
+                return Err("explicit pipeline supports plain text only".into());
+            }
+        }
         if self.input.contains_key(&request)
             || self.target.contains_key(&request)
             || self.head.contains_key(&request)

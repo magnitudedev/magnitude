@@ -18,6 +18,10 @@ serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }
 sha2 = "=0.11.0"
 
 [features]
+# Explicit two-CUDA execution; never selected by catalog or default policy.
+experimental-pipeline-cuda = []
+# Development-only partial-step lifecycle qualification; absent from normal builds.
+pipeline-fault-injection = ["experimental-pipeline-cuda"]
 # Development-only bounded precision calibration; production uses fixed limits.
 tuning-precision-experiment = []
 # Development-only tuning pin for bit-exact measurement runs

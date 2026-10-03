@@ -1552,6 +1552,11 @@ pub struct NativeGraphFamily {
 }
 
 impl NativeGraphFamily {
+    /// Exact opened device identity, not a backend/name/shape match.
+    pub fn belongs_to(&self, device: &Arc<DeviceInner>) -> bool {
+        Arc::ptr_eq(&self.device, device)
+    }
+
     pub fn new(plans: &[Arc<NativeGraphPlan>]) -> Result<Self, WorkflowError> {
         let first = plans.first().ok_or(WorkflowError::Empty)?;
         if plans
@@ -1722,6 +1727,16 @@ impl NativeExecutionArena {
             allocation,
             bytes,
         })
+    }
+
+    /// Allocation identity, not equal byte capacity or equal device metadata.
+    pub fn same_arena(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.device, &other.device)
+            && match (&self.allocation, &other.allocation) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     pub fn bytes(&self) -> u64 {

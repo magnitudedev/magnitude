@@ -44,6 +44,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 });
             }
         }
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(prefix) = &self.pipeline_owner {
+            let available = prefix.store.available_banks();
+            if available < requirements.target_banks {
+                return Err(CapacityError {
+                    resource: ResourceKind::RecurrentBanks,
+                    required: requirements.target_banks as u64,
+                    available: available as u64,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -59,6 +70,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         request: RequestId,
         from: Option<&ResumeState>,
     ) -> Result<Vec<Operation>, DomainError> {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if self.pipeline_owner.is_some()
+            && (from.is_some()
+                || self.head_store.is_some()
+                || bindings.head.is_some()
+                || bindings.lookahead.is_some())
+        {
+            return Err(DomainError::Input(
+                "explicit pipeline refuses resume, head and lookahead state".into(),
+            ));
+        }
         self.orphan_lookahead(bindings)?;
         let installed = self
             .input
@@ -75,7 +97,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Some(from) => self.fork_resume_state(from)?,
             None => self.fresh_state(bindings)?,
         };
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        let prefix = self
+            .pipeline_owner
+            .as_ref()
+            .map(|owner| owner.store.create())
+            .transpose()?;
         let position = target.position();
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(prefix) = prefix {
+            self.pipeline_prefix.insert(request, prefix);
+        }
         self.target.insert(request, target);
         if let Some(head) = head {
             self.head.insert(request, head);
@@ -160,6 +192,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The request's reconciled state as a resume state: both lanes and the
     /// features of spans straddling its position.
     pub fn resume_state(&self, request: RequestId) -> Result<ResumeState, String> {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if self.pipeline_owner.is_some() {
+            return Err(
+                "explicit pipeline does not support retained-prefix or resume state".into(),
+            );
+        }
         let target = self
             .target
             .get(&request)
@@ -206,6 +244,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         {
             return Err("request has unresolved work".into());
         }
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if installed.resident
+            && self.pipeline_owner.is_some()
+            && !self.pipeline_prefix.contains_key(&request)
+        {
+            return Err("request has unresolved prefix work".into());
+        }
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        self.pipeline_prefix.remove(&request);
         self.head.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
@@ -244,6 +291,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 )
                 .ok_or("reclaim byte count overflow")?;
         }
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(prefix) = &self.pipeline_owner {
+            let live = requests
+                .iter()
+                .map(|request| {
+                    self.pipeline_prefix
+                        .get(request)
+                        .map(Holder::State)
+                        .ok_or("reclamation request has unresolved prefix state")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            bytes = bytes
+                .checked_add(
+                    prefix
+                        .store
+                        .exclusive_bytes(&live)
+                        .map_err(|e| e.to_string())?,
+                )
+                .ok_or("reclaim byte count overflow")?;
+        }
         Ok(bytes)
     }
 
@@ -263,6 +330,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             self.target.remove(request);
             self.head.remove(request);
+            #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+            self.pipeline_prefix.remove(request);
         }
         Ok(bytes)
     }
@@ -284,6 +353,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .checked_add(
                     u64::try_from(store.release_idle().map_err(|error| error.to_string())?)
                         .map_err(|_| "head idle bytes exceed u64")?,
+                )
+                .ok_or("idle reclaim byte count overflow")?;
+        }
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if let Some(store) = &mut bindings.pipeline_prefix {
+            bytes = bytes
+                .checked_add(
+                    u64::try_from(store.release_idle().map_err(|e| e.to_string())?)
+                        .map_err(|_| "prefix idle bytes exceed u64")?,
                 )
                 .ok_or("idle reclaim byte count overflow")?;
         }

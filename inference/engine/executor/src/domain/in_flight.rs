@@ -50,6 +50,9 @@ pub(super) struct PrimingFlight<H> {
 /// One submitted target step: a group's flight, or the lookahead queued
 /// behind one.
 pub(super) struct TargetWork<F: ProgramFamily> {
+    /// A completed prefix is still provisional while suffix output is consumed.
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pub(super) pipeline_prefix: Option<OwnedStateAdvance>,
     pub(super) requests: Vec<(
         RequestId,
         usize,

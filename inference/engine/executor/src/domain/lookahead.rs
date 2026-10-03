@@ -494,6 +494,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             );
         }
         let mut queued = TargetWork {
+            #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+            pipeline_prefix: None,
             launch_trace: None,
             requests,
             submission,

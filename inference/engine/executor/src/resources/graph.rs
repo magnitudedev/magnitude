@@ -37,6 +37,15 @@ pub struct NativeGraphPool {
 }
 
 impl NativeGraphPool {
+    pub fn belongs_to(&self, device: &seismic::Device) -> bool {
+        self.family.belongs_to(device)
+    }
+
+    #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+    pub(crate) fn uses_arena(&self, arena: &NativeExecutionArena) -> bool {
+        self.arena.same_arena(arena)
+    }
+
     /// The startup slots of `charge`: its activations in `arena`, each with
     /// `upload_regions` upload regions, and its startup output slots.
     pub(crate) fn new(

@@ -2130,6 +2130,11 @@ pub struct NativeGraphFamily {
 }
 
 impl NativeGraphFamily {
+    /// Whether this sealed family was formed on this exact opened device.
+    pub fn belongs_to(&self, device: &Device) -> bool {
+        self.inner.belongs_to(&device.inner)
+    }
+
     pub fn new(plans: &[NativeGraphPlan]) -> Result<Self, WorkflowError> {
         let members = plans
             .iter()
@@ -2185,6 +2190,11 @@ pub struct NativeExecutionArena {
 }
 
 impl NativeExecutionArena {
+    /// Whether both handles retain the exact opened-device workspace storage.
+    pub fn same_arena(&self, other: &Self) -> bool {
+        self.inner.same_arena(&other.inner)
+    }
+
     pub fn bytes(&self) -> u64 {
         self.inner.bytes()
     }

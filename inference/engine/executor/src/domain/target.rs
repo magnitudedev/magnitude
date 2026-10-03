@@ -167,7 +167,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         operations: &[Operation],
         reservation: TargetLaunchReservation,
     ) -> Result<TargetWork<F>, Unsubmitted> {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if reservation.pipeline.is_some() {
+            return self.launch_pipeline_target(operations, reservation);
+        }
         let TargetLaunchReservation {
+            #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+                pipeline: _,
             advances,
             graph_workspace,
             graph_outputs,
@@ -370,6 +376,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         };
         Ok(TargetWork {
+            #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+            pipeline_prefix: None,
             requests: metadata,
             submission,
             priming: None,
@@ -401,6 +409,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         bindings: &mut StateBindings<F>,
         flight: TargetWork<F>,
     ) -> Result<Vec<PendingOperationOutcome>, DomainError> {
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        let mut pipeline_prefix = flight.pipeline_prefix;
+        #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+        if pipeline_prefix.is_some()
+            && (flight.requests.len() != 1
+                || flight.continuation.is_some()
+                || flight.priming.is_some())
+        {
+            return Err(DomainError::invariant(
+                "pipeline flight is not an exclusive ordinary target step",
+            ));
+        }
         let completed = match flight.submission.finish() {
             Ok(completed) => completed,
             Err(error) => {
@@ -635,6 +655,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
             };
             pending.push(PendingOperationOutcome {
+                #[cfg(any(test, feature = "experimental-pipeline-cuda"))]
+                pipeline_prefix: pipeline_prefix.take(),
                 request,
                 outcome: Outcome::Forward { rows: result },
                 advance: Some(advance),
@@ -726,6 +748,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         operation: &Operation,
         advance: &TentativeAdvance,
     ) -> Result<(Slot, Vec<crate::ConditioningSlice>), String> {
+        let bidirectional = self.bidirectional_reads()?;
+        self.target_slot_for_store(operation, advance, &self.target_store, &bidirectional)
+    }
+
+    pub(super) fn target_slot_for_store(
+        &self,
+        operation: &Operation,
+        advance: &TentativeAdvance,
+        store: &StateStore,
+        bidirectional: &[bool],
+    ) -> Result<(Slot, Vec<crate::ConditioningSlice>), String> {
         let Operation::Forward {
             request,
             tokens,
@@ -740,7 +773,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // A media row's span end; an advance never splits a span. The
         // history reads whose layers attend media bidirectionally read every
         // fresh row of the span.
-        let bidirectional = self.bidirectional_reads()?;
         let span_end = |index: usize| {
             slices
                 .iter()
@@ -756,13 +788,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             rows.push(Row {
                 token: i32::try_from(token.0).map_err(|_| "token exceeds i32")?,
                 coordinates,
-                histories: row_histories(
-                    &self.target_store,
-                    advance,
-                    index,
-                    span_end(index),
-                    &bidirectional,
-                )?,
+                histories: row_histories(store, advance, index, span_end(index), bidirectional)?,
                 demand: row_demand(operation, index),
                 select: selection(operation, index),
             });
