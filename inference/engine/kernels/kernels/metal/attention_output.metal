@@ -12,6 +12,7 @@ typedef element::Act activation;
     device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],                 \
     device float *small_partials [[buffer(SEISMIC_BUFFER_SCRATCH_SMALL_PARTIALS)]],     \
+    device uchar *fragments [[buffer(SEISMIC_BUFFER_SCRATCH_FRAGMENTS)]],               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 // `gated` is [M, Q, W] and canonical, so a row is Q*W contiguous values.
@@ -100,5 +101,28 @@ kernel void attention_output_finalize(ATTENTION_OUTPUT_ARGUMENTS,
     ATTENTION_OUTPUT_OPERANDS;
     projection::gemm_reduce(out, partials, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_D),
         uint(SEISMIC_RUNTIME_SPLIT), index);
+}
+#endif
+
+// The TALL form past 64 rows: the gated rows in the tall GEMM's order, then
+// its tiles.
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_RELAYOUT
+kernel void attention_output_relayout(ATTENTION_OUTPUT_ARGUMENTS,
+    uint item [[thread_position_in_grid]]) {
+    ATTENTION_OUTPUT_OPERANDS;
+    projection::tall_relayout(in, fragments, uint(SEISMIC_DIM_M), k, item);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_TALL
+template <uint TALL_M, uint TALL_K, uint STAGERS>
+kernel void attention_output_tall(ATTENTION_OUTPUT_ARGUMENTS,
+    uint3 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    PROJECTION_GEMM_TALL_SHARED(shared, TALL_K);
+    ATTENTION_OUTPUT_OPERANDS;
+    projection::gemm_tall<packets::W0, TALL_M, TALL_K, STAGERS>(projection::tall_operand(in, fragments), out, w,
+        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_D), k, tile.y, tile.x, shared, sg, lane);
 }
 #endif

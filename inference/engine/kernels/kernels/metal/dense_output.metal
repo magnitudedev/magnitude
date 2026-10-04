@@ -13,6 +13,7 @@ typedef element::Act activation;
     device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],                 \
     device float *small_partials [[buffer(SEISMIC_BUFFER_SCRATCH_SMALL_PARTIALS)]],     \
+    device uchar *fragments [[buffer(SEISMIC_BUFFER_SCRATCH_FRAGMENTS)]],               \
     device const float *down_scale [[buffer(SEISMIC_BUFFER_DOWN_SCALE)]],               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
@@ -101,5 +102,28 @@ kernel void dense_output_reduce(DENSE_OUTPUT_ARGUMENTS,
     DENSE_OUTPUT_OPERANDS;
     projection::gemm_reduce(out, partials, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H),
         uint(SEISMIC_RUNTIME_SPLIT), index);
+}
+#endif
+
+// The TALL form past 64 rows: the product rows in the tall GEMM's order, then
+// its tiles.
+#ifdef SEISMIC_FORMING_DENSE_OUTPUT_RELAYOUT
+kernel void dense_output_relayout(DENSE_OUTPUT_ARGUMENTS,
+    uint item [[thread_position_in_grid]]) {
+    DENSE_OUTPUT_OPERANDS;
+    projection::tall_relayout(in, fragments, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), item);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_DENSE_OUTPUT_TALL
+template <uint TALL_M, uint TALL_K, uint STAGERS>
+kernel void dense_output_tall(DENSE_OUTPUT_ARGUMENTS,
+    uint3 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    PROJECTION_GEMM_TALL_SHARED(shared, TALL_K);
+    DENSE_OUTPUT_OPERANDS;
+    projection::gemm_tall<packets::W0, TALL_M, TALL_K, STAGERS>(projection::tall_operand(in, fragments), out, w,
+        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile.y, tile.x, shared, sg, lane);
 }
 #endif

@@ -89,11 +89,16 @@ fn attention_output[M, D, Q, W](hidden: &tensor[M, D] f32,
 # Metal: GEMV below BATCH_FROM rows, batched GEMV to 16, GEMM beyond with
 # SPLIT-way split-K summed by `finalize`. The input needs no prologue, so
 # there is no `stage`. (CUDA: GEMV to 16 rows, INT8 candidate on the GEMM.)
+# TALL selects the tall GEMM past 64 rows (see `dense_rows.seismic`): on
+# simdgroup matrices `relayout` first reorders the gated rows into
+# `fragments`, a second copy of them in whole 64-row tiles.
 native attention_output for metal from "metal/attention_output.metal":
     static (D, Q, W)
-    params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4])
+    params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4], form TALL in [1, 0])
+    where TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)
     scratch partials bytes (SPLIT * M * D * 4) when M > 64 and SPLIT > 1
     scratch small_partials bytes (4 * M * D * 4) when M > 16 and M <= 64
+    scratch fragments bytes (ceil_div(M, 64) * 64 * Q * W * 2) when M > 64 and TALL == 1
     launch attention_output_gemv when M < BATCH_FROM:
         params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
         threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
@@ -110,13 +115,20 @@ native attention_output for metal from "metal/attention_output.metal":
     launch attention_output_finalize_small when M > 16 and M <= 64:
         threadgroups (ceil_div(M * D, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_output_gemm when M > 64:
+    launch attention_output_gemm when M > 64 and TALL == 0:
         params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
         threadgroups (ceil_div(D, TILE_N), ceil_div(M, TILE_M), SPLIT)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
     launch attention_output_finalize when M > 64 and SPLIT > 1:
         threadgroups (ceil_div(M * D, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+    launch attention_output_relayout when M > 64 and TALL == 1:
+        threadgroups (ceil_div(ceil_div(M, 64) * Q * W, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch attention_output_tall when M > 64 and TALL == 1:
+        params (code TALL_M in [128, 256, 512], code TALL_K in [64, 128], code STAGERS in [2, 1])
+        threadgroups (ceil_div(D, 32), ceil_div(M, TALL_M), 1)
+        threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
 
 # CUDA: GEMV to 8 rows, `gemv16` to 16, GEMM beyond in the K1 row bands
 # (`gemm_small` to 64 rows with the INT8 candidate, `gemm` beyond), both split
@@ -263,11 +275,14 @@ fn attention_project[M, D, Q, GR, K, V](hidden: &tensor[M, D] f32, input_norm: &
         linear(normalized, value_weight, value)
     return query, gate, key, value
 
+# Metal: TALL selects the tall GEMM past 64 rows (see `dense_rows.seismic`)
+# over rows staged in its order.
 native attention_project for metal from "metal/attention_project.metal":
     static (D, Q, GR, K, V)
-    params (arithmetic BATCH_FROM in [5, 3, 9])
-    scratch normalized bytes (M * D * 2) when M > 16
-    launch attention_project_stage when M > 16:
+    params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0])
+    where TALL == 0 or D % 128 == 0
+    scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * D * 2) when M > 16
+    launch attention_project_stage when M > 16 and (M <= 64 or TALL == 0):
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch attention_project_gemv when M < BATCH_FROM:
@@ -290,11 +305,19 @@ native attention_project for metal from "metal/attention_project.metal":
         threadgroups (ceil_div(Q, 64) + ceil_div(GR, 64) + ceil_div(K, 64) + ceil_div(V, 64),
             ceil_div(M, 32), 1)
         threads_per_threadgroup (128, 1, 1)
-    launch attention_project_gemm when M > 64:
+    launch attention_project_gemm when M > 64 and TALL == 0:
         params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
         threadgroups (ceil_div(Q, TILE_N) + ceil_div(GR, TILE_N) + ceil_div(K, TILE_N)
             + ceil_div(V, TILE_N), ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    launch attention_project_stage_tall when M > 64 and TALL == 1:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch attention_project_tall when M > 64 and TALL == 1:
+        params (code TALL_M in [128, 256, 512], code TALL_K in [64, 128], code STAGERS in [2, 1])
+        threadgroups (ceil_div(Q, 32) + ceil_div(GR, 32) + ceil_div(K, 32) + ceil_div(V, 32),
+            ceil_div(M, TALL_M), 1)
+        threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
 
 native attention_project for cuda from "cuda/attention_project.cu":
     static (D, Q, GR, K, V)

@@ -1859,20 +1859,25 @@ fn step_form(
 ) -> (Vec<f32>, Outcome) {
     use magnitude_kernels::gated_delta_project;
     let g = case.geometry;
-    // gated_delta_project's launches: stage, gemv, batch, gemm_small, gemm.
+    // gated_delta_project's launches: stage, gemv, batch, gemm_small, gemm,
+    // stage_tall, tall.
     let specialization = NativeSpecialization::new()
         .with_static("H", hidden as u64)
         .with_static("NK", g.key_heads as u64)
         .with_static("NV", g.value_heads as u64)
         .with_static("W", g.width as u64)
         .with_param("BATCH_FROM", mapping.batch_from)
+        .with_param("TALL", 0)
         .with_launch_param(1, "SIMDGROUPS", mapping.simdgroups)
         .with_launch_param(1, "ROWS", mapping.rows)
         .with_launch_param(1, "LANES", mapping.lanes)
         .with_launch_param(2, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
         .with_launch_param(2, "BATCH_ROWS", mapping.batch_rows)
         .with_launch_param(4, "TILE_M", 64)
-        .with_launch_param(4, "TILE_N", 64);
+        .with_launch_param(4, "TILE_N", 64)
+        .with_launch_param(6, "TALL_M", 128)
+        .with_launch_param(6, "TALL_K", 64)
+        .with_launch_param(6, "STAGERS", 2);
     let projection = gated_delta_project::native_for_device_with(
         device,
         gated_delta_project::Elements {

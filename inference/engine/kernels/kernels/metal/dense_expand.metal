@@ -107,3 +107,31 @@ kernel void dense_expand_gemm(DENSE_EXPAND_ARGUMENTS,
     DENSE_EXPAND_GEMM(TILE_M, TILE_N);
 }
 #endif
+
+// The TALL form past 64 rows: the normalized rows in the tall GEMM's order,
+// then its tiles.
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_NORMALIZE_TALL
+kernel void dense_expand_normalize_tall(DENSE_EXPAND_ARGUMENTS,
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(norms);
+    DENSE_EXPAND_OPERANDS;
+    projection::device_normalize<256, projection::TallOrder<activation>>(in, item, normalized, uint(SEISMIC_DIM_H),
+        norms, thread_index);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_TALL
+template <uint TALL_M, uint TALL_K, uint STAGERS>
+kernel void dense_expand_tall(DENSE_EXPAND_ARGUMENTS,
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    PROJECTION_GEMM_TALL_SHARED(shared, TALL_K);
+    DENSE_EXPAND_OPERANDS;
+    projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
+    projection::gemm_tall_paired<packets::W0, packets::W1, TALL_M, TALL_K, STAGERS>(
+        projection::tall_operand(x, normalized), out, gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F),
+        uint(SEISMIC_DIM_H), tile.y, tile.x, shared, sg, lane);
+}
+#endif

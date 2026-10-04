@@ -625,8 +625,9 @@ fn read_act(act: Act, tensor: &Tensor) -> Vec<f32> {
 /// LANES lanes), the first row count served by the batched GEMV (BATCH_FROM;
 /// smaller classes run the GEMV), the batched threadgroup (BATCH_SIMDGROUPS x
 /// BATCH_ROWS blocks of 8 weight rows), the GEMM tile (TILE_M x TILE_N; on
-/// Vulkan over subgroups of SUB_M x SUB_N) and, for the small-N output
-/// projections, the split-K factor.
+/// Vulkan over subgroups of SUB_M x SUB_N), for the small-N output
+/// projections the split-K factor, and for the Metal dense entries the tall
+/// GEMM when they take that form.
 #[derive(Clone, Copy, Debug)]
 struct Mapping {
     simdgroups: u64,
@@ -640,7 +641,24 @@ struct Mapping {
     sub_m: u64,
     sub_n: u64,
     split: u64,
+    tall: Option<Tall>,
 }
+
+/// A tall GEMM threadgroup: TALL_M rows, TALL_K columns per stage, STAGERS
+/// staging simdgroups.
+#[derive(Clone, Copy, Debug)]
+struct Tall {
+    rows: u64,
+    columns: u64,
+    stagers: u64,
+}
+
+/// The tall launch's declaration defaults.
+const TALL_DEFAULT: Tall = Tall {
+    rows: 128,
+    columns: 64,
+    stagers: 2,
+};
 
 /// Decode defaults with the given GEMM tile and split.
 const fn gemm_mapping(tile_m: u64, tile_n: u64, split: u64) -> Mapping {
@@ -656,6 +674,7 @@ const fn gemm_mapping(tile_m: u64, tile_n: u64, split: u64) -> Mapping {
         sub_m: 32,
         sub_n: 32,
         split,
+        tall: None,
     }
 }
 
@@ -672,6 +691,7 @@ const MAPPINGS: [Mapping; 4] = [
         sub_m: 64,
         sub_n: 64,
         split: 1,
+        tall: None,
     },
     Mapping {
         simdgroups: 2,
@@ -685,6 +705,7 @@ const MAPPINGS: [Mapping; 4] = [
         sub_m: 64,
         sub_n: 32,
         split: 2,
+        tall: None,
     },
     Mapping {
         simdgroups: 32,
@@ -698,6 +719,7 @@ const MAPPINGS: [Mapping; 4] = [
         sub_m: 32,
         sub_n: 64,
         split: 4,
+        tall: None,
     },
     Mapping {
         simdgroups: 16,
@@ -711,6 +733,7 @@ const MAPPINGS: [Mapping; 4] = [
         sub_m: 32,
         sub_n: 32,
         split: 2,
+        tall: None,
     },
 ];
 
@@ -839,12 +862,31 @@ fn scoped_projection_specialization_on(
     }
 }
 
+/// The TALL form of a Metal dense entry and the tile of its tall launch
+/// (`launch`), which takes the declaration defaults under the staged form.
+fn with_tall(
+    device: &Device,
+    specialization: NativeSpecialization,
+    launch: usize,
+    tall: Option<Tall>,
+) -> NativeSpecialization {
+    if device.backend() != BackendName::Metal {
+        return specialization;
+    }
+    let tile = tall.unwrap_or(TALL_DEFAULT);
+    specialization
+        .with_param("TALL", u64::from(tall.is_some()))
+        .with_launch_param(launch, "TALL_M", tile.rows)
+        .with_launch_param(launch, "TALL_K", tile.columns)
+        .with_launch_param(launch, "STAGERS", tile.stagers)
+}
+
 fn dense_output_specialization_on(
     device: &Device,
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
-    scoped_projection_specialization_on(
+    let specialization = scoped_projection_specialization_on(
         device,
         statics,
         mapping,
@@ -855,7 +897,8 @@ fn dense_output_specialization_on(
         },
         true,
     )
-    .with_static("DS", 0)
+    .with_static("DS", 0);
+    with_tall(device, specialization, 7, mapping.tall)
 }
 
 fn attention_output_specialization_on(
@@ -863,7 +906,7 @@ fn attention_output_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
-    scoped_projection_specialization_on(
+    let specialization = scoped_projection_specialization_on(
         device,
         statics,
         mapping,
@@ -873,7 +916,29 @@ fn attention_output_specialization_on(
             gemm: 4,
         },
         true,
-    )
+    );
+    with_tall(device, specialization, 7, mapping.tall)
+}
+
+/// The specialization of a segmented projection (`attention_project`,
+/// `gated_delta_project`) on `device`.
+fn segmented_projection_specialization_on(
+    device: &Device,
+    statics: &[(&str, usize)],
+    mapping: Mapping,
+) -> NativeSpecialization {
+    let specialization = scoped_projection_specialization_on(
+        device,
+        statics,
+        mapping,
+        ProjectionLaunches {
+            gemv: 1,
+            batch: 2,
+            gemm: 4,
+        },
+        false,
+    );
+    with_tall(device, specialization, 6, mapping.tall)
 }
 
 fn dense_expand_specialization_on(
@@ -881,7 +946,7 @@ fn dense_expand_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
-    scoped_projection_specialization_on(
+    let specialization = scoped_projection_specialization_on(
         device,
         statics,
         mapping,
@@ -893,7 +958,8 @@ fn dense_expand_specialization_on(
         false,
     )
     .with_static("GS", 0)
-    .with_static("US", 0)
+    .with_static("US", 0);
+    with_tall(device, specialization, 6, mapping.tall)
 }
 
 fn readout_projection_specialization_on(
@@ -1344,6 +1410,280 @@ fn metal_dense_expand_scoped_launches_match_the_host() {
                 &actual,
                 &expected,
                 &bound,
+            );
+        }
+    }
+}
+
+/// Every tall tile of the Metal dense entries.
+const TALL_TILES: [Tall; 6] = [
+    TALL_DEFAULT,
+    Tall {
+        rows: 256,
+        columns: 128,
+        stagers: 1,
+    },
+    Tall {
+        rows: 512,
+        columns: 64,
+        stagers: 1,
+    },
+    Tall {
+        rows: 256,
+        columns: 64,
+        stagers: 2,
+    },
+    Tall {
+        rows: 128,
+        columns: 128,
+        stagers: 1,
+    },
+    Tall {
+        rows: 512,
+        columns: 128,
+        stagers: 2,
+    },
+];
+
+/// The tall GEMM multiplies the staged tile's operand values in its K order
+/// per output, so TALL 1 reproduces TALL 0 bit for bit: paired and plain, in
+/// every packed format and tall tile, over whole row tiles (128, 192), a row
+/// count past its last 64-row and 16-row groups (200), and weight rows past
+/// the last tile (200 features, 72 outputs).
+#[test]
+fn metal_tall_gemm_is_bit_identical_to_the_staged_tiles() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits());
+    let staged = gemm_mapping(64, 64, 1);
+    for repr in [
+        Repr::Q4k,
+        Repr::Q5k,
+        Repr::Q6k,
+        Repr::Q8,
+        Repr::Iq4,
+        Repr::Bf16,
+    ] {
+        let (h, f) = (256, 200);
+        let gate = weight(repr, f, h, 71, 1.0);
+        let up = weight(repr, f, h, 72, 1.0);
+        let norm = norm_values(h, 73);
+        let (outputs, k) = (72, 512);
+        let down = weight(repr, outputs, k, 74, 1.0);
+        for rows in [128usize, 192, 200] {
+            let mut rng = Rng::new(rows as u64 + 75);
+            let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let narrow = (0..rows * outputs)
+                .map(|_| rng.symmetric())
+                .collect::<Vec<_>>();
+            let product = (0..rows * k).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let out_rows = (0..rows as i32).collect::<Vec<_>>();
+            let expand = |mapping| {
+                dense_expand_native(
+                    &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, mapping,
+                )
+            };
+            let output = |mapping| {
+                dense_output_native(
+                    &device, act, &down, &narrow, rows, &product, &out_rows, mapping,
+                )
+            };
+            let (expand_staged, output_staged) = (expand(staged), output(staged));
+            let (expand_expected, expand_bound) = under(rows, || {
+                dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6)
+            });
+            let (output_expected, output_bound) = under(rows, || {
+                dense_output_reference(act, &down, &narrow, &product, &out_rows)
+            });
+            for tile in TALL_TILES {
+                let mapping = Mapping {
+                    tall: Some(tile),
+                    ..staged
+                };
+                let (expand_tall, output_tall) = (expand(mapping), output(mapping));
+                assert_within(
+                    &format!("tall dense_expand {repr:?} rows {rows} {tile:?}"),
+                    &expand_tall,
+                    &expand_expected,
+                    &expand_bound,
+                );
+                assert_within(
+                    &format!("tall dense_output {repr:?} rows {rows} {tile:?}"),
+                    &output_tall,
+                    &output_expected,
+                    &output_bound,
+                );
+                assert!(
+                    same(&expand_tall, &expand_staged),
+                    "dense_expand {repr:?} rows {rows} {tile:?}"
+                );
+                assert!(
+                    same(&output_tall, &output_staged),
+                    "dense_output {repr:?} rows {rows} {tile:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The attention and recurrent projections under TALL 1 reproduce TALL 0 bit
+/// for bit, as the dense entries do: the segmented projections (query | key |
+/// value, with and without the zeroed query; qkv | z | alpha | beta), and the
+/// output projection, over whole row tiles and a row count past its last
+/// 64-row and 16-row groups.
+#[test]
+fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits());
+    let staged = gemm_mapping(64, 64, 1);
+    let (d, kv, g, w) = (256, 1, 3, 40);
+    let rows_of = [kv * g * 2 * w, kv * w, kv * w];
+    let reprs = [Repr::Q4k, Repr::Q8, Repr::Q6k];
+    let weights = (0..3)
+        .map(|i| weight(reprs[i], rows_of[i], d, 81 + i as u64, 1.0))
+        .collect::<Vec<_>>();
+    let norm = norm_values(d, 84);
+    let (outputs, heads, width) = (72, 8, 64);
+    let out_weight = weight(Repr::Q5k, outputs, heads * width, 85, 1.0);
+    let (nk, nv, head_width) = (1, 3, 24);
+    let recurrent_reprs = [Repr::Q5k, Repr::Q4k, Repr::Q8, Repr::Bf16];
+    let recurrent_rows = [(2 * nk + nv) * head_width, nv * head_width, nv, nv];
+    let recurrent_weights = (0..4)
+        .map(|i| weight(recurrent_reprs[i], recurrent_rows[i], d, 90 + i as u64, 1.0))
+        .collect::<Vec<_>>();
+    for rows in [128usize, 200] {
+        let mut rng = Rng::new(rows as u64 + 86);
+        let hidden = (0..rows * d).map(|_| rng.symmetric()).collect::<Vec<_>>();
+        let narrow = (0..rows * outputs)
+            .map(|_| rng.symmetric())
+            .collect::<Vec<_>>();
+        let gated = (0..rows * heads * width)
+            .map(|_| act.round(rng.symmetric()))
+            .collect::<Vec<_>>();
+        let project = |mapping, project_mode| {
+            let out = attention_project::native_for_device_with(
+                &device,
+                attention_project::Elements {
+                    NW: Element::bf16(),
+                    QW: reprs[0].element(),
+                    GW: Element::bf16(),
+                    KW: reprs[1].element(),
+                    VW: reprs[2].element(),
+                    A: act.element(),
+                },
+                &segmented_projection_specialization_on(
+                    &device,
+                    &attention_project_statics(d, kv, g, w),
+                    mapping,
+                ),
+            )
+            .unwrap()
+            .call(attention_project::Args {
+                hidden: &f32_tensor(&device, &[rows, d], &hidden),
+                input_norm: &bf16_norm(&device, &norm),
+                query_weight: &weights[0].tensor(&device),
+                gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
+                key_weight: &weights[1].tensor(&device),
+                value_weight: &weights[2].tensor(&device),
+                epsilon: 1e-6,
+                project_mode,
+            })
+            .unwrap();
+            [
+                read_act(act, &out.r0),
+                read_act(act, &out.r2),
+                read_act(act, &out.r3),
+            ]
+        };
+        let output = |mapping| {
+            let out = attention_output::native_for_device_with(
+                &device,
+                attention_output::Elements {
+                    OW: out_weight.repr.element(),
+                    A: act.element(),
+                },
+                &attention_output_specialization_on(
+                    &device,
+                    &[("D", outputs), ("Q", heads), ("W", width)],
+                    mapping,
+                ),
+            )
+            .unwrap()
+            .call(attention_output::Args {
+                hidden: &f32_tensor(&device, &[rows, outputs], &narrow),
+                gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
+                output_weight: &out_weight.tensor(&device),
+            })
+            .unwrap()
+            .value;
+            read_f32(&out)
+        };
+        let recurrent = |mapping| {
+            let out = gated_delta_project::native_for_device_with(
+                &device,
+                gated_delta_project::Elements {
+                    NW: Element::bf16(),
+                    QW: recurrent_reprs[0].element(),
+                    GW: recurrent_reprs[1].element(),
+                    AW: recurrent_reprs[2].element(),
+                    BW: recurrent_reprs[3].element(),
+                    A: act.element(),
+                },
+                &segmented_projection_specialization_on(
+                    &device,
+                    &[("H", d), ("NK", nk), ("NV", nv), ("W", head_width)],
+                    mapping,
+                ),
+            )
+            .unwrap()
+            .call(gated_delta_project::Args {
+                hidden: &f32_tensor(&device, &[rows, d], &hidden),
+                input_norm: &bf16_norm(&device, &norm),
+                qkv_weight: &recurrent_weights[0].tensor(&device),
+                gate_weight: &recurrent_weights[1].tensor(&device),
+                alpha_weight: &recurrent_weights[2].tensor(&device),
+                beta_weight: &recurrent_weights[3].tensor(&device),
+                epsilon: 1e-6,
+            })
+            .unwrap()
+            .value;
+            read_act(act, &out)
+        };
+        let project_staged = [project(staged, 0), project(staged, 1)];
+        let output_staged = output(staged);
+        let recurrent_staged = recurrent(staged);
+        for tile in TALL_TILES {
+            let mapping = Mapping {
+                tall: Some(tile),
+                ..staged
+            };
+            assert!(
+                same(&recurrent(mapping), &recurrent_staged),
+                "gated_delta_project rows {rows} {tile:?}"
+            );
+            for (mode, expected) in project_staged.iter().enumerate() {
+                let actual = project(mapping, mode as i32);
+                for (segment, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                    assert!(
+                        same(actual, expected),
+                        "attention_project segment {segment} mode {mode} rows {rows} {tile:?}"
+                    );
+                }
+            }
+            assert!(
+                same(&output(mapping), &output_staged),
+                "attention_output rows {rows} {tile:?}"
             );
         }
     }
@@ -1914,16 +2254,10 @@ fn recurrent_project_cases_on(device: &Device, scoped: bool) {
                     BW: reprs[3].element(),
                     A: act.element(),
                 },
-                &scoped_projection_specialization_on(
+                &segmented_projection_specialization_on(
                     device,
                     &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
                     mapping,
-                    ProjectionLaunches {
-                        gemv: 1,
-                        batch: 2,
-                        gemm: 4,
-                    },
-                    false,
                 ),
             )
             .unwrap();
@@ -2225,16 +2559,10 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     VW: reprs[2].element(),
                     A: act.element(),
                 },
-                &scoped_projection_specialization_on(
+                &segmented_projection_specialization_on(
                     device,
                     &attention_project_statics(d, kv, g, w),
                     mapping,
-                    ProjectionLaunches {
-                        gemv: 1,
-                        batch: 2,
-                        gemm: 4,
-                    },
-                    false,
                 ),
             )
             .unwrap();
@@ -2875,16 +3203,21 @@ fn uniform_values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
 /// One timed configuration: the per-call device time, the weight bytes one
 /// call streams and its multiply-add work.
 fn report(label: &str, m: usize, mapping: Mapping, seconds: f64, bytes: usize, macs: usize) {
+    let tile = match mapping.tall {
+        None => format!("TILE_M {}, TILE_N {}", mapping.tile_m, mapping.tile_n),
+        Some(tall) => format!(
+            "TALL_M {}, TALL_K {}, STAGERS {}",
+            tall.rows, tall.columns, tall.stagers
+        ),
+    };
     eprintln!(
-        "timing {label} M {m} (SG {}, R {}, LANES {}, BATCH_FROM {}, BATCH SG {}, BATCH R {}, TILE_M {}, TILE_N {}, SPLIT {}): {:.1} us, {:.1} GB/s, {:.2} TFLOP/s",
+        "timing {label} M {m} (SG {}, R {}, LANES {}, BATCH_FROM {}, BATCH SG {}, BATCH R {}, {tile}, SPLIT {}): {:.1} us, {:.1} GB/s, {:.2} TFLOP/s",
         mapping.simdgroups,
         mapping.rows,
         mapping.lanes,
         mapping.batch_from,
         mapping.batch_simdgroups,
         mapping.batch_rows,
-        mapping.tile_m,
-        mapping.tile_n,
         mapping.split,
         seconds * 1e6,
         bytes as f64 / seconds / 1e9,
@@ -2978,6 +3311,29 @@ fn split_mappings(m: usize) -> Vec<Mapping> {
         .collect()
 }
 
+/// The tall tiles of the Metal entries with the TALL form, taken past 64 rows.
+fn tall_mappings(device: &Device, m: usize) -> Vec<Mapping> {
+    if device.backend() != BackendName::Metal || m <= 64 {
+        return Vec::new();
+    }
+    let mut all = Vec::new();
+    for rows in [128, 256, 512] {
+        for columns in [64, 128] {
+            for stagers in [1, 2] {
+                all.push(Mapping {
+                    tall: Some(Tall {
+                        rows,
+                        columns,
+                        stagers,
+                    }),
+                    ..gemm_mapping(64, 64, 1)
+                });
+            }
+        }
+    }
+    all
+}
+
 fn timing_selected(name: &str) -> bool {
     std::env::var("PROJECTION_TIMING_ENTRIES")
         .map_or(true, |list| list.split(',').any(|entry| entry == name))
@@ -3026,7 +3382,10 @@ fn timing_on(device: &Device) {
         for &m in &rows_list {
             let product = act_tensor(&device, act, &[m, f], &uniform_values(m * f, 2, 1.0));
             let out_rows = i32_tensor(&device, &[m], &(0..m as i32).collect::<Vec<_>>());
-            for mapping in split_mappings(m) {
+            for mapping in split_mappings(m)
+                .into_iter()
+                .chain(tall_mappings(device, m))
+            {
                 let kernel = dense_output::native_for_device_with(
                     &device,
                     dense_output::Elements {
@@ -3079,7 +3438,10 @@ fn timing_on(device: &Device) {
         let norm = bf16_norm(&device, &norm_values(h, 3));
         for &m in &rows_list {
             let out_rows = i32_tensor(&device, &[m], &(0..m as i32).collect::<Vec<_>>());
-            for mapping in timing_mappings(m) {
+            for mapping in timing_mappings(m)
+                .into_iter()
+                .chain(tall_mappings(device, m))
+            {
                 let kernel = dense_expand::native_for_device_with(
                     &device,
                     dense_expand::Elements {
@@ -3150,7 +3512,10 @@ fn timing_on(device: &Device) {
         let total = rows_of.iter().sum::<usize>();
         for &m in &rows_list {
             let hidden = f32_tensor(&device, &[m, h], &uniform_values(m * h, 4, 1.0));
-            for mapping in timing_mappings(m) {
+            for mapping in timing_mappings(m)
+                .into_iter()
+                .chain(tall_mappings(device, m))
+            {
                 let kernel = gated_delta_project::native_for_device_with(
                     &device,
                     gated_delta_project::Elements {
@@ -3161,16 +3526,10 @@ fn timing_on(device: &Device) {
                         BW: reprs[3].element(),
                         A: a,
                     },
-                    &scoped_projection_specialization_on(
+                    &segmented_projection_specialization_on(
                         device,
                         &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
                         mapping,
-                        ProjectionLaunches {
-                            gemv: 1,
-                            batch: 2,
-                            gemm: 4,
-                        },
-                        false,
                     ),
                 )
                 .unwrap();
@@ -3214,7 +3573,10 @@ fn timing_on(device: &Device) {
         for &m in &rows_list {
             let hidden = f32_tensor(&device, &[m, h], &uniform_values(m * h, 5, 1.0));
             let gated = act_tensor(&device, act, &[m, nv, w], &uniform_values(m * k, 6, 1.0));
-            for mapping in split_mappings(m) {
+            for mapping in split_mappings(m)
+                .into_iter()
+                .chain(tall_mappings(device, m))
+            {
                 let kernel = attention_output::native_for_device_with(
                     &device,
                     attention_output::Elements {
@@ -3288,7 +3650,10 @@ fn timing_on(device: &Device) {
         let total = rows_of.iter().sum::<usize>();
         for &m in &rows_list {
             let hidden = f32_tensor(&device, &[m, d], &uniform_values(m * d, 8, 1.0));
-            for mapping in timing_mappings(m) {
+            for mapping in timing_mappings(m)
+                .into_iter()
+                .chain(tall_mappings(device, m))
+            {
                 let kernel = attention_project::native_for_device_with(
                     &device,
                     attention_project::Elements {
@@ -3299,16 +3664,10 @@ fn timing_on(device: &Device) {
                         VW: reprs[2].element(),
                         A: a,
                     },
-                    &scoped_projection_specialization_on(
+                    &segmented_projection_specialization_on(
                         device,
                         &attention_project_statics(d, kv, g, w),
                         mapping,
-                        ProjectionLaunches {
-                            gemv: 1,
-                            batch: 2,
-                            gemm: 4,
-                        },
-                        false,
                     ),
                 )
                 .unwrap();
@@ -3353,7 +3712,10 @@ fn timing_on(device: &Device) {
         for &m in &rows_list {
             let hidden = f32_tensor(&device, &[m, d], &uniform_values(m * d, 9, 1.0));
             let gated = act_tensor(&device, act, &[m, q, w], &uniform_values(m * k, 10, 1.0));
-            for mapping in split_mappings(m) {
+            for mapping in split_mappings(m)
+                .into_iter()
+                .chain(tall_mappings(device, m))
+            {
                 let kernel = attention_output::native_for_device_with(
                     &device,
                     attention_output::Elements {
