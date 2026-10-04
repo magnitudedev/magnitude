@@ -306,15 +306,25 @@ fn prefill_specializations_on(
             } else {
                 ("QT", query_tile)
             };
+            let specialization = qwen_form(statics(geometry), geometry)
+                .with_param(tile.0, tile.1)
+                .with_param("SPLIT_GROUPS", split_groups);
             (
                 format!(
                     "{:?} (QT, SPLIT_GROUPS) {:?}",
                     device.backend(),
                     (query_tile, split_groups)
                 ),
-                qwen_form(statics(geometry), geometry)
-                    .with_param(tile.0, tile.1)
-                    .with_param("SPLIT_GROUPS", split_groups),
+                // Metal splits a kv head's query heads into groups of HEADS:
+                // here one group, the smallest declared value holding them.
+                if device.backend() == BackendName::Metal {
+                    specialization.with_param(
+                        "HEADS",
+                        (geometry.g.next_power_of_two() as u64).min(16),
+                    )
+                } else {
+                    specialization
+                },
             )
         })
         .collect()

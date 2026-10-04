@@ -831,10 +831,14 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
             ));
             configurations
         }
-        (BackendName::Metal, false) => vec![
-            vec![("QT", 16), ("SPLIT_GROUPS", 256)],
-            vec![("QT", 8), ("SPLIT_GROUPS", 1)],
-        ],
+        (BackendName::Metal, false) => {
+            // The smallest declared HEADS holding all of a kv head's query heads.
+            let heads = (form.g.next_power_of_two() as u64).min(16);
+            vec![
+                vec![("QT", 16), ("HEADS", heads), ("SPLIT_GROUPS", 256)],
+                vec![("QT", 8), ("HEADS", heads), ("SPLIT_GROUPS", 1)],
+            ]
+        }
         (BackendName::Cuda, true) => {
             let slices = [8u64, 4, 2, 1]
                 .into_iter()
