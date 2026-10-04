@@ -250,6 +250,7 @@ async fn memory(State(identity): State<Identity>) -> Response {
 }
 
 fn main() {
+    magnitude_executor::platform::relax_gpu_watchdog();
     if let Err(error) = run() {
         eprintln!("magnitude-engine: {error}");
         std::process::exit(1);

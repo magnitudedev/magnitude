@@ -101,6 +101,7 @@ fn parse() -> Result<Options, String> {
 }
 
 fn main() {
+    magnitude_executor::platform::relax_gpu_watchdog();
     match run() {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),

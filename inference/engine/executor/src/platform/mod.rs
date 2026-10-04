@@ -20,3 +20,17 @@ pub use selection::{
     select, unusable_reason, DeviceRequest, DeviceRequestParseError, SelectionError,
     AUTOMATIC_BACKEND_ORDER,
 };
+
+/// Relaxes the macOS GPU watchdog for this process. M1 and M2 GPUs cannot
+/// preempt a long prefill attention launch, so while the window server waits
+/// for the GPU, macOS kills the command buffer ("Impacting Interactivity")
+/// and the model is lost. `AGX_RELAX_CDM_CTXSTORE_TIMEOUT` is read by Apple's
+/// GPU driver; llama.cpp sets it for the same failure. Call first in `main`,
+/// before any thread or Metal device exists; child processes inherit it, and
+/// an explicit setting is kept.
+pub fn relax_gpu_watchdog() {
+    const RELAX: &str = "AGX_RELAX_CDM_CTXSTORE_TIMEOUT";
+    if cfg!(target_os = "macos") && std::env::var_os(RELAX).is_none() {
+        std::env::set_var(RELAX, "1");
+    }
+}
