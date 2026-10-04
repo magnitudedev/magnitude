@@ -249,6 +249,12 @@ The default configuration at given static dimensions is the first configuration 
 in declared parameter and value order, so reordering values or adding a `where` conjunct cannot
 leave admissible statics without a default. Statics that no configuration admits lie outside the
 kernel's domain: graph construction rejects such a node, naming the call and its statics.
+A configuration that changes the entry's numerics beyond summation order declares it:
+`error_class NAME when C` names the error class of the configurations satisfying `C`, a condition
+over static dimensions and entry parameters (reduced-precision operands, a result row that depends
+on its launch's other rows). A configuration may be in several classes; the default is in none.
+Classes do not restrict direct selection, which stays explicit; native tuning forms a class's
+configurations only for a caller that admits the class.
 An inactive launch is neither encoded nor checked against pipeline or device limits, its geometry is not
 evaluated, and it keeps its ordinal (formed functions and trace entries stay in declaration order;
 a trace records it as an empty launch). An inactive scratch buffer keeps its ABI slot at the minimum

@@ -60,6 +60,7 @@ fn resolved(projector: bool) -> ResolvedEngineConfiguration {
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows: 512,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(CONTEXT),
         service: limits(),

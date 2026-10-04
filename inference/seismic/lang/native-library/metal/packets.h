@@ -471,6 +471,118 @@ struct Loader<Dense<E>> {
     }
 };
 
+// A row's coefficients over a run of `packets` consecutive packets, held in
+// registers by a kernel that walks one row along K. `load` reads the run's
+// coefficient storage once, positioned at packet p; `packet` then forms
+// packet p from its codes and that state, with the values `Loader<W>::load`
+// yields, and moves the state on to packet p + 1. The k-quant formats keep
+// their local coefficients and super factors per 256 values in planes apart
+// from the codes, so a walk that loads them per packet touches two more
+// places of every row on every packet; with a run it touches them once per
+// eight packets. Other representations have no run: `packets` is 1, the
+// state is empty and `packet` is the plain load.
+template <typename W>
+struct Block {
+    static constant constexpr uint packets = 1;
+    struct state {};
+    static state load(device const uchar *, Rows16, uint) { return state{}; }
+    static typename W::packet packet(device const uchar *row, Rows16 layout, uint p, uint k, thread state &) {
+        return Loader<W>::load(row, layout, p, k);
+    }
+};
+
+// q4k and q5k: the twelve bytes of a 256-value block's packed (scale6, min6)
+// fields, the next packet's lowest, and (d, -dmin).
+struct KBlock {
+    uint3 fields;
+    float2 factors;
+    static void advance(thread KBlock &run) {
+        run.fields = uint3((run.fields.x >> 12) | (run.fields.y << 20), (run.fields.y >> 12) | (run.fields.z << 20),
+            run.fields.z >> 12);
+    }
+    static KBlock load(device const uchar *row, Rows16 layout, uint p) {
+        uint block = p >> 3;
+        KBlock run;
+        run.fields = uint3(*reinterpret_cast<device const packed_uint3 *>(row + layout.scales + 12ul * block));
+        half2 factors = *reinterpret_cast<device const half2 *>(row + layout.supers + 4ul * block);
+        run.factors = float2(float(factors.x), -float(factors.y));
+        for (uint skipped = 0; skipped < (p & 7u); ++skipped)
+            advance(run);
+        return run;
+    }
+    // The next packet's (scale, bias): d * scale6 and -(dmin * min6).
+    static float2 take(thread KBlock &run) {
+        uint pair = run.fields.x;
+        advance(run);
+        return run.factors * code_pair((pair & 63u) | ((pair & 0xfc0u) << 10), 1024.0h);
+    }
+};
+
+template <>
+struct Block<Q4K> {
+    static constant constexpr uint packets = 8;
+    typedef KBlock state;
+    static state load(device const uchar *row, Rows16 layout, uint p) { return KBlock::load(row, layout, p); }
+    static Q4K::packet packet(device const uchar *row, Rows16 layout, uint p, uint, thread state &run) {
+        Q4K::packet k;
+        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
+        float2 coefficients = KBlock::take(run);
+        k.scale = coefficients.x;
+        k.bias = coefficients.y;
+        return k;
+    }
+};
+
+template <>
+struct Block<Q5K> {
+    static constant constexpr uint packets = 8;
+    typedef KBlock state;
+    static state load(device const uchar *row, Rows16 layout, uint p) { return KBlock::load(row, layout, p); }
+    static Q5K::packet packet(device const uchar *row, Rows16 layout, uint p, uint, thread state &run) {
+        Q5K::packet k;
+        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
+        k.high = *reinterpret_cast<device const uint *>(row + layout.high + 4ul * p);
+        float2 coefficients = KBlock::take(run);
+        k.scale = coefficients.x;
+        k.bias = coefficients.y;
+        return k;
+    }
+};
+
+// q6k: a block's sixteen int8 scales (two per packet), the next packet's
+// lowest, and d.
+template <>
+struct Block<Q6K> {
+    static constant constexpr uint packets = 8;
+    struct state {
+        uint4 scales;
+        float d;
+    };
+    static void advance(thread state &run) {
+        run.scales = uint4((run.scales.x >> 16) | (run.scales.y << 16), (run.scales.y >> 16) | (run.scales.z << 16),
+            (run.scales.z >> 16) | (run.scales.w << 16), run.scales.w >> 16);
+    }
+    static state load(device const uchar *row, Rows16 layout, uint p) {
+        uint block = p >> 3;
+        state run;
+        run.scales = uint4(*reinterpret_cast<device const packed_uint4 *>(row + layout.scales + 16ul * block));
+        run.d = float(*reinterpret_cast<device const half *>(row + layout.supers + 2ul * block));
+        for (uint skipped = 0; skipped < (p & 7u); ++skipped)
+            advance(run);
+        return run;
+    }
+    static Q6K::packet packet(device const uchar *row, Rows16 layout, uint p, uint, thread state &run) {
+        Q6K::packet k;
+        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
+        k.high = *reinterpret_cast<device const uint2 *>(row + layout.high + 8ul * p);
+        char2 scales = as_type<char2>(ushort(run.scales.x));
+        advance(run);
+        k.scale0 = run.d * float(scales.x);
+        k.scale1 = run.d * float(scales.y);
+        return k;
+    }
+};
+
 // One decoded logical weight value (used by gathers such as the embedding).
 template <typename W>
 inline float value_at(thread const typename W::packet &k, uint i) {

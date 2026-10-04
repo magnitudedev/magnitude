@@ -53,6 +53,7 @@ fn plain_owner(limits: ServiceLimits) -> (Host, usize, std::sync::Arc<ByteBpeTok
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows: 0,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -208,6 +209,7 @@ fn plain_domain(bound: usize, exported: usize) -> (ExecutorDomain, StateBindings
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows: exported,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(1024),
         service: ServiceLimits {

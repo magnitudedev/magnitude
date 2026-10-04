@@ -136,6 +136,8 @@ pub(crate) fn prepare(
     .map_err(platform_error)?;
     report_load_phase("device open", &mut phase_started);
     let preparing = Instant::now();
+    let error_classes = magnitude_executor::AdmittedErrorClasses::of(&manifest.model.error_classes)
+        .map_err(internal)?;
     let programs = AttestedPrograms::prepare_draft(
         &draft,
         opened.device(),
@@ -144,6 +146,7 @@ pub(crate) fn prepare(
             weights: package,
             observer: &TuningReport { progress },
             cache: kernel_cache.as_deref(),
+            error_classes: &error_classes,
         },
     )
     .map_err(|error| LoadError::from(classify_catalog(error)))?;

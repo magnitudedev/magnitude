@@ -154,6 +154,7 @@ impl Decl {
 ///     params ([code] [arithmetic] NAME in [V, ..], ..)
 ///     elements (ELEMENT in [DTYPE, ..], ..)
 ///     where CONDITION
+///     error_class NAME when CONDITION
 ///     scratch NAME bytes (EXPR) [sync] [when CONDITION]
 ///     launch KERNEL [when CONDITION]:
 ///         params ([code] [arithmetic] NAME in [V, ..], ..)
@@ -177,6 +178,8 @@ pub struct NativeDecl {
     pub elements: Vec<NativeElementsDecl>,
     /// The `where` condition restricting admissible configurations.
     pub constraint: Option<Expr>,
+    /// The error classes of the configurations that change numerics.
+    pub error_classes: Vec<NativeErrorClassDecl>,
     pub scratch: Vec<NativeScratchDecl>,
     pub launches: Vec<NativeLaunchDecl>,
     pub span: Span,
@@ -203,6 +206,16 @@ pub struct NativeParamDecl {
 pub struct NativeElementsDecl {
     pub name: Ident,
     pub dtypes: Vec<Ident>,
+    pub span: Span,
+}
+
+/// `error_class NAME when CONDITION`: the configurations satisfying the
+/// condition change the entry's numerics beyond summation order, by an error
+/// of the named class.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeErrorClassDecl {
+    pub name: Ident,
+    pub when: Expr,
     pub span: Span,
 }
 

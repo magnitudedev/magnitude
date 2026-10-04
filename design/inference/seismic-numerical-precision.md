@@ -46,6 +46,21 @@ Native artifact and numerical-environment identities protect reuse of an assesse
 
 The interpreter and comparator diagnose and test implementations; they do not create selectable scope. A completed reference outcome owns returned values, final input state, and permitted outcome information. Full compiler diagnostic comparison uses the actual completed native observation and checks every subject's geometry and read-only bytes before numeric differences. Native tuning compares complete results and writable state against retained observations from the selected reference on identical initialized inputs; a case that declares a writable parameter's written rows scopes that parameter's observation to them, and the caller keeps a case that observes it whole. It binds evidence to the source, reference kind and artifact, policy, cases, implementation and device; routine comparison need not reread immutable weights after every candidate. Integer and Boolean subjects remain exact under every floating policy.
 
+Native tuning separates two questions the element tolerances cannot answer together. Whether a
+candidate is a correct kernel is tuning's question; whether a model tolerates a form's error is
+not, and is decided outside it by whole-model qualification. A native declaration names the error
+class of every configuration that changes numerics beyond summation order. The caller passes the
+classes it admits, each with an envelope. A configuration in a class that is not admitted is
+outside the search domain: it is never formed, timed or chosen. A configuration in admitted
+classes is compared with the same reference under the widest of its classes' envelopes instead of
+the element tolerances: per floating subject, the error's root mean square relative to the
+reference's, and the largest element error in units of the reference's root mean square. The
+first bound admits the class's expected error; the second rejects an error concentrated in a few
+elements, which is what a defective kernel produces. Non-finite values must agree bit for bit and
+discrete subjects stay exact. A configuration in no class is held to the policy as before, and the
+declaration default, which is the reference, must be in none. Admitted classes and their
+envelopes are part of the evidence identity.
+
 For finite floating elements, diagnostic comparison records absolute error, scale-stabilized relative error, and published-dtype ULP distance. The bounded comparison envelope is abs_error <= atol + rtol * max(abs(reference), relative_floor), together with any ULP and special-value rules. NaN, infinity, signed-zero, and subnormal changes are counted separately. A passing sample, corpus, feedback observation, or benchmark never grants numerical applicability. A definite mismatch from an admitted candidate is a compiler or backend defect, not a reason to widen tolerance or gather more samples.
 
 ## Intentional limits and acceptance

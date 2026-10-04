@@ -99,6 +99,18 @@ struct Plain {
             reinterpret_cast<device const typename A::storage *>(x) + ulong(rows.at(m)) * stride0;
         return words8_storage<A>(row, stride1, k, columns, stride1 == 1 && (stride0 & 7u) == 0);
     }
+    // x[m, k] and x[m, k + 1] as one storage word (k + 1 < columns), zero
+    // for a row at or past `m_rows`.
+    uint words2(uint m, uint k, uint m_rows) const {
+        if (m >= m_rows)
+            return 0u;
+        device const typename A::storage *row =
+            reinterpret_cast<device const typename A::storage *>(x) + ulong(rows.at(m)) * stride0;
+        if (stride1 == 1)
+            return as_type<uint>(ushort2(*reinterpret_cast<device const packed_ushort2 *>(row + k)));
+        return uint(as_type<ushort>(row[ulong(k) * stride1]))
+            | uint(as_type<ushort>(row[ulong(k + 1u) * stride1])) << 16u;
+    }
 };
 
 template <typename A, typename N, typename Rows>

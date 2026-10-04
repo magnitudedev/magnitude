@@ -30,6 +30,41 @@ native accumulate for cpu from "cpu/accumulate.rs":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
+# The same kernels with `BIAS` declared for what it is: a choice that changes
+# the written values, in an error class. Tuning forms it only when the class
+# is admitted and holds it to the class's envelope.
+fn classed_accumulate[N](state: &mut tensor[N] f32, x: &tensor[N] f32):
+    parallel for i in 0..N:
+        state[i] = state[i] + x[i]
+
+native classed_accumulate for metal from "metal/accumulate.metal":
+    params (BIAS in [0, 1], WIDTH in [32, 64])
+    error_class biased when BIAS == 1
+    launch accumulate:
+        threadgroups (ceil_div(N, WIDTH), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+
+native classed_accumulate for cuda from "cuda/accumulate.cu":
+    params (BIAS in [0, 1], WIDTH in [32, 64])
+    error_class biased when BIAS == 1
+    launch accumulate:
+        threadgroups (ceil_div(N, WIDTH), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+
+native classed_accumulate for vulkan from "vulkan/accumulate.comp":
+    params (BIAS in [0, 1], WIDTH in [32, 64])
+    error_class biased when BIAS == 1
+    launch accumulate:
+        threadgroups (ceil_div(N, WIDTH), 1, 1)
+        threads_per_threadgroup (WIDTH, 1, 1)
+
+native classed_accumulate for cpu from "cpu/accumulate.rs":
+    params (BIAS in [0, 1], WIDTH in [32, 64])
+    error_class biased when BIAS == 1
+    launch accumulate:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
 # Two row bands with independently named code and runtime parameters. The
 # same parameter names in both launches address distinct tuning choices.
 fn scoped_scale[N](x: &tensor[N] f32) -> tensor[N] f32:

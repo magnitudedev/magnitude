@@ -132,6 +132,7 @@ fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) ->
             weights: &crate::ZeroTuningWeights,
             observer: &crate::UnreportedTuning,
             cache: None,
+            error_classes: &crate::NO_ERROR_CLASSES,
         },
     )
     .unwrap();

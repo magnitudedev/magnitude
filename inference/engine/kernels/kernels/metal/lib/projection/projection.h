@@ -46,6 +46,9 @@
 //   multiplies them into F32 accumulators (on a device with Metal 4 tensor
 //   operations, one `matmul2d` per step over the whole tile, into
 //   cooperative accumulators); small-N outputs may split K.
+// - Tall GEMM (M > 64, an entry's TALL form): TM x 32 tiles whose weights are
+//   decoded once by staging simdgroups and whose activations are read from
+//   device memory, with the same products in the same order.
 //
 // This file is independent of any entry ABI.
 
@@ -87,6 +90,14 @@ struct Weights {
     }
     typename W::packet packet(uint n, uint p) const {
         return packets::Loader<W>::load(row(n), layout, p, k);
+    }
+    // Row n's coefficient run positioned at packet p, and the packet a run
+    // is positioned at (`packets::Block`).
+    typename packets::Block<W>::state run(uint n, uint p) const {
+        return packets::Block<W>::load(row(n), layout, p);
+    }
+    typename W::packet packet(uint n, uint p, thread typename packets::Block<W>::state &state) const {
+        return packets::Block<W>::packet(row(n), layout, p, k, state);
     }
 };
 
@@ -274,7 +285,18 @@ inline float scale_factor(device const float *scale, ulong extent, ulong stride,
 // arithmetic. `partials` is PROJECTION_NORMALIZE_SHARED threadgroup memory.
 #define PROJECTION_NORMALIZE_SHARED(name) threadgroup float name[32]
 
-template <uint THREADS, typename In>
+// Row-major rows of A at `columns` elements a row: the order of a plain operand.
+template <typename A>
+struct RowOrder {
+    static void store8(device uchar *x, uint columns, uint m, uint k, uint4 words) {
+        *reinterpret_cast<device uint4 *>(x + (ulong(m) * columns + k) * 2u) = words;
+    }
+};
+
+// `Order` lays the rows out: `RowOrder` (the default), or the tall GEMM's
+// `TallOrder` when whole 8-column words are written (columns and every
+// group's first column multiples of 8).
+template <uint THREADS, typename Order, typename In>
 inline void device_normalize(thread const In &in, uint item, device uchar *x, uint columns,
     threadgroup float *partials, uint thread_index) {
     static_assert(THREADS % 32 == 0 && THREADS <= 1024, "a normalizing threadgroup is whole simdgroups");
@@ -302,12 +324,18 @@ inline void device_normalize(thread const In &in, uint item, device uchar *x, ui
         float4 even, odd;
         in.load8(m, first + i, inverse, even, odd);
         if (vector && i + 8u <= in.width()) {
-            *reinterpret_cast<device uint4 *>(row + first + i) = A::pack8(even, odd);
+            Order::store8(x, columns, m, first + i, A::pack8(even, odd));
         } else {
             for (uint j = 0; j < 8u && i + j < in.width(); ++j)
                 row[first + i + j] = A::store((j & 1u) ? odd[j >> 1] : even[j >> 1]);
         }
     }
+}
+
+template <uint THREADS, typename In>
+inline void device_normalize(thread const In &in, uint item, device uchar *x, uint columns,
+    threadgroup float *partials, uint thread_index) {
+    device_normalize<THREADS, RowOrder<typename In::activation>>(in, item, x, columns, partials, thread_index);
 }
 
 // ---------------------------------------------------------------------------
@@ -753,23 +781,47 @@ inline void gemm_store_a(thread const gemm_a_registers<ITEMS> &regs, threadgroup
 // Weight packets one thread stages per step: COUNT items, item i being the
 // half-packet (16 codes with their coefficient group) i % gemm_halves of the
 // tile's local row i / gemm_halves.
+// A thread stages the same weight rows on every step, so it keeps each
+// item's coefficient run (`packets::Block`) in registers across steps.
 template <typename W, uint COUNT>
 struct gemm_b_registers {
     typename W::packet packet[COUNT];
+    typename packets::Block<W>::state run[COUNT];
     bool valid[COUNT];
 };
 
-template <typename W, uint THREADS, uint COUNT>
+// Whether a TM-row tile keeps coefficient runs. On simdgroup matrices a
+// staging thread carries its runs beside its fragments: a 32-row tile has no
+// registers to spare (the runs cost it 6-17% on Apple GPU family 7), nor has
+// a paired tile with a run per stream (2% on family 9), so those load every
+// packet's coefficients as before.
+template <uint TM, bool PAIRED>
+constexpr bool gemm_runs() {
+    return TM >= 64 && (SEISMIC_HAS_TENSOR_OPS || !PAIRED);
+}
+
+// Loads the step at column k0. With RUNS, `fresh` on a tile's first step
+// opens its coefficient runs wherever in a run it starts, and later steps
+// open a run as they enter it.
+template <typename W, uint THREADS, uint COUNT, bool RUNS>
 inline void gemm_load_b(thread const Weights<W> &w, uint first, uint count, uint rows, uint k0,
-    uint k, uint thread_index, thread gemm_b_registers<W, COUNT> &regs) {
+    uint k, uint thread_index, bool fresh, thread gemm_b_registers<W, COUNT> &regs) {
     PROJECTION_UNROLL
     for (uint j = 0; j < COUNT; ++j) {
         uint item = thread_index + j * THREADS;
         uint local = item / gemm_halves;
         uint p = k0 / 32u + (item % gemm_halves) / 2u;
         regs.valid[j] = local < count && 32u * p < k;
-        if (regs.valid[j])
-            regs.packet[j] = w.packet(min(first + local, rows - 1), p);
+        if (regs.valid[j]) {
+            uint n = min(first + local, rows - 1);
+            if (RUNS) {
+                if (fresh || p % packets::Block<W>::packets == 0)
+                    regs.run[j] = w.run(n, p);
+                regs.packet[j] = w.packet(n, p, regs.run[j]);
+            } else {
+                regs.packet[j] = w.packet(n, p);
+            }
+        }
     }
 }
 
@@ -1039,9 +1091,9 @@ inline void gemm_accumulate(thread const In &in, thread const Weights<W> &w,
     gemm_b_registers<U, items> u_regs;
     uint k0 = step_begin * gemm_k;
     gemm_load_a<TM, tile::threads, tile::a_items>(in, m0, m_rows, k0, k, thread_index, a_regs);
-    gemm_load_b<W, tile::threads, items>(w, first, count, rows, k0, k, thread_index, w_regs);
+    gemm_load_b<W, tile::threads, items, gemm_runs<TM, PAIRED>()>(w, first, count, rows, k0, k, thread_index, true, w_regs);
     if (PAIRED)
-        gemm_load_b<U, tile::threads, items>(u, first, count, rows, k0, k, thread_index, u_regs);
+        gemm_load_b<U, tile::threads, items, gemm_runs<TM, PAIRED>()>(u, first, count, rows, k0, k, thread_index, true, u_regs);
     gemm_store_a<TM, tile::threads, tile::a_items>(a_regs, buffer.a, thread_index);
     gemm_store_b<W, tile::threads, items>(w_regs, count, 0, spacing, buffer.b, thread_index);
     if (PAIRED)
@@ -1052,9 +1104,9 @@ inline void gemm_accumulate(thread const In &in, thread const Weights<W> &w,
         uint k1 = (t + 1) * gemm_k;
         if (more) {
             gemm_load_a<TM, tile::threads, tile::a_items>(in, m0, m_rows, k1, k, thread_index, a_regs);
-            gemm_load_b<W, tile::threads, items>(w, first, count, rows, k1, k, thread_index, w_regs);
+            gemm_load_b<W, tile::threads, items, gemm_runs<TM, PAIRED>()>(w, first, count, rows, k1, k, thread_index, false, w_regs);
             if (PAIRED)
-                gemm_load_b<U, tile::threads, items>(u, first, count, rows, k1, k, thread_index, u_regs);
+                gemm_load_b<U, tile::threads, items, gemm_runs<TM, PAIRED>()>(u, first, count, rows, k1, k, thread_index, false, u_regs);
         }
         gemm_step(buffer, acc...);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1176,6 +1228,407 @@ inline void gemm_paired(thread const In &in, thread const Out &out, thread const
     uint first = tn * (TN / 2u), m0 = tm * TM;
     gemm_run<G, U, true, TM, TN>(in, gate, up, first, rows, m0, m_rows, k, 0, (k + gemm_k - 1) / gemm_k,
         live_rows, shared, sg, lane, gemm_store_pair<Out>{out, m0, m_rows, first, rows});
+}
+
+// ---------------------------------------------------------------------------
+// Tall GEMM (M > 64, the TALL form).
+//
+// A threadgroup owns TM output rows by 32 weight rows (16 features of gate
+// and up for a paired tile). NS staging simdgroups decode the tile's weights
+// once for all TM rows into threadgroup memory, KS columns per stage and one
+// stage ahead (two buffers), so one barrier per KS columns separates a stage
+// from its use; TM / 32 multiplying simdgroups read the staged weights and
+// take their activations straight from device memory. The staged tile above
+// decodes every weight once per TM <= 128 rows and stages the activations too.
+//
+// K is a multiple of KS (the entries admit the form for K % 128 == 0), so
+// every stage is whole. Products accumulate in F32 in K order per output,
+// as in the staged tile.
+//
+// The activations are a `Tall` operand: with tensor operations the plain
+// row-major operand itself, read as a device tensor; on simdgroup matrices a
+// fragment-ordered copy (`Fragments`), written by the entry's pre-pass
+// (`TallOrder` in `device_normalize`) or by `tall_relayout` from a plain input.
+constant constexpr uint tall_n = 32;
+
+// Threadgroup storage of one tall threadgroup staging KS columns, as
+// `threadgroup uchar *name`.
+#define PROJECTION_GEMM_TALL_SHARED(name, KS)                                                       \
+    threadgroup float4 name##_words[((KS) + 8) * 8];                                                \
+    threadgroup uchar *name = reinterpret_cast<threadgroup uchar *>(name##_words)
+
+// Fragment-ordered activations: an operand laid out for lanes that read it
+// straight from device memory. Per 64-row tile t and 8-column block g, lane
+// (y, x) of an 8 x 8 fragment owns eight element pairs in a row, pair i
+// being x[64 t + 8 i + y, 8 g + x + {0, 1}] as stored; a lane loads its
+// pairs of a block as two uint4. `columns` is a multiple of 8, and the last
+// tile is whole (rows past the operand's hold anything).
+template <typename A>
+struct Fragments {
+    typedef A activation;
+    device const uchar *x;
+    uint columns;
+    // The pairs of lane `lane` in block g of tile t.
+    device const uint4 *block(uint t, uint g, uint lane) const {
+        return reinterpret_cast<device const uint4 *>(x) + ((ulong(t) * (columns / 8u) + g) * 32u + lane) * 2u;
+    }
+    // x[m, k .. k + 8) as its storage words (pair w in word w).
+    static void store8(device uchar *x, uint columns, uint m, uint k, uint4 words) {
+        device uint *block = reinterpret_cast<device uint *>(x)
+            + (ulong(m / 64u) * (columns / 8u) + k / 8u) * 256u + (m % 64u) / 8u;
+        PROJECTION_UNROLL
+        for (ushort w = 0; w < 4; ++w)
+            block[fragment_lane(ushort(2 * w), ushort(m % 8u)) * 8u] = words[w];
+    }
+};
+
+template <typename W, typename U, uint ITEMS>
+struct gemm_tall_runs {
+    typename packets::Block<W>::state w[ITEMS];
+    typename packets::Block<U>::state u[ITEMS];
+};
+
+#if SEISMIC_HAS_TENSOR_OPS
+template <typename A>
+using Tall = Plain<A, AllRows>;
+template <typename A>
+using TallOrder = RowOrder<A>;
+
+template <typename A>
+inline Tall<A> tall_operand(Plain<A, AllRows> rows, device const uchar *) {
+    return rows;
+}
+
+// The relayout pass of a plain operand: nothing, the tensor reads it in place.
+template <typename In>
+inline void tall_relayout(thread const In &, device uchar *, uint, uint, uint) {}
+
+// The staged weights of two stages: tile row r of buffer `slot` holds its KS
+// columns in order. Tile rows are weight rows first .. (plain), or 16 gate
+// rows then 16 up rows of features first ..
+template <uint KS>
+struct gemm_tall_stage {
+    static constant constexpr uint pitch = KS + 8u;
+    threadgroup half *base;
+    threadgroup half *row(uint slot, uint r) const { return base + (slot * tall_n + r) * pitch; }
+};
+
+// Half `within` (16 columns) of every packet of weight row n in stage `group`.
+template <typename X, uint KS>
+inline void gemm_tall_stage_item(thread const Weights<X> &x, uint n, uint group, uint within, bool fresh,
+    thread typename packets::Block<X>::state &run, threadgroup half *row) {
+    PROJECTION_UNROLL
+    for (uint i = 0; i < KS / 32u; ++i) {
+        uint p = group * (KS / 32u) + i;
+        if ((fresh && i == 0) || p % packets::Block<X>::packets == 0)
+            run = x.run(n, p);
+        typename X::packet packet = x.packet(n, p, run);
+        float scale = X::scale(packet, 2u * within);
+        float bias = X::bias(packet, X::groups == 1 ? 0u : within);
+        threadgroup half4 *to = reinterpret_cast<threadgroup half4 *>(row + 32u * i + 16u * within);
+        PROJECTION_UNROLL
+        for (uint s = 0; s < 2; ++s) {
+            float4 even, odd;
+            X::codes(packet, 2u * within + s, even, odd);
+            even = metal::fma(float4(scale), even, float4(bias));
+            odd = metal::fma(float4(scale), odd, float4(bias));
+            to[2 * s] = half4(half(even.x), half(odd.x), half(even.y), half(odd.y));
+            to[2 * s + 1] = half4(half(even.z), half(odd.z), half(even.w), half(odd.w));
+        }
+    }
+}
+
+// A staging thread's items of stage `group`: item i is half i % 2 of every
+// packet of tile row i / 2.
+template <typename W, typename U, bool PAIRED, uint KS, uint NS, uint ITEMS>
+inline void gemm_tall_stage_group(thread const Weights<W> &w, thread const Weights<U> &u, uint first, uint rows,
+    uint group, bool fresh, gemm_tall_stage<KS> stage, uint thread_index, thread gemm_tall_runs<W, U, ITEMS> &runs) {
+    PROJECTION_UNROLL
+    for (uint j = 0; j < ITEMS; ++j) {
+        uint item = thread_index + j * NS * 32u;
+        uint r = item / 2u, within = item % 2u;
+        threadgroup half *row = stage.row(group & 1u, r);
+        if (PAIRED && r >= 16u)
+            gemm_tall_stage_item<U, KS>(u, min(first + r - 16u, rows - 1u), group, within, fresh, runs.u[j], row);
+        else
+            gemm_tall_stage_item<W, KS>(w, min(first + r, rows - 1u), group, within, fresh, runs.w[j], row);
+    }
+}
+
+// A multiplying simdgroup owns 32 rows as two 16-row groups, each one
+// `matmul2d` 16 x 32 x KS per stage with the operand as a device tensor. A
+// group that would run past the operand's last row starts 16 rows before it
+// instead and publishes only its own rows. A paired tile's lane publishes a
+// feature's gate and up together: on the cooperative layout it holds (m, n)
+// and (m, n + 16) eight elements apart.
+template <typename W, typename U, bool PAIRED, uint TM, uint KS, uint NS, typename In, typename F>
+inline void gemm_tall_run(thread const In &in, thread const Weights<W> &w, thread const Weights<U> &u,
+    uint first, uint rows, uint m0, uint m_rows, uint k, threadgroup uchar *shared, uint sg, uint lane,
+    thread const F &emit) {
+    static_assert(TM % 32 == 0 && KS % 32 == 0 && (NS == 1 || NS == 2),
+        "a tall tile is whole 32-row simdgroups and packets");
+    typedef typename In::activation::native E;
+    constexpr uint items = 2u / NS;
+    gemm_tall_stage<KS> stage{reinterpret_cast<threadgroup half *>(shared)};
+    bool stager = sg < NS;
+    uint thread_index = sg * 32u + lane;
+    uint groups = k / KS;
+    uint row0 = m0 + (sg - NS) * 32u;
+    bool live = !stager && row0 < m_rows;
+    typedef metal::extents<int32_t, KS, 16> a_extents;
+    typedef metal::extents<int32_t, KS, tall_n> b_extents;
+    typedef metal::tensor<device E, a_extents, metal::tensor_inline> a_tensor;
+    typedef metal::tensor<threadgroup half, b_extents, metal::tensor_inline> b_tensor;
+    typedef mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(16, tall_n, KS, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        metal::execution_simdgroup> operation;
+    typedef typename operation::template cooperative_tensor_destination_t<a_tensor, b_tensor, float> destination;
+    operation op;
+    destination upper = op.template get_destination_cooperative_tensor<a_tensor, b_tensor, float>();
+    destination lower = op.template get_destination_cooperative_tensor<a_tensor, b_tensor, float>();
+    PROJECTION_UNROLL
+    for (uint16_t e = 0; e < upper.get_capacity(); ++e) {
+        if (upper.is_valid_element(e)) {
+            upper[e] = 0.0f;
+            lower[e] = 0.0f;
+        }
+    }
+    gemm_tall_runs<W, U, items> runs;
+    if (stager)
+        gemm_tall_stage_group<W, U, PAIRED, KS, NS, items>(w, u, first, rows, 0, true, stage, thread_index, runs);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint start0 = min(row0, m_rows - 16u), start1 = min(row0 + 16u, m_rows - 16u);
+    device E *base = reinterpret_cast<device E *>(const_cast<device uchar *>(in.x));
+    device E *base0 = base + ulong(start0) * in.stride0, *base1 = base + ulong(start1) * in.stride0;
+    for (uint group = 0; group < groups; ++group) {
+        if (stager) {
+            if (group + 1u < groups)
+                gemm_tall_stage_group<W, U, PAIRED, KS, NS, items>(w, u, first, rows, group + 1u, false, stage,
+                    thread_index, runs);
+        } else if (live) {
+            b_tensor b(stage.row(group & 1u, 0), b_extents(),
+                metal::array<int32_t, 2>{1, int32_t(gemm_tall_stage<KS>::pitch)});
+            a_tensor a0(base0 + ulong(group * KS) * in.stride1, a_extents(),
+                metal::array<int32_t, 2>{int32_t(in.stride1), int32_t(in.stride0)});
+            a_tensor a1(base1 + ulong(group * KS) * in.stride1, a_extents(),
+                metal::array<int32_t, 2>{int32_t(in.stride1), int32_t(in.stride0)});
+            op.run(a0, b, upper);
+            op.run(a1, b, lower);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (!live)
+        return;
+    const auto publish = [&](uint own, uint start, thread destination &acc) {
+        PROJECTION_UNROLL
+        for (uint16_t e = 0; e < acc.get_capacity(); ++e) {
+            if (!acc.is_valid_element(e))
+                continue;
+            auto index = acc.get_multidimensional_index(e);
+            uint m = start + uint(index[1]), n = uint(index[0]);
+            if (m < own)
+                continue;
+            if (!PAIRED)
+                emit(m - m0, n, acc[e], 0.0f);
+            else if (n < 16u)
+                emit(m - m0, n, acc[e], acc[e + 8]);
+        }
+    };
+    publish(row0, start0, upper);
+    publish(row0 + 16u, start1, lower);
+}
+#else
+template <typename A>
+using Tall = Fragments<A>;
+template <typename A>
+using TallOrder = Fragments<A>;
+
+template <typename A>
+inline Tall<A> tall_operand(Plain<A, AllRows> rows, device const uchar *fragments) {
+    return {fragments, rows.columns};
+}
+
+// The relayout pass of a plain operand: item = (64-row tile, 32-column span,
+// lane). A thread gathers its lane's pairs of the span's four blocks from
+// the tile's rows (zero past the operand's last row) and stores each block's
+// as two uint4.
+template <typename In>
+inline void tall_relayout(thread const In &in, device uchar *x, uint m_rows, uint columns, uint item) {
+    uint lane = item % 32u, span = item / 32u;
+    uint spans = columns / 32u;
+    uint t = span / spans, g0 = 4u * (span % spans);
+    if (64u * t >= m_rows)
+        return;
+    ushort2 at = fragment_coordinate(lane);
+    PROJECTION_UNROLL
+    for (uint b = 0; b < 4; ++b) {
+        uint g = g0 + b;
+        uint4 low, high;
+        PROJECTION_UNROLL
+        for (uint i = 0; i < 4; ++i) {
+            low[i] = in.words2(64u * t + 8u * i + at.y, 8u * g + at.x, m_rows);
+            high[i] = in.words2(64u * t + 8u * (i + 4u) + at.y, 8u * g + at.x, m_rows);
+        }
+        device uint4 *to = reinterpret_cast<device uint4 *>(x) + ((ulong(t) * (columns / 8u) + g) * 32u + lane) * 2u;
+        to[0] = low;
+        to[1] = high;
+    }
+}
+
+// The staged weights of two stages in fragment lane order: lane `lane`'s
+// weight pair of fragment column j (tile rows 8 j ..) in 8-column block q.
+template <uint KS>
+struct gemm_tall_stage {
+    threadgroup half2 *base;
+    threadgroup half2 *at(uint slot, uint q, uint j, uint lane) const {
+        return base + ((slot * (KS / 8u) + q) * (tall_n / 8u) + j) * 32u + lane;
+    }
+};
+
+// The 8 values of row n in block `block` of packet p, as (even, odd).
+template <typename X>
+inline void gemm_tall_decode(thread const Weights<X> &x, uint n, uint p, uint block, bool fresh,
+    thread typename packets::Block<X>::state &run, thread float4 &even, thread float4 &odd) {
+    if (fresh || p % packets::Block<X>::packets == 0)
+        run = x.run(n, p);
+    typename X::packet packet = x.packet(n, p, run);
+    X::codes(packet, block, even, odd);
+    float scale = X::scale(packet, 2u * (block / 2u));
+    float bias = X::bias(packet, X::groups == 1 ? 0u : block / 2u);
+    even = metal::fma(float4(scale), even, float4(bias));
+    odd = metal::fma(float4(scale), odd, float4(bias));
+}
+
+// A staging thread's items of stage `group`: item i is the tile's weight row
+// pair i % 16 at the 8-column block i / 16 of every packet. A pair is two
+// tile rows a lane multiplies together: weight rows first + 2 i, + 1 (plain)
+// or gate and up of feature first + i.
+template <typename W, typename U, bool PAIRED, uint KS, uint NS, uint ITEMS>
+inline void gemm_tall_stage_group(thread const Weights<W> &w, thread const Weights<U> &u, uint first, uint rows,
+    uint group, bool fresh, gemm_tall_stage<KS> stage, uint thread_index, thread gemm_tall_runs<W, U, ITEMS> &runs) {
+    PROJECTION_UNROLL
+    for (uint j = 0; j < ITEMS; ++j) {
+        uint item = thread_index + j * NS * 32u;
+        uint pair = item % (tall_n / 2u), block = item / (tall_n / 2u);
+        uint n0 = min(PAIRED ? first + pair : first + 2u * pair, rows - 1u);
+        uint n1 = min(PAIRED ? first + pair : first + 2u * pair + 1u, rows - 1u);
+        ushort column = ushort(2u * (pair % 4u));
+        PROJECTION_UNROLL
+        for (uint i = 0; i < KS / 32u; ++i) {
+            uint p = group * (KS / 32u) + i;
+            float4 even0, odd0, even1, odd1;
+            gemm_tall_decode<W>(w, n0, p, block, fresh && i == 0, runs.w[j], even0, odd0);
+            gemm_tall_decode<U>(u, n1, p, block, fresh && i == 0, runs.u[j], even1, odd1);
+            PROJECTION_UNROLL
+            for (ushort v = 0; v < 4; ++v) {
+                *stage.at(group & 1u, 4u * i + block, pair / 4u, fragment_lane(column, ushort(2 * v))) =
+                    half2(half(even0[v]), half(even1[v]));
+                *stage.at(group & 1u, 4u * i + block, pair / 4u, fragment_lane(column, ushort(2 * v + 1))) =
+                    half2(half(odd0[v]), half(odd1[v]));
+            }
+        }
+    }
+}
+
+// A multiplying simdgroup owns 64 rows by 16 tile rows of weights (8 x 2
+// fragments): per 8-column block a lane loads its eight activation pairs as
+// two uint4 and its two weight pairs as one half2 each.
+template <typename W, typename U, bool PAIRED, uint TM, uint KS, uint NS, typename In, typename F>
+inline void gemm_tall_run(thread const In &in, thread const Weights<W> &w, thread const Weights<U> &u,
+    uint first, uint rows, uint m0, uint m_rows, uint k, threadgroup uchar *shared, uint sg, uint lane,
+    thread const F &emit) {
+    static_assert(TM % 64 == 0 && KS % 32 == 0 && (NS == 1 || NS == 2),
+        "a tall tile is whole 64-row simdgroups and packets");
+    typedef typename In::activation::native E;
+    constexpr uint TI = 8, TJ = 2;
+    constexpr uint items = 2u / NS;
+    gemm_tall_stage<KS> stage{reinterpret_cast<threadgroup half2 *>(shared)};
+    bool stager = sg < NS;
+    uint thread_index = sg * 32u + lane;
+    // A multiplying simdgroup's 64-row tile of the operand and half of the weight rows.
+    uint local = (sg - NS) / 2u, side = (sg - NS) % 2u;
+    uint tile = m0 / 64u + local;
+    bool live = !stager && 64u * tile < m_rows;
+    uint groups = k / KS;
+    ushort2 at = fragment_coordinate(lane);
+    simdgroup_float8x8 acc[TI][TJ];
+    PROJECTION_UNROLL
+    for (uint i = 0; i < TI; ++i)
+        PROJECTION_UNROLL
+        for (uint j = 0; j < TJ; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    gemm_tall_runs<W, U, items> runs;
+    if (stager)
+        gemm_tall_stage_group<W, U, PAIRED, KS, NS, items>(w, u, first, rows, 0, true, stage, thread_index, runs);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint group = 0; group < groups; ++group) {
+        if (stager) {
+            if (group + 1u < groups)
+                gemm_tall_stage_group<W, U, PAIRED, KS, NS, items>(w, u, first, rows, group + 1u, false, stage,
+                    thread_index, runs);
+        } else if (live) {
+            PROJECTION_UNROLL
+            for (uint q = 0; q < KS / 8u; ++q) {
+                simdgroup_matrix<E, 8, 8> a[TI];
+                simdgroup_half8x8 b[TJ];
+                device const uint4 *pairs = in.block(tile, group * (KS / 8u) + q, lane);
+                uint4 low = pairs[0], high = pairs[1];
+                PROJECTION_UNROLL
+                for (uint i = 0; i < 4; ++i) {
+                    reinterpret_cast<thread uint &>(a[i].thread_elements()) = low[i];
+                    reinterpret_cast<thread uint &>(a[i + 4].thread_elements()) = high[i];
+                }
+                PROJECTION_UNROLL
+                for (uint j = 0; j < TJ; ++j)
+                    reinterpret_cast<thread half2 &>(b[j].thread_elements()) =
+                        *stage.at(group & 1u, q, 2u * side + j, lane);
+                PROJECTION_UNROLL
+                for (uint i = 0; i < TI; ++i)
+                    PROJECTION_UNROLL
+                    for (uint j = 0; j < TJ; ++j)
+                        simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (!live)
+        return;
+    PROJECTION_UNROLL
+    for (uint i = 0; i < TI; ++i) {
+        PROJECTION_UNROLL
+        for (uint j = 0; j < TJ; ++j) {
+            float2 c = reinterpret_cast<thread float2 &>(acc[i][j].thread_elements());
+            uint m = local * 64u + 8u * i + at.y, n = 16u * side + 8u * j + at.x;
+            if (PAIRED) {
+                emit(m, n / 2u, c.x, c.y);
+            } else {
+                emit(m, n, c.x, 0.0f);
+                emit(m, n + 1u, c.y, 0.0f);
+            }
+        }
+    }
+}
+#endif
+
+// One tall tile of a plain projection: output rows tm * TM .., weight rows
+// tn * 32 .. of `w`.
+template <typename W, uint TM, uint KS, uint NS, typename In, typename Out>
+inline void gemm_tall(thread const In &in, thread const Out &out, thread const Weights<W> &w, uint m_rows, uint rows,
+    uint k, uint tm, uint tn, threadgroup uchar *shared, uint sg, uint lane) {
+    uint first = tn * tall_n, m0 = tm * TM;
+    gemm_tall_run<W, W, false, TM, KS, NS>(in, w, w, first, rows, m0, m_rows, k, shared, sg, lane,
+        gemm_store<Out>{out, m0, m_rows, first, rows});
+}
+
+// One tall tile of a paired projection: 16 features of gate and up.
+template <typename G, typename U, uint TM, uint KS, uint NS, typename In, typename Out>
+inline void gemm_tall_paired(thread const In &in, thread const Out &out, thread const Weights<G> &gate,
+    thread const Weights<U> &up, uint m_rows, uint rows, uint k, uint tm, uint tn, threadgroup uchar *shared,
+    uint sg, uint lane) {
+    uint first = tn * (tall_n / 2u), m0 = tm * TM;
+    gemm_tall_run<G, U, true, TM, KS, NS>(in, gate, up, first, rows, m0, m_rows, k, shared, sg, lane,
+        gemm_store_pair<Out>{out, m0, m_rows, first, rows});
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,6 +1870,375 @@ inline void gemv_batch_paired_runtime(thread const In &in, thread const Out &out
     else
         gemv_batch_body<G, U, true, R, 2, BYTES>(in, out, gate, up, m_rows, rows, k, tile, shared,
             simdgroups, sg, lane);
+}
+
+// ---------------------------------------------------------------------------
+// INT8 GEMM (an entry's INT8 form, M > 64, on tensor operations). The
+// activations are quantized to int8 per (row, 32 columns), the weights enter
+// as their stored 4-bit codes, and each 32-column block is one int8
+// `matmul2d` on register fragments whose int32 result folds into the F32
+// output under (activation scale) x (weight scale); the weights' min term is
+// one F16 product of the activation block sums with the block biases. The
+// weights stay exact; the form's error is the activation quantization, so it
+// is an error class of its entry.
+//
+// Two pre-passes write the form's scratch in the order the lanes read it
+// (per-lane device loads decide the rate: scattered scale loads cost as much
+// as the products): `int8_quantize` the operand, its scales and block sums;
+// `int8_coefficients` the weights' block scales and biases. Weight codes are
+// gathered by each lane from the resident rows, eight 2-byte loads per block.
+//
+// A 16 x 32 x K fragment's lane holds rows r, r + 8 and columns c .. c + 3,
+// c + 16 .. c + 19 of the destination (element e: column c + (e & 3) +
+// 16 (e >> 3), row r + 8 ((e >> 2) & 1)); the left operand alike over
+// (row, k), and the right operand k = c + (e & 3) + 16 (e >> 4) of weight
+// rows r + 8 ((e >> 2) & 3).
+struct int8_lane {
+    uint r, c;
+    int8_lane(uint lane)
+        : r(((lane >> 1) & 3u) + ((lane >> 4) & 1u) * 4u), c((lane & 1u) * 4u + ((lane >> 3) & 1u) * 8u) {}
+    // The lane holding row class r (0 .. 7) and column class c (0, 4, 8, 12).
+    static uint of(uint r, uint c) {
+        return ((c >> 2) & 1u) | ((r & 3u) << 1) | (((c >> 3) & 1u) << 3) | ((r >> 2) << 4);
+    }
+};
+
+// The form's scratch, for `groups` = K / 32 blocks:
+//   quantized     16 int8 per (16-row tile, block, lane): the left fragment
+//   row_scales    4 F32 per (32-row tile, block, r): rows r, r + 8 of its two
+//                 16-row tiles
+//   block_sums    8 F16 per (16-row tile, 4 blocks, r): the quantized rows'
+//                 block sums / 64, the min-term product's left fragment
+//   coefficients  8 F32 per (32-row weight tile, block, c / 4): d * scale6 of
+//                 the lane's eight destination columns
+//   biases        16 F16 per (32-row weight tile, 16 blocks, lane):
+//                 -(dmin * min6), the min-term product's right fragment
+struct int8_scratch {
+    device uchar *quantized;
+    device float *row_scales;
+    device half *block_sums;
+    device float *coefficients;
+    device half *biases;
+};
+
+// Weights whose stored codes enter the int8 product (on tensor operations):
+// how a lane reads a group of four codes of one block, whether the format
+// has a min term, and a row's (scale, bias) of the eight blocks of one
+// 256-column block.
+template <typename W>
+struct int8_codes {
+    static constant constexpr bool available = false;
+    static constant constexpr bool biased = false;
+    static void coefficients(device const uchar *, Rows16, uint, thread float2 (&)[8]) {}
+};
+#if SEISMIC_HAS_TENSOR_OPS
+// q4k: two bytes hold four codes, a nibble each; value = d * scale6 * code
+// - dmin * min6.
+template <>
+struct int8_codes<packets::Q4K> {
+    static constant constexpr bool available = true;
+    static constant constexpr bool biased = true;
+    static constant constexpr uint block_bytes = 16, group_bytes = 2;
+    static char4 group(device const uchar *at) {
+        uint v = *reinterpret_cast<device const ushort *>(at);
+        v = (v | (v << 8)) & 0x00ff00ffu;
+        v = (v | (v << 4)) & 0x0f0f0f0fu;
+        return as_type<char4>(v);
+    }
+    static void coefficients(device const uchar *row, Rows16 layout, uint block, thread float2 (&to)[8]) {
+        packets::KBlock run = packets::KBlock::load(row, layout, block * 8u);
+        // (d * scale6, -(dmin * min6)), both exact in F32.
+        PROJECTION_UNROLL
+        for (uint i = 0; i < 8; ++i)
+            to[i] = packets::KBlock::take(run);
+    }
+};
+// q8: int8 codes, one F16 scale per block.
+template <>
+struct int8_codes<packets::Q8> {
+    static constant constexpr bool available = true;
+    static constant constexpr bool biased = false;
+    static constant constexpr uint block_bytes = 32, group_bytes = 4;
+    static char4 group(device const uchar *at) {
+        return as_type<char4>(*reinterpret_cast<device const uint *>(at));
+    }
+    static void coefficients(device const uchar *row, Rows16 layout, uint block, thread float2 (&to)[8]) {
+        PROJECTION_UNROLL
+        for (uint i = 0; i < 8; ++i)
+            to[i] = float2(float(*reinterpret_cast<device const half *>(row + layout.supers
+                + 2ul * (block * 8u + i))), 0.0f);
+    }
+};
+#endif
+
+// The activation pass: one threadgroup of 256 threads per row; a thread takes
+// 8 columns at a time, four neighbouring lanes one 32-column block. The block
+// is scaled by its largest magnitude / 127 (rounded to F16, the scale the
+// fold uses), rounded to nearest and stored in fragment order. Rows at or
+// past `m_rows` are zero.
+template <typename In>
+inline void int8_quantize(thread const In &in, thread const int8_scratch &s, uint m_rows, uint columns, uint m,
+    uint thread_index, uint lane, float inverse) {
+    const uint groups = columns / 32u;
+    const uint tile = m / 16u, rr = m & 7u, h = (m >> 3) & 1u;
+    for (uint chunk = thread_index; chunk < columns / 8u; chunk += 256u) {
+        float4 even = float4(0.0f), odd = float4(0.0f);
+        if (m < m_rows)
+            in.load8(m, chunk * 8u, inverse, even, odd);
+        const float4 a = float4(even.x, odd.x, even.y, odd.y), b = float4(even.z, odd.z, even.w, odd.w);
+        const uint g = chunk / 4u, first = (chunk % 4u) * 8u;
+        const float4 peaks = metal::max(metal::abs(a), metal::abs(b));
+        float peak = metal::max(metal::max(peaks.x, peaks.y), metal::max(peaks.z, peaks.w));
+        peak = metal::max(peak, simd_shuffle_xor(peak, ushort(1)));
+        peak = metal::max(peak, simd_shuffle_xor(peak, ushort(2)));
+        const float scale = float(half(peak / 127.0f));
+        const float reciprocal = scale > 0.0f ? 1.0f / scale : 0.0f;
+        const int4 qa = metal::clamp(int4(metal::rint(a * reciprocal)), -127, 127);
+        const int4 qb = metal::clamp(int4(metal::rint(b * reciprocal)), -127, 127);
+        PROJECTION_UNROLL
+        for (uint half_chunk = 0; half_chunk < 2; ++half_chunk) {
+            const uint k = first + 4u * half_chunk;
+            const uint to = int8_lane::of(rr, k & 12u);
+            *reinterpret_cast<device char4 *>(s.quantized + (ulong(tile) * groups + g) * 512u + to * 16u
+                + (h + 2u * (k >> 4)) * 4u) = half_chunk == 0 ? char4(qa) : char4(qb);
+        }
+        float sum = float(qa.x + qa.y + qa.z + qa.w + qb.x + qb.y + qb.z + qb.w);
+        sum += simd_shuffle_xor(sum, ushort(1));
+        sum += simd_shuffle_xor(sum, ushort(2));
+        if ((lane & 3u) == 0) {
+            s.row_scales[((ulong(m / 32u) * groups + g) * 8u + rr) * 4u + ((m >> 4) & 1u) * 2u + h] = scale;
+            s.block_sums[((ulong(tile) * (groups / 4u) + g / 4u) * 8u + rr) * 8u + h * 4u + (g & 3u)]
+                = half(scale * sum * 0x1p-6f);
+        }
+    }
+}
+
+// The coefficient pass: one thread per (weight row, 256-column block).
+template <typename W>
+inline void int8_coefficients(thread const Weights<W> &w, thread const int8_scratch &s, uint rows, uint columns,
+    uint item) {
+    const uint groups = columns / 32u, blocks = columns / 256u;
+    const uint n = item / blocks, block = item % blocks;
+    if (n >= rows)
+        return;
+    float2 coefficient[8];
+    int8_codes<W>::coefficients(w.row(n), w.layout, block, coefficient);
+    const uint tile = n / 32u, within = n % 32u;
+    PROJECTION_UNROLL
+    for (uint i = 0; i < 8; ++i) {
+        const uint g = block * 8u + i;
+        s.coefficients[((ulong(tile) * groups + g) * 4u + ((within & 15u) >> 2)) * 8u + (within >> 4) * 4u
+            + (within & 3u)] = coefficient[i].x;
+        if (int8_codes<W>::biased) {
+            const uint lane = int8_lane::of(within & 7u, g & 12u);
+            s.biases[((ulong(tile) * (groups / 16u) + g / 16u) * 32u + lane) * 16u + (within >> 3) * 4u
+                + (g & 3u)] = half(coefficient[i].y);
+        }
+    }
+}
+
+#if SEISMIC_HAS_TENSOR_OPS
+// One simdgroup's 32 x 32 tile at (m0, n0): two 16-row left fragments
+// against one right fragment per block. `f[i]` receives the sums of rows
+// m0 + 16 i .. in the destination fragment's order.
+template <typename W>
+inline void gemm_int8_sums(thread const Weights<W> &w, thread const int8_scratch &s, uint k, uint m0, uint n0,
+    uint lane, thread float (&f)[2][16]) {
+    const uint groups = k / 32u;
+    const int8_lane at(lane);
+    const uint tile_m = m0 / 16u, tile_n = n0 / 32u;
+    constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(16, 32, 32, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+    mpp::tensor_ops::matmul2d<descriptor, metal::execution_simdgroup> op;
+    typedef decltype(op.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>()) left_t;
+    typedef decltype(op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>()) right_t;
+    typedef decltype(op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<left_t>,
+        metal::remove_addrspace_t<right_t>, int32_t>()) product_t;
+    PROJECTION_UNROLL
+    for (uint16_t e = 0; e < 16; ++e) {
+        f[0][e] = 0.0f;
+        f[1][e] = 0.0f;
+    }
+    // The min term: sum over blocks of (row block sum) x (weight block
+    // bias), 16 blocks per F16 product.
+    if constexpr (int8_codes<W>::biased) {
+        constexpr auto bias_descriptor = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<bias_descriptor, metal::execution_simdgroup> bias_op;
+        typedef decltype(bias_op.template get_left_input_cooperative_tensor<half, half, float>()) sums_t;
+        typedef decltype(bias_op.template get_right_input_cooperative_tensor<half, half, float>()) biases_t;
+        typedef decltype(bias_op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<sums_t>,
+            metal::remove_addrspace_t<biases_t>, float>()) min_t;
+        min_t min0, min1;
+        PROJECTION_UNROLL
+        for (uint16_t e = 0; e < 16; ++e) {
+            min0[e] = 0.0f;
+            min1[e] = 0.0f;
+        }
+        for (uint g0 = 0; g0 < groups; g0 += 16u) {
+            sums_t sums0 = bias_op.template get_left_input_cooperative_tensor<half, half, float>();
+            sums_t sums1 = bias_op.template get_left_input_cooperative_tensor<half, half, float>();
+            const ulong sums_at = (ulong(groups / 4u) * tile_m + (g0 + at.c) / 4u) * 8u + at.r;
+            const uint4 s0 = reinterpret_cast<device const uint4 *>(s.block_sums)[sums_at];
+            const uint4 s1 = reinterpret_cast<device const uint4 *>(s.block_sums)[sums_at + ulong(groups / 4u) * 8u];
+            biases_t biases = bias_op.template get_right_input_cooperative_tensor<half, half, float>();
+            device const uint4 *bias_at = reinterpret_cast<device const uint4 *>(s.biases)
+                + ((ulong(tile_n) * (groups / 16u) + g0 / 16u) * 32u + lane) * 2u;
+            const uint4 b0 = bias_at[0], b1 = bias_at[1];
+            PROJECTION_UNROLL
+            for (uint16_t e = 0; e < 8; ++e) {
+                sums0[e] = as_type<half2>(s0[e >> 1])[e & 1];
+                sums1[e] = as_type<half2>(s1[e >> 1])[e & 1];
+                biases[e] = as_type<half2>(b0[e >> 1])[e & 1];
+                biases[8 + e] = as_type<half2>(b1[e >> 1])[e & 1];
+            }
+            bias_op.run(sums0, biases, min0);
+            bias_op.run(sums1, biases, min1);
+        }
+        PROJECTION_UNROLL
+        for (uint16_t e = 0; e < 16; ++e) {
+            f[0][e] = min0[e] * 64.0f;
+            f[1][e] = min1[e] * 64.0f;
+        }
+    }
+    // The lane's positions as 32-bit offsets from the bound buffers: a
+    // per-lane pointer is a 64-bit register held through the loop.
+    uint codes[4];
+    PROJECTION_UNROLL
+    for (uint q = 0; q < 4; ++q)
+        codes[q] = uint(w.row(n0 + at.r + 8u * q) - w.base) + uint(w.layout.codes)
+            + at.c / 4u * int8_codes<W>::group_bytes;
+    device const uint4 *left = reinterpret_cast<device const uint4 *>(s.quantized);
+    device const float4 *scales = reinterpret_cast<device const float4 *>(s.row_scales);
+    device const float4 *coefficients = reinterpret_cast<device const float4 *>(s.coefficients);
+    const uint left_at = tile_m * groups * 32u + lane;
+    const uint scales_at = (m0 / 32u) * groups * 8u + at.r;
+    const uint coefficients_at = (tile_n * groups * 4u + at.c / 4u) * 2u;
+    for (uint g = 0; g < groups; ++g) {
+        const uint4 a0 = left[left_at + g * 32u], a1 = left[left_at + (groups + g) * 32u];
+        const float4 row_scale = scales[scales_at + g * 8u];
+        const float4 low = coefficients[coefficients_at + g * 8u], high = coefficients[coefficients_at + g * 8u + 1u];
+        left_t left0 = op.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+        left_t left1 = op.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+        right_t right = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+        PROJECTION_UNROLL
+        for (uint16_t e = 0; e < 16; ++e) {
+            left0[e] = as_type<char4>(a0[e >> 2])[e & 3];
+            left1[e] = as_type<char4>(a1[e >> 2])[e & 3];
+        }
+        PROJECTION_UNROLL
+        for (uint q = 0; q < 8; ++q) {
+            // Four codes of one weight row.
+            const char4 v = int8_codes<W>::group(w.base + codes[q & 3u] + g * int8_codes<W>::block_bytes
+                + (q >> 2) * (int8_codes<W>::block_bytes / 2u));
+            PROJECTION_UNROLL
+            for (uint16_t x = 0; x < 4; ++x)
+                right[uint16_t(q * 4u) + x] = v[x];
+        }
+        {
+            product_t product;
+            op.run(left0, right, product);
+            const float4 s00 = low * row_scale.x, s10 = low * row_scale.y;
+            const float4 s01 = high * row_scale.x, s11 = high * row_scale.y;
+            PROJECTION_UNROLL
+            for (uint16_t x = 0; x < 4; ++x) {
+                f[0][x] = metal::fma(float(product[x]), s00[x], f[0][x]);
+                f[0][4 + x] = metal::fma(float(product[4 + x]), s10[x], f[0][4 + x]);
+                f[0][8 + x] = metal::fma(float(product[8 + x]), s01[x], f[0][8 + x]);
+                f[0][12 + x] = metal::fma(float(product[12 + x]), s11[x], f[0][12 + x]);
+            }
+        }
+        {
+            product_t product;
+            op.run(left1, right, product);
+            const float4 s00 = low * row_scale.z, s10 = low * row_scale.w;
+            const float4 s01 = high * row_scale.z, s11 = high * row_scale.w;
+            PROJECTION_UNROLL
+            for (uint16_t x = 0; x < 4; ++x) {
+                f[1][x] = metal::fma(float(product[x]), s00[x], f[1][x]);
+                f[1][4 + x] = metal::fma(float(product[4 + x]), s10[x], f[1][4 + x]);
+                f[1][8 + x] = metal::fma(float(product[8 + x]), s01[x], f[1][8 + x]);
+                f[1][12 + x] = metal::fma(float(product[12 + x]), s11[x], f[1][12 + x]);
+            }
+        }
+    }
+}
+#endif
+
+// The INT8 launch: a 64 x 64 tile of four simdgroups, each one 32 x 32
+// `gemm_int8_sums`. Weights without an int8 path, and devices without tensor
+// operations, run the staged 64 x 64 tile of the default form instead, with
+// its results.
+template <typename W, typename In, typename Out>
+inline void gemm_int8(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    thread const int8_scratch &s, uint m_rows, uint rows, uint k, uint tm, uint tn, threadgroup uchar *shared,
+    uint sg, uint lane) {
+#if SEISMIC_HAS_TENSOR_OPS
+    if constexpr (int8_codes<W>::available) {
+        const uint m0 = tm * 64u + (sg / 2u) * 32u, n0 = tn * 64u + (sg % 2u) * 32u;
+        const int8_lane at(lane);
+        float f[2][16];
+        gemm_int8_sums<W>(w, s, k, m0, n0, lane, f);
+        PROJECTION_UNROLL
+        for (uint i = 0; i < 2; ++i) {
+            PROJECTION_UNROLL
+            for (uint e = 0; e < 16; ++e) {
+                const uint m = m0 + 16u * i + at.r + 8u * ((e >> 2) & 1u);
+                if (m < m_rows)
+                    out.store(m, n0 + at.c + (e & 3u) + 16u * (e >> 3), f[i][e]);
+            }
+        }
+        return;
+    }
+#endif
+    gemm<W, 64, 64>(in, out, w, m_rows, rows, k, tm, tn, shared, sg, lane);
+}
+
+// The paired INT8 launch (gate and up weights over one operand): a tile of
+// 64 rows by 32 features; simdgroups 0 and 2 sum the gate weights' products
+// for the tile's two 32-row halves, 1 and 3 the up weights', and each up
+// simdgroup stores the pair with its gate simdgroup's sums, exchanged through
+// `exchange` (2 x 32 x 32 floats). `gate_scratch` and `up_scratch` share the
+// operand and differ in the weights' coefficients and biases. Either weight
+// without an int8 path, and devices without tensor operations, run the staged
+// paired 64 x 64 tile of the default form, with its results.
+template <typename G, typename U, typename In, typename Out>
+inline void gemm_int8_paired(thread const In &in, thread const Out &out, thread const Weights<G> &gate,
+    thread const Weights<U> &up, thread const int8_scratch &gate_scratch, thread const int8_scratch &up_scratch,
+    uint m_rows, uint rows, uint k, uint tm, uint tn, threadgroup uchar *shared, threadgroup float *exchange,
+    uint sg, uint lane) {
+#if SEISMIC_HAS_TENSOR_OPS
+    if constexpr (int8_codes<G>::available && int8_codes<U>::available) {
+        const uint half_tile = sg / 2u, m0 = tm * 64u + half_tile * 32u, n0 = tn * 32u;
+        const int8_lane at(lane);
+        const bool second = (sg % 2u) != 0;
+        float f[2][16];
+        if (second)
+            gemm_int8_sums<U>(up, up_scratch, k, m0, n0, lane, f);
+        else
+            gemm_int8_sums<G>(gate, gate_scratch, k, m0, n0, lane, f);
+        threadgroup float *slot = exchange + (half_tile * 32u + lane) * 32u;
+        if (!second) {
+            PROJECTION_UNROLL
+            for (uint e = 0; e < 32; ++e)
+                slot[e] = f[e >> 4][e & 15u];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!second)
+            return;
+        PROJECTION_UNROLL
+        for (uint i = 0; i < 2; ++i) {
+            PROJECTION_UNROLL
+            for (uint e = 0; e < 16; ++e) {
+                const uint m = m0 + 16u * i + at.r + 8u * ((e >> 2) & 1u);
+                if (m < m_rows)
+                    out.store_pair(m, n0 + at.c + (e & 3u) + 16u * (e >> 3), slot[16u * i + e], f[i][e]);
+            }
+        }
+        return;
+    }
+#endif
+    gemm_paired<G, U, 64, 64>(in, out, gate, up, m_rows, rows, k, tm, tn, shared, sg, lane);
 }
 
 } // namespace projection

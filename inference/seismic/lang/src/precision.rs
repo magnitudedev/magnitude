@@ -22,6 +22,12 @@ impl Limit {
     pub fn get(self) -> f64 {
         self.0
     }
+    /// A limit from a positive finite constant, for tables: `new` for
+    /// values known when the program is written.
+    pub const fn from_finite(value: f64) -> Self {
+        assert!(value > 0.0 && value < f64::INFINITY);
+        Self(value)
+    }
 }
 impl TryFrom<f64> for Limit {
     type Error = String;
@@ -205,6 +211,46 @@ impl PrecisionPolicy {
                 default, outputs, ..
             } => Some(outputs.get(output).copied().unwrap_or(*default)),
             Self::Unconstrained => None,
+        }
+    }
+}
+
+/// The bound on one error class's deviation from the reference, per floating
+/// result or state subject: the root-mean-square error relative to the
+/// reference's root mean square, and the largest absolute error in units of
+/// the reference's root mean square. The first admits the class's expected
+/// error; the second rejects an error concentrated in a few elements, which
+/// the first alone would average away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ErrorEnvelope {
+    pub relative_rms: Limit,
+    pub peak: Limit,
+}
+impl ErrorEnvelope {
+    /// The envelope that admits what either admits.
+    pub fn widest(self, other: Self) -> Self {
+        Self {
+            relative_rms: self.relative_rms.max(other.relative_rms),
+            peak: self.peak.max(other.peak),
+        }
+    }
+}
+
+/// What empirical native tuning holds its candidates to: `policy` for a
+/// configuration in no error class, and for one in declared error classes
+/// the envelopes of the classes the caller admits. A configuration in a
+/// class that is not admitted is never formed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TuningPrecision {
+    pub policy: PrecisionPolicy,
+    pub admitted: BTreeMap<String, ErrorEnvelope>,
+}
+impl From<PrecisionPolicy> for TuningPrecision {
+    /// No error class admitted.
+    fn from(policy: PrecisionPolicy) -> Self {
+        Self {
+            policy,
+            admitted: BTreeMap::new(),
         }
     }
 }

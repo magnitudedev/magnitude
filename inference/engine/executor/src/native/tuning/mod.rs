@@ -53,7 +53,7 @@ macro_rules! generated_entry {
             device: &seismic::Device,
             statics: &seismic::NativeSpecialization,
             points: &mut dyn seismic::PointSource<'_, Self::Entry>,
-            validation: seismic::PrecisionPolicy,
+            validation: seismic::TuningPrecision,
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
             let $this = self;
@@ -92,7 +92,7 @@ macro_rules! generated_entry {
             device: &seismic::Device,
             statics: &seismic::NativeSpecialization,
             points: &mut dyn seismic::PointSource<'_, Self::Entry>,
-            validation: seismic::PrecisionPolicy,
+            validation: seismic::TuningPrecision,
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
             $module::native_tune(
@@ -137,6 +137,7 @@ pub mod survey;
 mod weights;
 
 pub(crate) use weights::TuningWeights;
+pub use precision::{AdmittedErrorClasses, NO_ERROR_CLASSES};
 pub use weights::{TuningWeightSource, ZeroTuningWeights};
 
 use super::CatalogFailure;
@@ -514,9 +515,26 @@ pub(crate) trait EntryTuning {
         device: &Device,
         statics: &NativeSpecialization,
         points: &mut dyn seismic::PointSource<'_, Self::Entry>,
-        validation: PrecisionPolicy,
+        validation: seismic::TuningPrecision,
         strategy: Strategy,
     ) -> Result<TuningResult, TuneError>;
+    /// The envelopes of the classes among `admitted` that the entry's
+    /// implementation for `device` declares: what its tuning admits, and
+    /// what its stored results are keyed by.
+    fn admitted(
+        &self,
+        device: &Device,
+        admitted: &AdmittedErrorClasses,
+    ) -> BTreeMap<String, seismic::ErrorEnvelope> {
+        let declared =
+            seismic::generated::native_error_classes::<Self::Entry>(device).unwrap_or_default();
+        admitted
+            .envelopes()
+            .iter()
+            .filter(|(class, _)| declared.contains(class))
+            .map(|(class, envelope)| (class.clone(), *envelope))
+            .collect()
+    }
     /// The entry's generated `native_digest[_with]`.
     fn digest(&self, device: &Device, statics: &NativeSpecialization) -> Result<String, TuneError>;
     /// Check a stored choice against the same device-augmented declaration
@@ -603,6 +621,9 @@ pub struct TuningContext<'a> {
     /// Where tuning results are stored between loads; `None` tunes every
     /// unit at every load.
     pub cache: Option<&'a KernelCache>,
+    /// The error classes the model's qualification admits. A configuration
+    /// of any other class is never formed.
+    pub error_classes: &'a AdmittedErrorClasses,
 }
 
 /// Inputs a case builds its argument sets from. Every tensor it returns is
@@ -1610,6 +1631,7 @@ impl<'a> Tuner<'a> {
             statics,
             &digest,
             &policy,
+            &case.admitted(self.device, self.context.error_classes),
             shapes,
         ));
         let hit = cache
@@ -1629,7 +1651,10 @@ impl<'a> Tuner<'a> {
         shapes: &[PointShape],
         strategy: Strategy,
     ) -> Result<TuningResult, String> {
-        let precision = case.precision().map_err(|error| error.to_string())?;
+        let precision = seismic::TuningPrecision {
+            policy: case.precision().map_err(|error| error.to_string())?,
+            admitted: case.admitted(self.device, self.context.error_classes),
+        };
         let keep = matches!(strategy, Strategy::Census(_));
         let mut cases = self
             .built
@@ -1878,6 +1903,7 @@ fn tuning_key_material(
     statics: &NativeSpecialization,
     digest: &str,
     policy: &PrecisionPolicy,
+    admitted: &BTreeMap<String, seismic::ErrorEnvelope>,
     shapes: &[PointShape],
 ) -> String {
     let mut shapes = shapes
@@ -1885,14 +1911,21 @@ fn tuning_key_material(
         .map(|shape| shape.label.as_str())
         .collect::<Vec<_>>();
     shapes.sort_unstable();
-    format!(
+    let mut material = format!(
         "tuning {SEARCH_VERSION}\ndevice {}\nentry {entry}\nbindings {bindings}\nstatics {:?}\n\
          implementation {digest}\npolicy {:?}\nshapes {}",
         device.tuning_identity(),
         statics.statics(),
         seismic::precision::PolicyIdentity::of(policy).0,
         shapes.join(","),
-    )
+    );
+    // The admitted error classes the entry declares, with their envelopes:
+    // a choice searched with a class admitted may be of that class. A unit
+    // that admits none keeps the key its results were stored under.
+    if !admitted.is_empty() {
+        material.push_str(&format!("\nerror classes {admitted:?}"));
+    }
+    material
 }
 
 fn tuned_entry(

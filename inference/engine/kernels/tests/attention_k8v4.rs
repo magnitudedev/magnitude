@@ -749,13 +749,30 @@ fn prefill_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'stati
             .into_iter()
             .map(|split| vec![("ROWS", 64), ("SPLIT_GROUPS", split)])
             .collect(),
-        // QT = 32 where its 32 G rows fit the device's threadgroup memory
-        // with the tensor-operation form (32 G <= 128).
-        _ => [(16, 1), (8, 1), (16, 256), (8, 256), (32, 1), (32, 256)]
-            .into_iter()
-            .filter(|&(qt, _)| qt < 32 || qt as usize * geometry.g <= 128)
-            .map(|(qt, split)| vec![("QT", qt), ("SPLIT_GROUPS", split)])
-            .collect(),
+        // Each query tile with one head group and with groups of 4 and 2
+        // heads, staged and (for whole 16-row simdgroups) in the direct
+        // form. QT = 32 where its 32 HEADS rows fit the device's threadgroup
+        // memory with the tensor-operation form (32 HEADS <= 128).
+        _ => {
+            let single = single_head_group(geometry.g);
+            let mut heads = vec![single];
+            heads.extend([4, 2].into_iter().filter(|&heads| heads < single));
+            [(16, 1), (8, 1), (16, 256), (8, 256), (32, 1), (32, 256)]
+                .into_iter()
+                .flat_map(|(qt, split)| heads.iter().map(move |&heads| (qt, heads, split)))
+                .filter(|&(qt, heads, _)| qt < 32 || qt * heads.min(geometry.g as u64) <= 128)
+                .flat_map(|(qt, heads, split)| {
+                    (0..1 + u64::from(qt >= 16)).map(move |direct| {
+                        vec![
+                            ("QT", qt),
+                            ("HEADS", heads),
+                            ("SPLIT_GROUPS", split),
+                            ("DIRECT", direct),
+                        ]
+                    })
+                })
+                .collect()
+        }
     }
 }
 
@@ -776,9 +793,25 @@ fn specialization_on(
         statics(geometry)
     };
     let base = qwen_form(base, geometry);
-    params
+    let spec = params
         .iter()
-        .fold(base, |spec, (name, value)| spec.with_param(*name, *value))
+        .fold(base, |spec, (name, value)| spec.with_param(*name, *value));
+    // Metal's prefill splits a kv head's query heads into groups of HEADS and
+    // has the DIRECT form; unless the configuration names them, a single
+    // group and the staged form.
+    let names = |name: &str| params.iter().any(|(param, _)| *param == name);
+    if device.backend() != BackendName::Metal || !names("QT") {
+        return spec;
+    }
+    [("HEADS", single_head_group(geometry.g)), ("DIRECT", 0)]
+        .into_iter()
+        .filter(|(name, _)| !names(name))
+        .fold(spec, |spec, (name, value)| spec.with_param(name, value))
+}
+
+/// The smallest declared HEADS holding all of a kv head's `g` query heads.
+fn single_head_group(g: usize) -> u64 {
+    (g.next_power_of_two() as u64).min(16)
 }
 
 fn decode_kernel(
@@ -2201,6 +2234,9 @@ fn gemma_head_geometry_matches_synthetic_reference() {
             ("SPAN", 32),
             ("SIMDS", simds),
             ("SLICES", slices),
+            ("MATRIX", 0),
+            ("KEYS", 16),
+            ("TOKENS", 1),
         ];
         let kernel = decode_kernel(&device, geometry, &configuration);
         let mut bound = Bound::new(&device, &encoded);

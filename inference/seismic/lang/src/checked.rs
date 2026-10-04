@@ -664,6 +664,10 @@ pub struct NativeImplementation {
     /// The `where` condition restricting admissible parameter
     /// configurations. It reads only static dimensions and parameters.
     pub constraint: Option<NativeCondition>,
+    /// The error classes of the configurations that change numerics beyond
+    /// summation order. A configuration in no class agrees with the default
+    /// within the caller's tolerances; the default itself is in none.
+    pub error_classes: Vec<NativeErrorClass>,
     /// Call-private scratch buffers, in ABI order.
     pub scratch: Vec<NativeScratch>,
     /// Ordered dispatches of one call. Never empty.
@@ -795,6 +799,46 @@ pub enum NativeCondition {
     },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
+}
+
+impl NativeCondition {
+    /// The condition that holds exactly where this one does not.
+    pub fn negated(&self) -> Self {
+        match self {
+            Self::Compare {
+                comparison,
+                left,
+                right,
+            } => Self::Compare {
+                comparison: match comparison {
+                    NativeComparison::Lt => NativeComparison::Ge,
+                    NativeComparison::Le => NativeComparison::Gt,
+                    NativeComparison::Gt => NativeComparison::Le,
+                    NativeComparison::Ge => NativeComparison::Lt,
+                    NativeComparison::Eq => NativeComparison::Ne,
+                    NativeComparison::Ne => NativeComparison::Eq,
+                },
+                left: left.clone(),
+                right: right.clone(),
+            },
+            Self::And(left, right) => {
+                Self::Or(Box::new(left.negated()), Box::new(right.negated()))
+            }
+            Self::Or(left, right) => Self::And(Box::new(left.negated()), Box::new(right.negated())),
+        }
+    }
+}
+
+/// One error class of a native implementation: the configurations whose
+/// static dimensions and entry parameters satisfy `when` differ from the
+/// default by an error of this class (reduced-precision operands, a result
+/// row that depends on its launch's other rows). Tuning forms such a
+/// configuration only when the caller admits the class, and validates it
+/// under the class's envelope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeErrorClass {
+    pub name: String,
+    pub when: NativeCondition,
 }
 
 /// Call-private device memory of one native call.
@@ -1492,6 +1536,49 @@ impl NativeImplementation {
         first.ok_or(NativeSpecializationError::Inadmissible)
     }
 
+    /// The error classes of `specialization` (its static and entry parameter
+    /// values), in declaration order. None for a configuration that changes
+    /// no numerics beyond summation order.
+    pub fn error_classes_of(
+        &self,
+        specialization: &NativeSpecialization,
+    ) -> Result<Vec<&str>, NativeSpecializationError> {
+        let dimension = |name: &str| specialization.static_value(name);
+        let parameter = |name: &str| specialization.param(name);
+        let mut classes = Vec::new();
+        for class in &self.error_classes {
+            if class
+                .when
+                .holds(&dimension, &parameter)
+                .map_err(NativeSpecializationError::Evaluation)?
+            {
+                classes.push(class.name.as_str());
+            }
+        }
+        Ok(classes)
+    }
+
+    /// This implementation restricted to the error classes `admitted`
+    /// accepts: the condition of every other class, negated, joins `where`,
+    /// so no configuration of such a class is admissible.
+    pub fn admitting(mut self, admitted: impl Fn(&str) -> bool) -> Self {
+        let excluded: Vec<NativeCondition> = self
+            .error_classes
+            .iter()
+            .filter(|class| !admitted(&class.name))
+            .map(|class| class.when.negated())
+            .collect();
+        for condition in excluded {
+            self.constraint = Some(match self.constraint.take() {
+                Some(constraint) => {
+                    NativeCondition::And(Box::new(constraint), Box::new(condition))
+                }
+                None => condition,
+            });
+        }
+        self
+    }
+
     /// The values a static search tries, most preferred first: powers of two
     /// up to 4096, then the `where` condition's other literals above one,
     /// then one and zero.
@@ -1948,6 +2035,68 @@ mod native_tests {
             native.validate(&default.clone().with_launch_param(1, "ROWS", 2)),
             Err(NativeSpecializationError::OutsideLaunchDomain { launch: 1, .. })
         ));
+    }
+
+    #[test]
+    fn error_classes_follow_their_conditions() {
+        let declaration = |classes: &str| {
+            format!(
+                "native scale for metal from \"scale.metal\":\n    static (N)\n    params (arithmetic form DEPTH in [0, 1, 2], code PACKED in [0, 1])\n{classes}    launch scale:\n        params (ROWS in [1, 2])\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n"
+            )
+        };
+        let module = check_source(source(&declaration(
+            "    error_class row_mixing when DEPTH >= 1\n    error_class int8_activations when PACKED == 1 and N >= 64\n",
+        )))
+        .expect("error classes check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let classes = |n, depth, packed| {
+            native
+                .error_classes_of(
+                    &NativeSpecialization::new()
+                        .with_static("N", n)
+                        .with_param("DEPTH", depth)
+                        .with_param("PACKED", packed),
+                )
+                .unwrap()
+        };
+        assert!(classes(64, 0, 0).is_empty());
+        assert_eq!(classes(64, 2, 0), ["row_mixing"]);
+        assert_eq!(classes(64, 1, 1), ["row_mixing", "int8_activations"]);
+        assert!(classes(32, 0, 1).is_empty());
+
+        // Only admitted classes' configurations stay admissible.
+        let statics = NativeSpecialization::new().with_static("N", 64);
+        let count = |admitted: &[&str]| {
+            native
+                .clone()
+                .admitting(|name| admitted.contains(&name))
+                .admissible(&statics)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(count(&["row_mixing", "int8_activations"]), 12);
+        assert_eq!(count(&["row_mixing"]), 6);
+        assert_eq!(count(&["int8_activations"]), 4);
+        assert_eq!(count(&[]), 2);
+
+        for (classes, message) in [
+            (
+                "    error_class row_mixing when DEPTH >= 1\n    error_class row_mixing when PACKED == 1\n",
+                "declared twice",
+            ),
+            (
+                "    error_class row_mixing when ROWS == 2\n",
+                "references `ROWS`",
+            ),
+        ] {
+            let error = check_source(source(&declaration(classes))).expect_err(message);
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        let dynamic = "native scale for metal from \"scale.metal\":\n    params (code PACKED in [0, 1])\n    error_class int8_activations when PACKED == 1 and N >= 64\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n";
+        let error = check_source(source(dynamic)).expect_err("a dynamic dimension is unknown");
+        assert!(error.to_string().contains("which is not static"), "{error}");
     }
 
     #[test]

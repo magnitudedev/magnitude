@@ -176,6 +176,7 @@ fn main() -> Result<(), String> {
             kv_codec: options.codec,
             lookahead: false,
             exported_logits_rows: 512,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(options.tokens.len().next_power_of_two().max(256)),
         service: ServiceLimits {

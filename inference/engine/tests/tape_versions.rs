@@ -42,6 +42,7 @@ fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows: 64,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(1024),
         service: ServiceLimits {

@@ -23,7 +23,9 @@ pub use seismic_lang::checked::{
     NativeComparison, NativeCondition, NativeImplementation, NativeLaunch, NativeNatExpr,
     NativeParameter, NativeScratch, NativeSpecialization, NativeSpecializationError,
 };
-pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
+pub use seismic_lang::precision::{
+    ErrorEnvelope, Limit, PrecisionPolicy, SpecialPolicy, Tolerance, TuningPrecision,
+};
 /// Numerical comparison helpers used by validation frontends.
 pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
@@ -3537,6 +3539,26 @@ pub mod generated {
         ))
     }
 
+    /// The error classes the entry's implementation for `device`'s backend
+    /// declares, in declaration order.
+    pub fn native_error_classes<E: Entry>(
+        device: &Device,
+    ) -> Result<Vec<String>, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        Ok(module
+            .checked()
+            .native_implementation(entry.id(), device.backend())
+            .map(|implementation| {
+                implementation
+                    .error_classes
+                    .iter()
+                    .map(|class| class.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Digest of the entry's implementation for `device`'s backend at these
     /// bindings and static values, for keying stored tuning results.
     pub fn digest_native<E: Entry>(
@@ -3607,7 +3629,7 @@ pub mod generated {
         elements: &[(&str, Element)],
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
         points: &mut dyn PointSource<'_, E>,
-        validation: PrecisionPolicy,
+        validation: impl Into<TuningPrecision>,
         strategy: Strategy,
         reference: TuningReference,
     ) -> Result<TuningResult, TuneError> {
@@ -3636,7 +3658,7 @@ pub mod generated {
             statics: statics.clone(),
             cpu,
             points: &mut Typed(points),
-            validation,
+            validation: validation.into(),
             strategy,
             reference,
         })

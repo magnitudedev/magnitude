@@ -75,13 +75,15 @@ fn gated_delta_project[M, H, NK, NV, W](hidden: &tensor[M, H] f32,
 # Metal: GEMV below BATCH_FROM rows, batched GEMV to 16, each normalizing
 # in-threadgroup; larger classes stage the normalized rows, then the GEMM
 # (17..64 rows at the fixed small-row geometry `_gemm_small`, 32 x 64 tiles;
-# beyond over tuned TILE_M x TILE_N tiles).
+# beyond over tuned TILE_M x TILE_N tiles, or under TALL the tall GEMM over
+# rows staged in its order).
 # (CUDA: GEMV to 16 rows, no batched class, GEMM row bands; see below.)
 native gated_delta_project for metal from "metal/gated_delta_project.metal":
     static (H, NK, NV, W)
-    params (arithmetic BATCH_FROM in [5, 3, 9])
-    scratch normalized bytes (M * H * 2) when M > 16
-    launch gated_delta_project_stage when M > 16:
+    params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0])
+    where TALL == 0 or H % 128 == 0
+    scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * H * 2) when M > 16
+    launch gated_delta_project_stage when M > 16 and (M <= 64 or TALL == 0):
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch gated_delta_project_gemv when M < BATCH_FROM:
@@ -101,11 +103,19 @@ native gated_delta_project for metal from "metal/gated_delta_project.metal":
         threadgroups (ceil_div((2 * NK + NV) * W, 64)
             + ceil_div(NV * W, 64) + 2 * ceil_div(NV, 64), ceil_div(M, 32), 1)
         threads_per_threadgroup (128, 1, 1)
-    launch gated_delta_project_gemm when M > 64:
+    launch gated_delta_project_gemm when M > 64 and TALL == 0:
         params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
         threadgroups (ceil_div((2 * NK + NV) * W, TILE_N)
             + ceil_div(NV * W, TILE_N) + 2 * ceil_div(NV, TILE_N), ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    launch gated_delta_project_stage_tall when M > 64 and TALL == 1:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch gated_delta_project_tall when M > 64 and TALL == 1:
+        params (code TALL_M in [128, 256, 512], code TALL_K in [64, 128], code STAGERS in [2, 1])
+        threadgroups (ceil_div((2 * NK + NV) * W, 32)
+            + ceil_div(NV * W, 32) + 2 * ceil_div(NV, 32), ceil_div(M, TALL_M), 1)
+        threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
 
 # CUDA: GEMV to 16 rows (`gemv` to 8, `gemv16` beyond; at M = 1 the block
 # forms its A row in shared memory), GEMM beyond in the K1 row bands

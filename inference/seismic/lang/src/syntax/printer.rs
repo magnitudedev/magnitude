@@ -99,6 +99,12 @@ impl Printer {
                     self.expr(constraint, 0);
                     self.out.push('\n');
                 }
+                for class in &n.error_classes {
+                    self.indent();
+                    let _ = write!(self.out, "error_class {} when ", class.name.name);
+                    self.expr(&class.when, 0);
+                    self.out.push('\n');
+                }
                 for scratch in &n.scratch {
                     self.indent();
                     let _ = write!(self.out, "scratch {} bytes (", scratch.name.name);

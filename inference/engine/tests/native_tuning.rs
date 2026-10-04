@@ -107,6 +107,7 @@ fn prepare_every_entry(
                 weights: &package,
                 observer: &UnreportedTuning,
                 cache: cache.as_deref(),
+                error_classes: &magnitude_executor::NO_ERROR_CLASSES,
             },
         )
         .unwrap_or_else(|error| panic!("{error}"));

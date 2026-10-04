@@ -108,6 +108,12 @@ def parser() -> argparse.ArgumentParser:
         "--native-prefill-tokens", type=int, help="native engine prefill row budget"
     )
     native.add_argument(
+        "--native-error-class",
+        action="append",
+        default=[],
+        help="kernel error class admitted for the model (repeatable)",
+    )
+    native.add_argument(
         "--native-draft", type=Path, help="separate draft model (DFlash, DSpark, DFlash2)"
     )
     llama = execute.add_argument_group("llama.cpp engine (--engine llama.cpp)")
@@ -274,6 +280,7 @@ def main(argv=None) -> int:
                     draft=(
                         args.native_draft.expanduser().absolute() if args.native_draft else None
                     ),
+                    error_classes=tuple(args.native_error_class),
                 ),
                 llama=LlamaOptions(
                     binary=(

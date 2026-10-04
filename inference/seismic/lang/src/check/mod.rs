@@ -1250,6 +1250,46 @@ fn check_native(
         }
     }
 
+    // An error class is a property of the entry's configuration: its
+    // condition reads static dimensions and entry parameters only.
+    let mut error_classes: Vec<crate::checked::NativeErrorClass> = Vec::new();
+    for class in &native.error_classes {
+        if error_classes
+            .iter()
+            .any(|existing| existing.name == class.name.name)
+        {
+            errors.push((
+                class.name.span,
+                format!("error class `{}` is declared twice", class.name.name),
+            ));
+            continue;
+        }
+        match native_condition(
+            "error_class",
+            &class.when,
+            &entry.dimensions,
+            &parameter_names,
+        ) {
+            Ok(when) => {
+                let mut read = Vec::new();
+                when.dimensions(&mut read);
+                if let Some(dynamic) = read.iter().find(|name| !statics.contains(name)) {
+                    errors.push((
+                        class.when.span,
+                        format!(
+                            "native `error_class` reads dimension `{dynamic}`, which is not static; its value is unknown at preparation"
+                        ),
+                    ));
+                }
+                error_classes.push(crate::checked::NativeErrorClass {
+                    name: class.name.name.clone(),
+                    when,
+                });
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+
     let mut scratch: Vec<NativeScratch> = Vec::new();
     for buffer in &native.scratch {
         if scratch
@@ -1426,6 +1466,7 @@ fn check_native(
         params,
         elements,
         constraint,
+        error_classes,
         scratch,
         launches,
     })

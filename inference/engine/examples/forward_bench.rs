@@ -488,6 +488,7 @@ impl Bench {
                 kv_codec,
                 lookahead,
                 exported_logits_rows,
+                error_classes: Vec::new(),
             },
             context_tokens: Some(context_tokens),
             service: ServiceLimits {
