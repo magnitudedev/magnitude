@@ -127,6 +127,12 @@ struct Weights<packets::ProgressiveExact> {
             uint4(bit3[ulong(n) * bit3_stride + p], low[0], low[rest_plane], low[2u * rest_plane]),
             float(scales[ulong(n) * scale_stride + p])};
     }
+    // The planes keep no coefficient run: every packet has its own scale.
+    packets::Block<packets::ProgressiveExact>::state run(uint, uint) const { return {}; }
+    packets::ProgressiveExact::packet packet(uint n, uint p,
+        thread packets::Block<packets::ProgressiveExact>::state &) const {
+        return packet(n, p);
+    }
 };
 
 } // namespace projection

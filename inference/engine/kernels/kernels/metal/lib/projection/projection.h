@@ -88,6 +88,14 @@ struct Weights {
     typename W::packet packet(uint n, uint p) const {
         return packets::Loader<W>::load(row(n), layout, p, k);
     }
+    // Row n's coefficient run positioned at packet p, and the packet a run
+    // is positioned at (`packets::Block`).
+    typename packets::Block<W>::state run(uint n, uint p) const {
+        return packets::Block<W>::load(row(n), layout, p);
+    }
+    typename W::packet packet(uint n, uint p, thread typename packets::Block<W>::state &state) const {
+        return packets::Block<W>::packet(row(n), layout, p, k, state);
+    }
 };
 
 #include "stage.h"
@@ -753,23 +761,47 @@ inline void gemm_store_a(thread const gemm_a_registers<ITEMS> &regs, threadgroup
 // Weight packets one thread stages per step: COUNT items, item i being the
 // half-packet (16 codes with their coefficient group) i % gemm_halves of the
 // tile's local row i / gemm_halves.
+// A thread stages the same weight rows on every step, so it keeps each
+// item's coefficient run (`packets::Block`) in registers across steps.
 template <typename W, uint COUNT>
 struct gemm_b_registers {
     typename W::packet packet[COUNT];
+    typename packets::Block<W>::state run[COUNT];
     bool valid[COUNT];
 };
 
-template <typename W, uint THREADS, uint COUNT>
+// Whether a TM-row tile keeps coefficient runs. On simdgroup matrices a
+// staging thread carries its runs beside its fragments: a 32-row tile has no
+// registers to spare (the runs cost it 6-17% on Apple GPU family 7), nor has
+// a paired tile with a run per stream (2% on family 9), so those load every
+// packet's coefficients as before.
+template <uint TM, bool PAIRED>
+constexpr bool gemm_runs() {
+    return TM >= 64 && (SEISMIC_HAS_TENSOR_OPS || !PAIRED);
+}
+
+// Loads the step at column k0. With RUNS, `fresh` on a tile's first step
+// opens its coefficient runs wherever in a run it starts, and later steps
+// open a run as they enter it.
+template <typename W, uint THREADS, uint COUNT, bool RUNS>
 inline void gemm_load_b(thread const Weights<W> &w, uint first, uint count, uint rows, uint k0,
-    uint k, uint thread_index, thread gemm_b_registers<W, COUNT> &regs) {
+    uint k, uint thread_index, bool fresh, thread gemm_b_registers<W, COUNT> &regs) {
     PROJECTION_UNROLL
     for (uint j = 0; j < COUNT; ++j) {
         uint item = thread_index + j * THREADS;
         uint local = item / gemm_halves;
         uint p = k0 / 32u + (item % gemm_halves) / 2u;
         regs.valid[j] = local < count && 32u * p < k;
-        if (regs.valid[j])
-            regs.packet[j] = w.packet(min(first + local, rows - 1), p);
+        if (regs.valid[j]) {
+            uint n = min(first + local, rows - 1);
+            if (RUNS) {
+                if (fresh || p % packets::Block<W>::packets == 0)
+                    regs.run[j] = w.run(n, p);
+                regs.packet[j] = w.packet(n, p, regs.run[j]);
+            } else {
+                regs.packet[j] = w.packet(n, p);
+            }
+        }
     }
 }
 
@@ -1039,9 +1071,9 @@ inline void gemm_accumulate(thread const In &in, thread const Weights<W> &w,
     gemm_b_registers<U, items> u_regs;
     uint k0 = step_begin * gemm_k;
     gemm_load_a<TM, tile::threads, tile::a_items>(in, m0, m_rows, k0, k, thread_index, a_regs);
-    gemm_load_b<W, tile::threads, items>(w, first, count, rows, k0, k, thread_index, w_regs);
+    gemm_load_b<W, tile::threads, items, gemm_runs<TM, PAIRED>()>(w, first, count, rows, k0, k, thread_index, true, w_regs);
     if (PAIRED)
-        gemm_load_b<U, tile::threads, items>(u, first, count, rows, k0, k, thread_index, u_regs);
+        gemm_load_b<U, tile::threads, items, gemm_runs<TM, PAIRED>()>(u, first, count, rows, k0, k, thread_index, true, u_regs);
     gemm_store_a<TM, tile::threads, tile::a_items>(a_regs, buffer.a, thread_index);
     gemm_store_b<W, tile::threads, items>(w_regs, count, 0, spacing, buffer.b, thread_index);
     if (PAIRED)
@@ -1052,9 +1084,9 @@ inline void gemm_accumulate(thread const In &in, thread const Weights<W> &w,
         uint k1 = (t + 1) * gemm_k;
         if (more) {
             gemm_load_a<TM, tile::threads, tile::a_items>(in, m0, m_rows, k1, k, thread_index, a_regs);
-            gemm_load_b<W, tile::threads, items>(w, first, count, rows, k1, k, thread_index, w_regs);
+            gemm_load_b<W, tile::threads, items, gemm_runs<TM, PAIRED>()>(w, first, count, rows, k1, k, thread_index, false, w_regs);
             if (PAIRED)
-                gemm_load_b<U, tile::threads, items>(u, first, count, rows, k1, k, thread_index, u_regs);
+                gemm_load_b<U, tile::threads, items, gemm_runs<TM, PAIRED>()>(u, first, count, rows, k1, k, thread_index, false, u_regs);
         }
         gemm_step(buffer, acc...);
         threadgroup_barrier(mem_flags::mem_threadgroup);
