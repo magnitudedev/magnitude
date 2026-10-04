@@ -8,6 +8,7 @@ import {
   proxyAnthropicInferenceRequest,
   proxyCodexInferenceRequest,
   proxyLocalAnthropicInferenceRequest,
+  proxyOpenAiInferenceRequest,
 } from "./inference-gateway"
 
 const icn = {
@@ -641,5 +642,63 @@ describe("generic Anthropic inference proxy", () => {
     expect(forwarded?.url).toBe("http://127.0.0.1:9999/anthropic/v1/models?source=generic")
     expect(forwarded?.headers.get("authorization")).toBe("Bearer private-icn-token")
     expect(await response.json()).toEqual({ generic: true })
+  })
+})
+
+// Bun's fetch drops a request after about five minutes without upstream bytes.
+// A non-streaming local generation is silent that long, so only local engine
+// requests disable the timeout; real upstreams keep Bun's default.
+describe("upstream fetch timeout", () => {
+  const timeoutOf = async (proxy: (fetchTarget: (input: RequestInfo | URL, init?: RequestInit & { readonly timeout?: boolean }) => Promise<Response>) => Promise<Response>) => {
+    let timeout: boolean | undefined | "unset" = "unset"
+    await proxy(async (_input, init) => {
+      timeout = init?.timeout
+      return new Response("{}", { headers: { "content-type": "application/json" } })
+    })
+    return timeout
+  }
+  const post = (url: string, body: string, headers: Record<string, string> = {}) =>
+    new Request(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body })
+
+  test("local OpenAI-compatible requests disable it", async () => {
+    expect(await timeoutOf((fetchTarget) => proxyOpenAiInferenceRequest(
+      post("http://127.0.0.1:10100/inference/v1/chat/completions", '{"model":"m","messages":[]}'),
+      icn,
+      fetchTarget,
+    ))).toBe(false)
+  })
+
+  test("Codex local models disable it and OpenAI keeps the default", async () => {
+    expect(await timeoutOf((fetchTarget) => proxyCodexInferenceRequest(
+      post("http://127.0.0.1:10100/inference/v1/proxies/codex/responses", `{"model":"${LOCAL_CODEX_MODEL_PREFIX}m","input":[]}`),
+      icn,
+      fetchTarget,
+    ))).toBe(false)
+    expect(await timeoutOf((fetchTarget) => proxyCodexInferenceRequest(
+      post("http://127.0.0.1:10100/inference/v1/proxies/codex/responses", '{"model":"gpt-5.6-sol"}', { authorization: "Bearer sk-test" }),
+      icn,
+      fetchTarget,
+    ))).toBeUndefined()
+  })
+
+  test("Claude Code local models disable it and Anthropic keeps the default", async () => {
+    expect(await timeoutOf((fetchTarget) => proxyAnthropicInferenceRequest(
+      post("http://127.0.0.1:10100/inference/anthropic/proxies/claude-code/v1/messages", `{"model":"${LOCAL_ANTHROPIC_MODEL_PREFIX}m","max_tokens":4,"messages":[]}`),
+      icn,
+      fetchTarget,
+    ))).toBe(false)
+    expect(await timeoutOf((fetchTarget) => proxyAnthropicInferenceRequest(
+      post("http://127.0.0.1:10100/inference/anthropic/proxies/claude-code/v1/messages", '{"model":"claude-sonnet-4-5","max_tokens":4,"messages":[]}', { "x-api-key": "k" }),
+      icn,
+      fetchTarget,
+    ))).toBeUndefined()
+  })
+
+  test("the generic local Anthropic endpoint disables it", async () => {
+    expect(await timeoutOf((fetchTarget) => proxyLocalAnthropicInferenceRequest(
+      post("http://127.0.0.1:10100/inference/anthropic/v1/messages", '{"model":"m","max_tokens":4,"messages":[]}'),
+      icn,
+      fetchTarget,
+    ))).toBe(false)
   })
 })
