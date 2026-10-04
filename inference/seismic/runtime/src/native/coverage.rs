@@ -165,6 +165,7 @@ enum Former {
     #[cfg(target_os = "macos")]
     Metal {
         device: seismic_metal::DeviceHandle,
+        language: seismic_metal::facts::LanguageVersion,
         tensor_ops: bool,
     },
 }
@@ -201,8 +202,10 @@ impl Former {
             BackendName::Metal => {
                 let device = seismic_metal::DeviceHandle::system_default()
                     .map_err(|error| CoverageError::ToolchainUnavailable(format!("{error:?}")))?;
-                let tensor_ops = seismic_metal::toolchain::forms_tensor_operations(&device);
-                Ok(Self::Metal { device, tensor_ops })
+                let language = seismic_metal::profile::probe_language_version(&device)
+                    .ok_or_else(|| CoverageError::ToolchainUnavailable("no supported Metal language version".into()))?;
+                let tensor_ops = seismic_metal::toolchain::forms_tensor_operations(&device, language);
+                Ok(Self::Metal { device, language, tensor_ops })
             }
             #[cfg(not(target_os = "macos"))]
             BackendName::Metal => Err(CoverageError::ToolchainUnavailable(
@@ -288,9 +291,9 @@ impl Former {
                 Ok(())
             }
             #[cfg(target_os = "macos")]
-            (Self::Metal { device, .. }, Configuration::Metal { .. }) => {
+            (Self::Metal { device, language, .. }, Configuration::Metal { .. }) => {
                 for program in programs {
-                    seismic_metal::toolchain::form_functions(device, program)?;
+                    seismic_metal::toolchain::form_functions(device, program, *language)?;
                 }
                 Ok(())
             }
