@@ -693,21 +693,22 @@ fn attention_prefill[M, T, KV, G, P, S, I, U, F, N, NV, R](
 # such value is admitted.
 native attention_prefill for metal from "metal/attention_prefill.metal":
     static (KV, G, P, S, I, U, F, N, NV)
-    params (arithmetic QT in [16, 8, 32], arithmetic HEADS in [16, 8, 4, 2, 1], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
-    where (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and (32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + 64 * 16 <= 32768
+    params (arithmetic QT in [16, 8, 32], arithmetic HEADS in [16, 8, 4, 2, 1], arithmetic SPLIT_GROUPS in [256, 128, 512, 1],
+        arithmetic form DIRECT in [0, 1])
+    where (DIRECT == 0 or QT >= 16) and (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and (32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + 64 * 16 <= 32768
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
-    scratch keys bytes (M * KV * (2 * P + S) * 2)
-    scratch values bytes (M * KV * (2 * P + S) * 2)
+    scratch keys bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
+    scratch values bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
     scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, QT) * 4)
     launch attention_prefill_prepare:
-        threadgroups (ceil_div(ceil_div(M, QT) * QT * KV * (G + 1), 8), 1, 1)
+        threadgroups (ceil_div((ceil_div(M, QT) * QT + 32 * DIRECT) * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch attention_prefill_attend:
         threadgroups (ceil_div(M, QT), KV * ceil_div(G, HEADS), max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))))
-        threads_per_threadgroup (QT * min(HEADS, G) * 4, 1, 1)
-        shared_bytes ((32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + (R + 1) * 16)
+        threads_per_threadgroup (QT * min(HEADS, G) * (4 - 2 * DIRECT), 1, 1)
+        shared_bytes ((32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + (R + 1) * 16 + DIRECT * ((R + 1) * 48 + 16))
     launch attention_prefill_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS)) > 1:
         threadgroups (ceil_div(M, QT), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
@@ -1048,21 +1049,31 @@ native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
 
 native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal":
     static (KV, G, P, S, I, U, F, N, NV)
-    params (arithmetic QT in [16, 8, 32], arithmetic HEADS in [16, 8, 4, 2, 1], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
-    where (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
+    params (arithmetic QT in [16, 8, 32], arithmetic HEADS in [16, 8, 4, 2, 1], arithmetic SPLIT_GROUPS in [256, 128, 512, 1],
+        arithmetic form DIRECT in [0, 1])
+    where (DIRECT == 0 or QT >= 16) and (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
-    scratch keys bytes (M * KV * (2 * P + S) * 2)
-    scratch values bytes (M * KV * (2 * P + S) * 2)
+    scratch keys bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
+    scratch values bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
     scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, QT) * 4)
+    scratch spans bytes (max(R, 1) * 8) when DIRECT == 1
+    scratch history_keys bytes ((T + 32) * KV * (2 * P + S) * 2) when DIRECT == 1
+    scratch history_values bytes ((T + 32) * KV * (2 * P + S) * 2) when DIRECT == 1
     launch attention_prefill_k8v4_prepare:
-        threadgroups (ceil_div(ceil_div(M, QT) * QT * KV * (G + 1), 8), 1, 1)
+        threadgroups (ceil_div((ceil_div(M, QT) * QT + 32 * DIRECT) * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+    launch attention_prefill_k8v4_bounds when DIRECT == 1:
+        threadgroups (max(R, 1), 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_prefill_k8v4_decode when DIRECT == 1:
+        threadgroups (ceil_div(T + 32, 32), 1, 1)
+        threads_per_threadgroup (1024, 1, 1)
     launch attention_prefill_k8v4_attend:
         threadgroups (ceil_div(M, QT), KV * ceil_div(G, HEADS), max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))))
-        threads_per_threadgroup (QT * min(HEADS, G) * 4, 1, 1)
-        shared_bytes ((32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + (R + 1) * 16)
+        threads_per_threadgroup (QT * min(HEADS, G) * (4 - 2 * DIRECT), 1, 1)
+        shared_bytes ((32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + (R + 1) * 16 + DIRECT * ((R + 1) * 48 + 16))
     launch attention_prefill_k8v4_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS)) > 1:
         threadgroups (ceil_div(M, QT), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)

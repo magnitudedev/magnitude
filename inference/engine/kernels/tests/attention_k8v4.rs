@@ -750,7 +750,8 @@ fn prefill_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'stati
             .map(|split| vec![("ROWS", 64), ("SPLIT_GROUPS", split)])
             .collect(),
         // Each query tile with one head group and with groups of 4 and 2
-        // heads. QT = 32 where its 32 HEADS rows fit the device's threadgroup
+        // heads, staged and (for whole 16-row simdgroups) in the direct
+        // form. QT = 32 where its 32 HEADS rows fit the device's threadgroup
         // memory with the tensor-operation form (32 HEADS <= 128).
         _ => {
             let single = single_head_group(geometry.g);
@@ -760,8 +761,15 @@ fn prefill_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'stati
                 .into_iter()
                 .flat_map(|(qt, split)| heads.iter().map(move |&heads| (qt, heads, split)))
                 .filter(|&(qt, heads, _)| qt < 32 || qt * heads.min(geometry.g as u64) <= 128)
-                .map(|(qt, heads, split)| {
-                    vec![("QT", qt), ("HEADS", heads), ("SPLIT_GROUPS", split)]
+                .flat_map(|(qt, heads, split)| {
+                    (0..1 + u64::from(qt >= 16)).map(move |direct| {
+                        vec![
+                            ("QT", qt),
+                            ("HEADS", heads),
+                            ("SPLIT_GROUPS", split),
+                            ("DIRECT", direct),
+                        ]
+                    })
                 })
                 .collect()
         }
@@ -788,14 +796,17 @@ fn specialization_on(
     let spec = params
         .iter()
         .fold(base, |spec, (name, value)| spec.with_param(*name, *value));
-    // Metal's prefill splits a kv head's query heads into groups of HEADS;
-    // unless the configuration names one, a single group.
+    // Metal's prefill splits a kv head's query heads into groups of HEADS and
+    // has the DIRECT form; unless the configuration names them, a single
+    // group and the staged form.
     let names = |name: &str| params.iter().any(|(param, _)| *param == name);
-    if device.backend() == BackendName::Metal && names("QT") && !names("HEADS") {
-        spec.with_param("HEADS", single_head_group(geometry.g))
-    } else {
-        spec
+    if device.backend() != BackendName::Metal || !names("QT") {
+        return spec;
     }
+    [("HEADS", single_head_group(geometry.g)), ("DIRECT", 0)]
+        .into_iter()
+        .filter(|(name, _)| !names(name))
+        .fold(spec, |spec, (name, value)| spec.with_param(name, value))
 }
 
 /// The smallest declared HEADS holding all of a kv head's `g` query heads.

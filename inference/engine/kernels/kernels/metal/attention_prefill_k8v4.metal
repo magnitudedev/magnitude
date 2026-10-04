@@ -4,12 +4,16 @@
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
 #define PREFILL_HEADS_PER_GROUP SEISMIC_TUNE_HEADS
+#define PREFILL_DIRECT SEISMIC_TUNE_DIRECT
 #include "lib/attention/attention.h"
 
-// The three launches over affine K8/V4 history (bodies in lib/attention/attention.h):
+// The launches over affine K8/V4 history (bodies in lib/attention/attention.h):
 // the prepare launch appends encoded rows, and every history K/V tile is
 // decoded to F16 as it is staged; every product takes F16 operands
-// (attention::affine_history). The scratch rows are F16.
+// (attention::affine_history). The scratch rows are F16. Under DIRECT the
+// `bounds` and `decode` launches first decode the history rows the batch sees
+// to F16 scratch, once for the call, and the attend launch reads its tiles
+// from there (attention::decoded_history).
 
 kernel void attention_prefill_k8v4_prepare(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
@@ -43,6 +47,34 @@ kernel void attention_prefill_k8v4_prepare(
         group, simd, lane);
 }
 
+kernel void attention_prefill_k8v4_bounds(
+    device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
+    device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
+    device int *spans [[buffer(SEISMIC_BUFFER_SCRATCH_SPANS)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    attention::prefill_span_bounds(visible, fresh, spans, SEISMIC_DIM_M, SEISMIC_DIM_R, group, lane);
+}
+
+kernel void attention_prefill_k8v4_decode(
+    device const ulong *key_codes [[buffer(SEISMIC_BUFFER_HISTORY_KEY_CODES)]],
+    device const ulong *key_coefficients [[buffer(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS)]],
+    device const ulong *value_codes [[buffer(SEISMIC_BUFFER_HISTORY_VALUE_CODES)]],
+    device const ulong *value_coefficients [[buffer(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)]],
+    device const int *spans [[buffer(SEISMIC_BUFFER_SCRATCH_SPANS)]],
+    device half *history_keys [[buffer(SEISMIC_BUFFER_SCRATCH_HISTORY_KEYS)]],
+    device half *history_values [[buffer(SEISMIC_BUFFER_SCRATCH_HISTORY_VALUES)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    attention::prefill_decode(
+        attention::affine_history{key_codes, key_coefficients, value_codes, value_coefficients,
+            ulong(SEISMIC_PARAM_SLAB_ROWS)},
+        spans, history_keys, history_values, SEISMIC_DIM_R, group * 32 + simd, lane);
+}
+
 kernel void attention_prefill_k8v4_attend(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
@@ -59,6 +91,8 @@ kernel void attention_prefill_k8v4_attend(
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
     device float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     device uint *counts [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTS)]],
+    device const half *history_keys [[buffer(SEISMIC_BUFFER_SCRATCH_HISTORY_KEYS)]],
+    device const half *history_values [[buffer(SEISMIC_BUFFER_SCRATCH_HISTORY_VALUES)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
     uint3 group [[threadgroup_position_in_grid]],
@@ -69,9 +103,13 @@ kernel void attention_prefill_k8v4_attend(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     PREFILL_EXCHANGE(exchange, SEISMIC_TUNE_QT);
-    attention::prefill_attend<SEISMIC_TUNE_QT>(
-        attention::affine_history{key_codes, key_coefficients, value_codes, value_coefficients,
-            ulong(SEISMIC_PARAM_SLAB_ROWS)},
+#if SEISMIC_TUNE_DIRECT
+    const attention::decoded_history history{history_keys, history_values};
+#else
+    const attention::affine_history history{key_codes, key_coefficients, value_codes, value_coefficients,
+        ulong(SEISMIC_PARAM_SLAB_ROWS)};
+#endif
+    attention::prefill_attend<SEISMIC_TUNE_QT>(history,
         query, gate, visible, fresh, result, queries, keys, values, partials, statistics, counts,
         SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
         SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane);

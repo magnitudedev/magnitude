@@ -357,7 +357,12 @@ Vulkan), and prefill scores whole heads but accumulates outputs one 256-column
 window per pass, so a wide form is a specialization of the same entries. Few kv heads over long
 history are parallelized across the history, never across a different graph: decode splits a row's
 keys into tuned partitions, and prefill may split a tile's history keys across tuned partition
-groups whose partial softmax states merge in fixed order in a second launch.
+groups whose partial softmax states merge in fixed order in a second launch. Metal's prefill also
+declares a direct form, a tuned specialization of the same entries: a simdgroup keeps its queries in
+tensor-operation registers and reads key and value tiles as device tensor operands, so nothing is
+staged; K8/V4 history is first decoded for the call into F16 scratch, with the staged decode's
+arithmetic, so both forms multiply the same operands. That scratch is transient workspace of
+(T + 32) x KV x W x 4 bytes, and the form is chosen only where tuning measures it faster.
 
 Vision patch capacity is the admitted merged output row limit times the merge area; input validation
 rejects a larger aggregate before reserving a vision slot. Vision attention sees every physical
