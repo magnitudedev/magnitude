@@ -82,7 +82,7 @@ pub fn open_device(
 fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, TargetError> {
     let handle = device.handle();
     let raw = handle.raw();
-    let language = probe_language_version(raw).ok_or_else(|| {
+    let language = probe_language_version(handle).ok_or_else(|| {
         TargetError::UnsupportedToolchain(
             "the Metal compiler accepts none of the language versions this backend emits".into(),
         )
@@ -500,7 +500,9 @@ pub(crate) fn compile_options(language: LanguageVersion) -> objc2::rc::Retained<
 
 const PROBE_PRELUDE: &str = "#include <metal_stdlib>\nusing namespace metal;\n";
 
-fn probe_language_version(device: &ProtocolObject<dyn MTLDevice>) -> Option<LanguageVersion> {
+/// The highest language version accepted by the runtime compiler.
+pub fn probe_language_version(device: &crate::DeviceHandle) -> Option<LanguageVersion> {
+    let device = device.raw();
     let source = NSString::from_str(&format!(
         "{PROBE_PRELUDE}kernel void seismic_language_probe(device uint* output [[buffer(0)]]) {{ output[0] = 0u; }}\n"
     ));

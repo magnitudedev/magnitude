@@ -59,7 +59,7 @@ use seismic_ir::metal::MetalIntrinsic;
 /// Revision of this backend's implementation: every change to a lowering,
 /// an emission rule, a resource rule, or an execution-service rule changes
 /// this string and with it every cache identity (§15.1).
-pub const BACKEND_REVISION: &str = "seismic-metal-v10";
+pub const BACKEND_REVISION: &str = "seismic-metal-v11";
 
 /// The Metal backend.
 #[derive(Debug)]

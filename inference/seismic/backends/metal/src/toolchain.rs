@@ -6,7 +6,7 @@
 //! libraries itself.
 
 use crate::direct::DirectPipeline;
-use crate::facts::MetalFacts;
+use crate::facts::{LanguageVersion, MetalFacts};
 use crate::{DeviceHandle, MetalDevice};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -19,16 +19,22 @@ use seismic_native_target::{
 pub struct MetalToolchain {
     device: MetalDevice,
     identity: ToolchainIdentity,
+    language: LanguageVersion,
 }
 
 impl MetalToolchain {
     pub fn new(device: MetalDevice, facts: &MetalFacts) -> Self {
         Self {
             device,
+            language: facts.language,
             // The OS build ships the Metal compiler.
             identity: ToolchainIdentity {
                 namespace: "metal",
-                material: format!("metal;{}", facts.operating_system()),
+                material: format!(
+                    "metal;{};msl-{}",
+                    facts.operating_system(),
+                    facts.language.label()
+                ),
             },
         }
     }
@@ -64,7 +70,7 @@ impl Toolchain for MetalToolchain {
         _cache: Option<&dyn ProgramCache>,
     ) -> Result<Vec<DirectPipeline>, NativeCompilationError> {
         let device = self.device.handle().raw();
-        let functions = form_functions(self.device.handle(), source)?;
+        let functions = form_functions(self.device.handle(), source, self.language)?;
         let failure =
             |error: Retained<NSError>| NativeCompilationError::ToolchainFailure(error.to_string());
         // Each symbol's pipeline is formed once. An entry's group size is the
@@ -117,6 +123,7 @@ impl Toolchain for MetalToolchain {
 pub fn form_functions(
     device: &DeviceHandle,
     source: &ProgramSource,
+    language: LanguageVersion,
 ) -> Result<Vec<Retained<ProtocolObject<dyn MTLFunction>>>, NativeCompilationError> {
     let mut text = source.text.clone();
     let mut instantiated = Vec::new();
@@ -132,9 +139,7 @@ pub fn form_functions(
             ));
         }
     }
-    let options = objc2_metal::MTLCompileOptions::new();
-    options.setMathMode(objc2_metal::MTLMathMode::Safe);
-    options.setMathFloatingPointFunctions(objc2_metal::MTLMathFloatingPointFunctions::Precise);
+    let options = crate::profile::compile_options(language);
     let library = device
         .raw()
         .newLibraryWithSource_options_error(&NSString::from_str(&text), Some(&options))
@@ -155,24 +160,54 @@ pub fn form_functions(
         .collect()
 }
 
-/// Whether this host's Metal compiler forms a source that includes the
-/// tensor-operation headers (Metal 4), whatever the GPU executes: what
+/// Whether this host's Metal compiler forms tensor-operation types and
+/// cooperative destinations (Metal 4), whatever the GPU executes: what
 /// forming a `SEISMIC_HAS_TENSOR_OPS` source needs.
-pub fn forms_tensor_operations(device: &DeviceHandle) -> bool {
+pub fn forms_tensor_operations(device: &DeviceHandle, language: LanguageVersion) -> bool {
     let source = ProgramSource {
         text: "#include <metal_stdlib>\n#include <metal_tensor>\n\
                #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n\
-               kernel void seismic_tensor_headers(device float* out [[buffer(0)]]) { out[0] = 0.0f; }\n"
+               kernel void seismic_tensor_headers(device float* out [[buffer(0)]]) { \
+               using shape = metal::extents<int32_t, 16, 16>; \
+               using tile = metal::tensor<threadgroup half, shape, metal::tensor_inline>; \
+               constexpr auto d = mpp::tensor_ops::matmul2d_descriptor(16, 16, 16, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate); \
+               mpp::tensor_ops::matmul2d<d, metal::execution_simdgroups<1>> op; \
+               auto acc = op.get_destination_cooperative_tensor<tile, tile, float>(); \
+               out[0] = float(acc.get_capacity()); }\n"
             .to_owned(),
         entries: vec![seismic_native_target::ProgramEntry::named("seismic_tensor_headers")],
     };
-    form_functions(device, &source).is_ok()
+    form_functions(device, &source, language).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use seismic_native_target::ProgramEntry;
+
+    #[test]
+    fn native_tensor_operations_use_the_probed_language() {
+        let device = crate::test_support::metal_device();
+        let facts = crate::profile::open_device(&device).unwrap();
+        if !facts.facts().tensor_ops {
+            return;
+        }
+        let source = ProgramSource {
+            text: "#include <metal_stdlib>\n#include <metal_tensor>\n\
+                   #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n\
+                   using namespace metal;\n\
+                   kernel void tensor_probe(device float* out [[buffer(0)]]) { \
+                   typedef extents<int32_t, 16, 16> shape; \
+                   typedef tensor<threadgroup half, shape, tensor_inline> tile; \
+                   constexpr auto d = mpp::tensor_ops::matmul2d_descriptor(16, 16, 16, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate); \
+                   mpp::tensor_ops::matmul2d<d, execution_simdgroups<1>> op; \
+                   auto acc = op.get_destination_cooperative_tensor<tile, tile, float>(); \
+                   out[0] = float(acc.get_capacity()); }\n".into(),
+            entries: vec![ProgramEntry::named("tensor_probe")],
+        };
+        let toolchain = MetalToolchain::new(device, facts.facts());
+        assert_eq!(toolchain.compile(&source, None).unwrap().len(), 1);
+    }
 
     #[test]
     fn template_instances_are_named_by_their_arguments() {
