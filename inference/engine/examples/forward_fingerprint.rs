@@ -281,6 +281,7 @@ fn main() -> Result<(), String> {
             kv_codec: options.codec,
             lookahead: false,
             exported_logits_rows: 64,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(2048),
         service: ServiceLimits {

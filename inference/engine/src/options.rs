@@ -104,6 +104,11 @@ pub struct ModelPolicy {
     /// Rows one launch may export full logits for: zero for serving, which
     /// never reads them; set by diagnostics that do.
     pub exported_logits_rows: usize,
+    /// The kernel error classes this model's qualification admits (top-1
+    /// agreement and KL against an F32 forward with the class's forms
+    /// selected). Tuning forms a configuration of an error class only when
+    /// it is named here; none by default.
+    pub error_classes: Vec<String>,
 }
 
 impl Default for ModelPolicy {
@@ -114,6 +119,7 @@ impl Default for ModelPolicy {
             kv_codec: KvCodec::AffineK8V4,
             lookahead: true,
             exported_logits_rows: 0,
+            error_classes: Vec::new(),
         }
     }
 }
@@ -192,12 +198,20 @@ pub struct ResolvedModelPolicy {
     pub kv_codec: KvCodec,
     pub lookahead: bool,
     pub exported_logits_rows: usize,
+    /// The admitted kernel error classes, sorted and distinct.
+    #[serde(default)]
+    pub error_classes: Vec<String>,
 }
 
 impl ModelPolicy {
     pub fn resolve(&self, definition: &ModelDefinition) -> Result<ResolvedModelPolicy, String> {
         definition.validate().map_err(|error| error.to_string())?;
         let method = resolve_method(self.method, self.mtp_proposals, definition)?;
+        let mut error_classes = self.error_classes.clone();
+        error_classes.sort();
+        error_classes.dedup();
+        // A class no kernel declares is a configuration error.
+        magnitude_executor::AdmittedErrorClasses::of(&error_classes)?;
         Ok(ResolvedModelPolicy {
             method,
             kv_codec: self.kv_codec,
@@ -205,6 +219,7 @@ impl ModelPolicy {
             // its steps cannot chain on device-selected tokens.
             lookahead: self.lookahead && definition.decoder.entry.per_layer.is_none(),
             exported_logits_rows: self.exported_logits_rows,
+            error_classes,
         })
     }
 }
@@ -560,6 +575,21 @@ mod tests {
                 sampled_proposals: DEFAULT_PROPOSALS,
             }
         );
+    }
+
+    #[test]
+    fn an_error_class_no_kernel_declares_is_refused() {
+        let policy = ModelPolicy {
+            error_classes: vec!["undeclared".to_owned()],
+            ..ModelPolicy::default()
+        };
+        let error = policy.resolve(&definition(false)).unwrap_err();
+        assert!(error.contains("unknown error class `undeclared`"), "{error}");
+        assert!(ModelPolicy::default()
+            .resolve(&definition(false))
+            .unwrap()
+            .error_classes
+            .is_empty());
     }
 
     #[test]

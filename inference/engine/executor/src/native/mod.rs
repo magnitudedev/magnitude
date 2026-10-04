@@ -42,7 +42,8 @@ pub use tuning::pinned as pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use tuning::survey as tuning_survey;
 pub use tuning::{
-    attention_points, row_points, PointShape, TunedEntry, TuningContext, TuningEvent, TuningLimits,
+    attention_points, row_points, AdmittedErrorClasses, PointShape, TunedEntry, TuningContext,
+    TuningEvent, TuningLimits, NO_ERROR_CLASSES,
     TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ZeroTuningWeights,
     ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
 };

@@ -15,7 +15,7 @@ use seismic_lang::{
     checked::CheckedModule,
     entry::{ElementBindings, LogicalEntry},
     ids::EntryId,
-    precision::PrecisionPolicy,
+    precision::{ErrorEnvelope, PrecisionPolicy},
     registry::{self, RepresentationKind},
     types::DType,
 };
@@ -197,6 +197,13 @@ impl<'a> PreparedPoint<'a> {
         if let Some(verdict) = self.case.verdicts.borrow().get(&candidate) {
             return verdict.as_ref().map(|_| ()).map_err(Clone::clone);
         }
+        let envelope = self
+            .case
+            .envelope(timing.kernel())
+            .map_err(|detail| Exclusion::Validation {
+                point: self.label.clone(),
+                detail,
+            })?;
         let mut metrics = BTreeMap::new();
         let verdict = timing
             .observe_first(minimum_seconds, |rotation, values, args| {
@@ -211,6 +218,7 @@ impl<'a> PreparedPoint<'a> {
                         &actual,
                         &self.case.subjects,
                         &self.case.policy,
+                        envelope,
                         &mut metrics,
                     )
                     .map_err(|detail| Exclusion::Validation {
@@ -258,6 +266,7 @@ struct ReferenceCase<'a> {
     reference_kind: TuningReference,
     initialize: Option<Initializer<'a>>,
     policy: Arc<PrecisionPolicy>,
+    admitted: Arc<BTreeMap<String, ErrorEnvelope>>,
     subjects: Vec<String>,
     mutable: Vec<Observed>,
     references: Rc<References>,
@@ -268,11 +277,33 @@ struct ReferenceCase<'a> {
     validation_seconds: RefCell<f64>,
 }
 
+impl ReferenceCase<'_> {
+    /// The envelope `kernel`'s configuration is validated under: none for a
+    /// configuration in no error class (the policy's element tolerances
+    /// apply), else the widest of its classes' admitted envelopes.
+    fn envelope(&self, kernel: &super::NativePrepared) -> Result<Option<ErrorEnvelope>, String> {
+        let classes = kernel
+            .implementation()
+            .error_classes_of(kernel.specialization())
+            .map_err(|error| error.to_string())?;
+        let mut envelope: Option<ErrorEnvelope> = None;
+        for class in classes {
+            let admitted = self
+                .admitted
+                .get(class)
+                .ok_or_else(|| format!("error class `{class}` is not admitted"))?;
+            envelope = Some(envelope.map_or(*admitted, |widest| widest.widest(*admitted)));
+        }
+        Ok(envelope)
+    }
+}
+
 /// Prepares points for validation as their inputs arrive: the policy, the
 /// reference implementation and what every point's case identity covers.
 pub(super) struct Validator {
     reference_kind: TuningReference,
     policy: Arc<PrecisionPolicy>,
+    admitted: Arc<BTreeMap<String, ErrorEnvelope>>,
     subjects: Vec<String>,
     mutable: Vec<(usize, String)>,
     references: Rc<References>,
@@ -290,6 +321,7 @@ impl Validator {
         logical: &LogicalEntry,
         mutable: &[(usize, String)],
         policy: &PrecisionPolicy,
+        admitted: &BTreeMap<String, ErrorEnvelope>,
         reference_kind: TuningReference,
         default: &seismic_lang::checked::NativeSpecialization,
         cpu: Option<&'static super::cpu::CpuNativeKernels>,
@@ -388,9 +420,15 @@ impl Validator {
         identity.update(device.tuning_identity());
         identity.update(reference_device.tuning_identity());
         identity.update(PolicyIdentity::of(&policy).0);
+        // Admitted error classes join the identity only when there are any,
+        // so a case without them keeps its identity.
+        if !admitted.is_empty() {
+            identity.update(format!("{admitted:?}"));
+        }
         Ok(Self {
             reference_kind,
             policy,
+            admitted: Arc::new(admitted.clone()),
             subjects,
             mutable: mutable.to_vec(),
             references: Rc::new(References {
@@ -466,6 +504,7 @@ impl Validator {
             reference_kind: self.reference_kind,
             initialize,
             policy: self.policy.clone(),
+            admitted: self.admitted.clone(),
             subjects: self.subjects.clone(),
             mutable: observed,
             references: self.references.clone(),
@@ -566,11 +605,68 @@ fn element(
     }
     Ok(())
 }
+/// One floating subject of an error-class configuration against its
+/// reference, as (reference bits, actual bits) per element: the error's root
+/// mean square within `relative_rms` of the reference's, and every element
+/// within `peak` reference root mean squares. Non-finite values must agree
+/// bit for bit.
+fn within_envelope(
+    subject: &str,
+    dtype: DType,
+    elements: impl IntoIterator<Item = (u32, u32)>,
+    envelope: ErrorEnvelope,
+    metrics: &mut NumericalMetrics,
+) -> Result<(), String> {
+    let value = |bits| seismic_lang::reference_math::conversion::exact_f64(dtype, bits);
+    let (mut count, mut squared_error, mut squared_reference) = (0usize, 0f64, 0f64);
+    let (mut peak, mut peak_index) = (0f64, 0usize);
+    for (index, (reference, actual)) in elements.into_iter().enumerate() {
+        let (r, a) = (value(reference), value(actual));
+        if !r.is_finite() || !a.is_finite() {
+            if reference != actual {
+                return Err(format!(
+                    "subject {subject} element {index}: non-finite reference bits {reference:#x}, actual bits {actual:#x}"
+                ));
+            }
+            continue;
+        }
+        let error = (a - r).abs();
+        squared_error += error * error;
+        squared_reference += r * r;
+        if error > peak {
+            (peak, peak_index) = (error, index);
+        }
+        count += 1;
+    }
+    if squared_error == 0. {
+        return Ok(());
+    }
+    let reference_rms = (squared_reference / count as f64).sqrt();
+    let relative_rms = (squared_error / squared_reference).sqrt();
+    let peak_limit = envelope.peak.get() * reference_rms;
+    if !(relative_rms <= envelope.relative_rms.get()) || !(peak <= peak_limit) {
+        return Err(format!(
+            "subject {subject}: relative RMS error {relative_rms:.3e} (limit {:.3e}), largest error {peak:.3e} at element {peak_index} (limit {peak_limit:.3e}, {} reference RMS)",
+            envelope.relative_rms.get(),
+            envelope.peak.get()
+        ));
+    }
+    metrics.maximum_absolute_error = metrics.maximum_absolute_error.max(peak);
+    let usage = (relative_rms / envelope.relative_rms.get()).max(peak / peak_limit);
+    if usage > metrics.maximum_envelope_usage {
+        metrics.maximum_envelope_usage = usage;
+        metrics.worst_subject = subject.to_owned();
+        metrics.worst_element = peak_index;
+    }
+    Ok(())
+}
+
 fn compare(
     expected: &[Observation],
     actual: &[Observation],
     subjects: &[String],
     policy: &PrecisionPolicy,
+    envelope: Option<ErrorEnvelope>,
     metrics: &mut BTreeMap<String, NumericalMetrics>,
 ) -> Result<(), String> {
     if expected.len() != actual.len() || expected.len() != subjects.len() {
@@ -608,6 +704,23 @@ fn compare(
                     return Err(format!("subject {subject}: packed storage differs"));
                 };
                 let width = dtype.bytes() as usize;
+                // A floating subject of an error-class configuration is
+                // held to the class's envelope as a whole.
+                if let Some(envelope) = envelope.filter(|_| dtype.is_float()) {
+                    let bits = |v: &[u8]| {
+                        let mut b = [0; 4];
+                        b[..v.len()].copy_from_slice(v);
+                        u32::from_le_bytes(b)
+                    };
+                    let elements = eb.iter().zip(ab).flat_map(|(expected, actual)| {
+                        expected
+                            .chunks_exact(width)
+                            .zip(actual.chunks_exact(width))
+                            .map(|(e, a)| (bits(e), bits(a)))
+                    });
+                    within_envelope(subject, dtype, elements, envelope, metrics)?;
+                    continue;
+                }
                 for (page_index, (expected, actual)) in eb.iter().zip(ab).enumerate() {
                     if expected == actual {
                         continue;
@@ -639,9 +752,12 @@ fn compare(
             }
             (Observation::Scalar(e), Observation::Scalar(a)) => {
                 match (scalar_bits(e), scalar_bits(a)) {
-                    (Some((ed, eb)), Some((ad, ab))) if ed == ad => {
-                        element(policy, subject, ed, eb, ab, 0, metrics)?
-                    }
+                    (Some((ed, eb)), Some((ad, ab))) if ed == ad => match envelope {
+                        Some(envelope) if ed.is_float() => {
+                            within_envelope(subject, ed, [(eb, ab)], envelope, metrics)?
+                        }
+                        _ => element(policy, subject, ed, eb, ab, 0, metrics)?,
+                    },
                     _ if e == a => (),
                     _ => return Err(format!("subject {subject}: discrete scalar differs")),
                 }
@@ -701,6 +817,7 @@ mod tests {
             &[tensor(DType::F32, &values)],
             &subjects,
             &policy(),
+            None,
             &mut BTreeMap::new()
         )
         .is_ok());
@@ -710,6 +827,7 @@ mod tests {
             &[tensor(DType::F32, &values)],
             &subjects,
             &policy(),
+            None,
             &mut BTreeMap::new()
         )
         .unwrap_err()
@@ -719,6 +837,7 @@ mod tests {
             &[tensor(DType::U32, &[2])],
             &subjects,
             &policy(),
+            None,
             &mut BTreeMap::new()
         )
         .is_err());
@@ -736,6 +855,7 @@ mod tests {
             &[wrong_shape],
             &subjects,
             &policy(),
+            None,
             &mut BTreeMap::new()
         )
         .is_err());
@@ -749,9 +869,66 @@ mod tests {
                 &[tensor(DType::F32, &[bits])],
                 &subjects,
                 &policy(),
+                None,
                 &mut BTreeMap::new()
             )
             .is_err());
         }
+    }
+    #[test]
+    fn an_error_class_envelope_bounds_the_whole_subject_and_its_worst_element() {
+        let envelope = ErrorEnvelope {
+            relative_rms: Limit::new(2e-2).unwrap(),
+            peak: Limit::new(0.25).unwrap(),
+        };
+        let subjects = vec!["value".into()];
+        let values = |f: &dyn Fn(usize) -> f32| -> Vec<u32> {
+            (0..1000).map(|i| f(i).to_bits()).collect()
+        };
+        let reference = vec![tensor(
+            DType::F32,
+            &values(&|i| if i % 2 == 0 { 1. } else { -1. }),
+        )];
+        let check = |actual: Vec<u32>, envelope| {
+            compare(
+                &reference,
+                &[tensor(DType::F32, &actual)],
+                &subjects,
+                &policy(),
+                envelope,
+                &mut BTreeMap::new(),
+            )
+        };
+        // A 1% error on every element: outside the element tolerance of
+        // nothing here (0.01 absolute), inside the envelope.
+        let spread = values(&|i| if i % 2 == 0 { 1.01 } else { -0.99 });
+        assert!(check(spread.clone(), Some(envelope)).is_ok());
+        // Five times that is outside the envelope's RMS bound.
+        let wide = values(&|i| if i % 2 == 0 { 1.05 } else { -0.95 });
+        assert!(check(wide.clone(), None).is_err());
+        assert!(check(wide, Some(envelope))
+            .unwrap_err()
+            .contains("relative RMS error"));
+        // One element off by half the reference RMS: its RMS share is 1.6%,
+        // but it is a localized defect.
+        let mut local = values(&|i| if i % 2 == 0 { 1. } else { -1. });
+        local[731] = (-0.5f32).to_bits();
+        assert!(check(local, Some(envelope))
+            .unwrap_err()
+            .contains("element 731"));
+        // Non-finite values never pass under an envelope.
+        let mut infinite = spread;
+        infinite[3] = f32::INFINITY.to_bits();
+        assert!(check(infinite, Some(envelope)).is_err());
+        // Integer subjects stay exact.
+        assert!(compare(
+            &[tensor(DType::U32, &[1])],
+            &[tensor(DType::U32, &[2])],
+            &subjects,
+            &policy(),
+            Some(envelope),
+            &mut BTreeMap::new()
+        )
+        .is_err());
     }
 }

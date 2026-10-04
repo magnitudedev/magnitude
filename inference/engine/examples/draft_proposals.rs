@@ -123,6 +123,7 @@ fn main() -> Result<(), String> {
         kv_codec: KvCodec::Dense,
         lookahead: false,
         exported_logits_rows: 0,
+        error_classes: Vec::new(),
     }
     .resolve(&definition)?;
     let proposals = model.method.proposals();

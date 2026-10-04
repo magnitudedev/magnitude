@@ -321,6 +321,7 @@ pub(crate) mod tests {
                     weights: &crate::ZeroTuningWeights,
                     observer: &crate::UnreportedTuning,
                     cache: None,
+                    error_classes: &crate::NO_ERROR_CLASSES,
                 },
             )
             .unwrap()
@@ -414,6 +415,7 @@ pub(crate) mod tests {
                 weights: &crate::ZeroTuningWeights,
                 observer: &crate::UnreportedTuning,
                 cache: None,
+                error_classes: &crate::NO_ERROR_CLASSES,
             },
         )
         .unwrap();

@@ -134,7 +134,9 @@ is cached). It holds the program artifacts Seismic keeps (CUDA CUBINs, Vulkan SP
 the device's artifact store, one directory per toolchain namespace, and one tuning result per
 tuning key. The key is a digest over what a stored result is valid for: the tuning version, the
 device and toolchain identity (Metal OS build; CUDA driver and NVRTC release), the unit, the
-implementation digest (declaration and rendered source), the precision policy, and the labels of
+implementation digest (declaration and rendered source), the precision policy, the admitted error
+classes the entry declares with their envelopes (none for an entry that declares none, so
+admitting a class retunes only the entries that have it), and the labels of
 the served shapes its choice was validated at. How it was searched is not part of the key (search
 settings, tuning time, budget shares, workload weights, the points timed), so improving the
 search never invalidates a result that is still correct. The tuning version changes only with the
@@ -170,9 +172,18 @@ against an F32 reference forward and end to end by logit top-1 agreement, mean K
 its tail against an external F32 reference forward of the same artifact (its weights dequantized
 once to F32; no activation quantization). Reduced-precision activations, packed weights
 dequantized inside a kernel to the activation element, changed accumulation order, and explicit
-fast math functions are admitted on any backend when they pass. A row's result never depends on peer rows' values; it may depend on its launch's shape class
-and prepared configuration, and different shape classes agree within the gate's tolerance, not
-bit for bit. Speculative verification is therefore statistically, not exactly, equivalent to
+fast math functions are admitted on any backend when they pass. The gate is model-level and runs
+outside the load: tuning times one entry on generated inputs and cannot measure it. A kernel form
+whose error exceeds the per-dtype tolerances against its entry's default declares an error class,
+and the engine keeps one envelope per class (the form's measured per-entry error with room for
+the tuning inputs). A model's qualification admits classes; the host names the admitted classes
+in the model policy at load, none by default, and a name no kernel declares is refused. Tuning
+forms a configuration of an error class only when the class is admitted, and validates it against
+the default under the class's envelope, so a defective kernel still fails while the form's
+expected error passes. Without an admitted class a row's result never depends on peer rows'
+values; a form that makes it depend on them is its own error class. A result may depend on its
+launch's shape class and prepared configuration, and different shape classes agree within the
+gate's tolerance, not bit for bit. Speculative verification is therefore statistically, not exactly, equivalent to
 plain decoding; acceptance over the logits a verification produced remains exact.
 
 The resource plan authorizes persistent weights and startup state slabs, including the permanently

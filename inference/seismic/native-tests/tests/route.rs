@@ -1418,6 +1418,109 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
     }
 }
 
+/// A choice that changes numerics declares its error class: tuning forms it
+/// only when the caller admits the class, and holds it to the class's
+/// envelope in place of the policy's element tolerances.
+#[test]
+fn tuning_forms_an_error_class_only_when_admitted_and_holds_it_to_its_envelope() {
+    use seismic::{ErrorEnvelope, Limit, TuningPrecision, TuningResult};
+    use seismic_native_tests::classed_accumulate;
+    for device in devices() {
+        let n = 256u64;
+        // Every element is 100 by the reference and 100.5 under BIAS 1.
+        let tune = |envelope: Option<f64>| -> TuningResult {
+            let mut state = zeroed(&device, n);
+            let mut restore = state.clone();
+            let zeros = vec![0u8; n as usize * 4];
+            let initialize: TuningInitializer<'_> =
+                Box::new(move || restore.write_from_host(&zeros));
+            let x = f32_tensor(&device, &[n], &vec![100.0; n as usize]);
+            let points = vec![TuningPoint {
+                label: "rows".into(),
+                weight: 1.0,
+                class: None,
+                cost: 1.0,
+                required: false,
+                rotation: vec![classed_accumulate::Args {
+                    state: &mut state,
+                    x: &x,
+                }],
+                initialize: Some(initialize),
+                written: Default::default(),
+            }];
+            classed_accumulate::native_tune(
+                &device,
+                &NativeSpecialization::new(),
+                points,
+                TuningPrecision {
+                    policy: PrecisionPolicy::Exact,
+                    admitted: envelope
+                        .into_iter()
+                        .map(|limit| {
+                            let limit = Limit::new(limit).unwrap();
+                            (
+                                "biased".to_owned(),
+                                ErrorEnvelope {
+                                    relative_rms: limit,
+                                    peak: limit,
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+                search(2),
+                seismic::TuningReference::Portable,
+            )
+            .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()))
+        };
+        let biased = |result: &TuningResult| -> Vec<Outcome> {
+            result
+                .configurations
+                .iter()
+                .filter(|record| record.configuration.params["BIAS"] == 1)
+                .map(|record| record.outcome.clone())
+                .collect()
+        };
+
+        let unadmitted = tune(None);
+        assert!(
+            biased(&unadmitted).is_empty(),
+            "{:?}: an unadmitted class was formed",
+            device.backend()
+        );
+        assert_eq!(unadmitted.overall.params["BIAS"], 0);
+
+        let admitted = biased(&tune(Some(1e-2)));
+        assert!(!admitted.is_empty(), "{:?}", device.backend());
+        for outcome in admitted {
+            assert!(
+                matches!(
+                    outcome,
+                    Outcome::Measured {
+                        validated: true,
+                        ..
+                    }
+                ),
+                "{:?}: {outcome:?}",
+                device.backend()
+            );
+        }
+
+        let narrow = tune(Some(1e-3));
+        let outside = biased(&narrow);
+        assert!(!outside.is_empty(), "{:?}", device.backend());
+        for outcome in outside {
+            match outcome {
+                Outcome::Excluded(Exclusion::Validation { detail, .. }) => {
+                    assert!(detail.contains("relative RMS error"), "{detail}")
+                }
+                other => panic!("{:?}: {other:?}", device.backend()),
+            }
+        }
+        assert_eq!(narrow.overall.params["BIAS"], 0);
+    }
+}
+
 /// Static bindings are checked once by `bind_static`; a run checks only the
 /// bindings it adds, and still rejects unbound, mismatched and illegally
 /// aliased external ports before anything is encoded.

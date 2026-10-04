@@ -335,6 +335,23 @@ impl Parser {
             constraint = Some(self.expr()?);
             self.expect_newline()?;
         }
+        let mut error_classes = Vec::new();
+        while self.at_word("error_class") {
+            let begin = self.bump().span;
+            let name = self.expect_name()?;
+            let Some(when) = self.native_when()? else {
+                return Err(self.error(format!(
+                    "expected `when <condition>` after the error class name, found {}",
+                    self.peek().describe()
+                )));
+            };
+            self.expect_newline()?;
+            error_classes.push(NativeErrorClassDecl {
+                name,
+                when,
+                span: begin.to(self.prev_span()),
+            });
+        }
         let mut scratch = Vec::new();
         while self.at_word("scratch") {
             let begin = self.bump().span;
@@ -369,7 +386,7 @@ impl Parser {
         }
         if launches.is_empty() {
             return Err(self.error(format!(
-                "expected `launch <kernel>:`, found {}; a native declaration lists `static`, `params`, `elements`, `where`, `scratch`, then one or more launches",
+                "expected `launch <kernel>:`, found {}; a native declaration lists `static`, `params`, `elements`, `where`, `error_class`, `scratch`, then one or more launches",
                 self.peek().describe()
             )));
         }
@@ -382,6 +399,7 @@ impl Parser {
             params,
             elements,
             constraint,
+            error_classes,
             scratch,
             launches,
             span: start.to(self.prev_span()),
@@ -1263,6 +1281,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["f32", "u32"]
         );
+    }
+
+    #[test]
+    fn error_class_declarations_round_trip() {
+        let file = round_trip(
+            "native scale for metal from \"scale.metal\":\n    static (N)\n    params (arithmetic form DEPTH in [0, 1], code PACKED in [0, 1])\n    where N >= 64\n    error_class row_mixing when DEPTH >= 1\n    error_class int8_activations when PACKED == 1 and N >= 128\n    scratch sums bytes (N * 4)\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert_eq!(
+            native
+                .error_classes
+                .iter()
+                .map(|class| class.name.name.as_str())
+                .collect::<Vec<_>>(),
+            ["row_mixing", "int8_activations"]
+        );
+        assert!(parse(
+            "native scale for metal from \"scale.metal\":\n    error_class row_mixing\n    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"
+        )
+        .is_err());
     }
 
     #[test]

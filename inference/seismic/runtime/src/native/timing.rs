@@ -217,6 +217,11 @@ impl<'a> PointTiming<'a> {
         &self.kernel.artifact().0
     }
 
+    /// The configuration this timing executes.
+    pub(super) fn kernel(&self) -> &NativePrepared {
+        &self.kernel
+    }
+
     /// The calibration pass also supplies numerical observations, before any rotation or
     /// subsequent candidate can overwrite the result/state buffers.
     pub(super) fn observe_first(

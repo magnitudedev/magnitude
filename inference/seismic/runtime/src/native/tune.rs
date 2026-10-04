@@ -21,7 +21,7 @@ use seismic_lang::checked::{CheckedModule, NativeImplementation, NativeSpecializ
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::EntryId;
-use seismic_lang::precision::PrecisionPolicy;
+use seismic_lang::precision::{PrecisionPolicy, TuningPrecision};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -450,7 +450,9 @@ pub struct TuneRequest<'r, 'a> {
     pub statics: NativeSpecialization,
     pub cpu: Option<&'static CpuNativeKernels>,
     pub points: &'r mut dyn PointSource<'a>,
-    pub validation: PrecisionPolicy,
+    /// The policy every configuration in no error class is validated under,
+    /// and the admitted error classes with their envelopes.
+    pub validation: TuningPrecision,
     pub strategy: Strategy,
     pub reference: TuningReference,
 }
@@ -1409,7 +1411,10 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         statics,
         cpu,
         points: source,
-        validation,
+        validation: TuningPrecision {
+            policy: validation,
+            admitted,
+        },
         strategy,
         reference,
     } = request;
@@ -1434,6 +1439,9 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     if let Strategy::Survey(plan) = &strategy {
         widen(&mut implementation, &plan.domains)?;
     }
+    // Configurations of an error class that is not admitted are outside the
+    // domain: never formed, timed or chosen.
+    let implementation = implementation.admitting(|class| admitted.contains_key(class));
     // Every configuration formed below is this one entry at these bindings.
     let logical = Arc::new(
         module
@@ -1486,6 +1494,17 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     let default = implementation
         .default_specialization(&statics)
         .map_err(|error| TuneError::Declaration(error.to_string()))?;
+    // The default is the validation reference: it changes no numerics.
+    if let Some(class) = implementation
+        .error_classes_of(&default)
+        .map_err(|error| TuneError::Declaration(error.to_string()))?
+        .first()
+    {
+        return Err(TuneError::Declaration(format!(
+            "the default configuration of `{}` is in error class `{class}`",
+            unit.entry
+        )));
+    }
     let default_kernel = NativePrepared::prepare_implementation(
         device,
         module,
@@ -1505,6 +1524,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         &logical,
         &mutable,
         &unit.validation,
+        &admitted,
         reference,
         &default,
         cpu,
@@ -2859,6 +2879,11 @@ fn update_declaration_digest(
         )
         .as_bytes(),
     );
+    // Only a declaration with error classes digests them, so one without
+    // keeps the digest its stored results were keyed by.
+    if !implementation.error_classes.is_empty() {
+        digest.update(format!("{:?}", implementation.error_classes).as_bytes());
+    }
 }
 
 /// Replace parameter domains for a survey. Each keeps its default first.

@@ -161,6 +161,7 @@ mod tests {
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows,
+            error_classes: Vec::new(),
         }
     }
 

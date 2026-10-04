@@ -63,7 +63,8 @@ pub use native::pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use native::tuning_survey;
 pub use native::{
-    attention_points, row_points, AttestedPrograms, CatalogError, CatalogFailure, PointShape,
+    attention_points, row_points, AdmittedErrorClasses, AttestedPrograms, CatalogError,
+    CatalogFailure, PointShape, NO_ERROR_CLASSES,
     QualificationCase, QualificationReport, TunedEntry, TuningContext, TuningEvent, TuningLimits,
     TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ZeroTuningWeights,
     ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
