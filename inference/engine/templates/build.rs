@@ -115,8 +115,11 @@ fn main() {
         .flag_if_supported("-fvisibility-inlines-hidden");
     // The sources carry UTF-8 string literals (template tokens); MSVC otherwise
     // reads them in the system code page, as upstream's CMake also prevents.
+    // Without /EHsc MSVC leaves _CPPUNWIND undefined, so nlohmann::json turns
+    // every throw into abort() and compiles its try/catch blocks away.
     if build.get_compiler().is_like_msvc() {
         build.flag("/utf-8");
+        build.flag("/EHsc");
     }
     for source in SOURCES {
         build.file(root.join(source));
