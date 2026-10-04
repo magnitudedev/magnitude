@@ -741,7 +741,8 @@ pub enum ResponseInput {
 // discriminator; variants are matched by shape, and each explicit `type`
 // field is a single-literal enum so a present tag is still verified.
 // Replay closure invariant: every item `ResponseOutputItem` can emit must
-// parse here, because clients replay our output verbatim as later input.
+// parse here, because clients replay our output verbatim as later input, or
+// re-serialized with explicit nulls for the fields we omit.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum ResponseInputItem {
@@ -772,12 +773,22 @@ pub struct ResponseReasoningInput {
     pub id: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub content: Vec<ResponseReasoningInputContent>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub summary: Vec<ResponseReasoningInputContent>,
     #[serde(default)]
     pub encrypted_content: Option<String>,
+}
+
+/// A replayed list that a client re-serialized as `null` (Codex does for the
+/// reasoning fields we omit) is empty.
+fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

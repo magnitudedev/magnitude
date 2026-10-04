@@ -861,6 +861,68 @@ fn responses_output_items_replay_as_input() {
     );
 }
 
+// Codex re-serializes our reasoning item with explicit nulls for the fields
+// we omit, and adds its own metadata to every item.
+#[test]
+fn responses_accepts_codex_replayed_items_with_null_fields() {
+    let metadata = json!({ "turn_id": "turn-1" });
+    let request = responses_request(json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": "be concise" }]
+            },
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "read notes.txt" }],
+                "internal_chat_message_metadata_passthrough": metadata
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_icn_1",
+                "summary": [{ "type": "summary_text", "text": "read the file first" }],
+                "content": null,
+                "encrypted_content": null,
+                "internal_chat_message_metadata_passthrough": metadata
+            },
+            {
+                "type": "function_call",
+                "id": "fc_call_1",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"cat notes.txt\"}",
+                "call_id": "call_1",
+                "internal_chat_message_metadata_passthrough": metadata
+            },
+            {
+                "type": "function_call_output",
+                "id": "fco_1",
+                "call_id": "call_1",
+                "output": "secret PERIWINKLE",
+                "internal_chat_message_metadata_passthrough": metadata
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_icn_2",
+                "summary": null,
+                "content": null
+            }
+        ]
+    }))
+    .unwrap();
+    assert_eq!(
+        assistant(&request, 1).reasoning.as_deref(),
+        Some("read the file first")
+    );
+    assert_eq!(
+        assistant(&request, 1).tool_calls[0].result,
+        vec![magnitude_chat::request::ToolResultPart::Text("secret PERIWINKLE".into())]
+    );
+}
+
 #[test]
 fn anthropic_output_blocks_replay_as_input() {
     let (output, completion) = full_output();
