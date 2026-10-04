@@ -54,7 +54,21 @@ pub(super) fn policy(subjects: Vec<(String, DType)>) -> Result<PrecisionPolicy, 
 /// Whether a model tolerates a class is not decided here: its qualification
 /// (top-1 agreement and KL against an F32 forward) admits classes per model,
 /// and the host passes the admitted names at load.
-const ERROR_CLASSES: &[(&str, seismic::ErrorEnvelope)] = &[];
+const ERROR_CLASSES: &[(&str, seismic::ErrorEnvelope)] = &[
+    // Activations quantized to int8 per (row, 32 columns) against exact
+    // weights (`dense_expand`, `dense_output` on Metal tensor operations).
+    // On the tuning inputs the down projection differs from its default by
+    // 1.8e-3 relative RMS (largest element 1.3e-2 reference RMS) and the
+    // gate/up product by 3.5e-3; real activations measure 8e-3 to 1e-2.
+    ("int8_activations", envelope(2e-2, 0.25)),
+];
+
+const fn envelope(relative_rms: f64, peak: f64) -> seismic::ErrorEnvelope {
+    seismic::ErrorEnvelope {
+        relative_rms: seismic::Limit::from_finite(relative_rms),
+        peak: seismic::Limit::from_finite(peak),
+    }
+}
 
 /// The error classes a load admits, with their envelopes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

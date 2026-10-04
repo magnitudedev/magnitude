@@ -133,6 +133,11 @@ class Native(Adapter):
                 else []
             ),
             *(["--draft", str(native.draft)] if native.draft is not None else []),
+            *(
+                flag
+                for error_class in native.error_classes
+                for flag in ("--admit-error-class", error_class)
+            ),
         ]
 
     def verify_ready(self, data, context, parallel):

@@ -22,6 +22,12 @@ impl Limit {
     pub fn get(self) -> f64 {
         self.0
     }
+    /// A limit from a positive finite constant, for tables: `new` for
+    /// values known when the program is written.
+    pub const fn from_finite(value: f64) -> Self {
+        assert!(value > 0.0 && value < f64::INFINITY);
+        Self(value)
+    }
 }
 impl TryFrom<f64> for Limit {
     type Error = String;

@@ -30,6 +30,9 @@ class NativeOptions(Record):
     #: A separate draft model (DFlash, DSpark, DFlash2) for the target; the
     #: engine refuses a draft that is not the requested method's.
     draft: Path | None = None
+    #: Kernel error classes admitted for the model (the engine's
+    #: `--admit-error-class`); none by default.
+    error_classes: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def proposals_need_a_drafter(self) -> Self:
@@ -53,6 +56,8 @@ class NativeOptions(Record):
             args += ["--native-prefill-tokens", str(self.prefill_tokens)]
         if self.draft is not None:
             args += ["--native-draft", str(self.draft)]
+        for error_class in self.error_classes:
+            args += ["--native-error-class", error_class]
         return args
 
 

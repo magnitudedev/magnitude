@@ -898,7 +898,12 @@ fn dense_output_specialization_on(
         true,
     )
     .with_static("DS", 0);
-    with_tall(device, specialization, 7, mapping.tall)
+    let specialization = with_tall(device, specialization, 7, mapping.tall);
+    if device.backend() == BackendName::Metal {
+        specialization.with_param("INT8", 0)
+    } else {
+        specialization
+    }
 }
 
 fn attention_output_specialization_on(
@@ -959,7 +964,12 @@ fn dense_expand_specialization_on(
     )
     .with_static("GS", 0)
     .with_static("US", 0);
-    with_tall(device, specialization, 6, mapping.tall)
+    let specialization = with_tall(device, specialization, 6, mapping.tall);
+    if device.backend() == BackendName::Metal {
+        specialization.with_param("INT8", 0)
+    } else {
+        specialization
+    }
 }
 
 fn readout_projection_specialization_on(
@@ -1197,7 +1207,31 @@ fn dense_expand_native(
     eps: f32,
     mapping: Mapping,
 ) -> Vec<f32> {
+    dense_expand_native_arithmetic(
+        device, act, gate, up, residual, rows, norm, out_rows, eps, mapping, false,
+    )
+}
+
+/// `dense_expand` on `device`; `int8` selects Metal's INT8 form.
+#[allow(clippy::too_many_arguments)]
+fn dense_expand_native_arithmetic(
+    device: &Device,
+    act: Act,
+    gate: &Weight,
+    up: &Weight,
+    residual: &[f32],
+    rows: usize,
+    norm: &[f32],
+    out_rows: &[i32],
+    eps: f32,
+    mapping: Mapping,
+    int8: bool,
+) -> Vec<f32> {
     let (h, f) = (gate.k, gate.rows);
+    let mut specialization = dense_expand_specialization_on(device, &[("H", h), ("F", f)], mapping);
+    if device.backend() == BackendName::Metal {
+        specialization = specialization.with_param("INT8", u64::from(int8));
+    }
     let kernel = dense_expand::native_for_device_with(
         device,
         dense_expand::Elements {
@@ -1206,7 +1240,7 @@ fn dense_expand_native(
             UW: up.repr.element(),
             A: act.element(),
         },
-        &dense_expand_specialization_on(device, &[("H", h), ("F", f)], mapping),
+        &specialization,
     )
     .unwrap();
     let out = kernel
@@ -1717,7 +1751,7 @@ fn dense_output_native_arithmetic(
 ) -> Vec<f32> {
     let (h, f) = (down.rows, down.k);
     let mut specialization = dense_output_specialization_on(device, &[("H", h), ("F", f)], mapping);
-    if is_cpu(device) {
+    if is_cpu(device) || device.backend() == BackendName::Metal {
         specialization = specialization.with_param("INT8", u64::from(int8));
     }
     let kernel = dense_output::native_for_device_with(
@@ -1802,6 +1836,128 @@ fn cpu_int8_dense_output_agrees_with_exact_projection() {
         "relative CPU INT8 error {}",
         (error / scale).sqrt()
     );
+}
+
+/// Metal's INT8 form of the down projection: int8 activations per (row, 32
+/// columns) against the exact weights. On tensor operations with Q4_K weights
+/// its results differ from the tall form's by the activation quantization
+/// alone; other weights and devices without tensor operations run the staged
+/// 64 x 64 tile, bit for bit.
+#[test]
+fn metal_int8_dense_output_agrees_with_the_tall_form() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let staged = gemm_mapping(64, 64, 1);
+    let tall = Mapping {
+        tall: Some(TALL_DEFAULT),
+        ..staged
+    };
+    for repr in [Repr::Q4k, Repr::Q6k, Repr::Q8] {
+        let (outputs, k) = (192, 1024);
+        let down = weight(repr, outputs, k, 91, 1.0);
+        for rows in [128usize, 200, 512] {
+            let mut rng = Rng::new(rows as u64 + 92);
+            let residual = (0..rows * outputs)
+                .map(|_| rng.symmetric())
+                .collect::<Vec<_>>();
+            let product = (0..rows * k).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let out_rows = (0..rows as i32).collect::<Vec<_>>();
+            let run = |mapping, int8| {
+                dense_output_native_arithmetic(
+                    &device, act, &down, &residual, rows, &product, &out_rows, mapping, int8,
+                )
+            };
+            let exact = run(staged, false);
+            let int8 = run(tall, true);
+            // The projection alone (the residual rows are exact in both).
+            let projected = |values: &[f32]| {
+                values
+                    .iter()
+                    .zip(&residual)
+                    .map(|(value, residual)| f64::from(value - residual))
+                    .collect::<Vec<_>>()
+            };
+            let (reference, actual) = (projected(&exact), projected(&int8));
+            let scale = reference.iter().map(|value| value * value).sum::<f64>();
+            let error = reference
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f64>();
+            let relative = (error / scale).sqrt();
+            let worst = reference
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max)
+                / (scale / reference.len() as f64).sqrt();
+            eprintln!(
+                "int8 dense_output {repr:?} rows {rows}: relative RMS error {relative:.2e}, largest {worst:.2e} reference RMS"
+            );
+            assert!(
+                relative <= 1.5e-2 && worst <= 0.1,
+                "int8 dense_output {repr:?} rows {rows}: relative RMS error {relative:.2e}, largest {worst:.2e}"
+            );
+        }
+    }
+}
+
+/// Metal's INT8 form of the paired gate/up projection, as for the down
+/// projection: the GLU outputs differ from the tall form's by the activation
+/// quantization on tensor operations with Q4_K gate and up weights, and are
+/// the staged tile's bit for bit otherwise.
+#[test]
+fn metal_int8_dense_expand_agrees_with_the_tall_form() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let staged = gemm_mapping(64, 64, 1);
+    let tall = Mapping {
+        tall: Some(TALL_DEFAULT),
+        ..staged
+    };
+    for repr in [Repr::Q4k, Repr::Q8] {
+        let (h, f) = (512, 192);
+        let gate = weight(repr, f, h, 93, 1.0);
+        let up = weight(repr, f, h, 94, 1.0);
+        let norm = norm_values(h, 95);
+        for rows in [128usize, 200, 512] {
+            let mut rng = Rng::new(rows as u64 + 96);
+            let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let out_rows = (0..rows as i32).collect::<Vec<_>>();
+            let run = |mapping, int8| {
+                dense_expand_native_arithmetic(
+                    &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, mapping, int8,
+                )
+            };
+            let exact = run(staged, false);
+            let int8 = run(tall, true);
+            let scale = exact
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum::<f64>();
+            let error = exact
+                .iter()
+                .zip(&int8)
+                .map(|(a, b)| f64::from(a - b) * f64::from(a - b))
+                .sum::<f64>();
+            let relative = (error / scale).sqrt();
+            eprintln!("int8 dense_expand {repr:?} rows {rows}: relative RMS error {relative:.2e}");
+            assert!(
+                relative <= 3e-2,
+                "int8 dense_expand {repr:?} rows {rows}: relative RMS error {relative:.2e}"
+            );
+        }
+    }
 }
 
 fn dense_output_reference(
@@ -3382,17 +3538,41 @@ fn timing_on(device: &Device) {
         for &m in &rows_list {
             let product = act_tensor(&device, act, &[m, f], &uniform_values(m * f, 2, 1.0));
             let out_rows = i32_tensor(&device, &[m], &(0..m as i32).collect::<Vec<_>>());
-            for mapping in split_mappings(m)
+            // Metal's INT8 form past 64 rows, after every exact mapping.
+            let int8 = (device.backend() == BackendName::Metal && m > 64 && f % 512 == 0).then(|| {
+                (
+                    Mapping {
+                        tall: Some(TALL_DEFAULT),
+                        ..gemm_mapping(64, 64, 1)
+                    },
+                    true,
+                )
+            });
+            for (mapping, int8) in split_mappings(m)
                 .into_iter()
                 .chain(tall_mappings(device, m))
+                .map(|mapping| (mapping, false))
+                .chain(int8)
             {
+                let specialization =
+                    dense_output_specialization_on(device, &[("H", h), ("F", f)], mapping);
+                let label = if int8 {
+                    format!("{label} int8")
+                } else {
+                    label.to_owned()
+                };
+                let label = label.as_str();
                 let kernel = dense_output::native_for_device_with(
                     &device,
                     dense_output::Elements {
                         A: a,
                         DW: repr.element(),
                     },
-                    &dense_output_specialization_on(device, &[("H", h), ("F", f)], mapping),
+                    &if int8 {
+                        specialization.with_param("INT8", 1)
+                    } else {
+                        specialization
+                    },
                 )
                 .unwrap();
                 let rotation = weights
@@ -3438,10 +3618,30 @@ fn timing_on(device: &Device) {
         let norm = bf16_norm(&device, &norm_values(h, 3));
         for &m in &rows_list {
             let out_rows = i32_tensor(&device, &[m], &(0..m as i32).collect::<Vec<_>>());
-            for mapping in timing_mappings(m)
+            // Metal's INT8 form past 64 rows, after every exact mapping.
+            let int8 = (device.backend() == BackendName::Metal && m > 64 && h % 512 == 0).then(|| {
+                (
+                    Mapping {
+                        tall: Some(TALL_DEFAULT),
+                        ..gemm_mapping(64, 64, 1)
+                    },
+                    true,
+                )
+            });
+            for (mapping, int8) in timing_mappings(m)
                 .into_iter()
                 .chain(tall_mappings(device, m))
+                .map(|mapping| (mapping, false))
+                .chain(int8)
             {
+                let specialization =
+                    dense_expand_specialization_on(device, &[("H", h), ("F", f)], mapping);
+                let label = if int8 {
+                    format!("{label} int8")
+                } else {
+                    label.to_owned()
+                };
+                let label = label.as_str();
                 let kernel = dense_expand::native_for_device_with(
                     &device,
                     dense_expand::Elements {
@@ -3450,7 +3650,11 @@ fn timing_on(device: &Device) {
                         UW: repr.element(),
                         A: a,
                     },
-                    &dense_expand_specialization_on(device, &[("H", h), ("F", f)], mapping),
+                    &if int8 {
+                        specialization.with_param("INT8", 1)
+                    } else {
+                        specialization
+                    },
                 )
                 .unwrap();
                 let rotation = weights

@@ -180,8 +180,14 @@ the tuning inputs). A model's qualification admits classes; the host names the a
 in the model policy at load, none by default, and a name no kernel declares is refused. Tuning
 forms a configuration of an error class only when the class is admitted, and validates it against
 the default under the class's envelope, so a defective kernel still fails while the form's
-expected error passes. Without an admitted class a row's result never depends on peer rows'
-values; a form that makes it depend on them is its own error class. A result may depend on its
+expected error passes. The first class is `int8_activations`: Metal's gate/up and down projections
+past 64 rows, on tensor operations with Q4_K or Q8_0 weights, quantize each activation row to int8
+per 32 columns in a pre-pass and multiply the weights' stored codes on the int8 tensor operation,
+folding each 32-column block under its activation and weight scales; the weights stay exact, and
+every other weight format or device runs the exact form in the same launches. Its transient
+scratch is the int8 operand with its scales and block sums (rows x K x 1.2 bytes) and the weights'
+decoded block scales and biases (weight rows x K / 32 x 6 bytes), per call. Without an admitted
+class a row's result never depends on peer rows' values; a form that makes it depend on them is its own error class. A result may depend on its
 launch's shape class and prepared configuration, and different shape classes agree within the
 gate's tolerance, not bit for bit. Speculative verification is therefore statistically, not exactly, equivalent to
 plain decoding; acceptance over the logits a verification produced remains exact.
