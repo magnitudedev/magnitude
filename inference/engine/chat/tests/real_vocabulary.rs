@@ -392,3 +392,47 @@ fn structured_output_and_tool_grammars_compute_masks_over_the_real_vocabulary() 
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Oh My Pi's `task` tool (issue #165, minimized): an array of objects with no
+/// required properties, closed, holding free-form JSON in an `anyOf`. With
+/// parallel calls the grammar must still compile fully lexical and bind.
+#[test]
+#[ignore = "requires MAGNITUDE_TEST_GGUF"]
+fn harness_task_schema_binds_with_parallel_calls() {
+    let mut model = model();
+    let task = json!({
+        "type": "object",
+        "properties": {
+            "i": {"type": "string"},
+            "context": {"type": "string"},
+            "tasks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "agent": {"type": "string"},
+                        "model": {"anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                        "outputSchema": {"anyOf": [{"type": "object"}, {"type": "boolean"}, {"type": "string"}, {"type": "null"}]}
+                    },
+                    "required": [],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["context", "tasks", "i"],
+        "additionalProperties": false
+    });
+    let request = tools(vec![tool("task", task)], ToolChoice::Auto, true);
+    let completion = format!(
+        "{THINK}{}",
+        call(
+            "task",
+            &[
+                ("i", "one"),
+                ("context", "ctx"),
+                ("tasks", "[{\"agent\": \"a\", \"outputSchema\": {\"type\": \"object\", \"x\": [1, 2]}}]"),
+            ]
+        )
+    );
+    walk(&mut model, &request, &completion).unwrap();
+}

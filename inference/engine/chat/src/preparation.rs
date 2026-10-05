@@ -56,7 +56,42 @@ fn internal(message: String) -> ChatError {
 }
 
 impl PreparedChat {
+    /// Template grammars must compile fully lexical. A template's
+    /// parallel-call grammar can fail that where its single-call grammar does
+    /// not (Qwen's, for an object of free-form JSON among optional
+    /// properties): certification renders lexemes one byte at a time and the
+    /// first mask exceeds the matcher's item limit. Such a request is
+    /// prepared for one tool call per turn instead.
     pub fn prepare(
+        bundle: &TemplateBundle,
+        tokenizer: &ByteBpeTokenizer,
+        request: &ChatRequest,
+        selection: &TemplateSelection<'_>,
+    ) -> Result<Self, ChatError> {
+        let prepared = Self::prepare_exactly(bundle, tokenizer, request, selection)?;
+        let character_lexemes = |prepared: &Self| {
+            prepared
+                .constraint
+                .as_ref()
+                .map_or(0, |constraint| constraint.report.character_lexemes)
+        };
+        if !request.parallel_tool_calls
+            || request.grammar.is_some()
+            || character_lexemes(&prepared) == 0
+        {
+            return Ok(prepared);
+        }
+        let mut single = request.clone();
+        single.parallel_tool_calls = false;
+        let fallback = Self::prepare_exactly(bundle, tokenizer, &single, selection)?;
+        Ok(if character_lexemes(&fallback) < character_lexemes(&prepared) {
+            fallback
+        } else {
+            prepared
+        })
+    }
+
+    fn prepare_exactly(
         bundle: &TemplateBundle,
         tokenizer: &ByteBpeTokenizer,
         request: &ChatRequest,
