@@ -1347,8 +1347,6 @@ fn dense_expand_matches_its_portable_body_on(device: &Device, pairs: &[(Repr, Re
                     Input::I32(0),
                     floats(&[0], &[]),
                     floats(&[0], &[]),
-                    floats(&[0], &[]),
-                    floats(&[0], &[]),
                 ],
             );
             let oracle = result(&outcome, 0);
@@ -2052,6 +2050,7 @@ fn dense_output_gguf_formats_at_32_granular_k_on(device: &Device) {
                 activations(act, &[out_rows.len(), f], &product),
                 Input::Data(down.oracle()),
                 ints(&[out_rows.len()], &out_rows),
+                floats(&[0], &[]),
             ],
         );
         let oracle = result(&outcome, 0);
@@ -2169,6 +2168,7 @@ fn dense_output_matches_its_portable_body_and_the_host_reference_on(
                     activations(act, &[out_rows.len(), f], &product),
                     Input::Data(down.oracle()),
                     ints(&[out_rows.len()], &out_rows),
+                    floats(&[0], &[]),
                 ],
             );
             let oracle = result(&outcome, 0);
