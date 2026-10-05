@@ -1029,6 +1029,33 @@ fn unstable(confirmed: &[PointMeasurement]) -> Option<Exclusion> {
     })
 }
 
+/// What a finalist's confirmed cost is taken from. Samples that spread
+/// widely leave a rival out of the ranking, but not the defaults: they are
+/// costed at their fastest sample at each point, a time they did reach (a
+/// sample cannot read faster than the kernel runs), so a leader must beat the
+/// defaults at their best by the margin to replace them, and noise in the
+/// defaults' own timing neither removes them nor makes them win.
+fn confirmed_measurement(
+    defaults: bool,
+    confirmed: Vec<PointMeasurement>,
+) -> Result<Vec<PointMeasurement>, Exclusion> {
+    match unstable(&confirmed) {
+        None => Ok(confirmed),
+        Some(exclusion) if !defaults => Err(exclusion),
+        Some(_) => Ok(confirmed
+            .into_iter()
+            .map(|point| PointMeasurement {
+                median_seconds: point
+                    .samples
+                    .iter()
+                    .copied()
+                    .fold(point.median_seconds, f64::min),
+                ..point
+            })
+            .collect()),
+    }
+}
+
 /// The points' weights and classes: how the objective weighs them.
 struct Weighing {
     weights: Vec<f64>,
@@ -1223,9 +1250,11 @@ impl Evaluator for Live<'_, '_> {
                 ((point, key), measurement)
             })
             .collect::<HashMap<_, _>>();
+        let default = self.space.default_index();
         let confirmed = keys
             .into_iter()
-            .map(|keys| {
+            .zip(finalists)
+            .map(|(keys, index)| {
                 let confirmed = keys?
                     .into_iter()
                     .enumerate()
@@ -1237,10 +1266,7 @@ impl Evaluator for Live<'_, '_> {
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                match unstable(&confirmed) {
-                    Some(exclusion) => Err(exclusion),
-                    None => Ok(confirmed),
-                }
+                confirmed_measurement(*index == default, confirmed)
             })
             .collect::<Vec<_>>();
         self.time.measuring_seconds += began.elapsed().as_secs_f64();
@@ -3324,6 +3350,96 @@ mod tests {
             repetitions: 1,
             rotation_bytes: 0,
         }
+    }
+
+    /// A confirmation at the points `(label, median, samples)` in microseconds,
+    /// every point keyed by `form`.
+    fn confirmation(form: u64, points: &[(&str, f64, &[f64])]) -> Vec<PointMeasurement> {
+        points
+            .iter()
+            .map(|(label, median, samples)| {
+                let mut sorted = samples.to_vec();
+                sorted.sort_by(f64::total_cmp);
+                let mut deviations = samples
+                    .iter()
+                    .map(|sample| (sample - median).abs())
+                    .collect::<Vec<_>>();
+                deviations.sort_by(f64::total_cmp);
+                PointMeasurement {
+                    point: (*label).into(),
+                    key: PointKey {
+                        launches: vec![0],
+                        values: [("DIRECT".to_owned(), form)].into(),
+                    },
+                    median_seconds: median * 1e-6,
+                    deviation_seconds: deviations[deviations.len() / 2] * 1e-6,
+                    samples: samples.iter().map(|sample| sample * 1e-6).collect(),
+                    repetitions: 1,
+                    rotation_bytes: 0,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether confirmed finalist `rival` replaces defaults confirmed as
+    /// `defaults`, by the search's ranking rule and margin.
+    fn replaces(rival: Vec<PointMeasurement>, defaults: Vec<PointMeasurement>) -> bool {
+        let weighing = Weighing {
+            weights: vec![0.5; defaults.len()],
+            classes: (0..defaults.len()).collect(),
+        };
+        let reference = confirmed_measurement(true, defaults).unwrap();
+        let rival = confirmed_measurement(false, rival).unwrap();
+        weighing
+            .cost(&rival, &reference)
+            .improves_on(&weighing.cost(&reference, &reference), 0.02)
+    }
+
+    /// Defaults whose own re-measurement spreads at one small point (the
+    /// staged K8/V4 prefill at 64 rows over 256 history on an M6, bimodal in
+    /// 35 us steps) do not thereby beat a tightly confirmed finalist that is
+    /// 40% ahead where the time goes; they do keep their place against a
+    /// finalist that is ahead of their median only, not of their fastest
+    /// samples.
+    #[test]
+    fn unstable_defaults_are_ranked_at_their_fastest_samples() {
+        let defaults = || {
+            confirmation(
+                0,
+                &[
+                    ("m64-c256", 213.0, &[147.0, 262.0, 149.0, 213.0, 213.0]),
+                    ("m512-c4096", 7822.0, &[7822.0]),
+                ],
+            )
+        };
+        assert!(unstable(&defaults()).is_some());
+        let fastest = confirmed_measurement(true, defaults()).unwrap();
+        assert_eq!(
+            medians(&fastest),
+            [147.0 * 1e-6, 7822.0 * 1e-6],
+            "the defaults at their fastest samples"
+        );
+        // Unstable rivals still leave the ranking.
+        assert!(confirmed_measurement(false, defaults()).is_err());
+
+        let direct = confirmation(
+            1,
+            &[
+                ("m64-c256", 96.0, &[97.0, 96.0, 98.0, 96.0, 96.0]),
+                ("m512-c4096", 4563.0, &[4563.0]),
+            ],
+        );
+        assert!(replaces(direct, defaults()));
+        // Ahead of the defaults' median at the unstable point, level with
+        // their fastest sample, and level elsewhere: within noise of them.
+        let level = confirmation(
+            1,
+            &[
+                ("m64-c256", 148.0, &[148.0, 147.0, 149.0, 148.0, 150.0]),
+                ("m512-c4096", 7800.0, &[7800.0]),
+            ],
+        );
+        assert!(!replaces(level, defaults()));
     }
 
     #[test]

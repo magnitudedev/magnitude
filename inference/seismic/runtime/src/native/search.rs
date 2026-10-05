@@ -16,9 +16,11 @@
 //! ranked by those costs; a finalist the evaluator cannot confirm (its
 //! re-measurement failed or is not trustworthy) leaves the ranking, and the
 //! defaults rank first unless the leader beats them by `default_margin` or
-//! could not be confirmed themselves. When the defaults passed the search but
-//! their re-measurement did not, they are the choice; only defaults that
-//! failed the search itself leave the ranking to confirmed finalists.
+//! could not be confirmed themselves. Defaults whose re-measured samples
+//! spread are confirmed at their fastest samples, so the leader must beat
+//! the defaults at their best. When the defaults passed the search but their
+//! re-measurement failed, they are the choice; only defaults that failed the
+//! search itself leave the ranking to confirmed finalists.
 //!
 //! The objective ([`Cost`]) is per point: each tuning point contributes its
 //! weight (share of step time) times the configuration's time there relative

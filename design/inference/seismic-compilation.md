@@ -120,8 +120,11 @@ tuned entry whole so writes outside the declared rows are rejected.
 The default receives the same validation as every candidate. The first fully passing candidate
 establishes the timing anchor; if none passes, tuning returns a failure with the observed exclusions.
 A default that failed validation or measurement cannot be selected as an implicit fallback;
-a default that passed both but whose timing re-measurement was unstable remains the choice,
-since timing noise is not a numerical verdict. The defaults' measurement and evidence from
+a default that passed both but whose timing re-measurement was unstable stays in the ranking,
+costed at its fastest sample at each point (a time it reached; a sample cannot read faster than
+the kernel runs), so a confirmed leader replaces it only by beating it at its best by δ, and
+otherwise it remains the choice: timing noise is not a numerical verdict, against the default or
+for it. A default whose re-measurement failed outright remains the choice. The defaults' measurement and evidence from
 admitting the points carry into the search.
 Seismic does not reuse stored results: the consumer keys and stores them, by what a result is
 valid for (device, implementation, numerical policy, served shapes), and names what case inputs
