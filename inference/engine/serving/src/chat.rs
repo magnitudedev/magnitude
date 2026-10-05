@@ -39,7 +39,6 @@ use crate::{Serving, include_progress, media, unix_timestamp, with_request_id};
 
 const DEFAULT_TEMPERATURE: f32 = 0.8;
 const DEFAULT_TOP_P: f32 = 0.95;
-const DEFAULT_SEED: u32 = 42;
 
 fn deserialize_bool_or_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
@@ -1048,7 +1047,7 @@ pub(crate) fn validate_request(
             repetition_penalty,
             presence_penalty,
             frequency_penalty,
-            seed: u64::from(request.seed.unwrap_or(DEFAULT_SEED)),
+            seed: crate::responses::request_seed(request.seed),
         },
         cache_prompt: request.cache_prompt,
         ignore_eos: request.ignore_eos,

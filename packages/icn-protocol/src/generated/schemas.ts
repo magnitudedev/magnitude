@@ -1435,6 +1435,10 @@ export const MessagesRequest = S.Struct({
     ),
     { exact: true, as: "Option" },
   ),
+  seed: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+    exact: true,
+    as: "Option",
+  }),
   stop_sequences: S.optionalWith(S.Array(S.String), { exact: true, as: "Option" }),
   stream: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
   system: S.optionalWith(
@@ -2098,6 +2102,10 @@ export const ResponseCreateRequest = S.Struct({
     ),
     { exact: true, as: "Option" },
   ),
+  seed: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+    exact: true,
+    as: "Option",
+  }),
   store: S.optionalWith(S.Union(S.Boolean, S.Null), { exact: true, as: "Option" }),
   stream: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
   temperature: S.optionalWith(S.Union(S.Number, S.Null), { exact: true, as: "Option" }),

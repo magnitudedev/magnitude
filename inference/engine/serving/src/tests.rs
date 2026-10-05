@@ -449,7 +449,8 @@ fn equivalent_wire_dialects_construct_equal_canonical_requests() {
             "input": "hello",
             "max_output_tokens": 16,
             "temperature": 1.0,
-            "top_p": 1.0
+            "top_p": 1.0,
+            "seed": 0
         }))
         .unwrap(),
     )
@@ -462,7 +463,8 @@ fn equivalent_wire_dialects_construct_equal_canonical_requests() {
             "messages": [{ "role": "user", "content": "hello" }],
             "max_tokens": 16,
             "temperature": 1.0,
-            "top_p": 1.0
+            "top_p": 1.0,
+            "seed": 0
         }))
         .unwrap(),
     )
@@ -1355,7 +1357,55 @@ fn preserves_model_defaults_when_optional_controls_are_omitted() {
     assert_eq!(request.controls.end_of_generation, EndOfGeneration::Stop);
     assert_eq!(request.controls.sampling.temperature, 0.8);
     assert_eq!(request.controls.sampling.top_p, 0.95);
-    assert_eq!(request.controls.sampling.seed, 42);
+}
+
+// Without a caller seed, identical requests sample anew instead of repeating
+// the same draws; a caller seed is kept, in every protocol.
+#[test]
+fn an_omitted_seed_is_fresh_per_request_and_an_explicit_seed_is_kept() {
+    let chat = |seed: Option<u32>| {
+        let mut body = json!({
+            "model": "test-model",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        if let Some(seed) = seed {
+            body["seed"] = json!(seed);
+        }
+        chat_request(body).unwrap().controls.sampling.seed
+    };
+    let responses = |seed: Option<u32>| {
+        let mut body = json!({ "model": "test-model", "input": "hello" });
+        if let Some(seed) = seed {
+            body["seed"] = json!(seed);
+        }
+        responses::adapt(serde_json::from_value(body).unwrap())
+            .unwrap()
+            .request
+            .controls
+            .sampling
+            .seed
+    };
+    let anthropic = |seed: Option<u32>| {
+        let mut body = json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        if let Some(seed) = seed {
+            body["seed"] = json!(seed);
+        }
+        anthropic::adapt(serde_json::from_value(body).unwrap())
+            .unwrap()
+            .request
+            .controls
+            .sampling
+            .seed
+    };
+    for seeded in [&chat as &dyn Fn(Option<u32>) -> u64, &responses, &anthropic] {
+        assert_ne!(seeded(None), seeded(None));
+        assert_eq!(seeded(Some(7)), 7);
+        assert_eq!(seeded(Some(7)), seeded(Some(7)));
+    }
 }
 
 #[test]

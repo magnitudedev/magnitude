@@ -47,6 +47,7 @@ pub struct ResponseCreateRequest {
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    pub seed: Option<u32>,
     pub tools: Option<Vec<ResponseTool>>,
     #[schema(value_type = Object, nullable = false)]
     pub tool_choice: Option<ResponseToolChoice>,
@@ -1115,7 +1116,7 @@ pub fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseRequest, A
                 .ok_or_else(|| ApiError::invalid("max_output_tokens must be positive"))
         })
         .transpose()?;
-    let sampling = openai_sampling(request.temperature, request.top_p)?;
+    let sampling = openai_sampling(request.temperature, request.top_p, request.seed)?;
     Ok(AdaptedResponseRequest {
         model: request.model,
         request: GenerationRequest {
@@ -1139,18 +1140,33 @@ pub fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseRequest, A
     })
 }
 
-/// Responses sampling: OpenAI defaults, a fixed seed.
+/// Responses sampling: OpenAI defaults.
 fn openai_sampling(
     temperature: Option<f32>,
     top_p: Option<f32>,
+    seed: Option<u32>,
 ) -> Result<SamplingControls, ApiError> {
     let temperature = temperature.unwrap_or(0.8);
     let top_p = top_p.unwrap_or(0.95);
-    sampling(temperature, top_p)
+    sampling(temperature, top_p, seed)
 }
 
-/// Validated temperature and top-p with identity shaping otherwise and seed 0.
-pub(crate) fn sampling(temperature: f32, top_p: f32) -> Result<SamplingControls, ApiError> {
+/// The seed a request samples with: the caller's, or a fresh one, so an
+/// identical request without a seed samples anew rather than repeating
+/// the same draws (and the same failure) on every retry.
+pub(crate) fn request_seed(seed: Option<u32>) -> u64 {
+    seed.map(u64::from).unwrap_or_else(|| {
+        use std::hash::{BuildHasher, Hasher};
+        std::collections::hash_map::RandomState::new().build_hasher().finish()
+    })
+}
+
+/// Validated temperature and top-p with identity shaping otherwise.
+pub(crate) fn sampling(
+    temperature: f32,
+    top_p: f32,
+    seed: Option<u32>,
+) -> Result<SamplingControls, ApiError> {
     if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
         return Err(ApiError::invalid(
             "temperature must be finite and between 0 and 2",
@@ -1169,7 +1185,7 @@ pub(crate) fn sampling(temperature: f32, top_p: f32) -> Result<SamplingControls,
         repetition_penalty: 1.0,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
-        seed: 0,
+        seed: request_seed(seed),
     })
 }
 

@@ -45,6 +45,7 @@ pub struct MessagesRequest {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub top_k: Option<u32>,
+    pub seed: Option<u32>,
     #[serde(default)]
     pub tools: Vec<Tool>,
     #[schema(nullable = false)]
@@ -284,6 +285,7 @@ pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
     let sampling = crate::responses::sampling(
         request.temperature.unwrap_or(1.0),
         request.top_p.unwrap_or(1.0),
+        request.seed,
     )?;
     Ok(AdaptedRequest {
         model: adapted.model,
