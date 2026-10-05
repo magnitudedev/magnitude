@@ -106,6 +106,7 @@ pub(crate) fn prepare(
     };
     let capacity = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes,
+        tensor_operations: magnitude_executor::TensorOperations::of(selected.tensor_operations),
     };
     // The same derivation metadata-only assessment and preview plan through.
     let draft =

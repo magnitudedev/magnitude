@@ -28,7 +28,7 @@ pub use programs::{
 pub use resources::{
     GraphSlots, HistoryStorePlan, LayerHistory, NativeGraphCharge, ResourceBytes,
     ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
-    StateCapacityPlan, StateResourcePlan, StateStorePlan,
+    StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations,
 };
 pub use weights::{
     resident_element, resident_layout, source_element, AttentionBinding, AttentionShape,
@@ -383,6 +383,7 @@ pub(crate) mod tests {
         };
         let capacity_bytes = ResourceCapacity {
             domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
+            tensor_operations: TensorOperations::of(selected.tensor_operations),
         };
         let draft = ExecutionPlanner::prepare(
             &selected,

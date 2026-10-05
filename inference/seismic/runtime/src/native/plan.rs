@@ -232,6 +232,12 @@ pub fn partition(
         geometry_reads.push(geometry);
         condition_reads.push(condition);
     }
+    // How often a repeated launch is dispatched is part of its geometry.
+    if let Some(repeat) = &implementation.repeat {
+        for geometry in &mut geometry_reads[repeat.first..repeat.first + repeat.launches] {
+            repeat.count.parameters(geometry);
+        }
+    }
     let mut scratch_reads = Vec::new();
     for scratch in &implementation.scratch {
         scratch.bytes.parameters(&mut scratch_reads);

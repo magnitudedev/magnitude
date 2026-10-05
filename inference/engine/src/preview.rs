@@ -71,6 +71,9 @@ impl ExecutionManifest {
             policy.limits(),
             ResourceCapacity {
                 domain_bytes: selected.assessment_capacity_bytes,
+                tensor_operations: magnitude_executor::TensorOperations::of(
+                    selected.tensor_operations,
+                ),
             },
         )
         .map_err(|error| internal(error.to_string()))?;

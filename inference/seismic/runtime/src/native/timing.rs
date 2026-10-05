@@ -172,6 +172,7 @@ impl<'a> PointTiming<'a> {
             .iter()
             .flat_map(|call| {
                 call.launches
+                    .geometry
                     .iter()
                     .enumerate()
                     .filter(|(_, geometry)| {

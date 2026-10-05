@@ -82,7 +82,7 @@ kernel void attention_project_gemv(ATTENTION_PROJECT_ARGUMENTS,
     }
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     if (tile < t0) {
         PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
             x, query_out, query_w, rows, query_rows, k, tile, shared, simdgroups, sg, lane));
@@ -123,7 +123,7 @@ kernel void attention_project_batch(ATTENTION_PROJECT_ARGUMENTS,
     }
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     if (tile < t0)
         projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(x, query_out, query_w, rows, query_rows, k,
             tile, shared, simdgroups, sg, lane);

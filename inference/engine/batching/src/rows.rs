@@ -584,6 +584,30 @@ fn fresh_end(history: &RowHistory, offset: usize) -> Result<i32, PackError> {
     }
 }
 
+/// The history row tiles (`SLAB_ROW_TILE` rows; tile `t` is rows
+/// `[t * SLAB_ROW_TILE, (t + 1) * SLAB_ROW_TILE)`, the unit a domain's pages
+/// are whole multiples of) that hold a row of any of the visible ranges
+/// `spans` of one history domain: distinct and ascending, then `-1` up to
+/// `count` entries. An implementation that keeps per-launch storage for the
+/// history rows it reads holds listed tile `i` at slot `i`, so tiles
+/// adjacent in the history are adjacent there. `None` when the ranges touch
+/// more than `count` tiles.
+pub fn history_tiles(spans: impl IntoIterator<Item = [i32; 2]>, count: usize) -> Option<Vec<i32>> {
+    let tile = magnitude_state::SLAB_ROW_TILE as i32;
+    let mut tiles = spans
+        .into_iter()
+        .filter(|range| range[1] > range[0])
+        .flat_map(|range| range[0] / tile..=(range[1] - 1) / tile)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if tiles.len() > count {
+        return None;
+    }
+    tiles.resize(count, -1);
+    Some(tiles)
+}
+
 fn validate_visible(row: usize, ranges: &[[i32; 2]]) -> Result<(), PackError> {
     for &range in ranges {
         if range[0] < 0 || range[0] >= range[1] {
@@ -944,6 +968,36 @@ mod tests {
             packed.histories[0].visible[0],
             vec![[40, 44], [44, 46], [8, 12], [60, 61]]
         );
+    }
+
+    #[test]
+    fn history_tiles_are_distinct_ascending_and_padded() {
+        // Two requests: spans out of address order, one ending at a tile's
+        // last row and continuing elsewhere, a fork sharing the first's rows,
+        // and an empty padding range.
+        let spans = [
+            [3_900, 4_096],
+            [1_024, 1_100],
+            [3_900, 4_000],
+            [9_000, 9_217],
+            [0, 0],
+            [255, 257],
+        ];
+        let tiles = history_tiles(spans, 12).unwrap();
+        let listed = tiles.iter().copied().take_while(|tile| *tile >= 0).collect::<Vec<_>>();
+        assert_eq!(listed, [0, 1, 4, 15, 35, 36]);
+        assert!(tiles[listed.len()..].iter().all(|tile| *tile == -1));
+        assert_eq!(tiles.len(), 12);
+        assert!(listed.windows(2).all(|pair| pair[0] < pair[1]));
+        // Every tile a range touches is listed, so tiles adjacent in the
+        // history take adjacent slots: a range's rows are contiguous there.
+        for [start, end] in spans.into_iter().filter(|range| range[1] > range[0]) {
+            let slot = |row: i32| listed.iter().position(|tile| *tile == row / 256).unwrap();
+            assert_eq!(slot(end - 1) - slot(start), ((end - 1) / 256 - start / 256) as usize);
+        }
+        assert_eq!(history_tiles(spans, 6).unwrap(), listed);
+        assert_eq!(history_tiles(spans, 5), None);
+        assert_eq!(history_tiles([[0, 0]], 2).unwrap(), [-1, -1]);
     }
 
     #[test]

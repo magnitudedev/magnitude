@@ -15,8 +15,8 @@ pub use classes::{
 pub use demand::Demand;
 pub use head::{BlockSlot, HeadPasses, HeadSlot, ValidatedHeadBatch};
 pub use rows::{
-    Draw, DrawKind, HistoryTables, PackError, PackedRowTables, Row, RowHistory, Select, Shaping,
-    Slot, HISTORY_WIDTH, SHAPING_WIDTH,
+    history_tiles, Draw, DrawKind, HistoryTables, PackError, PackedRowTables, Row, RowHistory,
+    Select, Shaping, Slot, HISTORY_WIDTH, SHAPING_WIDTH,
 };
 pub use state::{StateBatchError, StateBatchKind, ValidatedStateBatch};
 pub use target::{SlotHistory, TargetBatchSlot, TargetBatchUpload, ValidatedTargetBatch};

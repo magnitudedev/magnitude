@@ -399,6 +399,14 @@ struct SharedNorm {
     }
 };
 
+// `in` as a SharedNorm over `squares`. The operand's type is deduced from a
+// value: `decltype` of a local carries its address space under Metal 4.1,
+// which a field's type may not.
+template <typename In>
+inline SharedNorm<In> shared_norm(In in, threadgroup const float *squares) {
+    return SharedNorm<In>{in, squares};
+}
+
 // ---------------------------------------------------------------------------
 // GEMV.
 //
@@ -884,6 +892,7 @@ struct gemm_fragments {
     typedef gemm_tile<TM, TN> tile;
     uint row0, column0;
     ushort2 coordinate;
+    gemm_fragments() = default;
     gemm_fragments(uint sg, uint lane) {
         row0 = (sg / tile::wn) * 8u * tile::fm;
         column0 = (sg % tile::wn) * 8u * tile::fn;
@@ -961,26 +970,31 @@ struct gemm_fragment_engine {
     gemm_fragments<TM, TN> at;
     uint live;
     gemm_accumulators<TM, TN> acc;
-    gemm_fragment_engine(uint sg, uint lane, uint m0, uint m_rows) : at(sg, lane) {
-        live = gemm_live_fragments<TM, TN>(at, m0, m_rows);
+
+    // The struct stays an aggregate and its accumulators are reached through
+    // a thread reference: Metal 4.1 gives a member reached through `this` no
+    // address space, and simdgroup matrices only assign and read in `thread`.
+    static inline void zero(thread gemm_fragment_engine &self, uint sg, uint lane, uint m0, uint m_rows) {
+        self.at = gemm_fragments<TM, TN>(sg, lane);
+        self.live = gemm_live_fragments<TM, TN>(self.at, m0, m_rows);
         PROJECTION_UNROLL
         for (uint i = 0; i < tile::fm; ++i)
             PROJECTION_UNROLL
             for (uint j = 0; j < tile::fn; ++j)
-                acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                self.acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
     template <typename F>
-    void emit(thread const F &f) {
+    static inline void emit(thread gemm_fragment_engine &self, thread const F &f) {
         PROJECTION_UNROLL
         for (uint i = 0; i < tile::fm; ++i) {
             PROJECTION_UNROLL
             for (uint j = 0; j < tile::fn; ++j) {
-                float2 c = reinterpret_cast<thread float2 &>(acc[i][j].thread_elements());
+                float2 c = reinterpret_cast<thread float2 &>(self.acc[i][j].thread_elements());
                 if (PAIRED) {
-                    f(at.row(i), at.column(j) / 2u, c.x, c.y);
+                    f(self.at.row(i), self.at.column(j) / 2u, c.x, c.y);
                 } else {
-                    f(at.row(i), at.column(j), c.x, 0.0f);
-                    f(at.row(i), at.column(j) + 1u, c.y, 0.0f);
+                    f(self.at.row(i), self.at.column(j), c.x, 0.0f);
+                    f(self.at.row(i), self.at.column(j) + 1u, c.y, 0.0f);
                 }
             }
         }
@@ -1142,10 +1156,12 @@ inline void gemm_run(thread const In &in, thread const Weights<W> &w, thread con
         T::emit(acc, acc, emit);
     }
 #else
-    gemm_fragment_engine<TM, TN, E, PAIRED> engine(sg, lane, m0, min(m_rows, live_rows));
+    typedef gemm_fragment_engine<TM, TN, E, PAIRED> Engine;
+    Engine engine;
+    Engine::zero(engine, sg, lane, m0, min(m_rows, live_rows));
     gemm_accumulate<W, U, PAIRED, TM, TN>(in, w, u, first, rows, m0, m_rows, k, step_begin, step_end,
         shared, sg, lane, engine);
-    engine.emit(emit);
+    Engine::emit(engine, emit);
 #endif
 }
 

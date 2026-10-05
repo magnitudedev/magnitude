@@ -672,6 +672,35 @@ pub struct NativeImplementation {
     pub scratch: Vec<NativeScratch>,
     /// Ordered dispatches of one call. Never empty.
     pub launches: Vec<NativeLaunch>,
+    /// The launches a call dispatches more than once.
+    pub repeat: Option<NativeRepeat>,
+}
+
+/// Consecutive launches a call dispatches in order `count` times, each round
+/// with the call's one set of arguments: a kernel learns its round from
+/// scratch the launches themselves advance. A count of zero dispatches none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRepeat {
+    /// Ordinal of the block's first launch.
+    pub first: usize,
+    /// Number of launches in the block.
+    pub launches: usize,
+    /// Reads entry dimensions and entry parameters.
+    pub count: NativeNatExpr,
+}
+
+impl NativeImplementation {
+    /// The launch ordinals of one call in dispatch order when its repeat
+    /// block runs `rounds` times.
+    pub fn dispatch_order(&self, rounds: u64) -> impl Iterator<Item = usize> + '_ {
+        let (first, end) = self
+            .repeat
+            .as_ref()
+            .map_or((0, 0), |repeat| (repeat.first, repeat.first + repeat.launches));
+        (0..first)
+            .chain((0..rounds).flat_map(move |_| first..end))
+            .chain(end..self.launches.len())
+    }
 }
 
 /// The dense element types a build-time compiled native form binds one
@@ -1863,6 +1892,83 @@ pub(crate) mod internals {
 #[cfg(test)]
 mod native_tests {
     use super::*;
+
+    #[test]
+    fn a_repeat_block_dispatches_in_order_and_only_on_metal() {
+        let check = |target: &str| {
+            let launch = |name: &str, indent: &str| {
+                format!("{indent}launch {name}:\n{indent}    threadgroups (1, 1, 1)\n{indent}    threads_per_threadgroup (1, 1, 1)\n")
+            };
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text: format!(
+                    "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for {target} from \"scale.{target}\":\n{}    repeat (ceil_div(N, 4)):\n{}{}{}",
+                    launch("prepare", "    "),
+                    launch("decode", "        "),
+                    launch("attend", "        "),
+                    launch("merge", "    "),
+                ),
+            }]))
+        };
+        let module = check("metal").unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        assert_eq!(native.dispatch_order(2).collect::<Vec<_>>(), [0, 1, 2, 1, 2, 3]);
+        assert_eq!(native.dispatch_order(0).collect::<Vec<_>>(), [0, 3]);
+        let refused = format!("{:?}", check("cuda").err().unwrap());
+        assert!(refused.contains("`repeat` is not implemented for cuda"), "{refused}");
+    }
+
+    /// Terms are names for expressions: a declaration that names them checks
+    /// to the implementation of the one that writes them out, wherever a
+    /// native expression or condition may stand.
+    #[test]
+    fn named_terms_check_to_the_declaration_that_writes_them_out() {
+        let check = |body: &str| {
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text: format!(
+                    "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    static (N)\n    params (PARTS in [1, 2, 4])\n{body}"
+                ),
+            }]))
+            .map_err(|error| format!("{error:?}"))?;
+            Ok::<_, String>(
+                module
+                    .native_implementation(module.entries()[0].id, BackendName::Metal)
+                    .unwrap()
+                    .clone(),
+            )
+        };
+        let named = check(
+            "    let MOST = ceil_div(64, N)\n    let SPARE = (MOST - PARTS) * N - 1\n    let ROUNDS = max(1, ceil_div(N, SPARE))\n    where PARTS <= MOST\n    error_class coarse when SPARE < 8\n    scratch window bytes (SPARE * 4) when ROUNDS > 1\n    launch prepare when ROUNDS > 1:\n        threadgroups (MOST, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n        shared_bytes (SPARE)\n    repeat (ROUNDS):\n        launch attend:\n            threadgroups (ceil_div(N, 32), PARTS, 1)\n            threads_per_threadgroup (min(SPARE, 32), 1, 1)\n",
+        )
+        .unwrap();
+        let written = check(
+            "    where PARTS <= ceil_div(64, N)\n    error_class coarse when (ceil_div(64, N) - PARTS) * N - 1 < 8\n    scratch window bytes (((ceil_div(64, N) - PARTS) * N - 1) * 4) when max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1)) > 1\n    launch prepare when max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1)) > 1:\n        threadgroups (ceil_div(64, N), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n        shared_bytes ((ceil_div(64, N) - PARTS) * N - 1)\n    repeat (max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1))):\n        launch attend:\n            threadgroups (ceil_div(N, 32), PARTS, 1)\n            threads_per_threadgroup (min((ceil_div(64, N) - PARTS) * N - 1, 32), 1, 1)\n",
+        )
+        .unwrap();
+        // Each source is its own module; everything else is equal.
+        assert_eq!(
+            named,
+            NativeImplementation {
+                entry: named.entry,
+                ..written
+            }
+        );
+
+        let launch = "    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        for (terms, message) in [
+            ("    let N = 4\n", "term `N` is already a dimension, a parameter or a term"),
+            ("    let PARTS = 4\n", "term `PARTS` is already"),
+            ("    let A = 1\n    let A = 2\n", "term `A` is already"),
+            ("    let A = B + 1\n    let B = 2\n", "references `B`"),
+            ("    let A = ROWS\n", "references `ROWS`"),
+        ] {
+            let refused = check(&format!("{terms}{launch}")).unwrap_err();
+            assert!(refused.contains(message), "{terms}: {refused}");
+        }
+    }
 
     #[test]
     fn scratch_maximum_evaluates_guards_and_charges_exactly() {

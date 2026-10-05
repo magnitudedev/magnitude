@@ -59,6 +59,9 @@ pub(crate) enum AttentionHistoryEntries<'a, G: GraphDraft + 'a> {
         verify_four: Option<G::Binding<'a, attention_decode_k8v4::Entry>>,
         verify_eight: Option<G::Binding<'a, attention_decode_k8v4::Entry>>,
         prefill: G::Binding<'a, attention_prefill_k8v4::Entry>,
+        /// The prefill of a class that lists its launch's history row tiles
+        /// (`StateResourcePlan::lists_history_tiles`).
+        prefill_listed: Option<G::Binding<'a, attention_prefill_k8v4::Entry>>,
     },
 }
 
@@ -87,12 +90,14 @@ impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
                 verify_four,
                 verify_eight,
                 prefill,
+                prefill_listed,
             } => AttentionHistoryEntries::AffineK8V4 {
                 decode,
                 verify: verify.as_ref(),
                 verify_four: verify_four.as_ref(),
                 verify_eight: verify_eight.as_ref(),
                 prefill,
+                prefill_listed: prefill_listed.as_ref(),
             },
         };
         Self {
@@ -111,11 +116,16 @@ pub(crate) struct CheckedAttentionEntries {
     output: [(&'static str, Element); 2],
     post_norm: Option<CheckedPostNormEntries>,
     history: KvCodec,
+    /// Whether the graphs may list their launch's history row tiles
+    /// (`StateResourcePlan::lists_history_tiles`, for a program whose
+    /// classes have the listing axis).
+    lists: bool,
 }
 
 impl CheckedAttentionEntries {
-    pub(crate) fn new(binding: AttentionBinding) -> Self {
+    pub(crate) fn new(binding: AttentionBinding, lists: bool) -> Self {
         Self {
+            lists: lists && binding.history == KvCodec::AffineK8V4,
             project: [
                 ("NW", binding.norm),
                 ("QW", binding.query),
@@ -151,6 +161,7 @@ impl CheckedAttentionEntries {
                 verify_four: None,
                 verify_eight: None,
                 prefill: &self.mix[..],
+                prefill_listed: self.lists.then_some(&self.mix[..]),
             },
             KvCodec::RotatedK4V4 => {
                 return Err("rotated K4/V4 has no native attention entry".into())
@@ -204,6 +215,9 @@ pub(crate) struct AttentionBlock<'a> {
     pub segments: u64,
     pub history_rows: u64,
     pub slab_rows: u32,
+    /// The history row tiles one launch of the class can see
+    /// (`HistoryStorePlan::launch_tiles` of its request slots).
+    pub history_tiles: u64,
     pub shape: AttentionShape,
     pub operator: &'a Attention,
     /// The input norm's epsilon.
@@ -236,7 +250,35 @@ pub(crate) struct AttentionControlPorts {
     pub visible: NativePort,
     pub fresh: NativePort,
     pub destinations: NativePort,
+    /// The history row tiles the launch's rows see, for an entry that takes
+    /// them (the affine prefill).
+    pub history_tiles: Option<HistoryTilesPort>,
 }
+
+/// The `history_tiles` input of a graph class that lists the history row
+/// tiles its launch's rows see, and the tiles it lists.
+#[derive(Clone)]
+pub(crate) struct HistoryTilesPort {
+    pub port: NativePort,
+    pub tiles: usize,
+}
+
+/// The history row tiles the rows of a launch see, from its encoded
+/// `visible` table (little-endian `[start, end)` pairs): distinct and
+/// ascending, then -1 up to `tiles` entries, as little-endian bytes. `None`
+/// when they see more than `tiles`: the launch takes the class that lists
+/// none.
+pub(crate) fn history_tile_bytes(visible: &[u8], tiles: usize) -> Option<Vec<u8>> {
+    let spans = visible.chunks_exact(8).map(|span| {
+        [
+            i32::from_le_bytes([span[0], span[1], span[2], span[3]]),
+            i32::from_le_bytes([span[4], span[5], span[6], span[7]]),
+        ]
+    });
+    magnitude_batching::history_tiles(spans, tiles)
+        .map(|tiles| tiles.iter().flat_map(|tile| tile.to_le_bytes()).collect())
+}
+
 
 /// The block's attention weights in the order and presence its operator's
 /// form and its sublayer tail define, from a lookup of a role's port.
@@ -401,11 +443,41 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             graph.input_for(*decode, name, &dimensions)
         }
     };
+    let decode = decodes(rows);
+    // The affine prefill of a class that lists its launch's history row
+    // tiles sizes its per-call history storage by them, never by the store's
+    // reservation; a class that lists none (and an injection-only route,
+    // which attends to nothing) reads the history in place.
+    let listed = match &history {
+        AttentionHistoryEntries::AffineK8V4 {
+            prefill_listed: Some(kernel),
+            ..
+        } if !decode && !block.inject_only && block.history_tiles > 0 => Some(*kernel),
+        _ => None,
+    };
+    let tile_dimensions = dimensions
+        .iter()
+        .copied()
+        .chain([
+            ("L", u64::from(listed.is_some())),
+            ("HT", listed.map_or(1, |_| block.history_tiles)),
+        ])
+        .collect::<Vec<_>>();
+    let history_tiles = listed
+        .map(|kernel| {
+            Ok::<_, GraphError>(HistoryTilesPort {
+                port: graph.input_for(kernel, "history_tiles", &tile_dimensions)?,
+                tiles: usize::try_from(block.history_tiles)
+                    .map_err(|_| "history tile count exceeds host domain")?,
+            })
+        })
+        .transpose()?;
     let controls = AttentionControlPorts {
         coordinates: input(graph, "coordinates")?,
         visible: input(graph, "visible")?,
         fresh: input(graph, "fresh")?,
         destinations: input(graph, "destinations")?,
+        history_tiles,
     };
     let rotary = &block.operator.rotary;
     let components = GraphConstant::i32(graph, &rotary_components(rotary)?)?;
@@ -459,14 +531,18 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     };
     // Every entry takes the same arguments but its history planes.
     macro_rules! mix {
-        ($kernel:expr, $module:ident, $($plane:ident),*) => {{
+        ($kernel:expr, $module:ident, $($plane:ident),*) => {
+            mix!(@enqueue $kernel, $module, &dimensions, {}, $($plane),*)
+        };
+        (@enqueue $kernel:expr, $module:ident, $dimensions:expr, {$($extra:ident: $value:expr),*},
+            $($plane:ident),*) => {{
             let [$($plane),*] = planes.as_mut_slice() else {
                 return Err("attention history planes disagree with the entry".into());
             };
             graph
                 .enqueue(
                     *$kernel,
-                    &dimensions,
+                    $dimensions,
                     $module::WorkflowArgs {
                         query: (&query).into(),
                         gate: (&gate).into(),
@@ -482,6 +558,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                         visible: controls.visible.tensor().into(),
                         fresh: controls.fresh.tensor().into(),
                         destinations: controls.destinations.tensor().into(),
+                        $($extra: $value,)*
                         $($plane: $plane.tensor_mut().into(),)*
                         epsilon: block.head_epsilon,
                         scale,
@@ -492,7 +569,6 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                 .value
         }};
     }
-    let decode = decodes(rows);
     let attended = match &history {
         AttentionHistoryEntries::Dense {
             verify: Some(kernel),
@@ -549,16 +625,30 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             history_value_codes,
             history_value_coefficients
         ),
-        AttentionHistoryEntries::AffineK8V4 {
-            prefill: kernel, ..
-        } => mix!(
-            kernel,
+        AttentionHistoryEntries::AffineK8V4 { prefill, .. } => {
+            // No list: zero rows of an I32 table.
+            let unlisted = controls
+                .destinations
+                .tensor()
+                .slice_leading(0, 0)
+                .reshape(&[0, 1]);
+            let kernel = listed.as_ref().unwrap_or(prefill);
+            mix!(
+            @enqueue kernel,
             attention_prefill_k8v4,
+            &tile_dimensions,
+            {
+                history_tiles: match &controls.history_tiles {
+                    Some(tiles) => tiles.port.tensor().into(),
+                    None => (&unlisted).into(),
+                }
+            },
             history_key_codes,
             history_key_coefficients,
             history_value_codes,
             history_value_coefficients
-        ),
+            )
+        }
     };
     constants.extend([components, frequencies, amplitudes, unit]);
     Ok((attended, AttentionStatePorts { planes }, controls))
@@ -651,6 +741,50 @@ pub(crate) fn rotary_amplitudes(rotary: &Rotary) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launch takes the class that lists its history row tiles exactly
+    /// when its rows see at most that class's tiles: one request with a long
+    /// history does, however many rows and spans it has; several requests
+    /// whose histories together exceed it take the class that lists none.
+    #[test]
+    fn a_launch_lists_its_history_tiles_when_they_fit_one_request() {
+        let visible = |spans: &[[i32; 2]]| {
+            spans
+                .iter()
+                .flatten()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let listed = |bytes: Vec<u8>| {
+            bytes
+                .chunks_exact(4)
+                .map(|tile| i32::from_le_bytes([tile[0], tile[1], tile[2], tile[3]]))
+                .collect::<Vec<_>>()
+        };
+        // One request of 64 rows over a 16,384-row history in two spans, the
+        // second at a lower address: 64 tiles of 256 rows.
+        let request = [[40_960, 49_152], [8_192, 16_384]];
+        let rows = std::iter::repeat(request).take(64).flatten().collect::<Vec<_>>();
+        let tiles = listed(history_tile_bytes(&visible(&rows), 66).unwrap());
+        assert_eq!(tiles[..64], (32..64).chain(160..192).collect::<Vec<_>>());
+        assert_eq!(tiles[64..], [-1, -1]);
+        // A second request with as long a history of its own no longer fits.
+        let both = rows
+            .iter()
+            .copied()
+            .chain([[65_536, 73_728], [90_112, 98_304]])
+            .collect::<Vec<_>>();
+        assert_eq!(history_tile_bytes(&visible(&both), 66), None);
+        // A fork sharing the first request's rows adds no tile.
+        let fork = rows
+            .iter()
+            .copied()
+            .chain([[40_960, 45_056], [0, 0]])
+            .collect::<Vec<_>>();
+        assert_eq!(listed(history_tile_bytes(&visible(&fork), 66).unwrap()), tiles);
+        // Rows that see no history list nothing.
+        assert_eq!(listed(history_tile_bytes(&visible(&[[0, 0]]), 2).unwrap()), [-1, -1]);
+    }
 
     #[test]
     fn rotary_components_interleave_axes_with_section_cutoffs() {

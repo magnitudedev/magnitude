@@ -11,6 +11,13 @@ namespace recurrent {
 
 #define RECURRENT_TAPS SEISMIC_DIM_C
 
+// The input rows of taps 0..C. A struct, so that it is passed by a thread
+// reference: Metal 4.1 refuses a reference to an array of device pointers
+// that spells both address spaces on one declarator.
+struct Taps {
+    device const Storage *rows[RECURRENT_TAPS];
+};
+
 // The raw input row at slot-local `position`: the source version's window rows
 // before the slot, the projection after.
 inline device const Storage *raw_row(device const Storage *projection, device const ulong *window, Slot slot,
@@ -23,25 +30,25 @@ inline device const Storage *raw_row(device const Storage *projection, device co
 
 // The convolution input rows of slot-local row `local` for taps 0..C.
 inline void taps(device const Storage *projection, device const ulong *window, Slot slot, long local,
-    thread device const Storage *(&rows)[RECURRENT_TAPS], constant ulong *seismic_words) {
+    thread Taps &taps, constant ulong *seismic_words) {
     RECURRENT_UNROLL for (uint tap = 0; tap < RECURRENT_TAPS; ++tap) {
-        rows[tap] = raw_row(projection, window, slot, local + long(tap) - long(RECURRENT_TAPS - 1), seismic_words);
+        taps.rows[tap] = raw_row(projection, window, slot, local + long(tap) - long(RECURRENT_TAPS - 1), seismic_words);
     }
 }
 
 // SiLU of the causal depthwise convolution of `channel` over `rows`.
-inline float convolve(device const float *convolution, thread device const Storage *const (&rows)[RECURRENT_TAPS],
+inline float convolve(device const float *convolution, thread const Taps &taps,
     ulong channel, constant ulong *seismic_words) {
     float sum = 0.0f;
     RECURRENT_UNROLL for (uint tap = 0; tap < RECURRENT_TAPS; ++tap) {
         sum = metal::fma(convolution[channel * SEISMIC_CONVOLUTION_STRIDE_0 + tap * SEISMIC_CONVOLUTION_STRIDE_1],
-            element::Act::load(rows[tap][channel]), sum);
+            element::Act::load(taps.rows[tap][channel]), sum);
     }
     return sum / (1.0f + metal::exp(-sum));
 }
 
 // The same for the four channels `channel`..`channel + 3`.
-inline float4 convolve4(device const float *convolution, thread device const Storage *const (&rows)[RECURRENT_TAPS],
+inline float4 convolve4(device const float *convolution, thread const Taps &taps,
     ulong channel, constant ulong *seismic_words) {
     float4 sum = 0.0f;
     RECURRENT_UNROLL for (uint tap = 0; tap < RECURRENT_TAPS; ++tap) {
@@ -49,7 +56,7 @@ inline float4 convolve4(device const float *convolution, thread device const Sto
         RECURRENT_UNROLL for (uint e = 0; e < 4; ++e) {
             weights[e] = convolution[(channel + e) * SEISMIC_CONVOLUTION_STRIDE_0 + tap * SEISMIC_CONVOLUTION_STRIDE_1];
         }
-        sum = metal::fma(weights, element::Act::load4(rows[tap] + channel), sum);
+        sum = metal::fma(weights, element::Act::load4(taps.rows[tap] + channel), sum);
     }
     return sum / (1.0f + metal::exp(-sum));
 }
@@ -62,15 +69,18 @@ struct Convolving {
     device const float *convolution;
     Slot slot;
     struct Row {
-        device const Storage *rows[RECURRENT_TAPS];
+        Taps taps;
         device const float *convolution;
         float at(ulong channel, constant ulong *seismic_words) const {
-            return convolve(convolution, rows, channel, seismic_words);
+            // A member reached through `this` has no stated address space
+            // under Metal 4.1; the copy is a thread object.
+            const Taps held = taps;
+            return convolve(convolution, held, channel, seismic_words);
         }
     };
     Row row(long row, constant ulong *seismic_words) const {
         Row result;
-        taps(projection, window, slot, row - slot.lo, result.rows, seismic_words);
+        taps(projection, window, slot, row - slot.lo, result.taps, seismic_words);
         result.convolution = convolution;
         return result;
     }

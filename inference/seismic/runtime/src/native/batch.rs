@@ -95,7 +95,8 @@ impl DispatchList for BatchCalls<'_> {
             kernel,
             words: &call.words,
             word_bytes: &call.word_bytes,
-            launches: &call.launches,
+            launches: &call.launches.geometry,
+            rounds: call.launches.rounds,
             representations: &call.representations,
         }
     }

@@ -377,9 +377,33 @@ keys into tuned partitions, and prefill may split a tile's history keys across t
 groups whose partial softmax states merge in fixed order in a second launch. Metal's prefill also
 declares a direct form, a tuned specialization of the same entries: a simdgroup keeps its queries in
 tensor-operation registers and reads key and value tiles as device tensor operands, so nothing is
-staged; K8/V4 history is first decoded for the call into F16 scratch, with the staged decode's
-arithmetic, so both forms multiply the same operands. That scratch is transient workspace of
-(T + 32) x KV x W x 4 bytes, and the form is chosen only where tuning measures it faster.
+staged; K8/V4 history is first decoded into F16, with the staged decode's arithmetic, so both forms
+multiply the same operands, and the form is chosen only where tuning measures it faster. Decoded
+history follows neither the history reservation (an address-space ceiling from the device's bytes)
+nor the context limit, and adds no scratch: the affine prefill entry takes the history row tiles its
+launch's rows see (`history_tiles`: the distinct 256-row tiles holding a row of any visible span,
+ascending, then -1), and a call that lists tiles is charged its partial outputs for the most key
+partitions any configuration takes, which is what a call that lists none is charged; the direct
+form decodes into what its own partitions leave (a window of about 16k x G / KV rows less M x G
+per partition in use; the form's key partitions stop at half of the most). The listed rows are
+taken in list order, tiles adjacent in the history adjacent in the window, and a tile the launch
+does not see (between two requests' spans) reads zero rows. A class whose listed rows fit the
+window is one round of a decode and an attend launch; a larger one repeats them (the entry's
+`repeat` block), each round taking a window's worth of keys and splitting those into its own key
+partitions, and a fold launch after each attend merges the round's split records into the one
+state per row the window keeps, by the partition merge rule, so a row's rounds are to it what key
+partitions are. A prefill attention graph over K8/V4 history therefore
+comes in classes that list tiles (powers
+of two from 16 up to one request's worth, the domain's span limit in pages) and one that lists none;
+all hold the same workspace, the listing classes admit the direct form, and the other admits only
+the forms that read history in place. A launch takes the smallest listing class that holds the tiles
+its rows together see (so it dispatches at most twice the rounds it needs; a round with nothing to
+do returns at once) and the class that lists none when they exceed the largest; listing and
+unlisted kernels tune separately. A device without tensor operations has only the class that lists
+none, which spares it tuning and forming a kernel whose direct form wins only on tensor operations:
+the fact is the device's own probe (`DeviceInfo::forms_tensor_operations` before it is opened, which
+planning and assessment read; graph preparation fails if the opened device disagrees).
+The draft head's and the separate draft's graphs list none.
 
 Vision patch capacity is the admitted merged output row limit times the merge area; input validation
 rejects a larger aggregate before reserving a vision slot. Vision attention sees every physical

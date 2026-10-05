@@ -27,6 +27,11 @@ pub struct SelectedDevice {
     /// The allocation domain's stable fit capacity: its capacity, bounded
     /// by process limits and working-set advice, less its planning reserve.
     pub assessment_capacity_bytes: u64,
+    /// Whether the device forms Metal tensor operations
+    /// (`DeviceInfo::forms_tensor_operations`, the probe its opened device
+    /// runs): graphs are planned and assessed for the kernel forms that
+    /// exist only with them.
+    pub tensor_operations: bool,
 }
 
 /// The selected device, resolved and opened in the executing process,
@@ -103,6 +108,7 @@ pub fn select_device(
         .1
         .fit_bytes();
     Ok(SelectedDevice {
+        tensor_operations: info.forms_tensor_operations(),
         info,
         assessment_capacity_bytes,
     })

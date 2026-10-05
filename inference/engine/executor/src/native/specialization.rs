@@ -16,6 +16,9 @@ use seismic::{
 
 pub(super) struct Specializer<'a> {
     backend: BackendName,
+    /// Whether the device forms Metal tensor operations
+    /// (`Device::forms_tensor_operations`).
+    tensor_operations: bool,
     mode: Mode<'a>,
 }
 
@@ -108,29 +111,38 @@ impl<'a> Specializer<'a> {
     pub fn new(device: &'a Device) -> Self {
         Self {
             backend: device.backend(),
+            tensor_operations: device.forms_tensor_operations(),
             mode: Mode::Prepare(device),
         }
     }
 
-    /// A specializer for a tuning count or census, which forms nothing.
-    pub fn count(backend: BackendName) -> Self {
+    /// A specializer for a tuning count or census of `device`'s programs,
+    /// which forms nothing.
+    pub fn count(device: &Device) -> Self {
         Self {
-            backend,
+            backend: device.backend(),
+            tensor_operations: device.forms_tensor_operations(),
             mode: Mode::Count,
         }
     }
 
     /// A specializer that lists the request of every entry, without a
-    /// device.
+    /// device: those of a device with every optional form, so the listing
+    /// covers any device of the backend.
     pub fn list(backend: BackendName) -> Self {
         Self {
             backend,
+            tensor_operations: backend == BackendName::Metal,
             mode: Mode::List(Vec::new()),
         }
     }
 
     pub fn backend(&self) -> BackendName {
         self.backend
+    }
+
+    pub fn forms_tensor_operations(&self) -> bool {
+        self.tensor_operations
     }
 
     /// The requests a listing named, in walk order.

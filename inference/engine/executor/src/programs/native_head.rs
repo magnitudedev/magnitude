@@ -270,7 +270,7 @@ impl CheckedHeadEntries {
                 ("HN", binding.hidden_norm),
                 ("CW", binding.combine),
             ],
-            attention: CheckedAttentionEntries::new(binding.attention),
+            attention: CheckedAttentionEntries::new(binding.attention, false),
             feed_forward: match binding.feed_forward {
                 FeedForwardProgramSlot::Dense(binding) => {
                     CheckedHeadFeedForwardEntries::Dense(CheckedDenseEntries::new(binding))
@@ -601,6 +601,8 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 segments: class.segments,
                 history_rows: class.history_rows,
                 slab_rows: class.slab_rows,
+                // The head's classes list no history row tiles.
+                history_tiles: 0,
                 shape: attention_shape,
                 operator: attention,
                 epsilon,

@@ -2300,7 +2300,8 @@ impl DispatchList for SequenceList<'_> {
             kernel: &node.kernel,
             words: &node.words,
             word_bytes: &node.word_bytes,
-            launches: &node.launches,
+            launches: &node.launches.geometry,
+            rounds: node.launches.rounds,
             representations: &node.representations,
         }
     }

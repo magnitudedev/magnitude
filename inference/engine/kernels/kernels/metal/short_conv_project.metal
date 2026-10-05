@@ -54,7 +54,7 @@ kernel void short_conv_project_gemv(SHORT_CONV_PROJECT_ARGUMENTS,
     const uint segment = (channels + per_tile - 1u) / per_tile;
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     if (tile < segment) {
         PROJECTION_FOR_ROWS(rows,
             projection::gemv_paired_runtime<packets::W0, packets::W1, ROWS, MAXM, LANES>(
@@ -81,7 +81,7 @@ kernel void short_conv_project_batch(SHORT_CONV_PROJECT_ARGUMENTS,
     const uint segment = (channels + per_tile - 1u) / per_tile;
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     if (tile < segment)
         projection::gemv_batch_paired_runtime<packets::W0, packets::W1, BATCH_ROWS>(x, u, b_rows, x_rows, rows,
             channels, hidden, tile, shared, simdgroups, sg, lane);

@@ -636,6 +636,18 @@ struct direct_rows {
     inline ulong offset(int start) const { return ulong(start - first) * SEISMIC_DIM_KV * ATTENTION_W; }
 };
 
+// The part of the history one attend launch of the direct form takes: the
+// keys in rows [lo, hi), when the launch is `live`. A call attends its
+// history over one or more launches; `first` and `last` mark the ends of
+// that run (the last one takes the fresh keys).
+struct prefill_held {
+    bool live;
+    bool first;
+    bool last;
+    int lo;
+    int hi;
+};
+
 // One run of the direct form's 16-key steps over the keys [first, end) of
 // span `span` (R is the fresh span). An unmasked run is whole steps that
 // every row sees, in one history slab; a masked run's steps mask per (row,
@@ -685,6 +697,9 @@ struct dense_history {
         return direct_rows<Scalar>{slab::region<Scalar>(key, index) + kv_head * ATTENTION_W,
             slab::region<Scalar>(value, index) + kv_head * ATTENTION_W, int(index * rows), int(rows)};
     }
+
+    // History read in place is attended in one launch.
+    inline prefill_held held() const { return prefill_held{true, true, true, 0, INT_MAX}; }
 
     // The matrix decode's key operand: the history dtype. Its values enter the
     // P.V product as F16, exact for activation values within F16's range.
@@ -1015,83 +1030,237 @@ struct affine_history {
     }
 };
 
-// Affine history decoded to F16 scratch for one call (`prefill_decode`):
-// [T + 32, KV, W] key and value planes holding, at its logical row, every
-// history row a query row of the batch sees, as the staged tiles hold it,
-// and zeros in the rows after each span. The DIRECT form's history operands:
-// read as device tensors, or staged like the fresh rows.
+// The history row tiles a call's rows see (the entry's `history_tiles`):
+// `count` listed tiles of PREFILL_HISTORY_TILE rows, distinct and ascending.
+// Per-call storage of history rows holds listed tile i at slot i, so tiles
+// adjacent in the history are adjacent in it.
+#define PREFILL_HISTORY_TILE 256
+// Zero rows after the decoded history's rows, which a tile reads past its
+// rows or in place of a history tile the call does not see.
+#define PREFILL_HISTORY_PAD 32
+struct held_tiles {
+    device const int *tiles;
+    uint count;
+
+    // The listed tiles among the entry's `limit`: those before the first -1.
+    static inline held_tiles listed(device const int *tiles, uint limit) {
+        uint lo = 0;
+        uint hi = limit;
+        while (lo < hi) {
+            const uint middle = (lo + hi) / 2;
+            if (tiles[middle] >= 0)
+                lo = middle + 1;
+            else
+                hi = middle;
+        }
+        return held_tiles{tiles, lo};
+    }
+
+    // The slot of history tile `tile`, or `count` when the call sees none of
+    // its rows. One request's tiles are mostly one ascending run, which the
+    // first probe finds.
+    inline uint slot(uint tile) const {
+        if (count == 0)
+            return 0;
+        const uint guess = tile - uint(tiles[0]);
+        if (guess < count && uint(tiles[guess]) == tile)
+            return guess;
+        uint lo = 0;
+        uint hi = count;
+        while (lo < hi) {
+            const uint middle = (lo + hi) / 2;
+            if (uint(tiles[middle]) < tile)
+                lo = middle + 1;
+            else
+                hi = middle;
+        }
+        return lo < count && uint(tiles[lo]) == tile ? lo : count;
+    }
+};
+
+// Where the direct form over affine history keeps decoded rows: the entry
+// charges a listed call's `partials` for the most key partitions any
+// configuration takes (`charged`; attention.seismic), and what the call's
+// own `taken` partitions leave holds the window, in rows of [KV, W] F32 (the
+// partial outputs of one query head of every kv head) or of [KV, W] F16 keys
+// and values. The first row holds the call's words: the round the next
+// decode launch takes, the round the attend launch takes (each written by
+// the other launch, so no launch reads a word it writes), and the listed
+// tile count. A call whose class lists more rows (`limit` tiles) than the
+// rest holds takes several rounds, and keeps each row's state over the
+// rounds before the one under way ([M, H, W] partial outputs, then their
+// statistics once per round parity, so a round reads the ones the round
+// before wrote; `prefill_fold`). Then the key plane and the value plane,
+// each `capacity` rows (whole tiles) and the zero rows.
+struct history_window {
+    enum : uint { DECODE = 0, ATTEND = 1, TILES = 2 };
+    device uint *words;
+    device float *kept;
+    device float *kept_statistics;
+    device half *keys;
+    device half *values;
+    uint capacity;
+
+    // Row counts fit 32 bits (a launch's rows and partitions are few), and
+    // 64-bit division is slow where every thread of a launch runs this.
+    // `spare`, `state` and `capacity` are the declaration's SPARE, STATE and
+    // WINDOW or ROUND (attention.seismic), which the launch grids follow.
+    static inline history_window in(device float *partials, uint M, uint taken, uint charged, uint limit) {
+        constexpr ulong ROW = SEISMIC_DIM_KV * ATTENTION_W;
+        constexpr uint TILE = PREFILL_HISTORY_TILE;
+        constexpr uint PAD = PREFILL_HISTORY_PAD;
+        constexpr uint G = SEISMIC_DIM_G;
+        device float *rows = partials + ulong(taken * M * G) * ROW;
+        const uint spare = (charged - taken) * M * G - 1 - PAD;
+        const uint state = M * G + (M * G * 4 + ATTENTION_W - 1) / ATTENTION_W;
+        const bool rounds = limit * TILE > spare / TILE * TILE;
+        const uint capacity = (rounds ? spare - state : spare) / TILE * TILE;
+        device half *keys = reinterpret_cast<device half *>(rows + ulong(rounds ? 1 + state : 1) * ROW);
+        return history_window{reinterpret_cast<device uint *>(rows), rows + ROW, rows + ulong(1 + M * G) * ROW, keys,
+            keys + ulong(capacity + PAD) * ROW, capacity};
+    }
+
+    // The rounds a call that lists `tiles` tiles takes.
+    inline uint rounds(uint tiles) const {
+        return tiles == 0 ? 1u : (tiles * PREFILL_HISTORY_TILE - 1) / capacity + 1;
+    }
+};
+
+// Affine history decoded to F16 for one round of a call (`prefill_decode`),
+// the DIRECT form's history operands: read as device tensors, or staged like
+// the fresh rows. The call's history is its listed tiles' rows in list order
+// (slot row x is row x % 256 of listed tile x / 256), and round r holds the
+// slot rows [r capacity, (r + 1) capacity) as [.., KV, W] key and value
+// planes, as the staged tiles hold their rows, then zero rows. A history
+// that fits takes one round. A key of a tile the call does not see (between
+// two rows' spans of one index) reads the zero rows.
 struct decoded_history {
     enum : bool { AFFINE = true };
     typedef half Operand;
     device const half *key;
     device const half *value;
+    held_tiles tiles;
+    uint capacity;
+    uint round;
+    uint rows_per_slab;
+
+    static inline decoded_history of(history_window window, held_tiles tiles, uint round, uint rows_per_slab) {
+        return decoded_history{window.keys, window.values, tiles, window.capacity, round, rows_per_slab};
+    }
+
+    // The call's slot rows, the round's first, and how many it holds (the
+    // zero rows follow them).
+    inline int extent() const { return int(tiles.count) * PREFILL_HISTORY_TILE; }
+    inline int origin() const { return int(round * capacity); }
+    inline uint filled() const { return uint(metal::clamp(extent() - origin(), 0, int(capacity))); }
+
+    // Rounds are whole tiles, so a round's rows are the rows of consecutive
+    // listed tiles.
+    inline prefill_held held() const {
+        constexpr int TILE = PREFILL_HISTORY_TILE;
+        const uint last = tiles.count == 0 ? 0u : uint(extent() - 1) / capacity;
+        // A call of one round takes every key.
+        if (last == 0)
+            return prefill_held{round == 0, true, true, 0, INT_MAX};
+        const int lo = metal::min(origin(), extent());
+        const int hi = metal::min(origin() + int(capacity), extent());
+        const bool any = lo < hi;
+        return prefill_held{round <= last, round == 0, round == last,
+            any ? tiles.tiles[lo / TILE] * TILE : 0, any ? (tiles.tiles[(hi - 1) / TILE] + 1) * TILE : 0};
+    }
+
+    // The scratch row of history row `at`, which the round holds unless its
+    // tile is not listed: then the first zero row.
+    inline ulong row(int at) const {
+        constexpr uint TILE = PREFILL_HISTORY_TILE;
+        const uint slot = tiles.slot(uint(at) / TILE);
+        if (slot == tiles.count)
+            return filled();
+        return ulong(int(slot * TILE + uint(at) % TILE) - origin());
+    }
+
+    // A staged tile's rows up to its first history tile boundary, then the
+    // rest: each part is contiguous in the scratch.
+    template <uint THREADS, uint KEYS>
+    inline void stage(threadgroup half *staged, device const half *plane, int first, int end, uint kv_head,
+        uint thread_index) const {
+        constexpr uint W = ATTENTION_W;
+        constexpr uint PIECES = W / 8;
+        constexpr int TILE = PREFILL_HISTORY_TILE;
+        static_assert(KEYS <= PREFILL_HISTORY_PAD && KEYS <= PREFILL_HISTORY_TILE, "a staged tile fits the zero rows");
+        const int boundary = (first / TILE + 1) * TILE;
+        const ulong head = row(first);
+        const ulong tail = boundary < metal::min(first + int(KEYS), end) ? row(boundary) : 0;
+        ATTENTION_ROLLED
+        for (uint item = thread_index; item < KEYS * PIECES; item += THREADS) {
+            const uint k = item / PIECES;
+            const uint c = (item % PIECES) * 8;
+            const int t = first + int(k);
+            uint4 bits = uint4(0);
+            if (t < end)
+                bits = *reinterpret_cast<device const uint4 *>(
+                    plane + ((t < boundary ? head + k : tail + ulong(t - boundary)) * SEISMIC_DIM_KV + kv_head) * W + c);
+            *reinterpret_cast<threadgroup uint4 *>(staged + k * PREFILL_PITCH + c) = bits;
+        }
+    }
 
     template <uint THREADS, uint KEYS = PREFILL_KEYS>
     inline void stage_key(threadgroup half *staged, int first, int end, uint kv_head, uint thread_index) const {
-        prefill_stage<THREADS, half, KEYS>(staged, key, first, end, kv_head, thread_index);
+        stage<THREADS, KEYS>(staged, key, first, end, kv_head, thread_index);
     }
 
     template <uint THREADS, uint KEYS = PREFILL_KEYS>
     inline void stage_value(threadgroup half *staged, int first, int end, uint kv_head, uint thread_index) const {
-        prefill_stage<THREADS, half, KEYS>(staged, value, first, end, kv_head, thread_index);
+        stage<THREADS, KEYS>(staged, value, first, end, kv_head, thread_index);
     }
 
-    // The planes are whole: a tile starts at its own row.
-    inline direct_rows<half> direct(int, uint kv_head) const {
-        return direct_rows<half>{key + kv_head * ATTENTION_W, value + kv_head * ATTENTION_W, 0, INT_MAX};
+    // The operand rows that hold history row `at` of the round: from its
+    // scratch row to the end of its slab or of the round's rows, whichever
+    // is first (the tiles of a run of keys every row sees are all listed,
+    // so they are contiguous in the scratch), or for a tile the call does
+    // not see the zero rows, to the end of that tile.
+    inline direct_rows<half> direct(int at, uint kv_head) const {
+        constexpr int TILE = PREFILL_HISTORY_TILE;
+        constexpr int PAD = PREFILL_HISTORY_PAD;
+        device const half *keys = key + kv_head * ATTENTION_W;
+        device const half *values = value + kv_head * ATTENTION_W;
+        const uint slot = tiles.slot(uint(at) / uint(TILE));
+        if (slot == tiles.count) {
+            const ulong zeros = ulong(filled()) * SEISMIC_DIM_KV * ATTENTION_W;
+            const int left = metal::min(PAD, (at / TILE + 1) * TILE - at);
+            return direct_rows<half>{keys + zeros, values + zeros, at - (PAD - left), PAD};
+        }
+        const int position = int(slot) * TILE + at % TILE - origin();
+        const int first = at - position;
+        const int slab = (at / int(rows_per_slab) + 1) * int(rows_per_slab);
+        return direct_rows<half>{keys, values, first, metal::min(slab, at + int(filled()) - position) - first};
     }
 };
 
-// The decode pre-pass of the DIRECT form over affine history, in two
-// launches. `prefill_span_bounds`: one simdgroup per history span index, the
-// union over the batch's rows of that span's key interval, to spans[span]
-// (lo, hi; equal when empty).
-inline void prefill_span_bounds(device const int *visible, device const int *fresh, device int *spans,
-    ulong M, ulong R, uint span, uint lane) {
-    if (span >= R)
-        return;
-    int lo = INT_MAX;
-    int hi = INT_MIN;
-    for (ulong row = lane; row < M; row += 32) {
-        int row_lo, row_hi;
-        form_span(visible, fresh, row, R, span, row_lo, row_hi);
-        if (row_hi > row_lo) {
-            lo = metal::min(lo, row_lo);
-            hi = metal::max(hi, row_hi);
-        }
-    }
-    lo = simd_min(lo);
-    hi = simd_max(hi);
-    if (lane == 0) {
-        spans[span * 2] = hi > lo ? lo : 0;
-        spans[span * 2 + 1] = hi > lo ? hi : 0;
-    }
-}
-
-// `prefill_decode`: one simdgroup per history row. A row inside a span union
-// is decoded for every kv head, 16-byte code pieces striped over the lanes,
-// to F16 exactly as `affine_history::stage` decodes it; a row within 32 rows
-// after a union (which a span's last tile reads) is zeroed; other rows are
-// left alone.
-inline void prefill_decode(affine_history history, device const int *spans, device half *keys,
-    device half *values, ulong R, uint row, uint lane) {
+// The decode launch of the DIRECT form over affine history
+// (`prefill_decode`): one simdgroup per scratch row. A scratch row the round
+// holds is its history row decoded for every kv head, 16-byte code pieces
+// striped over the lanes, to F16 exactly as `affine_history::stage` decodes
+// it (zero past the history's T rows); the PREFILL_HISTORY_PAD rows after
+// the round's last are zeroed, and the rest are left alone.
+inline void prefill_decode(affine_history history, history_window window, decoded_history decoded, ulong T,
+    uint row, uint lane) {
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
-    bool inside = false;
-    bool after = false;
-    for (ulong span = lane; span < R; span += 32) {
-        const int lo = spans[span * 2];
-        const int hi = spans[span * 2 + 1];
-        inside = inside || (int(row) >= lo && int(row) < hi);
-        after = after || (hi > lo && int(row) >= hi && int(row) < hi + 32);
-    }
-    inside = simd_any(inside);
-    if (!inside && !simd_any(after))
+    constexpr uint TILE = PREFILL_HISTORY_TILE;
+    const uint filled = decoded.filled();
+    if (row >= filled + PREFILL_HISTORY_PAD)
         return;
-    history.template decode_row<ATTENTION_KEY_BITS>(history.key_codes, history.key_coefficients, row, inside,
-        keys + ulong(row) * KV * W, lane);
-    history.template decode_row<ATTENTION_VALUE_BITS>(history.value_codes, history.value_coefficients, row, inside,
-        values + ulong(row) * KV * W, lane);
+    ulong source = 0;
+    if (row < filled) {
+        const uint x = uint(decoded.origin()) + row;
+        source = ulong(uint(decoded.tiles.tiles[x / TILE])) * TILE + x % TILE;
+    }
+    const bool decode = row < filled && source < T;
+    history.template decode_row<ATTENTION_KEY_BITS>(history.key_codes, history.key_coefficients, uint(source), decode,
+        window.keys + ulong(row) * KV * W, lane);
+    history.template decode_row<ATTENTION_VALUE_BITS>(history.value_codes, history.value_coefficients, uint(source),
+        decode, window.values + ulong(row) * KV * W, lane);
 }
 
 // L1: one simdgroup per (row, kv head), rows padded to whole QT tiles: the
@@ -1206,10 +1375,13 @@ struct prefill_fragments {
     float maximum;
     float denominator;
 
-    prefill_fragments(uint lane) {
+    // The lane's fragment coordinates. The struct stays an aggregate: Metal
+    // 4.1 gives simdgroup matrices no default constructor for a member
+    // initializer.
+    static inline void place(thread prefill_fragments &self, uint lane) {
         const uint quad = lane / 4;
-        fm = (quad & 4) + ((lane / 2) % 4);
-        fn = (quad & 2) * 2 + (lane % 2) * 2;
+        self.fm = (quad & 4) + ((lane / 2) % 4);
+        self.fn = (quad & 2) * 2 + (lane % 2) * 2;
     }
 
     static inline void reset(thread prefill_fragments &self) {
@@ -1968,14 +2140,15 @@ struct prefill_owner {
     uint tiles_lo, uint tiles_hi, uint thread_index, uint simd, uint lane
 #define PREFILL_OWNED_ARGUMENTS                                                                           \
     history, query, gate, visible, fresh, result, queries, keys, values, partials, statistics, M, R, scale, \
-    softplus, staged, intervals, exchange, tile, kv_head, head_group, partition, active, tiles_lo,         \
+    softplus, staged, intervals, exchange, tile, kv_head, head_group, partition, stored, tiles_lo,         \
     tiles_hi, thread_index, simd, lane
 
 template <uint QT, class History>
 inline void prefill_owned_fragments(PREFILL_OWNED_PARAMETERS) {
     typedef prefill_fragments<QT, History> Form;
     const prefill_owner<QT, Form::ROWS> own(tile, kv_head, head_group, simd);
-    Form state(lane);
+    Form state;
+    Form::place(state, lane);
     prefill_windows<QT, History>(history, query, gate, visible, fresh, result, keys, values, partials,
         statistics, M, R, scale, softplus, staged, intervals, kv_head, partition, active, tiles_lo, tiles_hi,
         queries + (own.first_token * SEISMIC_DIM_KV * SEISMIC_DIM_G + own.head) * ATTENTION_W, own.head,
@@ -2051,6 +2224,15 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     threadgroup prefill_interval *intervals = reinterpret_cast<threadgroup prefill_interval *>(
         shared + KEYS * PREFILL_PITCH * sizeof(Operand));
 
+    // The direct form attends the history over one or more launches
+    // (`History::held`), each taking the keys in its part of the history
+    // and the last the fresh keys: a launch's intervals, and so its key
+    // partitions, are those of its keys.
+    prefill_held held{true, true, true, 0, INT_MAX};
+    if constexpr (PREFILL_DIRECT != 0)
+        held = history.held();
+    if (!held.live)
+        return;
     if (simd == 0) {
         const ulong tile_row = ulong(tile) * QT + lane;
         const bool row_valid = lane < QT && tile_row < M;
@@ -2059,6 +2241,12 @@ inline void prefill_attend(History history, device const Scalar *query, device c
             int hi = 0;
             if (row_valid)
                 form_span(visible, fresh, tile_row, R, index, lo, hi);
+            if (index < R) {
+                lo = metal::max(lo, held.lo);
+                hi = metal::min(hi, held.hi);
+            } else if (!held.last) {
+                hi = lo;
+            }
             const bool nonempty = row_valid && hi > lo;
             const int union_lo = simd_min(nonempty ? lo : INT_MAX);
             const int union_hi = simd_max(nonempty ? hi : INT_MIN);
@@ -2086,6 +2274,9 @@ inline void prefill_attend(History history, device const Scalar *query, device c
         counts[tile] = active;
     const uint tiles_lo = partition * per;
     const uint tiles_hi = metal::min(tiles_lo + per, total_tiles);
+    // A call of several launches stores the split record in each, which
+    // the fold launch takes.
+    const uint stored = held.first && held.last ? active : metal::max(active, 2u);
 
     // On tensor operations the direct form when the entry takes it, else the
     // tensor form where its rows fit; otherwise the fragment form. A DIRECT
@@ -2096,7 +2287,7 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     if constexpr (PREFILL_DIRECT != 0) {
         if (thread_index == 0)
             prefill_direct<QT, History>::schedule(history, intervals,
-                reinterpret_cast<threadgroup prefill_run *>(intervals + R + 1), M, R, kv_head, active, tiles_lo,
+                reinterpret_cast<threadgroup prefill_run *>(intervals + R + 1), M, R, kv_head, stored, tiles_lo,
                 tiles_hi);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         prefill_owned_direct<QT, History>(PREFILL_OWNED_ARGUMENTS);
@@ -2116,6 +2307,64 @@ inline void prefill_attend(History history, device const Scalar *query, device c
         prefill_owned_fragments<QT, History>(PREFILL_OWNED_ARGUMENTS);
     }
 #endif
+}
+
+// The fold launch of the direct form over decoded history, after each
+// round's attend launch of a call of several rounds: threadgroup (QT-row
+// tile, query head), one thread per column. Each row's split records of the
+// round (one per key partition the round's keys took) fold into the state
+// the window keeps of the rounds before it, by the merge launch's rule
+// (`merge`): a row's state is its rounds' partitions merged in round then
+// partition order. The last round stores the gated output, and the merge
+// launch leaves such a call alone.
+template <uint QT>
+inline void prefill_fold(history_window window, prefill_held held, uint round, device const Scalar *query,
+    device const Scalar *gate, device Scalar *result, device const float *partials, device const float *statistics,
+    device const uint *counts, ulong M, uint tile, ulong head, uint column, bool softplus) {
+    constexpr uint W = ATTENTION_W;
+    constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
+    // A call of one round stored its results in the attend launch.
+    if (!held.live || (held.first && held.last))
+        return;
+    const uint count = counts[tile];
+    device const float *before = window.kept_statistics + (round % 2) * M * H * 2;
+    device float *after = window.kept_statistics + ((round + 1) % 2) * M * H * 2;
+    for (ulong row = ulong(tile) * QT; row < metal::min(ulong(tile + 1) * QT, M); ++row) {
+        const ulong state = row * H + head;
+        const float kept = held.first ? 0.0f : before[state * 2 + 1];
+        float maximum = kept > 0.0f ? before[state * 2] : -INFINITY;
+        for (uint partition = 0; partition < count; ++partition) {
+            const ulong slot = ulong(partition) * M * H + state;
+            if (statistics[slot * 2 + 1] > 0.0f)
+                maximum = metal::max(maximum, statistics[slot * 2]);
+        }
+        float denominator = 0.0f;
+        float accumulated = 0.0f;
+        if (kept > 0.0f) {
+            const float weight = metal::fast::exp2(before[state * 2] - maximum);
+            denominator = kept * weight;
+            accumulated = window.kept[state * W + column] * weight;
+        }
+        for (uint partition = 0; partition < count; ++partition) {
+            const ulong slot = ulong(partition) * M * H + state;
+            const float d = statistics[slot * 2 + 1];
+            if (d > 0.0f) {
+                const float weight = metal::fast::exp2(statistics[slot * 2] - maximum);
+                denominator = metal::fma(d, weight, denominator);
+                accumulated = metal::fma(partials[slot * W + column], weight, accumulated);
+            }
+        }
+        if (held.last) {
+            result[state * W + column] = gate_output(query, gate, row, head, column,
+                accumulated / metal::max(denominator, 1e-30f), softplus);
+            continue;
+        }
+        window.kept[state * W + column] = accumulated;
+        if (column == 0) {
+            after[state * 2] = maximum;
+            after[state * 2 + 1] = denominator;
+        }
+    }
 }
 
 // L3: threadgroup (QT-row tile, query head), one thread per column. A tile

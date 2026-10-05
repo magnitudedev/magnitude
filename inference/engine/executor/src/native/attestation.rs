@@ -1817,6 +1817,7 @@ impl AttestedPrograms {
                         verify_four,
                         verify_eight,
                         prefill,
+                        prefill_listed,
                     } => {
                         charge!(decode);
                         if let Some(verify) = verify {
@@ -1829,6 +1830,9 @@ impl AttestedPrograms {
                             charge!(verify_eight);
                         }
                         charge!(prefill);
+                        if let Some(prefill_listed) = prefill_listed {
+                            charge!(prefill_listed);
+                        }
                     }
                 }
                 tail!(&handles.output);

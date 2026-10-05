@@ -362,6 +362,9 @@ fn header_only_assessment_charges_what_a_load_commits() {
         policy.limits(),
         ResourceCapacity {
             domain_bytes: plan.device().assessment_capacity_bytes(),
+            tensor_operations: magnitude_executor::TensorOperations::of(
+                plan.device().tensor_operations(),
+            ),
         },
     )
     .unwrap();

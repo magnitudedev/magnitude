@@ -432,6 +432,17 @@ pub mod device {
         pub fn tuning_identity(&self) -> String {
             format!("{};{}", self.info.name, self.kind.tuning_identity())
         }
+        /// Whether this opened device forms Metal tensor operations (the
+        /// fact its native sources are formed under); false on every other
+        /// backend. `DeviceInfo::forms_tensor_operations` answers the same
+        /// before the device is opened.
+        pub fn forms_tensor_operations(&self) -> bool {
+            match &self.kind {
+                #[cfg(target_os = "macos")]
+                OpenedKind::Metal(opened) => opened.device_description().facts().tensor_ops(),
+                _ => false,
+            }
+        }
         pub(crate) fn supports_representation(
             &self,
             representation: seismic_lang::ids::RepresentationId,

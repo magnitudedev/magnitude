@@ -116,6 +116,7 @@ pub fn prepare_execution_assessment(
         policy.limits(),
         ResourceCapacity {
             domain_bytes: draft.device().assessment_capacity_bytes(),
+            tensor_operations: crate::TensorOperations::of(draft.device().tensor_operations()),
         },
     )
     .map_err(AssessmentError::Plan)?;

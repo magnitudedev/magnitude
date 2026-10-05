@@ -304,6 +304,22 @@ fn f32_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {
     Tensor::from_host(device, Element::f32(), &shape, &bytes).unwrap()
 }
 
+/// The history row tiles (256 rows) holding a row of any of the `visible`
+/// spans ([lo, hi) pairs): distinct and ascending, as the affine prefill
+/// entry's `history_tiles` lists them; one -1 when no row sees history.
+fn history_tiles(visible: &[i32]) -> Vec<i32> {
+    let tiles = visible
+        .chunks_exact(2)
+        .filter(|span| span[1] > span[0])
+        .flat_map(|span| span[0] / 256..=(span[1] - 1) / 256)
+        .collect::<std::collections::BTreeSet<_>>();
+    if tiles.is_empty() {
+        vec![-1]
+    } else {
+        tiles.into_iter().collect()
+    }
+}
+
 fn i32_tensor(device: &Device, shape: &[usize], values: &[i32]) -> Tensor {
     let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
     let bytes = values

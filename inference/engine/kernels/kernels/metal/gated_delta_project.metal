@@ -55,7 +55,7 @@ kernel void gated_delta_project_gemv(RECURRENT_PROJECT_ARGUMENTS,
     uint rows = uint(SEISMIC_DIM_M);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     uint t0 = (qkv_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
     uint t2 = (head_rows + per - 1) / per;
     if (tile < t0) {
@@ -87,7 +87,7 @@ kernel void gated_delta_project_batch(RECURRENT_PROJECT_ARGUMENTS,
     uint rows = uint(SEISMIC_DIM_M);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     uint t0 = (qkv_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
     uint t2 = (head_rows + per - 1) / per;
     if (tile < t0)

@@ -203,7 +203,13 @@ pub enum AttentionHistoryKernels {
         verify: Option<NativeKernel<attention_decode_k8v4::Entry>>,
         verify_four: Option<NativeKernel<attention_decode_k8v4::Entry>>,
         verify_eight: Option<NativeKernel<attention_decode_k8v4::Entry>>,
+        /// The prefill of a launch that lists no history row tiles: it reads
+        /// the history in place.
         prefill: NativeKernel<attention_prefill_k8v4::Entry>,
+        /// The prefill of a launch that lists the history row tiles its rows
+        /// see, where the entry's forms differ by it
+        /// (`StateResourcePlan::lists_history_tiles`).
+        prefill_listed: Option<NativeKernel<attention_prefill_k8v4::Entry>>,
     },
 }
 
@@ -226,6 +232,7 @@ impl AttentionHistoryKernels {
                 verify_four,
                 verify_eight,
                 prefill,
+                prefill_listed,
             } => {
                 decode
                     .invocation_workspace_bytes()
@@ -244,7 +251,11 @@ impl AttentionHistoryKernels {
                             .as_ref()
                             .map_or(0, NativeKernel::invocation_workspace_bytes),
                     )
-                    + prefill.invocation_workspace_bytes()
+                    + prefill.invocation_workspace_bytes().max(
+                        prefill_listed
+                            .as_ref()
+                            .map_or(0, NativeKernel::invocation_workspace_bytes),
+                    )
             }
         }
     }

@@ -910,7 +910,18 @@ fn attention_decode_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R](
 # Prefill rows (M >= 16) over affine K8/V4 history: `attention_prefill`'s
 # launches with the prepare launch appending encoded rows and every history
 # K/V tile decoded (rounded to F16) as it is staged.
-fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R](
+#
+# `history_tiles` (L = 1) lists the history row tiles the call's rows see:
+# the distinct tiles (256 rows; tile t is rows [256 t, 256 t + 256), the unit
+# a history domain's pages are whole multiples of) that hold a row of any
+# visible span, ascending, then -1. T is the store's reservation of row
+# addresses, not what a call reads: an implementation that decodes history
+# rows ahead of its products decodes the listed tiles' rows, in list order
+# (so tiles adjacent in the history stay adjacent), a bounded part at a time.
+# A call whose rows see more tiles than its caller lists passes no list (L =
+# 0), and only implementations that read history rows in place serve it. The
+# body and those implementations ignore the list.
+fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, L, HT](
     query: &tensor[M, KV * G, 2 * P + S + I] A, gate: &tensor[M, KV * G, U] A,
     key: &tensor[F, M, KV * (2 * P + S)] A, value: &tensor[F, M, KV * (2 * P + S)] A,
     query_norm: &tensor[N, 2 * P + S] f32, key_norm: &tensor[N, 2 * P + S] f32,
@@ -919,13 +930,14 @@ fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R](
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+    history_tiles: &tensor[L, HT] i32,
     history_key_codes: &mut tensor[T, KV, (2 * P + S) / 4] u32,
     history_key_coefficients: &mut tensor[T, KV, (2 * P + S) / 16] f16,
     history_value_codes: &mut tensor[T, KV, (2 * P + S) / 8] u32,
     history_value_coefficients: &mut tensor[T, KV, (2 * P + S) / 16] f16,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
-    where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0:
+    where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0 and L >= 0:
     return attention_rows_k8v4(query, gate, key, value, query_norm, key_norm, value_norm,
         rotary_components, rotary_frequencies, rotary_amplitudes, coordinates, visible,
         fresh, destinations, history_key_codes, history_key_coefficients, history_value_codes,
@@ -1047,34 +1059,59 @@ native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes ((2 * P + S) * 4)
 
+# Metal: `attention_prefill`'s launches and forms. DIRECT reads the listed
+# history tiles decoded to F16, in rounds of a `decode` and an attend launch.
+# A listed call (L = 1) is charged `partials` for the most key partitions any
+# configuration takes (CHARGED: SPLIT_GROUPS 512, QT 32, HEADS 16), which is
+# what an unlisted call's is charged; DIRECT takes at most half of them
+# (TAKEN, so its SPLIT_GROUPS partitions stop there), and what they leave, in
+# rows of [KV, W] F32 (M G to a partition) or of [KV, W] F16 keys and values,
+# holds the decoded window, less 33 rows of round words and zero rows (SPARE),
+# in whole tiles (WINDOW). A class whose listed rows (HT tiles) fit the window
+# is one round, with no other launch than `decode`. Otherwise the window
+# gives up the rows of one state per row and head (STATE), each round takes
+# what is left of keys (ROUND, and splits those into its key partitions),
+# and its `fold` launch folds the round's split records into the state, in
+# round order by the merge rule; the last stores the gated output. No scratch
+# or launch of the entry is sized by T. DIRECT is declared for at most 8 kv
+# head groups, which leaves it partitions in launches of up to 512 rows (a
+# class whose rows do not hold a tile fails to evaluate), and a call that
+# lists no tiles (L = 0) takes the staged form alone. The kernels place the
+# window by the same terms (`prefill_window` in the source).
 native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal":
-    static (KV, G, P, S, I, U, F, N, NV)
+    static (KV, G, P, S, I, U, F, N, NV, L)
     params (arithmetic QT in [16, 8, 32], arithmetic HEADS in [16, 8, 4, 2, 1], arithmetic SPLIT_GROUPS in [256, 128, 512, 1],
         arithmetic form DIRECT in [0, 1])
-    where (DIRECT == 0 or QT >= 16) and (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
+    let SPLIT = max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS)))
+    let CHARGED = ceil_div(512, ceil_div(M, 32) * KV * ceil_div(G, 16))
+    let TAKEN = min(SPLIT, max(1, CHARGED / 2) + (1 - DIRECT) * 512)
+    let SPARE = max((CHARGED - DIRECT * TAKEN) * M * G, 33 * (1 - DIRECT)) - 33
+    let STATE = DIRECT * (M * G + ceil_div(M * G * 4, 2 * P + S))
+    let WINDOW = SPARE / 256 * 256
+    let ROUND = max((SPARE - STATE) / 256 * 256, 256 * (1 - DIRECT))
+    let ROUNDS = max(1, DIRECT * min(1, HT * 256 / (WINDOW + 1)) * ceil_div(HT * 256, ROUND))
+    where L <= 1 and (DIRECT == 0 or (L == 1 and KV * ceil_div(G, 16) <= 8)) and (DIRECT == 0 or QT >= 16) and (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
     scratch keys bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
     scratch values bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
-    scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) * M * KV * G * (2 * P + S) * 4)
-    scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) * M * KV * G * 8)
+    scratch partials bytes (((1 - L) * SPLIT + L * CHARGED) * M * KV * G * (2 * P + S) * 4)
+    scratch statistics bytes (SPLIT * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, QT) * 4)
-    scratch spans bytes (max(R, 1) * 8) when DIRECT == 1
-    scratch history_keys bytes ((T + 32) * KV * (2 * P + S) * 2) when DIRECT == 1
-    scratch history_values bytes ((T + 32) * KV * (2 * P + S) * 2) when DIRECT == 1
     launch attention_prefill_k8v4_prepare:
         threadgroups (ceil_div((ceil_div(M, QT) * QT + 32 * DIRECT) * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_prefill_k8v4_bounds when DIRECT == 1:
-        threadgroups (max(R, 1), 1, 1)
-        threads_per_threadgroup (32, 1, 1)
-    launch attention_prefill_k8v4_decode when DIRECT == 1:
-        threadgroups (ceil_div(T + 32, 32), 1, 1)
-        threads_per_threadgroup (1024, 1, 1)
-    launch attention_prefill_k8v4_attend:
-        threadgroups (ceil_div(M, QT), KV * ceil_div(G, HEADS), max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))))
-        threads_per_threadgroup (QT * min(HEADS, G) * (4 - 2 * DIRECT), 1, 1)
-        shared_bytes ((32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + (R + 1) * 16 + DIRECT * ((R + 1) * 48 + 16))
-    launch attention_prefill_k8v4_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS)) > 1:
+    repeat (ROUNDS):
+        launch attention_prefill_k8v4_decode when DIRECT == 1:
+            threadgroups (ceil_div(min(HT * 256, WINDOW) + 32, 32), 1, 1)
+            threads_per_threadgroup (1024, 1, 1)
+        launch attention_prefill_k8v4_attend:
+            threadgroups (ceil_div(M, QT), KV * ceil_div(G, HEADS), TAKEN)
+            threads_per_threadgroup (QT * min(HEADS, G) * (4 - 2 * DIRECT), 1, 1)
+            shared_bytes ((32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + (R + 1) * 16 + DIRECT * ((R + 1) * 48 + 16))
+        launch attention_prefill_k8v4_fold when DIRECT == 1 and HT * 256 > WINDOW:
+            threadgroups (ceil_div(M, QT), KV * G, 1)
+            threads_per_threadgroup (2 * P + S, 1, 1)
+    launch attention_prefill_k8v4_merge when SPLIT > 1:
         threadgroups (ceil_div(M, QT), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 

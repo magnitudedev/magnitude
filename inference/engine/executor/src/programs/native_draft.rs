@@ -484,8 +484,8 @@ impl CheckedDraftEntries {
                 .iter()
                 .map(|block| {
                     (
-                        CheckedAttentionEntries::new(block.attention),
-                        CheckedAttentionEntries::new(block.injection),
+                        CheckedAttentionEntries::new(block.attention, false),
+                        CheckedAttentionEntries::new(block.injection, false),
                         CheckedDenseEntries::new(block.feed_forward),
                     )
                 })
@@ -732,6 +732,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             segments,
             history_rows,
             slab_rows,
+            // The draft's classes list no history row tiles.
+            history_tiles: 0,
             shape,
             operator,
             epsilon,
@@ -1464,6 +1466,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
             segments: layer.segments,
             history_rows: layer.history.0,
             slab_rows: layer.history.1,
+            history_tiles: 0,
             shape,
             operator: layer.operator,
             epsilon,
