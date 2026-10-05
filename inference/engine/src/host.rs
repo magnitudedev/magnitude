@@ -110,10 +110,13 @@ pub fn bind_draft(
 impl HostArtifacts {
     /// Interpret an opened package: family recognition, definition,
     /// tokenizer, templates, media processor and input adapter.
-    /// `served_context` bounds the served definition within the declared one.
+    /// `served_context` bounds the served definition within the declared one;
+    /// `vision_rows` bounds each image to the merged rows a load's vision
+    /// graphs encode, so the media processor never admits a larger image.
     pub(crate) fn interpret(
         package: Package,
         served_context: Option<usize>,
+        vision_rows: Option<u64>,
     ) -> Result<Self, ResolveError> {
         let (family, declared) = package_definition(&package)?;
         let mut definition = declared.clone();
@@ -122,6 +125,11 @@ impl HostArtifacts {
         let unsupported = |reason: String| {
             ResolveError::Unsupported(UnsupportedModel::Representation { reason })
         };
+        if let (Some(rows), Some(vision)) = (vision_rows, definition.vision.as_mut()) {
+            vision
+                .bound_to_merged_rows(rows)
+                .map_err(|error| unsupported(error.to_string()))?;
+        }
         let tokenizer = Arc::new(
             gguf_byte_bpe(
                 package.tokenizer(),
@@ -169,7 +177,7 @@ impl HostArtifacts {
         let opened = package
             .open()
             .map_err(|error| ResolveError::Artifact(ArtifactError::from_artifacts(error, &package.target)))?;
-        Self::interpret(opened, None)
+        Self::interpret(opened, None, None)
     }
 
     pub fn package(&self) -> &Package {

@@ -110,6 +110,15 @@ fn planner_inputs(
     Ok((selection, method, limits))
 }
 
+/// The most merged vision rows one image may encode under these service
+/// limits: the largest launch row class, which bounds the vision patch classes
+/// a load prepares. `None` when the limits admit no row class.
+pub(crate) fn vision_merged_rows(service: &ServiceLimits) -> Option<u64> {
+    magnitude_batching::row_classes(service.prefill_tokens.max(service.decode_tokens))
+        .last()
+        .map(|rows| *rows as u64)
+}
+
 /// The resource limits a load of this manifest plans for.
 fn resource_limits(
     service: &ServiceLimits,
@@ -171,6 +180,20 @@ mod tests {
             decode_tokens,
             decode_share: 0.5,
             locality_seconds: 1.0,
+        }
+    }
+
+    #[test]
+    fn vision_rows_are_the_largest_launch_row_class() {
+        for (prefill, decode) in [(512, 64), (64, 512), (500, 16), (16, 16)] {
+            let service = service(prefill, decode);
+            let limits = resource_limits(&service, &model(0), seismic::BackendName::Metal).unwrap();
+            let prepared = magnitude_batching::row_classes(limits.max_launch_rows);
+            assert_eq!(
+                vision_merged_rows(&service),
+                prepared.last().map(|rows| *rows as u64),
+                "{prefill}/{decode}"
+            );
         }
     }
 

@@ -846,3 +846,46 @@ fn qwen_adapter_rejects_media_with_wrong_processor_identity() {
     let altered = PreparedMedia::new("b".repeat(64), original.tensors().to_vec()).unwrap();
     assert!(adapter.prepare(&model, plan, &[altered]).is_err());
 }
+
+#[test]
+fn bounding_merged_rows_keeps_every_image_inside_the_prepared_vision_classes() {
+    // The fixture: patch 2, merge 2, and Qwen3-VL's default maximum of
+    // 16,777,216 pixels, far above what a 512-row vision launch encodes.
+    let merged_cells = |processor: &ImageProcessor, height, width| {
+        let (h, w) = processor.resized_size(height, width).unwrap();
+        (h / 4) * (w / 4)
+    };
+    let declared = describe_projector(&projector()).unwrap();
+    let unbounded = ImageProcessor::new(declared.image_processor_config().unwrap()).unwrap();
+    assert!(merged_cells(&unbounded, 700, 760) > 512);
+
+    let mut bounded = declared.clone();
+    bounded.bound_to_merged_rows(512).unwrap();
+    assert_eq!(
+        bounded.preprocessing.resize,
+        VisionResize::PixelBounds {
+            min_pixels: match declared.preprocessing.resize {
+                VisionResize::PixelBounds { min_pixels, .. } => min_pixels.min(8_192),
+                _ => unreachable!(),
+            },
+            max_pixels: 512 * 4 * 4,
+        }
+    );
+    let processor = ImageProcessor::new(bounded.image_processor_config().unwrap()).unwrap();
+    for (height, width) in [
+        (640, 760),
+        (700, 760),
+        (390, 1520),
+        (1200, 760),
+        (4000, 3000),
+    ] {
+        assert!(
+            merged_cells(&processor, height, width) <= 512,
+            "{height}x{width}"
+        );
+    }
+    // A bound at or above the declared maximum changes nothing.
+    let mut loose = declared.clone();
+    loose.bound_to_merged_rows(1 << 30).unwrap();
+    assert_eq!(loose.preprocessing.resize, declared.preprocessing.resize);
+}

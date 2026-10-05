@@ -44,6 +44,37 @@ pub enum VisionResize {
     CellBudget { max_cells: u64 },
 }
 
+impl VisionResize {
+    /// This resize bounded so one image encodes into at most `merged_rows`
+    /// merged cells of `merge × merge` patches of `patch` pixels.
+    pub fn bounded_to_merged_rows(
+        self,
+        merged_rows: u64,
+        patch: u64,
+        merge: u64,
+    ) -> Result<Self, DefinitionError> {
+        let patches = checked_product(&[merged_rows, merge, merge])?;
+        Ok(match self {
+            Self::PixelBounds {
+                min_pixels,
+                max_pixels,
+            } => {
+                let max_pixels = max_pixels.min(checked_product(&[patches, patch, patch])?);
+                Self::PixelBounds {
+                    min_pixels: min_pixels.min(max_pixels),
+                    max_pixels,
+                }
+            }
+            Self::PatchBudget { max_patches } => Self::PatchBudget {
+                max_patches: max_patches.min(patches),
+            },
+            Self::CellBudget { max_cells } => Self::CellBudget {
+                max_cells: max_cells.min(merged_rows),
+            },
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VisionResampling {
@@ -502,6 +533,17 @@ impl VisionDescription {
         self.preprocessing.merge * self.preprocessing.merge
     }
 
+    /// Bound the image resize to `merged_rows` merged cells per image: the
+    /// largest vision patch class a load prepares. A declared bound above it
+    /// (Qwen3-VL's `max_pixels`) admits images no prepared graph encodes.
+    pub fn bound_to_merged_rows(&mut self, merged_rows: u64) -> Result<(), DefinitionError> {
+        let p = &mut self.preprocessing;
+        p.resize = p
+            .resize
+            .bounded_to_merged_rows(merged_rows, p.patch, p.merge)?;
+        self.validate()
+    }
+
     pub fn image_processor_config(&self) -> Result<ImageProcessorConfig, DefinitionError> {
         self.validate()?;
         let p = &self.preprocessing;
@@ -822,5 +864,51 @@ impl VisionDescription {
             norm.weights(vision, VisionNormSite::Output, &mut out);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VisionResize;
+
+    #[test]
+    fn every_resize_rule_is_bounded_to_the_merged_rows() {
+        let rows = 512;
+        assert_eq!(
+            VisionResize::PixelBounds {
+                min_pixels: 1_024,
+                max_pixels: 16_777_216
+            }
+            .bounded_to_merged_rows(rows, 16, 2)
+            .unwrap(),
+            VisionResize::PixelBounds {
+                min_pixels: 1_024,
+                max_pixels: 524_288
+            }
+        );
+        assert_eq!(
+            VisionResize::PixelBounds {
+                min_pixels: 1 << 20,
+                max_pixels: 1 << 24
+            }
+            .bounded_to_merged_rows(rows, 16, 2)
+            .unwrap(),
+            VisionResize::PixelBounds {
+                min_pixels: 524_288,
+                max_pixels: 524_288
+            }
+        );
+        assert_eq!(
+            VisionResize::PatchBudget { max_patches: 9_000 }
+                .bounded_to_merged_rows(rows, 16, 3)
+                .unwrap(),
+            VisionResize::PatchBudget { max_patches: 4_608 }
+        );
+        assert_eq!(
+            VisionResize::CellBudget { max_cells: 1_024 }
+                .bounded_to_merged_rows(rows, 14, 2)
+                .unwrap(),
+            VisionResize::CellBudget { max_cells: 512 }
+        );
     }
 }
