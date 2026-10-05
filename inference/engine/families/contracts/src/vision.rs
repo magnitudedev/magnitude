@@ -44,6 +44,52 @@ pub enum VisionResize {
     CellBudget { max_cells: u64 },
 }
 
+impl VisionResize {
+    /// The most merged cells of `merge × merge` patches of `patch` pixels a
+    /// resized image holds.
+    pub fn max_cells(self, patch: u64, merge: u64) -> Result<u64, DefinitionError> {
+        let cell = checked_product(&[patch, merge])?;
+        let cell_pixels = checked_product(&[cell, cell])?;
+        let cell_rows = checked_product(&[merge, merge])?;
+        if cell_pixels == 0 {
+            return Err(DefinitionError::new("a vision cell holds no pixels"));
+        }
+        Ok(match self {
+            Self::PixelBounds { max_pixels, .. } => max_pixels / cell_pixels,
+            Self::PatchBudget { max_patches } => max_patches / cell_rows,
+            Self::CellBudget { max_cells } => max_cells,
+        })
+    }
+
+    /// This resize admitting at most `cells` merged cells per image.
+    pub fn bounded_to_cells(
+        self,
+        cells: u64,
+        patch: u64,
+        merge: u64,
+    ) -> Result<Self, DefinitionError> {
+        let patches = checked_product(&[cells, merge, merge])?;
+        Ok(match self {
+            Self::PixelBounds {
+                min_pixels,
+                max_pixels,
+            } => {
+                let max_pixels = max_pixels.min(checked_product(&[patches, patch, patch])?);
+                Self::PixelBounds {
+                    min_pixels: min_pixels.min(max_pixels),
+                    max_pixels,
+                }
+            }
+            Self::PatchBudget { max_patches } => Self::PatchBudget {
+                max_patches: max_patches.min(patches),
+            },
+            Self::CellBudget { max_cells } => Self::CellBudget {
+                max_cells: max_cells.min(cells),
+            },
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VisionResampling {
@@ -502,6 +548,20 @@ impl VisionDescription {
         self.preprocessing.merge * self.preprocessing.merge
     }
 
+    /// The most merged cells, one feature row each, the declared resize
+    /// admits for one image.
+    pub fn max_cells(&self) -> Result<u64, DefinitionError> {
+        let p = &self.preprocessing;
+        p.resize.max_cells(p.patch, p.merge)
+    }
+
+    /// Bound the resize to at most `cells` merged cells per image.
+    pub fn bound_cells(&mut self, cells: u64) -> Result<(), DefinitionError> {
+        let p = &mut self.preprocessing;
+        p.resize = p.resize.bounded_to_cells(cells, p.patch, p.merge)?;
+        self.validate()
+    }
+
     pub fn image_processor_config(&self) -> Result<ImageProcessorConfig, DefinitionError> {
         self.validate()?;
         let p = &self.preprocessing;
@@ -822,5 +882,48 @@ impl VisionDescription {
             norm.weights(vision, VisionNormSite::Output, &mut out);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VisionResize;
+
+    #[test]
+    fn a_resize_admits_its_declared_cells_and_bounds_to_fewer() {
+        let qwen = VisionResize::PixelBounds {
+            min_pixels: 65_536,
+            max_pixels: 16_777_216,
+        };
+        assert_eq!(qwen.max_cells(16, 2).unwrap(), 16_384);
+        assert_eq!(
+            qwen.bounded_to_cells(4096, 16, 2).unwrap(),
+            VisionResize::PixelBounds {
+                min_pixels: 65_536,
+                max_pixels: 4_194_304,
+            }
+        );
+        assert_eq!(
+            qwen.bounded_to_cells(32, 16, 2).unwrap(),
+            VisionResize::PixelBounds {
+                min_pixels: 32_768,
+                max_pixels: 32_768,
+            }
+        );
+        assert_eq!(qwen.bounded_to_cells(1 << 20, 16, 2).unwrap(), qwen);
+
+        let gemma = VisionResize::PatchBudget { max_patches: 2_520 };
+        assert_eq!(gemma.max_cells(16, 3).unwrap(), 280);
+        assert_eq!(
+            gemma.bounded_to_cells(100, 16, 3).unwrap(),
+            VisionResize::PatchBudget { max_patches: 900 }
+        );
+
+        let glimmer = VisionResize::CellBudget { max_cells: 4_096 };
+        assert_eq!(glimmer.max_cells(14, 2).unwrap(), 4_096);
+        assert_eq!(
+            glimmer.bounded_to_cells(512, 14, 2).unwrap(),
+            VisionResize::CellBudget { max_cells: 512 }
+        );
     }
 }

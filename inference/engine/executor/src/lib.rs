@@ -82,7 +82,8 @@ pub use operators::short_conv::{ShortConvBinding, ShortConvShape};
 pub use operators::state_space::{StateSpaceBinding, StateSpaceShape};
 pub use operators::vision::{VisionEntry, VisionKernel};
 pub use planning::{
-    resident_element, resident_layout, source_element, ArtifactComponent, ArtifactComponentKind,
+    image_cell_limit, resident_element, resident_layout, source_element, ArtifactComponent,
+    ArtifactComponentKind,
     AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding,
     AttentionShape, BackendPlan, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
@@ -97,6 +98,7 @@ pub use planning::{
     TensorOperations,
     SublayerTail, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan,
     VisionProgramPlan, WeightPlan, WeightScalePlan, WeightStorageIdentity, MAX_DRAFT_PROPOSALS,
+    MAX_IMAGE_CELLS,
 };
 
 /// Whether this executor runs `definition` with its draft head selected.
@@ -115,4 +117,5 @@ pub use resources::{
     AllocatedResources, AllocationError, GraphOutputOwner, GraphOutputTensor, ImportWorkspaceLease,
     NativeGraphOutputLease, NativeGraphPool, NativeGraphWorkspaceLease, PoolClass,
     ResourceAllocator, TargetGraphOutputLease, TargetGraphPool, TargetGraphWorkspaceLease,
+    VisionGraphPool,
 };

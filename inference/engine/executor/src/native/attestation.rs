@@ -321,12 +321,12 @@ impl AttestedPrograms {
             .into_iter()
             .map(|rows| rows as u64)
             .collect::<Vec<_>>();
-        let max_rows = *row_classes.last().ok_or_else(|| {
-            format!(
+        if row_classes.is_empty() {
+            return Err(format!(
                 "launch row bound {} has no row class",
                 limits.max_launch_rows
-            )
-        })?;
+            ));
+        }
         if self.vision.is_some() != vision_plan.is_some()
             || self.vision.is_some() != definition.vision.is_some()
         {
@@ -384,17 +384,13 @@ impl AttestedPrograms {
         if let (Some(handles), Some(vision), Some(_)) =
             (&self.vision, definition.vision.as_ref(), vision_plan)
         {
-            let cell = vision.cell_rows();
-            max_rows
-                .checked_mul(cell)
-                .ok_or("vision patch row bound overflow")?;
+            let patch_rows = crate::programs::native_vision::image_patch_classes(
+                limits.max_image_cells,
+                vision,
+            )?;
             self.vision_graphs = Some(Rc::new(
-                crate::programs::native_vision::PreparedVisionGraphs::prepare_exact_classes(
-                    device,
-                    handles,
-                    load,
-                    vision,
-                    (1..=max_rows).map(|outputs| outputs * cell),
+                crate::programs::native_vision::PreparedVisionGraphs::prepare_classes(
+                    device, handles, load, vision, patch_rows,
                 )
                 .map_err(|error| error.to_string())?,
             ));

@@ -33,10 +33,53 @@ pub struct ResourceLimits {
     /// which prepares no logits class; diagnostics that read logits set it.
     pub exported_logits_rows: usize,
     pub max_images_per_request: usize,
+    pub max_image_cells: usize,
     /// Queue each continuable target step's successor before the step
     /// completes (cross-step pipelining): one more target launch in flight
     /// and one more successor bank per live request.
     pub lookahead: bool,
+}
+
+/// The most merged cells one image encodes, whatever its model declares:
+/// about 4.2 MP at Qwen3-VL's 32-pixel cells. A larger image is resized
+/// down to it.
+pub const MAX_IMAGE_CELLS: usize = 4096;
+
+/// The most merged cells one image of `definition` encodes in a load whose
+/// launches carry `launch_rows` rows: the declared resize's bound within
+/// [`MAX_IMAGE_CELLS`]. Prefill places an image's features across launches,
+/// unless its rows attend each other in the decoder: such an image is one
+/// launch. Zero without vision.
+pub fn image_cell_limit(
+    definition: &ModelDefinition,
+    launch_rows: usize,
+) -> Result<usize, crate::PlanError> {
+    let Some(vision) = &definition.vision else {
+        return Ok(0);
+    };
+    let declared = vision
+        .max_cells()
+        .map_err(|error| crate::PlanError::InvalidDefinition(error.to_string()))?;
+    let declared = usize::try_from(declared).unwrap_or(usize::MAX);
+    let bidirectional = definition.decoder.sublayers().any(|(_, sublayer)| {
+        matches!(
+            &sublayer.op,
+            magnitude_family_contracts::Operator::Attention(attention)
+                if attention.media_rows == magnitude_family_contracts::MediaRowAttention::Bidirectional
+        )
+    });
+    let limit = declared.min(MAX_IMAGE_CELLS);
+    let limit = if bidirectional {
+        limit.min(launch_rows)
+    } else {
+        limit
+    };
+    if limit == 0 {
+        return Err(crate::PlanError::InvalidDefinition(
+            "the model's images encode no cells".into(),
+        ));
+    }
+    Ok(limit)
 }
 
 impl ResourceLimits {
@@ -73,7 +116,8 @@ impl ResourceLimits {
                 output: 1 + launches,
             },
             // Vision holds nothing until an image arrives: a text-only
-            // session never uses it. Its workspace is the shared arena.
+            // session never uses it. An encode claims storage of its image's
+            // class (`VisionGraphPool`), outside the shared arena.
             vision: GraphSlots {
                 activations: 0,
                 output: 0,
@@ -256,10 +300,14 @@ impl NativeGraphCharge {
     }
 }
 
-/// The device's one workspace arena: the largest workspace of `charges`.
+/// The device's one workspace arena: the largest workspace of the `charges`
+/// that hold activations from startup. A family that holds none (vision)
+/// claims its own workspace with its first activation, so an image's
+/// workspace never enlarges what every load holds.
 pub(crate) fn arena_bytes(charges: &[&NativeGraphCharge]) -> u64 {
     charges
         .iter()
+        .filter(|charge| charge.activations != 0)
         .map(|charge| charge.workspace_bytes)
         .max()
         .unwrap_or(0)

@@ -405,11 +405,16 @@ the fact is the device's own probe (`DeviceInfo::forms_tensor_operations` before
 planning and assessment read; graph preparation fails if the opened device disagrees).
 The draft head's and the separate draft's graphs list none.
 
-Vision patch capacity is the admitted merged output row limit times the merge area; input validation
-rejects a larger aggregate before reserving a vision slot. Vision attention sees every physical
-patch row of its image (or of its row's window, a contiguous tower-row range the family supplies),
-so its prepared workflow uses the exact admitted patch-row count; padding with additional patches
-would alter real outputs. The tower is one program of vision operators the projector description
+An image encodes at most the load's image cell limit: the cells its declared resize admits, within
+4096 (`MAX_IMAGE_CELLS`), and within the launch row bound only when the decoder's media rows attend
+each other, since such an image is one launch. Otherwise prefill places an image's features across
+launches, so the vision limit is independent of the launch row bound. The host bounds image resize to
+the limit, and input installation refuses a larger image as a request error before reserving a vision
+slot. The load prepares one vision graph per image cell class (the launch row ladder continued past
+the launch bound); an image runs in the class covering its cells, its patch rows first and the
+class's padding rows after. Every vision attention reads its keys as a span per row, its window's
+rows or its image's, so no image row reads a padding row; padding inputs are zero and the published
+features are the image's leading cell rows. The tower is one program of vision operators the projector description
 composes (patch stem, row norms, projections with their epilogues, rotary attention, cell pooling
 or concatenation); a form a backend's operators do not run is refused when the program is
 prepared, never approximated. Seismic's recurrent workflow derives
@@ -422,9 +427,12 @@ copy state between banks, or bind padded request state. Workflow activations cov
 submitted concurrency, and retained outputs cover submitted and live request owners. The target's
 residual stream between block graphs is one device pair, returned at the end of each submission:
 every reader of it is queued in that submission and the device runs the next launch after it.
-Vision holds no activation or output until a request encodes an image; it then claims them under
-the heap like any growth and releases them when idle. Encoded images belong to their request, so
-the vision output pool holds every live request's images; retained checkpoints share those
+Vision holds no activation or output until a request encodes an image, and it is outside the
+shared workspace arena. Each image cell class has its own layout and storage: an encode claims an
+activation (its own workspace and upload regions) and an output slot of its image's class under the
+heap like any growth, and free ones are released when idle, so vision memory follows the images
+actually encoded, never the largest class. Encoded images belong to their request, so the vision
+output slots hold every live request's images; retained checkpoints share those
 features and do not size the pool: an encode that finds every output pinned by retention releases
 retention through the ordinary capacity release order. Source-weight upload uses the largest admitted encoded tensor as a one-shot startup
 resource. Qualification holds one weight scope's fixtures at a time, at their resident

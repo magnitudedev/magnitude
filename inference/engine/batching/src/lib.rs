@@ -20,4 +20,4 @@ pub use rows::{
 };
 pub use state::{StateBatchError, StateBatchKind, ValidatedStateBatch};
 pub use target::{SlotHistory, TargetBatchSlot, TargetBatchUpload, ValidatedTargetBatch};
-pub use vision::{ValidatedVisionBatch, VisionBatchError};
+pub use vision::{image_cell_class, image_cell_classes, ValidatedVisionBatch, VisionBatchError};

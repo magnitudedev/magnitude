@@ -420,6 +420,7 @@ mod tests {
             max_drafting_slots: 8,
             exported_logits_rows: 0,
             max_images_per_request: 1,
+            max_image_cells: 0,
             lookahead: false,
         };
         for backend in [

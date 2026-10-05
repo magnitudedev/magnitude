@@ -225,15 +225,10 @@ impl AssessmentGraphResourceBounds {
         };
         let (vision, vision_constant_bytes) = match (plan.vision(), definition.vision.as_ref()) {
             (Some(vision_plan), Some(vision_definition)) => {
-                let max_rows = magnitude_batching::row_classes(limits.max_launch_rows)
-                    .last()
-                    .copied()
-                    .ok_or("batch row bound has no class")? as u64;
-                let merge = vision_definition.cell_rows();
-                max_rows
-                    .checked_mul(merge)
-                    .ok_or("vision patch row bound overflow")?;
-                let patch_rows = (1..=max_rows).map(|rows| rows * merge);
+                let patch_rows = crate::programs::native_vision::image_patch_classes(
+                    limits.max_image_cells,
+                    vision_definition,
+                )?;
                 let vision_graph = crate::programs::native_vision::checked_vision_family_resources(
                     backend,
                     load,
@@ -694,6 +689,7 @@ mod tests {
             max_drafting_slots: 2,
             exported_logits_rows: 0,
             max_images_per_request: 1,
+            max_image_cells: 0,
             lookahead: false,
         };
         let state = crate::ResourcePlanner::state_plan(
@@ -845,6 +841,7 @@ mod tests {
             max_drafting_slots: 2,
             exported_logits_rows: 0,
             max_images_per_request: 1,
+            max_image_cells: 0,
             lookahead: false,
         };
         let state = crate::ResourcePlanner::state_plan(
@@ -1257,6 +1254,7 @@ mod tests {
             max_drafting_slots: 2,
             exported_logits_rows: 0,
             max_images_per_request: 0,
+            max_image_cells: 0,
             lookahead: false,
         };
         let family = crate::programs::graph::readout::checked_readout_family_storage(
@@ -1436,6 +1434,7 @@ mod tests {
             max_drafting_slots: 2,
             exported_logits_rows: 0,
             max_images_per_request: 1,
+            max_image_cells: 0,
             lookahead,
         }
     }

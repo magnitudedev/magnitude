@@ -38,8 +38,10 @@ EngineConfiguration -> resolve -> ResolvedEngineConfiguration { host, manifest }
 ```
 
 - **Resolve** is device-free. It opens the package, recognizes its family, interprets the model
-  definition and input adapter, and resolves the model policy and served context. Nothing opens a
-  device or imports a tensor.
+  definition and input adapter, and resolves the model policy and served context. It bounds the
+  served image resize to the cells the service limits' load encodes per image (the image cell limit,
+  [execution plan](engine/execution-plan.md)), so the host's media processor admits no image the
+  worker has no vision graph for. Nothing opens a device or imports a tensor.
 - **Host artifacts** own chat semantics: tokenizer, templates and their inspection, input adapter
   and media placeholder policy. They stay on the host.
 - **The execution manifest** is owned and serializable; it is the only value a worker needs.

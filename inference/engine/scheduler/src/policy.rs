@@ -21,6 +21,11 @@ impl ServiceLimits {
         self.decode_tokens
     }
 
+    /// The most rows one launch carries: the larger step token allowance.
+    pub fn launch_rows(&self) -> usize {
+        self.prefill_tokens.max(self.decode_tokens)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.prefill_tokens == 0
             || self.decode_tokens == 0

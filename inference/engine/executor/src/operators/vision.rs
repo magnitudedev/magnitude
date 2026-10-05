@@ -103,7 +103,7 @@ pub enum VisionOperands {
         query_norm: Option<WeightRole>,
         key_norm: Option<WeightRole>,
         value_norm: bool,
-        windowed: bool,
+        span: VisionAttentionSpan,
         log_base: f32,
         epsilon: f32,
         unit_scale: bool,
@@ -333,14 +333,13 @@ impl Builder<'_> {
         }
         let query_norm = attention.query_norm.as_ref().map(|_| role(scope, VisionWeight::QueryNorm));
         let key_norm = attention.key_norm.as_ref().map(|_| role(scope, VisionWeight::KeyNorm));
-        let windowed = attention.span == VisionAttentionSpan::Window;
         let elements = vec![("A", a)];
         let statics = vec![
             ("H", attention.heads),
             ("P", attention.width / 4),
             ("NQ", u64::from(query_norm.is_some())),
             ("NV", u64::from(attention.value_norm.is_some())),
-            ("WS", u64::from(windowed)),
+            ("WS", 1),
         ];
         let attended = self.push(VisionEntry::Attention, elements, statics, inner,
             VisionOperands::Attention {
@@ -350,7 +349,7 @@ impl Builder<'_> {
                 query_norm,
                 key_norm,
                 value_norm: attention.value_norm.is_some(),
-                windowed,
+                span: attention.span,
                 log_base: attention.rotary_base.ln() as f32,
                 // Unread without head norms.
                 epsilon: epsilon.unwrap_or(0.0) as f32,

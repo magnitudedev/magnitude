@@ -96,6 +96,7 @@ fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) ->
         max_drafting_slots: 2,
         exported_logits_rows: 0,
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+        max_image_cells: 0,
         lookahead,
     };
     let capacity_bytes = ResourceCapacity {
@@ -934,6 +935,33 @@ fn vision_input(placements: &[(usize, &str)], count: usize) -> PreparedModelInpu
             .collect(),
     )
     .unwrap()
+}
+
+/// An image encodes its declared cells within the engine's bound, across
+/// launches; one whose rows attend each other in the decoder fits one launch.
+#[test]
+fn an_image_encodes_its_declared_cells_and_one_launch_when_bidirectional() {
+    use magnitude_family_contracts::{MediaRowAttention, Operator, VisionResize};
+    assert_eq!(crate::image_cell_limit(&tiny_definition(), 2).unwrap(), 0);
+    let mut definition = vision_definition();
+    assert_eq!(crate::image_cell_limit(&definition, 2).unwrap(), 4);
+    let vision = definition.vision.as_mut().unwrap();
+    vision.preprocessing.resize = VisionResize::PixelBounds {
+        min_pixels: 16,
+        max_pixels: 1 << 30,
+    };
+    assert_eq!(
+        crate::image_cell_limit(&definition, 512).unwrap(),
+        crate::MAX_IMAGE_CELLS
+    );
+    for block in &mut definition.decoder.blocks {
+        for sublayer in &mut block.sublayers {
+            if let Operator::Attention(attention) = &mut sublayer.op {
+                attention.media_rows = MediaRowAttention::Bidirectional;
+            }
+        }
+    }
+    assert_eq!(crate::image_cell_limit(&definition, 512).unwrap(), 512);
 }
 
 const TEXT: crate::TokenId = crate::TokenId(5);

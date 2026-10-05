@@ -26,9 +26,9 @@ pub use programs::{
     StateProgramPlan, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    GraphSlots, HistoryStorePlan, LayerHistory, NativeGraphCharge, ResourceBytes,
+    image_cell_limit, GraphSlots, HistoryStorePlan, LayerHistory, NativeGraphCharge, ResourceBytes,
     ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
-    StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations,
+    StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, MAX_IMAGE_CELLS,
 };
 pub use weights::{
     resident_element, resident_layout, source_element, AttentionBinding, AttentionShape,
@@ -295,6 +295,7 @@ pub(crate) mod tests {
             max_drafting_slots: 2,
             exported_logits_rows: 0,
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+            max_image_cells: 0,
             lookahead: false,
         };
         let selection = ComponentSelection {
@@ -379,6 +380,7 @@ pub(crate) mod tests {
             max_drafting_slots: 2,
             exported_logits_rows: 0,
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+            max_image_cells: 0,
             lookahead: false,
         };
         let capacity_bytes = ResourceCapacity {
