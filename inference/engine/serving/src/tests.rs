@@ -636,6 +636,43 @@ fn user(request: &GenerationRequest, index: usize) -> &[UserPart] {
     }
 }
 
+// OpenCode records a step that failed before producing anything as an empty
+// assistant message and replays it on every later turn.
+#[test]
+fn chat_skips_empty_assistant_messages_in_history() {
+    let request = chat_request(json!({
+        "model": "test-model",
+        "messages": [
+            { "role": "user", "content": "read notes.txt" },
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "read the file first",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "read", "arguments": "{\"path\":\"notes.txt\"}" }
+                }]
+            },
+            { "role": "tool", "tool_call_id": "call_1", "content": "secret PERIWINKLE" },
+            { "role": "assistant", "content": "" },
+            { "role": "assistant", "content": null },
+            { "role": "assistant", "content": "The secret word is PERIWINKLE." },
+            { "role": "user", "content": "and again?" }
+        ]
+    }))
+    .unwrap();
+    let entries = request.input.conversation.entries();
+    assert!(entries.iter().all(|entry| match entry {
+        Entry::Assistant(turn) => turn.text.is_some() || turn.reasoning.is_some() || !turn.tool_calls.is_empty(),
+        Entry::User(_) => true,
+    }));
+    assert_eq!(
+        assistant(&request, 1).tool_calls[0].result,
+        vec![magnitude_chat::request::ToolResultPart::Text("secret PERIWINKLE".into())]
+    );
+}
+
 #[test]
 fn chat_accepts_empty_assistant_content_when_tool_calls_are_present() {
     let request = chat_request(json!({
@@ -1119,27 +1156,43 @@ fn anthropic_attribution_recognition_is_strictly_positional() {
     assert_eq!(anthropic_system(json!(malformed)).as_deref(), Some(malformed));
 }
 
+// Replay closure: an empty generation is emitted as an empty assistant turn in
+// each protocol's native shape, so that shape must replay, as nothing.
 #[test]
-fn protocol_forbidden_empty_assistant_forms_remain_invalid() {
+fn empty_assistant_turns_replay_as_nothing() {
     for content in [Value::Null, json!("")] {
-        assert!(chat_request(json!({
+        let request = chat_request(json!({
             "model": "test-model",
             "messages": [
                 { "role": "user", "content": "hi" },
-                { "role": "assistant", "content": content }
+                { "role": "assistant", "content": content },
+                { "role": "user", "content": "again" }
             ]
         }))
-        .is_err());
+        .unwrap();
+        assert!(request
+            .input
+            .conversation
+            .entries()
+            .iter()
+            .all(|entry| matches!(entry, Entry::User(_))));
     }
-    assert!(anthropic_request(json!({
+    let request = anthropic_request(json!({
         "model": "test-model",
         "max_tokens": 16,
         "messages": [
             { "role": "user", "content": "hi" },
-            { "role": "assistant", "content": [] }
+            { "role": "assistant", "content": [] },
+            { "role": "user", "content": "again" }
         ]
     }))
-    .is_err());
+    .unwrap();
+    assert!(request
+        .input
+        .conversation
+        .entries()
+        .iter()
+        .all(|entry| matches!(entry, Entry::User(_))));
 }
 
 #[test]

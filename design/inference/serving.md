@@ -81,7 +81,10 @@ Prompt caching allowed retains exact prompt prefixes; disallowed requests are
 transient.
 
 Stream parsing emits semantic text, reasoning and complete validated tool calls
-in one ordered stream that non-streaming responses also assemble from. Each
+in one ordered stream that non-streaming responses also assemble from. An empty
+generation is an empty assistant turn in each protocol's native shape, and an
+empty assistant turn in history (that output replayed, or a client's record of
+a step that failed before any output) contributes nothing to the prompt. Each
 tool call's ID is unique across responses, since clients key calls and results
 by ID over a whole conversation: the ID the model wrote when its format carries
 one (templates render it back), otherwise a fresh random one. A

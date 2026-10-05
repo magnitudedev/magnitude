@@ -1148,10 +1148,10 @@ fn chat_context(messages: Vec<ChatMessageRequest>) -> Result<Conversation, ApiEr
             } => {
                 let reasoning = reasoning_content.filter(|value| !value.is_empty());
                 let text = content.filter(|value| !value.is_empty());
+                // An assistant turn with nothing in it (a client's record of a
+                // step that failed before any output) contributes nothing.
                 if text.is_none() && reasoning.is_none() && tool_calls.is_empty() {
-                    return Err(ApiError::invalid(
-                        "assistant content is required unless tool_calls are present",
-                    ));
+                    continue;
                 }
                 let exchanges = if tool_calls.is_empty() {
                     Vec::new()
