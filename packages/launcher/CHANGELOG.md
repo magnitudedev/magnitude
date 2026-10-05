@@ -1,5 +1,29 @@
 # @magnitudedev/cli
 
+## 0.2.6
+
+### Patch Changes
+
+- [`02568d6`](https://github.com/magnitudedev/magnitude/commit/02568d6dd2ec52edd8b521e49d8571301f87a5ab) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix Codex failing to send tool results back to a local model. Reasoning items that a client replays with `content` or `summary` set to null are now accepted as empty.
+
+- [`835a476`](https://github.com/magnitudedev/magnitude/commit/835a4761bca9b2bbc619e11c14586c49d3e1bbdc) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix an OpenCode session being rejected with "assistant content is required unless tool_calls are present" after a step that failed before producing any output. An empty assistant turn in the history is now skipped, in both the Chat Completions and Anthropic APIs.
+
+- [`2a481f7`](https://github.com/magnitudedev/magnitude/commit/2a481f7c5d3c78e8e16ddf4f551ba0c13ba9c16f) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix a headless `magnitude serve` that failed to start crashing with EBADF instead of reporting the error that stopped it.
+
+- [`76d35d7`](https://github.com/magnitudedev/magnitude/commit/76d35d737355f0f5dc3aad3c36ec7ecf5611cfa2) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix long requests to a local model failing with a 502 after about five minutes. A non-streaming generation or a long prompt sends nothing until it finishes, and the connection to the engine no longer times out while it waits.
+
+- [`d5bf92d`](https://github.com/magnitudedev/magnitude/commit/d5bf92d087805b6d78cebe8a918fcece824fd20d) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix models failing on M1 and M2 Macs during long prompts with "device lost: … Impacting Interactivity", after which the model stayed unloaded. The engine now relaxes the macOS GPU watchdog at start (as llama.cpp does), so prompts of 35k and 69k tokens on Gemma 4 26B complete instead of failing at about 20k.
+
+- [`01a1728`](https://github.com/magnitudedev/magnitude/commit/01a17287bd4dfb15b61e0861a8f17a6db12eadcf) Thanks [@anerli](https://github.com/anerli)! - - Speed up prompt processing on M5 and later Macs by about 50%: Qwen3.5-4B at a 64K context now processes prompts at about 970 tok/s (previously 652). Attention over the prompt reads keys and values directly through the GPU's tensor operations instead of staging them, and kernel tuning no longer keeps a slower default whose own timing was unstable.
+
+  - Speed up prompt processing on every Mac by decoding each block of weights once for up to 512 rows instead of once per 64: matrix multiplies run 7–11% faster on an M4 Pro and 17–25% faster on an M1, with identical output. Qwen3.5-4B at a 64K context processes prompts at 534 tok/s on an M4 Pro (previously 513).
+
+- [#166](https://github.com/magnitudedev/magnitude/pull/166) [`c738ead`](https://github.com/magnitudedev/magnitude/commit/c738ead74d6176861311ac43567eb36d8023d8c7) Thanks [@aaronjensen](https://github.com/aaronjensen)! - - Fix models failing to load on some Macs (for example Qwen 3.6 on an M5 Max) with a Metal shader compilation error such as "no template named 'extents' in namespace 'metal'". Metal kernels are now compiled with the same language version the device was probed with, so kernels that use tensor operations build wherever the probe found them available.
+
+- [`44af293`](https://github.com/magnitudedev/magnitude/commit/44af293bd9968ba0e428437bd5bdc6f5274218a4) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix Oh My Pi and OpenClaw failing on Qwen models when their tools take free-form JSON among optional properties. Where a model's grammar for parallel tool calls cannot be compiled efficiently but its grammar for a single call can, the request now allows one tool call per turn.
+
+- [`048a92d`](https://github.com/magnitudedev/magnitude/commit/048a92de8c5fc971250207cb5dea7890a8b39ccf) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix the Windows engine aborting when a chat template or tool call produced invalid JSON. The template library is now built with C++ exception handling on MSVC, so JSON errors are reported instead of crashing the engine.
+
 ## 0.2.5
 
 ### Patch Changes
