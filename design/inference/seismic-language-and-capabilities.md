@@ -390,9 +390,12 @@ Metal compilation or execution errors are reported directly.
   backend's pinned toolchain, as preparation forms it, under configurations (element bindings,
   specializations, device facts) that together compile every preprocessor group of its authored
   sources; a group no admitted configuration reaches is rejected with `#error` or removed. Every
-  kernel request of every supported catalog model on every GPU backend its assessment accepts is
-  admissible, implemented and forms at its default specialization. For a backend whose toolchain
-  the operating system supplies, this holds for the verifying host's toolchain.
+  value of every `form` tuning parameter also forms, under each device configuration the host's
+  toolchain forms, at statics searched for it where only some admit it (a form may be a template a
+  constant selects, with no group of its own); a form value no configuration forms fails the check.
+  Every kernel request of every supported catalog model on every GPU backend its assessment
+  accepts is admissible, implemented and forms at its default specialization. For a backend whose
+  toolchain the operating system supplies, this holds for the verifying host's toolchain.
 - Ownership and bounded iteration determine legal reads, writes, moves, and parallel effects.
 - Every accepted write to storage shared across parallel participants carries
   an exclusive or atomic capability for those participants. Iteration-local

@@ -1107,6 +1107,35 @@ impl NativeCondition {
         }
     }
 
+    /// The condition's value when `dimension` and `parameter` supply only
+    /// some of the names it reads, or `None` while they do not decide it.
+    /// Unlike [`Self::holds`], an operand that cannot be evaluated does not
+    /// hide one that decides the result: `and` is false with either operand
+    /// false, `or` true with either true.
+    pub fn decided(
+        &self,
+        dimension: &impl Fn(&str) -> Option<u64>,
+        parameter: &impl Fn(&str) -> Option<u64>,
+    ) -> Option<bool> {
+        match self {
+            Self::Compare { .. } => self.holds(dimension, parameter).ok(),
+            Self::And(left, right) => {
+                match (left.decided(dimension, parameter), right.decided(dimension, parameter)) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
+            }
+            Self::Or(left, right) => {
+                match (left.decided(dimension, parameter), right.decided(dimension, parameter)) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
+            }
+        }
+    }
+
     /// Every dimension name the condition reads.
     pub fn dimensions(&self, out: &mut Vec<String>) {
         match self {
@@ -1631,25 +1660,75 @@ impl NativeImplementation {
     /// which every specialization walk succeeds and admits at least one
     /// configuration, with `fixed` holding the statics it names. A
     /// depth-first search over the statics in declaration order: every
-    /// top-level conjunct of `where` that reads only assigned statics prunes
-    /// a partial assignment. `None` when no assignment over the candidates is
-    /// admitted.
+    /// top-level conjunct of `where` that the assigned statics decide as
+    /// false prunes a partial assignment. `None` when no assignment over the
+    /// candidates is admitted.
     pub fn search_statics(&self, fixed: &[(&str, u64)]) -> Option<NativeSpecialization> {
+        self.search(fixed, &|_| None, &|statics| match self.admissible(statics) {
+            Ok(admissible) if !admissible.is_empty() => Some(statics.clone()),
+            Ok(_) | Err(_) => None,
+        })
+    }
+
+    /// The first admissible configuration that holds the tuning parameter
+    /// `name` (of `launch`, or the entry's) at `value`, over the static
+    /// assignments [`Self::search_statics`] walks, in its order: the
+    /// configuration of a form that only some statics admit (a head width,
+    /// say). The value of an entry parameter joins the assigned statics in
+    /// pruning. `None` when no assignment over the candidates admits it.
+    pub fn search_form(
+        &self,
+        launch: Option<usize>,
+        name: &str,
+        value: u64,
+    ) -> Option<NativeSpecialization> {
+        let held = |configuration: &NativeSpecialization| match launch {
+            None => configuration.param(name),
+            Some(launch) => configuration.launch_param(launch, name),
+        };
+        let parameter =
+            |parameter: &str| (launch.is_none() && parameter == name).then_some(value);
+        self.search(&[], &parameter, &|statics| {
+            let mut found = None;
+            self.walk_admissible(statics, |configuration| {
+                if held(configuration) == Some(value) {
+                    found = Some(configuration.clone());
+                }
+                found.is_none()
+            })
+            .ok()?;
+            found
+        })
+    }
+
+    /// The first complete static assignment, in candidate order, at which
+    /// `found` yields: statics in declaration order, `fixed` holding the
+    /// ones it names, a partial assignment pruned when it and `parameter`
+    /// decide a top-level conjunct of `where` as false.
+    fn search(
+        &self,
+        fixed: &[(&str, u64)],
+        parameter: &dyn Fn(&str) -> Option<u64>,
+        found: &dyn Fn(&NativeSpecialization) -> Option<NativeSpecialization>,
+    ) -> Option<NativeSpecialization> {
         let mut conjuncts = Vec::new();
         if let Some(constraint) = &self.constraint {
             constraint.conjuncts(&mut conjuncts);
         }
         let candidates = self.static_candidates();
         let mut assigned = std::collections::BTreeMap::new();
-        self.search_from(0, fixed, &conjuncts, &candidates, &mut assigned)
+        self.search_from(0, fixed, &conjuncts, &candidates, parameter, found, &mut assigned)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_from(
         &self,
         depth: usize,
         fixed: &[(&str, u64)],
         conjuncts: &[&NativeCondition],
         candidates: &[u64],
+        parameter: &dyn Fn(&str) -> Option<u64>,
+        found: &dyn Fn(&NativeSpecialization) -> Option<NativeSpecialization>,
         assigned: &mut std::collections::BTreeMap<String, u64>,
     ) -> Option<NativeSpecialization> {
         let Some(name) = self.statics.get(depth) else {
@@ -1658,10 +1737,7 @@ impl NativeImplementation {
                 .fold(NativeSpecialization::new(), |statics, (name, value)| {
                     statics.with_static(name.clone(), *value)
                 });
-            return match self.admissible(&statics) {
-                Ok(admissible) if !admissible.is_empty() => Some(statics),
-                Ok(_) | Err(_) => None,
-            };
+            return found(&statics);
         };
         let values = match fixed.iter().find(|(candidate, _)| *candidate == name) {
             Some((_, value)) => vec![*value],
@@ -1670,11 +1746,20 @@ impl NativeImplementation {
         for value in values {
             assigned.insert(name.clone(), value);
             let dimension = |dimension: &str| assigned.get(dimension).copied();
+            let supplied = |name: &str| parameter(name);
             let refuted = conjuncts
                 .iter()
-                .any(|conjunct| matches!(conjunct.holds(&dimension, &|_| None), Ok(false)));
+                .any(|conjunct| conjunct.decided(&dimension, &supplied) == Some(false));
             if !refuted {
-                if let Some(found) = self.search_from(depth + 1, fixed, conjuncts, candidates, assigned) {
+                if let Some(found) = self.search_from(
+                    depth + 1,
+                    fixed,
+                    conjuncts,
+                    candidates,
+                    parameter,
+                    found,
+                    assigned,
+                ) {
                     return Some(found);
                 }
             }
@@ -2231,6 +2316,62 @@ mod native_tests {
         let error =
             check_source(source(&source_text("ROWS < TILE"))).expect_err("cross-launch conjunct");
         assert!(error.to_string().contains("only one launch"), "{error}");
+    }
+
+    /// A form only some statics admit is found by the search that takes its
+    /// value: the first statics, in candidate order, at which a configuration
+    /// holds it, where the plain search stops at the first admitted statics.
+    #[test]
+    fn a_form_is_searched_at_the_statics_that_admit_it() {
+        let declaration = |condition: &str| {
+            format!(
+                "native scale for metal from \"scale.metal\":\n    static (N)\n    params (form WIDE in [0, 1], ROWS in [8, 4])\n    where N >= 2 and {condition}\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            )
+        };
+        let module =
+            check_source(source(&declaration("(WIDE == 0 or (N == 96 and ROWS == 4))"))).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let first = native.search_statics(&[]).unwrap();
+        assert_eq!(first.static_value("N"), Some(2));
+        let narrow = native.search_form(None, "WIDE", 0).unwrap();
+        assert_eq!((narrow.static_value("N"), narrow.param("ROWS")), (Some(2), Some(8)));
+        let wide = native.search_form(None, "WIDE", 1).unwrap();
+        assert_eq!(wide.static_value("N"), Some(96));
+        assert_eq!((wide.param("WIDE"), wide.param("ROWS")), (Some(1), Some(4)));
+        assert!(native.validate(&wide).is_ok());
+        assert!(native.search_form(None, "WIDE", 2).is_none());
+
+        let module = check_source(source(&declaration("(WIDE == 0 or N < 1)"))).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        assert!(native.search_form(None, "WIDE", 1).is_none());
+    }
+
+    /// A partial assignment decides a condition when an operand it can
+    /// evaluate settles the result, whichever side that operand is on.
+    #[test]
+    fn a_condition_is_decided_by_the_operands_it_can_evaluate() {
+        let module = check_source(source(
+            "native scale for metal from \"scale.metal\":\n    static (N)\n    params (form WIDE in [0, 1])\n    where (WIDE == 0 or N == 96) and (N <= 512 or WIDE == 1)\n    launch scale:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ))
+        .unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let mut conjuncts = Vec::new();
+        native.constraint.as_ref().unwrap().conjuncts(&mut conjuncts);
+        let none = |_: &str| None;
+        let wide = |name: &str| (name == "WIDE").then_some(1);
+        let at = |n: u64| move |name: &str| (name == "N").then_some(n);
+        assert_eq!(conjuncts[0].decided(&at(96), &none), Some(true));
+        assert_eq!(conjuncts[0].decided(&at(32), &none), None);
+        assert_eq!(conjuncts[0].decided(&at(32), &wide), Some(false));
+        assert!(conjuncts[0].holds(&at(96), &none).is_err());
+        assert_eq!(conjuncts[1].decided(&none, &wide), Some(true));
+        assert_eq!(conjuncts[1].decided(&none, &none), None);
     }
 
     #[test]
