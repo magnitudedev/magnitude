@@ -24,6 +24,11 @@ Execution joins a validated batch with owned state advances, conditioning, works
 leases into one opaque launch. Its constructor checks only cross-domain facts: resource identity,
 slot-to-advance cardinality and row alignment, conditioning references, and planned lease class.
 Programs accept the launch as one value and retain it in their submission until completion.
+A program whose attention graphs have a class that lists history row tiles derives the list from the
+batch's visible spans per history domain (`magnitude_batching::history_tiles`: distinct, ascending,
+`-1` padded 256-row tiles) and selects the smallest such class the list fits; a launch whose rows see
+more tiles than the largest runs the class that lists none. The choice changes neither admission nor
+the batch.
 
 Head feature projection is a distinct checked launch because it consumes retained features and
 selection controls without advancing sequence state. Its requests, feature extents, domain,

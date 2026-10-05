@@ -136,7 +136,6 @@ impl NativePreparationCache {
             limits,
             tuning,
         } = inputs;
-        let backend = device.backend();
         let mut spec = Specializer::new(device);
         let import = imports(&mut spec, plan)?;
         let owner = Tensor::zeros(device, Element::u32(), &[1]).map_err(|error| {
@@ -158,7 +157,7 @@ impl NativePreparationCache {
             tuning.definition,
             limits,
             epsilon,
-            Specializer::count(backend),
+            Specializer::count(device),
             Tuning::Tuner(Tuner::count(
                 device,
                 tuning,
@@ -172,7 +171,7 @@ impl NativePreparationCache {
             tuning.definition,
             limits,
             epsilon,
-            Specializer::count(backend),
+            Specializer::count(device),
             Tuning::Tuner(count.tuning.into_tuner().census()),
         );
         census.walk(plan)?;
@@ -701,6 +700,7 @@ impl<'a> Preparation<'a> {
             scopes: scopes.clone(),
             epsilon: self.epsilon,
             decode_rows: None,
+            listed: false,
         };
         let history = match binding.history {
             KvCodec::Dense => {
@@ -789,9 +789,24 @@ impl<'a> Preparation<'a> {
                 } else {
                     None
                 };
+                // Where the entry's forms differ by it, a launch that lists
+                // the history row tiles its rows see and one that does not
+                // are two kernels with their own admissible forms.
+                // (`StateResourcePlan::lists_history_tiles`, of the opened
+                // device's own fact; graph preparation checks they agree.)
+                let lists = self.spec.forms_tensor_operations()
+                    && binding.history == KvCodec::AffineK8V4;
                 let prefill = self
                     .spec
                     .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(mix()))?;
+                let prefill_listed = if lists {
+                    let mut listed = mix();
+                    listed.listed = true;
+                    self.spec
+                        .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(listed))?
+                } else {
+                    None
+                };
                 decode
                     .zip(prefill)
                     .map(|(decode, prefill)| AttentionHistoryKernels::AffineK8V4 {
@@ -800,6 +815,7 @@ impl<'a> Preparation<'a> {
                         verify_four,
                         verify_eight,
                         prefill,
+                        prefill_listed,
                     })
             }
             KvCodec::RotatedK4V4 => {

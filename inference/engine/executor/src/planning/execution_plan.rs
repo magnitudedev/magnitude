@@ -19,6 +19,7 @@ pub struct PlannedDevice {
     backend: BackendName,
     name: String,
     assessment_capacity_bytes: u64,
+    tensor_operations: bool,
 }
 
 impl PlannedDevice {
@@ -37,6 +38,12 @@ impl PlannedDevice {
     /// Stable capacity of the selected allocation domain at planning time.
     pub fn assessment_capacity_bytes(&self) -> u64 {
         self.assessment_capacity_bytes
+    }
+
+    /// Whether the device forms Metal tensor operations
+    /// (`SelectedDevice::tensor_operations`).
+    pub fn tensor_operations(&self) -> bool {
+        self.tensor_operations
     }
 }
 
@@ -240,6 +247,7 @@ impl ExecutionPlanner {
                 backend,
                 name: device.info.name.clone(),
                 assessment_capacity_bytes: device.assessment_capacity_bytes,
+                tensor_operations: device.tensor_operations,
             },
             components,
             load,

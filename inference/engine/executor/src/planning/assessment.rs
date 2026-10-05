@@ -704,6 +704,7 @@ mod tests {
             limits,
             crate::ResourceCapacity {
                 domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
             },
         )
         .unwrap();
@@ -727,6 +728,7 @@ mod tests {
             2,
             4,
             2,
+            0,
         )
         .unwrap();
         assert!(family.storage.workspace >= block.workspace);
@@ -853,6 +855,7 @@ mod tests {
             limits,
             crate::ResourceCapacity {
                 domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
             },
         )
         .unwrap();
@@ -1522,6 +1525,7 @@ mod tests {
             limits,
             crate::ResourceCapacity {
                 domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
             },
         )
         .unwrap();

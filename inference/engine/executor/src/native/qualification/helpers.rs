@@ -60,6 +60,8 @@ pub(super) fn qualify_attention(
     let visible = semantic_i32(device, &[1, 1, 2], &[0, 1], ENTRY, label)?;
     let fresh = semantic_i32(device, &[1, 2], &[0, 1], ENTRY, label)?;
     let destinations = semantic_i32(device, &[1], &[1], ENTRY, label)?;
+    // The affine prefill kernel of a launch that lists no history row tiles.
+    let history_tiles = semantic_i32(device, &[0, 1], &[], ENTRY, label)?;
     let projected = kernels
         .project
         .call(attention_project::Args {
@@ -90,7 +92,11 @@ pub(super) fn qualify_attention(
     // Every entry takes the same arguments but its history planes, which
     // start zero (a zero key row and a zero value row).
     macro_rules! mix {
-        ($kernel:expr, $module:ident, $($plane:ident: $element:expr, $elements:expr),*) => {{
+        ($kernel:expr, $module:ident, $($plane:ident: $element:expr, $elements:expr),*) => {
+            mix!(@call $kernel, $module, {}, $($plane: $element, $elements),*)
+        };
+        (@call $kernel:expr, $module:ident, {$($extra:ident: $value:expr),*},
+            $($plane:ident: $element:expr, $elements:expr),*) => {{
             let mut slabs = Vec::new();
             $(
                 let mut slab = seismic::SlabTensor::new(device, 2, 2, vec![
@@ -126,6 +132,7 @@ pub(super) fn qualify_attention(
                     fresh: &fresh,
                     destinations: &destinations,
                     slab_rows: 2,
+                    $($extra: $value,)*
                     $($plane: &mut $plane,)*
                     epsilon: 1.0e-5,
                     scale: 1.0 / (width as f32).sqrt(),
@@ -166,7 +173,7 @@ pub(super) fn qualify_attention(
                 ),
                 (
                     "attention_prefill_k8v4",
-                    mix!(prefill, attention_prefill_k8v4,
+                    mix!(@call prefill, attention_prefill_k8v4, {history_tiles: &history_tiles},
                         history_key_codes: Element::u32(), width / 4,
                         history_key_coefficients: Element::f16(), pairs,
                         history_value_codes: Element::u32(), width / 8,

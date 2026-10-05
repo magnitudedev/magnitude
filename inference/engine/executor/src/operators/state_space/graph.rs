@@ -497,6 +497,7 @@ mod tests {
                 limits,
                 ResourceCapacity {
                     domain_bytes: 16 * 1024 * 1024 * 1024,
+                    tensor_operations: crate::TensorOperations::Absent,
                 },
             )
             .unwrap();
@@ -643,6 +644,7 @@ mod tests {
                 limits,
                 ResourceCapacity {
                     domain_bytes: 16 * 1024 * 1024 * 1024,
+                    tensor_operations: crate::TensorOperations::Absent,
                 },
             )
             .unwrap();

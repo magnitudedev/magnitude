@@ -6,6 +6,7 @@
 
 use super::attention::graph::{
     attention, attention_weights, AttentionBlock, AttentionGraphEntries, CheckedAttentionEntries,
+    HistoryTilesPort,
 };
 use super::dense_ffn::graph::{dense, CheckedDenseEntries, DenseGraphEntries};
 use super::gated_delta::graph::{
@@ -74,6 +75,7 @@ pub(crate) enum BlockControlPorts {
         visible: NativePort,
         fresh: NativePort,
         destinations: NativePort,
+        history_tiles: Option<HistoryTilesPort>,
     },
     Recurrent(RecurrentControlPorts),
 }
@@ -126,11 +128,17 @@ pub(crate) enum CheckedMixerEntries {
 }
 
 impl CheckedMixerEntries {
-    /// The entries of `slot` on `backend`.
-    pub(crate) fn new(slot: MixerProgramSlot, backend: BackendName) -> Result<Self, String> {
+    /// The entries of `slot` on `backend`; `lists` when its attention
+    /// graphs have classes that list their launch's history row tiles
+    /// (`StateResourcePlan::lists_history_tiles`).
+    pub(crate) fn new(
+        slot: MixerProgramSlot,
+        backend: BackendName,
+        lists: bool,
+    ) -> Result<Self, String> {
         Ok(match slot {
             MixerProgramSlot::Attention(binding) => {
-                Self::Attention(CheckedAttentionEntries::new(binding))
+                Self::Attention(CheckedAttentionEntries::new(binding, lists))
             }
             MixerProgramSlot::Recurrent(binding) => {
                 Self::Recurrent(CheckedRecurrentEntries::new(binding, backend)?)
@@ -213,6 +221,9 @@ pub(crate) struct BlockSublayers<'a> {
     pub rows: u64,
     pub segments: u64,
     pub slots: u64,
+    /// Whether an attention block's class lists the history row tiles its
+    /// launch's rows see.
+    pub listed: u64,
     pub output_scales: OutputScales,
 }
 
@@ -247,6 +258,7 @@ impl BlockSublayers<'_> {
             rows,
             segments,
             slots,
+            listed,
             output_scales,
         } = *self;
         let scope = self.scope(0)?;
@@ -284,6 +296,7 @@ impl BlockSublayers<'_> {
                         history_rows: u64::try_from(history.rows)
                             .map_err(|_| "history rows exceed u64")?,
                         slab_rows: history.slab_rows,
+                        history_tiles: listed,
                         shape,
                         operator,
                         epsilon,
@@ -307,6 +320,7 @@ impl BlockSublayers<'_> {
                         visible: controls.visible,
                         fresh: controls.fresh,
                         destinations: controls.destinations,
+                        history_tiles: controls.history_tiles,
                     },
                 )
             }

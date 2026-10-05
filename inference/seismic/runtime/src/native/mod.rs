@@ -93,9 +93,15 @@ pub(crate) struct LaunchGeometry {
     pub(crate) shared_bytes: u64,
 }
 
-/// Geometry of every launch of one call, by declaration ordinal; `None` for
-/// a launch whose `when` condition does not hold (not encoded).
-pub(crate) type CallLaunches = Vec<Option<LaunchGeometry>>;
+/// The launches of one call.
+pub(crate) struct CallLaunches {
+    /// Geometry by declaration ordinal; `None` for a launch whose `when`
+    /// condition does not hold (not encoded).
+    pub(crate) geometry: Vec<Option<LaunchGeometry>>,
+    /// How often the implementation's repeat block is dispatched; 1 without
+    /// one.
+    pub(crate) rounds: u64,
+}
 
 /// Alignment of the base of every buffer the route places: standalone
 /// scratch, and every graph result, local, host-written input, export and
@@ -1205,7 +1211,11 @@ impl NativePrepared {
                 shared_bytes,
             }));
         }
-        Ok(geometry)
+        let rounds = match &self.implementation.repeat {
+            None => 1,
+            Some(repeat) => self.evaluate(&repeat.count, values, None)?,
+        };
+        Ok(CallLaunches { geometry, rounds })
     }
 
     /// Every scratch buffer of one invocation. An inactive buffer is charged
@@ -1644,7 +1654,8 @@ impl DispatchList for StandaloneCalls<'_> {
             kernel: self.kernel,
             words: &call.words,
             word_bytes: &call.word_bytes,
-            launches: &call.launches,
+            launches: &call.launches.geometry,
+            rounds: call.launches.rounds,
             representations: &call.representations,
         }
     }
@@ -1662,6 +1673,8 @@ pub(crate) struct Dispatch<'a> {
     pub(crate) word_bytes: &'a [u8],
     /// By declaration ordinal; `None` for an inactive launch.
     pub(crate) launches: &'a [Option<LaunchGeometry>],
+    /// How often the kernel's repeat block is dispatched.
+    pub(crate) rounds: u64,
     /// Registry name of each buffer's representation, in ABI order.
     pub(crate) representations: &'a [&'static str],
 }
@@ -1835,7 +1848,11 @@ fn launch_labels(list: &impl DispatchList, repetitions: usize) -> Vec<(String, u
         for index in 0..list.count() {
             let dispatch = list.dispatch(index, &mut Vec::new());
             labels.extend(
-                (0..dispatch.launches.len()).map(|launch| (dispatch.kernel.name.clone(), launch)),
+                dispatch
+                    .kernel
+                    .implementation
+                    .dispatch_order(dispatch.rounds)
+                    .map(|launch| (dispatch.kernel.name.clone(), launch)),
             );
         }
     }
@@ -1888,9 +1905,9 @@ fn encode(
                         (typed_buffer::<Metal, Executor>(allocation), *offset)
                     }));
                     let scalars = typed_buffer::<Metal, Executor>(&dispatch.kernel.scalars);
-                    for (ordinal, launch) in dispatch.launches.iter().enumerate() {
+                    for ordinal in dispatch.kernel.implementation.dispatch_order(dispatch.rounds) {
                         let pipeline = pipelines.pipeline(ordinal);
-                        let Some(launch) = launch else {
+                        let Some(launch) = &dispatch.launches[ordinal] else {
                             batch.skip();
                             continue;
                         };

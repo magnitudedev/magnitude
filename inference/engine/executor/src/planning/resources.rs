@@ -108,6 +108,28 @@ pub struct StartupSlots {
 pub struct ResourceCapacity {
     /// Stable capacity of the selected device's physical allocation domain.
     pub domain_bytes: u64,
+    /// Whether the selected device forms Metal tensor operations: its own
+    /// probe (`seismic::DeviceInfo::forms_tensor_operations`), which decides
+    /// the graph classes a plan has, so assessment and load plan the same
+    /// graphs. A plan for no concrete device states which it assumes.
+    pub tensor_operations: TensorOperations,
+}
+
+/// Whether a device forms Metal tensor operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorOperations {
+    Formed,
+    Absent,
+}
+
+impl TensorOperations {
+    pub fn of(forms: bool) -> Self {
+        if forms {
+            Self::Formed
+        } else {
+            Self::Absent
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,6 +318,33 @@ pub struct LayerHistory<'a> {
 }
 
 impl HistoryStorePlan {
+    /// The most history row tiles (`SLAB_ROW_TILE` rows) the rows of one
+    /// launch of `slots` requests see: each request's history lies in at most
+    /// `span_limit` pages. The bound a launch's per-call storage of history
+    /// rows is sized by, whatever the reservation `rows`.
+    pub fn launch_tiles(&self, slots: u64) -> Result<u64, String> {
+        let page_tiles = u64::from(self.page_rows) / magnitude_state::SLAB_ROW_TILE as u64;
+        u64::try_from(self.span_limit)
+            .ok()
+            .and_then(|spans| spans.checked_mul(page_tiles))
+            .and_then(|tiles| tiles.checked_mul(slots))
+            .ok_or_else(|| "launch history tile count overflows".into())
+    }
+
+    /// The tile counts of the graph classes that list a launch's history
+    /// row tiles, ascending: powers of two from 16 tiles, then one request's
+    /// worth (`launch_tiles(1)`). A launch takes the smallest that holds the
+    /// tiles its rows see, so a form that attends the listed rows a part at
+    /// a time dispatches at most twice the parts the launch needs.
+    pub fn listed_tile_classes(&self) -> Result<Vec<u64>, String> {
+        let most = self.launch_tiles(1)?;
+        let mut classes = std::iter::successors(Some(16u64), |tiles| tiles.checked_mul(2))
+            .take_while(|tiles| *tiles < most)
+            .collect::<Vec<_>>();
+        classes.push(most);
+        Ok(classes)
+    }
+
     fn trace(&self) -> HistoryDomainTrace {
         HistoryDomainTrace {
             kind: self.kind,
@@ -669,6 +718,24 @@ pub struct StateResourcePlan {
 impl StateResourcePlan {
     pub fn limits(&self) -> ResourceLimits {
         self.limits
+    }
+
+    /// Whether the planned device forms Metal tensor operations
+    /// (`ResourceCapacity::tensor_operations`, which its opened device must
+    /// confirm).
+    pub fn tensor_operations(&self) -> bool {
+        self.capacity_bytes.tensor_operations == TensorOperations::Formed
+    }
+
+    /// Whether prefill attention graphs over this plan's history come in a
+    /// class that lists the history row tiles its launch's rows see, beside
+    /// the class that lists none: where the affine prefill entry has forms
+    /// that decode the listed tiles for the call, which only tensor
+    /// operations make faster than reading the history in place. A listing
+    /// class holds one request's history decoded, so a device without those
+    /// forms has none.
+    pub fn lists_history_tiles(&self) -> bool {
+        self.tensor_operations() && self.codec == KvCodec::AffineK8V4
     }
 
     pub fn capacity(&self) -> StateCapacityPlan {

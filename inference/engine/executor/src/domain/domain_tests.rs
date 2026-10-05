@@ -100,6 +100,7 @@ fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) ->
     };
     let capacity_bytes = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
+        tensor_operations: crate::TensorOperations::of(selected.tensor_operations),
     };
     let draft = ExecutionPlanner::prepare(
         &selected,

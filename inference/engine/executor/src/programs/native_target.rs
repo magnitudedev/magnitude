@@ -733,9 +733,33 @@ impl NativeTargetProgram {
         }
         for index in 0..self.geometry.blocks.len() {
             let block_started = self.trace.blocks.then(Instant::now);
+            // A block with listing classes lists the history row tiles the
+            // launch's rows see in the smallest class that holds them; a
+            // launch that sees more than the largest (many requests with
+            // long histories) takes the class that lists none.
+            let listed_tiles = self
+                .graphs
+                .prepared
+                .listed_tiles(index, rows)
+                .iter()
+                .find_map(|&tiles| {
+                    let (read, _) = state.history(LayerRef::Target(index as u32)).ok()?;
+                    let visible = &controls.histories.get(read)?.visible;
+                    crate::operators::attention::graph::history_tile_bytes(
+                        visible,
+                        usize::try_from(tiles).ok()?,
+                    )
+                    .map(|bytes| (tiles, bytes))
+                });
             let (graph, bound) = self
                 .graphs
-                .block(rows, segments, slots, index)
+                .block(
+                    rows,
+                    segments,
+                    slots,
+                    listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),
+                    index,
+                )
                 .map_err(invalid)?;
             let parity = (index + 1) % 2;
             let mut active = graph_workspace
@@ -781,6 +805,7 @@ impl NativeTargetProgram {
                         visible,
                         fresh,
                         destinations,
+                        history_tiles,
                     },
                 ) => {
                     let (read, history) = state.history(LayerRef::Target(index as u32))?;
@@ -808,6 +833,17 @@ impl NativeTargetProgram {
                     active
                         .write_input(destinations, &history_controls.destinations)
                         .map_err(device)?;
+                    match (history_tiles, &listed_tiles) {
+                        (Some(tiles), Some((_, bytes))) => active
+                            .write_input(&tiles.port, bytes)
+                            .map_err(device)?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(invalid(
+                                "the block's graph class and its history tile list disagree",
+                            ))
+                        }
+                    }
                 }
                 (BlockStatePorts::Recurrent(ports), BlockControlPorts::Recurrent(recurrent)) => {
                     let arenas = state.recurrent_arenas()?;
@@ -869,7 +905,8 @@ impl NativeTargetProgram {
                     BlockStatePorts::Recurrent(_) => "recurrent",
                 };
                 eprintln!(
-                    "target block {index} {kind} {:.3}s",
+                    "target block {index} {kind} rows {rows} lists {} history tiles {:.3}s",
+                    listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),
                     started.elapsed().as_secs_f64()
                 );
             }

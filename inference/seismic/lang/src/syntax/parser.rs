@@ -330,6 +330,19 @@ impl Parser {
             self.expect_op(Op::RParen)?;
             self.expect_newline()?;
         }
+        let mut terms = Vec::new();
+        while matches!(self.peek(), Tok::Kw(Kw::Let)) {
+            let begin = self.bump().span;
+            let name = self.expect_name()?;
+            self.expect_op(Op::Assign)?;
+            let value = self.expr()?;
+            self.expect_newline()?;
+            terms.push(NativeTermDecl {
+                name,
+                value,
+                span: begin.to(self.prev_span()),
+            });
+        }
         let mut constraint = None;
         if self.eat_kw(Kw::Where) {
             constraint = Some(self.expr()?);
@@ -381,12 +394,41 @@ impl Parser {
             self.expect_newline()?;
         }
         let mut launches = Vec::new();
-        while self.at_word("launch") {
-            launches.push(self.native_launch()?);
+        let mut repeat = None;
+        loop {
+            if self.at_word("launch") {
+                launches.push(self.native_launch()?);
+            } else if self.at_word("repeat") && repeat.is_none() {
+                let begin = self.bump().span;
+                self.expect_op(Op::LParen)?;
+                let count = self.expr()?;
+                self.expect_op(Op::RParen)?;
+                self.expect_op(Op::Colon)?;
+                self.native_block_start("repeat")?;
+                let first = launches.len();
+                while self.at_word("launch") {
+                    launches.push(self.native_launch()?);
+                }
+                if launches.len() == first {
+                    return Err(self.error(format!(
+                        "expected `launch <kernel>:` in the repeat block, found {}",
+                        self.peek().describe()
+                    )));
+                }
+                self.native_block_end("repeat")?;
+                repeat = Some(NativeRepeatDecl {
+                    count,
+                    first,
+                    launches: launches.len() - first,
+                    span: begin.to(self.prev_span()),
+                });
+            } else {
+                break;
+            }
         }
         if launches.is_empty() {
             return Err(self.error(format!(
-                "expected `launch <kernel>:`, found {}; a native declaration lists `static`, `params`, `elements`, `where`, `error_class`, `scratch`, then one or more launches",
+                "expected `launch <kernel>:`, found {}; a native declaration lists `static`, `params`, `elements`, `let`, `where`, `error_class`, `scratch`, then one or more launches",
                 self.peek().describe()
             )));
         }
@@ -398,10 +440,12 @@ impl Parser {
             statics,
             params,
             elements,
+            terms,
             constraint,
             error_classes,
             scratch,
             launches,
+            repeat,
             span: start.to(self.prev_span()),
         })
     }
@@ -1402,6 +1446,37 @@ mod tests {
             printed.contains("launch rows_gemv when O <= 2 or INT8 == 1 and O <= 8:\n"),
             "{printed}"
         );
+    }
+
+    #[test]
+    fn native_terms_round_trip() {
+        let file = round_trip(
+            "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2])\n    let PARTS = max(1, SPLIT * O)\n    let SPARE = (8 - PARTS) * O\n    where PARTS <= 8\n    scratch partials bytes (PARTS * 4)\n    launch rows:\n        threadgroups (ceil_div(SPARE, 4), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert_eq!(
+            native
+                .terms
+                .iter()
+                .map(|term| term.name.name.as_str())
+                .collect::<Vec<_>>(),
+            ["PARTS", "SPARE"]
+        );
+    }
+
+    #[test]
+    fn repeated_native_launches_round_trip() {
+        let file = round_trip(
+            "native rows for metal from \"rows.metal\":\n    scratch window bytes (64)\n    launch rows_prepare:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    repeat (ceil_div(O, 64)):\n        launch rows_decode when O > 8:\n            threadgroups (2, 1, 1)\n            threads_per_threadgroup (32, 1, 1)\n        launch rows_attend:\n            threadgroups (O, 1, 1)\n            threads_per_threadgroup (32, 1, 1)\n    launch rows_merge:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert_eq!(native.launches.len(), 4);
+        let repeat = native.repeat.as_ref().unwrap();
+        assert_eq!((repeat.first, repeat.launches), (1, 2));
     }
 
     #[test]

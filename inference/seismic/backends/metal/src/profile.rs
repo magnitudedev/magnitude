@@ -111,8 +111,7 @@ fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, Tar
         bfloat_arithmetic: probe_bfloat_arithmetic(raw, language),
         matrix_dtypes: probe_matrix_dtypes(raw, language),
         matrix_combinations: probe_matrix_combinations(raw, language),
-        tensor_ops: raw.supportsFamily(MTLGPUFamily::Apple10)
-            && probe_tensor_ops(raw, language),
+        tensor_ops: tensor_operations_at(raw, language),
         argument_table_entries: ARGUMENT_TABLE_ENTRIES,
         reserved_argument_entries: RESERVED_ARGUMENT_ENTRIES,
         backend_revision: BACKEND_REVISION,
@@ -649,6 +648,23 @@ fn probe_matrix_combinations(
         }
     }
     combinations
+}
+
+/// Whether the device forms tensor operations (`MetalFacts::tensor_ops`):
+/// Apple GPU family 10 or later, and the tensor probe forms a pipeline at
+/// `language`.
+fn tensor_operations_at(device: &ProtocolObject<dyn MTLDevice>, language: LanguageVersion) -> bool {
+    device.supportsFamily(MTLGPUFamily::Apple10) && probe_tensor_ops(device, language)
+}
+
+/// Whether an unopened device forms tensor operations: the fact its opened
+/// description holds (`MetalFacts::tensor_ops`), from the same family test
+/// and probes at the same language version, so planning before a device is
+/// opened and the opened device agree. It compiles the probes; callers ask
+/// once per decision, not per enumeration.
+pub fn forms_tensor_operations(device: &crate::DeviceHandle) -> bool {
+    probe_language_version(device)
+        .is_some_and(|language| tensor_operations_at(device.raw(), language))
 }
 
 /// Whether a `matmul2d` over a device and a threadgroup tensor into a

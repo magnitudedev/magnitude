@@ -263,6 +263,12 @@ impl Device {
     pub fn tuning_identity(&self) -> String {
         self.inner.tuning_identity()
     }
+    /// Whether this opened device forms Metal tensor operations (false on
+    /// every other backend): what `DeviceInfo::forms_tensor_operations`
+    /// answers before the device is opened.
+    pub fn forms_tensor_operations(&self) -> bool {
+        self.inner.forms_tensor_operations()
+    }
     /// Record every native submission on this device until the returned
     /// trace is dropped (measurement only; see `TraceDetail`).
     pub fn trace_submissions(&self, detail: TraceDetail) -> Result<SubmissionTrace, TraceError> {

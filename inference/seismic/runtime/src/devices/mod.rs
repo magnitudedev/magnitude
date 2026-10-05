@@ -239,6 +239,18 @@ impl DeviceInfo {
         }
         None
     }
+
+    /// Whether the device forms Metal tensor operations: what
+    /// `Device::forms_tensor_operations` reports once it is opened, probed
+    /// here without opening an execution context (it compiles the probes).
+    /// False on every other backend.
+    pub fn forms_tensor_operations(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let crate::backends::Descriptor::Metal { handle } = self.descriptor.as_ref() {
+            return seismic_metal::profile::forms_tensor_operations(handle);
+        }
+        false
+    }
 }
 
 impl fmt::Debug for DeviceInfo {
