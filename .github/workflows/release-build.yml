@@ -86,7 +86,7 @@ jobs:
           - backend: cuda
             runner: blacksmith-16vcpu-ubuntu-2404
           - backend: metal
-            runner: macos-26
+            runner: blacksmith-12vcpu-macos-26
     runs-on: ${{ matrix.runner }}
     env:
       MAGNITUDE_REQUIRE_KERNEL_FORMATION: "1"
