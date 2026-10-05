@@ -482,6 +482,8 @@ pub(crate) fn native_language(language: LanguageVersion) -> MTLLanguageVersion {
         LanguageVersion::V3_1 => MTLLanguageVersion::Version3_1,
         LanguageVersion::V3_2 => MTLLanguageVersion::Version3_2,
         LanguageVersion::V4_0 => MTLLanguageVersion::Version4_0,
+        // MTLLanguageVersion4_1, which the bindings do not name yet.
+        LanguageVersion::V4_1 => MTLLanguageVersion((4 << 16) + 1),
     }
 }
 
@@ -507,6 +509,7 @@ pub fn probe_language_version(device: &crate::DeviceHandle) -> Option<LanguageVe
         "{PROBE_PRELUDE}kernel void seismic_language_probe(device uint* output [[buffer(0)]]) {{ output[0] = 0u; }}\n"
     ));
     [
+        LanguageVersion::V4_1,
         LanguageVersion::V4_0,
         LanguageVersion::V3_2,
         LanguageVersion::V3_1,

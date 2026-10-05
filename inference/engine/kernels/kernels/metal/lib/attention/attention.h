@@ -1206,10 +1206,13 @@ struct prefill_fragments {
     float maximum;
     float denominator;
 
-    prefill_fragments(uint lane) {
+    // The lane's fragment coordinates. The struct stays an aggregate: Metal
+    // 4.1 gives simdgroup matrices no default constructor for a member
+    // initializer.
+    static inline void place(thread prefill_fragments &self, uint lane) {
         const uint quad = lane / 4;
-        fm = (quad & 4) + ((lane / 2) % 4);
-        fn = (quad & 2) * 2 + (lane % 2) * 2;
+        self.fm = (quad & 4) + ((lane / 2) % 4);
+        self.fn = (quad & 2) * 2 + (lane % 2) * 2;
     }
 
     static inline void reset(thread prefill_fragments &self) {
@@ -1975,7 +1978,8 @@ template <uint QT, class History>
 inline void prefill_owned_fragments(PREFILL_OWNED_PARAMETERS) {
     typedef prefill_fragments<QT, History> Form;
     const prefill_owner<QT, Form::ROWS> own(tile, kv_head, head_group, simd);
-    Form state(lane);
+    Form state;
+    Form::place(state, lane);
     prefill_windows<QT, History>(history, query, gate, visible, fresh, result, keys, values, partials,
         statistics, M, R, scale, softplus, staged, intervals, kv_head, partition, active, tiles_lo, tiles_hi,
         queries + (own.first_token * SEISMIC_DIM_KV * SEISMIC_DIM_G + own.head) * ATTENTION_W, own.head,

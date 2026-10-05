@@ -143,7 +143,7 @@ kernel void gated_delta_chunk_inputs(
 
     // The tap rows: the window of the slot's source version before the slot,
     // the projection after.
-    device const recurrent::Storage *taps[RECURRENT_TAPS];
+    recurrent::Taps taps;
     recurrent::taps(projection, window, slot, long(row) - slot.lo, taps, seismic_words);
     // This lane's channel quads.
     float4 values[RCH_LANE_QUADS];

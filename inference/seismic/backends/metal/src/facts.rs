@@ -40,6 +40,7 @@ pub enum LanguageVersion {
     V3_1,
     V3_2,
     V4_0,
+    V4_1,
 }
 
 impl LanguageVersion {
@@ -51,6 +52,7 @@ impl LanguageVersion {
             Self::V3_1 => "3.1",
             Self::V3_2 => "3.2",
             Self::V4_0 => "4.0",
+            Self::V4_1 => "4.1",
         }
     }
 }

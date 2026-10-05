@@ -139,7 +139,7 @@ inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
     threadgroup_barrier(mem_flags::mem_threadgroup);                                    \
-    projection::SharedNorm<decltype(in)> x{in, squares};                                \
+    const auto x = projection::shared_norm(in, squares);                               \
     top_lengths(x, rows, d, features, lengths_out, SEISMIC_RESULT_3_STRIDE_0, lengths, parts, lowest, tile, tid, simdgroups, sg, lane); \
     /* Radius column 0: the 4-bit view's. */                                             \
     const BoundOut out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, radius, \
