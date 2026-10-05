@@ -26,7 +26,7 @@ pub use programs::{
     StateProgramPlan, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    GraphSlots, HistoryStorePlan, LayerHistory, NativeGraphCharge, ResourceBytes,
+    reads_decoded_history, GraphSlots, HistoryStorePlan, LayerHistory, NativeGraphCharge, ResourceBytes,
     ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
     StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations,
 };

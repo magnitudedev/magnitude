@@ -794,8 +794,12 @@ impl<'a> Preparation<'a> {
                 // are two kernels with their own admissible forms.
                 // (`StateResourcePlan::lists_history_tiles`, of the opened
                 // device's own fact; graph preparation checks they agree.)
-                let lists = self.spec.forms_tensor_operations()
-                    && binding.history == KvCodec::AffineK8V4;
+                let lists = binding.history == KvCodec::AffineK8V4
+                    && crate::planning::reads_decoded_history(
+                        self.spec.backend(),
+                        self.spec.forms_tensor_operations(),
+                        shape.width,
+                    );
                 let prefill = self
                     .spec
                     .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(mix()))?;

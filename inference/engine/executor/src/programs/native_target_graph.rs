@@ -42,21 +42,32 @@ use std::time::Instant;
 /// none).
 type BlockClass = (u64, u64, u64, u64);
 
+/// Whether the prefill graphs of `slot`'s block come in classes that list
+/// their launch's history row tiles: an attention block's, where the plan's
+/// device of `backend` reads its heads' history decoded.
+fn slot_lists(state: &StateResourcePlan, backend: BackendName, slot: TargetBlockProgramSlot) -> bool {
+    match slot.mixer() {
+        crate::MixerProgramSlot::Attention(binding) => {
+            state.lists_history_tiles(backend, binding.shape.width)
+        }
+        _ => false,
+    }
+}
+
 /// The tile counts of the classes of block `index`'s graphs of `rows` rows
 /// that list their launch's history row tiles, beside the class that lists
 /// none (`HistoryStorePlan::listed_tile_classes`): those of an attention
-/// block's prefill rows, on a plan whose device has the forms that decode
-/// the listed tiles (`StateResourcePlan::lists_history_tiles`).
+/// block's prefill rows, on a plan whose device of `backend` has a form
+/// that reads its heads' history decoded
+/// (`StateResourcePlan::lists_history_tiles`).
 fn block_listings(
     state: &StateResourcePlan,
+    backend: BackendName,
     slot: TargetBlockProgramSlot,
     index: usize,
     rows: u64,
 ) -> Result<Vec<u64>, String> {
-    if !matches!(slot.mixer(), crate::MixerProgramSlot::Attention(_))
-        || !state.lists_history_tiles()
-        || crate::operators::attention::graph::decodes(rows)
-    {
+    if !slot_lists(state, backend, slot) || crate::operators::attention::graph::decodes(rows) {
         return Ok(Vec::new());
     }
     state
@@ -468,7 +479,8 @@ impl PreparedTargetGraphs {
                     shapes[first] == shapes[index]
                         && handles.blocks[first].output_scales == handle.output_scales
                 });
-                let listings = block_listings(state, plan.blocks()[index], index, rows)?;
+                let listings =
+                    block_listings(state, device.backend(), plan.blocks()[index], index, rows)?;
                 if !listings.is_empty() {
                     listed_tiles[index] = listings.clone();
                 }
@@ -1360,7 +1372,7 @@ fn checked_block_graph_draft(
     let checked_mixer = block::CheckedMixerEntries::new(
         slot.mixer(),
         graph.backend(),
-        state.lists_history_tiles(),
+        slot_lists(state, graph.backend(), slot),
     )?;
     let mixer = checked_mixer.entries()?;
     let checked_feed_forward = slot
@@ -1556,11 +1568,11 @@ fn certify_target_family(
             for listed in [false, true] {
                 let listings = match listed {
                     false => Vec::new(),
-                    true => block_listings(state, slot, index, largest)?,
+                    true => block_listings(state, backend, slot, index, largest)?,
                 };
                 let mut listing_rows = Vec::new();
                 for &rows in &rows {
-                    if !listed || !block_listings(state, slot, index, rows)?.is_empty() {
+                    if !listed || !block_listings(state, backend, slot, index, rows)?.is_empty() {
                         listing_rows.push(rows);
                     }
                 }
@@ -1740,8 +1752,14 @@ mod resource_template_tests {
         .unwrap();
         assert_eq!(assessed.target.workspace_bytes, family);
         let max_segments = state.target_state().span_limit().next_power_of_two() as u64;
-        let listings = block_listings(&state, plan.target().blocks()[index], index, 512).unwrap();
-        assert_eq!(listings.is_empty(), !tensor_operations);
+        let listings =
+            block_listings(&state, backend, plan.target().blocks()[index], index, 512).unwrap();
+        // Tensor operations read every head's history decoded; without
+        // them the co-issue form reads 128- and 256-column heads'.
+        assert_eq!(
+            listings.is_empty(),
+            !(tensor_operations || matches!(head_width, 128 | 256))
+        );
         for (rows, segments, slots, listed) in
             block_classes(MixerKind::Attention, 512, 512, max_segments, &listings)
         {
@@ -1803,9 +1821,9 @@ mod resource_template_tests {
     /// device's bytes) nor the context limit, and listing a launch's history
     /// row tiles adds nothing to it: on Metal over K8/V4 history every
     /// 512-row class that lists tiles is charged what the class that lists
-    /// none is (the DIRECT form decodes into the cells of the partial
-    /// outputs its key partitions leave), so the family holds the same bytes
-    /// with and without tensor operations.
+    /// none is (the DIRECT and COISSUE forms decode into the rows of the
+    /// partial outputs their key partitions leave), so the family holds the
+    /// same bytes with and without tensor operations.
     #[test]
     fn attention_graph_scratch_follows_neither_the_reservation_nor_the_context() {
         for heads in [(4, 256), (1, 128), (2, 128), (1, 256), (2, 512), (4, 512)] {
@@ -1815,7 +1833,7 @@ mod resource_template_tests {
                 let large = charged(heads, context, 256 << 30, true);
                 assert!(large.reservation > small.reservation);
                 assert!(!small.listed.is_empty());
-                for &listed in small.listed.iter().chain(&large.listed) {
+                for &listed in small.listed.iter().chain(&large.listed).chain(&plain.listed) {
                     assert_eq!(listed, small.unlisted, "{heads:?} at {context}");
                 }
                 assert_eq!(
@@ -1937,8 +1955,14 @@ mod resource_template_tests {
                             rows,
                             limits.max_launch_slots as u64,
                             max_segments,
-                            &block_listings(&state, plan.target().blocks()[index], index, rows)
-                                .unwrap(),
+                            &block_listings(
+                                &state,
+                                backend,
+                                plan.target().blocks()[index],
+                                index,
+                                rows,
+                            )
+                            .unwrap(),
                         ) {
                             let (graph, block_constants) = checked_block_graph_draft(
                                 NativeGraphMetadata::new(backend),
