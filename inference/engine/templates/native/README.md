@@ -26,6 +26,11 @@ makes a required tool choice follow reasoning directly in every other format, wi
 before the call, and makes Qwen3-Coder-format grammars read reasoning the generation prompt opens
 only as reasoning, so it closes before the turn ends.
 
+Patch 0022 gives Muse Glimmer a way to disable reasoning. Its template has no switch: the system
+message carries a reasoning strength and the model chooses its recipient after `<|start|>assistant`.
+With `enable_thinking` false the strength is none unless the request names one, and the reply is
+opened to the user (` to=user<|message|>`); with callable tools the recipient stays the model's choice.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

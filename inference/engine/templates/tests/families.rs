@@ -321,3 +321,64 @@ fn family_templates_render_tools_and_parse_reasoning_and_calls() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Muse Glimmer's template has no reasoning switch: disabled reasoning writes
+/// strength none and opens the answer to the user, and the reply is content.
+#[test]
+fn muse_glimmer_disabled_reasoning_opens_the_answer() {
+    let template = Template::new(MUSE, &special("<|begin_of_text|>", "<|end_of_text|>")).unwrap();
+    let conversation = || {
+        Request::new(
+            vec![
+                json!({"role":"system","content":"Be brief."}),
+                json!({"role":"user","content":"Say hello."}),
+            ],
+            946684800,
+        )
+    };
+    let default = template.prepare(&conversation()).unwrap();
+    assert!(default.description().prompt.contains("Reasoning strength: high."));
+    assert!(default.description().prompt.ends_with("<|eot|><|start|>assistant"));
+
+    let mut request = conversation();
+    request
+        .template_arguments
+        .insert("enable_thinking".into(), json!(false));
+    let disabled = template.prepare(&request).unwrap();
+    let description = disabled.description();
+    assert!(description.prompt.contains("Be brief.\n\nReasoning strength: none.\n\n"));
+    assert!(description
+        .prompt
+        .ends_with("<|eot|><|start|>assistant to=user<|message|>"));
+    assert_eq!(
+        description.generation_prefix,
+        "<|start|>assistant to=user<|message|>"
+    );
+    assert_eq!(
+        parse(&disabled, "Hello.").unwrap(),
+        Transcript {
+            content: "Hello.".into(),
+            ..Default::default()
+        }
+    );
+
+    // A strength the request names is kept.
+    request
+        .template_arguments
+        .insert("reasoning_effort".into(), json!("low"));
+    let named = template.prepare(&request).unwrap();
+    assert!(named.description().prompt.contains("Reasoning strength: low."));
+    assert!(named
+        .description()
+        .prompt
+        .ends_with("<|start|>assistant to=user<|message|>"));
+
+    // With callable tools the recipient stays the model's choice.
+    let mut tools = self::request(false);
+    tools
+        .template_arguments
+        .insert("enable_thinking".into(), json!(false));
+    let prepared = template.prepare(&tools).unwrap();
+    assert!(prepared.description().prompt.contains("Reasoning strength: none."));
+    assert!(prepared.description().prompt.ends_with("<|start|>assistant"));
+}

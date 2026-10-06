@@ -140,6 +140,26 @@ DeepSeek V3.2 uses chat/thinking mode values. MiniMax M3 uses disabled/adaptive/
 ICN preserves adaptive as a separate choice. It does not infer an ordering between adaptive and
 high from prompt differences.
 
+### Recipient-routed reasoning
+
+Muse Glimmer's template has no reasoning switch. The system message states a reasoning strength and
+the generation prompt ends at the assistant header; the model itself then addresses its next message
+to `self` (reasoning) or to `user` (the answer). Writing strength `none` does not stop it from
+addressing `self` first.
+
+The native Glimmer handler therefore implements the boolean control the template lacks. With
+`enable_thinking` false it renders strength `none`, unless the request names a strength, and opens
+the reply to the user by extending the generation prompt with the answer header. Detection sees an
+ordinary boolean toggle.
+
+| Example | Native behavior | Normalized options | Normalized default |
+| --- | --- | --- | --- |
+| Muse Glimmer | Strength in the system message; recipient chosen by the model | `none`, `high` | `high` |
+
+When tools are callable the recipient stays the model's choice, because a tool call is addressed
+the same way; `none` then lowers the strength only. The template's intermediate strengths are an
+open pass-through domain and are not advertised without a trusted declaration.
+
 ### Open pass-through symbolic effort
 
 GPT-OSS interpolates a reasoning-effort value into the prompt. Arbitrary strings can therefore
@@ -339,6 +359,8 @@ advertise a disabling option.
 - DeepSeek V3/V4 modes map to the correct normalized options and private mode recipes.
 - MiniMax M3 preserves `adaptive` rather than relabeling it as an effort.
 - GPT-OSS exposes only its declared low, medium, and high values despite open pass-through Jinja.
+- Muse Glimmer normalizes to `none` and `high`; `none` opens the reply to the user when no tool is
+  callable.
 - Equivalent native spellings collapse to one normalized option in deterministic order.
 - Equivalent ordinal inputs use rendered affiliated-name evidence first and normalized rank second.
 - One meaningful alternate effort is not discarded.

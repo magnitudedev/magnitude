@@ -182,3 +182,27 @@ fn disabled_and_extra_high_spellings_normalize() {
     assert_eq!(normalize_effort("adaptive"), Some("adaptive"));
     assert_eq!(normalize_effort("ultra"), None);
 }
+
+#[test]
+fn muse_glimmer_reasoning_can_be_disabled() {
+    let template = Template::new(
+        include_str!("../../templates/tests/assets/Muse-Glimmer-30B.jinja"),
+        &Default::default(),
+    )
+    .unwrap();
+    let profile = inspect_reasoning(&template, &Default::default()).unwrap();
+    assert_eq!(
+        profile
+            .mappings
+            .iter()
+            .map(|mapping| mapping.effort.as_str())
+            .collect::<Vec<_>>(),
+        ["none", "high"]
+    );
+    assert_eq!(profile.default_effort.as_deref(), Some("high"));
+    let disabled = profile.resolve(&ReasoningIntent::Disabled).unwrap();
+    assert_eq!(
+        disabled.controls,
+        BTreeMap::from([("enable_thinking".to_string(), json!(false))])
+    );
+}
