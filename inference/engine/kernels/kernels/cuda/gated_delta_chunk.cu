@@ -29,7 +29,9 @@
 //
 // A slot of at most recurrent::SEQUENTIAL_ROWS rows (an MTP verify) has no
 // pieces: its scan blocks advance all its rows row-sequentially with the
-// step's bits. Grid z = B zeroes the mixed rows no slot covers. ROWS never
+// step's bits. The scan stores the raw outputs to the `mixed` scratch, and
+// grid z = B zeroes the raw rows no slot covers; `gated_delta_chunk_gate`
+// then gates each row (`recurrent::gate_row`, one block per row). ROWS never
 // changes result bits.
 
 #include "lib/recurrent/recurrent.cuh"
@@ -441,7 +443,7 @@ __global__ void gated_delta_chunk_scan(SEISMIC_KERNEL_PARAMS) {
                   "the sequential advance fits the stage ring");
     const recurrent::Inputs in = RECURRENT_INPUTS();
     u8 *pieces = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PIECES);
-    u8 *mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    u8 *mixed = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_MIXED);
     const int head = blockIdx.y;
     const int row0 = blockIdx.x * ROWS;  // the block's first state row
     const u64 slot_index = blockIdx.z;
@@ -450,11 +452,7 @@ __global__ void gated_delta_chunk_scan(SEISMIC_KERNEL_PARAMS) {
     const int g = lane / 4;
     const int t4 = lane % 4;
     const int warp_row = row0 + 16 * warp;  // this warp's first state row
-    auto mixed_at = [&](int row, int state_row) {
-        return static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 +
-               static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
-               static_cast<u64>(state_row) * SEISMIC_RESULT_0_STRIDE_2;
-    };
+    auto mixed_at = [&](int row, int state_row) { return recurrent::raw_index(row, head, state_row); };
     if (slot_index == SEISMIC_DIM_B) {
         const u64 covered = recurrent::covered_end(in);
         for (u64 index = covered * ROWS + threadIdx.x; index < SEISMIC_DIM_M * ROWS;
@@ -671,5 +669,14 @@ __global__ void gated_delta_chunk_scan(SEISMIC_KERNEL_PARAMS) {
         recurrent::advance_rows<16, ROWS>(in, slot, slot.lo + slot.stop, head, row0, true, warp_row, rows, mixed,
                                           sequential);
     }
+}
+#endif
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_CHUNK_GATE
+extern "C" __global__ void gated_delta_chunk_gate(SEISMIC_KERNEL_PARAMS) {
+    const recurrent::Inputs in = RECURRENT_INPUTS();
+    recurrent::gate_row<ELEMENT_OF(SEISMIC_RECURRENT_NORM)>(
+        in, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_MIXED), SEISMIC_PTR(SEISMIC_BUFFER_RECURRENT_NORM),
+        element::word_f32(SEISMIC_PARAM_EPSILON), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), blockIdx.x);
 }
 #endif

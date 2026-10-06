@@ -29,6 +29,9 @@
 
 extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS + attention::prefill::PRODUCERS)
     attention_decode_k8v4_partial(SEISMIC_KERNEL_PARAMS) {
+    // Let a programmatic dependent start (its first weight loads overlap this
+    // launch; it still waits for this launch's completion).
+    seismic_dependents_launch();
     attention::prefill::attend(
         ATTENTION_INPUTS(),
         attention::AffineHistory{
@@ -152,6 +155,9 @@ __device__ __forceinline__ void fold(State &state, float (&bias)[H]) {
 
 extern "C" __global__ void __launch_bounds__(WARPS * 32)
     attention_decode_k8v4_partial(SEISMIC_KERNEL_PARAMS) {
+    // Let a programmatic dependent start (its first weight loads overlap this
+    // launch; it still waits for this launch's completion).
+    seismic_dependents_launch();
     const attention::Inputs in = ATTENTION_INPUTS();
     const attention::AffineHistory history{
         reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),
@@ -286,6 +292,9 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
 #endif
 
 extern "C" __global__ void attention_decode_k8v4_merge(SEISMIC_KERNEL_PARAMS) {
+    // Let a programmatic dependent start (its first weight loads overlap this
+    // launch; it still waits for this launch's completion).
+    seismic_dependents_launch();
     attention::decode_gate<SEISMIC_TUNE_PARTS>(
         ATTENTION_INPUTS(),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),

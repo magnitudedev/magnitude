@@ -21,12 +21,14 @@ pub struct ProgramSource {
 }
 
 /// One entry of a program: its symbol (a kernel name, or a template
-/// instance such as `kernel<16, 2>`), and the backend's launch constants
-/// fixed when it is instantiated (Vulkan's workgroup size and
-/// specialization constants; empty elsewhere).
+/// instance such as `kernel<16, 2>`), the group size its launches run when the
+/// caller fixes it (Vulkan forms its pipeline with it; Metal forms a pipeline
+/// that admits it), and the backend's specialization constants (Vulkan's
+/// view lengths; empty elsewhere).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramEntry {
     pub symbol: String,
+    pub group_size: Option<[u32; 3]>,
     pub constants: Vec<u32>,
 }
 
@@ -34,6 +36,7 @@ impl ProgramEntry {
     pub fn named(symbol: impl Into<String>) -> Self {
         Self {
             symbol: symbol.into(),
+            group_size: None,
             constants: Vec::new(),
         }
     }

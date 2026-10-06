@@ -1,6 +1,6 @@
 // gated_delta_chunk (large row classes): the same contract as
 // `gated_delta_step`, in two launches that share the `inputs` scratch (f32,
-// the chunked rows only). The chunked rows of a slot are those before its
+// the chunked rows only), then the gate. The chunked rows of a slot are those before its
 // stop row in a slot of more than CHUNK_SEQUENTIAL_ROWS rows; a shorter slot
 // (an MTP verify) and a slot with a zero stop advance row-sequentially with
 // the step's bits (`recurrent_sequential`), and the rows after a stop row
@@ -23,7 +23,11 @@
 // parallel instead of one reduction per state row. Per piece of
 // RECURRENT_SPAN rows the workgroup stages the piece's q, k, v and gates in
 // the shared region, the next piece's loads in flight while the piece
-// advances. ROWS and WARPS never change result bits.
+// advances. The raw outputs go to the `mixed` scratch. ROWS and WARPS never
+// change result bits.
+//
+// `gated_delta_chunk_gate`: one subgroup per (head, row) gates the raw
+// outputs into the result (`recurrent_gate`, the staging launch's order).
 #include "lib/recurrent/recurrent.glsl"
 #include "lib/core/reduce.glsl"
 
@@ -217,7 +221,7 @@ void chunk_store_piece(chunk_stage stage) {
 }
 
 // Advance the lane's state row over the slot's rows [lo, lo + stop), write
-// their mixed outputs, and publish the state after them.
+// their raw outputs, and publish the state after them.
 void chunk_scan_rows(recurrent_inputs in_, recurrent_slot slot, uint head, uint block_row, uint64_t mixed,
     inout float state[CHUNK_MAX_COLUMNS]) {
     const uint64_t inputs = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INPUTS);
@@ -255,9 +259,7 @@ void chunk_scan_rows(recurrent_inputs in_, recurrent_slot slot, uint head, uint 
             }
             attended = reduce_lanes_sum(attended, L);
             if (part == 0u && chunk_active())
-                element_put(ELEMENT_ACT, mixed,
-                    uint64_t(first + r) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(head) * SEISMIC_RESULT_0_STRIDE_1
-                        + uint64_t(block_row + local_row) * SEISMIC_RESULT_0_STRIDE_2,
+                element_put(ELEMENT_ACT, mixed, recurrent_raw_index(uint64_t(first + r), head, block_row + local_row),
                     attended);
         }
     }
@@ -272,7 +274,7 @@ void gated_delta_chunk_scan() {
     }
     const recurrent_inputs in_ = recurrent_inputs_of();
     const recurrent_slot slot = recurrent_slot_of(slot_index);
-    const uint64_t mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t mixed = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_MIXED);
     const uint head = gl_WorkGroupID.x;
     const uint block_row = gl_WorkGroupID.y * CHUNK_BLOCK_ROWS;
     float state[CHUNK_MAX_COLUMNS];
@@ -290,4 +292,8 @@ void gated_delta_chunk_scan() {
         recurrent_advance_rows(in_, slot, slot.lo + slot.stop, head, block_row, CHUNK_BLOCK_ROWS, CHUNK_ROWS, first_row,
             rows, mixed);
     }
+}
+
+void gated_delta_chunk_gate() {
+    recurrent_gate(false);
 }

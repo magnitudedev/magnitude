@@ -3,6 +3,8 @@
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
+#define PREFILL_HEADS_PER_GROUP SEISMIC_TUNE_HEADS
+#define PREFILL_DIRECT SEISMIC_TUNE_DIRECT
 #include "lib/attention/attention.h"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
@@ -63,11 +65,12 @@ kernel void attention_prefill_attend(
     uint lane [[thread_index_in_simdgroup]]) {
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
+    PREFILL_EXCHANGE(exchange, SEISMIC_TUNE_QT);
     attention::prefill_attend<SEISMIC_TUNE_QT>(attention::dense_history{history_key, history_value,
         ulong(SEISMIC_PARAM_SLAB_ROWS)},
         query, gate, visible, fresh, result, queries, keys, values, partials, statistics, counts,
         SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
-        SEISMIC_PARAM_GATE_FUNCTION != 0, shared, group, groups, thread_index, simd, lane);
+        SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane);
 }
 
 kernel void attention_prefill_merge(

@@ -16,7 +16,8 @@
 
 use super::cases::projection_shape;
 use super::{
-    row_points, served_row_points, with_contexts, CaseState, EntryTuning, PointShape, TuningInputs,
+    row_points, served_row_points, with_contexts, CaseState, EntryTuning, ModelInputs, PointShape,
+    TuningInputs,
     TuningLimits,
 };
 use crate::operators;
@@ -125,7 +126,11 @@ fn decode_starts(
                     let (tokens, target_parts, keys, simds, span) = if packed_g8 {
                         (4, history_parts.max(32).next_power_of_two(), 16, 4, 32)
                     } else if wide_group {
-                        (1, history_parts.max(32), 8, 2, 128)
+                        // One row: about 256 KiB of encoded history per
+                        // partition. Fewer, larger partitions leave cores idle
+                        // on the wider Apple GPUs (M4 Max Qwen35B 65k: P64
+                        // 330 us, P128 235 us).
+                        (1, history_parts.saturating_mul(2).max(32), 8, 2, 128)
                     } else {
                         (4, history_parts, 8, 4, 128)
                     };
@@ -179,7 +184,7 @@ impl AttentionProjectTuning {
 
 /// The attention operator of the layers a case binds.
 fn operator<'i>(
-    inputs: &'i TuningInputs<'_, '_>,
+    inputs: &'i ModelInputs<'_>,
     scopes: &[WeightScope],
 ) -> Result<&'i Attention, String> {
     match inputs.operator(scopes)? {
@@ -209,7 +214,7 @@ impl EntryTuning for AttentionProjectTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.binding.shape;
         let query = operators::attention::query_kind(operator(inputs, &self.scopes)?);
         if projection_shape(inputs, &self.scopes, query)? != (shape.query_rows(), shape.hidden) {
@@ -311,7 +316,7 @@ impl EntryTuning for AttentionOutputTuning {
         format!("OW={},A={}", self.output.name(), self.activation.name())
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
         let heads = shape.kv_heads * shape.group;
         if projection_shape(inputs, &self.scopes, WeightKind::AttentionOutput)?
@@ -375,6 +380,10 @@ pub(crate) struct AttentionMix {
     /// The row classes this variant serves. Distinct ranges have distinct
     /// tuning identities and are validated on their own rows.
     pub decode_rows: Option<Range<u64>>,
+    /// For the affine prefill: whether the launch lists the history row
+    /// tiles its rows see (the entry's `L`, static where the forms differ by
+    /// it: the two then have different admissible forms and tune apart).
+    pub listed: bool,
 }
 
 /// `attention_decode`, for row classes up to [`DECODE_ROWS`].
@@ -406,6 +415,9 @@ pub(crate) struct AttentionMixCase<H> {
     visible: Tensor,
     fresh: Tensor,
     destinations: Tensor,
+    /// The history row tiles the case's rows see (the affine prefill's
+    /// `history_tiles`).
+    history_tiles: Tensor,
     history: H,
     slab_rows: u32,
     epsilon: f32,
@@ -581,12 +593,17 @@ impl AttentionMix {
                 rows.start,
                 rows.end
             ),
+            None if self.listed => format!("A={},L=1", self.activation.name()),
             None => format!("A={}", self.activation.name()),
         }
     }
 
     fn statics(&self) -> Vec<(&'static str, u64)> {
-        self.shape.mix_statics().to_vec()
+        self.shape
+            .mix_statics()
+            .into_iter()
+            .chain([("L", u64::from(self.listed))])
+            .collect()
     }
 
     /// The history rows the planes of points with `context` history rows
@@ -706,6 +723,23 @@ impl AttentionMix {
                     visible: inputs.i32s(&[rows, segments, 2], &visible)?,
                     fresh: inputs.i32s(&[rows, 2], &fresh)?,
                     destinations: inputs.i32s(&[rows], &history_tables.destinations)?,
+                    history_tiles: {
+                        // Exactly the tiles the case's rows see (one entry
+                        // when they see none).
+                        let spans = || visible.chunks_exact(2).map(|span| [span[0], span[1]]);
+                        let bound = spans()
+                            .map(|[start, end]| (end - start).max(0) as usize / 256 + 2)
+                            .sum::<usize>();
+                        let mut tiles = magnitude_batching::history_tiles(spans(), bound)
+                            .ok_or("tuning history tiles exceed their bound")?;
+                        tiles.truncate(tiles.iter().filter(|tile| **tile >= 0).count().max(1));
+                        // An unlisted launch passes no list.
+                        if !self.listed {
+                            inputs.i32s(&[0, 1], &[])?
+                        } else {
+                            inputs.i32s(&[1, tiles.len() as u64], &tiles)?
+                        }
+                    },
                     history: history.share(),
                     slab_rows: u32::try_from(view).map_err(|_| "tuning history rows exceed u32")?,
                     epsilon: self.epsilon,
@@ -753,7 +787,7 @@ macro_rules! mix_entry {
 
             fn statics(
                 &self,
-                _inputs: &TuningInputs<'_, '_>,
+                _inputs: &ModelInputs<'_>,
             ) -> Result<Vec<(&'static str, u64)>, String> {
                 Ok(self.0.statics())
             }
@@ -854,6 +888,7 @@ mix_entry!(
     AffineMixHistory,
     |rows| rows > DECODE_ROWS,
     |case| {
+        history_tiles: &case.history_tiles,
         history_key_codes: case.history.key_codes.tensor_mut(),
         history_key_coefficients: case.history.key_coefficients.tensor_mut(),
         history_value_codes: case.history.value_codes.tensor_mut(),
@@ -868,6 +903,7 @@ mod tests {
     #[test]
     fn verify_decode_has_distinct_tuning_identity_and_served_rows() {
         let mix = AttentionMix {
+            listed: false,
             activation: Element::bf16(),
             shape: AttentionShape {
                 hidden: 2560,

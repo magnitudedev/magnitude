@@ -19,6 +19,7 @@ pub struct PlannedDevice {
     backend: BackendName,
     name: String,
     assessment_capacity_bytes: u64,
+    tensor_operations: bool,
 }
 
 impl PlannedDevice {
@@ -37,6 +38,12 @@ impl PlannedDevice {
     /// Stable capacity of the selected allocation domain at planning time.
     pub fn assessment_capacity_bytes(&self) -> u64 {
         self.assessment_capacity_bytes
+    }
+
+    /// Whether the device forms Metal tensor operations
+    /// (`SelectedDevice::tensor_operations`).
+    pub fn tensor_operations(&self) -> bool {
+        self.tensor_operations
     }
 }
 
@@ -82,6 +89,37 @@ pub struct ExecutionPlan {
     resources: ResourcePlan,
     capabilities: CapabilityPlan,
     policy: ResolvedPolicy,
+}
+
+/// Model topology on a backend: everything planning derives without a
+/// device. A load's [`ExecutionPlanDraft`] is this plan on its selected
+/// device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendPlan {
+    backend: BackendName,
+    components: ComponentPlan,
+    load: ModelLoadPlan,
+    programs: ProgramPlan,
+    capabilities: CapabilityPlan,
+    policy: ResolvedPolicy,
+}
+
+impl BackendPlan {
+    pub fn backend(&self) -> BackendName {
+        self.backend
+    }
+
+    pub fn programs(&self) -> &ProgramPlan {
+        &self.programs
+    }
+
+    pub fn policy(&self) -> ResolvedPolicy {
+        self.policy
+    }
+
+    pub fn load(&self) -> &ModelLoadPlan {
+        &self.load
+    }
 }
 
 /// Model topology and device choice before physical storage admission. Native
@@ -175,6 +213,7 @@ impl ExecutionPlan {
 pub struct ExecutionPlanner;
 
 impl ExecutionPlanner {
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         device: &SelectedDevice,
         manifest: &PackageManifest,
@@ -185,6 +224,52 @@ impl ExecutionPlanner {
         codec: KvCodec,
         limits: ResourceLimits,
     ) -> Result<ExecutionPlanDraft, PlanError> {
+        let BackendPlan {
+            backend,
+            components,
+            load,
+            programs,
+            capabilities,
+            policy,
+        } = Self::backend_plan(
+            device.info.backend,
+            manifest,
+            definition,
+            selection,
+            path,
+            method,
+            codec,
+            limits,
+        )?;
+        Ok(ExecutionPlanDraft {
+            device: PlannedDevice {
+                selector: device.info.selector,
+                backend,
+                name: device.info.name.clone(),
+                assessment_capacity_bytes: device.assessment_capacity_bytes,
+                tensor_operations: device.tensor_operations,
+            },
+            components,
+            load,
+            programs,
+            capabilities,
+            policy,
+        })
+    }
+
+    /// The model's plan on `backend`, which is all the planner reads of a
+    /// device: [`Self::prepare`] adds the selected device to it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn backend_plan(
+        backend: BackendName,
+        manifest: &PackageManifest,
+        definition: &ModelDefinition,
+        selection: ComponentSelection,
+        path: ExecutionPath,
+        method: PlannedMethod,
+        codec: KvCodec,
+        limits: ResourceLimits,
+    ) -> Result<BackendPlan, PlanError> {
         if path == ExecutionPath::Native && codec == KvCodec::RotatedK4V4 {
             return Err(PlanError::Unsupported("native rotated K4/V4 KV codec"));
         }
@@ -204,13 +289,19 @@ impl ExecutionPlanner {
             }
             _ => {}
         }
-        let load = ModelLoadPlan::derive(
-            manifest,
-            definition,
-            selection,
-            super::resident_layout(path, device.info.backend),
-        )
-        .map_err(PlanError::InvalidDefinition)?;
+        let layout = super::resident_layout(path, backend);
+        let load = ModelLoadPlan::derive(manifest, definition, selection, layout)
+            .map_err(PlanError::InvalidDefinition)?;
+        // The head in progressive planes, where the backend reads them.
+        let load = if path == ExecutionPath::Native
+            && crate::programs::graph::readout::reads_progressive_heads(backend)
+                .map_err(PlanError::ResourcePlanning)?
+        {
+            load.with_progressive_head(definition)
+                .map_err(PlanError::InvalidDefinition)?
+        } else {
+            load
+        };
         let programs = load.program_plan(definition, codec)?;
         let target = ArtifactComponent {
             kind: ArtifactComponentKind::Target,
@@ -283,13 +374,8 @@ impl ExecutionPlanner {
                     .identity,
             }),
         };
-        Ok(ExecutionPlanDraft {
-            device: PlannedDevice {
-                selector: device.info.selector,
-                backend: device.info.backend,
-                name: device.info.name.clone(),
-                assessment_capacity_bytes: device.assessment_capacity_bytes,
-            },
+        Ok(BackendPlan {
+            backend,
             components: ComponentPlan {
                 target,
                 head,

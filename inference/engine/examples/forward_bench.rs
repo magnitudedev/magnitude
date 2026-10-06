@@ -8,8 +8,10 @@
 //! - `decode`: one sequence with `--context` tokens of history, then 16 warm
 //!   and 32 measured greedy decode steps (median reported);
 //! - `prefill`: fresh sequences of 32/128/512 tokens, one cold and three warm
-//!   (median of warm); with `--prefill-history H`, the chunks instead follow
-//!   H tokens of history on one sequence, back to back;
+//!   (median of warm); `--prefill-history H,..` runs each cell at every
+//!   listed history (default 0), where for H > 0 the chunks follow H tokens of
+//!   history on one sequence, back to back (a prompt longer than one prefill
+//!   runs fresh only);
 //! - `concurrent`: `--sequences N` sequences with `--context` history each,
 //!   decoding together; aggregate tokens per second.
 //!
@@ -26,16 +28,25 @@
 //! ```text
 //! forward_bench bench --model M.gguf --output out.json [--path native]
 //!     [--cells decode,prefill,concurrent]
-//!     [--context 256,4096,16384] [--prefill 32,128,512] [--prefill-history 0]
+//!     [--context 256,4096,16384] [--prefill 32,128,512] [--prefill-history 0,4096]
 //!     [--prefill-samples 4]
 //!     [--sequences 1,2,4,8]
 //!     [--warm 16] [--steps 32] [--attribution-steps 4]
+//!     [--context-tokens FILE] [--temperature T] [--diagnostic]
 //! forward_bench qualify --model M.gguf --reference REF_DIR --output out.json
 //!     [--chunks N] [--label NAME] [--verify-width W] [--batch B]
 //! ```
 //!
 //! `qualify` decodes up to B chunks (across categories) together in each
 //! step and compares their rows against the reference in parallel.
+//!
+//! `--context-tokens FILE` forces the token ids in FILE (whitespace-separated,
+//! repeated to length) instead of the pseudo-random spread, so history and
+//! forced decode tokens are real text and the readout sees real logit
+//! distributions. `--temperature T` samples each decode selection at T
+//! (seeded per position) instead of taking the greedy token. `--diagnostic`
+//! benches a diagnostic load (it exports logits, so every selection reads
+//! the full readout rather than a certified selection's levels).
 //!
 //! Either mode takes `--cache-dir DIR`, the engine's kernel cache (compiled
 //! kernels and tuning results); without it every load forms and tunes every
@@ -101,152 +112,10 @@ fn run() -> Result<(), String> {
     outcome
 }
 
-/// `--tuning-record FILE` / `--tuning-replay FILE`, only with the
-/// development feature `pinned-tuning`
-/// (`cargo run --release --example forward_bench --features pinned-tuning`).
-///
-/// A measurement tool for bit-exact comparisons between runs: tuning at load
-/// may choose different configurations each run, so the baseline run records
-/// the configuration chosen per entry and the comparison run replays exactly
-/// those (it tunes nothing). Within the recording run every load reuses the
-/// first choice per entry. See `magnitude_executor::pinned_tuning`.
+/// `--tuning-record FILE` / `--tuning-replay FILE` (`support/tuning_pin.rs`).
 #[cfg(feature = "pinned-tuning")]
-mod tuning_pin {
-    use magnitude_executor::pinned_tuning::{self, PinnedConfiguration, TuningPin};
-    use serde_json::{json, Value};
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
-
-    pub(crate) struct Pin {
-        record: Option<PathBuf>,
-    }
-
-    impl Pin {
-        /// Remove the pin flags from `args` and install the pin they ask for.
-        pub(crate) fn extract(args: &mut Vec<String>) -> Result<Self, String> {
-            let (mut record, mut replay) = (None, None);
-            if let Some(index) = args.iter().position(|arg| arg == "--tuning-defaults") {
-                args.remove(index);
-                pinned_tuning::install(TuningPin::Defaults);
-                eprintln!("forward_bench: running every entry's default configuration");
-                return Ok(Self { record: None });
-            }
-            let mut index = 0;
-            while index < args.len() {
-                let slot = match args[index].as_str() {
-                    "--tuning-record" => &mut record,
-                    "--tuning-replay" => &mut replay,
-                    _ => {
-                        index += 1;
-                        continue;
-                    }
-                };
-                if index + 1 == args.len() {
-                    return Err(format!("{} requires a file", args[index]));
-                }
-                *slot = Some(PathBuf::from(args.remove(index + 1)));
-                args.remove(index);
-            }
-            match (record, replay) {
-                (Some(_), Some(_)) => {
-                    Err("--tuning-record and --tuning-replay exclude each other".into())
-                }
-                (None, Some(path)) => {
-                    let configurations = read(&path)?;
-                    eprintln!(
-                        "forward_bench: replaying {} pinned tuning configurations from {}",
-                        configurations.len(),
-                        path.display()
-                    );
-                    pinned_tuning::install(TuningPin::Replay(configurations));
-                    Ok(Self { record: None })
-                }
-                (record, None) => {
-                    if record.is_some() {
-                        pinned_tuning::install(TuningPin::Record);
-                    }
-                    Ok(Self { record })
-                }
-            }
-        }
-
-        /// Write the recorded configurations when recording.
-        pub(crate) fn finish(self) -> Result<(), String> {
-            let Some(path) = self.record else {
-                return Ok(());
-            };
-            let configurations = pinned_tuning::recorded();
-            let entries = configurations
-                .iter()
-                .map(|pinned| {
-                    json!({
-                        "entry": pinned.entry,
-                        "bindings": pinned.bindings,
-                        "statics": pinned.statics,
-                        "params": pinned.params,
-                        "launch_params": pinned
-                            .launch_params
-                            .iter()
-                            .map(|((launch, name), value)| (format!("{launch}:{name}"), *value))
-                            .collect::<BTreeMap<_, _>>(),
-                    })
-                })
-                .collect::<Vec<_>>();
-            let text = serde_json::to_string_pretty(&entries).map_err(|error| error.to_string())?;
-            std::fs::write(&path, text)
-                .map_err(|error| format!("writing {}: {error}", path.display()))?;
-            eprintln!(
-                "forward_bench: recorded {} tuning configurations to {}",
-                configurations.len(),
-                path.display()
-            );
-            Ok(())
-        }
-    }
-
-    fn read(path: &std::path::Path) -> Result<Vec<PinnedConfiguration>, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|error| format!("reading {}: {error}", path.display()))?;
-        let entries: Vec<Value> =
-            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-        let malformed = || format!("{}: malformed tuning pin", path.display());
-        let map = |value: &Value| -> Result<BTreeMap<String, u64>, String> {
-            value
-                .as_object()
-                .ok_or_else(malformed)?
-                .iter()
-                .map(|(name, value)| Ok((name.clone(), value.as_u64().ok_or_else(malformed)?)))
-                .collect()
-        };
-        entries
-            .iter()
-            .map(|entry| {
-                let text = |field: &str| {
-                    entry[field]
-                        .as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(malformed)
-                };
-                Ok(PinnedConfiguration {
-                    entry: text("entry")?,
-                    bindings: text("bindings")?,
-                    statics: map(&entry["statics"])?,
-                    params: map(&entry["params"])?,
-                    launch_params: map(&entry["launch_params"])?
-                        .into_iter()
-                        .map(|(key, value)| {
-                            let (launch, name) = key.split_once(':').ok_or_else(malformed)?;
-                            Ok((
-                                (launch.parse().map_err(|_| malformed())?, name.to_owned()),
-                                value,
-                            ))
-                        })
-                        .collect::<Result<_, String>>()?,
-                })
-            })
-            .collect()
-    }
-}
+#[path = "support/tuning_pin.rs"]
+mod tuning_pin;
 
 /// `--tuning-survey DIR [--tuning-survey-samples N] [--tuning-survey-entries
 /// E,..] [--tuning-survey-widen ENTRY:P=v,v,..;Q=v,..]`, only with the
@@ -345,8 +214,8 @@ pub(crate) struct Options {
     cells: Vec<String>,
     contexts: Vec<usize>,
     prefills: Vec<usize>,
-    /// History tokens before each prefill cell's chunks (0 = fresh sequences).
-    prefill_history: usize,
+    /// History lengths each prefill cell runs at (0 = fresh sequences).
+    prefill_histories: Vec<usize>,
     /// Full-prompt samples, including one cold run (minimum two).
     prefill_samples: usize,
     sequences: Vec<usize>,
@@ -365,6 +234,8 @@ pub(crate) struct Options {
     label: Option<String>,
     /// The kernel cache directory (`--cache-dir`); none caches nothing.
     kernel_cache: Option<PathBuf>,
+    /// `bench`: a diagnostic load (`--diagnostic`) rather than a served one.
+    diagnostic: bool,
     /// The target history codec (`--kv-codec`).
     kv_codec: KvCodec,
     /// The device to run on (`--device auto|metal|cuda|vulkan|cpu|SELECTOR`).
@@ -376,6 +247,12 @@ pub(crate) struct Options {
     /// Decode input tokens (`--decode-tokens forced|selected`, default
     /// forced): the forced stream, or each step's greedy selection fed back.
     feedback: bool,
+    /// Forced tokens from a file of token ids (`--context-tokens`); empty
+    /// forces the pseudo-random spread.
+    context_tokens: Vec<TokenId>,
+    /// Decode selections sample at this temperature (`--temperature`);
+    /// greedy when absent.
+    temperature: Option<f32>,
 }
 
 fn list(value: &str) -> Result<Vec<usize>, String> {
@@ -399,7 +276,7 @@ impl Options {
             cells: vec!["decode".into(), "prefill".into(), "concurrent".into()],
             contexts: vec![256, 4096, 16384],
             prefills: vec![32, 128, 512],
-            prefill_history: 0,
+            prefill_histories: vec![0],
             prefill_samples: 4,
             sequences: vec![1, 2, 4, 8],
             widths: vec![1, 2, 3, 4, 5, 6, 8],
@@ -412,10 +289,13 @@ impl Options {
             batch: 32,
             label: None,
             kernel_cache: None,
+            diagnostic: false,
             kv_codec: KvCodec::AffineK8V4,
             device: magnitude_executor::platform::DeviceRequest::Automatic,
             lookahead: false,
             feedback: false,
+            context_tokens: Vec::new(),
+            temperature: None,
         };
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or(format!("{flag} requires a value"));
@@ -433,11 +313,7 @@ impl Options {
                 "--prefill" => options.prefills = list(&value()?)?,
                 "--sequences" => options.sequences = list(&value()?)?,
                 "--widths" => options.widths = list(&value()?)?,
-                "--prefill-history" => {
-                    options.prefill_history = value()?
-                        .parse()
-                        .map_err(|_| "--prefill-history requires a count")?
-                }
+                "--prefill-history" => options.prefill_histories = list(&value()?)?,
                 "--prefill-samples" => {
                     options.prefill_samples = value()?
                         .parse()
@@ -497,6 +373,32 @@ impl Options {
                         }
                     }
                 }
+                "--context-tokens" => {
+                    let path = value()?;
+                    options.context_tokens = std::fs::read_to_string(&path)
+                        .map_err(|error| format!("--context-tokens {path}: {error}"))?
+                        .split_whitespace()
+                        .map(|token| {
+                            token
+                                .parse()
+                                .map(TokenId)
+                                .map_err(|_| format!("{token:?} is not a token id"))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    if options.context_tokens.is_empty() {
+                        return Err(format!("--context-tokens {path} holds no tokens"));
+                    }
+                }
+                "--diagnostic" => options.diagnostic = true,
+                "--temperature" => {
+                    options.temperature = Some(
+                        value()?
+                            .parse()
+                            .ok()
+                            .filter(|temperature: &f32| *temperature > 0.0)
+                            .ok_or("--temperature requires a positive value")?,
+                    )
+                }
                 other => return Err(format!("unknown flag {other}")),
             }
         }
@@ -538,6 +440,10 @@ pub(crate) struct Bench {
     lookahead: bool,
     /// Decode feeds back each step's selection instead of forced tokens.
     feedback: bool,
+    /// Forced tokens (`Options::context_tokens`); empty forces the spread.
+    context: Vec<TokenId>,
+    /// Selections sample at this temperature; greedy when absent.
+    temperature: Option<f32>,
 }
 
 /// One open request and its accepted position.
@@ -568,6 +474,7 @@ impl Bench {
         kv_codec: KvCodec,
         device: magnitude_executor::platform::DeviceRequest,
         lookahead: bool,
+        exported_logits_rows: usize,
     ) -> Result<(Self, StateBindings), String> {
         let resolved = EngineConfiguration {
             package: PackageOptions {
@@ -580,7 +487,8 @@ impl Bench {
                 mtp_proposals: None,
                 kv_codec,
                 lookahead,
-                exported_logits_rows: PREFILL_ROWS,
+                exported_logits_rows,
+                error_classes: Vec::new(),
             },
             context_tokens: Some(context_tokens),
             service: ServiceLimits {
@@ -611,6 +519,8 @@ impl Bench {
             next_request: 1,
             lookahead,
             feedback: false,
+            context: Vec::new(),
+            temperature: None,
         };
         Ok((bench, bindings))
     }
@@ -650,9 +560,13 @@ impl Bench {
         self.domain.close(sequence.request)
     }
 
-    /// The forced token at a position: a fixed spread over ordinary
-    /// vocabulary rows, away from the special tokens at the top.
+    /// The forced token at a position: the context's, repeated to length,
+    /// or a fixed spread over ordinary vocabulary rows, away from the special
+    /// tokens at the top.
     fn token(&self, position: usize) -> TokenId {
+        if !self.context.is_empty() {
+            return self.context[position % self.context.len()];
+        }
         let span = (self.vocabulary - 1024) as u64;
         TokenId(((position as u64 * 2_654_435_761 + 12_345) % span + 512) as u32)
     }
@@ -675,10 +589,28 @@ impl Bench {
         }
     }
 
+    /// The selection at a position: greedy, or sampled at the bench's
+    /// temperature.
+    fn select(&self, position: usize) -> SelectSpec {
+        match self.temperature {
+            None => Self::greedy(position),
+            Some(temperature) => SelectSpec {
+                sampling: Sampling::Categorical,
+                seed: 1,
+                shaping: Shaping {
+                    temperature,
+                    ..Shaping::default()
+                },
+                ..Self::greedy(position)
+            },
+        }
+    }
+
     /// A forward of `tokens` at the sequence's position. `demand` decides the
-    /// readout: `SELECT` samples greedily from the last row (a decode, or a
-    /// finishing prefill), `LOGITS` exports the last row's logits.
+    /// readout: `SELECT` selects from the last row (a decode, or a finishing
+    /// prefill), `LOGITS` exports the last row's logits.
     pub(crate) fn forward(
+        &self,
         sequence: &Sequence,
         kind: WorkKind,
         tokens: Vec<TokenId>,
@@ -686,7 +618,7 @@ impl Bench {
     ) -> Operation {
         let last = sequence.position + tokens.len() - 1;
         let select = if demand.contains(Demand::SELECT) {
-            vec![Self::greedy(last)]
+            vec![self.select(last)]
         } else {
             Vec::new()
         };
@@ -789,7 +721,7 @@ impl Bench {
         while sequence.position < target {
             let chunk = (target - sequence.position).min(PREFILL_ROWS);
             let tokens = self.forced(sequence.position, chunk);
-            let operation = Self::forward(sequence, WorkKind::Prefill, tokens, Demand::NONE);
+            let operation = self.forward(sequence, WorkKind::Prefill, tokens, Demand::NONE);
             bindings = self.step(bindings, vec![operation], &mut [sequence], trace)?.2;
             if rows >= 32 * PREFILL_ROWS && sequence.position >= next_progress {
                 eprintln!(
@@ -1073,7 +1005,7 @@ fn decode_operations(bench: &Bench, sequences: &[Sequence]) -> Vec<Operation> {
     sequences
         .iter()
         .map(|sequence| {
-            Bench::forward(
+            bench.forward(
                 sequence,
                 WorkKind::Decode,
                 vec![bench.decode_token(sequence)],
@@ -1129,7 +1061,6 @@ fn prefill_prompt_cell(
     let mut samples = Vec::with_capacity(options.prefill_samples);
     for _ in 0..options.prefill_samples {
         let mut sequence = bench.open_sequence(&mut bindings)?;
-        bindings = bench.history(bindings, &mut sequence, options.prefill_history, None)?;
         let start = host_seconds();
         let mut remaining = rows;
         while remaining > 0 {
@@ -1139,7 +1070,7 @@ fn prefill_prompt_cell(
             } else {
                 Demand::NONE
             };
-            let operation = Bench::forward(
+            let operation = bench.forward(
                 &sequence,
                 WorkKind::Prefill,
                 bench.forced(sequence.position, chunk),
@@ -1158,7 +1089,7 @@ fn prefill_prompt_cell(
     let median_ms = median(&mut warm);
     let result = json!({
         "rows": rows,
-        "history": options.prefill_history,
+        "history": 0,
         "chunks": rows.div_ceil(PREFILL_ROWS),
         "sample_count": options.prefill_samples,
         "median_ms": median_ms,
@@ -1170,18 +1101,18 @@ fn prefill_prompt_cell(
 }
 
 /// Without history, every chunk is a fresh sequence at position 0. With
-/// `--prefill-history H`, one sequence first accepts H tokens of history and
-/// the chunks follow each other on it, so chunk `i` starts at H + i * rows.
+/// `history` H, one sequence first accepts H tokens of history and the chunks
+/// follow each other on it, so chunk `i` starts at H + i * rows.
 fn prefill_cell(
     bench: &mut Bench,
     mut bindings: StateBindings,
     options: &Options,
     rows: usize,
+    history: usize,
 ) -> Result<(Value, StateBindings), String> {
     if rows > PREFILL_ROWS {
         return prefill_prompt_cell(bench, bindings, options, rows);
     }
-    let history = options.prefill_history;
     let mut shared = if history == 0 {
         None
     } else {
@@ -1199,7 +1130,7 @@ fn prefill_cell(
             None => Some(bench.open_sequence(&mut bindings)?),
         };
         let sequence = shared.as_mut().or(fresh.as_mut()).expect("a sequence");
-        let operation = Bench::forward(
+        let operation = bench.forward(
             sequence,
             WorkKind::Prefill,
             bench.forced(sequence.position, rows),
@@ -1277,10 +1208,18 @@ fn bench(options: &Options) -> Result<(), String> {
     };
     let steps = (options.warm + options.steps + options.attribution_steps + 1) * widest;
     let widest_prefill = options.prefills.iter().copied().max().unwrap_or(0);
-    let longest_prefill = match (prefill, options.prefill_history) {
-        (false, _) => 0,
-        (true, 0) => widest_prefill,
-        (true, history) => history + PREFILL_CHUNKS * widest_prefill,
+    let longest_prefill = if prefill {
+        options
+            .prefill_histories
+            .iter()
+            .map(|&history| match history {
+                0 => widest_prefill,
+                history => history + PREFILL_CHUNKS * widest_prefill.min(PREFILL_ROWS),
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
     };
     let context_tokens = (longest + steps).max(longest_prefill);
     let concurrent_sequences = if concurrent {
@@ -1298,8 +1237,13 @@ fn bench(options: &Options) -> Result<(), String> {
         options.kv_codec,
         options.device,
         options.lookahead,
+        // A served load: the bench reads selections only, so the readout
+        // runs as it serves (no logits are exported).
+        if options.diagnostic { PREFILL_ROWS } else { 0 },
     )?;
     bench.feedback = options.feedback;
+    bench.context = options.context_tokens.clone();
+    bench.temperature = options.temperature;
     let load_seconds = host_seconds() - loaded;
     let mut report = json!({
         "tool": "engine/examples/forward_bench.rs",
@@ -1341,9 +1285,17 @@ fn bench(options: &Options) -> Result<(), String> {
         }
     }
     if prefill {
-        for &rows in &options.prefills {
-            eprintln!("prefill rows={rows}");
-            let (cell, next) = prefill_cell(&mut bench, bindings, options, rows)?;
+        // A whole prompt (more rows than one prefill) is measured fresh only.
+        let cells = options.prefill_histories.iter().flat_map(|&history| {
+            options
+                .prefills
+                .iter()
+                .filter(move |&&rows| history == 0 || rows <= PREFILL_ROWS)
+                .map(move |&rows| (rows, history))
+        });
+        for (rows, history) in cells {
+            eprintln!("prefill rows={rows} history={history}");
+            let (cell, next) = prefill_cell(&mut bench, bindings, options, rows, history)?;
             bindings = next;
             eprintln!(
                 "  median {:.3} ms",
@@ -1940,6 +1892,8 @@ mod qualify {
             options.kv_codec,
             options.device,
             false,
+            // A diagnostic load: qualification reads every scored row's logits.
+            super::PREFILL_ROWS,
         )?;
         let limits = limits(&bench.geometry)?;
         for (name, base) in &bases {
@@ -2043,9 +1997,9 @@ mod qualify {
 
     /// The teacher-forced step of `forced` rows: a single-row decode, or above
     /// one row a verification forward (the MTP verify shapes).
-    fn scored(sequence: &Sequence, forced: Vec<TokenId>) -> Operation {
+    fn scored(bench: &Bench, sequence: &Sequence, forced: Vec<TokenId>) -> Operation {
         if forced.len() == 1 {
-            return Bench::forward(sequence, WorkKind::Decode, forced, Demand::LOGITS);
+            return bench.forward(sequence, WorkKind::Decode, forced, Demand::LOGITS);
         }
         Operation::Forward {
             request: sequence.request,
@@ -2082,7 +2036,7 @@ mod qualify {
                 }
                 budget -= rows;
                 let piece = tokens[sequence.position..sequence.position + rows].to_vec();
-                operations.push(Bench::forward(
+                operations.push(bench.forward(
                     sequence,
                     WorkKind::Prefill,
                     piece,
@@ -2128,7 +2082,7 @@ mod qualify {
                 .iter()
                 .zip(&tokens)
                 .map(|(sequence, tokens)| {
-                    scored(sequence, tokens[first + row..first + row + group].to_vec())
+                    scored(bench, sequence, tokens[first + row..first + row + group].to_vec())
                 })
                 .collect();
             let mut advancing: Vec<&mut Sequence> = sequences.iter_mut().collect();

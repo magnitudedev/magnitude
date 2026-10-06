@@ -228,6 +228,7 @@ struct Bound {
     visible: Tensor,
     fresh: Tensor,
     destinations: Tensor,
+    history_tiles: Tensor,
     _history_slabs: SlabTensor,
     key_codes: Tensor,
     key_coefficients: Tensor,
@@ -340,6 +341,10 @@ impl Bound {
             visible: i32_tensor(device, &[m, case.spans, 2], &case.visible),
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
             destinations: i32_tensor(device, &[m], &case.destinations),
+            history_tiles: {
+                let tiles = history_tiles(&case.visible);
+                i32_tensor(device, &[1, tiles.len()], &tiles)
+            },
             _history_slabs: slabs,
             key_codes,
             key_coefficients,
@@ -376,6 +381,38 @@ macro_rules! args {
             visible: &$bound.visible,
             fresh: &$bound.fresh,
             destinations: &$bound.destinations,
+            history_key_codes: &mut $bound.key_codes,
+            history_key_coefficients: &mut $bound.key_coefficients,
+            history_value_codes: &mut $bound.value_codes,
+            history_value_coefficients: &mut $bound.value_coefficients,
+            epsilon: $case.epsilon,
+            scale: $case.scale,
+            gate_function: 0,
+            slab_rows: $bound.slab_rows,
+        }
+    };
+}
+
+/// The affine prefill entry's arguments: `args!`'s, and the history row tiles
+/// the case's rows see.
+macro_rules! prefill_args {
+    ($bound:expr, $case:expr) => {
+        attention_prefill_k8v4::Args {
+            query: &$bound.query,
+            gate: &$bound.gate,
+            key: &$bound.key,
+            value: &$bound.value,
+            query_norm: &$bound.query_norm,
+            key_norm: &$bound.key_norm,
+            value_norm: &$bound.value_norm,
+            rotary_components: &$bound.components,
+            rotary_frequencies: &$bound.frequencies,
+            rotary_amplitudes: &$bound.amplitudes,
+            coordinates: &$bound.coordinates,
+            visible: &$bound.visible,
+            fresh: &$bound.fresh,
+            destinations: &$bound.destinations,
+            history_tiles: &$bound.history_tiles,
             history_key_codes: &mut $bound.key_codes,
             history_key_coefficients: &mut $bound.key_coefficients,
             history_value_codes: &mut $bound.value_codes,
@@ -749,10 +786,30 @@ fn prefill_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'stati
             .into_iter()
             .map(|split| vec![("ROWS", 64), ("SPLIT_GROUPS", split)])
             .collect(),
-        _ => [(16, 1), (8, 1), (16, 256), (8, 256)]
-            .into_iter()
-            .map(|(qt, split)| vec![("QT", qt), ("SPLIT_GROUPS", split)])
-            .collect(),
+        // Each query tile with one head group and with groups of 4 and 2
+        // heads, staged and (for whole 16-row simdgroups) in the direct
+        // form. QT = 32 where its 32 HEADS rows fit the device's threadgroup
+        // memory with the tensor-operation form (32 HEADS <= 128).
+        _ => {
+            let single = single_head_group(geometry.g);
+            let mut heads = vec![single];
+            heads.extend([4, 2].into_iter().filter(|&heads| heads < single));
+            [(16, 1), (8, 1), (16, 256), (8, 256), (32, 1), (32, 256)]
+                .into_iter()
+                .flat_map(|(qt, split)| heads.iter().map(move |&heads| (qt, heads, split)))
+                .filter(|&(qt, heads, _)| qt < 32 || qt * heads.min(geometry.g as u64) <= 128)
+                .flat_map(|(qt, heads, split)| {
+                    (0..1 + u64::from(qt >= 16)).map(move |direct| {
+                        vec![
+                            ("QT", qt),
+                            ("HEADS", heads),
+                            ("SPLIT_GROUPS", split),
+                            ("DIRECT", direct),
+                        ]
+                    })
+                })
+                .collect()
+        }
     }
 }
 
@@ -773,9 +830,25 @@ fn specialization_on(
         statics(geometry)
     };
     let base = qwen_form(base, geometry);
-    params
+    let spec = params
         .iter()
-        .fold(base, |spec, (name, value)| spec.with_param(*name, *value))
+        .fold(base, |spec, (name, value)| spec.with_param(*name, *value));
+    // Metal's prefill splits a kv head's query heads into groups of HEADS and
+    // has the DIRECT form; unless the configuration names them, a single
+    // group and the staged form.
+    let names = |name: &str| params.iter().any(|(param, _)| *param == name);
+    if device.backend() != BackendName::Metal || !names("QT") {
+        return spec;
+    }
+    [("HEADS", single_head_group(geometry.g)), ("DIRECT", 0)]
+        .into_iter()
+        .filter(|(name, _)| !names(name))
+        .fold(spec, |spec, (name, value)| spec.with_param(name, value))
+}
+
+/// The smallest declared HEADS holding all of a kv head's `g` query heads.
+fn single_head_group(g: usize) -> u64 {
+    (g.next_power_of_two() as u64).min(16)
 }
 
 fn decode_kernel(
@@ -791,6 +864,21 @@ fn decode_kernel(
     .unwrap()
 }
 
+/// The affine prefill's specialization of `params` on `device`: on Metal, of
+/// a call that lists the history row tiles its rows see, as the cases do.
+fn prefill_specialization(
+    device: &Device,
+    geometry: Geometry,
+    params: &[(&'static str, u64)],
+) -> NativeSpecialization {
+    let spec = specialization_on(device, geometry, params);
+    if device.backend() == BackendName::Metal {
+        spec.with_static("L", 1)
+    } else {
+        spec
+    }
+}
+
 fn prefill_kernel(
     device: &Device,
     geometry: Geometry,
@@ -799,9 +887,270 @@ fn prefill_kernel(
     attention_prefill_k8v4::native_for_device_with(
         device,
         attention_prefill_k8v4::Elements { A: Element::bf16() },
-        &specialization_on(device, geometry, params),
+        &prefill_specialization(device, geometry, params),
     )
     .unwrap()
+}
+
+/// Two requests in one batch over a store much larger than what they see:
+/// each history is spans in different slabs, out of address order, one
+/// continuing from a slab's last row into another slab, and the second
+/// request is a fork sharing rows of the first's. The query tile that holds
+/// rows of both sees, per span index, two spans with thousands of rows the
+/// call does not read between them. `compact` is the same call with the used
+/// slabs moved, in address order, to the start of a store of just those
+/// slabs.
+fn scattered_history(geometry: Geometry) -> (Encoded, Encoded, usize) {
+    const SLAB: i32 = 768;
+    let (first, second) = ((5 * SLAB + 300, 6 * SLAB), (2 * SLAB, 2 * SLAB + 200));
+    let fork = [
+        (5 * SLAB + 300, 5 * SLAB + 556),
+        (11 * SLAB + 512, 11 * SLAB + 700),
+        (9 * SLAB, 9 * SLAB + 100),
+    ];
+    let rows = (0..48)
+        .map(|row| match row {
+            0..=23 => Row {
+                spans: vec![first, second],
+                fresh: (0, row + 1),
+                destination: second.1 + row,
+                position: 668 + row,
+            },
+            24..=43 => Row {
+                spans: fork.to_vec(),
+                fresh: (24, row + 1),
+                destination: if row % 7 == 3 { -1 } else { fork[2].1 + row - 24 },
+                position: 544 + row - 24,
+            },
+            _ => Row { spans: vec![], fresh: (0, 0), destination: -1, position: 0 },
+        })
+        .collect::<Vec<_>>();
+    let scattered = Case::new(geometry, 16 * SLAB as usize, 3, &rows, 31);
+    // Slabs 2, 5, 9 and 11 become slabs 0 to 3.
+    let moved = |row: i32| match row / SLAB {
+        2 => row - 2 * SLAB,
+        5 => row - 4 * SLAB,
+        9 => row - 7 * SLAB,
+        11 => row - 8 * SLAB,
+        _ => panic!("row {row} is in no used slab"),
+    };
+    let mut compact = scattered.clone();
+    compact.history_rows = 4 * SLAB as usize;
+    let vector = geometry.kv * geometry.w();
+    let slabs = |plane: &[f32]| {
+        [2, 5, 9, 11]
+            .into_iter()
+            .flat_map(|slab| plane[slab * SLAB as usize * vector..][..SLAB as usize * vector].to_vec())
+            .collect::<Vec<_>>()
+    };
+    compact.history_key = slabs(&scattered.history_key);
+    compact.history_value = slabs(&scattered.history_value);
+    for span in compact.visible.chunks_exact_mut(2) {
+        if span[1] > span[0] {
+            (span[0], span[1]) = (moved(span[0]), moved(span[1] - 1) + 1);
+        }
+    }
+    for destination in &mut compact.destinations {
+        if *destination >= 0 {
+            *destination = moved(*destination);
+        }
+    }
+    (Encoded::new(scattered), Encoded::new(compact), SLAB as usize)
+}
+
+/// Metal's prefill forms read only the history row tiles the call lists,
+/// wherever they lie in the store: over `scattered_history` every
+/// configuration matches the host model, and an unsplit configuration's
+/// result is bit for bit that of the compact layout (a moved slab keeps every
+/// span's place in its slab, so the call takes the same steps; a split
+/// configuration counts the rows between two requests' spans into its
+/// partitions).
+#[test]
+fn metal_prefill_reads_scattered_history_tiles() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    for geometry in [MINICPM5, QWEN] {
+        let (scattered, compact, slab_rows) = scattered_history(geometry);
+        let expected = scattered.expected();
+        let run = |encoded: &Encoded, config: &[(&'static str, u64)]| {
+            let mut bound = Bound::new_with_slab_rows(&device, encoded, slab_rows, false);
+            let gated = prefill_kernel(&device, geometry, config)
+                .call(prefill_args!(bound, encoded.case))
+                .unwrap()
+                .value;
+            (gated, bound)
+        };
+        let default = [
+            ("QT", 16),
+            ("HEADS", single_head_group(geometry.g)),
+            ("SPLIT_GROUPS", 256),
+            ("DIRECT", 0),
+        ];
+        let reference = bf16_values(&run(&scattered, &default).0);
+        for config in prefill_configs(BackendName::Metal, geometry) {
+            let label = format!("scattered prefill {config:?}");
+            let (gated, bound) = run(&scattered, &config);
+            check(&label, &scattered, &gated, &bound, &expected);
+            if config.contains(&("SPLIT_GROUPS", 1)) {
+                assert!(
+                    gated.read_to_host().unwrap() == run(&compact, &config).0.read_to_host().unwrap(),
+                    "{label}: differs from the compact layout"
+                );
+            }
+        }
+        // A call that lists no tiles (L = 0) is served by the staged form
+        // alone, which reads the history in place: the default's result bit
+        // for bit. The forms over decoded history are outside its domain.
+        let unlisted = |direct: u64| {
+            attention_prefill_k8v4::native_for_device_with(
+                &device,
+                attention_prefill_k8v4::Elements { A: Element::bf16() },
+                &specialization_on(
+                    &device,
+                    geometry,
+                    &[("QT", 16), ("SPLIT_GROUPS", 256), ("DIRECT", direct)],
+                )
+                .with_static("L", 0),
+            )
+        };
+        assert!(unlisted(1).is_err(), "the direct form takes a call without a tile list");
+        let mut bound = Bound::new_with_slab_rows(&device, &scattered, slab_rows, false);
+        bound.history_tiles = i32_tensor(&device, &[0, 1], &[]);
+        let gated = unlisted(0)
+            .unwrap()
+            .call(prefill_args!(bound, scattered.case))
+            .unwrap()
+            .value;
+        assert!(
+            bf16_values(&gated) == reference,
+            "the staged form without a tile list differs from the default"
+        );
+    }
+}
+
+/// The direct form attends a history its window does not hold in rounds,
+/// folding each round's split records into the state the window keeps.
+/// Sixteen rows of Qwen heads have a window of 7936 rows unsplit and of 3840
+/// at 256 split groups (64 key partitions, half of the most): 40 history
+/// tiles (with eight tiles between them that no row sees) take two rounds
+/// and three, each round splitting its own keys.
+///
+/// A round is to a row what a key partition is: its probabilities are
+/// rounded to F16 against its own maximum and its state merges by the merge
+/// rule. With spans that start on tile boundaries in address order, where
+/// the rounds take the keys in the order one round does, the result agrees
+/// with the same rows in a launch of 32 (whose window holds the whole
+/// history) as a split configuration agrees with an unsplit one: within two
+/// bf16 steps, or 2^-11 of the output's largest magnitude where that is
+/// more. Spans out of address order and off the tile grid, differing
+/// between rows, match the host model like every configuration.
+#[test]
+fn metal_direct_prefill_resumes_across_rounds() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let geometry = QWEN;
+    const STORE: usize = 12544;
+    let case = |spans: &dyn Fn(i32) -> Vec<(i32, i32)>, launch: i32| {
+        let rows = (0..launch)
+            .map(|row| match row {
+                0..=15 => Row {
+                    spans: spans(row),
+                    fresh: (0, row + 1),
+                    destination: 12288 + row,
+                    position: 10240 + row,
+                },
+                _ => Row { spans: vec![], fresh: (0, 0), destination: -1, position: 0 },
+            })
+            .collect::<Vec<_>>();
+        Case::new(geometry, STORE, 2, &rows, 17)
+    };
+    // `listed` pads the tile list to that many entries: the call of a class
+    // that lists more tiles than its rows see.
+    let run_listing = |encoded: &Encoded, split: u64, listed: Option<usize>| {
+        let mut bound = Bound::new(&device, encoded);
+        if let Some(listed) = listed {
+            let mut tiles = history_tiles(&encoded.case.visible);
+            tiles.resize(listed, -1);
+            bound.history_tiles = i32_tensor(&device, &[1, listed], &tiles);
+        }
+        let config = [
+            ("QT", 16),
+            ("HEADS", single_head_group(geometry.g)),
+            ("SPLIT_GROUPS", split),
+            ("DIRECT", 1),
+        ];
+        let gated = prefill_kernel(&device, geometry, &config)
+            .call(prefill_args!(bound, encoded.case))
+            .unwrap()
+            .value;
+        (gated, bound)
+    };
+    let run = |encoded: &Encoded, split: u64| run_listing(encoded, split, None);
+
+    // The launch of 32 is the sixteen rows and sixteen that see nothing;
+    // the launch of 16 is its first half.
+    let aligned = |_: i32| vec![(0, 6144), (8192, 12288)];
+    let one_round = case(&aligned, 32);
+    let mut rounds = one_round.clone();
+    rounds.rows = 16;
+    for plane in [&mut rounds.query_gate, &mut rounds.key, &mut rounds.value] {
+        plane.truncate(plane.len() / 2);
+    }
+    for controls in [
+        &mut rounds.coordinates,
+        &mut rounds.visible,
+        &mut rounds.fresh,
+        &mut rounds.destinations,
+    ] {
+        controls.truncate(controls.len() / 2);
+    }
+    let (rounds, one_round) = (Encoded::new(rounds), Encoded::new(one_round));
+    let expected = rounds.expected();
+    for split in [1, 256] {
+        let (gated, bound) = run(&rounds, split);
+        check(&format!("aligned rounds, {split} split groups"), &rounds, &gated, &bound, &expected);
+    }
+    let resumed = bf16_values(&run(&rounds, 1).0);
+    let whole = bf16_values(&run(&one_round, 1).0);
+    assert_eq!(resumed.len() * 2, whole.len());
+    let scale = whole.iter().fold(0f32, |largest, value| largest.max(value.abs()));
+    for (index, (resumed, whole)) in resumed.iter().zip(&whole).enumerate() {
+        let step = f32::from_bits((resumed.abs().max(whole.abs()).to_bits() & 0x7f80_0000).saturating_sub(7 << 23));
+        assert!(
+            (resumed - whole).abs() <= (2.0 * step).max(scale / 2048.0),
+            "element {index}: {resumed} over rounds, {whole} in one"
+        );
+    }
+
+    // A class that lists far more tiles than the call's rows see dispatches
+    // rounds the call does not need: the first takes everything, the rest
+    // return at once, and the result is that of the exact list bit for bit.
+    for split in [1, 256] {
+        assert!(
+            run_listing(&one_round, split, Some(1024)).0.read_to_host().unwrap()
+                == run(&one_round, split).0.read_to_host().unwrap(),
+            "a longer tile list changes the result at {split} split groups"
+        );
+    }
+
+    let ragged = |row: i32| match row {
+        0..=7 => vec![(8292, 12288), (37, 6000)],
+        _ => vec![(8492, 12000), (0, 5000 + 16 * row)],
+    };
+    let rounds = Encoded::new(case(&ragged, 16));
+    let expected = rounds.expected();
+    for split in [1, 256] {
+        let (gated, bound) = run(&rounds, split);
+        check(&format!("ragged rounds, {split} split groups"), &rounds, &gated, &bound, &expected);
+    }
 }
 
 /// Gated outputs agree with the host model within bf16 publication plus
@@ -922,7 +1271,7 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
             .collect::<Vec<_>>()
     };
     let planes = &encoded.planes;
-    let args = vec![
+    let mut args = vec![
         tensor(
             DType::BF16,
             vec![m, kv * g, 2 * w],
@@ -962,6 +1311,12 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
         Arg::Scalar(ReferenceScalar::I32(0)),
         Arg::Scalar(ReferenceScalar::U32(t as u32)),
     ];
+    // The prefill entry also takes the history row tiles its rows see, after
+    // the destinations.
+    if entry == "attention_prefill_k8v4" {
+        let tiles = history_tiles(&case.visible);
+        args.insert(14, tensor(DType::I32, vec![1, tiles.len()], ints(&tiles)));
+    }
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
         panic!("{entry} portable body failed: {failure}");
@@ -989,11 +1344,13 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
             .map(|index| tensor.read(index).unwrap())
             .collect::<Vec<_>>()
     };
+    // The planes follow the row tables (and the prefill entry's tiles).
+    let planes = args.len() - 8;
     let portable = Planes {
-        key_codes: read(14).into_iter().map(|x| x as u32).collect(),
-        key_coefficients: read(15).into_iter().map(|x| f16_bits(x as f32)).collect(),
-        value_codes: read(16).into_iter().map(|x| x as u32).collect(),
-        value_coefficients: read(17).into_iter().map(|x| f16_bits(x as f32)).collect(),
+        key_codes: read(planes).into_iter().map(|x| x as u32).collect(),
+        key_coefficients: read(planes + 1).into_iter().map(|x| f16_bits(x as f32)).collect(),
+        value_codes: read(planes + 2).into_iter().map(|x| x as u32).collect(),
+        value_coefficients: read(planes + 3).into_iter().map(|x| f16_bits(x as f32)).collect(),
     };
     assert_eq!(
         portable.value_codes, expected.1.value_codes,
@@ -1154,7 +1511,7 @@ fn prefill_matches_portable_body_on(device: &Device, encoded: &Encoded) {
         let kernel = prefill_kernel(device, SMALL, &config);
         let mut bound = Bound::new(device, encoded);
         let gated = kernel
-            .call(args!(attention_prefill_k8v4, bound, encoded.case))
+            .call(prefill_args!(bound, encoded.case))
             .unwrap()
             .value;
         check(
@@ -1200,7 +1557,7 @@ fn prefill_reads_and_writes_across_affine_history_slabs() {
         let kernel = prefill_kernel(&device, GROUPED, &config);
         let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, true);
         let gated = kernel
-            .call(args!(attention_prefill_k8v4, bound, encoded.case))
+            .call(prefill_args!(bound, encoded.case))
             .unwrap()
             .value;
         check(
@@ -1293,7 +1650,7 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
             let kernel = prefill_kernel(device, QWEN, &config);
             let mut bound = Bound::new(device, &encoded);
             let gated = kernel
-                .call(args!(attention_prefill_k8v4, bound, encoded.case))
+                .call(prefill_args!(bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -1393,11 +1750,11 @@ fn wide_head_decode_and_prefill_match_host_model() {
                     attention_prefill_k8v4::native_for_device_with(
                         &device,
                         attention_prefill_k8v4::Elements { A: Element::bf16() },
-                        &specialization,
+                        &prefill_specialization(&device, geometry, &config),
                     )
                     .map(|kernel| {
                         kernel
-                            .call(args!(attention_prefill_k8v4, bound, encoded.case))
+                            .call(prefill_args!(bound, encoded.case))
                             .unwrap()
                             .value
                     })
@@ -1459,7 +1816,7 @@ fn large_group_decode_and_prefill_at_4k_match_host_model(geometry: Geometry) {
             let kernel = prefill_kernel(&device, geometry, &config);
             let mut bound = Bound::new(&device, &encoded);
             let gated = kernel
-                .call(args!(attention_prefill_k8v4, bound, encoded.case))
+                .call(prefill_args!(bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -2129,7 +2486,7 @@ fn prefill_timing_on(device: &Device) {
             let mut bound = Bound::new(device, &encoded);
             let affine = kernel
                 .measure(
-                    vec![args!(attention_prefill_k8v4, bound, encoded.case)],
+                    vec![prefill_args!(bound, encoded.case)],
                     &TIMING,
                 )
                 .unwrap()
@@ -2198,6 +2555,9 @@ fn gemma_head_geometry_matches_synthetic_reference() {
             ("SPAN", 32),
             ("SIMDS", simds),
             ("SLICES", slices),
+            ("MATRIX", 0),
+            ("KEYS", 16),
+            ("TOKENS", 1),
         ];
         let kernel = decode_kernel(&device, geometry, &configuration);
         let mut bound = Bound::new(&device, &encoded);

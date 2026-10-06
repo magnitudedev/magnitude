@@ -1,5 +1,6 @@
 use super::super::*;
 use super::*;
+use crate::HeadProjection;
 
 impl<'a> QualificationView<'a> {
     pub(super) fn qualify_head(&self, device: &Device) -> Result<(), CatalogFailure> {
@@ -157,22 +158,39 @@ impl<'a> QualificationView<'a> {
                 })
                 .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
                 .value;
-            let projection = semantic_pattern(
-                device,
-                binding.projection,
-                &[vocabulary, hidden],
-                "head",
-                &label,
-            )?;
-            let logits = block
-                .logits
-                .call(head_logits_rows::Args {
-                    features: &projected_features,
-                    weight: &projection,
-                })
-                .map_err(|error| qualification_dynamic("head_logits_rows", &label, error))?
-                .value;
-            require_finite_nonzero_f32(&logits, "head_logits_rows", &label)?;
+            match (&block.logits, binding.projection) {
+                (HeadLogitsKernels::Packed(kernel), HeadProjection::Packed(element)) => {
+                    let projection =
+                        semantic_pattern(device, element, &[vocabulary, hidden], "head", &label)?;
+                    let logits = kernel
+                        .call(head_logits_rows::Args {
+                            features: &projected_features,
+                            weight: &projection,
+                        })
+                        .map_err(|error| qualification_dynamic("head_logits_rows", &label, error))?
+                        .value;
+                    require_finite_nonzero_f32(&logits, "head_logits_rows", &label)?;
+                }
+                (HeadLogitsKernels::Progressive(kernels), HeadProjection::Progressive) => {
+                    super::target::qualify_progressive(
+                        device,
+                        kernels,
+                        &advanced,
+                        &output_norm,
+                        &out_rows,
+                        (vocabulary, hidden),
+                        "head",
+                        &label,
+                    )?;
+                }
+                _ => {
+                    return Err(qualification_dynamic(
+                        "head",
+                        &label,
+                        "the prepared projection differs from the planned projection",
+                    ))
+                }
+            }
         }
         Ok(())
     }

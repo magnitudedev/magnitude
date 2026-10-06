@@ -1,7 +1,7 @@
 import { MagnitudeHealthResponseSchema, AcnIdentitySchema, AcnInstanceIdSchema, AcnRevisionSchema, type MagnitudeHealthResponse } from "@magnitudedev/acn-protocol"
 import type { DesktopChildEvent, DesktopOwnerCommand } from "@magnitudedev/acn-protocol/desktop-control"
 import { ProcessStartIdentitySchema } from "@magnitudedev/utils/process-groups"
-import { Deferred, Effect, Fiber, Logger, Queue, Ref, Schema, Stream, TestClock, TestContext } from "effect"
+import { Deferred, Effect, Fiber, Logger, Option, Queue, Ref, Schema, Stream, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { OwnedChildSpawner } from "./owned-child"
 import { makeOwnedService, type OwnerAgent } from "./owned-service"
@@ -27,7 +27,7 @@ const setup = Effect.gen(function* () {
       stop: Ref.update(stops, value => value + 1),
     }
   }) })
-  const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, executable: "test", arguments: [], environment: {} }, 1, idleOwner).pipe(Effect.provideService(OwnedChildSpawner, spawner))
+  const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1, idleOwner).pipe(Effect.provideService(OwnedChildSpawner, spawner))
   return { service, events, exit, commands, launches, stops }
 })
 const run = <A, E>(effect: Effect.Effect<A, E, import("effect").Scope.Scope>) => Effect.runPromise(Effect.scoped(effect).pipe(Effect.provide(TestContext.TestContext)))
@@ -43,7 +43,7 @@ describe("desktop-owned service supervision", () => {
         diagnosticTail: Effect.succeed("private child stack trace"),
         send: () => Effect.void, stop: Effect.void,
       }) })
-      const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, executable: "test", arguments: [], environment: {} }, 1, idleOwner).pipe(
+      const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1, idleOwner).pipe(
         Effect.provideService(OwnedChildSpawner, spawner),
       )
       yield* TestClock.adjust("8 seconds")
@@ -71,7 +71,7 @@ describe("desktop-owned service supervision", () => {
         ) : Effect.void,
       }
     }) })
-    const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, executable: "test", arguments: [], environment: {} }, 1, idleOwner).pipe(
+    const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1, idleOwner).pipe(
       Effect.provideService(OwnedChildSpawner, spawner),
     )
     yield* TestClock.adjust("8 seconds")

@@ -21,7 +21,7 @@ use seismic_lang::checked::{CheckedModule, NativeImplementation, NativeSpecializ
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::EntryId;
-use seismic_lang::precision::PrecisionPolicy;
+use seismic_lang::precision::{PrecisionPolicy, TuningPrecision};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -450,7 +450,9 @@ pub struct TuneRequest<'r, 'a> {
     pub statics: NativeSpecialization,
     pub cpu: Option<&'static CpuNativeKernels>,
     pub points: &'r mut dyn PointSource<'a>,
-    pub validation: PrecisionPolicy,
+    /// The policy every configuration in no error class is validated under,
+    /// and the admitted error classes with their envelopes.
+    pub validation: TuningPrecision,
     pub strategy: Strategy,
     pub reference: TuningReference,
 }
@@ -1027,6 +1029,33 @@ fn unstable(confirmed: &[PointMeasurement]) -> Option<Exclusion> {
     })
 }
 
+/// What a finalist's confirmed cost is taken from. Samples that spread
+/// widely leave a rival out of the ranking, but not the defaults: they are
+/// costed at their fastest sample at each point, a time they did reach (a
+/// sample cannot read faster than the kernel runs), so a leader must beat the
+/// defaults at their best by the margin to replace them, and noise in the
+/// defaults' own timing neither removes them nor makes them win.
+fn confirmed_measurement(
+    defaults: bool,
+    confirmed: Vec<PointMeasurement>,
+) -> Result<Vec<PointMeasurement>, Exclusion> {
+    match unstable(&confirmed) {
+        None => Ok(confirmed),
+        Some(exclusion) if !defaults => Err(exclusion),
+        Some(_) => Ok(confirmed
+            .into_iter()
+            .map(|point| PointMeasurement {
+                median_seconds: point
+                    .samples
+                    .iter()
+                    .copied()
+                    .fold(point.median_seconds, f64::min),
+                ..point
+            })
+            .collect()),
+    }
+}
+
 /// The points' weights and classes: how the objective weighs them.
 struct Weighing {
     weights: Vec<f64>,
@@ -1221,9 +1250,11 @@ impl Evaluator for Live<'_, '_> {
                 ((point, key), measurement)
             })
             .collect::<HashMap<_, _>>();
+        let default = self.space.default_index();
         let confirmed = keys
             .into_iter()
-            .map(|keys| {
+            .zip(finalists)
+            .map(|(keys, index)| {
                 let confirmed = keys?
                     .into_iter()
                     .enumerate()
@@ -1235,10 +1266,7 @@ impl Evaluator for Live<'_, '_> {
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                match unstable(&confirmed) {
-                    Some(exclusion) => Err(exclusion),
-                    None => Ok(confirmed),
-                }
+                confirmed_measurement(*index == default, confirmed)
             })
             .collect::<Vec<_>>();
         self.time.measuring_seconds += began.elapsed().as_secs_f64();
@@ -1409,7 +1437,10 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         statics,
         cpu,
         points: source,
-        validation,
+        validation: TuningPrecision {
+            policy: validation,
+            admitted,
+        },
         strategy,
         reference,
     } = request;
@@ -1434,6 +1465,9 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     if let Strategy::Survey(plan) = &strategy {
         widen(&mut implementation, &plan.domains)?;
     }
+    // Configurations of an error class that is not admitted are outside the
+    // domain: never formed, timed or chosen.
+    let implementation = implementation.admitting(|class| admitted.contains_key(class));
     // Every configuration formed below is this one entry at these bindings.
     let logical = Arc::new(
         module
@@ -1483,17 +1517,31 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
             .map_err(|error| TuneError::Declaration(error.to_string()))?;
         return Ok(unit.kept_defaults(&specs, &default, &strategy, &inputs, began));
     };
-    let (default, default_kernel) = launchable_default(
+    let default = implementation
+        .default_specialization(&statics)
+        .map_err(|error| TuneError::Declaration(error.to_string()))?;
+    // The default is the validation reference: it changes no numerics.
+    if let Some(class) = implementation
+        .error_classes_of(&default)
+        .map_err(|error| TuneError::Declaration(error.to_string()))?
+        .first()
+    {
+        return Err(TuneError::Declaration(format!(
+            "the default configuration of `{}` is in error class `{class}`",
+            unit.entry
+        )));
+    }
+    let default_kernel = NativePrepared::prepare_implementation(
         device,
         module,
         entry,
         &logical,
-        &bindings,
+        bindings.clone(),
+        default.clone(),
         cpu,
-        &implementation,
-        &statics,
-        std::slice::from_ref(&first),
-    )?;
+        implementation.clone(),
+    )
+    .map_err(|error| TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error))))?;
     let validator = Validator::new(
         device,
         module,
@@ -1502,6 +1550,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         &logical,
         &mutable,
         &unit.validation,
+        &admitted,
         reference,
         &default,
         cpu,
@@ -1550,8 +1599,8 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
             untimed.push(index);
             continue;
         };
-        // The defaults were chosen to launch at the first point; serving runs
-        // them at every point, so one they cannot launch at is an error.
+        // Serving runs the defaults at every point, so one they cannot launch
+        // at is an error.
         for args in &point.rotation {
             default_kernel.shape(&args.values()).map_err(|error| {
                 TuneError::DefaultUnusable(Exclusion::Execution(format!(
@@ -2806,7 +2855,7 @@ pub fn implementation_digest(
             None
         }
         #[cfg(target_os = "macos")]
-        crate::backends::OpenedKind::Metal(_) => Some(super::abi::Dialect::Metal),
+        crate::backends::OpenedKind::Metal(opened) => Some(super::metal_dialect(opened)),
         crate::backends::OpenedKind::Cuda(_) => Some(super::abi::Dialect::Cuda),
         #[cfg(not(target_os = "macos"))]
         crate::backends::OpenedKind::Vulkan(opened) => {
@@ -2856,6 +2905,11 @@ fn update_declaration_digest(
         )
         .as_bytes(),
     );
+    // Only a declaration with error classes digests them, so one without
+    // keeps the digest its stored results were keyed by.
+    if !implementation.error_classes.is_empty() {
+        digest.update(format!("{:?}", implementation.error_classes).as_bytes());
+    }
 }
 
 /// Replace parameter domains for a survey. Each keeps its default first.
@@ -3258,78 +3312,6 @@ fn mutable_parameters(logical: &LogicalEntry) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// The configuration tuning starts from and validates against, formed: the
-/// declared defaults when every launch at every point fits its formed program
-/// on this device, else the admissible configuration nearest them that does.
-/// A program's thread limit is known only once formed (Apple M1/M2 pipelines
-/// under register pressure admit fewer than the device's 1024), so declaration
-/// order alone cannot guarantee the defaults launch.
-#[allow(clippy::too_many_arguments)]
-fn launchable_default(
-    device: &Arc<DeviceInner>,
-    module: &CheckedModule,
-    entry: EntryId,
-    logical: &Arc<LogicalEntry>,
-    bindings: &ElementBindings,
-    cpu: Option<&'static CpuNativeKernels>,
-    implementation: &NativeImplementation,
-    statics: &NativeSpecialization,
-    points: &[TuningPoint<'_>],
-) -> Result<(NativeSpecialization, Arc<NativePrepared>), TuneError> {
-    let launchable = |specialization: &NativeSpecialization| {
-        let kernel = NativePrepared::prepare_implementation(
-            device,
-            module,
-            entry,
-            logical,
-            bindings.clone(),
-            specialization.clone(),
-            cpu,
-            implementation.clone(),
-        )
-        .map_err(|error| Exclusion::Formation(prepare_message(error)))?;
-        for args in points.iter().flat_map(|point| &point.rotation) {
-            kernel
-                .shape(&args.values())
-                .map_err(|error| Exclusion::Execution(error.to_string()))?;
-        }
-        Ok::<_, Exclusion>(kernel)
-    };
-    let declared = implementation
-        .default_specialization(statics)
-        .map_err(|error| TuneError::Declaration(error.to_string()))?;
-    let refusal = match launchable(&declared) {
-        Ok(kernel) => return Ok((declared, kernel)),
-        Err(exclusion) => exclusion,
-    };
-    let mut candidates = implementation
-        .admissible(statics)
-        .map_err(|error| TuneError::Declaration(error.to_string()))?;
-    // Stable: equally distant candidates keep declaration order.
-    candidates.sort_by_key(|candidate| {
-        let params = candidate
-            .params()
-            .iter()
-            .filter(|(name, value)| declared.param(name) != Some(**value))
-            .count();
-        let launch_params = candidate
-            .launch_params()
-            .iter()
-            .filter(|((launch, name), value)| declared.launch_param(*launch, name) != Some(**value))
-            .count();
-        params + launch_params
-    });
-    candidates
-        .into_iter()
-        .filter(|candidate| *candidate != declared)
-        .find_map(|candidate| {
-            launchable(&candidate)
-                .ok()
-                .map(|kernel| (candidate, kernel))
-        })
-        .ok_or(TuneError::DefaultUnusable(refusal))
-}
-
 pub(super) fn prepare_message(error: PrepareError) -> String {
     match error {
         PrepareError::Source(error) => error.to_string(),
@@ -3368,6 +3350,96 @@ mod tests {
             repetitions: 1,
             rotation_bytes: 0,
         }
+    }
+
+    /// A confirmation at the points `(label, median, samples)` in microseconds,
+    /// every point keyed by `form`.
+    fn confirmation(form: u64, points: &[(&str, f64, &[f64])]) -> Vec<PointMeasurement> {
+        points
+            .iter()
+            .map(|(label, median, samples)| {
+                let mut sorted = samples.to_vec();
+                sorted.sort_by(f64::total_cmp);
+                let mut deviations = samples
+                    .iter()
+                    .map(|sample| (sample - median).abs())
+                    .collect::<Vec<_>>();
+                deviations.sort_by(f64::total_cmp);
+                PointMeasurement {
+                    point: (*label).into(),
+                    key: PointKey {
+                        launches: vec![0],
+                        values: [("DIRECT".to_owned(), form)].into(),
+                    },
+                    median_seconds: median * 1e-6,
+                    deviation_seconds: deviations[deviations.len() / 2] * 1e-6,
+                    samples: samples.iter().map(|sample| sample * 1e-6).collect(),
+                    repetitions: 1,
+                    rotation_bytes: 0,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether confirmed finalist `rival` replaces defaults confirmed as
+    /// `defaults`, by the search's ranking rule and margin.
+    fn replaces(rival: Vec<PointMeasurement>, defaults: Vec<PointMeasurement>) -> bool {
+        let weighing = Weighing {
+            weights: vec![0.5; defaults.len()],
+            classes: (0..defaults.len()).collect(),
+        };
+        let reference = confirmed_measurement(true, defaults).unwrap();
+        let rival = confirmed_measurement(false, rival).unwrap();
+        weighing
+            .cost(&rival, &reference)
+            .improves_on(&weighing.cost(&reference, &reference), 0.02)
+    }
+
+    /// Defaults whose own re-measurement spreads at one small point (the
+    /// staged K8/V4 prefill at 64 rows over 256 history on an M6, bimodal in
+    /// 35 us steps) do not thereby beat a tightly confirmed finalist that is
+    /// 40% ahead where the time goes; they do keep their place against a
+    /// finalist that is ahead of their median only, not of their fastest
+    /// samples.
+    #[test]
+    fn unstable_defaults_are_ranked_at_their_fastest_samples() {
+        let defaults = || {
+            confirmation(
+                0,
+                &[
+                    ("m64-c256", 213.0, &[147.0, 262.0, 149.0, 213.0, 213.0]),
+                    ("m512-c4096", 7822.0, &[7822.0]),
+                ],
+            )
+        };
+        assert!(unstable(&defaults()).is_some());
+        let fastest = confirmed_measurement(true, defaults()).unwrap();
+        assert_eq!(
+            medians(&fastest),
+            [147.0 * 1e-6, 7822.0 * 1e-6],
+            "the defaults at their fastest samples"
+        );
+        // Unstable rivals still leave the ranking.
+        assert!(confirmed_measurement(false, defaults()).is_err());
+
+        let direct = confirmation(
+            1,
+            &[
+                ("m64-c256", 96.0, &[97.0, 96.0, 98.0, 96.0, 96.0]),
+                ("m512-c4096", 4563.0, &[4563.0]),
+            ],
+        );
+        assert!(replaces(direct, defaults()));
+        // Ahead of the defaults' median at the unstable point, level with
+        // their fastest sample, and level elsewhere: within noise of them.
+        let level = confirmation(
+            1,
+            &[
+                ("m64-c256", 148.0, &[148.0, 147.0, 149.0, 148.0, 150.0]),
+                ("m512-c4096", 7800.0, &[7800.0]),
+            ],
+        );
+        assert!(!replaces(level, defaults()));
     }
 
     #[test]

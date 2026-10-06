@@ -390,6 +390,7 @@ __device__ __forceinline__ void attend_stage(u16 *tile, const u8 *qkv, u64 row_s
 template <class A, u32 W, u32 WP>
 __device__ __forceinline__ void attend(AttendShared<WP> &shared, const u8 *qkv, u8 *out, u32 rows, u32 heads,
                                        float scale, const int *spans) {
+    static_assert(A::bytes == 2, "vision attention requires a bf16 or f16 activation element");
     constexpr u32 PITCH = AttendShared<WP>::PITCH;
     constexpr u32 ATTEND_KEYS = AttendShared<WP>::KEYS;
     constexpr u32 DK = WP / 16;          // k16 steps over the head width

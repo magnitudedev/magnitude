@@ -61,7 +61,15 @@ kernel void vision_attention_attend(ATTENTION_ARGUMENTS,
     threadgroup S values[vision::ATTEND_KEYS * vision::attend_pitch<VISION_WP>()];
     threadgroup uint bounds[2];
     const float scale = int(SEISMIC_PARAM_UNIT_SCALE) != 0 ? 1.0f : metal::rsqrt(float(VISION_W));
+#if SEISMIC_HAS_TENSOR_OPS
+    ATTEND_TENSOR_SLOTS(slots);
+    vision::attend_tensor<S, VISION_W, VISION_WP>(reinterpret_cast<device const S *>(operands),
+        reinterpret_cast<device S *>(result), uint(SEISMIC_DIM_M), SEISMIC_DIM_H, scale,
+        SEISMIC_DIM_WS == 1 ? spans : nullptr, keys, values, bounds, slots, group.x, group.y, thread_index, simd,
+        lane);
+#else
     vision::attend<S, VISION_W, VISION_WP>(reinterpret_cast<device const S *>(operands),
         reinterpret_cast<device S *>(result), uint(SEISMIC_DIM_M), SEISMIC_DIM_H, scale,
         SEISMIC_DIM_WS == 1 ? spans : nullptr, keys, values, bounds, group.x, group.y, thread_index, simd, lane);
+#endif
 }

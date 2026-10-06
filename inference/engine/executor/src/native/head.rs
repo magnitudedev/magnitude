@@ -1,4 +1,4 @@
-use super::{AttentionKernels, DenseKernels, RoutedKernels};
+use super::{AttentionKernels, DenseKernels, ProgressiveReadoutKernels, RoutedKernels};
 use crate::HeadBinding;
 use magnitude_kernels::{
     draft_rows, head_logits_rows, readout_features_rows, sample_rows, shape_rows,
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 /// 65536, 99% below 131072.
 const DRAFT_VOCABULARY: u64 = 65_536;
 
-/// The vocabulary the head's `head_logits_rows` projects onto.
+/// The vocabulary the head's projection projects onto.
 pub(crate) fn draft_vocabulary(vocabulary: u64) -> u64 {
     vocabulary.min(DRAFT_VOCABULARY)
 }
@@ -31,8 +31,19 @@ pub struct HeadKernels {
     pub(super) dense: HashMap<HeadBinding, DenseKernels>,
     pub(super) routed: HashMap<HeadBinding, RoutedKernels>,
     pub(super) features: HashMap<HeadBinding, NativeKernel<readout_features_rows::Entry>>,
-    pub(super) logits: HashMap<HeadBinding, NativeKernel<head_logits_rows::Entry>>,
+    pub(super) logits: HashMap<HeadBinding, HeadLogitsKernels>,
     /// Token selection over the draft vocabulary, shared by every block.
     pub(super) shape: Option<NativeKernel<shape_rows::Entry>>,
     pub(super) sample: Option<NativeKernel<sample_rows::Entry>>,
+}
+
+/// A head block's projection onto the draft vocabulary (`HeadProjection`).
+#[derive(Clone, Debug)]
+pub enum HeadLogitsKernels {
+    /// `head_logits_rows` over the packed output projection.
+    Packed(NativeKernel<head_logits_rows::Entry>),
+    /// The progressive planes' leading draft-vocabulary rows: a certified
+    /// selection's levels for drafting slots up to the backend's certified
+    /// bound, the full exact pass beyond.
+    Progressive(ProgressiveReadoutKernels),
 }

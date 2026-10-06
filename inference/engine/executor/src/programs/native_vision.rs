@@ -18,7 +18,7 @@ use crate::{
     NativeGraphWorkspaceLease, ResidentVision, SubmitError, ValidatedVisionLaunch,
     VisionLaunchCore, VisionProgramPlan, WeightPlan,
 };
-use magnitude_family_contracts::{VisionDescription, WeightRole};
+use magnitude_family_contracts::{VisionAttentionSpan, VisionDescription, WeightRole};
 use magnitude_kernels::{
     post_norm_residual, vision_attention, vision_clamp, vision_linear, vision_norm,
     vision_patch_stem, vision_pool, vision_position,
@@ -265,7 +265,8 @@ struct VisionGraphPorts {
     indices: NativePort,
     coefficients: NativePort,
     coordinates: Option<NativePort>,
-    spans: Option<NativePort>,
+    window_spans: Option<NativePort>,
+    image_spans: Option<NativePort>,
     order: Option<NativePort>,
     weights: Vec<(WeightRole, NativePort)>,
     constants: Vec<GraphConstant>,
@@ -283,7 +284,8 @@ struct Draft<'b, G: GraphDraft, B: VisionBindings<G>> {
     pixels: Option<NativePort>,
     indices: Option<(NativePort, NativePort)>,
     coordinates: Option<NativePort>,
-    spans: Option<NativePort>,
+    window_spans: Option<NativePort>,
+    image_spans: Option<NativePort>,
     order: Option<NativePort>,
     weights: Vec<(WeightRole, NativePort)>,
     constants: Vec<(Constant, GraphConstant)>,
@@ -589,7 +591,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                 query_norm,
                 key_norm,
                 value_norm,
-                windowed,
+                span,
                 log_base,
                 epsilon,
                 unit_scale,
@@ -608,9 +610,16 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                 if self.coordinates.is_none() {
                     self.coordinates = Some(self.graph.input_for(binding, "coordinates", &dims)?);
                 }
-                if *windowed && self.spans.is_none() {
-                    self.spans = Some(self.graph.input_for(binding, "spans", &dims)?);
+                // A row reads the keys of its span: its window's rows, or
+                // its image's, which excludes a larger class's padding rows.
+                let spans = match span {
+                    VisionAttentionSpan::Window => &mut self.window_spans,
+                    VisionAttentionSpan::Full => &mut self.image_spans,
+                };
+                if spans.is_none() {
+                    *spans = Some(self.graph.input_for(binding, "spans", &dims)?);
                 }
+                let spans = input_view(spans, &[1, rows, 2])?;
                 let shape = [rows, heads, width];
                 let query = self.value(*query, &shape)?;
                 let key = self.value(*key, &shape)?;
@@ -623,11 +632,6 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                     self.empty(Constant::EmptyF32, &[width])?
                 };
                 let coordinates = input_view(&self.coordinates, &[rows, 2])?;
-                let spans = if *windowed {
-                    input_view(&self.spans, &[1, rows, 2])?
-                } else {
-                    self.empty(Constant::EmptyI32, &[rows, 2])?
-                };
                 self.graph
                     .enqueue::<vision_attention::Entry>(
                         binding,
@@ -735,6 +739,27 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
     }
 }
 
+/// The patch rows of every class a load prepares vision graphs for: the
+/// cell classes of images of at most `max_image_cells` cells, in patch rows.
+pub(crate) fn image_patch_classes(
+    max_image_cells: usize,
+    description: &VisionDescription,
+) -> Result<Vec<u64>, String> {
+    let cell = description.cell_rows();
+    let classes = magnitude_batching::image_cell_classes(max_image_cells)
+        .into_iter()
+        .map(|cells| {
+            (cells as u64)
+                .checked_mul(cell)
+                .ok_or_else(|| "vision patch class overflows".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if classes.is_empty() {
+        return Err("the load admits no image cells".into());
+    }
+    Ok(classes)
+}
+
 /// A graph input viewed with `extents`.
 fn input_view(
     port: &Option<NativePort>,
@@ -770,7 +795,8 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
         pixels: None,
         indices: None,
         coordinates: None,
-        spans: None,
+        window_spans: None,
+        image_spans: None,
         order: None,
         weights: Vec::new(),
         constants,
@@ -790,7 +816,7 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
         .zip(draft.indices)
         .ok_or("the vision program reads no pixels or positions")?;
     if draft.coordinates.is_some() != program.coordinates
-        || draft.spans.is_some() != program.windows
+        || draft.window_spans.is_some() != program.windows
         || draft.order.is_some() != program.windows
     {
         return Err("the vision program's inputs disagree with its invocations".into());
@@ -802,7 +828,8 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
             indices,
             coefficients,
             coordinates: draft.coordinates,
-            spans: draft.spans,
+            window_spans: draft.window_spans,
+            image_spans: draft.image_spans,
             order: draft.order,
             weights: draft.weights,
             constants: draft
@@ -852,7 +879,7 @@ fn certify_vision_family(
     let &largest = patch_rows
         .iter()
         .max()
-        .ok_or("the vision graph family has no exact patch class")?;
+        .ok_or("the vision graph family has no patch class")?;
     if patch_rows.iter().any(|&rows| rows == 0 || rows % cell != 0)
         || patch_rows
             .iter()
@@ -871,21 +898,34 @@ fn certify_vision_family(
     )?;
     // Patch-row invocations read the class's patch rows; cell-row ones its
     // cells. The norm's rows are its `C` (the stem's `C` is its channels).
-    let slices = patch_rows
+    // Each class has its own layout, so its outputs hold its own image's
+    // features rather than the largest class's; the family's storage is the
+    // largest of each part.
+    let template = graph.seal_template()?;
+    let layouts = patch_rows
         .iter()
         .map(|&rows| {
-            NativeGraphClassSlice::new()
+            template.certify(&[NativeGraphClassSlice::new()
                 .dimension("M", [rows])
                 .dimension("O", [rows])
                 .scoped(<vision_norm::Entry as seismic::Entry>::NAME, "C", [rows])
                 .scoped(CELLS, "M", [rows / cell])
-                .scoped(CELLS, "C", [rows / cell])
+                .scoped(CELLS, "C", [rows / cell])])
         })
-        .collect::<Vec<_>>();
-    let layout = graph
-        .seal_template()
-        .and_then(|template| template.certify(&slices))?;
-    Ok((layout.storage_bytes(), vec![layout; patch_rows.len()]))
+        .collect::<Result<Vec<_>, _>>()?;
+    let storage = layouts.iter().map(NativeGraphLayout::storage_bytes).fold(
+        NativeGraphStorageBytes {
+            workspace: 0,
+            output: 0,
+            upload: 0,
+        },
+        |largest, class| NativeGraphStorageBytes {
+            workspace: largest.workspace.max(class.workspace),
+            output: largest.output.max(class.output),
+            upload: largest.upload.max(class.upload),
+        },
+    );
+    Ok((storage, layouts))
 }
 
 #[cfg(test)]
@@ -936,32 +976,52 @@ impl NativeVisionProgram {
         output: &mut Option<NativeGraphOutputLease>,
     ) -> Result<GraphOutputTensor, SubmitError> {
         let input = core.batch().input();
-        let rows = u64::try_from(core.batch().patch_rows())
-            .map_err(|_| invalid("vision patch rows exceed u64"))?;
+        let class = core.batch().class_patch_rows();
+        let rows = u64::try_from(class).map_err(|_| invalid("vision patch rows exceed u64"))?;
         let spatial = input.spatial();
+        let real = spatial.rows();
+        let image_rows = i32::try_from(real).map_err(|_| invalid("vision rows exceed i32"))?;
+        // The class's rows past the image's are padding: zero inputs, read
+        // by no image row (every span lies within the image), and dropped
+        // from the published features.
+        let padding = class
+            .checked_sub(real)
+            .ok_or_else(|| invalid("vision image exceeds its class"))?;
         let indices = spatial.interpolation_indices();
-        let indices = (0..spatial.rows())
+        let indices = (0..real)
             .flat_map(|row| indices.iter().map(move |plane| plane[row]))
+            .chain(std::iter::repeat_n(0, padding * indices.len()))
             .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>();
         let coefficients = spatial.interpolation_coefficients();
-        let coefficients = (0..spatial.rows())
+        let coefficients = (0..real)
             .flat_map(|row| coefficients.iter().map(move |plane| plane[row]))
+            .chain(std::iter::repeat_n(0.0, padding * coefficients.len()))
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        let pairs = |pairs: &[[i32; 2]]| {
+        let pairs = |pairs: &[[i32; 2]], pad: [i32; 2]| {
             pairs
                 .iter()
+                .chain(std::iter::repeat_n(&pad, padding))
                 .flatten()
                 .copied()
                 .flat_map(i32::to_le_bytes)
                 .collect::<Vec<_>>()
         };
-        let coordinates = pairs(spatial.attention_coordinates());
-        let spans = pairs(spatial.window_ranges());
+        let coordinates = pairs(spatial.attention_coordinates(), [0, 0]);
+        // A padding row reads the last image row's window, so a tile's key
+        // walk stays within the image.
+        let windows = spatial.window_ranges();
+        let window_spans = pairs(windows, windows.last().copied().unwrap_or([0, image_rows]));
+        let image_spans = std::iter::repeat_n([0, image_rows], class)
+            .flatten()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
         // Result row q of the merger reads the tower row that holds the
-        // processor's patch row q.
-        let mut order = vec![0i32; spatial.rows()];
+        // processor's patch row q; padding rows read themselves.
+        let mut order = (0..class)
+            .map(|row| i32::try_from(row).map_err(|_| invalid("vision rows exceed i32")))
+            .collect::<Result<Vec<_>, _>>()?;
         for (tower_row, &source) in spatial.patch_order().iter().enumerate() {
             order[source] =
                 i32::try_from(tower_row).map_err(|_| invalid("vision rows exceed i32"))?;
@@ -969,6 +1029,13 @@ impl NativeVisionProgram {
         let order = order
             .into_iter()
             .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let pixels = input.pixels().data();
+        let pixel_row = pixels.len() / real.max(1);
+        let pixels = pixels
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(0, padding * pixel_row))
             .collect::<Vec<_>>();
         let (prepared, bound) = self.graphs.class(rows)?;
         let output = output
@@ -981,11 +1048,12 @@ impl NativeVisionProgram {
                 workspace.slot_mut(),
                 output,
                 VisionGraphUploads {
-                    pixels: input.pixels().data(),
+                    pixels: &pixels,
                     indices: &indices,
                     coefficients: &coefficients,
                     coordinates: &coordinates,
-                    spans: &spans,
+                    window_spans: &window_spans,
+                    image_spans: &image_spans,
                     order: &order,
                 },
             )?
@@ -997,6 +1065,7 @@ struct PreparedVisionGraph {
     patch_rows: u64,
     plan: NativeGraphPlan,
     ports: VisionGraphPorts,
+    outputs: NativeGraphFamily,
 }
 
 pub struct PreparedVisionGraphs {
@@ -1017,7 +1086,8 @@ pub(crate) struct VisionGraphUploads<'a> {
     pub indices: &'a [u8],
     pub coefficients: &'a [u8],
     pub coordinates: &'a [u8],
-    pub spans: &'a [u8],
+    pub window_spans: &'a [u8],
+    pub image_spans: &'a [u8],
     pub order: &'a [u8],
 }
 
@@ -1026,7 +1096,7 @@ pub(crate) struct VisionGraphResult {
 }
 
 impl PreparedVisionGraphs {
-    pub(crate) fn prepare_exact_classes(
+    pub(crate) fn prepare_classes(
         target_device: &Device,
         handles: &AttestedVision,
         load: &ModelLoadPlan,
@@ -1056,14 +1126,16 @@ impl PreparedVisionGraphs {
                 rows,
             )
             .map_err(graph_error)?;
+            let plan = graph.seal().map_err(device)?;
             variants.push(PreparedVisionGraph {
                 patch_rows: rows,
-                plan: graph.seal().map_err(device)?,
+                outputs: NativeGraphFamily::new(std::slice::from_ref(&plan)).map_err(device)?,
+                plan,
                 ports,
             });
         }
         if variants.is_empty() {
-            return Err(invalid("vision graph family has no exact patch class"));
+            return Err(invalid("vision graph family has no patch class"));
         }
         let plans = variants
             .iter()
@@ -1087,6 +1159,14 @@ impl PreparedVisionGraphs {
 
     pub fn family(&self) -> &NativeGraphFamily {
         &self.family
+    }
+
+    /// Each class's patch rows and its one-plan family: an encode's
+    /// workspace and its image's output are of its own class.
+    pub fn class_families(&self) -> impl Iterator<Item = (u64, &NativeGraphFamily)> {
+        self.variants
+            .iter()
+            .map(|variant| (variant.patch_rows, &variant.outputs))
     }
 
     pub(crate) fn bind_weights(
@@ -1137,7 +1217,8 @@ impl PreparedVisionGraphs {
             (Some(&ports.indices), uploads.indices),
             (Some(&ports.coefficients), uploads.coefficients),
             (ports.coordinates.as_ref(), uploads.coordinates),
-            (ports.spans.as_ref(), uploads.spans),
+            (ports.window_spans.as_ref(), uploads.window_spans),
+            (ports.image_spans.as_ref(), uploads.image_spans),
             (ports.order.as_ref(), uploads.order),
         ] {
             if let Some(port) = port {

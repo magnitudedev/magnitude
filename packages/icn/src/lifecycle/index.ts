@@ -13,6 +13,7 @@ import {
 } from "@magnitudedev/icn-protocol";
 import { GeneratedClientTransportError } from "@magnitudedev/openapi-effect/client-runtime";
 import { FSM } from "@magnitudedev/utils";
+import { openLogFile, type LogFile } from "@magnitudedev/utils/log-file";
 import { dirname, join } from "node:path";
 import {
   Context,
@@ -115,6 +116,7 @@ export class IcnLifecycleConfig extends Schema.Class<IcnLifecycleConfig>(
     Schema.greaterThanDuration(Duration.zero)
   ),
   outputLimitBytes: PositiveInt,
+  logFile: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
 }) {}
 
 export interface ResolvedIcnBinary {
@@ -392,7 +394,14 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         const process = yield* children.spawn(new IcnChildLaunch({
           executable: installationNativePath(binary.path),
           arguments: renderIcnArguments(config, instanceId, binary.installation),
-          environment: { ...binary.environment, MAGNITUDE_ICN_AUTH_TOKEN: authorization, HF_HUB_DISABLE_IMPLICIT_TOKEN: "1" },
+          // Output is recorded, not shown: plain text, and a per-request line only on failure.
+          environment: {
+            ...(globalThis.process.env.RUST_LOG ? {} : { RUST_LOG: "info,tower_http=warn" }),
+            NO_COLOR: "1",
+            ...binary.environment,
+            MAGNITUDE_ICN_AUTH_TOKEN: authorization,
+            HF_HUB_DISABLE_IMPLICIT_TOKEN: "1",
+          },
           gracefulShutdownTimeout: config.gracefulShutdownTimeout,
           forceShutdownTimeout: config.forceShutdownTimeout,
         }));
@@ -410,6 +419,14 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       })
     );
     const output = yield* Ref.make("");
+    const log = yield* Option.match(config.logFile, {
+      onNone: () => Effect.succeed(Option.none<LogFile>()),
+      onSome: (file) => openLogFile(file, 10 * 1024 * 1024).pipe(Effect.map(Option.some)),
+    });
+    const logged = (text: string) =>
+      Option.match(log, { onNone: () => Effect.void, onSome: (file) => file.append(text) });
+    const record = (note: string) => logged(`[${new Date().toISOString()}] ${note}\n`);
+    yield* record(`magnitude-inference started (pid ${process.pid})`);
     const startupRecord = yield* Deferred.make<
       IcnStartupRecord,
       IcnLifecycleError
@@ -422,6 +439,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       Stream.runForEach((line) =>
         Effect.gen(function* () {
           yield* appendBounded(output, `${line}\n`, config.outputLimitBytes);
+          yield* logged(`${line}\n`);
           if (line.startsWith("MAGNITUDE_ICN_PROGRESS ")) {
             const encoded = line.slice("MAGNITUDE_ICN_PROGRESS ".length);
             const record = yield* Schema.decodeUnknown(
@@ -447,7 +465,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
     yield* process.stderr.pipe(
       Stream.decodeText(),
       Stream.runForEach((chunk) =>
-        appendBounded(output, chunk, config.outputLimitBytes)
+        appendBounded(output, chunk, config.outputLimitBytes).pipe(Effect.zipRight(logged(chunk)))
       ),
       Effect.option,
       Effect.asVoid,
@@ -455,6 +473,10 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
     );
     yield* process.exitCode.pipe(
       Effect.map(Number),
+      Effect.tapBoth({
+        onSuccess: (code) => record(`magnitude-inference exited with code ${code}`),
+        onFailure: (error) => record(`magnitude-inference exited: ${error.message}`),
+      }),
       Effect.flatMap((code) =>
         Ref.get(output).pipe(
           Effect.flatMap((diagnostic) =>

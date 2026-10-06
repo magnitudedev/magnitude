@@ -349,6 +349,18 @@ pub struct DomainReservation {
     resources: ReservedResources,
 }
 
+/// The patch rows of the class a vision reservation encodes in.
+fn image_patch_rows(pool: PoolClass) -> Result<u64, CapacityError> {
+    match pool {
+        PoolClass::Vision { patch_rows } => Ok(patch_rows as u64),
+        _ => Err(CapacityError {
+            resource: ResourceKind::Output,
+            required: 1,
+            available: 0,
+        }),
+    }
+}
+
 pub enum ReservedResources {
     Target(TargetGraphReservation),
     Head(
@@ -954,7 +966,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
                 (
                     PoolClass::Vision {
-                        patch_rows: image.patches(),
+                        patch_rows: self
+                            .image_class(image.patches())
+                            .map_err(DomainError::Input)?,
                     },
                     Vec::new(),
                     0,
@@ -1038,9 +1052,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     required: 1,
                     available: 0,
                 })?;
+                let class = image_patch_rows(requirements.pool)?;
                 available(
-                    Some(graph.available_workspace()),
-                    Some(graph.available_output()),
+                    Some(graph.available_workspace(class)),
+                    Some(graph.available_output(class)),
                 )?;
             }
         }
@@ -1214,12 +1229,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             ReservationLane::Vision => {
                 let graph = self.resources.vision_graph().expect("checked vision graph");
+                let class = image_patch_rows(requirements.pool).map_err(DomainError::Capacity)?;
                 ReservedResources::Vision(
                     graph
-                        .acquire_workspace()
+                        .acquire_workspace(class)
                         .map_err(|error| invariant("vision graph workspace", error))?,
                     graph
-                        .acquire_output()
+                        .acquire_output(class)
                         .map_err(|error| invariant("vision graph output", error))?,
                 )
             }

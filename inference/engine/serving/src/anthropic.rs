@@ -45,6 +45,7 @@ pub struct MessagesRequest {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub top_k: Option<u32>,
+    pub seed: Option<u32>,
     #[serde(default)]
     pub tools: Vec<Tool>,
     #[schema(nullable = false)]
@@ -284,6 +285,7 @@ pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
     let sampling = crate::responses::sampling(
         request.temperature.unwrap_or(1.0),
         request.top_p.unwrap_or(1.0),
+        request.seed,
     )?;
     Ok(AdaptedRequest {
         model: adapted.model,
@@ -459,10 +461,10 @@ fn context(system: Option<SystemPrompt>, messages: Vec<Message>) -> Result<Conve
             Role::User => entries.push(Entry::User(user_content(message.content)?)),
             Role::Assistant => {
                 let (reasoning, text, calls) = assistant_content(message.content)?;
+                // An empty assistant turn (our empty output, or a client's
+                // record of a step that failed first) contributes nothing.
                 if reasoning.is_none() && text.is_none() && calls.is_empty() {
-                    return Err(ApiError::invalid(
-                        "assistant message content must not be empty",
-                    ));
+                    continue;
                 }
                 let (exchanges, trailing_user_content) = if calls.is_empty() {
                     (Vec::new(), Vec::new())

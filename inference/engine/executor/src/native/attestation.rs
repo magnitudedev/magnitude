@@ -4,12 +4,15 @@
 use super::preparation::PreparationInputs;
 use super::tuning::{TunedEntry, TuningContext, TuningLimits};
 use super::*;
+use crate::operators::gated_delta::graph::StepForm;
+use crate::operators::routed::fused_graph::DecodeForm;
 use crate::SublayerTail;
 use crate::{
-    ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, ImportProgramSlot, MixerProgramSlot,
-    PlanError, PlannedDevice, ProgramPlan,
+    ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, HeadProjection, ImportProgramSlot,
+    MixerProgramSlot,
+    PlanError, PlannedDevice, ProgramPlan, ReadoutHead,
 };
-use magnitude_family_contracts::SublayerIndex;
+use magnitude_family_contracts::{ProgressivePlane, SublayerIndex};
 use magnitude_kernels::{
     draft_confidence, draft_convolve_input, draft_convolve_residual, draft_gated_rows,
     draft_path_step, draft_top_k, feature_rows, import_dense, post_norm_residual, project_rows,
@@ -17,6 +20,28 @@ use magnitude_kernels::{
 };
 use magnitude_state::KvCodec;
 use std::{collections::HashSet, rc::Rc};
+
+/// Invocation workspace of the fused routed form's decode kernels.
+fn routed_decode_bytes(decode: &RoutedDecodeKernels) -> u128 {
+    match decode {
+        RoutedDecodeKernels::Expand(expand) => u128::from(expand.invocation_workspace_bytes()),
+        RoutedDecodeKernels::SharedRoute { route, choices } => {
+            u128::from(route.invocation_workspace_bytes())
+                + u128::from(choices.invocation_workspace_bytes())
+        }
+    }
+}
+
+/// Invocation workspace of the recurrent step row classes' kernels.
+fn recurrent_step_bytes(step: &RecurrentStepKernels) -> u128 {
+    match step {
+        RecurrentStepKernels::Step(step) => u128::from(step.invocation_workspace_bytes()),
+        RecurrentStepKernels::Convolved { project, step } => {
+            u128::from(project.invocation_workspace_bytes())
+                + u128::from(step.invocation_workspace_bytes())
+        }
+    }
+}
 
 pub struct AttestedPrograms {
     backend: BackendName,
@@ -43,7 +68,6 @@ pub(crate) struct AttestedTarget {
     pub blocks: Vec<AttestedTargetBlock>,
     pub readout: ReadoutKernels,
     pub features: Option<NativeKernel<readout_features_rows::Entry>>,
-    pub selected: NativeKernel<readout_selected_rows::Entry>,
     pub shape: NativeKernel<shape_rows::Entry>,
     pub sample: NativeKernel<sample_rows::Entry>,
     /// A separate draft's taps, when one drafts.
@@ -193,7 +217,7 @@ pub(crate) struct AttestedHeadBlock {
     pub attention: AttentionKernels,
     pub feed_forward: AttestedFeedForward,
     pub features: NativeKernel<readout_features_rows::Entry>,
-    pub logits: NativeKernel<head_logits_rows::Entry>,
+    pub logits: HeadLogitsKernels,
 }
 
 /// A separate draft's entries: per layer in draft order, then the block
@@ -297,12 +321,12 @@ impl AttestedPrograms {
             .into_iter()
             .map(|rows| rows as u64)
             .collect::<Vec<_>>();
-        let max_rows = *row_classes.last().ok_or_else(|| {
-            format!(
+        if row_classes.is_empty() {
+            return Err(format!(
                 "launch row bound {} has no row class",
                 limits.max_launch_rows
-            )
-        })?;
+            ));
+        }
         if self.vision.is_some() != vision_plan.is_some()
             || self.vision.is_some() != definition.vision.is_some()
         {
@@ -360,17 +384,13 @@ impl AttestedPrograms {
         if let (Some(handles), Some(vision), Some(_)) =
             (&self.vision, definition.vision.as_ref(), vision_plan)
         {
-            let cell = vision.cell_rows();
-            max_rows
-                .checked_mul(cell)
-                .ok_or("vision patch row bound overflow")?;
+            let patch_rows = crate::programs::native_vision::image_patch_classes(
+                limits.max_image_cells,
+                vision,
+            )?;
             self.vision_graphs = Some(Rc::new(
-                crate::programs::native_vision::PreparedVisionGraphs::prepare_exact_classes(
-                    device,
-                    handles,
-                    load,
-                    vision,
-                    (1..=max_rows).map(|outputs| outputs * cell),
+                crate::programs::native_vision::PreparedVisionGraphs::prepare_classes(
+                    device, handles, load, vision, patch_rows,
                 )
                 .map_err(|error| error.to_string())?,
             ));
@@ -437,14 +457,29 @@ impl AttestedPrograms {
     }
 
     /// Device bytes reserved by the exact native specializations before
-    /// construction. Duplicate bindings share one prepared handle, matching
-    /// the native factory's preparation and the actual measured charge.
-    pub fn planned_invocation_workspace_bytes(plan: &ProgramPlan) -> Result<u64, PlanError> {
+    /// construction on `backend`. Duplicate bindings share one prepared
+    /// handle, matching the native factory's preparation and the actual
+    /// measured charge.
+    pub fn planned_invocation_workspace_bytes(
+        plan: &ProgramPlan,
+        backend: BackendName,
+    ) -> Result<u64, PlanError> {
         macro_rules! bytes {
             ($entry:ident) => {
                 u128::from(NativeKernel::<$entry::Entry>::planned_invocation_workspace_bytes())
             };
         }
+        // The fused routed form's entries: the decode ones by the backend's
+        // form.
+        let routed_bytes = bytes!(routed_route)
+            + match DecodeForm::of(backend).map_err(PlanError::ResourcePlanning)? {
+                DecodeForm::Expand => bytes!(routed_expand),
+                DecodeForm::SharedRoute => bytes!(routed_route_shared) + bytes!(routed_gate_up),
+            }
+            + bytes!(routed_output)
+            + bytes!(routed_group)
+            + bytes!(routed_experts)
+            + bytes!(routed_combine);
         fn general_routed_bytes(shape: crate::GeneralRoutedShape) -> u128 {
             let mut bytes = bytes!(routed_select)
                 + bytes!(routed_down)
@@ -519,9 +554,15 @@ impl AttestedPrograms {
                     if charged_mixers.insert(MixerProgramSlot::Recurrent(binding)) =>
                 {
                     bytes += bytes!(gated_delta_project)
-                        + bytes!(gated_delta_step)
+                        + match StepForm::of(backend).map_err(PlanError::ResourcePlanning)? {
+                            StepForm::Step => bytes!(gated_delta_step),
+                            StepForm::Convolved => {
+                                bytes!(gated_delta_project_convolved)
+                                    + bytes!(gated_delta_step_convolved)
+                            }
+                        }
                         + bytes!(gated_delta_chunk)
-                        + bytes!(gated_delta_output)
+                        + bytes!(attention_output)
                 }
                 MixerProgramSlot::StateSpace(binding)
                     if charged_mixers.insert(MixerProgramSlot::StateSpace(binding)) =>
@@ -556,12 +597,7 @@ impl AttestedPrograms {
                 Some(FeedForwardProgramSlot::Routed(binding))
                     if charged_feed_forward.insert(FeedForwardProgramSlot::Routed(binding)) =>
                 {
-                    bytes += bytes!(routed_route)
-                        + bytes!(routed_expand)
-                        + bytes!(routed_output)
-                        + bytes!(routed_group)
-                        + bytes!(routed_experts)
-                        + bytes!(routed_combine)
+                    bytes += routed_bytes
                 }
                 Some(FeedForwardProgramSlot::GeneralRouted(binding))
                     if charged_feed_forward
@@ -593,8 +629,17 @@ impl AttestedPrograms {
                 + bytes!(per_layer_inputs);
         }
         bytes += bytes!(readout_features_rows)
-            + bytes!(readout_head_rows)
-            + bytes!(readout_selected_rows);
+            + match target.readout().head {
+                ReadoutHead::Packed { .. } => {
+                    bytes!(readout_head_rows) + bytes!(readout_selected_rows)
+                }
+                ReadoutHead::Progressive => {
+                    bytes!(readout_top_rows)
+                        + bytes!(readout_refine_rows)
+                        + bytes!(readout_exact_rows)
+                        + bytes!(readout_planes_rows)
+                }
+            };
         if target.features().is_some() {
             bytes += bytes!(readout_features_rows);
         }
@@ -611,20 +656,21 @@ impl AttestedPrograms {
                         + bytes!(attention_decode)
                         + bytes!(attention_prefill)
                         + bytes!(attention_output)
-                        + bytes!(readout_features_rows)
-                        + bytes!(head_logits_rows);
+                        + bytes!(readout_features_rows);
+                    bytes += match binding.projection {
+                        HeadProjection::Packed(_) => bytes!(head_logits_rows),
+                        HeadProjection::Progressive => {
+                            bytes!(readout_top_rows)
+                                + bytes!(readout_refine_rows)
+                                + bytes!(readout_exact_rows)
+                                + bytes!(readout_planes_rows)
+                        }
+                    };
                     match binding.feed_forward {
                         FeedForwardProgramSlot::Dense(_) => {
                             bytes += bytes!(dense_expand) + bytes!(dense_output)
                         }
-                        FeedForwardProgramSlot::Routed(_) => {
-                            bytes += bytes!(routed_route)
-                                + bytes!(routed_expand)
-                                + bytes!(routed_output)
-                                + bytes!(routed_group)
-                                + bytes!(routed_experts)
-                                + bytes!(routed_combine)
-                        }
+                        FeedForwardProgramSlot::Routed(_) => bytes += routed_bytes,
                         // `operators::admit` keeps draft heads on the fused
                         // form.
                         FeedForwardProgramSlot::GeneralRouted(_)
@@ -706,18 +752,12 @@ impl AttestedPrograms {
         device: &Device,
         tuning: TuningContext<'_>,
     ) -> Result<Self, CatalogError> {
-        let limits = plan.policy().limits();
         Self::prepare_for(
             plan.policy().path(),
             plan.device(),
             plan.programs(),
             plan.load(),
-            TuningLimits {
-                max_rows: limits.max_launch_rows as u64,
-                max_projected_rows: crate::programs::graph::readout::max_projected_rows(limits)
-                    as u64,
-                context_tokens: tuning.definition.decoder.context_limit,
-            },
+            TuningLimits::of(plan.policy().limits(), tuning.definition),
             device,
             tuning,
         )
@@ -946,11 +986,6 @@ impl AttestedPrograms {
                 .features()
                 .map(|binding| slot(&prepared.target.features, binding, "readout_features_rows"))
                 .transpose()?,
-            selected: slot(
-                &prepared.target.selected,
-                target_plan.readout(),
-                "readout_selected_rows",
-            )?,
             shape: prepared
                 .glue
                 .shape_rows
@@ -1027,7 +1062,11 @@ impl AttestedPrograms {
                             }
                         },
                         features: slot(&handles.features, binding, "readout_features_rows")?,
-                        logits: slot(&handles.logits, binding, "head_logits_rows")?,
+                        logits: handles
+                            .logits
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("head_logits", binding))?,
                     });
                 }
                 Ok::<_, CatalogFailure>(AttestedHead {
@@ -1178,13 +1217,11 @@ impl AttestedPrograms {
             imports.push((binding, handle));
         }
         let invocation_workspace_bytes = Self::sum_invocation_workspace_bytes(&prepared)?;
-        let planned_bytes =
-            Self::planned_invocation_workspace_bytes(topology).map_err(|error| {
-                CatalogFailure::Preparation {
-                    entry: "program_factory",
-                    bindings: "native invocation workspace".into(),
-                    outcome: error.to_string(),
-                }
+        let planned_bytes = Self::planned_invocation_workspace_bytes(topology, device.backend())
+            .map_err(|error| CatalogFailure::Preparation {
+                entry: "program_factory",
+                bindings: "native invocation workspace".into(),
+                outcome: error.to_string(),
             })?;
         if invocation_workspace_bytes != planned_bytes {
             return Err(CatalogFailure::Qualification {
@@ -1245,7 +1282,7 @@ impl AttestedPrograms {
         }
         for handles in prepared.target.recurrent.values() {
             bytes += u128::from(handles.project.invocation_workspace_bytes())
-                + u128::from(handles.step.invocation_workspace_bytes())
+                + recurrent_step_bytes(&handles.step)
                 + u128::from(handles.chunk.invocation_workspace_bytes())
                 + u128::from(handles.output.invocation_workspace_bytes());
         }
@@ -1329,7 +1366,7 @@ impl AttestedPrograms {
         }
         for handles in prepared.target.routed.values() {
             bytes += u128::from(handles.route.invocation_workspace_bytes())
-                + u128::from(handles.expand.invocation_workspace_bytes())
+                + routed_decode_bytes(&handles.decode)
                 + u128::from(handles.output.invocation_workspace_bytes())
                 + u128::from(handles.group.invocation_workspace_bytes())
                 + u128::from(handles.experts.invocation_workspace_bytes())
@@ -1337,10 +1374,20 @@ impl AttestedPrograms {
         }
         for handles in prepared.target.readout.values() {
             bytes += u128::from(handles.features.invocation_workspace_bytes())
-                + u128::from(handles.head.invocation_workspace_bytes());
+                + match &handles.head {
+                    ReadoutHeadKernels::Packed { head, selected } => {
+                        u128::from(head.invocation_workspace_bytes())
+                            + u128::from(selected.invocation_workspace_bytes())
+                    }
+                    ReadoutHeadKernels::Progressive(kernels) => {
+                        u128::from(kernels.top.invocation_workspace_bytes())
+                            + u128::from(kernels.refine.invocation_workspace_bytes())
+                            + u128::from(kernels.exact.invocation_workspace_bytes())
+                            + u128::from(kernels.planes.invocation_workspace_bytes())
+                    }
+                };
         }
         charge!(prepared.target.features.values());
-        charge!(prepared.target.selected.values());
         if let Some(taps) = &prepared.target.taps {
             bytes += u128::from(taps.tap.invocation_workspace_bytes())
                 + u128::from(taps.fusion.invocation_workspace_bytes())
@@ -1359,14 +1406,24 @@ impl AttestedPrograms {
             }
             for handles in head.routed.values() {
                 bytes += u128::from(handles.route.invocation_workspace_bytes())
-                    + u128::from(handles.expand.invocation_workspace_bytes())
+                    + routed_decode_bytes(&handles.decode)
                     + u128::from(handles.output.invocation_workspace_bytes())
                     + u128::from(handles.group.invocation_workspace_bytes())
                     + u128::from(handles.experts.invocation_workspace_bytes())
                     + u128::from(handles.combine.invocation_workspace_bytes());
             }
             charge!(head.features.values());
-            charge!(head.logits.values());
+            for logits in head.logits.values() {
+                match logits {
+                    HeadLogitsKernels::Packed(kernel) => charge!([kernel]),
+                    HeadLogitsKernels::Progressive(kernels) => {
+                        charge!([&kernels.top]);
+                        charge!([&kernels.refine]);
+                        charge!([&kernels.exact]);
+                        charge!([&kernels.planes]);
+                    }
+                }
+            }
             charge!(head.shape.iter());
             charge!(head.sample.iter());
         }
@@ -1485,21 +1542,41 @@ impl AttestedPrograms {
                 .ok_or("qualification scope byte count overflows")?;
         }
         if load.head().is_some() {
-            let output = load
-                .target()
-                .iter()
-                .find(|weight| {
-                    weight.role.scope == WeightScope::Target
-                        && weight.role.kind == WeightKind::Output
+            // The draft projection fixture: the output projection's (or its
+            // planes') draft-vocabulary rows.
+            let target = |kind| {
+                load.target().iter().find(|weight| {
+                    weight.role.scope == WeightScope::Target && weight.role.kind == kind
                 })
-                .ok_or("head qualification requires the target output")?;
-            let [vocabulary, hidden] = output.shape[..] else {
-                return Err("target output is not a matrix".into());
             };
-            let projection = output
-                .resident
-                .canonical_byte_len(&[draft_vocabulary(vocabulary), hidden])
-                .map_err(|error| format!("draft projection fixture: {error}"))?;
+            let fixture = |element: Element, shape: &[u64]| {
+                element
+                    .canonical_byte_len(shape)
+                    .map_err(|error| format!("draft projection fixture: {error}"))
+            };
+            let projection = match target(WeightKind::Output) {
+                Some(output) => {
+                    let [vocabulary, hidden] = output.shape[..] else {
+                        return Err("target output is not a matrix".into());
+                    };
+                    fixture(output.resident, &[draft_vocabulary(vocabulary), hidden])?
+                }
+                None => {
+                    let top = target(WeightKind::OutputPlane(ProgressivePlane::Top))
+                        .ok_or("head qualification requires the target output")?;
+                    let [vocabulary, words] = top.shape[..] else {
+                        return Err("target top plane is not a matrix".into());
+                    };
+                    ProgressivePlane::ALL.into_iter().try_fold(0u64, |bytes, plane| {
+                        let element = crate::progressive::element(plane);
+                        let plane_bytes =
+                            fixture(element, &plane.shape(draft_vocabulary(vocabulary), words * 8))?;
+                        bytes
+                            .checked_add(plane_bytes)
+                            .ok_or_else(|| "draft projection fixture overflows".to_owned())
+                    })?
+                }
+            };
             for (scope, bytes) in &mut scopes {
                 if matches!(scope, FixtureScope::Head(_)) {
                     *bytes = bytes
@@ -1736,6 +1813,7 @@ impl AttestedPrograms {
                         verify_four,
                         verify_eight,
                         prefill,
+                        prefill_listed,
                     } => {
                         charge!(decode);
                         if let Some(verify) = verify {
@@ -1748,6 +1826,9 @@ impl AttestedPrograms {
                             charge!(verify_eight);
                         }
                         charge!(prefill);
+                        if let Some(prefill_listed) = prefill_listed {
+                            charge!(prefill_listed);
+                        }
                     }
                 }
                 tail!(&handles.output);
@@ -1796,7 +1877,13 @@ impl AttestedPrograms {
                     AttestedFeedForward::Dense(handles) => dense!(handles),
                     AttestedFeedForward::Routed(handles) => {
                         charge!(&handles.route);
-                        charge!(&handles.expand);
+                        match &handles.decode {
+                            RoutedDecodeKernels::Expand(expand) => charge!(expand),
+                            RoutedDecodeKernels::SharedRoute { route, choices } => {
+                                charge!(route);
+                                charge!(choices);
+                            }
+                        }
                         charge!(&handles.output);
                         charge!(&handles.group);
                         charge!(&handles.experts);
@@ -1818,7 +1905,13 @@ impl AttestedPrograms {
                 AttestedMixer::Attention(handles) => attention!(handles),
                 AttestedMixer::Recurrent(handles) => {
                     charge!(&handles.project);
-                    charge!(&handles.step);
+                    match &handles.step {
+                        RecurrentStepKernels::Step(step) => charge!(step),
+                        RecurrentStepKernels::Convolved { project, step } => {
+                            charge!(project);
+                            charge!(step);
+                        }
+                    }
                     charge!(&handles.chunk);
                     charge!(&handles.output);
                 }
@@ -1855,7 +1948,18 @@ impl AttestedPrograms {
             charge!(&entry.copy);
         }
         charge!(&self.target.readout.features);
-        charge!(&self.target.readout.head);
+        match &self.target.readout.head {
+            ReadoutHeadKernels::Packed { head, selected } => {
+                charge!(head);
+                charge!(selected);
+            }
+            ReadoutHeadKernels::Progressive(kernels) => {
+                charge!(&kernels.top);
+                charge!(&kernels.refine);
+                charge!(&kernels.exact);
+                charge!(&kernels.planes);
+            }
+        }
         if let Some(features) = &self.target.features {
             charge!(features);
         }
@@ -1864,7 +1968,6 @@ impl AttestedPrograms {
             charge!(&taps.fusion);
             charge!(&taps.features);
         }
-        charge!(&self.target.selected);
         charge!(&self.target.shape);
         charge!(&self.target.sample);
         if let Some(head) = &self.head {
@@ -1873,7 +1976,15 @@ impl AttestedPrograms {
                 attention!(&block.attention);
                 feed_forward!(&block.feed_forward);
                 charge!(&block.features);
-                charge!(&block.logits);
+                match &block.logits {
+                    HeadLogitsKernels::Packed(kernel) => charge!(kernel),
+                    HeadLogitsKernels::Progressive(kernels) => {
+                        charge!(&kernels.top);
+                        charge!(&kernels.refine);
+                        charge!(&kernels.exact);
+                        charge!(&kernels.planes);
+                    }
+                }
             }
             charge!(&head.shape);
             charge!(&head.sample);

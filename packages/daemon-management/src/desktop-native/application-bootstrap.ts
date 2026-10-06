@@ -1,4 +1,4 @@
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import { FileSystem } from "@effect/platform"
 import { posix, win32 } from "node:path"
 import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
@@ -69,6 +69,7 @@ export const applicationServiceCommand = (options: {
   const path = paths(platform)
   return {
     output: options.output,
+    logFile: Option.some(path.join(profile.dataDirectory, "logs", "service.log")),
     executable: runtime._tag === "Installed"
       ? path.join(runtime.resourcesDirectory, platform === "win32" ? "magnitude-service.exe" : "magnitude-service")
       : environment.MAGNITUDE_BUN_PATH ?? "bun",

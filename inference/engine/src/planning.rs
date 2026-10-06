@@ -10,8 +10,8 @@
 use crate::options::{ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
 use magnitude_batching::MAX_CLASS_ROWS;
 use magnitude_executor::{
-    platform::SelectedDevice, ComponentSelection, ExecutionPlanDraft, ExecutionPlanner, PlanError,
-    PlannedMethod, ResourceLimits,
+    image_cell_limit, platform::SelectedDevice, BackendPlan, ComponentSelection,
+    ExecutionPlanDraft, ExecutionPlanner, PlanError, PlannedMethod, ResourceLimits,
 };
 use magnitude_scheduler::ServiceLimits;
 use std::fmt;
@@ -51,6 +51,46 @@ pub fn plan_execution(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
 ) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
+    let (selection, method, limits) = planner_inputs(manifest, selected.info.backend)?;
+    ExecutionPlanner::prepare(
+        selected,
+        &manifest.package,
+        &manifest.definition,
+        selection,
+        manifest.path,
+        method,
+        manifest.model.kv_codec,
+        limits,
+    )
+    .map_err(ExecutionPlanningError::Plan)
+}
+
+/// Plan the manifest's model on `backend`, which is all planning reads of a
+/// device: the plan a load on any device of that backend executes.
+pub fn plan_backend(
+    manifest: &ExecutionManifest,
+    backend: seismic::BackendName,
+) -> Result<BackendPlan, ExecutionPlanningError> {
+    let (selection, method, limits) = planner_inputs(manifest, backend)?;
+    ExecutionPlanner::backend_plan(
+        backend,
+        &manifest.package,
+        &manifest.definition,
+        selection,
+        manifest.path,
+        method,
+        manifest.model.kv_codec,
+        limits,
+    )
+    .map_err(ExecutionPlanningError::Plan)
+}
+
+/// The component selection, planned method and resource limits the
+/// manifest resolves on `backend`.
+fn planner_inputs(
+    manifest: &ExecutionManifest,
+    backend: seismic::BackendName,
+) -> Result<(ComponentSelection, PlannedMethod, ResourceLimits), ExecutionPlanningError> {
     let selection = ComponentSelection {
         head: !matches!(manifest.model.method, ResolvedMethod::Plain),
         vision: manifest.definition.vision.is_some(),
@@ -66,27 +106,21 @@ pub fn plan_execution(
         },
         ResolvedMethod::DFlash { proposals } => PlannedMethod::DFlash { proposals },
     };
-    let limits = resource_limits(&manifest.service, &manifest.model, selected.info.backend)?;
-    ExecutionPlanner::prepare(
-        selected,
-        &manifest.package,
-        &manifest.definition,
-        selection,
-        manifest.path,
-        method,
-        manifest.model.kv_codec,
-        limits,
-    )
-    .map_err(ExecutionPlanningError::Plan)
+    let image_cells = image_cell_limit(&manifest.definition, manifest.service.launch_rows())
+        .map_err(ExecutionPlanningError::Plan)?;
+    let limits = resource_limits(&manifest.service, &manifest.model, image_cells, backend)?;
+    Ok((selection, method, limits))
 }
 
-/// The resource limits a load of this manifest plans for.
+/// The resource limits a load of this manifest plans for, encoding images of
+/// at most `image_cells` cells.
 fn resource_limits(
     service: &ServiceLimits,
     model: &ResolvedModelPolicy,
+    image_cells: usize,
     backend: seismic::BackendName,
 ) -> Result<ResourceLimits, ExecutionPlanningError> {
-    let max_launch_rows = service.prefill_tokens.max(service.decode_tokens);
+    let max_launch_rows = service.launch_rows();
     // Larger prefill classes have a served gain and memory gate on CUDA.
     // Other backends retain their measured 512-row admission bound.
     let admitted = if backend == seismic::BackendName::Cuda {
@@ -116,6 +150,7 @@ fn resource_limits(
         max_drafting_slots: service.selection_bound(),
         exported_logits_rows: model.exported_logits_rows,
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+        max_image_cells: image_cells,
         lookahead: model.lookahead,
     })
 }
@@ -131,6 +166,7 @@ mod tests {
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows,
+            error_classes: Vec::new(),
         }
     }
 
@@ -146,7 +182,7 @@ mod tests {
     #[test]
     fn prefill_budget_admits_more_request_slots_than_decode_budget() {
         let limits =
-            resource_limits(&service(64, 16), &model(0), seismic::BackendName::Metal).unwrap();
+            resource_limits(&service(64, 16), &model(0), 0, seismic::BackendName::Metal).unwrap();
         assert_eq!(limits.max_launch_rows, 64);
         assert_eq!(limits.max_launch_slots, 64);
     }
@@ -154,7 +190,7 @@ mod tests {
     #[test]
     fn the_selection_bound_is_the_decode_allowance() {
         let limits =
-            resource_limits(&service(512, 32), &model(0), seismic::BackendName::Metal).unwrap();
+            resource_limits(&service(512, 32), &model(0), 0, seismic::BackendName::Metal).unwrap();
         assert_eq!(limits.max_selected_rows, 32);
         assert_eq!(limits.max_drafting_slots, 32);
         assert_eq!(limits.exported_logits_rows, 0);
@@ -162,11 +198,21 @@ mod tests {
 
     #[test]
     fn logits_export_is_bounded_by_the_launch() {
-        let limits =
-            resource_limits(&service(512, 32), &model(512), seismic::BackendName::Metal).unwrap();
+        let limits = resource_limits(
+            &service(512, 32),
+            &model(512),
+            0,
+            seismic::BackendName::Metal,
+        )
+        .unwrap();
         assert_eq!(limits.exported_logits_rows, 512);
         assert_eq!(
-            resource_limits(&service(512, 32), &model(513), seismic::BackendName::Metal),
+            resource_limits(
+                &service(512, 32),
+                &model(513),
+                0,
+                seismic::BackendName::Metal
+            ),
             Err(ExecutionPlanningError::LogitsRows {
                 required: 513,
                 admitted: 512,
@@ -178,13 +224,13 @@ mod tests {
     fn large_prefill_classes_require_cuda() {
         let service = service(1024, 32);
         assert_eq!(
-            resource_limits(&service, &model(0), seismic::BackendName::Cuda)
+            resource_limits(&service, &model(0), 0, seismic::BackendName::Cuda)
                 .unwrap()
                 .max_launch_rows,
             1024
         );
         assert_eq!(
-            resource_limits(&service, &model(0), seismic::BackendName::Metal),
+            resource_limits(&service, &model(0), 0, seismic::BackendName::Metal),
             Err(ExecutionPlanningError::LaunchRows {
                 required: 1024,
                 admitted: 512,

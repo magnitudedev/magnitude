@@ -298,14 +298,17 @@ __device__ __forceinline__ void gemv_accumulate(float (&acc)[NB][4], const typen
 // `tiles` tiles and `rows` valid rows, superblock share `part` of KSPLIT, for
 // M <= 8 * NB activation rows (column block nb holds rows 8 nb .. 8 nb + 7).
 // Each iteration decodes one superblock (4 k-blocks) while the codes and
-// packed coefficients of the next are in flight in registers. `pro` reads
-// its A operands in place (`pair`); `reduce` is the group's reduction area,
-// `barrier` its named barrier.
-template <int TPW, int KSPLIT, int NB, class Pro, class WA, class WB, class Epi>
-__device__ __forceinline__ void gemv_group(const Pro &pro, u32 M, u64 kblocks, u64 tile0, u64 tiles, u64 rows,
+// packed coefficients of the next are in flight in registers. `ready()`
+// returns the activation source, which reads its A operands in place
+// (`pair`); it runs once the first superblock's weight loads are issued, so
+// it may wait for the previous launch (`seismic_dependency_wait`) while they
+// are in flight. A group past the segment (tile0 >= tiles) loads nothing but
+// still runs `ready()`, which may be block-collective. `reduce` is the
+// group's reduction area, `barrier` its named barrier.
+template <int TPW, int KSPLIT, int NB, class Ready, class WA, class WB, class Epi>
+__device__ __forceinline__ void gemv_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles, u64 rows,
                                            const WA &wa, const WB &wb, const Epi &epi, float *reduce, u32 barrier,
                                            u32 part) {
-    static_assert(Pro::FACTORS == 0, "a GEMV reads its operands in place");
     constexpr bool PAIR = !Same<WB, NoWeight>::value;
     constexpr bool BIAS = WA::BIAS || WB::BIAS;
     const u32 lane = threadIdx.x % 32;
@@ -345,6 +348,15 @@ __device__ __forceinline__ void gemv_group(const Pro &pro, u32 M, u64 kblocks, u
                 stage.bb[i] = wb.block(tile0 + i, sb, lane);
         }
     };
+    // The next superblock's loads are in flight while the current one
+    // decodes; the first one's are issued before the source is ready.
+    Stage current;
+    if (tile0 < tiles && begin < end)
+        load(current, begin);
+    const auto pro = ready();
+    static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
+    if (tile0 >= tiles)
+        return;
     auto compute = [&](const Stage &stage, u64 sb) {
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
@@ -385,10 +397,6 @@ __device__ __forceinline__ void gemv_group(const Pro &pro, u32 M, u64 kblocks, u
                 }
         }
     };
-    // The next superblock's loads are in flight while the current one decodes.
-    Stage current;
-    if (begin < end)
-        load(current, begin);
     for (u64 sb = begin; sb < end; ++sb) {
         Stage next;
         if (sb + 1 < end)
@@ -464,12 +472,31 @@ template <class Shape> __device__ __forceinline__ u64 gemv_groups(u64 rows) {
 }
 
 // Run a GEMV warp over one segment: `group` is the segment-local tile group.
+// `ready()` returns the activation source once the warp's first weight loads
+// are issued (see `gemv_group`).
+template <class Shape, class Ready, class WA, class WB, class Epi, class Shared>
+__device__ __forceinline__ void gemv_segment_ready(Shared &shared, const Ready &ready, u32 M, u64 kblocks, u64 group,
+                                                   u64 rows, const WA &wa, const WB &wb, const Epi &epi) {
+    gemv_group<Shape::TPW, Shape::KSPLIT, Shape::NB>(ready, M, kblocks, group * Shape::TPW, (rows + 15) / 16, rows,
+                                                     wa, wb, epi, shared.reduce[Shape::group()], 1 + Shape::group(),
+                                                     Shape::part());
+}
+
 template <class Shape, class Pro, class WA, class WB, class Epi, class Shared>
 __device__ __forceinline__ void gemv_segment(Shared &shared, const Pro &pro, u32 M, u64 kblocks, u64 group,
                                              u64 rows, const WA &wa, const WB &wb, const Epi &epi) {
-    gemv_group<Shape::TPW, Shape::KSPLIT, Shape::NB>(pro, M, kblocks, group * Shape::TPW, (rows + 15) / 16, rows,
-                                                     wa, wb, epi, shared.reduce[Shape::group()], 1 + Shape::group(),
-                                                     Shape::part());
+    gemv_segment_ready<Shape>(shared, [&] { return pro; }, M, kblocks, group, rows, wa, wb, epi);
+}
+
+// Ready callbacks of a programmatic dependent (SEISMIC_PROGRAMMATIC_DEPENDENCY):
+// wait for the previous launch, let the next one start, and return the
+// source: `after_dependency` for a source read in place,
+// `source_after_dependency` for a `GemvSource` (block-collective at M = 1).
+template <class Pro> __device__ __forceinline__ auto after_dependency(const Pro &pro) {
+    return [pro] {
+        seismic_dependency_start();
+        return pro;
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1258,6 +1285,13 @@ template <class Pro> struct GemvSourceOf<true, Pro> {
     }
 };
 template <class Pro> using GemvSource = GemvSourceOf<Pro::STAGED, Pro>;
+template <class Pro>
+__device__ __forceinline__ auto source_after_dependency(const Pro &pro, u8 *row, u32 M, u64 K, const u8 *staged) {
+    return [=] {
+        seismic_dependency_start();
+        return GemvSource<Pro>::make(pro, row, M, K, staged);
+    };
+}
 
 // One GEMM block on either path: `act` is the A rows (row stride
 // `act_stride`) for the 16-bit path or the staged s8 rows (with their

@@ -1,5 +1,7 @@
 ---
 applies_to:
+  - inference/engine/executor/src/progressive.rs
+  - inference/engine/executor/src/import_transforms.rs
   - inference/engine/executor/src/residency.rs
   - inference/engine/executor/src/resident_weights.rs
   - inference/engine/executor/src/planning/weights.rs
@@ -39,6 +41,15 @@ accumulator through an accumulator-scale port; no import or family folds it into
 A missing or misshapen scale, a scaled weight dequantized for dense-only kernels, and a scaled
 weight bound by an entry without a scale port are refused at plan time, so the model is
 `Unsupported` rather than failing on a device.
+A progressive head replaces the stored Q8_0 head by its five planes (`ImportTransform::Progressive`,
+each its own `WeightKind::OutputPlane` weight): the offset-binary codes' bits 7..4, bit 3 and bits
+2..0, the group scales, and per row the radii of its 4- and 5-bit views (`[V, 2]`, so every
+plane's leading rows are a draft head's draft-vocabulary rows; in F32 rounded up, the
+Euclidean distance between the row and its view plus `4 · K · 2⁻²⁴ · |w|₂`, which covers both
+projections' F32 rounding). The planes hold the head's values bit for bit, so the head's resident
+bytes are unchanged and the radii add `8 · V` bytes. The host places each plane from the stored
+rows and the device holds the placed bytes as they are: a host-placed weight takes no import entry
+and joins no mapped import window. A draft head binds the target's resident planes, imported once.
 
 Each import takes an immutable artifact source and validates its exact WeightPlan. On Metal,
 component weights are visited in source-file order. Consecutive whole tensors whose combined

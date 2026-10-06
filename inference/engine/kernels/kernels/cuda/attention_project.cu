@@ -11,6 +11,8 @@
 #define KERNEL_W3 SEISMIC_VALUE_WEIGHT
 #include "lib/projection/projection.cuh"
 
+SEISMIC_PROGRAMMATIC_DEPENDENCY
+
 using Pro = projection::Rms<ELEMENT_OF(SEISMIC_INPUT_NORM), projection::AllRows>;
 using Source = projection::GemvSource<Pro>;
 using Out = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
@@ -76,27 +78,33 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
         projection::gemv_groups<Shape>(s.rows[2]), projection::gemv_groups<Shape>(s.rows[3])};
     const int segment = projection::locate_segment(group, groups);
     if (project_mode != 0 && segment < 2) {
+        seismic_dependency_start();
         project_zero(s.out[segment], M, s.rows[segment], 0, M, group * Shape::TPW * 16,
                      Shape::TPW * 16, threadIdx.x % (32 * Shape::KSPLIT), 32 * Shape::KSPLIT);
         return;
     }
-    const Source::type x = Source::make(pro, row, M, D, staged);
+    // Every other warp runs `x` (block-collective at M = 1), including a
+    // group past the last segment, which has no rows.
+    const auto x = projection::source_after_dependency(pro, row, M, D, staged);
     switch (segment) {
     case 0:
-        projection::gemv_segment<Shape>(shared, x, M, kblocks, group, s.rows[0], s.query, projection::NoWeight{},
-                                        s.out[0]);
+        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[0], s.query,
+                                              projection::NoWeight{}, s.out[0]);
         break;
     case 1:
-        projection::gemv_segment<Shape>(shared, x, M, kblocks, group, s.rows[1], s.gate, projection::NoWeight{},
-                                        s.out[1]);
+        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[1], s.gate,
+                                              projection::NoWeight{}, s.out[1]);
         break;
     case 2:
-        projection::gemv_segment<Shape>(shared, x, M, kblocks, group, s.rows[2], s.key, projection::NoWeight{},
-                                        s.out[2]);
+        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[2], s.key,
+                                              projection::NoWeight{}, s.out[2]);
         break;
     case 3:
-        projection::gemv_segment<Shape>(shared, x, M, kblocks, group, s.rows[3], s.value, projection::NoWeight{},
-                                        s.out[3]);
+        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[3], s.value,
+                                              projection::NoWeight{}, s.out[3]);
+        break;
+    default:
+        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, 0, 0, s.value, projection::NoWeight{}, s.out[3]);
         break;
     }
 }
@@ -108,6 +116,7 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
                                              unsigned long long D, const Segments &s,
                                              unsigned project_mode) {
     extern __shared__ uint4 dynamic_shared[];
+    seismic_dependency_start();
     projection::u8 *shared = reinterpret_cast<projection::u8 *>(dynamic_shared);
     unsigned long long column = projection::gemm_column<Shape>();
     const unsigned long long columns[4] = {
@@ -151,6 +160,7 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_STAGE
 template <unsigned INT8>
 __global__ void attention_project_stage(SEISMIC_KERNEL_PARAMS) {
+    seismic_dependency_start();
     projection::stage_row<false>(PROLOGUE, blockIdx.x, SEISMIC_DIM_D, STAGING, GROUPS);
 }
 #endif
@@ -158,6 +168,7 @@ __global__ void attention_project_stage(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_STAGE_S8
 template <unsigned INT8>
 __global__ void attention_project_stage_s8(SEISMIC_KERNEL_PARAMS) {
+    seismic_dependency_start();
     constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
     projection::stage_row<S8>(PROLOGUE, blockIdx.x, SEISMIC_DIM_D, STAGING, GROUPS);
 }

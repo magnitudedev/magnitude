@@ -19,6 +19,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if input.vision().len() > self.execution.policy().limits().max_images_per_request {
             return Err("input exceeds planned image capacity".into());
         }
+        if self.definition.vision.is_some() {
+            for prepared in input.vision().values() {
+                self.image_class(prepared.spatial().rows())?;
+            }
+        }
         let images = input
             .vision()
             .iter()

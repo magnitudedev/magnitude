@@ -225,15 +225,10 @@ impl AssessmentGraphResourceBounds {
         };
         let (vision, vision_constant_bytes) = match (plan.vision(), definition.vision.as_ref()) {
             (Some(vision_plan), Some(vision_definition)) => {
-                let max_rows = magnitude_batching::row_classes(limits.max_launch_rows)
-                    .last()
-                    .copied()
-                    .ok_or("batch row bound has no class")? as u64;
-                let merge = vision_definition.cell_rows();
-                max_rows
-                    .checked_mul(merge)
-                    .ok_or("vision patch row bound overflow")?;
-                let patch_rows = (1..=max_rows).map(|rows| rows * merge);
+                let patch_rows = crate::programs::native_vision::image_patch_classes(
+                    limits.max_image_cells,
+                    vision_definition,
+                )?;
                 let vision_graph = crate::programs::native_vision::checked_vision_family_resources(
                     backend,
                     load,
@@ -305,12 +300,13 @@ impl AssessmentHeaderBounds {
         definition: &ModelDefinition,
         load: &ModelLoadPlan,
         codec: KvCodec,
+        backend: BackendName,
     ) -> Result<Self, String> {
         let programs = load
             .program_plan(definition, codec)
             .map_err(|error| error.to_string())?;
         let prepared_program_bytes =
-            AttestedPrograms::planned_invocation_workspace_bytes(&programs)
+            AttestedPrograms::planned_invocation_workspace_bytes(&programs, backend)
                 .map_err(|error| error.to_string())?;
         let largest_source = load
             .weights()
@@ -693,6 +689,7 @@ mod tests {
             max_drafting_slots: 2,
             exported_logits_rows: 0,
             max_images_per_request: 1,
+            max_image_cells: 0,
             lookahead: false,
         };
         let state = crate::ResourcePlanner::state_plan(
@@ -703,6 +700,7 @@ mod tests {
             limits,
             crate::ResourceCapacity {
                 domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
             },
         )
         .unwrap();
@@ -726,6 +724,7 @@ mod tests {
             2,
             4,
             2,
+            0,
         )
         .unwrap();
         assert!(family.storage.workspace >= block.workspace);
@@ -842,6 +841,7 @@ mod tests {
             max_drafting_slots: 2,
             exported_logits_rows: 0,
             max_images_per_request: 1,
+            max_image_cells: 0,
             lookahead: false,
         };
         let state = crate::ResourcePlanner::state_plan(
@@ -852,6 +852,7 @@ mod tests {
             limits,
             crate::ResourceCapacity {
                 domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
             },
         )
         .unwrap();
@@ -918,6 +919,71 @@ mod tests {
             pools.binding_constant_bytes,
             target.binding_constant_bytes + family.binding_constant_bytes
         );
+
+        // A Q8_0 output head a backend reads progressively: the head projects
+        // the planes' leading draft-vocabulary rows, certifying the drafting
+        // slots the backend's bound covers (Metal's one of the two here, so
+        // both forms seal).
+        let output = manifest
+            .target
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == definition.decoder.exit.output.name)
+            .unwrap();
+        let packed = (output.encoding, output.nbytes);
+        output.encoding = Encoding::Q8_0;
+        output.nbytes = output.shape.iter().product::<u64>() / 32 * 34;
+        for backend in [BackendName::Metal, BackendName::Cuda] {
+            let load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                ComponentSelection {
+                    head: true,
+                    vision: false,
+                },
+                crate::planning::resident_layout(crate::ExecutionPath::Native, backend),
+            )
+            .unwrap()
+            .with_progressive_head(&definition)
+            .unwrap();
+            let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+            let binding = plan.head().unwrap().blocks()[0];
+            assert_eq!(binding.projection, crate::HeadProjection::Progressive);
+            let classes = crate::programs::native_head::head_graph_classes(
+                limits,
+                head_history.rows as u64,
+                head_history.slab_rows,
+                head_state.span_limit(),
+                method.draft_rows(),
+            )
+            .unwrap();
+            let family = crate::programs::native_head::checked_head_family_storage(
+                backend,
+                &load,
+                &definition.decoder,
+                &head_block,
+                binding,
+                classes.clone(),
+            )
+            .unwrap();
+            assert!(family.storage.workspace > 0, "{backend:?}");
+            crate::programs::native_head::verify_head_family_certificates(
+                backend,
+                &load,
+                &definition.decoder,
+                &head_block,
+                binding,
+                &classes,
+            )
+            .unwrap();
+        }
+        let output = manifest
+            .target
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == definition.decoder.exit.output.name)
+            .unwrap();
+        (output.encoding, output.nbytes) = packed;
 
         let descriptor = |name: &str, shape: &[u64]| {
             WeightDescriptor::stored(format!("routed_head_{name}"), shape)
@@ -1188,6 +1254,7 @@ mod tests {
             max_drafting_slots: 2,
             exported_logits_rows: 0,
             max_images_per_request: 0,
+            max_image_cells: 0,
             lookahead: false,
         };
         let family = crate::programs::graph::readout::checked_readout_family_storage(
@@ -1367,6 +1434,7 @@ mod tests {
             max_drafting_slots: 2,
             exported_logits_rows: 0,
             max_images_per_request: 1,
+            max_image_cells: 0,
             lookahead,
         }
     }
@@ -1427,11 +1495,14 @@ mod tests {
         )
         .is_err());
 
-        let header = AssessmentHeaderBounds::derive(&definition, &load, KvCodec::Dense).unwrap();
+        let header =
+            AssessmentHeaderBounds::derive(&definition, &load, KvCodec::Dense, BackendName::Cpu)
+                .unwrap();
         assert_eq!(
             header.prepared_program_bytes,
             AttestedPrograms::planned_invocation_workspace_bytes(
-                &load.program_plan(&definition, KvCodec::Dense).unwrap()
+                &load.program_plan(&definition, KvCodec::Dense).unwrap(),
+                BackendName::Cpu
             )
             .unwrap()
         );
@@ -1453,6 +1524,7 @@ mod tests {
             limits,
             crate::ResourceCapacity {
                 domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
             },
         )
         .unwrap();

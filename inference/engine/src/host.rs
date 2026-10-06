@@ -13,6 +13,7 @@ use magnitude_chat::{
     request::ImageInput,
     ByteBpeTokenizer, SpecialTokens, TemplateBundle, TemplateInspection,
 };
+use magnitude_executor::image_cell_limit;
 use magnitude_family_contracts::{
     FamilyError, FamilyInputAdapter, MarkerTokens, ModelDefinition, ModelFamily,
     PreparedModelInput, TokenPlan,
@@ -110,10 +111,13 @@ pub fn bind_draft(
 impl HostArtifacts {
     /// Interpret an opened package: family recognition, definition,
     /// tokenizer, templates, media processor and input adapter.
-    /// `served_context` bounds the served definition within the declared one.
+    /// `served_context` bounds the served definition within the declared one;
+    /// `launch_rows`, a load's launch row bound, bounds its image resize to the
+    /// cells that load's vision graphs encode.
     pub(crate) fn interpret(
         package: Package,
         served_context: Option<usize>,
+        launch_rows: Option<usize>,
     ) -> Result<Self, ResolveError> {
         let (family, declared) = package_definition(&package)?;
         let mut definition = declared.clone();
@@ -122,6 +126,15 @@ impl HostArtifacts {
         let unsupported = |reason: String| {
             ResolveError::Unsupported(UnsupportedModel::Representation { reason })
         };
+        if let Some(launch_rows) = launch_rows {
+            let cells = image_cell_limit(&definition, launch_rows)
+                .map_err(|error| unsupported(error.to_string()))?;
+            if let Some(vision) = definition.vision.as_mut() {
+                vision
+                    .bound_cells(cells as u64)
+                    .map_err(|error| unsupported(error.to_string()))?;
+            }
+        }
         let tokenizer = Arc::new(
             gguf_byte_bpe(
                 package.tokenizer(),
@@ -169,7 +182,7 @@ impl HostArtifacts {
         let opened = package
             .open()
             .map_err(|error| ResolveError::Artifact(ArtifactError::from_artifacts(error, &package.target)))?;
-        Self::interpret(opened, None)
+        Self::interpret(opened, None, None)
     }
 
     pub fn package(&self) -> &Package {

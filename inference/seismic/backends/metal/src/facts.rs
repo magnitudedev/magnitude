@@ -40,6 +40,7 @@ pub enum LanguageVersion {
     V3_1,
     V3_2,
     V4_0,
+    V4_1,
 }
 
 impl LanguageVersion {
@@ -51,6 +52,7 @@ impl LanguageVersion {
             Self::V3_1 => "3.1",
             Self::V3_2 => "3.2",
             Self::V4_0 => "4.0",
+            Self::V4_1 => "4.1",
         }
     }
 }
@@ -94,6 +96,11 @@ pub struct MetalFacts {
     pub(crate) matrix_dtypes: BTreeSet<DType>,
     /// Multiply-accumulate combinations the compiler accepts.
     pub(crate) matrix_combinations: BTreeSet<MatrixCombination>,
+    /// Whether the GPU executes Metal 4 tensor operations (`matmul2d` on
+    /// threadgroup and device tensors into cooperative destinations) on its
+    /// matrix hardware: Apple GPU family 10 or later, and the probe forms a
+    /// pipeline at MSL 4.0.
+    pub(crate) tensor_ops: bool,
     /// Buffer argument-table entries of one compute pipeline (Metal: 31).
     pub(crate) argument_table_entries: u32,
     /// Argument-table entries this backend reserves for its own kernel
@@ -135,6 +142,11 @@ impl MetalFacts {
         &self.operating_system
     }
 
+    /// Whether native sources may use Metal 4 tensor operations.
+    pub fn tensor_ops(&self) -> bool {
+        self.tensor_ops
+    }
+
     /// Every fact, serialized deterministically for the profile fingerprint.
     pub fn fingerprint_material(&self) -> String {
         let families = self
@@ -165,7 +177,7 @@ impl MetalFacts {
         format!(
             "backend={};arch={};os={};unified={};families={families};msl={};threads={:?};\
              threadgroup={};buffer={};alignment={};scalar={};bfloat={};matrix={};mma={combinations};\
-             args={};reserved={}",
+             tensor={};args={};reserved={}",
             self.backend_revision,
             self.architecture,
             self.operating_system,
@@ -178,6 +190,7 @@ impl MetalFacts {
             dtypes(&self.scalar_collective_dtypes),
             self.bfloat_arithmetic,
             dtypes(&self.matrix_dtypes),
+            self.tensor_ops,
             self.argument_table_entries,
             self.reserved_argument_entries,
         )

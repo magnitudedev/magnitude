@@ -78,7 +78,11 @@ geometry and plane encoding. These are compile-time macros. Static dimensions re
 constants, as do the extents they fix and the row geometry of a row-layout tensor with a static
 packing axis; a tensor whose every extent is static also renders its canonical strides as
 constants and must be bound canonically. Other dimensions, extents, strides, and scalars remain
-invocation words. Native assets do
+invocation words. The Metal prefix includes the Metal 4 tensor-operation headers and defines
+`SEISMIC_HAS_TENSOR_OPS` as 1 only when device discovery establishes that the GPU executes tensor
+operations on its matrix hardware (Apple GPU family 10 or later, and a `matmul2d` probe forms a
+pipeline); otherwise it is 0. The capability enters the device facts and, through the rendered
+source, formation identity. Native assets do
 not infer representations from byte lengths or reproduce registry layout tables. A Metal, CUDA or
 Vulkan asset may include library files written for its backend (`.h`, `.cuh`, `.glsl`) with
 `#include "<relative path>"`, resolved relative to the including file; the canonical target must lie
@@ -245,10 +249,34 @@ The default configuration at given static dimensions is the first configuration 
 in declared parameter and value order, so reordering values or adding a `where` conjunct cannot
 leave admissible statics without a default. Statics that no configuration admits lie outside the
 kernel's domain: graph construction rejects such a node, naming the call and its statics.
+A configuration that changes the entry's numerics beyond summation order declares it:
+`error_class NAME when C` names the error class of the configurations satisfying `C`, a condition
+over static dimensions and entry parameters (reduced-precision operands, a result row that depends
+on its launch's other rows). A configuration may be in several classes; the default is in none.
+Classes do not restrict direct selection, which stays explicit; native tuning forms a class's
+configurations only for a caller that admits the class.
 An inactive launch is neither encoded nor checked against pipeline or device limits, its geometry is not
 evaluated, and it keeps its ordinal (formed functions and trace entries stay in declaration order;
 a trace records it as an empty launch). An inactive scratch buffer keeps its ABI slot at the minimum
 charge without evaluating its size. A call whose launches are all inactive is legal and does nothing.
+A native declaration may name natural-number expressions: `let NAME = E` lines after `params` and
+`elements`, each over entry dimensions, entry parameters and the terms before it. A term is
+substitution: the `where` condition, error classes, scratch sizes and guards, launch conditions and
+geometry and the `repeat` count read its name as its expression, and the checked implementation is
+that of the declaration with every term written out. A term may not take the name of a dimension,
+a parameter (entry or launch) or another term.
+A native declaration may dispatch one block of consecutive launches several times: `repeat (E):`
+with the launches indented under it, `E` a natural-number expression over entry dimensions and
+entry parameters evaluated per call (zero dispatches none of them). Every round is dispatched with
+the call's one set of arguments, so a kernel learns its round from scratch the launches themselves
+advance (a launch never reads a word it writes); a launch's ordinal, formed function and tuning
+parameters are those of its declaration, a trace records each dispatch under that ordinal, and a
+parameter the count reads is part of the block's launch geometry for tuning. Only the Metal encoder
+dispatches a block more than once: the checker rejects `repeat` on every other backend.
+A scratch buffer declared `sync` (`scratch S bytes (E) sync`) holds arrival counters: it is zero
+whenever one of the call's launches starts, and the call's kernels restore every counter they use
+to zero before the call ends. Kernels use it for "the last threadgroup to arrive finishes the
+work", in which no threadgroup waits for another, so it needs no co-residency.
 
 ## Backend capabilities
 
@@ -283,6 +311,8 @@ Each backend gathers device, driver, toolchain, and backend-revision facts and t
 one immutable device legality description: supported intrinsic signatures, device-wide
 limits, dtype and atomic support, numerical environment, and a canonical identity.
 Candidate-specific native reflection completes admission during preparation.
+A Metal pipeline whose launch fixes its group size is formed to admit that size, so register
+allocation cannot lower its thread limit below the declared size.
 Unknown is distinct from unsupported.
 
 For an intrinsic signature, availability is the intersection of:
@@ -356,6 +386,13 @@ Metal compilation or execution errors are reported directly.
   scratch sizes, tuning domains and conditions (`where`, `when`).
 - An inactive native launch does no device work and is exempt from limit checks; its geometry and
   an inactive scratch buffer's size are never evaluated.
+- Before a release is built, every native implementation of a shipped module forms with each GPU
+  backend's pinned toolchain, as preparation forms it, under configurations (element bindings,
+  specializations, device facts) that together compile every preprocessor group of its authored
+  sources; a group no admitted configuration reaches is rejected with `#error` or removed. Every
+  kernel request of every supported catalog model on every GPU backend its assessment accepts is
+  admissible, implemented and forms at its default specialization. For a backend whose toolchain
+  the operating system supplies, this holds for the verifying host's toolchain.
 - Ownership and bounded iteration determine legal reads, writes, moves, and parallel effects.
 - Every accepted write to storage shared across parallel participants carries
   an exclusive or atomic capability for those participants. Iteration-local

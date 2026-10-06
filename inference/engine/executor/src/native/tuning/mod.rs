@@ -37,9 +37,9 @@
 //! Entries sharing element bindings, static values and model weight groups can
 //! reuse matching numerical evidence; equal geometry alone never authorizes reuse.
 
-/// Implements [`EntryTuning::tune`] and [`EntryTuning::prepare`] through an
+/// Implements [`EntryTuning::tune`] and [`EntryTuning::entry`] through an
 /// entry module's generated `native_tune[_with]` and
-/// `native_for_device[_with]`. `$this => $elements` names the case and the
+/// `native_entry[_with]`. `$this => $elements` names the case and the
 /// entry's element bindings built from it.
 macro_rules! generated_entry {
     ($module:ident, $this:ident => $elements:expr) => {
@@ -53,7 +53,7 @@ macro_rules! generated_entry {
             device: &seismic::Device,
             statics: &seismic::NativeSpecialization,
             points: &mut dyn seismic::PointSource<'_, Self::Entry>,
-            validation: seismic::PrecisionPolicy,
+            validation: seismic::TuningPrecision,
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
             let $this = self;
@@ -77,13 +77,9 @@ macro_rules! generated_entry {
             $module::native_digest_with(device, $elements, statics)
         }
 
-        fn prepare(
-            &self,
-            device: &seismic::Device,
-            specialization: &seismic::NativeSpecialization,
-        ) -> Result<seismic::NativeKernel<Self::Entry>, seismic::LoadError> {
+        fn entry(&self) -> seismic::BoundEntry<Self::Entry> {
             let $this = self;
-            $module::native_for_device_with(device, $elements, specialization)
+            $module::native_entry_with($elements)
         }
     };
     ($module:ident) => {
@@ -96,7 +92,7 @@ macro_rules! generated_entry {
             device: &seismic::Device,
             statics: &seismic::NativeSpecialization,
             points: &mut dyn seismic::PointSource<'_, Self::Entry>,
-            validation: seismic::PrecisionPolicy,
+            validation: seismic::TuningPrecision,
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
             $module::native_tune(
@@ -117,12 +113,8 @@ macro_rules! generated_entry {
             $module::native_digest(device, statics)
         }
 
-        fn prepare(
-            &self,
-            device: &seismic::Device,
-            specialization: &seismic::NativeSpecialization,
-        ) -> Result<seismic::NativeKernel<Self::Entry>, seismic::LoadError> {
-            $module::native_for_device(device, specialization)
+        fn entry(&self) -> seismic::BoundEntry<Self::Entry> {
+            $module::native_entry()
         }
     };
 }
@@ -145,15 +137,16 @@ pub mod survey;
 mod weights;
 
 pub(crate) use weights::TuningWeights;
+pub use precision::{AdmittedErrorClasses, NO_ERROR_CLASSES};
 pub use weights::{TuningWeightSource, ZeroTuningWeights};
 
 use super::CatalogFailure;
 use crate::kernel_cache::{KernelCache, TuningCacheKey};
+use crate::ModelLoadPlan;
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
 use magnitude_family_contracts::{ModelDefinition, Operator, WeightKind, WeightScope};
 use seismic::{
-    CensusPlan, Configuration, DType, Device, Element, NativeImplementation, NativeKernel,
-    NativeSpecialization, ParameterValues, PrecisionPolicy, SearchPlan, SearchSettings, SearchStop,
+    CensusPlan, Configuration, DType, Device, Element, NativeImplementation, NativeSpecialization, ParameterValues, PrecisionPolicy, SearchPlan, SearchSettings, SearchStop,
     Strategy, Tensor, TensorError, TuneError, TuningInitializer, TuningMethod, TuningResult,
     TuningTime,
 };
@@ -286,6 +279,17 @@ pub struct TuningLimits {
     pub max_projected_rows: u64,
     /// The served context: the longest history a row attends to.
     pub context_tokens: u64,
+}
+
+impl TuningLimits {
+    /// The bounds a load under `limits` tunes `definition`'s entries within.
+    pub(crate) fn of(limits: crate::ResourceLimits, definition: &ModelDefinition) -> Self {
+        Self {
+            max_rows: limits.max_launch_rows as u64,
+            max_projected_rows: crate::programs::graph::readout::max_projected_rows(limits) as u64,
+            context_tokens: definition.decoder.context_limit,
+        }
+    }
 }
 
 /// Provisional share of expected step time per row count. Decode (1 row)
@@ -478,7 +482,7 @@ pub(crate) trait EntryTuning {
     /// layer the case binds, one for a per-step entry.
     fn launches(&self) -> usize;
     /// The value of every dimension the model fixes.
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String>;
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String>;
     fn points(&self, limits: TuningLimits) -> Vec<PointShape>;
     /// Workload-informed admissible configurations to measure at the start
     /// of a search. A hint in another structural form replaces that form's
@@ -511,9 +515,26 @@ pub(crate) trait EntryTuning {
         device: &Device,
         statics: &NativeSpecialization,
         points: &mut dyn seismic::PointSource<'_, Self::Entry>,
-        validation: PrecisionPolicy,
+        validation: seismic::TuningPrecision,
         strategy: Strategy,
     ) -> Result<TuningResult, TuneError>;
+    /// The envelopes of the classes among `admitted` that the entry's
+    /// implementation for `device` declares: what its tuning admits, and
+    /// what its stored results are keyed by.
+    fn admitted(
+        &self,
+        device: &Device,
+        admitted: &AdmittedErrorClasses,
+    ) -> BTreeMap<String, seismic::ErrorEnvelope> {
+        let declared =
+            seismic::generated::native_error_classes::<Self::Entry>(device).unwrap_or_default();
+        admitted
+            .envelopes()
+            .iter()
+            .filter(|(class, _)| declared.contains(class))
+            .map(|(class, envelope)| (class.clone(), *envelope))
+            .collect()
+    }
     /// The entry's generated `native_digest[_with]`.
     fn digest(&self, device: &Device, statics: &NativeSpecialization) -> Result<String, TuneError>;
     /// Check a stored choice against the same device-augmented declaration
@@ -522,12 +543,9 @@ pub(crate) trait EntryTuning {
         seismic::generated::native_specialization_valid::<Self::Entry>(device, specialization)
             .unwrap_or(false)
     }
-    /// The entry's generated `native_for_device[_with]`.
-    fn prepare(
-        &self,
-        device: &Device,
-        specialization: &NativeSpecialization,
-    ) -> Result<NativeKernel<Self::Entry>, seismic::LoadError>;
+    /// The entry bound to the case's elements (its generated
+    /// `native_entry[_with]`).
+    fn entry(&self) -> seismic::BoundEntry<Self::Entry>;
 }
 
 /// Progress of tuning at load, for readiness reporting.
@@ -603,6 +621,9 @@ pub struct TuningContext<'a> {
     /// Where tuning results are stored between loads; `None` tunes every
     /// unit at every load.
     pub cache: Option<&'a KernelCache>,
+    /// The error classes the model's qualification admits. A configuration
+    /// of any other class is never formed.
+    pub error_classes: &'a AdmittedErrorClasses,
 }
 
 /// Inputs a case builds its argument sets from. Every tensor it returns is
@@ -655,21 +676,16 @@ impl Noise {
     }
 }
 
-pub(crate) struct TuningInputs<'w, 'a> {
-    pub device: &'a Device,
+/// What a case's static values derive from: the model, its load plan and the
+/// engine's bounds. No device.
+#[derive(Clone, Copy)]
+pub(crate) struct ModelInputs<'a> {
     pub definition: &'a ModelDefinition,
     pub limits: TuningLimits,
-    pub weights: &'w mut TuningWeights<'a>,
-    noise: &'w Noise,
-    /// Tensors shared by the units of one tuning, by a name that identifies
-    /// their contents.
-    shared: &'w mut HashMap<String, Tensor>,
-    /// What the point being built may take; a weight import or activation
-    /// predicted not to fit is refused.
-    building: &'w RefCell<BuildBudget>,
+    pub load: &'a ModelLoadPlan,
 }
 
-impl TuningInputs<'_, '_> {
+impl ModelInputs<'_> {
     /// The operator of the sublayer whose weights `scope` names: the first
     /// scope of a case's layers (every layer of one binding shares its
     /// statics).
@@ -722,6 +738,40 @@ impl TuningInputs<'_, '_> {
             .ok_or_else(|| format!("{scope:?} names no sublayer of the model"))
     }
 
+    /// The planned shape of one weight role.
+    pub fn weight_shape(&self, scope: WeightScope, kind: WeightKind) -> Result<Vec<u64>, String> {
+        Ok(weights::weight_plan(self.load, scope, kind)?.shape.clone())
+    }
+
+    /// The planned extent of one weight role's accumulator-scale port (0
+    /// without a second-level scale).
+    pub fn scale_extent(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
+        Ok(weights::weight_plan(self.load, scope, kind)?.scale_extent())
+    }
+}
+
+pub(crate) struct TuningInputs<'w, 'a> {
+    model: ModelInputs<'a>,
+    pub device: &'a Device,
+    pub weights: &'w mut TuningWeights<'a>,
+    noise: &'w Noise,
+    /// Tensors shared by the units of one tuning, by a name that identifies
+    /// their contents.
+    shared: &'w mut HashMap<String, Tensor>,
+    /// What the point being built may take; a weight import or activation
+    /// predicted not to fit is refused.
+    building: &'w RefCell<BuildBudget>,
+}
+
+impl<'a> std::ops::Deref for TuningInputs<'_, 'a> {
+    type Target = ModelInputs<'a>;
+
+    fn deref(&self) -> &ModelInputs<'a> {
+        &self.model
+    }
+}
+
+impl TuningInputs<'_, '_> {
     /// The layers of `point`'s argument sets: up to [`ROTATION_LAYERS`] of
     /// `scopes`, spread over the model's depth, for decode rows (up to
     /// [`STREAMING_ROWS`]); the first layer alone for prefill rows.
@@ -753,17 +803,6 @@ impl TuningInputs<'_, '_> {
             .borrow_mut()
             .record(Building::Import, bytes, started.elapsed().as_secs_f64());
         Ok(weight)
-    }
-
-    /// The planned shape of one weight role.
-    pub fn weight_shape(&self, scope: WeightScope, kind: WeightKind) -> Result<Vec<u64>, String> {
-        self.weights.shape(scope, kind)
-    }
-
-    /// The planned extent of one weight role's accumulator-scale port (0
-    /// without a second-level scale).
-    pub fn scale_extent(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
-        self.weights.scale_extent(scope, kind)
     }
 
     /// A unit accumulator-scale port of `extent` (absent at 0): the scale's
@@ -1592,6 +1631,7 @@ impl<'a> Tuner<'a> {
             statics,
             &digest,
             &policy,
+            &case.admitted(self.device, self.context.error_classes),
             shapes,
         ));
         let hit = cache
@@ -1611,7 +1651,10 @@ impl<'a> Tuner<'a> {
         shapes: &[PointShape],
         strategy: Strategy,
     ) -> Result<TuningResult, String> {
-        let precision = case.precision().map_err(|error| error.to_string())?;
+        let precision = seismic::TuningPrecision {
+            policy: case.precision().map_err(|error| error.to_string())?,
+            admitted: case.admitted(self.device, self.context.error_classes),
+        };
         let keep = matches!(strategy, Strategy::Census(_));
         let mut cases = self
             .built
@@ -1629,9 +1672,8 @@ impl<'a> Tuner<'a> {
             case,
             shapes,
             inputs: TuningInputs {
+                model: self.model(),
                 device: self.device,
-                definition: self.context.definition,
-                limits: self.limits,
                 weights: &mut self.weights,
                 noise: &self.noise,
                 shared: &mut self.shared,
@@ -1670,27 +1712,13 @@ impl<'a> Tuner<'a> {
         chosen
     }
 
-    pub fn statics<T: EntryTuning>(
-        &mut self,
-        case: &T,
-    ) -> Result<Vec<(&'static str, u64)>, CatalogFailure> {
-        let mut shared = HashMap::new();
-        let building = RefCell::new(BuildBudget::default());
-        let inputs = TuningInputs {
-            device: self.device,
+    /// What the static values of this tuning's cases derive from.
+    pub fn model(&self) -> ModelInputs<'a> {
+        ModelInputs {
             definition: self.context.definition,
             limits: self.limits,
-            weights: &mut self.weights,
-            noise: &self.noise,
-            shared: &mut shared,
-            building: &building,
-        };
-        case.statics(&inputs)
-            .map_err(|outcome| CatalogFailure::Preparation {
-                entry: <T::Entry as seismic::Entry>::NAME,
-                bindings: case.bindings(),
-                outcome,
-            })
+            load: self.weights.load(),
+        }
     }
 }
 
@@ -1875,6 +1903,7 @@ fn tuning_key_material(
     statics: &NativeSpecialization,
     digest: &str,
     policy: &PrecisionPolicy,
+    admitted: &BTreeMap<String, seismic::ErrorEnvelope>,
     shapes: &[PointShape],
 ) -> String {
     let mut shapes = shapes
@@ -1882,14 +1911,21 @@ fn tuning_key_material(
         .map(|shape| shape.label.as_str())
         .collect::<Vec<_>>();
     shapes.sort_unstable();
-    format!(
+    let mut material = format!(
         "tuning {SEARCH_VERSION}\ndevice {}\nentry {entry}\nbindings {bindings}\nstatics {:?}\n\
          implementation {digest}\npolicy {:?}\nshapes {}",
         device.tuning_identity(),
         statics.statics(),
         seismic::precision::PolicyIdentity::of(policy).0,
         shapes.join(","),
-    )
+    );
+    // The admitted error classes the entry declares, with their envelopes:
+    // a choice searched with a class admitted may be of that class. A unit
+    // that admits none keeps the key its results were stored under.
+    if !admitted.is_empty() {
+        material.push_str(&format!("\nerror classes {admitted:?}"));
+    }
+    material
 }
 
 fn tuned_entry(

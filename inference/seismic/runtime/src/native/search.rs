@@ -16,9 +16,11 @@
 //! ranked by those costs; a finalist the evaluator cannot confirm (its
 //! re-measurement failed or is not trustworthy) leaves the ranking, and the
 //! defaults rank first unless the leader beats them by `default_margin` or
-//! could not be confirmed themselves. When the defaults passed the search but
-//! their re-measurement did not, they are the choice; only defaults that
-//! failed the search itself leave the ranking to confirmed finalists.
+//! could not be confirmed themselves. Defaults whose re-measured samples
+//! spread are confirmed at their fastest samples, so the leader must beat
+//! the defaults at their best. When the defaults passed the search but their
+//! re-measurement failed, they are the choice; only defaults that failed the
+//! search itself leave the ranking to confirmed finalists.
 //!
 //! The objective ([`Cost`]) is per point: each tuning point contributes its
 //! weight (share of step time) times the configuration's time there relative
@@ -199,8 +201,8 @@ pub enum SearchSpaceError {
     /// A configuration values a parameter the declaration lacks, lacks one
     /// it declares, or takes an undeclared value.
     Undeclared(ParameterValues),
-    /// The defaults are not among the admissible configurations.
-    DefaultInadmissible,
+    /// No configuration is admissible.
+    Empty,
 }
 
 impl std::fmt::Display for SearchSpaceError {
@@ -212,9 +214,7 @@ impl std::fmt::Display for SearchSpaceError {
                     "configuration {values:?} does not match the declared parameters"
                 )
             }
-            Self::DefaultInadmissible => {
-                f.write_str("the all-defaults configuration is inadmissible")
-            }
+            Self::Empty => f.write_str("no configuration is admissible"),
         }
     }
 }
@@ -223,7 +223,8 @@ impl std::error::Error for SearchSpaceError {}
 
 impl SearchSpace {
     /// `declared` lists the parameters in declaration order; `admissible`
-    /// lists the configurations the declaration's `where` admits.
+    /// lists the configurations the declaration's `where` admits, in declaration
+    /// order, so the first is the defaults.
     pub fn new(
         declared: &[SearchParameter],
         admissible: &[ParameterValues],
@@ -259,18 +260,17 @@ impl SearchSpace {
             .iter()
             .map(coordinates)
             .collect::<Result<Vec<_>, _>>()?;
-        let defaults = declared
-            .iter()
-            .map(|parameter| (parameter.name.clone(), parameter.values[0]))
-            .collect::<ParameterValues>();
+        if configurations.is_empty() {
+            return Err(SearchSpaceError::Empty);
+        }
         let positions = configurations
             .iter()
             .enumerate()
             .map(|(index, coordinates)| (coordinates.clone(), index))
             .collect::<HashMap<_, _>>();
-        let default = *positions
-            .get(&coordinates(&defaults)?)
-            .ok_or(SearchSpaceError::DefaultInadmissible)?;
+        // The first admissible configuration in declaration order: each
+        // parameter's first value wherever `where` admits it.
+        let default = 0;
         Ok(Self {
             parameters,
             forms,
@@ -279,6 +279,7 @@ impl SearchSpace {
             default,
         })
     }
+
 
     pub fn len(&self) -> usize {
         self.configurations.len()
@@ -822,6 +823,52 @@ mod tests {
             samples: 3,
             confirmation_samples: 7,
         }
+    }
+
+    /// Out of time from the start, and unable to launch the declared default
+    /// (QT 16): only the defaults are evaluated.
+    /// An evaluator whose time has already run out: the search evaluates its
+    /// defaults only.
+    struct Expired<'s> {
+        space: &'s SearchSpace,
+    }
+
+    impl Evaluator for Expired<'_> {
+        fn evaluate(&mut self, batch: &[usize]) -> Vec<Result<Cost, Exclusion>> {
+            batch
+                .iter()
+                .map(|index| {
+                    let values = self.space.values(*index);
+                    Ok(Cost::new(vec![(PointKey { launches: vec![0], values }, 1.0)]))
+                })
+                .collect()
+        }
+        fn confirm(&mut self, finalists: &[usize]) -> Vec<Result<Cost, Exclusion>> {
+            self.evaluate(finalists)
+        }
+        fn expired(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn the_default_is_the_first_admissible_configuration() {
+        // QT 16 is declared first but inadmissible here, so the search starts
+        // from QT 8.
+        let declared = vec![SearchParameter {
+            name: "QT".into(),
+            values: vec![16, 8, 4],
+            form: false,
+        }];
+        let admissible = [8, 4]
+            .map(|value| [("QT".to_string(), value)].into_iter().collect::<ParameterValues>());
+        let space = SearchSpace::new(&declared, &admissible).unwrap();
+        let trace = search(&space, &[], &settings(), &mut Expired { space: &space });
+        assert_eq!(space.values(trace.ranking[0])["QT"], 8);
+        assert!(matches!(
+            SearchSpace::new(&declared, &[]),
+            Err(SearchSpaceError::Empty)
+        ));
     }
 
     #[test]

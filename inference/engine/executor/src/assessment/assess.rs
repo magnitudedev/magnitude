@@ -101,8 +101,13 @@ pub fn prepare_execution_assessment(
     .map_err(AssessmentError::Memory)?;
     let fit_context_tokens = u32::try_from(terms.fit_depth)
         .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
-    let header = AssessmentHeaderBounds::derive(definition, draft.load(), policy.codec())
-        .map_err(AssessmentError::Memory)?;
+    let header = AssessmentHeaderBounds::derive(
+        definition,
+        draft.load(),
+        policy.codec(),
+        draft.device().backend(),
+    )
+    .map_err(AssessmentError::Memory)?;
     let state = ResourcePlanner::state_plan(
         definition,
         draft.load(),
@@ -111,6 +116,7 @@ pub fn prepare_execution_assessment(
         policy.limits(),
         ResourceCapacity {
             domain_bytes: draft.device().assessment_capacity_bytes(),
+            tensor_operations: crate::TensorOperations::of(draft.device().tensor_operations()),
         },
     )
     .map_err(AssessmentError::Plan)?;
@@ -251,6 +257,7 @@ mod tests {
                 max_drafting_slots: 32,
                 exported_logits_rows: 0,
                 max_images_per_request: 1,
+                max_image_cells: 0,
                 lookahead: true,
             },
         )

@@ -28,7 +28,7 @@ void readout_features_rows() {
         FEATURES_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), width, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS));
     float squares = 0.0;
     for (uint i = thread; i < width; i += gl_WorkGroupSize.x) {
-        const float v = projection_norm_input(in_, row, 0u, i);
+        const float v = projection_norm_input(in_, row, i);
         squares = seismic_fma_rn(v, v, squares);
     }
     squares = reduce_group_sum(squares, 0u);
@@ -36,7 +36,7 @@ void readout_features_rows() {
     const uint64_t features = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
     for (uint i = thread; i < width; i += gl_WorkGroupSize.x) {
         const float value = element_round(FEATURES_ACT,
-            projection_norm_input(in_, row, 0u, i) * inverse
+            projection_norm_input(in_, row, i) * inverse
                 * element_at(FEATURES_NORM, in_.norm, uint64_t(i) * in_.norm_stride));
         element_put(FEATURES_ACT, features,
             uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1, value);

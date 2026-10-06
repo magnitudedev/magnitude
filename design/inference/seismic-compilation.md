@@ -120,8 +120,11 @@ tuned entry whole so writes outside the declared rows are rejected.
 The default receives the same validation as every candidate. The first fully passing candidate
 establishes the timing anchor; if none passes, tuning returns a failure with the observed exclusions.
 A default that failed validation or measurement cannot be selected as an implicit fallback;
-a default that passed both but whose timing re-measurement was unstable remains the choice,
-since timing noise is not a numerical verdict. The defaults' measurement and evidence from
+a default that passed both but whose timing re-measurement was unstable stays in the ranking,
+costed at its fastest sample at each point (a time it reached; a sample cannot read faster than
+the kernel runs), so a confirmed leader replaces it only by beating it at its best by δ, and
+otherwise it remains the choice: timing noise is not a numerical verdict, against the default or
+for it. A default whose re-measurement failed outright remains the choice. The defaults' measurement and evidence from
 admitting the points carry into the search.
 Seismic does not reuse stored results: the consumer keys and stores them, by what a result is
 valid for (device, implementation, numerical policy, served shapes), and names what case inputs
@@ -187,6 +190,14 @@ is a tuning axis. The measured interval of a CPU submission starts when it holds
 submission never measures another's work.
 Standalone native calls use the same checked entry without creating a graph. Their scalar-result
 slots and scratch are the prepared kernel's invocation workspace, which reports both.
+Every non-empty scratch arena (the standalone arena and every graph workspace that places
+anything) reserves a fixed range at its start for `sync` scratch. Nothing else is placed there;
+within one graph each node's sync buffers are disjoint from every other node's, and never
+lifetime-aliased. Arenas are zeroed when allocated and kernels restore their counters, so the
+range is zero whenever a launch starts, whichever call or graph used it last. Reserving it in
+every non-empty workspace, not only in graphs that declare sync scratch, is required: graphs of
+one family share a workspace arena, and a graph without sync scratch placing ordinary buffers in
+the range would leave counters nonzero for the next graph that uses them.
 A native graph composes checked native entries, owns the shapes and lifetimes of
 its graph-local mutable tensors, host-uploaded input tensors, intermediate results, and exported
 outputs, and reports its exact storage charge and the liveness floor its workspace cannot go
@@ -235,7 +246,14 @@ storage rather than its tensor handles, so output leases it reads can be recycle
 later runs of the same sequence. On CUDA a submission's launches are fully determined by its
 plans and the addresses it binds: the device keeps the instantiated CUDA graph of each (plans,
 bound addresses) key (least recently used dropped beyond a bound) and a submission with a known
-key is one graph launch. Standalone calls and launch-detail traces launch individually. Graph
+key is one graph launch. A launch of a module that declares a programmatic dependency
+(`SEISMIC_PROGRAMMATIC_DEPENDENCY`, compute capability 9.0 and later) follows the node before it
+by a programmatic edge: it starts once every block of that node has triggered
+(`griddepcontrol.launch_dependents`, which a kernel issues only after its own wait) or exited, and
+each of its kernels waits (`griddepcontrol.wait`) before it reads anything but weights or what
+launches before its predecessor wrote, and before it writes anything, so at most two launches run
+at once and a kernel's first weight loads overlap its predecessor's tail. Standalone calls and
+launch-detail traces launch individually. Graph
 nodes publish no scalar results and never touch a kernel's scalar slots. A submission holds all
 referenced storage through its completion. An allocation's host access orders after only the
 newest submitted device use (host writes) or write (host reads): a device's native submissions

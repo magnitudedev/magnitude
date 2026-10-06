@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { isAbsolute, join } from "node:path"
 import { Effect, Layer, Option, Stream } from "effect"
+import { NodeContext } from "@effect/platform-node"
 import { nativeWindowsJobOwnerLayer, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native"
 import { makeWindowsOwnedChildSpawner } from "../windows-owned-child"
 
@@ -19,6 +20,7 @@ const run = Effect.acquireUseRelease(
     const spawner = yield* makeWindowsOwnedChildSpawner
     const child = yield* spawner.spawn({
       output: "DiagnosticTail",
+      logFile: Option.none(),
       executable: service, arguments: ["serve", "--data-dir", root, "--port", "0"],
       environment: { ...process.env, MAGNITUDE_NATIVE_HOST: addon, MAGNITUDE_ICN_PATH: join(root, "absent-engine.json") },
     })
@@ -41,6 +43,6 @@ const run = Effect.acquireUseRelease(
     yield* Effect.logInfo("PASS compiled service delivers terminal health before exit and retires its job")
   })),
   root => Effect.promise(() => rm(root, { recursive: true, force: true })),
-).pipe(Effect.provide(Layer.merge(nativeWindowsJobOwnerLayer(addon), nativeWindowsPrivatePipesLayer(addon))))
+).pipe(Effect.provide(Layer.mergeAll(nativeWindowsJobOwnerLayer(addon), nativeWindowsPrivatePipesLayer(addon), NodeContext.layer)))
 
 Effect.runPromise(run).catch(error => { console.error(error); process.exitCode = 1 })

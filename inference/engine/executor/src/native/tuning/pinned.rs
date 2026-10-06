@@ -115,15 +115,52 @@ pub(super) fn lookup(
             Ok(Pinned::Tune)
         };
     };
-    let mut specialization = NativeSpecialization::new();
+    // A parameter the pin does not name (one the implementation gained after
+    // the pin was recorded) takes its value in the default configuration at
+    // these statics, so another build's configurations replay unchanged.
+    let mut statics_only = NativeSpecialization::new();
     for (name, value) in &pinned.statics {
-        specialization = specialization.with_static(name.clone(), *value);
+        statics_only = statics_only.with_static(name.clone(), *value);
     }
-    for (name, value) in &pinned.params {
-        specialization = specialization.with_param(name.clone(), *value);
+    let defaults = implementation
+        .default_specialization(&statics_only)
+        .map_err(|error| format!("default configuration of {entry}: {error}"))?;
+    let mut specialization = statics_only;
+    for parameter in &implementation.params {
+        let value = pinned
+            .params
+            .get(&parameter.name)
+            .copied()
+            .or_else(|| defaults.param(&parameter.name))
+            .expect("the default configuration values every parameter");
+        specialization = specialization.with_param(parameter.name.clone(), value);
     }
-    for ((launch, name), value) in &pinned.launch_params {
-        specialization = specialization.with_launch_param(*launch, name.clone(), *value);
+    for (launch, declaration) in implementation.launches.iter().enumerate() {
+        for parameter in &declaration.params {
+            let value = pinned
+                .launch_params
+                .get(&(launch, parameter.name.clone()))
+                .copied()
+                .or_else(|| defaults.launch_param(launch, &parameter.name))
+                .expect("the default configuration values every launch parameter");
+            specialization = specialization.with_launch_param(launch, parameter.name.clone(), value);
+        }
+    }
+    let declared = |name: &String| implementation.params.iter().any(|parameter| &parameter.name == name);
+    let declared_in = |launch: usize, name: &String| {
+        implementation.launches.get(launch).is_some_and(|declaration| {
+            declaration.params.iter().any(|parameter| &parameter.name == name)
+        })
+    };
+    if let Some(name) = pinned.params.keys().find(|name| !declared(name)) {
+        return Err(format!("pinned parameter `{name}` is not a native parameter of {entry}"));
+    }
+    if let Some((launch, name)) = pinned
+        .launch_params
+        .keys()
+        .find(|(launch, name)| !declared_in(*launch, name))
+    {
+        return Err(format!("pinned parameter `{name}` is not a parameter of launch {launch} of {entry}"));
     }
     implementation
         .validate(&specialization)

@@ -134,7 +134,9 @@ is cached). It holds the program artifacts Seismic keeps (CUDA CUBINs, Vulkan SP
 the device's artifact store, one directory per toolchain namespace, and one tuning result per
 tuning key. The key is a digest over what a stored result is valid for: the tuning version, the
 device and toolchain identity (Metal OS build; CUDA driver and NVRTC release), the unit, the
-implementation digest (declaration and rendered source), the precision policy, and the labels of
+implementation digest (declaration and rendered source), the precision policy, the admitted error
+classes the entry declares with their envelopes (none for an entry that declares none, so
+admitting a class retunes only the entries that have it), and the labels of
 the served shapes its choice was validated at. How it was searched is not part of the key (search
 settings, tuning time, budget shares, workload weights, the points timed), so improving the
 search never invalidates a result that is still correct. The tuning version changes only with the
@@ -170,9 +172,24 @@ against an F32 reference forward and end to end by logit top-1 agreement, mean K
 its tail against an external F32 reference forward of the same artifact (its weights dequantized
 once to F32; no activation quantization). Reduced-precision activations, packed weights
 dequantized inside a kernel to the activation element, changed accumulation order, and explicit
-fast math functions are admitted on any backend when they pass. A row's result never depends on peer rows' values; it may depend on its launch's shape class
-and prepared configuration, and different shape classes agree within the gate's tolerance, not
-bit for bit. Speculative verification is therefore statistically, not exactly, equivalent to
+fast math functions are admitted on any backend when they pass. The gate is model-level and runs
+outside the load: tuning times one entry on generated inputs and cannot measure it. A kernel form
+whose error exceeds the per-dtype tolerances against its entry's default declares an error class,
+and the engine keeps one envelope per class (the form's measured per-entry error with room for
+the tuning inputs). A model's qualification admits classes; the host names the admitted classes
+in the model policy at load, none by default, and a name no kernel declares is refused. Tuning
+forms a configuration of an error class only when the class is admitted, and validates it against
+the default under the class's envelope, so a defective kernel still fails while the form's
+expected error passes. The first class is `int8_activations`: Metal's gate/up and down projections
+past 64 rows, on tensor operations with Q4_K or Q8_0 weights, quantize each activation row to int8
+per 32 columns in a pre-pass and multiply the weights' stored codes on the int8 tensor operation,
+folding each 32-column block under its activation and weight scales; the weights stay exact, and
+every other weight format or device runs the exact form in the same launches. Its transient
+scratch is the int8 operand with its scales and block sums (rows x K x 1.2 bytes) and the weights'
+decoded block scales and biases (weight rows x K / 32 x 6 bytes), per call. Without an admitted
+class a row's result never depends on peer rows' values; a form that makes it depend on them is its own error class. A result may depend on its
+launch's shape class and prepared configuration, and different shape classes agree within the
+gate's tolerance, not bit for bit. Speculative verification is therefore statistically, not exactly, equivalent to
 plain decoding; acceptance over the logits a verification produced remains exact.
 
 The resource plan authorizes persistent weights and startup state slabs, including the permanently
@@ -228,6 +245,13 @@ pipelines share projection results through checked Seismic result edges. Dense f
 its activation product; attention owns the normed Q/K/V projection and one fused entry that prepares
 queries and keys (norms, rotary) in place, accumulates the stable softmax and gates the values
 (decode row classes use the partitioned decode entry, larger classes the streaming prefill entry);
+a gated delta mixer owns its normed segmented projection, then one state entry (row-sequential for
+decode row classes, chunked above) that advances its bank in place and publishes the gated rows
+(each head's recurrent output RMS-normalized, scaled by the recurrent norm and gated by SiLU(z),
+formed once per row and head), then a plain residual output projection that repeats no prologue;
+on a backend that declares the convolved step form, the decode row classes' projection launch also
+convolves each channel once and publishes the successor windows, and the state entry advances from
+those convolved channels with the same bits;
 a state-space (Mamba-2) mixer owns its normed projected row (gate, convolved channels and time
 steps together) and runs the checked step entry for decode row classes or the chunked entry
 above them over its bank's window and state slabs, then its gated group norm and output
@@ -237,7 +261,13 @@ component, whose rows are also its tape), gates, and publishes the successor win
 output projection; a block may hold a lone mixer with no feed-forward, and its output is the mixer's
 residual row; routed feed-forward owns normalized input, routes and scores (ranked once by probability), and the
 shared coefficient, then either the per-choice expert and shared products (row classes within the
-GEMV bound) or, for larger classes, grouped tables and grouped expert outputs: choices grouped by
+GEMV bound; a backend that declares the shared-route entry forms the shared product, which does not
+depend on the routes, in the routing launch with the separate expansion's bits, and expands the
+choices alone; every choice's product has its own one-row GEMV's bits, so a backend may stream an
+expert that several rows choose once for all of them, as CUDA does for classes of two or more rows;
+Metal keeps the per-choice form, whose repeated expert reads its cache already serves and whose
+one-row GEMVs outrun a gathered multi-row one)
+or, for larger classes, grouped tables and grouped expert outputs: choices grouped by
 expert into tile-aligned blocks whose capacity derives from the class, the selected-expert count and
 the tile rows, so no table is uploaded per step and no host readback sizes a launch. The general
 routed form (every family without that gated shared expert) owns the normalized input, routes and
@@ -276,6 +306,26 @@ have: a diagnostic load declares the rows it exports, exports the logits of ever
 class, and selects only unshaped, since shaping must not rewrite logits it exports. The head and
 separate draft keep their vocabulary logits as graph locals too, their drafting classes bounded
 by the selection bound.
+On a backend that declares the progressive head readout
+(Metal, CUDA), a plan whose head admits it (a transform-free Q8_0 matrix of whole 32-value groups
+without a second-level scale, under no logit softcap, with no separate draft) holds the head in
+progressive planes (residency): every projecting class reads the head through the planes
+(`readout_planes_rows`, the exact logits), and served loads also have certified selection
+graphs, which serve every step whose selected rows, up to the backend's certified bound (one on
+Metal, whose batched projection is arithmetic-bound, four on CUDA), are all unpenalized and uncut
+(a temperature at most). Their levels score a row as the sampler does (`logit / temperature`
+plus the row's own Gumbel noise, masks applied): `readout_top_rows` projects every vocabulary row
+onto the codes' top four bits and keeps per row the largest lower-bound score as its threshold;
+`readout_refine_rows` adds bit 3 to the rows whose upper-bound score reaches it and raises the
+threshold; `readout_exact_rows` projects the remaining rows exactly and writes −∞ elsewhere (Metal's
+top level and full pass are the projection library's GEMV, batched GEMV and GEMM over the
+views' packets). Every row whose exact score can be the largest survives
+each level, so the selection is the full readout's, while the head's low bits are read only for
+the survivors (about 54% of the head's bytes on real text). An MTP draft head projects the planes'
+leading draft-vocabulary rows: its drafting classes up to the certified bound run the certified
+levels over them and the rest the full pass; a certified class serves every drafting row whatever
+its shaping, since only verification decides what is emitted. MTP verification rows select
+through the target's certified classes like any other step.
 A separate draft (DFlash, DSpark, DFlash2) conditions on target taps instead of the final features. A
 tapped block's workflow rounds the residual entering it, entering its feed-forward, or leaving it
 (the exit tap is the last block's output) into that tap's column block of a draft-input buffer
@@ -324,27 +374,65 @@ Vulkan), and prefill scores whole heads but accumulates outputs one 256-column
 window per pass, so a wide form is a specialization of the same entries. Few kv heads over long
 history are parallelized across the history, never across a different graph: decode splits a row's
 keys into tuned partitions, and prefill may split a tile's history keys across tuned partition
-groups whose partial softmax states merge in fixed order in a second launch.
+groups whose partial softmax states merge in fixed order in a second launch. Metal's prefill also
+declares a direct form, a tuned specialization of the same entries: a simdgroup keeps its queries in
+tensor-operation registers and reads key and value tiles as device tensor operands, so nothing is
+staged; K8/V4 history is first decoded into F16, with the staged decode's arithmetic, so both forms
+multiply the same operands, and the form is chosen only where tuning measures it faster. Decoded
+history follows neither the history reservation (an address-space ceiling from the device's bytes)
+nor the context limit, and adds no scratch: the affine prefill entry takes the history row tiles its
+launch's rows see (`history_tiles`: the distinct 256-row tiles holding a row of any visible span,
+ascending, then -1), and a call that lists tiles is charged its partial outputs for the most key
+partitions any configuration takes, which is what a call that lists none is charged; the direct
+form decodes into what its own partitions leave (a window of about 16k x G / KV rows less M x G
+per partition in use; the form's key partitions stop at half of the most). The listed rows are
+taken in list order, tiles adjacent in the history adjacent in the window, and a tile the launch
+does not see (between two requests' spans) reads zero rows. A class whose listed rows fit the
+window is one round of a decode and an attend launch; a larger one repeats them (the entry's
+`repeat` block), each round taking a window's worth of keys and splitting those into its own key
+partitions, and a fold launch after each attend merges the round's split records into the one
+state per row the window keeps, by the partition merge rule, so a row's rounds are to it what key
+partitions are. A prefill attention graph over K8/V4 history therefore
+comes in classes that list tiles (powers
+of two from 16 up to one request's worth, the domain's span limit in pages) and one that lists none;
+all hold the same workspace, the listing classes admit the direct form, and the other admits only
+the forms that read history in place. A launch takes the smallest listing class that holds the tiles
+its rows together see (so it dispatches at most twice the rounds it needs; a round with nothing to
+do returns at once) and the class that lists none when they exceed the largest; listing and
+unlisted kernels tune separately. A device without tensor operations has only the class that lists
+none, which spares it tuning and forming a kernel whose direct form wins only on tensor operations:
+the fact is the device's own probe (`DeviceInfo::forms_tensor_operations` before it is opened, which
+planning and assessment read; graph preparation fails if the opened device disagrees).
+The draft head's and the separate draft's graphs list none.
 
-Vision patch capacity is the admitted merged output row limit times the merge area; input validation
-rejects a larger aggregate before reserving a vision slot. Vision attention sees every physical
-patch row of its image (or of its row's window, a contiguous tower-row range the family supplies),
-so its prepared workflow uses the exact admitted patch-row count; padding with additional patches
-would alter real outputs. The tower is one program of vision operators the projector description
+An image encodes at most the load's image cell limit: the cells its declared resize admits, within
+4096 (`MAX_IMAGE_CELLS`), and within the launch row bound only when the decoder's media rows attend
+each other, since such an image is one launch. Otherwise prefill places an image's features across
+launches, so the vision limit is independent of the launch row bound. The host bounds image resize to
+the limit, and input installation refuses a larger image as a request error before reserving a vision
+slot. The load prepares one vision graph per image cell class (the launch row ladder continued past
+the launch bound); an image runs in the class covering its cells, its patch rows first and the
+class's padding rows after. Every vision attention reads its keys as a span per row, its window's
+rows or its image's, so no image row reads a padding row; padding inputs are zero and the published
+features are the image's leading cell rows. The tower is one program of vision operators the projector description
 composes (patch stem, row norms, projections with their epilogues, rotary attention, cell pooling
 or concatenation); a form a backend's operators do not run is refused when the program is
 prepared, never approximated. Seismic's recurrent workflow derives
 the exact window and delta state contracts from its checked entries. Each recurrent block binds
-the store's bank slabs and, per run, bank tables for its exact active request slots: each slot's
-state entry reads the slot's accepted bank and writes only its successor bank, in place, within
-the block's ordered submission. The engine does not dispatch state transfers around the block,
+the store's bank slabs and, per run, bank tables for its exact active request slots: each entry
+that binds them (the state entry, and the convolved step form's projection for the windows) reads
+the slot's accepted bank and writes only its successor bank, in place, within the block's ordered
+submission. The engine does not dispatch state transfers around the block,
 copy state between banks, or bind padded request state. Workflow activations cover
 submitted concurrency, and retained outputs cover submitted and live request owners. The target's
 residual stream between block graphs is one device pair, returned at the end of each submission:
 every reader of it is queued in that submission and the device runs the next launch after it.
-Vision holds no activation or output until a request encodes an image; it then claims them under
-the heap like any growth and releases them when idle. Encoded images belong to their request, so
-the vision output pool holds every live request's images; retained checkpoints share those
+Vision holds no activation or output until a request encodes an image, and it is outside the
+shared workspace arena. Each image cell class has its own layout and storage: an encode claims an
+activation (its own workspace and upload regions) and an output slot of its image's class under the
+heap like any growth, and free ones are released when idle, so vision memory follows the images
+actually encoded, never the largest class. Encoded images belong to their request, so the vision
+output slots hold every live request's images; retained checkpoints share those
 features and do not size the pool: an encode that finds every output pinned by retention releases
 retention through the ordinary capacity release order. Source-weight upload uses the largest admitted encoded tensor as a one-shot startup
 resource. Qualification holds one weight scope's fixtures at a time, at their resident
@@ -394,9 +482,8 @@ generation transitions, or publication.
 - No independent kernel requirement set, semantic class set, or runtime handle query remains.
 - No independent numerical tensor recipe or request-time role lookup remains; Seismic owns each
   prepared workflow's complete tensor contracts and reports its exact storage charge.
-- Recurrent state is read and published in place by the block's checked state entry for the
-  exact active request slots; no bank is copied, and no entry writes an accepted bank or the zero
-  seed.
+- Recurrent state is read and published in place by the block's checked entries for the exact
+  active request slots; no bank is copied, and no entry writes an accepted bank or the zero seed.
 - Every persistent, workspace, output, retention, and startup-peak byte traces to the plan.
 - Ready and pending submissions drive one executor lifecycle, and no round is submitted before
   its predecessor's output is reconciled.

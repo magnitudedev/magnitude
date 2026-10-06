@@ -12,6 +12,10 @@ use seismic::{
 use seismic_native_tests::{accumulate, gated_sum, scale_rows, scoped_scale, split_sum};
 use std::time::Duration;
 
+/// The range every non-empty scratch arena reserves at its start for `sync`
+/// scratch (the runtime's `SYNC_SCRATCH_BYTES`).
+const SYNC_RESERVE: u64 = 64 * 1024;
+
 /// A search whose time outlasts its convergence on the test entries.
 fn search(samples: usize) -> Strategy {
     Strategy::Search(SearchPlan {
@@ -1305,10 +1309,11 @@ fn standalone_scratch_is_charged_to_the_invocation_workspace() {
         for _ in 0..2 {
             let value = kernel.call(split_sum::Args { x: &x }).unwrap().value;
             assert_eq!(read_f32(&value), [exact_values(64).iter().sum::<f32>()]);
-            // Four f32 partials, reused by the second call.
+            // The reserved sync range, then four f32 partials, reused by the
+            // second call.
             assert_eq!(
                 kernel.invocation_workspace_bytes(),
-                before + 16,
+                before + SYNC_RESERVE + 16,
                 "{:?}",
                 device.backend()
             );
@@ -1410,6 +1415,109 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
             }
         }
         assert_eq!(result.overall.params["BIAS"], 0);
+    }
+}
+
+/// A choice that changes numerics declares its error class: tuning forms it
+/// only when the caller admits the class, and holds it to the class's
+/// envelope in place of the policy's element tolerances.
+#[test]
+fn tuning_forms_an_error_class_only_when_admitted_and_holds_it_to_its_envelope() {
+    use seismic::{ErrorEnvelope, Limit, TuningPrecision, TuningResult};
+    use seismic_native_tests::classed_accumulate;
+    for device in devices() {
+        let n = 256u64;
+        // Every element is 100 by the reference and 100.5 under BIAS 1.
+        let tune = |envelope: Option<f64>| -> TuningResult {
+            let mut state = zeroed(&device, n);
+            let mut restore = state.clone();
+            let zeros = vec![0u8; n as usize * 4];
+            let initialize: TuningInitializer<'_> =
+                Box::new(move || restore.write_from_host(&zeros));
+            let x = f32_tensor(&device, &[n], &vec![100.0; n as usize]);
+            let points = vec![TuningPoint {
+                label: "rows".into(),
+                weight: 1.0,
+                class: None,
+                cost: 1.0,
+                required: false,
+                rotation: vec![classed_accumulate::Args {
+                    state: &mut state,
+                    x: &x,
+                }],
+                initialize: Some(initialize),
+                written: Default::default(),
+            }];
+            classed_accumulate::native_tune(
+                &device,
+                &NativeSpecialization::new(),
+                points,
+                TuningPrecision {
+                    policy: PrecisionPolicy::Exact,
+                    admitted: envelope
+                        .into_iter()
+                        .map(|limit| {
+                            let limit = Limit::new(limit).unwrap();
+                            (
+                                "biased".to_owned(),
+                                ErrorEnvelope {
+                                    relative_rms: limit,
+                                    peak: limit,
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+                search(2),
+                seismic::TuningReference::Portable,
+            )
+            .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()))
+        };
+        let biased = |result: &TuningResult| -> Vec<Outcome> {
+            result
+                .configurations
+                .iter()
+                .filter(|record| record.configuration.params["BIAS"] == 1)
+                .map(|record| record.outcome.clone())
+                .collect()
+        };
+
+        let unadmitted = tune(None);
+        assert!(
+            biased(&unadmitted).is_empty(),
+            "{:?}: an unadmitted class was formed",
+            device.backend()
+        );
+        assert_eq!(unadmitted.overall.params["BIAS"], 0);
+
+        let admitted = biased(&tune(Some(1e-2)));
+        assert!(!admitted.is_empty(), "{:?}", device.backend());
+        for outcome in admitted {
+            assert!(
+                matches!(
+                    outcome,
+                    Outcome::Measured {
+                        validated: true,
+                        ..
+                    }
+                ),
+                "{:?}: {outcome:?}",
+                device.backend()
+            );
+        }
+
+        let narrow = tune(Some(1e-3));
+        let outside = biased(&narrow);
+        assert!(!outside.is_empty(), "{:?}", device.backend());
+        for outcome in outside {
+            match outcome {
+                Outcome::Excluded(Exclusion::Validation { detail, .. }) => {
+                    assert!(detail.contains("relative RMS error"), "{detail}")
+                }
+                other => panic!("{:?}: {other:?}", device.backend()),
+            }
+        }
+        assert_eq!(narrow.overall.params["BIAS"], 0);
     }
 }
 
@@ -1736,14 +1844,14 @@ fn inactive_scratch_is_charged_the_minimum() {
         call(10);
         assert_eq!(
             kernel.invocation_workspace_bytes(),
-            before + 1,
+            before + SYNC_RESERVE + 1,
             "{:?}",
             device.backend()
         );
         call(200);
         assert_eq!(
             kernel.invocation_workspace_bytes(),
-            before + 800,
+            before + SYNC_RESERVE + 800,
             "{:?}",
             device.backend()
         );
@@ -1763,8 +1871,8 @@ fn inactive_scratch_is_charged_the_minimum() {
             graph.export(&sum).unwrap();
             graph.seal().unwrap().workspace_bytes()
         };
-        assert!(workspace(10) < 800, "{:?}", device.backend());
-        assert!(workspace(200) >= 800, "{:?}", device.backend());
+        assert!(workspace(10) < SYNC_RESERVE + 800, "{:?}", device.backend());
+        assert!(workspace(200) >= SYNC_RESERVE + 800, "{:?}", device.backend());
     }
 }
 

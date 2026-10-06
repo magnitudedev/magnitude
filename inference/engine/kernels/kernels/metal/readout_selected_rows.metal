@@ -37,7 +37,7 @@ kernel void readout_selected_rows_gemv(SELECTED_ROWS_ARGUMENTS,
     uint rows = uint(SEISMIC_DIM_O);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     PROJECTION_FOR_ROWS(rows,
         projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
             x, out, w, rows, uint(SEISMIC_DIM_SV), k, tile, shared, simdgroups, sg, lane));
@@ -55,7 +55,7 @@ kernel void readout_selected_rows_batch(SELECTED_ROWS_ARGUMENTS,
     SELECTED_ROWS_OPERANDS;
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, uint(SEISMIC_DIM_O), squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(x, out, w,
         uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_SV), k, tile, shared, simdgroups, sg, lane);
 }

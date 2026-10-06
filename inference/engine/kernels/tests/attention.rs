@@ -296,9 +296,19 @@ fn prefill_specializations_on(
     if is_cpu(device) {
         return vec![("Cpu".to_owned(), cpu_statics(geometry))];
     }
+    // Metal runs every configuration with staged K/V tiles, and query tiles
+    // of whole 16-row simdgroups in the direct form too.
+    let metal = device.backend() == BackendName::Metal;
     configs
         .iter()
-        .map(|&(query_tile, split_groups)| {
+        .flat_map(|&(query_tile, split_groups)| {
+            let direct = metal && query_tile >= 16;
+            [0, 1]
+                .into_iter()
+                .take(1 + usize::from(direct))
+                .map(move |direct| ((query_tile, split_groups), direct))
+        })
+        .map(|((query_tile, split_groups), direct)| {
             // Vulkan tiles ROWS = 64 matrix rows (query tile x query heads), the
             // one tile admissible at every tested geometry, whatever QT asks for.
             let tile = if device.backend() == BackendName::Vulkan {
@@ -306,15 +316,27 @@ fn prefill_specializations_on(
             } else {
                 ("QT", query_tile)
             };
+            let specialization = qwen_form(statics(geometry), geometry)
+                .with_param(tile.0, tile.1)
+                .with_param("SPLIT_GROUPS", split_groups);
             (
                 format!(
-                    "{:?} (QT, SPLIT_GROUPS) {:?}",
+                    "{:?} (QT, SPLIT_GROUPS, DIRECT) {:?}",
                     device.backend(),
-                    (query_tile, split_groups)
+                    (query_tile, split_groups, direct)
                 ),
-                qwen_form(statics(geometry), geometry)
-                    .with_param(tile.0, tile.1)
-                    .with_param("SPLIT_GROUPS", split_groups),
+                // Metal splits a kv head's query heads into groups of HEADS:
+                // here one group, the smallest declared value holding them.
+                if device.backend() == BackendName::Metal {
+                    specialization
+                        .with_param(
+                            "HEADS",
+                            (geometry.g.next_power_of_two() as u64).min(16),
+                        )
+                        .with_param("DIRECT", direct)
+                } else {
+                    specialization
+                },
             )
         })
         .collect()
@@ -887,7 +909,7 @@ fn prefill_timing_on(device: &Device) {
             .sum::<f64>();
         let flop = pairs * (QWEN.kv * QWEN.g * QWEN.w() * 4) as f64;
         let case = Case::new(QWEN, history as usize + rows.len(), 1, &rows, 9);
-        let configs = [(16, 1), (16, 128), (16, 256), (16, 512), (8, 1), (8, 256)];
+        let configs = [(16, 1), (16, 128), (16, 256), (16, 512), (8, 1), (8, 256), (32, 1), (32, 256), (32, 512)];
         for (config, specialization) in prefill_specializations_on(device, QWEN, &configs) {
             let kernel = prefill_kernel(device, &specialization);
             let mut bound = Bound::new(device, &case);

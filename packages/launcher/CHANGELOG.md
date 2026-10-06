@@ -1,5 +1,48 @@
 # @magnitudedev/cli
 
+## 0.2.6
+
+### Patch Changes
+
+- [`02568d6`](https://github.com/magnitudedev/magnitude/commit/02568d6dd2ec52edd8b521e49d8571301f87a5ab) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix Codex failing to send tool results back to a local model. Reasoning items that a client replays with `content` or `summary` set to null are now accepted as empty.
+
+- [`835a476`](https://github.com/magnitudedev/magnitude/commit/835a4761bca9b2bbc619e11c14586c49d3e1bbdc) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix an OpenCode session being rejected with "assistant content is required unless tool_calls are present" after a step that failed before producing any output. An empty assistant turn in the history is now skipped, in both the Chat Completions and Anthropic APIs.
+
+- [`2a481f7`](https://github.com/magnitudedev/magnitude/commit/2a481f7c5d3c78e8e16ddf4f551ba0c13ba9c16f) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix a headless `magnitude serve` that failed to start crashing with EBADF instead of reporting the error that stopped it.
+
+- [`76d35d7`](https://github.com/magnitudedev/magnitude/commit/76d35d737355f0f5dc3aad3c36ec7ecf5611cfa2) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix long requests to a local model failing with a 502 after about five minutes. A non-streaming generation or a long prompt sends nothing until it finishes, and the connection to the engine no longer times out while it waits.
+
+- [`d5bf92d`](https://github.com/magnitudedev/magnitude/commit/d5bf92d087805b6d78cebe8a918fcece824fd20d) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix models failing on M1 and M2 Macs during long prompts with "device lost: … Impacting Interactivity", after which the model stayed unloaded. The engine now relaxes the macOS GPU watchdog at start (as llama.cpp does), so prompts of 35k and 69k tokens on Gemma 4 26B complete instead of failing at about 20k.
+
+- [`01a1728`](https://github.com/magnitudedev/magnitude/commit/01a17287bd4dfb15b61e0861a8f17a6db12eadcf) Thanks [@anerli](https://github.com/anerli)! - - Speed up prompt processing on M5 and later Macs by about 50%: Qwen3.5-4B at a 64K context now processes prompts at about 970 tok/s (previously 652). Attention over the prompt reads keys and values directly through the GPU's tensor operations instead of staging them, and kernel tuning no longer keeps a slower default whose own timing was unstable.
+
+  - Speed up prompt processing on every Mac by decoding each block of weights once for up to 512 rows instead of once per 64: matrix multiplies run 7–11% faster on an M4 Pro and 17–25% faster on an M1, with identical output. Qwen3.5-4B at a 64K context processes prompts at 534 tok/s on an M4 Pro (previously 513).
+
+- [#166](https://github.com/magnitudedev/magnitude/pull/166) [`c738ead`](https://github.com/magnitudedev/magnitude/commit/c738ead74d6176861311ac43567eb36d8023d8c7) Thanks [@aaronjensen](https://github.com/aaronjensen)! - - Fix models failing to load on some Macs (for example Qwen 3.6 on an M5 Max) with a Metal shader compilation error such as "no template named 'extents' in namespace 'metal'". Metal kernels are now compiled with the same language version the device was probed with, so kernels that use tensor operations build wherever the probe found them available.
+
+- [`44af293`](https://github.com/magnitudedev/magnitude/commit/44af293bd9968ba0e428437bd5bdc6f5274218a4) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix Oh My Pi and OpenClaw failing on Qwen models when their tools take free-form JSON among optional properties. Where a model's grammar for parallel tool calls cannot be compiled efficiently but its grammar for a single call can, the request now allows one tool call per turn.
+
+- [`048a92d`](https://github.com/magnitudedev/magnitude/commit/048a92de8c5fc971250207cb5dea7890a8b39ccf) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix the Windows engine aborting when a chat template or tool call produced invalid JSON. The template library is now built with C++ exception handling on MSVC, so JSON errors are reported instead of crashing the engine.
+
+## 0.2.5
+
+### Patch Changes
+
+- [`32e095e`](https://github.com/magnitudedev/magnitude/commit/32e095e6561b2e58daaaf1438604a21d36ee827f) Thanks [@anerli](https://github.com/anerli)! - - Speed up generation for mixture-of-experts models with multi-token prediction by drafting three tokens ahead instead of one: Qwen3.6-35B-A3B now generates 106–138 tok/s on a GB10 (previously 97–105) and 109–138 tok/s on an M4 Pro (previously 103–111).
+
+  - Speed up generation at a 16K context by about 8% on Macs (67.0 → 72.4 tok/s) and 11% on NVIDIA GPUs (66.3 → 73.4 tok/s), with the same output, by choosing each token while reading less of the output layer and doing more of each step in fewer GPU launches.
+  - Speed up multi-token prediction on NVIDIA GPUs by loading each expert's weights once per step when several drafted tokens choose it, cutting verification time by up to 11%.
+
+- [`32e095e`](https://github.com/magnitudedev/magnitude/commit/32e095e6561b2e58daaaf1438604a21d36ee827f) Thanks [@anerli](https://github.com/anerli)! - - Speed up prompt processing on M5 and later Macs about 2x by running matrix multiplies and attention on the GPU's tensor operations: Qwen3.5-4B at a 64K context now processes prompts at 649 tok/s (previously 308), cutting time to first token from 213 to 101 seconds, with identical output. Other Macs are unchanged.
+
+- [`7aea836`](https://github.com/magnitudedev/magnitude/commit/7aea83653a5acf2035d6d3229efd5700ff684e8d) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix models failing to load on M1 and M2 Macs with "requests N threads per threadgroup; the pipeline allows M". Metal kernels are now built to accept the thread count they launch with, which fixes Qwen3.8 27B on M1 Max and similar errors in other kernels.
+
+  - Fix models with 16 or more query heads per key (Gemma 4 12B, Muse Glimmer 30B, Nemotron 3.5 Lightning, Qwen3.5 122B, Nemotron 3 Super) failing on M1 and M2 Macs. Prefill attention now splits a key's query heads into groups, so it fits every Mac's thread limit, with no change in speed or output elsewhere.
+
+- [`cffe46e`](https://github.com/magnitudedev/magnitude/commit/cffe46e77af5f45ce99565f096d545443dbbd3d0) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix removing a model that is running or loading failing with a misleading error. Removing it now stops the model first, and the confirmation says so.
+
+- [`a3e5422`](https://github.com/magnitudedev/magnitude/commit/a3e542241b075567894881290aad2a5ed2f94aaf) Thanks [@anerli](https://github.com/anerli)! - - Fix models with DFlash2 speculative decoding (Qwen3.8 27B) and Nemotron models failing to load on Vulkan GPUs with a shader compilation error. Every GPU kernel is now compiled for Vulkan, CUDA and Metal before each release, including every kernel each catalog model loads.
+
 ## 0.2.4
 
 ### Patch Changes

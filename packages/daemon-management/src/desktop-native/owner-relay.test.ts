@@ -22,7 +22,7 @@ const start = (owner: OwnerAgent) => Effect.gen(function* () {
     send: command => Ref.update(commands, values => [...values, command]),
     stop: Effect.void,
   }) })
-  yield* makeOwnedService({ output: "DiagnosticTail" as const, executable: "test", arguments: [], environment: {} }, 1, owner).pipe(Effect.provideService(OwnedChildSpawner, spawner))
+  yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1, owner).pipe(Effect.provideService(OwnedChildSpawner, spawner))
   yield* Queue.offer(events, { _tag: "Booted", pid: 42 })
   yield* Queue.offer(events, { _tag: "Health", health: ready })
   const settle = Effect.sleep("20 millis")
@@ -66,7 +66,7 @@ describe("owner relay", () => {
       events: Stream.fromQueue(events), exit: Effect.never, diagnosticTail: Effect.succeed(""),
       send: () => Effect.void, stop: Effect.void,
     }) })
-    const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, executable: "test", arguments: [], environment: {} }, 1, {
+    const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1, {
       state: Stream.never, handle: () => Deferred.succeed(handled, undefined).pipe(Effect.as({ reply: { _tag: "Done" as const }, afterReply: Effect.void })),
     }).pipe(Effect.provideService(OwnedChildSpawner, spawner))
     yield* Queue.offer(events, { _tag: "OwnerRequest", id: 1, request: { _tag: "Quit" } })

@@ -1,6 +1,6 @@
 import { createRequire } from "node:module"
 import { dirname, join } from "node:path"
-import { createReadStream, createWriteStream, closeSync } from "node:fs"
+import { createReadStream, createWriteStream } from "node:fs"
 import { Duplex } from "node:stream"
 import { Socket } from "node:net"
 import { DesktopChildEvent, DesktopOwnerCommand } from "@magnitudedev/acn-protocol/desktop-control"
@@ -51,7 +51,8 @@ const openOwnerChannel = process.platform === "win32" ? Effect.gen(function* () 
       writable: createWriteStream("", { fd: 3, autoClose: false }),
     }),
     catch: error => new AcnOwnerUnavailable({ message: `Missing inherited desktop control channel: ${String(error)}` }),
-  }), socket => Effect.sync(() => { socket.destroy(); closeSync(3) }))
+    // Destroying Bun's fs streams closes the descriptor despite `autoClose: false`.
+  }), socket => Effect.sync(() => socket.destroy()))
 
 export const makeAcnOwnerControl: Effect.Effect<AcnOwnerControl, AcnOwnerUnavailable | JsonLineChannelFailed, Scope.Scope> = Effect.gen(function* () {
   const socket = yield* openOwnerChannel

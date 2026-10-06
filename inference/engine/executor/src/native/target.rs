@@ -5,10 +5,11 @@ use crate::{
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project, dense_expand, dense_output, embedding_rows,
-    gated_delta_chunk, gated_delta_output, gated_delta_project, gated_delta_step,
-    post_norm_residual, project_rows, readout_features_rows, readout_head_rows,
-    readout_selected_rows, routed_combine, routed_expand, routed_experts, routed_group,
-    routed_output, routed_route,
+    gated_delta_chunk, gated_delta_project, gated_delta_project_convolved, gated_delta_step,
+    gated_delta_step_convolved, post_norm_residual, project_rows, readout_exact_rows,
+    readout_features_rows, readout_head_rows, readout_planes_rows, readout_refine_rows,
+    readout_selected_rows, readout_top_rows, routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
+    routed_route_shared,
 };
 use magnitude_kernels::{
     dense_up, feature_rows, routed_down, routed_experts_up, routed_gate_up, routed_scatter,
@@ -31,7 +32,6 @@ pub struct TargetKernels {
     pub(super) routed: HashMap<RoutedBinding, RoutedKernels>,
     pub(super) readout: HashMap<ReadoutBinding, ReadoutKernels>,
     pub(super) features: HashMap<FeaturesBinding, NativeKernel<readout_features_rows::Entry>>,
-    pub(super) selected: HashMap<ReadoutBinding, NativeKernel<readout_selected_rows::Entry>>,
     pub(super) taps: Option<TapKernels>,
     pub(super) per_layer_entry: HashMap<crate::PerLayerEntryBinding, PerLayerEntryKernels>,
     pub(super) per_layer: HashMap<crate::PerLayerBinding, PerLayerKernels>,
@@ -93,24 +93,59 @@ pub struct TapKernels {
     pub features: NativeKernel<feature_rows::Entry>,
 }
 
-/// The target readout: final-norm features, and the head projection that
-/// normalizes its own rows.
+/// The target readout: final-norm features, and the vocabulary projection
+/// that normalizes its own rows, by the plan's head placement.
 #[derive(Clone, Debug)]
 pub struct ReadoutKernels {
     pub features: NativeKernel<readout_features_rows::Entry>,
-    pub head: NativeKernel<readout_head_rows::Entry>,
+    pub head: ReadoutHeadKernels,
+}
+
+/// The vocabulary projection's entries (`ReadoutHead`).
+#[derive(Clone, Debug)]
+pub enum ReadoutHeadKernels {
+    /// The head GEMV, and its projection of selected vocabulary rows.
+    Packed {
+        head: NativeKernel<readout_head_rows::Entry>,
+        selected: NativeKernel<readout_selected_rows::Entry>,
+    },
+    Progressive(ProgressiveReadoutKernels),
+}
+
+/// A progressive head's certified levels and its full exact pass.
+#[derive(Clone, Debug)]
+pub struct ProgressiveReadoutKernels {
+    pub top: NativeKernel<readout_top_rows::Entry>,
+    pub refine: NativeKernel<readout_refine_rows::Entry>,
+    pub exact: NativeKernel<readout_exact_rows::Entry>,
+    pub planes: NativeKernel<readout_planes_rows::Entry>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RoutedKernels {
+    /// Every row class of the expand form; the grouped row classes of the
+    /// shared-route form.
     pub route: NativeKernel<routed_route::Entry>,
     /// Decode form (row classes up to the GEMV bound).
-    pub expand: NativeKernel<routed_expand::Entry>,
+    pub decode: RoutedDecodeKernels,
     pub output: NativeKernel<routed_output::Entry>,
     /// Grouped form (larger row classes).
     pub group: NativeKernel<routed_group::Entry>,
     pub experts: NativeKernel<routed_experts::Entry>,
     pub combine: NativeKernel<routed_combine::Entry>,
+}
+
+/// The decode rows' routing and expansions, by the backend's
+/// `DecodeForm`.
+#[derive(Clone, Debug)]
+pub enum RoutedDecodeKernels {
+    /// `routed_route`, then the choices' and the shared expert's gate/up.
+    Expand(NativeKernel<routed_expand::Entry>),
+    /// The routing with the shared expert's gate/up, then the choices'.
+    SharedRoute {
+        route: NativeKernel<routed_route_shared::Entry>,
+        choices: NativeKernel<routed_gate_up::Entry>,
+    },
 }
 
 /// An attention block: normed query/gate/key/value projection, the fused
@@ -168,7 +203,13 @@ pub enum AttentionHistoryKernels {
         verify: Option<NativeKernel<attention_decode_k8v4::Entry>>,
         verify_four: Option<NativeKernel<attention_decode_k8v4::Entry>>,
         verify_eight: Option<NativeKernel<attention_decode_k8v4::Entry>>,
+        /// The prefill of a launch that lists no history row tiles: it reads
+        /// the history in place.
         prefill: NativeKernel<attention_prefill_k8v4::Entry>,
+        /// The prefill of a launch that lists the history row tiles its rows
+        /// see, where the entry's forms differ by it
+        /// (`StateResourcePlan::lists_history_tiles`).
+        prefill_listed: Option<NativeKernel<attention_prefill_k8v4::Entry>>,
     },
 }
 
@@ -191,6 +232,7 @@ impl AttentionHistoryKernels {
                 verify_four,
                 verify_eight,
                 prefill,
+                prefill_listed,
             } => {
                 decode
                     .invocation_workspace_bytes()
@@ -209,7 +251,11 @@ impl AttentionHistoryKernels {
                             .as_ref()
                             .map_or(0, NativeKernel::invocation_workspace_bytes),
                     )
-                    + prefill.invocation_workspace_bytes()
+                    + prefill.invocation_workspace_bytes().max(
+                        prefill_listed
+                            .as_ref()
+                            .map_or(0, NativeKernel::invocation_workspace_bytes),
+                    )
             }
         }
     }
@@ -221,14 +267,30 @@ pub struct DenseKernels {
     pub output: SublayerOutput<NativeKernel<dense_output::Entry>>,
 }
 
-/// A recurrent block: normed projection, the state advance (row-sequential
-/// `step` for small row classes, chunked for the rest), gated output.
+/// A recurrent block: normed projection, the state advance publishing the
+/// gated rows (row-sequential `step` for small row classes, chunked for the
+/// rest), and the plain residual output projection.
 #[derive(Clone, Debug)]
 pub struct RecurrentKernels {
+    /// The chunked row classes' projection, and every row class's in the
+    /// step form.
     pub project: NativeKernel<gated_delta_project::Entry>,
-    pub step: NativeKernel<gated_delta_step::Entry>,
+    /// The step row classes, by the backend's `StepForm`.
+    pub step: RecurrentStepKernels,
     pub chunk: NativeKernel<gated_delta_chunk::Entry>,
-    pub output: NativeKernel<gated_delta_output::Entry>,
+    pub output: NativeKernel<attention_output::Entry>,
+}
+
+/// The step row classes' entries, by the backend's `StepForm`.
+#[derive(Clone, Debug)]
+pub enum RecurrentStepKernels {
+    /// `gated_delta_project`, then the step that convolves.
+    Step(NativeKernel<gated_delta_step::Entry>),
+    /// The projection that also convolves, then the step over its channels.
+    Convolved {
+        project: NativeKernel<gated_delta_project_convolved::Entry>,
+        step: NativeKernel<gated_delta_step_convolved::Entry>,
+    },
 }
 
 /// A general routed feed-forward (`operators::routed`).

@@ -459,6 +459,7 @@ mod tests {
             max_drafting_slots: 8,
             exported_logits_rows: 0,
             max_images_per_request: 1,
+            max_image_cells: 0,
             lookahead: false,
         };
         for backend in [
@@ -497,6 +498,7 @@ mod tests {
                 limits,
                 ResourceCapacity {
                     domain_bytes: 16 * 1024 * 1024 * 1024,
+                    tensor_operations: crate::TensorOperations::Absent,
                 },
             )
             .unwrap();
@@ -553,6 +555,7 @@ mod tests {
             max_drafting_slots: 8,
             exported_logits_rows: 0,
             max_images_per_request: 1,
+            max_image_cells: 0,
             lookahead: false,
         };
         let selection = ComponentSelection {
@@ -630,7 +633,10 @@ mod tests {
                     latent: (1, 1),
                 }
             );
-            assert_eq!(plan.target().readout().weight_scale, 1);
+            assert!(matches!(
+                plan.target().readout().head,
+                crate::ReadoutHead::Packed { weight_scale: 1, .. }
+            ));
 
             let state = ResourcePlanner::state_plan(
                 &definition,
@@ -640,6 +646,7 @@ mod tests {
                 limits,
                 ResourceCapacity {
                     domain_bytes: 16 * 1024 * 1024 * 1024,
+                    tensor_operations: crate::TensorOperations::Absent,
                 },
             )
             .unwrap();

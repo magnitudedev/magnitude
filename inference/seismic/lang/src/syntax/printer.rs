@@ -93,10 +93,22 @@ impl Printer {
                     });
                     self.out.push_str(")\n");
                 }
+                for term in &n.terms {
+                    self.indent();
+                    let _ = write!(self.out, "let {} = ", term.name.name);
+                    self.expr(&term.value, 0);
+                    self.out.push('\n');
+                }
                 if let Some(constraint) = &n.constraint {
                     self.indent();
                     self.out.push_str("where ");
                     self.expr(constraint, 0);
+                    self.out.push('\n');
+                }
+                for class in &n.error_classes {
+                    self.indent();
+                    let _ = write!(self.out, "error_class {} when ", class.name.name);
+                    self.expr(&class.when, 0);
                     self.out.push('\n');
                 }
                 for scratch in &n.scratch {
@@ -104,13 +116,24 @@ impl Printer {
                     let _ = write!(self.out, "scratch {} bytes (", scratch.name.name);
                     self.expr(&scratch.bytes, 0);
                     self.out.push(')');
+                    if scratch.sync {
+                        self.out.push_str(" sync");
+                    }
                     if let Some(when) = &scratch.when {
                         self.out.push_str(" when ");
                         self.expr(when, 0);
                     }
                     self.out.push('\n');
                 }
-                for launch in &n.launches {
+                for (ordinal, launch) in n.launches.iter().enumerate() {
+                    let repeat = n.repeat.as_ref();
+                    if let Some(repeat) = repeat.filter(|repeat| repeat.first == ordinal) {
+                        self.indent();
+                        self.out.push_str("repeat (");
+                        self.expr(&repeat.count, 0);
+                        self.out.push_str("):\n");
+                        self.level += 1;
+                    }
                     self.indent();
                     let _ = write!(self.out, "launch {}", launch.kernel.name);
                     if let Some(when) = &launch.when {
@@ -144,6 +167,9 @@ impl Printer {
                         self.out.push_str(")\n");
                     }
                     self.level -= 1;
+                    if repeat.is_some_and(|repeat| repeat.first + repeat.launches == ordinal + 1) {
+                        self.level -= 1;
+                    }
                 }
                 self.level -= 1;
             }

@@ -23,6 +23,21 @@ pub(crate) struct VulkanFeatures {
     pub(crate) shared_int64_atomics: bool,
 }
 
+impl VulkanFeatures {
+    /// The features a device with `facts` exposes.
+    pub(crate) fn of(facts: &seismic_vulkan::FormationFacts) -> Self {
+        Self {
+            subgroup_lanes: facts.subgroup_lanes,
+            float16: facts.float16,
+            matrix: facts.matrix,
+            wide_accumulators: facts.wide_accumulators,
+            mixed_dot: facts.mixed_dot,
+            f32_atomic_add: facts.f32_atomic_add,
+            shared_int64_atomics: facts.shared_int64_atomics,
+        }
+    }
+}
+
 /// The typed views of a Vulkan launch's one group-memory region, in
 /// specialization-constant order after the workgroup size (ids 3..): view
 /// name suffix, GLSL element type and element bytes. Every view covers the
@@ -245,7 +260,8 @@ void main() {
                     text: source,
                     entries: vec![ProgramEntry {
                         symbol: "numerics".into(),
-                        constants: vec![64, 1, 1],
+                        group_size: Some([64, 1, 1]),
+                        constants: Vec::new(),
                     }],
                 },
                 None,
@@ -444,7 +460,8 @@ void main() {
                     text: source,
                     entries: vec![ProgramEntry {
                         symbol: "halves".into(),
-                        constants: vec![64, 1, 1],
+                        group_size: Some([64, 1, 1]),
+                        constants: Vec::new(),
                     }],
                 },
                 None,

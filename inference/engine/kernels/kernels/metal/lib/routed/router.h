@@ -53,6 +53,7 @@ inline void inverses(device const float *residual, ulong residual0, ulong residu
 // the norm's element N.
 template <typename N>
 struct Rows {
+    static_assert(Act::bytes == 2, "the Metal router requires a bf16 or f16 activation element");
     typedef Act activation;
     device const float *residual;
     ulong residual0, residual1;

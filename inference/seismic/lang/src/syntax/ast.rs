@@ -153,13 +153,17 @@ impl Decl {
 ///     static (DIM, ..)
 ///     params ([code] [arithmetic] NAME in [V, ..], ..)
 ///     elements (ELEMENT in [DTYPE, ..], ..)
+///     let NAME = EXPR
 ///     where CONDITION
-///     scratch NAME bytes (EXPR) [when CONDITION]
+///     error_class NAME when CONDITION
+///     scratch NAME bytes (EXPR) [sync] [when CONDITION]
 ///     launch KERNEL [when CONDITION]:
 ///         params ([code] [arithmetic] NAME in [V, ..], ..)
 ///         threadgroups (X, Y, Z)
 ///         threads_per_threadgroup (X, Y, Z)
 ///         shared_bytes (EXPR)
+///     repeat (EXPR):
+///         launch ..
 /// ```
 ///
 /// A `CONDITION` is comparisons of natural-number expressions joined by
@@ -175,10 +179,38 @@ pub struct NativeDecl {
     /// The dense representations a build-time compiled (CPU) form covers,
     /// per element parameter it monomorphizes.
     pub elements: Vec<NativeElementsDecl>,
+    /// Named natural-number expressions, in declaration order.
+    pub terms: Vec<NativeTermDecl>,
     /// The `where` condition restricting admissible configurations.
     pub constraint: Option<Expr>,
+    /// The error classes of the configurations that change numerics.
+    pub error_classes: Vec<NativeErrorClassDecl>,
     pub scratch: Vec<NativeScratchDecl>,
+    /// Every launch in dispatch order, those of the `repeat` block included.
     pub launches: Vec<NativeLaunchDecl>,
+    pub repeat: Option<NativeRepeatDecl>,
+    pub span: Span,
+}
+
+/// `let NAME = EXPR`: a name for a natural-number expression over entry
+/// dimensions, entry parameters and the terms before it. The declaration's
+/// later expressions read it as that expression.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeTermDecl {
+    pub name: Ident,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// `repeat (EXPR):` over consecutive launches: a call dispatches the block's
+/// launches in order, `count` times.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeRepeatDecl {
+    pub count: Expr,
+    /// Ordinal of the block's first launch.
+    pub first: usize,
+    /// Number of launches in the block.
+    pub launches: usize,
     pub span: Span,
 }
 
@@ -206,11 +238,24 @@ pub struct NativeElementsDecl {
     pub span: Span,
 }
 
+/// `error_class NAME when CONDITION`: the configurations satisfying the
+/// condition change the entry's numerics beyond summation order, by an error
+/// of the named class.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeErrorClassDecl {
+    pub name: Ident,
+    pub when: Expr,
+    pub span: Span,
+}
+
 /// Call-private device memory shared by the launches of one native call.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeScratchDecl {
     pub name: Ident,
     pub bytes: Expr,
+    /// Arrival counters: every buffer of this kind is zero when a launch
+    /// starts, and the call's kernels restore it to zero before it ends.
+    pub sync: bool,
     /// The buffer is sized only when this condition holds.
     pub when: Option<Expr>,
     pub span: Span,

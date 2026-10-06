@@ -82,7 +82,7 @@ kernel void attention_project_gemv(ATTENTION_PROJECT_ARGUMENTS,
     }
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     if (tile < t0) {
         PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
             x, query_out, query_w, rows, query_rows, k, tile, shared, simdgroups, sg, lane));
@@ -123,7 +123,7 @@ kernel void attention_project_batch(ATTENTION_PROJECT_ARGUMENTS,
     }
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     if (tile < t0)
         projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(x, query_out, query_w, rows, query_rows, k,
             tile, shared, simdgroups, sg, lane);
@@ -195,5 +195,57 @@ kernel void attention_project_gemm(ATTENTION_PROJECT_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     ATTENTION_PROJECT_GEMM(TILE_M, TILE_N);
+}
+#endif
+
+// The TALL form past 64 rows: the normalized rows in the tall GEMM's order,
+// then its tiles, 32 rows of one segment each.
+#ifdef SEISMIC_FORMING_ATTENTION_PROJECT_STAGE_TALL
+kernel void attention_project_stage_tall(ATTENTION_PROJECT_ARGUMENTS,
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(norms);
+    ATTENTION_PROJECT_OPERANDS;
+    projection::device_normalize<256, projection::TallOrder<activation>>(in, item, normalized, k, norms,
+        thread_index);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_ATTENTION_PROJECT_TALL
+template <uint TALL_M, uint TALL_K, uint STAGERS>
+kernel void attention_project_tall(ATTENTION_PROJECT_ARGUMENTS,
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    PROJECTION_GEMM_TALL_SHARED(shared, TALL_K);
+    ATTENTION_PROJECT_OPERANDS;
+    const uint TN = projection::tall_n;
+    const auto x = projection::tall_operand(
+        projection::Plain<activation, projection::AllRows>{normalized, k, 1, k, {}}, normalized);
+    uint m = uint(SEISMIC_DIM_M);
+    uint t0 = (query_rows + TN - 1) / TN, t1 = (gate_rows + TN - 1) / TN;
+    uint t2 = (key_rows + TN - 1) / TN;
+    uint n = tile.x;
+    if (SEISMIC_PARAM_PROJECT_MODE != 0 && n < t0 + t1) {
+        if (n < t0)
+            attention_project_zero_tile(query_out, m, query_rows, tile.y * TALL_M, TALL_M,
+                n * TN, TN, sg * 32 + lane, (TALL_M / 32u + STAGERS) * 32u);
+        else
+            attention_project_zero_tile(gate_out, m, gate_rows, tile.y * TALL_M, TALL_M,
+                (n - t0) * TN, TN, sg * 32 + lane, (TALL_M / 32u + STAGERS) * 32u);
+        return;
+    }
+    if (n < t0)
+        projection::gemm_tall<packets::W0, TALL_M, TALL_K, STAGERS>(x, query_out, query_w, m, query_rows, k,
+            tile.y, n, shared, sg, lane);
+    else if (n < t0 + t1)
+        projection::gemm_tall<packets::W1, TALL_M, TALL_K, STAGERS>(x, gate_out, gate_w, m, gate_rows, k,
+            tile.y, n - t0, shared, sg, lane);
+    else if (n < t0 + t1 + t2)
+        projection::gemm_tall<packets::W2, TALL_M, TALL_K, STAGERS>(x, key_out, key_w, m, key_rows, k,
+            tile.y, n - t0 - t1, shared, sg, lane);
+    else
+        projection::gemm_tall<packets::W3, TALL_M, TALL_K, STAGERS>(x, value_out, value_w, m, value_rows, k,
+            tile.y, n - t0 - t1 - t2, shared, sg, lane);
 }
 #endif

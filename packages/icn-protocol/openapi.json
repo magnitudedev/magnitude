@@ -4918,6 +4918,14 @@
             "format": "int32",
             "minimum": 0
           },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
           "tools": {
             "type": "array",
             "items": {
@@ -6430,6 +6438,14 @@
               "null"
             ],
             "format": "float"
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
           },
           "tools": {
             "type": [

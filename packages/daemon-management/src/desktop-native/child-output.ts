@@ -1,11 +1,20 @@
 import type { Writable } from "node:stream"
-import { Effect, Ref, Schema } from "effect"
+import { Effect, Option, Ref, Schema } from "effect"
+import { openLogFile, type LogFile } from "@magnitudedev/utils/log-file"
 
 export const ChildOutputMode = Schema.Literal("DiagnosticTail", "Foreground")
 export type ChildOutputMode = typeof ChildOutputMode.Type
 
-/** Diagnostic collection never waits for the terminal and never owns its lifetime. */
-export const makeChildOutput = (mode: ChildOutputMode, sink: Writable = process.stderr) => Effect.gen(function* () {
+const LOG_FILE_BYTES = 10 * 1024 * 1024
+
+/** Opens the persistent log a child's output is recorded in, when its command names one. */
+export const openChildLog = (file: Option.Option<string>) => Option.match(file, {
+  onNone: () => Effect.succeed(Option.none<LogFile>()),
+  onSome: path => openLogFile(path, LOG_FILE_BYTES).pipe(Effect.map(Option.some)),
+})
+
+/** Diagnostic collection never waits for the terminal or the log file and never owns its lifetime. */
+export const makeChildOutput = (mode: ChildOutputMode, log: Option.Option<LogFile>, sink: Writable = process.stderr) => Effect.gen(function* () {
   const tail = yield* Ref.make(Buffer.alloc(0))
   let enabled = mode === "Foreground"
   let pending = false
@@ -20,9 +29,11 @@ export const makeChildOutput = (mode: ChildOutputMode, sink: Writable = process.
       if (!pending) sink.removeListener("error", failed)
     }),
   )
+  const logged = (text: string | Uint8Array) => Option.match(log, { onNone: () => Effect.void, onSome: file => file.append(text) })
   return {
     diagnosticTail: Ref.get(tail).pipe(Effect.map(bytes => bytes.toString("utf8"))),
-    append: (chunk: Uint8Array) => Ref.update(tail, bytes => chunk.length >= 16_384
+    record: (note: string) => logged(`[${new Date().toISOString()}] ${note}\n`),
+    append: (chunk: Uint8Array) => logged(chunk).pipe(Effect.zipRight(Ref.update(tail, bytes => chunk.length >= 16_384
       ? Buffer.from(chunk.subarray(chunk.length - 16_384))
       : Buffer.concat([bytes.subarray(Math.max(0, bytes.length + chunk.length - 16_384)), chunk])).pipe(
       Effect.zipRight(Effect.sync(() => {
@@ -40,6 +51,6 @@ export const makeChildOutput = (mode: ChildOutputMode, sink: Writable = process.
           enabled = false
         }
       })),
-    ),
+    ))),
   }
 })

@@ -37,19 +37,49 @@ use seismic::{
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-/// A block graph's class: (rows, history segments, request slots).
-type BlockClass = (u64, u64, u64);
+/// A block graph's class: (rows, history segments, request slots, the
+/// history row tiles of its launch's rows it lists; 0 for a class that lists
+/// none).
+type BlockClass = (u64, u64, u64, u64);
+
+/// The tile counts of the classes of block `index`'s graphs of `rows` rows
+/// that list their launch's history row tiles, beside the class that lists
+/// none (`HistoryStorePlan::listed_tile_classes`): those of an attention
+/// block's prefill rows, on a plan whose device has the forms that decode
+/// the listed tiles (`StateResourcePlan::lists_history_tiles`).
+fn block_listings(
+    state: &StateResourcePlan,
+    slot: TargetBlockProgramSlot,
+    index: usize,
+    rows: u64,
+) -> Result<Vec<u64>, String> {
+    if !matches!(slot.mixer(), crate::MixerProgramSlot::Attention(_))
+        || !state.lists_history_tiles()
+        || crate::operators::attention::graph::decodes(rows)
+    {
+        return Ok(Vec::new());
+    }
+    state
+        .target_state()
+        .layer_history(LayerRef::Target(index as u32))
+        .ok_or("attention block has no history domain")?
+        .store
+        .listed_tile_classes()
+}
 
 /// The classes a block's sealed graph distinguishes for one row class. An
 /// attention block reads history segments and is independent of request
-/// slots; a recurrent block binds exact per-slot bank tables (every slot
-/// count a launch of `rows` rows can serve, up to the launch slot bound) and
-/// is independent of segments. Everything else is per row.
+/// slots; each segment count has a class per `listed` tile count and one
+/// that lists none. A recurrent block
+/// binds exact per-slot bank tables (every slot count a launch of `rows`
+/// rows can serve, up to the launch slot bound) and is independent of
+/// segments. Everything else is per row.
 fn block_classes(
     mixer: MixerKind,
     rows: u64,
     max_slots: u64,
     max_segments: u64,
+    listed: &[u64],
 ) -> Vec<BlockClass> {
     match mixer {
         MixerKind::Attention => std::iter::successors(Some(1u64), |segments| {
@@ -57,20 +87,25 @@ fn block_classes(
                 .checked_mul(2)
                 .filter(|segments| *segments <= max_segments)
         })
-        .map(|segments| (rows, segments, 1))
+        .flat_map(|segments| {
+            std::iter::once(0)
+                .chain(listed.iter().copied())
+                .map(move |listed| (rows, segments, 1, listed))
+        })
         .collect(),
         MixerKind::Recurrent => (1..=rows.min(max_slots))
-            .map(|slots| (rows, 1, slots))
+            .map(|slots| (rows, 1, slots, 0))
             .collect(),
     }
 }
 
 /// The class of a block's graph serving a launch of `rows` rows over
-/// `segments` history segments and `slots` requests.
-fn block_class(mixer: MixerKind, rows: u64, segments: u64, slots: u64) -> BlockClass {
+/// `segments` history segments and `slots` requests, listing `listed` of the
+/// launch's history row tiles.
+fn block_class(mixer: MixerKind, rows: u64, segments: u64, slots: u64, listed: u64) -> BlockClass {
     match mixer {
-        MixerKind::Attention => (rows, segments, 1),
-        MixerKind::Recurrent => (rows, 1, slots),
+        MixerKind::Attention => (rows, segments, 1, listed),
+        MixerKind::Recurrent => (rows, 1, slots, 0),
     }
 }
 
@@ -83,17 +118,24 @@ fn block_class_slice(
     rows: u64,
     max_slots: u64,
     max_segments: u64,
+    listed: &[u64],
 ) -> Result<NativeGraphClassSlice, String> {
     let mixer = block.mixer.kind();
-    let classes = block_classes(mixer, rows, max_slots, max_segments);
+    // The segment and slot counts are those of every listing class.
+    let classes = block_classes(mixer, rows, max_slots, max_segments, &[]);
     let slice = NativeGraphClassSlice::new()
         .dimension("M", [rows])
         .dimension("O", [rows]);
     let slice = match mixer {
+        MixerKind::Attention if !listed.is_empty() => slice
+            .dimension("R", classes.iter().map(|&(_, segments, ..)| segments))
+            .dimension("HT", listed.iter().copied()),
         MixerKind::Attention => {
-            slice.dimension("R", classes.iter().map(|&(_, segments, _)| segments))
+            slice.dimension("R", classes.iter().map(|&(_, segments, ..)| segments))
         }
-        MixerKind::Recurrent => slice.dimension("B", classes.iter().map(|&(_, _, slots)| slots)),
+        MixerKind::Recurrent => {
+            slice.dimension("B", classes.iter().map(|&(_, _, slots, _)| slots))
+        }
     };
     block::feed_forward_class_slice(block, rows, slice)
 }
@@ -103,6 +145,9 @@ pub struct PreparedTargetGraphs {
     entries: BTreeMap<(u64, EntryTokens), PreparedTargetEntryGraph>,
     /// Per block, its graph for each class it distinguishes.
     blocks_by_class: Vec<BTreeMap<BlockClass, PreparedTargetBlockGraph>>,
+    /// Per block, the tile counts of its prefill rows' listing classes
+    /// (`block_listings`).
+    listed_tiles: Vec<Vec<u64>>,
     /// Block mixers, which decide the class a launch selects per block.
     mixers: Vec<MixerKind>,
     classes: usize,
@@ -339,6 +384,16 @@ impl PreparedTargetGraphs {
                     .map_err(|error| error.to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // The plan was assessed for a device that forms tensor operations or
+        // not; the opened device's own probe must say the same, or its
+        // kernels and these graphs would be of different classes.
+        if state.tensor_operations() != device.forms_tensor_operations() {
+            return Err(format!(
+                "the plan holds that the device {} Metal tensor operations, and the opened device {}",
+                if state.tensor_operations() { "forms" } else { "does not form" },
+                if device.forms_tensor_operations() { "does" } else { "does not" },
+            ));
+        }
         let certificate =
             certify_target_family(device.backend(), load, geometry, state, plan, limits)
                 .map_err(|error| error.to_string())?;
@@ -367,6 +422,7 @@ impl PreparedTargetGraphs {
         let shapes = block_graph_shapes(load, geometry, state, &tapped)?;
         let mut blocks_by_class: Vec<BTreeMap<BlockClass, PreparedTargetBlockGraph>> =
             vec![BTreeMap::new(); handles.blocks.len()];
+        let mut listed_tiles = vec![Vec::new(); handles.blocks.len()];
         let mut launch_classes = std::collections::BTreeSet::new();
         let mut entries = BTreeMap::new();
         let per_layer = PerLayerEntryGraphSource::of(
@@ -412,8 +468,12 @@ impl PreparedTargetGraphs {
                     shapes[first] == shapes[index]
                         && handles.blocks[first].output_scales == handle.output_scales
                 });
-                for class @ (rows, segments, slots) in
-                    block_classes(mixer, rows, max_slots, max_segments)
+                let listings = block_listings(state, plan.blocks()[index], index, rows)?;
+                if !listings.is_empty() {
+                    listed_tiles[index] = listings.clone();
+                }
+                for class @ (rows, segments, slots, listed) in
+                    block_classes(mixer, rows, max_slots, max_segments, &listings)
                 {
                     launch_classes.insert(class);
                     if let Some(first) = shared {
@@ -434,10 +494,10 @@ impl PreparedTargetGraphs {
                     };
                     let block = PreparedTargetBlockGraph::prepare(device, handle, tap,
                         plan.blocks()[index].per_layer(),
-                        load, geometry, state, index, rows, segments, slots,
-                        &certificate.blocks[index][&RowForm::of(rows)])
+                        load, geometry, state, index, rows, segments, slots, listed,
+                        &certificate.blocks[index][&(RowForm::of(rows), listed > 0)])
                         .map_err(|error| format!(
-                            "target graph row class {rows}, history segments {segments}, request slots {slots}, block {index}: {error}"
+                            "target graph row class {rows}, history segments {segments}, request slots {slots}, listed {listed}, block {index}: {error}"
                         ))?;
                     sealed_graphs += 1;
                     max_output_bytes = max_output_bytes.max(block.plan.output_bytes());
@@ -462,6 +522,7 @@ impl PreparedTargetGraphs {
         Ok(Self {
             entries,
             blocks_by_class,
+            listed_tiles,
             mixers,
             classes: launch_classes.len(),
             family,
@@ -473,6 +534,15 @@ impl PreparedTargetGraphs {
             per_layer_rows: per_layer_rows(plan, largest_rows),
             seal,
         })
+    }
+
+    /// The tile counts of block `index`'s listing classes for a launch of
+    /// `rows` rows, ascending; empty when that row class has none.
+    pub(crate) fn listed_tiles(&self, index: usize, rows: u64) -> &[u64] {
+        match self.listed_tiles.get(index) {
+            Some(tiles) if !crate::operators::attention::graph::decodes(rows) => tiles,
+            _ => &[],
+        }
     }
 
     /// The tap indices block `index` writes.
@@ -780,6 +850,7 @@ impl BoundTargetGraphs {
         rows: u64,
         segments: u64,
         slots: u64,
+        listed: u64,
         index: usize,
     ) -> Result<(&PreparedTargetBlockGraph, &BoundNativeGraphPlan), String> {
         let mixer = *self
@@ -787,7 +858,7 @@ impl BoundTargetGraphs {
             .mixers
             .get(index)
             .ok_or_else(|| format!("target block {index} does not exist"))?;
-        let key = block_class(mixer, rows, segments, slots);
+        let key = block_class(mixer, rows, segments, slots, listed);
         let graph = self.prepared.blocks_by_class[index]
             .get(&key)
             .ok_or_else(|| format!("target graph class {key:?} block {index} was not sealed"))?;
@@ -1106,6 +1177,7 @@ impl PreparedTargetBlockGraph {
         rows: u64,
         segments: u64,
         slots: u64,
+        listed: u64,
         layout: &NativeGraphLayout,
     ) -> Result<Self, String> {
         let mut graph = device.native_graph_with_layout(layout);
@@ -1136,6 +1208,7 @@ impl PreparedTargetBlockGraph {
                 rows,
                 segments,
                 slots,
+                listed,
                 output_scales: handle.output_scales,
             },
             &mut weights,
@@ -1167,6 +1240,7 @@ struct BlockGraphInputs<'a> {
     rows: u64,
     segments: u64,
     slots: u64,
+    listed: u64,
     output_scales: OutputScales,
 }
 
@@ -1202,6 +1276,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         rows,
         segments,
         slots,
+        listed,
         output_scales,
     } = inputs;
     let block = geometry
@@ -1218,6 +1293,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         rows,
         segments,
         slots,
+        listed,
         output_scales,
     };
     let mut taps = tap_entry
@@ -1264,6 +1340,7 @@ fn checked_block_graph_draft(
     rows: u64,
     segments: u64,
     slots: u64,
+    listed: u64,
 ) -> Result<(NativeGraphMetadata, Vec<GraphConstant>), GraphError> {
     let mut weights = Vec::new();
     let mut constants = Vec::new();
@@ -1280,9 +1357,16 @@ fn checked_block_graph_draft(
         0,
         "M",
     )?;
-    let checked_mixer = block::CheckedMixerEntries::new(slot.mixer());
+    let checked_mixer = block::CheckedMixerEntries::new(
+        slot.mixer(),
+        graph.backend(),
+        state.lists_history_tiles(),
+    )?;
     let mixer = checked_mixer.entries()?;
-    let checked_feed_forward = slot.feed_forward().map(block::CheckedFeedForwardEntries::new);
+    let checked_feed_forward = slot
+        .feed_forward()
+        .map(|slot| block::CheckedFeedForwardEntries::new(slot, graph.backend()))
+        .transpose()?;
     let feed_forward = checked_feed_forward.as_ref().map(|checked| checked.entries());
     let checked_per_layer = block::checked_per_layer(slot.per_layer())?;
     let per_layer = checked_per_layer
@@ -1303,6 +1387,7 @@ fn checked_block_graph_draft(
             rows,
             segments,
             slots,
+            listed,
             // Scalar arguments leave the checked shapes and storage alone.
             output_scales: OutputScales {
                 mixer: 1.0,
@@ -1329,6 +1414,7 @@ pub(crate) fn checked_block_graph_resources(
     rows: u64,
     segments: u64,
     slots: u64,
+    listed: u64,
 ) -> Result<(NativeGraphStorageBytes, Vec<GraphConstant>), GraphError> {
     let (graph, constants) = checked_block_graph_draft(
         NativeGraphMetadata::new(backend),
@@ -1341,6 +1427,7 @@ pub(crate) fn checked_block_graph_resources(
         rows,
         segments,
         slots,
+        listed,
     )?;
     Ok((GraphDraft::seal(graph)?, constants))
 }
@@ -1365,7 +1452,9 @@ struct TargetFamilyCertificate {
     entries: BTreeMap<EntryTokens, NativeGraphLayout>,
     /// The per-layer entry graph's layout, of a per-layer entry.
     per_layer: Option<NativeGraphLayout>,
-    blocks: Vec<BTreeMap<RowForm, NativeGraphLayout>>,
+    /// Per block, the layout of each row regime's classes, those that list
+    /// their launch's history row tiles apart.
+    blocks: Vec<BTreeMap<(RowForm, bool), NativeGraphLayout>>,
 }
 
 fn certify_target_family(
@@ -1461,30 +1550,52 @@ fn certify_target_family(
         }
         for (form, rows) in regimes {
             let largest = *rows.last().expect("a regime holds a row class");
-            let (graph, constants) = checked_block_graph_draft(
-                NativeGraphMetadata::new_template(backend),
-                load,
-                geometry,
-                state,
-                slot,
-                tap_width
-                    .map(|width| (width, tapped[index].positions()))
-                    .filter(|(_, positions)| positions.any()),
-                index,
-                largest,
-                1,
-                1,
-            )?;
-            let slices = rows
-                .iter()
-                .map(|&rows| block_class_slice(&paired, rows, max_slots, max_segments))
-                .collect::<Result<Vec<_>, _>>()?;
-            let layout = graph
-                .seal_template()
-                .and_then(|template| template.certify(&slices))
-                .map_err(|error| format!("target block {index}: {error}"))?;
-            family.include(layout.storage_bytes(), constants);
-            blocks[index].insert(form, layout);
+            // A regime's listing classes are their own topology (another
+            // kernel of the entry, and the list's input), over every listed
+            // tile count.
+            for listed in [false, true] {
+                let listings = match listed {
+                    false => Vec::new(),
+                    true => block_listings(state, slot, index, largest)?,
+                };
+                let mut listing_rows = Vec::new();
+                for &rows in &rows {
+                    if !listed || !block_listings(state, slot, index, rows)?.is_empty() {
+                        listing_rows.push(rows);
+                    }
+                }
+                let rows = listing_rows;
+                if rows.is_empty() {
+                    continue;
+                }
+                let (graph, constants) = checked_block_graph_draft(
+                    NativeGraphMetadata::new_template(backend),
+                    load,
+                    geometry,
+                    state,
+                    slot,
+                    tap_width
+                        .map(|width| (width, tapped[index].positions()))
+                        .filter(|(_, positions)| positions.any()),
+                    index,
+                    largest,
+                    1,
+                    1,
+                    listings.last().copied().unwrap_or(0),
+                )?;
+                let slices = rows
+                    .iter()
+                    .map(|&rows| {
+                        block_class_slice(&paired, rows, max_slots, max_segments, &listings)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let layout = graph
+                    .seal_template()
+                    .and_then(|template| template.certify(&slices))
+                    .map_err(|error| format!("target block {index}: {error}"))?;
+                family.include(layout.storage_bytes(), constants);
+                blocks[index].insert((form, listed), layout);
+            }
         }
         // Row-class constants (`block::class_constants_of`).
         for &rows in &row_classes {
@@ -1542,6 +1653,194 @@ mod resource_template_tests {
     };
     use magnitude_state::KvCodec;
 
+    /// The 512-row attention class workspaces of one model on Metal over
+    /// K8/V4 history: the family's, each listing class's and that of the class
+    /// that lists none, with the store's reservation of history rows.
+    struct Charged {
+        reservation: u64,
+        family: u64,
+        listed: Vec<u64>,
+        unlisted: u64,
+    }
+
+    fn charged(
+        (kv_heads, head_width): (u64, u64),
+        context: u64,
+        domain_bytes: u64,
+        tensor_operations: bool,
+    ) -> Charged {
+        let limits = ResourceLimits {
+            max_launch_rows: 512,
+            max_launch_slots: 512,
+            max_selected_rows: 64,
+            max_drafting_slots: 64,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+        };
+        let mut configuration = QWEN35_CONFIGURATIONS[0];
+        configuration.blocks = configuration.attention_interval;
+        configuration.kv_heads = kv_heads;
+        configuration.head_width = head_width;
+        let (mut definition, manifest) = declared_model(&configuration);
+        definition.decoder.context_limit = context;
+        let backend = BackendName::Metal;
+        let codec = KvCodec::AffineK8V4;
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            resident_layout(ExecutionPath::Native, backend),
+        )
+        .unwrap();
+        let plan = load.program_plan(&definition, codec).unwrap();
+        let index = plan
+            .target()
+            .blocks()
+            .iter()
+            .position(|slot| matches!(slot.mixer(), crate::MixerProgramSlot::Attention(_)))
+            .unwrap();
+        let state = ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            PlannedMethod::Plain,
+            codec,
+            limits,
+            ResourceCapacity {
+                domain_bytes,
+                tensor_operations: crate::TensorOperations::of(tensor_operations),
+            },
+        )
+        .unwrap();
+        let certificate = certify_target_family(
+            backend,
+            &load,
+            &definition.decoder,
+            &state,
+            plan.target(),
+            limits,
+        )
+        .unwrap();
+        let family = certificate.resources.storage.workspace;
+        // The load's assessment charges the family's workspace, and every
+        // exact 512-row class of the block seals into the layout the family
+        // certified for it and is charged that layout.
+        let assessed = crate::AssessmentGraphResourceBounds::derive(
+            &definition,
+            &load,
+            &state,
+            PlannedMethod::Plain,
+            codec,
+            limits,
+            backend,
+        )
+        .unwrap();
+        assert_eq!(assessed.target.workspace_bytes, family);
+        let max_segments = state.target_state().span_limit().next_power_of_two() as u64;
+        let listings = block_listings(&state, plan.target().blocks()[index], index, 512).unwrap();
+        assert_eq!(listings.is_empty(), !tensor_operations);
+        for (rows, segments, slots, listed) in
+            block_classes(MixerKind::Attention, 512, 512, max_segments, &listings)
+        {
+            let (graph, _) = checked_block_graph_draft(
+                NativeGraphMetadata::new(backend),
+                &load,
+                &definition.decoder,
+                &state,
+                plan.target().blocks()[index],
+                None,
+                index,
+                rows,
+                segments,
+                slots,
+                listed,
+            )
+            .unwrap();
+            let layout = &certificate.blocks[index][&(RowForm::of(rows), listed > 0)];
+            assert_eq!(graph.seal_with_layout(layout).unwrap(), layout.storage_bytes());
+            assert!(layout.storage_bytes().workspace <= family);
+        }
+        let class = |listed| {
+            checked_block_graph_resources(
+                backend,
+                &load,
+                &definition.decoder,
+                &state,
+                plan.target().blocks()[index],
+                index,
+                512,
+                1,
+                1,
+                listed,
+            )
+            .unwrap()
+            .0
+            .workspace
+        };
+        // One request's worth of tiles is the largest listing: its context,
+        // and two pages.
+        let history = state
+            .target_state()
+            .layer_history(LayerRef::Target(index as u32))
+            .unwrap()
+            .store;
+        if let Some(&most) = listings.last() {
+            assert!(most * 256 <= context + 2 * u64::from(history.page_rows));
+        }
+        Charged {
+            reservation: history.rows as u64,
+            family,
+            listed: listings.iter().map(|&tiles| class(tiles)).collect(),
+            unlisted: class(0),
+        }
+    }
+
+    /// An attention block's graph scratch follows neither the store's
+    /// reservation of history rows (an address-space ceiling from the
+    /// device's bytes) nor the context limit, and listing a launch's history
+    /// row tiles adds nothing to it: on Metal over K8/V4 history every
+    /// 512-row class that lists tiles is charged what the class that lists
+    /// none is (the DIRECT form decodes into the cells of the partial
+    /// outputs its key partitions leave), so the family holds the same bytes
+    /// with and without tensor operations.
+    #[test]
+    fn attention_graph_scratch_follows_neither_the_reservation_nor_the_context() {
+        for heads in [(4, 256), (1, 128), (2, 128), (1, 256), (2, 512), (4, 512)] {
+            for context in [65_536, 262_144] {
+                let plain = charged(heads, context, 8 << 30, false);
+                let small = charged(heads, context, 8 << 30, true);
+                let large = charged(heads, context, 256 << 30, true);
+                assert!(large.reservation > small.reservation);
+                assert!(!small.listed.is_empty());
+                for &listed in small.listed.iter().chain(&large.listed) {
+                    assert_eq!(listed, small.unlisted, "{heads:?} at {context}");
+                }
+                assert_eq!(
+                    (small.family, small.unlisted),
+                    (large.family, large.unlisted),
+                    "{heads:?} at {context}: graph scratch follows the history reservation"
+                );
+                assert_eq!((plain.family, plain.unlisted), (small.family, small.unlisted));
+                assert_eq!(
+                    charged(heads, context, 256 << 30, false).family,
+                    plain.family
+                );
+                eprintln!(
+                    "kv heads and width {heads:?}, context {context}, reservation {} / {} rows: family {} bytes, 512-row attention class {} bytes in {} listing classes and the one listing none",
+                    small.reservation,
+                    large.reservation,
+                    small.family,
+                    small.unlisted,
+                    small.listed.len()
+                );
+            }
+        }
+    }
+
     /// Every exact entry and block class seals into the layout certified for
     /// its structural regime and is charged that layout, and the family
     /// charges exactly the binding constants the exact classes bind.
@@ -1554,6 +1853,7 @@ mod resource_template_tests {
             max_drafting_slots: 64,
             exported_logits_rows: 0,
             max_images_per_request: 1,
+            max_image_cells: 0,
             lookahead: false,
         };
         for mut configuration in [QWEN35_CONFIGURATIONS[0], QWEN35_CONFIGURATIONS[3]] {
@@ -1584,6 +1884,7 @@ mod resource_template_tests {
                     limits,
                     ResourceCapacity {
                         domain_bytes: 64 * 1024 * 1024 * 1024,
+                        tensor_operations: crate::TensorOperations::Absent,
                     },
                 )
                 .unwrap();
@@ -1633,11 +1934,13 @@ mod resource_template_tests {
                         );
                     }
                     for (index, block) in geometry.blocks.iter().enumerate() {
-                        for (rows, segments, slots) in block_classes(
+                        for (rows, segments, slots, listed) in block_classes(
                             paired_block(block).unwrap().mixer.kind(),
                             rows,
                             limits.max_launch_slots as u64,
                             max_segments,
+                            &block_listings(&state, plan.target().blocks()[index], index, rows)
+                                .unwrap(),
                         ) {
                             let (graph, block_constants) = checked_block_graph_draft(
                                 NativeGraphMetadata::new(backend),
@@ -1650,11 +1953,12 @@ mod resource_template_tests {
                                 rows,
                                 segments,
                                 slots,
+                                listed,
                             )
                             .unwrap();
                             fits(
                                 graph,
-                                &certificate.blocks[index][&RowForm::of(rows)],
+                                &certificate.blocks[index][&(RowForm::of(rows), listed > 0)],
                                 format!(
                                     "block {index} rows={rows} segments={segments} slots={slots}"
                                 ),

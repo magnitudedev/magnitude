@@ -1,8 +1,10 @@
 import type { Duplex } from "node:stream"
-import { makeChildOutput, type ChildOutputMode } from "./child-output"
+import { makeChildOutput, openChildLog, type ChildOutputMode } from "./child-output"
 import { DesktopChildEvent, DesktopOwnerCommand } from "@magnitudedev/acn-protocol/desktop-control"
 import { receiveJsonLines, sendJsonLine, type JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channel"
 import { spawn, type ChildProcess } from "node:child_process"
+import { basename } from "node:path"
+import type { FileSystem, Path } from "@effect/platform"
 import {
   ProcessGroupController,
   type ExactProcess,
@@ -42,6 +44,7 @@ export interface OwnedChild {
 }
 export interface OwnedChildCommand {
   readonly output: ChildOutputMode
+  readonly logFile: Option.Option<string>
   readonly executable: string
   readonly arguments: ReadonlyArray<string>
   readonly environment: Readonly<Record<string, string | undefined>>
@@ -58,13 +61,15 @@ export const OwnedChildSpawner = Context.GenericTag<OwnedChildSpawner>("@magnitu
 /** Native Windows spawning is supplied separately: ordinary spawn cannot atomically join a job. */
 export const makeUnixOwnedChildSpawner = Effect.gen(function* () {
   const groups = yield* ProcessGroupController
+  const files = yield* Effect.context<FileSystem.FileSystem | Path.Path>()
   return OwnedChildSpawner.of({
     spawn: command => Effect.gen(function* () {
       if (process.platform === "win32") return yield* new OwnedChildPlatformUnsupported({ platform: process.platform })
-      const output = yield* makeChildOutput(command.output)
+      const output = yield* makeChildOutput(command.output, yield* openChildLog(command.logFile).pipe(Effect.provide(files)))
       const exited = yield* Deferred.make<number>()
       const runtime = yield* Effect.runtime<never>()
-      const publishExit = (code: number) => Runtime.runSync(runtime)(Deferred.succeed(exited, code))
+      const publishExit = (code: number) => Runtime.runSync(runtime)(
+        output.record(`${basename(command.executable)} exited with code ${code}`).pipe(Effect.zipRight(Deferred.succeed(exited, code))))
       const append = (chunk: Buffer) => Runtime.runSync(runtime)(output.append(chunk))
       // Own the raw handle before any interruptible identity observation.
       const child = yield* Effect.acquireRelease(
@@ -93,6 +98,7 @@ export const makeUnixOwnedChildSpawner = Effect.gen(function* () {
         }),
       )
       const pid = child.pid!
+      yield* output.record(`${basename(command.executable)} started (pid ${pid})`)
       const observed = yield* groups.inspect(pid)
       if (Option.isNone(observed)) return yield* new OwnedChildIdentityLost({ pid })
       const identity = observed.value

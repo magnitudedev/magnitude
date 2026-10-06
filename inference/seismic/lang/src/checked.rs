@@ -664,10 +664,43 @@ pub struct NativeImplementation {
     /// The `where` condition restricting admissible parameter
     /// configurations. It reads only static dimensions and parameters.
     pub constraint: Option<NativeCondition>,
+    /// The error classes of the configurations that change numerics beyond
+    /// summation order. A configuration in no class agrees with the default
+    /// within the caller's tolerances; the default itself is in none.
+    pub error_classes: Vec<NativeErrorClass>,
     /// Call-private scratch buffers, in ABI order.
     pub scratch: Vec<NativeScratch>,
     /// Ordered dispatches of one call. Never empty.
     pub launches: Vec<NativeLaunch>,
+    /// The launches a call dispatches more than once.
+    pub repeat: Option<NativeRepeat>,
+}
+
+/// Consecutive launches a call dispatches in order `count` times, each round
+/// with the call's one set of arguments: a kernel learns its round from
+/// scratch the launches themselves advance. A count of zero dispatches none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRepeat {
+    /// Ordinal of the block's first launch.
+    pub first: usize,
+    /// Number of launches in the block.
+    pub launches: usize,
+    /// Reads entry dimensions and entry parameters.
+    pub count: NativeNatExpr,
+}
+
+impl NativeImplementation {
+    /// The launch ordinals of one call in dispatch order when its repeat
+    /// block runs `rounds` times.
+    pub fn dispatch_order(&self, rounds: u64) -> impl Iterator<Item = usize> + '_ {
+        let (first, end) = self
+            .repeat
+            .as_ref()
+            .map_or((0, 0), |repeat| (repeat.first, repeat.first + repeat.launches));
+        (0..first)
+            .chain((0..rounds).flat_map(move |_| first..end))
+            .chain(end..self.launches.len())
+    }
 }
 
 /// The dense element types a build-time compiled native form binds one
@@ -797,11 +830,55 @@ pub enum NativeCondition {
     Or(Box<Self>, Box<Self>),
 }
 
+impl NativeCondition {
+    /// The condition that holds exactly where this one does not.
+    pub fn negated(&self) -> Self {
+        match self {
+            Self::Compare {
+                comparison,
+                left,
+                right,
+            } => Self::Compare {
+                comparison: match comparison {
+                    NativeComparison::Lt => NativeComparison::Ge,
+                    NativeComparison::Le => NativeComparison::Gt,
+                    NativeComparison::Gt => NativeComparison::Le,
+                    NativeComparison::Ge => NativeComparison::Lt,
+                    NativeComparison::Eq => NativeComparison::Ne,
+                    NativeComparison::Ne => NativeComparison::Eq,
+                },
+                left: left.clone(),
+                right: right.clone(),
+            },
+            Self::And(left, right) => {
+                Self::Or(Box::new(left.negated()), Box::new(right.negated()))
+            }
+            Self::Or(left, right) => Self::And(Box::new(left.negated()), Box::new(right.negated())),
+        }
+    }
+}
+
+/// One error class of a native implementation: the configurations whose
+/// static dimensions and entry parameters satisfy `when` differ from the
+/// default by an error of this class (reduced-precision operands, a result
+/// row that depends on its launch's other rows). Tuning forms such a
+/// configuration only when the caller admits the class, and validates it
+/// under the class's envelope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeErrorClass {
+    pub name: String,
+    pub when: NativeCondition,
+}
+
 /// Call-private device memory of one native call.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeScratch {
     pub name: String,
     pub bytes: NativeNatExpr,
+    /// Arrival counters, placed apart from every other buffer: zero when a
+    /// launch starts, restored to zero by the call's kernels before it ends
+    /// (so one zeroed region serves every call and graph that uses it).
+    pub sync: bool,
     /// The buffer is sized by `bytes` only when this holds; otherwise it
     /// keeps its ABI slot at the minimum charge and `bytes` is not
     /// evaluated. `None` is always active.
@@ -947,9 +1024,55 @@ impl NativeNatExpr {
             }
         }
     }
+
+    /// Every integer literal the expression contains.
+    pub fn constants(&self, out: &mut std::collections::BTreeSet<u64>) {
+        match self {
+            Self::Constant(value) => {
+                out.insert(*value);
+            }
+            Self::Dimension(_) | Self::Parameter(_) => {}
+            Self::Add(left, right)
+            | Self::Sub(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Rem(left, right)
+            | Self::CeilDiv(left, right)
+            | Self::Min(left, right)
+            | Self::Max(left, right) => {
+                left.constants(out);
+                right.constants(out);
+            }
+        }
+    }
 }
 
 impl NativeCondition {
+    /// The top-level `and` operands, in order.
+    pub fn conjuncts<'c>(&'c self, out: &mut Vec<&'c Self>) {
+        match self {
+            Self::And(left, right) => {
+                left.conjuncts(out);
+                right.conjuncts(out);
+            }
+            Self::Compare { .. } | Self::Or(..) => out.push(self),
+        }
+    }
+
+    /// Every integer literal the condition contains.
+    pub fn constants(&self, out: &mut std::collections::BTreeSet<u64>) {
+        match self {
+            Self::Compare { left, right, .. } => {
+                left.constants(out);
+                right.constants(out);
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.constants(out);
+                right.constants(out);
+            }
+        }
+    }
+
     /// Evaluate with `dimension` and `parameter` supplying named values.
     /// `and` and `or` evaluate their right side only when the left side
     /// does not decide the result.
@@ -1384,6 +1507,33 @@ impl NativeImplementation {
         Ok(())
     }
 
+    /// The group size of launch `launch` under `specialization`, when every
+    /// axis reads only static dimensions and parameters (none when one reads
+    /// a call-time dimension).
+    pub fn static_group_size(
+        &self,
+        specialization: &NativeSpecialization,
+        launch: usize,
+    ) -> Option<[u64; 3]> {
+        let declaration = &self.launches[launch];
+        let mut size = [0u64; 3];
+        for (axis, extent) in declaration.group_extent.iter().enumerate() {
+            let mut dimensions = Vec::new();
+            extent.dimensions(&mut dimensions);
+            if dimensions.iter().any(|name| !self.statics.contains(name)) {
+                return None;
+            }
+            size[axis] = extent
+                .evaluate(&|name| specialization.static_value(name), &|name| {
+                    specialization
+                        .launch_param(launch, name)
+                        .or_else(|| specialization.param(name))
+                })
+                .ok()?;
+        }
+        Some(size)
+    }
+
     /// Every admissible specialization for the given static values: the
     /// cartesian product of the parameter domains in declaration order,
     /// filtered by the `where` condition.
@@ -1413,6 +1563,124 @@ impl NativeImplementation {
             false
         })?;
         first.ok_or(NativeSpecializationError::Inadmissible)
+    }
+
+    /// The error classes of `specialization` (its static and entry parameter
+    /// values), in declaration order. None for a configuration that changes
+    /// no numerics beyond summation order.
+    pub fn error_classes_of(
+        &self,
+        specialization: &NativeSpecialization,
+    ) -> Result<Vec<&str>, NativeSpecializationError> {
+        let dimension = |name: &str| specialization.static_value(name);
+        let parameter = |name: &str| specialization.param(name);
+        let mut classes = Vec::new();
+        for class in &self.error_classes {
+            if class
+                .when
+                .holds(&dimension, &parameter)
+                .map_err(NativeSpecializationError::Evaluation)?
+            {
+                classes.push(class.name.as_str());
+            }
+        }
+        Ok(classes)
+    }
+
+    /// This implementation restricted to the error classes `admitted`
+    /// accepts: the condition of every other class, negated, joins `where`,
+    /// so no configuration of such a class is admissible.
+    pub fn admitting(mut self, admitted: impl Fn(&str) -> bool) -> Self {
+        let excluded: Vec<NativeCondition> = self
+            .error_classes
+            .iter()
+            .filter(|class| !admitted(&class.name))
+            .map(|class| class.when.negated())
+            .collect();
+        for condition in excluded {
+            self.constraint = Some(match self.constraint.take() {
+                Some(constraint) => {
+                    NativeCondition::And(Box::new(constraint), Box::new(condition))
+                }
+                None => condition,
+            });
+        }
+        self
+    }
+
+    /// The values a static search tries, most preferred first: powers of two
+    /// up to 4096, then the `where` condition's other literals above one,
+    /// then one and zero.
+    pub fn static_candidates(&self) -> Vec<u64> {
+        let mut literals = std::collections::BTreeSet::new();
+        if let Some(constraint) = &self.constraint {
+            constraint.constants(&mut literals);
+        }
+        let powers = (1..=12).map(|exponent| 1u64 << exponent);
+        let mut candidates: Vec<u64> = powers.clone().collect();
+        candidates.extend(
+            literals
+                .into_iter()
+                .filter(|value| *value > 1 && !powers.clone().any(|power| power == *value)),
+        );
+        candidates.extend([1, 0]);
+        candidates
+    }
+
+    /// The first static values, in [`Self::static_candidates`] order, at
+    /// which every specialization walk succeeds and admits at least one
+    /// configuration, with `fixed` holding the statics it names. A
+    /// depth-first search over the statics in declaration order: every
+    /// top-level conjunct of `where` that reads only assigned statics prunes
+    /// a partial assignment. `None` when no assignment over the candidates is
+    /// admitted.
+    pub fn search_statics(&self, fixed: &[(&str, u64)]) -> Option<NativeSpecialization> {
+        let mut conjuncts = Vec::new();
+        if let Some(constraint) = &self.constraint {
+            constraint.conjuncts(&mut conjuncts);
+        }
+        let candidates = self.static_candidates();
+        let mut assigned = std::collections::BTreeMap::new();
+        self.search_from(0, fixed, &conjuncts, &candidates, &mut assigned)
+    }
+
+    fn search_from(
+        &self,
+        depth: usize,
+        fixed: &[(&str, u64)],
+        conjuncts: &[&NativeCondition],
+        candidates: &[u64],
+        assigned: &mut std::collections::BTreeMap<String, u64>,
+    ) -> Option<NativeSpecialization> {
+        let Some(name) = self.statics.get(depth) else {
+            let statics = assigned
+                .iter()
+                .fold(NativeSpecialization::new(), |statics, (name, value)| {
+                    statics.with_static(name.clone(), *value)
+                });
+            return match self.admissible(&statics) {
+                Ok(admissible) if !admissible.is_empty() => Some(statics),
+                Ok(_) | Err(_) => None,
+            };
+        };
+        let values = match fixed.iter().find(|(candidate, _)| *candidate == name) {
+            Some((_, value)) => vec![*value],
+            None => candidates.to_vec(),
+        };
+        for value in values {
+            assigned.insert(name.clone(), value);
+            let dimension = |dimension: &str| assigned.get(dimension).copied();
+            let refuted = conjuncts
+                .iter()
+                .any(|conjunct| matches!(conjunct.holds(&dimension, &|_| None), Ok(false)));
+            if !refuted {
+                if let Some(found) = self.search_from(depth + 1, fixed, conjuncts, candidates, assigned) {
+                    return Some(found);
+                }
+            }
+        }
+        assigned.remove(name);
+        None
     }
 
     /// Visit the admissible specializations at `statics` in declaration
@@ -1626,11 +1894,89 @@ mod native_tests {
     use super::*;
 
     #[test]
+    fn a_repeat_block_dispatches_in_order_and_only_on_metal() {
+        let check = |target: &str| {
+            let launch = |name: &str, indent: &str| {
+                format!("{indent}launch {name}:\n{indent}    threadgroups (1, 1, 1)\n{indent}    threads_per_threadgroup (1, 1, 1)\n")
+            };
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text: format!(
+                    "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for {target} from \"scale.{target}\":\n{}    repeat (ceil_div(N, 4)):\n{}{}{}",
+                    launch("prepare", "    "),
+                    launch("decode", "        "),
+                    launch("attend", "        "),
+                    launch("merge", "    "),
+                ),
+            }]))
+        };
+        let module = check("metal").unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        assert_eq!(native.dispatch_order(2).collect::<Vec<_>>(), [0, 1, 2, 1, 2, 3]);
+        assert_eq!(native.dispatch_order(0).collect::<Vec<_>>(), [0, 3]);
+        let refused = format!("{:?}", check("cuda").err().unwrap());
+        assert!(refused.contains("`repeat` is not implemented for cuda"), "{refused}");
+    }
+
+    /// Terms are names for expressions: a declaration that names them checks
+    /// to the implementation of the one that writes them out, wherever a
+    /// native expression or condition may stand.
+    #[test]
+    fn named_terms_check_to_the_declaration_that_writes_them_out() {
+        let check = |body: &str| {
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text: format!(
+                    "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    static (N)\n    params (PARTS in [1, 2, 4])\n{body}"
+                ),
+            }]))
+            .map_err(|error| format!("{error:?}"))?;
+            Ok::<_, String>(
+                module
+                    .native_implementation(module.entries()[0].id, BackendName::Metal)
+                    .unwrap()
+                    .clone(),
+            )
+        };
+        let named = check(
+            "    let MOST = ceil_div(64, N)\n    let SPARE = (MOST - PARTS) * N - 1\n    let ROUNDS = max(1, ceil_div(N, SPARE))\n    where PARTS <= MOST\n    error_class coarse when SPARE < 8\n    scratch window bytes (SPARE * 4) when ROUNDS > 1\n    launch prepare when ROUNDS > 1:\n        threadgroups (MOST, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n        shared_bytes (SPARE)\n    repeat (ROUNDS):\n        launch attend:\n            threadgroups (ceil_div(N, 32), PARTS, 1)\n            threads_per_threadgroup (min(SPARE, 32), 1, 1)\n",
+        )
+        .unwrap();
+        let written = check(
+            "    where PARTS <= ceil_div(64, N)\n    error_class coarse when (ceil_div(64, N) - PARTS) * N - 1 < 8\n    scratch window bytes (((ceil_div(64, N) - PARTS) * N - 1) * 4) when max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1)) > 1\n    launch prepare when max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1)) > 1:\n        threadgroups (ceil_div(64, N), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n        shared_bytes ((ceil_div(64, N) - PARTS) * N - 1)\n    repeat (max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1))):\n        launch attend:\n            threadgroups (ceil_div(N, 32), PARTS, 1)\n            threads_per_threadgroup (min((ceil_div(64, N) - PARTS) * N - 1, 32), 1, 1)\n",
+        )
+        .unwrap();
+        // Each source is its own module; everything else is equal.
+        assert_eq!(
+            named,
+            NativeImplementation {
+                entry: named.entry,
+                ..written
+            }
+        );
+
+        let launch = "    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        for (terms, message) in [
+            ("    let N = 4\n", "term `N` is already a dimension, a parameter or a term"),
+            ("    let PARTS = 4\n", "term `PARTS` is already"),
+            ("    let A = 1\n    let A = 2\n", "term `A` is already"),
+            ("    let A = B + 1\n    let B = 2\n", "references `B`"),
+            ("    let A = ROWS\n", "references `ROWS`"),
+        ] {
+            let refused = check(&format!("{terms}{launch}")).unwrap_err();
+            assert!(refused.contains(message), "{terms}: {refused}");
+        }
+    }
+
+    #[test]
     fn scratch_maximum_evaluates_guards_and_charges_exactly() {
         let rows = || NativeNatExpr::Dimension("M".into());
         let scratch = NativeScratch {
             name: "groups".into(),
             bytes: NativeNatExpr::Mul(Box::new(rows()), Box::new(NativeNatExpr::Constant(4))),
+            sync: false,
             when: Some(NativeCondition::And(
                 Box::new(NativeCondition::Compare {
                     comparison: NativeComparison::Gt,
@@ -1657,6 +2003,7 @@ mod native_tests {
                 Box::new(rows()),
                 Box::new(NativeNatExpr::Constant(u64::MAX)),
             ),
+            sync: false,
             when: None,
         };
         assert_eq!(
@@ -1794,6 +2141,68 @@ mod native_tests {
             native.validate(&default.clone().with_launch_param(1, "ROWS", 2)),
             Err(NativeSpecializationError::OutsideLaunchDomain { launch: 1, .. })
         ));
+    }
+
+    #[test]
+    fn error_classes_follow_their_conditions() {
+        let declaration = |classes: &str| {
+            format!(
+                "native scale for metal from \"scale.metal\":\n    static (N)\n    params (arithmetic form DEPTH in [0, 1, 2], code PACKED in [0, 1])\n{classes}    launch scale:\n        params (ROWS in [1, 2])\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n"
+            )
+        };
+        let module = check_source(source(&declaration(
+            "    error_class row_mixing when DEPTH >= 1\n    error_class int8_activations when PACKED == 1 and N >= 64\n",
+        )))
+        .expect("error classes check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let classes = |n, depth, packed| {
+            native
+                .error_classes_of(
+                    &NativeSpecialization::new()
+                        .with_static("N", n)
+                        .with_param("DEPTH", depth)
+                        .with_param("PACKED", packed),
+                )
+                .unwrap()
+        };
+        assert!(classes(64, 0, 0).is_empty());
+        assert_eq!(classes(64, 2, 0), ["row_mixing"]);
+        assert_eq!(classes(64, 1, 1), ["row_mixing", "int8_activations"]);
+        assert!(classes(32, 0, 1).is_empty());
+
+        // Only admitted classes' configurations stay admissible.
+        let statics = NativeSpecialization::new().with_static("N", 64);
+        let count = |admitted: &[&str]| {
+            native
+                .clone()
+                .admitting(|name| admitted.contains(&name))
+                .admissible(&statics)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(count(&["row_mixing", "int8_activations"]), 12);
+        assert_eq!(count(&["row_mixing"]), 6);
+        assert_eq!(count(&["int8_activations"]), 4);
+        assert_eq!(count(&[]), 2);
+
+        for (classes, message) in [
+            (
+                "    error_class row_mixing when DEPTH >= 1\n    error_class row_mixing when PACKED == 1\n",
+                "declared twice",
+            ),
+            (
+                "    error_class row_mixing when ROWS == 2\n",
+                "references `ROWS`",
+            ),
+        ] {
+            let error = check_source(source(&declaration(classes))).expect_err(message);
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        let dynamic = "native scale for metal from \"scale.metal\":\n    params (code PACKED in [0, 1])\n    error_class int8_activations when PACKED == 1 and N >= 64\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n";
+        let error = check_source(source(dynamic)).expect_err("a dynamic dimension is unknown");
+        assert!(error.to_string().contains("which is not static"), "{error}");
     }
 
     #[test]

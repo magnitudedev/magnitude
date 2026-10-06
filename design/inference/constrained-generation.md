@@ -38,7 +38,10 @@ by this layer.
   exactly is scanned one character at a time. That applies to that part only,
   never to the whole grammar.
 - **Template grammars are fully lexical.** Grammars produced by the templates
-  compile with no character-level parts.
+  compile with no character-level parts. Where a template's parallel-call
+  grammar does not, but its single-call grammar does, the request is prepared
+  for one tool call per turn; a grammar that still has character-level parts
+  is a compiler defect.
 - **Observable.** Every compilation reports its size, lexical shape and every
   degradation; the host records the report.
 

@@ -6,7 +6,7 @@
 
 void draft_convolve_residual() {
     const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL);
-    const uint64_t output = SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT);
+    const uint64_t sublayer = SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT);
     const uint64_t dynamic = SEISMIC_PTR(SEISMIC_BUFFER_DYNAMIC);
     const uint64_t base = SEISMIC_PTR(SEISMIC_BUFFER_BASE);
     const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
@@ -24,7 +24,7 @@ void draft_convolve_residual() {
                 + element_f32_at(dynamic + (row * SEISMIC_DYNAMIC_STRIDE_0 + SEISMIC_DYNAMIC_STRIDE_1
                     + offset * SEISMIC_DYNAMIC_STRIDE_2 + group * SEISMIC_DYNAMIC_STRIDE_3) * 4ul);
             sum = seismic_fma_rn(coefficient,
-                element_f32_at(output + ((row - offset) * SEISMIC_OUTPUT_STRIDE_0 + column * SEISMIC_OUTPUT_STRIDE_1) * 4ul),
+                element_f32_at(sublayer + ((row - offset) * SEISMIC_OUTPUT_STRIDE_0 + column * SEISMIC_OUTPUT_STRIDE_1) * 4ul),
                 sum);
         }
         element_f32_put(result + (row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1) * 4ul,

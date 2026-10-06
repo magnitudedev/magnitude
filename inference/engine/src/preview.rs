@@ -71,6 +71,9 @@ impl ExecutionManifest {
             policy.limits(),
             ResourceCapacity {
                 domain_bytes: selected.assessment_capacity_bytes,
+                tensor_operations: magnitude_executor::TensorOperations::of(
+                    selected.tensor_operations,
+                ),
             },
         )
         .map_err(|error| internal(error.to_string()))?;
@@ -84,9 +87,10 @@ impl ExecutionManifest {
             backend,
         )
         .map_err(|error| PreviewError::from(classify_graph(error)))?;
-        let bounds = AssessmentHeaderBounds::derive(definition, draft.load(), policy.codec())
-            .and_then(|header| header.with_graph_resource_bound(&graph))
-            .map_err(internal)?;
+        let bounds =
+            AssessmentHeaderBounds::derive(definition, draft.load(), policy.codec(), backend)
+                .and_then(|header| header.with_graph_resource_bound(&graph))
+                .map_err(internal)?;
         let initial_state = state
             .target_state()
             .initial_committed_bytes()

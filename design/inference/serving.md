@@ -81,13 +81,19 @@ Prompt caching allowed retains exact prompt prefixes; disallowed requests are
 transient.
 
 Stream parsing emits semantic text, reasoning and complete validated tool calls
-in one ordered stream that non-streaming responses also assemble from. Each
+in one ordered stream that non-streaming responses also assemble from. An empty
+generation is an empty assistant turn in each protocol's native shape, and an
+empty assistant turn in history (that output replayed, or a client's record of
+a step that failed before any output) contributes nothing to the prompt. Each
 tool call's ID is unique across responses, since clients key calls and results
 by ID over a whole conversation: the ID the model wrote when its format carries
 one (templates render it back), otherwise a fresh random one. A
 caller stop sequence ends output with a stop-sequence termination; tool calls
 terminate as tool calls; the output limit or context end is a length
-termination. Terminal usage and timings come from actual engine execution;
+termination. A request samples with the seed it names (every
+protocol accepts `seed`) or, when it names none, a fresh one, so retrying an
+identical request samples anew; a seed's draws are position-addressed, so
+batching and speculation never change them. Terminal usage and timings come from actual engine execution;
 progressive per-token timings are host-observed. Client disconnection cancels
 its request; one request's cancellation does not retire shared device work
 still used by peers.

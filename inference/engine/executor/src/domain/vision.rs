@@ -56,17 +56,33 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if slot.features.is_some() {
             return Err("image is already encoded".into());
         }
-        let patch_rows = image
-            .prepared_input()
-            .map_err(|error| error.to_string())?
-            .spatial()
-            .rows();
-        let batch = crate::batching::ValidatedVisionBatch::new(
-            image.prepared_input().map_err(|error| error.to_string())?,
-            patch_rows,
-        )
-        .map_err(|error| error.to_string())?;
+        let prepared = image.prepared_input().map_err(|error| error.to_string())?;
+        let class = self.image_class(prepared.spatial().rows())?;
+        let batch = crate::batching::ValidatedVisionBatch::new(prepared, class)
+            .map_err(|error| error.to_string())?;
         Ok((*request, image.clone(), batch))
+    }
+
+    /// The patch rows of the class an image of `patch_rows` encodes in: the
+    /// cell class covering its cells, within the load's image cell limit.
+    pub(super) fn image_class(&self, patch_rows: usize) -> Result<usize, String> {
+        let cell = self
+            .definition
+            .vision
+            .as_ref()
+            .ok_or("vision definition is absent")?
+            .cell_rows();
+        let cell = usize::try_from(cell).map_err(|_| "vision merge area exceeds host domain")?;
+        let limit = self.execution.policy().limits().max_image_cells;
+        if cell == 0 || !patch_rows.is_multiple_of(cell) || patch_rows / cell > limit {
+            return Err(format!(
+                "image encodes {patch_rows} vision patch rows but the load prepares at most {}",
+                limit.saturating_mul(cell)
+            ));
+        }
+        let cells = magnitude_batching::image_cell_class(patch_rows / cell)
+            .ok_or("image encodes no vision cells")?;
+        Ok(cells * cell)
     }
 
     /// Complete an encode and return the bindings its flight held. An error

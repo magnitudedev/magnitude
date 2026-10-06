@@ -42,6 +42,7 @@ struct Options {
     method: ModelMethod,
     mtp_proposals: Option<u8>,
     kv_codec: KvCodec,
+    error_classes: Vec<String>,
     lookahead: bool,
     telemetry_endpoint: String,
     device: DeviceRequest,
@@ -51,7 +52,7 @@ struct Options {
 const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
 [--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
 [--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2] [--mtp-proposals N] \
-[--kv-codec dense|affine-k8v4] [--lookahead on|off] [--telemetry URL] \
+[--kv-codec dense|affine-k8v4] [--admit-error-class CLASS]... [--lookahead on|off] [--telemetry URL] \
 [--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR]";
 
 /// `on` or `off`.
@@ -94,6 +95,7 @@ fn parse() -> Result<Options, String> {
     let mut method = ModelMethod::Auto;
     let mut mtp_proposals = None;
     let mut kv_codec = defaults.kv_codec;
+    let mut error_classes = defaults.error_classes;
     let mut lookahead = defaults.lookahead;
     let mut telemetry_endpoint = DEFAULT_TRACES_ENDPOINT.to_owned();
     let mut device = DeviceRequest::Automatic;
@@ -126,6 +128,7 @@ fn parse() -> Result<Options, String> {
             }
             "--mtp-proposals" => mtp_proposals = Some(number(&flag, &mut args)?),
             "--kv-codec" => kv_codec = value(&flag, &mut args)?.parse()?,
+            "--admit-error-class" => error_classes.push(value(&flag, &mut args)?),
             "--lookahead" => lookahead = switch(&flag, &value(&flag, &mut args)?)?,
             "--telemetry" => telemetry_endpoint = value(&flag, &mut args)?,
             "--device" => {
@@ -165,6 +168,7 @@ fn parse() -> Result<Options, String> {
         method,
         mtp_proposals,
         kv_codec,
+        error_classes,
         lookahead,
         telemetry_endpoint,
         device,
@@ -246,6 +250,7 @@ async fn memory(State(identity): State<Identity>) -> Response {
 }
 
 fn main() {
+    magnitude_executor::platform::relax_gpu_watchdog();
     if let Err(error) = run() {
         eprintln!("magnitude-engine: {error}");
         std::process::exit(1);
@@ -278,6 +283,7 @@ fn run() -> Result<(), String> {
             kv_codec: options.kv_codec,
             lookahead: options.lookahead,
             exported_logits_rows: 0,
+            error_classes: options.error_classes,
         },
         context_tokens: options.context_tokens,
         service,

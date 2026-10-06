@@ -106,6 +106,7 @@ pub(crate) fn prepare(
     };
     let capacity = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes,
+        tensor_operations: magnitude_executor::TensorOperations::of(selected.tensor_operations),
     };
     // The same derivation metadata-only assessment and preview plan through.
     let draft =
@@ -136,6 +137,8 @@ pub(crate) fn prepare(
     .map_err(platform_error)?;
     report_load_phase("device open", &mut phase_started);
     let preparing = Instant::now();
+    let error_classes = magnitude_executor::AdmittedErrorClasses::of(&manifest.model.error_classes)
+        .map_err(internal)?;
     let programs = AttestedPrograms::prepare_draft(
         &draft,
         opened.device(),
@@ -144,6 +147,7 @@ pub(crate) fn prepare(
             weights: package,
             observer: &TuningReport { progress },
             cache: kernel_cache.as_deref(),
+            error_classes: &error_classes,
         },
     )
     .map_err(|error| LoadError::from(classify_catalog(error)))?;
@@ -248,6 +252,7 @@ pub(crate) fn build(
         )
         .map_err(internal)?;
     let resources = ResourcePlanner::plan_with_state(
+        opened.device().backend(),
         state,
         &target_graphs,
         &target_readout_graphs,

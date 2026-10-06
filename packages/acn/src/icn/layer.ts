@@ -154,6 +154,7 @@ const makeProcess = (dataDir: string, modelStore: string) =>
       gracefulShutdownTimeout: Duration.millis(500),
       forceShutdownTimeout: Duration.millis(500),
       outputLimitBytes: 256 * 1024,
+      logFile: Option.some(join(dataDir, "logs", "inference.log")),
     })
   ).pipe(Layer.provide(process.platform === "win32"
     ? WindowsIcnChildSpawner.pipe(Layer.provide(Layer.merge(

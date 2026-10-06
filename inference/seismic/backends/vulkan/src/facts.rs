@@ -19,6 +19,78 @@ const FLOOR_PUSH_CONSTANT_BYTES: u32 = 128;
 /// The width of the logical subgroup every kernel is written for (§6.3).
 pub const SUBGROUP_WIDTH: u32 = 32;
 
+/// The device facts formation reads (§7.2): what the generated prefix
+/// exposes to sources and what the seal pass declares. Two devices with
+/// equal formation facts form every source identically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FormationFacts {
+    /// Lanes of one hardware subgroup: 32, or 64 holding two logical
+    /// subgroups.
+    pub subgroup_lanes: u32,
+    pub float16: bool,
+    pub matrix: bool,
+    pub wide_accumulators: bool,
+    pub mixed_dot: bool,
+    pub f32_atomic_add: bool,
+    pub shared_int64_atomics: bool,
+    pub rounding_rte_32: bool,
+    pub denorm_preserve_32: bool,
+}
+
+impl FormationFacts {
+    /// Whether a device meeting the floor can have these facts: its subgroup
+    /// has 32 or 64 lanes, and cooperative matrix needs fp16 arithmetic and
+    /// 32-lane subgroups (see `describe`).
+    pub fn consistent(&self) -> bool {
+        matches!(self.subgroup_lanes, 32 | 64)
+            && (!self.matrix || (self.float16 && self.subgroup_lanes == SUBGROUP_WIDTH))
+    }
+
+    /// The environment the seal pass declares.
+    pub fn environment(&self) -> crate::seal::Environment {
+        crate::seal::Environment {
+            float16: self.float16,
+            rounding_rte_32: self.rounding_rte_32,
+            denorm_preserve_32: self.denorm_preserve_32,
+        }
+    }
+
+    /// The consistent facts that differ from these in exactly one field,
+    /// each field's other values in turn.
+    pub fn variations(&self) -> Vec<Self> {
+        let Self {
+            subgroup_lanes,
+            float16,
+            matrix,
+            wide_accumulators,
+            mixed_dot,
+            f32_atomic_add,
+            shared_int64_atomics,
+            rounding_rte_32,
+            denorm_preserve_32,
+        } = *self;
+        let other_lanes = if subgroup_lanes == SUBGROUP_WIDTH {
+            2 * SUBGROUP_WIDTH
+        } else {
+            SUBGROUP_WIDTH
+        };
+        [
+            Self { subgroup_lanes: other_lanes, ..*self },
+            Self { float16: !float16, ..*self },
+            Self { matrix: !matrix, ..*self },
+            Self { wide_accumulators: !wide_accumulators, ..*self },
+            Self { mixed_dot: !mixed_dot, ..*self },
+            Self { f32_atomic_add: !f32_atomic_add, ..*self },
+            Self { shared_int64_atomics: !shared_int64_atomics, ..*self },
+            Self { rounding_rte_32: !rounding_rte_32, ..*self },
+            Self { denorm_preserve_32: !denorm_preserve_32, ..*self },
+        ]
+        .into_iter()
+        .filter(Self::consistent)
+        .collect()
+    }
+}
+
 /// How a device runs the 32-lane logical subgroup (§6.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubgroupWidth {
@@ -233,11 +305,27 @@ impl Facts {
 
     /// The environment the seal pass declares for this device.
     pub fn environment(&self) -> crate::seal::Environment {
-        crate::seal::Environment {
+        self.formation().environment()
+    }
+
+    /// The facts formation reads.
+    pub fn formation(&self) -> FormationFacts {
+        let facts = FormationFacts {
+            subgroup_lanes: self.subgroup_width().lanes(),
             float16: self.float16,
+            matrix: self.matrix,
+            wide_accumulators: self.wide_accumulators,
+            mixed_dot: self.mixed_dot_accelerated,
+            f32_atomic_add: self.f32_atomic_add,
+            shared_int64_atomics: self.shared_int64_atomics,
             rounding_rte_32: self.rounding_rte_32,
             denorm_preserve_32: self.denorm_preserve_32,
-        }
+        };
+        assert!(
+            facts.consistent(),
+            "device description produced inconsistent formation facts: {facts:?}"
+        );
+        facts
     }
 
     /// Tuning identity (§7.5): vendor and device, name, driver ID and

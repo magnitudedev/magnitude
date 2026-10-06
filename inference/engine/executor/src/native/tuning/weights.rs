@@ -26,15 +26,14 @@ impl TuningWeightSource for Package {
             Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
         let bytes = crate::programs::native_import::stored_source_bytes(&stored)
             .map_err(|error| error.to_string())?;
-        let bytes =
-            crate::import_transforms::apply(&weight.descriptor, stored.shape(), weight.source, bytes)?;
-        if weight.upload == weight.source {
-            return Ok(bytes);
-        }
-        let encoding = stored
-            .packed_encoding()
-            .ok_or("a dequantized weight is stored dense")?;
-        crate::import_transforms::dequantize(encoding, weight.source, &weight.shape, &bytes)
+        crate::import_transforms::upload_bytes(
+            &weight.descriptor,
+            stored.shape(),
+            weight.source,
+            stored.packed_encoding(),
+            weight.upload,
+            bytes,
+        )
     }
 }
 
@@ -79,6 +78,18 @@ fn logical_count(shape: &[u64]) -> Result<u64, String> {
         .ok_or_else(|| "weight element count overflows".to_owned())
 }
 
+/// The load plan's weight of one role.
+pub(crate) fn weight_plan(
+    load: &ModelLoadPlan,
+    scope: WeightScope,
+    kind: WeightKind,
+) -> Result<&WeightPlan, String> {
+    let role = WeightRole { scope, kind };
+    load.weights()
+        .find(|weight| weight.role == role)
+        .ok_or_else(|| format!("weight {role:?} is absent from the load plan"))
+}
+
 pub(crate) struct TuningWeights<'a> {
     device: &'a Device,
     load: &'a ModelLoadPlan,
@@ -108,12 +119,12 @@ impl<'a> TuningWeights<'a> {
         self.resident.clear();
     }
 
-    fn plan(&self, scope: WeightScope, kind: WeightKind) -> Result<&'a WeightPlan, String> {
-        let role = WeightRole { scope, kind };
+    pub fn load(&self) -> &'a ModelLoadPlan {
         self.load
-            .weights()
-            .find(|weight| weight.role == role)
-            .ok_or_else(|| format!("weight {role:?} is absent from the load plan"))
+    }
+
+    fn plan(&self, scope: WeightScope, kind: WeightKind) -> Result<&'a WeightPlan, String> {
+        weight_plan(self.load, scope, kind)
     }
 
     /// Whether the weight of one role is already imported.
@@ -126,14 +137,6 @@ impl<'a> TuningWeights<'a> {
         Ok(self.plan(scope, kind)?.resident_bytes)
     }
 
-    pub fn shape(&self, scope: WeightScope, kind: WeightKind) -> Result<Vec<u64>, String> {
-        Ok(self.plan(scope, kind)?.shape.clone())
-    }
-
-    /// The planned extent of one weight role's accumulator-scale port.
-    pub fn scale_extent(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
-        Ok(self.plan(scope, kind)?.scale_extent())
-    }
 
     pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
         let role = WeightRole { scope, kind };
@@ -142,6 +145,12 @@ impl<'a> TuningWeights<'a> {
         }
         let plan = self.plan(scope, kind)?;
         let bytes = self.source.source_bytes(plan)?;
+        if plan.placed_on_host() {
+            let tensor = Tensor::from_host(self.device, plan.resident, &plan.shape, &bytes)
+                .map_err(|error| error.to_string())?;
+            self.resident.insert(role, tensor.clone());
+            return Ok(tensor);
+        }
         let logical = logical_count(&plan.shape)?;
         let source = Tensor::from_host(self.device, plan.upload, &[logical], &bytes)
             .map_err(|error| error.to_string())?;

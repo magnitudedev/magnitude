@@ -4,7 +4,7 @@
 
 use super::{
     graph::readout::{
-        shapes, write_selection, BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind,
+        certifies, shapes, write_selection, BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind,
     },
     native_target_graph::{BoundTargetGraphs, EntryTokens},
     DeviceSubmission, TargetProgram,
@@ -283,6 +283,8 @@ impl NativeTargetProgram {
         // Projected outputs, the selected ones first and in selection order:
         // shaping and sampling read the leading selected logits rows.
         let mut projected_output_rows = Vec::new();
+        // Whether a selected row also reads its logits on the host.
+        let mut selection_reads_logits = false;
         for &output_index in batch.select_rows {
             projected_output_rows.push(
                 usize::try_from(output_index)
@@ -297,6 +299,7 @@ impl NativeTargetProgram {
                 .and_then(|bits| Demand::from_bits(*bits))
                 .ok_or_else(|| invalid("readout demand is absent or invalid"))?;
             let selected = projected_output_rows[..actual_selected].contains(&output_index);
+            selection_reads_logits |= selected && demand.contains(Demand::LOGITS);
             if demand.computes_logits() && !selected {
                 projected_output_rows.push(output_index);
             } else if selected && !demand.computes_logits() {
@@ -316,9 +319,17 @@ impl NativeTargetProgram {
             magnitude_batching::row_class(actual_projected)
                 .ok_or_else(|| invalid("readout projected rows have no class"))?
         };
+        // A selection the certified readout serves: every selected row
+        // samples or takes its largest admitted logit at a temperature at
+        // most, none reads its logits, and nothing else projects.
+        let certified = actual_projected == actual_selected
+            && projected_class as u64 <= self.readout_graphs.prepared.certified_rows()
+            && !selection_reads_logits
+            && batch.shaping[..actual_selected].iter().all(certifies);
         let kind = if actual_selected > 0 {
             ReadoutKind::Selection {
                 shaped: batch.shaping[..actual_selected].iter().any(shapes),
+                certified,
             }
         } else if actual_projected > 0 {
             ReadoutKind::Logits
@@ -722,9 +733,33 @@ impl NativeTargetProgram {
         }
         for index in 0..self.geometry.blocks.len() {
             let block_started = self.trace.blocks.then(Instant::now);
+            // A block with listing classes lists the history row tiles the
+            // launch's rows see in the smallest class that holds them; a
+            // launch that sees more than the largest (many requests with
+            // long histories) takes the class that lists none.
+            let listed_tiles = self
+                .graphs
+                .prepared
+                .listed_tiles(index, rows)
+                .iter()
+                .find_map(|&tiles| {
+                    let (read, _) = state.history(LayerRef::Target(index as u32)).ok()?;
+                    let visible = &controls.histories.get(read)?.visible;
+                    crate::operators::attention::graph::history_tile_bytes(
+                        visible,
+                        usize::try_from(tiles).ok()?,
+                    )
+                    .map(|bytes| (tiles, bytes))
+                });
             let (graph, bound) = self
                 .graphs
-                .block(rows, segments, slots, index)
+                .block(
+                    rows,
+                    segments,
+                    slots,
+                    listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),
+                    index,
+                )
                 .map_err(invalid)?;
             let parity = (index + 1) % 2;
             let mut active = graph_workspace
@@ -770,6 +805,7 @@ impl NativeTargetProgram {
                         visible,
                         fresh,
                         destinations,
+                        history_tiles,
                     },
                 ) => {
                     let (read, history) = state.history(LayerRef::Target(index as u32))?;
@@ -797,6 +833,17 @@ impl NativeTargetProgram {
                     active
                         .write_input(destinations, &history_controls.destinations)
                         .map_err(device)?;
+                    match (history_tiles, &listed_tiles) {
+                        (Some(tiles), Some((_, bytes))) => active
+                            .write_input(&tiles.port, bytes)
+                            .map_err(device)?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(invalid(
+                                "the block's graph class and its history tile list disagree",
+                            ))
+                        }
+                    }
                 }
                 (BlockStatePorts::Recurrent(ports), BlockControlPorts::Recurrent(recurrent)) => {
                     let arenas = state.recurrent_arenas()?;
@@ -858,7 +905,8 @@ impl NativeTargetProgram {
                     BlockStatePorts::Recurrent(_) => "recurrent",
                 };
                 eprintln!(
-                    "target block {index} {kind} {:.3}s",
+                    "target block {index} {kind} rows {rows} lists {} history tiles {:.3}s",
+                    listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),
                     started.elapsed().as_secs_f64()
                 );
             }

@@ -9,9 +9,7 @@ use std::{cell::RefCell, rc::Rc};
 
 /// One family's graph storage. Activations cover the launches of the family
 /// in flight at once; each holds its upload regions and binds the device's
-/// one workspace arena. They are fixed at startup, except for a family that
-/// starts with none (vision), which claims one when a launch first needs it
-/// and releases it at idle. Output slots outlive their
+/// one workspace arena. They are fixed at startup. Output slots outlive their
 /// launches (a request retains its last published features), so their count
 /// follows the live requests: the pool starts with what one request needs
 /// and grows one slot at a time under a heap claim, and slots idle beyond
@@ -19,13 +17,8 @@ use std::{cell::RefCell, rc::Rc};
 pub struct NativeGraphPool {
     domain: ResourceDomainId,
     family: NativeGraphFamily,
-    arena: NativeExecutionArena,
-    upload_regions: usize,
     /// Upload regions of one activation.
     activation_bytes: u64,
-    /// Startup activations. A family with none (vision) claims its
-    /// activation when a launch first needs it and releases it when idle.
-    minimum_activations: usize,
     /// Activations allocated now, lent or free.
     activations: usize,
     output_bytes: u64,
@@ -65,10 +58,7 @@ impl NativeGraphPool {
         Ok(Self {
             domain,
             family: family.clone(),
-            arena: arena.clone(),
-            upload_regions: charge.upload_regions,
             activation_bytes,
-            minimum_activations: charge.activations,
             activations: charge.activations,
             output_bytes: charge.output_bytes,
             minimum_outputs: charge.output_slots,
@@ -91,41 +81,6 @@ impl NativeGraphPool {
     /// The charge of one more output slot.
     pub fn output_slot_bytes(&self) -> u64 {
         self.output_bytes
-    }
-
-    /// Whether the family claims its activation on demand: it holds none
-    /// from startup, so a launch that finds none free grows one.
-    pub fn activates_on_demand(&self) -> bool {
-        self.minimum_activations == 0
-    }
-
-    /// The charge of one more activation: its upload regions. Its workspace
-    /// is the shared arena, already charged.
-    pub fn activation_slot_bytes(&self) -> u64 {
-        self.activation_bytes
-    }
-
-    /// Allocate one more activation in the arena. The caller holds a heap
-    /// claim for [`Self::activation_slot_bytes`] across this call.
-    pub(crate) fn grow_activation(&mut self) -> Result<(), seismic::WorkflowError> {
-        let slot = self.family.new_slot_in(&self.arena, self.upload_regions)?;
-        self.workspace.borrow_mut().push(slot);
-        self.activations += 1;
-        Ok(())
-    }
-
-    /// Release free activations beyond the startup count; returns how many
-    /// were released. A lent activation stays until its launch completes.
-    pub(crate) fn release_idle_activations(&mut self) -> usize {
-        let mut free = self.workspace.borrow_mut();
-        let releasable = self
-            .activations
-            .saturating_sub(self.minimum_activations)
-            .min(free.len());
-        let kept = free.len() - releasable;
-        free.truncate(kept);
-        self.activations -= releasable;
-        releasable
     }
 
     pub fn available_workspace(&self) -> usize {
@@ -184,6 +139,189 @@ impl NativeGraphPool {
             free: self.output.clone(),
         })
     }
+}
+
+/// Vision storage, one family per class: an encode's workspace and its
+/// image's output slot are of its image's class, so a small image never holds
+/// the largest class's storage. Vision holds nothing until an image arrives;
+/// an encode claims an activation and an output slot of its class under the
+/// heap, the image holds its slot until its features are released, and free
+/// slots are released when idle.
+pub struct VisionGraphPool {
+    domain: ResourceDomainId,
+    upload_regions: usize,
+    classes: Vec<VisionGraphClass>,
+}
+
+struct VisionGraphClass {
+    patch_rows: u64,
+    family: NativeGraphFamily,
+    activations: usize,
+    outputs: usize,
+    workspace: Rc<RefCell<Vec<NativeGraphFamilySlot>>>,
+    output: Rc<RefCell<Vec<NativeGraphFamilyOutputSlot>>>,
+}
+
+impl VisionGraphPool {
+    pub(crate) fn new<'a>(
+        domain: ResourceDomainId,
+        upload_regions: usize,
+        classes: impl IntoIterator<Item = (u64, &'a NativeGraphFamily)>,
+    ) -> Self {
+        Self {
+            domain,
+            upload_regions,
+            classes: classes
+                .into_iter()
+                .map(|(patch_rows, family)| VisionGraphClass {
+                    patch_rows,
+                    family: family.clone(),
+                    activations: 0,
+                    outputs: 0,
+                    workspace: Rc::new(RefCell::new(Vec::new())),
+                    output: Rc::new(RefCell::new(Vec::new())),
+                })
+                .collect(),
+        }
+    }
+
+    fn class(&self, patch_rows: u64) -> Result<&VisionGraphClass, CapacityError> {
+        self.classes
+            .iter()
+            .find(|class| class.patch_rows == patch_rows)
+            .ok_or(CapacityError {
+                resource: ResourceKind::Workspace,
+                required: 1,
+                available: 0,
+            })
+    }
+
+    fn class_mut(&mut self, patch_rows: u64) -> Result<&mut VisionGraphClass, CapacityError> {
+        self.classes
+            .iter_mut()
+            .find(|class| class.patch_rows == patch_rows)
+            .ok_or(CapacityError {
+                resource: ResourceKind::Workspace,
+                required: 1,
+                available: 0,
+            })
+    }
+
+    /// The charge of one activation of the class of `patch_rows`: its own
+    /// workspace and its upload regions.
+    pub fn activation_bytes(&self, patch_rows: u64) -> Result<u64, CapacityError> {
+        let family = &self.class(patch_rows)?.family;
+        Ok(family.workspace_bytes() + family.upload_bytes() * self.upload_regions as u64)
+    }
+
+    /// The charge of one output slot of the class of `patch_rows`.
+    pub fn output_bytes(&self, patch_rows: u64) -> Result<u64, CapacityError> {
+        Ok(self.class(patch_rows)?.family.output_bytes())
+    }
+
+    pub fn available_workspace(&self, patch_rows: u64) -> usize {
+        self.class(patch_rows)
+            .map_or(0, |class| class.workspace.borrow().len())
+    }
+
+    pub fn available_output(&self, patch_rows: u64) -> usize {
+        self.class(patch_rows)
+            .map_or(0, |class| class.output.borrow().len())
+    }
+
+    /// Allocate one more activation of the class of `patch_rows`. The caller
+    /// holds a heap claim for [`Self::activation_bytes`] across this call.
+    pub(crate) fn grow_activation(&mut self, patch_rows: u64) -> Result<(), VisionGrowth> {
+        let regions = self.upload_regions;
+        let class = self.class_mut(patch_rows).map_err(VisionGrowth::Class)?;
+        let slot = class
+            .family
+            .new_slot(regions)
+            .map_err(VisionGrowth::Device)?;
+        class.workspace.borrow_mut().push(slot);
+        class.activations += 1;
+        Ok(())
+    }
+
+    /// Allocate one more output slot of the class of `patch_rows`. The
+    /// caller holds a heap claim for [`Self::output_bytes`] across this call.
+    pub(crate) fn grow_output(&mut self, patch_rows: u64) -> Result<(), VisionGrowth> {
+        let class = self.class_mut(patch_rows).map_err(VisionGrowth::Class)?;
+        let slot = class
+            .family
+            .new_output_slot()
+            .map_err(VisionGrowth::Device)?;
+        class.output.borrow_mut().push(slot);
+        class.outputs += 1;
+        Ok(())
+    }
+
+    pub fn acquire_workspace(
+        &self,
+        patch_rows: u64,
+    ) -> Result<NativeGraphWorkspaceLease, CapacityError> {
+        let class = self.class(patch_rows)?;
+        let slot = class.workspace.borrow_mut().pop().ok_or(CapacityError {
+            resource: ResourceKind::Workspace,
+            required: 1,
+            available: 0,
+        })?;
+        Ok(NativeGraphWorkspaceLease {
+            domain: self.domain.clone(),
+            slot: Some(slot),
+            free: class.workspace.clone(),
+        })
+    }
+
+    pub fn acquire_output(&self, patch_rows: u64) -> Result<NativeGraphOutputLease, CapacityError> {
+        let class = self.class(patch_rows)?;
+        let slot = class.output.borrow_mut().pop().ok_or(CapacityError {
+            resource: ResourceKind::Output,
+            required: 1,
+            available: 0,
+        })?;
+        Ok(NativeGraphOutputLease {
+            domain: self.domain.clone(),
+            slot: Some(slot),
+            free: class.output.clone(),
+        })
+    }
+
+    /// Release every free activation and output slot; returns how many were
+    /// released. A lent activation stays until its encode completes, a lent
+    /// output slot until its image's features are released.
+    pub(crate) fn release_idle(&mut self) -> usize {
+        self.classes
+            .iter_mut()
+            .map(|class| {
+                let activations = class.workspace.borrow_mut().drain(..).count();
+                let outputs = class.output.borrow_mut().drain(..).count();
+                class.activations -= activations;
+                class.outputs -= outputs;
+                activations + outputs
+            })
+            .sum()
+    }
+
+    /// Storage allocated now, lent or free.
+    pub fn committed_bytes(&self) -> u64 {
+        self.classes
+            .iter()
+            .map(|class| {
+                let family = &class.family;
+                let activation =
+                    family.workspace_bytes() + family.upload_bytes() * self.upload_regions as u64;
+                activation * class.activations as u64 + family.output_bytes() * class.outputs as u64
+            })
+            .sum()
+    }
+}
+
+/// A failed vision slot growth: a class the load did not prepare, or the
+/// device's refusal.
+pub(crate) enum VisionGrowth {
+    Class(CapacityError),
+    Device(seismic::TensorError),
 }
 
 pub struct NativeGraphWorkspaceLease {

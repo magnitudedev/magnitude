@@ -3,7 +3,7 @@
 //! no tuning parameters.
 
 use super::cases::{projection_shape, scale_extent};
-use super::{row_points, EntryTuning, PointShape, TuningInputs, TuningLimits};
+use super::{row_points, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::project_rows;
 use seismic::{Element, Tensor};
@@ -54,7 +54,7 @@ impl EntryTuning for ProjectRowsTuning {
         )
     }
 
-    fn statics(&self, inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (outputs, inputs_width) = projection_shape(inputs, &self.scopes, self.kind)?;
         Ok(vec![
             ("K", inputs_width),

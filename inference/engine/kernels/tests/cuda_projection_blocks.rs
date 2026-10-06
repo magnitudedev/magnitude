@@ -1,15 +1,13 @@
 //! CUDA recurrent and attention projection entries
 //! (`kernels/{attention,recurrent}.seismic`) against host models over mma16
-//! weights; the gated recurrent-output host model is pinned to C's portable
-//! body by the reference interpreter. Tests return early without CUDA.
+//! weights. The recurrent output projection is `attention_output` over the
+//! gated rows the state entries publish. Tests return early without CUDA.
 
 mod cuda_common;
 
 use cuda_common::*;
-use magnitude_kernels::{
-    attention_output, attention_project, gated_delta_output, gated_delta_project,
-};
-use seismic::{Element, Layout, NativeSpecialization, Tensor};
+use magnitude_kernels::{attention_output, attention_project, gated_delta_project};
+use seismic::{Element, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
 
 const ROWS: [usize; 8] = [1, 3, 8, 12, 16, 17, 40, 128];
@@ -157,240 +155,6 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
                 );
             }
         }
-    }
-}
-
-/// C's gated prologue: round(round(v * inv * norm) * round(silu(z))).
-fn gated(mixed: &[f32], z: &[f32], norm: &[f32], m: usize, nv: usize, w: usize) -> Vec<f32> {
-    let mut out = vec![0.0; m * nv * w];
-    for row in 0..m {
-        for head in 0..nv {
-            let base = row * nv * w + head * w;
-            let squares = mixed[base..base + w]
-                .iter()
-                .fold(0.0f32, |acc, v| v.mul_add(*v, acc));
-            let inverse = 1.0 / (squares / w as f32 + EPSILON).sqrt();
-            for c in 0..w {
-                let normalized = bf16_round(mixed[base + c] * inverse * norm[c]);
-                let g = z[base + c];
-                let activated = bf16_round(g / (1.0 + (-g).exp()));
-                out[base + c] = bf16_round(normalized * activated);
-            }
-        }
-    }
-    out
-}
-
-struct RecurrentOutputCase {
-    m: usize,
-    h: usize,
-    nk: usize,
-    nv: usize,
-    w: usize,
-    hidden: Vec<f32>,
-    mixed: Vec<f32>,
-    projection: Vec<f32>,
-    norm: Vec<f32>,
-}
-
-impl RecurrentOutputCase {
-    fn new(m: usize, rng: &mut Rng) -> Self {
-        let (h, nk, nv, w) = (272usize, 2usize, 4usize, 128usize);
-        let width = (2 * nk + nv) * w + nv * w + 2 * nv;
-        Self {
-            m,
-            h,
-            nk,
-            nv,
-            w,
-            hidden: (0..m * h).map(|_| rng.uniform(-2.0, 2.0)).collect(),
-            mixed: (0..m * nv * w)
-                .map(|_| bf16_round(rng.uniform(-1.5, 1.5)))
-                .collect(),
-            projection: (0..m * width)
-                .map(|_| bf16_round(rng.uniform(-4.0, 4.0)))
-                .collect(),
-            norm: (0..w).map(|_| rng.uniform(0.5, 1.5)).collect(),
-        }
-    }
-    fn width(&self) -> usize {
-        (2 * self.nk + self.nv) * self.w + self.nv * self.w + 2 * self.nv
-    }
-    fn z(&self) -> Vec<f32> {
-        let offset = (2 * self.nk + self.nv) * self.w;
-        (0..self.m)
-            .flat_map(|row| {
-                self.projection
-                    [row * self.width() + offset..row * self.width() + offset + self.nv * self.w]
-                    .iter()
-                    .copied()
-            })
-            .collect()
-    }
-    fn expected(&self, weight: &Weight, mapping: Mapping) -> (Vec<f64>, Vec<f64>) {
-        let k = self.nv * self.w;
-        let (x, slack) = operand_rows(
-            &gated(&self.mixed, &self.z(), &self.norm, self.m, self.nv, self.w),
-            k,
-            mapping,
-        );
-        let (projected, magnitude) = project(&x, &weight.values, self.m, self.h, k);
-        let bound = slack_bound(&slack, &weight.values, self.m, self.h, k);
-        let dequant = dequant_bound(&x, &weight.values, self.m, self.h, k, mapping);
-        let expected = (0..self.m * self.h)
-            .map(|i| f64::from(self.hidden[i]) + projected[i])
-            .collect();
-        let tolerance = (0..self.m * self.h)
-            .map(|i| {
-                projected[i].abs() / 256.0 + magnitude[i] * 2.5e-4 + bound[i] + dequant[i] + 1e-6
-            })
-            .collect();
-        (expected, tolerance)
-    }
-}
-
-#[test]
-fn cuda_recurrent_output_matches_host_model() {
-    let Some(device) = cuda() else { return };
-    let mut rng = Rng(43);
-    for format in Format::ALL {
-        for m in ROWS {
-            let case = RecurrentOutputCase::new(m, &mut rng);
-            let output = weight(&device, format, case.h, case.nv * case.w, &mut rng);
-            let hidden = f32_tensor(&device, &[m as u64, case.h as u64], &case.hidden);
-            let mixed = bf16_tensor(
-                &device,
-                &[m as u64, case.nv as u64, case.w as u64],
-                &case.mixed,
-            );
-            let projection =
-                bf16_tensor(&device, &[m as u64, case.width() as u64], &case.projection);
-            let norm = f32_tensor(&device, &[case.w as u64], &case.norm);
-            for &mapping in mappings(m) {
-                let (expected, tolerance) = case.expected(&output, mapping);
-                let result = gated_delta_output::native_for_device_with(
-                    &device,
-                    gated_delta_output::Elements {
-                        A: Element::bf16(),
-                        RN: Element::f32(),
-                        OW: format.resident(),
-                    },
-                    &mapping.recurrent_params(statics_specialization(&[
-                        ("H", case.h),
-                        ("NK", case.nk),
-                        ("NV", case.nv),
-                        ("W", case.w),
-                    ])),
-                )
-                .unwrap()
-                .call(gated_delta_output::Args {
-                    hidden: &hidden,
-                    mixed: &mixed,
-                    projection: &projection,
-                    recurrent_norm: &norm,
-                    output_weight: &output.tensor,
-                    epsilon: EPSILON,
-                })
-                .unwrap()
-                .value;
-                check(
-                    &format!("recurrent output {format:?} M={m} {mapping:?}"),
-                    &read_f32(&result),
-                    &expected,
-                    &tolerance,
-                );
-            }
-        }
-    }
-}
-
-/// The gated host model is C's portable body: the reference interpreter over
-/// the same mma16 bytes agrees with it.
-#[test]
-fn recurrent_output_host_model_matches_portable_body() {
-    use seismic_lang::{
-        checked::{check_source, SourceFile},
-        entry::ElementBindings,
-        failure::SourceTermination,
-        interp::{Arg, Interpreter, OutcomeValue, TensorData},
-        reference_math::ReferenceScalar,
-        registry,
-        types::DType,
-    };
-    let Some(device) = cuda() else { return };
-    let mut rng = Rng(47);
-    let mut sources = seismic_std::sources();
-    sources.push(SourceFile {
-        path: "recurrent.seismic".into(),
-        text: include_str!("../kernels/recurrent.seismic").into(),
-    });
-    let module = check_source(sources).unwrap();
-    for format in Format::ALL {
-        let case = RecurrentOutputCase::new(2, &mut rng);
-        let output = weight(&device, format, case.h, case.nv * case.w, &mut rng);
-        let (expected, tolerance) = case.expected(&output, GEMV_MAPPINGS[0]);
-        let storage = registry::storage(format.representation(), Layout::Mma16).unwrap();
-        let logical = module
-            .entry(
-                module.entry_named("gated_delta_output").unwrap(),
-                &ElementBindings::new()
-                    .bind("A", registry::dense(DType::BF16))
-                    .bind("RN", registry::dense(DType::F32))
-                    .bind("OW", storage),
-            )
-            .unwrap();
-        let mut interpreter = Interpreter::new(&logical);
-        let floats = |values: &[f32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
-        let args = vec![
-            Arg::Tensor(interpreter.add_tensor(TensorData::dense(
-                DType::F32,
-                vec![case.m, case.h],
-                floats(&case.hidden),
-            ))),
-            Arg::Tensor(interpreter.add_tensor(TensorData::dense(
-                DType::BF16,
-                vec![case.m, case.nv, case.w],
-                floats(&case.mixed),
-            ))),
-            Arg::Tensor(interpreter.add_tensor(TensorData::dense(
-                DType::BF16,
-                vec![case.m, case.width()],
-                floats(&case.projection),
-            ))),
-            Arg::Tensor(interpreter.add_tensor(TensorData::dense(
-                DType::F32,
-                vec![case.w],
-                floats(&case.norm),
-            ))),
-            Arg::Tensor(
-                interpreter.add_tensor(
-                    TensorData::encoded(
-                        storage,
-                        vec![case.h, case.nv * case.w],
-                        output.bytes.clone(),
-                    )
-                    .unwrap(),
-                ),
-            ),
-            Arg::Scalar(ReferenceScalar::F32(EPSILON.to_bits())),
-        ];
-        let outcome = interpreter.run(&args).unwrap();
-        if let SourceTermination::Failed(failure) = outcome.termination() {
-            panic!("gated_delta_output portable body failed: {failure}");
-        }
-        let result = outcome.results().next().unwrap();
-        let OutcomeValue::Tensor(values) = result.value() else {
-            panic!("tensor result")
-        };
-        let actual: Vec<f32> = (0..case.m * case.h)
-            .map(|i| values.read(i).unwrap() as f32)
-            .collect();
-        check(
-            &format!("portable recurrent output {format:?}"),
-            &actual,
-            &expected,
-            &tolerance,
-        );
     }
 }
 
@@ -570,17 +334,11 @@ fn cuda_projection_block_timings() {
     for m in timing_rows(&[1, 8, 32, 128, 512]) {
         let hidden = f32_tensor(&device, &[m as u64, h as u64], &vec![0.5; m * h]);
         let norm = f32_tensor(&device, &[h as u64], &vec![1.0; h]);
-        let mixed = bf16_tensor(
+        let gated = bf16_tensor(
             &device,
             &[m as u64, nv as u64, w as u64],
             &vec![0.25; m * z],
         );
-        let projection = bf16_tensor(
-            &device,
-            &[m as u64, (qkv + z + 2 * nv) as u64],
-            &vec![0.5; m * (qkv + z + 2 * nv)],
-        );
-        let recurrent_norm = f32_tensor(&device, &[w as u64], &vec![1.0; w]);
         for &mapping in mappings(m) {
             let kernel = gated_delta_project::native_for_device_with(
                 &device,
@@ -620,30 +378,25 @@ fn cuda_projection_block_timings() {
                 project_bytes / measured.median / 1e9,
                 2.0 * (m * h * (qkv + z + 2 * nv)) as f64 / measured.median / 1e12
             );
-            let kernel = gated_delta_output::native_for_device_with(
+            let kernel = attention_output::native_for_device_with(
                 &device,
-                gated_delta_output::Elements {
+                attention_output::Elements {
                     A: Element::bf16(),
-                    RN: Element::f32(),
                     OW: Format::Q5K.resident(),
                 },
-                &mapping.recurrent_params(statics_specialization(&[
-                    ("H", h),
-                    ("NK", nk),
-                    ("NV", nv),
+                &mapping.attention_output_params(statics_specialization(&[
+                    ("D", h),
+                    ("Q", nv),
                     ("W", w),
                 ])),
             )
             .unwrap();
             let args = output_weights
                 .iter()
-                .map(|weight| gated_delta_output::Args {
+                .map(|weight| attention_output::Args {
                     hidden: &hidden,
-                    mixed: &mixed,
-                    projection: &projection,
-                    recurrent_norm: &recurrent_norm,
+                    gated: &gated,
                     output_weight: weight,
-                    epsilon: EPSILON,
                 })
                 .collect();
             let measured = kernel.measure(args, &options).unwrap();

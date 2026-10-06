@@ -449,7 +449,8 @@ fn equivalent_wire_dialects_construct_equal_canonical_requests() {
             "input": "hello",
             "max_output_tokens": 16,
             "temperature": 1.0,
-            "top_p": 1.0
+            "top_p": 1.0,
+            "seed": 0
         }))
         .unwrap(),
     )
@@ -462,7 +463,8 @@ fn equivalent_wire_dialects_construct_equal_canonical_requests() {
             "messages": [{ "role": "user", "content": "hello" }],
             "max_tokens": 16,
             "temperature": 1.0,
-            "top_p": 1.0
+            "top_p": 1.0,
+            "seed": 0
         }))
         .unwrap(),
     )
@@ -634,6 +636,43 @@ fn user(request: &GenerationRequest, index: usize) -> &[UserPart] {
         Entry::User(parts) => parts,
         Entry::Assistant(_) => panic!("entry {index} must be a user entry"),
     }
+}
+
+// OpenCode records a step that failed before producing anything as an empty
+// assistant message and replays it on every later turn.
+#[test]
+fn chat_skips_empty_assistant_messages_in_history() {
+    let request = chat_request(json!({
+        "model": "test-model",
+        "messages": [
+            { "role": "user", "content": "read notes.txt" },
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "read the file first",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "read", "arguments": "{\"path\":\"notes.txt\"}" }
+                }]
+            },
+            { "role": "tool", "tool_call_id": "call_1", "content": "secret PERIWINKLE" },
+            { "role": "assistant", "content": "" },
+            { "role": "assistant", "content": null },
+            { "role": "assistant", "content": "The secret word is PERIWINKLE." },
+            { "role": "user", "content": "and again?" }
+        ]
+    }))
+    .unwrap();
+    let entries = request.input.conversation.entries();
+    assert!(entries.iter().all(|entry| match entry {
+        Entry::Assistant(turn) => turn.text.is_some() || turn.reasoning.is_some() || !turn.tool_calls.is_empty(),
+        Entry::User(_) => true,
+    }));
+    assert_eq!(
+        assistant(&request, 1).tool_calls[0].result,
+        vec![magnitude_chat::request::ToolResultPart::Text("secret PERIWINKLE".into())]
+    );
 }
 
 #[test]
@@ -861,6 +900,68 @@ fn responses_output_items_replay_as_input() {
     );
 }
 
+// Codex re-serializes our reasoning item with explicit nulls for the fields
+// we omit, and adds its own metadata to every item.
+#[test]
+fn responses_accepts_codex_replayed_items_with_null_fields() {
+    let metadata = json!({ "turn_id": "turn-1" });
+    let request = responses_request(json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": "be concise" }]
+            },
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "read notes.txt" }],
+                "internal_chat_message_metadata_passthrough": metadata
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_icn_1",
+                "summary": [{ "type": "summary_text", "text": "read the file first" }],
+                "content": null,
+                "encrypted_content": null,
+                "internal_chat_message_metadata_passthrough": metadata
+            },
+            {
+                "type": "function_call",
+                "id": "fc_call_1",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"cat notes.txt\"}",
+                "call_id": "call_1",
+                "internal_chat_message_metadata_passthrough": metadata
+            },
+            {
+                "type": "function_call_output",
+                "id": "fco_1",
+                "call_id": "call_1",
+                "output": "secret PERIWINKLE",
+                "internal_chat_message_metadata_passthrough": metadata
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_icn_2",
+                "summary": null,
+                "content": null
+            }
+        ]
+    }))
+    .unwrap();
+    assert_eq!(
+        assistant(&request, 1).reasoning.as_deref(),
+        Some("read the file first")
+    );
+    assert_eq!(
+        assistant(&request, 1).tool_calls[0].result,
+        vec![magnitude_chat::request::ToolResultPart::Text("secret PERIWINKLE".into())]
+    );
+}
+
 #[test]
 fn anthropic_output_blocks_replay_as_input() {
     let (output, completion) = full_output();
@@ -1057,27 +1158,43 @@ fn anthropic_attribution_recognition_is_strictly_positional() {
     assert_eq!(anthropic_system(json!(malformed)).as_deref(), Some(malformed));
 }
 
+// Replay closure: an empty generation is emitted as an empty assistant turn in
+// each protocol's native shape, so that shape must replay, as nothing.
 #[test]
-fn protocol_forbidden_empty_assistant_forms_remain_invalid() {
+fn empty_assistant_turns_replay_as_nothing() {
     for content in [Value::Null, json!("")] {
-        assert!(chat_request(json!({
+        let request = chat_request(json!({
             "model": "test-model",
             "messages": [
                 { "role": "user", "content": "hi" },
-                { "role": "assistant", "content": content }
+                { "role": "assistant", "content": content },
+                { "role": "user", "content": "again" }
             ]
         }))
-        .is_err());
+        .unwrap();
+        assert!(request
+            .input
+            .conversation
+            .entries()
+            .iter()
+            .all(|entry| matches!(entry, Entry::User(_))));
     }
-    assert!(anthropic_request(json!({
+    let request = anthropic_request(json!({
         "model": "test-model",
         "max_tokens": 16,
         "messages": [
             { "role": "user", "content": "hi" },
-            { "role": "assistant", "content": [] }
+            { "role": "assistant", "content": [] },
+            { "role": "user", "content": "again" }
         ]
     }))
-    .is_err());
+    .unwrap();
+    assert!(request
+        .input
+        .conversation
+        .entries()
+        .iter()
+        .all(|entry| matches!(entry, Entry::User(_))));
 }
 
 #[test]
@@ -1240,7 +1357,55 @@ fn preserves_model_defaults_when_optional_controls_are_omitted() {
     assert_eq!(request.controls.end_of_generation, EndOfGeneration::Stop);
     assert_eq!(request.controls.sampling.temperature, 0.8);
     assert_eq!(request.controls.sampling.top_p, 0.95);
-    assert_eq!(request.controls.sampling.seed, 42);
+}
+
+// Without a caller seed, identical requests sample anew instead of repeating
+// the same draws; a caller seed is kept, in every protocol.
+#[test]
+fn an_omitted_seed_is_fresh_per_request_and_an_explicit_seed_is_kept() {
+    let chat = |seed: Option<u32>| {
+        let mut body = json!({
+            "model": "test-model",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        if let Some(seed) = seed {
+            body["seed"] = json!(seed);
+        }
+        chat_request(body).unwrap().controls.sampling.seed
+    };
+    let responses = |seed: Option<u32>| {
+        let mut body = json!({ "model": "test-model", "input": "hello" });
+        if let Some(seed) = seed {
+            body["seed"] = json!(seed);
+        }
+        responses::adapt(serde_json::from_value(body).unwrap())
+            .unwrap()
+            .request
+            .controls
+            .sampling
+            .seed
+    };
+    let anthropic = |seed: Option<u32>| {
+        let mut body = json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        if let Some(seed) = seed {
+            body["seed"] = json!(seed);
+        }
+        anthropic::adapt(serde_json::from_value(body).unwrap())
+            .unwrap()
+            .request
+            .controls
+            .sampling
+            .seed
+    };
+    for seeded in [&chat as &dyn Fn(Option<u32>) -> u64, &responses, &anthropic] {
+        assert_ne!(seeded(None), seeded(None));
+        assert_eq!(seeded(Some(7)), 7);
+        assert_eq!(seeded(Some(7)), seeded(Some(7)));
+    }
 }
 
 #[test]

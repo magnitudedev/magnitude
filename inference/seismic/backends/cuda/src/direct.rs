@@ -22,7 +22,15 @@ pub struct DirectModule {
     /// Keeps the functions' module loaded.
     _module: Arc<Module>,
     functions: Vec<DirectFunction>,
+    /// How a replayed launch of this module depends on the launch before
+    /// it: programmatic when the source declares
+    /// `SEISMIC_PROGRAMMATIC_DEPENDENCY` (every kernel waits for its
+    /// predecessor itself) and the driver supports typed edges.
+    edge: driver::Edge,
 }
+
+/// The global a source defines through `SEISMIC_PROGRAMMATIC_DEPENDENCY`.
+const PROGRAMMATIC_DECLARATION: &str = "seismic_programmatic_dependency";
 
 struct DirectFunction {
     raw: Handle,
@@ -104,9 +112,17 @@ impl DirectModule {
                 dynamic_shared_limit: AtomicU64::new(attribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)?),
             });
         }
+        let edge = if context.driver.graph_add_dependencies.is_some()
+            && driver::module_defines(&module, PROGRAMMATIC_DECLARATION).map_err(driver_failure)?
+        {
+            driver::Edge::Programmatic
+        } else {
+            driver::Edge::Complete
+        };
         Ok(Self {
             _module: Arc::new(module),
             functions,
+            edge,
         })
     }
 
@@ -143,6 +159,7 @@ struct FormedLaunch {
     /// Buffer addresses in ABI order, then the scalar-result address.
     pointers: Vec<u64>,
     words: Vec<u8>,
+    edge: driver::Edge,
 }
 
 impl FormedLaunch {
@@ -209,6 +226,7 @@ impl FormedLaunch {
             shared_bytes: dimension(launch.shared_bytes)?,
             pointers,
             words,
+            edge: launch.module.edge,
         }))
     }
 
@@ -253,16 +271,19 @@ impl DirectGraphBuilder {
         };
         let mut parameters = formed.parameters();
         self.graph
-            .push_kernel(&driver::KernelNodeParams {
-                function: formed.function,
-                grid: formed.grid,
-                block: formed.block,
-                shared_bytes: formed.shared_bytes,
-                parameters: parameters.as_mut_ptr(),
-                extra: std::ptr::null_mut(),
-                kernel: std::ptr::null_mut(),
-                context: std::ptr::null_mut(),
-            })
+            .push_kernel(
+                &driver::KernelNodeParams {
+                    function: formed.function,
+                    grid: formed.grid,
+                    block: formed.block,
+                    shared_bytes: formed.shared_bytes,
+                    parameters: parameters.as_mut_ptr(),
+                    extra: std::ptr::null_mut(),
+                    kernel: std::ptr::null_mut(),
+                    context: std::ptr::null_mut(),
+                },
+                formed.edge,
+            )
             .map_err(submission)
     }
 

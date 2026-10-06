@@ -9,8 +9,8 @@ use magnitude_artifacts::{
     ArtifactIdentity, PackageHeaders, PackageIdentity, PackageManifest,
 };
 use magnitude_family_contracts::{
-    ActivationDType, ImportTransform, ModelDefinition, VisionDescription, WeightDescriptor,
-    WeightKind, WeightRole, WeightScope,
+    ActivationDType, ImportTransform, ModelDefinition, ProgressivePlane, VisionDescription,
+    WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
 use seismic::{BackendName, DType, Element, Layout};
@@ -48,6 +48,13 @@ impl WeightPlan {
             .iter()
             .any(|transform| !matches!(transform, ImportTransform::ScaleByTensor { .. }))
             || self.upload != self.source
+    }
+
+    /// Whether the host places the weight's resident bytes itself (a
+    /// progressive plane): the device holds them as uploaded, with no import
+    /// entry.
+    pub fn placed_on_host(&self) -> bool {
+        matches!(self.descriptor.transforms[..], [ImportTransform::Progressive(_)])
     }
 
     /// Every resident byte of the weight: its representation and its scale.
@@ -354,10 +361,18 @@ pub struct RoutedBinding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ReadoutBinding {
     pub norm: Element,
-    pub weight: Element,
+    pub head: ReadoutHead,
     pub activation: Element,
-    /// The extent of the vocabulary projection's accumulator-scale port.
-    pub weight_scale: u64,
+}
+
+/// How the plan places the vocabulary projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReadoutHead {
+    /// The output projection's resident element and the extent of its
+    /// accumulator-scale port.
+    Packed { weight: Element, weight_scale: u64 },
+    /// Its progressive planes (`ModelLoadPlan::with_progressive_head`).
+    Progressive,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -375,8 +390,17 @@ pub struct HeadBinding {
     pub attention: AttentionBinding,
     pub feed_forward: FeedForwardProgramSlot,
     pub output_norm: Element,
-    pub projection: Element,
+    pub projection: HeadProjection,
     pub activation: Element,
+}
+
+/// How a draft head projects onto the target's output head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HeadProjection {
+    /// The output projection's resident element.
+    Packed(Element),
+    /// Its progressive planes (`ModelLoadPlan::with_progressive_head`).
+    Progressive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -758,6 +782,75 @@ impl ModelLoadPlan {
             vision,
             host_tables,
         })
+    }
+
+    /// Place the output projection in progressive planes
+    /// (`ImportTransform::Progressive`, `WeightKind::OutputPlane`), replacing
+    /// it, when the head admits them: a Q8_0 matrix of whole groups, imported
+    /// as stored without transforms or a second-level scale, a decoder
+    /// without a logit softcap, and no selected drafter (a drafter projects
+    /// through the stored head). Otherwise the plan is unchanged.
+    pub fn with_progressive_head(mut self, definition: &ModelDefinition) -> Result<Self, String> {
+        let role = WeightRole {
+            scope: WeightScope::Target,
+            kind: WeightKind::Output,
+        };
+        let index = self
+            .target
+            .iter()
+            .position(|weight| weight.role == role)
+            .ok_or("the plan has no output projection")?;
+        let output = &self.target[index];
+        // A draft head projects onto the planes too; a separate draft's
+        // readouts read the packed output projection.
+        let drafts = self
+            .target
+            .iter()
+            .any(|weight| weight.role.scope == WeightScope::Draft);
+        let admitted = !drafts
+            && output.scale.is_none()
+            && output.descriptor.transforms.is_empty()
+            && output.upload == output.source
+            && Some(output.source) == source_element(Encoding::Q8_0)
+            && output.shape.len() == 2
+            && output.shape[1].is_multiple_of(32)
+            && definition.decoder.exit.softcap.is_none_or(|cap| cap == 0.0);
+        if !admitted {
+            return Ok(self);
+        }
+        let planes = ProgressivePlane::ALL
+            .into_iter()
+            .map(|plane| {
+                let descriptor = WeightDescriptor {
+                    transforms: vec![ImportTransform::Progressive(plane)],
+                    ..output.descriptor.clone()
+                };
+                let shape = descriptor
+                    .transformed_shape(&output.shape)
+                    .map_err(|error| error.to_string())?;
+                let element = crate::progressive::element(plane);
+                Ok(WeightPlan {
+                    role: WeightRole {
+                        scope: WeightScope::Target,
+                        kind: WeightKind::OutputPlane(plane),
+                    },
+                    component: output.component,
+                    source: output.source,
+                    upload: element,
+                    resident: element,
+                    source_bytes: representation_bytes(element, &shape)?,
+                    resident_bytes: representation_bytes(element, &shape)?,
+                    descriptor: WeightDescriptor {
+                        shape: shape.clone(),
+                        ..descriptor
+                    },
+                    shape,
+                    scale: None,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        self.target.splice(index..=index, planes);
+        Ok(self)
     }
 
     pub fn weights(&self) -> impl Iterator<Item = &WeightPlan> {

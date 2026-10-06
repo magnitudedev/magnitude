@@ -82,6 +82,7 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    magnitude_executor::platform::relax_gpu_watchdog();
     let cli = Cli::parse();
     match cli.command {
         // The engine worker owns standard output for its protocol: it installs no telemetry

@@ -4,7 +4,7 @@ use crate::native::import::ImportKernels;
 use crate::planning::tests::{fixture_definition, fixture_manifest};
 use crate::{ComponentSelection, ModelLoadPlan};
 use magnitude_kernels::{dense_output, shape_rows};
-use seismic::{BackendName, ConfigurationRecord, DeviceCatalog, Exclusion, LoadError, Outcome};
+use seismic::{BackendName, ConfigurationRecord, DeviceCatalog, Exclusion, Outcome};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -113,6 +113,7 @@ fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
             &NativeSpecialization::new(),
             "same-implementation",
             &policy,
+            &BTreeMap::new(),
             shapes,
         )
     };
@@ -131,6 +132,32 @@ fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
     reweighted.pop();
     assert_ne!(key(&shapes), key(&reweighted));
     assert!(key(&shapes).contains(&format!("tuning {SEARCH_VERSION}\n")));
+    // An admitted error class the entry declares, and its envelope, are
+    // what a choice was searched and validated under.
+    let admitting = |limit: f64| {
+        let limit = seismic::precision::Limit::new(limit).unwrap();
+        tuning_key_material(
+            &device,
+            "dense_output",
+            "A=bf16",
+            &NativeSpecialization::new(),
+            "same-implementation",
+            &policy,
+            &[(
+                "int8_activations".to_owned(),
+                seismic::ErrorEnvelope {
+                    relative_rms: limit,
+                    peak: limit,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            &shapes,
+        )
+    };
+    assert_ne!(admitting(1e-2), key(&shapes));
+    assert_ne!(admitting(1e-2), admitting(2e-2));
+    assert!(admitting(1e-2).starts_with(&key(&shapes)));
 }
 
 #[test]
@@ -334,7 +361,7 @@ impl EntryTuning for FakeCase {
     fn bindings(&self) -> String {
         self.bindings.clone()
     }
-    fn statics(&self, _inputs: &TuningInputs<'_, '_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, _inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         Ok(vec![("H", 8), ("F", 16), ("DS", 0)])
     }
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -372,7 +399,7 @@ impl EntryTuning for FakeCase {
         _device: &Device,
         statics: &NativeSpecialization,
         points: &mut dyn seismic::PointSource<'_, Self::Entry>,
-        validation: PrecisionPolicy,
+        validation: seismic::TuningPrecision,
         strategy: Strategy,
     ) -> Result<TuningResult, TuneError> {
         let specs = points.points();
@@ -403,7 +430,7 @@ impl EntryTuning for FakeCase {
                     entry: "dense_output".into(),
                     backend: "metal".into(),
                     points: specs.iter().map(|spec| record(&spec.label)).collect(),
-                    validation,
+                    validation: validation.policy,
                     numerical_evidence: Vec::new(),
                     implementation_identity: String::new(),
                     parameters: Vec::new(),
@@ -453,7 +480,7 @@ impl EntryTuning for FakeCase {
                     class: point.class.clone(),
                 })
                 .collect(),
-            validation,
+            validation: validation.policy,
             numerical_evidence: Vec::new(),
             implementation_identity: String::new(),
             parameters: Vec::new(),
@@ -491,19 +518,11 @@ impl EntryTuning for FakeCase {
     ) -> Result<String, TuneError> {
         Ok(self.digest.clone())
     }
-    fn prepare(
-        &self,
-        device: &Device,
-        specialization: &NativeSpecialization,
-    ) -> Result<NativeKernel<Self::Entry>, LoadError> {
-        dense_output::native_for_device_with(
-            device,
-            dense_output::Elements {
-                DW: Element::bf16(),
-                A: Element::bf16(),
-            },
-            specialization,
-        )
+    fn entry(&self) -> seismic::BoundEntry<Self::Entry> {
+        dense_output::native_entry_with(dense_output::Elements {
+            DW: Element::bf16(),
+            A: Element::bf16(),
+        })
     }
 }
 
@@ -523,6 +542,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         weights: &ZeroTuningWeights,
         observer: &recorder,
         cache: None,
+        error_classes: &NO_ERROR_CLASSES,
     };
     let limits = TuningLimits {
         max_rows: 64,
@@ -671,6 +691,7 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
             weights: &ZeroTuningWeights,
             observer: &recorder,
             cache: Some(&cache),
+            error_classes: &NO_ERROR_CLASSES,
         };
         let weights = || TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
         let mut tuner = Tuner::count(&device, context, limits, weights());
@@ -777,6 +798,7 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
             weights: &ZeroTuningWeights,
             observer: &recorder,
             cache: None,
+            error_classes: &NO_ERROR_CLASSES,
         },
         LIMITS,
         TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
@@ -808,9 +830,12 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     let noise = Noise::default();
     let building = RefCell::new(BuildBudget::default());
     let mut inputs = TuningInputs {
+        model: ModelInputs {
+            definition: &definition,
+            limits: LIMITS,
+            load: &load,
+        },
         device: &device,
-        definition: &definition,
-        limits: LIMITS,
         weights: &mut weights,
         noise: &noise,
         shared: &mut shared,
@@ -860,9 +885,12 @@ fn case_state_restores_its_written_rows() {
     let noise = Noise::default();
     let building = RefCell::new(BuildBudget::default());
     let inputs = TuningInputs {
+        model: ModelInputs {
+            definition: &definition,
+            limits: LIMITS,
+            load: &load,
+        },
         device: &device,
-        definition: &definition,
-        limits: LIMITS,
         weights: &mut weights,
         noise: &noise,
         shared: &mut shared,
@@ -965,6 +993,7 @@ fn units_share_the_tuning_time_by_step_time_and_pass_on_what_they_leave() {
             weights: &ZeroTuningWeights,
             observer: &recorder,
             cache: None,
+            error_classes: &NO_ERROR_CLASSES,
         },
         limits,
         TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),

@@ -1,5 +1,7 @@
 use super::super::*;
 use super::*;
+use crate::ReadoutHead;
+use magnitude_family_contracts::ProgressivePlane;
 use crate::operators::routed::fused_graph::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
 
 impl<'a> QualificationView<'a> {
@@ -196,27 +198,75 @@ impl<'a> QualificationView<'a> {
                 })
                 .map_err(|error| qualification_dynamic("gated_delta_project", &label, error))?
                 .value;
-            let mixed = kernels
-                .step
-                .call(gated_delta_step::Args {
-                    projection: &projection,
-                    convolution: &convolution,
-                    rate: &rate,
-                    time_bias: &time_bias,
-                    segments: &segments,
-                    stop: &stop,
-                    previous_bank: &previous_bank,
-                    previous_tape: &previous_tape,
-                    following_bank: &following_bank,
-                    window: &mut window,
-                    delta: &mut delta,
-                    tape: &mut tape,
-                    norm_epsilon: 1.0e-5,
-                    grouped: false,
-                    slab_banks: 2,
-                })
-                .map_err(|error| qualification_dynamic("gated_delta_step", &label, error))?
-                .value;
+            let gated = match &kernels.step {
+                RecurrentStepKernels::Step(step) => step
+                    .call(gated_delta_step::Args {
+                        projection: &projection,
+                        convolution: &convolution,
+                        rate: &rate,
+                        time_bias: &time_bias,
+                        recurrent_norm: &recurrent_norm,
+                        segments: &segments,
+                        stop: &stop,
+                        previous_bank: &previous_bank,
+                        previous_tape: &previous_tape,
+                        following_bank: &following_bank,
+                        window: &mut window,
+                        delta: &mut delta,
+                        tape: &mut tape,
+                        norm_epsilon: 1.0e-5,
+                        epsilon: 1.0e-5,
+                        grouped: false,
+                        slab_banks: 2,
+                    })
+                    .map_err(|error| qualification_dynamic("gated_delta_step", &label, error))?
+                    .value,
+                RecurrentStepKernels::Convolved { project, step } => {
+                    let projected = project
+                        .call(gated_delta_project_convolved::Args {
+                            hidden: &hidden_residual,
+                            input_norm: &norm,
+                            qkv_weight: &qkv,
+                            gate_weight: &gate,
+                            alpha_weight: &alpha,
+                            beta_weight: &beta,
+                            convolution: &convolution,
+                            segments: &segments,
+                            stop: &stop,
+                            previous_bank: &previous_bank,
+                            previous_tape: &previous_tape,
+                            following_bank: &following_bank,
+                            window: &mut window,
+                            epsilon: 1.0e-5,
+                            slab_banks: 2,
+                        })
+                        .map_err(|error| {
+                            qualification_dynamic("gated_delta_project_convolved", &label, error)
+                        })?;
+                    step.call(gated_delta_step_convolved::Args {
+                        projection: &projected.r0,
+                        convolved: &projected.r1,
+                        rate: &rate,
+                        time_bias: &time_bias,
+                        recurrent_norm: &recurrent_norm,
+                        segments: &segments,
+                        stop: &stop,
+                        previous_bank: &previous_bank,
+                        previous_tape: &previous_tape,
+                        following_bank: &following_bank,
+                        delta: &mut delta,
+                        tape: &mut tape,
+                        norm_epsilon: 1.0e-5,
+                        epsilon: 1.0e-5,
+                        grouped: false,
+                        slab_banks: 2,
+                    })
+                    .map_err(|error| {
+                        qualification_dynamic("gated_delta_step_convolved", &label, error)
+                    })?
+                    .value
+                }
+            };
             kernels
                 .chunk
                 .call(gated_delta_chunk::Args {
@@ -224,6 +274,7 @@ impl<'a> QualificationView<'a> {
                     convolution: &convolution,
                     rate: &rate,
                     time_bias: &time_bias,
+                    recurrent_norm: &recurrent_norm,
                     segments: &segments,
                     stop: &stop,
                     previous_bank: &previous_bank,
@@ -233,23 +284,21 @@ impl<'a> QualificationView<'a> {
                     delta: &mut delta,
                     tape: &mut tape,
                     norm_epsilon: 1.0e-5,
+                    epsilon: 1.0e-5,
                     grouped: false,
                     slab_banks: 2,
                 })
                 .map_err(|error| qualification_dynamic("gated_delta_chunk", &label, error))?;
             let result = kernels
                 .output
-                .call(gated_delta_output::Args {
+                .call(attention_output::Args {
                     hidden: &hidden_residual,
-                    mixed: &mixed,
-                    projection: &projection,
-                    recurrent_norm: &recurrent_norm,
+                    gated: &gated,
                     output_weight: &output,
-                    epsilon: 1.0e-5,
                 })
-                .map_err(|error| qualification_dynamic("gated_delta_output", &label, error))?
+                .map_err(|error| qualification_dynamic("attention_output", &label, error))?
                 .value;
-            require_f32_values(&result, &hidden_values, "gated_delta_output", &label)?;
+            require_f32_values(&result, &hidden_values, "attention_output", &label)?;
         }
 
         let mut qualified = std::collections::HashSet::new();
@@ -448,13 +497,6 @@ impl<'a> QualificationView<'a> {
         for binding in [self.plan.target().readout()] {
             let label = format!("{binding:?}");
             let norm = semantic_ones(device, binding.norm, &[hidden], "target_readout", &label)?;
-            let weight = semantic_zeros(
-                device,
-                binding.weight,
-                &[self.geometry.vocabulary, hidden],
-                "target_readout",
-                &label,
-            )?;
             let features = self
                 .programs
                 .target
@@ -469,46 +511,73 @@ impl<'a> QualificationView<'a> {
                 .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
                 .value;
             require_finite_nonzero(&features, "readout_features_rows", &label)?;
-            let logits = self
-                .programs
-                .target
-                .readout
-                .head
-                .call(readout_head_rows::Args {
-                    hidden: &hidden_residual,
-                    norm: &norm,
-                    weight: &weight,
-                    out_rows: &out_rows,
-                    epsilon: 1.0e-5,
-                    softcap: 0.0,
-                    weight_scale: &semantic_ones(
+            let vocabulary = self.geometry.vocabulary;
+            match (&self.programs.target.readout.head, binding.head) {
+                (
+                    ReadoutHeadKernels::Packed { head, selected },
+                    ReadoutHead::Packed {
+                        weight: element,
+                        weight_scale,
+                    },
+                ) => {
+                    let weight =
+                        semantic_zeros(device, element, &[vocabulary, hidden], "target_readout", &label)?;
+                    let logits = head
+                        .call(readout_head_rows::Args {
+                            hidden: &hidden_residual,
+                            norm: &norm,
+                            weight: &weight,
+                            out_rows: &out_rows,
+                            epsilon: 1.0e-5,
+                            softcap: 0.0,
+                            weight_scale: &semantic_ones(
+                                device,
+                                Element::f32(),
+                                &[weight_scale],
+                                "target_readout",
+                                &label,
+                            )?,
+                        })
+                        .map_err(|error| qualification_dynamic("readout_head_rows", &label, error))?
+                        .value;
+                    require_zero_result(&logits, "readout_head_rows", &label)?;
+                    let rows = semantic_i32(device, &[1], &[0], "readout_selected_rows", &label)?;
+                    let selected_result = selected
+                        .call(readout_selected_rows::Args {
+                            hidden: &hidden_residual,
+                            norm: &norm,
+                            weight: &weight,
+                            out_rows: &out_rows,
+                            selected: &rows,
+                            epsilon: 1.0e-5,
+                            softcap: 0.0,
+                        })
+                        .map_err(|error| {
+                            qualification_dynamic("readout_selected_rows", &label, error)
+                        })?
+                        .value;
+                    require_zero_result(&selected_result, "readout_selected_rows", &label)?;
+                }
+                (ReadoutHeadKernels::Progressive(kernels), ReadoutHead::Progressive) => {
+                    qualify_progressive(
                         device,
-                        Element::f32(),
-                        &[binding.weight_scale],
+                        kernels,
+                        &hidden_residual,
+                        &norm,
+                        &out_rows,
+                        (vocabulary, hidden),
                         "target_readout",
                         &label,
-                    )?,
-                })
-                .map_err(|error| qualification_dynamic("readout_head_rows", &label, error))?
-                .value;
-            require_zero_result(&logits, "readout_head_rows", &label)?;
-            let selected = semantic_i32(device, &[1], &[0], "readout_selected_rows", &label)?;
-            let selected_result = self
-                .programs
-                .target
-                .selected
-                .call(readout_selected_rows::Args {
-                    hidden: &hidden_residual,
-                    norm: &norm,
-                    weight: &weight,
-                    out_rows: &out_rows,
-                    selected: &selected,
-                    epsilon: 1.0e-5,
-                    softcap: 0.0,
-                })
-                .map_err(|error| qualification_dynamic("readout_selected_rows", &label, error))?
-                .value;
-            require_zero_result(&selected_result, "readout_selected_rows", &label)?;
+                    )?;
+                }
+                _ => {
+                    return Err(qualification_dynamic(
+                        "target_readout",
+                        &label,
+                        "the prepared head differs from the planned head",
+                    ))
+                }
+            }
         }
 
         if let (Some(binding), Some(kernel)) = (
@@ -567,47 +636,84 @@ pub(super) fn qualify_routed(
         let residual = semantic_f32(device, &[rows, h], &values, "target_routed", &label)?;
         let mut routes = zeros(Element::i32(), &[rows, k])?;
         let mut scores = zeros(Element::f32(), &[rows, k])?;
-        let routed = kernels
-            .route
-            .call(routed_route::Args {
-                residual: &residual,
-                norm: &norm,
-                router: &router,
-                shared_router: &shared_router,
-                routes: &mut routes,
-                scores: &mut scores,
-                eps: 1.0e-5,
-                normalize: 1,
-            })
-            .map_err(|error| qualification_dynamic("routed_route", &label, error))?;
+        let route = |routes: &mut Tensor, scores: &mut Tensor| {
+            kernels
+                .route
+                .call(routed_route::Args {
+                    residual: &residual,
+                    norm: &norm,
+                    router: &router,
+                    shared_router: &shared_router,
+                    routes,
+                    scores,
+                    eps: 1.0e-5,
+                    normalize: 1,
+                })
+                .map_err(|error| qualification_dynamic("routed_route", &label, error))
+        };
         let first = zeros(Element::i32(), &[rows, k])?;
         let result = if rows <= DECODE_ROWS {
-            let expanded = kernels
-                .expand
-                .call(routed_expand::Args {
-                    normalized: &routed.r0,
-                    routes: &first,
-                    expert_gate: &expert_gate,
-                    expert_up: &expert_up,
-                    shared_gate: &shared_gate,
-                    shared_up: &shared_up,
-                })
-                .map_err(|error| qualification_dynamic("routed_expand", &label, error))?;
+            let (expert_product, shared_product, coefficient) = match &kernels.decode {
+                RoutedDecodeKernels::Expand(expand) => {
+                    let routed = route(&mut routes, &mut scores)?;
+                    let expanded = expand
+                        .call(routed_expand::Args {
+                            normalized: &routed.r0,
+                            routes: &first,
+                            expert_gate: &expert_gate,
+                            expert_up: &expert_up,
+                            shared_gate: &shared_gate,
+                            shared_up: &shared_up,
+                        })
+                        .map_err(|error| qualification_dynamic("routed_expand", &label, error))?;
+                    (expanded.r0, expanded.r1, routed.r1)
+                }
+                RoutedDecodeKernels::SharedRoute { route, choices } => {
+                    let routed = route
+                        .call(routed_route_shared::Args {
+                            residual: &residual,
+                            norm: &norm,
+                            router: &router,
+                            shared_router: &shared_router,
+                            shared_gate: &shared_gate,
+                            shared_up: &shared_up,
+                            routes: &mut routes,
+                            scores: &mut scores,
+                            eps: 1.0e-5,
+                            normalize: 1,
+                        })
+                        .map_err(|error| {
+                            qualification_dynamic("routed_route_shared", &label, error)
+                        })?;
+                    let product = choices
+                        .call(routed_gate_up::Args {
+                            normalized: &routed.r0,
+                            routes: &first,
+                            expert_gate: &expert_gate,
+                            expert_up: &expert_up,
+                            activation: 0,
+                        })
+                        .map_err(|error| qualification_dynamic("routed_gate_up", &label, error))?
+                        .value;
+                    (product, routed.r2, routed.r1)
+                }
+            };
             kernels
                 .output
                 .call(routed_output::Args {
                     residual: &residual,
-                    expert_product: &expanded.r0,
-                    shared_product: &expanded.r1,
+                    expert_product: &expert_product,
+                    shared_product: &shared_product,
                     routes: &first,
                     scores: &scores,
-                    coefficient: &routed.r1,
+                    coefficient: &coefficient,
                     expert_down: &expert_down,
                     shared_down: &shared_down,
                 })
                 .map_err(|error| qualification_dynamic("routed_output", &label, error))?
                 .value
         } else {
+            let routed = route(&mut routes, &mut scores)?;
             let blocks = grouped_blocks(rows, e, k)
                 .map_err(|error| qualification_dynamic("routed_group", &label, error))?;
             let mut counts = zeros(Element::i32(), &[e])?;
@@ -1344,4 +1450,123 @@ impl QualificationView<'_> {
         }
         Ok(())
     }
+}
+
+/// A progressive head's levels and full exact pass over zero planes of
+/// `[vocabulary, hidden]`: every logit of every level is zero, every row
+/// reaches the zero threshold, and the exact level keeps them.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn qualify_progressive(
+    device: &Device,
+    kernels: &ProgressiveReadoutKernels,
+    hidden_residual: &Tensor,
+    norm: &Tensor,
+    out_rows: &Tensor,
+    (vocabulary, hidden): (u64, u64),
+    context: &'static str,
+    label: &str,
+) -> Result<(), CatalogFailure> {
+    let label = label.to_owned();
+    let plane = |plane: ProgressivePlane| {
+        semantic_zeros(
+            device,
+            crate::progressive::element(plane),
+            &plane.shape(vocabulary, hidden),
+            context,
+            &label,
+        )
+    };
+    let top = plane(ProgressivePlane::Top)?;
+    let bit3 = plane(ProgressivePlane::Bit3)?;
+    let rest = plane(ProgressivePlane::Rest)?;
+    let scales = plane(ProgressivePlane::Scales)?;
+    let radius = plane(ProgressivePlane::Radius)?;
+    let draws = semantic_zeros(device, Element::u32(), &[1, 6], context, &label)?;
+    let temperature =
+        semantic_ones(device, Element::f32(), &[1], context, &label)?;
+    let mask = semantic_zeros(
+        device,
+        Element::u32(),
+        &[1, vocabulary.div_ceil(32)],
+        context,
+        &label,
+    )?;
+    let constrained =
+        semantic_i32(device, &[1], &[0], context, &label)?;
+    let first = kernels
+        .top
+        .call(readout_top_rows::Args {
+            hidden: hidden_residual,
+            norm,
+            top: &top,
+            bit3: &bit3,
+            rest: &rest,
+            scales: &scales,
+            radius: &radius,
+            out_rows,
+            draws: &draws,
+            temperature: &temperature,
+            mask: &mask,
+            constrained: &constrained,
+            epsilon: 1.0e-5,
+        })
+        .map_err(|error| qualification_dynamic("readout_top_rows", &label, error))?;
+    require_zero_result(&first.r0, "readout_top_rows", &label)?;
+    let second = kernels
+        .refine
+        .call(readout_refine_rows::Args {
+            features: &first.r2,
+            top: &top,
+            bit3: &bit3,
+            rest: &rest,
+            scales: &scales,
+            radius: &radius,
+            coarse: &first.r0,
+            floor: &first.r1,
+            length: &first.r3,
+            draws: &draws,
+            temperature: &temperature,
+            mask: &mask,
+            constrained: &constrained,
+        })
+        .map_err(|error| {
+            qualification_dynamic("readout_refine_rows", &label, error)
+        })?;
+    require_zero_result(&second.r0, "readout_refine_rows", &label)?;
+    let exact = kernels
+        .exact
+        .call(readout_exact_rows::Args {
+            features: &first.r2,
+            top: &top,
+            bit3: &bit3,
+            rest: &rest,
+            scales: &scales,
+            radius: &radius,
+            fine: &second.r0,
+            floor: &second.r1,
+            length: &first.r3,
+            draws: &draws,
+            temperature: &temperature,
+            mask: &mask,
+            constrained: &constrained,
+        })
+        .map_err(|error| qualification_dynamic("readout_exact_rows", &label, error))?
+        .value;
+    require_zero_result(&exact, "readout_exact_rows", &label)?;
+    let planes = kernels
+        .planes
+        .call(readout_planes_rows::Args {
+            hidden: hidden_residual,
+            norm,
+            top: &top,
+            bit3: &bit3,
+            rest: &rest,
+            scales: &scales,
+            out_rows,
+            epsilon: 1.0e-5,
+        })
+        .map_err(|error| qualification_dynamic("readout_planes_rows", &label, error))?
+        .value;
+    require_zero_result(&planes, "readout_planes_rows", &label)?;
+    Ok(())
 }

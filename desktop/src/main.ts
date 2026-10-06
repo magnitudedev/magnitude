@@ -47,6 +47,7 @@ import { makeElectronRpcServerLayer } from "./electron-rpc"
 import { resolveHarnessEnvironment } from "@magnitudedev/harness-connections"
 import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { MAGNITUDE_VERSION } from "@magnitudedev/version"
+import { desktopLogLayer } from "./desktop-log"
 
 app.setName("Magnitude")
 if (process.platform === "win32") app.setAppUserModelId(WINDOWS_APPLICATION_ID)
@@ -327,7 +328,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     },
   }
   const service = yield* makeApplicationService({ owner: ownerAgent, output: "DiagnosticTail", admission: "Supervised", runtime: applicationRuntime, profile,
-    stateDirectory: stateDir, home: homedir(), environment: process.env }).pipe(Effect.provide(NodeSqliteDriverLayer))
+    stateDirectory: stateDir, home: homedir(), environment: process.env }).pipe(Effect.provide([NodeSqliteDriverLayer, NodeContext.layer]))
   const snapshot = Effect.all({ service: service.state, tray: tray.state }).pipe(Effect.map(value => ({ version: 1 as const, pid: process.pid, endpoint, service: value.service, owner: { _tag: "Desktop" as const, tray: value.tray } })))
   const snapshots = Stream.zipLatest(service.changes, tray.changes).pipe(Stream.map(([service, tray]) => ({ version: 1 as const, pid: process.pid, endpoint, service, owner: { _tag: "Desktop" as const, tray } })))
   yield* service.changes.pipe(Stream.runForEach(current => Ref.set(state, current).pipe(Effect.zipRight(refreshTray))), Effect.forkScoped)
@@ -447,7 +448,10 @@ const program = Effect.scoped(Effect.gen(function* () {
     }
   }
 })).pipe(Effect.provide(nativeHostLayer(addonPath)), Effect.provideService(ProcessGroupController, ProcessGroupControllerLive))
-Effect.runPromiseExit(program).then(Exit.match({
+Effect.runPromiseExit(program.pipe(
+  Effect.tapErrorCause(cause => Effect.logFatal("Magnitude stopped unexpectedly", cause)),
+  Effect.provide(desktopLogLayer(dataDir)),
+)).then(Exit.match({
   onSuccess: intent => {
     exiting = true
     if (intent === "Relaunch") {

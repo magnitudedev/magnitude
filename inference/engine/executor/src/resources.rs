@@ -1,9 +1,11 @@
 //! Seismic graph slots for numerical execution and owned import sources.
 
 mod graph;
+pub(crate) use graph::VisionGrowth;
 pub use graph::{
     GraphOutputOwner, GraphOutputTensor, NativeGraphOutputLease, NativeGraphPool,
     NativeGraphWorkspaceLease, TargetGraphOutputLease, TargetGraphPool, TargetGraphWorkspaceLease,
+    VisionGraphPool,
 };
 
 use crate::Stored;
@@ -194,7 +196,7 @@ pub struct AllocatedResources {
     target_graph: NativeGraphPool,
     target_readout_graph: NativeGraphPool,
     head_graph: Option<NativeGraphPool>,
-    vision_graph: Option<NativeGraphPool>,
+    vision_graph: Option<VisionGraphPool>,
     state_graph: NativeGraphPool,
 }
 
@@ -206,7 +208,6 @@ impl AllocatedResources {
             Some(&self.target_graph),
             Some(&self.target_readout_graph),
             self.head_graph.as_ref(),
-            self.vision_graph.as_ref(),
             Some(&self.state_graph),
         ]
         .into_iter()
@@ -215,7 +216,13 @@ impl AllocatedResources {
             bytes
                 .checked_add(pool.committed_bytes())
                 .ok_or("graph pool charge overflows")
-        })
+        })?
+        .checked_add(
+            self.vision_graph
+                .as_ref()
+                .map_or(0, VisionGraphPool::committed_bytes),
+        )
+        .ok_or("graph pool charge overflows")
     }
 
     pub fn domain(&self) -> &ResourceDomainId {
@@ -232,15 +239,19 @@ impl AllocatedResources {
     pub fn head_graph(&self) -> Option<&NativeGraphPool> {
         self.head_graph.as_ref()
     }
-    pub fn vision_graph(&self) -> Option<&NativeGraphPool> {
+    pub fn vision_graph(&self) -> Option<&VisionGraphPool> {
         self.vision_graph.as_ref()
+    }
+    pub(crate) fn vision_graph_mut(&mut self) -> Option<&mut VisionGraphPool> {
+        self.vision_graph.as_mut()
     }
     pub fn state_graph(&self) -> &NativeGraphPool {
         &self.state_graph
     }
 
     /// The pool whose output slots `lane`'s launches retain beyond their
-    /// completion: target readout, head or vision outputs.
+    /// completion: target readout or head outputs. Encoded images hold
+    /// slots of their own class ([`VisionGraphPool`]).
     pub(crate) fn retained_outputs_mut(
         &mut self,
         lane: crate::domain::ReservationLane,
@@ -248,36 +259,27 @@ impl AllocatedResources {
         match lane {
             crate::domain::ReservationLane::Target => Some(&mut self.target_readout_graph),
             crate::domain::ReservationLane::Head => self.head_graph.as_mut(),
-            crate::domain::ReservationLane::Vision => self.vision_graph.as_mut(),
+            crate::domain::ReservationLane::Vision => None,
         }
     }
 
-    /// Release every pool's free activations and output slots beyond its
-    /// startup counts; returns how many were released.
+    /// Release every pool's free output slots beyond its startup count and
+    /// vision's free storage; returns how many slots were released.
     pub(crate) fn release_idle_slots(&mut self) -> usize {
         [
             Some(&mut self.target_graph),
             Some(&mut self.target_readout_graph),
             self.head_graph.as_mut(),
-            self.vision_graph.as_mut(),
             Some(&mut self.state_graph),
         ]
         .into_iter()
         .flatten()
-        .map(|pool| pool.release_idle_activations() + pool.release_idle_outputs())
-        .sum()
-    }
-
-    /// The pool whose launches `lane` reserves an activation from.
-    pub(crate) fn activations_mut(
-        &mut self,
-        lane: crate::domain::ReservationLane,
-    ) -> Option<&mut NativeGraphPool> {
-        match lane {
-            crate::domain::ReservationLane::Target => Some(&mut self.target_graph),
-            crate::domain::ReservationLane::Head => self.head_graph.as_mut(),
-            crate::domain::ReservationLane::Vision => self.vision_graph.as_mut(),
-        }
+        .map(NativeGraphPool::release_idle_outputs)
+        .sum::<usize>()
+            + self
+                .vision_graph
+                .as_mut()
+                .map_or(0, VisionGraphPool::release_idle)
     }
 }
 
@@ -433,9 +435,13 @@ impl ResourceAllocator {
             }
         };
         let vision_graph = match (vision_graphs, plan.vision_graph()) {
-            (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => Some(
-                NativeGraphPool::new(domain.clone(), graphs.family(), charge, &arena)?,
-            ),
+            (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => {
+                Some(VisionGraphPool::new(
+                    domain.clone(),
+                    charge.upload_regions,
+                    graphs.class_families(),
+                ))
+            }
             (None, None) => None,
             _ => {
                 return Err(AllocationError::Plan(InvariantError {

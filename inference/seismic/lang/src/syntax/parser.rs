@@ -330,10 +330,40 @@ impl Parser {
             self.expect_op(Op::RParen)?;
             self.expect_newline()?;
         }
+        let mut terms = Vec::new();
+        while matches!(self.peek(), Tok::Kw(Kw::Let)) {
+            let begin = self.bump().span;
+            let name = self.expect_name()?;
+            self.expect_op(Op::Assign)?;
+            let value = self.expr()?;
+            self.expect_newline()?;
+            terms.push(NativeTermDecl {
+                name,
+                value,
+                span: begin.to(self.prev_span()),
+            });
+        }
         let mut constraint = None;
         if self.eat_kw(Kw::Where) {
             constraint = Some(self.expr()?);
             self.expect_newline()?;
+        }
+        let mut error_classes = Vec::new();
+        while self.at_word("error_class") {
+            let begin = self.bump().span;
+            let name = self.expect_name()?;
+            let Some(when) = self.native_when()? else {
+                return Err(self.error(format!(
+                    "expected `when <condition>` after the error class name, found {}",
+                    self.peek().describe()
+                )));
+            };
+            self.expect_newline()?;
+            error_classes.push(NativeErrorClassDecl {
+                name,
+                when,
+                span: begin.to(self.prev_span()),
+            });
         }
         let mut scratch = Vec::new();
         while self.at_word("scratch") {
@@ -349,22 +379,56 @@ impl Parser {
             self.expect_op(Op::LParen)?;
             let bytes = self.expr()?;
             self.expect_op(Op::RParen)?;
+            let sync = self.at_word("sync");
+            if sync {
+                self.bump();
+            }
             let when = self.native_when()?;
             scratch.push(NativeScratchDecl {
                 name,
                 bytes,
+                sync,
                 when,
                 span: begin.to(self.prev_span()),
             });
             self.expect_newline()?;
         }
         let mut launches = Vec::new();
-        while self.at_word("launch") {
-            launches.push(self.native_launch()?);
+        let mut repeat = None;
+        loop {
+            if self.at_word("launch") {
+                launches.push(self.native_launch()?);
+            } else if self.at_word("repeat") && repeat.is_none() {
+                let begin = self.bump().span;
+                self.expect_op(Op::LParen)?;
+                let count = self.expr()?;
+                self.expect_op(Op::RParen)?;
+                self.expect_op(Op::Colon)?;
+                self.native_block_start("repeat")?;
+                let first = launches.len();
+                while self.at_word("launch") {
+                    launches.push(self.native_launch()?);
+                }
+                if launches.len() == first {
+                    return Err(self.error(format!(
+                        "expected `launch <kernel>:` in the repeat block, found {}",
+                        self.peek().describe()
+                    )));
+                }
+                self.native_block_end("repeat")?;
+                repeat = Some(NativeRepeatDecl {
+                    count,
+                    first,
+                    launches: launches.len() - first,
+                    span: begin.to(self.prev_span()),
+                });
+            } else {
+                break;
+            }
         }
         if launches.is_empty() {
             return Err(self.error(format!(
-                "expected `launch <kernel>:`, found {}; a native declaration lists `static`, `params`, `elements`, `where`, `scratch`, then one or more launches",
+                "expected `launch <kernel>:`, found {}; a native declaration lists `static`, `params`, `elements`, `let`, `where`, `error_class`, `scratch`, then one or more launches",
                 self.peek().describe()
             )));
         }
@@ -376,9 +440,12 @@ impl Parser {
             statics,
             params,
             elements,
+            terms,
             constraint,
+            error_classes,
             scratch,
             launches,
+            repeat,
             span: start.to(self.prev_span()),
         })
     }
@@ -1261,6 +1328,28 @@ mod tests {
     }
 
     #[test]
+    fn error_class_declarations_round_trip() {
+        let file = round_trip(
+            "native scale for metal from \"scale.metal\":\n    static (N)\n    params (arithmetic form DEPTH in [0, 1], code PACKED in [0, 1])\n    where N >= 64\n    error_class row_mixing when DEPTH >= 1\n    error_class int8_activations when PACKED == 1 and N >= 128\n    scratch sums bytes (N * 4)\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert_eq!(
+            native
+                .error_classes
+                .iter()
+                .map(|class| class.name.name.as_str())
+                .collect::<Vec<_>>(),
+            ["row_mixing", "int8_activations"]
+        );
+        assert!(parse(
+            "native scale for metal from \"scale.metal\":\n    error_class row_mixing\n    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn specialized_native_declarations_round_trip() {
         let file = round_trip(
             "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic form PARTS in [1, 2, 4], WIDTH in [64, 128])\n    where PARTS * WIDTH <= N and WIDTH >= 64\n    scratch partials bytes (PARTS * N * 4)\n    launch scale_partial:\n        threadgroups (ceil_div(N, WIDTH), PARTS, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (max(WIDTH * 4, 256))\n    launch scale_merge:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (min(N, 256), 1, 1)\n",
@@ -1357,6 +1446,37 @@ mod tests {
             printed.contains("launch rows_gemv when O <= 2 or INT8 == 1 and O <= 8:\n"),
             "{printed}"
         );
+    }
+
+    #[test]
+    fn native_terms_round_trip() {
+        let file = round_trip(
+            "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2])\n    let PARTS = max(1, SPLIT * O)\n    let SPARE = (8 - PARTS) * O\n    where PARTS <= 8\n    scratch partials bytes (PARTS * 4)\n    launch rows:\n        threadgroups (ceil_div(SPARE, 4), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert_eq!(
+            native
+                .terms
+                .iter()
+                .map(|term| term.name.name.as_str())
+                .collect::<Vec<_>>(),
+            ["PARTS", "SPARE"]
+        );
+    }
+
+    #[test]
+    fn repeated_native_launches_round_trip() {
+        let file = round_trip(
+            "native rows for metal from \"rows.metal\":\n    scratch window bytes (64)\n    launch rows_prepare:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    repeat (ceil_div(O, 64)):\n        launch rows_decode when O > 8:\n            threadgroups (2, 1, 1)\n            threads_per_threadgroup (32, 1, 1)\n        launch rows_attend:\n            threadgroups (O, 1, 1)\n            threads_per_threadgroup (32, 1, 1)\n    launch rows_merge:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert_eq!(native.launches.len(), 4);
+        let repeat = native.repeat.as_ref().unwrap();
+        assert_eq!((repeat.first, repeat.launches), (1, 2));
     }
 
     #[test]

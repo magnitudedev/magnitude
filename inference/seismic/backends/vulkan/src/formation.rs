@@ -42,20 +42,11 @@ pub fn compile(
         NativeCompilationError::ToolchainFailure("glslang could not be initialized".into())
     })?;
     let text = glslang::ShaderSource::from(source);
-    let options = glslang::CompilerOptions {
-        source_language: glslang::SourceLanguage::GLSL,
-        target: glslang::Target::Vulkan {
-            version: glslang::VulkanVersion::Vulkan1_3,
-            spirv_version: glslang::SpirvVersion::SPIRV1_6,
-        },
-        version_profile: None,
-        messages: glslang::ShaderMessage::DEFAULT,
-    };
     let defines = [("SEISMIC_KERNEL", Some(kernel))];
     let input = glslang::ShaderInput::new(
         &text,
         glslang::ShaderStage::Compute,
-        &options,
+        &options(),
         Some(&defines[..]),
         None,
     )
@@ -66,6 +57,41 @@ pub fn compile(
         .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?;
     validate(&sealed).map_err(NativeCompilationError::MalformedToolchainOutput)?;
     clean(&sealed)
+}
+
+/// The glslang options of every formation.
+fn options() -> glslang::CompilerOptions {
+    glslang::CompilerOptions {
+        source_language: glslang::SourceLanguage::GLSL,
+        target: glslang::Target::Vulkan {
+            version: glslang::VulkanVersion::Vulkan1_3,
+            spirv_version: glslang::SpirvVersion::SPIRV1_6,
+        },
+        version_profile: None,
+        messages: glslang::ShaderMessage::DEFAULT,
+    }
+}
+
+/// glslang's preprocessed text of `source` for the launch `kernel`, as
+/// [`compile`] preprocesses it. glslang parses what it preprocesses, so
+/// `source` must parse as a compute shader; a preprocessing failure (an
+/// active `#error` among them) is a toolchain failure.
+pub fn preprocess(source: &str, kernel: &str) -> Result<String, NativeCompilationError> {
+    let compiler = glslang::Compiler::acquire().ok_or_else(|| {
+        NativeCompilationError::ToolchainFailure("glslang could not be initialized".into())
+    })?;
+    let text = glslang::ShaderSource::from(source);
+    let defines = [("SEISMIC_KERNEL", Some(kernel))];
+    let input = glslang::ShaderInput::new(
+        &text,
+        glslang::ShaderStage::Compute,
+        &options(),
+        Some(&defines[..]),
+        None,
+    )
+    .map_err(toolchain)?;
+    let shader = glslang::Shader::new(compiler, input).map_err(toolchain)?;
+    Ok(shader.get_preprocessed_code())
 }
 
 fn target() -> spirv_tools::TargetEnv {
@@ -154,7 +180,7 @@ impl DirectModule {
         words: &[u32],
         entry: &ProgramEntry,
     ) -> Result<vk::Pipeline, NativeCompilationError> {
-        let threads = entry.constants.get(..3).ok_or_else(|| {
+        let threads = entry.group_size.ok_or_else(|| {
             NativeCompilationError::MalformedToolchainOutput(format!(
                 "`{}` carries no workgroup size",
                 entry.symbol
@@ -171,7 +197,7 @@ impl DirectModule {
                 entry.symbol
             ))
         })?;
-        let values = &entry.constants;
+        let values = threads.iter().chain(&entry.constants).collect::<Vec<_>>();
         let entries = (0..values.len() as u32)
             .map(|id| vk::SpecializationMapEntry {
                 constant_id: id,

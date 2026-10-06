@@ -41,7 +41,8 @@ use crate::{
         native_target_graph::{resident_scale, weight, WeightPort},
     },
     DeviceError, DraftProgramPlan, GraphOutputTensor, HeadLaunchCore, InvariantError,
-    ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentWeight,
+    ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentOutput,
+    ResidentWeight,
     ResourceLimits, StateStorePlan, SubmitError, ValidatedHeadLaunch,
 };
 use magnitude_batching::{row_class, TargetBatchUpload};
@@ -483,8 +484,8 @@ impl CheckedDraftEntries {
                 .iter()
                 .map(|block| {
                     (
-                        CheckedAttentionEntries::new(block.attention),
-                        CheckedAttentionEntries::new(block.injection),
+                        CheckedAttentionEntries::new(block.attention, false),
+                        CheckedAttentionEntries::new(block.injection, false),
                         CheckedDenseEntries::new(block.feed_forward),
                     )
                 })
@@ -731,6 +732,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             segments,
             history_rows,
             slab_rows,
+            // The draft's classes list no history row tiles.
+            history_tiles: 0,
             shape,
             operator,
             epsilon,
@@ -1046,6 +1049,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let anchors = match (&draft.method, &entries.markov) {
         (DraftMethod::DFlash, None) => {
             let mut all = result.tensor().slice_leading(0, outputs);
+            let inputs =
+                readout::selection_inputs(&mut graph, entries.sample, outputs, readout_vocabulary)?;
             selections.push(readout::sample(
                 &mut graph,
                 entries.shape,
@@ -1054,6 +1059,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 &mut logits,
                 outputs,
                 class.shaped,
+                inputs,
                 (&mut all).into(),
             )?);
             None
@@ -1144,6 +1150,12 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 let mut step_result = result
                     .tensor()
                     .slice_leading(step * slots, (step + 1) * slots);
+                let inputs = readout::selection_inputs(
+                    &mut graph,
+                    entries.sample,
+                    slots,
+                    readout_vocabulary,
+                )?;
                 selections.push(readout::sample(
                     &mut graph,
                     entries.shape,
@@ -1152,6 +1164,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                     &mut biased,
                     slots,
                     class.shaped,
+                    inputs,
                     (&mut step_result).into(),
                 )?);
                 let step_rows = head_rows
@@ -1453,6 +1466,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
             segments: layer.segments,
             history_rows: layer.history.0,
             slab_rows: layer.history.1,
+            history_tiles: 0,
             shape,
             operator: layer.operator,
             epsilon,
@@ -1855,7 +1869,13 @@ fn resident_draft_weight(
         (WeightScope::Target | WeightScope::Draft, WeightKind::Embedding) => {
             Ok(&resident.embedding)
         }
-        (WeightScope::Target, WeightKind::Output) => Ok(&resident.output),
+        // A separate draft admits no progressive head.
+        (WeightScope::Target, WeightKind::Output) => match &resident.output {
+            ResidentOutput::Packed(weight) => Ok(weight),
+            ResidentOutput::Progressive(_) => Err(invalid(
+                "a separate draft reads the packed output projection",
+            )),
+        },
         _ => resident.weights.get(role).map_err(invalid),
     }
 }

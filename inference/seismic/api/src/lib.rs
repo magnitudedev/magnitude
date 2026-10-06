@@ -23,12 +23,85 @@ pub use seismic_lang::checked::{
     NativeComparison, NativeCondition, NativeImplementation, NativeLaunch, NativeNatExpr,
     NativeParameter, NativeScratch, NativeSpecialization, NativeSpecializationError,
 };
-pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
+pub use seismic_lang::precision::{
+    ErrorEnvelope, Limit, PrecisionPolicy, SpecialPolicy, Tolerance, TuningPrecision,
+};
 /// Numerical comparison helpers used by validation frontends.
 pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
+/// Offline formation coverage of a generated module's native
+/// implementations, and offline formation of the kernels a program requests.
+#[cfg(feature = "coverage")]
+pub mod coverage {
+    use crate::{generated::Module, BackendName, KernelRequest, NativeSpecialization};
+    pub use seismic_runtime::native::coverage::{
+        Configuration, Coverage, CoverageError, FormationFailure, GroupSite, RequestFailure,
+    };
+
+    /// Form every native implementation of `module` for `backend` until
+    /// every preprocessor group of its sources has been formed under some
+    /// configuration.
+    pub fn cover(module: &Module, backend: BackendName) -> Result<Coverage, CoverageError> {
+        seismic_runtime::native::coverage::cover(module.checked(), backend)
+    }
+
+    /// Forms kernel requests at their default specialization on one
+    /// backend's base configuration.
+    pub struct RequestFormer {
+        inner: seismic_runtime::native::coverage::RequestFormer,
+    }
+
+    impl RequestFormer {
+        pub fn open(backend: BackendName) -> Result<Self, CoverageError> {
+            Ok(Self {
+                inner: seismic_runtime::native::coverage::RequestFormer::open(backend)?,
+            })
+        }
+
+        /// Form every request, in parallel; results in request order.
+        pub fn form_all(
+            &self,
+            module: &Module,
+            requests: &[KernelRequest],
+        ) -> Vec<Result<(), RequestFailure>> {
+            let requests = requests
+                .iter()
+                .map(|request| self.request(module, request))
+                .collect::<Vec<_>>();
+            self.inner.form_all(module.checked(), &requests)
+        }
+
+        fn request(
+            &self,
+            module: &Module,
+            request: &KernelRequest,
+        ) -> seismic_runtime::native::coverage::Request {
+            assert_eq!(
+                request.backend,
+                self.inner.backend(),
+                "a request forms on its own backend"
+            );
+            seismic_runtime::native::coverage::Request {
+                entry: module
+                    .checked()
+                    .entry_named(request.entry)
+                    .expect("a request names an entry of its module"),
+                bindings: request.elements.iter().fold(
+                    seismic_lang::entry::ElementBindings::new(),
+                    |bindings, (name, element)| bindings.bind(name, element.id()),
+                ),
+                statics: request
+                    .statics
+                    .iter()
+                    .fold(NativeSpecialization::new(), |statics, (name, value)| {
+                        statics.with_static(name.clone(), *value)
+                    }),
+            }
+        }
+    }
+}
 /// Replay of the tuning search against recorded surveys (development).
 pub use seismic_runtime::native::replay;
 pub use seismic_runtime::native::search::{
@@ -86,7 +159,7 @@ pub mod native_cpu {
 }
 
 pub use seismic_lang::expr::{BigInt, BigUint};
-pub use seismic_lang::registry::{BackendName, Layout};
+pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
@@ -189,6 +262,12 @@ impl Device {
     /// tuning records.
     pub fn tuning_identity(&self) -> String {
         self.inner.tuning_identity()
+    }
+    /// Whether this opened device forms Metal tensor operations (false on
+    /// every other backend): what `DeviceInfo::forms_tensor_operations`
+    /// answers before the device is opened.
+    pub fn forms_tensor_operations(&self) -> bool {
+        self.inner.forms_tensor_operations()
     }
     /// Record every native submission on this device until the returned
     /// trace is dropped (measurement only; see `TraceDetail`).
@@ -1556,7 +1635,7 @@ impl NativeGraphResourceTemplate {
         // contract at the same dimensions has the same buffer maxima.
         let mut certified = std::collections::HashMap::<
             (usize, Option<&'static str>, &[(String, u64)]),
-            (Vec<u64>, Vec<u64>),
+            (Vec<u64>, Vec<seismic_runtime::native::ScratchNeed>),
         >::new();
         for source in &self.recorder.nodes {
             // Every class calls the node's entry at the statics it was
@@ -1629,6 +1708,10 @@ impl NativeGraphResourceTemplate {
                                 })
                                 .map_err(|error| format!("scratch `{}`: {error}", buffer.name))
                         })
+                        .map(|bytes| seismic_runtime::native::ScratchNeed {
+                            bytes,
+                            sync: buffer.sync,
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             );
@@ -1653,16 +1736,21 @@ fn checked_native_scratch_bound(
     scratch_buffers: &[NativeScratch],
     tuning_parameters: &[NativeParameter],
     dimensions: &[(&str, u64)],
-) -> Result<Vec<u64>, String> {
+) -> Result<Vec<seismic_runtime::native::ScratchNeed>, String> {
     scratch_buffers
         .iter()
         .map(|scratch| {
-            scratch.maximum_bytes(tuning_parameters, &|name| {
-                dimensions
-                    .iter()
-                    .find(|(candidate, _)| *candidate == name)
-                    .map(|(_, value)| *value)
-            })
+            scratch
+                .maximum_bytes(tuning_parameters, &|name| {
+                    dimensions
+                        .iter()
+                        .find(|(candidate, _)| *candidate == name)
+                        .map(|(_, value)| *value)
+                })
+                .map(|bytes| seismic_runtime::native::ScratchNeed {
+                    bytes,
+                    sync: scratch.sync,
+                })
         })
         .collect::<Result<_, _>>()
         .map_err(|error| error.to_string())
@@ -1689,6 +1777,7 @@ mod metadata_scratch_tests {
                 Box::new(NativeNatExpr::Dimension("D".into())),
                 Box::new(NativeNatExpr::Parameter("tile".into())),
             ),
+            sync: false,
             when: Some(NativeCondition::Compare {
                 comparison: NativeComparison::Gt,
                 left: NativeNatExpr::Parameter("tile".into()),
@@ -1697,9 +1786,123 @@ mod metadata_scratch_tests {
         };
         assert_eq!(
             checked_native_scratch_bound(&[scratch], &[parameter], &[("D", 4)]).unwrap(),
-            vec![16]
+            vec![seismic_runtime::native::ScratchNeed {
+                bytes: 16,
+                sync: false
+            }]
         );
     }
+}
+
+/// A native kernel a program needs on a backend: an entry at element
+/// bindings and static values. Every specialization of it (its tuning
+/// choices) shares the request.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct KernelRequest {
+    pub backend: BackendName,
+    pub entry: &'static str,
+    pub elements: std::collections::BTreeMap<String, Element>,
+    pub statics: std::collections::BTreeMap<String, u64>,
+}
+
+impl KernelRequest {
+    fn new(
+        backend: BackendName,
+        entry: &'static str,
+        elements: &[(&str, Element)],
+        statics: &NativeSpecialization,
+    ) -> Self {
+        Self {
+            backend,
+            entry,
+            elements: elements
+                .iter()
+                .map(|(name, element)| ((*name).to_owned(), *element))
+                .collect(),
+            statics: statics.statics().clone(),
+        }
+    }
+}
+
+impl fmt::Display for KernelRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let elements = self
+            .elements
+            .iter()
+            .map(|(name, element)| format!("{name}={}", element.name()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let statics = self
+            .statics
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        write!(f, "{} `{}` [{elements}] {{{statics}}}", self.backend.as_str(), self.entry)
+    }
+}
+
+/// An entry bound to its element bindings: prepared on a device, or named,
+/// without one, as the request preparing it makes.
+pub struct BoundEntry<E> {
+    elements: Vec<(&'static str, Element)>,
+    cpu: Option<&'static native_cpu::CpuNativeKernels>,
+    entry: std::marker::PhantomData<fn() -> E>,
+}
+
+impl<E: Entry> BoundEntry<E> {
+    pub fn prepare(
+        &self,
+        device: &Device,
+        specialization: &NativeSpecialization,
+    ) -> Result<NativeKernel<E>, LoadError> {
+        generated::prepare_native::<E>(device, specialization, &self.elements, self.cpu)
+    }
+
+    pub fn request(
+        &self,
+        backend: BackendName,
+        specialization: &NativeSpecialization,
+    ) -> KernelRequest {
+        KernelRequest::new(backend, E::NAME, &self.elements, specialization)
+    }
+}
+
+thread_local! {
+    static RECORDING: std::cell::RefCell<Option<Vec<KernelRequest>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `run`, recording the request of every kernel this thread prepares
+/// meanwhile. Recordings do not nest.
+pub fn record_kernel_requests<R>(run: impl FnOnce() -> R) -> (R, Vec<KernelRequest>) {
+    /// Ends the recording however `run` exits.
+    struct Recording;
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            RECORDING.with(|recording| recording.borrow_mut().take());
+        }
+    }
+    RECORDING.with(|recording| {
+        let mut recording = recording.borrow_mut();
+        assert!(recording.is_none(), "kernel request recordings do not nest");
+        *recording = Some(Vec::new());
+    });
+    let guard = Recording;
+    let result = run();
+    let requests = RECORDING
+        .with(|recording| recording.borrow_mut().take())
+        .expect("the recording is active until its guard drops");
+    drop(guard);
+    (result, requests)
+}
+
+fn record(request: impl FnOnce() -> KernelRequest) {
+    RECORDING.with(|recording| {
+        if let Some(requests) = recording.borrow_mut().as_mut() {
+            requests.push(request());
+        }
+    });
 }
 
 impl NativeGraphMetadata {
@@ -1722,6 +1925,11 @@ impl NativeGraphMetadata {
             }),
             class_scope: None,
         }
+    }
+
+    /// The backend whose native declarations the graph checks.
+    pub fn backend(&self) -> BackendName {
+        self.backend
     }
 
     /// Tag following checked ports and nodes with a semantic class extent
@@ -2939,12 +3147,26 @@ pub mod generated {
         )
     }
 
+    pub fn bound_entry<E: Entry>(
+        elements: &[(&'static str, Element)],
+        cpu: Option<&'static native_cpu::CpuNativeKernels>,
+    ) -> super::BoundEntry<E> {
+        super::BoundEntry {
+            elements: elements.to_vec(),
+            cpu,
+            entry: std::marker::PhantomData,
+        }
+    }
+
     pub fn prepare_native<E: Entry>(
         device: &Device,
         specialization: &NativeSpecialization,
         elements: &[(&str, Element)],
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
     ) -> Result<NativeKernel<E>, LoadError> {
+        super::record(|| {
+            super::KernelRequest::new(device.backend(), E::NAME, elements, specialization)
+        });
         NativeKernel::prepare(
             device,
             specialization.clone(),
@@ -3323,6 +3545,26 @@ pub mod generated {
         ))
     }
 
+    /// The error classes the entry's implementation for `device`'s backend
+    /// declares, in declaration order.
+    pub fn native_error_classes<E: Entry>(
+        device: &Device,
+    ) -> Result<Vec<String>, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        Ok(module
+            .checked()
+            .native_implementation(entry.id(), device.backend())
+            .map(|implementation| {
+                implementation
+                    .error_classes
+                    .iter()
+                    .map(|class| class.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Digest of the entry's implementation for `device`'s backend at these
     /// bindings and static values, for keying stored tuning results.
     pub fn digest_native<E: Entry>(
@@ -3393,7 +3635,7 @@ pub mod generated {
         elements: &[(&str, Element)],
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
         points: &mut dyn PointSource<'_, E>,
-        validation: PrecisionPolicy,
+        validation: impl Into<TuningPrecision>,
         strategy: Strategy,
         reference: TuningReference,
     ) -> Result<TuningResult, TuneError> {
@@ -3422,7 +3664,7 @@ pub mod generated {
             statics: statics.clone(),
             cpu,
             points: &mut Typed(points),
-            validation,
+            validation: validation.into(),
             strategy,
             reference,
         })

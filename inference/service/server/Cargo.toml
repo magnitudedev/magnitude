@@ -41,6 +41,9 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
+# Every catalog model's kernel requests form (`assessment/catalog_kernels_tests.rs`).
+magnitude-kernels = { path = "../../engine/kernels" }
+seismic = { workspace = true, features = ["coverage"] }
 tempfile = "3.24.0"
 tower = { workspace = true, features = ["util"] }
 tokio = { workspace = true, features = ["test-util"] }

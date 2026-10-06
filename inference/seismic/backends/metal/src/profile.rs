@@ -82,7 +82,7 @@ pub fn open_device(
 fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, TargetError> {
     let handle = device.handle();
     let raw = handle.raw();
-    let language = probe_language_version(raw).ok_or_else(|| {
+    let language = probe_language_version(handle).ok_or_else(|| {
         TargetError::UnsupportedToolchain(
             "the Metal compiler accepts none of the language versions this backend emits".into(),
         )
@@ -111,6 +111,7 @@ fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, Tar
         bfloat_arithmetic: probe_bfloat_arithmetic(raw, language),
         matrix_dtypes: probe_matrix_dtypes(raw, language),
         matrix_combinations: probe_matrix_combinations(raw, language),
+        tensor_ops: tensor_operations_at(raw, language),
         argument_table_entries: ARGUMENT_TABLE_ENTRIES,
         reserved_argument_entries: RESERVED_ARGUMENT_ENTRIES,
         backend_revision: BACKEND_REVISION,
@@ -480,6 +481,8 @@ pub(crate) fn native_language(language: LanguageVersion) -> MTLLanguageVersion {
         LanguageVersion::V3_1 => MTLLanguageVersion::Version3_1,
         LanguageVersion::V3_2 => MTLLanguageVersion::Version3_2,
         LanguageVersion::V4_0 => MTLLanguageVersion::Version4_0,
+        // MTLLanguageVersion4_1, which the bindings do not name yet.
+        LanguageVersion::V4_1 => MTLLanguageVersion((4 << 16) + 1),
     }
 }
 
@@ -498,11 +501,14 @@ pub(crate) fn compile_options(language: LanguageVersion) -> objc2::rc::Retained<
 
 const PROBE_PRELUDE: &str = "#include <metal_stdlib>\nusing namespace metal;\n";
 
-fn probe_language_version(device: &ProtocolObject<dyn MTLDevice>) -> Option<LanguageVersion> {
+/// The highest language version accepted by the runtime compiler.
+pub fn probe_language_version(device: &crate::DeviceHandle) -> Option<LanguageVersion> {
+    let device = device.raw();
     let source = NSString::from_str(&format!(
         "{PROBE_PRELUDE}kernel void seismic_language_probe(device uint* output [[buffer(0)]]) {{ output[0] = 0u; }}\n"
     ));
     [
+        LanguageVersion::V4_1,
         LanguageVersion::V4_0,
         LanguageVersion::V3_2,
         LanguageVersion::V3_1,
@@ -642,6 +648,47 @@ fn probe_matrix_combinations(
         }
     }
     combinations
+}
+
+/// Whether the device forms tensor operations (`MetalFacts::tensor_ops`):
+/// Apple GPU family 10 or later, and the tensor probe forms a pipeline at
+/// `language`.
+fn tensor_operations_at(device: &ProtocolObject<dyn MTLDevice>, language: LanguageVersion) -> bool {
+    device.supportsFamily(MTLGPUFamily::Apple10) && probe_tensor_ops(device, language)
+}
+
+/// Whether an unopened device forms tensor operations: the fact its opened
+/// description holds (`MetalFacts::tensor_ops`), from the same family test
+/// and probes at the same language version, so planning before a device is
+/// opened and the opened device agree. It compiles the probes; callers ask
+/// once per decision, not per enumeration.
+pub fn forms_tensor_operations(device: &crate::DeviceHandle) -> bool {
+    probe_language_version(device)
+        .is_some_and(|language| tensor_operations_at(device.raw(), language))
+}
+
+/// Whether a `matmul2d` over a device and a threadgroup tensor into a
+/// cooperative F32 destination forms a pipeline: the tensor-operation
+/// facilities native sources use under `SEISMIC_HAS_TENSOR_OPS`.
+fn probe_tensor_ops(device: &ProtocolObject<dyn MTLDevice>, language: LanguageVersion) -> bool {
+    language >= LanguageVersion::V4_0
+        && probe_pipeline(
+            device,
+            language,
+            "seismic_tensor_probe",
+            "#include <metal_tensor>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n\
+             kernel void seismic_tensor_probe(device bfloat* a [[buffer(0)]], device float* c [[buffer(1)]], uint t [[thread_index_in_threadgroup]]) { \
+             threadgroup half b[256]; b[t % 256] = half(t); threadgroup_barrier(mem_flags::mem_threadgroup); \
+             auto ta = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(a, dextents<int32_t, 2>(16, 16)); \
+             auto tb = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(b, dextents<int32_t, 2>(16, 16)); \
+             auto tc = tensor<device float, dextents<int32_t, 2>, tensor_inline>(c, dextents<int32_t, 2>(16, 16)); \
+             constexpr auto d = mpp::tensor_ops::matmul2d_descriptor(16, 16, 16, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate); \
+             mpp::tensor_ops::matmul2d<d, execution_simdgroups<1>> op; \
+             auto acc = op.get_destination_cooperative_tensor<decltype(ta), decltype(tb), float>(); \
+             for (uint16_t i = 0; i < acc.get_capacity(); ++i) if (acc.is_valid_element(i)) acc[i] = 0.0f; \
+             op.run(ta, tb, acc); acc.store(tc); }\n",
+        )
+        .is_some()
 }
 
 /// Pure target assembly from a complete immutable description. No device

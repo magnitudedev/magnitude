@@ -10,10 +10,10 @@ use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     ExecutionPath, ResourcePlan, MAX_DRAFT_PROPOSALS,
 };
-use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, Operator};
+use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily};
 use magnitude_generation::{DFlash, Method, Mtp, Plain};
 
-/// Dense-target MTP width when none is requested.
+/// MTP width when none is requested.
 const DEFAULT_PROPOSALS: u8 = 3;
 use crate::census::AllocationCensus;
 use magnitude_scheduler::ServiceLimits;
@@ -104,6 +104,11 @@ pub struct ModelPolicy {
     /// Rows one launch may export full logits for: zero for serving, which
     /// never reads them; set by diagnostics that do.
     pub exported_logits_rows: usize,
+    /// The kernel error classes this model's qualification admits (top-1
+    /// agreement and KL against an F32 forward with the class's forms
+    /// selected). Tuning forms a configuration of an error class only when
+    /// it is named here; none by default.
+    pub error_classes: Vec<String>,
 }
 
 impl Default for ModelPolicy {
@@ -114,6 +119,7 @@ impl Default for ModelPolicy {
             kv_codec: KvCodec::AffineK8V4,
             lookahead: true,
             exported_logits_rows: 0,
+            error_classes: Vec::new(),
         }
     }
 }
@@ -192,12 +198,20 @@ pub struct ResolvedModelPolicy {
     pub kv_codec: KvCodec,
     pub lookahead: bool,
     pub exported_logits_rows: usize,
+    /// The admitted kernel error classes, sorted and distinct.
+    #[serde(default)]
+    pub error_classes: Vec<String>,
 }
 
 impl ModelPolicy {
     pub fn resolve(&self, definition: &ModelDefinition) -> Result<ResolvedModelPolicy, String> {
         definition.validate().map_err(|error| error.to_string())?;
         let method = resolve_method(self.method, self.mtp_proposals, definition)?;
+        let mut error_classes = self.error_classes.clone();
+        error_classes.sort();
+        error_classes.dedup();
+        // A class no kernel declares is a configuration error.
+        magnitude_executor::AdmittedErrorClasses::of(&error_classes)?;
         Ok(ResolvedModelPolicy {
             method,
             kv_codec: self.kv_codec,
@@ -205,6 +219,7 @@ impl ModelPolicy {
             // its steps cannot chain on device-selected tokens.
             lookahead: self.lookahead && definition.decoder.entry.per_layer.is_none(),
             exported_logits_rows: self.exported_logits_rows,
+            error_classes,
         })
     }
 }
@@ -412,18 +427,12 @@ fn resolve_method(
         return Ok(ResolvedMethod::Plain);
     }
     head.ok_or("MTP was requested but the artifact has no draft head")?;
-    let routed = definition
-        .decoder
-        .sublayers()
-        .any(|(_, sublayer)| matches!(sublayer.op, Operator::RoutedFfn(_)));
     let (greedy_proposals, sampled_proposals) = match override_width {
         Some(0) => return Err("mtp_proposals must be positive".into()),
         Some(width) if width > MAX_DRAFT_PROPOSALS => {
             return Err(format!("mtp_proposals exceeds {MAX_DRAFT_PROPOSALS}"))
         }
         Some(width) => (width, width),
-        // Every verify row of a routed target streams more experts.
-        None if routed => (1, 1),
         None => (DEFAULT_PROPOSALS, DEFAULT_PROPOSALS),
     };
     Ok(ResolvedMethod::Mtp {
@@ -440,7 +449,7 @@ mod tests {
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, Head,
         HeadBlock, HeadNorm, HistoryDomain, HistoryReads, InputNorm, KeyValue, MediaRowAttention,
-        OutputForm, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource,
+        Operator, OutputForm, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource,
         WeightDescriptor,
     };
 
@@ -566,6 +575,21 @@ mod tests {
                 sampled_proposals: DEFAULT_PROPOSALS,
             }
         );
+    }
+
+    #[test]
+    fn an_error_class_no_kernel_declares_is_refused() {
+        let policy = ModelPolicy {
+            error_classes: vec!["undeclared".to_owned()],
+            ..ModelPolicy::default()
+        };
+        let error = policy.resolve(&definition(false)).unwrap_err();
+        assert!(error.contains("unknown error class `undeclared`"), "{error}");
+        assert!(ModelPolicy::default()
+            .resolve(&definition(false))
+            .unwrap()
+            .error_classes
+            .is_empty());
     }
 
     #[test]

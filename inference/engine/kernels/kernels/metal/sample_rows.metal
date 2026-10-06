@@ -11,28 +11,10 @@
 // and either its row is unconstrained (`constrained` 0) or its mask bit is set. Status 0 success, 1 no competing token, 2 some logit
 // of the row is NaN or +inf.
 
+#include "lib/core/gumbel.h"
+
 constant constexpr uint sample_threads = 256;
 constant constexpr uint no_token = 0xffffffffu;
-
-inline uint2 sample_multiply(uint left, uint right) {
-    ulong product = ulong(left) * ulong(right);
-    return uint2(uint(product >> 32), uint(product));
-}
-
-inline float sample_score(float value, uint token, device const uint *draw, ulong stride) {
-    if (draw[0] != 1u)
-        return value;
-    uint4 counter(token, draw[3 * stride], draw[4 * stride], draw[5 * stride]);
-    uint2 key(draw[stride], draw[2 * stride]);
-    for (uint round = 0; round < 10; ++round) {
-        uint2 p0 = sample_multiply(3528531795u, counter.x);
-        uint2 p1 = sample_multiply(3449720151u, counter.z);
-        counter = uint4(p1.x ^ counter.y ^ key.x, p1.y, p0.x ^ counter.w ^ key.y, p0.y);
-        key += uint2(2654435769u, 3144134277u);
-    }
-    float uniform = (float(counter.x >> 9) + 0.5f) * 0.00000011920928955078125f;
-    return value - metal::log(-metal::log(uniform));
-}
 
 // The better of two (score, token) candidates: higher score, then lower token.
 inline bool sample_better(float score, uint token, float best_score, uint best_token) {
@@ -83,7 +65,7 @@ kernel void sample_rows_partition(
             continue;
         if (masked && ((words[ulong(token / 32u) * SEISMIC_MASK_STRIDE_1] >> (token % 32u)) & 1u) == 0u)
             continue;
-        float score = sample_score(value, token, draw, SEISMIC_DRAWS_STRIDE_1);
+        float score = value + gumbel::noise(token, draw, SEISMIC_DRAWS_STRIDE_1);
         if (sample_better(score, token, best, best_token)) {
             best = score;
             best_token = token;

@@ -79,6 +79,7 @@ struct norm8<element::F16> {
 
 template <typename A, typename Rows>
 struct Plain {
+    static_assert(A::bytes == 2, "the Metal projection family requires a bf16 or f16 activation element");
     typedef A activation;
     device const uchar *x;
     ulong stride0, stride1;
@@ -98,10 +99,23 @@ struct Plain {
             reinterpret_cast<device const typename A::storage *>(x) + ulong(rows.at(m)) * stride0;
         return words8_storage<A>(row, stride1, k, columns, stride1 == 1 && (stride0 & 7u) == 0);
     }
+    // x[m, k] and x[m, k + 1] as one storage word (k + 1 < columns), zero
+    // for a row at or past `m_rows`.
+    uint words2(uint m, uint k, uint m_rows) const {
+        if (m >= m_rows)
+            return 0u;
+        device const typename A::storage *row =
+            reinterpret_cast<device const typename A::storage *>(x) + ulong(rows.at(m)) * stride0;
+        if (stride1 == 1)
+            return as_type<uint>(ushort2(*reinterpret_cast<device const packed_ushort2 *>(row + k)));
+        return uint(as_type<ushort>(row[ulong(k) * stride1]))
+            | uint(as_type<ushort>(row[ulong(k + 1u) * stride1])) << 16u;
+    }
 };
 
 template <typename A, typename N, typename Rows>
 struct Rms {
+    static_assert(A::bytes == 2, "the Metal projection family requires a bf16 or f16 activation element");
     typedef A activation;
     device const float *x;
     ulong stride0, stride1;
@@ -165,86 +179,6 @@ struct Rms {
                 : 0.0f;
         even = float4(v[0], v[2], v[4], v[6]);
         odd = float4(v[1], v[3], v[5], v[7]);
-    }
-};
-
-// Gated per-head RMS·SiLU(z): `mixed` is [rows, heads, W] in A, `z` sits at
-// column `z_column` of a row of `projection` (A).
-template <typename A, typename N, typename Rows>
-struct GatedRms {
-    typedef A activation;
-    device const uchar *mixed;
-    ulong mixed0, mixed1, mixed2;
-    device const uchar *projection;
-    ulong projection0, projection1;
-    ulong z_column;
-    device const uchar *norm;
-    ulong norm_stride;
-    float eps;
-    uint heads;
-    uint head_width;
-    Rows rows;
-    uint groups() const { return heads; }
-    uint width() const { return head_width; }
-    float mixed_at(uint m, uint head, uint i) const {
-        return A::load(reinterpret_cast<device const typename A::storage *>(mixed)
-            [ulong(rows.at(m)) * mixed0 + ulong(head) * mixed1 + ulong(i) * mixed2]);
-    }
-    float norm_input(uint m, uint head, uint i) const { return mixed_at(m, head, i); }
-    float epsilon() const { return eps; }
-    float value(uint m, uint column, float inverse) const {
-        uint head = column / head_width, i = column % head_width;
-        float normalized = A::round(mixed_at(m, head, i) * inverse
-            * element::at<N>(norm, ulong(i) * norm_stride));
-        float gate = A::load(reinterpret_cast<device const typename A::storage *>(projection)
-            [ulong(rows.at(m)) * projection0 + (z_column + column) * projection1]);
-        float activated = A::round(gate / (1.0f + metal::exp(-gate)));
-        return A::round(normalized * activated);
-    }
-    // The inputs of columns k..k+7 (one head; head_width is a multiple of 8)
-    // as (even, odd): mixed, z and the norm weights.
-    struct inputs8 {
-        float4 me, mo, ze, zo, ne, no;
-    };
-    inputs8 load_inputs8(uint m, uint k) const {
-        uint head = k / head_width, i = k % head_width;
-        ulong mixed_at0 = ulong(rows.at(m)) * mixed0 + ulong(head) * mixed1 + ulong(i) * mixed2;
-        ulong z_at = ulong(rows.at(m)) * projection0 + (z_column + k) * projection1;
-        device const typename A::storage *mixed_row = reinterpret_cast<device const typename A::storage *>(mixed);
-        device const typename A::storage *z_row = reinterpret_cast<device const typename A::storage *>(projection);
-        inputs8 v;
-        load8_storage<A>(mixed_row + mixed_at0, mixed2, 0, 8, mixed2 == 1 && (mixed_at0 & 7u) == 0, v.me, v.mo);
-        load8_storage<A>(z_row + z_at, projection1, 0, 8, projection1 == 1 && (z_at & 7u) == 0, v.ze, v.zo);
-        norm8<N>::load(norm, norm_stride, i, v.ne, v.no);
-        return v;
-    }
-    void finish8(thread const inputs8 &v, float inverse, thread float4 &even, thread float4 &odd) const {
-        float4 e = v.me * inverse * v.ne, o = v.mo * inverse * v.no;
-        float4 ae = v.ze / (1.0f + metal::exp(-v.ze)), ao = v.zo / (1.0f + metal::exp(-v.zo));
-        for (uint j = 0; j < 4; ++j) {
-            even[j] = A::round(A::round(e[j]) * A::round(ae[j]));
-            odd[j] = A::round(A::round(o[j]) * A::round(ao[j]));
-        }
-    }
-    void load8(uint m, uint k, float inverse, thread float4 &even, thread float4 &odd) const {
-        finish8(load_inputs8(m, k), inverse, even, odd);
-    }
-    // The prologue of columns k..k+7 when the head_width / 8 adjacent lanes of
-    // this lane's aligned lane group load the head's columns in order (the
-    // GEMV staging's layout): each lane sums the squares of its eight mixed
-    // values in column order, and a butterfly over the group gives every lane
-    // the head's square sum. No separate square-sum pass is needed, and the
-    // sum does not depend on the threadgroup shape.
-    void load8_across_lanes(uint m, uint k, thread float4 &even, thread float4 &odd) const {
-        inputs8 v = load_inputs8(m, k);
-        float squares = 0.0f;
-        for (uint j = 0; j < 4; ++j) {
-            squares = metal::fma(v.me[j], v.me[j], squares);
-            squares = metal::fma(v.mo[j], v.mo[j], squares);
-        }
-        for (ushort offset = 1; offset < head_width / 8u; offset <<= 1)
-            squares += simd_shuffle_xor(squares, offset);
-        finish8(v, metal::rsqrt(squares / float(head_width) + eps), even, odd);
     }
 };
 

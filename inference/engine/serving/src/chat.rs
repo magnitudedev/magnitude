@@ -39,7 +39,6 @@ use crate::{Serving, include_progress, media, unix_timestamp, with_request_id};
 
 const DEFAULT_TEMPERATURE: f32 = 0.8;
 const DEFAULT_TOP_P: f32 = 0.95;
-const DEFAULT_SEED: u32 = 42;
 
 fn deserialize_bool_or_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
@@ -1048,7 +1047,7 @@ pub(crate) fn validate_request(
             repetition_penalty,
             presence_penalty,
             frequency_penalty,
-            seed: u64::from(request.seed.unwrap_or(DEFAULT_SEED)),
+            seed: crate::responses::request_seed(request.seed),
         },
         cache_prompt: request.cache_prompt,
         ignore_eos: request.ignore_eos,
@@ -1148,10 +1147,10 @@ fn chat_context(messages: Vec<ChatMessageRequest>) -> Result<Conversation, ApiEr
             } => {
                 let reasoning = reasoning_content.filter(|value| !value.is_empty());
                 let text = content.filter(|value| !value.is_empty());
+                // An assistant turn with nothing in it (a client's record of a
+                // step that failed before any output) contributes nothing.
                 if text.is_none() && reasoning.is_none() && tool_calls.is_empty() {
-                    return Err(ApiError::invalid(
-                        "assistant content is required unless tool_calls are present",
-                    ));
+                    continue;
                 }
                 let exchanges = if tool_calls.is_empty() {
                     Vec::new()

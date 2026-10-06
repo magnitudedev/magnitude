@@ -73,6 +73,48 @@ jobs:
           path: inference/target/catalog-inputs/
           if-no-files-found: error
 
+  # Every native kernel forms with each GPU backend's real toolchain, and every kernel every
+  # supported catalog model requests forms.
+  kernels:
+    needs: catalog
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: vulkan
+            runner: blacksmith-16vcpu-ubuntu-2404
+          - backend: cuda
+            runner: blacksmith-16vcpu-ubuntu-2404
+          - backend: metal
+            runner: blacksmith-12vcpu-macos-26
+    runs-on: ${{ matrix.runner }}
+    env:
+      MAGNITUDE_REQUIRE_KERNEL_FORMATION: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: ./.github/actions/build-cache
+        with:
+          scope: kernels-${{ matrix.backend }}
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-build-tools
+        with:
+          packages: build-essential cmake clang
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: catalog-inputs
+          path: inference/target/catalog-inputs
+      - run: bun run --cwd inference kernels:form ${{ matrix.backend }}
+
   host:
     permissions:
       contents: read

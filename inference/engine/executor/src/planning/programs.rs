@@ -4,8 +4,9 @@
 use super::weights::{activation_dtype, ParallelBinding, PerLayerBinding, PerLayerEntryBinding};
 use super::{
     planned_element, planned_scalable, AttentionBinding, DenseBinding, EmbeddingBinding,
-    FeaturesBinding, HeadBinding, HostTablePlan, ReadoutBinding, RecurrentBinding, RoutedBinding,
-    ScalableWeight, WeightPlan,
+    FeaturesBinding, HeadBinding, HeadProjection, HostTablePlan, ReadoutBinding, ReadoutHead,
+    RecurrentBinding,
+    RoutedBinding, ScalableWeight, WeightPlan,
 };
 use crate::error::PlanError;
 use crate::operators::routed::GeneralRoutedBinding;
@@ -407,6 +408,8 @@ pub(super) fn derive_program_plan(
         .iter()
         .chain(head.unwrap_or_default())
         .chain(vision.unwrap_or_default())
+        // A host-placed weight needs no import entry.
+        .filter(|weight| !weight.placed_on_host())
         .map(|weight| (weight.upload, weight.resident))
     {
         let slot = match (source.dtype(), resident.dtype()) {
@@ -495,12 +498,22 @@ pub(super) fn derive_program_plan(
             })
         })
         .transpose()?;
-    let output = planned_scalable(target, WeightScope::Target, WeightKind::Output)?;
+    let progressive = target.iter().any(|weight| {
+        matches!(weight.role.kind, WeightKind::OutputPlane(_)) && weight.role.scope == WeightScope::Target
+    });
+    let readout_head = if progressive {
+        ReadoutHead::Progressive
+    } else {
+        let output = planned_scalable(target, WeightScope::Target, WeightKind::Output)?;
+        ReadoutHead::Packed {
+            weight: output.element,
+            weight_scale: output.scale,
+        }
+    };
     let readout = ReadoutBinding {
         norm: lookup(target, WeightScope::Target, WeightKind::OutputNorm)?,
-        weight: output.element,
+        head: readout_head,
         activation: active_element,
-        weight_scale: output.scale,
     };
     // A selected separate draft is the drafter; an embedded head otherwise.
     let separate = head.and(definition.draft.as_ref());
@@ -575,7 +588,11 @@ pub(super) fn derive_program_plan(
                         active_element,
                     )?,
                     output_norm: lookup(weights, scope, WeightKind::OutputNorm)?,
-                    projection: lookup(target, WeightScope::Target, WeightKind::Output)?,
+                    projection: if progressive {
+                        HeadProjection::Progressive
+                    } else {
+                        HeadProjection::Packed(lookup(target, WeightScope::Target, WeightKind::Output)?)
+                    },
                     activation: active_element,
                 });
             }

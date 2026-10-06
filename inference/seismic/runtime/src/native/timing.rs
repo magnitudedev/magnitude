@@ -172,6 +172,7 @@ impl<'a> PointTiming<'a> {
             .iter()
             .flat_map(|call| {
                 call.launches
+                    .geometry
                     .iter()
                     .enumerate()
                     .filter(|(_, geometry)| {
@@ -215,6 +216,11 @@ impl<'a> PointTiming<'a> {
 
     pub(super) fn artifact(&self) -> &str {
         &self.kernel.artifact().0
+    }
+
+    /// The configuration this timing executes.
+    pub(super) fn kernel(&self) -> &NativePrepared {
+        &self.kernel
     }
 
     /// The calibration pass also supplies numerical observations, before any rotation or

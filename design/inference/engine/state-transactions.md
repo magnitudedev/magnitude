@@ -22,8 +22,11 @@ convolution window, the gated delta rule's innovations, keys and decays, and the
 rule's inputs, `B` rows and steps. A reader of version (bank, tape rows) replays those rows onto the
 published state. Bank bytes, and with them the banks per slab, follow from the components.
 An advance names its accepted bank and its successor bank, and the batch carries both per slot, so
-kernels read one row and write another in place. No kernel writes an accepted bank or the zero
-seed; forks and checkpoints share accepted banks by claim, never by copy.
+kernels read one row and write another in place. A layer's components may be published by more
+than one of its entries in the layer's ordered submission (a convolving input projection publishes
+the successor window, its state entry the state and tape); each reads only the accepted bank and
+writes only the successor. No kernel writes an accepted bank or the zero seed; forks and
+checkpoints share accepted banks by claim, never by copy.
 Attention history is organized in history domains. A history domain is a set of attention layers
 whose history shares one row numbering; a row is one token's history in that domain's layers. A
 store holds one history slab tensor per stored domain, each with its own components, rows per slab,

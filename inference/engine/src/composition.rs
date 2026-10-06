@@ -57,7 +57,11 @@ impl EngineConfiguration {
         let package = self.package.open().map_err(|error| {
             ResolveError::Artifact(ArtifactError::from_artifacts(error, &self.package.target))
         })?;
-        let host = HostArtifacts::interpret(package, self.context_tokens)?;
+        let host = HostArtifacts::interpret(
+            package,
+            self.context_tokens,
+            Some(self.service.launch_rows()),
+        )?;
         let definition = host.definition();
         definition.validate().map_err(|error| {
             ResolveError::Unsupported(UnsupportedModel::Representation {

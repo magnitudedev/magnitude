@@ -88,16 +88,7 @@ impl VulkanOpened {
 
     /// The device features the generated prefix exposes.
     pub(crate) fn features(&self) -> VulkanFeatures {
-        let facts = self.service.facts();
-        VulkanFeatures {
-            subgroup_lanes: facts.subgroup_width().lanes(),
-            float16: facts.float16,
-            matrix: facts.matrix,
-            wide_accumulators: facts.wide_accumulators,
-            mixed_dot: facts.mixed_dot_accelerated,
-            f32_atomic_add: facts.f32_atomic_add,
-            shared_int64_atomics: facts.shared_int64_atomics,
-        }
+        VulkanFeatures::of(&self.service.facts().formation())
     }
 
     pub(crate) fn memory_usage(&self) -> MemoryUsage {

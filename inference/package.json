@@ -20,6 +20,7 @@
     "build": "bun run scripts/build-local.ts",
     "serve": "bun run scripts/build-local.ts --serve",
     "smoke": "bun run scripts/smoke.ts",
+    "kernels:form": "bun run scripts/kernels-form.ts",
     "catalog:build-bundle": "cargo run -p magnitude-service-catalog-tool -- build-bundle --output target/catalog-inputs/model-planner-inputs.bundle --model-store ~/.magnitude/models --cache-root ~/.magnitude/cache",
     "scripts:test": "bunx --bun vitest run scripts",
     "scripts:typecheck": "bunx tsc --noEmit -p tsconfig.json"

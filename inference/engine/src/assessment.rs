@@ -9,9 +9,9 @@
 //! template and reasoning inspection over header metadata. No device is
 //! opened, no weight payload is read and nothing is decoded.
 
-use crate::error::{classify_graph, classify_plan, PlanOutcome, UnsupportedModel};
+use crate::error::{classify_catalog, classify_graph, classify_plan, PlanOutcome, UnsupportedModel};
 use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy};
-use crate::planning::{ExecutionPlanningError, plan_execution};
+use crate::planning::{ExecutionPlanningError, plan_backend, plan_execution};
 use magnitude_artifacts::PackageHeaders;
 use magnitude_chat::{
     TemplateInspection,
@@ -249,54 +249,18 @@ pub fn prepare_model_assessment(
     package: &ModelPackagePaths,
     setup: &AssessmentSetup,
 ) -> Result<PreparedModelAssessment, ModelAssessmentError> {
-    let headers = PackageHeaders::open(&package.target, package.projector.as_deref())
-        .and_then(|headers| match &package.draft {
-            Some(draft) => headers.with_draft(draft),
-            None => Ok(headers),
-        })
-        .map_err(ModelAssessmentError::Artifact)?;
-    let family = match crate::families::recognize(headers.target()) {
-        Ok(family) => family,
-        Err(unsupported) => return Ok(PreparedModelAssessment::Unsupported(unsupported)),
-    };
-    let definition = match family
-        .inspect(headers.target(), headers.projector(), headers.identity())
-        .map_err(|error| error.0)
-        .and_then(|declared| crate::host::bind_draft(family, declared, headers.draft()))
-    {
-        Ok(definition) => definition,
-        Err(reason) => {
-            return Ok(PreparedModelAssessment::Unsupported(
-                UnsupportedModel::Representation { reason },
-            ));
-        }
-    };
-    let context_limit = u32::try_from(definition.decoder.context_limit)
-        .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
-    let facts = match model_facts(&headers, package, &definition, context_limit) {
-        Ok(facts) => facts,
-        Err(unsupported) => return Ok(PreparedModelAssessment::Unsupported(unsupported)),
-    };
-    let policy = ModelPolicy {
-        method: package.method,
-        ..setup.policy.clone()
-    };
-    // A method the package cannot run (a declared draft of another variant)
-    // is an invalid configuration of the bundle, as it is for a load.
-    let model = policy
-        .resolve(&definition)
-        .map_err(ModelAssessmentError::Configuration)?;
-    let manifest = ExecutionManifest::new(
-        headers.manifest(),
-        definition,
-        model,
-        setup.service.clone(),
-        ExecutionPath::Native,
+    let (facts, manifest) = match resolve_package(
+        package,
+        &setup.policy,
+        &setup.service,
         setup.device,
-        None,
         setup.reserves,
-    )
-    .map_err(ModelAssessmentError::Configuration)?;
+    )? {
+        ResolvedPackage::Unsupported(unsupported) => {
+            return Ok(PreparedModelAssessment::Unsupported(unsupported))
+        }
+        ResolvedPackage::Resolved { facts, manifest } => (facts, manifest),
+    };
     // Planner refusals and kernel domains classify exactly as a load's do.
     let refused = |outcome: PlanOutcome| match outcome {
         PlanOutcome::Unsupported(unsupported) => {
@@ -311,17 +275,133 @@ pub fn prepare_model_assessment(
         }
         Err(error) => return Err(ModelAssessmentError::Planning(error.to_string())),
     };
-    let execution = match prepare_execution_assessment(&manifest.definition, &draft, context_limit)
-    {
-        Ok(execution) => execution,
-        Err(AssessmentError::Graph(error)) => return refused(classify_graph(error)),
-        Err(error) => return Err(ModelAssessmentError::Assessment(error)),
-    };
+    let execution =
+        match prepare_execution_assessment(&manifest.definition, &draft, facts.context_limit) {
+            Ok(execution) => execution,
+            Err(AssessmentError::Graph(error)) => return refused(classify_graph(error)),
+            Err(error) => return Err(ModelAssessmentError::Assessment(error)),
+        };
     Ok(PreparedModelAssessment::Planned {
         facts,
         draft,
         execution,
     })
+}
+
+/// The native kernels a load of one package prepares on a backend, or why
+/// the engine cannot execute the package there: the classification
+/// assessment makes.
+pub enum KernelInventory {
+    Unsupported(UnsupportedModel),
+    Requests(Vec<seismic::KernelRequest>),
+}
+
+/// The native kernels a load of `package` under `policy` prepares on
+/// `backend`, derived from its headers without a device.
+pub fn kernel_inventory(
+    package: &ModelPackagePaths,
+    policy: &ModelPolicy,
+    service: &ServiceLimits,
+    backend: seismic::BackendName,
+) -> Result<KernelInventory, ModelAssessmentError> {
+    let manifest = match resolve_package(
+        package,
+        policy,
+        service,
+        DeviceRequest::Backend(backend),
+        MemoryReserves::standard(),
+    )? {
+        ResolvedPackage::Unsupported(unsupported) => {
+            return Ok(KernelInventory::Unsupported(unsupported))
+        }
+        ResolvedPackage::Resolved { manifest, .. } => manifest,
+    };
+    let refused = |outcome: PlanOutcome| match outcome {
+        PlanOutcome::Unsupported(unsupported) => Ok(KernelInventory::Unsupported(unsupported)),
+        PlanOutcome::Internal(reason) => Err(ModelAssessmentError::Planning(reason)),
+    };
+    let plan = match plan_backend(&manifest, backend) {
+        Ok(plan) => plan,
+        Err(ExecutionPlanningError::Plan(error)) => {
+            return refused(classify_plan(error, backend));
+        }
+        Err(error) => return Err(ModelAssessmentError::Planning(error.to_string())),
+    };
+    match magnitude_executor::kernel_inventory(&manifest.definition, &plan) {
+        Ok(requests) => Ok(KernelInventory::Requests(requests)),
+        Err(error) => refused(classify_catalog(error)),
+    }
+}
+
+/// A package resolved from its headers: the manifest a load of it executes
+/// and its host-side facts, or why the engine cannot execute it.
+enum ResolvedPackage {
+    Unsupported(UnsupportedModel),
+    Resolved {
+        facts: ModelFacts,
+        manifest: ExecutionManifest,
+    },
+}
+
+/// Recognition, the family definition, capabilities from the engine's own
+/// chat inspection and the execution manifest of `package` under `policy`
+/// (its method from the package).
+fn resolve_package(
+    package: &ModelPackagePaths,
+    policy: &ModelPolicy,
+    service: &ServiceLimits,
+    device: DeviceRequest,
+    reserves: MemoryReserves,
+) -> Result<ResolvedPackage, ModelAssessmentError> {
+    let headers = PackageHeaders::open(&package.target, package.projector.as_deref())
+        .and_then(|headers| match &package.draft {
+            Some(draft) => headers.with_draft(draft),
+            None => Ok(headers),
+        })
+        .map_err(ModelAssessmentError::Artifact)?;
+    let family = match crate::families::recognize(headers.target()) {
+        Ok(family) => family,
+        Err(unsupported) => return Ok(ResolvedPackage::Unsupported(unsupported)),
+    };
+    let definition = match family
+        .inspect(headers.target(), headers.projector(), headers.identity())
+        .map_err(|error| error.0)
+        .and_then(|declared| crate::host::bind_draft(family, declared, headers.draft()))
+    {
+        Ok(definition) => definition,
+        Err(reason) => {
+            return Ok(ResolvedPackage::Unsupported(
+                UnsupportedModel::Representation { reason },
+            ));
+        }
+    };
+    let context_limit = u32::try_from(definition.decoder.context_limit)
+        .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
+    let facts = match model_facts(&headers, package, &definition, context_limit) {
+        Ok(facts) => facts,
+        Err(unsupported) => return Ok(ResolvedPackage::Unsupported(unsupported)),
+    };
+    let policy = ModelPolicy {
+        method: package.method,
+        ..policy.clone()
+    };
+    // A method the package cannot run (a declared draft of another variant)
+    // is an invalid configuration of the bundle, as it is for a load.
+    let model = policy
+        .resolve(&definition)
+        .map_err(ModelAssessmentError::Configuration)?;
+    let manifest = ExecutionManifest::new(
+        headers.manifest(),
+        definition,
+        model,
+        service.clone(),
+        ExecutionPath::Native,
+        device,
+        None,
+        reserves,
+    )
+    .map_err(ModelAssessmentError::Configuration)?;
+    Ok(ResolvedPackage::Resolved { facts, manifest })
 }
 
 /// The package's host-side facts: capabilities and template fingerprint

@@ -1084,6 +1084,64 @@ fn check_native(
         .map(|parameter| parameter.name.clone())
         .collect::<Vec<_>>();
 
+    // Named terms are substitution: every later expression of the
+    // declaration is checked with each term's name replaced by its
+    // expression, so the checked implementation holds no trace of them.
+    let mut terms: Vec<(String, crate::syntax::ast::Expr)> = Vec::new();
+    for term in &native.terms {
+        let name = &term.name.name;
+        let taken = entry.dimensions.contains(name)
+            || parameter_names.contains(name)
+            || terms.iter().any(|(known, _)| known == name)
+            || native
+                .launches
+                .iter()
+                .any(|launch| launch.params.iter().any(|param| &param.name.name == name));
+        if taken {
+            errors.push((
+                term.name.span,
+                format!("term `{name}` is already a dimension, a parameter or a term"),
+            ));
+            continue;
+        }
+        let value = native_term_expansion(&term.value, &terms);
+        match native_nat_expr(&value, &entry.dimensions, &parameter_names) {
+            Ok(_) => terms.push((name.clone(), value)),
+            Err(message) => errors.push((term.value.span, message)),
+        }
+    }
+    let expanded;
+    let native = if terms.is_empty() {
+        native
+    } else {
+        let expand = |expr: &mut crate::syntax::ast::Expr| {
+            *expr = native_term_expansion(expr, &terms);
+        };
+        let mut declaration = native.clone();
+        declaration.constraint.iter_mut().for_each(expand);
+        for class in &mut declaration.error_classes {
+            expand(&mut class.when);
+        }
+        for scratch in &mut declaration.scratch {
+            expand(&mut scratch.bytes);
+            scratch.when.iter_mut().for_each(expand);
+        }
+        for launch in &mut declaration.launches {
+            launch.when.iter_mut().for_each(expand);
+            launch
+                .threadgroups
+                .iter_mut()
+                .chain(&mut launch.threads_per_threadgroup)
+                .chain(&mut launch.shared_bytes)
+                .for_each(expand);
+        }
+        if let Some(repeat) = &mut declaration.repeat {
+            expand(&mut repeat.count);
+        }
+        expanded = declaration;
+        &expanded
+    };
+
     let mut elements: Vec<crate::checked::NativeElementCoverage> = Vec::new();
     for coverage in &native.elements {
         let name = &coverage.name.name;
@@ -1250,6 +1308,46 @@ fn check_native(
         }
     }
 
+    // An error class is a property of the entry's configuration: its
+    // condition reads static dimensions and entry parameters only.
+    let mut error_classes: Vec<crate::checked::NativeErrorClass> = Vec::new();
+    for class in &native.error_classes {
+        if error_classes
+            .iter()
+            .any(|existing| existing.name == class.name.name)
+        {
+            errors.push((
+                class.name.span,
+                format!("error class `{}` is declared twice", class.name.name),
+            ));
+            continue;
+        }
+        match native_condition(
+            "error_class",
+            &class.when,
+            &entry.dimensions,
+            &parameter_names,
+        ) {
+            Ok(when) => {
+                let mut read = Vec::new();
+                when.dimensions(&mut read);
+                if let Some(dynamic) = read.iter().find(|name| !statics.contains(name)) {
+                    errors.push((
+                        class.when.span,
+                        format!(
+                            "native `error_class` reads dimension `{dynamic}`, which is not static; its value is unknown at preparation"
+                        ),
+                    ));
+                }
+                error_classes.push(crate::checked::NativeErrorClass {
+                    name: class.name.name.clone(),
+                    when,
+                });
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+
     let mut scratch: Vec<NativeScratch> = Vec::new();
     for buffer in &native.scratch {
         if scratch
@@ -1268,6 +1366,7 @@ fn check_native(
             scratch.push(NativeScratch {
                 name: buffer.name.name.clone(),
                 bytes,
+                sync: buffer.sync,
                 when,
             });
         }
@@ -1413,6 +1512,25 @@ fn check_native(
         });
     }
 
+    // Only the Metal encoder dispatches a block more than once.
+    let repeat = match &native.repeat {
+        None => None,
+        Some(repeat) if backend != crate::registry::BackendName::Metal => {
+            errors.push((
+                repeat.span,
+                format!("`repeat` is not implemented for {}", native.target.name),
+            ));
+            None
+        }
+        Some(repeat) => expression(&repeat.count, &mut errors).map(|count| {
+            crate::checked::NativeRepeat {
+                first: repeat.first,
+                launches: repeat.launches,
+                count,
+            }
+        }),
+    };
+
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -1425,9 +1543,55 @@ fn check_native(
         params,
         elements,
         constraint,
+        error_classes,
         scratch,
         launches,
+        repeat,
     })
+}
+
+/// `expression` with every name of `terms` replaced by that term's
+/// expression (the parts a native expression or condition is made of; any
+/// other form is left for the lowering to reject).
+fn native_term_expansion(
+    expression: &crate::syntax::ast::Expr,
+    terms: &[(String, crate::syntax::ast::Expr)],
+) -> crate::syntax::ast::Expr {
+    use crate::syntax::ast::{Arg, Expr, ExprKind};
+    let expand = |expression: &Expr| native_term_expansion(expression, terms);
+    let kind = match &expression.kind {
+        ExprKind::Name(name) => {
+            return terms
+                .iter()
+                .find(|(term, _)| term == &name.name)
+                .map_or_else(|| expression.clone(), |(_, value)| value.clone());
+        }
+        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+            op: *op,
+            lhs: Box::new(expand(lhs)),
+            rhs: Box::new(expand(rhs)),
+        },
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
+        } => ExprKind::Call {
+            callee: callee.clone(),
+            bindings: bindings.clone(),
+            args: args
+                .iter()
+                .map(|arg| Arg {
+                    name: arg.name.clone(),
+                    value: expand(&arg.value),
+                })
+                .collect(),
+        },
+        _ => return expression.clone(),
+    };
+    Expr {
+        kind,
+        ..expression.clone()
+    }
 }
 
 /// Lower a native `where` or `when` condition: comparisons of native

@@ -349,45 +349,60 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let lane = match operations.first() {
             Some(Operation::Forward { .. }) => ReservationLane::Target,
             Some(Operation::Head { .. }) => ReservationLane::Head,
-            Some(Operation::Encode { .. }) => ReservationLane::Vision,
+            Some(Operation::Encode { image, .. }) => {
+                let class = self
+                    .image_class(image.patches())
+                    .map_err(DomainError::Input)?;
+                return self.provision_vision(class as u64);
+            }
             None => return Ok(()),
         };
-        self.provision_activation(lane)?;
         self.provision_output(lane)
     }
 
-    /// Grow an on-demand family's activations by one when none is free: a
-    /// family that holds none from startup (vision) claims its upload regions
-    /// when a launch first needs them. The charge is claimed from the heap
-    /// like any growth; a refusal is a demand deficit for the owner's
-    /// release order.
-    fn provision_activation(&mut self, lane: ReservationLane) -> Result<(), DomainError> {
-        let Some(pool) = self.resources.activations_mut(lane) else {
-            return Ok(());
-        };
-        if !pool.activates_on_demand() || pool.available_workspace() > 0 {
-            return Ok(());
-        }
-        let bytes = pool.activation_slot_bytes();
-        let claim = self.claim_device_growth(bytes, 0, HoldingClass::Live)?;
-        let grown = self
+    /// Grow the vision storage of `patch_rows`'s class by an activation and
+    /// an output slot when none is free: an encode claims both of its image's
+    /// class. Each charge is claimed from the heap like any growth; a refusal
+    /// is a demand deficit for the owner's release order.
+    fn provision_vision(&mut self, patch_rows: u64) -> Result<(), DomainError> {
+        let pool = self
             .resources
-            .activations_mut(lane)
-            .expect("the pool was found above")
-            .grow_activation();
+            .vision_graph()
+            .ok_or_else(|| DomainError::invariant("vision graph is absent"))?;
+        let activation = (pool.available_workspace(patch_rows) == 0)
+            .then(|| pool.activation_bytes(patch_rows))
+            .transpose()?;
+        let output = (pool.available_output(patch_rows) == 0)
+            .then(|| pool.output_bytes(patch_rows))
+            .transpose()?;
+        if let Some(bytes) = activation {
+            self.grow_vision(bytes, |pool| pool.grow_activation(patch_rows))?;
+        }
+        if let Some(bytes) = output {
+            self.grow_vision(bytes, |pool| pool.grow_output(patch_rows))?;
+        }
+        Ok(())
+    }
+
+    fn grow_vision(
+        &mut self,
+        bytes: u64,
+        grow: impl FnOnce(&mut crate::VisionGraphPool) -> Result<(), crate::resources::VisionGrowth>,
+    ) -> Result<(), DomainError> {
+        let claim = self.claim_device_growth(bytes, 0, HoldingClass::Live)?;
+        let grown = grow(
+            self.resources
+                .vision_graph_mut()
+                .expect("the vision graph was found above"),
+        );
         self.release_claim(claim);
-        grown.map_err(|error| match error {
-            seismic::WorkflowError::TensorView(seismic::TensorError::Execution(
-                seismic::ExecutionError::AllocationCapacity { .. }
-                | seismic::ExecutionError::AllocationFailed(_),
-            )) => DomainError::Capacity(CapacityError {
-                resource: ResourceKind::DeviceMemory,
-                required: bytes,
-                available: 0,
-            }),
-            other => DomainError::Device(crate::DeviceError::Execution(format!(
-                "graph activation growth: {other}"
-            ))),
+        grown.map_err(|growth| match growth {
+            crate::resources::VisionGrowth::Class(error) => {
+                DomainError::invariant(format!("vision class was not prepared: {error}"))
+            }
+            crate::resources::VisionGrowth::Device(error) => {
+                growth_failure(error, bytes, "vision growth")
+            }
         })?;
         self.refresh_memory()?;
         self.sync_static_holding().map_err(DomainError::Input)
@@ -413,19 +428,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .expect("the pool was found above")
             .grow_output();
         self.release_claim(claim);
-        grown.map_err(|error| match error {
-            seismic::TensorError::Execution(
-                seismic::ExecutionError::AllocationCapacity { .. }
-                | seismic::ExecutionError::AllocationFailed(_),
-            ) => DomainError::Capacity(CapacityError {
-                resource: ResourceKind::DeviceMemory,
-                required: bytes,
-                available: 0,
-            }),
-            other => DomainError::Device(crate::DeviceError::Execution(format!(
-                "graph output growth: {other}"
-            ))),
-        })?;
+        grown.map_err(|error| growth_failure(error, bytes, "graph output growth"))?;
         self.refresh_memory()?;
         self.sync_static_holding().map_err(DomainError::Input)
     }
@@ -696,5 +699,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             submission.finish().map_err(DomainError::Device)?;
         }
         Ok(())
+    }
+}
+
+/// A failed slot allocation of `bytes`: a capacity deficit when the device
+/// refused the bytes, otherwise a device failure.
+fn growth_failure(error: seismic::TensorError, bytes: u64, growth: &str) -> DomainError {
+    match error {
+        seismic::TensorError::Execution(
+            seismic::ExecutionError::AllocationCapacity { .. }
+            | seismic::ExecutionError::AllocationFailed(_),
+        ) => DomainError::Capacity(CapacityError {
+            resource: ResourceKind::DeviceMemory,
+            required: bytes,
+            available: 0,
+        }),
+        other => DomainError::Device(crate::DeviceError::Execution(format!("{growth}: {other}"))),
     }
 }

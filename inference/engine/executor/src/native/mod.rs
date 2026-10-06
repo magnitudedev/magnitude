@@ -24,14 +24,17 @@ pub(crate) use draft::{
 use glue::GlueKernels;
 pub(crate) use head::draft_vocabulary;
 use head::HeadKernels;
+pub use head::HeadLogitsKernels;
 pub(crate) use import::ImportKernels;
+pub(crate) use preparation::kernel_requests;
 use preparation::NativePreparationCache;
 use qualification::QualificationView;
 use target::TargetKernels;
 pub(crate) use target::{
     AttentionHistoryKernels, AttentionKernels, DenseExpansionKernel, DenseKernels, ExpertKernels,
     GeneralRoutedKernels, ParallelKernels, PerLayerEntryKernels, PerLayerKernels, PostNormKernels,
-    ReadoutKernels, RecurrentKernels, RoutedKernels, ShortConvKernels, StateSpaceKernels,
+    ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels, RecurrentKernels,
+    RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels, ShortConvKernels, StateSpaceKernels,
     SublayerOutput, TableConversion, TapKernels,
 };
 #[cfg(feature = "pinned-tuning")]
@@ -39,7 +42,8 @@ pub use tuning::pinned as pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use tuning::survey as tuning_survey;
 pub use tuning::{
-    attention_points, row_points, PointShape, TunedEntry, TuningContext, TuningEvent, TuningLimits,
+    attention_points, row_points, AdmittedErrorClasses, PointShape, TunedEntry, TuningContext,
+    TuningEvent, TuningLimits, NO_ERROR_CLASSES,
     TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ZeroTuningWeights,
     ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
 };
@@ -52,12 +56,15 @@ use crate::{
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows, dense_expand,
-    dense_output, dense_up, draft_rows, embedding_rows, gated_delta_chunk, gated_delta_output,
-    gated_delta_project, gated_delta_step, head_logits_rows, import_dense, moe_tail,
-    per_layer_gate, per_layer_inputs, post_norm_residual, project_rows, readout_features_rows,
-    readout_head_rows, readout_selected_rows, repack_weight, routed_combine, routed_down,
+    dense_output, dense_up, draft_rows, embedding_rows, gated_delta_chunk, gated_delta_project,
+    gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, head_logits_rows,
+    import_dense, moe_tail,
+    per_layer_gate, per_layer_inputs, post_norm_residual, project_rows, readout_exact_rows,
+    readout_features_rows, readout_head_rows, readout_planes_rows, readout_refine_rows,
+    readout_selected_rows, readout_top_rows, repack_weight, routed_combine, routed_down,
     routed_expand, routed_experts, routed_experts_up, routed_gate_up, routed_group, routed_output,
-    routed_route, routed_scatter, routed_select, routed_up, sample_rows, shape_rows,
+    routed_route, routed_route_shared, routed_scatter, routed_select, routed_up, sample_rows,
+    shape_rows,
     short_conv_project, short_conv_rows, state_space_chunk, state_space_gate, state_space_step,
     vision_attention, vision_clamp, vision_linear, vision_norm, vision_patch_stem, vision_pool,
     vision_position,
@@ -257,28 +264,66 @@ mod qualification_tests {
         gated_delta_step::native_for_device_with(
             &device,
             gated_delta_step::Elements {
+                RN: binding.recurrent_norm,
                 A: binding.activation,
             },
             &step,
+        )
+        .unwrap();
+        gated_delta_project_convolved::native_for_device_with(
+            &device,
+            gated_delta_project_convolved::Elements {
+                NW: binding.norm,
+                QW: binding.qkv,
+                GW: binding.gate,
+                AW: binding.alpha,
+                BW: binding.beta,
+                A: binding.activation,
+            },
+            &defaults::<gated_delta_project_convolved::Entry>(
+                &device,
+                &projections
+                    .clone()
+                    .with_static("C", binding.convolution_width),
+            ),
+        )
+        .unwrap();
+        gated_delta_step_convolved::native_for_device_with(
+            &device,
+            gated_delta_step_convolved::Elements {
+                RN: binding.recurrent_norm,
+                A: binding.activation,
+            },
+            &defaults::<gated_delta_step_convolved::Entry>(
+                &device,
+                &seismic::NativeSpecialization::new()
+                    .with_static("NK", binding.key_heads)
+                    .with_static("NV", binding.value_heads)
+                    .with_static("W", binding.width),
+            ),
         )
         .unwrap();
         let chunk = defaults::<gated_delta_chunk::Entry>(&device, &statics);
         gated_delta_chunk::native_for_device_with(
             &device,
             gated_delta_chunk::Elements {
+                RN: binding.recurrent_norm,
                 A: binding.activation,
             },
             &chunk,
         )
         .unwrap();
-        gated_delta_output::native_for_device_with(
+        let output = seismic::NativeSpecialization::new()
+            .with_static("D", 2560)
+            .with_static("Q", binding.value_heads)
+            .with_static("W", binding.width);
+        attention_output::native_for_device_with(
             &device,
-            gated_delta_output::Elements {
-                RN: binding.recurrent_norm,
+            attention_output::Elements {
                 OW: binding.output,
                 A: binding.activation,
             },
-            &defaults::<gated_delta_output::Entry>(&device, &projections),
+            &defaults::<attention_output::Entry>(&device, &output),
         )
         .unwrap();
     }

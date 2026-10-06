@@ -47,8 +47,15 @@ export interface InferenceProxyTarget {
 
 export type InferenceFetch = (
   input: RequestInfo | URL,
-  init?: RequestInit & { readonly decompress?: boolean },
+  init?: RequestInit & { readonly decompress?: boolean; readonly timeout?: boolean },
 ) => Promise<Response>
+
+/**
+ * Fetch options for requests to the local engine. Bun's fetch otherwise drops a
+ * request after about five minutes without upstream bytes, and a non-streaming
+ * generation or a long prefill is silent until it finishes.
+ */
+const localEngineFetch = { redirect: "manual", decompress: false, timeout: false } as const
 
 export class InferenceGatewayFailed extends Data.TaggedError("InferenceGatewayFailed")<{
   readonly cause: unknown
@@ -121,8 +128,7 @@ export const proxyOpenAiInferenceRequest = async (
       headers,
       body: source.body,
       signal,
-      redirect: "manual",
-      decompress: false,
+      ...localEngineFetch,
     },
   )
   return responseFromUpstream(response)
@@ -352,8 +358,7 @@ const localModels = async (
     method: "GET",
     headers,
     signal,
-    redirect: "manual",
-    decompress: false,
+    ...localEngineFetch,
   })
   if (!response.ok) return responseFromUpstream(response)
   const value = await Schema.decodeUnknownPromise(IcnSchemas.OpenAiModelsResponse)(
@@ -410,8 +415,7 @@ const proxyClassifiedRequest = async (
       headers,
       body: requestBody(rewrittenLocalBody(body, canonicalModel)),
       signal,
-      redirect: "manual",
-      decompress: false,
+      ...localEngineFetch,
     })
     return responseFromUpstream(response)
   }
@@ -675,8 +679,7 @@ export const proxyCodexInferenceRequest = async (
     headers,
     body: requestBody(rewrittenLocalBody(body, canonicalModel)),
     signal,
-    redirect: "manual",
-    decompress: false,
+    ...localEngineFetch,
   })
   return responseFromUpstream(response)
 }
@@ -699,8 +702,7 @@ export const proxyLocalAnthropicInferenceRequest = async (
     headers,
     body: source.body,
     signal,
-    redirect: "manual",
-    decompress: false,
+    ...localEngineFetch,
   })
   return responseFromUpstream(response)
 }

@@ -48,6 +48,7 @@ const LIMITS: ResourceLimits = ResourceLimits {
     max_drafting_slots: 8,
     exported_logits_rows: 0,
     max_images_per_request: 1,
+    max_image_cells: 0,
     lookahead: true,
 };
 
@@ -138,6 +139,7 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                 LIMITS,
                 ResourceCapacity {
                     domain_bytes: 64 << 30,
+                    tensor_operations: crate::TensorOperations::Absent,
                 },
             )
             .and_then(|state| {
@@ -277,6 +279,7 @@ fn separate_drafts_plan_and_charge_every_graph_class_from_headers() {
                 LIMITS,
                 ResourceCapacity {
                     domain_bytes: 64 << 30,
+                    tensor_operations: crate::TensorOperations::Absent,
                 },
             )
             .unwrap_or_else(|error| panic!("{context}: {error}"));

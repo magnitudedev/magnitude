@@ -346,4 +346,170 @@ inline void attend(device const S *qkv, device S *out, uint rows, uint heads, fl
                     S(output[d].thread_elements()[e] * inverse);
 }
 
+#if SEISMIC_HAS_TENSOR_OPS
+// The attend body on Metal 4 tensor operations: simdgroups 0..3 own 16 query
+// rows each and multiply (S = Q K^T and the output's P V are `matmul2d`
+// products in execution_simdgroup scope), while all eight stage. S goes to
+// the simdgroup's `slot` (16 x ATTEND_KEYS floats), where lanes own rows (2
+// lanes per row, 16 columns each) for the online softmax as `attend`'s lanes
+// do; the half probabilities follow it in the slot as the P V left operand,
+// and per-row carries and inverses reach the cooperative output's rows
+// through the slot's last 16 floats. `slots` is ATTEND_TENSOR_SLOTS memory.
+constant constexpr uint ATTEND_TENSOR_ROWS = 16;
+constant constexpr uint ATTEND_TENSOR_SLOT = ATTEND_TENSOR_ROWS * ATTEND_KEYS * 3 / 2 + ATTEND_TENSOR_ROWS;
+#define ATTEND_TENSOR_SLOTS(name) \
+    threadgroup float name[vision::ATTEND_ROWS / vision::ATTEND_TENSOR_ROWS * vision::ATTEND_TENSOR_SLOT]
+
+// Each lane's row value (published by the row's first of LANES lanes) into
+// the output's row tensor `rows`.
+template <uint LANES, typename Rows>
+inline void attend_load_rows(threadgroup float *published, uint lane, float value, thread Rows &rows) {
+    if (lane % LANES == 0)
+        published[lane / LANES] = value;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint16_t i = 0; i < rows.get_capacity(); ++i)
+        if (rows.is_valid_element(i))
+            rows[i] = published[rows.get_multidimensional_index(i)[0]];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template <typename S, uint W, uint WP>
+inline void attend_tensor(device const S *qkv, device S *out, uint rows, uint heads, float scale,
+    device const int *spans, threadgroup S *keys, threadgroup S *values, threadgroup uint *bounds,
+    threadgroup float *slots, uint tile, uint head, uint thread_index, uint simd, uint lane) {
+    constexpr uint THREADS = ATTEND_ROWS * 4;
+    constexpr uint ROWS = ATTEND_TENSOR_ROWS;
+    constexpr uint KEYS = ATTEND_KEYS;
+    constexpr int32_t PITCH = attend_pitch<WP>();
+    constexpr uint LANES = 32 / ROWS;
+    constexpr uint COLUMNS = KEYS / LANES;
+    typedef metal::extents<int32_t, WP, ROWS> q_extents;
+    typedef metal::extents<int32_t, WP, KEYS> kv_extents;
+    typedef metal::extents<int32_t, KEYS, ROWS> s_extents;
+    typedef metal::tensor<device S, q_extents, metal::tensor_inline> q_tensor;
+    typedef metal::tensor<threadgroup S, kv_extents, metal::tensor_inline> kv_tensor;
+    typedef metal::tensor<threadgroup float, s_extents, metal::tensor_inline> s_tensor;
+    typedef metal::tensor<threadgroup half, s_extents, metal::tensor_inline> p_tensor;
+    typedef mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(ROWS, KEYS, WP, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        metal::execution_simdgroup> score_op;
+    typedef mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(ROWS, WP, KEYS, false, false, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        metal::execution_simdgroup> output_op;
+    const ulong width = ulong(heads) * WP;
+    const ulong row_stride = 3 * width;
+    const float scale2 = scale * 1.4426950408889634f;
+    const bool computes = simd < ATTEND_ROWS / ROWS;
+    const uint owner = computes ? simd : 0;
+    const uint first_row = tile * ATTEND_ROWS + owner * ROWS;
+    threadgroup float *slot = slots + owner * ATTEND_TENSOR_SLOT;
+    threadgroup half *probabilities = reinterpret_cast<threadgroup half *>(slot + ROWS * KEYS);
+    threadgroup float *published = slot + ROWS * KEYS * 3 / 2;
+
+    // This lane's row's keys, and the keys the tile walks.
+    const uint row = lane / LANES;
+    const uint column0 = (lane % LANES) * COLUMNS;
+    uint row_first = 0, row_end = rows, walk_first = 0, walk_end = rows;
+    if (spans) {
+        const uint span_row = metal::min(first_row + row, rows - 1);
+        row_first = uint(spans[span_row * 2]);
+        row_end = uint(spans[span_row * 2 + 1]);
+        if (thread_index == 0) {
+            uint low = rows, high = 0;
+            for (uint r = tile * ATTEND_ROWS; r < metal::min(tile * ATTEND_ROWS + ATTEND_ROWS, rows); ++r) {
+                low = metal::min(low, uint(spans[r * 2]));
+                high = metal::max(high, uint(spans[r * 2 + 1]));
+            }
+            bounds[0] = low;
+            bounds[1] = high;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        walk_first = bounds[0];
+        walk_end = bounds[1];
+    }
+
+    q_tensor q(const_cast<device S *>(qkv) + ulong(first_row) * row_stride + ulong(head) * WP, q_extents(),
+        metal::array<int32_t, 2>{1, int32_t(row_stride)});
+    kv_tensor k(keys, kv_extents(), metal::array<int32_t, 2>{1, PITCH});
+    kv_tensor v(values, kv_extents(), metal::array<int32_t, 2>{1, PITCH});
+    s_tensor st(slot, s_extents(), metal::array<int32_t, 2>{1, int32_t(KEYS)});
+    p_tensor pt(probabilities, s_extents(), metal::array<int32_t, 2>{1, int32_t(KEYS)});
+    score_op score;
+    output_op product;
+    auto scores = score.template get_destination_cooperative_tensor<q_tensor, kv_tensor, float>();
+    auto output = product.template get_destination_cooperative_tensor<p_tensor, kv_tensor, float>();
+    auto output_rows = product.template get_row_reduction_destination_cooperative_tensor<p_tensor, kv_tensor, float>();
+    for (uint16_t i = 0; i < output.get_capacity(); ++i)
+        if (output.is_valid_element(i))
+            output[i] = 0.0f;
+    float maximum = -INFINITY;
+    float denominator = 0.0f;
+
+    for (uint first = walk_first; first < walk_end; first += KEYS) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        attend_stage<S, WP, THREADS>(keys, qkv, row_stride, width + ulong(head) * WP, first, rows, thread_index);
+        attend_stage<S, WP, THREADS>(values, qkv, row_stride, 2 * width + ulong(head) * WP, first, rows,
+            thread_index);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!computes)
+            continue;
+        score.run(q, k, scores);
+        scores.store(st);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const bool whole = first + KEYS <= rows;
+        float x[COLUMNS];
+        float tile_maximum = -INFINITY;
+        for (uint j = 0; j < COLUMNS; ++j) {
+            const uint key = first + column0 + j;
+            float value = slot[row * KEYS + column0 + j] * scale2;
+            if ((!whole && key >= rows) || key < row_first || key >= row_end)
+                value = -INFINITY;
+            x[j] = value;
+            tile_maximum = metal::max(tile_maximum, value);
+        }
+        for (ushort offset = 1; offset < LANES; offset <<= 1)
+            tile_maximum = metal::max(tile_maximum, simd_shuffle_xor(tile_maximum, offset));
+        const float next = metal::max(maximum, tile_maximum);
+        // A row that has seen no key of its span yet keeps its (empty) state.
+        const bool seen = next > -INFINITY;
+        const float carry = seen ? metal::fast::exp2(maximum - next) : 1.0f;
+        float tile_sum = 0.0f;
+        for (uint j = 0; j < COLUMNS; ++j) {
+            const float p = seen ? metal::fast::exp2(x[j] - next) : 0.0f;
+            probabilities[row * KEYS + column0 + j] = half(p);
+            tile_sum += p;
+        }
+        for (ushort offset = 1; offset < LANES; offset <<= 1)
+            tile_sum += simd_shuffle_xor(tile_sum, offset);
+        denominator = metal::fma(denominator, carry, tile_sum);
+        maximum = next;
+        if (!simd_all(carry == 1.0f)) {
+            attend_load_rows<LANES>(published, lane, carry, output_rows);
+            for (uint16_t i = 0; i < output.get_capacity(); ++i)
+                if (output.is_valid_element(i))
+                    output[i] *= *output_rows.map_iterator(output.get_iterator(i));
+        } else {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        product.run(pt, v, output);
+    }
+
+    if (!computes)
+        return;
+    attend_load_rows<LANES>(published, lane, 1.0f / denominator, output_rows);
+    for (uint16_t i = 0; i < output.get_capacity(); ++i) {
+        if (!output.is_valid_element(i))
+            continue;
+        const auto index = output.get_multidimensional_index(i);
+        const uint out_row = first_row + index[1];
+        const uint column = index[0];
+        if (out_row < rows && column < W)
+            out[ulong(out_row) * heads * W + ulong(head) * W + column] =
+                S(output[i] * *output_rows.map_iterator(output.get_iterator(i)));
+    }
+}
+#endif
+
 } // namespace vision

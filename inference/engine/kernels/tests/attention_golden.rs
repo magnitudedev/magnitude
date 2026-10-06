@@ -365,6 +365,7 @@ struct Inputs {
     visible: Tensor,
     fresh: Tensor,
     destinations: Tensor,
+    history_tiles: Tensor,
 }
 
 impl Inputs {
@@ -383,6 +384,10 @@ impl Inputs {
             visible: i32_tensor(device, &[m, case.spans, 2], &case.visible),
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
             destinations: i32_tensor(device, &[m], &case.destinations),
+            history_tiles: {
+                let tiles = history_tiles(&case.visible);
+                i32_tensor(device, &[1, tiles.len()], &tiles)
+            },
         }
     }
 }
@@ -492,7 +497,7 @@ fn run_family(
             }};
         }
         macro_rules! affine {
-            ($module:ident) => {{
+            ($module:ident $(, $extra:ident: $value:expr)?) => {{
                 let kernel = $module::native_for_device_with(
                     device,
                     $module::Elements { A: elements },
@@ -519,6 +524,7 @@ fn run_family(
                         visible: &inputs.visible,
                         fresh: &inputs.fresh,
                         destinations: &inputs.destinations,
+                        $($extra: $value,)?
                         history_key_codes: key_codes,
                         history_key_coefficients: key_coefficients,
                         history_value_codes: value_codes,
@@ -536,7 +542,9 @@ fn run_family(
             Kind::Decode => dense!(attention_decode),
             Kind::Prefill => dense!(attention_prefill),
             Kind::DecodeK8V4 => affine!(attention_decode_k8v4),
-            Kind::PrefillK8V4 => affine!(attention_prefill_k8v4),
+            Kind::PrefillK8V4 => {
+                affine!(attention_prefill_k8v4, history_tiles: &inputs.history_tiles)
+            }
         };
         Ok(outputs(&result, history))
     }
@@ -637,6 +645,19 @@ fn attention_golden() {
                                 }
                             }
                             _ => {}
+                        }
+                    }
+                    // Metal's prefill also splits a kv head's query heads
+                    // into groups and has the direct form, and the affine
+                    // entry takes a call that lists its history row tiles
+                    // or not; the goldens are one group's staged walk of a
+                    // listing call.
+                    if device.backend() == BackendName::Metal && !kind.decode() {
+                        specialization = specialization
+                            .with_param("HEADS", (geometry.g.next_power_of_two() as u64).min(16))
+                            .with_param("DIRECT", 0);
+                        if kind == Kind::PrefillK8V4 {
+                            specialization = specialization.with_static("L", 1);
                         }
                     }
                     // CUDA's prefill also splits key tiles; the goldens are

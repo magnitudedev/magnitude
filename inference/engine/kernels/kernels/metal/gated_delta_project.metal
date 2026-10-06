@@ -55,7 +55,7 @@ kernel void gated_delta_project_gemv(RECURRENT_PROJECT_ARGUMENTS,
     uint rows = uint(SEISMIC_DIM_M);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     uint t0 = (qkv_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
     uint t2 = (head_rows + per - 1) / per;
     if (tile < t0) {
@@ -87,7 +87,7 @@ kernel void gated_delta_project_batch(RECURRENT_PROJECT_ARGUMENTS,
     uint rows = uint(SEISMIC_DIM_M);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    projection::SharedNorm<decltype(in)> x{in, squares};
+    const auto x = projection::shared_norm(in, squares);
     uint t0 = (qkv_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
     uint t2 = (head_rows + per - 1) / per;
     if (tile < t0)
@@ -150,5 +150,47 @@ kernel void gated_delta_project_gemm(RECURRENT_PROJECT_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     RECURRENT_PROJECT_GEMM(TILE_M, TILE_N);
+}
+#endif
+
+// The TALL form past 64 rows: the normalized rows in the tall GEMM's order,
+// then its tiles, 32 rows of one segment each.
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_STAGE_TALL
+kernel void gated_delta_project_stage_tall(RECURRENT_PROJECT_ARGUMENTS,
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(norms);
+    RECURRENT_PROJECT_OPERANDS;
+    projection::device_normalize<256, projection::TallOrder<activation>>(in, item, normalized, k, norms,
+        thread_index);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_TALL
+template <uint TALL_M, uint TALL_K, uint STAGERS>
+kernel void gated_delta_project_tall(RECURRENT_PROJECT_ARGUMENTS,
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    PROJECTION_GEMM_TALL_SHARED(shared, TALL_K);
+    RECURRENT_PROJECT_OPERANDS;
+    const uint TN = projection::tall_n;
+    const auto x = projection::tall_operand(
+        projection::Plain<activation, projection::AllRows>{normalized, k, 1, k, {}}, normalized);
+    uint m = uint(SEISMIC_DIM_M);
+    uint t0 = (qkv_rows + TN - 1) / TN, t1 = (gate_rows + TN - 1) / TN, t2 = (head_rows + TN - 1) / TN;
+    uint n = tile.x;
+    if (n < t0)
+        projection::gemm_tall<packets::W0, TALL_M, TALL_K, STAGERS>(x, qkv_out, qkv, m, qkv_rows, k, tile.y, n,
+            shared, sg, lane);
+    else if (n < t0 + t1)
+        projection::gemm_tall<packets::W1, TALL_M, TALL_K, STAGERS>(x, gate_out, gate, m, gate_rows, k, tile.y,
+            n - t0, shared, sg, lane);
+    else if (n < t0 + t1 + t2)
+        projection::gemm_tall<packets::W2, TALL_M, TALL_K, STAGERS>(x, alpha_out, alpha, m, head_rows, k, tile.y,
+            n - t0 - t1, shared, sg, lane);
+    else
+        projection::gemm_tall<packets::W3, TALL_M, TALL_K, STAGERS>(x, beta_out, beta, m, head_rows, k, tile.y,
+            n - t0 - t1 - t2, shared, sg, lane);
 }
 #endif

@@ -18,7 +18,7 @@ pub use assessment::{
 pub use capabilities::{CapabilityPlan, PlannedMethod, MAX_DRAFT_PROPOSALS};
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
 pub use execution_plan::{
-    ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,
+    BackendPlan, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,
 };
 pub use programs::{
     Dflash2Binding, DraftBlockBinding, DraftProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
@@ -26,14 +26,14 @@ pub use programs::{
     StateProgramPlan, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    GraphSlots, HistoryStorePlan, LayerHistory, NativeGraphCharge, ResourceBytes,
+    image_cell_limit, GraphSlots, HistoryStorePlan, LayerHistory, NativeGraphCharge, ResourceBytes,
     ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
-    StateCapacityPlan, StateResourcePlan, StateStorePlan,
+    StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, MAX_IMAGE_CELLS,
 };
 pub use weights::{
     resident_element, resident_layout, source_element, AttentionBinding, AttentionShape,
-    DenseBinding, DenseBranchBinding, EmbeddingBinding, FeaturesBinding, HeadBinding,
-    HostTablePlan, ModelLoadPlan, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding,
+    DenseBinding, DenseBranchBinding, EmbeddingBinding, FeaturesBinding, HeadBinding, HeadProjection,
+    HostTablePlan, ModelLoadPlan, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding, ReadoutHead,
     DenseScales, RecurrentBinding, RoutedBinding, ScalableWeight, SublayerTail, WeightPlan, WeightScalePlan,
     WeightStorageIdentity,
 };
@@ -268,6 +268,95 @@ pub(crate) mod tests {
         }
     }
 
+    /// The kernel inventory, derived without a device, names exactly the
+    /// kernels a load prepares on the selected device.
+    #[test]
+    fn kernel_inventory_names_every_kernel_a_load_prepares() {
+        let Ok(catalog) = seismic::DeviceCatalog::discover() else {
+            return;
+        };
+        let Ok(selected) = crate::platform::select_device(
+            &catalog,
+            crate::ExecutionPath::Native,
+            crate::platform::DeviceRequest::Automatic,
+            &crate::platform::MemoryReserves::standard(),
+        ) else {
+            return;
+        };
+        let device = catalog
+            .open(catalog.resolve(selected.info.selector).unwrap())
+            .unwrap();
+        let definition = fixture_definition();
+        let manifest = fixture_manifest(&definition);
+        let limits = ResourceLimits {
+            max_launch_rows: 2,
+            max_launch_slots: 2,
+            max_selected_rows: 2,
+            max_drafting_slots: 2,
+            exported_logits_rows: 0,
+            max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+            max_image_cells: 0,
+            lookahead: false,
+        };
+        let selection = ComponentSelection {
+            head: false,
+            vision: false,
+        };
+        let draft = ExecutionPlanner::prepare(
+            &selected,
+            &manifest,
+            &definition,
+            selection,
+            crate::ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            limits,
+        )
+        .unwrap();
+        let (_, recorded) = seismic::record_kernel_requests(|| {
+            crate::AttestedPrograms::prepare_draft(
+                &draft,
+                &device,
+                crate::TuningContext {
+                    definition: &definition,
+                    weights: &crate::ZeroTuningWeights,
+                    observer: &crate::UnreportedTuning,
+                    cache: None,
+                    error_classes: &crate::NO_ERROR_CLASSES,
+                },
+            )
+            .unwrap()
+        });
+        let plan = ExecutionPlanner::backend_plan(
+            device.backend(),
+            &manifest,
+            &definition,
+            selection,
+            crate::ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            limits,
+        )
+        .unwrap();
+        let inventory = crate::kernel_inventory(&definition, &plan)
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let prepared = recorded
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert!(!prepared.is_empty());
+        let named = |requests: std::collections::hash_set::Difference<'_, _, _>| {
+            requests.map(ToString::to_string).collect::<Vec<_>>().join("\n")
+        };
+        assert!(
+            inventory == prepared,
+            "prepared kernels the inventory omits:\n{}\nlisted kernels the load does not prepare:\n{}",
+            named(prepared.difference(&inventory)),
+            named(inventory.difference(&prepared)),
+        );
+    }
+
     /// Build actual checked Seismic graph families. The engine may choose how
     /// many slots to reserve, but no test supplies intermediate tensor shapes.
     fn prepared_resource_plan() -> Option<ResourcePlan> {
@@ -291,10 +380,12 @@ pub(crate) mod tests {
             max_drafting_slots: 2,
             exported_logits_rows: 0,
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+            max_image_cells: 0,
             lookahead: false,
         };
         let capacity_bytes = ResourceCapacity {
             domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
+            tensor_operations: TensorOperations::of(selected.tensor_operations),
         };
         let draft = ExecutionPlanner::prepare(
             &selected,
@@ -327,6 +418,7 @@ pub(crate) mod tests {
                 weights: &crate::ZeroTuningWeights,
                 observer: &crate::UnreportedTuning,
                 cache: None,
+                error_classes: &crate::NO_ERROR_CLASSES,
             },
         )
         .unwrap();
@@ -390,8 +482,16 @@ pub(crate) mod tests {
             )
             .unwrap();
         let copy = programs.state_graphs().unwrap();
-        let plan =
-            ResourcePlanner::plan_with_state(state, &target, &readout, None, None, copy).unwrap();
+        let plan = ResourcePlanner::plan_with_state(
+            device.backend(),
+            state,
+            &target,
+            &readout,
+            None,
+            None,
+            copy,
+        )
+        .unwrap();
         assert_eq!(
             plan.target_graph().workspace_bytes,
             target.workspace_bytes()

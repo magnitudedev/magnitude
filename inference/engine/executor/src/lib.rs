@@ -7,7 +7,9 @@ mod domain;
 mod error;
 mod execution_path;
 mod host_tables;
+mod progressive;
 mod import_transforms;
+mod inventory;
 mod kernel_cache;
 mod lanes;
 pub mod memory;
@@ -41,6 +43,7 @@ pub use domain::{
 };
 pub use error::{CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError};
 pub use execution_path::ExecutionPath;
+pub use inventory::kernel_inventory;
 pub use kernel_cache::{KernelCache, KernelCacheError, TuningCacheKey, DEFAULT_KERNEL_CACHE_BYTES};
 pub use lanes::ConditioningSlice;
 pub use lanes::{
@@ -60,7 +63,8 @@ pub use native::pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use native::tuning_survey;
 pub use native::{
-    attention_points, row_points, AttestedPrograms, CatalogError, CatalogFailure, PointShape,
+    attention_points, row_points, AdmittedErrorClasses, AttestedPrograms, CatalogError,
+    CatalogFailure, PointShape, NO_ERROR_CLASSES,
     QualificationCase, QualificationReport, TunedEntry, TuningContext, TuningEvent, TuningLimits,
     TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ZeroTuningWeights,
     ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
@@ -78,20 +82,23 @@ pub use operators::short_conv::{ShortConvBinding, ShortConvShape};
 pub use operators::state_space::{StateSpaceBinding, StateSpaceShape};
 pub use operators::vision::{VisionEntry, VisionKernel};
 pub use planning::{
-    resident_element, resident_layout, source_element, ArtifactComponent, ArtifactComponentKind,
+    image_cell_limit, resident_element, resident_layout, source_element, ArtifactComponent,
+    ArtifactComponentKind,
     AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding,
-    AttentionShape, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
+    AttentionShape, BackendPlan, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
     DenseBranchBinding, DenseScales, Dflash2Binding, DraftBlockBinding, DraftProgramPlan,
     EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
-    FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HostTablePlan,
+    FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HeadProjection, HostTablePlan,
     ImportProgramSlot, MarkovBinding, MixerProgramSlot, ModelLoadPlan, NativeGraphCharge,
     ParallelBinding, PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod,
-    ProgramPlan, ReadoutBinding, RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity,
+    ProgramPlan, ReadoutBinding, ReadoutHead, RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity,
     ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding, ScalableWeight, SelectorBinding,
     StartupSlots, StateCapacityPlan, StateProgramPlan, StateResourcePlan, StateStorePlan,
+    TensorOperations,
     SublayerTail, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan,
     VisionProgramPlan, WeightPlan, WeightScalePlan, WeightStorageIdentity, MAX_DRAFT_PROPOSALS,
+    MAX_IMAGE_CELLS,
 };
 
 /// Whether this executor runs `definition` with its draft head selected.
@@ -103,10 +110,12 @@ pub use residency::{
 };
 pub use residency::{MappedImportReport, ResidencyStore};
 pub use resident_weights::{
-    ResidencyError, ResidentHead, ResidentRoles, ResidentTarget, ResidentVision,
+    ResidencyError, ResidentHead, ResidentOutput, ResidentPlanes, ResidentRoles, ResidentTarget,
+    ResidentVision,
 };
 pub use resources::{
     AllocatedResources, AllocationError, GraphOutputOwner, GraphOutputTensor, ImportWorkspaceLease,
     NativeGraphOutputLease, NativeGraphPool, NativeGraphWorkspaceLease, PoolClass,
     ResourceAllocator, TargetGraphOutputLease, TargetGraphPool, TargetGraphWorkspaceLease,
+    VisionGraphPool,
 };

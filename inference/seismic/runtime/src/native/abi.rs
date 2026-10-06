@@ -18,27 +18,54 @@ use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
 pub(crate) mod vulkan;
 
 /// Source dialects with a generated prefix. CPU implementations are Rust and
 /// receive a generated context instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Dialect {
-    Metal,
+    /// MSL, with the device's feature macros.
+    Metal(MetalFeatures),
     Cuda,
     /// GLSL 4.60 compute for Vulkan 1.3, with the device's feature macros.
     /// Vulkan is not built on macOS; its prefix still renders in tests there.
-    #[cfg(any(not(target_os = "macos"), test))]
+    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     Vulkan(vulkan::VulkanFeatures),
+}
+
+/// The Metal device features a native source tests as `SEISMIC_HAS_<NAME>`,
+/// from the opened device's facts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MetalFeatures {
+    /// Metal 4 tensor operations (`mpp::tensor_ops::matmul2d`) on the GPU's
+    /// matrix hardware; the prefix includes their headers.
+    pub(crate) tensor_ops: bool,
+}
+
+/// The standard library, the tensor-operation headers when enabled, and the
+/// device feature macros.
+fn metal_header(features: MetalFeatures) -> String {
+    let mut header = String::from("#include <metal_stdlib>\n");
+    if features.tensor_ops {
+        header.push_str(
+            "#include <metal_tensor>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n",
+        );
+    }
+    header.push_str("using namespace metal;\n");
+    header.push_str(&format!(
+        "#define SEISMIC_HAS_TENSOR_OPS {}\n",
+        u8::from(features.tensor_ops)
+    ));
+    header
 }
 
 /// A 64-bit constant in the dialect's syntax.
 fn literal(dialect: Dialect, value: u64) -> String {
     match dialect {
-        Dialect::Metal => format!("((ulong){value})"),
+        Dialect::Metal(_) => format!("((ulong){value})"),
         Dialect::Cuda => format!("((unsigned long long){value})"),
-        #[cfg(any(not(target_os = "macos"), test))]
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         Dialect::Vulkan(_) => format!("uint64_t({value}ul)"),
     }
 }
@@ -282,9 +309,9 @@ fn render_source_with(
     let schema = logical.schema();
     let geometry = static_geometry(logical, specialization);
     let mut prefix = match dialect {
-        Dialect::Metal => String::from("#include <metal_stdlib>\nusing namespace metal;\n"),
+        Dialect::Metal(features) => metal_header(features),
         Dialect::Cuda => String::from(CUDA_HELPERS),
-        #[cfg(any(not(target_os = "macos"), test))]
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         Dialect::Vulkan(features) => vulkan::header(features),
     };
     for (name, representation) in bindings.iter() {
@@ -319,7 +346,7 @@ fn render_source_with(
                 ));
                 // GLSL's preprocessor evaluates no typed literal: an `#if`
                 // guard on a static extent reads it as a plain integer.
-                #[cfg(any(not(target_os = "macos"), test))]
+                #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
                 if matches!(dialect, Dialect::Vulkan(_)) {
                     prefix.push_str(&format!("#define SEISMIC_STATIC_{name} {value}\n"));
                 }
@@ -475,7 +502,7 @@ fn render_source_with(
         })
         .chain(std::iter::repeat(false))
         .take(buffer);
-    #[cfg(any(not(target_os = "macos"), test))]
+    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     if let Dialect::Vulkan(_) = dialect {
         prefix.push_str(&vulkan::tail(buffer, read_only));
         debug_assert_eq!(word, word_count(schema) + runtime_parameters.len());
@@ -839,7 +866,7 @@ mod tests {
             .with_static("K", 64)
             .with_param("TILE", 4);
         let source = render_launch_source(
-            Dialect::Metal,
+            METAL,
             &logical,
             &bindings,
             implementation,
@@ -875,7 +902,7 @@ mod tests {
             base + 3
         );
         let source = render_launch_source(
-            Dialect::Metal,
+            METAL,
             &logical,
             &bindings,
             implementation,
@@ -900,7 +927,7 @@ mod tests {
     fn prefix_names_the_layout_and_row_geometry_of_row_storage() {
         // K is static (256): the row geometry renders as constants.
         let source = render_with(
-            Dialect::Metal,
+            METAL,
             "q5k@rows16",
             NativeSpecialization::new().with_static("K", 256),
         );
@@ -927,7 +954,7 @@ mod tests {
         assert!(mma.contains("#define SEISMIC_X_LAYOUT_MMA16 1\n"));
         assert!(mma.contains("#define SEISMIC_X_TILE_ROWS 16\n"));
         assert!(mma.contains("#define SEISMIC_X_MMA_KBLOCK 64\n"));
-        let packet = render(Dialect::Metal, "q5k");
+        let packet = render(METAL, "q5k");
         assert!(packet.contains("#define SEISMIC_X_LAYOUT_PACKET 1\n"));
         assert!(!packet.contains("ROW_STRIDE_BYTES"));
     }
@@ -936,7 +963,7 @@ mod tests {
     fn symbolic_row_geometry_matches_the_registry_byte_math() {
         // Evaluate the rendered expressions for a dynamic K with a tiny
         // arithmetic reader over the macro text.
-        let source = render_with(Dialect::Metal, "q6k@rows16", NativeSpecialization::new());
+        let source = render_with(METAL, "q6k@rows16", NativeSpecialization::new());
         assert!(source.contains("#define SEISMIC_X_EXTENT_1 (seismic_words["));
         let registry::RepresentationKind::PackedRows(rows) =
             &registry::representation_info(registry::representation("q6k@rows16").unwrap()).kind
@@ -1051,7 +1078,7 @@ mod tests {
 
     #[test]
     fn static_tensors_render_constant_canonical_strides() {
-        let source = render(Dialect::Metal, "f32");
+        let source = render(METAL, "f32");
         // N is dynamic, so x keeps runtime words; the result is fully static.
         assert!(source.contains("#define SEISMIC_X_STRIDE_0 (seismic_words["));
         assert!(source.contains("#define SEISMIC_X_EXTENT_0 (seismic_words["));
@@ -1072,7 +1099,7 @@ mod tests {
 
     #[test]
     fn prefix_describes_dense_element_parameter_and_tensor_abi() {
-        let source = render(Dialect::Metal, "f16");
+        let source = render(METAL, "f16");
         assert!(source.contains("#define SEISMIC_ELEMENT_E_REPRESENTATION_F16 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_KIND_DENSE 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_DECODED_F16 1\n"));
@@ -1084,7 +1111,7 @@ mod tests {
 
     #[test]
     fn prefix_describes_packed_planes_and_encoding() {
-        let source = render(Dialect::Metal, "q8g32");
+        let source = render(METAL, "q8g32");
         assert!(source.contains("#define SEISMIC_ELEMENT_E_REPRESENTATION_Q8G32 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_KIND_PACKED 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PACKET_SIZE 36\n"));
@@ -1102,7 +1129,7 @@ mod tests {
 
     #[test]
     fn prefix_describes_external_packets() {
-        let source = render(Dialect::Metal, "gguf_q4_k");
+        let source = render(METAL, "gguf_q4_k");
         assert!(source.contains("#define SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q4_K 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_KIND_EXTERNAL 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PACKET_SIZE 144\n"));
@@ -1112,7 +1139,7 @@ mod tests {
 
     #[test]
     fn specialization_renders_constants_and_scratch_follows_results() {
-        let source = render(Dialect::Metal, "f32");
+        let source = render(METAL, "f32");
         assert!(source.contains("#define SEISMIC_DIM_N (seismic_words[0])\n"));
         assert!(source.contains("#define SEISMIC_DIM_K ((ulong)64)\n"));
         assert!(source.contains("#define SEISMIC_TUNE_TILE 8\n"));
@@ -1122,6 +1149,24 @@ mod tests {
         assert!(source.contains("#define SEISMIC_BUFFER_WORDS 3\n"));
         assert!(source.contains("#define SEISMIC_BUFFER_SCALAR_RESULTS 4\n"));
         assert!(!source.contains("seismic_words_t"));
+    }
+
+    const METAL: Dialect = Dialect::Metal(MetalFeatures { tensor_ops: false });
+
+    #[test]
+    fn metal_prefix_includes_tensor_operations_only_when_the_device_has_them() {
+        let plain = render(METAL, "f32");
+        assert!(plain.starts_with("#include <metal_stdlib>\nusing namespace metal;\n"));
+        assert!(plain.contains("#define SEISMIC_HAS_TENSOR_OPS 0\n"));
+        assert!(!plain.contains("metal_tensor"));
+        let tensor = render(Dialect::Metal(MetalFeatures { tensor_ops: true }), "f32");
+        for line in [
+            "#include <metal_tensor>\n",
+            "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n",
+            "#define SEISMIC_HAS_TENSOR_OPS 1\n",
+        ] {
+            assert!(tensor.contains(line), "missing {line:?}");
+        }
     }
 
     const VULKAN_FEATURES: vulkan::VulkanFeatures = vulkan::VulkanFeatures {

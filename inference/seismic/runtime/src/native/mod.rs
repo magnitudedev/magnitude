@@ -14,6 +14,8 @@
 
 pub(crate) mod abi;
 mod batch;
+#[cfg(feature = "coverage")]
+pub mod coverage;
 pub(crate) use batch::{NativeTensorBatch, NativeTensorBatchCompletion};
 #[cfg(test)]
 mod bundle_identity_tests;
@@ -30,8 +32,6 @@ pub mod tune;
 mod validation;
 #[cfg(not(target_os = "macos"))]
 mod vulkan;
-#[cfg(test)]
-mod vulkan_formation_tests;
 
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{DecodedResults, DecodedValue, EncodedArgs, EncodedOutputs, PrepareError};
@@ -93,9 +93,15 @@ pub(crate) struct LaunchGeometry {
     pub(crate) shared_bytes: u64,
 }
 
-/// Geometry of every launch of one call, by declaration ordinal; `None` for
-/// a launch whose `when` condition does not hold (not encoded).
-pub(crate) type CallLaunches = Vec<Option<LaunchGeometry>>;
+/// The launches of one call.
+pub(crate) struct CallLaunches {
+    /// Geometry by declaration ordinal; `None` for a launch whose `when`
+    /// condition does not hold (not encoded).
+    pub(crate) geometry: Vec<Option<LaunchGeometry>>,
+    /// How often the implementation's repeat block is dispatched; 1 without
+    /// one.
+    pub(crate) rounds: u64,
+}
 
 /// Alignment of the base of every buffer the route places: standalone
 /// scratch, and every graph result, local, host-written input, export and
@@ -122,6 +128,44 @@ pub(crate) struct NativeQueue {
 /// Bytes charged to a scratch buffer that is empty or inactive: it keeps
 /// its ABI slot.
 const MINIMUM_SCRATCH_BYTES: u64 = 1;
+
+/// Bytes at the start of every non-empty scratch arena (the standalone arena
+/// and every graph workspace that places anything) reserved for `sync`
+/// scratch; a graph that places nothing needs no workspace. Nothing else is ever placed
+/// there, arenas are zeroed when allocated, and every call restores its sync
+/// buffers to zero before it ends, so the range is zero whenever a launch
+/// starts, whichever call or graph used it last.
+pub(crate) const SYNC_SCRATCH_BYTES: u64 = 64 * 1024;
+
+/// One call-private scratch buffer: its bytes, and whether it holds arrival
+/// counters (`sync`), which live in the reserved range of their arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScratchNeed {
+    pub bytes: u64,
+    pub sync: bool,
+}
+
+/// Place one standalone call's scratch buffers: `sync` buffers in the
+/// reserved range, the rest after it. Returns the offsets in declaration
+/// order and the end of the placed range.
+fn place_scratch(needs: &[ScratchNeed]) -> (Vec<u64>, u64) {
+    let mut sync_end = 0u64;
+    let mut end = SYNC_SCRATCH_BYTES;
+    let offsets = needs
+        .iter()
+        .map(|need| {
+            let cursor = if need.sync { &mut sync_end } else { &mut end };
+            let offset = cursor.next_multiple_of(BUFFER_ALIGNMENT);
+            *cursor = offset + need.bytes;
+            offset
+        })
+        .collect();
+    assert!(
+        sync_end <= SYNC_SCRATCH_BYTES,
+        "sync scratch of one call exceeds the reserved {SYNC_SCRATCH_BYTES} bytes"
+    );
+    (offsets, end)
+}
 
 enum NativeRoute {
     Cpu(cpu::CpuRoute),
@@ -425,6 +469,22 @@ fn compilation(error: seismic_native_target::NativeCompilationError) -> PrepareE
     PrepareError::Preparation(PreparationError::NativeCompilation(error))
 }
 
+/// `entry` with the group size its launch runs, on Metal: the pipeline is
+/// formed to admit that many threads, so its register allocation never lowers
+/// the limit below the declared size.
+fn bounded(dialect: abi::Dialect, mut entry: ProgramEntry, group_size: Option<[u64; 3]>) -> ProgramEntry {
+    if matches!(dialect, abi::Dialect::Metal(_)) {
+        entry.group_size = group_size.and_then(|size| {
+            Some([
+                u32::try_from(size[0]).ok()?,
+                u32::try_from(size[1]).ok()?,
+                u32::try_from(size[2]).ok()?,
+            ])
+        });
+    }
+    entry
+}
+
 /// The entry of one code variant of `kernel`: the kernel itself, or its
 /// template instance for the variant's code values.
 fn template_instance(kernel: &str, values: &[u64]) -> ProgramEntry {
@@ -442,9 +502,19 @@ fn template_instance(kernel: &str, values: &[u64]) -> ProgramEntry {
     })
 }
 
+/// The dialect of an opened Metal device's native sources: MSL with its
+/// feature macros.
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_dialect(opened: &crate::backends::MetalOpened) -> abi::Dialect {
+    abi::Dialect::Metal(abi::MetalFeatures {
+        tensor_ops: opened.device_description().facts().tensor_ops(),
+    })
+}
+
 /// One launch's program with `variants` as its entries. Every variant of a
 /// launch shares its source, so tuning forms all of them in one compile and
-/// preparation's single variant is served from that program.
+/// preparation's single variant is served from that program. Variants that
+/// differ only in a group size a backend does not form for share an entry.
 fn launch_program(
     dialect: abi::Dialect,
     logical: &LogicalEntry,
@@ -453,9 +523,16 @@ fn launch_program(
     specialization: &NativeSpecialization,
     asset: &str,
     ordinal: usize,
-    variants: &[Vec<u64>],
+    variants: &[plan::LaunchVariant],
 ) -> ProgramSource {
     let kernel = &implementation.launches[ordinal].kernel;
+    let mut entries = Vec::<ProgramEntry>::new();
+    for variant in variants {
+        let entry = bounded(dialect, template_instance(kernel, &variant.code), variant.group_size);
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
     ProgramSource {
         text: abi::render_launch_source(
             dialect,
@@ -466,11 +543,61 @@ fn launch_program(
             asset,
             ordinal,
         ),
-        entries: variants
-            .iter()
-            .map(|values| template_instance(kernel, values))
-            .collect(),
+        entries,
     }
+}
+
+/// The programs of a Metal or CUDA implementation at `specialization`: one
+/// per launch for launch-scoped parameters, holding `variants[launch]` as its
+/// entries, else the entry's whole source with one entry per launch.
+pub(crate) fn implementation_programs(
+    dialect: abi::Dialect,
+    logical: &LogicalEntry,
+    bindings: &ElementBindings,
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+    asset: &str,
+    variants: &[Vec<plan::LaunchVariant>],
+) -> Vec<ProgramSource> {
+    if implementation.launch_scoped() {
+        return (0..implementation.launches.len())
+            .map(|ordinal| {
+                launch_program(
+                    dialect,
+                    logical,
+                    bindings,
+                    implementation,
+                    specialization,
+                    asset,
+                    ordinal,
+                    &variants[ordinal],
+                )
+            })
+            .collect();
+    }
+    let entries = implementation
+        .launches
+        .iter()
+        .enumerate()
+        .map(|(ordinal, launch)| {
+            bounded(
+                dialect,
+                ProgramEntry::named(launch.kernel.as_str()),
+                implementation.static_group_size(specialization, ordinal),
+            )
+        })
+        .collect();
+    vec![ProgramSource {
+        text: abi::render_source(
+            dialect,
+            logical,
+            bindings,
+            implementation,
+            specialization,
+            asset,
+        ),
+        entries,
+    }]
 }
 
 /// Form `sources` and place each launch at its entry: `requests` names, by
@@ -517,9 +644,10 @@ impl NativePrepared {
         sources: &[plan::LaunchSource],
     ) -> Result<HeldPrograms, PrepareError> {
         let backend = backend_name(&device.kind);
-        let dialect = match backend {
-            BackendName::Metal => abi::Dialect::Metal,
-            BackendName::Cuda => abi::Dialect::Cuda,
+        let dialect = match &device.kind {
+            #[cfg(target_os = "macos")]
+            OpenedKind::Metal(opened) => metal_dialect(opened),
+            OpenedKind::Cuda(_) => abi::Dialect::Cuda,
             _ => return Ok(HeldPrograms(Box::new(()))),
         };
         let logical = module
@@ -542,7 +670,7 @@ impl NativePrepared {
                     statics,
                     asset,
                     source.ordinal,
-                    &source.code_variants,
+                    &source.variants,
                 )
             })
             .collect::<Vec<_>>();
@@ -666,11 +794,6 @@ impl NativePrepared {
             .collect::<Vec<_>>();
         let words = abi::native_word_count(schema, &implementation);
         let scalar_words = abi::scalar_word_count(schema);
-        let kernels = implementation
-            .launches
-            .iter()
-            .map(|launch| launch.kernel.as_str())
-            .collect::<Vec<_>>();
         let asset = |backend| {
             module.native_asset(entry, backend).ok_or_else(|| {
                 preparation(format!(
@@ -679,50 +802,40 @@ impl NativePrepared {
             })
         };
         let launches = implementation.launches.len();
-        // The implementation's programs: one per launch for launch-scoped
-        // parameters, else the whole entry's source with one entry per
-        // launch.
+        // Each launch runs its single variant: the specialization's code
+        // values and static group size.
+        let variants = (0..launches)
+            .map(|ordinal| {
+                vec![plan::LaunchVariant {
+                    code: plan::code_values(&implementation, &specialization, ordinal),
+                    group_size: implementation.static_group_size(&specialization, ordinal),
+                }]
+            })
+            .collect::<Vec<_>>();
         let programs = |dialect: abi::Dialect, asset: &str| {
-            if scoped {
-                let sources = (0..launches)
-                    .map(|ordinal| {
-                        launch_program(
-                            dialect,
-                            &logical,
-                            &bindings,
-                            &implementation,
-                            &specialization,
-                            asset,
-                            ordinal,
-                            &[plan::code_values(&implementation, &specialization, ordinal)],
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let requests = sources
+            let sources = implementation_programs(
+                dialect,
+                &logical,
+                &bindings,
+                &implementation,
+                &specialization,
+                asset,
+                &variants,
+            );
+            let requests = if scoped {
+                sources
                     .iter()
                     .enumerate()
                     .map(|(ordinal, source)| (ordinal, source.entries[0].clone()))
-                    .collect::<Vec<_>>();
-                (sources, requests)
+                    .collect::<Vec<_>>()
             } else {
-                let entries = kernels
+                sources[0]
+                    .entries
                     .iter()
-                    .map(|kernel| ProgramEntry::named(*kernel))
-                    .collect::<Vec<_>>();
-                let requests = entries.iter().map(|entry| (0, entry.clone())).collect();
-                let source = ProgramSource {
-                    text: abi::render_source(
-                        dialect,
-                        &logical,
-                        &bindings,
-                        &implementation,
-                        &specialization,
-                        asset,
-                    ),
-                    entries,
-                };
-                (vec![source], requests)
-            }
+                    .map(|entry| (0, entry.clone()))
+                    .collect()
+            };
+            (sources, requests)
         };
         let mut digest = Sha256::new();
         let (route, toolchain) = match &device.kind {
@@ -767,7 +880,7 @@ impl NativePrepared {
                         words * 8
                     )));
                 }
-                let (sources, requests) = programs(abi::Dialect::Metal, asset(BackendName::Metal)?);
+                let (sources, requests) = programs(metal_dialect(opened), asset(BackendName::Metal)?);
                 let former = device.programs.metal();
                 let launches = form_launches(former, &sources, &requests)?;
                 launches.identify(&mut digest);
@@ -812,12 +925,14 @@ impl NativePrepared {
                         &specialization,
                         asset(BackendName::Vulkan)?,
                     ),
-                    entries: kernels
+                    entries: implementation
+                        .launches
                         .iter()
                         .zip(&geometry)
-                        .map(|(kernel, (threads, views))| ProgramEntry {
-                            symbol: (*kernel).to_owned(),
-                            constants: threads.iter().chain(views).copied().collect(),
+                        .map(|(launch, (threads, views))| ProgramEntry {
+                            symbol: launch.kernel.clone(),
+                            group_size: Some(*threads),
+                            constants: views.clone(),
                         })
                         .collect(),
                 };
@@ -1096,21 +1211,29 @@ impl NativePrepared {
                 shared_bytes,
             }));
         }
-        Ok(geometry)
+        let rounds = match &self.implementation.repeat {
+            None => 1,
+            Some(repeat) => self.evaluate(&repeat.count, values, None)?,
+        };
+        Ok(CallLaunches { geometry, rounds })
     }
 
-    /// Bytes of every scratch buffer for one invocation. An inactive buffer
-    /// is charged the minimum without evaluating its size.
-    pub(crate) fn scratch_bytes(&self, values: &InvocationValues) -> Result<Vec<u64>, CallError> {
+    /// Every scratch buffer of one invocation. An inactive buffer is charged
+    /// the minimum without evaluating its size.
+    pub(crate) fn scratch_needs(&self, values: &InvocationValues) -> Result<Vec<ScratchNeed>, CallError> {
         self.implementation
             .scratch
             .iter()
             .map(|scratch| {
-                if !self.active(&scratch.when, values, None)? {
-                    return Ok(MINIMUM_SCRATCH_BYTES);
-                }
-                self.evaluate(&scratch.bytes, values, None)
-                    .map(|bytes| bytes.max(MINIMUM_SCRATCH_BYTES))
+                let bytes = if self.active(&scratch.when, values, None)? {
+                    self.evaluate(&scratch.bytes, values, None)?.max(MINIMUM_SCRATCH_BYTES)
+                } else {
+                    MINIMUM_SCRATCH_BYTES
+                };
+                Ok(ScratchNeed {
+                    bytes,
+                    sync: scratch.sync,
+                })
             })
             .collect()
     }
@@ -1170,7 +1293,7 @@ impl NativePrepared {
             &values,
         )?;
         Ok(CallShape {
-            scratch: self.scratch_bytes(&values)?,
+            scratch: self.scratch_needs(&values)?,
             results,
             words,
             launches,
@@ -1295,13 +1418,11 @@ impl NativePrepared {
             };
             results.push(tensor);
         }
-        let mut scratch = Vec::with_capacity(shape.scratch.len());
-        let mut scratch_end = 0u64;
-        for bytes in &shape.scratch {
-            let offset = scratch_end.next_multiple_of(BUFFER_ALIGNMENT);
-            scratch.push(offset);
-            scratch_end = offset + bytes;
-        }
+        let (scratch, scratch_end) = if shape.scratch.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            place_scratch(&shape.scratch)
+        };
         let arena = standalone.scratch(&self.public_device, scratch_end)?;
 
         let schema = self.schema();
@@ -1466,8 +1587,8 @@ impl Standalone {
 pub(crate) struct CallShape {
     /// Per result ordinal; `None` for a scalar result.
     pub(crate) results: Vec<Option<NativeTensorSpec>>,
-    /// Bytes of each scratch buffer.
-    pub(crate) scratch: Vec<u64>,
+    /// Each scratch buffer, in declaration order.
+    pub(crate) scratch: Vec<ScratchNeed>,
     pub(crate) words: Vec<u64>,
     pub(crate) launches: CallLaunches,
 }
@@ -1533,7 +1654,8 @@ impl DispatchList for StandaloneCalls<'_> {
             kernel: self.kernel,
             words: &call.words,
             word_bytes: &call.word_bytes,
-            launches: &call.launches,
+            launches: &call.launches.geometry,
+            rounds: call.launches.rounds,
             representations: &call.representations,
         }
     }
@@ -1551,6 +1673,8 @@ pub(crate) struct Dispatch<'a> {
     pub(crate) word_bytes: &'a [u8],
     /// By declaration ordinal; `None` for an inactive launch.
     pub(crate) launches: &'a [Option<LaunchGeometry>],
+    /// How often the kernel's repeat block is dispatched.
+    pub(crate) rounds: u64,
     /// Registry name of each buffer's representation, in ABI order.
     pub(crate) representations: &'a [&'static str],
 }
@@ -1724,7 +1848,11 @@ fn launch_labels(list: &impl DispatchList, repetitions: usize) -> Vec<(String, u
         for index in 0..list.count() {
             let dispatch = list.dispatch(index, &mut Vec::new());
             labels.extend(
-                (0..dispatch.launches.len()).map(|launch| (dispatch.kernel.name.clone(), launch)),
+                dispatch
+                    .kernel
+                    .implementation
+                    .dispatch_order(dispatch.rounds)
+                    .map(|launch| (dispatch.kernel.name.clone(), launch)),
             );
         }
     }
@@ -1777,9 +1905,9 @@ fn encode(
                         (typed_buffer::<Metal, Executor>(allocation), *offset)
                     }));
                     let scalars = typed_buffer::<Metal, Executor>(&dispatch.kernel.scalars);
-                    for (ordinal, launch) in dispatch.launches.iter().enumerate() {
+                    for ordinal in dispatch.kernel.implementation.dispatch_order(dispatch.rounds) {
                         let pipeline = pipelines.pipeline(ordinal);
-                        let Some(launch) = launch else {
+                        let Some(launch) = &dispatch.launches[ordinal] else {
                             batch.skip();
                             continue;
                         };

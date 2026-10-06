@@ -208,8 +208,10 @@ Launch configuration and model execution configuration are separate.
 
 The launch configuration contains only process-lifetime facts: binary resolution policy, loopback
 binding, model-store and cache roots, optional read-only import/source roots, startup and shutdown
-deadlines, output bounds, authentication/instance identity, and compatible API/build identity.
-It must be validated before spawning.
+deadlines, output bounds, an optional log file, authentication/instance identity, and compatible
+API/build identity. It must be validated before spawning. When a log file is named, the child's
+output, start and exit are also recorded there as plain text, with request logging limited to
+failures unless the caller set its own log filter; the file is bounded and rotated once.
 
 The model store and disposable cache are separate roots. In the managed product layout, authoritative
 model artifacts live under the configured model store root and every Magnitude-owned disposable cache

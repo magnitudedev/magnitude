@@ -9,7 +9,7 @@ use magnitude_state::{
     HistoryDomainLayout, HistoryDomainPlan, HistoryDomainTrace, KvCodec, LayerRef,
     ModelStateLayout, StateStore, StoreBindings,
 };
-use seismic::{DType, Device, Element, SlabLayout, SlabRegion};
+use seismic::{BackendName, DType, Device, Element, SlabLayout, SlabRegion};
 use std::rc::Rc;
 
 /// The service's bounds a load plans for. None is a request-count batch
@@ -33,10 +33,53 @@ pub struct ResourceLimits {
     /// which prepares no logits class; diagnostics that read logits set it.
     pub exported_logits_rows: usize,
     pub max_images_per_request: usize,
+    pub max_image_cells: usize,
     /// Queue each continuable target step's successor before the step
     /// completes (cross-step pipelining): one more target launch in flight
     /// and one more successor bank per live request.
     pub lookahead: bool,
+}
+
+/// The most merged cells one image encodes, whatever its model declares:
+/// about 4.2 MP at Qwen3-VL's 32-pixel cells. A larger image is resized
+/// down to it.
+pub const MAX_IMAGE_CELLS: usize = 4096;
+
+/// The most merged cells one image of `definition` encodes in a load whose
+/// launches carry `launch_rows` rows: the declared resize's bound within
+/// [`MAX_IMAGE_CELLS`]. Prefill places an image's features across launches,
+/// unless its rows attend each other in the decoder: such an image is one
+/// launch. Zero without vision.
+pub fn image_cell_limit(
+    definition: &ModelDefinition,
+    launch_rows: usize,
+) -> Result<usize, crate::PlanError> {
+    let Some(vision) = &definition.vision else {
+        return Ok(0);
+    };
+    let declared = vision
+        .max_cells()
+        .map_err(|error| crate::PlanError::InvalidDefinition(error.to_string()))?;
+    let declared = usize::try_from(declared).unwrap_or(usize::MAX);
+    let bidirectional = definition.decoder.sublayers().any(|(_, sublayer)| {
+        matches!(
+            &sublayer.op,
+            magnitude_family_contracts::Operator::Attention(attention)
+                if attention.media_rows == magnitude_family_contracts::MediaRowAttention::Bidirectional
+        )
+    });
+    let limit = declared.min(MAX_IMAGE_CELLS);
+    let limit = if bidirectional {
+        limit.min(launch_rows)
+    } else {
+        limit
+    };
+    if limit == 0 {
+        return Err(crate::PlanError::InvalidDefinition(
+            "the model's images encode no cells".into(),
+        ));
+    }
+    Ok(limit)
 }
 
 impl ResourceLimits {
@@ -73,7 +116,8 @@ impl ResourceLimits {
                 output: 1 + launches,
             },
             // Vision holds nothing until an image arrives: a text-only
-            // session never uses it. Its workspace is the shared arena.
+            // session never uses it. An encode claims storage of its image's
+            // class (`VisionGraphPool`), outside the shared arena.
             vision: GraphSlots {
                 activations: 0,
                 output: 0,
@@ -108,6 +152,28 @@ pub struct StartupSlots {
 pub struct ResourceCapacity {
     /// Stable capacity of the selected device's physical allocation domain.
     pub domain_bytes: u64,
+    /// Whether the selected device forms Metal tensor operations: its own
+    /// probe (`seismic::DeviceInfo::forms_tensor_operations`), which decides
+    /// the graph classes a plan has, so assessment and load plan the same
+    /// graphs. A plan for no concrete device states which it assumes.
+    pub tensor_operations: TensorOperations,
+}
+
+/// Whether a device forms Metal tensor operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorOperations {
+    Formed,
+    Absent,
+}
+
+impl TensorOperations {
+    pub fn of(forms: bool) -> Self {
+        if forms {
+            Self::Formed
+        } else {
+            Self::Absent
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,10 +300,14 @@ impl NativeGraphCharge {
     }
 }
 
-/// The device's one workspace arena: the largest workspace of `charges`.
+/// The device's one workspace arena: the largest workspace of the `charges`
+/// that hold activations from startup. A family that holds none (vision)
+/// claims its own workspace with its first activation, so an image's
+/// workspace never enlarges what every load holds.
 pub(crate) fn arena_bytes(charges: &[&NativeGraphCharge]) -> u64 {
     charges
         .iter()
+        .filter(|charge| charge.activations != 0)
         .map(|charge| charge.workspace_bytes)
         .max()
         .unwrap_or(0)
@@ -296,6 +366,33 @@ pub struct LayerHistory<'a> {
 }
 
 impl HistoryStorePlan {
+    /// The most history row tiles (`SLAB_ROW_TILE` rows) the rows of one
+    /// launch of `slots` requests see: each request's history lies in at most
+    /// `span_limit` pages. The bound a launch's per-call storage of history
+    /// rows is sized by, whatever the reservation `rows`.
+    pub fn launch_tiles(&self, slots: u64) -> Result<u64, String> {
+        let page_tiles = u64::from(self.page_rows) / magnitude_state::SLAB_ROW_TILE as u64;
+        u64::try_from(self.span_limit)
+            .ok()
+            .and_then(|spans| spans.checked_mul(page_tiles))
+            .and_then(|tiles| tiles.checked_mul(slots))
+            .ok_or_else(|| "launch history tile count overflows".into())
+    }
+
+    /// The tile counts of the graph classes that list a launch's history
+    /// row tiles, ascending: powers of two from 16 tiles, then one request's
+    /// worth (`launch_tiles(1)`). A launch takes the smallest that holds the
+    /// tiles its rows see, so a form that attends the listed rows a part at
+    /// a time dispatches at most twice the parts the launch needs.
+    pub fn listed_tile_classes(&self) -> Result<Vec<u64>, String> {
+        let most = self.launch_tiles(1)?;
+        let mut classes = std::iter::successors(Some(16u64), |tiles| tiles.checked_mul(2))
+            .take_while(|tiles| *tiles < most)
+            .collect::<Vec<_>>();
+        classes.push(most);
+        Ok(classes)
+    }
+
     fn trace(&self) -> HistoryDomainTrace {
         HistoryDomainTrace {
             kind: self.kind,
@@ -671,6 +768,24 @@ impl StateResourcePlan {
         self.limits
     }
 
+    /// Whether the planned device forms Metal tensor operations
+    /// (`ResourceCapacity::tensor_operations`, which its opened device must
+    /// confirm).
+    pub fn tensor_operations(&self) -> bool {
+        self.capacity_bytes.tensor_operations == TensorOperations::Formed
+    }
+
+    /// Whether prefill attention graphs over this plan's history come in a
+    /// class that lists the history row tiles its launch's rows see, beside
+    /// the class that lists none: where the affine prefill entry has forms
+    /// that decode the listed tiles for the call, which only tensor
+    /// operations make faster than reading the history in place. A listing
+    /// class holds one request's history decoded, so a device without those
+    /// forms has none.
+    pub fn lists_history_tiles(&self) -> bool {
+        self.tensor_operations() && self.codec == KvCodec::AffineK8V4
+    }
+
     pub fn capacity(&self) -> StateCapacityPlan {
         self.capacity
     }
@@ -897,6 +1012,7 @@ impl ResourcePlanner {
     }
 
     pub fn plan_with_state(
+        backend: BackendName,
         state: StateResourcePlan,
         target_graphs: &PreparedTargetGraphs,
         target_readout_graphs: &PreparedTargetReadoutGraphs,
@@ -960,6 +1076,7 @@ impl ResourcePlanner {
             &load
                 .program_plan(definition, state.codec)
                 .map_err(|error| error.to_string())?,
+            backend,
         )
         .map_err(|error| error.to_string())?;
         let [target_weights, head_weights, vision_weights] = weight_bytes_by_component(load)?;

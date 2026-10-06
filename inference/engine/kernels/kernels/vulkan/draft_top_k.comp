@@ -2,6 +2,7 @@
 // highest logits in (value descending, token ascending) order. Round r scans
 // the tokens ordered strictly after round r - 1's choice. The Vulkan form of
 // `metal/draft_top_k.metal`.
+#include <seismic/element.glsl>
 #include "lib/core/reduce.glsl"
 
 #define TOP_K_INF uintBitsToFloat(0x7f800000u)
