@@ -393,6 +393,24 @@ impl Element {
             .collect::<Option<Vec<_>>>()?;
         seismic_lang::interp::repack(conversion.id, &shape, bytes)
     }
+    /// `bytes`, arbitrary bytes of whole packets of `source`, brought into
+    /// the domain of the registered conversion from `source` into this
+    /// storage (`RepresentationConversion::admit_source`): what a check of a
+    /// repack against [`Element::repack_host`] may convert. `None` when no
+    /// conversion is registered or `bytes` is not whole source packets.
+    pub fn repack_source(self, source: Element, mut bytes: Vec<u8>) -> Option<Vec<u8>> {
+        let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
+        let seismic_lang::registry::RepresentationKind::External(layout) =
+            &seismic_lang::registry::representation_info(source.0).kind
+        else {
+            return None;
+        };
+        if bytes.len() % layout.packet_size as usize != 0 {
+            return None;
+        }
+        conversion.admit_source(&mut bytes);
+        Some(bytes)
+    }
     /// Host reference decode of canonical packed or dense bytes of a tensor
     /// of `shape` into logical values in row-major order. `None` for external
     /// storage or a wrong byte count.

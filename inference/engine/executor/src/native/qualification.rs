@@ -105,7 +105,8 @@ impl<'a> QualificationView<'a> {
                 continue;
             };
             // Two packets per row of 17 rows (a partial 16-row tile), of
-            // arbitrary source bytes, against the registry's host reference.
+            // arbitrary source bytes in the conversion's domain, against the
+            // registry's host reference.
             let bindings = element_binding_name(*source_element, *target_element);
             let failure = |error: String| qualification_dynamic("repack_weight", &bindings, error);
             let group = source_element
@@ -115,9 +116,14 @@ impl<'a> QualificationView<'a> {
             let length = source_element
                 .canonical_byte_len(&shape)
                 .map_err(|error| failure(error.to_string()))?;
-            let bytes = (0..length)
-                .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
-                .collect::<Vec<_>>();
+            let bytes = target_element
+                .repack_source(
+                    *source_element,
+                    (0..length)
+                        .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+                        .collect(),
+                )
+                .ok_or_else(|| failure("no registered conversion for the binding".into()))?;
             let source = Tensor::from_host(device, *source_element, &shape, &bytes)
                 .map_err(|error| failure(error.to_string()))?;
             let result = handle

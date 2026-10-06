@@ -372,6 +372,28 @@ pub struct RepresentationConversion {
     pub kind: ConversionKind,
 }
 
+impl RepresentationConversion {
+    /// Brings `packets`, whole source packets of arbitrary bytes, into the
+    /// conversion's domain, changing as few bits as that takes. The domain
+    /// is the source packets whose binary16 fields the recipe converts as
+    /// numbers ([`PacketRepackRecipe::converted_f16_fields`]) are finite: a
+    /// NaN's payload is not part of the contract, since a device's
+    /// conversion quiets a signaling NaN where the host reference widens its
+    /// bits. Each such field has the high bit of its exponent cleared.
+    pub fn admit_source(&self, packets: &mut [u8]) {
+        let RepresentationKind::External(source) = &representation_info(self.source).kind else {
+            unreachable!("a registered conversion's source is external storage")
+        };
+        let fields = self.recipe.converted_f16_fields();
+        for packet in packets.chunks_exact_mut(source.packet_size as usize) {
+            for field in &fields {
+                let bit = (field + 14) as usize;
+                packet[bit / 8] &= !(1 << (bit % 8));
+            }
+        }
+    }
+}
+
 /// The placement of a conversion's packets in its destination layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConversionKind {
@@ -391,6 +413,45 @@ pub enum ConversionKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PacketRepackRecipe {
     pub planes: Vec<PlaneRepackRecipe>,
+}
+
+impl PacketRepackRecipe {
+    /// The first bit of every binary16 field of the source packet the recipe
+    /// converts as a number (the operand of an `F16ToF32`), ascending.
+    pub fn converted_f16_fields(&self) -> Vec<u32> {
+        fn collect(expression: &RepackExpr, fields: &mut Vec<u32>) {
+            match expression {
+                RepackExpr::SourceBits { .. } => {}
+                RepackExpr::F16ToF32(value) => match &**value {
+                    RepackExpr::SourceBits { bit, .. } => fields.push(*bit),
+                    _ => unreachable!("a validated recipe widens a source field"),
+                },
+                RepackExpr::ShiftLeft { value, .. }
+                | RepackExpr::OffsetI32 { value, .. }
+                | RepackExpr::I32ToF32(value) => collect(value, fields),
+                RepackExpr::Lookup { index, .. } => collect(index, fields),
+                RepackExpr::BitOr(left, right) | RepackExpr::MultiplyF32(left, right) => {
+                    collect(left, fields);
+                    collect(right, fields);
+                }
+            }
+        }
+        let mut fields = Vec::new();
+        for plane in &self.planes {
+            match plane {
+                PlaneRepackRecipe::BitRoutes(_) => {}
+                PlaneRepackRecipe::DenseValues(values)
+                | PlaneRepackRecipe::PackedEntries(values) => {
+                    for value in values {
+                        collect(value, &mut fields);
+                    }
+                }
+            }
+        }
+        fields.sort_unstable();
+        fields.dedup();
+        fields
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2261,9 +2322,15 @@ pub(crate) mod internals {
                         "representation conversion reads beyond its source packet"
                     );
                 }
+                RepackExpr::F16ToF32(value) => {
+                    assert!(
+                        matches!(**value, RepackExpr::SourceBits { width: 16, .. }),
+                        "representation conversion widens something other than a binary16 source field"
+                    );
+                    validate_expr(value, source_bits);
+                }
                 RepackExpr::ShiftLeft { value, .. }
                 | RepackExpr::OffsetI32 { value, .. }
-                | RepackExpr::F16ToF32(value)
                 | RepackExpr::I32ToF32(value) => validate_expr(value, source_bits),
                 RepackExpr::Lookup { index, table } => {
                     validate_expr(index, source_bits);
@@ -2662,6 +2729,46 @@ mod tests {
             panic!("`{name}` is packed")
         };
         layout
+    }
+
+    /// A conversion's domain makes the scales it converts as numbers finite
+    /// and keeps every other source bit: IQ4_NL's eight block scales and
+    /// IQ4_XS's base, and nothing of Q4_0, whose scale moves bit for bit.
+    #[test]
+    fn a_conversion_admits_sources_with_finite_converted_scales() {
+        for (source, destination, fields) in [
+            (
+                "gguf_iq4_nl",
+                "iq4g32@rows16",
+                (0..8).map(|block| block * 144).collect::<Vec<u32>>(),
+            ),
+            ("gguf_iq4_xs", "iq4g32@rows16", vec![0]),
+            ("gguf_q4_0", "q4g32s@rows16", vec![]),
+        ] {
+            let conversion = representation_conversion(
+                representation(source).unwrap(),
+                representation(destination).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(conversion.recipe.converted_f16_fields(), fields, "{source}");
+            let RepresentationKind::External(layout) =
+                &representation_info(conversion.source).kind
+            else {
+                panic!("{source} is external storage")
+            };
+            let mut packets = vec![0xffu8; 2 * layout.packet_size as usize];
+            conversion.admit_source(&mut packets);
+            for (packet, bytes) in packets.chunks_exact(layout.packet_size as usize).enumerate() {
+                for (index, byte) in bytes.iter().enumerate() {
+                    let scale_high = fields.iter().any(|field| index as u32 == field / 8 + 1);
+                    assert_eq!(
+                        *byte,
+                        if scale_high { 0xbf } else { 0xff },
+                        "{source} packet {packet} byte {index}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
