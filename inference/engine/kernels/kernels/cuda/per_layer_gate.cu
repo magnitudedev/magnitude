@@ -1,5 +1,6 @@
-// per_layer_gate: `stage` rounds the F32 hidden rows to A in scratch (and
-// forms the INT8 candidate's q8_1 rows), then `project_rows`' bands project
+// per_layer_gate: `stage` rounds the F32 hidden rows to A in scratch
+// (`stage_s8` also forms the INT8 candidate's q8_1 rows, for the rows whose
+// GEMM reads them), then `project_rows`' bands project
 // them through the gate rows with the activated-product epilogue
 // A(A(act(A(gate))) * inputs[m, layer, p]).
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
@@ -32,16 +33,28 @@ __device__ __forceinline__ void gate_gemv(const Pro &rounded, unsigned M, unsign
         projection::gemv_segment<Shape>(shared, rounded, M, D / 64, group, P, gate, projection::NoWeight{}, epi);
 }
 
-// One row: the A-rounded hidden row, and with S8 its q8_1 row.
+// Hidden row `m`, rounded to A.
+#define ROUND_ROW(m)                                                                                      \
+    for (unsigned long long i = threadIdx.x; i < SEISMIC_DIM_D; i += blockDim.x)                          \
+        element::put<ELEMENT_OF(SEISMIC_ELEMENT_A)>(                                                      \
+            ROUNDED, (m) * SEISMIC_DIM_D + i,                                                             \
+            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN))[(m) * SEISMIC_HIDDEN_STRIDE_0 + \
+                                                                                i * SEISMIC_HIDDEN_STRIDE_1])
+
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_STAGE
 template <unsigned INT8>
 __global__ void per_layer_gate_stage(SEISMIC_KERNEL_PARAMS) {
-    using A = ELEMENT_OF(SEISMIC_ELEMENT_A);
     const unsigned long long m = blockIdx.x;
-    const float *hidden = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN));
-    for (unsigned long long i = threadIdx.x; i < SEISMIC_DIM_D; i += blockDim.x)
-        element::put<A>(ROUNDED, m * SEISMIC_DIM_D + i,
-                                    hidden[m * SEISMIC_HIDDEN_STRIDE_0 + i * SEISMIC_HIDDEN_STRIDE_1]);
+    ROUND_ROW(m);
+}
+#endif
+
+// The rounded row, and with S8 its q8_1 row.
+#ifdef SEISMIC_FORMING_PER_LAYER_GATE_STAGE_S8
+template <unsigned INT8>
+__global__ void per_layer_gate_stage_s8(SEISMIC_KERNEL_PARAMS) {
+    const unsigned long long m = blockIdx.x;
+    ROUND_ROW(m);
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     if constexpr (S8) {
         __syncthreads();

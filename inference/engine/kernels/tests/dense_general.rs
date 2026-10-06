@@ -988,8 +988,8 @@ fn native_per_layer_gate_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: [1, 2],
-        cuda_gemm: 4,
+        cuda_gemv: [2, 3],
+        cuda_gemm: 5,
         split: false,
     };
     let devices = devices();
