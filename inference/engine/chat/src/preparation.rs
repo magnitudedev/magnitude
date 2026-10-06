@@ -203,15 +203,50 @@ impl PreparedChat {
         if prompt == probed {
             return None;
         }
-        let content = prompt
+        self.shared_boundary(probed)
+    }
+
+    /// The prompt token position where the conversation's next turn leaves
+    /// this prompt: the position after the last added token the two prompts
+    /// share. A template may render an assistant turn in history unlike the
+    /// generation prompt this prompt ends with (an empty reasoning block the
+    /// history omits, reasoning it drops), so the next request shares this
+    /// prompt only up to there: short of the prompt's end, and of the reply
+    /// generated after it.
+    ///
+    /// `request` is rendered again followed by an assistant reply and a user
+    /// message, each of [`CONTENT_PROBE`]. `None` when the template rejects
+    /// those turns, or when no added token precedes the divergence inside
+    /// the prompt.
+    pub fn next_turn_boundary(
+        &self,
+        bundle: &TemplateBundle,
+        request: &ChatRequest,
+        selection: &TemplateSelection<'_>,
+    ) -> Option<usize> {
+        let mut probe = request.clone();
+        for role in ["assistant", "user"] {
+            probe
+                .messages
+                .push(serde_json::json!({"role": role, "content": CONTENT_PROBE}));
+        }
+        let (native, _) = bundle.prepare(&probe, selection).ok()?;
+        self.shared_boundary(&native.description().prompt)
+    }
+
+    /// The position after the last added token within the bytes this prompt
+    /// shares with `other`, when it lies inside the prompt.
+    fn shared_boundary(&self, other: &str) -> Option<usize> {
+        let shared = self
+            .prompt()
             .bytes()
-            .zip(probed.bytes())
+            .zip(other.bytes())
             .take_while(|(left, right)| left == right)
             .count();
         self.added_token_ends
             .iter()
             .rev()
-            .find(|end| end.offset <= content)
+            .find(|end| end.offset <= shared)
             .map(|end| end.position)
             .filter(|&position| position < self.input.tokens.len())
     }

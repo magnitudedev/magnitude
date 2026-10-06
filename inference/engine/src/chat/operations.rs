@@ -27,9 +27,11 @@ pub struct PreparedInput {
     pub chat: PreparedChat,
     pub input: PreparedModelInput,
     /// Input rows where a request that will generate retains prefix states
-    /// for later requests: where requests differing only in the last
-    /// message's content diverge from it (see
-    /// [`PreparedChat::last_message_boundary`]). Host-only sizing
+    /// for later requests, ascending: where requests differing only in the
+    /// last message's content diverge from it (see
+    /// [`PreparedChat::last_message_boundary`]), and where the
+    /// conversation's next turn does (see
+    /// [`PreparedChat::next_turn_boundary`]). Host-only sizing
     /// ([`InputBound::Declared`]) retains nothing and has none.
     pub cache_points: Vec<usize>,
 }
@@ -67,11 +69,16 @@ pub fn prepare(
     let (input, cache_points) = match bound {
         InputBound::Served => {
             let input = host.prepare_input(tokens, &images).map_err(input_error)?;
-            let cache_points = chat
-                .last_message_boundary(host.templates(), &request, &selection)
-                .map(|boundary| input.prompt_position_row(boundary))
-                .into_iter()
-                .collect();
+            let mut cache_points = [
+                chat.last_message_boundary(host.templates(), &request, &selection),
+                chat.next_turn_boundary(host.templates(), &request, &selection),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|boundary| input.prompt_position_row(boundary))
+            .collect::<Vec<_>>();
+            cache_points.sort_unstable();
+            cache_points.dedup();
             (input, cache_points)
         }
         InputBound::Declared => (
