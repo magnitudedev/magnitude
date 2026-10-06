@@ -10,8 +10,9 @@
 //! the step time each still takes, and each unit keeps the best
 //! configuration it confirmed.
 //! A unit builds each point's inputs only when Seismic admits the point, and
-//! forms only what it is about to measure. With a [`KernelCache`], each
-//! result is stored under a key over what it is valid for (tuning version,
+//! forms only what it is about to measure. With a [`KernelCache`], the
+//! result of each unit that was started is stored under a key over what it
+//! is valid for (tuning version,
 //! device and toolchain identity, unit, implementation digest, precision
 //! policy and served shapes). Nothing is shipped.
 //! The engine supplies what only it knows, per entry, through an
@@ -1624,7 +1625,11 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
             .map_err(|error| unit_failure(&self.key, error))?;
         tuner.weights.release();
         self.spent += began.elapsed();
-        if let Some((cache, key)) = &self.slot {
+        // A unit never started was not searched: its result is its census,
+        // the defaults unmeasured against anything. It is not stored, so
+        // the next preparation searches the unit instead of reading those
+        // defaults as its result ever after.
+        if let Some((cache, key)) = self.slot.as_ref().filter(|_| self.start.is_some()) {
             cache.store_tuning(key, &result);
         }
         let mut tuned = tuned_entry(

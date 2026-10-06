@@ -12,8 +12,16 @@
 //! own estimates by how the starts so far compared with theirs. A unit
 //! gets its form starts while they fit together with a defaults-only start
 //! and the conclusion of every unit after it; else a defaults-only start
-//! while that fits; else it keeps its defaults unmeasured. The plan is made
-//! again before each start, from what the starts before it took.
+//! while that fits; else it waits. The plan is made again before each
+//! start, from what the starts before it took.
+//!
+//! A unit that waits is not dropped. The plan is made again for the units
+//! waiting, largest share first, before every later step: a start that did
+//! not fit can fit once the starts after it have shown what a start costs
+//! against its estimate, or once a conclusion has given back what it left
+//! of its reserve. Such a unit is started then, and being the unit that has
+//! received the least for its weight it is refined before the others. Only
+//! a unit whose start never fit keeps its defaults unmeasured.
 //!
 //! The breadth is finished first: a unit started on its defaults alone is
 //! owed its form starts, and gets the step that measures them, largest
@@ -146,13 +154,15 @@ pub(crate) trait Unit {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct StartRecord {
     pub unit: usize,
-    /// None: neither start fit, and the unit keeps its defaults unmeasured.
+    /// None: neither start ever fit, and the unit keeps its defaults
+    /// unmeasured.
     pub depth: Option<Depth>,
     /// What the plan expected the start it gave to take, and a start with
     /// the form starts.
     pub estimated: Duration,
     pub with_forms: Duration,
-    /// The time the plan had for this start and everything after it.
+    /// The time the plan had for this start and everything after it; for a
+    /// unit never started, when its start was first refused.
     pub available: Duration,
     pub actual: Duration,
     pub cut: bool,
@@ -169,9 +179,11 @@ pub(crate) struct Overrun {
 /// The plan as it was made and what happened: for the log.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Report {
+    /// The starts in the order they were given, then the units never
+    /// started, largest share first.
     pub starts: Vec<StartRecord>,
-    /// When the starts ended, the last refinement slice ended and the last
-    /// conclusion ended.
+    /// When the last start ended, the last refinement slice ended and the
+    /// last conclusion ended.
     pub started: Duration,
     pub refined: Duration,
     pub concluded: Duration,
@@ -299,46 +311,71 @@ pub(crate) fn allocate<U: Unit>(
     order.sort_by(|left, right| run.units[*right].share().total_cmp(&run.units[*left].share()));
     let estimates = run.units.iter().map(Unit::estimate).collect::<Vec<_>>();
     let mut observed = Observed::default();
-    for (position, &unit) in order.iter().enumerate() {
+    // What the plan had for each unit when it first refused its start.
+    let mut refused = vec![None; run.units.len()];
+    // The longest an ordinary refinement has run past the end of its slice:
+    // what a unit cannot interrupt.
+    let mut overshoot = Duration::ZERO;
+    let mut short = None;
+    loop {
         let now = clock.now();
-        // What is left for this start and everything after it: the time
-        // less concluding the units already started.
-        let available = total
-            .saturating_sub(now)
-            .saturating_sub(reserved(run.units, &run.states, None));
-        // Every later unit keeps room for its defaults and its conclusion.
-        let later = order[position + 1..]
+        let reserve = reserved(run.units, &run.states, None);
+        // What is left for a start and everything after it: the time less
+        // concluding the units already started.
+        let available = total.saturating_sub(now).saturating_sub(reserve);
+        let waiting = order
             .iter()
-            .map(|later| {
-                observed.price(&estimates[*later], Depth::Defaults)
-                    + observed.conclusion(&estimates[*later])
-            })
-            .sum::<Duration>();
-        let conclusion = observed.conclusion(&estimates[unit]);
-        let with_forms = observed.price(&estimates[unit], Depth::Forms);
-        let defaults = observed.price(&estimates[unit], Depth::Defaults);
-        let depth = if with_forms + conclusion + later <= available {
-            Some(Depth::Forms)
-        } else if defaults + conclusion <= available {
-            Some(Depth::Defaults)
-        } else {
-            None
-        };
-        let mut record = StartRecord {
-            unit,
-            depth,
-            estimated: match depth {
-                Some(Depth::Forms) => with_forms,
-                Some(Depth::Defaults) => defaults,
-                None => Duration::ZERO,
-            },
-            with_forms,
-            available,
-            actual: Duration::ZERO,
-            cut: false,
-        };
-        if let Some(depth) = depth {
-            let until = total.saturating_sub(reserved(run.units, &run.states, None) + conclusion);
+            .copied()
+            .filter(|unit| matches!(run.states[*unit], State::Waiting))
+            .collect::<Vec<_>>();
+        // The first unit waiting whose start fits, largest share first.
+        let mut fits = None;
+        for (position, &unit) in waiting.iter().enumerate() {
+            // Every later unit keeps room for its defaults and its
+            // conclusion.
+            let later = waiting[position + 1..]
+                .iter()
+                .map(|later| {
+                    observed.price(&estimates[*later], Depth::Defaults)
+                        + observed.conclusion(&estimates[*later])
+                })
+                .sum::<Duration>();
+            let conclusion = observed.conclusion(&estimates[unit]);
+            let with_forms = observed.price(&estimates[unit], Depth::Forms);
+            let defaults = observed.price(&estimates[unit], Depth::Defaults);
+            let depth = if with_forms + conclusion + later <= available {
+                Some(Depth::Forms)
+            } else if defaults + conclusion <= available {
+                Some(Depth::Defaults)
+            } else {
+                None
+            };
+            let record = StartRecord {
+                unit,
+                depth,
+                estimated: match depth {
+                    Some(Depth::Forms) => with_forms,
+                    Some(Depth::Defaults) => defaults,
+                    None => Duration::ZERO,
+                },
+                with_forms,
+                available,
+                actual: Duration::ZERO,
+                cut: false,
+            };
+            match depth {
+                Some(depth) => {
+                    fits = Some((depth, record, conclusion, with_forms.saturating_sub(defaults)));
+                    break;
+                }
+                None => {
+                    refused[unit].get_or_insert(record);
+                }
+            }
+        }
+        if let Some((depth, mut record, conclusion, forms)) = fits {
+            let unit = record.unit;
+            let until = total.saturating_sub(reserve + conclusion);
             let started = run.units[unit].start(context, depth, until)?;
             let actual = clock.now().saturating_sub(now);
             observed.programs += started.programs;
@@ -353,26 +390,17 @@ pub(crate) fn allocate<U: Unit>(
             run.states[unit] = State::Open {
                 progress: started.progress,
                 received: Duration::ZERO,
-                starts: (depth == Depth::Defaults).then(|| with_forms.saturating_sub(defaults)),
+                starts: (depth == Depth::Defaults).then_some(forms),
             };
             run.check(unit, "start", until);
+            run.report.starts.push(record);
+            run.report.started = clock.now();
+            run.report.refined = run.report.started;
+            if started.progress.finished {
+                run.conclude(context, unit)?;
+            }
+            continue;
         }
-        run.report.starts.push(record);
-    }
-    run.report.started = clock.now();
-    for &unit in &order {
-        if matches!(run.states[unit], State::Open { progress, .. } if progress.finished) {
-            run.conclude(context, unit)?;
-        }
-    }
-    // The longest an ordinary refinement has run past the end of its slice:
-    // what a unit cannot interrupt.
-    let mut overshoot = Duration::ZERO;
-    let mut short = None;
-    run.report.refined = clock.now();
-    loop {
-        let now = clock.now();
-        let reserve = reserved(run.units, &run.states, None);
         // Time received, with one more slice, per unit of step time still
         // taken.
         let served = |unit: usize| match run.states[unit] {
@@ -461,6 +489,12 @@ pub(crate) fn allocate<U: Unit>(
         }
     }
     run.report.reserved = short.unwrap_or_else(|| reserved(run.units, &run.states, None));
+    run.report.starts.extend(
+        order
+            .iter()
+            .filter(|unit| matches!(run.states[**unit], State::Waiting))
+            .map(|unit| refused[*unit].expect("a unit still waiting was refused its start")),
+    );
     for unit in 0..run.units.len() {
         if matches!(run.states[unit], State::Waiting) {
             run.conclude(context, unit)?;
@@ -809,6 +843,84 @@ mod tests {
         assert!(units.iter().all(|unit| unit.concluded.is_some()));
         assert!(report.overruns.is_empty());
         assert_eq!(report.concluded, Duration::from_secs(3));
+    }
+
+    /// The largest unit's start does not fit by its own estimate, four times
+    /// what it takes. It waits; the next unit's start shows what starts cost
+    /// against their estimates, the plan made again has room for the largest
+    /// unit, and it is started before the unit after it.
+    #[test]
+    fn a_unit_refused_by_its_estimate_is_started_once_the_starts_correct_it() {
+        let clock = Fake::default();
+        let mut units = [0.5, 0.3, 0.2]
+            .into_iter()
+            .enumerate()
+            .map(|(name, share)| Synthetic {
+                defaults: SECOND / 4,
+                forms: SECOND / 4,
+                believed: 4.,
+                floor: 1.,
+                ..Synthetic::new(name, &clock, share, 1000)
+            })
+            .collect::<Vec<_>>();
+        // Its defaults alone are estimated at 8 s, with its conclusion more
+        // than the time.
+        units[0].defaults = SECOND * 2;
+        units[0].forms = SECOND * 2;
+        let (log, report) = run(&mut units, &clock, 8);
+        assert_eq!(
+            depths(&report),
+            [1, 0, 2].map(|unit| (unit, Some(Depth::Forms)))
+        );
+        assert_eq!(report.starts[1].estimated, report.starts[1].actual);
+        // It is refined with the others in the time left.
+        assert!(log
+            .iter()
+            .any(|(name, step, _)| *name == 0 && *step == Step::Refine));
+        assert!(report.overruns.is_empty(), "{:?}", report.overruns);
+        assert!(report.concluded <= Duration::from_secs(8));
+        assert!(units.iter().all(|unit| unit.concluded.is_some() && !unit.cut));
+    }
+
+    /// The reserves of the units started fill the time, so the last unit's
+    /// start does not fit. It waits; a conclusion gives back what it left of
+    /// its reserve, and the unit is started and refined in that time instead
+    /// of tuning ending with it unspent.
+    #[test]
+    fn a_unit_whose_start_did_not_fit_is_started_in_the_time_a_conclusion_gives_back() {
+        let clock = Fake::default();
+        let mut units = [0.5, 0.3, 0.2]
+            .into_iter()
+            .enumerate()
+            .map(|(name, share)| Synthetic {
+                confirm: Duration::from_millis(100),
+                reserved: (name < 2).then_some(SECOND * 5),
+                floor: 1.,
+                ..Synthetic::new(name, &clock, share, 1000)
+            })
+            .collect::<Vec<_>>();
+        let (log, report) = run(&mut units, &clock, 12);
+        // Two starts and their reserves are the time: the third unit waits.
+        let position = |unit: usize, step: Step| {
+            log.iter()
+                .position(|(name, at, _)| *name == unit && *at == step)
+                .unwrap()
+        };
+        let concluded = position(1, Step::Conclude);
+        let started = position(2, Step::Start(Depth::Forms));
+        assert!(concluded < started);
+        assert_eq!(log[concluded].2, SECOND * 2);
+        assert_eq!(
+            depths(&report),
+            [0, 1, 2].map(|unit| (unit, Some(Depth::Forms)))
+        );
+        // The time follows the weights from there: both units left are
+        // refined.
+        assert!(units[2].done > Duration::ZERO);
+        assert!(units[0].done > units[2].done);
+        assert!(report.overruns.is_empty(), "{:?}", report.overruns);
+        assert!(report.concluded <= Duration::from_secs(12));
+        assert!(units.iter().all(|unit| unit.concluded.is_some() && !unit.cut));
     }
 
     /// Estimates wrong by a factor of two: the first start shows it, the

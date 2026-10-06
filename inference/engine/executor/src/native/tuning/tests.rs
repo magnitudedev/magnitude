@@ -409,6 +409,8 @@ struct FakeCase {
     digest: String,
     bindings: String,
     launches: usize,
+    /// What the census reports the defaults take at every point.
+    defaults_seconds: f64,
     chosen: Configuration,
 }
 
@@ -430,6 +432,7 @@ impl FakeCase {
             digest: digest.into(),
             bindings: "fake".into(),
             launches: 1,
+            defaults_seconds: 1e-3,
             chosen: Configuration {
                 statics: chosen.statics().clone(),
                 params: chosen.params().clone(),
@@ -599,7 +602,7 @@ impl FakeSearch {
 }
 
 impl EntrySearch<dense_output::Entry> for FakeSearch {
-    /// The defaults measured at every point, a millisecond each.
+    /// The defaults measured at every point, at the case's time each.
     fn census(
         &mut self,
         points: &mut dyn seismic::PointSource<'static, dense_output::Entry>,
@@ -631,9 +634,9 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
                                 launches: vec![0],
                                 values: Default::default(),
                             },
-                            median_seconds: 1e-3,
+                            median_seconds: self.case.defaults_seconds,
                             deviation_seconds: 0.0,
-                            samples: vec![1e-3],
+                            samples: vec![self.case.defaults_seconds],
                             repetitions: 1,
                             rotation_bytes: 0,
                         })
@@ -960,6 +963,22 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
         TuningOrigin::Searched
     );
     assert_eq!(stored_results(), 3);
+
+    // A unit whose start never fits the tuning time (confirming defaults
+    // this slow would not end in it) keeps its defaults unmeasured and
+    // stores nothing, so the next load searches it instead of reading
+    // those defaults as its result.
+    let mut slow = FakeCase::new(&implementation, &statics, "implementation c");
+    slow.defaults_seconds = TUNING_TIME.as_secs_f64();
+    let (kept, started, _) = load_once(&slow, limits);
+    assert_eq!(kept.origin, TuningOrigin::Searched);
+    assert!(!started);
+    assert_eq!(stored_results(), 3);
+    let quick = FakeCase::new(&implementation, &statics, "implementation c");
+    let (searched, started, _) = load_once(&quick, limits);
+    assert_eq!(searched.origin, TuningOrigin::Searched);
+    assert!(started && searched.search.is_some());
+    assert_eq!(stored_results(), 4);
     std::fs::remove_dir_all(root).unwrap();
 }
 

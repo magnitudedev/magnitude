@@ -121,7 +121,8 @@ the timed points that stand for the class (its own where the census timed them, 
 costliest timed of its group), so the prefill classes weigh on the units that serve them and a
 unit serving only chunks holds its part of them. The units are then searched together, before the walk that prepares them. Tuning happens
 in this one tuning time: a stored result is used as it is by every later load, however far its
-search got. The time is planned before it is spent, so that tuning ends inside it because the
+search got. Only a unit that was started stores a result: a unit never started was not searched,
+so nothing is stored for it and the next load searches it. The time is planned before it is spent, so that tuning ends inside it because the
 planned work fits; everything between the census and the last walk counts against it, planning
 and formation as well as measurement. Breadth comes before depth. Each unit is first started,
 largest share first: it admits further points while they fit a tenth of its share of the tuning
@@ -138,8 +139,13 @@ covered by the reserve the started search states, so a unit whose defaults are s
 refused its start for a confirmation of configurations as slow as they. A unit gets its form starts while they fit together with a
 defaults-only start and the conclusion of every unit after it, else a defaults-only start while
 that fits (it is then refined first, before any slice is dealt by weight, and that step measures
-its form starts), else it keeps its defaults; the
-plan is made again before each start and reported with what each start took. The time left is
+its form starts), else it waits; the
+plan is made again before each start and reported with what each start took. A unit that waits
+is not dropped: before every later step the plan is made again for the units waiting, largest
+share first, and such a unit is started as soon as its start fits, because the starts since have
+shown what a start costs against its estimate or because a conclusion has given back what it left
+of its reserve; having received nothing, it is then refined before the others. Only a unit whose
+start never fit keeps its defaults unmeasured. The time left is
 dealt in half-second slices among the units whose searches have not ended, by the step time each
 still takes: a unit's share of step time times its best cost so far relative to its defaults.
 What one of a unit's measurements costs takes no part, so a unit whose measurements are slow
