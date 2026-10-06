@@ -879,7 +879,7 @@ function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (pa
       </div>
     </aside>
     <main key={page} className="min-w-0 flex-1 overflow-y-auto">
-      <div data-page-content className={`mx-auto w-[calc(100vw-224px)] max-w-6xl px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
+      <div data-page-content className={`mx-auto w-[calc(100vw-224px)] max-w-[min(100%,72rem)] px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
         {page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
         {children}
       </div>
