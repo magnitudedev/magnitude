@@ -411,9 +411,6 @@ pub mod device {
         pub(crate) fn allocation_address(&self, allocation: &Arc<Allocation>) -> u64 {
             self.kind.allocation_address(allocation)
         }
-        pub(crate) fn register_slab(&self, allocation: &Arc<Allocation>) {
-            self.kind.register_slab(allocation)
-        }
         /// A reserved tensor's storage resized in place; see
         /// `OpenedKind::recommit_in_place`.
         pub(crate) fn recommit_in_place(
@@ -729,10 +726,6 @@ pub mod tensor {
 
         pub fn device_address(&self) -> u64 {
             self.device.allocation_address(&self.allocation) + self.byte_offset
-        }
-
-        pub fn register_slab(&self) {
-            self.device.register_slab(&self.allocation)
         }
 
         /// Publish a new slab under its address table's hazard domain.

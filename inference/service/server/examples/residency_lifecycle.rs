@@ -34,7 +34,9 @@ use magnitude_service_models::{
 use magnitude_service_server::configurations::ResolvedConfigurations;
 use magnitude_service_server::hardware::HardwareInventory;
 use magnitude_service_server::residency::controller::{ModelInstances, ResidencyEnvironment};
-use magnitude_service_server::residency::supervisor::{HostMemoryObserver, SeismicHostMemory};
+use magnitude_service_server::residency::supervisor::{
+    HostMemoryObserver, HostMemorySample, SeismicHostMemory,
+};
 use magnitude_service_server::residency::worker::run_inference_worker;
 use magnitude_service_server::serving::ServiceModels;
 use magnitude_service_server::worker_process::{WorkerLauncher, install_parent_watchdog};
@@ -50,11 +52,15 @@ struct ScriptedHostMemory {
 }
 
 impl HostMemoryObserver for ScriptedHostMemory {
-    fn headroom_bytes(&self) -> Result<u64, String> {
-        match self.headroom.load(Ordering::Acquire) {
-            NO_OVERRIDE => self.seismic.headroom_bytes(),
-            bytes => Ok(bytes),
-        }
+    fn sample(&self) -> Result<HostMemorySample, String> {
+        let sample = self.seismic.sample()?;
+        Ok(match self.headroom.load(Ordering::Acquire) {
+            NO_OVERRIDE => sample,
+            headroom_bytes => HostMemorySample {
+                headroom_bytes,
+                ..sample
+            },
+        })
     }
 }
 

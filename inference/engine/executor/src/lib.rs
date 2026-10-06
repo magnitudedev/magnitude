@@ -36,7 +36,7 @@ pub use device_resources::{
     ResourceError,
 };
 pub use domain::{
-    ClaimRefusal, DeviceHeap, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
+    require_normal, ClaimRefusal, DeviceHeap, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
     HeadFlight, MemoryChargeReconciliation, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, ProgramFamily, ReservedResources, ResumeState,
     StateBindings, SubmitFailure, TargetFlight, TargetHostTiming, VisionFlight,

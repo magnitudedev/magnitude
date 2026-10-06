@@ -258,6 +258,14 @@ pub enum LoadError {
         domain: MemoryDomain,
         memory: InsufficientMemory,
     },
+    /// `domain` was in the Reclaim band when the load claimed from it or
+    /// while it imported weights: its headroom was at or below the planning
+    /// reserve, or its host was in distress. No byte count describes it.
+    /// Retryable once the domain recovers.
+    MemoryPressure {
+        purpose: String,
+        domain: MemoryDomain,
+    },
     MemoryObservationUnavailable { reason: String },
     DeviceLost { reason: String },
     /// The worker ended, or broke the protocol, before it was ready.
@@ -270,6 +278,7 @@ impl LoadError {
         matches!(
             self,
             Self::InsufficientMemory { .. }
+                | Self::MemoryPressure { .. }
                 | Self::MemoryObservationUnavailable { .. }
                 | Self::DeviceLost { .. }
                 | Self::WorkerLost { .. }
@@ -288,6 +297,9 @@ impl fmt::Display for LoadError {
                 domain,
                 memory,
             } => write!(formatter, "{purpose} in {domain}: {memory}"),
+            Self::MemoryPressure { purpose, domain } => {
+                write!(formatter, "{purpose} in {domain}: memory pressure")
+            }
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }

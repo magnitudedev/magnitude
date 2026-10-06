@@ -44,11 +44,17 @@ observed model, context, compute, and auxiliary bytes at the last observation. M
 so this is standing, not a fixed reservation. No plan or allocation carries fixed sequence slots
 or a physical context size.
 
-A low-memory load failure reports the required memory, the limiting domain's allocation headroom
-and planning reserve, the load boundary (required memory plus that reserve), and the minimum
-additional available memory the load needs. The limiting domain is the one whose claim the
-engine refused: the device's allocation domain, or system RAM when a dedicated device's staged
-upload did not fit.
+A load that fits the machine but cannot be given its memory fails as a memory shortage, in one
+of two forms. Blocked: memory that cannot be moved is in the way, and the failure reports the
+required memory and what a load may claim in the limiting domain, the reserve already taken out.
+The limiting domain is the one whose claim the engine refused: the device's allocation domain, or
+system RAM when a dedicated device's staged upload did not fit. Under pressure: a domain the load
+uses was in the Reclaim band when the load claimed from it or while it imported weights, and no
+byte count describes it. Clients present both as one condition and never show a reserve.
+
+A load requested while admission is closed waits in the queued stage and starts when admission
+reopens. An Instance released for memory pressure stays distinguishable from any other unloaded
+Instance, so a client can say why the model is no longer loaded.
 
 ## Lifecycle
 
@@ -146,11 +152,12 @@ Every release first asks the worker to shut down, which ends its open requests a
 `model_instance_stopped`. Graceful release (replacement, idle) allows two seconds and explicit Stop
 half a second before the worker is killed. Retirement is proven by the worker's exit status.
 
-Memory pressure has two sources with one outcome. The engine unloads itself when other programs
-keep headroom at or below its planning reserve, and the service kills the worker on the first
-system-RAM sample at or below the emergency reserve. Either releases the Instance as
-`memory_pressure` and closes load admission until system-RAM headroom has stayed above the planning
-reserve for five seconds; a failed sample restarts that wait. Nothing reloads automatically. Worker
+Memory pressure has two sources with one outcome. The engine unloads itself when a memory domain
+it uses stays in the Reclaim band (headroom at or below its planning reserve, or host distress),
+and the service kills the worker on the first system-RAM sample at or below the emergency reserve
+or at critical kernel pressure. Either releases the Instance as `memory_pressure` and closes load
+admission until system RAM has stayed out of distress with headroom above the planning reserve for
+five seconds; a failed sample restarts that wait. Nothing reloads automatically. Worker
 exit, a lost device, and one continuous second of failed memory observation fail the Instance.
 
 ## Inference acquisition
@@ -210,5 +217,6 @@ Instance ID.
 - A post-installation preparation never holds residency; a load of the same bundle stops it, and
   its tuned units remain stored for that load.
 - Engine unload for memory pressure and the service's emergency kill both publish
-  `memory_pressure` and gate new loads on five seconds of headroom above the planning reserve.
+  `memory_pressure` and gate new loads on five seconds without host distress and with headroom
+  above the planning reserve.
 - Client connection or presence state cannot change model residency.

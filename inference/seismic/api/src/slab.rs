@@ -294,7 +294,6 @@ impl SlabTensor {
             storage,
             regions: views,
         };
-        slab.storage.register_slab();
         self.write_addresses(index, slab.device_address())?;
         if index < self.slabs.len() {
             self.slabs[index] = Some(slab);

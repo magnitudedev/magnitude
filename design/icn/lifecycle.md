@@ -463,12 +463,13 @@ Every inference request holds an exact model-instance lease through stream end o
 Explicit load, replacement, and Stop share controller mutation authority. Stop and replacement
 close new inference admission. Replacement waits for existing leases to drain; explicit Stop
 terminates those requests. Memory-pressure
-eviction is deliberately different. The engine releases memory itself and unloads when other
-programs hold system headroom at or below its planning reserve. Persistent ICN is the independent
-guard: it observes limit-bounded system-RAM headroom through Seismic every 100 milliseconds while
-a worker is resident and every second otherwise, and kills the inference worker on the first sample
-at or below the emergency reserve. Either path publishes `memory_pressure` and closes load
-admission until headroom has stayed above the planning reserve for five seconds; a failed sample
+eviction is deliberately different. The engine releases memory itself and unloads when a memory
+domain it uses stays in the Reclaim band. Persistent ICN is the independent
+guard: it observes limit-bounded system-RAM headroom and host distress through Seismic every 100
+milliseconds while a worker is resident and every second otherwise, and kills the inference worker
+on the first sample at or below the emergency reserve or at critical kernel pressure. Either path
+publishes `memory_pressure` and closes load admission until the host has stayed out of distress
+with headroom above the planning reserve for five seconds; a failed sample
 restarts that interval. Eviction does not wait for leases or native cleanup. Worker exit, protocol
 loss, or one continuous second of unavailable memory supervision terminalizes the affected
 instance and fails its streams without terminating persistent ICN. There is no automatic reload.

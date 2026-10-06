@@ -56,7 +56,8 @@ component weights are visited in source-file order. Consecutive whole tensors wh
 range fits the largest source tensor share one page-rounded read-only mapped window and one
 ordered native submission. Their resident destinations are allocated without a host zero-fill;
 the attested import entries write every physical byte, including representation padding.
-The mapped window stays owned through completion. Other backends use a one-shot staged source
+The mapped window stays owned through completion. Resident weights on macOS are wired like every
+engine holding ([engine memory](memory.md)); the mapped window is file-backed and is not. Other backends use a one-shot staged source
 upload, also without a prefill. The source file streams into that upload in bounded chunks, without
 a second whole-tensor host copy. Residency publishes each weight
 only after its submission completes; failed imports leave no cache entry.

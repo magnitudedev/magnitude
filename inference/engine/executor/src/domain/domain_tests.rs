@@ -196,7 +196,7 @@ fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) ->
         execution,
         definition,
         resources,
-        DeviceHeap::open(catalog, reserves, device).unwrap(),
+        DeviceHeap::open(Rc::new(catalog), reserves, device).unwrap(),
         store,
         head,
         None,

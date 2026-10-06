@@ -62,6 +62,7 @@ export const deriveCurrentLocalModel = (
             )
           case "Requested":
           case "Unloaded":
+          case "Stopped":
           case "Failed":
             return Option.none()
         }
@@ -69,6 +70,7 @@ export const deriveCurrentLocalModel = (
     }
     switch (slot.residency._tag) {
       case "Unloaded":
+      case "Stopped":
         return { _tag: "NotLoaded", ...details }
       case "Requested":
         return {

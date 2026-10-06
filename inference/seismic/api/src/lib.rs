@@ -169,10 +169,10 @@ mod slab;
 pub use seismic_runtime::devices::{
     Availability, CapacityBasis, DeviceId, DeviceInfo, DeviceKind, DeviceMeasurements,
     DeviceMemory, DeviceMemoryInfo, DeviceMemoryStatus, DeviceSelector, DeviceTopology,
-    DiscoveryDiagnostic, DiscoveryError, HeadroomBasis, HeadroomEstimate, HostMeasurements,
-    HostMemoryStatus, LimitVisibility, MemoryPoolId, MemoryPoolInfo, MemoryPoolKind, MemoryUsage,
-    ObservationError, OpenError, ProcessLimitKind, ProcessMemoryLimit, ResolveError,
-    SelectorParseError,
+    DiscoveryDiagnostic, DiscoveryError, DisplacementWindow, HeadroomBasis, HeadroomEstimate,
+    HostDisplacement, HostMeasurements, HostMemoryStatus, KernelPressure, LimitVisibility,
+    MemoryPoolId, MemoryPoolInfo, MemoryPoolKind, MemoryUsage, ObservationError, OpenError,
+    ProcessLimitKind, ProcessMemoryLimit, ResolveError, SelectorParseError,
 };
 pub use slab::{Slab, SlabLayout, SlabRegion, SlabTensor};
 
@@ -603,10 +603,6 @@ impl Tensor {
 
     pub(crate) fn device_address(&self) -> u64 {
         self.inner.device_address()
-    }
-
-    pub(crate) fn register_slab(&self) {
-        self.inner.register_slab()
     }
 
     pub(crate) fn share_slab_access_with(&self, table: &Tensor) {

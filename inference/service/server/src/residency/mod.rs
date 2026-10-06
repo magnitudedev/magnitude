@@ -13,14 +13,15 @@ use std::sync::Arc;
 
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    ModelId, ModelInstance, ModelInstanceAllocation, ModelInstanceFailure, ModelInstanceId,
-    ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadPlan,
+    MemoryShortage, ModelId, ModelInstance, ModelInstanceAllocation, ModelInstanceFailure,
+    ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot,
+    ModelLoadPlan,
     ModelLoadStage, ModelPackageId, ModelReleaseReason, ModelServingConfiguration,
     ModelStoppingAllocation,
 };
 
-/// The failure code of a load refused for lack of memory.
-pub const LOW_MEMORY_FAILURE_CODE: &str = "low_memory";
+/// The failure code of a load that fits the machine but could not be given its memory.
+pub const MEMORY_SHORTAGE_FAILURE_CODE: &str = "memory_shortage";
 
 /// Observes model loading: its stage and completed fraction in `[0, 1]`.
 pub type LoadingObserver = Arc<dyn Fn(ModelLoadStage, f32) + Send + Sync>;
@@ -430,16 +431,21 @@ pub enum ModelOperationFailure {
         message: String,
         retryable: bool,
     },
-    LowMemory(LowMemory),
+    MemoryShortage(MemoryShortage),
 }
 
-/// A load refused because its limiting memory domain lacks room above its planning reserve.
-#[derive(Clone, Debug)]
-pub struct LowMemory {
-    pub required_memory_bytes: u64,
-    pub allocation_headroom_bytes: u64,
-    /// The limiting domain's planning reserve.
-    pub system_reserve_bytes: u64,
+fn memory_shortage_message(shortage: &MemoryShortage) -> String {
+    match shortage {
+        MemoryShortage::Blocked {
+            required_bytes,
+            available_bytes,
+        } => format!(
+            "not enough memory right now: the model requires {required_bytes} bytes and {available_bytes} bytes are available"
+        ),
+        MemoryShortage::UnderPressure {} => {
+            "not enough memory right now: loading stopped because the system is under memory pressure".to_owned()
+        }
+    }
 }
 
 impl ModelOperationFailure {
@@ -454,21 +460,21 @@ impl ModelOperationFailure {
     pub fn code(&self) -> &str {
         match self {
             Self::Operation { code, .. } => code,
-            Self::LowMemory(_) => LOW_MEMORY_FAILURE_CODE,
+            Self::MemoryShortage(_) => MEMORY_SHORTAGE_FAILURE_CODE,
         }
     }
 
     pub fn message(&self) -> String {
         match self {
             Self::Operation { message, .. } => message.clone(),
-            Self::LowMemory(low) => low.message(),
+            Self::MemoryShortage(shortage) => memory_shortage_message(shortage),
         }
     }
 
     pub fn retryable(&self) -> bool {
         match self {
             Self::Operation { retryable, .. } => *retryable,
-            Self::LowMemory(_) => true,
+            Self::MemoryShortage(_) => true,
         }
     }
 
@@ -483,41 +489,13 @@ impl ModelOperationFailure {
                 message,
                 retryable,
             },
-            Self::LowMemory(low) => ModelInstanceFailure::LowMemory {
-                code: LOW_MEMORY_FAILURE_CODE.to_owned(),
-                message: low.message(),
+            Self::MemoryShortage(shortage) => ModelInstanceFailure::MemoryShortage {
+                code: MEMORY_SHORTAGE_FAILURE_CODE.to_owned(),
+                message: memory_shortage_message(&shortage),
                 retryable: true,
-                required_memory_bytes: low.required_memory_bytes,
-                allocation_headroom_bytes: low.allocation_headroom_bytes,
-                system_reserve_bytes: low.system_reserve_bytes,
-                load_boundary_bytes: low.load_boundary_bytes(),
-                minimum_additional_available_bytes: low.minimum_additional_available_bytes(),
+                shortage,
             },
         }
-    }
-}
-
-impl LowMemory {
-    pub fn load_boundary_bytes(&self) -> u64 {
-        self.required_memory_bytes
-            .saturating_add(self.system_reserve_bytes)
-    }
-
-    pub fn minimum_additional_available_bytes(&self) -> u64 {
-        self.load_boundary_bytes()
-            .saturating_sub(self.allocation_headroom_bytes)
-            .saturating_add(1)
-    }
-
-    fn message(&self) -> String {
-        let short = self.minimum_additional_available_bytes();
-        format!(
-            "not enough memory available: model requires {} bytes plus {} bytes reserved for the system; {} bytes are available ({short} {} short)",
-            self.required_memory_bytes,
-            self.system_reserve_bytes,
-            self.allocation_headroom_bytes,
-            if short == 1 { "byte" } else { "bytes" },
-        )
     }
 }
 
@@ -1691,27 +1669,27 @@ mod tests {
     }
 
     #[test]
-    fn low_memory_failure_preserves_boundary_arithmetic() {
-        let failure = ModelOperationFailure::LowMemory(LowMemory {
-            required_memory_bytes: 10,
-            allocation_headroom_bytes: 11,
-            system_reserve_bytes: 3,
-        })
-        .into_instance_failure();
-        let ModelInstanceFailure::LowMemory {
-            required_memory_bytes,
-            load_boundary_bytes,
-            minimum_additional_available_bytes,
-            retryable,
-            ..
-        } = failure
-        else {
-            panic!("low memory failure changed kind");
-        };
-        assert_eq!(required_memory_bytes, 10);
-        assert_eq!(load_boundary_bytes, 13);
-        assert_eq!(minimum_additional_available_bytes, 3);
-        assert!(retryable);
+    fn a_memory_shortage_keeps_its_kind_and_is_retryable() {
+        for shortage in [
+            MemoryShortage::Blocked {
+                required_bytes: 10,
+                available_bytes: 8,
+            },
+            MemoryShortage::UnderPressure {},
+        ] {
+            let failure = ModelOperationFailure::MemoryShortage(shortage.clone());
+            assert_eq!(failure.code(), MEMORY_SHORTAGE_FAILURE_CODE);
+            assert!(failure.retryable());
+            assert_eq!(
+                failure.into_instance_failure(),
+                ModelInstanceFailure::MemoryShortage {
+                    code: MEMORY_SHORTAGE_FAILURE_CODE.to_owned(),
+                    message: memory_shortage_message(&shortage),
+                    retryable: true,
+                    shortage,
+                }
+            );
+        }
     }
 
     /// Test residents name the model their load was for.

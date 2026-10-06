@@ -78,22 +78,30 @@ export const ModelFailureSchema = Schema.Struct({
 })
 export type ModelFailure = typeof ModelFailureSchema.Type
 
-export const LowMemoryModelInstanceFailureSchema = Schema.TaggedStruct("LowMemory", {
-  code: Schema.Literal("low_memory"),
+/** Why a model that fits the machine could not be given its memory. */
+export const MemoryShortageSchema = Schema.Union(
+  /** Memory that cannot be moved is in the way. `availableBytes` is what a load may claim. */
+  Schema.TaggedStruct("Blocked", {
+    requiredBytes: NonNegativeSafeInteger,
+    availableBytes: NonNegativeSafeInteger,
+  }),
+  /** The machine was displacing other programs' memory; no byte count describes it. */
+  Schema.TaggedStruct("UnderPressure", {}),
+)
+export type MemoryShortage = typeof MemoryShortageSchema.Type
+
+export const MemoryShortageModelInstanceFailureSchema = Schema.TaggedStruct("MemoryShortage", {
+  code: Schema.Literal("memory_shortage"),
   message: Schema.String,
   retryable: Schema.Boolean,
-  requiredMemoryBytes: NonNegativeSafeInteger,
-  allocationHeadroomBytes: NonNegativeSafeInteger,
-  systemReserveBytes: NonNegativeSafeInteger,
-  loadBoundaryBytes: NonNegativeSafeInteger,
-  minimumAdditionalAvailableBytes: PositiveSafeInteger,
+  shortage: MemoryShortageSchema,
 })
-export type LowMemoryModelInstanceFailure =
-  typeof LowMemoryModelInstanceFailureSchema.Type
+export type MemoryShortageModelInstanceFailure =
+  typeof MemoryShortageModelInstanceFailureSchema.Type
 
 export const ModelInstanceFailureSchema = Schema.Union(
   ModelFailureSchema,
-  LowMemoryModelInstanceFailureSchema,
+  MemoryShortageModelInstanceFailureSchema,
 )
 export type ModelInstanceFailure = typeof ModelInstanceFailureSchema.Type
 
@@ -417,6 +425,8 @@ export type ModelLoadStage = typeof ModelLoadStageSchema.Type
 
 export const ModelResidencySchema = Schema.Union(
   Schema.TaggedStruct("Unloaded", {}),
+  /** Was loaded and is no longer, for `reason`. `Unloaded` is a model with no instance at all. */
+  Schema.TaggedStruct("Stopped", { reason: ModelReleaseReasonSchema }),
   Schema.TaggedStruct("Requested", {}),
   Schema.TaggedStruct("Loading", {
     stage: ModelLoadStageSchema,
@@ -624,47 +634,10 @@ export const LocalModelRankingScoresSchema = Schema.Struct({
 })
 export type LocalModelRankingScores = typeof LocalModelRankingScoresSchema.Type
 
-export const LocalModelMemoryHeadroomObservationSchema = Schema.Struct({
-  requiredSystemMemoryBytes: NonNegativeSafeInteger,
-  allocationHeadroomBytes: NonNegativeSafeInteger,
-  abortReserveBytes: NonNegativeSafeInteger,
-  loadBoundaryBytes: NonNegativeSafeInteger,
-})
-export type LocalModelMemoryHeadroomObservation =
-  typeof LocalModelMemoryHeadroomObservationSchema.Type
-
-export const LocalModelSystemMemoryUseStateSchema = Schema.Union(
-  Schema.TaggedStruct("NotObserved", {}),
-  Schema.TaggedStruct("WithinRecommendedHeadroom", {
-    recommendedHeadroomBytes: NonNegativeSafeInteger,
-    predictedHeadroomBytes: NonNegativeSafeInteger,
-  }),
-  Schema.TaggedStruct("High", {
-    recommendedHeadroomBytes: NonNegativeSafeInteger,
-    predictedHeadroomBytes: NonNegativeSafeInteger,
-  }),
-)
-export type LocalModelSystemMemoryUseState = typeof LocalModelSystemMemoryUseStateSchema.Type
-
-export const LocalModelCurrentHeadroomStateSchema = Schema.Union(
-  Schema.TaggedStruct("NotObserved", {}),
-  Schema.TaggedStruct("Sufficient", {
-    observation: LocalModelMemoryHeadroomObservationSchema,
-  }),
-  Schema.TaggedStruct("Insufficient", {
-    observation: LocalModelMemoryHeadroomObservationSchema,
-    minimumAdditionalAvailableBytes: PositiveSafeInteger,
-  }),
-)
-export type LocalModelCurrentHeadroomState =
-  typeof LocalModelCurrentHeadroomStateSchema.Type
-
 export const LocalModelMemorySchema = Schema.Struct({
   domains: Schema.Array(MemoryAssessmentSchema),
   totalRequiredBytes: NonNegativeSafeInteger,
   requiredSystemMemoryBytes: NonNegativeSafeInteger,
-  systemUseState: LocalModelSystemMemoryUseStateSchema,
-  currentHeadroomState: LocalModelCurrentHeadroomStateSchema,
 }).pipe(Schema.filter((memory) => {
   const uniqueDomains = new Set(memory.domains.map(({ memoryDomainId }) => memoryDomainId)).size
     === memory.domains.length
@@ -1060,6 +1033,7 @@ export const modelSlotActions = (
     case "Failed":
       return residency.failure.retryable ? ["RetryLoad"] : []
     case "Unloaded":
+    case "Stopped":
       return availability._tag === "Available" ? ["Load"] : []
   }
 }

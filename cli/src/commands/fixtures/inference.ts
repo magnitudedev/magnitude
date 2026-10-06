@@ -114,12 +114,6 @@ const makeModel = (overrides: Partial<ReadyDiscoveredLocalModel> = {}): ReadyDis
             domains: [],
             totalRequiredBytes: 0,
             requiredSystemMemoryBytes: 0,
-            systemUseState: {
-              _tag: "WithinRecommendedHeadroom",
-              recommendedHeadroomBytes: 4 * GIB,
-              predictedHeadroomBytes: 48 * GIB,
-            },
-            currentHeadroomState: { _tag: "NotObserved" },
           },
           performance: performance(contextLength),
         },

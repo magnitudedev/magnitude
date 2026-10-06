@@ -6,8 +6,8 @@ use crate::memory::{
     MemoryObservation,
 };
 use crate::platform::{
-    DomainReading, DomainRole, MemoryBand as ReadingBand, MemoryConstraint, MemoryPolicyError,
-    MemoryReserves,
+    DomainReading, DomainRole, HostDistress, MemoryBand as ReadingBand, MemoryConstraint,
+    MemoryPolicyError, MemoryReserves,
 };
 use seismic::{Device, DeviceCatalog};
 use std::fmt;
@@ -19,10 +19,14 @@ pub enum ClaimRefusal {
     /// A required observation failed; missing observations never authorize
     /// an allocation.
     Blind(MemoryPolicyError),
-    /// A domain's headroom is at or below its planning reserve: growth waits
-    /// while reclaimable holdings are released. `role` is the first such
-    /// domain.
-    Reclaim { role: DomainRole },
+    /// A domain is in the Reclaim band: growth waits while reclaimable
+    /// holdings are released. `role` is the first such domain; `distress` is
+    /// its host's, absent when headroom at or below the planning reserve is
+    /// the cause.
+    Reclaim {
+        role: DomainRole,
+        distress: Option<HostDistress>,
+    },
     /// The claim exceeds a domain's ceiling above its planning reserve.
     Deficit {
         role: DomainRole,
@@ -38,10 +42,17 @@ impl fmt::Display for ClaimRefusal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Blind(error) => write!(formatter, "memory observation unavailable: {error}"),
-            Self::Reclaim { role } => write!(
+            Self::Reclaim {
+                role,
+                distress: None,
+            } => write!(
                 formatter,
                 "{role:?} memory headroom is at or below the planning reserve"
             ),
+            Self::Reclaim {
+                distress: Some(distress),
+                ..
+            } => distress.fmt(formatter),
             Self::Deficit {
                 constraint,
                 required,
@@ -59,13 +70,38 @@ impl fmt::Display for ClaimRefusal {
 
 impl std::error::Error for ClaimRefusal {}
 
+/// The refusal of the first domain in the Reclaim band, if any is.
+fn reclaiming(readings: &[DomainReading]) -> Option<ClaimRefusal> {
+    readings
+        .iter()
+        .find(|reading| reading.band == ReadingBand::Reclaim)
+        .map(|reading| ClaimRefusal::Reclaim {
+            role: reading.role,
+            distress: reading.distress,
+        })
+}
+
+/// Whether every domain `device` uses is in the Normal band now, from a fresh
+/// reading. A physical operation that runs long under one claim asks this as
+/// it proceeds: its own allocations can put the host in distress after the
+/// claim was granted, and other programs can take the headroom.
+pub fn require_normal(
+    catalog: &DeviceCatalog,
+    device: &Device,
+    reserves: &MemoryReserves,
+) -> Result<(), ClaimRefusal> {
+    let readings = crate::platform::observe_domains(catalog, device, reserves)
+        .map_err(ClaimRefusal::Blind)?;
+    reclaiming(&readings).map_or(Ok(()), Err)
+}
+
 /// The heap of one opened device together with the host's threshold policy
 /// and the catalog that observes the domains the device uses. It exists
 /// before the first startup allocation, so loading and serving claim through
 /// one authority: every allocation's peak is claimed from a fresh reading,
 /// and Seismic's enforced limit is refreshed from the same reading.
 pub struct DeviceHeap {
-    catalog: DeviceCatalog,
+    catalog: Rc<DeviceCatalog>,
     reserves: MemoryReserves,
     device: Rc<Device>,
     capacity_bytes: u64,
@@ -80,7 +116,7 @@ impl DeviceHeap {
     /// The heap of `device`, observed once. The allocation domain's stable
     /// capacity is fixed here.
     pub fn open(
-        catalog: DeviceCatalog,
+        catalog: Rc<DeviceCatalog>,
         reserves: MemoryReserves,
         device: Rc<Device>,
     ) -> Result<Self, MemoryPolicyError> {
@@ -167,13 +203,8 @@ impl DeviceHeap {
             // The heap's band is the readings' band, so some reading is in
             // Reclaim.
             MemoryAction::Wait => {
-                let reclaiming = readings
-                    .iter()
-                    .find(|reading| reading.band == ReadingBand::Reclaim)
-                    .expect("a Reclaim band has a domain at or below its planning reserve");
-                return Err(ClaimRefusal::Reclaim {
-                    role: reclaiming.role,
-                });
+                return Err(reclaiming(&readings)
+                    .expect("a Reclaim band has a domain in the Reclaim band"));
             }
             MemoryAction::Grant { bytes } if bytes >= required => {}
             MemoryAction::Grant { bytes: available } | MemoryAction::Reject { available, .. } => {
@@ -244,7 +275,10 @@ impl DeviceHeap {
             .find(|reading| reading.role == role)
             .expect("readings include the host domain");
         if reading.band == ReadingBand::Reclaim {
-            return Err(ClaimRefusal::Reclaim { role });
+            return Err(ClaimRefusal::Reclaim {
+                role,
+                distress: reading.distress,
+            });
         }
         // Outstanding claims on a host-backed device hold host bytes too.
         let claimed = match role {
@@ -310,9 +344,19 @@ mod tests {
     use seismic::BackendName;
 
     fn cpu_heap() -> DeviceHeap {
-        let catalog = DeviceCatalog::discover().unwrap();
+        let catalog = Rc::new(DeviceCatalog::discover().unwrap());
         let device = Rc::new(catalog.open_backend(BackendName::Cpu).unwrap());
         DeviceHeap::open(catalog, MemoryReserves::standard(), device).unwrap()
+    }
+
+    #[test]
+    fn a_host_in_the_normal_band_lets_a_running_operation_continue() {
+        let catalog = DeviceCatalog::discover().unwrap();
+        let device = catalog.open_backend(BackendName::Cpu).unwrap();
+        assert_eq!(
+            require_normal(&catalog, &device, &MemoryReserves::standard()),
+            Ok(())
+        );
     }
 
     #[test]

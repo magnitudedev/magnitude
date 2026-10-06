@@ -44,7 +44,7 @@ mod vision;
 mod domain_tests;
 
 pub use family::{NativeFamily, ProgramFamily};
-pub use heap::{ClaimRefusal, DeviceHeap};
+pub use heap::{require_normal, ClaimRefusal, DeviceHeap};
 use in_flight::{decode_selected, PrimingFlight, TargetWork};
 pub use in_flight::{HeadFlight, TargetFlight, VisionFlight};
 pub use ownership::OpenRequirements;

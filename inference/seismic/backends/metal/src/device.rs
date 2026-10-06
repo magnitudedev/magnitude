@@ -98,12 +98,47 @@ impl fmt::Debug for DeviceHandle {
     }
 }
 
+type ResidencySet = Arc<Mutex<Retained<ProtocolObject<dyn MTLResidencySet>>>>;
+
+/// A buffer's membership of its device's residency set. The buffer is wired
+/// from the commit that adds it until its last handle is dropped, so the
+/// kernel never compresses or swaps it.
+struct WiredAllocation {
+    residency: ResidencySet,
+    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+unsafe impl Send for WiredAllocation {}
+unsafe impl Sync for WiredAllocation {}
+
+impl WiredAllocation {
+    fn wire(residency: &ResidencySet, buffer: &Retained<ProtocolObject<dyn MTLBuffer>>) -> Self {
+        let set = residency.lock().expect("Metal residency lock poisoned");
+        set.addAllocation(ProtocolObject::from_ref(&**buffer));
+        set.commit();
+        Self {
+            residency: residency.clone(),
+            buffer: buffer.clone(),
+        }
+    }
+}
+
+impl Drop for WiredAllocation {
+    fn drop(&mut self) {
+        let set = self.residency.lock().expect("Metal residency lock poisoned");
+        set.removeAllocation(ProtocolObject::from_ref(&*self.buffer));
+        set.commit();
+    }
+}
+
 /// One shared-storage Metal buffer.
 #[derive(Clone)]
 pub struct MetalBuffer {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: u64,
     _host_owner: Option<Arc<dyn Any + Send + Sync>>,
+    /// Absent for a read-only host mapping, whose pages stay file-backed.
+    _wired: Option<Arc<WiredAllocation>>,
     read_only: bool,
 }
 
@@ -170,7 +205,9 @@ impl MetalBuffer {
 pub struct MetalDevice {
     handle: DeviceHandle,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    slab_residency: Arc<Mutex<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
+    /// Every buffer this device allocates. The queue carries the set, so
+    /// command buffers inherit it without per-buffer encodings.
+    residency: ResidencySet,
 }
 
 unsafe impl Send for MetalDevice {}
@@ -189,14 +226,15 @@ impl MetalDevice {
             .raw()
             .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
             .map_err(|error| TargetError::DeviceUnavailable(format!(
-                "could not create a Metal slab residency set: {error}"
+                "could not create a Metal residency set: {error}"
             )))?;
         queue.addResidencySet(&residency);
+        // Requested once while empty: each later commit wires what it adds.
         residency.requestResidency();
         Ok(Self {
             handle,
             queue,
-            slab_residency: Arc::new(Mutex::new(residency)),
+            residency: Arc::new(Mutex::new(residency)),
         })
     }
 
@@ -208,23 +246,9 @@ impl MetalDevice {
         &self.queue
     }
 
-    /// Change residency only when a slab joins or leaves a store. Command
-    /// buffers inherit the set from the queue without per-slab encodings.
-    pub fn add_slab(&self, buffer: &MetalBuffer) {
-        let set = self.slab_residency.lock().expect("Metal slab residency lock poisoned");
-        set.addAllocation(ProtocolObject::from_ref(buffer.raw()));
-        set.commit();
-    }
-
-    pub fn remove_slab(&self, buffer: &MetalBuffer) {
-        let set = self.slab_residency.lock().expect("Metal slab residency lock poisoned");
-        set.removeAllocation(ProtocolObject::from_ref(buffer.raw()));
-        set.commit();
-    }
-
-    /// Allocates a shared buffer of `bytes`. Metal rejects a zero-length
-    /// buffer, so a zero-byte allocation reserves one byte while reporting
-    /// its requested length.
+    /// Allocates a wired shared buffer of `bytes`. Metal rejects a
+    /// zero-length buffer, so a zero-byte allocation reserves one byte while
+    /// reporting its requested length.
     pub(crate) fn allocate_bytes(&self, bytes: u64) -> Result<MetalBuffer, ExecutionError> {
         let length = usize::try_from(bytes.max(1)).map_err(|_| {
             ExecutionError::AllocationFailed(format!("{bytes} bytes exceed the host address space"))
@@ -236,10 +260,12 @@ impl MetalDevice {
             .ok_or_else(|| {
                 ExecutionError::AllocationFailed(format!("Metal refused a {bytes}-byte buffer"))
             })?;
+        let wired = WiredAllocation::wire(&self.residency, &buffer);
         Ok(MetalBuffer {
             buffer,
             len: bytes,
             _host_owner: None,
+            _wired: Some(Arc::new(wired)),
             read_only: false,
         })
     }
@@ -288,6 +314,7 @@ impl MetalDevice {
             buffer,
             len: length as u64,
             _host_owner: Some(owner),
+            _wired: None,
             read_only: true,
         })
     }
@@ -391,7 +418,37 @@ mod mapped_tests {
         buffer.read_bytes(0, &mut byte);
         assert_eq!(byte, [73]);
         assert!(device.write(&buffer, 0, &[1]).is_err());
+        // A host mapping stays file-backed: it never joins the residency set.
+        assert_eq!(device.residency.lock().unwrap().allocationCount(), 0);
         drop(buffer);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn an_allocated_buffer_is_wired_until_its_last_handle_is_dropped() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle).unwrap();
+        let wired = |buffer: &MetalBuffer| {
+            let set = device.residency.lock().unwrap();
+            (
+                set.containsAllocation(ProtocolObject::from_ref(buffer.raw())),
+                set.allocationCount(),
+                set.allocatedSize(),
+            )
+        };
+        let first = device.allocate_bytes(1 << 20).unwrap();
+        let second = device.allocate(1 << 16, 16).unwrap();
+        assert_eq!(wired(&first), (true, 2, (1 << 20) + (1 << 16)));
+        assert!(wired(&second).0);
+
+        let handle = first.clone();
+        drop(first);
+        assert_eq!(wired(&handle), (true, 2, (1 << 20) + (1 << 16)));
+        drop(handle);
+        assert_eq!(wired(&second), (true, 1, 1 << 16));
+        drop(second);
+        assert_eq!(device.residency.lock().unwrap().allocationCount(), 0);
     }
 }

@@ -31,9 +31,9 @@ or enumeration order. Distinct UUIDs retain distinct domains even when their nam
 
 | Layer | Guarantee | Fires when |
 |---|---|---|
-| Engine prevention | The engine never causes an out-of-memory condition: every claim leaves headroom above the planning reserve, enforced by Seismic's limit | Always |
-| Engine graceful response | When other programs push headroom to or below the planning reserve, the engine releases in the least destructive order and unloads if headroom does not recover | Reclaim band |
-| Service guard | The hosting service kills the worker process on the first observation at or below the emergency reserve, independent of the engine's state | The engine is stuck, too slow, or cannot free enough |
+| Engine prevention | The engine never causes an out-of-memory condition: every claim leaves headroom above the planning reserve, enforced by Seismic's limit, and a load stops when it puts its host in distress | Always |
+| Engine graceful response | When a domain enters Reclaim, the engine releases in the least destructive order and unloads if the domain does not recover | Reclaim band |
+| Service guard | The hosting service kills the worker process on the first observation at or below the emergency reserve or at critical kernel pressure, independent of the engine's state | The engine is stuck, too slow, or cannot free enough |
 
 The engine is the only layer that decides what to release. The service's kill is fault
 containment; in correct operation it never fires.
@@ -43,7 +43,8 @@ containment; in correct operation it never fires.
 Every memory domain has two thresholds from its own capacity: the planning reserve
 `P = max(capacity / 10, 2 GiB)` and the emergency reserve `E = max(capacity / 20, 1 GiB)`. The
 values are defined once, in the policy the host passes to the engine. They apply equally to host
-RAM and to a dedicated device's own memory; there is no other reserve and no OS pressure signal.
+RAM and to a dedicated device's own memory; there is no other reserve. Host distress (Bands) is the
+only other condition that moves a domain's band.
 
 ## Standing and claims
 
@@ -52,9 +53,13 @@ and its band. Every allocation, including startup imports, optional
 components, workspace growth and numerical state slab growth, has a claim before it occurs.
 The heap exists from the opened device's first startup allocation: startup claims are heap
 claims, each held through its allocation, and the loaded domain inherits the same heap, so no
-separate preclaim check or capacity table decides beside it. A refused startup claim fails the load
-with `InsufficientMemory` naming the domain that refused it (the allocation domain, or host RAM
-for a dedicated device's staging), so the host reports that domain's reserve. A claim is held until Seismic's
+separate preclaim check or capacity table decides beside it. A refused startup claim fails the
+load, naming the domain that refused it (the allocation domain, or host RAM for a dedicated
+device's staging): with `InsufficientMemory` and the bytes required and available when the claim
+exceeds the domain's ceiling, or with `MemoryPressure` and no byte count when the domain is in
+Reclaim. A weight import runs under one claim for as long as its weights take to become resident,
+so it observes its domains every 100 ms as weights are published and fails the load with
+`MemoryPressure` if one enters Reclaim. A claim is held until Seismic's
 charge reflects its physical operation (an import and binding, or an added state slab)
 and is then released; the charged bytes join a classified holding. A claim
 names its holding class, its minimum physical peak charge and any preferred charge for useful
@@ -106,14 +111,34 @@ target weights, bound constants and the pristine recurrent seed.
 ## Bands
 
 The heap observes every domain it uses on every claim and every 100 ms while loaded. Headroom is
-the domain's observed available bytes bounded by applicable process limits: host free-and-inactive
-or available memory and commit, CUDA free bytes, or Vulkan budget less usage.
+the domain's observed available bytes bounded by applicable process limits: host movable memory
+(macOS: free, active and inactive pages, every page neither wired nor compressed), available memory
+(Linux) or available memory and commit (Windows), CUDA free bytes, or Vulkan budget less usage.
 
-| Headroom | Band | Engine behavior |
+On macOS every engine holding is wired (a Metal residency set, or locked CPU-backend memory), so no
+holding appears in movable memory and the kernel never compresses or swaps one. A page list does
+not say whether a page is needed, so macOS headroom counts every movable page: a claim is refused
+only when it cannot fit beside wired and compressed memory.
+
+| Domain | Band | Engine behavior |
 |---|---|---|
-| Above the planning reserve | Normal | Claims are granted if headroom stays above the planning reserve |
-| At or below the planning reserve | Reclaim | Only other programs cause this. Refuse admission, hold residency and growth in memory waits, release, and unload if it persists |
-| At or below the emergency reserve | (still Reclaim) | The hosting service kills the worker on its first observation |
+| Headroom above the planning reserve and no host distress | Normal | Claims are granted if headroom stays above the planning reserve |
+| Headroom at or below the planning reserve, or host distress | Reclaim | Refuse admission, hold residency and growth in memory waits, release, and unload if it persists |
+| Headroom at or below the emergency reserve, or critical kernel pressure | (still Reclaim) | The hosting service kills the worker on its first observation |
+
+Taking a movable page another program holds displaces it: the kernel compresses it or writes it to
+swap. A host that counts displacement reports it over displacement windows, contiguous spans of at
+least 500 ms between that process's host samples. Compression of other programs' data is the
+accepted cost of a claim. Host distress is displacement the system is not absorbing, whoever caused
+it. Displacement is distress only when the two most recent windows both show it:
+
+- Swapping: pages were written to swap in each window.
+- Thrashing: each window compressed at least 2,000 and decompressed at least 5,000 pages per
+  second, the kernel's own rates.
+- Critical: the kernel classifies memory pressure as critical (no window needed).
+
+Only macOS reports displacement and kernel pressure. A host that reports neither is never in
+distress, and a dedicated device's own memory has none.
 
 Process limits are the visible ones. Inside a container the container's own cgroup limit is
 visible while cgroups above it may be hidden; hidden ancestors bound nothing beyond host headroom,
@@ -124,7 +149,8 @@ immediately, and a continuous second of Blind is treated as Reclaim. If Reclaim 
 second after releases are exhausted and in-flight work completes, the engine unloads the model. An
 admission attempted during Blind is refused at once with the typed `MemoryObservationUnavailable`
 result; during Reclaim it is refused at once as memory pressure. Already accepted work retains its state while the engine
-retries its observation. The engine reads no OS pressure signal.
+retries its observation. Displacement counters and the kernel pressure level are the only OS
+signals the engine reads.
 
 ## Release order
 
@@ -144,8 +170,7 @@ The request owner applies the same order to every deficit and stops when that de
 8. For persistent Reclaim, unload the model and finish open and new requests with
    `ModelUnloaded { cause: MemoryPressure }`.
 
-Reclaim uses steps 1–3, 5 and 8 and stops as soon as headroom is back above the planning
-reserve; each victim is preempted once, and in-flight work retains its storage until physical
+Reclaim uses steps 1–3, 5 and 8 and stops as soon as every domain is back in Normal; each victim is preempted once, and in-flight work retains its storage until physical
 completion. A release that changes slab bindings needs the binding right
 ([state transactions](state-transactions.md)), so during a flight it runs at that flight's
 completion. Removed index entries do not count as released bytes until Seismic's charge actually
@@ -164,7 +189,15 @@ kill is independent fault containment; it chooses nothing to release.
 - No engine claim leaves any used domain's headroom at or below its planning reserve; a claim
   never unloads the model; persistent Reclaim ends in the typed unloaded state within the
   one-second bound.
-- Threshold values exist in one policy definition; no code path reads an OS pressure signal.
+- Threshold values exist in one policy definition. Host distress is derived only from Seismic's
+  host observation; no other code path reads an OS pressure signal.
+- On macOS every engine holding is wired from allocation to release, and no holding is counted in
+  host headroom; a mapped import window stays file-backed.
+- macOS host headroom is never below the free and inactive pages of the same sample.
+- A load that puts its host in distress fails with `MemoryPressure` within two displacement
+  windows and returns its charge; a loaded model in persistent distress unloads within the
+  one-second bound.
+- A host that reports no displacement has the bands its headroom alone gives.
 - Stable fit capacity is capacity under process limits (and the Metal working set) less the
   planning reserve.
 - State growth allocates exactly one claimed slab per growing domain without copying existing
@@ -231,4 +264,5 @@ cache owns no byte budget or cached price (it bounds its entry count and names t
 least recently used victim, and the heap observes what dropping it released);
 native resource preclaims enter the same
 heap; and process supervision chooses no release, reacting only to the heap's
-typed unload outcome or to headroom at or below the emergency reserve.
+typed unload outcome, to headroom at or below the emergency reserve, or to critical
+kernel pressure.

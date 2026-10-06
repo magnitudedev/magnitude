@@ -602,20 +602,30 @@ pub enum ModelInstanceFailure {
         message: String,
         retryable: bool,
     },
-    #[serde(rename_all = "camelCase")]
-    LowMemory {
+    /// The model fits this machine but could not be given its memory now.
+    MemoryShortage {
         code: String,
         message: String,
         retryable: bool,
-        /// The load's startup peak claim in the limiting memory domain.
-        required_memory_bytes: u64,
-        allocation_headroom_bytes: u64,
-        /// The limiting domain's planning reserve.
-        system_reserve_bytes: u64,
-        /// The required memory plus the planning reserve.
-        load_boundary_bytes: u64,
-        minimum_additional_available_bytes: u64,
+        shortage: MemoryShortage,
     },
+}
+
+/// Why a model that fits the machine could not be given its memory.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum MemoryShortage {
+    /// Memory that cannot be moved is in the way of the load's claim in its limiting memory
+    /// domain. `available_bytes` is what a load may claim there: the reserve is already taken out.
+    #[serde(rename_all = "camelCase")]
+    Blocked {
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    /// A memory domain the load uses was under pressure: at its reserve, or with other programs'
+    /// memory being displaced faster than the system absorbs. No byte count describes it.
+    UnderPressure {},
 }
 
 impl From<ModelFailure> for ModelInstanceFailure {

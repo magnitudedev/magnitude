@@ -320,6 +320,9 @@ fn load_class(error: &LoadError) -> Class {
         LoadError::InsufficientMemory { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, SERVER, "insufficient_memory", true)
         }
+        LoadError::MemoryPressure { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, SERVER, "memory_pressure", true)
+        }
         LoadError::MemoryObservationUnavailable { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             SERVER,

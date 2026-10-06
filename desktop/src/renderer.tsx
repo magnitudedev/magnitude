@@ -50,7 +50,7 @@ import {
   createAgentClient, AgentClientProvider, useAgentClient, makeFirstPartyConnection,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
-  formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
+  formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
   catalogModelReplacement, performanceRangeSpeedLabel, localModelSpeedNote,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
@@ -273,6 +273,7 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
   const acquisition = model.acquisitionState
   const installed = "residencyState" in acquisition
   const residency = installed ? acquisition.residencyState : undefined
+  const stoppedForMemory = residency !== undefined && modelStoppedForMemory(residency)
   const canStop = residency !== undefined && ["Ready", "Loading", "Requested", "Stopping"].includes(residency._tag)
   const transferring = acquiring(acquisition)
   const fit = model.catalogData.support._tag === "Supported" ? fitNotice(model) : null
@@ -293,6 +294,7 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
     </div>
     {transferring && <div className="col-span-full mt-1"><DownloadProgress layout="row" modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /></div>}
     {fit !== null && !loadFailure && !downloadFailure && <ErrorNotice severity="info" title={fit} className="col-span-full mt-3" />}
+    {stoppedForMemory && !command.pendingOperations.includes("load") && <ErrorNotice severity="warning" title={MODEL_STOPPED_FOR_MEMORY_MESSAGE} description="It was stopped to keep your other apps running. Quit apps you aren’t using before loading it again." className="col-span-full mt-3" />}
     {model.catalogData.support._tag === "Disabled" && <ErrorNotice severity="warning" title="This model is unavailable" description="Choose another model from Catalog." className="col-span-full mt-3" />}
     {downloadFailure && <ErrorNotice {...downloadNotice(downloadFailure)} className="col-span-full mt-3" actions={<>
       {canDownload && <NoticeAction disabled={pending} onClick={() => install(model.modelId)}>Retry download</NoticeAction>}
@@ -303,14 +305,14 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
     {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
   </div></TooltipProvider>
 }
-function ModelCard({ model, models, showMemory = false, replacing }: { model: CatalogLocalModel; models: readonly CatalogLocalModel[]; showMemory?: boolean; replacing?: string }) {
+function ModelCard({ model, models, showMemory = false, replacing, hardware }: { model: CatalogLocalModel; models: readonly CatalogLocalModel[]; showMemory?: boolean; replacing?: string; hardware: Option.Option<LocalInferenceHardware> }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const detailsId = useId()
   const deprecation = localModelDeprecation(model)
   const detailsToggle = <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
   const acquisition = model.acquisitionState
   const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
-  const statusLabel = acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" ? "Downloaded" : residency?._tag === "Failed" ? "Not loaded" : residency?._tag === "Requested" ? "Preparing…" : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag === "InstallFailed" ? "Not downloaded" : acquisition._tag === "UpdateFailed" ? "Update incomplete" : acquisition._tag === "UpdateAvailable" ? "Update available" : acquisition._tag)
+  const statusLabel = acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" || residency?._tag === "Stopped" ? "Downloaded" : residency?._tag === "Failed" ? "Not loaded" : residency?._tag === "Requested" ? "Preparing…" : residency?._tag === "Loading" ? describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware) : residency?._tag ??(acquisition._tag === "NotInstalled" ? "" : acquisition._tag === "InstallFailed" ? "Not downloaded" : acquisition._tag === "UpdateFailed" ? "Update incomplete" : acquisition._tag === "UpdateAvailable" ? "Update available" : acquisition._tag)
   const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} memory</span></>}</div>
   return <article className={pageLayout.modelCard}>
     <div className={pageLayout.modelRow}>
@@ -464,7 +466,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
       ? <RecommendationsSkeleton assessment={assessment} waitingForHardware={Result.isInitial(hardware)} />
       : <Recommendations preference={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />)}
     {!discover && <>
-    <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} models={models} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
+    <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} models={models} showMemory={installedOnly} hardware={Result.value(hardware)} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
     {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
     </>}
     {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for memory and speed details.</p>}
@@ -515,6 +517,7 @@ const modelStatusText = (residency: ModelResidency, hardware: Option.Option<Loca
     case "Ready": return `Loaded · ${formatModelMemory(residency.allocation)}`
     case "Stopping": return "Stopping…"
     case "Unloaded":
+    case "Stopped":
     case "Failed": return "Not loaded"
   }
 }

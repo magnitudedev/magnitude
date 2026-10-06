@@ -16,7 +16,7 @@ use macos as platform;
 use windows as platform;
 
 use super::{CapacityBasis, ObservationError};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Established host RAM capacity and the definition of that figure.
 pub(crate) struct HostCapacity {
@@ -34,16 +34,50 @@ pub(crate) fn capacity() -> Result<HostCapacity, String> {
     Err("host memory discovery is not implemented for this operating system".into())
 }
 
+/// One host memory observation. `history` holds the displacement windows of
+/// the samples taken through it; the sample closes a window when it is due.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub(crate) fn status() -> Result<HostMemoryStatus, ObservationError> {
-    platform::status()
+pub(crate) fn status(
+    history: &mut DisplacementHistory,
+) -> Result<HostMemoryStatus, ObservationError> {
+    let sample = platform::sample()?;
+    Ok(HostMemoryStatus {
+        sampled_at: sample.sampled_at,
+        measurements: sample.measurements,
+        headroom: sample.headroom,
+        limits: sample.limits,
+        limit_visibility: sample.limit_visibility,
+        displacement: sample
+            .displacement
+            .map(|counters| history.record(Instant::now(), counters)),
+        kernel_pressure: sample.kernel_pressure,
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(crate) fn status() -> Result<HostMemoryStatus, ObservationError> {
+pub(crate) fn status(
+    _history: &mut DisplacementHistory,
+) -> Result<HostMemoryStatus, ObservationError> {
     Err(ObservationError::Unsupported(
         "host memory observation is not implemented for this operating system".into(),
     ))
+}
+
+/// One platform sample, before the displacement history of the catalog that
+/// took it is applied.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
+pub(crate) struct HostSample {
+    pub(crate) sampled_at: SystemTime,
+    pub(crate) measurements: HostMeasurements,
+    pub(crate) headroom: HeadroomEstimate,
+    pub(crate) limits: Vec<ProcessMemoryLimit>,
+    pub(crate) limit_visibility: LimitVisibility,
+    /// Cumulative displacement, on a platform that counts it.
+    pub(crate) displacement: Option<DisplacementCounters>,
+    pub(crate) kernel_pressure: Option<KernelPressure>,
 }
 
 /// One sampled host memory observation. Its fields share one sample time;
@@ -60,6 +94,96 @@ pub struct HostMemoryStatus {
     pub limits: Vec<ProcessMemoryLimit>,
     /// Whether every applicable limit could be observed.
     pub limit_visibility: LimitVisibility,
+    /// Displacement of programs' memory over the recent windows of the
+    /// catalog that took this sample. `None` on a platform that counts none.
+    pub displacement: Option<HostDisplacement>,
+    /// The kernel's own pressure classification. `None` on a platform
+    /// without one.
+    pub kernel_pressure: Option<KernelPressure>,
+}
+
+/// A program's pages leaving RAM under memory demand, counted in pages
+/// since boot: compressed in memory, faulted back from compression, written
+/// to swap, and read back from swap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct DisplacementCounters {
+    pub(crate) compressed_pages: u64,
+    pub(crate) decompressed_pages: u64,
+    pub(crate) swapped_out_pages: u64,
+    pub(crate) swapped_in_pages: u64,
+}
+
+/// Displacement over one completed window: the span between two host samples
+/// at least 500 ms apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplacementWindow {
+    pub duration: Duration,
+    pub compressed_pages: u64,
+    pub decompressed_pages: u64,
+    pub swapped_out_pages: u64,
+    pub swapped_in_pages: u64,
+}
+
+/// The two most recent completed displacement windows. They are contiguous:
+/// `previous` ends where `latest` begins.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostDisplacement {
+    pub latest: Option<DisplacementWindow>,
+    pub previous: Option<DisplacementWindow>,
+}
+
+/// The least span of one displacement window. Rates over a shorter span are
+/// dominated by when the kernel happened to run its pageout work.
+const MIN_DISPLACEMENT_WINDOW: Duration = Duration::from_millis(500);
+
+/// The completed displacement windows of one catalog's host samples. Windows
+/// tumble: the first sample at least [`MIN_DISPLACEMENT_WINDOW`] after a
+/// window opened completes it and opens the next.
+#[derive(Debug, Default)]
+pub(crate) struct DisplacementHistory {
+    open: Option<(Instant, DisplacementCounters)>,
+    completed: HostDisplacement,
+}
+
+impl DisplacementHistory {
+    pub(crate) fn record(&mut self, at: Instant, counters: DisplacementCounters) -> HostDisplacement {
+        let Some((opened_at, opening)) = self.open else {
+            self.open = Some((at, counters));
+            return self.completed;
+        };
+        let duration = at.saturating_duration_since(opened_at);
+        if duration >= MIN_DISPLACEMENT_WINDOW {
+            self.completed = HostDisplacement {
+                latest: Some(DisplacementWindow {
+                    duration,
+                    compressed_pages: counters
+                        .compressed_pages
+                        .saturating_sub(opening.compressed_pages),
+                    decompressed_pages: counters
+                        .decompressed_pages
+                        .saturating_sub(opening.decompressed_pages),
+                    swapped_out_pages: counters
+                        .swapped_out_pages
+                        .saturating_sub(opening.swapped_out_pages),
+                    swapped_in_pages: counters
+                        .swapped_in_pages
+                        .saturating_sub(opening.swapped_in_pages),
+                }),
+                previous: self.completed.latest,
+            };
+            self.open = Some((at, counters));
+        }
+        self.completed
+    }
+}
+
+/// A kernel's classification of system memory pressure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelPressure {
+    Normal,
+    Warning,
+    Critical,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,10 +230,11 @@ pub struct HeadroomEstimate {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadroomBasis {
-    /// macOS: (free + inactive pages) × page size. Inactive pages can be
-    /// reclaimed or compressed; wired, active and compressor pages cannot be
-    /// assumed reclaimable.
-    MachFreeAndInactivePages,
+    /// macOS: (free + active + inactive pages) × page size, the kernel's
+    /// own definition of available memory: every page that is neither wired
+    /// nor occupied by the compressor. Taking a page another program holds
+    /// displaces it; the displacement windows report that cost.
+    MachMovablePages,
     /// Linux `MemAvailable`.
     LinuxMemAvailable,
     /// Windows: the lesser of available physical memory and available commit.
@@ -155,4 +280,88 @@ pub enum LimitVisibility {
     /// This process's cgroup namespace hides ancestors above its root.
     /// Hidden ancestor limits cannot be presumed unlimited.
     CgroupAncestorsHidden,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counters(compressed: u64, swapped_out: u64) -> DisplacementCounters {
+        DisplacementCounters {
+            compressed_pages: compressed,
+            swapped_out_pages: swapped_out,
+            ..DisplacementCounters::default()
+        }
+    }
+
+    #[test]
+    fn a_window_completes_at_the_first_sample_past_the_minimum_span() {
+        let start = Instant::now();
+        let mut history = DisplacementHistory::default();
+        assert_eq!(history.record(start, counters(10, 0)), HostDisplacement::default());
+        // Samples inside the open window complete nothing.
+        let early = history.record(start + Duration::from_millis(499), counters(40, 0));
+        assert_eq!(early, HostDisplacement::default());
+        let first = history.record(start + Duration::from_millis(700), counters(110, 3));
+        let latest = first.latest.unwrap();
+        assert_eq!(latest.duration, Duration::from_millis(700));
+        assert_eq!(latest.compressed_pages, 100);
+        assert_eq!(latest.swapped_out_pages, 3);
+        assert_eq!(first.previous, None);
+    }
+
+    #[test]
+    fn completed_windows_are_contiguous_and_keep_the_previous_one() {
+        let start = Instant::now();
+        let mut history = DisplacementHistory::default();
+        history.record(start, counters(0, 0));
+        history.record(start + Duration::from_millis(500), counters(5, 1));
+        let second = history.record(start + Duration::from_millis(1100), counters(5, 4));
+        assert_eq!(second.previous.unwrap().swapped_out_pages, 1);
+        let latest = second.latest.unwrap();
+        assert_eq!(latest.duration, Duration::from_millis(600));
+        assert_eq!(latest.compressed_pages, 0);
+        assert_eq!(latest.swapped_out_pages, 3);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_headroom_is_movable_memory_and_its_samples_form_displacement_windows() {
+        let mut history = DisplacementHistory::default();
+        let first = status(&mut history).unwrap();
+        let HostMeasurements::MacOs {
+            page_size_bytes,
+            free_pages,
+            active_pages,
+            inactive_pages,
+            ..
+        } = first.measurements
+        else {
+            panic!("macOS reports Mach measurements");
+        };
+        assert_eq!(first.headroom.basis, HeadroomBasis::MachMovablePages);
+        assert_eq!(
+            first.headroom.bytes,
+            (free_pages + active_pages + inactive_pages) * page_size_bytes
+        );
+        assert!(first.kernel_pressure.is_some());
+        assert_eq!(first.displacement, Some(HostDisplacement::default()));
+        std::thread::sleep(MIN_DISPLACEMENT_WINDOW);
+        let second = status(&mut history).unwrap();
+        let window = second.displacement.unwrap().latest.unwrap();
+        assert!(window.duration >= MIN_DISPLACEMENT_WINDOW);
+    }
+
+    #[test]
+    fn a_counter_that_went_backwards_reports_no_displacement() {
+        let start = Instant::now();
+        let mut history = DisplacementHistory::default();
+        history.record(start, counters(100, 100));
+        let window = history
+            .record(start + Duration::from_secs(1), counters(0, 0))
+            .latest
+            .unwrap();
+        assert_eq!(window.compressed_pages, 0);
+        assert_eq!(window.swapped_out_pages, 0);
+    }
 }

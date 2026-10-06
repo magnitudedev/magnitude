@@ -1,10 +1,9 @@
 import { Atom } from "@effect-atom/atom-react"
 import { createId } from "@magnitudedev/generate-id"
 import type { ServiceRecoveryState } from "../connection/connection"
-import type { LocalModelsState, ModelSlotsState, ProviderModelId, SlotId } from "@magnitudedev/sdk"
+import type { LocalModelsState, ModelSlotsState, SlotId } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
-import { localModelProviderModelId, localModelServingState } from "../local-models/projection"
-import { formatMemorySize } from "../utils/format-bytes"
+import { MODEL_STOPPED_FOR_MEMORY_MESSAGE, describeModelLoadFailure, modelStoppedForMemory } from "../utils/model-load"
 
 export const NotificationIdSchema = Schema.NonEmptyString.pipe(
   Schema.brand("NotificationId"),
@@ -179,16 +178,6 @@ export const deriveModelDownloadNotificationState = (
   )
 }
 
-export const deriveSelectedModelLowMemoryNotificationState = (
-  modelsState: LocalModelsState | null,
-  slotsState: ModelSlotsState | null,
-): NotificationState | null => deriveSelectedModelLowMemoryNotificationStateByProviderModelId(
-  modelsState,
-  slotsState?.slots.primary._tag === "ConfiguredLocal"
-    ? slotsState.slots.primary.selection.providerModelId
-    : null,
-)
-
 export const deriveSelectedModelResidencyNotificationState = (
   slotsState: ModelSlotsState | null,
   slotId: SlotId,
@@ -206,9 +195,17 @@ export const deriveSelectedModelResidencyNotificationState = (
     case "Failed":
       return persistentNotificationState(
         `model-residency-${slotId}`,
-        slot.residency.failure.message,
+        describeModelLoadFailure(slot.residency.failure),
         "error",
       )
+    case "Stopped":
+      return modelStoppedForMemory(slot.residency)
+        ? persistentNotificationState(
+            `model-residency-${slotId}`,
+            MODEL_STOPPED_FOR_MEMORY_MESSAGE,
+            "warning",
+          )
+        : null
     case "Unloaded":
     case "Loading":
     case "Ready":
@@ -216,46 +213,6 @@ export const deriveSelectedModelResidencyNotificationState = (
       return null
   }
 }
-
-export const deriveSelectedModelLowMemoryNotificationStateByProviderModelId = (
-  modelsState: LocalModelsState | null,
-  selectedProviderModelId: ProviderModelId | null,
-): NotificationState | null => {
-  if (modelsState === null || selectedProviderModelId === null) return null
-  const selectedModel = modelsState.models.find((model) =>
-    Option.contains(
-      localModelProviderModelId(model),
-      selectedProviderModelId,
-    ))
-  if (selectedModel === undefined) return null
-  const serving = Option.getOrUndefined(localModelServingState(selectedModel))
-  if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits") return null
-  const currentHeadroomState =
-    serving.assessment.memory.currentHeadroomState
-  if (currentHeadroomState._tag !== "Insufficient") return null
-  const additionalMemory = formatMemorySize(
-    currentHeadroomState.minimumAdditionalAvailableBytes,
-    { rounding: "up" },
-  )
-  return persistentNotificationState(
-    "selected-local-model-low-memory",
-    `Low memory: close memory-intensive apps (need ${additionalMemory}) to load model`,
-    "warning",
-    Option.none(),
-    Option.some(`Low memory: Free ${additionalMemory} to load`),
-  )
-}
-
-export const deriveLocalModelPersistentNotificationStates = (
-  modelsState: LocalModelsState,
-  selectedProviderModelId: ProviderModelId | null,
-): readonly NotificationState[] => [
-  deriveModelDownloadNotificationState(modelsState),
-  deriveSelectedModelLowMemoryNotificationStateByProviderModelId(
-    modelsState,
-    selectedProviderModelId,
-  ),
-].filter((state): state is NotificationState => state !== null)
 
 export const notificationStatesEquivalent = Schema.equivalence(
   Schema.Array(NotificationStateSchema),

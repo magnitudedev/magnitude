@@ -59,12 +59,6 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
           domains: [],
           totalRequiredBytes: 0,
           requiredSystemMemoryBytes: 0,
-          systemUseState: {
-            _tag: "WithinRecommendedHeadroom",
-            recommendedHeadroomBytes: 0,
-            predictedHeadroomBytes: 0,
-          },
-          currentHeadroomState: { _tag: "NotObserved" },
         },
         performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 50 }],
       },

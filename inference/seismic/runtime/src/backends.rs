@@ -855,20 +855,6 @@ impl OpenedKind {
         }
     }
 
-    /// Keep Metal slab allocations in the queue's residency set until the
-    /// allocation itself is released, after all submitted uses complete.
-    pub(crate) fn register_slab(&self, allocation: &Arc<driver::Allocation>) {
-        #[cfg(target_os = "macos")]
-        if let Self::Metal(opened) = self {
-            let buffer = driver::typed_buffer::<seismic_metal::Metal, MetalExecutor>(allocation).clone();
-            let service = opened.service_arc();
-            service.add_slab(&buffer);
-            allocation.on_release(move || service.remove_slab(&buffer));
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = allocation;
-    }
-
     /// The storage of `allocation`'s reserved tensor with `committed` bytes
     /// backed, resized in place when the backend reserved its address range
     /// (the new allocation shares the address and the kept bytes; bytes past

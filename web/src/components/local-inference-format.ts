@@ -1,9 +1,12 @@
 import { Option } from "effect"
 import { localModelServingProfile, type LocalModel, type ModelSlot } from "@magnitudedev/sdk"
 import {
+  MODEL_STOPPED_FOR_MEMORY_MESSAGE,
+  describeModelLoadFailure,
   formatModelLoadPercentage,
   formatModelLoadStage,
   isMeasuredModelLoadStage,
+  modelStoppedForMemory,
 } from "@magnitudedev/client-common"
 
 export const formatBytes = (bytes: number): string => {
@@ -79,7 +82,10 @@ export const slotStatus = (
   }
   switch (slot.residency._tag) {
     case "Unloaded":
-      return { label: "Not loaded", tone: "neutral", detail: null }
+    case "Stopped":
+      return modelStoppedForMemory(slot.residency)
+        ? { label: "Not loaded", tone: "warning", detail: MODEL_STOPPED_FOR_MEMORY_MESSAGE }
+        : { label: "Not loaded", tone: "neutral", detail: null }
     case "Requested":
       return { label: "Queued", tone: "progress", detail: "Waiting to load" }
     case "Loading":
@@ -102,7 +108,7 @@ export const slotStatus = (
       return {
         label: "Failed",
         tone: "danger",
-        detail: slot.residency.failure.message,
+        detail: describeModelLoadFailure(slot.residency.failure),
       }
   }
 }

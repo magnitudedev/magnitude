@@ -10,8 +10,9 @@ mod qualification;
 mod selection;
 
 pub use policy::{
-    band_of, fit_capacities, observe_domains, refresh_device_ceiling, DomainReading, DomainRole,
-    DomainThresholds, FitCapacity, MemoryBand, MemoryConstraint, MemoryPolicyError, MemoryReserves,
+    band_of, fit_capacities, host_distress, observe_domains, refresh_device_ceiling,
+    DomainReading, DomainRole, DomainThresholds, FitCapacity, HostDistress, MemoryBand,
+    MemoryConstraint, MemoryPolicyError, MemoryReserves,
 };
 pub use qualification::{
     open_selected, select_device, OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice,
