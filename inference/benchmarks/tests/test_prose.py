@@ -145,6 +145,36 @@ async def test_prose_completion_budget_is_not_tool_truncation(source, finish, to
     assert result.outcome == outcome
 
 
+@pytest.mark.parametrize(
+    "deltas,reason",
+    [
+        ([{"reasoning_content": "Copy it."}, {"content": "Continuation."}], "reasoning text"),
+        ([{"reasoning_content": "Copy it."}], "reasoning text"),
+        ([{}], "no answer text"),
+    ],
+)
+async def test_prose_refuses_reasoning_and_missing_answers(source, deltas, reason):
+    plan = await compile_plan(
+        source, source.identity, ("single",), (4096,), counter=count, sizing_identity="test"
+    )
+    events = [
+        *({"id": "response-1", "choices": [{"index": 0, "delta": delta}]} for delta in deltas),
+        {"id": "response-1", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        terminal_event(),
+        "[DONE]",
+    ]
+
+    def response(request):
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=Fragments(events)
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+        result = await measure(client, "http://test", "model", plan.requests[0], lambda _: None)
+    assert result.outcome == "invalid" and reason in result.error
+    assert result.ttft_ms is None or deltas[-1].get("content")
+
+
 @pytest.mark.parametrize("workload", ["prose-continue", "prose-repeat"])
 def test_prose_command_roundtrip_and_incompatible_filters(tmp_path, workload):
     target = Target(engine="magnitude", reference=str(tmp_path))

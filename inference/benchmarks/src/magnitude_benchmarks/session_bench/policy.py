@@ -10,7 +10,7 @@ STARTUP_TIMEOUT_SECONDS = 900
 PREFILL_TOKENS = 2048
 OUTPUT_CAPACITY = 64
 DEFAULT_CONTEXTS = (1_024, 4_096, 16_384)
-ENGINES = ("magnitude", "mlx-vlm", "omlx", "llama.cpp")
+ENGINES = ("magnitude", "mlx-vlm", "omlx", "llama.cpp", "ollama", "ollama-mlx", "ollama-registry")
 WORKLOADS = {
     "tools": "BFCL tool-call decisions (default)",
     "prose-continue": "continue a Moby Dick passage; output varies",
