@@ -225,13 +225,17 @@ class Ollama:
         if self.args.answer_prefill and family != translate.GLIMMER_FAMILY:
             raise RuntimeError(f"answer prefill is for {translate.GLIMMER_FAMILY}, not {family}")
         self.load()
-        if self.args.answer_prefill:
-            self.verify_rendering()
-        entry = self.loaded()
         # The runner's load lines arrive through the log relay, shortly after the load returns.
         deadline = time.monotonic() + 5
         while not (self.gpu_layers or self.mlx_device) and time.monotonic() < deadline:
             time.sleep(0.05)
+        if self.args.answer_prefill:
+            self.verify_rendering()
+            # Its reloads cleared the load lines; wait for the last reload's.
+            deadline = time.monotonic() + 5
+            while not (self.gpu_layers or self.mlx_device) and time.monotonic() < deadline:
+                time.sleep(0.05)
+        entry = self.loaded()
         self.evidence = {
             "ready": True,
             "served_model": self.args.served_model,
@@ -277,7 +281,7 @@ class Ollama:
             "keep_alive": -1,
             "options": options,
         }
-        raw = translate.prefilled_request(chat) | {"stream": False}
+        raw = translate.prefilled_request(chat, self.runner) | {"stream": False}
         bare = raw | {"prompt": raw["prompt"].removesuffix(translate.GLIMMER_ANSWER_HEADER)}
         counts = []
         for path, body in (("/api/chat", chat), ("/api/generate", bare), ("/api/generate", raw)):
@@ -377,7 +381,8 @@ def handler(ollama: Ollama) -> type[BaseHTTPRequestHandler]:
         def native(self, request: dict[str, Any]):
             path = "/api/chat"
             if args.answer_prefill:
-                path, request = "/api/generate", translate.prefilled_request(request)
+                path = "/api/generate"
+                request = translate.prefilled_request(request, ollama.runner)
             data = json.dumps(request).encode()
             return urllib.request.urlopen(
                 urllib.request.Request(

@@ -130,7 +130,9 @@ def test_answer_prefill_sends_ollamas_glimmer_prompt_through_the_raw_route(tmp_p
         "chat_template_kwargs": {"enable_thinking": False},
     }
     chat = translate.chat_request(body, "muse-glimmer:30b", 65808)
-    raw = translate.prefilled_request(chat)
+    raw = translate.prefilled_request(chat, "llama-server")
+    # The MLX runner does not add the leading token on the raw route; the llama.cpp runner does.
+    assert translate.prefilled_request(chat, "mlx")["prompt"] == "<|begin_of_text|>" + raw["prompt"]
     assert raw["prompt"] == (
         "<|start|>system<|message|>Reading session.\n\nReasoning strength: none."
         '\n\n# Valid recipients: "self", "user".<|eot|>'
@@ -150,7 +152,7 @@ def test_answer_prefill_sends_ollamas_glimmer_prompt_through_the_raw_route(tmp_p
         with pytest.raises(ValueError):
             translate.glimmer_prompt(messages)
     with pytest.raises(ValueError):
-        translate.prefilled_request({**chat, "tools": [{"type": "function"}]})
+        translate.prefilled_request({**chat, "tools": [{"type": "function"}]}, "llama-server")
 
     options = EngineOptions(ollama=OllamaOptions(models=tmp_path / "store", answer_prefill=True))
     selected = adapter("ollama-registry", "registry", tmp_path, options)

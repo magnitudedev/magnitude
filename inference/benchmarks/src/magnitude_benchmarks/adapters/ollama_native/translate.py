@@ -51,14 +51,18 @@ def chat_request(body: dict[str, Any], model: str, context: int) -> dict[str, An
 # Muse Glimmer's format, as Ollama's ``glimmer`` renderer writes it (model/renderers/glimmer.go).
 GLIMMER_FAMILY = "muse-glimmer"
 GLIMMER_ANSWER_HEADER = " to=user<|message|>"
+GLIMMER_BOS = "<|begin_of_text|>"
+# On the raw completion route Ollama's llama.cpp runner adds the leading token itself; its MLX
+# runner does not, so there the prompt text carries it.
+GLIMMER_RAW_LEADING = {"llama-server": "", "mlx": GLIMMER_BOS}
 GLIMMER_ROLES = {"user": "user", "assistant": "assistant to=user"}
 
 
 def glimmer_prompt(messages: list[dict[str, Any]]) -> str:
     """The prompt Ollama's ``glimmer`` renderer produces for these messages with ``think`` false.
 
-    Without the leading ``<|begin_of_text|>``: the raw completion route leaves that token to the
-    runner. Only what the benchmark sends is reproduced (a system message, then text turns);
+    Without the leading ``<|begin_of_text|>``, which depends on the runner
+    (``GLIMMER_RAW_LEADING``). Only what the benchmark sends is reproduced (a system message, then text turns);
     anything the renderer would treat differently is refused rather than approximated.
     """
     if not messages or messages[0]["role"] != "system":
@@ -85,7 +89,7 @@ def glimmer_prompt(messages: list[dict[str, Any]]) -> str:
     return "".join(parts) + "<|start|>assistant"
 
 
-def prefilled_request(chat: dict[str, Any]) -> dict[str, Any]:
+def prefilled_request(chat: dict[str, Any], runner: str) -> dict[str, Any]:
     """The raw ``/api/generate`` request that continues ``chat`` from the answer header.
 
     Same model, options and keep-alive as the chat request; Ollama applies no template and no
@@ -95,7 +99,9 @@ def prefilled_request(chat: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("answer prefill does not support tools")
     return {
         "model": chat["model"],
-        "prompt": glimmer_prompt(chat["messages"]) + GLIMMER_ANSWER_HEADER,
+        "prompt": (
+            GLIMMER_RAW_LEADING[runner] + glimmer_prompt(chat["messages"]) + GLIMMER_ANSWER_HEADER
+        ),
         "raw": True,
         "stream": True,
         # An oversized prompt is rejected, as on the chat route, instead of being cut.
