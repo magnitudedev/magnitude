@@ -1,5 +1,5 @@
 //! Explicit serving limits for each floating result and writable state subject.
-use seismic::{DType, Limit, PrecisionPolicy, SpecialPolicy, Tolerance, TuneError};
+use seismic::{DType, Element, Limit, PrecisionPolicy, SpecialPolicy, Tolerance, TuneError};
 use std::collections::BTreeMap;
 
 pub(super) fn policy(subjects: Vec<(String, DType)>) -> Result<PrecisionPolicy, TuneError> {
@@ -45,6 +45,26 @@ pub(super) fn policy(subjects: Vec<(String, DType)>) -> Result<PrecisionPolicy, 
         specials: SpecialPolicy::PRESERVE,
         inputs: BTreeMap::new(),
     })
+}
+
+/// The policy of an entry whose results are a residual plus a value the entry
+/// rounds to `rounded` first (`dense_output`, `attention_output`). The results
+/// are stored as the residual's type but carry the rounded value's precision:
+/// a configuration that sums in another order may round that value one step
+/// differently, so each result takes `rounded`'s tolerance. The same holds
+/// for `gated_delta_project_convolved`'s convolved channels: an F32 tap chain
+/// and SiLU over the projection rows rounded to `rounded`.
+pub(super) fn rounded_policy(
+    subjects: Vec<(String, DType)>,
+    rounded: Element,
+) -> Result<PrecisionPolicy, TuneError> {
+    let rounded = rounded.dtype().expect("an activation element is a scalar type");
+    policy(
+        subjects
+            .into_iter()
+            .map(|(subject, _)| (subject, rounded))
+            .collect(),
+    )
 }
 
 /// The error classes the engine's kernels declare (`error_class` in their

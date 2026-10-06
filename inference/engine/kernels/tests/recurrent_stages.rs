@@ -1931,7 +1931,9 @@ fn convolved_form(
 ) -> (Vec<f32>, Outcome) {
     use magnitude_kernels::{gated_delta_project_convolved, gated_delta_step_convolved};
     let g = case.geometry;
-    // Launches: gemv, batch.
+    // Launches: gemv (one row), batch, gemv_rows (three rows up to
+    // BATCH_FROM), gemv_pair (two rows). Every GEMV launch takes the mapping, as `gated_delta_project`'s one
+    // GEMV launch does for every row count.
     let specialization = NativeSpecialization::new()
         .with_static("H", hidden as u64)
         .with_static("NK", g.key_heads as u64)
@@ -1943,7 +1945,13 @@ fn convolved_form(
         .with_launch_param(0, "ROWS", mapping.rows)
         .with_launch_param(0, "LANES", mapping.lanes)
         .with_launch_param(1, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
-        .with_launch_param(1, "BATCH_ROWS", mapping.batch_rows);
+        .with_launch_param(1, "BATCH_ROWS", mapping.batch_rows)
+        .with_launch_param(2, "SIMDGROUPS", mapping.simdgroups)
+        .with_launch_param(2, "ROWS", mapping.rows)
+        .with_launch_param(2, "LANES", mapping.lanes)
+        .with_launch_param(3, "SIMDGROUPS", mapping.simdgroups)
+        .with_launch_param(3, "ROWS", mapping.rows)
+        .with_launch_param(3, "LANES", mapping.lanes);
     let mut t = case.tensors(device, Element::bf16());
     let projected = gated_delta_project_convolved::native_for_device_with(
         device,

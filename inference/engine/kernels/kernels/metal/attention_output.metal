@@ -25,6 +25,15 @@ typedef element::Act activation;
         SEISMIC_HIDDEN_STRIDE_1, {}};                                                   \
     projection::Weights<packets::W0> w{output_weight, KERNEL_W0_LAYOUT(k), k}
 
+// The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows.
+#define ATTENTION_OUTPUT_GEMV(ROWS, LANES, COUNT)                                       \
+    ATTENTION_OUTPUT_OPERANDS;                                                          \
+    uint rows = uint(SEISMIC_DIM_M);                                                    \
+    PROJECTION_FOR_##COUNT##_ROWS(rows,                                                 \
+        projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(                       \
+            in, out, w, rows, uint(SEISMIC_DIM_D), k, tile, shared, simdgroups, sg, lane))
+
+// One row.
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV
 template <uint ROWS, uint LANES>
 kernel void attention_output_gemv(ATTENTION_OUTPUT_ARGUMENTS,
@@ -33,11 +42,33 @@ kernel void attention_output_gemv(ATTENTION_OUTPUT_ARGUMENTS,
     uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    ATTENTION_OUTPUT_OPERANDS;
-    uint rows = uint(SEISMIC_DIM_M);
-    PROJECTION_FOR_ROWS(rows,
-        projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
-            in, out, w, rows, uint(SEISMIC_DIM_D), k, tile, shared, simdgroups, sg, lane));
+    ATTENTION_OUTPUT_GEMV(ROWS, LANES, ONE);
+}
+#endif
+
+// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_ROWS
+template <uint ROWS, uint LANES>
+kernel void attention_output_gemv_rows(ATTENTION_OUTPUT_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    ATTENTION_OUTPUT_GEMV(ROWS, LANES, SEVERAL);
+}
+#endif
+
+// Two rows: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_PAIR
+template <uint ROWS, uint LANES>
+kernel void attention_output_gemv_pair(ATTENTION_OUTPUT_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    ATTENTION_OUTPUT_GEMV(ROWS, LANES, PAIR);
 }
 #endif
 

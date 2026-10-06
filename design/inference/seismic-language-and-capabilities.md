@@ -106,7 +106,11 @@ external source the entry only converts, and the packed result of a `repack` int
 parameter, are raw row views; the registered conversion between their representations is resolved
 when the kernel runs, and moves codes and coefficients bit for bit. The CPU `Rows8` resident layout
 pads each matrix's row axis to eight and interleaves corresponding code and coefficient storage
-groups across each eight-row tile; conversion owns complete tiles, including zero padding. Because a CPU form is compiled
+groups across each eight-row tile; conversion owns complete tiles, including zero padding. The Metal
+`Rows32` resident layout pads the row axis to 32 and interleaves only the code planes, per 32 columns,
+across each 32-row tile; its coefficient planes hold the tile's rows one after another. Metal's
+packet library addresses a row of either row layout by its tile's base and its index in the tile
+(`packets::Rows16`), so a kernel that reads packets through the library runs on both. Because a CPU form is compiled
 with the program, its element coverage is declared; other backends compile each binding at
 preparation, and `elements` is rejected on them. Declared tuning parameters are runtime values.
 CPU weight projections may declare activation INT8 as an arithmetic parameter. Their exact path is

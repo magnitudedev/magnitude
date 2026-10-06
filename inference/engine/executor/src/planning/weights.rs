@@ -1204,11 +1204,12 @@ struct ResidentForm {
 
 /// The layout resident packed weights use for an execution path on a device
 /// backend (spec S1/E7). Native kernels read the backend's execution layout:
-/// Metal and Vulkan `rows16`, CUDA `mma16`; native CPU kernels read `rows8`, while every planned
+/// Metal `rows32`, Vulkan `rows16`, CUDA `mma16`; native CPU kernels read `rows8`, while every planned
 /// (compiled) kernel reads the `packet` layout.
 pub fn resident_layout(path: ExecutionPath, backend: BackendName) -> Layout {
     match (path, backend) {
-        (ExecutionPath::Native, BackendName::Metal | BackendName::Vulkan) => Layout::Rows16,
+        (ExecutionPath::Native, BackendName::Metal) => Layout::Rows32,
+        (ExecutionPath::Native, BackendName::Vulkan) => Layout::Rows16,
         (ExecutionPath::Native, BackendName::Cuda) => Layout::Mma16,
         (ExecutionPath::Native, BackendName::Cpu) => Layout::Rows8,
         (ExecutionPath::Planned, _) => Layout::Packet,
@@ -1306,7 +1307,7 @@ mod representation_byte_tests {
     #[test]
     fn one_map_chooses_representation_from_format_and_layout_from_backend() {
         for (path, backend, layout) in [
-            (ExecutionPath::Native, BackendName::Metal, Layout::Rows16),
+            (ExecutionPath::Native, BackendName::Metal, Layout::Rows32),
             (ExecutionPath::Native, BackendName::Vulkan, Layout::Rows16),
             (ExecutionPath::Native, BackendName::Cuda, Layout::Mma16),
             (ExecutionPath::Native, BackendName::Cpu, Layout::Rows8),

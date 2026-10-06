@@ -27,9 +27,10 @@ native import_dense for cuda from "cuda/import_dense.cu":
 fn repack_weight[B, N, K](source: &tensor[B, N, K] E) -> tensor[B, N, K] U:
     return repack[U = U](source)
 
+# Metal: the grid covers whole 32-row tiles, which `rows32` stores in full.
 native repack_weight for metal from "metal/repack_weight.metal":
     launch repack_weight:
-        threadgroups (ceil_div(K, 256) * 8, ceil_div(N, 16), B)
+        threadgroups (ceil_div(K, 256) * 8, ceil_div(N, 32) * 2, B)
         threads_per_threadgroup (32, 1, 1)
 
 native repack_weight for cuda from "cuda/repack_weight.cu":

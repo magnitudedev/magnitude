@@ -58,6 +58,40 @@ inline void attention_project_zero_tile(Output out, uint rows, uint columns,
     }
 }
 
+// The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows.
+#define ATTENTION_PROJECT_GEMV(ROWS, LANES, COUNT)                                      \
+    ATTENTION_PROJECT_OPERANDS;                                                         \
+    uint per = simdgroups * ROWS * (32u / LANES);                                       \
+    uint rows = uint(SEISMIC_DIM_M);                                                    \
+    uint t0 = (query_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;           \
+    uint t2 = (key_rows + per - 1) / per;                                               \
+    if (SEISMIC_PARAM_PROJECT_MODE != 0 && tile < t0 + t1) {                            \
+        if (tile < t0)                                                                  \
+            attention_project_zero_tile(query_out, rows, query_rows, 0, rows,           \
+                tile * per, per, sg * 32 + lane, simdgroups * 32);                      \
+        else                                                                            \
+            attention_project_zero_tile(gate_out, rows, gate_rows, 0, rows,             \
+                (tile - t0) * per, per, sg * 32 + lane, simdgroups * 32);               \
+        return;                                                                         \
+    }                                                                                   \
+    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
+    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
+    const auto x = projection::shared_norm(in, squares);                                \
+    if (tile < t0) {                                                                    \
+        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>( \
+            x, query_out, query_w, rows, query_rows, k, tile, shared, simdgroups, sg, lane)); \
+    } else if (tile < t0 + t1) {                                                        \
+        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W1, ROWS, MAXM, LANES>( \
+            x, gate_out, gate_w, rows, gate_rows, k, tile - t0, shared, simdgroups, sg, lane)); \
+    } else if (tile < t0 + t1 + t2) {                                                   \
+        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W2, ROWS, MAXM, LANES>( \
+            x, key_out, key_w, rows, key_rows, k, tile - t0 - t1, shared, simdgroups, sg, lane)); \
+    } else {                                                                            \
+        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W3, ROWS, MAXM, LANES>( \
+            x, value_out, value_w, rows, value_rows, k, tile - t0 - t1 - t2, shared, simdgroups, sg, lane)); \
+    }
+
+// One row.
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV
 template <uint ROWS, uint LANES>
 kernel void attention_project_gemv(ATTENTION_PROJECT_ARGUMENTS,
@@ -66,36 +100,33 @@ kernel void attention_project_gemv(ATTENTION_PROJECT_ARGUMENTS,
     uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    ATTENTION_PROJECT_OPERANDS;
-    uint per = simdgroups * ROWS * (32u / LANES);
-    uint rows = uint(SEISMIC_DIM_M);
-    uint t0 = (query_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
-    uint t2 = (key_rows + per - 1) / per;
-    if (SEISMIC_PARAM_PROJECT_MODE != 0 && tile < t0 + t1) {
-        if (tile < t0)
-            attention_project_zero_tile(query_out, rows, query_rows, 0, rows,
-                tile * per, per, sg * 32 + lane, simdgroups * 32);
-        else
-            attention_project_zero_tile(gate_out, rows, gate_rows, 0, rows,
-                (tile - t0) * per, per, sg * 32 + lane, simdgroups * 32);
-        return;
-    }
-    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
-    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    const auto x = projection::shared_norm(in, squares);
-    if (tile < t0) {
-        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
-            x, query_out, query_w, rows, query_rows, k, tile, shared, simdgroups, sg, lane));
-    } else if (tile < t0 + t1) {
-        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W1, ROWS, MAXM, LANES>(
-            x, gate_out, gate_w, rows, gate_rows, k, tile - t0, shared, simdgroups, sg, lane));
-    } else if (tile < t0 + t1 + t2) {
-        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W2, ROWS, MAXM, LANES>(
-            x, key_out, key_w, rows, key_rows, k, tile - t0 - t1, shared, simdgroups, sg, lane));
-    } else {
-        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W3, ROWS, MAXM, LANES>(
-            x, value_out, value_w, rows, value_rows, k, tile - t0 - t1 - t2, shared, simdgroups, sg, lane));
-    }
+    ATTENTION_PROJECT_GEMV(ROWS, LANES, ONE)
+}
+#endif
+
+// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV_ROWS
+template <uint ROWS, uint LANES>
+kernel void attention_project_gemv_rows(ATTENTION_PROJECT_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    ATTENTION_PROJECT_GEMV(ROWS, LANES, SEVERAL)
+}
+#endif
+
+// Two rows: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV_PAIR
+template <uint ROWS, uint LANES>
+kernel void attention_project_gemv_pair(ATTENTION_PROJECT_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    ATTENTION_PROJECT_GEMV(ROWS, LANES, PAIR)
 }
 #endif
 

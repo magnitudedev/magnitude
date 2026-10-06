@@ -628,19 +628,82 @@ impl TuningObserver for TuningReport {
             TuningEvent::Started {
                 entry,
                 bindings,
-                configurations,
                 points,
-            } => eprintln!(
-                "magnitude-engine: tuning {entry} [{bindings}]: {configurations} configurations at {points} points"
-            ),
+            } => eprintln!("magnitude-engine: tuning {entry} [{bindings}] at {points} points"),
+            TuningEvent::Planned(plan) => {
+                for start in &plan.starts {
+                    let given = match start.forms {
+                        Some(true) => "defaults and form starts".to_owned(),
+                        Some(false) => format!(
+                            "defaults only (with form starts {:.2} s did not fit)",
+                            start.with_forms_seconds
+                        ),
+                        None => "not started (its defaults did not fit)".to_owned(),
+                    };
+                    eprintln!(
+                        "magnitude-engine: tuning plan: start {} [{}], share {:.1}%: {given}; estimated {:.2} s of {:.2} s available, took {:.2} s{}",
+                        start.entry,
+                        start.bindings,
+                        start.share * 100.0,
+                        start.estimated_seconds,
+                        start.available_seconds,
+                        start.actual_seconds,
+                        if start.cut { "; CUT at its limit" } else { "" }
+                    );
+                }
+                eprintln!(
+                    "magnitude-engine: tuning plan: starts ended at {:.2} s, refinement ({} slices) at {:.2} s with {:.2} s reserved for conclusions, conclusions at {:.2} s",
+                    plan.started_seconds,
+                    plan.slices,
+                    plan.refined_seconds,
+                    plan.reserved_seconds,
+                    plan.concluded_seconds
+                );
+                for (unit, step, seconds) in &plan.overruns {
+                    eprintln!(
+                        "magnitude-engine: tuning plan: the {step} of {unit} ended {seconds:.2} s after its limit"
+                    );
+                }
+            }
             TuningEvent::Finished(tuned) => {
                 let origin = match (tuned.origin, tuned.search) {
                     (TuningOrigin::Stored, _) => "stored".to_owned(),
                     (TuningOrigin::Searched, Some((allowance, stop))) => {
                         format!("budget {:.2} s, stop {stop:?}", allowance.as_secs_f64())
                     }
+                    (TuningOrigin::Searched, None) if tuned.progress.is_some() => {
+                        "not searched".to_owned()
+                    }
                     (TuningOrigin::Searched, None) => "surveyed".to_owned(),
                 };
+                // How far the unit's search got: reported here, not stored.
+                if let Some(progress) = &tuned.progress {
+                    let start = progress.start.map_or("not started".to_owned(), |(seconds, programs)| {
+                        format!("started in {seconds:.2} s with {programs} programs formed")
+                    });
+                    let search = progress.standing.map_or(String::new(), |standing| {
+                        format!(
+                            "; search {}: {} of {} configurations, {} of {} programs formed, best {:.3} of the defaults",
+                            if standing.finished { "complete" } else { "partial" },
+                            standing.measured,
+                            standing.admissible,
+                            standing.programs,
+                            standing.declared_programs,
+                            standing.cost
+                        )
+                    });
+                    eprintln!(
+                        "magnitude-engine: searched {} [{}]: share {:.1}% of step time; {start}{search}; building {:.2} s, references {:.2} s, forming {:.2} s, measuring {:.2} s, validating {:.2} s",
+                        tuned.entry,
+                        tuned.bindings,
+                        progress.share * 100.0,
+                        tuned.time.building_seconds,
+                        tuned.time.reference_seconds,
+                        tuned.time.forming_seconds,
+                        tuned.time.measuring_seconds,
+                        tuned.time.validating_seconds
+                    );
+                }
                 eprintln!(
                     "magnitude-engine: tuned {} [{}] in {:.2} s ({origin}): {:?} ({} measured, {} excluded, {} qualification rejections)",
                     tuned.entry,

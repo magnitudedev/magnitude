@@ -17,7 +17,7 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
     device uchar *quantized [[buffer(SEISMIC_BUFFER_SCRATCH_QUANTIZED)]],               \
-    device float *row_scales [[buffer(SEISMIC_BUFFER_SCRATCH_ROW_SCALES)]],             \
+    device half *row_scales [[buffer(SEISMIC_BUFFER_SCRATCH_ROW_SCALES)]],              \
     device half *block_sums [[buffer(SEISMIC_BUFFER_SCRATCH_BLOCK_SUMS)]],              \
     device float *gate_coefficients [[buffer(SEISMIC_BUFFER_SCRATCH_GATE_COEFFICIENTS)]], \
     device half *gate_biases [[buffer(SEISMIC_BUFFER_SCRATCH_GATE_BIASES)]],            \
@@ -40,23 +40,61 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
         uint(SEISMIC_DIM_H)};                                                           \
     projection::Weights<packets::W1> up{up_weight, KERNEL_W1_LAYOUT(SEISMIC_DIM_H), uint(SEISMIC_DIM_H)}
 
+// The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows.
+#define DENSE_EXPAND_GEMV(ROWS, LANES, TILED, COUNT)                                    \
+    DENSE_EXPAND_OPERANDS;                                                              \
+    uint rows = uint(SEISMIC_DIM_O);                                                    \
+    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
+    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
+    const auto x = projection::shared_norm(in, squares);                                \
+    if (TILED == 1 && projection::gemv_tile_row_serves(gate, rows) && projection::gemv_tile_row_serves(up, rows)) { \
+        PROJECTION_FOR_##COUNT##_TILE_ROWS(rows,                                        \
+            projection::gemv_tile_row<packets::W0, packets::W1, true, ROWS, MAXM, LANES>( \
+                x, out, gate, up, rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared, simdgroups, sg, \
+                lane));                                                                 \
+        return;                                                                         \
+    }                                                                                   \
+    PROJECTION_FOR_##COUNT##_ROWS(rows,                                                 \
+        projection::gemv_form<packets::W0, packets::W1, true, ROWS, MAXM, LANES, (TILED == 2)>( \
+            x, out, gate, up, rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared, \
+            simdgroups, sg, lane))
+
+// One row.
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV
-template <uint ROWS, uint LANES>
+template <uint ROWS, uint LANES, uint TILED>
 kernel void dense_expand_gemv(DENSE_EXPAND_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
     uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    DENSE_EXPAND_OPERANDS;
-    uint rows = uint(SEISMIC_DIM_O);
-    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
-    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    const auto x = projection::shared_norm(in, squares);
-    PROJECTION_FOR_ROWS(rows,
-        projection::gemv_paired_runtime<packets::W0, packets::W1, ROWS, MAXM, LANES>(
-            x, out, gate, up, rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared,
-            simdgroups, sg, lane));
+    DENSE_EXPAND_GEMV(ROWS, LANES, TILED, ONE);
+}
+#endif
+
+// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV_ROWS
+template <uint ROWS, uint LANES, uint TILED>
+kernel void dense_expand_gemv_rows(DENSE_EXPAND_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    DENSE_EXPAND_GEMV(ROWS, LANES, TILED, SEVERAL);
+}
+#endif
+
+// Two rows: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV_PAIR
+template <uint ROWS, uint LANES, uint TILED>
+kernel void dense_expand_gemv_pair(DENSE_EXPAND_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    DENSE_EXPAND_GEMV(ROWS, LANES, TILED, PAIR);
 }
 #endif
 
@@ -150,7 +188,8 @@ kernel void dense_expand_tall(DENSE_EXPAND_ARGUMENTS,
     const projection::int8_scratch gate_scratch{quantized, row_scales, block_sums, gate_coefficients, gate_biases}; \
     const projection::int8_scratch up_scratch{quantized, row_scales, block_sums, up_coefficients, up_biases}
 #define DENSE_EXPAND_INT8_AVAILABLE \
-    (projection::int8_codes<packets::W0>::available && projection::int8_codes<packets::W1>::available)
+    (projection::int8_codes<packets::W0>::available && projection::int8_codes<packets::W1>::available && \
+        projection::int8_codes<packets::W0>::interleaved == projection::int8_codes<packets::W1>::interleaved)
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_QUANTIZE
 kernel void dense_expand_quantize(DENSE_EXPAND_ARGUMENTS,
@@ -161,8 +200,8 @@ kernel void dense_expand_quantize(DENSE_EXPAND_ARGUMENTS,
         return;
     DENSE_EXPAND_INT8_SCRATCH;
     projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    projection::int8_quantize(x, gate_scratch, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H), row, thread_index, lane,
-        1.0f);
+    projection::int8_quantize<projection::int8_codes<packets::W0>::interleaved>(x, gate_scratch,
+        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H), row, thread_index, lane, 1.0f);
 }
 #endif
 
@@ -184,7 +223,10 @@ kernel void dense_expand_int8(DENSE_EXPAND_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float exchange[DENSE_EXPAND_INT8_AVAILABLE ? 2 * 32 * 32 : 1];
-    PROJECTION_GEMM_SHARED(shared, 64, 64);
+    // The default form's tile only where the launch takes that form:
+    // threadgroup memory a kernel does not use still slows its products.
+    threadgroup float4 shared_words[DENSE_EXPAND_INT8_AVAILABLE ? 1 : projection::gemm_tile<64, 64>::bytes / 16];
+    threadgroup uchar *shared = reinterpret_cast<threadgroup uchar *>(shared_words);
     DENSE_EXPAND_OPERANDS;
     DENSE_EXPAND_INT8_SCRATCH;
     projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};

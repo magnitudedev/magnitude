@@ -29,6 +29,7 @@ fn packed_stages_on(device: &seismic::Device) {
     let q8_external = seismic::Element::named("gguf_q8_0").unwrap();
     let layout = match device.backend() {
         seismic::BackendName::Cuda => seismic::Layout::Mma16,
+        seismic::BackendName::Metal => seismic::Layout::Rows32,
         _ => seismic::Layout::Rows16,
     };
     let q8 = seismic::Element::stored("q8g32s", layout).unwrap();

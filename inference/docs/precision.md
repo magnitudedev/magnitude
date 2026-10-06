@@ -37,6 +37,12 @@ model can produce BF16 activations, F32 results, and F16 state; each receives it
 policy. Every floating result/state subject is assigned an explicit tolerance, with exact
 comparison as the default for other subjects.
 
+One case takes the type of what was computed instead of the type it is stored as: a result that
+is a residual plus a value the kernel rounds to the activation type first (the MLP down
+projection and the attention output projection write the F32 residual stream this way). Summing
+in another order can round that value one step differently, which no F32 tolerance admits, so
+such a result takes the activation type's row: BF16 for a BF16 model.
+
 For example, BF16 allows **0.01 plus 1% of the reference's magnitude**:
 
 | Reference | Maximum allowed error | Accepted interval |

@@ -338,6 +338,16 @@ representation!(Q5KRows8, "q5k", Rows8, F32, 4);
 representation!(Q6KRows8, "q6k", Rows8, F32, 4);
 representation!(Q8G32SRows8, "q8g32s", Rows8, F32, 2);
 representation!(IQ4G32Rows8, "iq4g32", Rows8, F32, 2);
+representation!(Q4G32SRows32, "q4g32s", Rows32, F32, 2);
+representation!(Q5G32SRows32, "q5g32s", Rows32, F32, 3);
+representation!(Q5G32Rows32, "q5g32", Rows32, F32, 3);
+representation!(MXFP4G32Rows32, "mxfp4g32", Rows32, F32, 2);
+representation!(NVFP4G16Rows32, "nvfp4g16", Rows32, F32, 2);
+representation!(Q4KRows32, "q4k", Rows32, F32, 3);
+representation!(Q5KRows32, "q5k", Rows32, F32, 4);
+representation!(Q6KRows32, "q6k", Rows32, F32, 4);
+representation!(Q8G32SRows32, "q8g32s", Rows32, F32, 2);
+representation!(IQ4G32Rows32, "iq4g32", Rows32, F32, 2);
 representation!(Q4KMma16, "q4k", Mma16, F32, 3);
 representation!(Q5KMma16, "q5k", Mma16, F32, 4);
 representation!(Q6KMma16, "q6k", Mma16, F32, 4);
@@ -369,6 +379,16 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q6k", registry::Layout::Rows8) => return visitor.visit::<Q6KRows8>(),
         ("q8g32s", registry::Layout::Rows8) => return visitor.visit::<Q8G32SRows8>(),
         ("iq4g32", registry::Layout::Rows8) => return visitor.visit::<IQ4G32Rows8>(),
+        ("q4k", registry::Layout::Rows32) => return visitor.visit::<Q4KRows32>(),
+        ("q5k", registry::Layout::Rows32) => return visitor.visit::<Q5KRows32>(),
+        ("q6k", registry::Layout::Rows32) => return visitor.visit::<Q6KRows32>(),
+        ("q8g32s", registry::Layout::Rows32) => return visitor.visit::<Q8G32SRows32>(),
+        ("iq4g32", registry::Layout::Rows32) => return visitor.visit::<IQ4G32Rows32>(),
+        ("q4g32s", registry::Layout::Rows32) => return visitor.visit::<Q4G32SRows32>(),
+        ("q5g32s", registry::Layout::Rows32) => return visitor.visit::<Q5G32SRows32>(),
+        ("q5g32", registry::Layout::Rows32) => return visitor.visit::<Q5G32Rows32>(),
+        ("mxfp4g32", registry::Layout::Rows32) => return visitor.visit::<MXFP4G32Rows32>(),
+        ("nvfp4g16", registry::Layout::Rows32) => return visitor.visit::<NVFP4G16Rows32>(),
         ("q4k", registry::Layout::Mma16) => return visitor.visit::<Q4KMma16>(),
         ("q5k", registry::Layout::Mma16) => return visitor.visit::<Q5KMma16>(),
         ("q6k", registry::Layout::Mma16) => return visitor.visit::<Q6KMma16>(),

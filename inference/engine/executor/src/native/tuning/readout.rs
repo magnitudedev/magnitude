@@ -25,6 +25,7 @@ use seismic::{Element, Tensor};
 const SELECTED_TOKENS: u64 = 256;
 
 /// The MTP input's fused embedding, two RMS norms and combine projection.
+#[derive(Clone)]
 pub(crate) struct DraftRowsTuning {
     pub embedding: Element,
     pub embedding_norm: Element,
@@ -152,6 +153,7 @@ fn vocabulary_shape(inputs: &ModelInputs<'_>) -> Result<(u64, u64), String> {
 
 /// `readout_head_rows`: final RMS norm and vocabulary projection of the rows
 /// `out_rows` selects.
+#[derive(Clone)]
 pub(crate) struct HeadRowsTuning {
     pub norm: Element,
     pub weight: Element,
@@ -354,6 +356,7 @@ impl Selecting {
 
 /// `readout_top_rows`: the final norm and the 4-bit view of every
 /// vocabulary row, with each row's threshold.
+#[derive(Clone)]
 pub(crate) struct TopRowsTuning(pub ProgressiveTuning);
 
 pub(crate) struct TopRowsCase {
@@ -483,6 +486,7 @@ impl LevelCase {
 }
 
 /// `readout_refine_rows`: the 5-bit view of the rows level one keeps.
+#[derive(Clone)]
 pub(crate) struct RefineRowsTuning(pub ProgressiveTuning);
 
 impl EntryTuning for RefineRowsTuning {
@@ -545,6 +549,7 @@ impl EntryTuning for RefineRowsTuning {
 
 /// `readout_exact_rows`: the exact logits of the rows level two keeps (a few
 /// hundred of a large vocabulary).
+#[derive(Clone)]
 pub(crate) struct ExactRowsTuning(pub ProgressiveTuning);
 
 impl EntryTuning for ExactRowsTuning {
@@ -607,6 +612,7 @@ impl EntryTuning for ExactRowsTuning {
 
 /// `readout_planes_rows`: the final norm and the exact logits of every
 /// vocabulary row from the planes.
+#[derive(Clone)]
 pub(crate) struct PlanesRowsTuning(pub ProgressiveTuning);
 
 pub(crate) struct PlanesRowsCase {
@@ -675,6 +681,7 @@ impl EntryTuning for PlanesRowsTuning {
 
 /// `readout_selected_rows`: final RMS norm and the logits of a candidate token
 /// set.
+#[derive(Clone)]
 pub(crate) struct SelectedRowsTuning {
     pub norm: Element,
     pub weight: Element,
@@ -770,6 +777,7 @@ impl EntryTuning for SelectedRowsTuning {
 
 /// `head_logits_rows`: the MTP head's vocabulary projection of its normed
 /// feature rows.
+#[derive(Clone)]
 pub(crate) struct HeadLogitsTuning {
     pub weight: Element,
     pub activation: Element,
@@ -852,6 +860,7 @@ fn logits(
 /// selected row over `vocabulary` tokens (the target's, or the draft
 /// head's). Its parameters partition the vocabulary without changing any
 /// result.
+#[derive(Clone)]
 pub(crate) struct ShapeRowsTuning {
     pub vocabulary: u64,
 }
@@ -936,6 +945,7 @@ impl EntryTuning for ShapeRowsTuning {
 /// `sample_rows`: one draw per selected row over its shaped logits of
 /// `vocabulary` tokens. Its parameters partition the vocabulary without
 /// changing any draw.
+#[derive(Clone)]
 pub(crate) struct SampleRowsTuning {
     pub vocabulary: u64,
 }

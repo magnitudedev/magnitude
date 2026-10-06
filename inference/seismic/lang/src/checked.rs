@@ -1769,8 +1769,11 @@ impl NativeImplementation {
     }
 
     /// Visit the admissible specializations at `statics` in declaration
-    /// order until `visit` returns false.
-    fn walk_admissible(
+    /// order until `visit` returns false. A caller that needs a few of them
+    /// (the nearest to one, the distinct values of a field) takes them here:
+    /// their number is the product of the parameter domains, which
+    /// [`Self::admissible`] holds all at once.
+    pub fn walk_admissible(
         &self,
         statics: &NativeSpecialization,
         mut visit: impl FnMut(&NativeSpecialization) -> bool,
@@ -1818,18 +1821,102 @@ impl NativeImplementation {
                 ),
             };
         }
-        let mut steps = vec![0usize; domains.len()];
-        loop {
-            match self.validate(&configuration) {
-                Ok(()) => {
-                    if !visit(&configuration) {
-                        return Ok(());
-                    }
-                }
-                Err(NativeSpecializationError::Inadmissible) => {}
-                Err(error) => return Err(error),
+        // The `where` condition's top-level conjuncts, each with the last
+        // parameter of the walk it reads: a conjunct that fails rejects every
+        // configuration with the same values up to that parameter, so the
+        // walk steps over them at once rather than visiting the product of
+        // the parameters after it.
+        let mut owners = std::collections::BTreeMap::<&str, Option<usize>>::new();
+        for (position, (_, parameter)) in domains.iter().enumerate() {
+            owners
+                .entry(parameter.name.as_str())
+                .and_modify(|owner| *owner = None)
+                .or_insert(Some(position));
+        }
+        let owner = |name: &str| owners.get(name).copied().flatten();
+        let mut conjuncts = Vec::new();
+        if let Some(constraint) = &self.constraint {
+            constraint.conjuncts(&mut conjuncts);
+        }
+        // A conjunct that reads no parameter is decided by the statics alone.
+        let mut fixed = 0;
+        for conjunct in &conjuncts {
+            let mut names = Vec::new();
+            conjunct.parameters(&mut names);
+            if !names.is_empty() {
+                continue;
             }
-            let Some(position) = (0..domains.len())
+            match conjunct.holds(&|name| configuration.static_value(name), &|_| None) {
+                Ok(true) => fixed += 1,
+                Ok(false) => return Ok(()),
+                Err(_) => {}
+            }
+        }
+        let total = conjuncts.len() - fixed;
+        let prefixes = conjuncts
+            .into_iter()
+            .filter_map(|conjunct| {
+                let mut names = Vec::new();
+                conjunct.parameters(&mut names);
+                let positions = names
+                    .iter()
+                    .map(|name| owner(name))
+                    .collect::<Option<Vec<_>>>()?;
+                Some((positions.into_iter().max()?, conjunct))
+            })
+            .collect::<Vec<_>>();
+        // The walk values every declared parameter from its domain, so a
+        // configuration no conjunct rejects is admissible once every
+        // conjunct is one of these; otherwise the whole condition decides.
+        let decided = prefixes.len() == total;
+        let launch_keys = domains
+            .iter()
+            .map(|(launch, parameter)| launch.map(|launch| (launch, parameter.name.clone())))
+            .collect::<Vec<_>>();
+        let mut steps = vec![0usize; domains.len()];
+        // The first parameter the last step changed: a conjunct that reads
+        // only parameters before it held on the configuration before, and
+        // still does.
+        let mut changed = 0;
+        loop {
+            let dimension = |name: &str| configuration.static_value(name);
+            let parameter = |name: &str| {
+                let (launch, _) = domains[owner(name)?];
+                match launch {
+                    None => configuration.param(name),
+                    Some(launch) => configuration.launch_param(launch, name),
+                }
+            };
+            // The shortest rejected prefix, if a conjunct rejects one.
+            let mut rejected: Option<usize> = None;
+            let mut failed = false;
+            for (last, conjunct) in &prefixes {
+                if *last < changed {
+                    continue;
+                }
+                match conjunct.holds(&dimension, &parameter) {
+                    Ok(true) => {}
+                    Ok(false) => rejected = Some(rejected.map_or(*last, |least| least.min(*last))),
+                    Err(_) => failed = true,
+                }
+            }
+            if rejected.is_none() {
+                let admitted = if decided && !failed {
+                    Ok(())
+                } else {
+                    self.validate(&configuration)
+                };
+                match admitted {
+                    Ok(()) => {
+                        if !visit(&configuration) {
+                            return Ok(());
+                        }
+                    }
+                    Err(NativeSpecializationError::Inadmissible) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let Some(position) = (0..rejected.map_or(domains.len(), |last| last + 1))
                 .rev()
                 .find(|&position| steps[position] + 1 < domains[position].1.values.len())
             else {
@@ -1846,10 +1933,10 @@ impl NativeImplementation {
                             .get_mut(&parameter.name)
                             .expect("every parameter was valued") = parameter.values[step];
                     }
-                    Some(launch) => {
+                    Some(_) => {
                         *configuration
                             .launch_params
-                            .get_mut(&(launch, parameter.name.clone()))
+                            .get_mut(launch_keys[position].as_ref().expect("a launch parameter"))
                             .expect("every launch parameter was valued") = parameter.values[step];
                     }
                 }
@@ -1858,6 +1945,7 @@ impl NativeImplementation {
                 set(reset, 0);
             }
             set(position, next);
+            changed = position;
         }
     }
 }
@@ -2316,6 +2404,33 @@ mod native_tests {
         let error =
             check_source(source(&source_text("ROWS < TILE"))).expect_err("cross-launch conjunct");
         assert!(error.to_string().contains("only one launch"), "{error}");
+    }
+
+    /// A conjunct that pins a launch's parameters outside its form rejects
+    /// whole prefixes of the walk; the configurations and their order are
+    /// those of filtering the full product.
+    #[test]
+    fn rejected_prefixes_leave_the_admissible_configurations_unchanged() {
+        let text = "native scale for metal from \"scale.metal\":\n    params (form WIDE in [0, 1])\n    where (WIDE == 1 or TILE == 4) and (WIDE == 0 or ROWS == 1)\n    launch small when WIDE == 0:\n        params (ROWS in [1, 2, 4])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when WIDE == 1:\n        params (TILE in [4, 8])\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
+        let module = check_source(source(text)).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let configurations = native.admissible(&NativeSpecialization::new()).unwrap();
+        let values = configurations
+            .iter()
+            .map(|configuration| {
+                (
+                    configuration.param("WIDE").unwrap(),
+                    configuration.launch_param(0, "ROWS").unwrap(),
+                    configuration.launch_param(1, "TILE").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, [(0, 1, 4), (0, 2, 4), (0, 4, 4), (1, 1, 4), (1, 1, 8)]);
+        for configuration in &configurations {
+            native.validate(configuration).unwrap();
+        }
     }
 
     /// A form only some statics admit is found by the search that takes its

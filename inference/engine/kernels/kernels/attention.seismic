@@ -86,7 +86,8 @@ fn attention_output[M, D, Q, W](hidden: &tensor[M, D] f32,
     add(hidden, projected, result)
     return result
 
-# Metal: GEMV below BATCH_FROM rows, batched GEMV to 16, GEMM beyond with
+# Metal: GEMV below BATCH_FROM rows (`gemv` for one row, `gemv_pair` for two,
+# `gemv_rows` for more, see `dense_rows.seismic`), batched GEMV to 16, GEMM beyond with
 # SPLIT-way split-K summed by `finalize`. The input needs no prologue, so
 # there is no `stage`. (CUDA: GEMV to 16 rows, INT8 candidate on the GEMM.)
 # TALL selects the tall GEMM past 64 rows (see `dense_rows.seismic`): on
@@ -99,8 +100,8 @@ native attention_output for metal from "metal/attention_output.metal":
     scratch partials bytes (SPLIT * M * D * 4) when M > 64 and SPLIT > 1
     scratch small_partials bytes (4 * M * D * 4) when M > 16 and M <= 64
     scratch fragments bytes (ceil_div(M, 64) * 64 * Q * W * 2) when M > 64 and TALL == 1
-    launch attention_output_gemv when M < BATCH_FROM:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+    launch attention_output_gemv when M < 2:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32, 8])
         threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
@@ -129,6 +130,16 @@ native attention_output for metal from "metal/attention_output.metal":
         params (code TALL_M in [128, 256, 512], code TALL_K in [64, 128], code STAGERS in [2, 1])
         threadgroups (ceil_div(D, 32), ceil_div(M, TALL_M), 1)
         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
+    launch attention_output_gemv_rows when M >= 3 and M < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [2, 1, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch attention_output_gemv_pair when M == 2 and M < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [2, 1, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
 
 # CUDA: GEMV to 8 rows, `gemv16` to 16, GEMM beyond in the K1 row bands
 # (`gemm_small` to 64 rows with the INT8 candidate, `gemm` beyond), both split
@@ -285,8 +296,8 @@ native attention_project for metal from "metal/attention_project.metal":
     launch attention_project_stage when M > 16 and (M <= 64 or TALL == 0):
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_project_gemv when M < BATCH_FROM:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+    launch attention_project_gemv when M < 2:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32, 8])
         threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
@@ -318,6 +329,22 @@ native attention_project for metal from "metal/attention_project.metal":
         threadgroups (ceil_div(Q, 32) + ceil_div(GR, 32) + ceil_div(K, 32) + ceil_div(V, 32),
             ceil_div(M, TALL_M), 1)
         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
+    launch attention_project_gemv_rows when M >= 3 and M < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch attention_project_gemv_pair when M == 2 and M < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
 
 native attention_project for cuda from "cuda/attention_project.cu":
     static (D, Q, GR, K, V)

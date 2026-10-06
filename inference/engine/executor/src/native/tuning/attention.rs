@@ -47,9 +47,6 @@ fn decode_starts(
     let Some(defaults) = implementation.default_specialization(statics).ok() else {
         return Vec::new();
     };
-    let Some(admissible) = implementation.admissible(statics).ok() else {
-        return Vec::new();
-    };
     let default_parts = defaults.param("PARTS").unwrap_or(1);
     // K8/V4 codes and the scale/zero pairs use 7W/4 bytes per KV head row.
     let bytes_per_head = limits
@@ -70,12 +67,11 @@ fn decode_starts(
     };
     match device.backend() {
         seismic::BackendName::Vulkan if desired_parts > default_parts || wide_verification => {
-            admissible
-                .into_iter()
-                .filter(|choice| {
-                    choice.param("MATRIX") == Some(0) && choice.param("KEYWISE") == Some(1)
-                })
-                .min_by_key(|choice| {
+            nearest(
+                implementation,
+                statics,
+                |choice| choice.param("MATRIX") == Some(0) && choice.param("KEYWISE") == Some(1),
+                |choice| {
                     let parts = choice.param("PARTS").unwrap_or(1);
                     let distance = defaults
                         .params()
@@ -88,10 +84,8 @@ fn decode_starts(
                         parts < desired_parts,
                         distance,
                     )
-                })
-                .map(|choice| choice.params().clone())
-                .into_iter()
-                .collect()
+                },
+            )
         }
         seismic::BackendName::Metal
             if mix.shape.width <= 256
@@ -99,10 +93,11 @@ fn decode_starts(
                     && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2))
                     || mix.shape.group == 8) =>
         {
-            admissible
-                .into_iter()
-                .filter(|choice| choice.param("MATRIX") == Some(1))
-                .min_by_key(|choice| {
+            nearest(
+                implementation,
+                statics,
+                |choice| choice.param("MATRIX") == Some(1),
+                |choice| {
                     let parts = choice.param("PARTS").unwrap_or(1);
                     // The long-context G8/W256 multirow form reuses one decoded
                     // K/V tile across four verification rows. Seed it at the
@@ -141,17 +136,41 @@ fn decode_starts(
                         choice.param("SIMDS").unwrap_or(4).abs_diff(simds),
                         choice.param("SPAN").unwrap_or(128).abs_diff(span),
                     )
-                })
-                .map(|choice| choice.params().clone())
-                .into_iter()
-                .collect()
+                },
+            )
         }
         _ => Vec::new(),
     }
 }
 
+/// The parameter values of the admissible configuration `accepts` takes
+/// whose `key` is least, the first of equals in declaration order: found by
+/// walking the domain, never holding it.
+fn nearest<K: Ord>(
+    implementation: &seismic::NativeImplementation,
+    statics: &seismic::NativeSpecialization,
+    accepts: impl Fn(&seismic::NativeSpecialization) -> bool,
+    key: impl Fn(&seismic::NativeSpecialization) -> K,
+) -> Vec<seismic::ParameterValues> {
+    let mut best: Option<(K, seismic::ParameterValues)> = None;
+    let walked = implementation.walk_admissible(statics, |choice| {
+        if accepts(choice) {
+            let key = key(choice);
+            if best.as_ref().is_none_or(|(least, _)| key < *least) {
+                best = Some((key, choice.params().clone()));
+            }
+        }
+        true
+    });
+    match walked {
+        Ok(()) => best.map(|(_, values)| values).into_iter().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// `attention_project`: RMS prologue, one segmented query | gate | key |
 /// value projection.
+#[derive(Clone)]
 pub(crate) struct AttentionProjectTuning {
     pub binding: AttentionBinding,
     pub scopes: Vec<WeightScope>,
@@ -282,6 +301,7 @@ impl EntryTuning for AttentionProjectTuning {
 }
 
 /// `attention_output`: output projection plus residual.
+#[derive(Clone)]
 pub(crate) struct AttentionOutputTuning {
     pub output: Element,
     pub activation: Element,
@@ -367,7 +387,7 @@ impl EntryTuning for AttentionOutputTuning {
         }
     }
 
-    generated_entry!(attention_output, this => this.elements());
+    generated_entry!(attention_output, this => this.elements(), rounded to this.activation);
 }
 
 /// What every fused attention entry tunes over.
@@ -387,15 +407,19 @@ pub(crate) struct AttentionMix {
 }
 
 /// `attention_decode`, for row classes up to [`DECODE_ROWS`].
+#[derive(Clone)]
 pub(crate) struct AttentionDecodeTuning(pub AttentionMix);
 
 /// `attention_prefill`, for row classes beyond [`DECODE_ROWS`].
+#[derive(Clone)]
 pub(crate) struct AttentionPrefillTuning(pub AttentionMix);
 
 /// `attention_decode_k8v4`, for row classes up to [`DECODE_ROWS`].
+#[derive(Clone)]
 pub(crate) struct AttentionDecodeK8V4Tuning(pub AttentionMix);
 
 /// `attention_prefill_k8v4`, for row classes beyond [`DECODE_ROWS`].
+#[derive(Clone)]
 pub(crate) struct AttentionPrefillK8V4Tuning(pub AttentionMix);
 
 /// One argument set of a fused entry: the inputs every codec shares, and the

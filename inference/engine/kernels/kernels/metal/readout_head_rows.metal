@@ -28,6 +28,18 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
         projection::scale_factor(weight_scale, SEISMIC_DIM_WS, 0, 0), 1.0f);            \
     projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(k), k}
 
+// The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows.
+#define HEAD_ROWS_GEMV(ROWS, LANES, COUNT)                                              \
+    HEAD_ROWS_OPERANDS;                                                                 \
+    uint rows = uint(SEISMIC_DIM_O);                                                    \
+    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
+    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
+    const auto x = projection::shared_norm(in, squares);                                \
+    PROJECTION_FOR_##COUNT##_ROWS(rows,                                                 \
+        projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(                       \
+            x, out, w, rows, uint(SEISMIC_DIM_V), k, tile, shared, simdgroups, sg, lane))
+
+// One row.
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV
 template <uint ROWS, uint LANES>
 kernel void readout_head_rows_gemv(HEAD_ROWS_ARGUMENTS,
@@ -36,14 +48,33 @@ kernel void readout_head_rows_gemv(HEAD_ROWS_ARGUMENTS,
     uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    HEAD_ROWS_OPERANDS;
-    uint rows = uint(SEISMIC_DIM_O);
-    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
-    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    const auto x = projection::shared_norm(in, squares);
-    PROJECTION_FOR_ROWS(rows,
-        projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
-            x, out, w, rows, uint(SEISMIC_DIM_V), k, tile, shared, simdgroups, sg, lane));
+    HEAD_ROWS_GEMV(ROWS, LANES, ONE);
+}
+#endif
+
+// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV_ROWS
+template <uint ROWS, uint LANES>
+kernel void readout_head_rows_gemv_rows(HEAD_ROWS_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    HEAD_ROWS_GEMV(ROWS, LANES, SEVERAL);
+}
+#endif
+
+// Two rows: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV_PAIR
+template <uint ROWS, uint LANES>
+kernel void readout_head_rows_gemv_pair(HEAD_ROWS_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    HEAD_ROWS_GEMV(ROWS, LANES, PAIR);
 }
 #endif
 

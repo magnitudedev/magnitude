@@ -507,7 +507,8 @@ fn gated_delta_project_convolved[M, B, S, H, NK, NV, W, C, T](hidden: &tensor[M,
     return (projection, convolved)
 
 # Metal: `gated_delta_project`'s GEMV and batched GEMV launches with its
-# parameters. The qkv segment's epilogue receives every row's sum of its
+# parameters, the GEMV launched as `gemv` for one row, `gemv_pair` for two and
+# `gemv_rows` for more (see `dense_rows.seismic`). The qkv segment's epilogue receives every row's sum of its
 # channel (a GEMV lane group holds them all; the batched class gathers them
 # from the matrix fragment's lanes). For each row it publishes, it convolves
 # the channel over the slot's earlier rows (rounded to A, as published) and
@@ -518,8 +519,8 @@ fn gated_delta_project_convolved[M, B, S, H, NK, NV, W, C, T](hidden: &tensor[M,
 native gated_delta_project_convolved for metal from "metal/gated_delta_project_convolved.metal":
     static (H, NK, NV, W, C)
     params (arithmetic BATCH_FROM in [5, 3, 9])
-    launch gated_delta_project_convolved_gemv when M < BATCH_FROM:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+    launch gated_delta_project_convolved_gemv when M < 2:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32, 8])
         threadgroups (ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES)
             + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
@@ -531,6 +532,20 @@ native gated_delta_project_convolved for metal from "metal/gated_delta_project_c
             + ceil_div(NV * W, BATCH_SIMDGROUPS * BATCH_ROWS * 8) + 2 * ceil_div(NV, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (16640)
+    launch gated_delta_project_convolved_gemv_rows when M >= 3 and M < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [2, 1, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES)
+            + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch gated_delta_project_convolved_gemv_pair when M == 2 and M < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [2, 1, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES)
+            + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
 
 fn gated_delta_step_convolved[M, B, S, NK, NV, W, T](
     projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
