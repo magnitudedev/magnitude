@@ -1860,7 +1860,8 @@ fn step_form(
     use magnitude_kernels::gated_delta_project;
     let g = case.geometry;
     // gated_delta_project's launches: stage, gemv, batch, gemm_small, gemm,
-    // stage_tall, tall.
+    // stage_tall, tall, then the PACK form's four (its tile launch the third
+    // of them).
     let specialization = NativeSpecialization::new()
         .with_static("H", hidden as u64)
         .with_static("NK", g.key_heads as u64)
@@ -1868,6 +1869,9 @@ fn step_form(
         .with_static("W", g.width as u64)
         .with_param("BATCH_FROM", mapping.batch_from)
         .with_param("TALL", 0)
+        .with_param("PACK", 0)
+        .with_launch_param(9, "PACK_TOKENS", 4)
+        .with_launch_param(9, "WEIGHTS_AHEAD", 0)
         .with_launch_param(1, "SIMDGROUPS", mapping.simdgroups)
         .with_launch_param(1, "ROWS", mapping.rows)
         .with_launch_param(1, "LANES", mapping.lanes)

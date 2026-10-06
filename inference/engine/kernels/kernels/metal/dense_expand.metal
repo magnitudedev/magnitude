@@ -4,6 +4,7 @@
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
 #include "lib/projection/projection.h"
+#include "lib/projection/packing.h"
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
@@ -23,6 +24,13 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     device half *gate_biases [[buffer(SEISMIC_BUFFER_SCRATCH_GATE_BIASES)]],            \
     device float *up_coefficients [[buffer(SEISMIC_BUFFER_SCRATCH_UP_COEFFICIENTS)]],   \
     device half *up_biases [[buffer(SEISMIC_BUFFER_SCRATCH_UP_BIASES)]],                \
+    device float *packed [[buffer(SEISMIC_BUFFER_SCRATCH_PACKED)]],                     \
+    device half *token_factors [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_FACTORS)]],        \
+    device half *gate_factors [[buffer(SEISMIC_BUFFER_SCRATCH_GATE_FACTORS)]],          \
+    device half *up_factors [[buffer(SEISMIC_BUFFER_SCRATCH_UP_FACTORS)]],              \
+    device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
+    device float *gate_scales [[buffer(SEISMIC_BUFFER_SCRATCH_GATE_SCALES)]],           \
+    device float *up_scales [[buffer(SEISMIC_BUFFER_SCRATCH_UP_SCALES)]],               \
     device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],               \
     device const float *up_scale [[buffer(SEISMIC_BUFFER_UP_SCALE)]],                   \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
@@ -232,5 +240,82 @@ kernel void dense_expand_int8(DENSE_EXPAND_ARGUMENTS,
     projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
     projection::gemm_int8_paired<packets::W0, packets::W1>(x, out, gate, up, gate_scratch, up_scratch,
         uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile.y, tile.x, shared, exchange, sg, lane);
+}
+#endif
+
+// The PACK form past 64 rows: the normalized rows (`dense_expand_normalize`)
+// as integer codes, two tokens packed per operand element, both weights'
+// block scales and biases, then the paired packed tiles.
+#define DENSE_EXPAND_PACKING_SCRATCH                                                     \
+    const projection::packing_scratch gate_scratch{packed, token_factors, token_scales, gate_factors, gate_scales}; \
+    const projection::packing_scratch up_scratch{packed, token_factors, token_scales, up_factors, up_scales}
+#define DENSE_EXPAND_PACKING_AVAILABLE \
+    (projection::packing_codes<packets::W0>::available \
+        && projection::packing_serves<packets::W1, projection::packing_codes<packets::W0>::folds>::value)
+
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_PACK
+kernel void dense_expand_pack(DENSE_EXPAND_ARGUMENTS,
+    uint pairs [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if constexpr (!DENSE_EXPAND_PACKING_AVAILABLE)
+        return;
+    threadgroup float4 peaks[8];
+    DENSE_EXPAND_PACKING_SCRATCH;
+    projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
+    projection::packing_operand<projection::packing_shared<packets::W0, packets::W1>::centre,
+        projection::packing_shared<packets::W0, packets::W1>::folds>(x, gate_scratch, uint(SEISMIC_DIM_O),
+        uint(SEISMIC_DIM_H), pairs, peaks, thread_index, sg, lane);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_PACK_COEFFICIENTS
+kernel void dense_expand_pack_coefficients(DENSE_EXPAND_ARGUMENTS,
+    uint tile [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if constexpr (!DENSE_EXPAND_PACKING_AVAILABLE)
+        return;
+    threadgroup float gate_peaks[8];
+    threadgroup float up_peaks[8];
+    DENSE_EXPAND_OPERANDS;
+    DENSE_EXPAND_PACKING_SCRATCH;
+    projection::packing_tile_coefficients(gate, gate_scratch, uint(SEISMIC_DIM_H), tile, gate_peaks, thread_index,
+        sg, lane);
+    projection::packing_tile_coefficients(up, up_scratch, uint(SEISMIC_DIM_H), tile, up_peaks, thread_index, sg,
+        lane);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_PACKED
+template <uint PACK_TOKENS, uint WEIGHTS_AHEAD>
+kernel void dense_expand_packed(DENSE_EXPAND_ARGUMENTS,
+    uint tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if constexpr (!DENSE_EXPAND_PACKING_AVAILABLE)
+        return;
+    threadgroup float4 exchange[projection::packing_simdgroups / 2 * projection::packing_exchange];
+    DENSE_EXPAND_OPERANDS;
+    DENSE_EXPAND_PACKING_SCRATCH;
+    const uint m = uint(SEISMIC_DIM_O);
+    projection::gemm_packed_paired<packets::W0, packets::W1, PACK_TOKENS, WEIGHTS_AHEAD>(out, gate,
+        up, gate_scratch, up_scratch, m, (m + 63u) / 64u * 64u, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile,
+        projection::packing_simdgroups, exchange, sg, lane);
+}
+#endif
+
+// PACK with weights that have no packed path: the staged paired tiles of the
+// default form, with its results.
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_UNPACKED
+kernel void dense_expand_unpacked(DENSE_EXPAND_ARGUMENTS,
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if constexpr (DENSE_EXPAND_PACKING_AVAILABLE)
+        return;
+    DENSE_EXPAND_GEMM(64, 64);
 }
 #endif

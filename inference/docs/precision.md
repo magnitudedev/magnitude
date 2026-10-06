@@ -61,6 +61,26 @@ The shared `Tolerance` type also supports a relative floor and a limit on repres
 floating-point steps (ULPs). Production uses a zero relative floor and no additional ULP cap.
 The constants are defined in the engine's [precision policy](../engine/executor/src/native/tuning/precision.rs).
 
+## Error classes
+
+A kernel form whose error against its entry's default exceeds these limits by design declares an
+**error class** (`error_class NAME when ...` in its native declaration). The tuner forms a
+configuration of a class only when the load admits the class by name, none by default
+(`--admit-error-class` on the engine CLI), and then validates it against the default under the
+class's envelope instead of the per-element limits: a bound on the relative RMS difference of
+each result and on its largest element difference in units of the reference RMS. Whether a model
+tolerates a class is decided by the model's qualification, not at load. The envelopes are in the
+engine's [precision policy](../engine/executor/src/native/tuning/precision.rs):
+
+| Class | Forms | Relative RMS | Largest element |
+| --- | --- | ---: | ---: |
+| `int8_activations` | INT8 of `dense_expand` and `dense_output` on Metal tensor operations: activations as int8 per (row, 32 columns) against exact weight codes | `0.02` | `0.25` |
+| `int8_token_packing` | PACK of `dense_expand`, `dense_output`, `gated_delta_project`, `attention_project` and `attention_output` on Metal without tensor operations, over Q4_K, Q5_K or Q6_K weights: activations as integer codes per (row, 32 columns), two rows packed into one F32 matrix operand against exact weight codes | `0.02` | `0.5` |
+
+`int8_token_packing` is row-dependent: the top row's sums of a pair are exact, and the low row's
+carry the rounding of the accumulator the two share, so a row's result depends on the row it is
+packed with (and through it on how a request is split into forwards).
+
 ## What the reference is
 
 Production executes the native kernel with its **declared default tuning parameters** to produce

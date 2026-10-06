@@ -231,7 +231,23 @@ per 32 columns in a pre-pass and multiply the weights' stored codes on the int8 
 folding each 32-column block under its activation and weight scales; the weights stay exact, and
 every other weight format or device runs the exact form in the same launches. Its transient
 scratch is the int8 operand with its scales and block sums (rows x K x 1.2 bytes) and the weights'
-decoded block scales and biases (weight rows x K / 32 x 6 bytes), per call. Without an admitted
+decoded block scales and biases (weight rows x K / 32 x 6 bytes), per call. The second class is
+`int8_token_packing`: Metal's gate/up and down projections, the recurrent projection's qkv and z
+segments, the attention projection's segments and the attention output projection past 64 rows,
+with Q4_K, Q5_K or Q6_K weights on devices without tensor operations, round each activation row to
+integer codes per 32 columns under a gain that bounds every sum for any row of the weight format,
+and pack two rows into one F32 matrix operand against the weights' stored codes minus the centre
+of their range, so one multiply-accumulate carries two products; the two 16-bit sums of each run
+of columns under one weight scale (a 32-column block; 16 columns for Q6_K, whose rows are coded
+per run) are split from the accumulator and folded in F16 under the row and weight scales, each
+held over one power of two per row (applied to the F32 result) so that no input can overflow the
+fold. The segments of one entry share one operand, coded under the tightest of their formats'
+bounds; a segment whose format needs another column order runs the staged exact form. The weights
+stay exact and the pair's top sum is exact; its low sum carries the accumulator's rounding, so a
+row's result depends on the row it is packed with: the class is row-dependent. Its transient
+scratch is the packed operand with the rows' scales and code sums (rows x K x 2.1 bytes) and the
+weights' block scales and biases (weight rows x K / 32 x 4 bytes), per call; other weight formats,
+and devices with tensor operations, run the staged exact form in a launch of their own. Without an admitted
 class a row's result never depends on peer rows' values; a form that makes it depend on them is its own error class. A result may depend on its
 launch's shape class and prepared configuration, and different shape classes agree within the
 gate's tolerance, not bit for bit. Speculative verification is therefore statistically, not exactly, equivalent to

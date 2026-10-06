@@ -60,8 +60,8 @@ Applying the three steps to both Metal primitives gives the same layout, **tile-
 
 Only the code planes are in tile-row order. They interleave because the multiply reads them a
 tile at a time. Coefficient planes (scales, minimums, super factors) do not: every consumer reads
-them a row at a time (decode per packet or per run of packets; the int8 form once per row and
-256-column block in a pre-pass that writes its own table), so inside the tile each row's
+them a row at a time (decode per packet or per run of packets; the int8 and packing forms once per
+row and 256-column block in a pre-pass that writes its own table), so inside the tile each row's
 coefficients are contiguous, the rows one after another, as in row order.
 
 | Backend primitive | Weights side | A lane's load |
@@ -74,8 +74,10 @@ The table is the derivation, not the engine's prefill kernels. Metal weights are
 tile-row order (`rows32`), and every kernel reads them through the packet library, which addresses
 a row by its tile and its index in the tile. The exact prefill forms still stage decoded weights,
 and the int8 form on tensor operations still has the weights as the right operand and gathers each
-row's codes with small loads, now from the tile. Prefill forms that take the weights as the left
-operand and read a tile's codes in place are not in the engine yet.
+row's codes with small loads, now from the tile. The packing form on simdgroup matrices
+(`metal/lib/projection/packing.h`) takes the weights as the left operand and reads a tile's codes
+in place, one 4-byte word per weight row and run; exact prefill forms that do so are not in the
+engine yet.
 
 ## Decode and prefill
 
@@ -136,7 +138,7 @@ when both hold on every device of that backend.
 | --- | --- |
 | Operand side is free | M6 800 against 803 µs; M4 Pro 1859 against 1864 µs; M1 equal |
 | Prefill on tile-row order matches a multi-row lane order on the M6 | 812 against 803 µs; gathered from row order 926 µs |
-| Packing on tile-row order against the eight-row patch (harness probe; the engine has no packing form) | M1 7542 against 7564 µs; M4 Pro 1894 against 1858 µs (1.9% short, open) |
+| Packing on tile-row order against the eight-row patch (harness probe) | M1 7542 against 7564 µs; M4 Pro 1894 against 1858 µs (1.9% short, open) |
 | Decode on tile-row order (harness, one row per lane) | M6 +1.4%, M4 Pro −5%, M1 +1.2% against row order |
 | Engine single-row GEMV on tile-row order | M4 Pro q4k 56.1 against 56.6 µs, q6k 81.0 against 84.2, q8 59.5 against 59.1; M6 q4k 107.7 against 101.1, q6k 156.2 against 150.0, q8 104.6 against 98.7; M1 (before the addressing change) q4k 241.2 against 237.0, q6k 339.7 against 346.0, q8 222.8 against 222.7 |
 | Engine GEMV at 4 activation rows | M4 Pro q4k 98.6 against 96.3 µs, q6k 113.3 against 108.0, q8 77.4 against 75.5; M6 q4k 154.0 against 156.0, q6k 184.6 against 180.4, q8 118.2 against 115.5 |

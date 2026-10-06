@@ -80,10 +80,19 @@ fn dense_expand[M, O, H, F, GS, US](residual: &tensor[M, H] f32, norm: &tensor[H
 
 native dense_expand for metal from "metal/dense_expand.metal":
     static (H, F, GS, US)
-    params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0], arithmetic form INT8 in [0, 1])
-    where GS <= 1 and US <= 1 and (TALL == 0 or H % 128 == 0) and (INT8 == 0 or (TALL == 1 and H % 512 == 0 and F % 32 == 0))
+    params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0], arithmetic form INT8 in [0, 1],
+        arithmetic form PACK in [0, 1])
+    where GS <= 1 and US <= 1 and (TALL == 0 or H % 128 == 0) and (INT8 == 0 or (TALL == 1 and H % 512 == 0 and F % 32 == 0)) and (PACK == 0 or (TALL == 1 and INT8 == 0 and H % 256 == 0 and H < 1048576 and F % 32 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))
     error_class int8_activations when INT8 == 1
+    error_class int8_token_packing when PACK == 1
     scratch normalized bytes ((O + TALL * (ceil_div(O, 64) * 64 - O)) * H * 2) when O > 16
+    scratch packed bytes (ceil_div(O, 64) * 64 * H * 2 + 1024) when O > 64 and PACK == 1
+    scratch token_factors bytes (ceil_div(O, 64) * 64 * (H / 32) * 4) when O > 64 and PACK == 1
+    scratch gate_factors bytes (F * (H / 32) * 4) when O > 64 and PACK == 1
+    scratch up_factors bytes (F * (H / 32) * 4) when O > 64 and PACK == 1
+    scratch token_scales bytes (ceil_div(O, 64) * 64 * 4) when O > 64 and PACK == 1
+    scratch gate_scales bytes (F * 4) when O > 64 and PACK == 1
+    scratch up_scales bytes (F * 4) when O > 64 and PACK == 1
     scratch quantized bytes (ceil_div(O, 64) * 64 * H) when O > 64 and INT8 == 1
     scratch row_scales bytes (ceil_div(O, 64) * 64 * (H / 32) * 2) when O > 64 and INT8 == 1
     scratch block_sums bytes (ceil_div(O, 64) * 64 * ceil_div(H, 1024) * 32 * 2) when O > 64 and INT8 == 1
@@ -91,7 +100,7 @@ native dense_expand for metal from "metal/dense_expand.metal":
     scratch gate_biases bytes (ceil_div(F, 32) * 32 * ceil_div(H, 1024) * 32 * 2) when O > 64 and INT8 == 1
     scratch up_coefficients bytes (F * (H / 32) * 4) when O > 64 and INT8 == 1
     scratch up_biases bytes (ceil_div(F, 32) * 32 * ceil_div(H, 1024) * 32 * 2) when O > 64 and INT8 == 1
-    launch dense_expand_normalize when O > 16 and (O <= 64 or TALL == 0 or INT8 == 1):
+    launch dense_expand_normalize when O > 16 and (O <= 64 or TALL == 0 or INT8 == 1 or PACK == 1):
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_expand_gemv when O < 2:
@@ -112,10 +121,10 @@ native dense_expand for metal from "metal/dense_expand.metal":
         params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
         threadgroups (ceil_div(F, TILE_N / 2), ceil_div(O, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch dense_expand_normalize_tall when O > 64 and TALL == 1 and INT8 == 0:
+    launch dense_expand_normalize_tall when O > 64 and TALL == 1 and INT8 == 0 and PACK == 0:
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch dense_expand_tall when O > 64 and TALL == 1 and INT8 == 0:
+    launch dense_expand_tall when O > 64 and TALL == 1 and INT8 == 0 and PACK == 0:
         params (code TALL_M in [128, 256, 512], code TALL_K in [64, 128], code STAGERS in [2, 1])
         threadgroups (ceil_div(F, 16), ceil_div(O, TALL_M), 1)
         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
@@ -140,6 +149,19 @@ native dense_expand for metal from "metal/dense_expand.metal":
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(min(ceil_div(H, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64, TILED * SIMDGROUPS * 256))
+    launch dense_expand_pack when O > 64 and PACK == 1:
+        threadgroups (ceil_div(O, 64) * 16, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_expand_pack_coefficients when O > 64 and PACK == 1:
+        threadgroups (F / 32, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_expand_packed when O > 64 and PACK == 1:
+        params (code PACK_TOKENS in [4, 2], code WEIGHTS_AHEAD in [0, 1])
+        threadgroups (ceil_div(O, 64) * F / 32, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch dense_expand_unpacked when O > 64 and PACK == 1:
+        threadgroups (ceil_div(F, 32), ceil_div(O, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
 
 # Vulkan: the K1 projection library (`vulkan/common/projection.glsl`). Output
 # rows O <= 8 run the GEMV launch (SIMDGROUPS x ROWS lane groups of LANES
@@ -181,15 +203,46 @@ fn dense_output[M, O, H, F, DS](residual: &tensor[M, H] f32,
             result[row, col] = residual[out_rows[row], col] + f32(projected[row, col])
     return result
 
+# PACK selects the token-packing GEMM past 64 rows (`gemm_packed`, Q4_K,
+# Q5_K or Q6_K weights on a device without tensor operations, and in
+# `dense_expand` a gate and an up weight one operand serves: Q4_K and Q5_K
+# together, or both Q6_K; other weights and devices run the staged tile, with
+# its results, in the `unpacked` launch, and each launch of the other path
+# returns at once): the activations become integer codes per (row, 32 columns)
+# and two rows share one F32 matrix operand against the weights' stored codes,
+# so a row's result depends on the row it is packed with
+# (`int8_token_packing`). A simdgroup multiplies PACK_TOKENS operand fragments
+# (16 rows each) by 8 / PACK_TOKENS weight fragments (8 weight rows each),
+# four of them a threadgroup (independent tiles; a gate and an up simdgroup
+# pair in `dense_expand`); WEIGHTS_AHEAD loads a block's weight words one
+# block ahead (the best of both differs by device and shape). The `where`
+# condition holds the form's launch parameters at their defaults outside the
+# form, and the staged and tall tiles' inside it, where they are not
+# launched, so the form's configurations do not multiply another's. Its
+# scratch is transient, per call: the packed operand (`packed`, 2 bytes per
+# padded row and column, plus one step read ahead), the rows' scales and code
+# sums (`token_factors`, 4 bytes per padded row and 32 columns) and the
+# weights' block scales and biases (`weight_factors`, 4 bytes per weight row
+# and 32 columns), both held over one power of two per row (`token_scales`,
+# `weight_scales`, 4 bytes a row; a weight tile's 32 rows share theirs) so
+# that the F16 fold cannot overflow. `dense_expand` packs its normalized rows
+# alike, with one such pair of tables per weight (`gate_factors`,
+# `up_factors`, `gate_scales`, `up_scales`).
 native dense_output for metal from "metal/dense_output.metal":
     static (H, F, DS)
     params (arithmetic BATCH_FROM in [5, 3, 9, 2], arithmetic SPLIT in [1, 2, 4], form TALL in [1, 0],
-        arithmetic form INT8 in [0, 1])
-    where DS <= 1 and (TALL == 0 or (SPLIT == 1 and F % 128 == 0)) and (INT8 == 0 or (TALL == 1 and F % 512 == 0 and H % 64 == 0)) and (INT8 == 1 or INT8_TILE == 128)
+        arithmetic form INT8 in [0, 1], arithmetic form PACK in [0, 1])
+    where DS <= 1 and (TALL == 0 or (SPLIT == 1 and F % 128 == 0)) and (INT8 == 0 or (TALL == 1 and F % 512 == 0 and H % 64 == 0)) and (INT8 == 1 or INT8_TILE == 128) and (PACK == 0 or (TALL == 1 and INT8 == 0 and F % 256 == 0 and F < 1048576 and H % 64 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))
     error_class int8_activations when INT8 == 1
+    error_class int8_token_packing when PACK == 1
     scratch partials bytes (SPLIT * O * H * 4) when O > 64 and SPLIT > 1
     scratch small_partials bytes (4 * O * H * 4) when O > 16 and O <= 64
-    scratch fragments bytes (ceil_div(O, 64) * 64 * F * 2) when O > 64 and TALL == 1 and INT8 == 0
+    scratch fragments bytes (ceil_div(O, 64) * 64 * F * 2) when O > 64 and TALL == 1 and INT8 == 0 and PACK == 0
+    scratch packed bytes (ceil_div(O, 128) * 128 * F * 2 + 1024) when O > 64 and PACK == 1
+    scratch token_factors bytes (ceil_div(O, 128) * 128 * (F / 32) * 4) when O > 64 and PACK == 1
+    scratch weight_factors bytes (H * (F / 32) * 4) when O > 64 and PACK == 1
+    scratch token_scales bytes (ceil_div(O, 128) * 128 * 4) when O > 64 and PACK == 1
+    scratch weight_scales bytes (H * 4) when O > 64 and PACK == 1
     scratch quantized bytes (ceil_div(O, 128) * 128 * F) when O > 64 and INT8 == 1
     scratch row_scales bytes (ceil_div(O, 128) * 128 * (F / 32) * 2) when O > 64 and INT8 == 1
     scratch block_sums bytes (ceil_div(O, 128) * 128 * ceil_div(F, 1024) * 32 * 2) when O > 64 and INT8 == 1
@@ -220,10 +273,10 @@ native dense_output for metal from "metal/dense_output.metal":
     launch dense_output_reduce when O > 64 and SPLIT > 1:
         threadgroups (ceil_div(O * H, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch dense_output_relayout when O > 64 and TALL == 1 and INT8 == 0:
+    launch dense_output_relayout when O > 64 and TALL == 1 and INT8 == 0 and PACK == 0:
         threadgroups (ceil_div(ceil_div(O, 64) * F, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch dense_output_tall when O > 64 and TALL == 1 and INT8 == 0:
+    launch dense_output_tall when O > 64 and TALL == 1 and INT8 == 0 and PACK == 0:
         params (code TALL_M in [128, 256, 512], code TALL_K in [64, 128], code STAGERS in [2, 1])
         threadgroups (ceil_div(H, 32), ceil_div(O, TALL_M), 1)
         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
@@ -249,6 +302,19 @@ native dense_output for metal from "metal/dense_output.metal":
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(min(ceil_div(F, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64, TILED * SIMDGROUPS * 128))
+    launch dense_output_pack when O > 64 and PACK == 1:
+        threadgroups (ceil_div(O, 128) * 32, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_output_pack_coefficients when O > 64 and PACK == 1:
+        threadgroups (H / 32, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_output_packed when O > 64 and PACK == 1:
+        params (code PACK_TOKENS in [4, 2], code WEIGHTS_AHEAD in [0, 1])
+        threadgroups (ceil_div(O, 128) * H / 32, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch dense_output_unpacked when O > 64 and PACK == 1:
+        threadgroups (ceil_div(H, 64), ceil_div(O, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
 
 # Vulkan: the K1 projection (see `dense_expand`): GEMV to 8 rows, GEMM
 # beyond with SPLIT-way split-K summed in order by `finalize`.

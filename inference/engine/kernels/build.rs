@@ -92,6 +92,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "bounded-error `exp`: Vulkan permits 3 + 2|x| ulp where Metal and CUDA do not",
     ),
     (
+        "lib/projection/packing",
+        &[BackendName::Metal],
+        "the token-packing GEMM of the projection entries' PACK form, on simdgroup matrices",
+    ),
+    (
         "lib/core/rotary",
         &[BackendName::Vulkan],
         "rotary sin/cos shared by attention and vision; inside `attention.h` / `attention.cuh` elsewhere",

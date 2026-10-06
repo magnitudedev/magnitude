@@ -956,8 +956,11 @@ fn dense_gemv_mapping(device: &Device, mapping: Mapping) -> Mapping {
     }
 }
 
-/// `dense_output`'s INT8 tile launch on Metal.
+/// `dense_output`'s INT8 tile launch on Metal, and the dense entries' PACK
+/// tile launches.
 const DENSE_OUTPUT_INT8_LAUNCH: usize = 10;
+const DENSE_OUTPUT_PACKED_LAUNCH: usize = 15;
+const DENSE_EXPAND_PACKED_LAUNCH: usize = 14;
 
 fn dense_output_specialization_on(
     device: &Device,
@@ -981,7 +984,8 @@ fn dense_output_specialization_on(
     let specialization =
         with_gemv_rows(device, specialization, DENSE_OUTPUT_GEMV_ROWS_LAUNCH, mapping);
     if device.backend() == BackendName::Metal {
-        specialization
+        with_pack(specialization, DENSE_OUTPUT_PACKED_LAUNCH, PACK_DEFAULT)
+            .with_param("PACK", 0)
             .with_param("INT8", 0)
             .with_launch_param(0, "TILED", mapping.tiled)
             .with_launch_param(DENSE_OUTPUT_GEMV_ROWS_LAUNCH, "TILED", mapping.tiled.min(1))
@@ -1010,15 +1014,29 @@ fn attention_output_specialization_on(
         true,
     );
     let specialization = with_tall(device, specialization, 7, mapping.tall);
-    with_gemv_rows(device, specialization, ATTENTION_OUTPUT_GEMV_ROWS_LAUNCH, mapping)
+    let specialization =
+        with_gemv_rows(device, specialization, ATTENTION_OUTPUT_GEMV_ROWS_LAUNCH, mapping);
+    if device.backend() == BackendName::Metal {
+        with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, PACK_DEFAULT).with_param("PACK", 0)
+    } else {
+        specialization
+    }
 }
 
+/// The PACK tile launches on Metal: `attention_output`'s, `attention_project`'s
+/// and `gated_delta_project`'s.
+const ATTENTION_OUTPUT_PACKED_LAUNCH: usize = 12;
+const ATTENTION_PROJECT_PACKED_LAUNCH: usize = 11;
+const RECURRENT_PROJECT_PACKED_LAUNCH: usize = 9;
+
 /// The specialization of a segmented projection (`attention_project`,
-/// `gated_delta_project`) on `device`.
+/// `gated_delta_project`) on `device`; `packed` is its PACK tile launch on
+/// Metal.
 fn segmented_projection_specialization_on(
     device: &Device,
     statics: &[(&str, usize)],
     mapping: Mapping,
+    packed: usize,
 ) -> NativeSpecialization {
     let specialization = scoped_projection_specialization_on(
         device,
@@ -1031,7 +1049,12 @@ fn segmented_projection_specialization_on(
         },
         false,
     );
-    with_tall(device, specialization, 6, mapping.tall)
+    let specialization = with_tall(device, specialization, 6, mapping.tall);
+    if device.backend() == BackendName::Metal {
+        with_pack(specialization, packed, PACK_DEFAULT).with_param("PACK", 0)
+    } else {
+        specialization
+    }
 }
 
 /// The specialization of `attention_project` on `device`: the segmented
@@ -1043,7 +1066,7 @@ fn attention_project_specialization_on(
 ) -> NativeSpecialization {
     with_gemv_rows(
         device,
-        segmented_projection_specialization_on(device, statics, mapping),
+        segmented_projection_specialization_on(device, statics, mapping, ATTENTION_PROJECT_PACKED_LAUNCH),
         ATTENTION_PROJECT_GEMV_ROWS_LAUNCH,
         mapping,
     )
@@ -1072,7 +1095,8 @@ fn dense_expand_specialization_on(
     let specialization =
         with_gemv_rows(device, specialization, DENSE_EXPAND_GEMV_ROWS_LAUNCH, mapping);
     if device.backend() == BackendName::Metal {
-        specialization
+        with_pack(specialization, DENSE_EXPAND_PACKED_LAUNCH, PACK_DEFAULT)
+            .with_param("PACK", 0)
             .with_param("INT8", 0)
             .with_launch_param(1, "TILED", mapping.tiled)
             .with_launch_param(DENSE_EXPAND_GEMV_ROWS_LAUNCH, "TILED", mapping.tiled.min(1))
@@ -1080,6 +1104,51 @@ fn dense_expand_specialization_on(
     } else {
         specialization
     }
+}
+
+/// A PACK tile launch of the Metal projection entries: operand fragments per
+/// simdgroup (4 x 2 or 2 x 4 fragments), and whether the weight words are
+/// loaded one block ahead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pack {
+    tokens: u64,
+    weights_ahead: u64,
+}
+
+const PACK_DEFAULT: Pack = Pack {
+    tokens: 4,
+    weights_ahead: 0,
+};
+
+/// The exact forms' launches at their defaults, where a PACK configuration
+/// holds them.
+fn pack_mapping() -> Mapping {
+    Mapping {
+        tall: Some(TALL_DEFAULT),
+        ..gemm_mapping(64, 64, 1)
+    }
+}
+
+/// Every PACK tile launch.
+fn pack_tiles() -> Vec<Pack> {
+    let mut all = Vec::new();
+    for tokens in [4, 2] {
+        for weights_ahead in [0, 1] {
+            all.push(Pack {
+                tokens,
+                weights_ahead,
+            });
+        }
+    }
+    all
+}
+
+/// `specialization` under the PACK form with the tile launch `pack`.
+fn with_pack(specialization: NativeSpecialization, launch: usize, pack: Pack) -> NativeSpecialization {
+    specialization
+        .with_param("PACK", 1)
+        .with_launch_param(launch, "PACK_TOKENS", pack.tokens)
+        .with_launch_param(launch, "WEIGHTS_AHEAD", pack.weights_ahead)
 }
 
 fn readout_projection_specialization_on(
@@ -1866,6 +1935,7 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                     &device,
                     &[("H", d), ("NK", nk), ("NV", nv), ("W", head_width)],
                     mapping,
+                    RECURRENT_PROJECT_PACKED_LAUNCH,
                 ),
             )
             .unwrap()
@@ -2092,6 +2162,741 @@ fn metal_int8_dense_output_agrees_with_the_tall_form() {
                 "int8 dense_output {repr:?} rows {rows}: relative RMS error {relative:.2e}, largest {worst:.2e}"
             );
         }
+    }
+}
+
+/// The relative RMS difference of `actual` from `reference` and the largest
+/// element difference in units of the reference RMS.
+fn relative_difference(reference: &[f64], actual: &[f64]) -> (f64, f64) {
+    let scale = reference.iter().map(|value| value * value).sum::<f64>();
+    let error = reference
+        .iter()
+        .zip(actual)
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum::<f64>();
+    let worst = reference
+        .iter()
+        .zip(actual)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
+    (
+        (error / scale).sqrt(),
+        worst / (scale / reference.len() as f64).sqrt(),
+    )
+}
+
+/// `dense_output` under Metal's PACK form with the tile launch `pack`.
+#[allow(clippy::too_many_arguments)]
+fn dense_output_packed(
+    device: &Device,
+    act: Act,
+    down: &Weight,
+    residual: &[f32],
+    rows: usize,
+    product: &[f32],
+    out_rows: &[i32],
+    pack: Pack,
+) -> Vec<f32> {
+    let (h, f) = (down.rows, down.k);
+    let specialization = with_pack(
+        dense_output_specialization_on(device, &[("H", h), ("F", f)], pack_mapping()),
+        DENSE_OUTPUT_PACKED_LAUNCH,
+        pack,
+    );
+    let kernel = dense_output::native_for_device_with(
+        device,
+        dense_output::Elements {
+            A: act.element(),
+            DW: down.repr.resident(device),
+        },
+        &specialization,
+    )
+    .unwrap();
+    let out = kernel
+        .call(dense_output::Args {
+            residual: &f32_tensor(device, &[rows, h], residual),
+            product: &act_tensor(device, act, &[out_rows.len(), f], product),
+            down_weight: &down.tensor(device),
+            out_rows: &i32_tensor(device, &[out_rows.len()], out_rows),
+            down_scale: &f32_tensor(device, &[0], &[]),
+        })
+        .unwrap()
+        .value;
+    read_f32(&out)
+}
+
+/// Metal's PACK form of the down projection: integer activation codes per
+/// (row, 32 columns), two rows packed per operand element against the exact
+/// Q4_K, Q5_K or Q6_K codes. Its results differ from the staged form's by the
+/// activation rounding, the packed accumulator's rounding and the F16 fold;
+/// other weights run the staged 64 x 64 tile, bit for bit.
+#[test]
+fn metal_packed_dense_output_agrees_with_the_staged_form() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let staged = gemm_mapping(64, 64, 1);
+    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8] {
+        let (outputs, k) = (192, 1024);
+        let down = weight(repr, outputs, k, 91, 1.0);
+        for rows in [128usize, 200, 512] {
+            let mut rng = Rng::new(rows as u64 + 92);
+            let residual = (0..rows * outputs)
+                .map(|_| rng.symmetric())
+                .collect::<Vec<_>>();
+            let product = (0..rows * k).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let out_rows = (0..rows as i32).collect::<Vec<_>>();
+            let exact = dense_output_native_arithmetic(
+                &device, act, &down, &residual, rows, &product, &out_rows, staged, false,
+            );
+            let mut first: Option<Vec<f32>> = None;
+            for pack in pack_tiles() {
+                let packed = dense_output_packed(
+                    &device, act, &down, &residual, rows, &product, &out_rows, pack,
+                );
+                if repr == Repr::Q8 {
+                    assert_eq!(exact, packed, "{repr:?} rows {rows}");
+                    continue;
+                }
+                // A sum is its token pair's and weight row's alone: every
+                // tile launch gives the same bits.
+                let first = first.get_or_insert_with(|| packed.clone());
+                assert!(
+                    first.iter().zip(&packed).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "packed dense_output {repr:?} rows {rows} {pack:?} differs from {PACK_DEFAULT:?}"
+                );
+                // The projection alone (the residual rows are exact in both).
+                let projected = |values: &[f32]| {
+                    values
+                        .iter()
+                        .zip(&residual)
+                        .map(|(value, residual)| f64::from(value - residual))
+                        .collect::<Vec<_>>()
+                };
+                let (relative, worst) = relative_difference(&projected(&exact), &projected(&packed));
+                if pack == PACK_DEFAULT {
+                    eprintln!(
+                        "packed dense_output {repr:?} rows {rows}: relative RMS error {relative:.2e}, largest {worst:.2e} reference RMS"
+                    );
+                }
+                assert!(
+                    relative <= 1.5e-2 && worst <= 0.1,
+                    "packed dense_output {repr:?} rows {rows} {pack:?}: relative RMS error {relative:.2e}, largest {worst:.2e}"
+                );
+            }
+        }
+    }
+}
+
+/// Metal's PACK form of the paired gate/up projection, as for the down
+/// projection: the GLU outputs differ from the staged form's by the packed
+/// form's error with gate and up weights one packed operand serves (Q4_K and
+/// Q5_K together, or both Q6_K), and are the staged tile's bit for bit
+/// otherwise.
+#[test]
+fn metal_packed_dense_expand_agrees_with_the_staged_form() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let staged = gemm_mapping(64, 64, 1);
+    for (gate_repr, up_repr, served) in [
+        (Repr::Q4k, Repr::Q4k, true),
+        (Repr::Q5k, Repr::Q4k, true),
+        (Repr::Q6k, Repr::Q6k, true),
+        (Repr::Q4k, Repr::Q6k, false),
+        (Repr::Q8, Repr::Q8, false),
+    ] {
+        let (h, f) = (512, 192);
+        let gate = weight(gate_repr, f, h, 93, 1.0);
+        let up = weight(up_repr, f, h, 94, 1.0);
+        let norm = norm_values(h, 95);
+        for rows in [128usize, 200, 512] {
+            let mut rng = Rng::new(rows as u64 + 96);
+            let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let out_rows = (0..rows as i32).collect::<Vec<_>>();
+            let exact = dense_expand_native_arithmetic(
+                &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, staged, false,
+            );
+            let mut first: Option<Vec<f32>> = None;
+            for pack in pack_tiles() {
+                let specialization = with_pack(
+                    dense_expand_specialization_on(&device, &[("H", h), ("F", f)], pack_mapping()),
+                    DENSE_EXPAND_PACKED_LAUNCH,
+                    pack,
+                );
+                let kernel = dense_expand::native_for_device_with(
+                    &device,
+                    dense_expand::Elements {
+                        NW: Element::bf16(),
+                        GW: gate.repr.resident(&device),
+                        UW: up.repr.resident(&device),
+                        A: act.element(),
+                    },
+                    &specialization,
+                )
+                .unwrap();
+                let packed = read_act(
+                    act,
+                    &kernel
+                        .call(dense_expand::Args {
+                            residual: &f32_tensor(&device, &[rows, h], &residual),
+                            norm: &bf16_norm(&device, &norm),
+                            gate_weight: &gate.tensor(&device),
+                            up_weight: &up.tensor(&device),
+                            out_rows: &i32_tensor(&device, &[rows], &out_rows),
+                            eps: 1e-6,
+                            activation: 0,
+                            gate_scale: &f32_tensor(&device, &[0], &[]),
+                            up_scale: &f32_tensor(&device, &[0], &[]),
+                        })
+                        .unwrap()
+                        .value,
+                );
+                if !served {
+                    assert_eq!(exact, packed, "{gate_repr:?} {up_repr:?} rows {rows}");
+                    continue;
+                }
+                // Every tile launch gives the same bits.
+                let first = first.get_or_insert_with(|| packed.clone());
+                assert!(
+                    first.iter().zip(&packed).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "packed dense_expand {gate_repr:?} {up_repr:?} rows {rows} {pack:?} differs from {PACK_DEFAULT:?}"
+                );
+                let wide = |values: &[f32]| values.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+                let (relative, _) = relative_difference(&wide(&exact), &wide(&packed));
+                if pack == PACK_DEFAULT {
+                    eprintln!(
+                        "packed dense_expand {gate_repr:?} {up_repr:?} rows {rows}: relative RMS error {relative:.2e}"
+                    );
+                }
+                assert!(
+                    relative <= 3e-2,
+                    "packed dense_expand {gate_repr:?} {up_repr:?} rows {rows} {pack:?}: relative RMS error {relative:.2e}"
+                );
+            }
+        }
+    }
+}
+
+fn recurrent_project_elements(device: &Device, reprs: [Repr; 4], act: Act) -> gated_delta_project::Elements {
+    gated_delta_project::Elements {
+        NW: Element::bf16(),
+        QW: reprs[0].resident(device),
+        GW: reprs[1].resident(device),
+        AW: reprs[2].resident(device),
+        BW: reprs[3].resident(device),
+        A: act.element(),
+    }
+}
+
+/// Metal's PACK form of the recurrent projection (qkv | z | alpha | beta), the
+/// attention projection (query | key | value, with and without the zeroed
+/// query) and the output projection past 64 rows. A segment whose weights the
+/// packed operand serves on the device differs from the staged tiles by the
+/// form's error; every other segment, and every segment on a device without
+/// the form, is the staged tiles' bit for bit.
+#[test]
+fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let staged = gemm_mapping(64, 64, 1);
+    let d = 512;
+    let norm = norm_values(d, 84);
+    let (kv, g, w) = (1, 1, 64);
+    let project_rows = [kv * g * 2 * w, kv * w, kv * w];
+    let project_reprs = [Repr::Q4k, Repr::Q5k, Repr::Q6k];
+    let project_weights = (0..3)
+        .map(|i| weight(project_reprs[i], project_rows[i], d, 181 + i as u64, 1.0))
+        .collect::<Vec<_>>();
+    let (outputs, heads, width) = (128, 8, 64);
+    let out_weights = [Repr::Q5k, Repr::Q4k, Repr::Q6k].map(|repr| weight(repr, outputs, heads * width, 185, 1.0));
+    let (nk, nv, head_width) = (1, 2, 32);
+    let recurrent_reprs = [Repr::Q5k, Repr::Q4k, Repr::Q8, Repr::Bf16];
+    let recurrent_rows = [(2 * nk + nv) * head_width, nv * head_width, nv, nv];
+    let recurrent_weights = (0..4)
+        .map(|i| weight(recurrent_reprs[i], recurrent_rows[i], d, 190 + i as u64, 1.0))
+        .collect::<Vec<_>>();
+    let recurrent_columns = recurrent_rows.iter().sum::<usize>();
+    let tiles = [
+        PACK_DEFAULT,
+        Pack {
+            tokens: 2,
+            weights_ahead: 1,
+        },
+    ];
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits());
+    let check = |label: String, pack: Pack, reference: &[f32], actual: &[f32]| {
+        let wide = |values: &[f32]| values.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+        let (relative, worst) = relative_difference(&wide(reference), &wide(actual));
+        if pack == PACK_DEFAULT {
+            eprintln!("packed {label}: relative RMS error {relative:.2e}, largest {worst:.2e} reference RMS");
+        }
+        assert!(
+            relative <= 2e-2 && worst <= 0.2,
+            "packed {label} {pack:?}: relative RMS error {relative:.2e}, largest {worst:.2e}"
+        );
+    };
+    for rows in [128usize, 200, 512] {
+        let mut rng = Rng::new(rows as u64 + 186);
+        let hidden = (0..rows * d).map(|_| rng.symmetric()).collect::<Vec<_>>();
+        let narrow = (0..rows * outputs)
+            .map(|_| rng.symmetric())
+            .collect::<Vec<_>>();
+        let gated = (0..rows * heads * width)
+            .map(|_| act.round(rng.symmetric()))
+            .collect::<Vec<_>>();
+        let project = |pack: Option<Pack>, project_mode| {
+            let specialization = attention_project_specialization_on(
+                &device,
+                &attention_project_statics(d, kv, g, w),
+                if pack.is_some() { pack_mapping() } else { staged },
+            );
+            let out = attention_project::native_for_device_with(
+                &device,
+                attention_project::Elements {
+                    NW: Element::bf16(),
+                    QW: project_reprs[0].resident(&device),
+                    GW: Element::bf16(),
+                    KW: project_reprs[1].resident(&device),
+                    VW: project_reprs[2].resident(&device),
+                    A: act.element(),
+                },
+                &match pack {
+                    Some(pack) => with_pack(specialization, ATTENTION_PROJECT_PACKED_LAUNCH, pack),
+                    None => specialization,
+                },
+            )
+            .unwrap()
+            .call(attention_project::Args {
+                hidden: &f32_tensor(&device, &[rows, d], &hidden),
+                input_norm: &bf16_norm(&device, &norm),
+                query_weight: &project_weights[0].tensor(&device),
+                gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
+                key_weight: &project_weights[1].tensor(&device),
+                value_weight: &project_weights[2].tensor(&device),
+                epsilon: 1e-6,
+                project_mode,
+            })
+            .unwrap();
+            [
+                read_act(act, &out.r0),
+                read_act(act, &out.r2),
+                read_act(act, &out.r3),
+            ]
+        };
+        let output = |pack: Option<Pack>, weight: &Weight| {
+            let specialization = attention_output_specialization_on(
+                &device,
+                &[("D", outputs), ("Q", heads), ("W", width)],
+                if pack.is_some() { pack_mapping() } else { staged },
+            );
+            let out = attention_output::native_for_device_with(
+                &device,
+                attention_output::Elements {
+                    OW: weight.repr.resident(&device),
+                    A: act.element(),
+                },
+                &match pack {
+                    Some(pack) => with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, pack),
+                    None => specialization,
+                },
+            )
+            .unwrap()
+            .call(attention_output::Args {
+                hidden: &f32_tensor(&device, &[rows, outputs], &narrow),
+                gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
+                output_weight: &weight.tensor(&device),
+            })
+            .unwrap()
+            .value;
+            // The projection alone (the residual rows are exact in every form).
+            read_f32(&out)
+                .iter()
+                .zip(&narrow)
+                .map(|(value, residual)| value - residual)
+                .collect::<Vec<_>>()
+        };
+        let recurrent = |pack: Option<Pack>| {
+            let specialization = segmented_projection_specialization_on(
+                &device,
+                &[("H", d), ("NK", nk), ("NV", nv), ("W", head_width)],
+                if pack.is_some() { pack_mapping() } else { staged },
+                RECURRENT_PROJECT_PACKED_LAUNCH,
+            );
+            let out = gated_delta_project::native_for_device_with(
+                &device,
+                recurrent_project_elements(&device, recurrent_reprs, act),
+                &match pack {
+                    Some(pack) => with_pack(specialization, RECURRENT_PROJECT_PACKED_LAUNCH, pack),
+                    None => specialization,
+                },
+            )
+            .unwrap()
+            .call(gated_delta_project::Args {
+                hidden: &f32_tensor(&device, &[rows, d], &hidden),
+                input_norm: &bf16_norm(&device, &norm),
+                qkv_weight: &recurrent_weights[0].tensor(&device),
+                gate_weight: &recurrent_weights[1].tensor(&device),
+                alpha_weight: &recurrent_weights[2].tensor(&device),
+                beta_weight: &recurrent_weights[3].tensor(&device),
+                epsilon: 1e-6,
+            })
+            .unwrap()
+            .value;
+            // The row-major projection as its segments' columns.
+            let values = read_act(act, &out);
+            let mut first = 0;
+            recurrent_rows.map(|columns| {
+                let segment = values
+                    .chunks(recurrent_columns)
+                    .flat_map(|row| row[first..first + columns].iter().copied())
+                    .collect::<Vec<_>>();
+                first += columns;
+                segment
+            })
+        };
+        let project_staged = [project(None, 0), project(None, 1)];
+        let output_staged = out_weights.each_ref().map(|weight| output(None, weight));
+        let recurrent_staged = recurrent(None);
+        for pack in tiles {
+            let actual = recurrent(Some(pack));
+            for (segment, name) in ["qkv", "z"].into_iter().enumerate() {
+                check(
+                    format!("gated_delta_project {name} rows {rows}"),
+                    pack,
+                    &recurrent_staged[segment],
+                    &actual[segment],
+                );
+            }
+            for segment in 2..4 {
+                assert!(
+                    same(&actual[segment], &recurrent_staged[segment]),
+                    "gated_delta_project segment {segment} rows {rows} {pack:?}"
+                );
+            }
+            for (mode, expected) in project_staged.iter().enumerate() {
+                let actual = project(Some(pack), mode as i32);
+                for (segment, name) in ["query", "key"].into_iter().enumerate() {
+                    if segment == 0 && mode == 1 {
+                        assert!(
+                            same(&actual[0], &expected[0]),
+                            "attention_project zeroed query rows {rows} {pack:?}"
+                        );
+                        continue;
+                    }
+                    check(
+                        format!("attention_project {name} mode {mode} rows {rows}"),
+                        pack,
+                        &expected[segment],
+                        &actual[segment],
+                    );
+                }
+                // The operand is laid out for the query's Q4_K runs, which
+                // do not serve the Q6_K value weights.
+                assert!(
+                    same(&actual[2], &expected[2]),
+                    "attention_project value mode {mode} rows {rows} {pack:?}"
+                );
+            }
+            for (weight, expected) in out_weights.iter().zip(&output_staged) {
+                check(
+                    format!("attention_output {:?} rows {rows}", weight.repr),
+                    pack,
+                    expected,
+                    &output(Some(pack), weight),
+                );
+            }
+        }
+    }
+}
+
+/// Device time of the PACK form in every tile launch against every tall tile
+/// at 512 rows, at the Qwen3.5 4B shapes, on Metal: `cargo test --release -p
+/// magnitude-kernels --test projection -- --ignored --nocapture --exact
+/// packed_timing`. `PROJECTION_TIMING_ENTRIES` (comma-separated case labels)
+/// narrows the run.
+#[test]
+#[ignore]
+fn packed_timing() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let (m, h, f) = (512usize, 2560usize, 9216usize);
+    let talls = tall_mappings(&device, m);
+    let absent_scale = f32_tensor(&device, &[0], &[]);
+    let out_rows = i32_tensor(&device, &[m], &(0..m as i32).collect::<Vec<_>>());
+    let hidden = f32_tensor(&device, &[m, h], &uniform_values(m * h, 3, 1.0));
+    let norm = bf16_norm(&device, &norm_values(h, 3));
+    // Every tall tile, then every PACK tile launch over the exact forms'
+    // defaults.
+    let run = |label: &str,
+               packed: usize,
+               specialization: &dyn Fn(Mapping) -> NativeSpecialization,
+               time: &dyn Fn(&NativeSpecialization) -> f64| {
+        let tall = talls
+            .iter()
+            .map(|mapping| (*mapping, time(&specialization(*mapping))))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
+        let best = pack_tiles()
+            .into_iter()
+            .map(|pack| {
+                let seconds = time(&with_pack(specialization(pack_mapping()), packed, pack));
+                eprintln!("packed timing {label} M {m} {pack:?}: {:.1} us", seconds * 1e6);
+                (pack, seconds)
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
+        eprintln!(
+            "packed timing {label} M {m}: tall {:.1} us ({:?}), packed {:.1} us ({:?}), {:.3}x",
+            tall.1 * 1e6,
+            tall.0.tall.unwrap(),
+            best.1 * 1e6,
+            best.0,
+            tall.1 / best.1
+        );
+    };
+
+    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k] {
+        let label = format!("dense_output 4b {} 2560x9216", repr.name());
+        if !timing_selected(label.split(' ').next().unwrap()) {
+            continue;
+        }
+        let weights = (0..copies(weight_bytes(repr, h, f)))
+            .map(|i| noise_weight(&device, repr, h, f, i as u64 + 1))
+            .collect::<Vec<_>>();
+        let residual = f32_tensor(&device, &[m, h], &uniform_values(m * h, 1, 1.0));
+        let product = act_tensor(&device, act, &[m, f], &uniform_values(m * f, 2, 1.0));
+        let time = |specialization: &NativeSpecialization| {
+            let kernel = dense_output::native_for_device_with(
+                &device,
+                dense_output::Elements {
+                    A: act.element(),
+                    DW: repr.resident(&device),
+                },
+                specialization,
+            )
+            .unwrap();
+            let rotation = weights
+                .iter()
+                .map(|weight| dense_output::Args {
+                    residual: &residual,
+                    product: &product,
+                    down_weight: weight,
+                    out_rows: &out_rows,
+                    down_scale: &absent_scale,
+                })
+                .collect();
+            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+        };
+        run(
+            &label,
+            DENSE_OUTPUT_PACKED_LAUNCH,
+            &|mapping| dense_output_specialization_on(&device, &[("H", h), ("F", f)], mapping),
+            &time,
+        );
+    }
+
+    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k] {
+        let label = format!("dense_expand 4b {} 2x9216x2560", repr.name());
+        if !timing_selected(label.split(' ').next().unwrap()) {
+            continue;
+        }
+        let weights = (0..copies(2 * weight_bytes(repr, f, h)))
+            .map(|i| {
+                (
+                    noise_weight(&device, repr, f, h, 2 * i as u64 + 1),
+                    noise_weight(&device, repr, f, h, 2 * i as u64 + 2),
+                )
+            })
+            .collect::<Vec<_>>();
+        let time = |specialization: &NativeSpecialization| {
+            let kernel = dense_expand::native_for_device_with(
+                &device,
+                dense_expand::Elements {
+                    NW: Element::bf16(),
+                    GW: repr.resident(&device),
+                    UW: repr.resident(&device),
+                    A: act.element(),
+                },
+                specialization,
+            )
+            .unwrap();
+            let rotation = weights
+                .iter()
+                .map(|(gate, up)| dense_expand::Args {
+                    residual: &hidden,
+                    norm: &norm,
+                    gate_weight: gate,
+                    up_weight: up,
+                    out_rows: &out_rows,
+                    eps: 1e-6,
+                    activation: 0,
+                    gate_scale: &absent_scale,
+                    up_scale: &absent_scale,
+                })
+                .collect();
+            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+        };
+        run(
+            &label,
+            DENSE_EXPAND_PACKED_LAUNCH,
+            &|mapping| dense_expand_specialization_on(&device, &[("H", h), ("F", f)], mapping),
+            &time,
+        );
+    }
+
+    let label = "gated_delta_project 4b q5k|q4k|q8|q8 8192|4096|32|32 x 2560";
+    if timing_selected(label.split(' ').next().unwrap()) {
+        let (nk, nv, w) = (16usize, 32usize, 128usize);
+        let reprs = [Repr::Q5k, Repr::Q4k, Repr::Q8, Repr::Q8];
+        let rows = [(2 * nk + nv) * w, nv * w, nv, nv];
+        let bytes = (0..4).map(|i| weight_bytes(reprs[i], rows[i], h)).sum::<usize>();
+        let weights = (0..copies(bytes))
+            .map(|copy| {
+                [0, 1, 2, 3].map(|i| noise_weight(&device, reprs[i], rows[i], h, 4 * copy as u64 + i as u64 + 1))
+            })
+            .collect::<Vec<_>>();
+        let time = |specialization: &NativeSpecialization| {
+            let kernel = gated_delta_project::native_for_device_with(
+                &device,
+                recurrent_project_elements(&device, reprs, act),
+                specialization,
+            )
+            .unwrap();
+            let rotation = weights
+                .iter()
+                .map(|[qkv, gate, alpha, beta]| gated_delta_project::Args {
+                    hidden: &hidden,
+                    input_norm: &norm,
+                    qkv_weight: qkv,
+                    gate_weight: gate,
+                    alpha_weight: alpha,
+                    beta_weight: beta,
+                    epsilon: 1e-6,
+                })
+                .collect();
+            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+        };
+        run(
+            label,
+            RECURRENT_PROJECT_PACKED_LAUNCH,
+            &|mapping| {
+                segmented_projection_specialization_on(
+                    &device,
+                    &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
+                    mapping,
+                    RECURRENT_PROJECT_PACKED_LAUNCH,
+                )
+            },
+            &time,
+        );
+    }
+
+    for value in [Repr::Q6k, Repr::Q4k] {
+        let label = format!("attention_project 4b q4k|q4k|{} 8192|1024|1024 x 2560", value.name());
+        if !timing_selected(label.split(' ').next().unwrap()) {
+            continue;
+        }
+        let (kv, g, w) = (4usize, 4usize, 256usize);
+        let reprs = [Repr::Q4k, Repr::Q4k, value];
+        let rows = [kv * g * 2 * w, kv * w, kv * w];
+        let bytes = (0..3).map(|i| weight_bytes(reprs[i], rows[i], h)).sum::<usize>();
+        let weights = (0..copies(bytes))
+            .map(|copy| [0, 1, 2].map(|i| noise_weight(&device, reprs[i], rows[i], h, 3 * copy as u64 + i as u64 + 1)))
+            .collect::<Vec<_>>();
+        let absent = act_tensor(&device, Act::Bf16, &[0, h], &[]);
+        let time = |specialization: &NativeSpecialization| {
+            let kernel = attention_project::native_for_device_with(
+                &device,
+                attention_project::Elements {
+                    NW: Element::bf16(),
+                    QW: reprs[0].resident(&device),
+                    GW: Element::bf16(),
+                    KW: reprs[1].resident(&device),
+                    VW: reprs[2].resident(&device),
+                    A: act.element(),
+                },
+                specialization,
+            )
+            .unwrap();
+            let rotation = weights
+                .iter()
+                .map(|[query, key, value]| attention_project::Args {
+                    hidden: &hidden,
+                    input_norm: &norm,
+                    query_weight: query,
+                    gate_weight: &absent,
+                    key_weight: key,
+                    value_weight: value,
+                    epsilon: 1e-6,
+                    project_mode: 0,
+                })
+                .collect();
+            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+        };
+        run(
+            &label,
+            ATTENTION_PROJECT_PACKED_LAUNCH,
+            &|mapping| attention_project_specialization_on(&device, &attention_project_statics(h, kv, g, w), mapping),
+            &time,
+        );
+    }
+
+    for repr in [Repr::Q5k, Repr::Q4k] {
+        let label = format!("attention_output 4b {} 2560x4096", repr.name());
+        if !timing_selected(label.split(' ').next().unwrap()) {
+            continue;
+        }
+        let (heads, width) = (16usize, 256usize);
+        let k = heads * width;
+        let weights = (0..copies(weight_bytes(repr, h, k)))
+            .map(|i| noise_weight(&device, repr, h, k, i as u64 + 1))
+            .collect::<Vec<_>>();
+        let gated = act_tensor(&device, act, &[m, heads, width], &uniform_values(m * k, 2, 1.0));
+        let time = |specialization: &NativeSpecialization| {
+            let kernel = attention_output::native_for_device_with(
+                &device,
+                attention_output::Elements {
+                    OW: repr.resident(&device),
+                    A: act.element(),
+                },
+                specialization,
+            )
+            .unwrap();
+            let rotation = weights
+                .iter()
+                .map(|weight| attention_output::Args {
+                    hidden: &hidden,
+                    gated: &gated,
+                    output_weight: weight,
+                })
+                .collect();
+            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+        };
+        run(
+            &label,
+            ATTENTION_OUTPUT_PACKED_LAUNCH,
+            &|mapping| attention_output_specialization_on(&device, &[("D", h), ("Q", heads), ("W", width)], mapping),
+            &time,
+        );
     }
 }
 
@@ -2659,6 +3464,7 @@ fn recurrent_project_cases_on(device: &Device, scoped: bool) {
                     device,
                     &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
                     mapping,
+                    RECURRENT_PROJECT_PACKED_LAUNCH,
                 ),
             )
             .unwrap();
@@ -4040,6 +4846,7 @@ fn timing_on(device: &Device) {
                         device,
                         &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
                         mapping,
+                        RECURRENT_PROJECT_PACKED_LAUNCH,
                     ),
                 )
                 .unwrap();

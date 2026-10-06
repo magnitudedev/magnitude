@@ -93,13 +93,25 @@ fn attention_output[M, D, Q, W](hidden: &tensor[M, D] f32,
 # TALL selects the tall GEMM past 64 rows (see `dense_rows.seismic`): on
 # simdgroup matrices `relayout` first reorders the gated rows into
 # `fragments`, a second copy of them in whole 64-row tiles.
+# PACK selects `dense_output`'s token-packing form past 64 rows (see
+# `dense_rows.seismic`), with its launches, error class and transient
+# scratch, over the gated rows (the weights' factors a simdgroup per weight
+# row); weights or devices without the packed path run the staged tile, with
+# its results.
 native attention_output for metal from "metal/attention_output.metal":
     static (D, Q, W)
-    params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4], form TALL in [1, 0])
-    where TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)
+    params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4], form TALL in [1, 0],
+        arithmetic form PACK in [0, 1])
+    where (TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)) and (PACK == 0 or (TALL == 1 and Q * W % 256 == 0 and Q * W < 1048576 and D % 64 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))
+    error_class int8_token_packing when PACK == 1
     scratch partials bytes (SPLIT * M * D * 4) when M > 64 and SPLIT > 1
     scratch small_partials bytes (4 * M * D * 4) when M > 16 and M <= 64
-    scratch fragments bytes (ceil_div(M, 64) * 64 * Q * W * 2) when M > 64 and TALL == 1
+    scratch fragments bytes (ceil_div(M, 64) * 64 * Q * W * 2) when M > 64 and TALL == 1 and PACK == 0
+    scratch packed bytes (ceil_div(M, 128) * 128 * Q * W * 2 + 1024) when M > 64 and PACK == 1
+    scratch token_factors bytes (ceil_div(M, 128) * 128 * (Q * W / 32) * 4) when M > 64 and PACK == 1
+    scratch weight_factors bytes (D * (Q * W / 32) * 4) when M > 64 and PACK == 1
+    scratch token_scales bytes (ceil_div(M, 128) * 128 * 4) when M > 64 and PACK == 1
+    scratch weight_scales bytes (D * 4) when M > 64 and PACK == 1
     launch attention_output_gemv when M < 2:
         params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32, 8])
         threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
@@ -123,10 +135,10 @@ native attention_output for metal from "metal/attention_output.metal":
     launch attention_output_finalize when M > 64 and SPLIT > 1:
         threadgroups (ceil_div(M * D, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_output_relayout when M > 64 and TALL == 1:
+    launch attention_output_relayout when M > 64 and TALL == 1 and PACK == 0:
         threadgroups (ceil_div(ceil_div(M, 64) * Q * W, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_output_tall when M > 64 and TALL == 1:
+    launch attention_output_tall when M > 64 and TALL == 1 and PACK == 0:
         params (code TALL_M in [128, 256, 512], code TALL_K in [64, 128], code STAGERS in [2, 1])
         threadgroups (ceil_div(D, 32), ceil_div(M, TALL_M), 1)
         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
@@ -140,6 +152,19 @@ native attention_output for metal from "metal/attention_output.metal":
         threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch attention_output_pack when M > 64 and PACK == 1:
+        threadgroups (ceil_div(M, 128) * 32, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch attention_output_pack_coefficients when M > 64 and PACK == 1:
+        threadgroups (D, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_output_packed when M > 64 and PACK == 1:
+        params (code PACK_TOKENS in [4, 2], code WEIGHTS_AHEAD in [0, 1])
+        threadgroups (ceil_div(M, 128) * D / 32, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch attention_output_unpacked when M > 64 and PACK == 1:
+        threadgroups (ceil_div(D, 64), ceil_div(M, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
 
 # CUDA: GEMV to 8 rows, `gemv16` to 16, GEMM beyond in the K1 row bands
 # (`gemm_small` to 64 rows with the INT8 candidate, `gemm` beyond), both split
@@ -288,12 +313,24 @@ fn attention_project[M, D, Q, GR, K, V](hidden: &tensor[M, D] f32, input_norm: &
 
 # Metal: TALL selects the tall GEMM past 64 rows (see `dense_rows.seismic`)
 # over rows staged in its order.
+# PACK selects the token-packing form of `dense_rows.seismic` past 64 rows for
+# the four segments, over the staged normalized rows, as in
+# `gated_delta_project` (`recurrent.seismic`): one operand for every segment,
+# each weight's own factor tables in segment order, the packed tiles in
+# segment order, and the staged 64 x 64 tiles (`unpacked`) for a segment whose
+# weights the operand does not serve and for the zero tiles of mode 1.
 native attention_project for metal from "metal/attention_project.metal":
     static (D, Q, GR, K, V)
-    params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0])
-    where TALL == 0 or D % 128 == 0
+    params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0], arithmetic form PACK in [0, 1])
+    where (TALL == 0 or D % 128 == 0) and (PACK == 0 or (TALL == 1 and D % 256 == 0 and D < 1048576 and Q % 32 == 0 and GR % 32 == 0 and K % 32 == 0 and V % 32 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))
+    error_class int8_token_packing when PACK == 1
     scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * D * 2) when M > 16
-    launch attention_project_stage when M > 16 and (M <= 64 or TALL == 0):
+    scratch packed bytes (ceil_div(M, 128) * 128 * D * 2 + 1024) when M > 64 and PACK == 1
+    scratch token_factors bytes (ceil_div(M, 128) * 128 * (D / 32) * 4) when M > 64 and PACK == 1
+    scratch weight_factors bytes ((Q + GR + K + V) * (D / 32) * 4) when M > 64 and PACK == 1
+    scratch token_scales bytes (ceil_div(M, 128) * 128 * 4) when M > 64 and PACK == 1
+    scratch weight_scales bytes ((Q + GR + K + V) * 4) when M > 64 and PACK == 1
+    launch attention_project_stage when M > 16 and (M <= 64 or TALL == 0 or PACK == 1):
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch attention_project_gemv when M < 2:
@@ -321,10 +358,10 @@ native attention_project for metal from "metal/attention_project.metal":
         threadgroups (ceil_div(Q, TILE_N) + ceil_div(GR, TILE_N) + ceil_div(K, TILE_N)
             + ceil_div(V, TILE_N), ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch attention_project_stage_tall when M > 64 and TALL == 1:
+    launch attention_project_stage_tall when M > 64 and TALL == 1 and PACK == 0:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_project_tall when M > 64 and TALL == 1:
+    launch attention_project_tall when M > 64 and TALL == 1 and PACK == 0:
         params (code TALL_M in [128, 256, 512], code TALL_K in [64, 128], code STAGERS in [2, 1])
         threadgroups (ceil_div(Q, 32) + ceil_div(GR, 32) + ceil_div(K, 32) + ceil_div(V, 32),
             ceil_div(M, TALL_M), 1)
@@ -345,6 +382,20 @@ native attention_project for metal from "metal/attention_project.metal":
             + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch attention_project_pack when M > 64 and PACK == 1:
+        threadgroups (ceil_div(M, 128) * 32, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch attention_project_pack_coefficients when M > 64 and PACK == 1:
+        threadgroups (Q + GR + K + V, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_project_packed when M > 64 and PACK == 1:
+        params (code PACK_TOKENS in [4, 2], code WEIGHTS_AHEAD in [0, 1])
+        threadgroups (ceil_div(M, 128) * (Q / 32) + ceil_div(M, 128) * (GR / 32) + ceil_div(M, 128) * (K / 32)
+            + ceil_div(M, 128) * (V / 32), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch attention_project_unpacked when M > 64 and PACK == 1:
+        threadgroups (ceil_div(Q, 64) + ceil_div(GR, 64) + ceil_div(K, 64) + ceil_div(V, 64), ceil_div(M, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
 
 native attention_project for cuda from "cuda/attention_project.cu":
     static (D, Q, GR, K, V)
