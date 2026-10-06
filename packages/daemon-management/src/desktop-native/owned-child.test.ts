@@ -1,16 +1,18 @@
 import { fileURLToPath } from "node:url"
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
-import { Effect, Schema } from "effect"
+import { NodeContext } from "@effect/platform-node"
+import { Effect, Option, Schema } from "effect"
 import { describe, expect, it, vi } from "vitest"
 import { makeUnixOwnedChildSpawner, type OwnedChild } from "./owned-child"
 
 const addon = fileURLToPath(new URL(`../../dist/native/${process.platform}-${process.arch}/desktop-host.node`, import.meta.url))
 const fixture = fileURLToPath(new URL("./fixtures/process.cjs", import.meta.url))
-const run = <A, E>(work: Effect.Effect<A, E, ProcessGroupController>) => Effect.runPromise(work.pipe(
+const run = <A, E>(work: Effect.Effect<A, E, ProcessGroupController | NodeContext.NodeContext>) => Effect.runPromise(work.pipe(
   Effect.provideService(ProcessGroupController, ProcessGroupControllerLive),
+  Effect.provide(NodeContext.layer),
 ))
-const command = (mode: string) => ({ output: "DiagnosticTail" as const, executable: process.execPath, arguments: [fixture, addon, mode], environment: process.env })
+const command = (mode: string) => ({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: process.execPath, arguments: [fixture, addon, mode], environment: process.env })
 const workerPid = (child: OwnedChild) => Effect.gen(function* () {
   for (;;) {
     const tail = yield* child.diagnosticTail
@@ -77,7 +79,7 @@ describe.skipIf(process.platform === "win32")("owned service child", () => {
   it("reports spawn failure as a typed outcome", async () => {
     await run(Effect.scoped(Effect.gen(function* () {
       const spawner = yield* makeUnixOwnedChildSpawner
-      const result = yield* spawner.spawn({ output: "DiagnosticTail" as const, executable: "/missing/magnitude-service", arguments: [], environment: {} }).pipe(Effect.either)
+      const result = yield* spawner.spawn({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "/missing/magnitude-service", arguments: [], environment: {} }).pipe(Effect.either)
       expect(result._tag === "Left" && result.left._tag).toBe("OwnedChildSpawnFailed")
     })))
   })

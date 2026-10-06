@@ -1,5 +1,5 @@
 import { Writable } from "node:stream"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { makeChildOutput } from "./child-output"
 
@@ -7,7 +7,7 @@ describe("owned child diagnostics", () => {
   it("retains the last 16 KiB without writing desktop diagnostics to the terminal", async () => {
     const sink = new Writable({ write() { throw new Error("unexpected terminal output") } })
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const output = yield* makeChildOutput("DiagnosticTail", sink)
+      const output = yield* makeChildOutput("DiagnosticTail", Option.none(), sink)
       yield* output.append(Buffer.alloc(1_000_000, "a"))
       yield* output.append(Buffer.from("last output"))
       const tail = yield* output.diagnosticTail
@@ -20,7 +20,7 @@ describe("owned child diagnostics", () => {
     let writes = 0
     const sink = new Writable({ write() { writes++ } })
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const output = yield* makeChildOutput("Foreground", sink)
+      const output = yield* makeChildOutput("Foreground", Option.none(), sink)
       for (let index = 0; index < 100; index++) yield* output.append(Buffer.alloc(100_000, "a"))
       yield* output.append(Buffer.from("final diagnostic"))
       expect(writes).toBe(1)
@@ -35,7 +35,7 @@ describe("owned child diagnostics", () => {
     let complete: ((error?: Error | null) => void) | undefined
     const sink = new Writable({ write(_chunk, _encoding, callback) { complete = callback } })
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const output = yield* makeChildOutput("Foreground", sink)
+      const output = yield* makeChildOutput("Foreground", Option.none(), sink)
       yield* output.append(Buffer.from("diagnostic"))
     })))
     complete!(new Error("terminal closed"))
@@ -46,7 +46,7 @@ describe("owned child diagnostics", () => {
   it("keeps collecting after a synchronous sink failure", async () => {
     const sink = new Writable({ write() { throw new Error("terminal unavailable") } })
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const output = yield* makeChildOutput("Foreground", sink)
+      const output = yield* makeChildOutput("Foreground", Option.none(), sink)
       yield* output.append(Buffer.from("first"))
       yield* output.append(Buffer.from("second"))
       expect(yield* output.diagnosticTail).toBe("firstsecond")

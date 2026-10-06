@@ -50,6 +50,7 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
     gracefulShutdownTimeout: Duration.seconds(5),
     forceShutdownTimeout: Duration.seconds(2),
     outputLimitBytes: 64 * 1024,
+    logFile: Option.none(),
   });
 
 describe("ICN managed launch", () => {

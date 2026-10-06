@@ -1,3 +1,4 @@
+import { NodeContext } from "@effect/platform-node"
 import { Deferred, Effect, Layer, Option, Ref, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { windowsJobOwnerLayer } from "@magnitudedev/utils/windows-native"
@@ -30,7 +31,7 @@ const fixture = (peer = 42, earlyExit: number | null = null) => {
   }) }))
   return { observed, layer: Layer.merge(jobs, pipes) }
 }
-const command = { output: "DiagnosticTail" as const, executable: "C:\\Magnitude\\magnitude-service.exe", arguments: [], environment: { MAGNITUDE_OWNER_PIPE: "caller-value" } }
+const command = { output: "DiagnosticTail" as const, logFile: Option.none(), executable: "C:\\Magnitude\\magnitude-service.exe", arguments: [], environment: { MAGNITUDE_OWNER_PIPE: "caller-value" } }
 describe("Windows owned service composition (simulated native boundary)", () => {
   it("fences the control peer, retains diagnostics, encodes commands and retires the owned job", async () => {
     const test = fixture()
@@ -47,7 +48,7 @@ describe("Windows owned service composition (simulated native boundary)", () => 
       expect(JSON.parse(test.observed.writes[0]!)).toEqual({ _tag: "Start" })
       yield* child.stop
       expect(yield* child.exit).toBe(1)
-    })).pipe(Effect.provide(test.layer)))
+    })).pipe(Effect.provide(test.layer), Effect.provide(NodeContext.layer)))
     expect(test.observed.retired).toBe(1)
     expect(test.observed.closed).toBe(1)
     expect(test.observed.pipesClosed.size).toBe(2)
@@ -58,7 +59,7 @@ describe("Windows owned service composition (simulated native boundary)", () => 
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const spawner = yield* makeWindowsOwnedChildSpawner
       return yield* Effect.either(spawner.spawn(command))
-    })).pipe(Effect.provide(test.layer)))
+    })).pipe(Effect.provide(test.layer), Effect.provide(NodeContext.layer)))
     expect(result._tag).toBe("Left")
     if (result._tag === "Left") expect(result.left._tag).toBe("OwnedChildSpawnFailed")
     expect(test.observed.writes).toEqual([])
@@ -71,7 +72,7 @@ describe("Windows owned service composition (simulated native boundary)", () => 
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const spawner = yield* makeWindowsOwnedChildSpawner
       return yield* Effect.either(spawner.spawn(command))
-    })).pipe(Effect.provide(test.layer), Effect.timeout("1 second")))
+    })).pipe(Effect.provide(test.layer), Effect.provide(NodeContext.layer), Effect.timeout("1 second")))
     expect(result._tag).toBe("Left")
     if (result._tag === "Left") expect(result.left.message).toContain("exit code 3")
     expect(test.observed.closed).toBe(1)

@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto"
+import { win32 } from "node:path"
+import type { FileSystem, Path } from "@effect/platform"
 import { Effect, Fiber, Stream } from "effect"
-import { makeChildOutput } from "./child-output"
+import { makeChildOutput, openChildLog } from "./child-output"
 import { DesktopChildEvent, DesktopOwnerCommand } from "@magnitudedev/acn-protocol/desktop-control"
 import { JsonLineChannelFailed, receiveJsonLines, sendJsonLine } from "@magnitudedev/utils/json-line-channel"
 import { ProcessStartIdentitySchema } from "@magnitudedev/utils/process-groups"
@@ -14,13 +16,14 @@ import { windowsPipeDuplex } from "./windows-control"
 export const makeWindowsOwnedChildSpawner = Effect.gen(function* () {
   const jobs = yield* WindowsJobOwner
   const pipes = yield* WindowsPrivatePipes
+  const files = yield* Effect.context<FileSystem.FileSystem | Path.Path>()
   return OwnedChildSpawner.of({ spawn: command => Effect.gen(function* () {
     const spawnFailure = (message: string) => new OwnedChildSpawnFailed({ executable: command.executable, message })
     const outputName = yield* Effect.sync(() => WindowsPipeName.make(`\\\\.\\pipe\\magnitude-output-${randomUUID()}`))
     const controlName = yield* Effect.sync(() => WindowsPipeName.make(`\\\\.\\pipe\\magnitude-child-${randomUUID()}`))
     const output = yield* pipes.bind(outputName, true).pipe(Effect.mapError(error => spawnFailure(error.message)))
     const control = yield* pipes.bind(controlName, true).pipe(Effect.mapError(error => spawnFailure(error.message)))
-    const diagnostics = yield* makeChildOutput(command.output)
+    const diagnostics = yield* makeChildOutput(command.output, yield* openChildLog(command.logFile).pipe(Effect.provide(files)))
     const diagnosticReader = yield* output.accept.pipe(Effect.zipRight(Stream.repeatEffect(output.read).pipe(
       Stream.takeWhile(bytes => bytes.length > 0),
       Stream.runForEach(diagnostics.append),
@@ -32,6 +35,9 @@ export const makeWindowsOwnedChildSpawner = Effect.gen(function* () {
       job => job.retire("10 seconds").pipe(Effect.catchAll(error => Effect.logError("Windows child cleanup remains unproven; application retains its job", error))),
     )
     const observed = yield* job.identity.pipe(Effect.mapError(error => spawnFailure(error.message)))
+    const name = win32.basename(command.executable)
+    yield* diagnostics.record(`${name} started (pid ${observed.pid})`)
+    yield* job.exit.pipe(Effect.flatMap(code => diagnostics.record(`${name} exited with code ${code}`)), Effect.ignore, Effect.forkScoped)
     const peer = yield* Effect.raceFirst(control.accept.pipe(Effect.mapError(error => spawnFailure(error.message))), job.exit.pipe(
       Effect.mapError(error => spawnFailure(error.message)), Effect.flatMap(code => Effect.fail(spawnFailure(`Magnitude service exited before connecting its control channel (exit code ${code}).`))),
     )).pipe(Effect.timeoutFail({ duration: "30 seconds", onTimeout: () => spawnFailure("Magnitude service did not connect its owned control channel.") }))

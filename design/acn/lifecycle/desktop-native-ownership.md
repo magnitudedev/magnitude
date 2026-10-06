@@ -223,7 +223,11 @@ Service failure presentation uses ACN's safe detail or a concise typed error mes
 stacks and stderr remain in logs instead of becoming the ordinary Status label.
 Failed child attempts retain bounded diagnostics in logs even when control-channel closure is
 observed before process exit; diagnostic visibility cannot depend on which failure wins that race.
-Each service attempt retains the final 16 KiB of output. Desktop ownership collects diagnostics
+Each service attempt retains the final 16 KiB of output. Every owner also records each attempt's
+output, start and exit in the data directory's `logs/service.log`; the desktop records its own log
+lines in `logs/desktop.log`, and the service records the inference server's in `logs/inference.log`.
+Each file is bounded and rotated once, and recording never blocks or fails the child it records.
+Desktop ownership collects diagnostics
 without forwarding them to the terminal. Foreground ownership additionally forwards output to parent
 stderr, with at most one 16 KiB write outstanding. Slow terminals may lose live output; diagnostic
 collection continues independently. Terminal errors disable forwarding and cannot fail service
