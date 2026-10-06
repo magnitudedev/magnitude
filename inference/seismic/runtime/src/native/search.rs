@@ -416,9 +416,32 @@ pub struct SearchTrace {
     pub stop: SearchStop,
 }
 
+/// How far an exploration goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// The defaults alone.
+    Defaults,
+    /// The defaults, every form's start and the hints, then no further.
+    Starts,
+    /// Until the search ends or the evaluator's time runs out.
+    End,
+}
+
+/// What an exploration evaluated, in order, and why it stopped. Given again
+/// as the `prior` of a later exploration of the same space and starts, that
+/// one continues where this one stopped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Explored {
+    pub evaluated: Vec<(usize, Result<Cost, Exclusion>)>,
+    pub stop: SearchStop,
+}
+
 struct State<'s, E> {
     space: &'s SearchSpace,
     evaluator: &'s mut E,
+    /// What an earlier exploration evaluated: answered without the
+    /// evaluator, whatever its time.
+    prior: HashMap<usize, &'s Result<Cost, Exclusion>>,
     /// The cost of every evaluated configuration; `None` when excluded.
     costs: HashMap<usize, Option<Cost>>,
     evaluated: Vec<(usize, Result<Cost, Exclusion>)>,
@@ -466,17 +489,31 @@ impl<E: Evaluator> State<'_, E> {
         if self.stop.is_some() {
             return;
         }
-        if self.evaluator.expired() {
-            self.stop = Some(SearchStop::Expired);
-            return;
-        }
         let mut fresh = Vec::new();
         for &index in batch {
             if !self.visited(index) && !fresh.contains(&index) {
                 fresh.push(index);
             }
         }
+        // An earlier exploration evaluated a prefix of what this one asks
+        // for, in the same order.
+        let known = fresh
+            .iter()
+            .take_while(|index| self.prior.contains_key(index))
+            .count();
+        for index in fresh.drain(..known) {
+            let result = self.prior[&index].clone();
+            self.record(index, result);
+        }
+        if self.evaluated.len() == self.space.len() {
+            self.stop = Some(SearchStop::Exhausted);
+            return;
+        }
         if fresh.is_empty() {
+            return;
+        }
+        if self.evaluator.expired() {
+            self.stop = Some(SearchStop::Expired);
             return;
         }
         let results = self.evaluator.evaluate(&fresh);
@@ -574,9 +611,28 @@ pub fn search(
     settings: &SearchSettings,
     evaluator: &mut impl Evaluator,
 ) -> SearchTrace {
+    let explored = explore(space, start, settings, &[], Reach::End, evaluator);
+    rank(space, settings, explored, evaluator)
+}
+
+/// The exploration of [`search`]: everything before its finalists are
+/// confirmed. `prior` is what an earlier exploration of `space` from the
+/// same `start` evaluated; this one evaluates the same configurations in the
+/// same order, answering those from `prior` whatever the evaluator's time,
+/// and continues from there. An exploration interrupted and continued any
+/// number of times therefore evaluates what an uninterrupted one does.
+pub fn explore(
+    space: &SearchSpace,
+    start: &[usize],
+    settings: &SearchSettings,
+    prior: &[(usize, Result<Cost, Exclusion>)],
+    reach: Reach,
+    evaluator: &mut impl Evaluator,
+) -> Explored {
     let mut state = State {
         space,
         evaluator,
+        prior: prior.iter().map(|(index, result)| (*index, result)).collect(),
         costs: HashMap::new(),
         evaluated: Vec::new(),
         nearest: vec![u32::MAX; space.len()],
@@ -589,7 +645,7 @@ pub fn search(
         .collect::<Vec<_>>();
     // The defaults are the reference of every cost: evaluated even when the
     // time has already run out.
-    if state.evaluator.expired() {
+    if prior.is_empty() && state.evaluator.expired() {
         state.stop = Some(SearchStop::Expired);
         let results = state.evaluator.evaluate(&[default]);
         let result = results
@@ -597,8 +653,16 @@ pub fn search(
             .next()
             .expect("an evaluator answers the first configuration");
         state.record(default, result);
+    } else if reach == Reach::Defaults {
+        state.evaluate(&[default]);
     } else {
         state.evaluate(&starts);
+    }
+    if reach != Reach::End {
+        return Explored {
+            stop: state.stop.unwrap_or(SearchStop::Expired),
+            evaluated: state.evaluated,
+        };
     }
     // The cheapest measured start of each form, cheapest form first.
     let mut descents: Vec<usize> = Vec::new();
@@ -639,13 +703,26 @@ pub fn search(
             failed_restarts += 1;
         }
     }
-    let stop = state.stop.unwrap_or(SearchStop::Converged);
-    let State {
-        evaluated,
-        costs,
-        evaluator,
-        ..
-    } = state;
+    Explored {
+        stop: state.stop.unwrap_or(SearchStop::Converged),
+        evaluated: state.evaluated,
+    }
+}
+
+/// The confirmation of [`search`]: the cheapest explored configurations and
+/// the defaults re-measured and ranked.
+pub fn rank(
+    space: &SearchSpace,
+    settings: &SearchSettings,
+    explored: Explored,
+    evaluator: &mut impl Evaluator,
+) -> SearchTrace {
+    let default = space.default;
+    let Explored { evaluated, stop } = explored;
+    let costs = evaluated
+        .iter()
+        .map(|(index, result)| (*index, result.as_ref().ok().cloned()))
+        .collect::<HashMap<_, _>>();
 
     // Confirm the cheapest measured configurations against the defaults.
     let mut cheapest = evaluated
@@ -1144,6 +1221,135 @@ mod tests {
         assert_eq!(evaluator.evaluations[..2], [space.default_index(), start]);
         let chosen = space.values(trace.ranking[0]);
         assert_eq!((chosen["M"], chosen["A"]), (1, 8), "{chosen:?}");
+    }
+
+    /// A space with two forms, a ridge and an interacting optimum, and its
+    /// cost: a search of it descends from two starts and restarts.
+    fn rugged() -> (SearchSpace, impl Fn(&ParameterValues) -> f64 + Copy) {
+        let space = forms_space(
+            &[
+                ("A", &[1, 2, 3, 4, 5, 6, 7, 8]),
+                ("K", &[1, 2, 3, 4]),
+                ("M", &[0, 1]),
+            ],
+            &["M"],
+            |values| values["M"] == 0 || values["K"] >= 2,
+        );
+        let cost = |values: &ParameterValues| match values["M"] {
+            0 => 1.0 + 0.01 * (values["A"] + values["K"]) as f64,
+            _ => 0.9 + 0.1 * (8 - values["A"]) as f64 + 0.01 * values["K"] as f64,
+        };
+        (space, cost)
+    }
+
+    #[test]
+    fn an_exploration_continued_from_any_interruption_evaluates_what_one_run_does() {
+        let (space, cost) = rugged();
+        let exact = |limit: usize| Exact {
+            space: &space,
+            cost,
+            evaluations: Vec::new(),
+            limit,
+        };
+        let whole = explore(
+            &space,
+            &[],
+            &settings(),
+            &[],
+            Reach::End,
+            &mut exact(usize::MAX),
+        );
+        assert_ne!(whole.stop, SearchStop::Expired);
+        let chosen = rank(&space, &settings(), whole.clone(), &mut exact(usize::MAX)).ranking;
+        // The recorded choice of the uninterrupted search: the matrix form
+        // tuned along A.
+        let values = space.values(chosen[0]);
+        assert_eq!((values["M"], values["A"]), (1, 8), "{values:?}");
+        for slice in 1..=whole.evaluated.len() {
+            let mut explored = Explored {
+                evaluated: Vec::new(),
+                stop: SearchStop::Expired,
+            };
+            let mut slices = 0;
+            while explored.stop == SearchStop::Expired {
+                let mut evaluator = exact(slice);
+                let next = explore(
+                    &space,
+                    &[],
+                    &settings(),
+                    &explored.evaluated,
+                    Reach::End,
+                    &mut evaluator,
+                );
+                // A slice measures only what no earlier slice measured, and
+                // keeps everything they measured, in order.
+                assert!(evaluator.evaluations.len() <= slice);
+                assert_eq!(
+                    next.evaluated[..explored.evaluated.len()],
+                    explored.evaluated[..]
+                );
+                assert_eq!(
+                    next.evaluated.len(),
+                    explored.evaluated.len() + evaluator.evaluations.len()
+                );
+                explored = next;
+                slices += 1;
+                assert!(slices <= whole.evaluated.len() + 1, "the slices make progress");
+            }
+            assert_eq!(explored, whole, "slices of {slice}");
+            assert_eq!(
+                rank(&space, &settings(), explored, &mut exact(usize::MAX)).ranking,
+                chosen
+            );
+        }
+    }
+
+    #[test]
+    fn the_starts_are_every_forms_first_measurement_and_the_search_continues_from_them() {
+        let (space, cost) = rugged();
+        let mut evaluator = Exact {
+            space: &space,
+            cost,
+            evaluations: Vec::new(),
+            limit: usize::MAX,
+        };
+        let starts = explore(&space, &[], &settings(), &[], Reach::Starts, &mut evaluator);
+        assert_eq!(starts.stop, SearchStop::Expired);
+        assert_eq!(
+            evaluator.evaluations,
+            [space.default_index(), space.form_starts()[0]]
+        );
+        // Out of time after the starts: each form holds its start, and the
+        // ranking is the confirmed order of those.
+        let ranking = rank(&space, &settings(), starts.clone(), &mut evaluator).ranking;
+        assert_eq!(ranking[0], space.default_index());
+        let whole = search(
+            &space,
+            &[],
+            &settings(),
+            &mut Exact {
+                space: &space,
+                cost,
+                evaluations: Vec::new(),
+                limit: usize::MAX,
+            },
+        );
+        let mut rest = Exact {
+            space: &space,
+            cost,
+            evaluations: Vec::new(),
+            limit: usize::MAX,
+        };
+        let explored = explore(
+            &space,
+            &[],
+            &settings(),
+            &starts.evaluated,
+            Reach::End,
+            &mut rest,
+        );
+        assert_eq!(explored.evaluated, whole.evaluated);
+        assert!(!rest.evaluations.contains(&space.default_index()));
     }
 
     #[test]

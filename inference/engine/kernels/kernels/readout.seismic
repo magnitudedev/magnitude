@@ -74,7 +74,8 @@ fn readout_head_rows[M, O, V, D, WS](hidden: &tensor[M, D] f32,
                 logits[row, col] = softcap * (2.0 / (1.0 + exp(-2.0 * z / softcap)) - 1.0)
     return logits
 
-# Metal: rows below BATCH_FROM run the GEMV, BATCH_FROM..8 the batched GEMV,
+# Metal: rows below BATCH_FROM run the GEMV (`gemv` for one row, `gemv_pair`
+# for two, `gemv_rows` for more, see `dense_rows.seismic`), BATCH_FROM..8 the batched GEMV,
 # each normalizing its rows in-threadgroup; larger classes stage the
 # normalized rows, then the GEMM. (CUDA: GEMV up to 8 rows, no batched launch.)
 native readout_head_rows for metal from "metal/readout_head_rows.metal":
@@ -85,8 +86,8 @@ native readout_head_rows for metal from "metal/readout_head_rows.metal":
     launch readout_head_rows_stage when O > 16:
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch readout_head_rows_gemv when O < BATCH_FROM:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+    launch readout_head_rows_gemv when O < 2:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32, 8])
         threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(D, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
@@ -99,6 +100,16 @@ native readout_head_rows for metal from "metal/readout_head_rows.metal":
         params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
         threadgroups (ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    launch readout_head_rows_gemv_rows when O >= 3 and O < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [2, 1, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(D, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
+    launch readout_head_rows_gemv_pair when O == 2 and O < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [2, 1, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(D, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
 
 # CUDA: the GEMV up to 16 rows (`gemv` to 8, `gemv16` beyond; at O = 1 the
 # block forms its normalized row in shared memory, else `stage` forms the

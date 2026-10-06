@@ -38,6 +38,7 @@ impl Random {
 fn resident_q8(device: &Device) -> Element {
     let layout = match device.backend() {
         seismic::BackendName::Cuda => Layout::Mma16,
+        seismic::BackendName::Metal => Layout::Rows32,
         _ => Layout::Rows16,
     };
     Element::stored("q8g32s", layout).unwrap()

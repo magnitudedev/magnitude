@@ -33,6 +33,7 @@ const PUBLISHED_BANK: u64 = 2;
 const TUNING_TAPE_ROWS: u64 = 1;
 
 /// `attention_project` as the state-space input projection.
+#[derive(Clone)]
 pub(crate) struct StateSpaceProjectTuning {
     pub binding: StateSpaceBinding,
     pub scopes: Vec<WeightScope>,
@@ -142,6 +143,7 @@ impl EntryTuning for StateSpaceProjectTuning {
 }
 
 /// `attention_output` as the state-space output projection plus residual.
+#[derive(Clone)]
 pub(crate) struct StateSpaceOutputTuning {
     pub binding: StateSpaceBinding,
     pub scopes: Vec<WeightScope>,
@@ -223,11 +225,12 @@ impl EntryTuning for StateSpaceOutputTuning {
     generated_entry!(attention_output, this => attention_output::Elements {
         OW: this.binding.output,
         A: this.binding.activation,
-    });
+    }, rounded to this.binding.activation);
 }
 
 /// What both state entries tune over: the advance of one request's rows from
 /// the bank it reads to the bank it publishes.
+#[derive(Clone)]
 pub(crate) struct StateSpaceState {
     pub activation: Element,
     pub shape: StateSpaceShape,
@@ -236,9 +239,11 @@ pub(crate) struct StateSpaceState {
 
 /// `state_space_step`, for row classes below [`CHUNKED_ROWS`]. Its
 /// parameters are mappings: every configuration is bit-exact.
+#[derive(Clone)]
 pub(crate) struct StateSpaceStepTuning(pub StateSpaceState);
 
 /// `state_space_chunk`, for row classes of [`CHUNKED_ROWS`] and more.
+#[derive(Clone)]
 pub(crate) struct StateSpaceChunkTuning(pub StateSpaceState);
 
 /// One argument set of either state entry; they share one contract.

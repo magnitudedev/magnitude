@@ -26,9 +26,10 @@ pub use programs::{
     StateProgramPlan, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    image_cell_limit, GraphSlots, HistoryStorePlan, LayerHistory, NativeGraphCharge, ResourceBytes,
-    ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
-    StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, MAX_IMAGE_CELLS,
+    image_cell_limit, reads_decoded_history, GraphSlots, HistoryStorePlan, LayerHistory,
+    NativeGraphCharge, ResourceBytes, ResourceCapacity, ResourceLimits, ResourcePlan,
+    ResourcePlanner, StartupSlots, StateCapacityPlan, StateResourcePlan, StateStorePlan,
+    TensorOperations, MAX_IMAGE_CELLS,
 };
 pub use weights::{
     resident_element, resident_layout, source_element, AttentionBinding, AttentionShape,

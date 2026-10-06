@@ -149,50 +149,67 @@ impl NativePreparationCache {
         // Tuning walks the program three times: a count finds the units that
         // will search and their launches, a census measures their defaults
         // at their points within the tuning time left (keeping the inputs it
-        // builds), and
-        // the last walk searches each within its share of step time and
-        // prepares it.
-        let mut count = Preparation::new(
-            plan,
-            tuning.definition,
-            limits,
-            epsilon,
-            Specializer::count(device),
-            Tuning::Tuner(Tuner::count(
-                device,
-                tuning,
+        // builds and each unit's opened search). The units are then searched
+        // together within the tuning time left, and the last walk prepares
+        // each with its choice.
+        // Each walk's preparation ends with its walk: the tuner, which
+        // borrows the import kernels, passes on to the next.
+        let counted = {
+            let mut count = Preparation::new(
+                plan,
+                tuning.definition,
                 limits,
-                TuningWeights::new(device, load, tuning.weights, &import),
-            )),
-        );
-        count.walk(plan)?;
-        let mut census = Preparation::new(
-            plan,
-            tuning.definition,
-            limits,
-            epsilon,
-            Specializer::count(device),
-            Tuning::Tuner(count.tuning.into_tuner().census()),
-        );
-        census.walk(plan)?;
-        let mut preparation = Preparation::new(
-            plan,
-            tuning.definition,
-            limits,
-            epsilon,
-            spec,
-            Tuning::Tuner(census.tuning.into_tuner().search()),
-        );
-        let glue = preparation.walk(plan)?;
-        let Preparation {
-            tuning,
-            target,
-            head,
-            draft,
-            vision,
-            ..
-        } = preparation;
-        let tuned = tuning.into_tuner().tuned();
+                epsilon,
+                Specializer::count(device),
+                Tuning::Tuner(Tuner::count(
+                    device,
+                    tuning,
+                    limits,
+                    TuningWeights::new(device, load, tuning.weights, &import),
+                )),
+            );
+            count.walk(plan)?;
+            count.tuning.into_tuner()
+        };
+        let censused = {
+            let mut census = Preparation::new(
+                plan,
+                tuning.definition,
+                limits,
+                epsilon,
+                Specializer::count(device),
+                Tuning::Tuner(counted.census()),
+            );
+            census.walk(plan)?;
+            census.tuning.into_tuner()
+        };
+        let (glue, target, head, draft, vision, tuned) = {
+            let mut preparation = Preparation::new(
+                plan,
+                tuning.definition,
+                limits,
+                epsilon,
+                spec,
+                Tuning::Tuner(censused.search()?),
+            );
+            let glue = preparation.walk(plan)?;
+            let Preparation {
+                tuning,
+                target,
+                head,
+                draft,
+                vision,
+                ..
+            } = preparation;
+            (
+                glue,
+                target,
+                head,
+                draft,
+                vision,
+                tuning.into_tuner().tuned(),
+            )
+        };
         Ok(Self {
             owner,
             import,
@@ -462,34 +479,54 @@ impl<'a> Preparation<'a> {
                 | FeedForwardProgramSlot::GeneralRouted(_) => None,
             },
         ));
+        // Each binding is walked once: its case binds every layer it serves,
+        // and a walk that tunes nothing (the count, the census) must not
+        // meet it again at each of them, or its launches per step would be
+        // counted once per layer.
+        let mut mixers = HashSet::new();
+        let mut feeds = HashSet::new();
         for block in target.blocks() {
-            match block.mixer() {
-                MixerProgramSlot::Attention(b) if !self.target.attention.contains_key(&b) => {
+            match Some(block.mixer()).filter(|slot| mixers.insert(*slot)) {
+                Some(MixerProgramSlot::Attention(b))
+                    if !self.target.attention.contains_key(&b) =>
+                {
                     if let Some(kernels) = self.attention(b, attention_layers.scopes(b))? {
                         self.target.attention.insert(b, kernels);
                     }
                 }
-                MixerProgramSlot::Recurrent(b) if !self.target.recurrent.contains_key(&b) => {
+                Some(MixerProgramSlot::Recurrent(b))
+                    if !self.target.recurrent.contains_key(&b) =>
+                {
                     if let Some(kernels) = self.recurrent(b, recurrent_layers.scopes(b))? {
                         self.target.recurrent.insert(b, kernels);
                     }
                 }
-                MixerProgramSlot::StateSpace(b) if !self.target.state_space.contains_key(&b) => {
+                Some(MixerProgramSlot::StateSpace(b))
+                    if !self.target.state_space.contains_key(&b) =>
+                {
                     if let Some(kernels) = self.state_space(b, state_space_layers.scopes(b))? {
                         self.target.state_space.insert(b, kernels);
                     }
                 }
-                MixerProgramSlot::ShortConv(b) if !self.target.short_conv.contains_key(&b) => {
+                Some(MixerProgramSlot::ShortConv(b))
+                    if !self.target.short_conv.contains_key(&b) =>
+                {
                     if let Some(kernels) = self.short_conv(b, short_conv_layers.scopes(b))? {
                         self.target.short_conv.insert(b, kernels);
                     }
                 }
-                MixerProgramSlot::Attention(_)
-                | MixerProgramSlot::Recurrent(_)
-                | MixerProgramSlot::StateSpace(_)
-                | MixerProgramSlot::ShortConv(_) => {}
+                Some(
+                    MixerProgramSlot::Attention(_)
+                    | MixerProgramSlot::Recurrent(_)
+                    | MixerProgramSlot::StateSpace(_)
+                    | MixerProgramSlot::ShortConv(_),
+                )
+                | None => {}
             }
-            match block.feed_forward() {
+            match block
+                .feed_forward()
+                .filter(|slot| feeds.insert(*slot))
+            {
                 Some(FeedForwardProgramSlot::Dense(b)) if !self.target.dense.contains_key(&b) => {
                     if let Some(kernels) = self.dense(b, dense_layers.scopes(b))? {
                         self.target.dense.insert(b, kernels);
@@ -532,8 +569,9 @@ impl<'a> Preparation<'a> {
                 .enumerate()
                 .filter_map(|(index, block)| Some((block.per_layer()?, sublayer_scope(index, 2)))),
         );
+        let mut per_layers = HashSet::new();
         for b in target.blocks().iter().filter_map(|block| block.per_layer()) {
-            if !self.target.per_layer.contains_key(&b) {
+            if per_layers.insert(b) && !self.target.per_layer.contains_key(&b) {
                 if let Some(kernels) = self.per_layer(b, per_layer_layers.scopes(b))? {
                     self.target.per_layer.insert(b, kernels);
                 }
@@ -794,8 +832,12 @@ impl<'a> Preparation<'a> {
                 // are two kernels with their own admissible forms.
                 // (`StateResourcePlan::lists_history_tiles`, of the opened
                 // device's own fact; graph preparation checks they agree.)
-                let lists = self.spec.forms_tensor_operations()
-                    && binding.history == KvCodec::AffineK8V4;
+                let lists = binding.history == KvCodec::AffineK8V4
+                    && crate::planning::reads_decoded_history(
+                        self.spec.backend(),
+                        self.spec.forms_tensor_operations(),
+                        shape.width,
+                    );
                 let prefill = self
                     .spec
                     .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(mix()))?;

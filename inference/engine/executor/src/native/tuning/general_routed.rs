@@ -40,6 +40,7 @@ fn sum_element(binding: &GeneralRoutedBinding) -> Element {
 /// normalized, scaled weights. Integer routes are compared exactly, so a
 /// configuration that flips a near-tie choice on the tuning rows is not
 /// chosen.
+#[derive(Clone)]
 pub(crate) struct RoutedSelectTuning {
     pub binding: GeneralRoutedBinding,
     pub scopes: Vec<WeightScope>,
@@ -164,6 +165,7 @@ impl EntryTuning for RoutedSelectTuning {
 }
 
 /// The decode expansion: `routed_gate_up` (gated experts) or `routed_up`.
+#[derive(Clone)]
 pub(crate) struct RoutedExpandDecodeTuning {
     pub binding: GeneralRoutedBinding,
     pub scopes: Vec<WeightScope>,
@@ -224,9 +226,11 @@ impl RoutedExpandDecodeTuning {
 }
 
 /// `routed_gate_up` over [`RoutedExpandDecodeTuning`].
+#[derive(Clone)]
 pub(crate) struct RoutedGateUpTuning(pub RoutedExpandDecodeTuning);
 
 /// `routed_up` over [`RoutedExpandDecodeTuning`].
+#[derive(Clone)]
 pub(crate) struct RoutedUpTuning(pub RoutedExpandDecodeTuning);
 
 impl EntryTuning for RoutedGateUpTuning {
@@ -330,6 +334,7 @@ impl EntryTuning for RoutedUpTuning {
 
 /// `routed_down`: the selected experts' down projections, weighted in slot
 /// order, onto the base (decode rows).
+#[derive(Clone)]
 pub(crate) struct RoutedDownTuning {
     pub binding: GeneralRoutedBinding,
     pub scopes: Vec<WeightScope>,
@@ -424,6 +429,7 @@ impl EntryTuning for RoutedDownTuning {
 
 /// The grouped expert tiles: `routed_experts` (gated) or
 /// `routed_experts_up`.
+#[derive(Clone)]
 pub(crate) struct RoutedExpertTilesTuning {
     pub binding: GeneralRoutedBinding,
     pub scopes: Vec<WeightScope>,
@@ -487,9 +493,11 @@ impl RoutedExpertTilesTuning {
 }
 
 /// `routed_experts` over [`RoutedExpertTilesTuning`].
+#[derive(Clone)]
 pub(crate) struct RoutedGatedTilesTuning(pub RoutedExpertTilesTuning);
 
 /// `routed_experts_up` over [`RoutedExpertTilesTuning`].
+#[derive(Clone)]
 pub(crate) struct RoutedUpTilesTuning(pub RoutedExpertTilesTuning);
 
 impl EntryTuning for RoutedGatedTilesTuning {
@@ -605,6 +613,7 @@ impl EntryTuning for RoutedUpTilesTuning {
 
 /// `routed_scatter`: the grouped outputs unpermuted and weighted onto the
 /// base (grouped rows).
+#[derive(Clone)]
 pub(crate) struct RoutedScatterTuning {
     pub binding: GeneralRoutedBinding,
     /// Layers prepared with this specialization.

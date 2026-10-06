@@ -16,8 +16,8 @@
 #endif
 
 #if !defined(SEISMIC_ELEMENT_U_LAYOUT_PACKET) && !defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS16) && \
-    !defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
-#error "repack_weight writes packet, rows16 or mma16 storage"
+    !defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16) && !defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS32)
+#error "repack_weight writes packet, rows16, mma16 or rows32 storage"
 #endif
 
 #if defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q3_K) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q6K)
@@ -405,6 +405,42 @@ inline device uchar *row_base(device uchar *destination, constant ulong *seismic
                              SEISMIC_RESULT_0_ROW_STRIDE_BYTES;
 }
 
+// Rows of one stored row tile: `rows32` interleaves every plane across 32
+// rows; `rows16` rows stand alone.
+#if defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS32)
+#define STORED_TILE 32ul
+#else
+#define STORED_TILE 1ul
+#endif
+
+// Unit `unit` (of `unit_bytes` bytes) of stored row `n` in the code plane at
+// row offset `offset`: units follow one another along a `rows16` row; in
+// `rows32` the tile's rows of one unit are adjacent
+// (`PackedRowLayout::code_bit`).
+inline device uchar *plane_unit(device uchar *destination, constant ulong *seismic_words, ulong b, ulong n,
+                                ulong offset, ulong unit_bytes, ulong unit) {
+    return row_base(destination, seismic_words, b, n - n % STORED_TILE) + offset * STORED_TILE +
+           (unit * STORED_TILE + n % STORED_TILE) * unit_bytes;
+}
+
+// Storage group `group` (of `group_bytes` bytes) of stored row `n` in the
+// group plane at row offset `offset` (`row_bytes` a row): a row's groups are
+// contiguous in every layout, and a `rows32` tile holds its rows' shares of
+// the plane one after another (`PackedRowLayout::packet_bit`).
+inline device uchar *plane_group(device uchar *destination, constant ulong *seismic_words, ulong b, ulong n,
+                                 ulong offset, ulong row_bytes, ulong group_bytes, ulong group) {
+    return row_base(destination, seismic_words, b, n - n % STORED_TILE) + offset * STORED_TILE +
+           n % STORED_TILE * row_bytes + group * group_bytes;
+}
+
+// The share of stored row `n` in the `length`-bytes-a-row gap that starts at
+// row offset `offset` (a plane's alignment tail).
+inline device uchar *plane_gap(device uchar *destination, constant ulong *seismic_words, ulong b, ulong n,
+                               ulong offset, ulong length) {
+    return row_base(destination, seismic_words, b, n - n % STORED_TILE) + offset * STORED_TILE +
+           (n % STORED_TILE) * length;
+}
+
 #if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
 // Code of fragment slot `slot` of k16 step `step` (within k-block `block`)
 // owned by `lane`: (row lane/4 + 8 (slot % 2), column 64 block + 16 step +
@@ -453,35 +489,46 @@ kernel void repack_weight(
     const uint within = column0 % GROUP;
 #if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
     // Every row of a tile is stored; rows beyond N are zero padding.
+    if (row0 >= (SEISMIC_DIM_N + TILE_ROWS - 1) / TILE_ROWS * TILE_ROWS) return;
+    const ulong rows = TILE_ROWS;
+#elif defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS32)
+    // Every row of a 32-row tile is stored; rows beyond N are zero padding.
     const ulong rows = TILE_ROWS;
 #else
+    if (row0 >= SEISMIC_DIM_N) return;
     const ulong rows = min(ulong(TILE_ROWS), SEISMIC_DIM_N - row0);
 #endif
 
-#if defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS16)
-    // Code planes: the code of column c sits at bit `c * bits` of the plane.
+#if defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS16) || defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS32)
+    // Code planes: the 32 codes of this tile's columns of one row are one
+    // unit of each code plane, the code of column c at bit `(c % 32) * bits`.
     if (lane < rows) {
         const ulong n = row0 + lane;
-        device const uchar *in = source_packet(source, seismic_words, b, n, column0 / GROUP);
-        device uchar *row = row_base(destination, seismic_words, b, n);
+        const bool stored = n < SEISMIC_DIM_N;
+        const ulong unit = column0 / TILE_COLUMNS;
+        device const uchar *in = source_packet(source, seismic_words, b, stored ? n : 0ul, column0 / GROUP);
 #if defined(SEISMIC_ELEMENT_U_PLANE_CODES)
-        device uint4 *codes = reinterpret_cast<device uint4 *>(row + SEISMIC_RESULT_0_PLANE_CODES_ROW_OFFSET + column0);
-        codes[0] = uint4(pack_four_bytes(in, within), pack_four_bytes(in, within + 4),
-                         pack_four_bytes(in, within + 8), pack_four_bytes(in, within + 12));
-        codes[1] = uint4(pack_four_bytes(in, within + 16), pack_four_bytes(in, within + 20),
-                         pack_four_bytes(in, within + 24), pack_four_bytes(in, within + 28));
+        device uint4 *codes = reinterpret_cast<device uint4 *>(plane_unit(destination, seismic_words, b, n,
+            SEISMIC_RESULT_0_PLANE_CODES_ROW_OFFSET, 32ul, unit));
+        codes[0] = stored ? uint4(pack_four_bytes(in, within), pack_four_bytes(in, within + 4),
+                                  pack_four_bytes(in, within + 8), pack_four_bytes(in, within + 12)) : uint4(0u);
+        codes[1] = stored ? uint4(pack_four_bytes(in, within + 16), pack_four_bytes(in, within + 20),
+                                  pack_four_bytes(in, within + 24), pack_four_bytes(in, within + 28)) : uint4(0u);
 #else
-        *reinterpret_cast<device uint4 *>(row + SEISMIC_RESULT_0_PLANE_CODES_LO_ROW_OFFSET + column0 / 2) =
-            uint4(pack_eight(in, within, 0, 4), pack_eight(in, within + 8, 0, 4),
-                  pack_eight(in, within + 16, 0, 4), pack_eight(in, within + 24, 0, 4));
+        *reinterpret_cast<device uint4 *>(plane_unit(destination, seismic_words, b, n,
+            SEISMIC_RESULT_0_PLANE_CODES_LO_ROW_OFFSET, 16ul, unit)) =
+            stored ? uint4(pack_eight(in, within, 0, 4), pack_eight(in, within + 8, 0, 4),
+                           pack_eight(in, within + 16, 0, 4), pack_eight(in, within + 24, 0, 4)) : uint4(0u);
 #if defined(SEISMIC_ELEMENT_U_PLANE_CODES_HI) && SEISMIC_ELEMENT_U_PLANE_CODES_HI_CODE_BITS == 1
-        *reinterpret_cast<device uint *>(row + SEISMIC_RESULT_0_PLANE_CODES_HI_ROW_OFFSET + column0 / 8) =
-            pack_eight(in, within, 4, 1) | (pack_eight(in, within + 8, 4, 1) << 8) |
-            (pack_eight(in, within + 16, 4, 1) << 16) | (pack_eight(in, within + 24, 4, 1) << 24);
+        *reinterpret_cast<device uint *>(plane_unit(destination, seismic_words, b, n,
+            SEISMIC_RESULT_0_PLANE_CODES_HI_ROW_OFFSET, 4ul, unit)) =
+            stored ? pack_eight(in, within, 4, 1) | (pack_eight(in, within + 8, 4, 1) << 8) |
+                     (pack_eight(in, within + 16, 4, 1) << 16) | (pack_eight(in, within + 24, 4, 1) << 24) : 0u;
 #elif defined(SEISMIC_ELEMENT_U_PLANE_CODES_HI)
-        *reinterpret_cast<device uint2 *>(row + SEISMIC_RESULT_0_PLANE_CODES_HI_ROW_OFFSET + column0 / 4) =
-            uint2(pack_eight(in, within, 4, 2) | (pack_eight(in, within + 8, 4, 2) << 16),
-                  pack_eight(in, within + 16, 4, 2) | (pack_eight(in, within + 24, 4, 2) << 16));
+        *reinterpret_cast<device uint2 *>(plane_unit(destination, seismic_words, b, n,
+            SEISMIC_RESULT_0_PLANE_CODES_HI_ROW_OFFSET, 8ul, unit)) =
+            stored ? uint2(pack_eight(in, within, 4, 2) | (pack_eight(in, within + 8, 4, 2) << 16),
+                           pack_eight(in, within + 16, 4, 2) | (pack_eight(in, within + 24, 4, 2) << 16)) : uint2(0u);
 #endif
 #endif
     }
@@ -546,17 +593,16 @@ kernel void repack_weight(
     // Coefficient planes, once per group (at its first tile), per row.
     if (within == 0 && lane < rows) {
         const ulong n = row0 + lane;
-        device uchar *row = row_base(destination, seismic_words, b, n);
         const ulong group = column0 / GROUP;
         const bool real = n < SEISMIC_DIM_N && occupied;
 #if defined(SEISMIC_ELEMENT_U_PLANE_SCALES)
-        device uchar *scales =
-            row + SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET + group * SEISMIC_ELEMENT_U_PLANE_SCALES_BYTES_PER_GROUP;
+        device uchar *scales = plane_group(destination, seismic_words, b, n, SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET,
+            SEISMIC_RESULT_0_PLANE_SCALES_BYTES_PER_ROW, SEISMIC_ELEMENT_U_PLANE_SCALES_BYTES_PER_GROUP, group);
         if (real) write_scales(source_packet(source, seismic_words, b, n, group), scales);
         else zero_bytes(scales, SEISMIC_ELEMENT_U_PLANE_SCALES_BYTES_PER_GROUP);
 #endif
-        device uchar *supers =
-            row + SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET + group * SEISMIC_ELEMENT_U_PLANE_SUPERS_BYTES_PER_GROUP;
+        device uchar *supers = plane_group(destination, seismic_words, b, n, SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET,
+            SEISMIC_RESULT_0_PLANE_SUPERS_BYTES_PER_ROW, SEISMIC_ELEMENT_U_PLANE_SUPERS_BYTES_PER_GROUP, group);
         if (real) write_supers(source_packet(source, seismic_words, b, n, group), supers);
         else zero_bytes(supers, SEISMIC_ELEMENT_U_PLANE_SUPERS_BYTES_PER_GROUP);
     }
@@ -565,25 +611,30 @@ kernel void repack_weight(
     // last stored tile. Low code planes are whole multiples of 16 bytes; a
     // high-bit plane of 32-value groups may not be.
     if (column0 + TILE_COLUMNS == stored_columns && lane < rows) {
-        device uchar *row = row_base(destination, seismic_words, b, row0 + lane);
+        const ulong n = row0 + lane;
 #if defined(SEISMIC_ELEMENT_U_PLANE_CODES_HI)
 #if defined(SEISMIC_ELEMENT_U_PLANE_SCALES)
         const ulong after_high = SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET;
 #else
         const ulong after_high = SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET;
 #endif
-        zero_bytes(row + SEISMIC_RESULT_0_PLANE_CODES_HI_ROW_OFFSET + SEISMIC_RESULT_0_PLANE_CODES_HI_BYTES_PER_ROW,
-                   after_high - SEISMIC_RESULT_0_PLANE_CODES_HI_ROW_OFFSET -
-                       SEISMIC_RESULT_0_PLANE_CODES_HI_BYTES_PER_ROW);
+        const ulong high_end =
+            SEISMIC_RESULT_0_PLANE_CODES_HI_ROW_OFFSET + SEISMIC_RESULT_0_PLANE_CODES_HI_BYTES_PER_ROW;
+        zero_bytes(plane_gap(destination, seismic_words, b, n, high_end, after_high - high_end),
+                   after_high - high_end);
 #endif
 #if defined(SEISMIC_ELEMENT_U_PLANE_SCALES)
-        zero_bytes(row + SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET + SEISMIC_RESULT_0_PLANE_SCALES_BYTES_PER_ROW,
-                   SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET - SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET -
-                       SEISMIC_RESULT_0_PLANE_SCALES_BYTES_PER_ROW);
+        const ulong scales_end =
+            SEISMIC_RESULT_0_PLANE_SCALES_ROW_OFFSET + SEISMIC_RESULT_0_PLANE_SCALES_BYTES_PER_ROW;
+        zero_bytes(plane_gap(destination, seismic_words, b, n, scales_end,
+                             SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET - scales_end),
+                   SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET - scales_end);
 #endif
-        zero_bytes(row + SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET + SEISMIC_RESULT_0_PLANE_SUPERS_BYTES_PER_ROW,
-                   SEISMIC_RESULT_0_ROW_STRIDE_BYTES - SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET -
-                       SEISMIC_RESULT_0_PLANE_SUPERS_BYTES_PER_ROW);
+        const ulong supers_end =
+            SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET + SEISMIC_RESULT_0_PLANE_SUPERS_BYTES_PER_ROW;
+        zero_bytes(plane_gap(destination, seismic_words, b, n, supers_end,
+                             SEISMIC_RESULT_0_ROW_STRIDE_BYTES - supers_end),
+                   SEISMIC_RESULT_0_ROW_STRIDE_BYTES - supers_end);
     }
 }
 

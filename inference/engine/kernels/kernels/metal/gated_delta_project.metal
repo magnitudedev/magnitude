@@ -6,6 +6,7 @@
 #define KERNEL_W2 SEISMIC_ALPHA_WEIGHT
 #define KERNEL_W3 SEISMIC_BETA_WEIGHT
 #include "lib/projection/projection.h"
+#include "lib/projection/packing.h"
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
@@ -19,6 +20,11 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     device const uchar *beta_weight [[buffer(SEISMIC_BUFFER_BETA_WEIGHT)]],             \
     device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
+    device float *packed [[buffer(SEISMIC_BUFFER_SCRATCH_PACKED)]],                     \
+    device half *token_factors [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_FACTORS)]],        \
+    device half *weight_factors [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_FACTORS)]],      \
+    device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
+    device float *weight_scales [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_SCALES)]],       \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define RECURRENT_PROJECT_OPERANDS                                                      \
@@ -115,13 +121,18 @@ kernel void gated_delta_project_stage(RECURRENT_PROJECT_ARGUMENTS,
 }
 #endif
 
-#define RECURRENT_PROJECT_GEMM(TM, TN)                                                  \
+// The staged tiles of the segments; QKV and GATE say whether these tiles run
+// the qkv and the z segment (the PACK form's own tiles run the ones it
+// takes).
+#define RECURRENT_PROJECT_GEMM_SEGMENTS(TM, TN, QKV, GATE)                              \
     PROJECTION_GEMM_SHARED(shared, TM, TN);                                             \
     RECURRENT_PROJECT_OPERANDS;                                                         \
     projection::Plain<activation, projection::AllRows> x{normalized, k, 1, k, {}};      \
     uint m = uint(SEISMIC_DIM_M);                                                       \
     uint t0 = (qkv_rows + TN - 1) / TN, t1 = (gate_rows + TN - 1) / TN, t2 = (head_rows + TN - 1) / TN; \
     uint n = tile.x;                                                                    \
+    if (n < t0 + t1 && !(n < t0 ? QKV : GATE))                                          \
+        return;                                                                         \
     if (n < t0)                                                                         \
         projection::gemm<packets::W0, TM, TN>(x, qkv_out, qkv, m, qkv_rows, k, tile.y, n, shared, sg, lane); \
     else if (n < t0 + t1)                                                               \
@@ -132,6 +143,8 @@ kernel void gated_delta_project_stage(RECURRENT_PROJECT_ARGUMENTS,
     else                                                                                \
         projection::gemm<packets::W3, TM, TN>(x, beta_out, beta, m, head_rows, k, tile.y, n - t0 - t1 - t2, \
             shared, sg, lane)
+
+#define RECURRENT_PROJECT_GEMM(TM, TN) RECURRENT_PROJECT_GEMM_SEGMENTS(TM, TN, true, true)
 
 // 17..64 rows: the fixed small-row tile.
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM_SMALL
@@ -192,5 +205,83 @@ kernel void gated_delta_project_tall(RECURRENT_PROJECT_ARGUMENTS,
     else
         projection::gemm_tall<packets::W3, TALL_M, TALL_K, STAGERS>(x, beta_out, beta, m, head_rows, k, tile.y,
             n - t0 - t1 - t2, shared, sg, lane);
+}
+#endif
+
+// The PACK form past 64 rows: the normalized rows (`gated_delta_project_stage`)
+// as integer codes under the gain limits of the qkv and z weights together,
+// two rows packed per operand element, those weights' block scales and biases
+// (the z weights' after the qkv weights' in each table), then the packed
+// tiles of those two segments. The operand is laid out for the first of the
+// two weights with a packed path; a segment whose weights it does not serve
+// and the alpha and beta segments run the staged tiles (`unpacked`), with
+// their results.
+#define RECURRENT_PROJECT_PACKING_SCRATCH                                               \
+    const projection::packing_scratch qkv_scratch{packed, token_factors, token_scales, weight_factors, \
+        weight_scales};                                                                 \
+    const projection::packing_scratch gate_scratch{packed, token_factors, token_scales, \
+        weight_factors + ulong(qkv_rows) * (k / 32u) * 2u, weight_scales + qkv_rows}
+#define RECURRENT_PROJECT_PACKING projection::packing_shared<packets::W0, packets::W1>
+#define RECURRENT_PROJECT_PACKED(SLOT)                                                  \
+    projection::packing_serves<packets::SLOT, RECURRENT_PROJECT_PACKING::folds>::value
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_PACK
+kernel void gated_delta_project_pack(RECURRENT_PROJECT_ARGUMENTS,
+    uint pairs [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if constexpr (RECURRENT_PROJECT_PACKING::folds == 0)
+        return;
+    threadgroup float4 peaks[8];
+    RECURRENT_PROJECT_OPERANDS;
+    RECURRENT_PROJECT_PACKING_SCRATCH;
+    projection::Plain<activation, projection::AllRows> x{normalized, k, 1, k, {}};
+    projection::packing_operand<RECURRENT_PROJECT_PACKING::centre, RECURRENT_PROJECT_PACKING::folds>(x,
+        qkv_scratch, uint(SEISMIC_DIM_M), k, pairs, peaks, thread_index, sg, lane);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_PACK_COEFFICIENTS
+kernel void gated_delta_project_pack_coefficients(RECURRENT_PROJECT_ARGUMENTS,
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_PROJECT_OPERANDS;
+    RECURRENT_PROJECT_PACKING_SCRATCH;
+    if (row < qkv_rows) {
+        if constexpr (RECURRENT_PROJECT_PACKED(W0))
+            projection::packing_coefficients(qkv, qkv_scratch, qkv_rows, k, row, lane);
+    } else {
+        if constexpr (RECURRENT_PROJECT_PACKED(W1))
+            projection::packing_coefficients(gate, gate_scratch, gate_rows, k, row - qkv_rows, lane);
+    }
+}
+#endif
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_PACKED
+template <uint PACK_TOKENS, uint WEIGHTS_AHEAD>
+kernel void gated_delta_project_packed(RECURRENT_PROJECT_ARGUMENTS,
+    uint tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_PROJECT_OPERANDS;
+    RECURRENT_PROJECT_PACKING_SCRATCH;
+    const uint m = uint(SEISMIC_DIM_M), padded = (m + 127u) / 128u * 128u;
+    uint group = tile;
+    constexpr uint FOLDS = RECURRENT_PROJECT_PACKING::folds;
+    if (projection::gemm_packed_segment<packets::W0, FOLDS, PACK_TOKENS, WEIGHTS_AHEAD>(qkv_out, qkv,
+            qkv_scratch, m, padded, qkv_rows, k, group, projection::packing_simdgroups, sg, lane))
+        return;
+    projection::gemm_packed_segment<packets::W1, FOLDS, PACK_TOKENS, WEIGHTS_AHEAD>(gate_out, gate,
+        gate_scratch, m, padded, gate_rows, k, group, projection::packing_simdgroups, sg, lane);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_UNPACKED
+kernel void gated_delta_project_unpacked(RECURRENT_PROJECT_ARGUMENTS,
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_PROJECT_GEMM_SEGMENTS(64, 64, !RECURRENT_PROJECT_PACKED(W0), !RECURRENT_PROJECT_PACKED(W1));
 }
 #endif

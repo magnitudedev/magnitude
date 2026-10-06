@@ -158,6 +158,37 @@ struct ConvolvedChannel {
     projection::Store<activation> beta_out{result, SEISMIC_RESULT_0_STRIDE_0,           \
         SEISMIC_RESULT_0_STRIDE_1, qkv_rows + gate_rows + head_rows}
 
+// The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows. The last
+// simdgroup resolves the rows' slots after its share of the norm; the body's
+// opening barrier publishes them to the epilogue.
+#define RECURRENT_PROJECT_CONVOLVED_GEMV(ROWS, LANES, COUNT)                            \
+    threadgroup ConvolvedRow slot_rows[16];                                             \
+    RECURRENT_PROJECT_OPERANDS;                                                         \
+    uint per = simdgroups * ROWS * (32u / LANES);                                       \
+    uint rows = uint(SEISMIC_DIM_M);                                                    \
+    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
+    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
+    const auto x = projection::shared_norm(in, squares);                                \
+    uint t0 = (qkv_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;             \
+    uint t2 = (head_rows + per - 1) / per;                                              \
+    if (tile < t0 && sg + 1 == simdgroups)                                              \
+        convolved_rows({segments, stop, previous_bank, previous_tape, following_bank}, window, slot_rows, lane, \
+            seismic_words);                                                             \
+    if (tile < t0) {                                                                    \
+        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_columns_runtime<packets::W0, ROWS, MAXM, LANES>( \
+            x, qkv_out, qkv, rows, qkv_rows, k, tile, shared, simdgroups, sg, lane));   \
+    } else if (tile < t0 + t1) {                                                        \
+        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W1, ROWS, MAXM, LANES>( \
+            x, gate_out, gate, rows, gate_rows, k, tile - t0, shared, simdgroups, sg, lane)); \
+    } else if (tile < t0 + t1 + t2) {                                                   \
+        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W2, ROWS, MAXM, LANES>( \
+            x, alpha_out, alpha, rows, head_rows, k, tile - t0 - t1, shared, simdgroups, sg, lane)); \
+    } else {                                                                            \
+        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W3, ROWS, MAXM, LANES>( \
+            x, beta_out, beta, rows, head_rows, k, tile - t0 - t1 - t2, shared, simdgroups, sg, lane)); \
+    }
+
+// One row.
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV
 template <uint ROWS, uint LANES>
 kernel void gated_delta_project_convolved_gemv(RECURRENT_PROJECT_ARGUMENTS,
@@ -166,33 +197,33 @@ kernel void gated_delta_project_convolved_gemv(RECURRENT_PROJECT_ARGUMENTS,
     uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup ConvolvedRow slot_rows[16];
-    RECURRENT_PROJECT_OPERANDS;
-    uint per = simdgroups * ROWS * (32u / LANES);
-    uint rows = uint(SEISMIC_DIM_M);
-    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
-    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    const auto x = projection::shared_norm(in, squares);
-    uint t0 = (qkv_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;
-    uint t2 = (head_rows + per - 1) / per;
-    // The last simdgroup resolves the rows' slots after its share of the norm;
-    // the body's opening barrier publishes them to the epilogue.
-    if (tile < t0 && sg + 1 == simdgroups)
-        convolved_rows({segments, stop, previous_bank, previous_tape, following_bank}, window, slot_rows, lane,
-            seismic_words);
-    if (tile < t0) {
-        PROJECTION_FOR_ROWS(rows, projection::gemv_columns_runtime<packets::W0, ROWS, MAXM, LANES>(
-            x, qkv_out, qkv, rows, qkv_rows, k, tile, shared, simdgroups, sg, lane));
-    } else if (tile < t0 + t1) {
-        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W1, ROWS, MAXM, LANES>(
-            x, gate_out, gate, rows, gate_rows, k, tile - t0, shared, simdgroups, sg, lane));
-    } else if (tile < t0 + t1 + t2) {
-        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W2, ROWS, MAXM, LANES>(
-            x, alpha_out, alpha, rows, head_rows, k, tile - t0 - t1, shared, simdgroups, sg, lane));
-    } else {
-        PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W3, ROWS, MAXM, LANES>(
-            x, beta_out, beta, rows, head_rows, k, tile - t0 - t1 - t2, shared, simdgroups, sg, lane));
-    }
+    RECURRENT_PROJECT_CONVOLVED_GEMV(ROWS, LANES, ONE)
+}
+#endif
+
+// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_ROWS
+template <uint ROWS, uint LANES>
+kernel void gated_delta_project_convolved_gemv_rows(RECURRENT_PROJECT_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_PROJECT_CONVOLVED_GEMV(ROWS, LANES, SEVERAL)
+}
+#endif
+
+// Two rows: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_PAIR
+template <uint ROWS, uint LANES>
+kernel void gated_delta_project_convolved_gemv_pair(RECURRENT_PROJECT_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_PROJECT_CONVOLVED_GEMV(ROWS, LANES, PAIR)
 }
 #endif
 

@@ -10,6 +10,7 @@ use seismic::{Element, Tensor};
 
 /// `project_rows` of one sublayer output projection (`kind`: the attention
 /// output or the dense down projection), activation rows in, F32 rows out.
+#[derive(Clone)]
 pub(crate) struct ProjectRowsTuning {
     pub weight: Element,
     pub activation: Element,

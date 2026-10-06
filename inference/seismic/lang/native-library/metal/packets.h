@@ -37,12 +37,53 @@ namespace packets {
 // Weight row geometry. `stride` is the byte distance between rows; plane
 // offsets are within a row. Planes a representation lacks are unused.
 
+//
+// `tile` is the rows of one row tile: 1 for `rows16` and dense rows, 32 for
+// `rows32`, whose code planes are interleaved across the tile (unit `u` of
+// the tile's row `r` follows unit `u` of row `r - 1`) and whose coefficient
+// planes hold the tile's rows one after another, each row's bytes contiguous
+// (`scales_row`, `supers_row` bytes a row). A row is then addressed by its
+// tile's base and `r`, which the geometry of that row carries (`of`): a code
+// plane address is `at(row, plane, unit bytes, unit)`, a coefficient address
+// `scale_at(row, offset)` or `super_at(row, offset)`.
+
 struct Rows16 {
     ulong stride;
     ulong codes;    // codes_lo (k-quants), codes (q8) or the values (dense)
     ulong high;     // codes_hi (q5k, q6k)
     ulong scales;   // packed local coefficients (k-quants)
     ulong supers;   // super factors (k-quants) or group scales (q8)
+    uint tile;
+    uint r;
+    ulong scales_row;
+    ulong supers_row;
+
+    // Row `n`'s base (its tile's first row) from the tensor's `base`.
+    device const uchar *base_of(device const uchar *base, ulong n) const {
+        return base + (n - n % tile) * stride;
+    }
+    // This geometry for row `n`.
+    Rows16 of(ulong n) const {
+        Rows16 row = *this;
+        row.r = uint(n % tile);
+        return row;
+    }
+    // Unit `unit` (of `bytes` bytes) of the code plane at row offset `plane`.
+    // A tile's planes are below 4 GB, so the offset inside one is 32-bit
+    // arithmetic, and the row's share (everything but the unit's step) is
+    // one loop-invariant address: 64-bit index arithmetic on every load
+    // costs a decode lane several instructions a packet.
+    device const uchar *at(device const uchar *row, ulong plane, ulong bytes, ulong unit) const {
+        return (row + plane * tile + ulong(r * uint(bytes))) + ulong(uint(unit) * (tile * uint(bytes)));
+    }
+    // Byte `offset` of this row's share of the scales and of the supers
+    // plane.
+    device const uchar *scale_at(device const uchar *row, ulong offset) const {
+        return (row + scales * tile + ulong(r * uint(scales_row))) + ulong(uint(offset));
+    }
+    device const uchar *super_at(device const uchar *row, ulong offset) const {
+        return (row + supers * tile + ulong(r * uint(supers_row))) + ulong(uint(offset));
+    }
 };
 
 // Bytes 0,2,4,6 / 1,3,5,7 of a 16-bit field of 2-bit high codes, moved to
@@ -98,11 +139,11 @@ struct Q4K {
     };
     static packet load(device const uchar *row, Rows16 layout, uint p) {
         packet k;
-        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
+        k.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
         uint block = p >> 3, local = p & 7u;
-        device const uchar *fields = row + layout.scales + 12ul * block + ((3u * local) >> 1);
+        device const uchar *fields = layout.scale_at(row, 12ul * block) + ((3u * local) >> 1);
         uint pair = (uint(fields[0]) | (uint(fields[1]) << 8)) >> ((local & 1u) * 4u);
-        half2 factors = *reinterpret_cast<device const half2 *>(row + layout.supers + 4ul * block);
+        half2 factors = *reinterpret_cast<device const half2 *>(layout.super_at(row, 4ul * block));
         k.scale = float(factors.x) * float(pair & 63u);
         k.bias = -(float(factors.y) * float((pair >> 6) & 63u));
         return k;
@@ -136,12 +177,12 @@ struct Q5K {
     };
     static packet load(device const uchar *row, Rows16 layout, uint p) {
         packet k;
-        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
-        k.high = *reinterpret_cast<device const uint *>(row + layout.high + 4ul * p);
+        k.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
+        k.high = *reinterpret_cast<device const uint *>(layout.at(row, layout.high, 4ul, p));
         uint block = p >> 3, local = p & 7u;
-        device const uchar *fields = row + layout.scales + 12ul * block + ((3u * local) >> 1);
+        device const uchar *fields = layout.scale_at(row, 12ul * block) + ((3u * local) >> 1);
         uint pair = (uint(fields[0]) | (uint(fields[1]) << 8)) >> ((local & 1u) * 4u);
-        half2 factors = *reinterpret_cast<device const half2 *>(row + layout.supers + 4ul * block);
+        half2 factors = *reinterpret_cast<device const half2 *>(layout.super_at(row, 4ul * block));
         k.scale = float(factors.x) * float(pair & 63u);
         k.bias = -(float(factors.y) * float((pair >> 6) & 63u));
         return k;
@@ -177,10 +218,11 @@ struct Q6K {
     };
     static packet load(device const uchar *row, Rows16 layout, uint p) {
         packet k;
-        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
-        k.high = *reinterpret_cast<device const uint2 *>(row + layout.high + 8ul * p);
-        char2 local = *reinterpret_cast<device const char2 *>(row + layout.scales + 2ul * p);
-        float d = float(*reinterpret_cast<device const half *>(row + layout.supers + 2ul * (p >> 3)));
+        k.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
+        k.high = *reinterpret_cast<device const uint2 *>(layout.at(row, layout.high, 8ul, p));
+        char2 local = *reinterpret_cast<device const char2 *>(
+            layout.scale_at(row, 2ul * p));
+        float d = float(*reinterpret_cast<device const half *>(layout.super_at(row, 2ul * (p >> 3))));
         k.scale0 = d * float(local.x);
         k.scale1 = d * float(local.y);
         return k;
@@ -216,10 +258,10 @@ struct Q8 {
     };
     static packet load(device const uchar *row, Rows16 layout, uint p) {
         packet k;
-        device const uint4 *codes = reinterpret_cast<device const uint4 *>(row + layout.codes + 32ul * p);
+        device const uint4 *codes = reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 32ul, p));
         k.first = codes[0];
         k.second = codes[1];
-        k.scale = float(*reinterpret_cast<device const half *>(row + layout.supers + 2ul * p));
+        k.scale = float(*reinterpret_cast<device const half *>(layout.super_at(row, 2ul * p)));
         return k;
     }
     static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
@@ -301,24 +343,29 @@ struct E2M1Codes {
 
 // Scale fields of packet p in the supers plane, as the (one or two) group
 // scales of the packet.
+//
+// `bytes` are a packet's scale bytes; `load` takes the packet's field.
 struct F32Scale {
     static constant constexpr uint groups = 1;
-    static float2 load(device const uchar *supers, uint p) {
-        return float2(*reinterpret_cast<device const float *>(supers + 4ul * p));
+    static constant constexpr uint bytes = 4;
+    static float2 load(device const uchar *field) {
+        return float2(*reinterpret_cast<device const float *>(field));
     }
 };
 struct F16Scale {
     static constant constexpr uint groups = 1;
-    static float2 load(device const uchar *supers, uint p) {
-        return float2(float(*reinterpret_cast<device const half *>(supers + 2ul * p)));
+    static constant constexpr uint bytes = 2;
+    static float2 load(device const uchar *field) {
+        return float2(float(*reinterpret_cast<device const half *>(field)));
     }
 };
 // E8M0 2^(e - 127), halved for the doubled E2M1 codebook: 2^(e - 128) (e < 2
 // are F32 subnormals); 0xff is NaN.
 struct E8M0Scale {
     static constant constexpr uint groups = 1;
-    static float2 load(device const uchar *supers, uint p) {
-        uint e = supers[p];
+    static constant constexpr uint bytes = 1;
+    static float2 load(device const uchar *field) {
+        uint e = field[0];
         uint bits = e < 2u ? 0x00200000u << e : e == 255u ? 0x7fc00000u : (e - 1u) << 23;
         return float2(as_type<float>(bits));
     }
@@ -327,14 +374,15 @@ struct E8M0Scale {
 // E2M1 codebook: (1 + m/8) 2^(e - 8), or m 2^-10 when e = 0.
 struct UE4M3Scale {
     static constant constexpr uint groups = 2;
+    static constant constexpr uint bytes = 2;
     static float ue4m3_half(uint raw) {
         raw &= 0x7fu;
         uint e = raw >> 3, m = raw & 7u;
         float normal = as_type<float>(((e + 119u) << 23) | (m << 20));
         return raw == 0x7fu ? as_type<float>(0x7fc00000u) : e == 0u ? float(m) * 0.0009765625f : normal;
     }
-    static float2 load(device const uchar *supers, uint p) {
-        uint fields = *reinterpret_cast<device const ushort *>(supers + 2ul * p);
+    static float2 load(device const uchar *field) {
+        uint fields = *reinterpret_cast<device const ushort *>(field);
         return float2(ue4m3_half(fields & 0xffu), ue4m3_half(fields >> 8));
     }
 };
@@ -348,8 +396,8 @@ struct Coded4 {
     };
     static packet load(device const uchar *row, Rows16 layout, uint p) {
         packet k;
-        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
-        k.scale = S::load(row + layout.supers, p);
+        k.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
+        k.scale = S::load(layout.super_at(row, ulong(S::bytes) * p));
         return k;
     }
     static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
@@ -383,14 +431,14 @@ struct Q5G32 {
     };
     static packet load(device const uchar *row, Rows16 layout, uint p) {
         packet k;
-        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
-        k.high = *reinterpret_cast<device const uint *>(row + layout.high + 4ul * p);
+        k.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
+        k.high = *reinterpret_cast<device const uint *>(layout.at(row, layout.high, 4ul, p));
         if (MINIMUM) {
-            half2 factors = *reinterpret_cast<device const half2 *>(row + layout.supers + 4ul * p);
+            half2 factors = *reinterpret_cast<device const half2 *>(layout.super_at(row, 4ul * p));
             k.scale = float(factors.x);
             k.bias = float(factors.y);
         } else {
-            k.scale = float(*reinterpret_cast<device const half *>(row + layout.supers + 2ul * p));
+            k.scale = float(*reinterpret_cast<device const half *>(layout.super_at(row, 2ul * p)));
             k.bias = -16.0f * k.scale;
         }
         return k;
@@ -503,8 +551,8 @@ struct KBlock {
     static KBlock load(device const uchar *row, Rows16 layout, uint p) {
         uint block = p >> 3;
         KBlock run;
-        run.fields = uint3(*reinterpret_cast<device const packed_uint3 *>(row + layout.scales + 12ul * block));
-        half2 factors = *reinterpret_cast<device const half2 *>(row + layout.supers + 4ul * block);
+        run.fields = uint3(*reinterpret_cast<device const packed_uint3 *>(layout.scale_at(row, 12ul * block)));
+        half2 factors = *reinterpret_cast<device const half2 *>(layout.super_at(row, 4ul * block));
         run.factors = float2(float(factors.x), -float(factors.y));
         for (uint skipped = 0; skipped < (p & 7u); ++skipped)
             advance(run);
@@ -525,7 +573,7 @@ struct Block<Q4K> {
     static state load(device const uchar *row, Rows16 layout, uint p) { return KBlock::load(row, layout, p); }
     static Q4K::packet packet(device const uchar *row, Rows16 layout, uint p, uint, thread state &run) {
         Q4K::packet k;
-        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
+        k.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
         float2 coefficients = KBlock::take(run);
         k.scale = coefficients.x;
         k.bias = coefficients.y;
@@ -540,8 +588,8 @@ struct Block<Q5K> {
     static state load(device const uchar *row, Rows16 layout, uint p) { return KBlock::load(row, layout, p); }
     static Q5K::packet packet(device const uchar *row, Rows16 layout, uint p, uint, thread state &run) {
         Q5K::packet k;
-        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
-        k.high = *reinterpret_cast<device const uint *>(row + layout.high + 4ul * p);
+        k.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
+        k.high = *reinterpret_cast<device const uint *>(layout.at(row, layout.high, 4ul, p));
         float2 coefficients = KBlock::take(run);
         k.scale = coefficients.x;
         k.bias = coefficients.y;
@@ -565,16 +613,16 @@ struct Block<Q6K> {
     static state load(device const uchar *row, Rows16 layout, uint p) {
         uint block = p >> 3;
         state run;
-        run.scales = uint4(*reinterpret_cast<device const packed_uint4 *>(row + layout.scales + 16ul * block));
-        run.d = float(*reinterpret_cast<device const half *>(row + layout.supers + 2ul * block));
+        run.scales = uint4(*reinterpret_cast<device const packed_uint4 *>(layout.scale_at(row, 16ul * block)));
+        run.d = float(*reinterpret_cast<device const half *>(layout.super_at(row, 2ul * block)));
         for (uint skipped = 0; skipped < (p & 7u); ++skipped)
             advance(run);
         return run;
     }
     static Q6K::packet packet(device const uchar *row, Rows16 layout, uint p, uint, thread state &run) {
         Q6K::packet k;
-        k.low = *reinterpret_cast<device const uint4 *>(row + layout.codes + 16ul * p);
-        k.high = *reinterpret_cast<device const uint2 *>(row + layout.high + 8ul * p);
+        k.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
+        k.high = *reinterpret_cast<device const uint2 *>(layout.at(row, layout.high, 8ul, p));
         char2 scales = as_type<char2>(ushort(run.scales.x));
         advance(run);
         k.scale0 = run.d * float(scales.x);
@@ -601,21 +649,28 @@ inline float value_at(thread const typename W::packet &k, uint i) {
 
 #define PACKETS_ROWS16_Q4K(P)                                                                        \
     packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _PLANE_CODES_LO_ROW_OFFSET), 0, \
-        ELEMENT_CAT(P, _PLANE_SCALES_ROW_OFFSET), ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET) }
+        ELEMENT_CAT(P, _PLANE_SCALES_ROW_OFFSET), ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET), \
+        ELEMENT_CAT(P, _TILE_ROWS), 0, ELEMENT_CAT(P, _PLANE_SCALES_BYTES_PER_ROW),                   \
+        ELEMENT_CAT(P, _PLANE_SUPERS_BYTES_PER_ROW) }
 #define PACKETS_ROWS16_HIGH(P)                                                                       \
     packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _PLANE_CODES_LO_ROW_OFFSET),   \
         ELEMENT_CAT(P, _PLANE_CODES_HI_ROW_OFFSET), ELEMENT_CAT(P, _PLANE_SCALES_ROW_OFFSET),           \
-        ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET) }
+        ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET), \
+        ELEMENT_CAT(P, _TILE_ROWS), 0, ELEMENT_CAT(P, _PLANE_SCALES_BYTES_PER_ROW),                   \
+        ELEMENT_CAT(P, _PLANE_SUPERS_BYTES_PER_ROW) }
 #define PACKETS_ROWS16_Q8(P)                                                                         \
     packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _PLANE_CODES_ROW_OFFSET), 0, 0, \
-        ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET) }
+        ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET), \
+        ELEMENT_CAT(P, _TILE_ROWS), 0, 0, ELEMENT_CAT(P, _PLANE_SUPERS_BYTES_PER_ROW) }
 #define PACKETS_ROWS16_C4(P)                                                                         \
     packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _PLANE_CODES_LO_ROW_OFFSET), 0, 0, \
-        ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET) }
+        ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET), \
+        ELEMENT_CAT(P, _TILE_ROWS), 0, 0, ELEMENT_CAT(P, _PLANE_SUPERS_BYTES_PER_ROW) }
 #define PACKETS_ROWS16_Q5(P)                                                                         \
     packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _PLANE_CODES_LO_ROW_OFFSET),   \
-        ELEMENT_CAT(P, _PLANE_CODES_HI_ROW_OFFSET), 0, ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET) }
-#define PACKETS_ROWS16_DENSE(E, k) packets::Rows16 { ulong(k) * E::bytes, 0, 0, 0, 0 }
+        ELEMENT_CAT(P, _PLANE_CODES_HI_ROW_OFFSET), 0, ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET), \
+        ELEMENT_CAT(P, _TILE_ROWS), 0, 0, ELEMENT_CAT(P, _PLANE_SUPERS_BYTES_PER_ROW) }
+#define PACKETS_ROWS16_DENSE(E, k) packets::Rows16 { ulong(k) * E::bytes, 0, 0, 0, 0, 1, 0 }
 
 // Binds slot `SLOT` to the decoder type `TYPE`.
 #define PACKETS_BIND(SLOT, TYPE) namespace packets { typedef TYPE SLOT; }
@@ -630,8 +685,8 @@ PACKETS_BIND(W0, packets::Dense<element::Bf16>)
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_F16)
 PACKETS_BIND(W0, packets::Dense<element::F16>)
 #define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_DENSE(element::F16, k)
-#elif !ELEMENT_HAS(KERNEL_W0, _LAYOUT_ROWS16)
-#error "KERNEL_W0 must be dense or in the rows16 layout"
+#elif !ELEMENT_HAS(KERNEL_W0, _LAYOUT_ROWS16) && !ELEMENT_HAS(KERNEL_W0, _LAYOUT_ROWS32)
+#error "KERNEL_W0 must be dense or in the rows16 or rows32 layout"
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q4K)
 PACKETS_BIND(W0, packets::Q4K)
 #define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_Q4K(KERNEL_W0)
@@ -677,8 +732,8 @@ PACKETS_BIND(W1, packets::Dense<element::Bf16>)
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_F16)
 PACKETS_BIND(W1, packets::Dense<element::F16>)
 #define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_DENSE(element::F16, k)
-#elif !ELEMENT_HAS(KERNEL_W1, _LAYOUT_ROWS16)
-#error "KERNEL_W1 must be dense or in the rows16 layout"
+#elif !ELEMENT_HAS(KERNEL_W1, _LAYOUT_ROWS16) && !ELEMENT_HAS(KERNEL_W1, _LAYOUT_ROWS32)
+#error "KERNEL_W1 must be dense or in the rows16 or rows32 layout"
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q4K)
 PACKETS_BIND(W1, packets::Q4K)
 #define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_Q4K(KERNEL_W1)
@@ -724,8 +779,8 @@ PACKETS_BIND(W2, packets::Dense<element::Bf16>)
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_F16)
 PACKETS_BIND(W2, packets::Dense<element::F16>)
 #define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_DENSE(element::F16, k)
-#elif !ELEMENT_HAS(KERNEL_W2, _LAYOUT_ROWS16)
-#error "KERNEL_W2 must be dense or in the rows16 layout"
+#elif !ELEMENT_HAS(KERNEL_W2, _LAYOUT_ROWS16) && !ELEMENT_HAS(KERNEL_W2, _LAYOUT_ROWS32)
+#error "KERNEL_W2 must be dense or in the rows16 or rows32 layout"
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q4K)
 PACKETS_BIND(W2, packets::Q4K)
 #define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_Q4K(KERNEL_W2)
@@ -771,8 +826,8 @@ PACKETS_BIND(W3, packets::Dense<element::Bf16>)
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_F16)
 PACKETS_BIND(W3, packets::Dense<element::F16>)
 #define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_DENSE(element::F16, k)
-#elif !ELEMENT_HAS(KERNEL_W3, _LAYOUT_ROWS16)
-#error "KERNEL_W3 must be dense or in the rows16 layout"
+#elif !ELEMENT_HAS(KERNEL_W3, _LAYOUT_ROWS16) && !ELEMENT_HAS(KERNEL_W3, _LAYOUT_ROWS32)
+#error "KERNEL_W3 must be dense or in the rows16 or rows32 layout"
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q4K)
 PACKETS_BIND(W3, packets::Q4K)
 #define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_Q4K(KERNEL_W3)

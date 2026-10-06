@@ -111,19 +111,63 @@ defaults are validated and measured there. Each point is predicted from the last
 its building and validation as measured, its invocations at the defaults' measured device time
 scaled by cost. Every point of at most 8 rows (the decode range, where implementations'
 row-dependent code paths differ) is required: a unit whose required points do not fit keeps its
-defaults without searching. The census keeps the inputs it built for the unit's search. Its
-measurements give each unit's share of step time: every row class it measured holds its share of
-the step, split among the units serving it by launches per step times the defaults' mean time
-there. Each unit's budget is its share's part of the tuning time left among the units still to
-search, so time a unit leaves goes to the units after it and an overrun is taken from them, and
-tuning ends within the tuning time. The search reuses the census's measurements of the defaults
-and admits further points while they fit a tenth of its budget; a point not admitted is not
-timed and folds its weight into the largest admitted point of its history class. It validates
-every candidate at the timed points,
-ending exploration when what remains covers confirming its finalists (the defaults and the
+defaults without searching. Beyond those rows the census also times each unit at the costliest
+point it serves of the short chunks (16 and 32 rows) and of the prefill chunks (64 to 512 rows):
+the most rows, and for attention the longest history. Such a point is not required; one that does
+not fit is left for the unit's start. The census keeps the inputs it built and the unit's opened
+search. Its measurements give each unit's share of step time: every row class holds its share of
+the step, split among the units serving it by launches per step times the defaults' mean time at
+the timed points that stand for the class (its own where the census timed them, else the
+costliest timed of its group), so the prefill classes weigh on the units that serve them and a
+unit serving only chunks holds its part of them. The units are then searched together, before the walk that prepares them. Tuning happens
+in this one tuning time: a stored result is used as it is by every later load, however far its
+search got. The time is planned before it is spent, so that tuning ends inside it because the
+planned work fits; everything between the census and the last walk counts against it, planning
+and formation as well as measurement. Breadth comes before depth. Each unit is first started,
+largest share first: it admits further points while they fit a tenth of its share of the tuning
+time (a point not admitted is not timed and folds its weight into the largest admitted point of
+its history class), and measures its defaults and every form's start, so no unit and no form is
+left unmeasured because another unit was searched to exhaustion. Each unit estimates its start
+from its census (the defaults' pass over its points, its forms, the programs they need); the
+plan prices a program at what forming one has taken so far in this preparation, so a cold
+pipeline cache is seen after the first start, and scales the units' estimates by how the starts
+so far compared with theirs. A unit gets its form starts while they fit together with a
+defaults-only start and the conclusion of every unit after it, else a defaults-only start while
+that fits (it is then refined first, before any slice is dealt by weight, and that step measures
+its form starts), else it keeps its defaults; the
+plan is made again before each start and reported with what each start took. The time left is
+dealt in half-second slices among the units whose searches have not ended, by the step time each
+still takes: a unit's share of step time times its best cost so far relative to its defaults.
+What one of a unit's measurements costs takes no part, so a unit whose measurements are slow
+gets its share of the time and fewer measurements in it. Each slice
+goes to the unit that with it will have received the least time per unit of that weight (so no
+round of first slices is dealt whatever the shares), so the units' time
+follows it, an overrun is charged to the unit that made it, and the time of a search that ends
+goes to the rest. A unit's reserve for its conclusion bounds it and is not what it takes: when
+the time left only covers the reserves of the units not yet concluded, the unit that has received
+the most for its weight is concluded, what its conclusion left of its reserve is dealt to the
+others, and they are refined on, until the last is concluded with only its own reserve left. A
+slice is dealt while what a unit cannot interrupt (the longest a refinement of any unit has run
+past its slice) still fits before the reserves; the step that measures a unit's form
+starts is held to the plan's price of them and does not count as such a slice. A unit below a twentieth of step time confirms its finalists with three
+samples. A unit's steps together measure what one uninterrupted search of it measures, in the
+same order, and a unit forms only the programs of the configurations it is about to measure. A
+launch-scoped unit's search is coarse to fine: with its form starts it measures the base of every
+value of the parameters that choose which launch serves which rows (the defaults' mapping under
+that value, at the rows the value moves), then refines the launches' mappings under the value
+whose base is cheapest, then under the next; every value so measured stays ranked by what was
+measured under it, and a search that ends early concludes on the best of them all.
+Every candidate is validated at the timed points. Refinement ends when the time left covers
+only concluding the started units: confirming each one's finalists (the defaults and the
 cheapest candidates within noise of the leader, each predicted from its own measured samples)
 and validating its choice at the points it did not time (predicted from the last admitted
-point). Those points' inputs are built only to validate a choice other than the defaults; a
+point). Each unit then holds the best configuration it confirmed; a unit whose search ends
+earlier is concluded at once. Under the plan lies a guarantee: every step is given the instant
+by which it must return with what it has, and checks it before each point it admits and each
+configuration it forms. A step that reaches that instant, or ends after it, is a failure of the
+plan and is reported as one; what cannot be interrupted is one compile of a chunk's programs and
+that chunk's measurement, which bounds how far past the tuning time tuning can end. The inputs of the points a unit did
+not time are built only to validate a choice other than the defaults; a
 choice that fails there, or whose validation there would not fit, gives way to the defaults:
 every chosen configuration passes validation at every served point. Shared history planes live
 for the whole tuning, so units reading the same history build it once. A launch-scoped declaration admits its points the same
@@ -154,8 +198,9 @@ completed and a later preparation searches only the rest. Writes go through a
 temporary file renamed into place; an entry that cannot be read or parsed, or whose configuration
 the implementation does not admit, is a miss and is rewritten; opening the cache evicts the least
 recently used entries beyond its capacity. Stored results are local measurements; nothing is
-shipped. Tuning progress (milliseconds of the tuning time spent, reported when the search walk
-begins and after each unit it searches; nothing when every unit is stored), total tuning time and how many units were searched or stored are reported before
+shipped. Tuning progress (milliseconds of the tuning time spent, reported when the census
+begins and after each step of a unit; nothing when every unit is stored), how far each searched
+unit's search got (reported, not stored), total tuning time and how many units were searched or stored are reported before
 readiness, or before a prepare-only job reports that it is prepared. The load also reports its
 target weight import in resident bytes; no tuning or
 preparation occurs after readiness. Two development
@@ -186,7 +231,23 @@ per 32 columns in a pre-pass and multiply the weights' stored codes on the int8 
 folding each 32-column block under its activation and weight scales; the weights stay exact, and
 every other weight format or device runs the exact form in the same launches. Its transient
 scratch is the int8 operand with its scales and block sums (rows x K x 1.2 bytes) and the weights'
-decoded block scales and biases (weight rows x K / 32 x 6 bytes), per call. Without an admitted
+decoded block scales and biases (weight rows x K / 32 x 6 bytes), per call. The second class is
+`int8_token_packing`: Metal's gate/up and down projections, the recurrent projection's qkv and z
+segments, the attention projection's segments and the attention output projection past 64 rows,
+with Q4_K, Q5_K or Q6_K weights on devices without tensor operations, round each activation row to
+integer codes per 32 columns under a gain that bounds every sum for any row of the weight format,
+and pack two rows into one F32 matrix operand against the weights' stored codes minus the centre
+of their range, so one multiply-accumulate carries two products; the two 16-bit sums of each run
+of columns under one weight scale (a 32-column block; 16 columns for Q6_K, whose rows are coded
+per run) are split from the accumulator and folded in F16 under the row and weight scales, each
+held over one power of two per row (applied to the F32 result) so that no input can overflow the
+fold. The segments of one entry share one operand, coded under the tightest of their formats'
+bounds; a segment whose format needs another column order runs the staged exact form. The weights
+stay exact and the pair's top sum is exact; its low sum carries the accumulator's rounding, so a
+row's result depends on the row it is packed with: the class is row-dependent. Its transient
+scratch is the packed operand with the rows' scales and code sums (rows x K x 2.1 bytes) and the
+weights' block scales and biases (weight rows x K / 32 x 4 bytes), per call; other weight formats,
+and devices with tensor operations, run the staged exact form in a launch of their own. Without an admitted
 class a row's result never depends on peer rows' values; a form that makes it depend on them is its own error class. A result may depend on its
 launch's shape class and prepared configuration, and different shape classes agree within the
 gate's tolerance, not bit for bit. Speculative verification is therefore statistically, not exactly, equivalent to
@@ -392,17 +453,22 @@ window is one round of a decode and an attend launch; a larger one repeats them 
 `repeat` block), each round taking a window's worth of keys and splitting those into its own key
 partitions, and a fold launch after each attend merges the round's split records into the one
 state per row the window keeps, by the partition merge rule, so a row's rounds are to it what key
-partitions are. A prefill attention graph over K8/V4 history therefore
-comes in classes that list tiles (powers
-of two from 16 up to one request's worth, the domain's span limit in pages) and one that lists none;
-all hold the same workspace, the listing classes admit the direct form, and the other admits only
-the forms that read history in place. A launch takes the smallest listing class that holds the tiles
-its rows together see (so it dispatches at most twice the rounds it needs; a round with nothing to
-do returns at once) and the class that lists none when they exceed the largest; listing and
-unlisted kernels tune separately. A device without tensor operations has only the class that lists
-none, which spares it tuning and forming a kernel whose direct form wins only on tensor operations:
-the fact is the device's own probe (`DeviceInfo::forms_tensor_operations` before it is opened, which
-planning and assessment read; graph preparation fails if the opened device disagrees).
+partitions are. For 128- and 256-column heads on simdgroup matrices the co-issue form reads the
+same window in the same rounds: it pairs the attend launch's simdgroups, one forming Q K^T on the
+matrix pipe and one P V as scalar F16 products accumulated in F16 over a step of keys, within the
+BF16 tolerance of the default. A prefill attention graph over K8/V4 history therefore comes in
+classes that list tiles (powers of two from 16 up to one request's worth, the domain's span limit
+in pages) and one that lists none; all hold the same workspace, the listing classes admit the forms
+that read decoded history, and the other admits only the forms that read history in place. A
+launch takes the smallest listing class that holds the tiles its rows together see (so it
+dispatches at most twice the rounds it needs; a round with nothing to do returns at once) and the
+class that lists none when they exceed the largest; listing and unlisted kernels tune separately.
+A device that has no form reading decoded history for the graph's heads has only the class that
+lists none, which spares it tuning and forming kernels no form of which it can select: Metal has
+one on tensor operations, and on simdgroup matrices for 128- and 256-column heads
+(`planning::reads_decoded_history`). The tensor operations fact is the device's own probe
+(`DeviceInfo::forms_tensor_operations` before it is opened, which planning and assessment read;
+graph preparation fails if the opened device disagrees).
 The draft head's and the separate draft's graphs list none.
 
 An image encodes at most the load's image cell limit: the cells its declared resize admits, within

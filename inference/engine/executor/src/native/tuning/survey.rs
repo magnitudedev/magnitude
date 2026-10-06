@@ -66,8 +66,8 @@ pub(super) fn plan(entry: &str) -> Option<SurveyPlan> {
     })
 }
 
-/// Write one entry instance's survey, with the search allowance this load
-/// gave it.
+/// Write one entry instance's survey, with the most time a search of it
+/// could be given at this load.
 pub(super) fn record(
     key: &TuningKey,
     allowance: std::time::Duration,

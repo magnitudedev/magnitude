@@ -58,6 +58,7 @@ pub(crate) fn scale_extent(
 /// `dense_expand`: RMS prologue, paired gate/up projection, act·mul, over
 /// the `gate_kind`/`up_kind` weights (a dense feed-forward's or a routed
 /// operator's shared expert).
+#[derive(Clone)]
 pub(crate) struct DenseExpandTuning {
     pub norm: Element,
     pub gate: Element,
@@ -179,6 +180,7 @@ impl EntryTuning for DenseExpandTuning {
 
 /// `dense_up`: RMS prologue, up-only projection, act (a routed operator's
 /// up-only shared expert, or an up-only dense feed-forward).
+#[derive(Clone)]
 pub(crate) struct DenseUpTuning {
     pub norm: Element,
     pub up: Element,
@@ -280,6 +282,7 @@ impl EntryTuning for DenseUpTuning {
 
 /// `dense_output`: the `down_kind` projection plus residual (a dense or
 /// shared expert's down projection, or a latent operator's up projection).
+#[derive(Clone)]
 pub(crate) struct DenseOutputTuning {
     pub down: Element,
     pub activation: Element,
@@ -369,5 +372,5 @@ impl EntryTuning for DenseOutputTuning {
         }
     }
 
-    generated_entry!(dense_output, this => this.elements());
+    generated_entry!(dense_output, this => this.elements(), rounded to this.activation);
 }

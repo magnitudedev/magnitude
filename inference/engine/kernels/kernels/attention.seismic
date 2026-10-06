@@ -86,21 +86,34 @@ fn attention_output[M, D, Q, W](hidden: &tensor[M, D] f32,
     add(hidden, projected, result)
     return result
 
-# Metal: GEMV below BATCH_FROM rows, batched GEMV to 16, GEMM beyond with
+# Metal: GEMV below BATCH_FROM rows (`gemv` for one row, `gemv_pair` for two,
+# `gemv_rows` for more, see `dense_rows.seismic`), batched GEMV to 16, GEMM beyond with
 # SPLIT-way split-K summed by `finalize`. The input needs no prologue, so
 # there is no `stage`. (CUDA: GEMV to 16 rows, INT8 candidate on the GEMM.)
 # TALL selects the tall GEMM past 64 rows (see `dense_rows.seismic`): on
 # simdgroup matrices `relayout` first reorders the gated rows into
 # `fragments`, a second copy of them in whole 64-row tiles.
+# PACK selects `dense_output`'s token-packing form past 64 rows (see
+# `dense_rows.seismic`), with its launches, error class and transient
+# scratch, over the gated rows (the weights' factors a simdgroup per weight
+# row); weights or devices without the packed path run the staged tile, with
+# its results.
 native attention_output for metal from "metal/attention_output.metal":
     static (D, Q, W)
-    params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4], form TALL in [1, 0])
-    where TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)
+    params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4], form TALL in [1, 0],
+        arithmetic form PACK in [0, 1])
+    where (TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)) and (PACK == 0 or (TALL == 1 and Q * W % 256 == 0 and Q * W < 1048576 and D % 64 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))
+    error_class int8_token_packing when PACK == 1
     scratch partials bytes (SPLIT * M * D * 4) when M > 64 and SPLIT > 1
     scratch small_partials bytes (4 * M * D * 4) when M > 16 and M <= 64
-    scratch fragments bytes (ceil_div(M, 64) * 64 * Q * W * 2) when M > 64 and TALL == 1
-    launch attention_output_gemv when M < BATCH_FROM:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+    scratch fragments bytes (ceil_div(M, 64) * 64 * Q * W * 2) when M > 64 and TALL == 1 and PACK == 0
+    scratch packed bytes (ceil_div(M, 128) * 128 * Q * W * 2 + 1024) when M > 64 and PACK == 1
+    scratch token_factors bytes (ceil_div(M, 128) * 128 * (Q * W / 32) * 4) when M > 64 and PACK == 1
+    scratch weight_factors bytes (D * (Q * W / 32) * 4) when M > 64 and PACK == 1
+    scratch token_scales bytes (ceil_div(M, 128) * 128 * 4) when M > 64 and PACK == 1
+    scratch weight_scales bytes (D * 4) when M > 64 and PACK == 1
+    launch attention_output_gemv when M < 2:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32, 8])
         threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
@@ -122,13 +135,36 @@ native attention_output for metal from "metal/attention_output.metal":
     launch attention_output_finalize when M > 64 and SPLIT > 1:
         threadgroups (ceil_div(M * D, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_output_relayout when M > 64 and TALL == 1:
+    launch attention_output_relayout when M > 64 and TALL == 1 and PACK == 0:
         threadgroups (ceil_div(ceil_div(M, 64) * Q * W, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_output_tall when M > 64 and TALL == 1:
+    launch attention_output_tall when M > 64 and TALL == 1 and PACK == 0:
         params (code TALL_M in [128, 256, 512], code TALL_K in [64, 128], code STAGERS in [2, 1])
         threadgroups (ceil_div(D, 32), ceil_div(M, TALL_M), 1)
         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
+    launch attention_output_gemv_rows when M >= 3 and M < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [2, 1, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch attention_output_gemv_pair when M == 2 and M < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [2, 1, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch attention_output_pack when M > 64 and PACK == 1:
+        threadgroups (ceil_div(M, 128) * 32, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch attention_output_pack_coefficients when M > 64 and PACK == 1:
+        threadgroups (D, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_output_packed when M > 64 and PACK == 1:
+        params (code PACK_TOKENS in [4, 2], code WEIGHTS_AHEAD in [0, 1])
+        threadgroups (ceil_div(M, 128) * D / 32, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch attention_output_unpacked when M > 64 and PACK == 1:
+        threadgroups (ceil_div(D, 64), ceil_div(M, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
 
 # CUDA: GEMV to 8 rows, `gemv16` to 16, GEMM beyond in the K1 row bands
 # (`gemm_small` to 64 rows with the INT8 candidate, `gemm` beyond), both split
@@ -277,16 +313,28 @@ fn attention_project[M, D, Q, GR, K, V](hidden: &tensor[M, D] f32, input_norm: &
 
 # Metal: TALL selects the tall GEMM past 64 rows (see `dense_rows.seismic`)
 # over rows staged in its order.
+# PACK selects the token-packing form of `dense_rows.seismic` past 64 rows for
+# the four segments, over the staged normalized rows, as in
+# `gated_delta_project` (`recurrent.seismic`): one operand for every segment,
+# each weight's own factor tables in segment order, the packed tiles in
+# segment order, and the staged 64 x 64 tiles (`unpacked`) for a segment whose
+# weights the operand does not serve and for the zero tiles of mode 1.
 native attention_project for metal from "metal/attention_project.metal":
     static (D, Q, GR, K, V)
-    params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0])
-    where TALL == 0 or D % 128 == 0
+    params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0], arithmetic form PACK in [0, 1])
+    where (TALL == 0 or D % 128 == 0) and (PACK == 0 or (TALL == 1 and D % 256 == 0 and D < 1048576 and Q % 32 == 0 and GR % 32 == 0 and K % 32 == 0 and V % 32 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))
+    error_class int8_token_packing when PACK == 1
     scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * D * 2) when M > 16
-    launch attention_project_stage when M > 16 and (M <= 64 or TALL == 0):
+    scratch packed bytes (ceil_div(M, 128) * 128 * D * 2 + 1024) when M > 64 and PACK == 1
+    scratch token_factors bytes (ceil_div(M, 128) * 128 * (D / 32) * 4) when M > 64 and PACK == 1
+    scratch weight_factors bytes ((Q + GR + K + V) * (D / 32) * 4) when M > 64 and PACK == 1
+    scratch token_scales bytes (ceil_div(M, 128) * 128 * 4) when M > 64 and PACK == 1
+    scratch weight_scales bytes ((Q + GR + K + V) * 4) when M > 64 and PACK == 1
+    launch attention_project_stage when M > 16 and (M <= 64 or TALL == 0 or PACK == 1):
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_project_gemv when M < BATCH_FROM:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+    launch attention_project_gemv when M < 2:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32, 8])
         threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
@@ -310,14 +358,44 @@ native attention_project for metal from "metal/attention_project.metal":
         threadgroups (ceil_div(Q, TILE_N) + ceil_div(GR, TILE_N) + ceil_div(K, TILE_N)
             + ceil_div(V, TILE_N), ceil_div(M, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch attention_project_stage_tall when M > 64 and TALL == 1:
+    launch attention_project_stage_tall when M > 64 and TALL == 1 and PACK == 0:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_project_tall when M > 64 and TALL == 1:
+    launch attention_project_tall when M > 64 and TALL == 1 and PACK == 0:
         params (code TALL_M in [128, 256, 512], code TALL_K in [64, 128], code STAGERS in [2, 1])
         threadgroups (ceil_div(Q, 32) + ceil_div(GR, 32) + ceil_div(K, 32) + ceil_div(V, 32),
             ceil_div(M, TALL_M), 1)
         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
+    launch attention_project_gemv_rows when M >= 3 and M < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch attention_project_gemv_pair when M == 2 and M < BATCH_FROM:
+        params (SIMDGROUPS in [8, 16, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [8, 16, 32])
+        threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch attention_project_pack when M > 64 and PACK == 1:
+        threadgroups (ceil_div(M, 128) * 32, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch attention_project_pack_coefficients when M > 64 and PACK == 1:
+        threadgroups (Q + GR + K + V, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_project_packed when M > 64 and PACK == 1:
+        params (code PACK_TOKENS in [4, 2], code WEIGHTS_AHEAD in [0, 1])
+        threadgroups (ceil_div(M, 128) * (Q / 32) + ceil_div(M, 128) * (GR / 32) + ceil_div(M, 128) * (K / 32)
+            + ceil_div(M, 128) * (V / 32), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch attention_project_unpacked when M > 64 and PACK == 1:
+        threadgroups (ceil_div(Q, 64) + ceil_div(GR, 64) + ceil_div(K, 64) + ceil_div(V, 64), ceil_div(M, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
 
 native attention_project for cuda from "cuda/attention_project.cu":
     static (D, Q, GR, K, V)
@@ -1066,48 +1144,59 @@ native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
 # what an unlisted call's is charged; DIRECT takes at most half of them
 # (TAKEN, so its SPLIT_GROUPS partitions stop there), and what they leave, in
 # rows of [KV, W] F32 (M G to a partition) or of [KV, W] F16 keys and values,
-# holds the decoded window, less 33 rows of round words and zero rows (SPARE),
-# in whole tiles (WINDOW). A class whose listed rows (HT tiles) fit the window
-# is one round, with no other launch than `decode`. Otherwise the window
-# gives up the rows of one state per row and head (STATE), each round takes
-# what is left of keys (ROUND, and splits those into its key partitions),
-# and its `fold` launch folds the round's split records into the state, in
-# round order by the merge rule; the last stores the gated output. No scratch
-# or launch of the entry is sized by T. DIRECT is declared for at most 8 kv
-# head groups, which leaves it partitions in launches of up to 512 rows (a
-# class whose rows do not hold a tile fails to evaluate), and a call that
-# lists no tiles (L = 0) takes the staged form alone. The kernels place the
-# window by the same terms (`prefill_window` in the source).
+# holds the decoded window, less a row of round words and the zero rows
+# (SPARE), in whole tiles (WINDOW). A class whose listed rows (HT tiles) fit
+# the window is one round, with no other launch than `decode`. Otherwise the
+# window gives up the rows of one state per row and head (STATE), each round
+# takes what is left of keys (ROUND, and splits those into its key
+# partitions), and its `fold` launch folds the round's split records into the
+# state, in round order by the merge rule; the last stores the gated output.
+# No scratch or launch of the entry is sized by T. DIRECT is declared for at
+# most 8 kv head groups, which leaves it partitions in launches of up to 512
+# rows (a class whose rows do not hold a tile fails to evaluate), and a call
+# that lists no tiles (L = 0) takes the staged form alone. The kernels place
+# the window by the same terms (`prefill_window` in the source).
+#
+# COISSUE (128- and 256-column heads, on simdgroup matrices; with tensor
+# operations the direct form) pairs the attend launch's simdgroups over that
+# window, two per 8 rows: one forms Q K^T on the matrix pipe and the softmax,
+# the other P V as scalar F16 products accumulated in F16 over a step of 96
+# keys (32 for 256 columns) before they fold into the F32 output (measured
+# within the BF16 tolerance of the default). Its threadgroups hold
+# QT * HEADS / 8 pairs and their exchange in place of a staged tile, and the
+# window's planes end in 96 zero rows. The fresh rows' planes keep their 32
+# (a step that would end past them starts earlier and masks the keys before
+# its own) and hold one step at least, in a launch of fewer rows than that.
 native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal":
     static (KV, G, P, S, I, U, F, N, NV, L)
     params (arithmetic QT in [16, 8, 32], arithmetic HEADS in [16, 8, 4, 2, 1], arithmetic SPLIT_GROUPS in [256, 128, 512, 1],
-        arithmetic form DIRECT in [0, 1])
+        arithmetic form DIRECT in [0, 1], arithmetic form COISSUE in [0, 1])
     let SPLIT = max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS)))
     let CHARGED = ceil_div(512, ceil_div(M, 32) * KV * ceil_div(G, 16))
     let TAKEN = min(SPLIT, max(1, CHARGED / 2) + (1 - DIRECT) * 512)
-    let SPARE = max((CHARGED - DIRECT * TAKEN) * M * G, 33 * (1 - DIRECT)) - 33
+    let SPARE = max((CHARGED - DIRECT * TAKEN) * M * G, 33 * (1 - DIRECT)) - 33 - 64 * COISSUE
     let STATE = DIRECT * (M * G + ceil_div(M * G * 4, 2 * P + S))
     let WINDOW = SPARE / 256 * 256
     let ROUND = max((SPARE - STATE) / 256 * 256, 256 * (1 - DIRECT))
     let ROUNDS = max(1, DIRECT * min(1, HT * 256 / (WINDOW + 1)) * ceil_div(HT * 256, ROUND))
-    where L <= 1 and (DIRECT == 0 or (L == 1 and KV * ceil_div(G, 16) <= 8)) and (DIRECT == 0 or QT >= 16) and (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
+    where L <= 1 and (DIRECT == 0 or (L == 1 and KV * ceil_div(G, 16) <= 8)) and (DIRECT == 0 or QT >= 16) and (COISSUE == 0 or (DIRECT == 1 and (2 * P + S == 128 or 2 * P + S == 256) and 32 + QT * min(HEADS, G) / 8 * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * (2 * P + S)) + 64 * 16 <= 32768)) and (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
-    scratch keys bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
-    scratch values bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
+    scratch keys bytes (max(M + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV * (2 * P + S) * 2)
+    scratch values bytes (max(M + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV * (2 * P + S) * 2)
     scratch partials bytes (((1 - L) * SPLIT + L * CHARGED) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (SPLIT * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, QT) * 4)
     launch attention_prefill_k8v4_prepare:
-        threadgroups (ceil_div((ceil_div(M, QT) * QT + 32 * DIRECT) * KV, 8), 1, 1)
+        threadgroups (ceil_div(max(ceil_div(M, QT) * QT + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     repeat (ROUNDS):
         launch attention_prefill_k8v4_decode when DIRECT == 1:
-            threadgroups (ceil_div(min(HT * 256, WINDOW) + 32, 32), 1, 1)
+            threadgroups (ceil_div(min(HT * 256, WINDOW) + 32 + 64 * COISSUE, 32), 1, 1)
             threads_per_threadgroup (1024, 1, 1)
         launch attention_prefill_k8v4_attend:
             threadgroups (ceil_div(M, QT), KV * ceil_div(G, HEADS), TAKEN)
-            threads_per_threadgroup (QT * min(HEADS, G) * (4 - 2 * DIRECT), 1, 1)
-            shared_bytes ((32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + (R + 1) * 16 + DIRECT * ((R + 1) * 48 + 16))
+            threads_per_threadgroup (QT * min(HEADS, G) * (4 - 2 * DIRECT + 6 * COISSUE), 1, 1)
+            shared_bytes ((1 - COISSUE) * (32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + COISSUE * (32 + QT * min(HEADS, G) / 8 * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * (2 * P + S))) + (R + 1) * 16 + DIRECT * ((R + 1) * 48 + 16))
         launch attention_prefill_k8v4_fold when DIRECT == 1 and HT * 256 > WINDOW:
             threadgroups (ceil_div(M, QT), KV * G, 1)
             threads_per_threadgroup (2 * P + S, 1, 1)

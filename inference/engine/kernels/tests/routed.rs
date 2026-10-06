@@ -1146,6 +1146,7 @@ fn host_reference_matches_portable_decode_body() {
 fn resident_layout(device: &seismic::Device) -> registry::Layout {
     match device.backend() {
         seismic::BackendName::Cuda => registry::Layout::Mma16,
+        seismic::BackendName::Metal => registry::Layout::Rows32,
         _ => registry::Layout::Rows16,
     }
 }
@@ -2282,7 +2283,7 @@ impl Qwen35b {
     /// The graph's grouped tile rows (`TILE_ROWS`).
     const TILE: usize = 32;
     const USED: usize = 12;
-    /// Distinct 16-row tiles per weight pool.
+    /// Distinct 32-row tiles per weight pool.
     const POOL: usize = 4;
 
     fn new(device: &seismic::Device) -> Self {
@@ -2567,11 +2568,12 @@ impl NativeRouting {
     }
 }
 
-/// Rows of a resident row layout come in tiles of 16 that each occupy
-/// 16 row strides of bytes (`mma16` permutes codes only within a tile).
-const LAYOUT_TILE_ROWS: usize = 16;
+/// Every resident row layout stores 32 consecutive rows in 32 row strides
+/// of bytes of their own (`mma16` permutes codes only within a 16-row tile,
+/// `rows32` interleaves planes only within a 32-row tile).
+const LAYOUT_TILE_ROWS: usize = 32;
 
-/// A few distinct 16-row tiles of `representation` over `columns`, placed
+/// A few distinct 32-row tiles of `representation` over `columns`, placed
 /// and decoded once. Decoding through the reference recipe is slow, so the
 /// 35B weights are assembled from pooled tiles instead of decoded whole.
 struct TilePool {

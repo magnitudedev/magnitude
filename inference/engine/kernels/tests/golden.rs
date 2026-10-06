@@ -412,6 +412,7 @@ impl Ctx {
     fn layout(&self) -> Layout {
         match self.backend {
             BackendName::Cuda => Layout::Mma16,
+            BackendName::Metal => Layout::Rows32,
             _ => Layout::Rows16,
         }
     }

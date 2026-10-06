@@ -12,7 +12,7 @@ use super::search::{
 use super::timing::{self, OutputPool, PointTiming};
 pub use super::validation::{NumericalEvidence, NumericalMetrics};
 use super::validation::{PreparedPoint, Validator};
-use super::{MeasureOptions, Measurement, NativePrepared};
+use super::{HeldPrograms, MeasureOptions, Measurement, NativePrepared};
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
@@ -24,8 +24,9 @@ use seismic_lang::ids::EntryId;
 use seismic_lang::precision::{PrecisionPolicy, TuningPrecision};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -57,6 +58,11 @@ pub struct PointSpec {
     /// required points do not fit the unit's time, the unit keeps its
     /// defaults.
     pub required: bool,
+    /// The census measures the defaults here: the point's time stands for
+    /// its workload when the consumer divides its tuning time among units.
+    /// Every required point is measured by the census whatever this says;
+    /// a point that is only this is left for the start when it does not fit.
+    pub census: bool,
 }
 
 /// A point's inputs.
@@ -405,10 +411,10 @@ pub struct SurveyPlan {
     pub domains: BTreeMap<String, Vec<u64>>,
 }
 
-/// Measuring the defaults at the points every candidate must pass (the
-/// cheapest point when none must): the fixed cost of searching the unit, and
-/// the defaults' time there, from which the consumer divides its tuning time
-/// among units.
+/// Measuring the defaults at the points every candidate must pass and at the
+/// unit's census points (the cheapest point when there is neither): the
+/// fixed cost of searching the unit, and the defaults' time there, from
+/// which the consumer divides its tuning time among units.
 #[derive(Clone, Debug)]
 pub struct CensusPlan {
     /// The tuning time left. When the required points cannot fit it, the
@@ -420,15 +426,54 @@ pub struct CensusPlan {
 #[derive(Clone, Debug)]
 pub enum Strategy {
     Search(SearchPlan),
-    Census(CensusPlan),
-    /// A search after the unit's census: it times the points the census
-    /// measured, reusing its measurement of the defaults there, and admits
-    /// further points within the plan's admission.
-    Censused {
-        plan: SearchPlan,
-        census: TuningResult,
-    },
     Survey(SurveyPlan),
+}
+
+/// How a [`UnitSearch`] searches once its points are admitted.
+#[derive(Clone, Debug)]
+pub struct StartPlan {
+    /// What the required points not yet admitted may take; when they cannot
+    /// fit, the unit keeps its defaults. A census admitted them all.
+    pub required: Duration,
+    /// What building the further timed points and measuring the defaults
+    /// there may take, each point predicted from the last before it starts.
+    /// Points beyond it are not timed; the choice is validated there.
+    pub admission: Duration,
+    pub settings: SearchSettings,
+    /// Minimum device time of one sample; sets repetitions per sample.
+    pub min_sample_seconds: f64,
+    /// Consumer hints, as [`SearchPlan::start`].
+    pub start: Vec<ParameterValues>,
+    /// Whether the start measures every form's start besides the defaults.
+    /// A consumer whose time does not cover that for every unit starts some
+    /// with their defaults alone; their first refinement measures the form
+    /// starts.
+    pub forms: bool,
+}
+
+/// Where a unit's search stands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Standing {
+    /// The search ran to its own end: no further time would measure anything.
+    pub finished: bool,
+    /// The cheapest configuration measured so far relative to the defaults:
+    /// 1 until something measures cheaper.
+    pub cost: f64,
+    /// Configurations measured so far.
+    pub measured: usize,
+    /// Configurations the search can reach at its points.
+    pub admissible: usize,
+    /// Programs formed so far: launch variants of a launch-scoped
+    /// implementation, configurations of any other.
+    pub programs: usize,
+    /// Programs the search would form if it measured everything it can
+    /// reach.
+    pub declared_programs: usize,
+    /// What forming programs has taken so far.
+    pub forming_seconds: f64,
+    /// The step that returned this reached its hard limit before the work
+    /// planned for it was done.
+    pub cut: bool,
 }
 
 /// Numerical reference for empirical native tuning. Neither choice proves compiler applicability.
@@ -949,14 +994,6 @@ impl Measurer {
         }
     }
 
-    /// Record `measurement`, taken earlier, as its point's and key's.
-    fn seed(&mut self, measurement: PointMeasurement) {
-        self.measured.insert(
-            (measurement.point.clone(), measurement.key.clone()),
-            measurement,
-        );
-    }
-
     /// The measurement of `kernel` at every point: points whose key was
     /// measured before reuse that measurement, the others are sampled.
     fn measure(
@@ -1111,23 +1148,80 @@ struct Evaluated {
     confirmed: Vec<PointMeasurement>,
 }
 
-/// Forms and measures configurations on the device for [`search::search`].
+/// What the live search of a unit has formed and measured so far.
+struct Lived {
+    measurer: Measurer,
+    search: MeasureOptions,
+    confirmation: MeasureOptions,
+    /// Finalists confirmed besides the defaults.
+    confirmed: usize,
+    evaluated: HashMap<usize, Evaluated>,
+    anchor: Option<usize>,
+    /// Configurations formed.
+    formed: usize,
+    time: TuningTime,
+}
+
+impl Lived {
+    /// What confirming the finalists found so far will take: the defaults
+    /// re-measured with the cheapest rivals within noise of the leader, each
+    /// sample costing what that configuration's measured samples did; the
+    /// defaults alone are not re-measured.
+    fn reserve(&self, default: usize) -> Duration {
+        let sample = |evaluated: &Evaluated| {
+            evaluated
+                .points
+                .iter()
+                .map(|point| point.median_seconds * point.repetitions as f64)
+                .sum::<f64>()
+        };
+        let mut rivals = self
+            .evaluated
+            .iter()
+            .filter(|(index, _)| **index != default)
+            .map(|(_, evaluated)| sample(evaluated))
+            .collect::<Vec<_>>();
+        rivals.sort_by(f64::total_cmp);
+        rivals.truncate(self.confirmed);
+        let reserve = match rivals.first() {
+            Some(leader) => {
+                let contending = rivals
+                    .iter()
+                    .filter(|sample| **sample <= leader * (1. + search::CONTENDING))
+                    .sum::<f64>();
+                let defaults = self.evaluated.get(&default).map_or(0., sample);
+                (contending + defaults) * (self.confirmation.samples + 1) as f64
+            }
+            None => 0.,
+        };
+        Duration::from_secs_f64(reserve)
+    }
+}
+
+/// When a step of a unit's search must stop measuring: a refinement at
+/// `slice` (a start has none: it measures its starts whatever the slice),
+/// and every step when what remains before `until` only covers concluding
+/// the search. `until` is the guarantee under the consumer's plan: a step
+/// that reaches it returns with what it has.
+#[derive(Clone, Copy)]
+struct Limits {
+    slice: Option<Instant>,
+    until: Instant,
+}
+
+/// Forms and measures configurations on the device for [`search::explore`]
+/// and [`search::rank`].
 struct Live<'s, 'a> {
     formation: &'s Formation<'s>,
     space: &'s SearchSpace,
     statics: &'s NativeSpecialization,
     points: &'s [PreparedPoint<'a>],
-    measurer: Measurer,
-    search: MeasureOptions,
-    confirmation: MeasureOptions,
-    /// When the search's time ends, confirmation included. Exploration ends
-    /// when what remains only covers confirming the finalists found so far.
-    window: Instant,
-    /// Finalists confirmed besides the defaults.
-    confirmed: usize,
-    evaluated: HashMap<usize, Evaluated>,
-    anchor: Option<usize>,
-    time: TuningTime,
+    state: &'s mut Lived,
+    /// `None`: the finalists are confirmed whatever the time.
+    limits: Option<Limits>,
+    /// What concluding takes besides confirmation: validating the choice at
+    /// the points not timed.
+    untimed: Duration,
 }
 
 impl Live<'_, '_> {
@@ -1141,14 +1235,14 @@ impl Live<'_, '_> {
         weighing: &Weighing,
     ) -> Result<Cost, Exclusion> {
         let kernel = kernel?;
-        let points = self.measurer.measure(
+        let points = self.state.measurer.measure(
             &kernel,
             self.points,
             &self.space.values(index),
-            &self.search,
+            &self.state.search,
         )?;
-        self.anchor.get_or_insert(index);
-        self.evaluated.insert(
+        self.state.anchor.get_or_insert(index);
+        self.state.evaluated.insert(
             index,
             Evaluated {
                 kernel,
@@ -1161,9 +1255,11 @@ impl Live<'_, '_> {
 
     /// The first passing candidate supplies the timing normalization.
     fn reference(&self) -> Result<&[PointMeasurement], Exclusion> {
-        self.evaluated
+        self.state
+            .evaluated
             .get(
                 &self
+                    .state
                     .anchor
                     .expect("a passing candidate establishes the timing anchor"),
             )
@@ -1184,7 +1280,8 @@ impl Evaluator for Live<'_, '_> {
         let began = Instant::now();
         let formed = self.formation.form_all(&specializations);
         let measuring = Instant::now();
-        self.time.forming_seconds += (measuring - began).as_secs_f64();
+        self.state.time.forming_seconds += (measuring - began).as_secs_f64();
+        self.state.formed += specializations.len();
 
         let weighing = Weighing::of(self.points);
         let mut costs = Vec::with_capacity(batch.len());
@@ -1196,7 +1293,7 @@ impl Evaluator for Live<'_, '_> {
             }
             costs.push(self.cost(*index, kernel, &weighing));
         }
-        self.time.measuring_seconds += measuring.elapsed().as_secs_f64();
+        self.state.time.measuring_seconds += measuring.elapsed().as_secs_f64();
         costs
     }
 
@@ -1214,12 +1311,12 @@ impl Evaluator for Live<'_, '_> {
                     timings: placed,
                     keys,
                 } = place(
-                    &self.evaluated[index].kernel,
+                    &self.state.evaluated[index].kernel,
                     self.points,
-                    &self.measurer.influence,
+                    &self.state.measurer.influence,
                     &self.space.values(*index),
-                    &mut self.measurer.outputs,
-                    self.confirmation.min_sample_seconds,
+                    &mut self.state.measurer.outputs,
+                    self.state.confirmation.min_sample_seconds,
                 )?;
                 for (point, (timing, key)) in placed.into_iter().zip(&keys).enumerate() {
                     let id = (point, key.clone());
@@ -1233,7 +1330,7 @@ impl Evaluator for Live<'_, '_> {
             .collect::<Vec<Result<Vec<PointKey>, Exclusion>>>();
         let points = self.points;
         let mut failed = HashMap::new();
-        while let Err(failure) = timing::sample(&mut timings, &self.confirmation) {
+        while let Err(failure) = timing::sample(&mut timings, &self.state.confirmation) {
             let (point, key) = ids.remove(failure.point);
             timings.remove(failure.point);
             failed.insert(
@@ -1269,7 +1366,7 @@ impl Evaluator for Live<'_, '_> {
                 confirmed_measurement(*index == default, confirmed)
             })
             .collect::<Vec<_>>();
-        self.time.measuring_seconds += began.elapsed().as_secs_f64();
+        self.state.time.measuring_seconds += began.elapsed().as_secs_f64();
         let weighing = Weighing::of(points);
         // Any successfully confirmed finalist can anchor timing normalization.
         let reference = confirmed
@@ -1285,7 +1382,8 @@ impl Evaluator for Live<'_, '_> {
                     .as_ref()
                     .expect("a measured finalist establishes the anchor");
                 let cost = weighing.cost(&measured, reference);
-                self.evaluated
+                self.state
+                    .evaluated
                     .get_mut(index)
                     .expect("finalists were evaluated")
                     .confirmed = measured;
@@ -1295,38 +1393,12 @@ impl Evaluator for Live<'_, '_> {
     }
 
     fn expired(&self) -> bool {
-        // Confirmation re-measures the defaults with the cheapest rivals
-        // found so far within noise of the leader, each sample costing what
-        // that configuration's measured samples did; the defaults alone are
-        // not re-measured.
-        let sample = |evaluated: &Evaluated| {
-            evaluated
-                .points
-                .iter()
-                .map(|point| point.median_seconds * point.repetitions as f64)
-                .sum::<f64>()
-        };
-        let default = self.space.default_index();
-        let mut rivals = self
-            .evaluated
-            .iter()
-            .filter(|(index, _)| **index != default)
-            .map(|(_, evaluated)| sample(evaluated))
-            .collect::<Vec<_>>();
-        rivals.sort_by(f64::total_cmp);
-        rivals.truncate(self.confirmed);
-        let reserve = match rivals.first() {
-            Some(leader) => {
-                let contending = rivals
-                    .iter()
-                    .filter(|sample| **sample <= leader * (1. + search::CONTENDING))
-                    .sum::<f64>();
-                let defaults = self.evaluated.get(&default).map_or(0., sample);
-                (contending + defaults) * (self.confirmation.samples + 1) as f64
-            }
-            None => 0.,
-        };
-        Instant::now() + Duration::from_secs_f64(reserve) >= self.window
+        self.limits.is_some_and(|limits| {
+            let now = Instant::now();
+            limits.slice.is_some_and(|slice| now >= slice)
+                || now + self.state.reserve(self.space.default_index()) + self.untimed
+                    >= limits.until
+        })
     }
 }
 
@@ -1365,6 +1437,7 @@ impl<'a> Inputs<'_, 'a> {
 /// The last admitted point, from which later points' times are predicted.
 /// Only a point's invocations scale with its cost: building its inputs and
 /// the floor a calibrated sample measures do not.
+#[derive(Clone)]
 struct Admitted {
     cost: f64,
     /// Building the point, running its reference, validating and measuring
@@ -1419,14 +1492,9 @@ fn before(instant: Instant, duration: Duration) -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
-/// Tune one unit within its time. A search builds its points' inputs in
-/// ascending cost, measuring the defaults at each, while the points fit
-/// the plan's admission (the required points its `required` time; when
-/// they cannot fit, the unit keeps its defaults). A census stops after the
-/// required points; a search after it begins from them. It then searches at those
-/// points within what remains of the allowance, less confirming the
-/// finalists and validating the choice at the points it did not time, and
-/// builds those points only to validate a choice other than the defaults.
+/// Tune one unit within its time: a [`UnitSearch`] started, refined until
+/// what remains of the plan's allowance only covers its conclusion, and
+/// concluded; or a survey of every admissible configuration.
 pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     let began = Instant::now();
     let TuneRequest {
@@ -1436,378 +1504,1024 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         bindings,
         statics,
         cpu,
-        points: source,
-        validation: TuningPrecision {
-            policy: validation,
-            admitted,
-        },
+        points,
+        validation,
         strategy,
         reference,
     } = request;
-    let specs = source.points();
-    if specs.is_empty() {
-        return Err(TuneError::NoPoints);
-    }
-    let backend = super::backend_name(&device.kind);
-    let entry_name = super::entry_name(module, entry);
-    let mut implementation = super::on_device(
+    let request = UnitRequest {
         device,
-        module
-            .native_implementation(entry, backend)
-            .cloned()
-            .ok_or_else(|| {
-                TuneError::Declaration(format!(
-                    "`{entry_name}` has no native implementation for `{}`",
-                    backend.as_str()
-                ))
-            })?,
-    );
-    if let Strategy::Survey(plan) = &strategy {
-        widen(&mut implementation, &plan.domains)?;
-    }
-    // Configurations of an error class that is not admitted are outside the
-    // domain: never formed, timed or chosen.
-    let implementation = implementation.admitting(|class| admitted.contains_key(class));
-    // Every configuration formed below is this one entry at these bindings.
-    let logical = Arc::new(
-        module
-            .entry(entry, &bindings)
-            .map_err(|error| TuneError::Declaration(error.to_string()))?,
-    );
-    let mutable = mutable_parameters(&logical);
-    let implementation_identity =
-        implementation_digest(device, module, entry, &bindings, &statics, cpu)?;
-    let unit = Unit {
-        tuning_identity: device.tuning_identity(),
-        entry: entry_name,
-        backend: backend.as_str().to_owned(),
+        module,
+        entry,
+        bindings,
+        statics,
+        cpu,
         validation,
-        implementation_identity,
-        parameters: entry_parameters(&implementation),
+        reference,
     };
-    // A survey (development) builds and times every point.
-    let (admission, required, min_sample_seconds) = match &strategy {
-        Strategy::Search(plan) | Strategy::Censused { plan, .. } => {
-            (plan.admission, plan.required, plan.min_sample_seconds)
+    match strategy {
+        Strategy::Search(plan) => {
+            let mut unit = UnitSearch::open(request)?;
+            let until = began + plan.allowance;
+            let allowance = plan.allowance;
+            // One call measures its defaults and form starts whatever its
+            // allowance: there is no other unit whose time they could take.
+            let unbounded = until + Duration::from_secs(24 * 60 * 60);
+            unit.start(
+                points,
+                StartPlan {
+                    required: plan.required,
+                    admission: plan.admission,
+                    settings: plan.settings,
+                    min_sample_seconds: plan.min_sample_seconds,
+                    start: plan.start,
+                    forms: true,
+                },
+                unbounded,
+            )?;
+            unit.refine(until, until)?;
+            unit.conclude(points, until, allowance)
         }
-        Strategy::Census(plan) => (plan.limit, plan.limit, plan.min_sample_seconds),
-        Strategy::Survey(plan) => (Duration::MAX, Duration::MAX, plan.min_sample_seconds),
-    };
-    // A census times only the points every candidate must pass. A search
-    // after it reuses its measurement of the defaults there.
-    let census_only = matches!(strategy, Strategy::Census(_));
-    let census = match &strategy {
-        Strategy::Censused { census, .. } => Some(census),
-        Strategy::Search(_) | Strategy::Census(_) | Strategy::Survey(_) => None,
-    };
-    let censused = census.and_then(|census| measured_points(census, &census.overall));
-    let mut inputs = Inputs {
-        source,
-        specs: &specs,
-        seconds: 0.,
-        last: 0.,
-    };
-    let limit = |spec: &PointSpec| {
-        if spec.required { required } else { admission }.saturating_sub(began.elapsed())
-    };
-    // The cheapest point first: the defaults are formed against it.
-    let Some(first) = inputs.build(0, limit(&specs[0]))? else {
+        Strategy::Survey(plan) => {
+            UnitSearch::open_over(request, &plan.domains)?.survey(points, plan)
+        }
+    }
+}
+
+/// What opening a unit's search needs.
+pub struct UnitRequest<'r, 'm> {
+    pub device: &'r Arc<DeviceInner>,
+    pub module: &'m CheckedModule,
+    pub entry: EntryId,
+    pub bindings: ElementBindings,
+    /// Values of every static dimension.
+    pub statics: NativeSpecialization,
+    pub cpu: Option<&'static CpuNativeKernels>,
+    /// The policy every configuration in no error class is validated under,
+    /// and the admitted error classes with their envelopes.
+    pub validation: TuningPrecision,
+    pub reference: TuningReference,
+}
+
+/// The defaults formed, and the validator of every point against the
+/// reference.
+struct Ground {
+    kernel: Arc<NativePrepared>,
+    validator: Validator,
+}
+
+/// A point admitted to the objective: built, its reference run, and the
+/// defaults measured there.
+struct Timed<'a> {
+    point: PreparedPoint<'a>,
+    defaults: Option<PointMeasurement>,
+    admitted: Admitted,
+}
+
+/// How far a unit's search is.
+enum Stage<'a> {
+    /// Admitting points: each point's slot, by its position among the
+    /// unit's points.
+    Admitting(Vec<Option<Timed<'a>>>),
+    /// The points every candidate must pass did not fit: the unit keeps its
+    /// defaults. The settings of the search that found so; none when its
+    /// census did.
+    Unaffordable(Option<SearchSettings>),
+    Searching(Box<Searching<'a>>),
+}
+
+/// A unit searching at its timed points.
+struct Searching<'a> {
+    ground: Ground,
+    points: Vec<PreparedPoint<'a>>,
+    /// Every point's record, the untimed points' weights folded into timed
+    /// ones.
+    records: Vec<PointRecord>,
+    /// The points not timed: the choice is validated there.
+    untimed: Vec<usize>,
+    /// What validating a choice at the untimed points will take, each
+    /// predicted from the last admitted point.
+    untimed_reserve: Duration,
+    plan: StartPlan,
+    run: Run,
+}
+
+enum Run {
+    Search(SearchRun),
+    Factored(FactoredRun),
+}
+
+/// A local search of a unit's admissible configurations, as far as it got.
+struct SearchRun {
+    space: SearchSpace,
+    start: Vec<usize>,
+    lived: Lived,
+    explored: search::Explored,
+}
+
+/// The timed points of a unit, weighted for the objective.
+struct Timing<'a> {
+    points: Vec<PreparedPoint<'a>>,
+    records: Vec<PointRecord>,
+    untimed: Vec<usize>,
+    untimed_reserve: Duration,
+}
+
+/// One unit's search, advanced in steps so that a consumer tuning several
+/// units decides which of them the next time goes to.
+///
+/// A census admits the points every candidate must pass and the unit's
+/// census points, and measures the defaults there. Starting admits further points within the plan's
+/// admission, then measures the defaults and every form's start whatever the
+/// time: every form has a measurement before any is searched further.
+/// Refining continues the search until a given instant, and may be repeated:
+/// the steps together measure what one uninterrupted search measures, in the
+/// same order. Concluding confirms the finalists found so far and validates
+/// the choice at the points not timed, so a search concluded at any step
+/// yields the best configuration confirmed by the same rules.
+pub struct UnitSearch<'m, 'a> {
+    device: Arc<DeviceInner>,
+    module: &'m CheckedModule,
+    entry: EntryId,
+    bindings: ElementBindings,
+    statics: NativeSpecialization,
+    cpu: Option<&'static CpuNativeKernels>,
+    reference: TuningReference,
+    backend: seismic_lang::registry::BackendName,
+    admitted: BTreeMap<String, seismic_lang::precision::ErrorEnvelope>,
+    implementation: NativeImplementation,
+    logical: Arc<LogicalEntry>,
+    mutable: Vec<(usize, String)>,
+    default: NativeSpecialization,
+    unit: Unit,
+    /// The unit's points, once a step was given their source.
+    specs: Vec<PointSpec>,
+    ground: Option<Ground>,
+    /// Programs formed for the defaults.
+    grounded: usize,
+    /// Measures the defaults as points are admitted; a local search takes
+    /// it, with those measurements.
+    measurer: Option<Measurer>,
+    /// Why the defaults could not be measured at an admitted point.
+    defaults_failure: Option<Exclusion>,
+    min_sample_seconds: f64,
+    stage: Stage<'a>,
+    building: f64,
+    measuring: f64,
+}
+
+impl<'m, 'a> UnitSearch<'m, 'a> {
+    pub fn open(request: UnitRequest<'_, 'm>) -> Result<Self, TuneError> {
+        Self::open_over(request, &BTreeMap::new())
+    }
+
+    /// Open the unit with `domains` replacing the declared value lists of
+    /// the parameters they name (a survey's widened space).
+    fn open_over(
+        request: UnitRequest<'_, 'm>,
+        domains: &BTreeMap<String, Vec<u64>>,
+    ) -> Result<Self, TuneError> {
+        let UnitRequest {
+            device,
+            module,
+            entry,
+            bindings,
+            statics,
+            cpu,
+            validation: TuningPrecision {
+                policy: validation,
+                admitted,
+            },
+            reference,
+        } = request;
+        let backend = super::backend_name(&device.kind);
+        let entry_name = super::entry_name(module, entry);
+        let mut implementation = super::on_device(
+            device,
+            module
+                .native_implementation(entry, backend)
+                .cloned()
+                .ok_or_else(|| {
+                    TuneError::Declaration(format!(
+                        "`{entry_name}` has no native implementation for `{}`",
+                        backend.as_str()
+                    ))
+                })?,
+        );
+        widen(&mut implementation, domains)?;
+        // Configurations of an error class that is not admitted are outside the
+        // domain: never formed, timed or chosen.
+        let implementation = implementation.admitting(|class| admitted.contains_key(class));
+        // Every configuration formed is this one entry at these bindings.
+        let logical = Arc::new(
+            module
+                .entry(entry, &bindings)
+                .map_err(|error| TuneError::Declaration(error.to_string()))?,
+        );
+        let mutable = mutable_parameters(&logical);
+        let implementation_identity =
+            implementation_digest(device, module, entry, &bindings, &statics, cpu)?;
         let default = implementation
             .default_specialization(&statics)
             .map_err(|error| TuneError::Declaration(error.to_string()))?;
-        return Ok(unit.kept_defaults(&specs, &default, &strategy, &inputs, began));
-    };
-    let default = implementation
-        .default_specialization(&statics)
-        .map_err(|error| TuneError::Declaration(error.to_string()))?;
-    // The default is the validation reference: it changes no numerics.
-    if let Some(class) = implementation
-        .error_classes_of(&default)
-        .map_err(|error| TuneError::Declaration(error.to_string()))?
-        .first()
-    {
-        return Err(TuneError::Declaration(format!(
-            "the default configuration of `{}` is in error class `{class}`",
-            unit.entry
-        )));
-    }
-    let default_kernel = NativePrepared::prepare_implementation(
-        device,
-        module,
-        entry,
-        &logical,
-        bindings.clone(),
-        default.clone(),
-        cpu,
-        implementation.clone(),
-    )
-    .map_err(|error| TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error))))?;
-    let validator = Validator::new(
-        device,
-        module,
-        entry,
-        &bindings,
-        &logical,
-        &mutable,
-        &unit.validation,
-        &admitted,
-        reference,
-        &default,
-        cpu,
-    )?;
-    let search = !matches!(strategy, Strategy::Survey(_));
-    let mut measurer = Measurer::new(&implementation);
-    let options = MeasureOptions {
-        samples: 1,
-        min_sample_seconds,
-    };
-    let mut admitted = Vec::new();
-    let mut points = Vec::new();
-    let mut untimed = Vec::new();
-    let mut defaults: Result<Vec<PointMeasurement>, Exclusion> = Ok(Vec::new());
-    let mut measuring = 0.;
-    let mut last: Option<Admitted> = None;
-    let mut closed = false;
-    let first_build = inputs.last;
-    let mut first = Some(first);
-    for (index, spec) in specs.iter().enumerate() {
-        let reused = censused.and_then(|measured| {
-            measured
-                .iter()
-                .find(|measurement| measurement.point == spec.label)
-        });
-        let available = limit(spec);
-        let predicted_fits = last
-            .as_ref()
-            .is_none_or(|last| last.step_at(spec.cost) <= available.as_secs_f64());
-        let step = Instant::now();
-        let (point, built) = match first.take() {
-            Some(point) => (Some(point), first_build),
-            // The census built it.
-            None if reused.is_some() => (inputs.build(index, Duration::MAX)?, 0.),
-            None if census_only && !spec.required => (None, 0.),
-            None if (spec.required || !closed) && predicted_fits && !available.is_zero() => {
-                (inputs.build(index, available)?, 0.)
-            }
-            None => (None, 0.),
-        };
-        let Some(point) = point else {
-            if spec.required {
-                return Ok(unit.kept_defaults(&specs, &default, &strategy, &inputs, began));
-            }
-            closed = true;
-            untimed.push(index);
-            continue;
-        };
-        // Serving runs the defaults at every point, so one they cannot launch
-        // at is an error.
-        for args in &point.rotation {
-            default_kernel.shape(&args.values()).map_err(|error| {
-                TuneError::DefaultUnusable(Exclusion::Execution(format!(
-                    "at point `{}`: {error}",
-                    point.label
-                )))
-            })?;
+        // The default is the validation reference: it changes no numerics.
+        if let Some(class) = implementation
+            .error_classes_of(&default)
+            .map_err(|error| TuneError::Declaration(error.to_string()))?
+            .first()
+        {
+            return Err(TuneError::Declaration(format!(
+                "the default configuration of `{entry_name}` is in error class `{class}`"
+            )));
         }
-        let point = validator.point(point)?;
-        point.ensure_reference()?;
-        if let (Some(measurement), Ok(measured)) = (reused, &mut defaults) {
-            measurer.seed(measurement.clone());
-            measured.push(measurement.clone());
-        } else if search {
-            if let Ok(measured) = &mut defaults {
-                let started = Instant::now();
-                match measurer.measure(
-                    &default_kernel,
-                    std::slice::from_ref(&point),
-                    default.params(),
-                    &options,
-                ) {
-                    Ok(mut at) => measured.push(at.remove(0)),
-                    Err(exclusion) => defaults = Err(exclusion),
-                }
-                measuring += started.elapsed().as_secs_f64();
+        Ok(Self {
+            unit: Unit {
+                tuning_identity: device.tuning_identity(),
+                entry: entry_name,
+                backend: backend.as_str().to_owned(),
+                validation,
+                implementation_identity,
+                parameters: entry_parameters(&implementation),
+            },
+            device: device.clone(),
+            module,
+            entry,
+            bindings,
+            statics,
+            cpu,
+            reference,
+            backend,
+            admitted,
+            measurer: Some(Measurer::new(&implementation)),
+            implementation,
+            logical,
+            mutable,
+            default,
+            specs: Vec::new(),
+            ground: None,
+            grounded: 0,
+            defaults_failure: None,
+            min_sample_seconds: 0.,
+            stage: Stage::Admitting(Vec::new()),
+            building: 0.,
+            measuring: 0.,
+        })
+    }
+
+    /// Learn the unit's points from `source`, at the first step given one.
+    fn describe(&mut self, source: &dyn PointSource<'a>) -> Result<(), TuneError> {
+        if self.specs.is_empty() {
+            self.specs = source.points();
+            if self.specs.is_empty() {
+                return Err(TuneError::NoPoints);
             }
+            self.stage = Stage::Admitting(self.specs.iter().map(|_| None).collect());
         }
-        last = Some(Admitted {
-            cost: spec.cost,
-            step: built + step.elapsed().as_secs_f64(),
-            build: if index == 0 { first_build } else { inputs.last },
-            kernel: defaults
-                .as_ref()
-                .ok()
-                .and_then(|measured| measured.last())
-                .filter(|_| search)
-                .map(|measured| measured.median_seconds),
-            rotation: point.rotation.len(),
-        });
-        admitted.push(index);
-        points.push(point);
+        Ok(())
     }
-    let records = folded(&specs, &admitted);
-    for (point, index) in points.iter_mut().zip(&admitted) {
-        point.reweigh(records[*index].weight);
-    }
-    if matches!(strategy, Strategy::Census(_)) {
-        let time = TuningTime {
-            building_seconds: inputs.seconds,
-            reference_seconds: validator.reference_seconds(),
-            measuring_seconds: measuring,
-            ..TuningTime::default()
-        };
-        return unit.census(&points, records, &default, &default_kernel, defaults, time);
-    }
-    let strategy = match strategy {
-        Strategy::Censused { plan, .. } => Strategy::Search(plan),
-        other => other,
-    };
-    let formation = Formation {
-        device,
-        module,
-        entry,
-        logical: &logical,
-        bindings: &bindings,
-        cpu,
-        implementation: &implementation,
-    };
-    // Validating a choice at the points not timed, each predicted from the
-    // last admitted point.
-    let untimed_reserve = last.map_or(Duration::ZERO, |last| {
-        Duration::from_secs_f64(
-            untimed
-                .iter()
-                .map(|index| last.validation_at(specs[*index].cost))
-                .sum(),
+
+    /// Form the defaults and the validator.
+    fn form_ground(&self) -> Result<Ground, TuneError> {
+        let kernel = NativePrepared::prepare_implementation(
+            &self.device,
+            self.module,
+            self.entry,
+            &self.logical,
+            self.bindings.clone(),
+            self.default.clone(),
+            self.cpu,
+            self.implementation.clone(),
         )
-    });
-    let mut result = match strategy {
-        Strategy::Search(plan) => {
-            let window = before(began + plan.allowance, untimed_reserve);
-            if implementation.launch_scoped() {
-                if !matches!(
-                    backend,
-                    seismic_lang::registry::BackendName::Metal
-                        | seismic_lang::registry::BackendName::Cuda
-                ) {
-                    return Err(TuneError::Declaration(format!(
-                        "launch-scoped native tuning is not yet available on `{}`",
-                        backend.as_str(),
-                    )));
-                }
-                tune_factored(FactoredRequest {
-                    device,
-                    module,
-                    entry,
-                    logical: &logical,
-                    bindings: &bindings,
-                    statics: &statics,
-                    cpu,
-                    points: &points,
-                    validation: unit.validation.clone(),
-                    implementation_identity: unit.implementation_identity.clone(),
-                    implementation: &implementation,
-                    default: &default,
-                    search: plan,
-                    window,
-                })?
+        .map_err(|error| {
+            TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error)))
+        })?;
+        let validator = Validator::new(
+            &self.device,
+            self.module,
+            self.entry,
+            &self.bindings,
+            &self.logical,
+            &self.mutable,
+            &self.unit.validation,
+            &self.admitted,
+            self.reference,
+            &self.default,
+            self.cpu,
+        )?;
+        Ok(Ground { kernel, validator })
+    }
+
+    /// Admit points not yet admitted, in ascending cost: build each, run its
+    /// reference and, when `measure`, measure the defaults there. A required
+    /// point may take what is left of `required`, any other what is left of
+    /// `admission`, each predicted from the point before it; a `census`
+    /// admits only required points and census points (the cheapest point
+    /// when there is neither), and passes over the others. The first point
+    /// that did not fit closes admission to the points after it that are
+    /// not required. Whether every required point was admitted: when
+    /// not, the unit keeps its defaults.
+    fn admit(
+        &mut self,
+        source: &mut dyn PointSource<'a>,
+        census: bool,
+        measure: bool,
+        required: Duration,
+        admission: Duration,
+        until: Option<Instant>,
+    ) -> Result<bool, TuneError> {
+        let began = Instant::now();
+        let specs = self.specs.clone();
+        let mut inputs = Inputs {
+            source,
+            specs: &specs,
+            seconds: 0.,
+            last: 0.,
+        };
+        let options = MeasureOptions {
+            samples: 1,
+            min_sample_seconds: self.min_sample_seconds,
+        };
+        let mut last: Option<Admitted> = None;
+        let mut closed = false;
+        let mut affordable = true;
+        for (index, spec) in specs.iter().enumerate() {
+            let Stage::Admitting(slots) = &self.stage else {
+                unreachable!("points are admitted before the search starts");
+            };
+            if let Some(timed) = &slots[index] {
+                last = Some(timed.admitted.clone());
+                continue;
+            }
+            let available =
+                if spec.required { required } else { admission }.saturating_sub(began.elapsed());
+            let predicted_fits = last
+                .as_ref()
+                .is_none_or(|last| last.step_at(spec.cost) <= available.as_secs_f64());
+            // The cheapest point first: the defaults are formed against it.
+            let first = index == 0 && self.ground.is_none();
+            // Past the step's hard limit nothing more is admitted.
+            let late = until.is_some_and(|until| Instant::now() >= until);
+            // A census passes over the points it does not measure: they are
+            // admitted by the start, and close nothing.
+            if census && !first && !spec.required && !spec.census {
+                continue;
+            }
+            let attempted = !late
+                && (first
+                    || ((spec.required || !closed) && predicted_fits && !available.is_zero()));
+            let point = if attempted {
+                inputs.build(index, available)?
             } else {
-                let space = search_space(
-                    device,
-                    &logical,
-                    &implementation,
-                    &statics,
-                    &default,
-                    &points,
-                )?;
-                let tuned = Tuned {
-                    formation: &formation,
-                    space: &space,
-                    statics: &statics,
+                None
+            };
+            let built = if attempted { inputs.last } else { 0. };
+            let Some(point) = point else {
+                if spec.required || first {
+                    affordable = false;
+                    break;
+                }
+                closed = true;
+                continue;
+            };
+            if self.ground.is_none() {
+                self.ground = Some(self.form_ground()?);
+                self.grounded = if self.implementation.launch_scoped() {
+                    self.implementation.launches.len()
+                } else {
+                    1
                 };
-                let (configurations, overall, method, time) =
-                    tuned.search(&points, plan, window, measurer)?;
-                unit.result(configurations, &overall, method, time)
+            }
+            let ground = self
+                .ground
+                .as_ref()
+                .expect("the defaults were formed above");
+            let step = Instant::now();
+            // Serving runs the defaults at every point, so one they cannot launch
+            // at is an error.
+            for args in &point.rotation {
+                ground.kernel.shape(&args.values()).map_err(|error| {
+                    TuneError::DefaultUnusable(Exclusion::Execution(format!(
+                        "at point `{}`: {error}",
+                        point.label
+                    )))
+                })?;
+            }
+            let point = ground.validator.point(point)?;
+            point.ensure_reference()?;
+            let mut defaults = None;
+            if measure && self.defaults_failure.is_none() {
+                let started = Instant::now();
+                match self
+                    .measurer
+                    .as_mut()
+                    .expect("the measurer serves admission until a search takes it")
+                    .measure(
+                        &ground.kernel,
+                        std::slice::from_ref(&point),
+                        self.default.params(),
+                        &options,
+                    ) {
+                    Ok(mut at) => defaults = Some(at.remove(0)),
+                    Err(exclusion) => self.defaults_failure = Some(exclusion),
+                }
+                self.measuring += started.elapsed().as_secs_f64();
+            }
+            let admitted = Admitted {
+                cost: spec.cost,
+                step: built + step.elapsed().as_secs_f64(),
+                build: built,
+                kernel: defaults
+                    .as_ref()
+                    .map(|measured: &PointMeasurement| measured.median_seconds),
+                rotation: point.rotation.len(),
+            };
+            let Stage::Admitting(slots) = &mut self.stage else {
+                unreachable!("points are admitted before the search starts");
+            };
+            slots[index] = Some(Timed {
+                point,
+                defaults,
+                admitted: admitted.clone(),
+            });
+            last = Some(admitted);
+        }
+        self.building += inputs.seconds;
+        Ok(affordable)
+    }
+
+    /// The admitted points as the objective's timed points: each reweighed
+    /// with the weights of the points not admitted folded in.
+    fn timed(&mut self) -> Timing<'a> {
+        let Stage::Admitting(slots) = std::mem::replace(&mut self.stage, Stage::Unaffordable(None))
+        else {
+            unreachable!("points are admitted before the search starts");
+        };
+        let mut admitted = Vec::new();
+        let mut points = Vec::new();
+        let mut untimed = Vec::new();
+        let mut last = None;
+        for (index, slot) in slots.into_iter().enumerate() {
+            match slot {
+                Some(timed) => {
+                    admitted.push(index);
+                    points.push(timed.point);
+                    last = Some(timed.admitted);
+                }
+                None => untimed.push(index),
             }
         }
-        Strategy::Survey(plan) => {
-            if implementation.launch_scoped() {
-                return Err(TuneError::Domain(
-                    "launch-scoped surveys require the factored search".into(),
-                ));
-            }
-            let declared = search_parameters(&implementation);
-            let space = SearchSpace::new(
-                &declared,
-                &implementation
-                    .admissible(&statics)
-                    .map_err(|error| TuneError::Declaration(error.to_string()))?
+        let records = folded(&self.specs, &admitted);
+        for (point, index) in points.iter_mut().zip(&admitted) {
+            point.reweigh(records[*index].weight);
+        }
+        let untimed_reserve = last.map_or(Duration::ZERO, |last| {
+            Duration::from_secs_f64(
+                untimed
                     .iter()
-                    .map(|specialization| specialization.params().clone())
-                    .collect::<Vec<_>>(),
+                    .map(|index| last.validation_at(self.specs[*index].cost))
+                    .sum(),
             )
-            .map_err(TuneError::Space)?;
-            let tuned = Tuned {
-                formation: &formation,
-                space: &space,
-                statics: &statics,
+        });
+        Timing {
+            points,
+            records,
+            untimed,
+            untimed_reserve,
+        }
+    }
+
+    /// The defaults, chosen without searching.
+    fn kept(&self, method: TuningMethod) -> TuningResult {
+        let mut result = self.unit.result(
+            Records {
+                points: folded(&self.specs, &[]),
+                evidence: Vec::new(),
+                records: Vec::new(),
+            },
+            &self.default,
+            method,
+            TuningTime::default(),
+        );
+        result.time.building_seconds = self.building;
+        result
+    }
+
+    /// The census of a unit still admitting points: the defaults measured at
+    /// the points admitted, with their evidence there.
+    fn censused(&self) -> Result<TuningResult, TuneError> {
+        let (Stage::Admitting(slots), Some(ground)) = (&self.stage, &self.ground) else {
+            return Ok(self.kept(TuningMethod::Census));
+        };
+        let admitted = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_ref().map(|_| index))
+            .collect::<Vec<_>>();
+        let defaults = match &self.defaults_failure {
+            Some(exclusion) => Err(exclusion.clone()),
+            None => Ok(slots
+                .iter()
+                .flatten()
+                .filter_map(|timed| timed.defaults.clone())
+                .collect()),
+        };
+        self.unit.census(
+            slots.iter().flatten().map(|timed| &timed.point),
+            folded(&self.specs, &admitted),
+            &self.default,
+            &ground.kernel,
+            defaults,
+            TuningTime {
+                building_seconds: self.building,
+                reference_seconds: ground.validator.reference_seconds(),
+                measuring_seconds: self.measuring,
+                ..TuningTime::default()
+            },
+        )
+    }
+
+    /// Measure the defaults at the points every candidate must pass and at
+    /// the unit's census points (the cheapest point when there is neither)
+    /// within the plan's limit: the fixed
+    /// cost of searching the unit, and the defaults' time there. A result
+    /// without configurations says the required points did not fit: the
+    /// unit keeps its defaults.
+    pub fn census(
+        &mut self,
+        source: &mut dyn PointSource<'a>,
+        plan: CensusPlan,
+    ) -> Result<TuningResult, TuneError> {
+        self.describe(source)?;
+        self.min_sample_seconds = plan.min_sample_seconds;
+        let until = Instant::now().checked_add(plan.limit);
+        if !self.admit(source, true, true, plan.limit, plan.limit, until)? {
+            self.stage = Stage::Unaffordable(None);
+        }
+        self.censused()
+    }
+
+    /// Admit the further points the plan's admission covers, then measure
+    /// the defaults and every form's start whatever the time (`until` bounds
+    /// only the search for a passing configuration when the defaults fail).
+    pub fn start(
+        &mut self,
+        source: &mut dyn PointSource<'a>,
+        plan: StartPlan,
+        until: Instant,
+    ) -> Result<Standing, TuneError> {
+        self.describe(source)?;
+        if !matches!(self.stage, Stage::Admitting(_)) {
+            return Ok(self.standing());
+        }
+        self.min_sample_seconds = plan.min_sample_seconds;
+        if !self.admit(
+            source,
+            false,
+            true,
+            plan.required,
+            plan.admission,
+            Some(until),
+        )? {
+            self.stage = Stage::Unaffordable(Some(plan.settings));
+            return Ok(self.standing());
+        }
+        // The hard limit was reached admitting points: the unit stays as its
+        // census left it, on its defaults.
+        if Instant::now() >= until {
+            return Ok(Standing {
+                cut: true,
+                ..self.standing()
+            });
+        }
+        let Timing {
+            points,
+            records,
+            untimed,
+            untimed_reserve,
+        } = self.timed();
+        let ground = self
+            .ground
+            .take()
+            .expect("admitting a point forms the defaults");
+        let run = if self.implementation.launch_scoped() {
+            if !matches!(
+                self.backend,
+                seismic_lang::registry::BackendName::Metal
+                    | seismic_lang::registry::BackendName::Cuda
+            ) {
+                return Err(TuneError::Declaration(format!(
+                    "launch-scoped native tuning is not yet available on `{}`",
+                    self.backend.as_str(),
+                )));
+            }
+            let formation = Formation {
+                device: &self.device,
+                module: self.module,
+                entry: self.entry,
+                logical: &self.logical,
+                bindings: &self.bindings,
+                cpu: self.cpu,
+                implementation: &self.implementation,
             };
-            let (configurations, overall, method, time) = tuned.survey(&points, plan)?;
-            unit.result(configurations, &overall, method, time)
-        }
-        Strategy::Census(_) | Strategy::Censused { .. } => {
-            unreachable!(
-                "a census returns once its points are admitted; a censused search is a search"
-            )
-        }
-    };
-    result.points = records;
-    if !untimed.is_empty() {
-        let trusted =
-            (reference == TuningReference::NativeDefault).then(|| Configuration::of(&default));
-        if trusted.as_ref() != Some(&result.overall) {
-            let allowance = match &result.method {
-                TuningMethod::Search {
-                    allowance_seconds, ..
+            Run::Factored(FactoredRun::open(
+                &formation,
+                &self.statics,
+                &self.default,
+                &points,
+                &plan,
+                before(until, untimed_reserve),
+            )?)
+        } else {
+            let space = search_space(
+                &self.device,
+                &self.logical,
+                &self.implementation,
+                &self.statics,
+                &self.default,
+                &points,
+            )?;
+            let start = plan
+                .start
+                .iter()
+                .filter_map(|values| space.index_of(values))
+                .collect();
+            Run::Search(SearchRun {
+                space,
+                start,
+                lived: Lived {
+                    measurer: self
+                        .measurer
+                        .take()
+                        .expect("the measurer serves admission until a search takes it"),
+                    search: MeasureOptions {
+                        samples: plan.settings.samples,
+                        min_sample_seconds: plan.min_sample_seconds,
+                    },
+                    confirmation: MeasureOptions {
+                        samples: plan.settings.confirmation_samples,
+                        min_sample_seconds: plan.min_sample_seconds,
+                    },
+                    confirmed: plan.settings.confirmed,
+                    evaluated: HashMap::new(),
+                    anchor: None,
+                    formed: 0,
+                    time: TuningTime::default(),
+                },
+                explored: search::Explored {
+                    evaluated: Vec::new(),
+                    stop: SearchStop::Expired,
+                },
+            })
+        };
+        self.stage = Stage::Searching(Box::new(Searching {
+            ground,
+            points,
+            records,
+            untimed,
+            untimed_reserve,
+            plan,
+            run,
+        }));
+        let standing = self.explore(Limits { slice: None, until })?;
+        Ok(Standing {
+            // The guarantee was reached: the planned starts may not all
+            // have been measured.
+            cut: Instant::now() + self.reserve() >= until,
+            ..standing
+        })
+    }
+
+    /// Continue the search until `slice`, or until what remains before
+    /// `until` only covers concluding it ([`Self::reserve`]).
+    pub fn refine(&mut self, slice: Instant, until: Instant) -> Result<Standing, TuneError> {
+        self.explore(Limits {
+            slice: Some(slice),
+            until,
+        })
+    }
+
+    /// One step of the search: the starts without a slice, else whatever
+    /// the search asks for next within the limits.
+    fn explore(&mut self, limits: Limits) -> Result<Standing, TuneError> {
+        if let Stage::Searching(searching) = &mut self.stage {
+            let formation = Formation {
+                device: &self.device,
+                module: self.module,
+                entry: self.entry,
+                logical: &self.logical,
+                bindings: &self.bindings,
+                cpu: self.cpu,
+                implementation: &self.implementation,
+            };
+            let Searching {
+                points,
+                plan,
+                run,
+                untimed_reserve,
+                ..
+            } = &mut **searching;
+            match run {
+                Run::Search(run) => {
+                    let mut live = Live {
+                        formation: &formation,
+                        space: &run.space,
+                        statics: &self.statics,
+                        points,
+                        state: &mut run.lived,
+                        limits: Some(limits),
+                        untimed: *untimed_reserve,
+                    };
+                    let explored = search::explore(
+                        &run.space,
+                        &run.start,
+                        &plan.settings,
+                        &run.explored.evaluated,
+                        match limits.slice {
+                            Some(_) => search::Reach::End,
+                            None if plan.forms => search::Reach::Starts,
+                            None => search::Reach::Defaults,
+                        },
+                        &mut live,
+                    );
+                    run.explored = explored;
                 }
-                | TuningMethod::Factored {
-                    allowance_seconds, ..
-                } => Duration::from_secs_f64(*allowance_seconds),
-                TuningMethod::Survey { .. } | TuningMethod::Census => Duration::MAX,
-            };
-            let mut built = Vec::with_capacity(untimed.len());
-            for index in &untimed {
-                let limit = allowance.saturating_sub(began.elapsed());
-                match inputs.build(*index, limit)? {
-                    Some(point) => built.push(validator.point(point)?),
-                    None => break,
+                Run::Factored(run) => {
+                    let reserve = run.reserve(&plan.settings) + *untimed_reserve;
+                    let forms = plan.forms;
+                    // The form starts are measured whatever the slice, unless
+                    // the start was planned without them; anything else
+                    // within the slice; nothing once the time left only
+                    // covers the conclusion.
+                    let expired = move |start: bool| {
+                        let now = Instant::now();
+                        if now + reserve >= limits.until {
+                            true
+                        } else if start {
+                            limits.slice.is_none() && !forms
+                        } else {
+                            limits.slice.is_none_or(|slice| now >= slice)
+                        }
+                    };
+                    run.explore(&formation, &self.statics, &self.default, points, plan, &expired)?;
                 }
             }
-            if built.len() == untimed.len() {
-                validate_everywhere(
-                    &formation,
-                    &default,
-                    &points,
-                    &built,
-                    min_sample_seconds,
-                    &mut result,
-                )?;
-            } else {
-                give_way(
-                    &mut result,
-                    &default,
-                    &points,
-                    Exclusion::Execution(
-                        "validating it where the search did not time it would not fit the unit's time"
-                            .into(),
-                    ),
-                )?;
+        }
+        Ok(self.standing())
+    }
+
+    /// Where the search stands.
+    pub fn standing(&self) -> Standing {
+        match &self.stage {
+            Stage::Admitting(_) | Stage::Unaffordable(_) => Standing {
+                finished: matches!(self.stage, Stage::Unaffordable(_)),
+                cost: 1.,
+                measured: 0,
+                admissible: 0,
+                programs: self.grounded,
+                declared_programs: self.grounded,
+                forming_seconds: 0.,
+                cut: false,
+            },
+            Stage::Searching(searching) => {
+                let standing = match &searching.run {
+                    Run::Search(run) => {
+                        let default = run.space.default_index();
+                        let totals = run
+                            .explored
+                            .evaluated
+                            .iter()
+                            .filter_map(|(index, result)| {
+                                result.as_ref().ok().map(|cost| (*index, cost.total()))
+                            })
+                            .collect::<Vec<_>>();
+                        let defaults = totals
+                            .iter()
+                            .find(|(index, _)| *index == default)
+                            .map(|(_, total)| *total);
+                        let best = totals.iter().map(|(_, total)| *total).fold(f64::INFINITY, f64::min);
+                        Standing {
+                            finished: run.explored.stop != SearchStop::Expired,
+                            cost: defaults.map_or(1., |defaults| (best / defaults).min(1.)),
+                            measured: run.explored.evaluated.len(),
+                            admissible: run.space.len(),
+                            programs: run.lived.formed,
+                            declared_programs: run.space.len(),
+                            forming_seconds: run.lived.time.forming_seconds,
+                            cut: false,
+                        }
+                    }
+                    Run::Factored(run) => run.standing(&searching.points),
+                };
+                Standing {
+                    programs: standing.programs + self.grounded,
+                    ..standing
+                }
             }
         }
     }
-    result.time.building_seconds += inputs.seconds;
-    result.time.measuring_seconds += measuring;
-    result.time.reference_seconds += validator.reference_seconds();
-    Ok(result)
+
+    /// What concluding the search will take: confirming the finalists found
+    /// so far and validating the choice at the points not timed.
+    pub fn reserve(&self) -> Duration {
+        match &self.stage {
+            Stage::Admitting(_) | Stage::Unaffordable(_) => Duration::ZERO,
+            Stage::Searching(searching) => {
+                searching.untimed_reserve
+                    + match &searching.run {
+                        Run::Search(run) => run.lived.reserve(run.space.default_index()),
+                        Run::Factored(run) => run.reserve(&searching.plan.settings),
+                    }
+            }
+        }
+    }
+
+    /// Conclude the search with what it has reached: confirm its finalists,
+    /// choose by the confirmed costs, and validate a choice other than the
+    /// defaults at the points not timed, building those within what is left
+    /// before `until`. `allowance` is the time the unit was given, for the
+    /// record. A unit that never started returns its census.
+    pub fn conclude(
+        mut self,
+        source: &mut dyn PointSource<'a>,
+        until: Instant,
+        allowance: Duration,
+    ) -> Result<TuningResult, TuneError> {
+        let searching = match std::mem::replace(&mut self.stage, Stage::Unaffordable(None)) {
+            Stage::Admitting(slots) => {
+                self.stage = Stage::Admitting(slots);
+                return self.censused();
+            }
+            Stage::Unaffordable(None) => return Ok(self.kept(TuningMethod::Census)),
+            Stage::Unaffordable(Some(settings)) => {
+                return Ok(self.kept(TuningMethod::Search {
+                    allowance_seconds: allowance.as_secs_f64(),
+                    settings,
+                    stop: SearchStop::Unaffordable,
+                }))
+            }
+            Stage::Searching(searching) => *searching,
+        };
+        let Searching {
+            ground,
+            points,
+            records,
+            untimed,
+            untimed_reserve,
+            plan,
+            run,
+        } = searching;
+        let formation = Formation {
+            device: &self.device,
+            module: self.module,
+            entry: self.entry,
+            logical: &self.logical,
+            bindings: &self.bindings,
+            cpu: self.cpu,
+            implementation: &self.implementation,
+        };
+        let mut result = match run {
+            Run::Search(mut run) => {
+                let mut live = Live {
+                    formation: &formation,
+                    space: &run.space,
+                    statics: &self.statics,
+                    points: &points,
+                    state: &mut run.lived,
+                    limits: None,
+                    untimed: Duration::ZERO,
+                };
+                let trace = search::rank(&run.space, &plan.settings, run.explored, &mut live);
+                let (configurations, overall, method, time) = searched(
+                    &run.space,
+                    &self.statics,
+                    &points,
+                    plan.settings.clone(),
+                    allowance,
+                    run.lived,
+                    trace,
+                )?;
+                self.unit.result(configurations, &overall, method, time)
+            }
+            Run::Factored(run) => run.conclude(
+                &formation,
+                &self.statics,
+                &self.default,
+                &points,
+                &plan,
+                before(until, untimed_reserve),
+                allowance,
+                &self.unit,
+            )?,
+        };
+        result.points = records;
+        let mut inputs = Inputs {
+            source,
+            specs: &self.specs,
+            seconds: 0.,
+            last: 0.,
+        };
+        if !untimed.is_empty() {
+            let trusted = (self.reference == TuningReference::NativeDefault)
+                .then(|| Configuration::of(&self.default));
+            if trusted.as_ref() != Some(&result.overall) {
+                let mut built = Vec::with_capacity(untimed.len());
+                for index in &untimed {
+                    let limit = until.saturating_duration_since(Instant::now());
+                    match inputs.build(*index, limit)? {
+                        Some(point) => built.push(ground.validator.point(point)?),
+                        None => break,
+                    }
+                }
+                if built.len() == untimed.len() {
+                    validate_everywhere(
+                        &formation,
+                        &self.default,
+                        &points,
+                        &built,
+                        plan.min_sample_seconds,
+                        &mut result,
+                    )?;
+                } else {
+                    give_way(
+                        &mut result,
+                        &self.default,
+                        &points,
+                        Exclusion::Execution(
+                            "validating it where the search did not time it would not fit the unit's time"
+                                .into(),
+                        ),
+                    )?;
+                }
+            }
+        }
+        result.time.building_seconds += self.building + inputs.seconds;
+        result.time.measuring_seconds += self.measuring;
+        result.time.reference_seconds += ground.validator.reference_seconds();
+        Ok(result)
+    }
+
+    /// Measure and validate every admissible configuration at every point
+    /// (development).
+    pub fn survey(
+        mut self,
+        source: &mut dyn PointSource<'a>,
+        plan: SurveyPlan,
+    ) -> Result<TuningResult, TuneError> {
+        self.describe(source)?;
+        self.min_sample_seconds = plan.min_sample_seconds;
+        // A survey builds and times every point whatever it costs.
+        if !self.admit(source, false, false, Duration::MAX, Duration::MAX, None)? {
+            return Err(TuneError::Inputs {
+                point: self.specs[0].label.clone(),
+                detail: "a survey's point was refused for its time".into(),
+            });
+        }
+        let Timing {
+            points, records, ..
+        } = self.timed();
+        let ground = self
+            .ground
+            .take()
+            .expect("admitting a point forms the defaults");
+        if self.implementation.launch_scoped() {
+            return Err(TuneError::Domain(
+                "launch-scoped surveys require the factored search".into(),
+            ));
+        }
+        let declared = search_parameters(&self.implementation);
+        let space = SearchSpace::new(
+            &declared,
+            &self
+                .implementation
+                .admissible(&self.statics)
+                .map_err(|error| TuneError::Declaration(error.to_string()))?
+                .iter()
+                .map(|specialization| specialization.params().clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(TuneError::Space)?;
+        let formation = Formation {
+            device: &self.device,
+            module: self.module,
+            entry: self.entry,
+            logical: &self.logical,
+            bindings: &self.bindings,
+            cpu: self.cpu,
+            implementation: &self.implementation,
+        };
+        let tuned = Tuned {
+            formation: &formation,
+            space: &space,
+            statics: &self.statics,
+        };
+        let (configurations, overall, method, time) = tuned.survey(&points, plan)?;
+        let mut result = self.unit.result(configurations, &overall, method, time);
+        result.points = records;
+        result.time.building_seconds += self.building;
+        result.time.measuring_seconds += self.measuring;
+        result.time.reference_seconds += ground.validator.reference_seconds();
+        Ok(result)
+    }
 }
 
 /// What every result of one unit records about it.
@@ -1844,46 +2558,11 @@ impl Unit {
         }
     }
 
-    /// The defaults, chosen without searching: the points every candidate
-    /// must pass did not fit the unit's time.
-    fn kept_defaults(
-        &self,
-        specs: &[PointSpec],
-        default: &NativeSpecialization,
-        strategy: &Strategy,
-        inputs: &Inputs<'_, '_>,
-        began: Instant,
-    ) -> TuningResult {
-        let method = match strategy {
-            Strategy::Search(plan) | Strategy::Censused { plan, .. } => TuningMethod::Search {
-                allowance_seconds: plan.allowance.as_secs_f64(),
-                settings: plan.settings.clone(),
-                stop: SearchStop::Unaffordable,
-            },
-            Strategy::Census(_) => TuningMethod::Census,
-            Strategy::Survey(_) => unreachable!("a survey builds every point whatever it costs"),
-        };
-        let mut result = self.result(
-            Records {
-                points: folded(specs, &[]),
-                evidence: Vec::new(),
-                records: Vec::new(),
-            },
-            default,
-            method,
-            TuningTime::default(),
-        );
-        result.time.building_seconds = inputs.seconds;
-        result.time.measuring_seconds = began.elapsed().as_secs_f64() - inputs.seconds;
-        result
-    }
-
     /// A census: the defaults measured at the points it admitted, with their
-    /// evidence there; a later search of the unit times those points and
-    /// reuses this measurement.
-    fn census(
+    /// evidence there.
+    fn census<'p, 'a: 'p>(
         &self,
-        points: &[PreparedPoint<'_>],
+        points: impl IntoIterator<Item = &'p PreparedPoint<'a>>,
         records: Vec<PointRecord>,
         default: &NativeSpecialization,
         kernel: &NativePrepared,
@@ -1920,21 +2599,6 @@ impl Unit {
             time,
         ))
     }
-}
-
-/// The measurement of `configuration` in `result`, when measured.
-fn measured_points<'r>(
-    result: &'r TuningResult,
-    configuration: &Configuration,
-) -> Option<&'r [PointMeasurement]> {
-    result
-        .configurations
-        .iter()
-        .find(|record| record.configuration == *configuration)
-        .and_then(|record| match &record.outcome {
-            Outcome::Measured { points, .. } => Some(points.as_slice()),
-            Outcome::Excluded(_) => None,
-        })
 }
 
 /// The entry-wide parameters of `implementation`, as recorded.
@@ -2095,107 +2759,230 @@ fn validate_at(
         .collect()
 }
 
-struct FactoredRequest<'a, 'p> {
-    device: &'a Arc<DeviceInner>,
-    module: &'a CheckedModule,
-    entry: EntryId,
-    logical: &'a Arc<LogicalEntry>,
-    bindings: &'a ElementBindings,
-    statics: &'a NativeSpecialization,
-    cpu: Option<&'static CpuNativeKernels>,
-    points: &'a [PreparedPoint<'p>],
-    validation: PrecisionPolicy,
-    implementation_identity: String,
-    implementation: &'a NativeImplementation,
-    default: &'a NativeSpecialization,
-    search: SearchPlan,
-    /// When the unit's search and confirmation must end.
-    window: Instant,
+/// How many candidates of a sweep are formed and measured together: a step
+/// of the search can end between chunks, and only a chunk's programs are
+/// formed before it is measured.
+const SWEEP_CHUNK: usize = 16;
+/// How many candidates after a chunk have their programs formed with it
+/// when the chunk needs a compile: three chunks more, so that a pass costs a
+/// quarter of the compiles while at most three chunks' programs are formed
+/// and not measured when the time ends.
+const SWEEP_AHEAD: usize = 3 * SWEEP_CHUNK;
+
+/// The launch programs a factored search has formed. A launch's variants
+/// share one source, so those about to be measured are formed in one compile
+/// and the configurations assembled from them form nothing; a variant is
+/// formed only when a configuration about to be measured runs it.
+#[derive(Default)]
+struct LaunchPrograms {
+    /// Per launch, the program last formed for it and the variants it holds.
+    held: BTreeMap<usize, (BTreeSet<plan::LaunchVariant>, Rc<HeldPrograms>)>,
+    /// Every launch variant formed so far.
+    formed: BTreeSet<(usize, plan::LaunchVariant)>,
 }
 
-fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneError> {
-    let FactoredRequest {
-        device,
-        module,
-        entry,
-        logical,
-        bindings,
-        statics,
-        cpu,
-        points,
-        validation,
-        implementation_identity,
-        implementation,
-        default,
-        search,
-        window,
-    } = request;
-    // Until the seed is measured, the whole window; then the window less
-    // what confirming the finalists against the seed needs.
-    let mut deadline = window;
-    let mut time = TuningTime::default();
-    let shapes = point_shapes(device, logical, points)?;
-    let partition = plan::partition(implementation, statics, &shapes)
-        .map_err(|error| TuneError::Declaration(format!("factored native plan: {error:?}")))?;
-    let began = Instant::now();
-    // Each launch formed once with all its code variants and held, so that
-    // every specialization assembled below shares them.
-    let _held = NativePrepared::hold_launch_variants(
-        device,
-        module,
-        entry,
-        bindings,
-        default,
-        implementation,
-        &partition.sources,
-    )
-    .map_err(|error| TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error))))?;
-    time.forming_seconds += began.elapsed().as_secs_f64();
-    let form = |specialization: &NativeSpecialization| {
-        NativePrepared::prepare_implementation(
-            device,
-            module,
-            entry,
-            logical,
-            bindings.clone(),
-            specialization.clone(),
-            cpu,
-            implementation.clone(),
-        )
-        .map_err(|error| Exclusion::Formation(prepare_message(error)))
-    };
+impl LaunchPrograms {
+    /// Form `specializations`: first, in one compile per launch, the
+    /// variants they run that no held program has; then each of them from
+    /// the held programs. A compile of a launch's source costs much the
+    /// same whatever it instantiates, so one that must happen also forms
+    /// the variants `ahead`, the configurations measured next, run of that
+    /// launch. `default` is the unit's defaults.
+    fn form(
+        &mut self,
+        formation: &Formation<'_>,
+        default: &NativeSpecialization,
+        specializations: &[NativeSpecialization],
+        ahead: &[NativeSpecialization],
+    ) -> Result<Vec<Result<Arc<NativePrepared>, Exclusion>>, TuneError> {
+        let implementation = formation.implementation;
+        let variants = |specializations: &[NativeSpecialization]| {
+            let mut variants = BTreeMap::<usize, BTreeSet<plan::LaunchVariant>>::new();
+            for specialization in specializations {
+                let specialization = implementation.with_owned_defaults(specialization.clone());
+                for ordinal in 0..implementation.launches.len() {
+                    variants
+                        .entry(ordinal)
+                        .or_default()
+                        .insert(plan::LaunchVariant {
+                            code: plan::code_values(implementation, &specialization, ordinal),
+                            group_size: implementation
+                                .static_group_size(&specialization, ordinal),
+                        });
+                }
+            }
+            variants
+        };
+        let mut next = variants(ahead);
+        let sources = variants(specializations)
+            .into_iter()
+            .filter(|(ordinal, variants)| {
+                self.held
+                    .get(ordinal)
+                    .is_none_or(|(held, _)| !variants.is_subset(held))
+            })
+            .map(|(ordinal, mut variants)| {
+                variants.extend(next.remove(&ordinal).unwrap_or_default());
+                // The program replaces the launch's held one: it keeps what
+                // that one held, so a configuration formed again later (a
+                // finalist, another group's candidate) forms nothing.
+                if let Some((held, _)) = self.held.get(&ordinal) {
+                    variants.extend(held.iter().cloned());
+                }
+                plan::LaunchSource {
+                    ordinal,
+                    variants: variants.into_iter().collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+        if !sources.is_empty() {
+            let held = Rc::new(
+                NativePrepared::hold_launch_variants(
+                    formation.device,
+                    formation.module,
+                    formation.entry,
+                    formation.bindings,
+                    default,
+                    implementation,
+                    &sources,
+                )
+                .map_err(|error| {
+                    TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error)))
+                })?,
+            );
+            for source in sources {
+                self.formed.extend(
+                    source
+                        .variants
+                        .iter()
+                        .cloned()
+                        .map(|variant| (source.ordinal, variant)),
+                );
+                self.held.insert(
+                    source.ordinal,
+                    (source.variants.into_iter().collect(), held.clone()),
+                );
+            }
+        }
+        Ok(specializations
+            .iter()
+            .map(|specialization| {
+                NativePrepared::prepare_implementation(
+                    formation.device,
+                    formation.module,
+                    formation.entry,
+                    formation.logical,
+                    formation.bindings.clone(),
+                    specialization.clone(),
+                    formation.cpu,
+                    implementation.clone(),
+                )
+                .map_err(|error| Exclusion::Formation(prepare_message(error)))
+            })
+            .collect())
+    }
 
-    let measuring = MeasureOptions {
-        samples: search.settings.samples,
-        min_sample_seconds: search.min_sample_seconds,
-    };
-    let confirmation = MeasureOptions {
-        samples: search.settings.confirmation_samples,
-        min_sample_seconds: search.min_sample_seconds,
-    };
-    // Every configuration placed in this run writes its results here.
-    let mut outputs = OutputPool::default();
-    let mut records = Vec::new();
-    let measure_seed = |specialization: &NativeSpecialization, outputs: &mut OutputPool| {
-        let kernel = form(specialization)?;
-        let measured = measure_factored(
-            implementation,
-            &partition.boundary,
-            &kernel,
-            specialization,
-            points,
-            &measuring,
-            None,
-            None,
-            None,
-            outputs,
-        )?;
-        Ok::<_, Exclusion>((kernel, measured))
-    };
-    let began = Instant::now();
-    let mut seed = match measure_seed(default, &mut outputs) {
+    /// Form one specialization.
+    fn form_one(
+        &mut self,
+        formation: &Formation<'_>,
+        default: &NativeSpecialization,
+        specialization: &NativeSpecialization,
+    ) -> Result<Result<Arc<NativePrepared>, Exclusion>, TuneError> {
+        Ok(self
+            .form(formation, default, std::slice::from_ref(specialization), &[])?
+            .remove(0))
+    }
+}
+
+/// One boundary assignment as the sweeps left it: its score, its values,
+/// each group's best candidate and each group's ranking. A boundary no
+/// sweep reached stands at its base: the seed's group choices under it.
+type Boundary = (f64, Vec<u64>, Vec<usize>, Vec<Vec<(usize, f64)>>);
+
+/// A factored search of one unit's independent launch groups, as far as it
+/// got.
+struct FactoredRun {
+    partition: Rc<plan::TuningPartition>,
+    programs: LaunchPrograms,
+    /// Every configuration placed in this run writes its results here.
+    outputs: OutputPool,
+    records: Vec<ConfigurationRecord>,
+    /// The reference of every cost: the defaults, or when they fail the
+    /// first configuration that passes.
+    seed: NativeSpecialization,
+    seed_kernel: Arc<NativePrepared>,
+    reference: Vec<PointMeasurement>,
+    /// Sweep samples by point and key: a point with the same active launches
+    /// and parameters runs the same work under every candidate and boundary.
+    sweep_cache: BTreeMap<(usize, PointKey), PointMeasurement>,
+    /// Every configuration a sweep has measured, with its measurement; none
+    /// for one that could not be formed or measured. A step of the search
+    /// replays the sweeps over these and measures only what is missing.
+    swept: HashMap<Configuration, Option<Vec<PointMeasurement>>>,
+    default_choices: Vec<usize>,
+    default_boundary: Vec<u64>,
+    /// Configurations the sweeps can reach.
+    reachable: usize,
+    /// Every boundary whose base was measured, best first by what was
+    /// measured under it: swept as far as the sweeps got, else at its base.
+    boundaries: Vec<Boundary>,
+    /// Whether every candidate of every boundary was measured.
+    complete: bool,
+    time: TuningTime,
+}
+
+impl FactoredRun {
+    /// Form and measure the seed at `points`. `window` bounds the search
+    /// for a passing seed when the defaults fail.
+    fn open(
+        formation: &Formation<'_>,
+        statics: &NativeSpecialization,
+        default: &NativeSpecialization,
+        points: &[PreparedPoint<'_>],
+        search: &StartPlan,
+        window: Instant,
+    ) -> Result<Self, TuneError> {
+        let implementation = formation.implementation;
+        let deadline = window;
+        let mut time = TuningTime::default();
+        let shapes = point_shapes(formation.device, formation.logical, points)?;
+        let partition = plan::partition(implementation, statics, &shapes)
+            .map_err(|error| TuneError::Declaration(format!("factored native plan: {error:?}")))?;
+        let measuring = MeasureOptions {
+            samples: search.settings.samples,
+            min_sample_seconds: search.min_sample_seconds,
+        };
+        let mut programs = LaunchPrograms::default();
+        let mut outputs = OutputPool::default();
+        let mut records = Vec::new();
+        let mut swept = HashMap::new();
+        let mut measure_seed = |specialization: &NativeSpecialization,
+                                outputs: &mut OutputPool|
+         -> Result<_, TuneError> {
+            let kernel = match programs.form_one(formation, default, specialization)? {
+                Ok(kernel) => kernel,
+                Err(exclusion) => return Ok(Err(exclusion)),
+            };
+            Ok(measure_factored(
+                implementation,
+                &partition.boundary,
+                &kernel,
+                specialization,
+                points,
+                &measuring,
+                None,
+                None,
+                None,
+                outputs,
+            )
+            .map(|measured| (kernel, measured)))
+        };
+        let began = Instant::now();
+    let mut seed = match measure_seed(default, &mut outputs)? {
         Ok((kernel, measured)) => Some((default.clone(), kernel, measured)),
         Err(exclusion) => {
+            swept.insert(Configuration::of(default), None);
             records.push(ConfigurationRecord {
                 configuration: Configuration::of(default),
                 outcome: Outcome::Excluded(exclusion),
@@ -2216,7 +3003,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                     partition.assemble(implementation, statics, &choices, &boundary)
                 {
                     if candidate != *default {
-                        match measure_seed(&candidate, &mut outputs) {
+                        match measure_seed(&candidate, &mut outputs)? {
                             Ok((kernel, measured)) => {
                                 seed = Some((candidate, kernel, measured));
                                 break 'seeds;
@@ -2243,27 +3030,18 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
             }
         }
     }
-    let (seed, default_kernel, reference) =
+    let (seed, seed_kernel, reference) =
         seed.ok_or_else(|| TuneError::NoValidatedCandidate(excluded(&records)))?;
     let default = &seed;
     time.measuring_seconds += began.elapsed().as_secs_f64();
-    deadline = before(
-        window,
-        confirmation_time(
-            &reference,
-            search.settings.confirmed + 1,
-            search.settings.confirmation_samples,
-        ),
-    );
     // A point with the same active launches and parameters runs the same work
     // under every boundary assignment. Reuse its sweep sample across those
-    // assignments; confirmation below still takes fresh samples.
-    let mut sweep_cache = reference
+    // assignments; confirmation still takes fresh samples.
+    let sweep_cache = reference
         .iter()
         .enumerate()
         .map(|(point, measurement)| ((point, measurement.key.clone()), measurement.clone()))
         .collect::<BTreeMap<_, _>>();
-    let weighing = Weighing::of(points);
     let default_choices = partition
         .groups
         .iter()
@@ -2289,193 +3067,519 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
     records.push(ConfigurationRecord {
         configuration: Configuration::of(default),
         outcome: Outcome::Measured {
-            artifact: default_kernel.artifact().0.clone(),
+            artifact: seed_kernel.artifact().0.clone(),
             points: reference.clone(),
             confirmed: Vec::new(),
             validated: true,
         },
     });
-    let mut boundaries = Vec::new();
-    let mut complete = true;
-    'boundaries: for boundary in boundary_assignments(&partition, implementation) {
-        if Instant::now() >= deadline {
-            complete = false;
-            break;
+    let reachable = boundary_assignments(&partition, implementation).len()
+        * (1 + partition
+            .groups
+            .iter()
+            .map(|group| group.candidates.len() - 1)
+            .sum::<usize>());
+    Ok(Self {
+        partition: Rc::new(partition),
+        programs,
+        outputs,
+        records,
+        seed,
+        seed_kernel,
+        reference,
+        sweep_cache,
+        swept,
+        default_choices,
+        default_boundary,
+        reachable,
+        boundaries: Vec::new(),
+        complete: false,
+        time,
+    })
+    }
+
+    /// What confirming the choice against the seed will take.
+    fn reserve(&self, settings: &SearchSettings) -> Duration {
+        confirmation_time(
+            &self.reference,
+            settings.confirmed + 1,
+            settings.confirmation_samples,
+        )
+    }
+
+    fn standing(&self, points: &[PreparedPoint<'_>]) -> Standing {
+        let seed = Weighing::of(points)
+            .cost(&self.reference, &self.reference)
+            .total();
+        let best = self
+            .boundaries
+            .iter()
+            .map(|(score, ..)| *score)
+            .fold(seed, f64::min);
+        Standing {
+            finished: self.complete,
+            cost: best / seed,
+            measured: 1 + self.swept.values().flatten().count(),
+            admissible: self.reachable,
+            programs: self.programs.formed.len(),
+            declared_programs: self
+                .partition
+                .sources
+                .iter()
+                .map(|source| source.variants.len())
+                .sum(),
+            forming_seconds: self.time.forming_seconds,
+            cut: false,
         }
-        let base = partition
-            .assemble(implementation, statics, &default_choices, &boundary)
-            .map_err(|error| {
-                TuneError::Declaration(format!("factored native boundary: {error:?}"))
-            })?;
-        let baseline = if base == *default {
-            reference.clone()
-        } else {
-            let began = Instant::now();
-            let kernel = match form(&base) {
-                Ok(kernel) => kernel,
+    }
+
+    /// Form and measure the base of a boundary: the seed's group choices
+    /// under it. None when it cannot be formed or measured.
+    fn base(
+        &mut self,
+        formation: &Formation<'_>,
+        default: &NativeSpecialization,
+        base: &NativeSpecialization,
+        points: &[PreparedPoint<'_>],
+        measuring: &MeasureOptions,
+    ) -> Result<Option<Vec<PointMeasurement>>, TuneError> {
+        let configuration = Configuration::of(base);
+        let began = Instant::now();
+        let formed = self.programs.form_one(formation, default, base)?;
+        self.time.forming_seconds += began.elapsed().as_secs_f64();
+        let began = Instant::now();
+        let measured = formed.and_then(|kernel| {
+            measure_factored(
+                formation.implementation,
+                &self.partition.boundary,
+                &kernel,
+                base,
+                points,
+                measuring,
+                None,
+                Some(&self.reference),
+                Some(&mut self.sweep_cache),
+                &mut self.outputs,
+            )
+            .map(|measured| (kernel, measured))
+        });
+        self.time.measuring_seconds += began.elapsed().as_secs_f64();
+        Ok(match measured {
+            Ok((kernel, measured)) => {
+                self.records.push(ConfigurationRecord {
+                    configuration: configuration.clone(),
+                    outcome: Outcome::Measured {
+                        artifact: kernel.artifact().0.clone(),
+                        points: measured.clone(),
+                        confirmed: Vec::new(),
+                        validated: true,
+                    },
+                });
+                self.swept.insert(configuration, Some(measured.clone()));
+                Some(measured)
+            }
+            Err(exclusion) => {
+                self.records.push(ConfigurationRecord {
+                    configuration: configuration.clone(),
+                    outcome: Outcome::Excluded(exclusion),
+                });
+                self.swept.insert(configuration, None);
+                None
+            }
+        })
+    }
+
+    /// Form and measure the candidates `ready` of `group` together, and
+    /// rank those that pass.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep(
+        &mut self,
+        formation: &Formation<'_>,
+        default: &NativeSpecialization,
+        group: &plan::Group,
+        baseline: &[PointMeasurement],
+        ready: &mut Vec<(usize, NativeSpecialization)>,
+        ahead: &[(usize, NativeSpecialization)],
+        points: &[PreparedPoint<'_>],
+        measuring: &MeasureOptions,
+        weighing: &Weighing,
+        ranking: &mut Vec<(usize, f64)>,
+    ) -> Result<(), TuneError> {
+        if ready.is_empty() {
+            return Ok(());
+        }
+        let ready = std::mem::take(ready);
+        let began = Instant::now();
+        let specializations = |candidates: &[(usize, NativeSpecialization)]| {
+            candidates
+                .iter()
+                .map(|(_, specialization)| specialization.clone())
+                .collect::<Vec<_>>()
+        };
+        let formed = self.programs.form(
+            formation,
+            default,
+            &specializations(&ready),
+            &specializations(ahead),
+        )?;
+        self.time.forming_seconds += began.elapsed().as_secs_f64();
+        let mut candidates = Vec::with_capacity(ready.len());
+        for ((index, specialization), kernel) in ready.into_iter().zip(formed) {
+            match kernel {
+                Ok(kernel) => candidates.push(FactoredCandidate {
+                    index,
+                    specialization,
+                    kernel,
+                }),
                 Err(exclusion) => {
-                    records.push(ConfigurationRecord {
-                        configuration: Configuration::of(&base),
+                    let configuration = Configuration::of(&specialization);
+                    self.swept.insert(configuration.clone(), None);
+                    self.records.push(ConfigurationRecord {
+                        configuration,
                         outcome: Outcome::Excluded(exclusion),
                     });
-                    continue;
                 }
-            };
-            time.forming_seconds += began.elapsed().as_secs_f64();
-            let began = Instant::now();
-            match measure_factored(
-                implementation,
-                &partition.boundary,
-                &kernel,
-                &base,
-                points,
-                &measuring,
-                None,
-                Some(&reference),
-                Some(&mut sweep_cache),
-                &mut outputs,
-            ) {
+            }
+        }
+        let began = Instant::now();
+        let measured = measure_factored_group(
+            formation.implementation,
+            &self.partition.boundary,
+            &candidates,
+            points,
+            measuring,
+            &group.launches,
+            baseline,
+            Some(&mut self.sweep_cache),
+            &mut self.outputs,
+        );
+        self.time.measuring_seconds += began.elapsed().as_secs_f64();
+        for (candidate, outcome) in candidates.into_iter().zip(measured) {
+            let configuration = Configuration::of(&candidate.specialization);
+            match outcome {
                 Ok(measured) => {
-                    time.measuring_seconds += began.elapsed().as_secs_f64();
-                    records.push(ConfigurationRecord {
-                        configuration: Configuration::of(&base),
+                    ranking.push((
+                        candidate.index,
+                        weighing.cost(&measured, &self.reference).total(),
+                    ));
+                    self.swept.insert(configuration.clone(), Some(measured.clone()));
+                    self.records.push(ConfigurationRecord {
+                        configuration,
                         outcome: Outcome::Measured {
-                            artifact: kernel.artifact().0.clone(),
-                            points: measured.clone(),
+                            artifact: candidate.kernel.artifact().0.clone(),
+                            points: measured,
                             confirmed: Vec::new(),
                             validated: true,
                         },
                     });
-                    measured
                 }
                 Err(exclusion) => {
-                    records.push(ConfigurationRecord {
-                        configuration: Configuration::of(&base),
+                    self.swept.insert(configuration.clone(), None);
+                    self.records.push(ConfigurationRecord {
+                        configuration,
                         outcome: Outcome::Excluded(exclusion),
                     });
-                    continue;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// One step of the sweeps, coarse to fine. First the base of every
+    /// boundary is measured: the seed's group choices under each value of
+    /// the parameters that choose which launch serves which rows, so every
+    /// such value has a measurement at the rows it moves before any launch's
+    /// mapping is refined. The boundaries' groups are then swept, the
+    /// boundary with the cheapest base first (the default boundary when its
+    /// base is within one percent of the cheapest). That order is fixed by
+    /// the bases, so every step sweeps in the order one uninterrupted search
+    /// does; a configuration an earlier step measured is taken from it, and
+    /// one not yet measured is formed and measured unless `expired` says
+    /// the step's time is out for it, which ends the step's measuring.
+    /// `expired` is asked with whether the configuration is a start: a
+    /// boundary's base or one of the first boundary's form starts. A
+    /// boundary or a form nothing measured cannot be chosen, so those are
+    /// held back only by a start planned without them or by the step's hard
+    /// limit. Every boundary with a measured base stays ranked by what was
+    /// measured under it, so a search that ends early still chooses among
+    /// all of them.
+    fn explore(
+        &mut self,
+        formation: &Formation<'_>,
+        statics: &NativeSpecialization,
+        default: &NativeSpecialization,
+        points: &[PreparedPoint<'_>],
+        search: &StartPlan,
+        expired: &dyn Fn(bool) -> bool,
+    ) -> Result<(), TuneError> {
+        let implementation = formation.implementation;
+        let partition = self.partition.clone();
+        let measuring = MeasureOptions {
+            samples: search.settings.samples,
+            min_sample_seconds: search.min_sample_seconds,
         };
-        let base_cost = weighing.cost(&baseline, &reference).total();
-        let mut choices = default_choices.clone();
-        let mut group_rankings = Vec::with_capacity(partition.groups.len());
-        let mut score = base_cost;
-        let mut interrupted = false;
-        for (group_index, group) in partition.groups.iter().enumerate() {
-            let mut ranking = vec![(default_choices[group_index], base_cost)];
-            let mut ready = Vec::new();
-            for candidate in 0..group.candidates.len() {
-                if Instant::now() >= deadline {
-                    complete = false;
-                    interrupted = true;
-                    break;
+        let weighing = Weighing::of(points);
+        let default_choices = self.default_choices.clone();
+        let mut boundaries: Vec<Boundary> = Vec::new();
+        let mut complete = true;
+        let mut bases = Vec::new();
+        for boundary in boundary_assignments(&partition, implementation) {
+            let base = partition
+                .assemble(implementation, statics, &default_choices, &boundary)
+                .map_err(|error| {
+                    TuneError::Declaration(format!("factored native boundary: {error:?}"))
+                })?;
+            let baseline = if base == self.seed {
+                self.reference.clone()
+            } else {
+                match self.swept.get(&Configuration::of(&base)).cloned() {
+                    Some(Some(measured)) => measured,
+                    Some(None) => continue,
+                    None => {
+                        if expired(true) {
+                            complete = false;
+                            continue;
+                        }
+                        match self.base(formation, default, &base, points, &measuring)? {
+                            Some(measured) => measured,
+                            None => continue,
+                        }
+                    }
                 }
-                if candidate == default_choices[group_index] {
-                    continue;
-                }
-                let mut selected = default_choices.clone();
-                selected[group_index] = candidate;
-                let specialization = partition
-                    .assemble(implementation, statics, &selected, &boundary)
-                    .map_err(|error| {
-                        TuneError::Declaration(format!("factored native candidate: {error:?}"))
-                    })?;
-                let began = Instant::now();
-                let kernel = match form(&specialization) {
-                    Ok(kernel) => kernel,
-                    Err(exclusion) => {
-                        records.push(ConfigurationRecord {
-                            configuration: Configuration::of(&specialization),
-                            outcome: Outcome::Excluded(exclusion),
-                        });
+            };
+            let base_cost = weighing.cost(&baseline, &self.reference).total();
+            bases.push((base_cost, boundary, baseline));
+        }
+        bases.sort_by(|left, right| left.0.total_cmp(&right.0));
+        if let Some(default_index) = bases
+            .iter()
+            .position(|(_, boundary, _)| *boundary == self.default_boundary)
+        {
+            if bases[default_index].0 <= bases[0].0 * 1.01 {
+                let preferred = bases.remove(default_index);
+                bases.insert(0, preferred);
+            }
+        }
+        // Once a sweep runs out of time the later boundaries measure nothing
+        // more: they are ranked by what earlier steps measured under them.
+        let stopped = std::cell::Cell::new(false);
+        let expired = |start: bool| stopped.get() || expired(start);
+        for (base_cost, boundary, baseline) in bases {
+            let reserved = boundaries.is_empty();
+            let replayed = stopped.get();
+            let mut choices = default_choices.clone();
+            let mut group_rankings = Vec::with_capacity(partition.groups.len());
+            let mut score = base_cost;
+            let mut interrupted = false;
+            for (group_index, group) in partition.groups.iter().enumerate() {
+                let mut ranking = vec![(default_choices[group_index], base_cost)];
+                // Each form parameter's values seed a start of their own: the
+                // candidate of every other form nearest the defaults is measured
+                // first, then the forms' other candidates, the cheapest start's
+                // first. A group without form parameters is swept in order.
+                let form_of = |candidate: usize| {
+                    group
+                        .parameters
+                        .iter()
+                        .zip(&group.candidates[candidate])
+                        .filter(|(address, _)| match address {
+                            plan::ParameterAddress::Entry(name) => implementation
+                                .params
+                                .iter()
+                                .any(|parameter| parameter.form && &parameter.name == name),
+                            plan::ParameterAddress::Launch { .. } => false,
+                        })
+                        .map(|(_, value)| *value)
+                        .collect::<Vec<_>>()
+                };
+                let default_candidate = default_choices[group_index];
+                let mut starts = BTreeMap::<Vec<u64>, (usize, usize)>::new();
+                for candidate in 0..group.candidates.len() {
+                    let form = form_of(candidate);
+                    if form == form_of(default_candidate) {
                         continue;
                     }
-                };
-                time.forming_seconds += began.elapsed().as_secs_f64();
-                ready.push(FactoredCandidate {
-                    index: candidate,
-                    specialization,
-                    kernel,
-                });
-            }
-            let began = Instant::now();
-            let measured = measure_factored_group(
-                implementation,
-                &partition.boundary,
-                &ready,
-                points,
-                &measuring,
-                &group.launches,
-                &baseline,
-                Some(&mut sweep_cache),
-                &mut outputs,
-            );
-            time.measuring_seconds += began.elapsed().as_secs_f64();
-            for (candidate, outcome) in ready.into_iter().zip(measured) {
-                match outcome {
-                    Ok(measured) => {
-                        let cost = weighing.cost(&measured, &reference).total();
-                        records.push(ConfigurationRecord {
-                            configuration: Configuration::of(&candidate.specialization),
-                            outcome: Outcome::Measured {
-                                artifact: candidate.kernel.artifact().0.clone(),
-                                points: measured,
-                                confirmed: Vec::new(),
-                                validated: true,
-                            },
-                        });
-                        ranking.push((candidate.index, cost));
-                    }
-                    Err(exclusion) => {
-                        records.push(ConfigurationRecord {
-                            configuration: Configuration::of(&candidate.specialization),
-                            outcome: Outcome::Excluded(exclusion),
-                        });
+                    let distance = group.candidates[candidate]
+                        .iter()
+                        .zip(&group.candidates[default_candidate])
+                        .filter(|(value, default)| value != default)
+                        .count();
+                    let start = starts.entry(form).or_insert((distance, candidate));
+                    if distance < start.0 {
+                        *start = (distance, candidate);
                     }
                 }
+                let starts = starts
+                    .into_values()
+                    .map(|(_, candidate)| candidate)
+                    .collect::<Vec<_>>();
+                for pass in 0..2 {
+                    let sweep = if pass == 0 {
+                        starts.clone()
+                    } else {
+                        let start_cost = |candidate: usize| {
+                            let form = form_of(candidate);
+                            ranking
+                                .iter()
+                                .filter(|(ranked, _)| form_of(*ranked) == form)
+                                .map(|(_, cost)| *cost)
+                                .fold(f64::INFINITY, f64::min)
+                        };
+                        let mut rest = (0..group.candidates.len())
+                            .filter(|candidate| !starts.contains(candidate))
+                            .map(|candidate| (start_cost(candidate), candidate))
+                            .collect::<Vec<_>>();
+                        rest.sort_by(|left, right| {
+                            left.0.total_cmp(&right.0).then(left.1.cmp(&right.1))
+                        });
+                        rest.into_iter().map(|(_, candidate)| candidate).collect()
+                    };
+                    // The first boundary's form starts whatever the slice;
+                    // anything else while the step's slice lasts; a chunk
+                    // at a time, the step's limit checked before each
+                    // candidate.
+                    let always = reserved && pass == 0;
+                    // The pass's candidates no earlier step measured, in
+                    // sweep order.
+                    let mut pending = Vec::new();
+                    for candidate in sweep {
+                        if candidate == default_candidate {
+                            continue;
+                        }
+                        let mut selected = default_choices.clone();
+                        selected[group_index] = candidate;
+                        let specialization = partition
+                            .assemble(implementation, statics, &selected, &boundary)
+                            .map_err(|error| {
+                                TuneError::Declaration(format!(
+                                    "factored native candidate: {error:?}"
+                                ))
+                            })?;
+                        match self.swept.get(&Configuration::of(&specialization)) {
+                            Some(Some(measured)) => ranking.push((
+                                candidate,
+                                weighing.cost(measured, &self.reference).total(),
+                            )),
+                            Some(None) => {}
+                            None => pending.push((candidate, specialization)),
+                        }
+                    }
+                    let mut ready = Vec::new();
+                    for (position, candidate) in pending.iter().enumerate() {
+                        if expired(always) {
+                            complete = false;
+                            interrupted = true;
+                            break;
+                        }
+                        ready.push(candidate.clone());
+                        if ready.len() == SWEEP_CHUNK {
+                            let ahead = &pending
+                                [position + 1..pending.len().min(position + 1 + SWEEP_AHEAD)];
+                            self.sweep(
+                                formation, default, group, &baseline, &mut ready, ahead, points,
+                                &measuring, &weighing, &mut ranking,
+                            )?;
+                        }
+                    }
+                    self.sweep(
+                        formation, default, group, &baseline, &mut ready, &[], points,
+                        &measuring, &weighing, &mut ranking,
+                    )?;
+                    if interrupted {
+                        break;
+                    }
+                }
+                ranking.sort_by(|left, right| {
+                    left.1
+                        .total_cmp(&right.1)
+                        .then_with(|| left.0.cmp(&right.0))
+                });
+                choices[group_index] = ranking[0].0;
+                score += ranking[0].1 - base_cost;
+                group_rankings.push(ranking);
+                // Out of time, the first boundary's later groups still
+                // measure their form starts, and a boundary only replayed
+                // ranks what was measured in every group.
+                if interrupted && !reserved && !replayed {
+                    break;
+                }
             }
-            ranking.sort_by(|left, right| {
-                left.1
-                    .total_cmp(&right.1)
-                    .then_with(|| left.0.cmp(&right.0))
-            });
-            choices[group_index] = ranking[0].0;
-            score += ranking[0].1 - base_cost;
-            group_rankings.push(ranking);
-            if Instant::now() >= deadline {
-                complete = false;
-                interrupted = true;
-            }
+            boundaries.push((score, boundary, choices, group_rankings));
             if interrupted {
-                break;
+                stopped.set(true);
             }
         }
-        boundaries.push((score, boundary, choices, group_rankings));
-        if interrupted {
-            break 'boundaries;
+        boundaries.sort_by(|left, right| left.0.total_cmp(&right.0));
+        // A boundary moves work between launches. Prefer the default band split
+        // when its apparent loss is within one percent of the leading score.
+        if let Some(default_index) = boundaries
+            .iter()
+            .position(|(_, boundary, _, _)| *boundary == self.default_boundary)
+        {
+            if boundaries[default_index].0 <= boundaries[0].0 * 1.01 {
+                let preferred = boundaries.remove(default_index);
+                boundaries.insert(0, preferred);
+            }
         }
+        // A step can end inside a group's sweep: the candidates measured so
+        // far are ranked, while later groups retain their defaults, and the
+        // boundaries no sweep reached stand at their bases. All of them are
+        // costs at the same points against the same reference, so the
+        // conclusion chooses among them, never as a complete search.
+        self.boundaries = boundaries;
+        self.complete = complete;
+        Ok(())
     }
-    boundaries.sort_by(|left, right| left.0.total_cmp(&right.0));
-    // A boundary moves work between launches. Prefer the default band split
-    // when its apparent loss is within one percent of the leading score.
-    if let Some(default_index) = boundaries
-        .iter()
-        .position(|(_, boundary, _, _)| *boundary == default_boundary)
-    {
-        if boundaries[default_index].0 <= boundaries[0].0 * 1.01 {
-            let preferred = boundaries.remove(default_index);
-            boundaries.insert(0, preferred);
-        }
-    }
-    // The safety stop can interrupt a group's candidate formation. Its
-    // already formed candidates still get their sweep, while later groups
-    // retain their defaults. Confirm only that partial boundary and never
-    // store its result as a complete search.
-    if !complete {
-        boundaries.truncate(1);
-    }
+
+    /// Conclude the search with what its sweeps reached: when they are
+    /// complete and `window` allows, confirm each group's finalists; then
+    /// confirm the assembled choice against the seed. The boundaries are
+    /// taken best first. When the sweeps are not complete, the best
+    /// boundaries' assembled choices are confirmed in turn until one
+    /// improves on the seed, as many as the unit's reserve covers.
+    #[allow(clippy::too_many_arguments)]
+    fn conclude(
+        self,
+        formation: &Formation<'_>,
+        statics: &NativeSpecialization,
+        unit_default: &NativeSpecialization,
+        points: &[PreparedPoint<'_>],
+        search: &StartPlan,
+        window: Instant,
+        allowance: Duration,
+        unit: &Unit,
+    ) -> Result<TuningResult, TuneError> {
+        let implementation = formation.implementation;
+        let deadline = before(window, self.reserve(&search.settings));
+        let Self {
+            partition,
+            mut programs,
+            mut outputs,
+            mut records,
+            seed,
+            seed_kernel: default_kernel,
+            reference,
+            default_choices,
+            boundaries,
+            mut complete,
+            mut time,
+            ..
+        } = self;
+        let default = &seed;
+        let weighing = Weighing::of(points);
+        let confirmation = MeasureOptions {
+            samples: search.settings.confirmation_samples,
+            min_sample_seconds: search.min_sample_seconds,
+        };
+        let mut form = |specialization: &NativeSpecialization| {
+            programs.form_one(formation, unit_default, specialization)
+        };
     let mut overall = default.clone();
+    // The reserve covers the seed and the settings' finalists: each
+    // boundary confirmed without its groups' finalists samples the seed
+    // and its assembled choice.
+    let unswept = search.settings.confirmed.div_ceil(2).max(1);
+    let mut attempted = 0;
     'confirm_boundaries: for (_, best_boundary, mut best_choices, best_group_rankings) in boundaries
     {
         let mut confirmed_choices = Vec::with_capacity(partition.groups.len());
@@ -2492,7 +3596,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                     TuneError::Declaration(format!("factored confirmation baseline: {error:?}"))
                 })?;
             let began = Instant::now();
-            let kernel = match form(&base) {
+            let kernel = match form(&base)? {
                 Ok(kernel) => kernel,
                 Err(exclusion) => {
                     records.push(ConfigurationRecord {
@@ -2556,7 +3660,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                             TuneError::Declaration(format!("factored finalist: {error:?}"))
                         })?;
                     let began = Instant::now();
-                    let kernel = match form(&specialization) {
+                    let kernel = match form(&specialization)? {
                         Ok(kernel) => kernel,
                         Err(exclusion) => {
                             records.push(ConfigurationRecord {
@@ -2662,7 +3766,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
                 break;
             }
             let began = Instant::now();
-            let kernel = form(&selected);
+            let kernel = form(&selected)?;
             time.forming_seconds += began.elapsed().as_secs_f64();
             let outcome = match kernel {
                 Err(exclusion) => Outcome::Excluded(exclusion),
@@ -2745,7 +3849,10 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
             break;
         }
         if !complete {
-            break;
+            attempted += 1;
+            if attempted >= unswept || Instant::now() >= deadline {
+                break;
+            }
         }
     }
     let parameters = implementation
@@ -2780,25 +3887,18 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
     time.validating_seconds = points.iter().map(|p| p.validation_seconds()).sum::<f64>();
     time.measuring_seconds = (time.measuring_seconds - time.validating_seconds).max(0.);
     Ok(TuningResult {
-        tuning_identity: device.tuning_identity(),
-        entry: super::entry_name(module, entry),
+        tuning_identity: unit.tuning_identity.clone(),
+        entry: unit.entry.clone(),
         backend: "metal".into(),
-        points: points
-            .iter()
-            .map(|point| PointRecord {
-                label: point.label.clone(),
-                weight: point.weight,
-                class: point.class.clone(),
-            })
-            .collect(),
-        validation,
+        points: labels(points),
+        validation: unit.validation.clone(),
         numerical_evidence: winner_evidence(points, &records, &Configuration::of(&overall))?,
-        implementation_identity,
+        implementation_identity: unit.implementation_identity.clone(),
         parameters,
         configurations: records,
         overall: Configuration::of(&overall),
         method: TuningMethod::Factored {
-            allowance_seconds: search.allowance.as_secs_f64(),
+            allowance_seconds: allowance.as_secs_f64(),
             groups: partition.groups.len(),
             candidates: partition
                 .groups
@@ -2809,6 +3909,7 @@ fn tune_factored(request: FactoredRequest<'_, '_>) -> Result<TuningResult, TuneE
         },
         time,
     })
+    }
 }
 
 /// Digest of everything about an entry's implementation on `device`'s
@@ -2951,114 +4052,86 @@ struct Tuned<'s> {
 
 type Tuning = (Records, NativeSpecialization, TuningMethod, TuningTime);
 
-impl Tuned<'_> {
-    /// Search at `points` until `window` less what confirming the finalists
-    /// found so far needs; `measurer` holds the defaults' measurement there.
-    fn search(
-        &self,
-        points: &[PreparedPoint<'_>],
-        plan: SearchPlan,
-        window: Instant,
-        measurer: Measurer,
-    ) -> Result<Tuning, TuneError> {
-        let start = plan
-            .start
-            .iter()
-            .filter_map(|values| self.space.index_of(values))
-            .collect::<Vec<_>>();
-        let mut live = Live {
-            formation: self.formation,
-            space: self.space,
-            statics: self.statics,
-            points,
-            measurer,
-            search: MeasureOptions {
-                samples: plan.settings.samples,
-                min_sample_seconds: plan.min_sample_seconds,
-            },
-            confirmation: MeasureOptions {
-                samples: plan.settings.confirmation_samples,
-                min_sample_seconds: plan.min_sample_seconds,
-            },
-            window,
-            confirmed: plan.settings.confirmed,
-            evaluated: HashMap::new(),
-            anchor: None,
-            time: TuningTime::default(),
-        };
-        let trace = search::search(self.space, &start, &plan.settings, &mut live);
-        let Live {
-            evaluated,
-            mut time,
-            ..
-        } = live;
-        let default = self.space.default_index();
-        let chosen = *trace.ranking.first().ok_or_else(|| {
-            TuneError::NoValidatedCandidate(
-                trace
-                    .evaluated
-                    .iter()
-                    .chain(&trace.confirmed)
-                    .filter_map(|(_, outcome)| outcome.as_ref().err().cloned())
-                    .collect(),
-            )
-        })?;
-        time.validating_seconds = points.iter().map(|p| p.validation_seconds()).sum::<f64>();
-        time.measuring_seconds = (time.measuring_seconds - time.validating_seconds).max(0.);
-
-        let records: Vec<_> = trace
-            .evaluated
-            .iter()
-            .map(|(index, result)| {
-                let configuration =
-                    Configuration::of(&specialization(self.statics, &self.space.values(*index)));
-                // Failed confirmation excludes a finalist; the validated
-                // defaults stay the fallback whatever their confirmation showed.
-                let unconfirmed = trace
-                    .confirmed
-                    .iter()
-                    .find(|(finalist, _)| finalist == index && *index != default)
-                    .and_then(|(_, confirmed)| confirmed.as_ref().err());
-                let outcome = match (result, unconfirmed) {
-                    (Err(exclusion), _) | (Ok(_), Some(exclusion)) => {
-                        Outcome::Excluded(exclusion.clone())
-                    }
-                    (Ok(_), None) => {
-                        let measured = &evaluated[index];
-                        Outcome::Measured {
-                            artifact: measured.kernel.artifact().0.clone(),
-                            points: measured.points.clone(),
-                            confirmed: measured.confirmed.clone(),
-                            validated: true,
-                        }
-                    }
-                };
-                ConfigurationRecord {
-                    configuration,
-                    outcome,
+/// The outcome of a local search whose finalists `trace` confirmed: its
+/// records, its choice and where its time went. `lived` is what the search
+/// formed and measured.
+fn searched(
+    space: &SearchSpace,
+    statics: &NativeSpecialization,
+    points: &[PreparedPoint<'_>],
+    settings: SearchSettings,
+    allowance: Duration,
+    lived: Lived,
+    trace: search::SearchTrace,
+) -> Result<Tuning, TuneError> {
+    let Lived {
+        evaluated,
+        mut time,
+        ..
+    } = lived;
+    let default = space.default_index();
+    let chosen = *trace.ranking.first().ok_or_else(|| {
+        TuneError::NoValidatedCandidate(
+            trace
+                .evaluated
+                .iter()
+                .chain(&trace.confirmed)
+                .filter_map(|(_, outcome)| outcome.as_ref().err().cloned())
+                .collect(),
+        )
+    })?;
+    time.validating_seconds = points.iter().map(|p| p.validation_seconds()).sum::<f64>();
+    time.measuring_seconds = (time.measuring_seconds - time.validating_seconds).max(0.);
+    let records: Vec<_> = trace
+        .evaluated
+        .iter()
+        .map(|(index, result)| {
+            let configuration = Configuration::of(&specialization(statics, &space.values(*index)));
+            // Failed confirmation excludes a finalist; the validated
+            // defaults stay the fallback whatever their confirmation showed.
+            let unconfirmed = trace
+                .confirmed
+                .iter()
+                .find(|(finalist, _)| finalist == index && *index != default)
+                .and_then(|(_, confirmed)| confirmed.as_ref().err());
+            let outcome = match (result, unconfirmed) {
+                (Err(exclusion), _) | (Ok(_), Some(exclusion)) => {
+                    Outcome::Excluded(exclusion.clone())
                 }
-            })
-            .collect();
-        Ok((
-            Records {
-                points: labels(&points),
-                evidence: winner_evidence(
-                    points,
-                    &records,
-                    &Configuration::of(&specialization(self.statics, &self.space.values(chosen))),
-                )?,
-                records,
-            },
-            specialization(self.statics, &self.space.values(chosen)),
-            TuningMethod::Search {
-                allowance_seconds: plan.allowance.as_secs_f64(),
-                settings: plan.settings,
-                stop: trace.stop,
-            },
-            time,
-        ))
-    }
+                (Ok(_), None) => {
+                    let measured = &evaluated[index];
+                    Outcome::Measured {
+                        artifact: measured.kernel.artifact().0.clone(),
+                        points: measured.points.clone(),
+                        confirmed: measured.confirmed.clone(),
+                        validated: true,
+                    }
+                }
+            };
+            ConfigurationRecord {
+                configuration,
+                outcome,
+            }
+        })
+        .collect();
+    let overall = specialization(statics, &space.values(chosen));
+    Ok((
+        Records {
+            points: labels(points),
+            evidence: winner_evidence(points, &records, &Configuration::of(&overall))?,
+            records,
+        },
+        overall,
+        TuningMethod::Search {
+            allowance_seconds: allowance.as_secs_f64(),
+            settings,
+            stop: trace.stop,
+        },
+        time,
+    ))
+}
 
+impl Tuned<'_> {
     fn survey(&self, points: &[PreparedPoint<'_>], plan: SurveyPlan) -> Result<Tuning, TuneError> {
         let options = MeasureOptions {
             samples: plan.samples,

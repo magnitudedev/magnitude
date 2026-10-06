@@ -131,6 +131,7 @@ fn scores(
 /// reductions (arithmetic); its integer routes are still compared exactly,
 /// so a configuration that flips a near-tie choice on the tuning rows is
 /// not chosen.
+#[derive(Clone)]
 pub(crate) struct RoutedRouteTuning {
     pub norm: Element,
     pub router: Element,
@@ -266,6 +267,7 @@ impl EntryTuning for RoutedRouteTuning {
 /// (decode rows). SIMDGROUPS and ROWS never change bits; LANES reassociates
 /// the shared expert's reductions (arithmetic). Routes are compared exactly,
 /// as for `routed_route`.
+#[derive(Clone)]
 pub(crate) struct RoutedRouteSharedTuning {
     pub route: RoutedRouteTuning,
     pub shared_gate: Element,
@@ -362,6 +364,7 @@ impl EntryTuning for RoutedRouteSharedTuning {
 
 /// `routed_group`: the grouped form's expert tiles, formed from the
 /// routes. Its parameters are mappings.
+#[derive(Clone)]
 pub(crate) struct RoutedGroupTuning {
     pub shape: RoutedShape,
     /// Layers prepared with this specialization.
@@ -442,6 +445,7 @@ impl EntryTuning for RoutedGroupTuning {
 
 /// `routed_expand`: the selected experts' and the shared expert's
 /// gate/up with SiLU·mul (decode rows).
+#[derive(Clone)]
 pub(crate) struct RoutedExpandTuning {
     pub expert_gate: Element,
     pub expert_up: Element,
@@ -549,6 +553,7 @@ impl EntryTuning for RoutedExpandTuning {
 
 /// `routed_gate_up` (SiLU) of the shared-route form: the selected experts'
 /// gate/up (decode rows).
+#[derive(Clone)]
 pub(crate) struct RoutedChoicesTuning {
     pub expert_gate: Element,
     pub expert_up: Element,
@@ -639,6 +644,7 @@ impl EntryTuning for RoutedChoicesTuning {
 
 /// `routed_output`: the selected experts' down projections in slot
 /// order, the shared expert's, and the residual (decode rows).
+#[derive(Clone)]
 pub(crate) struct RoutedOutputTuning {
     pub expert_down: Element,
     pub shared_down: Element,
@@ -749,6 +755,7 @@ impl EntryTuning for RoutedOutputTuning {
 }
 
 /// `routed_experts`: grouped expert tiles (grouped rows).
+#[derive(Clone)]
 pub(crate) struct RoutedExpertsTuning {
     pub expert_gate: Element,
     pub expert_up: Element,
@@ -849,6 +856,7 @@ impl EntryTuning for RoutedExpertsTuning {
 
 /// `routed_combine`: the shared expert over every row with the grouped
 /// unpermute and the residual (grouped rows).
+#[derive(Clone)]
 pub(crate) struct RoutedCombineTuning {
     pub shared_gate: Element,
     pub shared_up: Element,

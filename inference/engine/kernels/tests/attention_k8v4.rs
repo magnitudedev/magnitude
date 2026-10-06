@@ -864,18 +864,27 @@ fn decode_kernel(
     .unwrap()
 }
 
-/// The affine prefill's specialization of `params` on `device`: on Metal, of
-/// a call that lists the history row tiles its rows see, as the cases do.
+/// The affine prefill's specialization of `params` on `device`. Metal's has
+/// the COISSUE form, which a configuration takes only by naming it.
 fn prefill_specialization(
     device: &Device,
     geometry: Geometry,
     params: &[(&'static str, u64)],
 ) -> NativeSpecialization {
     let spec = specialization_on(device, geometry, params);
-    if device.backend() == BackendName::Metal {
-        spec.with_static("L", 1)
-    } else {
+    let names = |name: &str| params.iter().any(|(param, _)| *param == name);
+    if device.backend() != BackendName::Metal {
+        return spec;
+    }
+    // The cases list the history row tiles their rows see.
+    let spec = spec.with_static("L", 1);
+    if !names("QT") {
+        return spec;
+    }
+    if names("COISSUE") {
         spec
+    } else {
+        spec.with_param("COISSUE", 0)
     }
 }
 
@@ -890,6 +899,125 @@ fn prefill_kernel(
         &prefill_specialization(device, geometry, params),
     )
     .unwrap()
+}
+
+/// Metal's COISSUE configurations of a 128- or 256-column geometry: the
+/// threadgroups of two to four simdgroup pairs that fit the device's
+/// threadgroup memory, unsplit and split key partitions.
+fn coissue_prefill_configs(geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> {
+    let w = geometry.w() as u64;
+    if w != 128 && w != 256 {
+        return Vec::new();
+    }
+    let keys = if w > 128 { 32 } else { 96 };
+    let pair = 48 + 2 * (keys * 16 + 32) + 32 * w;
+    [(16, 1), (16, 2), (32, 1)]
+        .into_iter()
+        .filter(|&(qt, heads)| 32 + qt * heads.min(geometry.g as u64) / 8 * pair + 64 * 16 <= 32768)
+        .flat_map(|(qt, heads)| [1, 256].into_iter().map(move |split| (qt, heads, split)))
+        .map(|(qt, heads, split)| {
+            vec![
+                ("QT", qt),
+                ("HEADS", heads),
+                ("SPLIT_GROUPS", split),
+                ("DIRECT", 1),
+                ("COISSUE", 1),
+            ]
+        })
+        .collect()
+}
+
+/// Metal's COISSUE form (Q K^T on the matrix pipe, P V as scalar F16 products
+/// in paired simdgroups) against the host model within the entry's tolerance
+/// and against the entry's default configuration on the same inputs: the form
+/// accumulates each step's products in F16 where the default accumulates in
+/// F32, and every gated output stays within the production tolerance of a
+/// BF16 result (0.01 + 1%), the bound tuning holds a configuration to; both
+/// leave the same history planes. With tensor operations COISSUE runs the
+/// direct form.
+#[test]
+fn metal_coissue_prefill_agrees_with_the_default() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    for (geometry, rows, history, total, slab_rows) in [MINICPM5, QWEN].into_iter().flat_map(|geometry| {
+        [
+            (40usize, 300i32, 512usize, None),
+            (128, 1000, 1280, None),
+            (512, 4096, 4736, None),
+            (64, 4096, 4352, Some(1088usize)),
+            (512, 16384, 17024, None),
+        ]
+        .into_iter()
+        .map(move |(rows, history, total, slab_rows)| (geometry, rows, history, total, slab_rows))
+    }) {
+        let encoded = Encoded::new(Case::new(
+            geometry,
+            total,
+            2,
+            &prefill_rows(rows, history),
+            7,
+        ));
+        let expected = encoded.expected();
+        let bind = |device: &Device| match slab_rows {
+            Some(slab_rows) => Bound::new_with_slab_rows(device, &encoded, slab_rows, false),
+            None => Bound::new(device, &encoded),
+        };
+        // The entry's default configuration, the reference tuning validates
+        // a configuration against.
+        let default = [
+            ("QT", 16),
+            ("HEADS", single_head_group(geometry.g)),
+            ("SPLIT_GROUPS", 256),
+            ("DIRECT", 0),
+        ];
+        let mut direct_bound = bind(&device);
+        let reference = bf16_values(
+            &prefill_kernel(&device, geometry, &default)
+                .call(prefill_args!(direct_bound, encoded.case))
+                .unwrap()
+                .value,
+        );
+        for config in coissue_prefill_configs(geometry) {
+            let mut bound = bind(&device);
+            let gated = prefill_kernel(&device, geometry, &config)
+                .call(prefill_args!(bound, encoded.case))
+                .unwrap()
+                .value;
+            let label = format!("COISSUE prefill {rows} rows after {history} {config:?}");
+            check(&label, &encoded, &gated, &bound, &expected);
+            let actual = bf16_values(&gated);
+            assert_eq!(actual.len(), reference.len());
+            let (mut error, mut norm, mut peak, mut outside) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+            for (a, e) in actual.iter().zip(&reference) {
+                assert!(a.is_finite(), "{label}: output is finite");
+                let difference = f64::from(a - e);
+                error += difference * difference;
+                norm += f64::from(*e) * f64::from(*e);
+                peak = peak.max(difference.abs());
+                outside += usize::from(difference.abs() > 1.0e-2 + 1.0e-2 * f64::from(e.abs()));
+            }
+            let rms = (norm / reference.len() as f64).sqrt();
+            let relative = (error / norm).sqrt();
+            eprintln!(
+                "{label}: relative RMS difference from the default {relative:.2e}, largest {:.2e} reference RMS, {outside} of {} elements outside the BF16 tolerance",
+                peak / rms,
+                actual.len()
+            );
+            assert_eq!(outside, 0, "{label}: elements outside the BF16 tolerance of the default");
+            let (planes, direct_planes) = (bound.planes(), direct_bound.planes());
+            for vector in 0..encoded.case.history_rows * geometry.kv {
+                assert_eq!(
+                    planes.decoded(geometry, vector),
+                    direct_planes.decoded(geometry, vector),
+                    "{label}: history vector {vector}"
+                );
+            }
+        }
+    }
 }
 
 /// Two requests in one batch over a store much larger than what they see:
@@ -991,7 +1119,10 @@ fn metal_prefill_reads_scattered_history_tiles() {
             ("DIRECT", 0),
         ];
         let reference = bf16_values(&run(&scattered, &default).0);
-        for config in prefill_configs(BackendName::Metal, geometry) {
+        for config in prefill_configs(BackendName::Metal, geometry)
+            .into_iter()
+            .chain(coissue_prefill_configs(geometry))
+        {
             let label = format!("scattered prefill {config:?}");
             let (gated, bound) = run(&scattered, &config);
             check(&label, &scattered, &gated, &bound, &expected);
@@ -1014,7 +1145,8 @@ fn metal_prefill_reads_scattered_history_tiles() {
                     geometry,
                     &[("QT", 16), ("SPLIT_GROUPS", 256), ("DIRECT", direct)],
                 )
-                .with_static("L", 0),
+                .with_static("L", 0)
+                .with_param("COISSUE", 0),
             )
         };
         assert!(unlisted(1).is_err(), "the direct form takes a call without a tile list");
@@ -1032,8 +1164,9 @@ fn metal_prefill_reads_scattered_history_tiles() {
     }
 }
 
-/// The direct form attends a history its window does not hold in rounds,
-/// folding each round's split records into the state the window keeps.
+/// The forms over decoded history attend a history their window does not
+/// hold in rounds, folding each round's split records into the state the
+/// window keeps.
 /// Sixteen rows of Qwen heads have a window of 7936 rows unsplit and of 3840
 /// at 256 split groups (64 key partitions, half of the most): 40 history
 /// tiles (with eight tiles between them that no row sees) take two rounds
@@ -1072,27 +1205,29 @@ fn metal_direct_prefill_resumes_across_rounds() {
             .collect::<Vec<_>>();
         Case::new(geometry, STORE, 2, &rows, 17)
     };
+    // `form` names the form over the window (with its head group size);
     // `listed` pads the tile list to that many entries: the call of a class
     // that lists more tiles than its rows see.
-    let run_listing = |encoded: &Encoded, split: u64, listed: Option<usize>| {
+    let run_form = |encoded: &Encoded, split: u64, form: &[(&'static str, u64)], listed: Option<usize>| {
         let mut bound = Bound::new(&device, encoded);
         if let Some(listed) = listed {
             let mut tiles = history_tiles(&encoded.case.visible);
             tiles.resize(listed, -1);
             bound.history_tiles = i32_tensor(&device, &[1, listed], &tiles);
         }
-        let config = [
-            ("QT", 16),
-            ("HEADS", single_head_group(geometry.g)),
-            ("SPLIT_GROUPS", split),
-            ("DIRECT", 1),
-        ];
+        let config = [("QT", 16), ("SPLIT_GROUPS", split), ("DIRECT", 1)]
+            .into_iter()
+            .chain(form.iter().copied())
+            .collect::<Vec<_>>();
         let gated = prefill_kernel(&device, geometry, &config)
             .call(prefill_args!(bound, encoded.case))
             .unwrap()
             .value;
         (gated, bound)
     };
+    let direct = [("HEADS", single_head_group(geometry.g))];
+    let run_listing =
+        |encoded: &Encoded, split: u64, listed: Option<usize>| run_form(encoded, split, &direct, listed);
     let run = |encoded: &Encoded, split: u64| run_listing(encoded, split, None);
 
     // The launch of 32 is the sixteen rows and sixteen that see nothing;
@@ -1117,6 +1252,13 @@ fn metal_direct_prefill_resumes_across_rounds() {
     for split in [1, 256] {
         let (gated, bound) = run(&rounds, split);
         check(&format!("aligned rounds, {split} split groups"), &rounds, &gated, &bound, &expected);
+    }
+    // The co-issue form (on simdgroup matrices; two pairs a threadgroup)
+    // takes the same rounds over the window, and matches the host model.
+    for split in [1, 256] {
+        let coissue = [("HEADS", 1), ("COISSUE", 1)];
+        let (gated, bound) = run_form(&rounds, split, &coissue, None);
+        check(&format!("aligned rounds, co-issue, {split} split groups"), &rounds, &gated, &bound, &expected);
     }
     let resumed = bf16_values(&run(&rounds, 1).0);
     let whole = bf16_values(&run(&one_round, 1).0);
@@ -2481,7 +2623,37 @@ fn prefill_timing_on(device: &Device) {
             9,
         ));
         let mut dense = DenseHistory::new(device, &encoded.case);
-        for config in prefill_configs(backend, geometry) {
+        let forms = if backend == BackendName::Metal {
+            coissue_prefill_configs(geometry)
+        } else {
+            Vec::new()
+        };
+        // `K8V4_PREFILL_ONLY=NAME=VALUE[,NAME=VALUE...]` times only the
+        // configurations with those parameter values (a parameter a
+        // configuration does not name is 0).
+        let only = std::env::var("K8V4_PREFILL_ONLY").map_or_else(
+            |_| Vec::new(),
+            |only| {
+                only.split(',')
+                    .map(|item| {
+                        let (name, value) = item
+                            .split_once('=')
+                            .expect("expected NAME=VALUE in K8V4_PREFILL_ONLY");
+                        (name.to_string(), value.parse::<u64>().unwrap())
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        for config in prefill_configs(backend, geometry).into_iter().chain(forms) {
+            let value_of = |name: &str| {
+                config
+                    .iter()
+                    .find(|(param, _)| *param == name)
+                    .map_or(0, |(_, value)| *value)
+            };
+            if only.iter().any(|(name, value)| value_of(name) != *value) {
+                continue;
+            }
             let kernel = prefill_kernel(device, geometry, &config);
             let mut bound = Bound::new(device, &encoded);
             let affine = kernel
@@ -2501,7 +2673,7 @@ fn prefill_timing_on(device: &Device) {
                     &config
                         .iter()
                         .copied()
-                        .filter(|(name, _)| *name != "PRODUCERS")
+                        .filter(|(name, _)| !["PRODUCERS", "COISSUE"].contains(name))
                         .collect::<Vec<_>>(),
                 ),
             )

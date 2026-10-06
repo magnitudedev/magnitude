@@ -114,8 +114,8 @@ pub use seismic_runtime::native::trace::{
 pub use seismic_runtime::native::tune::{
     CensusPlan, Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, NumericalEvidence,
     NumericalMetrics, Outcome, PointInputs, PointMeasurement, PointRecord, PointSpec,
-    PointUnavailable, SearchPlan, Strategy, SurveyPlan, TuneError, TuningInitializer, TuningMethod,
-    TuningReference, TuningResult, TuningTime,
+    PointUnavailable, SearchPlan, Standing, StartPlan, Strategy, SurveyPlan, TuneError,
+    TuningInitializer, TuningMethod, TuningReference, TuningResult, TuningTime,
 };
 pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
 
@@ -1204,6 +1204,86 @@ impl<'a, E: Entry, S: PointSource<'a, E> + ?Sized> PointSource<'a, E> for &mut S
     }
 }
 
+/// A typed point source as Seismic's runtime asks it.
+struct TypedPoints<'s, 'a, E: Entry>(&'s mut dyn PointSource<'a, E>);
+
+impl<'a, E: Entry> seismic_runtime::native::tune::PointSource<'a> for TypedPoints<'_, 'a, E> {
+    fn points(&self) -> Vec<PointSpec> {
+        self.0.points()
+    }
+
+    fn build(
+        &mut self,
+        point: usize,
+        limit: std::time::Duration,
+    ) -> Result<PointInputs<'a>, PointUnavailable> {
+        self.0.build(point, limit)
+    }
+}
+
+/// The search of one native tuning unit of entry `E`, advanced in steps: a
+/// census, a start that measures the defaults and every form's start, any
+/// number of refinements, and a conclusion that confirms and validates the
+/// choice. A consumer tuning several units decides which the next time goes
+/// to; the steps of one unit together measure what one uninterrupted search
+/// measures.
+pub struct NativeSearch<'a, E: Entry> {
+    inner: seismic_runtime::native::tune::UnitSearch<'static, 'a>,
+    entry: std::marker::PhantomData<E>,
+}
+
+impl<'a, E: Entry> NativeSearch<'a, E> {
+    /// Measure the defaults at the points every candidate must pass, within
+    /// the plan's limit. A result without configurations says they did not
+    /// fit: the unit keeps its defaults.
+    pub fn census(
+        &mut self,
+        points: &mut dyn PointSource<'a, E>,
+        plan: CensusPlan,
+    ) -> Result<TuningResult, TuneError> {
+        self.inner.census(&mut TypedPoints(points), plan)
+    }
+
+    /// Admit the further points the plan's admission covers, then measure
+    /// the defaults and every form's start, whatever the time.
+    pub fn start(
+        &mut self,
+        points: &mut dyn PointSource<'a, E>,
+        plan: StartPlan,
+        until: std::time::Instant,
+    ) -> Result<Standing, TuneError> {
+        self.inner.start(&mut TypedPoints(points), plan, until)
+    }
+
+    /// Continue the search until `slice`, or until what remains before
+    /// `until` only covers concluding it.
+    pub fn refine(
+        &mut self,
+        slice: std::time::Instant,
+        until: std::time::Instant,
+    ) -> Result<Standing, TuneError> {
+        self.inner.refine(slice, until)
+    }
+
+    /// What concluding the search will take.
+    pub fn reserve(&self) -> std::time::Duration {
+        self.inner.reserve()
+    }
+
+    /// Confirm the finalists found so far and validate the choice at the
+    /// points not timed; `allowance` is the time the unit was given, for
+    /// the record.
+    pub fn conclude(
+        self,
+        points: &mut dyn PointSource<'a, E>,
+        until: std::time::Instant,
+        allowance: std::time::Duration,
+    ) -> Result<TuningResult, TuneError> {
+        self.inner
+            .conclude(&mut TypedPoints(points), until, allowance)
+    }
+}
+
 /// `rotation`, with `initialize` and `written`, as a point's inputs.
 pub fn point_inputs<'a, E: Entry>(
     rotation: Vec<E::Args<'_>>,
@@ -1254,6 +1334,7 @@ impl<'a, E: Entry> PointSource<'a, E> for Vec<TuningPoint<'a, E>> {
                 class: point.class.clone(),
                 cost: point.cost,
                 required: point.required,
+                census: point.required,
             })
             .collect()
     }
@@ -3635,20 +3716,6 @@ pub mod generated {
         strategy: Strategy,
         reference: TuningReference,
     ) -> Result<TuningResult, TuneError> {
-        /// A typed point source as Seismic's runtime asks it.
-        struct Typed<'s, 'a, E: Entry>(&'s mut dyn PointSource<'a, E>);
-        impl<'a, E: Entry> seismic_runtime::native::tune::PointSource<'a> for Typed<'_, 'a, E> {
-            fn points(&self) -> Vec<PointSpec> {
-                self.0.points()
-            }
-            fn build(
-                &mut self,
-                point: usize,
-                limit: std::time::Duration,
-            ) -> Result<PointInputs<'a>, PointUnavailable> {
-                self.0.build(point, limit)
-            }
-        }
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
         let entry =
             E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
@@ -3659,10 +3726,39 @@ pub mod generated {
             bindings: element_bindings(elements),
             statics: statics.clone(),
             cpu,
-            points: &mut Typed(points),
+            points: &mut TypedPoints(points),
             validation: validation.into(),
             strategy,
             reference,
+        })
+    }
+
+    /// Open the search of the tuning unit of `E` at `statics` on `device`.
+    pub fn search_native<'a, E: Entry>(
+        device: &Device,
+        statics: &NativeSpecialization,
+        elements: &[(&str, Element)],
+        cpu: Option<&'static native_cpu::CpuNativeKernels>,
+        validation: impl Into<TuningPrecision>,
+        reference: TuningReference,
+    ) -> Result<NativeSearch<'a, E>, TuneError> {
+        let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
+        let entry =
+            E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
+        Ok(NativeSearch {
+            inner: seismic_runtime::native::tune::UnitSearch::open(
+                seismic_runtime::native::tune::UnitRequest {
+                    device: device.inner(),
+                    module: module.checked(),
+                    entry: entry.id(),
+                    bindings: element_bindings(elements),
+                    statics: statics.clone(),
+                    cpu,
+                    validation: validation.into(),
+                    reference,
+                },
+            )?,
+            entry: std::marker::PhantomData,
         })
     }
 

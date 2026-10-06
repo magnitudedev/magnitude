@@ -6,7 +6,8 @@
 use seismic::{
     Availability, BackendName, CallError, CensusPlan, Device, DeviceCatalog, Element, Exclusion,
     InvocationError, MeasureOptions, NativeGraphFamily, NativeSpecialization, Outcome,
-    PrecisionPolicy, SearchPlan, SearchSettings, SearchStop, Strategy, SurveyPlan, Tensor,
+    PrecisionPolicy, SearchPlan, SearchSettings, SearchStop, StartPlan, Strategy, SurveyPlan,
+    Tensor,
     TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint,
 };
 use seismic_native_tests::{accumulate, gated_sum, scale_rows, scoped_scale, split_sum};
@@ -690,18 +691,23 @@ fn a_census_times_the_required_points_and_its_search_admits_the_rest() {
         }
     };
     // The census times the cheapest point and the required one.
-    let census = split_sum::native_tune(
+    let mut unit = split_sum::native_search(
         &device,
         &statics(n),
-        points(),
         PrecisionPolicy::Exact,
-        Strategy::Census(CensusPlan {
-            limit: Duration::from_secs(3600),
-            min_sample_seconds: 0.005,
-        }),
         seismic::TuningReference::Portable,
     )
     .unwrap();
+    let mut source = points();
+    let census = unit
+        .census(
+            &mut source,
+            CensusPlan {
+                limit: Duration::from_secs(3600),
+                min_sample_seconds: 0.005,
+            },
+        )
+        .unwrap();
     assert!(matches!(census.method, TuningMethod::Census));
     let censused = timed(&census);
     assert_eq!(
@@ -712,19 +718,55 @@ fn a_census_times_the_required_points_and_its_search_admits_the_rest() {
         ["short", "required"]
     );
     // Its search reuses those measurements and admits the remaining point
-    // within its admission.
+    // within its admission. The start measures the defaults and, the entry
+    // declaring no form, nothing else; the search then runs to its end in
+    // steps, and concludes with every configuration it reached.
     let Strategy::Search(plan) = search(1) else {
         unreachable!()
     };
-    let searched = split_sum::native_tune(
-        &device,
-        &statics(n),
-        points(),
-        PrecisionPolicy::Exact,
-        Strategy::Censused { plan, census },
-        seismic::TuningReference::Portable,
-    )
-    .unwrap();
+    let until = std::time::Instant::now() + plan.allowance;
+    let started = unit
+        .start(
+            &mut source,
+            StartPlan {
+                required: plan.required,
+                admission: plan.admission,
+                settings: plan.settings,
+                min_sample_seconds: plan.min_sample_seconds,
+                start: plan.start,
+                forms: true,
+            },
+            until,
+        )
+        .unwrap();
+    assert_eq!((started.measured, started.cost), (1, 1.));
+    assert!(!started.finished);
+    let mut steps = 0;
+    let finished = loop {
+        // Each step may measure for a millisecond before the time is dealt
+        // again.
+        let standing = unit
+            .refine(
+                std::time::Instant::now() + Duration::from_millis(1),
+                until,
+            )
+            .unwrap();
+        steps += 1;
+        if standing.finished {
+            break standing;
+        }
+        assert!(steps < 10_000, "the steps make progress");
+    };
+    assert!(finished.measured > started.measured && finished.measured <= finished.admissible);
+    let searched = unit.conclude(&mut source, until, plan.allowance).unwrap();
+    assert!(matches!(
+        searched.method,
+        TuningMethod::Search {
+            stop: SearchStop::Exhausted | SearchStop::Converged,
+            ..
+        }
+    ));
+    assert_eq!(searched.configurations.len(), finished.measured);
     let measured = timed(&searched);
     assert_eq!(
         measured

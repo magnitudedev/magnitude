@@ -109,6 +109,20 @@ struct Weights<packets::ProgressiveTop> {
         return {*reinterpret_cast<device const uint4 *>(top + ulong(n) * top_stride + 4u * p), 16.0f * s,
             -120.5f * s};
     }
+    // The planes keep no coefficient run (every packet has its own scale)
+    // and no row tiles.
+    packets::Block<packets::ProgressiveTop>::state run(uint, uint) const { return {}; }
+    packets::ProgressiveTop::packet packet(uint n, uint p,
+        thread packets::Block<packets::ProgressiveTop>::state &) const {
+        return packet(n, p);
+    }
+    uint tile() const { return 1u; }
+    // A row is located by its index.
+    typedef uint located;
+    located locate(uint n) const { return n; }
+    template <uint R>
+    bool together(uint) const { return false; }
+    static located after(located at, uint r) { return at + r; }
 };
 
 template <>
@@ -133,6 +147,12 @@ struct Weights<packets::ProgressiveExact> {
         thread packets::Block<packets::ProgressiveExact>::state &) const {
         return packet(n, p);
     }
+    uint tile() const { return 1u; }
+    typedef uint located;
+    located locate(uint n) const { return n; }
+    template <uint R>
+    bool together(uint) const { return false; }
+    static located after(located at, uint r) { return at + r; }
 };
 
 } // namespace projection
