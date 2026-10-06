@@ -340,6 +340,28 @@ fn specialization(
         })
 }
 
+/// `project_rows`' specialization: on Metal the staged tiles of `mapping`
+/// (TALL and PACK off, their launches at their defaults); the tall and PACK
+/// forms are compared with them in `projection.rs`.
+fn project_rows_specialization(
+    device: &seismic::Device,
+    statics: &[(&str, usize)],
+    mapping: &Mapping,
+) -> seismic::NativeSpecialization {
+    let specialization = specialization(device, statics, mapping);
+    if device.backend() != seismic::BackendName::Metal {
+        return specialization;
+    }
+    specialization
+        .with_param("TALL", 0)
+        .with_param("PACK", 0)
+        .with_launch_param(7, "TALL_M", 128)
+        .with_launch_param(7, "TALL_K", 64)
+        .with_launch_param(7, "STAGERS", 2)
+        .with_launch_param(10, "PACK_TOKENS", 4)
+        .with_launch_param(10, "WEIGHTS_AHEAD", 0)
+}
+
 /// Row classes: Metal GEMV / batched GEMV / small GEMM / GEMM, CUDA GEMV /
 /// GEMV16 / small (split) GEMM / GEMM, Vulkan GEMV / GEMM.
 const ROW_CLASSES: [usize; 6] = [1, 3, 5, 12, 40, 80];
@@ -808,7 +830,7 @@ fn native_project_rows_matches_host_reference() {
                                     seismic::Element::bf16()
                                 },
                             },
-                            &specialization(device, &[("K", k), ("N", n)], &mapping)
+                            &project_rows_specialization(device, &[("K", k), ("N", n)], &mapping)
                                 .with_static("WS", extent as u64),
                         )
                         .unwrap()

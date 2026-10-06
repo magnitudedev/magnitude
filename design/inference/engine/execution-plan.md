@@ -242,9 +242,10 @@ folding each 32-column block under its activation and weight scales; the weights
 every other weight format or device runs the exact form in the same launches. Its transient
 scratch is the int8 operand with its scales and block sums (rows x K x 1.2 bytes) and the weights'
 decoded block scales and biases (weight rows x K / 32 x 6 bytes), per call. The second class is
-`int8_token_packing`: Metal's gate/up and down projections, the recurrent projection's qkv and z
-segments, the attention projection's segments and the attention output projection past 64 rows,
-with Q4_K, Q5_K or Q6_K weights on devices without tensor operations, round each activation row to
+`int8_token_packing`: Metal's gate/up and down projections, the plain projection of post-norm
+sublayer outputs, the recurrent projection's qkv and z segments, the attention projection's
+segments and the attention output projection past 64 rows, with Q4_K, Q5_K, Q6_K or q4g32s (GGUF
+Q4_0) weights on devices without tensor operations, round each activation row to
 integer codes per 32 columns under a gain that bounds every sum for any row of the weight format,
 and pack two rows into one F32 matrix operand against the weights' stored codes minus the centre
 of their range, so one multiply-accumulate carries two products; the two 16-bit sums of each run

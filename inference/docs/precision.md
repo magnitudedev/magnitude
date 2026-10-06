@@ -75,7 +75,7 @@ engine's [precision policy](../engine/executor/src/native/tuning/precision.rs):
 | Class | Forms | Relative RMS | Largest element |
 | --- | --- | ---: | ---: |
 | `int8_activations` | INT8 of `dense_expand` and `dense_output` on Metal tensor operations: activations as int8 per (row, 32 columns) against exact weight codes | `0.02` | `0.25` |
-| `int8_token_packing` | PACK of `dense_expand`, `dense_output`, `gated_delta_project`, `attention_project` and `attention_output` on Metal without tensor operations, over Q4_K, Q5_K or Q6_K weights: activations as integer codes per (row, 32 columns), two rows packed into one F32 matrix operand against exact weight codes | `0.02` | `0.5` |
+| `int8_token_packing` | PACK of `dense_expand`, `dense_output`, `project_rows`, `gated_delta_project`, `attention_project` and `attention_output` on Metal without tensor operations, over Q4_K, Q5_K, Q6_K or q4g32s (GGUF Q4_0) weights: activations as integer codes per (row, 32 columns), two rows packed into one F32 matrix operand against exact weight codes | `0.02` | `0.5` |
 
 `int8_token_packing` is row-dependent: the top row's sums of a pair are exact, and the low row's
 carry the rounding of the accumulator the two share, so a row's result depends on the row it is

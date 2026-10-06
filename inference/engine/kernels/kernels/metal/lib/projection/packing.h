@@ -18,8 +18,8 @@
 // two powers of two multiply the F32 result once, at the store.
 //
 // The gain is the largest one that bounds every block sum for any row of the
-// format (codes minus their centre c, 8 for Q4_K and 16 for Q5_K, have at
-// most l1 32 c and l2 c sqrt(32) per block), by Hoelder and Cauchy-Schwarz
+// format (codes minus their centre c, 8 for Q4_K and q4g32s and 16 for Q5_K,
+// have at most l1 32 c and l2 c sqrt(32) per block), by Hoelder and Cauchy-Schwarz
 // with the rounding of the codes inside:
 //   min((g |x|_2 + sqrt(32) / 2) c sqrt(32), (g |x|_inf + 1 / 2) 32 c) <= limit
 // with limit 32767 for the top token and 32767 - 32 x 64 for the low one
@@ -77,9 +77,9 @@ inline float4 packing_scale(float4 value) {
     return as_type<float4>((as_type<uint4>(value) & 0x7f800000u) + 0x00800000u);
 }
 
-// Weights whose stored codes enter the packed product: the k-quant formats
-// whose codes' low four bits are one plane (Q4_K; Q5_K and Q6_K with their
-// plane of high bits), on a device without tensor operations (their int8
+// Weights whose stored codes enter the packed product: the formats whose
+// codes' low four bits are one plane (Q4_K and q4g32s; Q5_K and Q6_K with
+// their plane of high bits), on a device without tensor operations (their int8
 // products carry more than a packed matrix operand does). The codes enter
 // minus `centre`, half their range. A block has `folds` runs of 32 / folds
 // columns under one weight scale each (Q6_K scales 16 columns), a sum pair
@@ -117,24 +117,67 @@ struct packing_k_factors {
         return float2(coefficient.x * (32767.0f / 64.0f), float(CENTRE) * coefficient.x + coefficient.y);
     }
 };
-// q4k: step s multiplies the block's columns 8 (c / 2) + s + 4 (c % 2) for
-// c = 0 .. 7: a row's word c / 2 holds them as nibble s of each half.
+// The 4-bit codes of a plane of low nibbles alone (q4k, q4g32s): step s
+// multiplies the block's columns 8 (c / 2) + s + 4 (c % 2) for c = 0 .. 7: a
+// row's word c / 2 holds them as nibble s of each half.
+template <typename W>
+struct packing_nibbles {
+    typedef uint place;
+    typedef uint words;
+    static place at(thread const Weights<W> &w, uint n, uint x) {
+        return w.codes_at(n, 16u, 0u) + (x >> 1) * 4u;
+    }
+    // A row tile's rows of one block are adjacent: 16 bytes a row.
+    static words load(thread const Weights<W> &w, place at, uint g) {
+        return *reinterpret_cast<device const uint *>(w.base + at + g * 16u * w.layout.tile);
+    }
+    static half2 step(words codes, uint s) { return as_type<half2>((codes >> (4u * s)) & 0x000f000fu); }
+};
 template <>
 struct packing_codes<packets::Q4K> {
     static constant constexpr bool available = true;
     static constant constexpr uint centre = 8, folds = 1;
     static constant constexpr bool biased = true;
     typedef packing_k_factors<8> factors;
-    typedef uint place;
-    typedef uint words;
-    static place at(thread const Weights<packets::Q4K> &w, uint n, uint x) {
-        return w.codes_at(n, 16u, 0u) + (x >> 1) * 4u;
+    typedef packing_nibbles<packets::Q4K> nibbles;
+    typedef nibbles::place place;
+    typedef nibbles::words words;
+    static place at(thread const Weights<packets::Q4K> &w, uint n, uint x) { return nibbles::at(w, n, x); }
+    static words load(thread const Weights<packets::Q4K> &w, place at, uint g) { return nibbles::load(w, at, g); }
+    static half2 step(words codes, uint s) { return nibbles::step(codes, s); }
+};
+// q4g32s: value = d * (code - 8) with one F16 d per 32 columns, so a block
+// is one run and, the codes entering minus 8, has no min. Its factor is
+// d * 32767 / 64 (the second is unused), and the fold takes a sum of at most
+// 1 of it: 512 |d| bounds it.
+struct packing_g32s_factors {
+    // The scales of a 256-column block's packets from the next taken.
+    typedef device const half *run;
+    static run start(device const uchar *row, Rows16 layout, uint block) {
+        return reinterpret_cast<device const half *>(layout.super_at(row, 16ul * block));
     }
-    // A row tile's rows of one block are adjacent: 16 bytes a row.
-    static words load(thread const Weights<packets::Q4K> &w, place at, uint g) {
-        return *reinterpret_cast<device const uint *>(w.base + at + g * 16u * w.layout.tile);
+    static float reach(device const uchar *row, Rows16 layout, uint block) {
+        const run scales = start(row, layout, block);
+        float largest = 0.0f;
+        PROJECTION_UNROLL
+        for (uint i = 0; i < 8; ++i)
+            largest = metal::max(largest, metal::abs(float(scales[i])));
+        return 512.0f * largest;
     }
-    static half2 step(words codes, uint s) { return as_type<half2>((codes >> (4u * s)) & 0x000f000fu); }
+    static float2 take(thread run &state) { return float2(float(*state++) * (32767.0f / 64.0f), 0.0f); }
+};
+template <>
+struct packing_codes<packets::Q4G32S> {
+    static constant constexpr bool available = true;
+    static constant constexpr uint centre = 8, folds = 1;
+    static constant constexpr bool biased = false;
+    typedef packing_g32s_factors factors;
+    typedef packing_nibbles<packets::Q4G32S> nibbles;
+    typedef nibbles::place place;
+    typedef nibbles::words words;
+    static place at(thread const Weights<packets::Q4G32S> &w, uint n, uint x) { return nibbles::at(w, n, x); }
+    static words load(thread const Weights<packets::Q4G32S> &w, place at, uint g) { return nibbles::load(w, at, g); }
+    static half2 step(words codes, uint s) { return nibbles::step(codes, s); }
 };
 // q5k: q4k's columns; the lane's byte of the block's high bits beside its
 // word of low nibbles, a nibble of the byte under each half of the word, so

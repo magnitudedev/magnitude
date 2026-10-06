@@ -82,10 +82,11 @@ const ERROR_CLASSES: &[(&str, seismic::ErrorEnvelope)] = &[
     // gate/up product by 3.5e-3; real activations measure 8e-3 to 1e-2.
     ("int8_activations", envelope(2e-2, 0.25)),
     // Activations as integer codes per (row, 32 columns), two rows packed
-    // into one F32 matrix operand against exact Q4_K, Q5_K or Q6_K weight
-    // codes (the PACK form of `dense_expand`, `dense_output`,
-    // `gated_delta_project`, `attention_project` and `attention_output` on
-    // Metal without tensor operations). A row's low sums carry the rounding
+    // into one F32 matrix operand against exact Q4_K, Q5_K, Q6_K or q4g32s
+    // weight codes (the PACK form of `dense_expand`, `dense_output`,
+    // `project_rows`, `gated_delta_project`, `attention_project` and
+    // `attention_output` on Metal without tensor operations). A row's low
+    // sums carry the rounding
     // of the accumulator it shares with the other row of its pair, so its
     // result depends on that row, and the fold runs in F16. On test inputs
     // the down projection differs from its default by 2.3e-3 relative RMS
@@ -94,7 +95,9 @@ const ERROR_CLASSES: &[(&str, seismic::ErrorEnvelope)] = &[
     // whose real activations measure 8e-3 to 1e-2. Q5_K weights and the
     // recurrent and attention projections measure 2.2e-3 to 2.6e-3 (largest
     // 2.2e-2); Q6_K, whose sums are bounded per 16 columns at twice the code
-    // range, 6.6e-3 (largest 4.2e-2) and 9.7e-3 for the gate/up product.
+    // range, 6.6e-3 (largest 4.2e-2) and 9.7e-3 for the gate/up product;
+    // q4g32s (GGUF Q4_0), Q4_K's bounds without a min, 3.0e-3 (largest
+    // 9.8e-3) and 5.7e-3 for the gate/up product.
     // On the tuning inputs the gate/up product measures 9.4e-3 with a
     // largest element of 0.33 reference RMS: one bf16 step of an output far
     // above the RMS, which any change of the sums can move.

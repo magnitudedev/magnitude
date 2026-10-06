@@ -2185,6 +2185,122 @@ fn relative_difference(reference: &[f64], actual: &[f64]) -> (f64, f64) {
     )
 }
 
+/// `project_rows`' launches on Metal: the tall tile and the PACK tile.
+const PROJECT_ROWS_TALL_LAUNCH: usize = 7;
+const PROJECT_ROWS_PACKED_LAUNCH: usize = 10;
+
+/// `project_rows` (activation rows in, F32 rows out, no scale port) on Metal
+/// under `mapping`, with the PACK tile launch `pack` or in an exact form.
+fn project_rows_native(
+    device: &Device,
+    act: Act,
+    weight: &Weight,
+    source: &[f32],
+    mapping: Mapping,
+    pack: Option<Pack>,
+) -> Vec<f32> {
+    let (n, k) = (weight.rows, weight.k);
+    let rows = source.len() / k;
+    let specialization = with_tall(
+        device,
+        scoped_projection_specialization_on(
+            device,
+            &[("K", k), ("N", n)],
+            mapping,
+            ProjectionLaunches {
+                gemv: 0,
+                batch: 1,
+                gemm: 4,
+            },
+            true,
+        )
+        .with_static("WS", 0),
+        PROJECT_ROWS_TALL_LAUNCH,
+        mapping.tall,
+    );
+    let specialization = with_pack(
+        specialization,
+        PROJECT_ROWS_PACKED_LAUNCH,
+        pack.unwrap_or(PACK_DEFAULT),
+    )
+    .with_param("PACK", u64::from(pack.is_some()));
+    let kernel = project_rows::native_for_device_with(
+        device,
+        project_rows::Elements {
+            A: act.element(),
+            W: weight.repr.resident(device),
+            Y: Element::f32(),
+        },
+        &specialization,
+    )
+    .unwrap();
+    let out = kernel
+        .call(project_rows::Args {
+            source: &act_tensor(device, act, &[rows, k], source),
+            weight: &weight.tensor(device),
+            weight_scale: &f32_tensor(device, &[0], &[]),
+        })
+        .unwrap()
+        .value;
+    read_f32(&out)
+}
+
+/// Metal's tall and PACK forms of the plain projection: the tall tile gives
+/// the staged tile's bits; the PACK form differs from them by the packed
+/// form's error over Q4_K, Q5_K, Q6_K or q4g32s weights, and runs the staged
+/// 64 x 64 tile, bit for bit, over other weights.
+#[test]
+fn metal_tall_and_packed_project_rows_agree_with_the_staged_form() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let staged = gemm_mapping(64, 64, 1);
+    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q4g32s, Repr::Q8] {
+        let (outputs, k) = (192, 1024);
+        let weight = weight(repr, outputs, k, 97, 1.0);
+        for rows in [128usize, 200, 512] {
+            let mut rng = Rng::new(rows as u64 + 98);
+            let source = (0..rows * k).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let exact = project_rows_native(&device, act, &weight, &source, staged, None);
+            let tall = project_rows_native(&device, act, &weight, &source, pack_mapping(), None);
+            assert!(
+                exact.iter().zip(&tall).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "tall project_rows {repr:?} rows {rows} differs from the staged tile"
+            );
+            let mut first: Option<Vec<f32>> = None;
+            for pack in pack_tiles() {
+                let packed =
+                    project_rows_native(&device, act, &weight, &source, pack_mapping(), Some(pack));
+                if repr == Repr::Q8 {
+                    assert_eq!(exact, packed, "{repr:?} rows {rows}");
+                    continue;
+                }
+                // Every tile launch gives the same bits.
+                let first = first.get_or_insert_with(|| packed.clone());
+                assert!(
+                    first.iter().zip(&packed).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "packed project_rows {repr:?} rows {rows} {pack:?} differs from {PACK_DEFAULT:?}"
+                );
+                let wide = |values: &[f32]| values.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+                let (relative, worst) = relative_difference(&wide(&exact), &wide(&packed));
+                if pack == PACK_DEFAULT {
+                    eprintln!(
+                        "packed project_rows {repr:?} rows {rows}: relative RMS error {relative:.2e}, largest {worst:.2e} reference RMS"
+                    );
+                }
+                assert!(
+                    relative <= 1.5e-2 && worst <= 0.1,
+                    "packed project_rows {repr:?} rows {rows} {pack:?}: relative RMS error {relative:.2e}, largest {worst:.2e}"
+                );
+            }
+        }
+    }
+}
+
 /// `dense_output` under Metal's PACK form with the tile launch `pack`.
 #[allow(clippy::too_many_arguments)]
 fn dense_output_packed(
@@ -2227,9 +2343,9 @@ fn dense_output_packed(
 
 /// Metal's PACK form of the down projection: integer activation codes per
 /// (row, 32 columns), two rows packed per operand element against the exact
-/// Q4_K, Q5_K or Q6_K codes. Its results differ from the staged form's by the
-/// activation rounding, the packed accumulator's rounding and the F16 fold;
-/// other weights run the staged 64 x 64 tile, bit for bit.
+/// Q4_K, Q5_K, Q6_K or q4g32s codes. Its results differ from the staged form's
+/// by the activation rounding, the packed accumulator's rounding and the F16
+/// fold; other weights run the staged 64 x 64 tile, bit for bit.
 #[test]
 fn metal_packed_dense_output_agrees_with_the_staged_form() {
     let Some(device) = devices()
@@ -2240,7 +2356,7 @@ fn metal_packed_dense_output_agrees_with_the_staged_form() {
     };
     let act = Act::Bf16;
     let staged = gemm_mapping(64, 64, 1);
-    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8] {
+    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q4g32s, Repr::Q8] {
         let (outputs, k) = (192, 1024);
         let down = weight(repr, outputs, k, 91, 1.0);
         for rows in [128usize, 200, 512] {
@@ -2294,9 +2410,9 @@ fn metal_packed_dense_output_agrees_with_the_staged_form() {
 
 /// Metal's PACK form of the paired gate/up projection, as for the down
 /// projection: the GLU outputs differ from the staged form's by the packed
-/// form's error with gate and up weights one packed operand serves (Q4_K and
-/// Q5_K together, or both Q6_K), and are the staged tile's bit for bit
-/// otherwise.
+/// form's error with gate and up weights one packed operand serves (Q4_K,
+/// Q5_K and q4g32s together, or both Q6_K), and are the staged tile's bit for
+/// bit otherwise.
 #[test]
 fn metal_packed_dense_expand_agrees_with_the_staged_form() {
     let Some(device) = devices()
@@ -2311,6 +2427,8 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
         (Repr::Q4k, Repr::Q4k, true),
         (Repr::Q5k, Repr::Q4k, true),
         (Repr::Q6k, Repr::Q6k, true),
+        (Repr::Q4g32s, Repr::Q4g32s, true),
+        (Repr::Q4g32s, Repr::Q4k, true),
         (Repr::Q4k, Repr::Q6k, false),
         (Repr::Q8, Repr::Q8, false),
     ] {
@@ -2673,6 +2791,67 @@ fn packed_timing() {
             tall.1 / best.1
         );
     };
+
+    for repr in [Repr::Q4k] {
+        let label = format!("project_rows 4b {} 2560x9216", repr.name());
+        if !timing_selected(label.split(' ').next().unwrap()) {
+            continue;
+        }
+        let weights = (0..copies(weight_bytes(repr, h, f)))
+            .map(|i| noise_weight(&device, repr, h, f, i as u64 + 1))
+            .collect::<Vec<_>>();
+        let source = act_tensor(&device, act, &[m, f], &uniform_values(m * f, 2, 1.0));
+        let time = |specialization: &NativeSpecialization| {
+            let kernel = project_rows::native_for_device_with(
+                &device,
+                project_rows::Elements {
+                    A: act.element(),
+                    W: repr.resident(&device),
+                    Y: Element::f32(),
+                },
+                specialization,
+            )
+            .unwrap();
+            let rotation = weights
+                .iter()
+                .map(|weight| project_rows::Args {
+                    source: &source,
+                    weight,
+                    weight_scale: &absent_scale,
+                })
+                .collect();
+            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+        };
+        run(
+            &label,
+            PROJECT_ROWS_PACKED_LAUNCH,
+            &|mapping| {
+                with_pack(
+                    with_tall(
+                        &device,
+                        scoped_projection_specialization_on(
+                            &device,
+                            &[("K", f), ("N", h)],
+                            mapping,
+                            ProjectionLaunches {
+                                gemv: 0,
+                                batch: 1,
+                                gemm: 4,
+                            },
+                            true,
+                        )
+                        .with_static("WS", 0),
+                        PROJECT_ROWS_TALL_LAUNCH,
+                        mapping.tall,
+                    ),
+                    PROJECT_ROWS_PACKED_LAUNCH,
+                    PACK_DEFAULT,
+                )
+                .with_param("PACK", 0)
+            },
+            &time,
+        );
+    }
 
     for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k] {
         let label = format!("dense_output 4b {} 2560x9216", repr.name());
