@@ -61,12 +61,14 @@ and state-repair forwards must also be exposed as operations, rather than hidden
 inside otherwise synchronous callbacks. The dispatcher is the sole submitter of
 model work and returns each operation's result to its owning continuation.
 
-A separate drafter enters prompt history as part of each prompt chunk's
-operation, not as method work after it: the prompt knows every token, so a
-chunk's entry pairs each following prompt token with the chunk row before it.
-The executor drafts that entry on the device right behind the chunk, reading
-the chunk's own feature output, and commits it with the chunk; prefill waits on
-no host feature read and schedules no separate drafter flight. A prompt chunk
+A target-conditioned drafter (the model's own draft head or a separate draft)
+enters prompt history as part of each prompt chunk's operation, not as method
+work after it: the prompt knows every token, so a chunk's entry pairs each
+following prompt token with the chunk row before it. The executor runs that
+entry on the device right behind the chunk, in the drafter's form (a draft
+head's entry pass over its history, a separate draft's injection), reading the
+chunk's own feature output, and commits it with the chunk; prefill waits on no
+host feature read and schedules no separate drafter flight. A prompt chunk
 whose successor is already known is queued behind the in-flight chunk, entry
 included. Method-owned drafter entries remain for replayed or resumed history
 and for rows whose successor token is sampled.

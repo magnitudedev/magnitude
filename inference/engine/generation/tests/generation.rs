@@ -471,72 +471,122 @@ fn reconcile_head(generation: &mut Generation, operation: &Operation, proposals:
     generation.commit_method_transition(transition);
 }
 
-#[test]
-fn prefill_chunks_enter_target_conditioned_pairs_and_keep_the_anchor() {
-    let generation = mtp_generation(&[1, 2, 3], 2);
-    // First chunk: rows 1, 2. Its pairs are (2, f5.0); f5.1 waits for 3.
-    let (mut generation, effects) = resolve(start(generation, 2), &[], Some(feature(5)));
-    let [head] = effects.as_slice() else {
-        panic!("a non-final chunk enters its complete pairs")
-    };
-    assert!(matches!(
-        head,
-        Operation::Head {
-            phase: magnitude_executor::HeadPhase::Priming { .. },
-            ..
-        }
-    ));
-    let (tokens, rows, position, proposals) = head_parts(head);
-    assert_eq!(
-        (tokens, rows, position),
-        (vec![TokenId(2)], vec![(5, 0)], 0)
-    );
-    assert!(proposals.is_empty());
-    reconcile_head(&mut generation, head, &[]);
-    // Final chunk: row 3 selects 10. Pairs (3, f5.1) are entered; the anchor
-    // (10, f6.0) waits for the first draft.
-    let (mut generation, effects) = resolve(start(generation, 1), &[10], Some(feature(6)));
-    let [head] = effects.as_slice() else {
-        panic!("the final chunk enters all but the anchor")
-    };
-    assert!(matches!(
-        head,
-        Operation::Head {
-            phase: magnitude_executor::HeadPhase::Priming { .. },
-            ..
-        }
-    ));
-    let (tokens, rows, position, _) = head_parts(head);
-    assert_eq!(
-        (tokens, rows, position),
-        (vec![TokenId(3)], vec![(5, 1)], 1)
-    );
-    reconcile_head(&mut generation, head, &[]);
+/// Both target-conditioned drafters over `prompt`, resident on fresh state.
+fn drafters(prompt: &[u32], proposals: u8) -> [Generation; 2] {
+    [
+        mtp_generation(prompt, proposals),
+        dflash_generation(prompt, proposals),
+    ]
+}
+
+/// A prompt chunk's drafter entry run on the device behind the chunk: its
+/// tokens, drafter position and the position the first draft anchors at.
+fn primed(round: &StartedRound) -> Option<(Vec<TokenId>, usize, usize)> {
+    round
+        .round_forward()
+        .prime
+        .as_ref()
+        .map(|prime| (prime.tokens.clone(), prime.position, prime.draft_from))
+}
+
+/// A drafter's generation after the device-primed prefill of its two-row
+/// prompt: the chunk's entry pairs 2 with its first row behind the chunk, no
+/// drafter transaction follows it, and the first draft is started.
+fn drafting(generation: Generation) -> (Generation, Operation) {
+    let round = start(generation, 2);
+    assert_eq!(primed(&round), Some((vec![TokenId(2)], 0, 2)));
+    let (mut generation, effects) = resolve(round, &[10], Some(feature(1)));
+    assert!(effects.is_empty());
     generation.take(4).unwrap();
-    let (_, draft) = draft(generation, 4);
-    let (tokens, rows, position, proposals) = head_parts(&draft[0]);
-    assert_eq!(
-        (tokens, rows, position),
-        (vec![TokenId(10)], vec![(6, 0)], 2)
-    );
-    // Proposal selections share the target's keys at the same output rows.
-    assert_eq!(
-        proposals
-            .iter()
-            .map(|select| (select.position, select.domain))
-            .collect::<Vec<_>>(),
-        [(1, 0), (2, 0)]
-    );
+    let (generation, draft) = draft(generation, 4);
+    let [draft] = <[Operation; 1]>::try_from(draft).unwrap();
+    let Operation::Head { phase, .. } = &draft else {
+        panic!("a draft is a head transaction")
+    };
+    assert_eq!(*phase, magnitude_executor::HeadPhase::Generation);
+    (generation, draft)
+}
+
+/// Prompt chunks enter the drafter on the device, behind each chunk: every
+/// following prompt token with the chunk row before it. No drafter
+/// transaction follows a chunk, and the anchor waits for the first draft.
+#[test]
+fn prompt_chunks_prime_the_drafter_on_the_device_and_keep_the_anchor() {
+    for generation in drafters(&[1, 2, 3], 2) {
+        // First chunk: rows 1, 2. Its entry pairs 2 and 3 with them.
+        let round = start(generation, 2);
+        assert_eq!(primed(&round), Some((vec![TokenId(2), TokenId(3)], 0, 3)));
+        let (generation, effects) = resolve(round, &[], Some(feature(5)));
+        assert!(effects.is_empty());
+        // Final chunk: row 3 selects 10. No prompt token follows it, so it
+        // has no entry; the anchor (10, f6.0) waits for the first draft.
+        let round = start(generation, 1);
+        assert_eq!(primed(&round), None);
+        let (mut generation, effects) = resolve(round, &[10], Some(feature(6)));
+        assert!(effects.is_empty());
+        generation.take(4).unwrap();
+        let (_, draft) = draft(generation, 4);
+        let (tokens, rows, position, proposals) = head_parts(&draft[0]);
+        assert_eq!(
+            (tokens, rows, position),
+            (vec![TokenId(10)], vec![(6, 0)], 2)
+        );
+        // Proposal selections share the target's keys at the same output rows.
+        assert_eq!(
+            proposals
+                .iter()
+                .map(|select| (select.position, select.domain))
+                .collect::<Vec<_>>(),
+            [(1, 0), (2, 0)]
+        );
+    }
+}
+
+/// Replayed history has no prompt chunk to follow on the device: the
+/// drafter enters it by a transaction after the replayed round, leaving the
+/// last row's feature open for the token after it.
+#[test]
+fn replayed_history_enters_the_drafter_by_transactions() {
+    for generation in drafters(&[1, 2], 2) {
+        let (mut generation, _) = resolve(start(generation, 2), &[10], Some(feature(1)));
+        generation.evicted().unwrap();
+        generation.resume_at(None).unwrap();
+        let replay = start(generation, 4);
+        assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+        assert_eq!(replay.round_forward().tokens, [TokenId(1), TokenId(2)]);
+        assert_eq!(primed(&replay), None);
+        let (mut generation, effects) = resolve(replay, &[], Some(feature(7)));
+        let [head] = effects.as_slice() else {
+            panic!("a replayed round enters its complete pairs")
+        };
+        assert!(matches!(
+            head,
+            Operation::Head {
+                phase: magnitude_executor::HeadPhase::Priming { .. },
+                ..
+            }
+        ));
+        let (tokens, rows, position, proposals) = head_parts(head);
+        assert_eq!(
+            (tokens, rows, position),
+            (vec![TokenId(2)], vec![(7, 0)], 0)
+        );
+        assert!(proposals.is_empty());
+        reconcile_head(&mut generation, head, &[]);
+        // The open feature f7.1 selected the accepted successor, the next
+        // decode's input.
+        assert_eq!(forward(&start(generation, 1)).tokens, [TokenId(10)]);
+    }
 }
 
 /// An MTP generation after its prefill, with its first draft started.
 fn mtp_drafting(proposals: u8) -> (Generation, Operation) {
-    let generation = mtp_generation(&[1, 2], proposals);
-    let (mut generation, effects) = resolve(start(generation, 2), &[10], Some(feature(1)));
-    reconcile_head(&mut generation, &effects[0], &[]);
-    generation.take(4).unwrap();
-    let (generation, mut draft) = draft(generation, 4);
-    (generation, draft.remove(0))
+    let (generation, draft) = drafting(mtp_generation(&[1, 2], proposals));
+    let Operation::Head { form, .. } = &draft else {
+        unreachable!()
+    };
+    assert_eq!(*form, magnitude_executor::DraftForm::Chained);
+    (generation, draft)
 }
 
 #[test]
@@ -590,20 +640,23 @@ fn proposals_stop_at_a_failed_selection_or_a_stop_token() {
 fn checkpoints_carry_host_rows_and_restore_at_their_target_boundary() {
     let source = mtp_generation(&[1, 2], 2);
     let (mut source, effects) = resolve(start(source, 2), &[10], Some(feature(3)));
-    // A checkpoint needs reconciled method work.
-    assert!(source.method_checkpoint().is_err());
-    reconcile_head(&mut source, &effects[0], &[]);
+    assert!(effects.is_empty());
     let checkpoint = source.method_checkpoint().unwrap();
     assert_eq!(checkpoint.retained_bytes(), 4);
     let MethodCheckpoint::Mtp(state) = &checkpoint else {
         panic!("MTP checkpoint")
     };
-    // Head row 0 entered, the anchor pending: two target rows.
+    // Head row 0 entered behind the chunk, the anchor pending: two target
+    // rows.
     assert_eq!((state.position(), state.target_rows()), (1, 2));
     let mut fresh = mtp_fresh(&[1, 2, 7], 2);
     assert!(fresh.resume_at(Some((1, &checkpoint))).is_err());
     fresh.resume_at(Some((2, &checkpoint))).unwrap();
     assert_eq!(fresh.resident_position(), 2);
+    // A checkpoint needs reconciled method work.
+    source.take(4).unwrap();
+    let (source, _) = draft(source, 4);
+    assert!(source.method_checkpoint().is_err());
 }
 
 #[test]
@@ -905,20 +958,14 @@ fn dflash_generation(prompt: &[u32], proposals: u8) -> Generation {
     resident(dflash_fresh(prompt, proposals))
 }
 
-/// A separate draft's generation after its prefill: the prefill's entry
-/// transaction reconciled and the first block draft started.
+/// A separate draft's generation after its prefill, with its first block
+/// draft started.
 fn dflash_drafting(proposals: u8) -> (Generation, Operation) {
-    let generation = dflash_generation(&[1, 2], proposals);
-    let (mut generation, effects) = resolve(start(generation, 2), &[10], Some(feature(1)));
-    reconcile_head(&mut generation, &effects[0], &[]);
-    generation.take(4).unwrap();
-    let (generation, draft) = draft(generation, 4);
-    let [draft] = <[Operation; 1]>::try_from(draft).unwrap();
-    let Operation::Head { form, phase, .. } = &draft else {
-        panic!("a draft is a head transaction")
+    let (generation, draft) = drafting(dflash_generation(&[1, 2], proposals));
+    let Operation::Head { form, .. } = &draft else {
+        unreachable!()
     };
     assert_eq!(*form, magnitude_executor::DraftForm::Block);
-    assert_eq!(*phase, magnitude_executor::HeadPhase::Generation);
     (generation, draft)
 }
 
@@ -974,12 +1021,13 @@ fn dflash_verification_publishes_the_accepted_prefix_and_re_enters_it() {
 fn dflash_checkpoints_wait_for_reconciled_drafts_and_keep_their_kind() {
     let source = dflash_generation(&[1, 2], 2);
     let (mut source, effects) = resolve(start(source, 2), &[10], Some(feature(3)));
-    assert!(source.method_checkpoint().is_err());
-    reconcile_head(&mut source, &effects[0], &[]);
+    assert!(effects.is_empty());
     let checkpoint = source.method_checkpoint().unwrap();
     let MethodCheckpoint::DFlash(state) = &checkpoint else {
         panic!("DFlash checkpoint")
     };
+    // Draft row 0 entered behind the chunk, the anchor pending: two target
+    // rows.
     assert_eq!((state.position(), state.target_rows()), (1, 2));
     let mut fresh = dflash_fresh(&[1, 2, 7], 2);
     assert!(fresh.resume_at(Some((1, &checkpoint))).is_err());
@@ -988,6 +1036,9 @@ fn dflash_checkpoints_wait_for_reconciled_drafts_and_keep_their_kind() {
     // An MTP generation never adopts a separate draft's state.
     let mut mtp = mtp_fresh(&[1, 2, 7], 2);
     assert!(mtp.resume_at(Some((2, &checkpoint))).is_err());
+    source.take(4).unwrap();
+    let (source, _) = draft(source, 4);
+    assert!(source.method_checkpoint().is_err());
 }
 
 /// Cancelling while a block draft is in flight finishes the generation
