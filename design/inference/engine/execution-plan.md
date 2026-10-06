@@ -131,7 +131,11 @@ left unmeasured because another unit was searched to exhaustion. Each unit estim
 from its census (the defaults' pass over its points, its forms, the programs they need); the
 plan prices a program at what forming one has taken so far in this preparation, so a cold
 pipeline cache is seen after the first start, and scales the units' estimates by how the starts
-so far compared with theirs. A unit gets its form starts while they fit together with a
+so far compared with theirs. Its conclusion is estimated as what the start leaves to confirm: the
+defaults and the form starts it measures (one rival where it has none; never more than the
+finalists a conclusion confirms), each at the defaults' measured sample. Rivals found later are
+covered by the reserve the started search states, so a unit whose defaults are slow is not
+refused its start for a confirmation of configurations as slow as they. A unit gets its form starts while they fit together with a
 defaults-only start and the conclusion of every unit after it, else a defaults-only start while
 that fits (it is then refined first, before any slice is dealt by weight, and that step measures
 its form starts), else it keeps its defaults; the

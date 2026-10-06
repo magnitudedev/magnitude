@@ -1519,11 +1519,8 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
             forms: configuration * forms as u32,
             default_programs: launches,
             form_programs: forms * launches,
-            // The defaults and the finalists, each sampled as confirmation
-            // samples it, at about half a pass a sample.
-            conclusion: Duration::from_secs_f64(
-                pass / 2. * ((settings.confirmed + 1) * (settings.confirmation_samples + 1)) as f64,
-            ) + admission,
+            conclusion: started_conclusion(censused_sample(&self.census), forms, scoped, &settings)
+                + admission,
         }
     }
 
@@ -1715,20 +1712,24 @@ fn step_shares(units: &[UnitTime<'_>]) -> Vec<f64> {
         .collect()
 }
 
-/// The defaults' time a census measured at each of its timed points, with
-/// those points' shapes.
-fn censused_times(shapes: &[PointShape], census: &TuningResult) -> (Vec<PointShape>, Vec<f64>) {
-    let Some(measured) = census
+/// The defaults' measurements at the points a census timed; none when its
+/// required points did not fit.
+fn censused_defaults(census: &TuningResult) -> &[seismic::PointMeasurement] {
+    census
         .configurations
         .iter()
         .find(|record| record.configuration == census.overall)
         .and_then(|record| match &record.outcome {
-            seismic::Outcome::Measured { points, .. } => Some(points),
+            seismic::Outcome::Measured { points, .. } => Some(points.as_slice()),
             seismic::Outcome::Excluded(_) => None,
         })
-    else {
-        return (Vec::new(), Vec::new());
-    };
+        .unwrap_or_default()
+}
+
+/// The defaults' time a census measured at each of its timed points, with
+/// those points' shapes.
+fn censused_times(shapes: &[PointShape], census: &TuningResult) -> (Vec<PointShape>, Vec<f64>) {
+    let measured = censused_defaults(census);
     shapes
         .iter()
         .filter_map(|shape| {
@@ -1738,6 +1739,46 @@ fn censused_times(shapes: &[PointShape], census: &TuningResult) -> (Vec<PointSha
                 .map(|point| (shape.clone(), point.median_seconds))
         })
         .unzip()
+}
+
+/// What one sample of the defaults over the points a census timed takes:
+/// each point's invocation as measured, times its repetitions. A search
+/// prices a confirmation sample of a configuration the same way.
+fn censused_sample(census: &TuningResult) -> Duration {
+    Duration::from_secs_f64(
+        censused_defaults(census)
+            .iter()
+            .map(|point| point.median_seconds * point.repetitions as f64)
+            .sum(),
+    )
+}
+
+/// What concluding a unit takes when its start is done, estimated before it
+/// starts: confirming the finalists the start leaves, each sampled as the
+/// confirmation samples it (after a calibrating pass) at the defaults'
+/// `sample`. The finalists are the defaults and the rivals the start
+/// measures: its `forms` form starts, at most the settings' confirmed
+/// finalists (a unit without form starts meets its first rival in its first
+/// refinement). A launch-scoped search reserves the settings' finalists
+/// whatever it has measured.
+///
+/// The rivals a refinement finds later take no part: once a unit has started
+/// its search states its own reserve from what it measured, and is not
+/// refined past it. Pricing them here at the defaults' sample would refuse
+/// the start of a unit whose defaults are slow, which is the unit a search
+/// recovers the most for, and whose rivals are the faster for it.
+fn started_conclusion(
+    sample: Duration,
+    forms: usize,
+    scoped: bool,
+    settings: &SearchSettings,
+) -> Duration {
+    let finalists = if scoped {
+        settings.confirmed + 1
+    } else {
+        1 + forms.max(1).min(settings.confirmed)
+    };
+    sample * (finalists * (settings.confirmation_samples + 1)) as u32
 }
 
 /// One unit's built cases by point, kept from its census for its search,

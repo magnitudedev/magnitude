@@ -191,6 +191,36 @@ fn the_census_times_the_costliest_point_of_each_chunk_class() {
 }
 
 #[test]
+fn a_conclusion_is_estimated_from_what_the_start_leaves_to_confirm() {
+    let settings = search_settings(BackendName::Cuda);
+    let samples = (settings.confirmation_samples + 1) as u32;
+    // One-row decode attention of one key/value head and sixteen query heads
+    // of 512 columns at up to 65536 rows of history, on a GB10: the defaults'
+    // sample over the census's points takes 1.21 s and their pass 5.81 s; the
+    // other form's start measures in a fiftieth of that.
+    let sample = Duration::from_millis(1210);
+    let pass = Duration::from_millis(5810);
+    // The defaults and the one form start.
+    let conclusion = started_conclusion(sample, 1, false, &settings);
+    assert_eq!(conclusion, sample * 2 * samples);
+    // The start with its form start and that conclusion fit the tuning
+    // time with room for the units after it.
+    assert!(pass * 2 + conclusion < TUNING_TIME.mul_f64(0.6));
+    // Without form starts the first refinement finds the first rival.
+    assert_eq!(started_conclusion(sample, 0, false, &settings), conclusion);
+    // No more rivals are confirmed than the settings' finalists.
+    assert_eq!(
+        started_conclusion(sample, 9, false, &settings),
+        sample * (settings.confirmed as u32 + 1) * samples
+    );
+    // A launch-scoped search reserves them all from its start.
+    assert_eq!(
+        started_conclusion(sample, 1, true, &settings),
+        sample * (settings.confirmed as u32 + 1) * samples
+    );
+}
+
+#[test]
 fn a_unit_serving_only_chunks_holds_its_part_of_the_prefill_classes() {
     // One unit serves every row count, one only chunks. The census timed
     // each at its census points: the first takes a second everywhere, the
