@@ -499,12 +499,36 @@ pub fn served_row_points(limits: TuningLimits, serves: impl Fn(u64) -> bool) -> 
     )
 }
 
-/// `rows` crossed with the history lengths the engine serves.
-pub fn with_contexts(limits: TuningLimits, rows: Vec<PointShape>) -> Vec<PointShape> {
-    let contexts = TUNING_CONTEXTS
+/// The longest history the engine serves to layers keeping at most `window`
+/// history rows: the window when it is shorter than the context, else the
+/// context.
+pub fn longest_history(limits: TuningLimits, window: Option<u64>) -> u64 {
+    window.map_or(limits.context_tokens, |window| window.min(limits.context_tokens))
+}
+
+/// `rows` crossed with the history lengths the engine serves to layers
+/// keeping at most `window` history rows (the whole context without one).
+///
+/// A layer whose window is shorter than the context never sees a longer
+/// history and sees exactly its window in every prompt longer than it, so
+/// its lengths are the ladder's below the window and the window itself. A
+/// window that holds the whole context bounds nothing.
+pub fn with_contexts(
+    limits: TuningLimits,
+    window: Option<u64>,
+    rows: Vec<PointShape>,
+) -> Vec<PointShape> {
+    let longest = longest_history(limits, window);
+    let window = window.filter(|window| *window < limits.context_tokens);
+    let mut contexts = TUNING_CONTEXTS
         .into_iter()
-        .filter(|context| *context <= limits.context_tokens)
+        .filter(|context| *context <= longest)
         .collect::<Vec<_>>();
+    if let Some(window) = window {
+        if !contexts.contains(&window) {
+            contexts.push(window);
+        }
+    }
     let contexts = if contexts.is_empty() {
         vec![limits.context_tokens]
     } else {
@@ -526,9 +550,10 @@ pub fn with_contexts(limits: TuningLimits, rows: Vec<PointShape>) -> Vec<PointSh
     )
 }
 
-/// Row points crossed with the history lengths the engine serves.
+/// Row points crossed with the history lengths the engine serves to layers
+/// keeping the whole context.
 pub fn attention_points(limits: TuningLimits) -> Vec<PointShape> {
-    with_contexts(limits, row_points(limits))
+    with_contexts(limits, None, row_points(limits))
 }
 
 /// In-place state a case lends to an entry's `&mut` parameter: the tensor,

@@ -1,8 +1,9 @@
 use super::specialization::{Specializer, Tuning};
 use super::tuning::{
     attention::{
-        AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
-        AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning,
+        history_window, AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix,
+        AttentionOutputTuning, AttentionPrefillK8V4Tuning, AttentionPrefillTuning,
+        AttentionProjectTuning,
     },
     cases::{DenseExpandTuning, DenseOutputTuning, DenseUpTuning},
     general_routed::{
@@ -732,6 +733,13 @@ impl<'a> Preparation<'a> {
                 epsilon: self.epsilon,
             },
         )?;
+        let window = history_window(&self.tuning.model(), &scopes).map_err(|outcome| {
+            CatalogFailure::Preparation {
+                entry: "attention_decode",
+                bindings: format!("{shape:?}"),
+                outcome,
+            }
+        })?;
         let mix = || AttentionMix {
             activation,
             shape,
@@ -739,6 +747,7 @@ impl<'a> Preparation<'a> {
             epsilon: self.epsilon,
             decode_rows: None,
             listed: false,
+            window,
         };
         let history = match binding.history {
             KvCodec::Dense => {

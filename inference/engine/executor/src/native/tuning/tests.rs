@@ -204,9 +204,104 @@ fn the_census_times_the_costliest_point_of_each_chunk_class() {
     // Attention: the most rows at the longest history.
     let chunks = served_row_points(LIMITS, |rows| rows >= 16);
     assert_eq!(
-        labels(&with_contexts(LIMITS, chunks)),
+        labels(&with_contexts(LIMITS, None, chunks.clone())),
         ["m32-c16384", "m512-c16384"]
     );
+    // Window layers: the most rows at the window.
+    assert_eq!(
+        labels(&with_contexts(LIMITS, Some(1024), chunks)),
+        ["m32-c1024", "m512-c1024"]
+    );
+}
+
+#[test]
+fn a_units_window_is_the_longest_history_its_layers_keep() {
+    use magnitude_family_contracts::{
+        Attention, HistoryDomain, KeyValue, ModelDefinition, Operator, SublayerIndex, WeightScope,
+    };
+    fn mixer(definition: &mut ModelDefinition, block: usize) -> &mut Attention {
+        match &mut definition.decoder.blocks[block].sublayers[0].op {
+            Operator::Attention(attention) => &mut **attention,
+            other => panic!("the fixture's mixer is {}", other.name()),
+        }
+    }
+    let layer = |block: u32| SublayerIndex { block, sublayer: 0 };
+    // Four attention layers: the whole context, windows of 1024 and 2048
+    // rows, and a layer reading the 1024-row window's history.
+    let (mut definition, load) = fixture_load();
+    let block = definition.decoder.blocks[0].clone();
+    definition.decoder.blocks = vec![block; 4];
+    for (block, tokens) in [(1, 1024), (2, 2048)] {
+        let KeyValue::Owned { domain, .. } = &mut mixer(&mut definition, block).key_value
+        else {
+            panic!("the fixture's attention owns its history");
+        };
+        *domain = HistoryDomain::Window { tokens };
+    }
+    mixer(&mut definition, 3).key_value = KeyValue::Shared { source: layer(1) };
+    let inputs = ModelInputs {
+        definition: &definition,
+        limits: LIMITS,
+        load: &load,
+    };
+    let kept = |blocks: &[u32]| {
+        attention::history_window(
+            &inputs,
+            &blocks
+                .iter()
+                .map(|block| WeightScope::TargetSublayer(layer(*block)))
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(kept(&[1]), Ok(Some(1024)));
+    // The largest window among a unit's layers.
+    assert_eq!(kept(&[1, 2]), Ok(Some(2048)));
+    // A Shared layer keeps what its source does.
+    assert_eq!(kept(&[3]), Ok(Some(1024)));
+    // Any layer keeping the whole context leaves the unit unbounded.
+    assert_eq!(kept(&[0]), Ok(None));
+    assert_eq!(kept(&[1, 0, 2]), Ok(None));
+    assert!(kept(&[]).is_err());
+}
+
+#[test]
+fn window_layers_are_timed_at_the_histories_their_window_keeps() {
+    let decode = || served_row_points(LIMITS, |rows| rows == 1);
+    let labels = |window: Option<u64>| {
+        with_contexts(LIMITS, window, decode())
+            .into_iter()
+            .map(|point| point.label)
+            .collect::<Vec<_>>()
+    };
+    // Layers keeping the whole context see every served length of the
+    // ladder: the points, and with them the key, of every stored result.
+    let whole = ["m1-c0", "m1-c256", "m1-c4096", "m1-c16384"];
+    assert_eq!(labels(None), whole);
+    // A window shorter than the context is the longest history its layers
+    // see, and the history of every prompt longer than it.
+    assert_eq!(labels(Some(1024)), ["m1-c0", "m1-c256", "m1-c1024"]);
+    assert_eq!(labels(Some(4096)), ["m1-c0", "m1-c256", "m1-c4096"]);
+    assert_eq!(labels(Some(128)), ["m1-c0", "m1-c128"]);
+    // A window that holds the whole context bounds nothing.
+    assert_eq!(labels(Some(16384)), whole);
+    assert_eq!(labels(Some(65536)), whole);
+    let windowed = with_contexts(LIMITS, Some(1024), row_points(LIMITS));
+    assert_eq!(windowed.len(), TUNING_ROWS.len() * 3);
+    assert!((windowed.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
+    // The window's lengths of one row point are its class, each row class
+    // keeping the share it has at any history.
+    assert_eq!(windowed[2].class.as_deref(), Some("m1"));
+    let share = |points: &[PointShape], rows: u64| {
+        points
+            .iter()
+            .filter(|point| point.rows == rows)
+            .map(|point| point.weight)
+            .sum::<f64>()
+    };
+    let whole = attention_points(LIMITS);
+    for rows in TUNING_ROWS {
+        assert!((share(&windowed, rows) - share(&whole, rows)).abs() < 1e-12);
+    }
 }
 
 #[test]

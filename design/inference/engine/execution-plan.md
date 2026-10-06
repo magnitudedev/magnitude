@@ -68,7 +68,11 @@ preparation, on the first preparation for each tuning key, whether by a load or 
 job that follows a catalog installation: each such entry registers a tuning case
 that supplies static values from model geometry, weighted tuning points over the shape classes that
 entry serves (every row class of its graph path, crossed with served history lengths for attention,
-including the empty history that exercises the fresh-only path;
+including the empty history that exercises the fresh-only path; a unit whose layers all keep a
+window of history shorter than the context is timed at the lengths below its largest window and at
+that window, the history every longer prompt gives it, instead of lengths its layers never see, and
+a search start sized from history (the attention decode forms' encoded-history slice) is sized from
+that window too;
 selection-row classes up to the selection bound for the readout, each retaining its own step-time
 share; the prefill chunk classes divide theirs by the octaves of prompt length each serves, the
 largest launch's class holding every octave from its rows to the served context, since a longer
