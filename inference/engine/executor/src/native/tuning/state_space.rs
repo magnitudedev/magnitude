@@ -354,7 +354,7 @@ macro_rules! state_entry {
             }
 
             fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-                served_row_points(limits.max_rows, $serves)
+                served_row_points(limits, $serves)
             }
 
             fn rotation(

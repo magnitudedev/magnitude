@@ -483,7 +483,7 @@ macro_rules! state_entry {
             }
 
             fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-                served_row_points(limits.max_rows, $serves)
+                served_row_points(limits, $serves)
             }
 
             fn rotation(
@@ -570,7 +570,7 @@ impl EntryTuning for RecurrentProjectConvolvedTuning {
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        served_row_points(limits.max_rows, |rows| rows < CHUNKED_ROWS)
+        served_row_points(limits, |rows| rows < CHUNKED_ROWS)
     }
 
     fn rotation(
@@ -673,7 +673,7 @@ impl EntryTuning for RecurrentStepConvolvedTuning {
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        served_row_points(limits.max_rows, |rows| rows < CHUNKED_ROWS)
+        served_row_points(limits, |rows| rows < CHUNKED_ROWS)
     }
 
     fn rotation(

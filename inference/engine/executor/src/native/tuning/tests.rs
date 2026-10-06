@@ -67,7 +67,10 @@ fn row_points_follow_the_shape_ladder_and_normalize_weights() {
     );
     let total = points.iter().map(|point| point.weight).sum::<f64>();
     assert!((total - 1.0).abs() < 1e-12);
-    // Each served row class retains its own share of step time.
+    // Each served row class retains its own share of step time. The prefill
+    // chunks divide theirs by the octaves of prompt length each serves: one
+    // each, and the largest every octave from 512 rows to the 16384-token
+    // context besides, five of them.
     let weights = points.iter().map(|point| point.weight).collect::<Vec<_>>();
     for (weight, expected) in weights.iter().zip([
         0.40,
@@ -76,13 +79,29 @@ fn row_points_follow_the_shape_ladder_and_normalize_weights() {
         0.20 / 3.0,
         0.05,
         0.05,
-        0.075,
-        0.075,
-        0.075,
-        0.075,
+        0.30 / 9.0,
+        0.30 / 9.0,
+        0.30 / 9.0,
+        0.30 * 6.0 / 9.0,
     ]) {
         assert!((weight - expected).abs() < 1e-12, "{weights:?}");
     }
+    // A context no longer than the largest launch holds no longer prompt:
+    // the chunks weigh alike.
+    let short = row_points(TuningLimits {
+        context_tokens: 512,
+        ..LIMITS
+    });
+    assert!(short[6..]
+        .iter()
+        .all(|point| (point.weight - 0.075).abs() < 1e-12));
+    // The largest launch of an engine bounded below 512 rows takes the
+    // longer prompts: 256 rows serve seven octaves of the nine.
+    let narrow = row_points(TuningLimits {
+        max_rows: 256,
+        ..LIMITS
+    });
+    assert!((narrow[8].weight / narrow[7].weight - 7.0).abs() < 1e-9);
     let bounded = row_points(TuningLimits {
         max_rows: 32,
         ..LIMITS
@@ -179,11 +198,11 @@ fn the_census_times_the_costliest_point_of_each_chunk_class() {
     );
     // An entry bounded below the largest chunk is timed at its own largest.
     assert_eq!(
-        labels(&served_row_points(256, |rows| rows >= 32)),
+        labels(&served_row_points(TuningLimits { max_rows: 256, ..LIMITS }, |rows| rows >= 32)),
         ["m32", "m256"]
     );
     // Attention: the most rows at the longest history.
-    let chunks = served_row_points(512, |rows| rows >= 16);
+    let chunks = served_row_points(LIMITS, |rows| rows >= 16);
     assert_eq!(
         labels(&with_contexts(LIMITS, chunks)),
         ["m32-c16384", "m512-c16384"]
@@ -226,7 +245,7 @@ fn a_unit_serving_only_chunks_holds_its_part_of_the_prefill_classes() {
     // each at its census points: the first takes a second everywhere, the
     // second three.
     let every = row_points(LIMITS);
-    let chunks = served_row_points(512, |rows| rows >= 16);
+    let chunks = served_row_points(LIMITS, |rows| rows >= 16);
     let timed = |shapes: &[PointShape]| {
         shapes
             .iter()
@@ -236,20 +255,23 @@ fn a_unit_serving_only_chunks_holds_its_part_of_the_prefill_classes() {
             .collect::<Vec<_>>()
     };
     let (every_timed, chunks_timed) = (timed(&every), timed(&chunks));
-    let shares = step_shares(&[
-        UnitTime {
-            launches: 1,
-            served: &every,
-            shapes: &every_timed,
-            seconds: &vec![1.; every_timed.len()],
-        },
-        UnitTime {
-            launches: 1,
-            served: &chunks,
-            shapes: &chunks_timed,
-            seconds: &vec![3.; chunks_timed.len()],
-        },
-    ]);
+    let shares = step_shares(
+        &[
+            UnitTime {
+                launches: 1,
+                served: &every,
+                shapes: &every_timed,
+                seconds: &vec![1.; every_timed.len()],
+            },
+            UnitTime {
+                launches: 1,
+                served: &chunks,
+                shapes: &chunks_timed,
+                seconds: &vec![3.; chunks_timed.len()],
+            },
+        ],
+        LIMITS,
+    );
     // The streaming classes (0.6 of the step) are the first unit's alone;
     // the chunk classes (0.4) split one to three.
     assert!((shares[0] - 0.7).abs() < 1e-9, "{shares:?}");
@@ -257,20 +279,23 @@ fn a_unit_serving_only_chunks_holds_its_part_of_the_prefill_classes() {
     // Timed at its cheapest point alone, as a census of required points
     // left it, the second unit held only its part of that one class.
     let cheapest = [chunks[0].clone()];
-    let shares = step_shares(&[
-        UnitTime {
-            launches: 1,
-            served: &every,
-            shapes: &every_timed,
-            seconds: &vec![1.; every_timed.len()],
-        },
-        UnitTime {
-            launches: 1,
-            served: &chunks,
-            shapes: &cheapest,
-            seconds: &[3.],
-        },
-    ]);
+    let shares = step_shares(
+        &[
+            UnitTime {
+                launches: 1,
+                served: &every,
+                shapes: &every_timed,
+                seconds: &vec![1.; every_timed.len()],
+            },
+            UnitTime {
+                launches: 1,
+                served: &chunks,
+                shapes: &cheapest,
+                seconds: &[3.],
+            },
+        ],
+        LIMITS,
+    );
     assert!(shares[1] < 0.3, "{shares:?}");
 }
 
@@ -318,24 +343,24 @@ fn attention_points_cross_rows_with_served_contexts() {
 
 #[test]
 fn served_points_keep_an_entry_whose_rows_exceed_the_bound() {
-    let chunked = served_row_points(512, |rows| rows >= 16);
+    let chunked = served_row_points(LIMITS, |rows| rows >= 16);
     assert_eq!(
         chunked.iter().map(|point| point.rows).collect::<Vec<_>>(),
         [16, 32, 64, 128, 256, 512]
     );
-    let decode = served_row_points(512, |rows| rows <= 8);
+    let decode = served_row_points(LIMITS, |rows| rows <= 8);
     assert_eq!(
         decode.iter().map(|point| point.rows).collect::<Vec<_>>(),
         [1, 2, 4, 8]
     );
     // A bound admits only the served rows at or below it.
-    let short = served_row_points(16, |rows| rows >= 16);
+    let short = served_row_points(TuningLimits { max_rows: 16, ..LIMITS }, |rows| rows >= 16);
     assert_eq!(
         short.iter().map(|point| point.rows).collect::<Vec<_>>(),
         [16]
     );
     assert!((chunked.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
-    let stand_in = served_row_points(8, |rows| rows >= 16);
+    let stand_in = served_row_points(TuningLimits { max_rows: 8, ..LIMITS }, |rows| rows >= 16);
     assert_eq!(stand_in.len(), 1);
     assert_eq!(stand_in[0].rows, 16);
     assert_eq!(stand_in[0].weight, 1.0);
@@ -350,7 +375,7 @@ fn rotations_take_distinct_layers_spread_over_depth() {
         })
     };
     let scopes = (0..32).map(block).collect::<Vec<_>>();
-    let rows = |rows| served_row_points(512, move |served| served == rows).remove(0);
+    let rows = |rows| served_row_points(LIMITS, move |served| served == rows).remove(0);
     assert_eq!(
         TuningInputs::rotation_scopes(&scopes, &rows(4)),
         [0, 8, 16, 24].map(block)

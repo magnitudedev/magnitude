@@ -35,12 +35,12 @@ pub(crate) struct RoutedShape {
 
 /// The decode points: row counts the decode form serves.
 pub(crate) fn decode_points(limits: TuningLimits) -> Vec<PointShape> {
-    served_row_points(limits.max_rows, |rows| rows <= DECODE_ROWS)
+    served_row_points(limits, |rows| rows <= DECODE_ROWS)
 }
 
 /// The grouped points: row counts past the decode form.
 pub(crate) fn grouped_points(limits: TuningLimits) -> Vec<PointShape> {
-    served_row_points(limits.max_rows, |rows| rows > DECODE_ROWS)
+    served_row_points(limits, |rows| rows > DECODE_ROWS)
 }
 
 /// Distinct experts per row with the uneven expert loads of real routing: the

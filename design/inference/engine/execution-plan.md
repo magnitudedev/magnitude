@@ -70,7 +70,9 @@ that supplies static values from model geometry, weighted tuning points over the
 entry serves (every row class of its graph path, crossed with served history lengths for attention,
 including the empty history that exercises the fresh-only path;
 selection-row classes up to the selection bound for the readout, each retaining its own step-time
-share), rotations over real resident weights of distinct layers for weight-streaming decode rows,
+share; the prefill chunk classes divide theirs by the octaves of prompt length each serves, the
+largest launch's class holding every octave from its rows to the served context, since a longer
+prompt is prefilled in launches of that many rows), rotations over real resident weights of distinct layers for weight-streaming decode rows,
 control tables packed by the batch builder. Every tuned entry uses a bounded precision policy,
 with explicit floating result and writable-state subject limits shared with the compiler policy
 representation. Production tuning uses the declaration default native specialization as its

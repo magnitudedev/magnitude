@@ -785,7 +785,7 @@ macro_rules! mix_entry {
             fn served(&self, limits: TuningLimits) -> Vec<PointShape> {
                 with_contexts(
                     limits,
-                    served_row_points(limits.max_rows, |rows| {
+                    served_row_points(limits, |rows| {
                         ($serves)(rows)
                             && self
                                 .0

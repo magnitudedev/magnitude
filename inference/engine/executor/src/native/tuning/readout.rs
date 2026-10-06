@@ -143,7 +143,13 @@ impl EntryTuning for DraftRowsTuning {
 
 /// The projected-row points of the readout.
 fn projected_points(limits: TuningLimits) -> Vec<PointShape> {
-    served_row_points(limits.max_projected_rows, |_| true)
+    served_row_points(
+        TuningLimits {
+            max_rows: limits.max_projected_rows,
+            ..limits
+        },
+        |_| true,
+    )
 }
 
 /// `[V, D]` of the output projection.
@@ -260,7 +266,13 @@ impl EntryTuning for HeadRowsTuning {
 /// The certified levels serve selection rows up to the backend's certified
 /// row bound.
 fn certified_points(limits: TuningLimits, rows: u64) -> Vec<PointShape> {
-    served_row_points(limits.max_projected_rows.min(rows), |_| true)
+    served_row_points(
+        TuningLimits {
+            max_rows: limits.max_projected_rows.min(rows),
+            ..limits
+        },
+        |_| true,
+    )
 }
 
 /// The bindings every progressive head entry shares.

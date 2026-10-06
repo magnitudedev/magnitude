@@ -362,16 +362,56 @@ impl TuningLimits {
     }
 }
 
-/// Provisional share of expected step time per row count. Decode (1 row)
-/// dominates serving; verify and concurrency rows (2–8) come next; prefill
-/// chunks share the rest. Weights of points beyond the engine's bounds are
-/// dropped and the remainder renormalized.
-fn row_share(rows: u64) -> f64 {
+/// Provisional share of expected step time per row count, for an engine
+/// whose largest launch has `limits.max_rows` rows and whose context is
+/// `limits.context_tokens`. Decode (1 row) dominates serving; verify and
+/// concurrency rows (2–8) come next; the short chunks (16 and 32 rows) and
+/// the prefill chunks share the rest. Weights of points beyond the engine's
+/// bounds are dropped and the remainder renormalized.
+///
+/// The prefill chunks divide their share by the prompts each row count
+/// serves ([`chunk_octaves`]): a prompt longer than the largest launch is
+/// prefilled in launches of that many rows, so the largest row count holds
+/// the share of every longer prompt up to the context, not one part in as
+/// many as there are chunk row counts.
+fn row_share(rows: u64, limits: TuningLimits) -> f64 {
     match rows {
         1 => 0.40,
         2..=8 => 0.20 / 3.0,
         16 | 32 => 0.05,
-        _ => 0.30 / 4.0,
+        _ => {
+            let octaves = |rows: u64| chunk_octaves(rows, limits);
+            let served = TUNING_ROWS
+                .into_iter()
+                .filter(|rows| *rows > SHORT_CHUNK_ROWS)
+                .map(octaves)
+                .sum::<f64>();
+            0.30 * octaves(rows) / served
+        }
+    }
+}
+
+/// The largest row count of the short chunks; larger row counts are the
+/// prefill chunks.
+const SHORT_CHUNK_ROWS: u64 = 32;
+
+/// The octaves of prompt length the prefill row count `rows` serves, prompt
+/// lengths being as likely in one octave as in another: its own (the prompts
+/// of more than half its rows up to its rows), and for the largest row count
+/// within the engine's row bound every octave from there to the context,
+/// whose prompts are prefilled in launches of that many rows. None for a row
+/// count beyond the bound.
+fn chunk_octaves(rows: u64, limits: TuningLimits) -> f64 {
+    let largest = TUNING_ROWS
+        .into_iter()
+        .filter(|rows| *rows <= limits.max_rows)
+        .max();
+    match largest {
+        Some(largest) if rows == largest => {
+            1. + (limits.context_tokens.max(largest) as f64 / largest as f64).log2()
+        }
+        Some(largest) if rows < largest => 1.,
+        _ => 0.,
     }
 }
 
@@ -415,10 +455,10 @@ fn normalized(mut points: Vec<PointShape>) -> Vec<PointShape> {
     points
 }
 
-fn row_point(rows: u64) -> PointShape {
+fn row_point(rows: u64, weight: f64) -> PointShape {
     PointShape {
         label: format!("m{rows}"),
-        weight: row_share(rows),
+        weight,
         rows,
         context: None,
         class: None,
@@ -427,14 +467,14 @@ fn row_point(rows: u64) -> PointShape {
 
 /// Row points up to the engine's row bound.
 pub fn row_points(limits: TuningLimits) -> Vec<PointShape> {
-    served_row_points(limits.max_rows, |_| true)
+    served_row_points(limits, |_| true)
 }
 
-/// Every row point an entry serves up to `bound`. An entry whose served rows
-/// all lie beyond the bound is still prepared (its graph classes do not
-/// exist, but the kernel set is complete); its smallest served row count
-/// stands in as the single point.
-pub fn served_row_points(bound: u64, serves: impl Fn(u64) -> bool) -> Vec<PointShape> {
+/// Every row point an entry serves up to the row bound of `limits`. An entry
+/// whose served rows all lie beyond the bound is still prepared (its graph
+/// classes do not exist, but the kernel set is complete); its smallest served
+/// row count stands in as the single point.
+pub fn served_row_points(limits: TuningLimits, serves: impl Fn(u64) -> bool) -> Vec<PointShape> {
     let served = TUNING_ROWS
         .into_iter()
         .filter(|rows| serves(*rows))
@@ -442,19 +482,21 @@ pub fn served_row_points(bound: u64, serves: impl Fn(u64) -> bool) -> Vec<PointS
     let within = served
         .iter()
         .copied()
-        .filter(|rows| *rows <= bound)
+        .filter(|rows| *rows <= limits.max_rows)
         .collect::<Vec<_>>();
     if within.is_empty() {
         return served
             .into_iter()
             .take(1)
-            .map(|rows| PointShape {
-                weight: 1.0,
-                ..row_point(rows)
-            })
+            .map(|rows| row_point(rows, 1.0))
             .collect();
     }
-    normalized(within.into_iter().map(row_point).collect())
+    normalized(
+        within
+            .into_iter()
+            .map(|rows| row_point(rows, row_share(rows, limits)))
+            .collect(),
+    )
 }
 
 /// `rows` crossed with the history lengths the engine serves.
@@ -1671,7 +1713,7 @@ struct UnitTime<'u> {
 /// them, and a unit serving only chunks holds its part of them. The
 /// defaults' time is also what tuning can recover: a unit far from its best
 /// spends more of the step and gets more of the time.
-fn step_shares(units: &[UnitTime<'_>]) -> Vec<f64> {
+fn step_shares(units: &[UnitTime<'_>], limits: TuningLimits) -> Vec<f64> {
     let time = |unit: &UnitTime<'_>, rows: u64| {
         if !unit.served.iter().any(|shape| shape.rows == rows) {
             return 0.0;
@@ -1711,7 +1753,7 @@ fn step_shares(units: &[UnitTime<'_>]) -> Vec<f64> {
                 .iter()
                 .zip(&class_time)
                 .filter(|(_, total)| **total > 0.0)
-                .map(|(rows, total)| row_share(*rows) * time(unit, *rows) / total)
+                .map(|(rows, total)| row_share(*rows, limits) * time(unit, *rows) / total)
                 .sum()
         })
         .collect()
@@ -1899,6 +1941,7 @@ impl<'a> Tuner<'a> {
                     seconds,
                 })
                 .collect::<Vec<_>>(),
+            self.limits,
         );
         // Shares among the units searching: a row class no unit was timed
         // at takes no part.
