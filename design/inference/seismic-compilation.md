@@ -198,7 +198,8 @@ own records of tuning results, Seismic exposes a device tuning identity that inc
 build, the CUDA driver and NVRTC release, or the CPU's detected instruction-set tier and CPU library
 version, and an implementation digest over an entry's declaration and the source rendered for it (on
 CPU, the compiled implementation's digest of its asset, its source root's CPU library files and the
-CPU library version).
+CPU library version). The digest names no location: the same sources built in another directory keep
+their stored results.
 A CPU device executes on one worker pool per process: one participant per physical performance core,
 the submitting thread among them, shared by every CPU device the process opens. A native submission
 is one pool job whatever its launch count: the participants of each launch claim its work items in

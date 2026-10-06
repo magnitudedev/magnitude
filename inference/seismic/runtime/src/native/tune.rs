@@ -3981,7 +3981,11 @@ pub fn implementation_digest(
 }
 
 /// Checked entry IDs carry a process-local owner. A tuning result names the
-/// declaration's values and stable source identity, never that owner.
+/// declaration's values and stable source identity, never that owner. Where
+/// the declaring file was read from is not the implementation either: a build
+/// canonicalizes its sources to absolute paths, so the same sources built in
+/// another directory must keep their stored results. The native source the
+/// declaration names is digested by content, rendered for the entry.
 fn update_declaration_digest(
     digest: &mut Sha256,
     entry_name: &str,
@@ -3994,7 +3998,6 @@ fn update_declaration_digest(
             "{:?}",
             (
                 implementation.backend,
-                &implementation.declared_in,
                 &implementation.source_path,
                 &implementation.statics,
                 &implementation.params,
@@ -4529,16 +4532,27 @@ mod tests {
             "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    launch scale:\n        params (code ROWS in {domain})\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
         )
         };
-        let check = |text: String| {
+        let check = |path: &str, text: String| {
             check_source(SourceSet::new(vec![SourceFile {
-                path: "scale.seismic".into(),
+                path: path.into(),
                 text,
             }]))
             .unwrap()
         };
-        let first = check(source("[1, 2]"));
-        let second = check(source("[1, 2]"));
-        let changed = check(source("[1, 3]"));
+        // The same sources built in two directories are one implementation.
+        let first = check("/build/one/kernels/scale.seismic", source("[1, 2]"));
+        let second = check("/build/two/kernels/scale.seismic", source("[1, 2]"));
+        let changed = check("/build/one/kernels/scale.seismic", source("[1, 3]"));
+        assert_ne!(
+            first
+                .native_implementation(first.entry_named("scale").unwrap(), BackendName::Metal)
+                .unwrap()
+                .declared_in,
+            second
+                .native_implementation(second.entry_named("scale").unwrap(), BackendName::Metal)
+                .unwrap()
+                .declared_in
+        );
         let first_entry = first.entry_named("scale").unwrap();
         let second_entry = second.entry_named("scale").unwrap();
         assert_ne!(first_entry, second_entry);

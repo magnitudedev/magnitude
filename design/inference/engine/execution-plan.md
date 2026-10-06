@@ -188,8 +188,9 @@ is cached). It holds the program artifacts Seismic keeps (CUDA CUBINs, Vulkan SP
 the device's artifact store, one directory per toolchain namespace, and one tuning result per
 tuning key. The key is a digest over what a stored result is valid for: the tuning version, the
 device and toolchain identity (Metal OS build; CUDA driver and NVRTC release), the unit, the
-implementation digest (declaration and rendered source), the precision policy, the admitted error
-classes the entry declares with their envelopes (none for an entry that declares none, so
+implementation digest (declaration and rendered source, never the directory they were built
+from), the precision policy, the admitted error classes the entry declares with their envelopes
+(none for an entry that declares none, so
 admitting a class retunes only the entries that have it), and the labels of
 the served shapes its choice was validated at. How it was searched is not part of the key (search
 settings, tuning time, budget shares, workload weights, the points timed), so improving the
