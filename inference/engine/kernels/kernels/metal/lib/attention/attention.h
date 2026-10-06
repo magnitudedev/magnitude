@@ -546,17 +546,25 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
 // The affine entry's COISSUE form on simdgroup matrices (`prefill_coissue`):
 // Q K^T on the matrix pipe and P V as scalar F16 products in paired
 // simdgroups, over the DIRECT form's decoded history. With tensor operations
-// a COISSUE entry runs the direct form.
+// a COISSUE entry of 16-row query tiles runs the direct form.
 #ifndef PREFILL_COISSUE
 #define PREFILL_COISSUE 0
 #endif
+// A head wider than PREFILL_WINDOW takes a pair per window of its columns
+// (PREFILL_COISSUE_WINDOWS of PREFILL_COISSUE_WIDTH columns each), whose
+// score simdgroups add their partial scores.
+#define PREFILL_COISSUE_WINDOWS (ATTENTION_W > PREFILL_WINDOW ? ATTENTION_W / PREFILL_WINDOW : 1)
+#define PREFILL_COISSUE_WIDTH (ATTENTION_W / PREFILL_COISSUE_WINDOWS)
 // Keys per step of the form (the score fragments of a step stay in registers
 // beside the queries), and the bytes of threadgroup memory a pair of its
-// simdgroups exchanges through (`prefill_coissue::pair`), after the 32 bytes
-// its waits read.
+// simdgroups exchanges through (`prefill_coissue::pair`, then with several
+// windows the pair's partial scores of two steps), after the 32 bytes its
+// waits read.
 #define PREFILL_COISSUE_KEYS (ATTENTION_W > 128 ? 32 : 96)
-#define PREFILL_COISSUE_PAIR_BYTES (48 + 2 * (PREFILL_COISSUE_KEYS * 16 + 32) + 32 * ATTENTION_W)
-#define PREFILL_COISSUE_BYTES(QT) (32 + (QT) * PREFILL_HEADS / 8 * PREFILL_COISSUE_PAIR_BYTES)
+#define PREFILL_COISSUE_PAIR_BYTES (48 + 2 * (PREFILL_COISSUE_KEYS * 16 + 32) + 32 * PREFILL_COISSUE_WIDTH)
+#define PREFILL_COISSUE_PARTIAL_BYTES (PREFILL_COISSUE_WINDOWS > 1 ? 2 * PREFILL_COISSUE_KEYS / 8 * 32 * 8 : 0)
+#define PREFILL_COISSUE_BYTES(QT) \
+    (32 + (QT) * PREFILL_HEADS / 8 * PREFILL_COISSUE_WINDOWS * (PREFILL_COISSUE_PAIR_BYTES + PREFILL_COISSUE_PARTIAL_BYTES))
 // Rows of zero keys and values after the decoded history's rows, which a
 // step reads past them or in place of a history tile the call does not see:
 // the longest step of the entry's form.
@@ -2285,28 +2293,48 @@ inline void prefill_schedule(History history, threadgroup const prefill_interval
 // roles the pair's score simdgroup forms the pair's rows alone with the
 // fragment form's arithmetic (`recompute`), which stores everything the pair
 // stores, so a failed pair's result is the fragment form's.
+//
+// A 512-column head is two windows of 256 columns, and 8 of its rows take a
+// pair per window (pairs 2 r and 2 r + 1 of rows r): a pair's score role
+// forms K Q^T over its window's columns alone, and its product role P V for
+// its window's output columns. The two score roles of the rows add their
+// partial scores: each stores a step's in its pair's `partial` slot of the
+// step's parity, publishes it (`scored`) and waits for the other's, and both
+// add the two (one F32 addition, the same in either order), so they hold the
+// same scores and run the same softmax. A score is then the sum of two F32 sums of 256
+// products, and a head's work is two 256-column heads'. A role reads the
+// other's slot of a step before it publishes the next step, and the other
+// writes that slot again only after it has read that next one. The two pairs
+// of a row group fail together: a pair whose wait expires stops the other's
+// score role, and after the roles either's failure has both recompute, each
+// its window's output from the whole head's scores.
 template <uint QT, class History, uint WIDTH = ATTENTION_W>
 struct prefill_coissue {
     static_assert(History::AFFINE, "the form's operands are F16 (decoded affine history)");
     static constant constexpr uint ROWS = 8;
     // The head width as a parameter, so that the form's layout is checked
-    // where an entry takes it (128- and 256-column heads) and not where a
-    // kernel of another width merely includes it.
+    // where an entry takes it (128-, 256- and 512-column heads) and not where
+    // a kernel of another width merely includes it.
     static constant constexpr uint W = WIDTH;
+    // The head's windows, and a window's columns.
+    static constant constexpr uint WINDOWS = W > PREFILL_WINDOW ? W / PREFILL_WINDOW : 1;
+    static constant constexpr uint C = W / WINDOWS;
     static constant constexpr uint KEYS = PREFILL_COISSUE_KEYS;
     static constant constexpr uint KB = KEYS / 8;
-    static constant constexpr uint DB = W / 8;
-    static constant constexpr uint PAIRS = QT * PREFILL_HEADS / ROWS;
-    // A product lane (kg, cg) owns columns [8 cg, 8 cg + 8) and the keys
-    // KG i + kg of a step; with two key groups it stores rows 4 kg .. 4 kg + 3.
-    static constant constexpr uint CG = W / 8;
+    static constant constexpr uint DB = C / 8;
+    static constant constexpr uint PAIRS = QT * PREFILL_HEADS / ROWS * WINDOWS;
+    // A product lane (kg, cg) owns columns [8 cg, 8 cg + 8) of its window and
+    // the keys KG i + kg of a step; with two key groups it stores rows 4 kg ..
+    // 4 kg + 3.
+    static constant constexpr uint CG = C / 8;
     static constant constexpr uint KG = 32 / CG;
     static constant constexpr uint LANE_KEYS = KEYS / KG;
     static constant constexpr uint OWNED = ROWS / KG;
     static constant constexpr uint SLOTS = 2;
     static constant constexpr float HEADROOM = 4.0f;
     static constant constexpr uint WAIT = 1u << 22;
-    static_assert(W == 128 || W == 256, "product lanes own 8 columns of 128 or 256");
+    static_assert(C == 128 || C == 256, "product lanes own 8 columns of 128 or 256");
+    static_assert(WINDOWS <= 2, "a head is one window or two");
     static_assert(LANE_KEYS % 4 == 0, "a lane's keys are whole pairs of 2-key groups");
 
     // One step's probabilities [key][row] (with two key groups, an odd key's
@@ -2317,18 +2345,28 @@ struct prefill_coissue {
         float carry[ROWS];
     };
     // A pair's exchange: steps filled and consumed, whether a wait expired,
+    // the steps whose partial scores it has stored (a head of two windows),
     // the rows' inverse denominators, the ring, and the product lanes' F32
     // partials [float4][lane].
     struct pair {
         atomic_uint filled;
         atomic_uint consumed;
         atomic_uint failed;
-        uint reserved;
+        atomic_uint scored;
         float inverse[ROWS];
         slot ring[SLOTS];
         float4 partials[OWNED * 2 * 32];
     };
     static_assert(sizeof(pair) == PREFILL_COISSUE_PAIR_BYTES, "the pair's bytes are the declared ones");
+    // A pair's partial scores of two steps, by the step's parity: [key
+    // block][lane], a lane's two elements. After the pairs in the exchange.
+    struct partial {
+        float2 scores[2][KB][32];
+    };
+    static_assert(WINDOWS == 1 || sizeof(partial) == PREFILL_COISSUE_PARTIAL_BYTES,
+        "the partial scores' bytes are the declared ones");
+    // The other pair of pair `index`'s rows (a head of two windows).
+    static inline uint sibling(uint index) { return index ^ 1u; }
 
     static inline void publish(threadgroup atomic_uint *counter, uint value, uint lane) {
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -2368,6 +2406,7 @@ struct prefill_coissue {
             atomic_store_explicit(&mine->filled, 0u, memory_order_relaxed);
             atomic_store_explicit(&mine->consumed, 0u, memory_order_relaxed);
             atomic_store_explicit(&mine->failed, 0u, memory_order_relaxed);
+            atomic_store_explicit(&mine->scored, 0u, memory_order_relaxed);
         }
     }
 
@@ -2409,21 +2448,25 @@ struct prefill_coissue {
     }
 
     // The score role of one pair. Lane (fm, fn) holds keys fm of every key
-    // block against rows fn, fn + 1.
+    // block against rows fn, fn + 1. Of a head of two windows it is window
+    // `window`'s, and `other` is the pair of the rows' other window, whose
+    // partial scores are `theirs` (this pair's are `ours`).
     static inline void scores(History history, device const int *visible, device const int *fresh,
         device const half *keys, device const half *values, device float *statistics, ulong M, ulong R, float scale,
         threadgroup const prefill_interval *intervals, threadgroup const prefill_run *runs,
-        threadgroup pair *mine, threadgroup const uint *spin, uint kv_head, uint partition,
+        threadgroup pair *mine, threadgroup pair *other, threadgroup partial *ours,
+        threadgroup const partial *theirs, threadgroup const uint *spin, uint kv_head, uint partition, uint window,
         device const half *query_rows, uint head, ulong first_token, uint lane) {
         constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
         constexpr ulong STRIDE = SEISMIC_DIM_KV * W;
+        const uint column = window * C;
         const uint quad = lane / 4;
         const uint fm = (quad & 4) + ((lane / 2) % 4);
         const uint fn = (quad & 2) * 2 + (lane % 2) * 2;
         simdgroup_matrix<half, 8, 8> q[DB];
         ATTENTION_UNROLL
         for (uint d = 0; d < DB; ++d)
-            simdgroup_load(q[d], query_rows + d * 8, H * W, ulong2(0, 0), true);
+            simdgroup_load(q[d], query_rows + column + d * 8, H * W, ulong2(0, 0), true);
         // A row's reference is 0 until it has seen a key (`maximum` is then
         // -inf), so an unseen key's probability is exp2(-inf) = 0.
         float maximum[2] = {-INFINITY, -INFINITY};
@@ -2431,12 +2474,19 @@ struct prefill_coissue {
         float denominator[2] = {0.0f, 0.0f};
         uint filled = 0;
         bool alive = true;
+        // A wait of this role expired or its pair failed: the rows' other
+        // pair cannot go on without this one's scores either.
+        const auto stop = [&]() {
+            alive = false;
+            if (WINDOWS > 1 && lane == 0)
+                atomic_store_explicit(&other->failed, 1u, memory_order_relaxed);
+        };
         steps(history, keys, values, runs, M, R, kv_head, [&](device const half *key_rows, device const half *,
             uint span, bool masked, int start, int first, int next) {
             if (!alive)
                 return;
             if (filled >= SLOTS && !await(mine, &mine->consumed, filled + 1 - SLOTS, spin, lane)) {
-                alive = false;
+                stop();
                 return;
             }
             threadgroup slot *to = &mine->ring[filled % SLOTS];
@@ -2449,8 +2499,27 @@ struct prefill_coissue {
                 ATTENTION_UNROLL
                 for (uint j = 0; j < KB; ++j) {
                     simdgroup_matrix<half, 8, 8> k;
-                    simdgroup_load(k, key_rows + j * 8 * STRIDE + d * 8, STRIDE);
+                    simdgroup_load(k, key_rows + j * 8 * STRIDE + column + d * 8, STRIDE);
                     simdgroup_multiply_accumulate(s[j], k, q[d], s[j]);
+                }
+            }
+            // A head of two windows: the step's scores are the two windows'
+            // partial scores added.
+            if constexpr (WINDOWS > 1) {
+                const uint parity = filled & 1u;
+                ATTENTION_UNROLL
+                for (uint j = 0; j < KB; ++j)
+                    ours->scores[parity][j][lane] = float2(s[j].thread_elements()[0], s[j].thread_elements()[1]);
+                publish(&mine->scored, filled + 1, lane);
+                if (!await(mine, &other->scored, filled + 1, spin, lane)) {
+                    stop();
+                    return;
+                }
+                ATTENTION_UNROLL
+                for (uint j = 0; j < KB; ++j) {
+                    const float2 total = ours->scores[parity][j][lane] + theirs->scores[parity][j][lane];
+                    s[j].thread_elements()[0] = total.x;
+                    s[j].thread_elements()[1] = total.y;
                 }
             }
             float peak[2] = {-INFINITY, -INFINITY};
@@ -2529,8 +2598,9 @@ struct prefill_coissue {
         if (!alive)
             return;
         // A split tile stores (maximum, denominator) per row and partition
-        // (the product role stores its partial output); an unsplit one hands
-        // the product role each row's inverse denominator.
+        // (the product role stores its partial output; the windows of a head
+        // hold the same statistics, and the first stores them); an unsplit
+        // one hands the product role each row's inverse denominator.
         ATTENTION_UNROLL
         for (uint e = 0; e < 2; ++e) {
             float total = denominator[e];
@@ -2542,7 +2612,7 @@ struct prefill_coissue {
             const ulong token = first_token + fn + e;
             if (runs[0].end <= 1) {
                 mine->inverse[fn + e] = 1.0f / metal::max(total, 1e-30f);
-            } else if (token < M) {
+            } else if (token < M && window == 0) {
                 const ulong slot_index = (ulong(partition) * M + token) * H + head;
                 statistics[slot_index * 2] = maximum[e];
                 statistics[slot_index * 2 + 1] = total;
@@ -2552,10 +2622,11 @@ struct prefill_coissue {
 
     // The product role of one pair: lane (kg, cg). Register row r of a lane
     // holds row r ^ 4 kg (the slot's order), so after the exchange a lane
-    // keeps register rows 0 .. OWNED - 1 as rows 4 kg + r.
+    // keeps register rows 0 .. OWNED - 1 as rows 4 kg + r. Its columns are
+    // window `window`'s.
     static inline void products(History history, device const half *keys, device const half *values, ulong M,
         ulong R, threadgroup const prefill_run *runs, threadgroup pair *mine, threadgroup const uint *spin,
-        uint kv_head, uint lane) {
+        uint kv_head, uint window, uint lane) {
         constexpr ulong STRIDE = SEISMIC_DIM_KV * W;
         const uint kg = lane / CG;
         const uint cg = lane % CG;
@@ -2599,7 +2670,8 @@ struct prefill_coissue {
             // flight under 128 products); the step's first key overwrites
             // the accumulators.
             threadgroup const uint4 *p = reinterpret_cast<threadgroup const uint4 *>(from->probabilities) + kg;
-            device const uint4 *v = reinterpret_cast<device const uint4 *>(value_rows + kg * STRIDE + cg * 8);
+            device const uint4 *v =
+                reinterpret_cast<device const uint4 *>(value_rows + kg * STRIDE + window * C + cg * 8);
             const auto load = [&](thread operands &o) {
                 o.p = *p;
                 o.v = *v;
@@ -2663,10 +2735,11 @@ struct prefill_coissue {
         });
     }
 
-    // After both roles: the product lanes store the rows they own.
+    // After both roles: the product lanes store the rows they own, in their
+    // window's columns.
     static inline void store(device const Scalar *query, device const Scalar *gate, device Scalar *result,
         device float *partials, ulong M, bool softplus, threadgroup const prefill_run *runs,
-        threadgroup const pair *mine, uint partition, uint head, ulong first_token, uint lane) {
+        threadgroup const pair *mine, uint partition, uint window, uint head, ulong first_token, uint lane) {
         constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
         const uint kg = lane / CG;
         const uint cg = lane % CG;
@@ -2682,7 +2755,7 @@ struct prefill_coissue {
                 const float4 output = owned[(r * 2 + i) * 32];
                 ATTENTION_UNROLL
                 for (uint c = 0; c < 4; ++c) {
-                    const uint column = cg * 8 + i * 4 + c;
+                    const uint column = window * C + cg * 8 + i * 4 + c;
                     if (runs[0].end > 1)
                         partials[((ulong(partition) * M + token) * H + head) * W + column] = output[c];
                     else
@@ -2700,26 +2773,37 @@ struct prefill_coissue {
         threadgroup const prefill_run *runs, threadgroup uchar *exchange, uint tile, uint kv_head,
         uint head_group, uint partition, uint simd, uint lane) {
         const bool product = simd >= PAIRS;
-        const prefill_owner<QT, ROWS> own(tile, kv_head, head_group, simd % PAIRS);
+        // The pair, its rows and its window; the rows' other pair is the
+        // pair itself in a head of one window.
+        const uint index = simd % PAIRS;
+        const uint window = index % WINDOWS;
+        const prefill_owner<QT, ROWS> own(tile, kv_head, head_group, index / WINDOWS);
         threadgroup const uint *spin = reinterpret_cast<threadgroup const uint *>(exchange);
-        threadgroup pair *mine = reinterpret_cast<threadgroup pair *>(exchange + 32) + simd % PAIRS;
+        threadgroup pair *pairs = reinterpret_cast<threadgroup pair *>(exchange + 32);
+        threadgroup pair *mine = pairs + index;
+        threadgroup pair *other = pairs + (WINDOWS > 1 ? sibling(index) : index);
+        threadgroup partial *scored = reinterpret_cast<threadgroup partial *>(pairs + PAIRS);
         device const half *query_rows = queries + (own.first_token * SEISMIC_DIM_KV * SEISMIC_DIM_G + own.head) * W;
         if (own.computes) {
             if (product)
-                products(history, keys, values, M, R, runs, mine, spin, kv_head, lane);
+                products(history, keys, values, M, R, runs, mine, spin, kv_head, window, lane);
             else
-                scores(history, visible, fresh, keys, values, statistics, M, R, scale, intervals, runs, mine, spin,
-                    kv_head, partition, query_rows, own.head, own.first_token, lane);
+                scores(history, visible, fresh, keys, values, statistics, M, R, scale, intervals, runs, mine, other,
+                    scored + index, scored + (WINDOWS > 1 ? sibling(index) : index), spin, kv_head, partition,
+                    window, query_rows, own.head, own.first_token, lane);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (!own.computes)
             return;
-        if (atomic_load_explicit(&mine->failed, memory_order_relaxed) != 0u) {
+        if (atomic_load_explicit(&mine->failed, memory_order_relaxed) != 0u
+            || atomic_load_explicit(&other->failed, memory_order_relaxed) != 0u) {
             if (!product)
                 recompute(history, query, gate, visible, fresh, result, keys, values, partials, statistics, M, R,
-                    scale, softplus, intervals, runs, kv_head, partition, query_rows, own.head, own.first_token, lane);
+                    scale, softplus, intervals, runs, kv_head, partition, window, query_rows, own.head,
+                    own.first_token, lane);
         } else if (product) {
-            store(query, gate, result, partials, M, softplus, runs, mine, partition, own.head, own.first_token, lane);
+            store(query, gate, result, partials, M, softplus, runs, mine, partition, window, own.head,
+                own.first_token, lane);
         }
     }
 
@@ -2727,15 +2811,17 @@ struct prefill_coissue {
     // form's arithmetic over the threadgroup's runs, in steps of that form's
     // keys read from the operand rows in place of a staged tile. A step takes
     // the keys from `first` to the end of their operand rows or of the run,
-    // as a masked step of the roles does.
+    // as a masked step of the roles does. A pair of a head of two windows
+    // forms the whole head's scores and its window's output.
     static inline void recompute(History history, device const Scalar *query, device const Scalar *gate,
         device const int *visible, device const int *fresh, device Scalar *result, device const half *keys,
         device const half *values, device float *partials, device float *statistics, ulong M, ulong R, float scale,
         bool softplus, threadgroup const prefill_interval *intervals, threadgroup const prefill_run *runs,
-        uint kv_head, uint partition, device const half *query_rows, uint head, ulong first_token, uint lane) {
+        uint kv_head, uint partition, uint window, device const half *query_rows, uint head, ulong first_token,
+        uint lane) {
         typedef prefill_fragments<QT, History> Form;
         constexpr ulong STRIDE = SEISMIC_DIM_KV * W;
-        static_assert(Form::WINDOW == W && Form::KEYS <= PREFILL_PAD, "one output window over padded operand rows");
+        static_assert(Form::WINDOW == C && Form::KEYS <= PREFILL_PAD, "one output window over padded operand rows");
         Form state;
         Form::place(state, lane);
         Form::reset(state);
@@ -2754,12 +2840,12 @@ struct prefill_coissue {
                 const prefill_rows rows{visible, fresh, R, run.span, historical, first, next};
                 Form::scores(query_rows, operands.keys + operands.offset(start), STRIDE, start, common, rows,
                     first_token, M, scale, state);
-                Form::accumulate(operands.values + operands.offset(start), STRIDE, 0u, state);
+                Form::accumulate(operands.values + operands.offset(start), STRIDE, window * C, state);
                 first = next;
             }
         }
-        Form::store(query, gate, result, partials, statistics, first_token, M, head, partition, uint(runs[0].end), 0u,
-            softplus, state);
+        Form::store(query, gate, result, partials, statistics, first_token, M, head, partition, uint(runs[0].end),
+            window * C, softplus, state);
     }
 };
 
@@ -2868,23 +2954,13 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     // threadgroup has half the simdgroups (16 rows each): on simdgroup
     // matrices each then takes its two 8-row blocks in turn, or under COISSUE
     // the threadgroup is the co-issue form's pairs (two simdgroups per 8
-    // rows).
-    static_assert(PREFILL_DIRECT == 0 || QT % 16 == 0, "the direct form's simdgroups own 16 rows");
-#if SEISMIC_HAS_TENSOR_OPS
-    if constexpr (PREFILL_DIRECT != 0) {
-        if (thread_index == 0)
-            prefill_direct<QT, History>::schedule(history, intervals,
-                reinterpret_cast<threadgroup prefill_run *>(intervals + R + 1), M, R, kv_head, stored, tiles_lo,
-                tiles_hi);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        prefill_owned_direct<QT, History>(PREFILL_OWNED_ARGUMENTS);
-    } else if constexpr (prefill_tensors_fit(QT)) {
-        prefill_owned_tensors<QT, History>(PREFILL_OWNED_ARGUMENTS);
-    } else {
-        prefill_owned_fragments<QT, History>(PREFILL_OWNED_ARGUMENTS);
-    }
-#else
-    if constexpr (PREFILL_COISSUE != 0) {
+    // rows). A COISSUE entry of 8-row query tiles (a head of two windows,
+    // whose pairs do not fit a threadgroup of 16 rows) is the co-issue form's
+    // on every device.
+    static_assert(PREFILL_DIRECT == 0 || QT % 16 == 0 || PREFILL_COISSUE != 0,
+        "the direct form's simdgroups own 16 rows");
+    constexpr bool COISSUES = PREFILL_COISSUE != 0 && (!SEISMIC_HAS_TENSOR_OPS || QT % 16 != 0);
+    if constexpr (COISSUES) {
         typedef prefill_coissue<QT, History> Form;
         threadgroup prefill_run *runs = reinterpret_cast<threadgroup prefill_run *>(intervals + R + 1);
         if (thread_index == 0)
@@ -2893,16 +2969,32 @@ inline void prefill_attend(History history, device const Scalar *query, device c
         threadgroup_barrier(mem_flags::mem_threadgroup);
         Form::attend(history, query, gate, visible, fresh, result, queries, keys, values, partials, statistics, M,
             R, scale, softplus, intervals, runs, shared, tile, kv_head, head_group, partition, simd, lane);
-    } else if constexpr (PREFILL_DIRECT != 0) {
-        const uint physical = simd;
-        for (uint block = 0; block < 2; ++block) {
-            const uint simd = 2 * physical + block;
+    } else {
+#if SEISMIC_HAS_TENSOR_OPS
+        if constexpr (PREFILL_DIRECT != 0) {
+            if (thread_index == 0)
+                prefill_direct<QT, History>::schedule(history, intervals,
+                    reinterpret_cast<threadgroup prefill_run *>(intervals + R + 1), M, R, kv_head, stored, tiles_lo,
+                    tiles_hi);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            prefill_owned_direct<QT, History>(PREFILL_OWNED_ARGUMENTS);
+        } else if constexpr (prefill_tensors_fit(QT)) {
+            prefill_owned_tensors<QT, History>(PREFILL_OWNED_ARGUMENTS);
+        } else {
             prefill_owned_fragments<QT, History>(PREFILL_OWNED_ARGUMENTS);
         }
-    } else {
-        prefill_owned_fragments<QT, History>(PREFILL_OWNED_ARGUMENTS);
-    }
+#else
+        if constexpr (PREFILL_DIRECT != 0) {
+            const uint physical = simd;
+            for (uint block = 0; block < 2; ++block) {
+                const uint simd = 2 * physical + block;
+                prefill_owned_fragments<QT, History>(PREFILL_OWNED_ARGUMENTS);
+            }
+        } else {
+            prefill_owned_fragments<QT, History>(PREFILL_OWNED_ARGUMENTS);
+        }
 #endif
+    }
 }
 
 // The fold launch of the direct form over decoded history, after each

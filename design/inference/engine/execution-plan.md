@@ -463,10 +463,14 @@ window is one round of a decode and an attend launch; a larger one repeats them 
 `repeat` block), each round taking a window's worth of keys and splitting those into its own key
 partitions, and a fold launch after each attend merges the round's split records into the one
 state per row the window keeps, by the partition merge rule, so a row's rounds are to it what key
-partitions are. For 128- and 256-column heads on simdgroup matrices the co-issue form reads the
-same window in the same rounds: it pairs the attend launch's simdgroups, one forming Q K^T on the
-matrix pipe and one P V as scalar F16 products accumulated in F16 over a step of keys, within the
-BF16 tolerance of the default. A prefill attention graph over K8/V4 history therefore comes in
+partitions are. For 128-, 256- and 512-column heads on simdgroup matrices the co-issue form reads
+the same window in the same rounds: it pairs the attend launch's simdgroups, one forming Q K^T on
+the matrix pipe and one P V as scalar F16 products accumulated in F16 over a step of keys, within
+the BF16 tolerance of the default. A 512-column head is two 256-column windows there, a pair per
+window: each pair scores and produces its own window's columns and the two score simdgroups of a
+row group add their partial scores, so the head's work is two 256-column heads' (the staged form
+walks its keys once per output window, forming the whole head's scores each time and decoding the
+history in every threadgroup). A prefill attention graph over K8/V4 history therefore comes in
 classes that list tiles (powers of two from 16 up to one request's worth, the domain's span limit
 in pages) and one that lists none; all hold the same workspace, the listing classes admit the forms
 that read decoded history, and the other admits only the forms that read history in place. A
@@ -475,7 +479,7 @@ dispatches at most twice the rounds it needs; a round with nothing to do returns
 class that lists none when they exceed the largest; listing and unlisted kernels tune separately.
 A device that has no form reading decoded history for the graph's heads has only the class that
 lists none, which spares it tuning and forming kernels no form of which it can select: Metal has
-one on tensor operations, and on simdgroup matrices for 128- and 256-column heads
+one on tensor operations, and on simdgroup matrices for 128-, 256- and 512-column heads
 (`planning::reads_decoded_history`). The tensor operations fact is the device's own probe
 (`DeviceInfo::forms_tensor_operations` before it is opened, which planning and assessment read;
 graph preparation fails if the opened device disagrees).

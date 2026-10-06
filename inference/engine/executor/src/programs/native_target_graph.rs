@@ -1756,10 +1756,10 @@ mod resource_template_tests {
         let listings =
             block_listings(&state, backend, plan.target().blocks()[index], index, 512).unwrap();
         // Tensor operations read every head's history decoded; without
-        // them the co-issue form reads 128- and 256-column heads'.
+        // them the co-issue form reads 128-, 256- and 512-column heads'.
         assert_eq!(
             listings.is_empty(),
-            !(tensor_operations || matches!(head_width, 128 | 256))
+            !(tensor_operations || matches!(head_width, 128 | 256 | 512))
         );
         for (rows, segments, slots, listed) in
             block_classes(MixerKind::Attention, 512, 512, max_segments, &listings)

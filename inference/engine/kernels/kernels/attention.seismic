@@ -1167,6 +1167,20 @@ native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
 # window's planes end in 96 zero rows. The fresh rows' planes keep their 32
 # (a step that would end past them starts earlier and masks the keys before
 # its own) and hold one step at least, in a launch of fewer rows than that.
+#
+# A 512-column head is two 256-column windows under COISSUE, with a pair per
+# window and 8 rows: the staged form walks such a head's keys once per output
+# window, forming the whole head's scores and staging its keys and values in
+# each walk (three products for a head's two, every threadgroup decoding the
+# history for itself). Here a pair's score simdgroup forms Q K^T over its
+# window's 256 columns of the decoded key rows, the two score simdgroups of
+# the rows add their partial scores through the pairs' exchange (a score is
+# the sum of two F32 sums of 256 products) and run the softmax on them, and
+# each pair's product simdgroup forms P V for its window's output columns, so
+# such a head costs two 256-column heads. The two pairs of 8 rows hold 22,752
+# bytes, so the form takes 8-row query tiles and one head a threadgroup (QT 8
+# under DIRECT is this form's alone, on every device: a 16-row threadgroup
+# does not hold four pairs).
 native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal":
     static (KV, G, P, S, I, U, F, N, NV, L)
     params (arithmetic QT in [16, 8, 32], arithmetic HEADS in [16, 8, 4, 2, 1], arithmetic SPLIT_GROUPS in [256, 128, 512, 1],
@@ -1179,7 +1193,7 @@ native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal
     let WINDOW = SPARE / 256 * 256
     let ROUND = max((SPARE - STATE) / 256 * 256, 256 * (1 - DIRECT))
     let ROUNDS = max(1, DIRECT * min(1, HT * 256 / (WINDOW + 1)) * ceil_div(HT * 256, ROUND))
-    where L <= 1 and (DIRECT == 0 or (L == 1 and KV * ceil_div(G, 16) <= 8)) and (DIRECT == 0 or QT >= 16) and (COISSUE == 0 or (DIRECT == 1 and (2 * P + S == 128 or 2 * P + S == 256) and 32 + QT * min(HEADS, G) / 8 * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * (2 * P + S)) + 64 * 16 <= 32768)) and (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
+    where L <= 1 and (DIRECT == 0 or (L == 1 and KV * ceil_div(G, 16) <= 8)) and (DIRECT == 0 or QT >= 16 or (COISSUE == 1 and 2 * P + S == 512)) and (COISSUE == 0 or (DIRECT == 1 and (2 * P + S == 128 or 2 * P + S == 256 or (2 * P + S == 512 and QT == 8)) and 32 + QT * min(HEADS, G) / 8 * max(1, (2 * P + S) / 256) * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * min(2 * P + S, 256) + 2048 * min(1, (2 * P + S) / 512)) + 64 * 16 <= 32768)) and (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
     scratch keys bytes (max(M + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV * (2 * P + S) * 2)
     scratch values bytes (max(M + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV * (2 * P + S) * 2)
@@ -1195,8 +1209,8 @@ native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal
             threads_per_threadgroup (1024, 1, 1)
         launch attention_prefill_k8v4_attend:
             threadgroups (ceil_div(M, QT), KV * ceil_div(G, HEADS), TAKEN)
-            threads_per_threadgroup (QT * min(HEADS, G) * (4 - 2 * DIRECT + 6 * COISSUE), 1, 1)
-            shared_bytes ((1 - COISSUE) * (32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + COISSUE * (32 + QT * min(HEADS, G) / 8 * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * (2 * P + S))) + (R + 1) * 16 + DIRECT * ((R + 1) * 48 + 16))
+            threads_per_threadgroup (QT * min(HEADS, G) * (4 - 2 * DIRECT + 6 * COISSUE + 8 * COISSUE * ((2 * P + S) / 512)), 1, 1)
+            shared_bytes ((1 - COISSUE) * (32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + COISSUE * (32 + QT * min(HEADS, G) / 8 * max(1, (2 * P + S) / 256) * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * min(2 * P + S, 256) + 2048 * min(1, (2 * P + S) / 512))) + (R + 1) * 16 + DIRECT * ((R + 1) * 48 + 16))
         launch attention_prefill_k8v4_fold when DIRECT == 1 and HT * 256 > WINDOW:
             threadgroups (ceil_div(M, QT), KV * G, 1)
             threads_per_threadgroup (2 * P + S, 1, 1)

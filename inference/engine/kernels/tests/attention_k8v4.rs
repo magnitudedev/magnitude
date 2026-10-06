@@ -901,19 +901,25 @@ fn prefill_kernel(
     .unwrap()
 }
 
-/// Metal's COISSUE configurations of a 128- or 256-column geometry: the
+/// Metal's COISSUE configurations of a 128-, 256- or 512-column geometry: the
 /// threadgroups of two to four simdgroup pairs that fit the device's
-/// threadgroup memory, unsplit and split key partitions.
+/// threadgroup memory (a 512-column head's two pairs per 8 rows, with their
+/// partial scores, fit 8-row query tiles alone), unsplit and split key
+/// partitions.
 fn coissue_prefill_configs(geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> {
     let w = geometry.w() as u64;
-    if w != 128 && w != 256 {
+    if w != 128 && w != 256 && w != 512 {
         return Vec::new();
     }
     let keys = if w > 128 { 32 } else { 96 };
-    let pair = 48 + 2 * (keys * 16 + 32) + 32 * w;
-    [(16, 1), (16, 2), (32, 1)]
+    let windows = (w / 256).max(1);
+    let pair = 48 + 2 * (keys * 16 + 32) + 32 * w.min(256) + 2048 * (windows - 1);
+    [(16, 1), (16, 2), (32, 1), (8, 1)]
         .into_iter()
-        .filter(|&(qt, heads)| 32 + qt * heads.min(geometry.g as u64) / 8 * pair + 64 * 16 <= 32768)
+        .filter(|&(qt, _)| (qt == 8) == (w == 512))
+        .filter(|&(qt, heads)| {
+            32 + qt * heads.min(geometry.g as u64) / 8 * windows * pair + 64 * 16 <= 32768
+        })
         .flat_map(|(qt, heads)| [1, 256].into_iter().map(move |split| (qt, heads, split)))
         .map(|(qt, heads, split)| {
             vec![
@@ -937,22 +943,60 @@ fn coissue_prefill_configs(geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> 
 /// direct form.
 #[test]
 fn metal_coissue_prefill_agrees_with_the_default() {
+    metal_form_agrees_with_the_default(
+        "COISSUE",
+        &[MINICPM5, QWEN],
+        &[
+            (40, 300, 512, None),
+            (128, 1000, 1280, None),
+            (512, 4096, 4736, None),
+            (64, 4096, 4352, Some(1088)),
+            (512, 16384, 17024, None),
+        ],
+        coissue_prefill_configs,
+    );
+}
+
+/// The COISSUE form of a 512-column head: a pair per 256-column window, the
+/// two score simdgroups of 8 rows adding their partial scores (a score is the
+/// sum of two F32 sums of 256 products where the default holds one sum of
+/// 512), each product simdgroup forming its window's output columns.
+#[test]
+fn metal_coissue_prefill_of_two_windows_agrees_with_the_default() {
+    metal_form_agrees_with_the_default(
+        "COISSUE",
+        &[GEMMA_E4B_FULL, GEMMA26_FULL],
+        &[
+            (40, 300, 512, None),
+            (128, 1000, 1280, None),
+            (512, 4096, 4736, None),
+            (64, 4096, 4352, Some(1088)),
+        ],
+        coissue_prefill_configs,
+    );
+}
+
+/// The configurations `configs` gives of Metal's form `form`, for each
+/// geometry and each case (rows, history rows, store rows, rows per slab):
+/// against the host model within the entry's tolerance, and against the
+/// entry's default configuration on the same inputs within the production
+/// tolerance of a BF16 result, leaving the same history planes.
+fn metal_form_agrees_with_the_default(
+    form: &str,
+    geometries: &[Geometry],
+    cases: &[(usize, i32, usize, Option<usize>)],
+    configs: fn(Geometry) -> Vec<Vec<(&'static str, u64)>>,
+) {
     let Some(device) = k8v4_devices()
         .into_iter()
         .find(|device| device.backend() == BackendName::Metal)
     else {
         return;
     };
-    for (geometry, rows, history, total, slab_rows) in [MINICPM5, QWEN].into_iter().flat_map(|geometry| {
-        [
-            (40usize, 300i32, 512usize, None),
-            (128, 1000, 1280, None),
-            (512, 4096, 4736, None),
-            (64, 4096, 4352, Some(1088usize)),
-            (512, 16384, 17024, None),
-        ]
-        .into_iter()
-        .map(move |(rows, history, total, slab_rows)| (geometry, rows, history, total, slab_rows))
+    for (geometry, rows, history, total, slab_rows) in geometries.iter().flat_map(|&geometry| {
+        cases
+            .iter()
+            .map(move |&(rows, history, total, slab_rows)| (geometry, rows, history, total, slab_rows))
     }) {
         let encoded = Encoded::new(Case::new(
             geometry,
@@ -981,13 +1025,18 @@ fn metal_coissue_prefill_agrees_with_the_default() {
                 .unwrap()
                 .value,
         );
-        for config in coissue_prefill_configs(geometry) {
+        for config in configs(geometry) {
             let mut bound = bind(&device);
             let gated = prefill_kernel(&device, geometry, &config)
                 .call(prefill_args!(bound, encoded.case))
                 .unwrap()
                 .value;
-            let label = format!("COISSUE prefill {rows} rows after {history} {config:?}");
+            let label = format!(
+                "{form} prefill kv {} g {} w {} {rows} rows after {history} {config:?}",
+                geometry.kv,
+                geometry.g,
+                geometry.w()
+            );
             check(&label, &encoded, &gated, &bound, &expected);
             let actual = bf16_values(&gated);
             assert_eq!(actual.len(), reference.len());
@@ -2269,6 +2318,15 @@ const GEMMA26_FULL: Geometry = Geometry {
     s: 0,
 };
 
+/// Gemma 4 E4B's full-attention layers: 2 kv heads of 4 query heads,
+/// W = 512.
+const GEMMA_E4B_FULL: Geometry = Geometry {
+    kv: 2,
+    g: 4,
+    p: 256,
+    s: 0,
+};
+
 /// The decode configurations a timing sweeps: the test configurations plus
 /// the larger partition counts long histories over few kv heads need.
 fn timing_decode_configs(
@@ -2589,11 +2647,13 @@ fn prefill_timing_on(device: &Device) {
         ],
     };
     // `K8V4_PREFILL_GEOMETRY=minicpm5` times MiniCPM5-2B's heads (2 kv heads
-    // of 8, W = 128), `gemma31` Gemma 4 31B's full layers, instead of
-    // Qwen3.5-4B's.
+    // of 8, W = 128), `gemma31`, `gemma26` and `gemma-e4b` those Gemma 4
+    // models' full layers (W = 512), instead of Qwen3.5-4B's.
     let geometry = match std::env::var("K8V4_PREFILL_GEOMETRY").as_deref() {
         Ok("minicpm5") => MINICPM5,
         Ok("gemma31") => GEMMA31_FULL,
+        Ok("gemma26") => GEMMA26_FULL,
+        Ok("gemma-e4b") => GEMMA_E4B_FULL,
         _ => QWEN,
     };
     for (rows, history) in rows_history {
@@ -2666,7 +2726,9 @@ fn prefill_timing_on(device: &Device) {
             let dense_kernel = attention_prefill::native_for_device_with(
                 device,
                 attention_prefill::Elements { A: Element::bf16() },
-                // The dense entry has no producer warps.
+                // The dense entry has no producer warps and no co-issue
+                // form; its direct form takes 16-row query tiles, so an
+                // 8-row configuration is timed staged.
                 &specialization_on(
                     device,
                     geometry,
@@ -2674,6 +2736,10 @@ fn prefill_timing_on(device: &Device) {
                         .iter()
                         .copied()
                         .filter(|(name, _)| !["PRODUCERS", "COISSUE"].contains(name))
+                        .map(|(name, value)| match name {
+                            "DIRECT" if value_of("QT") == 8 => (name, 0),
+                            _ => (name, value),
+                        })
                         .collect::<Vec<_>>(),
                 ),
             )

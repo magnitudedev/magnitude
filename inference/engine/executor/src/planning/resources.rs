@@ -151,11 +151,12 @@ pub struct StartupSlots {
 /// Whether a device of `backend` has a form of the affine K8/V4 prefill
 /// entry that reads history decoded for the call, for heads of `head_width`
 /// columns: on Metal the direct form on tensor operations (any head) and
-/// the co-issue form on simdgroup matrices (128- and 256-column heads).
+/// the co-issue form on simdgroup matrices (128-, 256- and 512-column heads,
+/// a 512-column head as two 256-column windows).
 /// Such forms take the history row tiles their launch's rows see; every
 /// other form reads the history in place.
 pub fn reads_decoded_history(backend: BackendName, tensor_operations: bool, head_width: u64) -> bool {
-    backend == BackendName::Metal && (tensor_operations || matches!(head_width, 128 | 256))
+    backend == BackendName::Metal && (tensor_operations || matches!(head_width, 128 | 256 | 512))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

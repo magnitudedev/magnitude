@@ -20,7 +20,8 @@
 // split records into the state the window keeps. Under COISSUE on simdgroup
 // matrices the attend launch pairs its simdgroups, one forming Q K^T on the
 // matrix pipe and one P V as scalar F16 products (attention::prefill_coissue),
-// over the same decoded history.
+// over the same decoded history; a 512-column head takes a pair per
+// 256-column window.
 
 #if SEISMIC_TUNE_DIRECT
 // The window of a call that lists `listed` tiles, placed by the terms of
