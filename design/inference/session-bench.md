@@ -36,6 +36,18 @@ terminal engine counts are authoritative measurements. Session, independent conc
 concurrency pressure and memory sections describe offered traffic; evidence explicitly distinguishes
 history sharing from actual retained-prefix reuse. No retention claim follows from session shape alone.
 
+Prose repeat preserves paragraph boundaries in normalized source. Each request retains its system
+message, supplies the passage as an assistant message, and ends with a user instruction quoting the
+opening of the paragraph to copy. It deterministically chooses the latest supplied paragraph boundary
+with at least the completion budget of source tokens remaining; the passage start is also eligible.
+Source contribution is measured with the selected renderer as the prefixed assistant suffix count minus
+prefix-only assistant framing. Insufficient source fails explicitly. No sentence or word fallback changes the
+selection. Provenance records the recipe version, supplied passage bounds, selected copy start,
+available source tokens and completion budget. Canonical completed history copies the selected source
+suffix, independently of observed output. Context sizes can therefore select different text near the
+end; this workload does not promise an identical answer across context checkpoints. Prose-repeat
+qualification builds a separate short passage and final copy request with the same fixture rules.
+
 Tool requests have a fixed 32,768 completion-token allowance, prose 256 and retrieval 1,024, with no
 CLI or environment override. Engine capacity must cover rendered inputs plus that full allowance within model limits.
 Shared capacity rounds up to 256-token allocation boundaries.
@@ -107,6 +119,8 @@ Tests demonstrate deterministic shared sessions, local alias resolution, alias-i
 commands, immutable output policy, input-plus-output capacity checks, fragmented SSE handling,
 terminal consistency, non-greedy semantic matching, cancellation cleanup, watchdog retirement and
 persistent partial results. Retrieval tests additionally demonstrate reversible resizing, stable facts, depth control,
-strict answer matching, no answer leakage and failure-inclusive accuracy denominators.
+strict answer matching, no answer leakage and failure-inclusive accuracy denominators. Prose-repeat
+tests verify paragraph preservation, final instruction placement, deterministic latest-boundary
+selection across context and output sizes, sufficient copy source and canonical suffix history.
 Adapter integration is qualified against the actual serving interface, not an invented
 benchmark-only inference implementation. Unsupported capabilities fail explicitly.
