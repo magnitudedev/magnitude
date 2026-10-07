@@ -74,6 +74,8 @@ impl std::error::Error for RequestError {}
 
 /// Elapsed native work measured per request from submission through completion.
 /// A request in a packed batch receives that batch's wall duration.
+/// Deferred work retains its originating prompt/generation phase; work solely
+/// for post-terminal prefix retention is excluded from these throughput fields.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PhysicalTimings {
     pub prompt_ns: u64,

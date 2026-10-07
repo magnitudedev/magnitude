@@ -57,10 +57,12 @@ Terminal success carries measured physical prompt and predicted durations accumu
 execution owner at completed program boundaries. The host response converts these durations to
 milliseconds without inferring them from token counts or scheduler estimates. A successful response
 requiring timing metadata fails closed if those measurements are absent.
-Draft history prepared from prompt or replay rows contributes to prompt duration, including
-separate-draft injection after each prompt or replay chunk. Proposal and catch-up work during generation
-contributes to predicted duration. The executor lane used for an operation does not determine its
-timing phase.
+An operation chain retains the request phase in which it started, including deferred or parked
+drafter-history preparation. Initial prompt preparation and restoration contribute to prompt
+duration; proposal, catch-up and history restoration after generation starts contribute to
+predicted duration. Final-prompt priming remains prompt work even after the first token publishes.
+Post-terminal work solely for prefix retention contributes to neither throughput duration.
+The executor lane and replay geometry do not determine timing phase.
 
 ## Acceptance criteria
 
@@ -74,5 +76,8 @@ timing phase.
 - Every execution stop terminates each live request and fails each pending control with its cause.
 - Dropping the worker sender gives an open receiver one terminal failure.
 - Every terminal path releases request-owned resources after physical work and state reconciliation.
+- Successful terminal retention and publication wait for all composed method work, including
+  parked drafter priming after target replay reaches its accepted boundary.
 - Terminal timing fields represent measured execution and remain consistent in streaming and complete responses.
-- Prompt and replay draft preparation are charged to prompt time even when they use the head executor lane.
+- Deferred draft preparation preserves its originating request phase across parking and resumption.
+- Generation-history recovery and terminal retention never inflate reported prompt service.

@@ -136,6 +136,8 @@ struct Record {
     waiting_since: u64,
     service_ns: u64,
     physical_timings: PhysicalTimings,
+    /// Purpose of the current operation chain, retained across pending/parked work.
+    timing_phase: TimingPhase,
     error: Option<RequestError>,
     preemption_debt: u32,
     protected_until: Option<usize>,
@@ -158,14 +160,45 @@ struct Record {
     publication_permits: VecDeque<PublicationPermit>,
 }
 
-impl Record {
-    fn add_physical_duration(&mut self, kind: WorkKind, duration: Duration) {
+/// Request service purpose, independent of target/head lane and replay geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimingPhase {
+    Prompt,
+    Generation,
+    Retention,
+}
+
+impl TimingPhase {
+    fn add(self, timings: &mut PhysicalTimings, duration: Duration) {
         let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-        let bucket = match kind {
-            WorkKind::Prefill | WorkKind::Replay => &mut self.physical_timings.prompt_ns,
-            WorkKind::Decode | WorkKind::Verify => &mut self.physical_timings.predicted_ns,
+        let bucket = match self {
+            Self::Prompt => &mut timings.prompt_ns,
+            Self::Generation => &mut timings.predicted_ns,
+            Self::Retention => return,
         };
         *bucket = bucket.saturating_add(nanos);
+    }
+}
+
+impl Record {
+    fn begin_service(&mut self, candidate: &Candidate) {
+        // A newly started chain owns its accounting purpose. Follow-up priming
+        // inherits it even after the target publishes its first token. Resuming
+        // pending/parked operations must not reclassify that existing chain.
+        if candidate.composed().is_none() {
+            let generation = candidate.generation();
+            self.timing_phase = if owes_reconciliation(self, generation) {
+                TimingPhase::Retention
+            } else if generation.generated().is_empty() {
+                TimingPhase::Prompt
+            } else {
+                TimingPhase::Generation
+            };
+        }
+    }
+
+    fn add_physical_duration(&mut self, duration: Duration) {
+        self.timing_phase.add(&mut self.physical_timings, duration);
     }
 
     /// Drop everything the host would still receive.
@@ -225,6 +258,21 @@ enum State {
 }
 
 impl State {
+    /// All composed work has completed. Only this state may be retained or
+    /// retired successfully; a logical terminal decision can precede priming.
+    fn settled(&self) -> Option<&Generation> {
+        match self {
+            Self::Between(
+                generation,
+                Stage::Ready
+                | Stage::NonResident(_)
+                | Stage::AwaitingCredit
+                | Stage::AwaitingPrefix { .. },
+            ) => Some(generation),
+            _ => None,
+        }
+    }
+
     fn generation(&self) -> &Generation {
         match self {
             Self::Between(generation, _) => generation,
@@ -892,6 +940,7 @@ impl<F: ProgramFamily> Service<F> {
                     waiting_since: now,
                     service_ns: 0,
                     physical_timings: PhysicalTimings::default(),
+                    timing_phase: TimingPhase::Prompt,
                     error: None,
                     preemption_debt: 0,
                     protected_until: None,
@@ -1653,6 +1702,7 @@ impl<F: ProgramFamily> Service<F> {
         selections: usize,
         bindings: &mut StateBindings<F>,
     ) -> Result<Start, Fatal> {
+        record.begin_service(&candidate);
         let generation = match candidate {
             Candidate::Parked(round, work) => {
                 return Ok(Start::Joined(
@@ -2279,7 +2329,7 @@ impl<F: ProgramFamily> Service<F> {
                 self.domain.abort(item).map_err(classify_domain_error)?;
                 continue;
             };
-            record.add_physical_duration(item.kind(), item.physical_duration());
+            record.add_physical_duration(item.physical_duration());
             let state = match state {
                 Membership::Started(started) if !ended(started.generation()) => {
                     match reconcile_forward(started, &mut self.domain, request, item) {
@@ -2354,14 +2404,7 @@ impl<F: ProgramFamily> Service<F> {
                 self.domain.abort(item).map_err(classify_domain_error)?;
                 continue;
             };
-            let kind = match operation {
-                Operation::Head {
-                    phase: HeadPhase::Priming { .. },
-                    ..
-                } => WorkKind::Prefill,
-                _ => item.kind(),
-            };
-            member.record.add_physical_duration(kind, item.physical_duration());
+            member.record.add_physical_duration(item.physical_duration());
             let Membership::Generation(generation) = &mut member.state else {
                 return Err(invariant("service method flight")(
                     "drafter work reached a request with a started target round".into(),
@@ -2432,7 +2475,7 @@ impl<F: ProgramFamily> Service<F> {
         };
         member
             .record
-            .add_physical_duration(item.kind(), item.physical_duration());
+            .add_physical_duration(item.physical_duration());
         if ended(member.state.generation()) {
             return self.domain.abort(item).map_err(classify_domain_error);
         }
@@ -2533,16 +2576,12 @@ impl<F: ProgramFamily> Service<F> {
         self.publish_ready()
     }
 
-    /// A request outside the pipeline between rounds: its record and
-    /// generation.
+    /// A request whose composed work is complete: its record and generation.
+    /// Retention must wait for pending method work even after target replay
+    /// reaches the accepted boundary.
     fn between(&self, id: RequestId) -> Option<(&Record, &Generation)> {
-        match self.requests.get(&id) {
-            Some(Request {
-                record,
-                state: State::Between(generation, _),
-            }) => Some((record, generation)),
-            _ => None,
-        }
+        let request = self.requests.get(&id)?;
+        Some((&request.record, request.state.settled()?))
     }
 
     /// Retain the request's reconciled state at a planned branch point it
@@ -2735,7 +2774,7 @@ impl<F: ProgramFamily> Service<F> {
                 self.terminate_request(id, true);
             }
             let request = &self.requests[&id];
-            let State::Between(generation, _) = &request.state else {
+            let Some(generation) = request.state.settled() else {
                 continue;
             };
             let record = &request.record;
@@ -2978,12 +3017,16 @@ mod termination_tests {
     };
     use std::collections::BTreeSet;
 
-    fn generation() -> Generation {
+    pub(super) fn generation() -> Generation {
+        generation_with_limit(8)
+    }
+
+    pub(super) fn generation_with_limit(max_tokens: usize) -> Generation {
         let mut generation = Generation::new(
             vec![TokenId(1), TokenId(2)],
             InputLayout::new(2, vec![]).unwrap(),
             Options {
-                max_tokens: 8,
+                max_tokens,
                 output_capacity: 4,
                 context_limit: 32,
                 vocabulary: 100,
@@ -3026,5 +3069,193 @@ mod termination_tests {
     fn a_failed_waiting_request_finishes_failed() {
         let failed = Membership::Generation(generation()).terminate(false);
         assert_eq!(failed.finish_reason(), Some(FinishReason::Failed));
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use magnitude_executor::{FeatureReader, FeatureRows, FeatureSpan};
+    use magnitude_generation::{RoundStart, TokenId};
+    use std::time::Duration;
+
+    struct NoFeatures;
+    impl FeatureReader for NoFeatures {
+        fn read(&mut self, _: &FeatureSpan) -> Result<FeatureRows, String> {
+            panic!("plain prompt needs no features")
+        }
+    }
+
+    #[test]
+    fn published_prompt_token_does_not_reclassify_parked_or_pending_work() {
+        let mut record = Record {
+            waiting_since: 0, service_ns: 0, physical_timings: PhysicalTimings::default(),
+            timing_phase: TimingPhase::Prompt, error: None, preemption_debt: 0,
+            protected_until: None, prefix_cache: true, prefix_source: None,
+            prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
+            publication: None, publication_batch_limit: 4, pending_publication: None,
+            publication_permits: VecDeque::new(),
+        };
+        let candidate = Candidate::Ready(super::termination_tests::generation());
+        record.begin_service(&candidate);
+        let Candidate::Ready(generation) = candidate else { unreachable!() };
+        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 4) else {
+            panic!("prompt round")
+        };
+        let work = lower_round(&round, RequestId(1), 0, None).unwrap();
+        let candidate = Candidate::Parked(round, Work(vec![work.clone()]));
+        record.begin_service(&candidate);
+        assert_eq!(record.timing_phase, TimingPhase::Prompt);
+        let Candidate::Parked(round, _) = candidate else { unreachable!() };
+        let transition = round.prepare_round_transition(
+            RequestId(1), &[TokenId(3)], None, &mut NoFeatures,
+        ).unwrap();
+        let (generation, _) = round.commit(transition);
+        assert_eq!(generation.generated(), &[TokenId(3)]);
+        // Pending operations retain the origin even though publication changed
+        // generation state. The operation's lane/kind is irrelevant here.
+        let candidate = Candidate::Pending(generation, Work(vec![work]));
+        record.begin_service(&candidate);
+        assert_eq!(record.timing_phase, TimingPhase::Prompt);
+        let Candidate::Pending(mut generation, _) = candidate else { unreachable!() };
+        generation.evicted().unwrap();
+        let candidate = Candidate::NonResident(generation);
+        record.begin_service(&candidate);
+        assert_eq!(record.timing_phase, TimingPhase::Generation);
+
+        let generation = super::termination_tests::generation_with_limit(1);
+        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 4) else {
+            panic!("terminal prompt round")
+        };
+        let transition = round.prepare_round_transition(
+            RequestId(1), &[TokenId(3)], None, &mut NoFeatures,
+        ).unwrap();
+        let (generation, _) = round.commit(transition);
+        assert!(owes_reconciliation(&record, &generation));
+        let candidate = Candidate::Ready(generation);
+        record.begin_service(&candidate);
+        assert_eq!(record.timing_phase, TimingPhase::Retention);
+        let Candidate::Ready(generation) = candidate else { unreachable!() };
+        let round = generation.start_reconciliation(4).unwrap_or_else(|(_, e)| panic!("{e}"));
+        let work = lower_round(&round, RequestId(1), round.generation().resident_position(), None).unwrap();
+        let candidate = Candidate::Parked(round, Work(vec![work]));
+        record.begin_service(&candidate);
+        assert_eq!(record.timing_phase, TimingPhase::Retention);
+    }
+
+    #[test]
+    fn history_work_follows_its_origin_and_retention_is_excluded() {
+        let mut timings = PhysicalTimings::default();
+        // The final target prompt publishes a token before its head priming
+        // completes. Both completions keep the prompt chain's phase.
+        let prompt_chain = TimingPhase::Prompt;
+        prompt_chain.add(&mut timings, Duration::from_millis(100));
+        prompt_chain.add(&mut timings, Duration::from_millis(3));
+        // Recovery can replay prompt rows after output has begun; it is still
+        // generation service, including its deferred head preparation.
+        let recovery_chain = TimingPhase::Generation;
+        recovery_chain.add(&mut timings, Duration::from_millis(7));
+        recovery_chain.add(&mut timings, Duration::from_millis(2));
+        // Retaining finished output does not change either throughput field.
+        TimingPhase::Retention.add(&mut timings, Duration::from_millis(20));
+        TimingPhase::Retention.add(&mut timings, Duration::from_millis(1));
+        assert_eq!(timings.prompt_ns, 103_000_000);
+        assert_eq!(timings.predicted_ns, 9_000_000);
+    }
+
+    #[test]
+    fn measured_duration_accumulation_saturates() {
+        let mut timings = PhysicalTimings { prompt_ns: u64::MAX - 1, predicted_ns: 0 };
+        TimingPhase::Prompt.add(&mut timings, Duration::from_nanos(2));
+        assert_eq!(timings.prompt_ns, u64::MAX);
+        assert_eq!(timings.predicted_ns, 0);
+    }
+}
+
+#[cfg(test)]
+mod pending_retention_tests {
+    use super::*;
+    use magnitude_executor::{DraftForm, FeatureReader, FeatureRows, FeatureSpan};
+
+    struct NoFeatures;
+    impl FeatureReader for NoFeatures {
+        fn read(&mut self, _: &FeatureSpan) -> Result<FeatureRows, String> {
+            panic!("plain logical fixture needs no features")
+        }
+    }
+
+    fn priming() -> Work {
+        let operation = Operation::Head {
+            request: RequestId(1),
+            phase: HeadPhase::Priming { draft_from: 3 },
+            tokens: vec![magnitude_generation::TokenId(3)],
+            conditioning: FeatureRows::new(vec![0u8; 4].into(), 1).unwrap(),
+            position: 2,
+            proposals: Vec::new(),
+            form: DraftForm::Chained,
+        };
+        operation.validate().unwrap();
+        Work::new(vec![operation]).unwrap()
+    }
+
+    #[test]
+    fn terminal_replay_with_parked_priming_cannot_retain_or_retire() {
+        let generation = super::termination_tests::generation_with_limit(1);
+        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 4) else {
+            panic!("prompt round")
+        };
+        let transition = round.prepare_round_transition(
+            RequestId(1), &[magnitude_generation::TokenId(3)], None, &mut NoFeatures,
+        ).unwrap();
+        let (mut generation, _) = round.commit(transition);
+        generation.discard_output();
+        assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
+        let round = generation.start_reconciliation(4).unwrap_or_else(|(_, e)| panic!("{e}"));
+        let work = lower_round(&round, RequestId(1), round.generation().resident_position(), None).unwrap();
+        let parked = State::Parked(round, Work::new(vec![work]).unwrap(), Some(Wait::Memory));
+        assert!(parked.settled().is_none());
+        let State::Parked(round, _, _) = parked else { unreachable!() };
+        let transition = round.prepare_round_transition(RequestId(1), &[], None, &mut NoFeatures).unwrap();
+        let (generation, _) = round.commit(transition);
+        // These are exactly the old publication predicates: all are satisfied
+        // before the priming continuation has become eligible to run.
+        assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
+        assert_eq!(generation.output_len(), 0);
+        assert!(generation.pending_reconciliation().is_none());
+        assert_eq!(generation.resident_position(), generation.accepted_position());
+        let pending = State::Between(generation, Stage::Pending(priming(), Some(Wait::Memory)));
+        assert!(pending.settled().is_none(), "pending priming must block retention and terminal publication");
+        let State::Between(generation, _) = pending else { unreachable!() };
+        // finish_round returns completed method work as Ready.
+        let completed = State::Between(generation, Stage::Ready);
+        assert_eq!(completed.settled().unwrap().finish_reason(), Some(FinishReason::Length));
+    }
+
+    #[test]
+    fn abandoned_pending_work_can_still_finish_cancelled_or_failed() {
+        for (cancel, expected) in [(true, FinishReason::Cancelled), (false, FinishReason::Failed)] {
+            let pending = State::Between(
+                super::termination_tests::generation(),
+                Stage::Pending(priming(), Some(Wait::Memory)),
+            );
+            assert!(pending.settled().is_none());
+            // terminate_request / fail_capacity_waiters discard composed work
+            // and normalize the terminated generation to Ready.
+            let terminal = State::Between(pending.terminate(cancel), Stage::Ready);
+            assert_eq!(terminal.settled().unwrap().finish_reason(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn finished_without_residency_does_not_require_model_work_to_publish() {
+        let mut generation = super::termination_tests::generation_with_limit(0);
+        generation.evicted().unwrap();
+        assert!(!generation.is_resident());
+        assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
+        let state = State::Between(generation, Stage::NonResident(Some(Wait::Memory)));
+        assert!(state.settled().is_some());
+        let State::Between(generation, _) = state else { unreachable!() };
+        let state = State::Between(generation, Stage::AwaitingPrefix { through: 1 });
+        assert!(state.settled().is_some());
     }
 }
