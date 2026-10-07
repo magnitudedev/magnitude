@@ -401,7 +401,7 @@ top level and full pass are the projection library's GEMV, batched GEMV and GEMM
 views' packets). Every row whose exact score can be the largest survives
 each level, so the selection is the full readout's, while the head's low bits are read only for
 the survivors (about 54% of the head's bytes on real text). An MTP draft head projects the planes'
-leading draft-vocabulary rows: its drafting classes up to the certified bound run the certified
+full vocabulary: its drafting classes up to the certified bound run the certified
 levels over them and the rest the full pass; a certified class serves every drafting row whatever
 its shaping, since only verification decides what is emitted. MTP verification rows select
 through the target's certified classes like any other step.
@@ -415,7 +415,9 @@ workflow per class and transaction: each draft layer's attention appends the ent
 keys and values (the fusion norm as its input norm, each row attending only itself); when
 drafting, one non-causal pass over each slot's block `[anchor, mask, …]` reads its domain's
 accepted and injected rows plus the whole slot block, and the target's vocabulary projection and
-selection read the proposing rows. DSpark then chains its slots through the Markov bias and
+selection read the proposing rows over the full target vocabulary. A reduced vocabulary requires an
+artifact-declared projection and token mapping; token frequency is never a vocabulary boundary.
+DSpark then chains its slots through the Markov bias and
 declines a proposal below its confidence threshold. DFlash2 runs every block-pass sublayer unfused:
 the normed rows project to per-row coefficients of a grouped causal convolution that restarts at
 each slot's block, its first half feeds the operator's plain projections and its second half

@@ -14,7 +14,7 @@ use super::{DeviceSubmission, HeadProgram};
 use crate::operators::{self, paired_block, Mixer};
 use crate::{
     completion::CompletionWaiter,
-    native::{draft_vocabulary, AttestedFeedForward, AttestedHead, AttestedHeadBlock, HeadLogitsKernels},
+    native::{AttestedFeedForward, AttestedHead, AttestedHeadBlock, HeadLogitsKernels},
     operators::attention::graph::{
         self as attention_graph, attention_weights, AttentionBlock, AttentionGraphEntries,
         CheckedAttentionEntries,
@@ -356,7 +356,7 @@ struct HeadGraphParts<P> {
     passes: Vec<PassPorts>,
     constants: Vec<GraphConstant>,
     weights: Vec<(WeightPort, NativePort)>,
-    /// The output head's leading `draft_vocabulary` rows, when drafting.
+    /// The complete output head, when drafting.
     projection: Option<HeadProjectionPorts>,
     /// Selections `[steps * slots, 2]` when drafting; otherwise the entry
     /// rows' block input, exported so the graph has a result.
@@ -419,9 +419,9 @@ fn planned_weight<G: GraphDraft>(
 
 /// The ports of the head's projection onto the draft vocabulary.
 enum HeadProjectionPorts {
-    /// The output projection's leading rows.
+    /// The complete output projection.
     Packed(NativePort),
-    /// The planes' leading rows (the radii only when certified).
+    /// The complete planes (the radii only when certified).
     Progressive(Vec<(ProgressivePlane, NativePort)>),
 }
 
@@ -519,13 +519,12 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     } else {
         Some(weight!(head, WeightKind::OutputNorm))
     };
-    let draft_vocabulary = draft_vocabulary(vocabulary);
     let certified = class.slots <= readout::certified_rows(backend);
     let projection = (class.steps > 0)
         .then(|| -> Result<_, GraphError> {
             Ok(match readout::HeadPlans::of(load)? {
                 readout::HeadPlans::Packed(plan) => {
-                    HeadProjectionPorts::Packed(graph.port(plan.resident, &[draft_vocabulary, hidden])?)
+                    HeadProjectionPorts::Packed(graph.port(plan.resident, &[vocabulary, hidden])?)
                 }
                 readout::HeadPlans::Progressive(_) => HeadProjectionPorts::Progressive(
                     ProgressivePlane::ALL
@@ -536,7 +535,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                                 plane,
                                 graph.port(
                                     crate::progressive::element(plane),
-                                    &plane.shape(draft_vocabulary, hidden),
+                                    &plane.shape(vocabulary, hidden),
                                 )?,
                             ))
                         })
@@ -576,7 +575,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             graph.local_for(
                 entries.sample,
                 "result",
-                &[("M", class.steps * class.slots), ("V", draft_vocabulary)],
+                &[("M", class.steps * class.slots), ("V", vocabulary)],
             )
         })
         .transpose()?;
@@ -800,7 +799,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         let logits = graph
                             .enqueue(
                                 *entry,
-                                &[("O", class.slots), ("V", draft_vocabulary), ("D", hidden)],
+                                &[("O", class.slots), ("V", vocabulary), ("D", hidden)],
                                 head_logits_rows::WorkflowArgs {
                                     features: (&features).into(),
                                     weight: weight.tensor().into(),
@@ -844,7 +843,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                                 projected: class.slots,
                                 selected: class.slots,
                             },
-                            (draft_vocabulary, hidden),
+                            (vocabulary, hidden),
                             epsilon,
                         )?
                     }
@@ -859,14 +858,14 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         &mut graph,
                         entries.sample,
                         class.slots,
-                        draft_vocabulary,
+                        vocabulary,
                     )?,
                 };
                 Some(readout::sample(
                     &mut graph,
                     entries.shape,
                     entries.sample,
-                    draft_vocabulary,
+                    vocabulary,
                     &mut logits,
                     class.slots,
                     class.shaped,
@@ -1174,30 +1173,18 @@ impl PreparedHeadGraphs {
         resident: &ResidentHead,
     ) -> Result<BoundHeadGraphs, SubmitError> {
         let mut uploaded = ConstantTensors::new(resident.embedding.tensor().device());
-        // The output head's leading draft-vocabulary rows: the packed
-        // projection's, or each plane's.
-        let leading = |tensor: &Tensor| -> Result<Tensor, SubmitError> {
-            let vocabulary = tensor
-                .extents()
-                .first()
-                .copied()
-                .ok_or_else(|| invalid("resident output head has no rows"))?;
-            tensor
-                .slice_leading(0, draft_vocabulary(vocabulary))
-                .map_err(device)
-        };
         let projection = match &resident.output {
-            ResidentOutput::Packed(weight) => vec![(None, leading(weight.tensor())?)],
+            ResidentOutput::Packed(weight) => vec![(None, weight.tensor())],
             ResidentOutput::Progressive(planes) => ProgressivePlane::ALL
                 .into_iter()
-                .map(|plane| Ok((Some(plane), leading(planes.plane(plane).tensor())?)))
-                .collect::<Result<Vec<_>, SubmitError>>()?,
+                .map(|plane| (Some(plane), planes.plane(plane).tensor()))
+                .collect(),
         };
         let projected = |plane: Option<ProgressivePlane>| -> Result<&Tensor, SubmitError> {
             projection
                 .iter()
                 .find(|(placed, _)| *placed == plane)
-                .map(|(_, tensor)| tensor)
+                .map(|(_, tensor)| *tensor)
                 .ok_or_else(|| invalid("the head projection and the resident output head disagree"))
         };
         let mut bound = BTreeMap::new();
@@ -1507,7 +1494,7 @@ impl NativeHeadProgram {
                 .write_input(&ports.destinations, &controls.destinations)
                 .map_err(device)?;
             if let Some(selection) = &ports.selection {
-                let words = draft_vocabulary(self.geometry.vocabulary).div_ceil(32) as usize;
+                let words = self.geometry.vocabulary.div_ceil(32) as usize;
                 readout::write_selection(pass, &mut active, selection, slots, words)?;
             }
         }

@@ -16,6 +16,51 @@ const LIMITS: TuningLimits = TuningLimits {
 };
 
 #[test]
+fn draft_readout_tuning_preserves_the_complete_artifact_vocabulary() {
+    let mut definition = fixture_definition();
+    let vocabulary = 248_320;
+    definition.decoder.vocabulary = vocabulary;
+    definition.decoder.entry.embedding.shape[0] = vocabulary;
+    definition.decoder.exit.output.shape[0] = vocabulary;
+    let manifest = fixture_manifest(&definition);
+    let load = ModelLoadPlan::derive(
+        &manifest,
+        &definition,
+        ComponentSelection {
+            head: false,
+            vision: false,
+        },
+        crate::resident_layout(crate::ExecutionPath::Native, BackendName::Metal),
+    )
+    .unwrap();
+    let inputs = ModelInputs {
+        definition: &definition,
+        limits: LIMITS,
+        load: &load,
+    };
+    let mtp = readout::HeadLogitsTuning {
+        weight: Element::f16(),
+        activation: Element::bf16(),
+    };
+    let separate = readout::HeadRowsTuning {
+        norm: Element::f16(),
+        weight: Element::f16(),
+        activation: Element::bf16(),
+        epsilon: 1e-6,
+        rows: None,
+    };
+    for statics in [
+        mtp.statics(&inputs).unwrap(),
+        separate.statics(&inputs).unwrap(),
+    ] {
+        assert_eq!(
+            statics.iter().find(|(name, _)| *name == "V").unwrap().1,
+            vocabulary
+        );
+    }
+}
+
+#[test]
 fn persisted_point_weights_preserve_cache_identity() {
     // Real prefill weights: parsing these one ULP away caused every warm
     // model load to retune otherwise identical, fully qualified entries.

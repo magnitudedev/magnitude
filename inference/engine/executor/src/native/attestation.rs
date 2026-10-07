@@ -1504,7 +1504,7 @@ impl AttestedPrograms {
     /// and fixture locals drop before the next binding. Two fixtures differ
     /// from a scope's planned weights: the embedding table is qualified on a
     /// single row, and each head block also holds its draft projection, the
-    /// target output restricted to the draft vocabulary. Sixteen MiB more
+    /// complete target output. Sixteen MiB more
     /// covers one-row activations and tables, logits rows, checked results
     /// and allocator alignment. Prepared invocation buffers are charged
     /// separately.
@@ -1542,8 +1542,8 @@ impl AttestedPrograms {
                 .ok_or("qualification scope byte count overflows")?;
         }
         if load.head().is_some() {
-            // The draft projection fixture: the output projection's (or its
-            // planes') draft-vocabulary rows.
+            // The draft projection fixture: the complete output projection
+            // or its complete progressive planes.
             let target = |kind| {
                 load.target().iter().find(|weight| {
                     weight.role.scope == WeightScope::Target && weight.role.kind == kind
@@ -1559,7 +1559,7 @@ impl AttestedPrograms {
                     let [vocabulary, hidden] = output.shape[..] else {
                         return Err("target output is not a matrix".into());
                     };
-                    fixture(output.resident, &[draft_vocabulary(vocabulary), hidden])?
+                    fixture(output.resident, &[vocabulary, hidden])?
                 }
                 None => {
                     let top = target(WeightKind::OutputPlane(ProgressivePlane::Top))
@@ -1570,7 +1570,7 @@ impl AttestedPrograms {
                     ProgressivePlane::ALL.into_iter().try_fold(0u64, |bytes, plane| {
                         let element = crate::progressive::element(plane);
                         let plane_bytes =
-                            fixture(element, &plane.shape(draft_vocabulary(vocabulary), words * 8))?;
+                            fixture(element, &plane.shape(vocabulary, words * 8))?;
                         bytes
                             .checked_add(plane_bytes)
                             .ok_or_else(|| "draft projection fixture overflows".to_owned())

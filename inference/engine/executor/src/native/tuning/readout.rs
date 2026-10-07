@@ -12,7 +12,6 @@ use super::{
     row_points, served_row_points, CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs,
     TuningLimits,
 };
-use crate::native::draft_vocabulary;
 use magnitude_batching::{HISTORY_WIDTH, SHAPING_WIDTH};
 use magnitude_family_contracts::{ProgressivePlane, WeightKind, WeightScope};
 use magnitude_kernels::{
@@ -165,8 +164,7 @@ pub(crate) struct HeadRowsTuning {
     pub weight: Element,
     pub activation: Element,
     pub epsilon: f32,
-    /// The output weight's leading rows it projects onto (a draft readout's
-    /// `draft_vocabulary`); `None` projects onto every row.
+    /// Optional declared output rows; `None` projects onto every row.
     pub rows: Option<u64>,
 }
 
@@ -284,8 +282,7 @@ pub(crate) struct ProgressiveTuning {
     /// The most selected rows the certified levels serve
     /// (`readout::certified_rows`).
     pub certified_rows: u64,
-    /// The planes' leading rows it projects onto (a draft head's
-    /// `draft_vocabulary`); `None` projects onto every row.
+    /// Optional declared plane rows; `None` projects onto every row.
     pub rows: Option<u64>,
 }
 
@@ -823,7 +820,7 @@ impl EntryTuning for HeadLogitsTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = vocabulary_shape(inputs)?;
-        Ok(vec![("V", draft_vocabulary(vocabulary)), ("D", hidden)])
+        Ok(vec![("V", vocabulary), ("D", hidden)])
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -836,12 +833,10 @@ impl EntryTuning for HeadLogitsTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, String> {
         let output = inputs.weight(WeightScope::Target, WeightKind::Output)?;
-        let [vocabulary, hidden] = output.extents()[..] else {
+        let [_, hidden] = output.extents()[..] else {
             return Err("the output weight is not a matrix".into());
         };
-        let weight = output
-            .slice_leading(0, draft_vocabulary(vocabulary))
-            .map_err(|error| error.to_string())?;
+        let weight = output;
         Ok(vec![HeadLogitsCase {
             features: inputs.activation(self.activation, &[point.rows, hidden], 1)?,
             weight,

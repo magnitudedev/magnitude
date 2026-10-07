@@ -18,11 +18,10 @@ pub(crate) use attestation::{
 };
 use draft::DraftKernels;
 pub(crate) use draft::{
-    draft_readout_vocabulary, AttestedDflash2, Dflash2Kernels, Dflash2Projections,
+    AttestedDflash2, Dflash2Kernels, Dflash2Projections,
     DraftBlockKernels, MarkovKernels,
 };
 use glue::GlueKernels;
-pub(crate) use head::draft_vocabulary;
 use head::HeadKernels;
 pub use head::HeadLogitsKernels;
 pub(crate) use import::ImportKernels;

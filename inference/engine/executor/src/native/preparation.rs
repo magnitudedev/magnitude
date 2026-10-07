@@ -1715,11 +1715,7 @@ impl<'a> Preparation<'a> {
                     )?
                     .map(HeadLogitsKernels::Packed),
                 HeadProjection::Progressive => self
-                    .progressive(
-                        b.output_norm,
-                        b.activation,
-                        Some(draft_vocabulary(self.vocabulary)),
-                    )?
+                    .progressive(b.output_norm, b.activation, None)?
                     .map(HeadLogitsKernels::Progressive),
             };
             let head = self
@@ -1756,7 +1752,7 @@ impl<'a> Preparation<'a> {
             }
         }
         // Token selection over the draft vocabulary.
-        let vocabulary = draft_vocabulary(self.vocabulary);
+        let vocabulary = self.vocabulary;
         let shape = self
             .spec
             .tuned(&mut self.tuning, &ShapeRowsTuning { vocabulary })?;
@@ -1828,8 +1824,6 @@ impl<'a> Preparation<'a> {
                 A: b.activation,
             }),
         )?;
-        let readout_vocabulary =
-            draft_readout_vocabulary(draft_plan.markov().is_some(), self.vocabulary);
         let head = self.spec.tuned(
             &mut self.tuning,
             &HeadRowsTuning {
@@ -1837,19 +1831,19 @@ impl<'a> Preparation<'a> {
                 weight: draft_plan.projection(),
                 activation: draft_plan.activation(),
                 epsilon: self.epsilon,
-                rows: Some(readout_vocabulary),
+                rows: None,
             },
         )?;
         let shape = self.spec.tuned(
             &mut self.tuning,
             &ShapeRowsTuning {
-                vocabulary: readout_vocabulary,
+                vocabulary: self.vocabulary,
             },
         )?;
         let sample = self.spec.tuned(
             &mut self.tuning,
             &SampleRowsTuning {
-                vocabulary: readout_vocabulary,
+                vocabulary: self.vocabulary,
             },
         )?;
         let widen = fixed!(

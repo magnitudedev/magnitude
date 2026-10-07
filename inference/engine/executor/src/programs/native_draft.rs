@@ -561,6 +561,11 @@ pub(crate) fn checked_draft_family_storage(
             class,
         )
         .map_err(|error| error.context(context()))?;
+        #[cfg(test)]
+        if let Some(block) = &parts.block {
+            assert_eq!(block.readout_vocabulary, geometry.definition.decoder.vocabulary,
+                "separate draft graph must retain every artifact vocabulary row");
+        }
         let storage = GraphDraft::seal(parts.plan).map_err(|error| error.context(context()))?;
         family.include(storage, parts.constants);
     }
@@ -988,10 +993,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         WeightKind::OutputNorm,
         &mut weights,
     )?;
-    let readout_vocabulary = crate::native::draft_readout_vocabulary(
-        matches!(draft.method, DraftMethod::DSpark { .. }),
-        vocabulary,
-    );
+    let readout_vocabulary = vocabulary;
     let mut leading = Vec::new();
     let projection = leading_port(
         &mut graph,
