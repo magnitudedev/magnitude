@@ -1,6 +1,10 @@
 import * as IcnSchemas from "@magnitudedev/icn-protocol/schemas"
+import { zstdDecompress } from "node:zlib"
+import { promisify } from "node:util"
 import { Context, Data, Effect, Schema } from "effect"
 import { parseTree, type Node, type ParseError } from "jsonc-parser"
+
+const decompressZstd = promisify(zstdDecompress)
 
 const HOP_BY_HOP_HEADERS = [
   "connection",
@@ -517,8 +521,17 @@ const classifyCodexRoutingBody = async (source: Request): Promise<RoutingBodyRes
   if (encoding !== "zstd") return classifyRoutingBytes(original, invalidCodex)
   let decoded: Uint8Array
   try {
-    decoded = await Bun.zstdDecompress(original)
-  } catch {
+    decoded = await decompressZstd(original, {
+      maxOutputLength: MAX_CODEX_ROUTING_BODY_BYTES,
+    })
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "ERR_BUFFER_TOO_LARGE"
+    ) {
+      return invalidCodex("Decoded request body exceeds the 128 MB routing limit", 413)
+    }
     return invalidCodex("Request body is not valid zstd content")
   }
   if (decoded.byteLength > MAX_CODEX_ROUTING_BODY_BYTES) {
