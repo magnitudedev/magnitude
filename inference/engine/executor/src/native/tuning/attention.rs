@@ -38,10 +38,11 @@ use std::ops::Range;
 /// forms at a bounded encoded-history slice of the longest history the
 /// case's layers keep (a window layer never holds the whole context). A start
 /// changes only the form's first measurement; every admissible configuration
-/// remains searchable and is judged on the case's served points.
+/// remains searchable and is judged on the case's served points. Metal verification
+/// also starts from the first legal scalar query-group split.
 fn decode_starts(
     mix: &AttentionMix,
-    device: &Device,
+    backend: seismic::BackendName,
     implementation: &seismic::NativeImplementation,
     statics: &seismic::NativeSpecialization,
     limits: TuningLimits,
@@ -64,7 +65,7 @@ fn decode_starts(
     } else {
         bytes_per_head.div_ceil(256 * 1024)
     };
-    match device.backend() {
+    let mut starts = match backend {
         seismic::BackendName::Vulkan if desired_parts > default_parts || wide_verification => {
             nearest(
                 implementation,
@@ -138,7 +139,40 @@ fn decode_starts(
             )
         }
         _ => Vec::new(),
+    };
+    // Verification can exhaust its short search after the default and matrix
+    // starts. Also measure the first legal scalar query-group split: fewer
+    // heads per subgroup reduce its live accumulators without changing forms.
+    // The domain supplies the split and all other default parameters stay put;
+    // this is a measured candidate, never an unconditional mapping choice.
+    if backend == seismic::BackendName::Metal
+        && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2)
+    {
+        if let Some(slices) = implementation
+            .params
+            .iter()
+            .find(|param| param.name == "SLICES")
+        {
+            let default_slices = defaults.param("SLICES").unwrap_or(1);
+            let candidate = slices
+                .values
+                .iter()
+                .copied()
+                .filter(|value| *value > default_slices)
+                .filter_map(|value| {
+                    let choice = defaults.clone().with_param("SLICES", value);
+                    implementation
+                        .validate(&choice)
+                        .ok()
+                        .map(|_| (value, choice))
+                })
+                .min_by_key(|(value, _)| *value);
+            if let Some((_, choice)) = candidate {
+                starts.push(choice.params().clone());
+            }
+        }
     }
+    starts
 }
 
 /// The parameter values of the admissible configuration `accepts` takes
@@ -876,7 +910,7 @@ macro_rules! mix_entry {
                 statics: &seismic::NativeSpecialization,
                 limits: TuningLimits,
             ) -> Vec<seismic::ParameterValues> {
-                $starts(&self.0, device, implementation, statics, limits)
+                $starts(&self.0, device.backend(), implementation, statics, limits)
             })?
 
             fn rotation(
@@ -972,6 +1006,93 @@ mix_entry!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metal_verification_exposes_legal_scalar_group_split() {
+        for implementation in [
+            seismic::generated::native_implementation_for_backend::<attention_decode::Entry>(
+                seismic::BackendName::Metal,
+            )
+            .unwrap()
+            .unwrap(),
+            seismic::generated::native_implementation_for_backend::<attention_decode_k8v4::Entry>(
+                seismic::BackendName::Metal,
+            )
+            .unwrap()
+            .unwrap(),
+        ] {
+            for group in [1, 2, 3, 4, 8] {
+                let mut mix = AttentionMix {
+                    listed: false,
+                    activation: Element::bf16(),
+                    shape: AttentionShape {
+                        hidden: 2560,
+                        kv_heads: 4,
+                        group,
+                        rotary_pairs: 32,
+                        width: 256,
+                        interleaved_gate: 256,
+                        separate_gate: 0,
+                        fresh: 1,
+                        head_norm: 1,
+                        value_norm: 0,
+                        projected_value: true,
+                    },
+                    scopes: Vec::new(),
+                    epsilon: 1.0e-5,
+                    decode_rows: Some(2..DECODE_ROWS + 1),
+                    window: None,
+                };
+                let limits = TuningLimits {
+                    max_rows: 8,
+                    max_projected_rows: 8,
+                    context_tokens: 4096,
+                };
+                let statics = mix
+                    .statics()
+                    .into_iter()
+                    .filter(|(name, _)| implementation.statics.iter().any(|item| item == name))
+                    .fold(
+                        seismic::NativeSpecialization::new(),
+                        |spec, (name, value)| spec.with_static(name, value),
+                    );
+                let defaults = implementation.default_specialization(&statics).unwrap();
+                let starts = decode_starts(
+                    &mix,
+                    seismic::BackendName::Metal,
+                    &implementation,
+                    &statics,
+                    limits,
+                );
+                let scalar = starts
+                    .iter()
+                    .filter(|choice| choice.get("MATRIX") == Some(&0))
+                    .collect::<Vec<_>>();
+                assert_eq!(scalar.len(), usize::from(group % 2 == 0));
+                for values in scalar {
+                    let mut expected = defaults.params().clone();
+                    expected.insert("SLICES".into(), 2);
+                    assert_eq!(*values, expected);
+                    implementation
+                        .validate(&defaults.clone().with_param("SLICES", 2))
+                        .unwrap();
+                }
+                mix.decode_rows = Some(1..2);
+                assert!(
+                    decode_starts(
+                        &mix,
+                        seismic::BackendName::Metal,
+                        &implementation,
+                        &statics,
+                        limits
+                    )
+                    .iter()
+                    .all(|choice| choice.get("MATRIX") != Some(&0))
+                );
+            }
+        }
+    }
+
 
     #[test]
     fn verify_decode_has_distinct_tuning_identity_and_served_rows() {
