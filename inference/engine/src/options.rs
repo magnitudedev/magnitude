@@ -204,6 +204,31 @@ pub struct ResolvedModelPolicy {
 }
 
 impl ModelPolicy {
+    /// Optional draft admission is host policy, never a numerical model property.
+    pub(crate) fn resolve_admitted(
+        &self,
+        definition: &ModelDefinition,
+        draft_unavailable: Option<&magnitude_family_dflash::Error>,
+    ) -> Result<ResolvedModelPolicy, String> {
+        if draft_unavailable.is_some()
+            && matches!(
+                self.method,
+                ModelMethod::Auto
+                    | ModelMethod::DFlash
+                    | ModelMethod::DSpark
+                    | ModelMethod::DFlash2
+            )
+        {
+            return Self {
+                method: ModelMethod::Plain,
+                mtp_proposals: None,
+                ..self.clone()
+            }
+            .resolve(definition);
+        }
+        self.resolve(definition)
+    }
+
     pub fn resolve(&self, definition: &ModelDefinition) -> Result<ResolvedModelPolicy, String> {
         definition.validate().map_err(|error| error.to_string())?;
         let method = resolve_method(self.method, self.mtp_proposals, definition)?;
@@ -559,6 +584,47 @@ mod tests {
             vision: None,
             draft: None,
         }
+    }
+
+    #[test]
+    fn unavailable_separate_draft_resolves_plain_even_with_mtp_head_and_width() {
+        let missing = magnitude_family_dflash::Error::MissingCausality;
+        let malformed = magnitude_family_dflash::Error::Metadata {
+            key: "dflash.attention.causal".into(),
+            expected: "BOOL",
+        };
+        for reason in [&missing, &malformed] {
+            for method in [
+                ModelMethod::Auto,
+                ModelMethod::DFlash,
+                ModelMethod::DSpark,
+                ModelMethod::DFlash2,
+            ] {
+                let policy = ModelPolicy {
+                    method,
+                    mtp_proposals: Some(3),
+                    ..ModelPolicy::default()
+                };
+                assert_eq!(
+                    policy
+                        .resolve_admitted(&definition(true), Some(reason))
+                        .unwrap()
+                        .method,
+                    ResolvedMethod::Plain
+                );
+            }
+        }
+        let policy = ModelPolicy {
+            method: ModelMethod::Mtp,
+            ..ModelPolicy::default()
+        };
+        assert!(matches!(
+            policy
+                .resolve_admitted(&definition(true), Some(&missing))
+                .unwrap()
+                .method,
+            ResolvedMethod::Mtp { .. }
+        ));
     }
 
     #[test]

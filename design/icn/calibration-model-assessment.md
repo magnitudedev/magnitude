@@ -84,9 +84,12 @@ across several GGUF files is assessed as one package: the engine is given its fi
 reads every shard's header. A speculative bundle's separate draft is interpreted against its
 target from its header exactly as a load binds it: its weights, history and draft workflows join
 the memory charge, and its decode speed is the target's plain decode (no acceptance is modeled). A
-draft the draft family cannot interpret against its target is an unsupported representation; a
-declared method the draft does not implement is an invalid configuration, which fails the
-assessment as it fails a load. Such a bundle is never assessed or served as plain decoding.
+draft with missing, malformed or unsupported semantics is disabled with a distinct diagnostic,
+and automatic or separate-draft selection resolves to plain target decoding before planning.
+Its weights, history and workflows then contribute nothing to the memory charge. Target
+interpretation failures still fail admission. A successfully admitted draft of another variant
+than the requested method remains an invalid configuration. Assessment and loading share
+these decisions.
 
 ### Executability
 

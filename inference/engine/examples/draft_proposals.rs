@@ -111,7 +111,8 @@ fn main() -> Result<(), String> {
     }
     .open()
     .map_err(|error| error.to_string())?;
-    let (_, mut definition) = package_definition(&package).map_err(|error| error.to_string())?;
+    let (_, admitted) = package_definition(&package).map_err(|error| error.to_string())?;
+    let mut definition = admitted.definition;
     definition.decoder.context_limit = definition
         .decoder
         .context_limit

@@ -52,7 +52,9 @@ const PAIRS: [(&str, &str); 6] = [
 
 fn family(target: &str) -> &'static dyn ModelFamily {
     match target.split("__").next().unwrap() {
-        "qwen3.6-35b-a3b" => &Qwen35Family,
+        "qwen3.6-35b-a3b" | "qwen3.6-27b" | "qwen3.5-4b" | "qwen3.5-9b" | "qwen3.8-27b" => {
+            &Qwen35Family
+        }
         "muse-glimmer-30b" => &MuseGlimmerFamily,
         "nemotron-3.5-lightning-30b-a3b" => &NemotronHFamily,
         "lfm2.5-2.6b" | "lfm2.5-8b-a1b" => &Lfm2Family,
@@ -67,11 +69,44 @@ fn target(file: &str) -> ModelDefinition {
         .unwrap_or_else(|error| panic!("{file}: {error}"))
 }
 
+/// Prospective explicit headers from the publication audit. Keep the captured
+/// upstream fixtures untouched so omission remains independently testable.
+fn explicit_directory(file: &str) -> Directory {
+    let mut directory = headers::directory(file);
+    directory
+        .metadata
+        .retain(|entry| entry.name != "dflash.attention.causal");
+    let value = if file == PAIRS[0].0 {
+        Value::Array(
+            vec![true, true, true, true, true, false]
+                .into_iter()
+                .map(Scalar::Bool)
+                .collect(),
+        )
+    } else {
+        Value::Scalar(Scalar::Bool(false))
+    };
+    directory.metadata.push(Metadata {
+        name: "dflash.attention.causal".into(),
+        value,
+    });
+    if file == PAIRS[1].0 {
+        // Muse's source radius is inclusive; GGUF/engine windows use distance < W.
+        directory
+            .metadata
+            .iter_mut()
+            .find(|entry| entry.name == "dflash.attention.sliding_window")
+            .unwrap()
+            .value = Value::Scalar(Scalar::Unsigned(2049));
+    }
+    directory
+}
+
 /// Bind a draft through its target family's layer mapping (Nemotron-H's GGUF
 /// layers are single sublayers; every other family's are blocks).
 fn draft_of(draft: &str, target_file: &str) -> Result<DraftDefinition, Error> {
     let definition = target(target_file);
-    let directory = headers::directory(draft);
+    let directory = explicit_directory(draft);
     let family = family(target_file);
     inspect(&directory, &definition, &|layer| {
         family.layer_entry(&definition, layer)
@@ -185,9 +220,12 @@ fn muse_dflash_windows_every_layer() {
     assert_eq!(draft.taps, block_taps(&[2, 14, 26, 38, 50]));
     assert_eq!(
         domains(&draft),
-        vec![HistoryDomain::Window { tokens: 2048 }; 5]
+        vec![HistoryDomain::Window { tokens: 2049 }; 5]
     );
-    assert_eq!(draft.block_attention, vec![BlockAttention::Causal; 5]);
+    assert_eq!(
+        draft.block_attention,
+        vec![BlockAttention::Bidirectional; 5]
+    );
     assert_eq!(draft.fusion.shape, [6656, 5 * 6656]);
     assert_eq!(draft.mask_token, TokenId(201818));
 }
@@ -315,7 +353,7 @@ fn drafts_and_targets_are_recognized_by_disjoint_families() {
 }
 
 fn qwen_draft() -> (Directory, ModelDefinition) {
-    (headers::directory(PAIRS[0].0), target(PAIRS[0].1))
+    (explicit_directory(PAIRS[0].0), target(PAIRS[0].1))
 }
 
 fn inspect_qwen(directory: &Directory, model: &ModelDefinition) -> Result<DraftDefinition, Error> {
@@ -477,7 +515,7 @@ fn qwen38(draft: &str) -> Result<DraftDefinition, Error> {
     let model = Qwen35Family
         .inspect(&headers::directory(QWEN38_TARGET), None, identity())
         .unwrap();
-    inspect(&headers::directory(draft), &model, &|layer| {
+    inspect(&explicit_directory(draft), &model, &|layer| {
         Qwen35Family.layer_entry(&model, layer)
     })
 }
@@ -576,7 +614,7 @@ fn dflash2_roles_are_all_or_nothing() {
         Error::MissingWeight("blk.4.ffn_conv_proj.weight".into())
     );
     // Selector metadata without the selector roles is not a DFlash draft.
-    let mut stray = headers::directory(QWEN38_DSPARK);
+    let mut stray = explicit_directory(QWEN38_DSPARK);
     headers::set(
         &mut stray,
         "dflash.selector_rank",
@@ -596,4 +634,125 @@ fn dflash2_roles_are_all_or_nothing() {
         ]),
     );
     assert!(matches!(bind(&sectioned), Err(Error::Geometry(_))));
+}
+
+#[test]
+fn missing_causality_is_not_inferred_from_windows() {
+    let (mut directory, model) = qwen_draft();
+    directory
+        .metadata
+        .retain(|entry| entry.name != "dflash.attention.causal");
+    assert_eq!(
+        inspect_qwen(&directory, &model),
+        Err(Error::MissingCausality)
+    );
+}
+
+#[test]
+fn causality_requires_booleans_and_exact_layer_count() {
+    for value in [
+        Value::Scalar(Scalar::Unsigned(1)),
+        Value::Array(vec![Scalar::Bool(true); 5]),
+        Value::Array(vec![Scalar::Unsigned(1); 6]),
+    ] {
+        let (mut directory, model) = qwen_draft();
+        directory
+            .metadata
+            .iter_mut()
+            .find(|entry| entry.name == "dflash.attention.causal")
+            .unwrap()
+            .value = value;
+        assert!(matches!(
+            inspect_qwen(&directory, &model),
+            Err(Error::Metadata { .. })
+        ));
+    }
+}
+
+#[test]
+fn scalar_causality_is_independent_of_window_pattern() {
+    for causal in [false, true] {
+        let (mut directory, model) = qwen_draft();
+        directory
+            .metadata
+            .iter_mut()
+            .find(|entry| entry.name == "dflash.attention.causal")
+            .unwrap()
+            .value = Value::Scalar(Scalar::Bool(causal));
+        let draft = inspect_qwen(&directory, &model).unwrap();
+        assert_eq!(
+            draft.block_attention,
+            vec![
+                if causal {
+                    BlockAttention::Causal
+                } else {
+                    BlockAttention::Bidirectional
+                };
+                6
+            ]
+        );
+        assert_eq!(domains(&draft)[5], HistoryDomain::Token);
+    }
+}
+
+/// Release qualification uses actual binary GGUF headers, not reconstructed JSON.
+#[test]
+#[ignore = "requires publication header paths"]
+fn publication_binary_headers_bind() {
+    let root = std::env::var("DRAFTER_PUBLICATION_HEADERS").unwrap();
+    for (name, target_file) in [
+        ("Qwen3.6-35B-A3B-DFlash", PAIRS[0].1),
+        ("Muse-Glimmer-30B-DFlash", PAIRS[1].1),
+        ("Qwen3.6-27B-DFlash", "qwen3.6-27b__target-gguf_q4.json"),
+        ("Qwen3.5-4B-DFlash", "qwen3.5-4b__target-gguf_q4.json"),
+        ("Qwen3.5-9B-DFlash", "qwen3.5-9b__target-gguf_q4.json"),
+        ("Qwen3.8-27B-DFlash2", "qwen3.8-27b__target-gguf_q4.json"),
+        ("Qwen3.8-27B-DSpark", "qwen3.8-27b__target-gguf_q4.json"),
+        ("MiniCPM5-2B-DSpark", PAIRS[5].1),
+        ("LFM2.5-2.6B-DSpark", PAIRS[3].1),
+        ("LFM2.5-8B-A1B-DSpark", PAIRS[4].1),
+        (
+            "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash",
+            PAIRS[2].1,
+        ),
+    ] {
+        let directory =
+            magnitude_artifacts::gguf::inspect_header(format!("{root}/{name}.gguf")).unwrap();
+        let model = target(target_file);
+        let family = family(target_file);
+        let draft = inspect(&directory, &model, &|layer| {
+            family.layer_entry(&model, layer)
+        })
+        .unwrap();
+        assert_eq!(draft.block_attention.len(), draft.blocks.len());
+        if name == "Qwen3.6-27B-DFlash" {
+            assert_eq!(
+                draft.block_attention,
+                vec![
+                    BlockAttention::Causal,
+                    BlockAttention::Causal,
+                    BlockAttention::Causal,
+                    BlockAttention::Causal,
+                    BlockAttention::Bidirectional
+                ]
+            );
+        } else if name.starts_with("Qwen3.5") || name == "Qwen3.6-35B-A3B-DFlash" {
+            assert_eq!(
+                draft.block_attention,
+                vec![
+                    BlockAttention::Causal,
+                    BlockAttention::Causal,
+                    BlockAttention::Causal,
+                    BlockAttention::Causal,
+                    BlockAttention::Causal,
+                    BlockAttention::Bidirectional
+                ]
+            );
+        } else {
+            assert!(draft
+                .block_attention
+                .iter()
+                .all(|attention| *attention == BlockAttention::Bidirectional));
+        }
+    }
 }

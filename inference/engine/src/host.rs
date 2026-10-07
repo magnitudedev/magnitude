@@ -27,6 +27,7 @@ pub struct HostArtifacts {
     family: &'static dyn ModelFamily,
     /// The definition at the served context bound.
     definition: ModelDefinition,
+    draft_unavailable: Option<magnitude_family_dflash::Error>,
     /// The same definition at the artifact's declared capability, for
     /// host-only sizing (counting).
     declared: ModelDefinition,
@@ -62,9 +63,15 @@ impl MarkerTokens for TokenizerMarkers<'_> {
 /// target family's definition, with the package's separate draft bound
 /// against it (the target family maps the draft's tapped layers onto its
 /// sublayers). Reads no tokenizer or template.
+/// Host admission retains optional-component failures outside the numerical model.
+pub struct AdmittedDefinition {
+    pub definition: ModelDefinition,
+    pub draft_unavailable: Option<magnitude_family_dflash::Error>,
+}
+
 pub fn package_definition(
     package: &Package,
-) -> Result<(&'static dyn ModelFamily, ModelDefinition), ResolveError> {
+) -> Result<(&'static dyn ModelFamily, AdmittedDefinition), ResolveError> {
     let unsupported =
         |reason: String| ResolveError::Unsupported(UnsupportedModel::Representation { reason });
     let target = package.target().directory();
@@ -80,32 +87,38 @@ pub fn package_definition(
         family,
         declared,
         package.draft().map(|draft| draft.directory()),
-    )
-    .map_err(unsupported)?;
+    );
     Ok((family, declared))
 }
 
-/// `declared` with the package's separate draft, when it has one, bound
-/// against it: the target family maps the draft's tapped layers onto its
-/// sublayers. A payload-backed load and a header-only assessment bind the
-/// same draft definition. A draft the draft family cannot interpret against
-/// this target is an unsupported representation of the package.
+/// Bind an optional draft after target interpretation has succeeded. A draft
+/// failure cannot hide a target failure or change target numerical semantics.
 pub fn bind_draft(
     family: &dyn ModelFamily,
     declared: ModelDefinition,
     draft: Option<&Directory>,
-) -> Result<ModelDefinition, String> {
+) -> AdmittedDefinition {
     let Some(draft) = draft else {
-        return Ok(declared);
+        return AdmittedDefinition {
+            definition: declared,
+            draft_unavailable: None,
+        };
     };
-    let draft = magnitude_family_dflash::inspect(draft, &declared, &|layer| {
+    match magnitude_family_dflash::inspect(draft, &declared, &|layer| {
         family.layer_entry(&declared, layer)
-    })
-    .map_err(|error| format!("draft: {error}"))?;
-    Ok(ModelDefinition {
-        draft: Some(draft),
-        ..declared
-    })
+    }) {
+        Ok(draft) => AdmittedDefinition {
+            definition: ModelDefinition {
+                draft: Some(draft),
+                ..declared
+            },
+            draft_unavailable: None,
+        },
+        Err(reason) => AdmittedDefinition {
+            definition: declared,
+            draft_unavailable: Some(reason),
+        },
+    }
 }
 
 impl HostArtifacts {
@@ -119,13 +132,19 @@ impl HostArtifacts {
         served_context: Option<usize>,
         launch_rows: Option<usize>,
     ) -> Result<Self, ResolveError> {
-        let (family, declared) = package_definition(&package)?;
+        let (family, admitted) = package_definition(&package)?;
+        let AdmittedDefinition {
+            definition: declared,
+            draft_unavailable,
+        } = admitted;
+        if let Some(reason) = &draft_unavailable {
+            eprintln!("magnitude-engine: separate drafter disabled: {reason}");
+        }
         let mut definition = declared.clone();
         definition.decoder.context_limit =
             resolve_served_context(served_context, declared.decoder.context_limit)?;
-        let unsupported = |reason: String| {
-            ResolveError::Unsupported(UnsupportedModel::Representation { reason })
-        };
+        let unsupported =
+            |reason: String| ResolveError::Unsupported(UnsupportedModel::Representation { reason });
         if let Some(launch_rows) = launch_rows {
             let cells = image_cell_limit(&definition, launch_rows)
                 .map_err(|error| unsupported(error.to_string()))?;
@@ -168,6 +187,7 @@ impl HostArtifacts {
             package: Arc::new(package),
             family,
             definition,
+            draft_unavailable,
             declared,
             tokenizer,
             templates,
@@ -179,9 +199,9 @@ impl HostArtifacts {
 
     /// Open and interpret a package at its declared context.
     pub fn open(package: &crate::options::PackageOptions) -> Result<Self, ResolveError> {
-        let opened = package
-            .open()
-            .map_err(|error| ResolveError::Artifact(ArtifactError::from_artifacts(error, &package.target)))?;
+        let opened = package.open().map_err(|error| {
+            ResolveError::Artifact(ArtifactError::from_artifacts(error, &package.target))
+        })?;
         Self::interpret(opened, None, None)
     }
 
@@ -200,6 +220,10 @@ impl HostArtifacts {
     /// The definition at the served context bound.
     pub fn definition(&self) -> &ModelDefinition {
         &self.definition
+    }
+
+    pub(crate) fn draft_unavailable(&self) -> Option<&magnitude_family_dflash::Error> {
+        self.draft_unavailable.as_ref()
     }
 
     /// The artifact's declared context capability.
@@ -287,12 +311,17 @@ impl HostArtifacts {
     }
 }
 
-fn resolve_served_context(requested: Option<usize>, artifact_limit: u64) -> Result<u64, ResolveError> {
+fn resolve_served_context(
+    requested: Option<usize>,
+    artifact_limit: u64,
+) -> Result<u64, ResolveError> {
     let Some(requested) = requested else {
         return Ok(artifact_limit);
     };
     let invalid = || ResolveError::InvalidConfiguration {
-        reason: format!("serving context {requested} is outside the artifact limit {artifact_limit}"),
+        reason: format!(
+            "serving context {requested} is outside the artifact limit {artifact_limit}"
+        ),
     };
     let requested = u64::try_from(requested).map_err(|_| invalid())?;
     if requested == 0 || requested > artifact_limit {
@@ -304,6 +333,56 @@ fn resolve_served_context(requested: Option<usize>, artifact_limit: u64) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_admission_retains_target_and_distinguishes_missing_from_invalid() {
+        use magnitude_artifacts::{
+            gguf::{Metadata, Scalar, Value},
+            ArtifactIdentity, PackageIdentity,
+        };
+        use magnitude_family_common::headers;
+        let family = magnitude_family_qwen35::Qwen35Family;
+        let target = family
+            .inspect(
+                &headers::directory("qwen3.6-35b-a3b__target-gguf_q4.json"),
+                None,
+                PackageIdentity {
+                    target: ArtifactIdentity([7; 32]),
+                    projector: None,
+                },
+            )
+            .unwrap();
+        let mut directory = headers::directory("qwen3.6-35b-a3b__draft.json");
+        directory
+            .metadata
+            .retain(|entry| entry.name != "dflash.attention.causal");
+        let missing = bind_draft(&family, target.clone(), Some(&directory));
+        assert_eq!(missing.definition, target);
+        assert_eq!(
+            missing.draft_unavailable,
+            Some(magnitude_family_dflash::Error::MissingCausality)
+        );
+        directory.metadata.push(Metadata {
+            name: "dflash.attention.causal".into(),
+            value: Value::Scalar(Scalar::Unsigned(1)),
+        });
+        let invalid = bind_draft(&family, target.clone(), Some(&directory));
+        assert_eq!(invalid.definition, target);
+        assert!(matches!(
+            invalid.draft_unavailable,
+            Some(magnitude_family_dflash::Error::Metadata { .. })
+        ));
+        directory.metadata.last_mut().unwrap().value = Value::Array(
+            vec![true, true, true, true, true, false]
+                .into_iter()
+                .map(Scalar::Bool)
+                .collect(),
+        );
+        let admitted = bind_draft(&family, target.clone(), Some(&directory));
+        assert!(admitted.draft_unavailable.is_none());
+        assert!(admitted.definition.draft.is_some());
+        assert_eq!(admitted.definition.decoder, target.decoder);
+    }
 
     #[test]
     fn served_context_is_an_explicit_bound_within_artifact_capability() {

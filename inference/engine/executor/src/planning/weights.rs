@@ -695,7 +695,10 @@ impl ModelLoadPlan {
         if projector.is_some() != definition.vision.is_some() {
             return Err("projector component and vision definition disagree".into());
         }
-        if draft.is_some() != definition.draft.is_some() {
+        // An optional draft can remain in the opened package after semantic
+        // admission rejected it. Only an admitted definition requires its
+        // component; an unbound artifact contributes no weights to Plain.
+        if definition.draft.is_some() && draft.is_none() {
             return Err("draft component and draft definition disagree".into());
         }
         if selection.vision && definition.vision.is_none() {

@@ -2228,6 +2228,7 @@ dependencies = [
  "magnitude-batching",
  "magnitude-chat",
  "magnitude-executor",
+ "magnitude-family-common",
  "magnitude-family-contracts",
  "magnitude-family-dflash",
  "magnitude-family-gemma4",

@@ -10,31 +10,31 @@
   "laguna-s-2.1": { "target": "750f92f90cf54159c4d7a610cb7b3e74498e75c6" },
   "lfm2.5-2.6b": {
     "target": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
-    "speculativeDraft": "7bc2896af56d82ccc7e156800197408db464d63b"
+    "speculativeDraft": "60103108e36ef66c2591c2b1ea3e6530a4e2c3b0"
   },
   "lfm2.5-8b-a1b": {
     "target": "dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0",
-    "speculativeDraft": "7ba04ee5ff05a4baf2681fe5ddda6d736581ccdf"
+    "speculativeDraft": "0e2ce447c266c98603073cf9927a56130b9dca43"
   },
   "minicpm5-1b": { "target": "3d55fac80935ae6456986ad2384b5cbcc4d6c948" },
   "minicpm5-2b": {
     "target": "2079a22f3beaa4e306449978533478fe0522f4b3",
-    "speculativeDraft": "a261d2b4abc9c9ebfbad2af8a817a09802fc4ca3"
+    "speculativeDraft": "fbc306afa97f19283820af3089f9306f7b2051cb"
   },
-  "muse-glimmer-30b": { "target": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5", "speculativeDraft": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5" },
+  "muse-glimmer-30b": { "target": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5", "speculativeDraft": "40434dabff898ca2dda99f88a02b422a03715d67" },
   "nemotron-3-super-120b-a12b": { "target": "036038fb30334a2d56a146c6f0d4871ab5edccbb" },
   "nemotron-3-ultra-550b-a55b": { "target": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6" },
   "nemotron-3.5-lightning-30b-a3b": {
     "target": "88d7ce0b0fa385c5108866ce5d33690927531a37",
-    "speculativeDraft": "cb86a5267e902064e551f028e97abb11990c258d"
+    "speculativeDraft": "4f5b414b9388a4543dcc4b24758e09d68140a6fe"
   },
   "qwen3.5-122b-a10b": { "target": "907becb33103ab66b23da06a2dc74a5fca0583bd" },
   "qwen3.5-4b": { "target": "86835bf9949e4d14d6860f7910b1340ad4f271a9" },
   "qwen3.5-9b": { "target": "9716a636ee4bddc3fed678220b7a33dd2a4160ae" },
   "qwen3.6-35b-a3b": {
     "target": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
-    "speculativeDraft": "0e8061d252dbac5a1b4abe506bf2b7613d438f87"
+    "speculativeDraft": "69e4642852bd025abbce700eb04ed2befae6d6e1"
   },
-  "qwen3.8-27b": { "target": "27af057ecb382ddfea5d12837360a8980560e3ed", "speculativeDraft": "2d9571f8ce46e151f61c6499c99dee6079e1d610" },
+  "qwen3.8-27b": { "target": "27af057ecb382ddfea5d12837360a8980560e3ed", "speculativeDraft": "ead2a051a43bf91e8982e00d2c060efb3b984cb5" },
   "qwen3.8-flash-next": { "target": "83cadfda58d30be06c110518208d1bb918b33f10" }
 }

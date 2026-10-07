@@ -67,6 +67,18 @@ policy, and its program inputs. Everything downstream (planning, scheduling, gen
 and assessment) consumes the model definition and the adapter contract only, so adding or
 replacing a family (including a compiled-program family) changes nothing outside the engine.
 
+Separate drafter admission is an optional-component outcome retained by the host,
+not a numerical property of the target. Explicit checkpoint attention semantics
+are required; a missing field disables drafting, and malformed or unsupported draft
+semantics retain their distinct diagnostic while leaving the target available.
+The host surfaces the reason once when resolving a load. Automatic or explicit
+separate-draft selection then resolves to plain target decoding, including when
+the target also has an MTP head; an explicitly requested MTP method remains
+independent. Resolution precedes draft workflows, feature capture, weight imports,
+state allocation and tuning. Target interpretation errors never become draft
+fallbacks. Header assessment and payload-backed loading use the same admission
+and method resolution.
+
 ## Host/worker boundary
 
 Only immutable, device-free values cross the worker boundary: the manifest, prepared inputs,

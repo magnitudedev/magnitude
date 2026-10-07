@@ -63,7 +63,7 @@
       "repository": "unsloth/Qwen3.8-27B-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
-      "speculativeDecoding": { "method": "dflash2", "draft": { "type": "file", "repository": "z-lab/Qwen3.8-27B-DFlash2-GGUF", "path": "Qwen3.8-27B-DFlash2-Q8_0.gguf" } },
+      "speculativeDecoding": { "method": "dflash2", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.8-27B-DFlash2-GGUF", "path": "Qwen3.8-27B-DFlash2-Q8_0.gguf" } },
       "license": "apache-2.0",
       "artificialAnalysis": {
         "score": 33.7,
@@ -135,7 +135,7 @@
       "repository": "unsloth/Muse-Glimmer-30B-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-Muse-Glimmer-30B-Q8_0.gguf" },
-      "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "path": "dflash-kquant.gguf" } },
+      "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Muse-Glimmer-30B-DFlash-GGUF", "path": "dflash-kquant.gguf" } },
       "license": "apache-2.0",
       "artificialAnalysis": {
         "score": 17.5,
@@ -210,7 +210,7 @@
         "method": "dspark",
         "draft": {
           "type": "file",
-          "repository": "LiquidAI/LFM2.5-2.6B-DSpark-GGUF",
+          "repository": "magnitudedev/LFM2.5-2.6B-DSpark-GGUF",
           "path": "LFM2.5-2.6B-DSpark-Q8_0.gguf"
         }
       },
@@ -242,7 +242,7 @@
         "method": "dspark",
         "draft": {
           "type": "file",
-          "repository": "LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF",
+          "repository": "magnitudedev/LFM2.5-8B-A1B-DSpark-GGUF",
           "path": "LFM2.5-8B-A1B-DSpark-Q8_0.gguf"
         }
       },
@@ -294,7 +294,7 @@
       "support": { "level": "supported" },
       "repository": "openbmb/MiniCPM5-2B-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "openbmb/MiniCPM5-2B-DSpark-GGUF", "path": "MiniCPM5-2.6B-DSpark.gguf" } },
+      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "magnitudedev/MiniCPM5-2B-DSpark-GGUF", "path": "MiniCPM5-2.6B-DSpark.gguf" } },
       "license": "apache-2.0",
       "artificialAnalysis": {
         "score": 12.5,
