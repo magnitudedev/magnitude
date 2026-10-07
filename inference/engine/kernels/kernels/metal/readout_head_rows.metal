@@ -1,5 +1,6 @@
 // readout_head_rows: final RMS prologue over the `out_rows` hidden rows and the
-// vocabulary projection into F32 logits, scaled by a present `weight_scale`
+// vocabulary projection into F32 logits. Batched rows normalize once and use
+// the shared compressed-code matrix form where supported. Logits are scaled by a present `weight_scale`
 // (static WS = 1) and softcapped from the accumulator when `softcap` > 0.
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.h"
@@ -79,7 +80,7 @@ kernel void readout_head_rows_gemv_pair(HEAD_ROWS_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_BATCH
-template <uint BATCH_ROWS>
+template <uint BATCH_ROWS, uint BATCH_PARTS>
 kernel void readout_head_rows_batch(HEAD_ROWS_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -87,9 +88,14 @@ kernel void readout_head_rows_batch(HEAD_ROWS_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     HEAD_ROWS_OPERANDS;
-    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
-    projection::threadgroup_squares_runtime(in, uint(SEISMIC_DIM_O), squares, simdgroups, sg, lane);
-    const auto x = projection::shared_norm(in, squares);
+    projection::Plain<activation, projection::AllRows> x{normalized, k, 1, k, {}};
+    if constexpr (projection::matrix_codes<packets::W0>::available) {
+        projection::gemv_matrix<packets::W0, BATCH_PARTS>(x, out, w,
+            uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), k, tile, shared, simdgroups, sg, lane);
+        return;
+    }
+    if (tile * simdgroups * BATCH_ROWS * 8u >= uint(SEISMIC_DIM_V))
+        return;
     projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(x, out, w,
         uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), k, tile, shared, simdgroups, sg, lane);
 }

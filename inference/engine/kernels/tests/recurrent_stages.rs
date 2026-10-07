@@ -1935,7 +1935,7 @@ fn convolved_form(
 ) -> (Vec<f32>, Outcome) {
     use magnitude_kernels::{gated_delta_project_convolved, gated_delta_step_convolved};
     let g = case.geometry;
-    // Launches: gemv (one row), batch, gemv_rows (three rows up to
+    // Launches: normalize, gemv (one row), batch, gemv_rows (three rows up to
     // BATCH_FROM), gemv_pair (two rows). Every GEMV launch takes the mapping, as `gated_delta_project`'s one
     // GEMV launch does for every row count.
     let specialization = NativeSpecialization::new()
@@ -1945,17 +1945,18 @@ fn convolved_form(
         .with_static("W", g.width as u64)
         .with_static("C", g.convolution as u64)
         .with_param("BATCH_FROM", mapping.batch_from)
-        .with_launch_param(0, "SIMDGROUPS", mapping.simdgroups)
-        .with_launch_param(0, "ROWS", mapping.rows)
-        .with_launch_param(0, "LANES", mapping.lanes)
-        .with_launch_param(1, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
-        .with_launch_param(1, "BATCH_ROWS", mapping.batch_rows)
-        .with_launch_param(2, "SIMDGROUPS", mapping.simdgroups)
-        .with_launch_param(2, "ROWS", mapping.rows)
-        .with_launch_param(2, "LANES", mapping.lanes)
+        .with_launch_param(1, "SIMDGROUPS", mapping.simdgroups)
+        .with_launch_param(1, "ROWS", mapping.rows)
+        .with_launch_param(1, "LANES", mapping.lanes)
+        .with_launch_param(2, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
+        .with_launch_param(2, "BATCH_ROWS", mapping.batch_rows)
+        .with_launch_param(2, "BATCH_PARTS", 2)
         .with_launch_param(3, "SIMDGROUPS", mapping.simdgroups)
         .with_launch_param(3, "ROWS", mapping.rows)
-        .with_launch_param(3, "LANES", mapping.lanes);
+        .with_launch_param(3, "LANES", mapping.lanes)
+        .with_launch_param(4, "SIMDGROUPS", mapping.simdgroups)
+        .with_launch_param(4, "ROWS", mapping.rows)
+        .with_launch_param(4, "LANES", mapping.lanes);
     let mut t = case.tensors(device, Element::bf16());
     let projected = gated_delta_project_convolved::native_for_device_with(
         device,
@@ -2131,5 +2132,65 @@ fn metal_recurrent_timings() {
                 );
             }
         }
+    }
+}
+
+/// The normalized staging of the batch fallback retains its prior projection
+/// and all recurrent state bits, including a partial second row fragment.
+#[test]
+fn convolved_batch_fallback_keeps_state_bits() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let case = Case::new(
+        Geometry {
+            banks: 5,
+            tape: 3,
+            ..SMALL
+        },
+        13,
+        vec![
+            SlotCase {
+                rows: 2,
+                stop: 1,
+                previous: 1,
+                following: 3,
+                taped: 2,
+            },
+            SlotCase {
+                rows: 10,
+                stop: 8,
+                previous: 2,
+                following: 4,
+                taped: 1,
+            },
+        ],
+        true,
+        172,
+    )
+    .with_bf16_activations();
+    let mapping = ProjectionMapping {
+        batch_from: 3,
+        simdgroups: 8,
+        rows: 2,
+        lanes: 16,
+        batch_simdgroups: 8,
+        batch_rows: 2,
+    };
+    let inputs = ProjectionInputs::new(&device, &case, 512, 173);
+    let (before_projection, before) = step_form(&device, &case, &inputs, 512, mapping);
+    let (after_projection, after) = convolved_form(&device, &case, &inputs, 512, mapping);
+    for (label, a, b) in [
+        ("projection", before_projection, after_projection),
+        ("gated", before.gated, after.gated),
+        ("window", before.window, after.window),
+        ("delta", before.delta, after.delta),
+        ("tape", before.tape, after.tape),
+    ] {
+        assert_eq!(
+            a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{label}"
+        );
     }
 }
