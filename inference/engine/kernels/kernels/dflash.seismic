@@ -322,15 +322,32 @@ native draft_gated_rows for cpu from "cpu/draft_gated_rows.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (F * 8)
 
-# Metal, CUDA, Vulkan: one threadgroup of 256 threads per row, K rounds of a
-# (value, token) arg-max reduction. CPU: one work item per row.
+# Large Metal and CUDA vocabularies select K per partition, then merge that exact
+# candidate union. Small rows use one workgroup without scratch or a merge.
+# Vulkan uses one workgroup per row; CPU uses one work item per row.
 native draft_top_k for metal from "metal/draft_top_k.metal":
-    launch draft_top_k:
+    scratch partial_tokens bytes (M * ceil_div(V, 4096) * K * 8) when V > 8192
+    scratch partial_values bytes (M * ceil_div(V, 4096) * K * 4) when V > 8192
+    launch draft_top_k when V <= 8192:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch draft_top_k_parts when V > 8192:
+        threadgroups (M, ceil_div(V, 4096), 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch draft_top_k_merge when V > 8192:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native draft_top_k for cuda from "cuda/draft_top_k.cu":
-    launch draft_top_k:
+    scratch partial_tokens bytes (M * ceil_div(V, 4096) * K * 8) when V > 8192
+    scratch partial_values bytes (M * ceil_div(V, 4096) * K * 4) when V > 8192
+    launch draft_top_k when V <= 8192:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch draft_top_k_parts when V > 8192:
+        threadgroups (M, ceil_div(V, 4096), 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch draft_top_k_merge when V > 8192:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
