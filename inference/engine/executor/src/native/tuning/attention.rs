@@ -237,7 +237,9 @@ impl EntryTuning for AttentionProjectTuning {
         if projection_shape(inputs, &self.scopes, query)? != (shape.query_rows(), shape.hidden) {
             return Err("the query projection disagrees with the binding".into());
         }
-        let [_, statics @ ..] = shape.project_dimensions(0);
+        let [_, statics @ ..] = if self.binding.key_value_only {
+            shape.key_value_dimensions(0)
+        } else { shape.project_dimensions(0) };
         Ok(statics.to_vec())
     }
 
@@ -266,7 +268,12 @@ impl EntryTuning for AttentionProjectTuning {
                     }
                 };
                 Ok(AttentionProjectCase {
-                    gate: segment(shape.gate_rows(), WeightKind::AttentionGate)?,
+                    gate: {
+                        let gate = segment(shape.gate_rows(), WeightKind::AttentionGate)?;
+                        if self.binding.key_value_only {
+                            gate.slice_leading(0, 0).map_err(|error| error.to_string())?
+                        } else { gate }
+                    },
                     key: segment(shape.key_rows(), WeightKind::Key)?,
                     value: segment(shape.value_rows(), WeightKind::Value)?,
                     hidden: inputs.activation(
@@ -275,7 +282,9 @@ impl EntryTuning for AttentionProjectTuning {
                         index as u64 + 1,
                     )?,
                     input_norm: inputs.weight(scope, WeightKind::InputNorm)?,
-                    query,
+                    query: if self.binding.key_value_only {
+                        query.slice_leading(0, 0).map_err(|error| error.to_string())?
+                    } else { query },
                     epsilon: self.epsilon,
                 })
             })

@@ -5789,3 +5789,34 @@ fn metal_attention_output_matrix_matches_host() {
         }
     }
 }
+
+
+#[test]
+fn metal_absent_query_projection_preserves_key_value() {
+    let Some(device) = devices().into_iter().find(|d| d.backend() == BackendName::Metal) else {
+        return;
+    };
+    let (d, q, kv) = (256usize, 256usize, 64usize);
+    for rows in [1usize, 2, 7, 128] {
+    let mut rng = Rng::new(776);
+    let values = (0..rows*d).map(|_| rng.symmetric()).collect::<Vec<_>>();
+    let hidden = f32_tensor(&device, &[rows,d], &values);
+    let norm = bf16_norm(&device, &norm_values(d, 13));
+    let query = weight(Repr::Bf16,q,d,777,1.0).tensor(&device);
+    let key = weight(Repr::Bf16,kv,d,778,1.0).tensor(&device);
+    let value = weight(Repr::Bf16,kv,d,779,1.0).tensor(&device);
+    let empty = query.slice_leading(0,0).unwrap();
+    let run = |absent: bool| {
+        let spec = attention_project_specialization_on(&device,
+            &[("D",d),("Q",if absent {0} else {q}),("GR",0),("K",kv),("V",kv)],
+            gemm_mapping(64,64,1));
+        let kernel = attention_project::native_for_device_with(&device,
+            attention_project::Elements { NW: Element::bf16(), QW: Element::bf16(), GW: Element::bf16(), KW: Element::bf16(), VW: Element::bf16(), A: Element::bf16() }, &spec).unwrap();
+        let out = kernel.call(attention_project::Args {hidden:&hidden,input_norm:&norm,query_weight:if absent {&empty}else{&query},gate_weight:&empty,key_weight:&key,value_weight:&value,epsilon:1e-6,project_mode:if absent {0}else{1}}).unwrap();
+        (out.r2.read_to_host().unwrap(),out.r3.read_to_host().unwrap())
+    };
+    let full=run(false);
+    let absent=run(true);
+    assert_eq!(full,absent, "K/V changed at {rows} rows");
+    }
+}

@@ -1,3 +1,4 @@
+#define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 // attention_decode: split-KV decode attention over dense history. The Vulkan
 // form of `metal/attention_decode.metal` over `lib/attention/attention.glsl`.
 #define ATTENTION_HEADS uint(SEISMIC_DIM_G / SEISMIC_TUNE_SLICES)

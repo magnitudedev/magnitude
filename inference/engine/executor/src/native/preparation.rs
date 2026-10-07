@@ -43,7 +43,7 @@ use crate::{
 };
 use magnitude_family_contracts::{ModelDefinition, SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{
-    conditioning_overlay, draft_confidence, draft_convolve_input, draft_convolve_residual,
+    attention_append_dense, conditioning_overlay, draft_confidence, draft_convolve_input, draft_convolve_residual,
     draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, moe_tail,
     per_layer_inputs, post_norm_residual, repack_weight, tap_rows, widen_rows,
 };
@@ -777,9 +777,14 @@ impl<'a> Preparation<'a> {
                 let prefill = self
                     .spec
                     .tuned(&mut self.tuning, &AttentionPrefillTuning(mix()))?;
+                let append = fixed!(self.spec, attention_append_dense, format!("{shape:?}"),
+                    attention_append_dense::Elements { A: binding.activation },
+                    statics &shape.append_statics());
                 decode
                     .zip(prefill)
-                    .map(|(decode, prefill)| AttentionHistoryKernels::Dense {
+                    .zip(append)
+                    .map(|((decode, prefill), append)| AttentionHistoryKernels::Dense {
+                        append,
                         decode,
                         verify,
                         prefill,
@@ -858,9 +863,14 @@ impl<'a> Preparation<'a> {
                 } else {
                     None
                 };
+                let append = fixed!(self.spec, attention_append_k8v4, format!("{shape:?}"),
+                    attention_append_k8v4::Elements { A: binding.activation },
+                    statics &shape.append_statics());
                 decode
                     .zip(prefill)
-                    .map(|(decode, prefill)| AttentionHistoryKernels::AffineK8V4 {
+                    .zip(append)
+                    .map(|((decode, prefill), append)| AttentionHistoryKernels::AffineK8V4 {
+                        append,
                         decode,
                         verify,
                         verify_four,
@@ -1686,6 +1696,11 @@ impl<'a> Preparation<'a> {
             )?;
             // The draft head's history is always dense (its binding says so).
             let attention = self.attention(b.attention, attention_layers.scopes(b))?;
+            let priming_project = self.spec.tuned(&mut self.tuning, &AttentionProjectTuning {
+                binding: AttentionBinding { key_value_only: true, ..b.attention },
+                scopes: attention_layers.scopes(b),
+                epsilon: self.epsilon,
+            })?;
             let feed_forward = match b.feed_forward {
                 FeedForwardProgramSlot::Dense(binding) => self
                     .dense(binding, feed_forward_layers.scopes(b))?
@@ -1725,13 +1740,15 @@ impl<'a> Preparation<'a> {
             if let (
                 Some(input),
                 Some(attention),
+                Some(priming_project),
                 Some(feed_forward),
                 Some(features),
                 Some(logits),
-            ) = (input, attention, feed_forward, features, logits)
+            ) = (input, attention, priming_project, feed_forward, features, logits)
             {
                 head.input.insert(b, input);
                 head.attention.insert(b, attention);
+                head.priming_project.insert(b, priming_project);
                 match feed_forward {
                     AttestedFeedForward::Dense(dense) => {
                         head.dense.insert(b, dense);

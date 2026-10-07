@@ -776,7 +776,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         let rows = graph.input_for(
             entries.layers[first].injection.project,
             "hidden",
-            &first_shape.project_dimensions(class.entry_rows),
+            &first_shape.key_value_dimensions(class.entry_rows),
         )?;
         let tensor = rows.tensor().clone();
         (DraftConditioning::Rows(rows), tensor)
@@ -1479,6 +1479,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
             inject_only: false,
         },
     )?;
+    let attended = attended.ok_or("draft block attention result is absent")?;
     let output = project(
         graph,
         entries.output,
@@ -2239,12 +2240,12 @@ fn write_controls(
     active
         .write_input(&ports.coordinates, &controls.coordinates)
         .map_err(device)?;
-    active
-        .write_input(&ports.visible, &controls.visible)
-        .map_err(device)?;
-    active
-        .write_input(&ports.fresh, &controls.fresh)
-        .map_err(device)?;
+    if let Some(visible) = &ports.visible {
+        active.write_input(visible, &controls.visible).map_err(device)?;
+    }
+    if let Some(fresh) = &ports.fresh {
+        active.write_input(fresh, &controls.fresh).map_err(device)?;
+    }
     active
         .write_input(&ports.destinations, &controls.destinations)
         .map_err(device)

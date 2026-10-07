@@ -201,6 +201,14 @@ impl AttentionShape {
         ]
     }
 
+    /// Projection of history rows has no query or gate outputs.
+    pub fn key_value_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+        let mut dimensions = self.project_dimensions(rows);
+        dimensions[2].1 = 0;
+        dimensions[3].1 = 0;
+        dimensions
+    }
+
     /// The static axes of the fused attention entries.
     pub fn mix_statics(&self) -> [(&'static str, u64); 9] {
         [
@@ -214,6 +222,11 @@ impl AttentionShape {
             ("N", self.head_norm),
             ("NV", self.value_norm),
         ]
+    }
+
+    /// Cache publication has no query-head or gate geometry.
+    pub fn append_statics(&self) -> Vec<(&'static str, u64)> {
+        self.mix_statics().into_iter().filter(|(name, _)| !matches!(*name, "G" | "I" | "U")).collect()
     }
 
     /// The fused entries' dimensions for `rows` rows over `history_rows`
@@ -248,6 +261,8 @@ impl AttentionShape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionBinding {
     pub shape: AttentionShape,
+    /// State-only projection omits query and gate segments statically.
+    pub key_value_only: bool,
     pub norm: Element,
     pub query: Element,
     pub gate: Element,

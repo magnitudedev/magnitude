@@ -1,3 +1,4 @@
+#define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 // attention_prefill: streaming attention for prefill rows over dense history.
 // The body (three launches) is `lib/attention/prefill.glsl`.
 #define ATTENTION_I uint(SEISMIC_DIM_I)

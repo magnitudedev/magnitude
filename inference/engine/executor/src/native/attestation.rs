@@ -14,7 +14,7 @@ use crate::{
 };
 use magnitude_family_contracts::{ProgressivePlane, SublayerIndex};
 use magnitude_kernels::{
-    draft_confidence, draft_convolve_input, draft_convolve_residual, draft_gated_rows,
+    attention_append_dense, draft_confidence, draft_convolve_input, draft_convolve_residual, draft_gated_rows,
     draft_path_step, draft_top_k, feature_rows, import_dense, post_norm_residual, project_rows,
     repack_weight, tap_rows, widen_rows,
 };
@@ -215,6 +215,7 @@ pub(crate) struct AttestedHeadBlock {
     pub binding: HeadBinding,
     pub input: NativeKernel<draft_rows::Entry>,
     pub attention: AttentionKernels,
+    pub priming_project: NativeKernel<attention_project::Entry>,
     pub feed_forward: AttestedFeedForward,
     pub features: NativeKernel<readout_features_rows::Entry>,
     pub logits: HeadLogitsKernels,
@@ -541,9 +542,9 @@ impl AttestedPrograms {
                             }
                         }
                         + match binding.history {
-                            KvCodec::Dense => bytes!(attention_decode) + bytes!(attention_prefill),
+                            KvCodec::Dense => bytes!(attention_append_dense) + bytes!(attention_decode) + bytes!(attention_prefill),
                             KvCodec::AffineK8V4 => {
-                                bytes!(attention_decode_k8v4) + bytes!(attention_prefill_k8v4)
+                                bytes!(attention_append_k8v4) + bytes!(attention_decode_k8v4) + bytes!(attention_prefill_k8v4)
                             }
                             KvCodec::RotatedK4V4 => {
                                 return Err(PlanError::Unsupported("native rotated K4/V4 KV codec"))
@@ -652,7 +653,8 @@ impl AttestedPrograms {
             for &binding in head.blocks() {
                 if charged_heads.insert(binding) {
                     bytes += bytes!(draft_rows)
-                        + bytes!(attention_project)
+                        + 2 * bytes!(attention_project)
+                        + bytes!(attention_append_dense)
                         + bytes!(attention_decode)
                         + bytes!(attention_prefill)
                         + bytes!(attention_output)
@@ -693,6 +695,7 @@ impl AttestedPrograms {
                     if attention.insert(binding) {
                         bytes += bytes!(attention_project)
                             + bytes!(attention_output)
+                            + bytes!(attention_append_dense)
                             + bytes!(attention_decode)
                             + bytes!(attention_prefill);
                     }
@@ -1030,6 +1033,7 @@ impl AttestedPrograms {
                     blocks.push(AttestedHeadBlock {
                         binding,
                         input: slot(&handles.input, binding, "draft_rows")?,
+                        priming_project: slot(&handles.priming_project, binding, "attention_project")?,
                         attention: handles
                             .attention
                             .get(&binding)
@@ -1395,6 +1399,7 @@ impl AttestedPrograms {
         }
         if let Some(head) = &prepared.head {
             charge!(head.input.values());
+            charge!(head.priming_project.values());
             for handles in head.attention.values() {
                 bytes += u128::from(handles.project.invocation_workspace_bytes())
                     + u128::from(handles.history.invocation_workspace_bytes())
@@ -1797,10 +1802,12 @@ impl AttestedPrograms {
                 charge!(&handles.project);
                 match &handles.history {
                     super::target::AttentionHistoryKernels::Dense {
+                        append,
                         decode,
                         verify,
                         prefill,
                     } => {
+                        charge!(append);
                         charge!(decode);
                         if let Some(verify) = verify {
                             charge!(verify);
@@ -1808,6 +1815,7 @@ impl AttestedPrograms {
                         charge!(prefill);
                     }
                     super::target::AttentionHistoryKernels::AffineK8V4 {
+                        append,
                         decode,
                         verify,
                         verify_four,
@@ -1815,6 +1823,7 @@ impl AttestedPrograms {
                         prefill,
                         prefill_listed,
                     } => {
+                        charge!(append);
                         charge!(decode);
                         if let Some(verify) = verify {
                             charge!(verify);
@@ -1973,6 +1982,7 @@ impl AttestedPrograms {
         if let Some(head) = &self.head {
             for block in &head.blocks {
                 charge!(&block.input);
+                charge!(&block.priming_project);
                 attention!(&block.attention);
                 feed_forward!(&block.feed_forward);
                 charge!(&block.features);

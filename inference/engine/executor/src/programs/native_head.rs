@@ -44,6 +44,7 @@ use magnitude_family_contracts::{
     WeightScope,
 };
 use magnitude_kernels::{
+    attention_project,
     dense_expand, dense_output, draft_rows, head_logits_rows, readout_features_rows, sample_rows,
     shape_rows,
 };
@@ -191,8 +192,8 @@ pub(crate) fn head_graph_classes(
 /// The per-run inputs of one pass.
 struct PassPorts {
     coordinates: NativePort,
-    visible: NativePort,
-    fresh: NativePort,
+    visible: Option<NativePort>,
+    fresh: Option<NativePort>,
     destinations: NativePort,
     /// The head's history planes, in plane-descriptor order.
     planes: Vec<NativePort>,
@@ -202,6 +203,7 @@ struct PassPorts {
 struct HeadGraphEntries<'a, G: GraphDraft + 'a> {
     input: G::Binding<'a, draft_rows::Entry>,
     attention: AttentionGraphEntries<'a, G>,
+    priming_project: G::Binding<'a, attention_project::Entry>,
     feed_forward: HeadFeedForwardEntries<'a, G>,
     features: G::Binding<'a, readout_features_rows::Entry>,
     logits: HeadLogitsEntries<'a, G>,
@@ -225,6 +227,7 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
         Ok(Self {
             input: &block.input,
             attention: (&block.attention).into(),
+            priming_project: &block.priming_project,
             feed_forward: match &block.feed_forward {
                 AttestedFeedForward::Dense(handles) => {
                     HeadFeedForwardEntries::Dense(handles.into())
@@ -320,6 +323,7 @@ impl CheckedHeadEntries {
         Ok(HeadGraphEntries {
             input: &self.input,
             attention: self.attention.entries()?,
+            priming_project: self.attention.entries()?.project,
             feed_forward: match &self.feed_forward {
                 CheckedHeadFeedForwardEntries::Dense(entries) => {
                     HeadFeedForwardEntries::Dense(entries.entries())
@@ -636,7 +640,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         };
         let (attended, state, controls) = attention_graph::attention(
             &mut graph,
-            entries.attention,
+            AttentionGraphEntries {
+                project: if inject_only { entries.priming_project } else { entries.attention.project },
+                ..entries.attention
+            },
             &attention_weights,
             &mut constants,
             &input,
@@ -1484,12 +1491,12 @@ impl NativeHeadProgram {
             active
                 .write_input(&ports.coordinates, &controls.coordinates)
                 .map_err(device)?;
-            active
-                .write_input(&ports.visible, &controls.visible)
-                .map_err(device)?;
-            active
-                .write_input(&ports.fresh, &controls.fresh)
-                .map_err(device)?;
+            if let Some(visible) = &ports.visible {
+                active.write_input(visible, &controls.visible).map_err(device)?;
+            }
+            if let Some(fresh) = &ports.fresh {
+                active.write_input(fresh, &controls.fresh).map_err(device)?;
+            }
             active
                 .write_input(&ports.destinations, &controls.destinations)
                 .map_err(device)?;

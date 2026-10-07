@@ -1,3 +1,7 @@
+#include "lib/attention/inputs.cuh"
+#define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
+#define ATTENTION_INTERLEAVED SEISMIC_DIM_I
+#define ATTENTION_SEPARATE SEISMIC_DIM_U
 // attention_decode_k8v4 (M <= 8): `attention_decode`'s split-KV decode over
 // affine K8/V4 history.
 //
@@ -18,6 +22,7 @@
 // Both forms' shared code (an entry's includes expand once, whatever the
 // branch).
 #include "lib/attention/attention.cuh"
+#include "lib/attention/decode_merge.cuh"
 
 #if SEISMIC_TUNE_MATRIX
 

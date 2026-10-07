@@ -1,0 +1,40 @@
+#define ATTENTION_QUERY_GROUP 1
+// State-only geometry: common helpers have no query or gate rows.
+// Ordered cache publication before causal target attention.
+#define ATTENTION_I uint(0)
+#define ATTENTION_U uint(0)
+#define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
+#define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
+#define ATTENTION_SOFTPLUS false
+#define ATTENTION_QUERY_BUFFER 0ul
+#define ATTENTION_GATE_BUFFER 0ul
+#define ATTENTION_AMPLITUDE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)
+#define ATTENTION_VALUE_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_VALUE_NORM)
+// Both forms' shared code (an entry's includes expand once, whatever the
+// branch).
+#include "lib/attention/history.glsl"
+
+void attention_append_dense() {
+    const uint64_t item = uint64_t(gl_WorkGroupID.x) * 8ul + uint64_t(SEISMIC_SUBGROUP);
+    const uint64_t row = item / uint64_t(ATTENTION_KV);
+    const uint kv_head = uint(item % uint64_t(ATTENTION_KV));
+    const uint lane = SEISMIC_LANE;
+    if (!ATTENTION_FRESH || row >= SEISMIC_DIM_M) return;
+    const int destination = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + row * 4ul);
+    if (destination < 0) return;
+    const attention_history h = attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY),
+        SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE));
+    const uint64_t source = (row * uint64_t(ATTENTION_KV) + uint64_t(kv_head)) * uint64_t(ATTENTION_W);
+    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    float x[ATTENTION_E];
+    attention_prepare(SEISMIC_PTR(SEISMIC_BUFFER_KEY) + source * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)),
+        SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul,
+        SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
+        ATTENTION_AMPLITUDE_BUFFER, epsilon, lane, x);
+    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) x[i] = element_round(ELEMENT_ACT, x[i]);
+    history_append(h, true, destination, kv_head, lane, x);
+    attention_value(SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + source * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)),
+        ATTENTION_VALUE_NORM_BUFFER, epsilon, lane, x);
+    history_append(h, false, destination, kv_head, lane, x);
+}

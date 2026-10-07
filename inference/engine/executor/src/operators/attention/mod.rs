@@ -296,6 +296,7 @@ pub(super) fn binding(
     let query = lookup(query_kind(attention))?;
     let segment = |present: bool, kind| if present { lookup(kind) } else { Ok(query) };
     Ok(AttentionBinding {
+        key_value_only: false,
         shape,
         norm: lookup(WeightKind::InputNorm)?,
         query,

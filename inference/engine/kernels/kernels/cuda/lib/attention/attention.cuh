@@ -23,7 +23,7 @@ using element::u64;
 typedef element::Act Act;
 
 constexpr int KV = static_cast<int>(SEISMIC_DIM_KV);
-constexpr int G = static_cast<int>(SEISMIC_DIM_G);
+constexpr int G = static_cast<int>(ATTENTION_QUERY_GROUP);
 constexpr int P = static_cast<int>(SEISMIC_DIM_P);
 constexpr int W = static_cast<int>(2 * SEISMIC_DIM_P + SEISMIC_DIM_S);
 // Dimensions owned by one lane when a warp holds a W-vector.
@@ -35,8 +35,8 @@ constexpr float LOG2E = 1.4426950408889634f;
 // The entry's form: queries with I interleaved gate columns, U separate gate
 // values per query head, layers with (F = 1) or without fresh rows, optional
 // q/k (N) and value (NV) norms.
-constexpr int I = static_cast<int>(SEISMIC_DIM_I);
-constexpr int U = static_cast<int>(SEISMIC_DIM_U);
+constexpr int I = static_cast<int>(ATTENTION_INTERLEAVED);
+constexpr int U = static_cast<int>(ATTENTION_SEPARATE);
 constexpr bool FRESH = SEISMIC_DIM_F != 0;
 constexpr bool NORM = SEISMIC_DIM_N != 0;
 constexpr bool VALUE_NORM = SEISMIC_DIM_NV != 0;
@@ -68,30 +68,19 @@ struct Inputs {
 
 // The entry's inputs, and their tensor addressing. Keys and values are [F, M,
 // KV * W]: axis 1 is the row.
-#define ATTENTION_INPUTS()                                                                      \
-    attention::Inputs {                                                                         \
-        &seismic_words_value, SEISMIC_PTR(SEISMIC_BUFFER_QUERY), SEISMIC_PTR(SEISMIC_BUFFER_GATE), \
-            SEISMIC_PTR(SEISMIC_BUFFER_KEY), SEISMIC_PTR(SEISMIC_BUFFER_VALUE),                 \
-            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM)),            \
-            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM)),              \
-            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_NORM)),            \
-            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS)),       \
-            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES)),             \
-            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE)),                 \
-            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_FRESH)),                   \
-            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS)),            \
-            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES)),   \
-            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)),    \
-            element::word_f32(SEISMIC_PARAM_EPSILON),                                           \
-            element::word_f32(SEISMIC_PARAM_SCALE),                                             \
-            SEISMIC_PARAM_GATE_FUNCTION != 0                                                    \
-    }
-#define ATTENTION_QUERY_AT(row, query_head)                                              \
-    (static_cast<attention::u64>(row) * SEISMIC_QUERY_STRIDE_0 +                         \
-     static_cast<attention::u64>(query_head) * SEISMIC_QUERY_STRIDE_1)
-#define ATTENTION_GATE_AT(row, query_head)                                               \
-    (static_cast<attention::u64>(row) * SEISMIC_GATE_STRIDE_0 +                          \
-     static_cast<attention::u64>(query_head) * SEISMIC_GATE_STRIDE_1)
+// Cache publication binds only the fields its preparation and append helpers read.
+#define ATTENTION_APPEND_INPUTS() \
+    attention::Inputs { &seismic_words_value, nullptr, nullptr, \
+        SEISMIC_PTR(SEISMIC_BUFFER_KEY), SEISMIC_PTR(SEISMIC_BUFFER_VALUE), nullptr, \
+        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM)), \
+        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_NORM)), \
+        reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS)), \
+        reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES)), nullptr, nullptr, \
+        reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS)), \
+        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES)), \
+        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)), \
+        element::word_f32(SEISMIC_PARAM_EPSILON), 0.0f, false }
+
 #define ATTENTION_KEY_AT(row, kv_head)                                                   \
     (static_cast<attention::u64>(row) * SEISMIC_KEY_STRIDE_1 +                           \
      static_cast<attention::u64>(kv_head) * attention::W)
@@ -100,13 +89,6 @@ struct Inputs {
      static_cast<attention::u64>(kv_head) * attention::W)
 
 // Control offsets, named alike in every attention entry's ABI.
-#define ATTENTION_VISIBLE(in, row, span, bound)                                          \
-    ((in).visible[static_cast<attention::u64>(row) * SEISMIC_VISIBLE_STRIDE_0 +          \
-                  static_cast<attention::u64>(span) * SEISMIC_VISIBLE_STRIDE_1 +         \
-                  static_cast<attention::u64>(bound) * SEISMIC_VISIBLE_STRIDE_2])
-#define ATTENTION_FRESH(in, row, bound)                                                  \
-    ((in).fresh[static_cast<attention::u64>(row) * SEISMIC_FRESH_STRIDE_0 +              \
-                static_cast<attention::u64>(bound) * SEISMIC_FRESH_STRIDE_1])
 #define ATTENTION_DESTINATION(in, row)                                                   \
     ((in).destinations[static_cast<attention::u64>(row) * SEISMIC_DESTINATIONS_STRIDE_0])
 
@@ -119,6 +101,7 @@ struct Span {
     int lo;
     int hi;
 };
+#ifndef ATTENTION_APPEND_ONLY
 __device__ __forceinline__ Span span(const Inputs &in, u64 row, u64 span, u64 spans) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     if (span < spans) {
@@ -137,6 +120,8 @@ __device__ __forceinline__ long long visible_total(const Inputs &in, u64 row, u6
     }
     return total;
 }
+
+#endif
 
 // Part `index` of [lo, hi) split into parts of `per` keys (the last ones
 // shorter or empty), as [lo, hi) in the same key numbering.
@@ -333,6 +318,7 @@ __device__ __forceinline__ void publish(const Heads<H> &state, float *exchange, 
     }
 }
 
+#ifndef ATTENTION_APPEND_ONLY
 // One attended column of (row, query head) times its output gate.
 __device__ __forceinline__ float gated(const Inputs &in, u64 row, int query_head, int column,
                                        float attended) {
@@ -350,23 +336,9 @@ __device__ __forceinline__ float gated(const Inputs &in, u64 row, int query_head
                        : attended / (1.0f + expf(-gate));
 }
 
-// The decode merge of one (query head, row) column: the row's PARTS
-// partitions in partition order, then the output gate.
-template <int PARTS>
-__device__ __forceinline__ void decode_gate(const Inputs &in, const float *partials,
-                                            const float *statistics, u8 *result, int query_head,
-                                            u64 row, int column) {
-    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    const u64 first = (row * KV * G + query_head) * PARTS;
-    float denominator, accumulator;
-    merge(statistics + first * 2, 2, partials + first * W + column, W, PARTS, denominator,
-          accumulator);
-    const float attended = gated(in, row, query_head, column, accumulator / fmaxf(denominator, 1e-30f));
-    element::put<Act>(result,
-                      row * SEISMIC_RESULT_0_STRIDE_0 + query_head * SEISMIC_RESULT_0_STRIDE_1 +
-                          column * SEISMIC_RESULT_0_STRIDE_2,
-                      attended);
-}
+
+
+#endif
 
 // ---------------------------------------------------------------------------
 // Per-head preparation and append.
@@ -446,16 +418,19 @@ __device__ __forceinline__ void prepared_key(const Inputs &in, u64 row, int kv_h
     for (int d = 0; d < DPL; ++d) k[d] = Act::round(k[d]);
 }
 
+#ifndef ATTENTION_APPEND_ONLY
 // The prepared query of batch row `row`, query head `query_head`, rounded to
 // the activation element as the contract publishes it.
 __device__ __forceinline__ void prepared_query(const Inputs &in, u64 row, int query_head,
                                                float (&q)[DPL], float *exchange, int lane) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     element::span<Act, DPL, true>(in.query, ATTENTION_QUERY_AT(row, query_head) + lane * DPL, q);
-    norm_rotary<NORM>(q, in.query_norm, SEISMIC_QUERY_NORM_STRIDE_1, in, row, exchange, lane);
+    norm_rotary<NORM>(q, in.query_norm, ATTENTION_QUERY_NORM_STRIDE, in, row, exchange, lane);
 #pragma unroll
     for (int d = 0; d < DPL; ++d) q[d] = Act::round(q[d]);
 }
+
+#endif
 
 // Row `row`'s value for `kv_head`, lane `lane`'s dimensions: the raw value, or
 // with a value norm the normalized value rounded to the activation.

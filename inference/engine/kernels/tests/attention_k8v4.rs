@@ -6,7 +6,8 @@
 #![allow(dead_code)]
 
 use magnitude_kernels::{
-    attention_decode, attention_decode_k8v4, attention_prefill, attention_prefill_k8v4,
+    attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_prefill,
+    attention_prefill_k8v4,
 };
 use seismic::{
     BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor,
@@ -365,6 +366,25 @@ impl Bound {
 }
 
 macro_rules! args {
+    (attention_append_k8v4, $bound:expr, $case:expr) => {
+        attention_append_k8v4::Args {
+            key: &$bound.key,
+            value: &$bound.value,
+            key_norm: &$bound.key_norm,
+            value_norm: &$bound.value_norm,
+            rotary_components: &$bound.components,
+            rotary_frequencies: &$bound.frequencies,
+            rotary_amplitudes: &$bound.amplitudes,
+            coordinates: &$bound.coordinates,
+            destinations: &$bound.destinations,
+            history_key_codes: &mut $bound.key_codes,
+            history_key_coefficients: &mut $bound.key_coefficients,
+            history_value_codes: &mut $bound.value_codes,
+            history_value_coefficients: &mut $bound.value_coefficients,
+            epsilon: $case.epsilon,
+            slab_rows: $bound.slab_rows,
+        }
+    };
     ($module:ident, $bound:expr, $case:expr) => {
         $module::Args {
             query: &$bound.query,
@@ -3133,4 +3153,56 @@ fn gemma_fresh_only_with_scale(scale: f64) {
         .configurations
         .iter()
         .any(|r| matches!(r.outcome, seismic::Outcome::Measured { .. })));
+}
+
+
+/// State-only publication agrees with the existing fused codec.
+#[test]
+fn ordered_append_matches_fused_codec() {
+    for device in k8v4_devices() {
+        for geometry in [
+            GROUPED,
+            QWEN,
+            Geometry {
+                kv: 1,
+                g: 1,
+                p: 128,
+                s: 256,
+            },
+        ] {
+            let encoded = Encoded::new(Case::new(geometry, 64, 2, &decode_rows(16), 731));
+            let config = decode_configs(device.backend(), geometry).remove(0);
+            let decode = decode_kernel(&device, geometry, &config);
+            let append = attention_append_k8v4::native_for_device_with(
+                &device,
+                attention_append_k8v4::Elements { A: Element::bf16() },
+                &append_specialization(&specialization_on(&device, geometry, &[])),
+            )
+            .unwrap();
+            let mut fused = Bound::new(&device, &encoded);
+            let mut ordered = Bound::new(&device, &encoded);
+            decode
+                .call(args!(attention_decode_k8v4, fused, encoded.case))
+                .unwrap();
+            append
+                .call(args!(attention_append_k8v4, ordered, encoded.case))
+                .unwrap();
+            assert_eq!(
+                ordered.planes(),
+                fused.planes(),
+                "{:?} ordered publication differs from fused codec",
+                device.backend()
+            );
+        }
+    }
+}
+
+fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecialization {
+    specialization
+        .statics()
+        .iter()
+        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U"))
+        .fold(NativeSpecialization::new(), |spec, (name, value)| {
+            spec.with_static(name, *value)
+        })
 }

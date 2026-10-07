@@ -18,7 +18,7 @@
 #define ATTENTION_E (ATTENTION_W / 32u)
 #define ATTENTION_P uint(SEISMIC_DIM_P)
 #define ATTENTION_KV uint(SEISMIC_DIM_KV)
-#define ATTENTION_G uint(SEISMIC_DIM_G)
+#define ATTENTION_G uint(ATTENTION_QUERY_GROUP)
 // Query heads one decode subgroup holds in registers. The decode entries split
 // the G heads of a kv head into ATTENTION_G / ATTENTION_HEADS slices (their
 // SLICES parameter) and define it before including this file; a subgroup

@@ -437,7 +437,7 @@ inline uint form_total(device const int *visible, device const int *fresh, ulong
 // Rounded to the activation.
 inline Scalar gate_output(device const Scalar *query, device const Scalar *gate, ulong row, ulong head,
     uint column, float attended, bool softplus) {
-    const ulong at = row * SEISMIC_DIM_KV * SEISMIC_DIM_G + head;
+    const ulong at = row * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + head;
     float g;
     if (ATTENTION_I > 0)
         g = float(query[at * ATTENTION_QUERY_STRIDE + ATTENTION_W + column]);
@@ -463,7 +463,7 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
     uint column, uint lane, bool softplus) {
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
-    constexpr uint G = SEISMIC_DIM_G;
+    constexpr uint G = ATTENTION_QUERY_GROUP;
     // The partitions of the row's tile (TOKENS of the launch's `rows` in the
     // matrix form; one row otherwise).
     const ulong row0 = row / TOKENS * TOKENS;
@@ -533,10 +533,10 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
 // into groups of PREFILL_HEADS (the last may be smaller), PREFILL_HEAD_GROUPS
 // of them, so the threadgroup's size follows the group, not G.
 #ifndef PREFILL_HEADS_PER_GROUP
-#define PREFILL_HEADS_PER_GROUP SEISMIC_DIM_G
+#define PREFILL_HEADS_PER_GROUP ATTENTION_QUERY_GROUP
 #endif
-#define PREFILL_HEADS (PREFILL_HEADS_PER_GROUP < SEISMIC_DIM_G ? PREFILL_HEADS_PER_GROUP : SEISMIC_DIM_G)
-#define PREFILL_HEAD_GROUPS ((SEISMIC_DIM_G + PREFILL_HEADS - 1) / PREFILL_HEADS)
+#define PREFILL_HEADS (PREFILL_HEADS_PER_GROUP < ATTENTION_QUERY_GROUP ? PREFILL_HEADS_PER_GROUP : ATTENTION_QUERY_GROUP)
+#define PREFILL_HEAD_GROUPS ((ATTENTION_QUERY_GROUP + PREFILL_HEADS - 1) / PREFILL_HEADS)
 // The entry's DIRECT form: K/V tiles are read from device memory as tensor
 // operands (`prefill_direct`), which needs PREFILL_KEYS rows of zero keys and
 // values after the fresh rows' scratch.
@@ -1137,7 +1137,7 @@ struct history_window {
         constexpr ulong ROW = SEISMIC_DIM_KV * ATTENTION_W;
         constexpr uint TILE = PREFILL_HISTORY_TILE;
         constexpr uint PAD = PREFILL_PAD;
-        constexpr uint G = SEISMIC_DIM_G;
+        constexpr uint G = ATTENTION_QUERY_GROUP;
         device float *rows = partials + ulong(taken * M * G) * ROW;
         const uint spare = (charged - taken) * M * G - 1 - PAD;
         const uint state = M * G + (M * G * 4 + ATTENTION_W - 1) / ATTENTION_W;
@@ -1313,7 +1313,7 @@ inline void prefill_prepare(History history, device const Scalar *query,
     constexpr uint W = ATTENTION_W;
     constexpr uint E = ATTENTION_E;
     constexpr uint KV = SEISMIC_DIM_KV;
-    constexpr uint G = SEISMIC_DIM_G;
+    constexpr uint G = ATTENTION_QUERY_GROUP;
     const ulong item = ulong(group) * 8 + simd;
     const ulong row = item / KV;
     const ulong kv_head = item % KV;
@@ -1438,7 +1438,7 @@ struct prefill_fragments {
         ATTENTION_UNROLL
         for (uint d = 0; d < DB; ++d) {
             simdgroup_matrix<Operand, 8, 8> q;
-            simdgroup_load(q, query_rows + d * 8, SEISMIC_DIM_KV * SEISMIC_DIM_G * W);
+            simdgroup_load(q, query_rows + d * 8, SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP * W);
             ATTENTION_UNROLL
             for (uint j = 0; j < KB; ++j) {
                 simdgroup_matrix<Operand, 8, 8> k;
@@ -1517,7 +1517,7 @@ struct prefill_fragments {
     static inline void store(device const Scalar *query, device const Scalar *gate, device Scalar *result,
         device float *partials, device float *statistics, ulong first_token, ulong M, uint head, uint partition,
         uint active, uint window_first, bool softplus, thread prefill_fragments &self) {
-        constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
+        constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
         const ulong token = first_token + self.fm;
         if (token >= M)
             return;
@@ -1622,7 +1622,7 @@ struct prefill_tensors {
         threadgroup float *exchange, uint kv_head, uint partition, uint active, uint tiles_lo, uint tiles_hi,
         device const Operand *query_rows, uint head, ulong first_token, bool computes, uint owner,
         uint thread_index, uint lane) {
-        constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
+        constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
         q_tensor q(const_cast<device Operand *>(query_rows), q_extents(),
             metal::array<int32_t, 2>{1, int32_t(H * W)});
         k_tensor k(staged, k_extents(), metal::array<int32_t, 2>{1, PITCH});
@@ -1889,7 +1889,7 @@ struct prefill_direct {
         float scale, bool softplus, threadgroup const prefill_interval *intervals,
         threadgroup const prefill_run *runs, uint kv_head, uint partition, device const Operand *query_rows,
         uint head, ulong first_token) {
-        constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
+        constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
         constexpr uint KV = SEISMIC_DIM_KV;
         score_op score;
         output_op product;
@@ -2158,9 +2158,9 @@ struct prefill_owner {
     prefill_owner(uint tile, uint kv_head, uint head_group, uint simd) {
         constexpr uint SPAN = QT / ROWS;
         const uint first_head = head_group * PREFILL_HEADS;
-        computes = simd < QT * PREFILL_HEADS / ROWS && first_head + simd / SPAN < SEISMIC_DIM_G;
+        computes = simd < QT * PREFILL_HEADS / ROWS && first_head + simd / SPAN < ATTENTION_QUERY_GROUP;
         owner = computes ? simd : 0;
-        head = kv_head * SEISMIC_DIM_G + first_head + owner / SPAN;
+        head = kv_head * ATTENTION_QUERY_GROUP + first_head + owner / SPAN;
         first_token = ulong(tile) * QT + (owner % SPAN) * ROWS;
     }
 };
@@ -2187,7 +2187,7 @@ inline void prefill_owned_fragments(PREFILL_OWNED_PARAMETERS) {
     Form::place(state, lane);
     prefill_windows<QT, History>(history, query, gate, visible, fresh, result, keys, values, partials,
         statistics, M, R, scale, softplus, staged, intervals, kv_head, partition, active, tiles_lo, tiles_hi,
-        queries + (own.first_token * SEISMIC_DIM_KV * SEISMIC_DIM_G + own.head) * ATTENTION_W, own.head,
+        queries + (own.first_token * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + own.head) * ATTENTION_W, own.head,
         own.first_token, own.computes, thread_index, state);
 }
 
@@ -2198,7 +2198,7 @@ inline void prefill_owned_tensors(PREFILL_OWNED_PARAMETERS) {
     const prefill_owner<QT, Form::ROWS> own(tile, kv_head, head_group, simd);
     Form::windows(history, query, gate, visible, fresh, result, keys, values, partials, statistics, M, R, scale,
         softplus, staged, intervals, exchange + own.owner * Form::EXCHANGE, kv_head, partition, active, tiles_lo,
-        tiles_hi, queries + (own.first_token * SEISMIC_DIM_KV * SEISMIC_DIM_G + own.head) * ATTENTION_W, own.head,
+        tiles_hi, queries + (own.first_token * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + own.head) * ATTENTION_W, own.head,
         own.first_token, own.computes, own.owner, thread_index, lane);
 }
 
@@ -2211,7 +2211,7 @@ inline void prefill_owned_direct(PREFILL_OWNED_PARAMETERS) {
         return;
     Form::windows(history, query, gate, visible, fresh, result, keys, values, partials, statistics, M, R, scale,
         softplus, intervals, reinterpret_cast<threadgroup const prefill_run *>(intervals + R + 1), kv_head,
-        partition, queries + (own.first_token * SEISMIC_DIM_KV * SEISMIC_DIM_G + own.head) * ATTENTION_W, own.head,
+        partition, queries + (own.first_token * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + own.head) * ATTENTION_W, own.head,
         own.first_token);
 }
 #endif
@@ -2457,7 +2457,7 @@ struct prefill_coissue {
         threadgroup pair *mine, threadgroup pair *other, threadgroup partial *ours,
         threadgroup const partial *theirs, threadgroup const uint *spin, uint kv_head, uint partition, uint window,
         device const half *query_rows, uint head, ulong first_token, uint lane) {
-        constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
+        constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
         constexpr ulong STRIDE = SEISMIC_DIM_KV * W;
         const uint column = window * C;
         const uint quad = lane / 4;
@@ -2740,7 +2740,7 @@ struct prefill_coissue {
     static inline void store(device const Scalar *query, device const Scalar *gate, device Scalar *result,
         device float *partials, ulong M, bool softplus, threadgroup const prefill_run *runs,
         threadgroup const pair *mine, uint partition, uint window, uint head, ulong first_token, uint lane) {
-        constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
+        constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
         const uint kg = lane / CG;
         const uint cg = lane % CG;
         threadgroup const float4 *owned = mine->partials + lane;
@@ -2783,7 +2783,7 @@ struct prefill_coissue {
         threadgroup pair *mine = pairs + index;
         threadgroup pair *other = pairs + (WINDOWS > 1 ? sibling(index) : index);
         threadgroup partial *scored = reinterpret_cast<threadgroup partial *>(pairs + PAIRS);
-        device const half *query_rows = queries + (own.first_token * SEISMIC_DIM_KV * SEISMIC_DIM_G + own.head) * W;
+        device const half *query_rows = queries + (own.first_token * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + own.head) * W;
         if (own.computes) {
             if (product)
                 products(history, keys, values, M, R, runs, mine, spin, kv_head, window, lane);
@@ -2878,7 +2878,7 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     typedef typename History::Operand Operand;
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
-    constexpr uint G = SEISMIC_DIM_G;
+    constexpr uint G = ATTENTION_QUERY_GROUP;
     constexpr uint KEYS = PREFILL_KEYS;
     constexpr uint WINDOW = W < PREFILL_WINDOW ? W : PREFILL_WINDOW;
     static_assert(W % WINDOW == 0, "output windows tile the head");
@@ -3010,7 +3010,7 @@ inline void prefill_fold(history_window window, prefill_held held, uint round, d
     device const Scalar *gate, device Scalar *result, device const float *partials, device const float *statistics,
     device const uint *counts, ulong M, uint tile, ulong head, uint column, bool softplus) {
     constexpr uint W = ATTENTION_W;
-    constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
+    constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
     // A call of one round stored its results in the attend launch.
     if (!held.live || (held.first && held.last))
         return;
@@ -3063,7 +3063,7 @@ inline void prefill_merge(device const Scalar *query, device const Scalar *gate,
     device const float *partials, device const float *statistics, device const uint *counts,
     ulong M, uint tile, ulong head, uint column, bool softplus) {
     constexpr uint W = ATTENTION_W;
-    constexpr uint H = SEISMIC_DIM_KV * SEISMIC_DIM_G;
+    constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
     const uint count = counts[tile];
     if (count <= 1)
         return;
@@ -3099,7 +3099,7 @@ inline void prefill_merge(device const Scalar *query, device const Scalar *gate,
 
 // The matrix rows of a tile of `tokens` decode rows (token-major, head-minor,
 // padded to whole 8-row blocks), and its column slices.
-#define DECODE_MATRIX_ROWS(tokens) (((SEISMIC_DIM_G * (tokens) + 7) / 8) * 8)
+#define DECODE_MATRIX_ROWS(tokens) (((ATTENTION_QUERY_GROUP * (tokens) + 7) / 8) * 8)
 #define DECODE_MATRIX_COLS(tokens)                                                                       \
     (DECODE_MATRIX_ROWS(tokens) / 8 * ATTENTION_W > 128 ? DECODE_MATRIX_ROWS(tokens) / 8 * ATTENTION_W / 128 \
                                                         : 1)
@@ -3158,7 +3158,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
     constexpr uint W = ATTENTION_W;
     constexpr uint E = ATTENTION_E;
     constexpr uint KV = SEISMIC_DIM_KV;
-    constexpr uint G = SEISMIC_DIM_G;
+    constexpr uint G = ATTENTION_QUERY_GROUP;
     // Packed: one simdgroup per token owns its G = 8 heads over the whole
     // head width, so scores need no exchange; the four tokens share each
     // tile's K and V, decoded once into separate regions.

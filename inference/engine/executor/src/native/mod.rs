@@ -54,7 +54,7 @@ use crate::{
     ProgramPlan, RecurrentBinding, RoutedBinding, SublayerTail, VisionEntry,
 };
 use magnitude_kernels::{
-    attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
+    attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows, dense_expand,
     dense_output, dense_up, draft_rows, embedding_rows, gated_delta_chunk, gated_delta_project,
     gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, head_logits_rows,

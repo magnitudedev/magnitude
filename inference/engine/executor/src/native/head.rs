@@ -1,7 +1,7 @@
 use super::{AttentionKernels, DenseKernels, ProgressiveReadoutKernels, RoutedKernels};
 use crate::HeadBinding;
 use magnitude_kernels::{
-    draft_rows, head_logits_rows, readout_features_rows, sample_rows, shape_rows,
+    attention_project, draft_rows, head_logits_rows, readout_features_rows, sample_rows, shape_rows,
 };
 use seismic::NativeKernel;
 use std::collections::HashMap;
@@ -12,6 +12,7 @@ use std::collections::HashMap;
 pub struct HeadKernels {
     pub(super) input: HashMap<HeadBinding, NativeKernel<draft_rows::Entry>>,
     pub(super) attention: HashMap<HeadBinding, AttentionKernels>,
+    pub(super) priming_project: HashMap<HeadBinding, NativeKernel<attention_project::Entry>>,
     pub(super) dense: HashMap<HeadBinding, DenseKernels>,
     pub(super) routed: HashMap<HeadBinding, RoutedKernels>,
     pub(super) features: HashMap<HeadBinding, NativeKernel<readout_features_rows::Entry>>,

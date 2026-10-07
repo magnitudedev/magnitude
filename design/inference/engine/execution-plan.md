@@ -432,6 +432,8 @@ count and never per request. A step with conditioning queues, after its embeddin
 overlay run per contiguous range, binding the source span and the matching row view of the
 embedding output; the device queue orders them before the first block. Overlays add no scratch or
 result storage; the embedding result remains under its original output lease.
+State-only draft priming uses an attention projection binding with static zero query and gate segments, followed by a cache-publication entry. That entry binds only key/value preparation, rotary coordinates, destinations and history planes; it has no query, gate, visibility, attention result or attention/merge launch. Its K/V arithmetic matches ordinary projection and publication. MTP heads retain a distinct priming projection specialization; preparation and resource accounting own that handle alongside ordinary attention.
+
 The fused attention entry appends each row's key and value at its destination while other rows read
 history. History and recurrent state ports bind slab address tables, with each slab retained and
 ordered as a used resource until submitted work completes. The entry resolves one slab base per
