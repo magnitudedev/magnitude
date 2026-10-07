@@ -210,8 +210,15 @@ fn draft_rows_match_on(device: &Device) {
     };
     let epsilon = 1.0e-6;
     // Widths of whole 64-column k-blocks, below and past one block's 32
-    // outputs, rows 1..3.
-    for (width, vocabulary, rows) in [(64, 5, 1), (128, 7, 3), (192, 4, 2)] {
+    // outputs, decode rows and the partial/full tiles of Metal prompt GEMM.
+    for (width, vocabulary, rows) in [
+        (64, 5, 1),
+        (128, 7, 3),
+        (192, 4, 2),
+        (64, 5, 17),
+        (128, 7, 64),
+        (192, 4, 65),
+    ] {
         let kernel = prepare(width, false);
         let mut random = Random(width as u64 * 31 + rows as u64);
         let (table, table_values) = q8_weight(&device, vocabulary, width, 0.03125, &mut random);
