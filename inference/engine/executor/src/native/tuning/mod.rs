@@ -2572,7 +2572,10 @@ fn tuning_key_material(
     // a choice searched with a class admitted may be of that class. A unit
     // that admits none keeps the key its results were stored under.
     if !admitted.is_empty() {
-        material.push_str(&format!("\nerror classes {admitted:?}"));
+        material.push_str(&format!(
+            "\nerror comparison {}\nerror classes {admitted:?}",
+            seismic::ErrorEnvelope::COMPARISON_VERSION,
+        ));
     }
     material
 }

@@ -223,6 +223,8 @@ fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
     assert_ne!(admitting(1e-2), key(&shapes));
     assert_ne!(admitting(1e-2), admitting(2e-2));
     assert!(admitting(1e-2).starts_with(&key(&shapes)));
+    assert!(admitting(1e-2).contains(seismic::ErrorEnvelope::COMPARISON_VERSION));
+    assert!(!key(&shapes).contains(seismic::ErrorEnvelope::COMPARISON_VERSION));
 }
 
 #[test]

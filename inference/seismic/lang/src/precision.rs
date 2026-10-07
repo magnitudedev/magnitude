@@ -217,16 +217,19 @@ impl PrecisionPolicy {
 
 /// The bound on one error class's deviation from the reference, per floating
 /// result or state subject: the root-mean-square error relative to the
-/// reference's root mean square, and the largest absolute error in units of
-/// the reference's root mean square. The first admits the class's expected
-/// error; the second rejects an error concentrated in a few elements, which
-/// the first alone would average away.
+/// reference's root mean square, and the largest gap between published
+/// values' rounding cells in units of the reference's root mean square.
+/// The first uses raw published errors; the second rejects concentrated
+/// error without charging final storage rounding as kernel error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ErrorEnvelope {
     pub relative_rms: Limit,
     pub peak: Limit,
 }
 impl ErrorEnvelope {
+    /// Part of both numerical evidence and persistent native tuning keys.
+    pub const COMPARISON_VERSION: &'static str = "rounding-cells-v1";
+
     /// The envelope that admits what either admits.
     pub fn widest(self, other: Self) -> Self {
         Self {
