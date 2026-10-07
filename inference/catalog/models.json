@@ -17,6 +17,7 @@
       "repository": "unsloth/Qwen3.5-4B-MTP-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
+      "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.5-4B-DFlash-GGUF", "path": "Qwen3.5-4B-DFlash-Q8_0.gguf" } },
       "license": "apache-2.0",
       "artificialAnalysis": {
         "score": 13.1,
@@ -42,6 +43,7 @@
       "repository": "unsloth/Qwen3.5-9B-MTP-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
+      "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.5-9B-DFlash-GGUF", "path": "Qwen3.5-9B-DFlash-Q8_0.gguf" } },
       "license": "apache-2.0",
       "artificialAnalysis": {
         "score": 11.2,
