@@ -598,13 +598,17 @@ describe("Codex WebSocket gateway", () => {
 }`
     const target = codexWebSocketTarget(
       firstMessage,
-      new Headers({ authorization: "Bearer caller-token" }),
+      new Headers({
+        authorization: "Bearer caller-token",
+        "content-encoding": "zstd",
+      }),
       icn,
     )
     expect(target._tag).toBe("Target")
     if (target._tag !== "Target") return
     expect(target.url.href).toBe("ws://127.0.0.1:9999/v1/responses")
     expect(target.headers.get("authorization")).toBe("Bearer private-icn-token")
+    expect(target.headers.has("content-encoding")).toBe(false)
     expect(new TextDecoder().decode(target.firstMessage as Uint8Array)).toBe(
       firstMessage.replace(`${LOCAL_CODEX_MODEL_PREFIX}canonical:model`, "canonical:model"),
     )
