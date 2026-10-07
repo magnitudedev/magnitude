@@ -444,7 +444,8 @@ pub struct StartPlan {
     pub min_sample_seconds: f64,
     /// Consumer hints, as [`SearchPlan::start`].
     pub start: Vec<ParameterValues>,
-    /// Whether the start measures every form's start besides the defaults.
+    /// Whether the start measures every form's start besides the defaults,
+    /// and active-coordinate starts for a factored declaration.
     /// A consumer whose time does not cover that for every unit starts some
     /// with their defaults alone; their first refinement measures the form
     /// starts.
@@ -2900,6 +2901,110 @@ impl LaunchPrograms {
 /// sweep reached stands at its base: the seed's group choices under it.
 type Boundary = (f64, Vec<u64>, Vec<usize>, Vec<Vec<(usize, f64)>>);
 
+/// Nearby admissible changes of each coordinate, keeping other coordinates
+/// at the seed whenever the declaration permits. Coupled restrictions can
+/// require more than one coordinate to change; those are still real starts.
+fn coordinate_starts(candidates: &[Vec<u64>], seed: usize) -> Vec<usize> {
+    let defaults = &candidates[seed];
+    let mut starts = Vec::new();
+    for (coordinate, &default) in defaults.iter().enumerate() {
+        let lower = candidates
+            .iter()
+            .map(|values| values[coordinate])
+            .filter(|&value| value < default)
+            .max();
+        let upper = candidates
+            .iter()
+            .map(|values| values[coordinate])
+            .filter(|&value| value > default)
+            .min();
+        for value in [lower, upper].into_iter().flatten() {
+            let candidate = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, values)| values[coordinate] == value)
+                .min_by_key(|(index, values)| {
+                    (
+                        values
+                            .iter()
+                            .zip(defaults)
+                            .filter(|(value, default)| value != default)
+                            .count(),
+                        *index,
+                    )
+                })
+                .map(|(index, _)| index)
+                .expect("coordinate value came from a candidate");
+            if !starts.contains(&candidate) {
+                starts.push(candidate);
+            }
+        }
+    }
+    starts
+}
+
+/// Give each working group one nearby change before giving any group its
+/// second. Declaration order cannot let a large first group consume the
+/// complete search slice before later active launches have a rival.
+fn coverage_order(
+    groups: &[plan::Group],
+    defaults: &[usize],
+    active: &[usize],
+) -> Vec<(usize, usize)> {
+    let starts = groups
+        .iter()
+        .zip(defaults)
+        .map(|(group, &default)| {
+            if group.launches.iter().any(|launch| active.contains(launch)) {
+                coordinate_starts(&group.candidates, default)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect::<Vec<_>>();
+    (0..starts.iter().map(Vec::len).max().unwrap_or(0))
+        .flat_map(|round| {
+            starts
+                .iter()
+                .enumerate()
+                .filter_map(move |(group, starts)| {
+                    starts.get(round).map(|&candidate| (group, candidate))
+                })
+        })
+        .collect()
+}
+
+fn rank_group(ranking: &mut [(usize, f64)], seed: usize) {
+    ranking.sort_by(|left, right| {
+        left.1.total_cmp(&right.1)
+            .then_with(|| (left.0 != seed).cmp(&(right.0 != seed)))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+}
+
+/// Replay all existing evidence before considering more device work. A
+/// missing form start or an expired budget cannot hide a measured candidate
+/// from a later pass of this group.
+fn replay_group(
+    seed: usize,
+    seed_cost: f64,
+    costs: impl IntoIterator<Item = Option<f64>>,
+) -> Vec<(usize, f64)> {
+    std::iter::once((seed, seed_cost))
+        .chain(
+            costs
+                .into_iter()
+                .enumerate()
+                .filter_map(|(candidate, cost)| {
+                    (candidate != seed)
+                        .then_some(cost)
+                        .flatten()
+                        .map(|cost| (candidate, cost))
+                }),
+        )
+        .collect()
+}
+
 /// A factored search of one unit's independent launch groups, as far as it
 /// got.
 struct FactoredRun {
@@ -3292,7 +3397,9 @@ impl FactoredRun {
     /// mapping is refined. The boundaries' groups are then swept, the
     /// boundary with the cheapest base first (the default boundary when its
     /// base is within one percent of the cheapest). That order is fixed by
-    /// the bases, so every step sweeps in the order one uninterrupted search
+    /// the bases. Nearby changes of the leading boundary's active groups are
+    /// measured round-robin before deeper sweeps, so every step follows the
+    /// order one uninterrupted search
     /// does; a configuration an earlier step measured is taken from it, and
     /// one not yet measured is formed and measured unless `expired` says
     /// the step's time is out for it, which ends the step's measuring.
@@ -3364,15 +3471,90 @@ impl FactoredRun {
         // more: they are ranked by what earlier steps measured under them.
         let stopped = std::cell::Cell::new(false);
         let expired = |start: bool| stopped.get() || expired(start);
+        // Cover the active coordinates of the leading boundary before a
+        // deep sweep of any group. These starts share the form-start budget:
+        // a short refinement slice cannot starve them, but the hard deadline
+        // and conclusion reserve still apply. Resume uses the same order and
+        // skips every configuration already measured or excluded.
+        if let Some((_, boundary, baseline)) = bases.first() {
+            let active = baseline
+                .iter()
+                .flat_map(|point| point.key.launches.iter().copied())
+                .collect::<Vec<_>>();
+            let mut coverage = Vec::new();
+            for (group_index, candidate) in
+                coverage_order(&partition.groups, &default_choices, &active)
+            {
+                let mut selected = default_choices.clone();
+                selected[group_index] = candidate;
+                let specialization = partition
+                    .assemble(implementation, statics, &selected, boundary)
+                    .map_err(|error| {
+                        TuneError::Declaration(format!("factored native coverage: {error:?}"))
+                    })?;
+                if self.swept.contains_key(&Configuration::of(&specialization)) {
+                    continue;
+                }
+                coverage.push((group_index, candidate, specialization));
+            }
+            for (position, (group_index, candidate, specialization)) in coverage.iter().enumerate()
+            {
+                if expired(true) {
+                    complete = false;
+                    stopped.set(true);
+                    break;
+                }
+                // Compile this group's nearby variants together when a
+                // compile is needed, but keep measurements round-robin.
+                let ahead = coverage[position + 1..]
+                    .iter()
+                    .filter(|(group, _, _)| group == group_index)
+                    .map(|(_, candidate, specialization)| (*candidate, specialization.clone()))
+                    .collect::<Vec<_>>();
+                self.sweep(
+                    formation,
+                    default,
+                    &partition.groups[*group_index],
+                    baseline,
+                    &mut vec![(*candidate, specialization.clone())],
+                    &ahead,
+                    points,
+                    &measuring,
+                    &weighing,
+                    &mut Vec::new(),
+                )?;
+            }
+        }
         for (base_cost, boundary, baseline) in bases {
             let reserved = boundaries.is_empty();
-            let replayed = stopped.get();
             let mut choices = default_choices.clone();
             let mut group_rankings = Vec::with_capacity(partition.groups.len());
             let mut score = base_cost;
             let mut interrupted = false;
             for (group_index, group) in partition.groups.iter().enumerate() {
-                let mut ranking = vec![(default_choices[group_index], base_cost)];
+                let specializations = (0..group.candidates.len())
+                    .map(|candidate| {
+                        let mut selected = default_choices.clone();
+                        selected[group_index] = candidate;
+                        partition
+                            .assemble(implementation, statics, &selected, &boundary)
+                            .map_err(|error| {
+                                TuneError::Declaration(format!(
+                                    "factored native candidate: {error:?}"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut ranking = replay_group(
+                    default_choices[group_index],
+                    base_cost,
+                    specializations.iter().map(|specialization| {
+                        self.swept
+                            .get(&Configuration::of(specialization))
+                            .and_then(Option::as_ref)
+                            .map(|measured| weighing.cost(measured, &self.reference).total())
+                    }),
+                );
                 // Each form parameter's values seed a start of their own: the
                 // candidate of every other form nearest the defaults is measured
                 // first, then the forms' other candidates, the cheapest start's
@@ -3446,22 +3628,9 @@ impl FactoredRun {
                         if candidate == default_candidate {
                             continue;
                         }
-                        let mut selected = default_choices.clone();
-                        selected[group_index] = candidate;
-                        let specialization = partition
-                            .assemble(implementation, statics, &selected, &boundary)
-                            .map_err(|error| {
-                                TuneError::Declaration(format!(
-                                    "factored native candidate: {error:?}"
-                                ))
-                            })?;
-                        match self.swept.get(&Configuration::of(&specialization)) {
-                            Some(Some(measured)) => ranking.push((
-                                candidate,
-                                weighing.cost(measured, &self.reference).total(),
-                            )),
-                            Some(None) => {}
-                            None => pending.push((candidate, specialization)),
+                        let specialization = &specializations[candidate];
+                        if !self.swept.contains_key(&Configuration::of(specialization)) {
+                            pending.push((candidate, specialization.clone()));
                         }
                     }
                     let mut ready = Vec::new();
@@ -3489,20 +3658,15 @@ impl FactoredRun {
                         break;
                     }
                 }
-                ranking.sort_by(|left, right| {
-                    left.1
-                        .total_cmp(&right.1)
-                        .then_with(|| left.0.cmp(&right.0))
-                });
+                // An inactive group reuses precisely the baseline cost for
+                // every candidate. Keep its seed instead of silently choosing
+                // the lexically first, unobserved mapping on that tie.
+                rank_group(&mut ranking, default_choices[group_index]);
                 choices[group_index] = ranking[0].0;
                 score += ranking[0].1 - base_cost;
                 group_rankings.push(ranking);
-                // Out of time, the first boundary's later groups still
-                // measure their form starts, and a boundary only replayed
-                // ranks what was measured in every group.
-                if interrupted && !reserved && !replayed {
-                    break;
-                }
+                // Always replay later groups, even after the deadline. New
+                // device work remains guarded by `expired` above.
             }
             boundaries.push((score, boundary, choices, group_rankings));
             if interrupted {
@@ -4410,6 +4574,95 @@ fn point_measurement(label: &str, key: PointKey, measurement: Measurement) -> Po
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn factored_coverage_reaches_later_active_groups_before_refining_first() {
+        let group = |launch, candidates| plan::Group {
+            launches: vec![launch],
+            parameters: Vec::new(),
+            candidates,
+        };
+        let groups = vec![
+            group(
+                1,
+                vec![
+                    vec![4, 1],
+                    vec![4, 2],
+                    vec![8, 1],
+                    vec![8, 2],
+                    vec![16, 1],
+                    vec![16, 2],
+                ],
+            ),
+            group(
+                2,
+                vec![
+                    vec![1, 1],
+                    vec![1, 2],
+                    vec![2, 1],
+                    vec![2, 2],
+                    vec![4, 1],
+                    vec![4, 2],
+                ],
+            ),
+            group(3, vec![vec![1], vec![2]]),
+        ];
+        let order = coverage_order(&groups, &[2, 3, 0], &[1, 2]);
+        assert_eq!(&order[..2], &[(0, 0), (1, 1)]);
+        assert!(
+            order
+                .iter()
+                .any(|&(group, candidate)| group == 1
+                    && groups[group].candidates[candidate] == [2, 1])
+        );
+        assert!(
+            order.iter().all(|&(group, _)| group != 2),
+            "inactive launches must keep their defaults"
+        );
+        let measured = order[..3].to_vec();
+        let resumed = coverage_order(&groups, &[2, 3, 0], &[1, 2])
+            .into_iter()
+            .filter(|candidate| !measured.contains(candidate))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resumed,
+            order[3..],
+            "continuation preserves uninterrupted search order"
+        );
+    }
+
+    #[test]
+    fn factored_coverage_respects_coupled_admissibility_and_deduplicates() {
+        // Only diagonal assignments are admissible: neither coordinate can
+        // change alone. A coupled start covers both coordinates once.
+        let candidates = vec![vec![1, 1], vec![2, 2], vec![4, 4]];
+        assert_eq!(coordinate_starts(&candidates, 1), vec![0, 2]);
+        assert!(coordinate_starts(&[vec![1, 2]], 0).is_empty());
+    }
+
+    #[test]
+    fn unobserved_group_keeps_seed_on_equal_cost() {
+        let mut ranking = vec![(0, 1.0), (2, 1.0), (1, 1.0)];
+        rank_group(&mut ranking, 2);
+        assert_eq!(ranking[0].0, 2);
+        ranking.push((3, 0.9));
+        rank_group(&mut ranking, 2);
+        assert_eq!(ranking[0].0, 3, "a measured improvement still wins");
+    }
+
+    #[test]
+    fn cutoff_replays_cached_candidates_beyond_missing_form_starts() {
+        // Candidate1 is an unmeasured form start. Candidate2 belongs to the
+        // later ordinary pass and was measured by coordinate coverage.
+        // No device work is admitted after cutoff; both groups still rank
+        // their already measured improvements, exactly once.
+        for costs in [[Some(1.0), None, Some(0.7)], [Some(1.0), None, Some(0.8)]] {
+            let mut ranking = replay_group(0, 1.0, costs);
+            assert_eq!(ranking.len(), 2);
+            rank_group(&mut ranking, 0);
+            assert_eq!(ranking[0], (2, costs[2].unwrap()));
+        }
+    }
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     use seismic_lang::registry::BackendName;
 

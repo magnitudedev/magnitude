@@ -159,10 +159,14 @@ before assembling one choice per group. An independent launch group outside the 
 served points keeps its declared default. Only what is about to be measured is formed: a
 launch's code variants share one source, so the variants a chunk of candidates runs that no
 held program has are formed in one compile per launch and held, and the candidates assembled
-from them form nothing and supply their runtime geometry. The first boundary's form starts of
-every group are measured whatever the time. A group's other candidates are formed and measured
-a chunk at a time, so a step of the search can end between chunks; a later step sweeps the
-groups in the same order, takes what earlier steps measured and measures only what is missing.
+from them form nothing and supply their runtime geometry. Before refining a group, the leading
+boundary measures nearby admissible coordinate changes across active groups in round-robin order;
+a large first group cannot consume the refinement slice before later active groups have rivals.
+These starts and the first boundary's form starts are protected from the refinement slice, while
+remaining subject to the consumer's hard limit and conclusion reserve. Inactive groups keep their
+defaults; exact cost ties retain the seed mapping. A group's other candidates are formed and measured a chunk at a time, so a step can end
+between chunks; a later step uses the same order, takes what earlier steps measured and measures
+only what is missing.
 The search runs within the consumer's limit, less what confirming the
 assembled choice and validating it at untimed points will cost; when that time ends, unmeasured
 groups keep their defaults, an interrupted group's measured candidates are
