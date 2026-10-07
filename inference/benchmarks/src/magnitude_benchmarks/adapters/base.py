@@ -358,8 +358,13 @@ class Adapter:
                     "stopped", target=self.target.id, label=label, peak_rss_bytes=running.peak_bytes
                 )
 
+    def counter(self):
+        """Host-only renderer/tokenizer. No model load, serving process or device activity."""
+        raise NotImplementedError("this target has no host-only tokenizer")
+
     async def prompt_counts(self, plan: Plan) -> dict[str, int]:
-        raise NotImplementedError
+        async with self.counter() as count:
+            return await count(plan.prepared_requests)
 
     async def memory_observation(self, engine: Running) -> dict | None:
         """Optional allocation census after the measured requests finish."""

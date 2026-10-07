@@ -13,10 +13,11 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import httpx
 
 from ..session_bench.models import file_hash
 from .base import Adapter, command
+from .counting import magnitude_count, tokenizer_json_count
+from .ollama_native.prompts import PromptCounter, PromptFormat, Tag
 from .ollama_native.translate import prompt_identity
 
 # Ollama picks the runner from the stored model format; the engine fixes which is expected.
@@ -42,6 +43,9 @@ class Ollama(Adapter):
             raise ValueError(f"ollama executable does not exist: {executable}")
         self.executable = executable
         self.store_directory = store_path(selected.models)
+        self.tag = (Tag.read(self.artifact.path, self.artifact.reference.removeprefix("ollama:"))
+                    if self.artifact.kind == "registry" else None)
+        self.format = PromptFormat.of(self.tag, RUNNERS[self.target.engine]) if self.tag else None
         self.identity = {
             "adapter": "ollama-native",
             "executable": executable,
@@ -147,49 +151,40 @@ class Ollama(Adapter):
                 f"Ollama did not place the whole model on the GPU: {accelerated} of {size} bytes"
             )
 
-    def counting_capacity(self, plan) -> int:
-        """Context for the counting launch: what the largest request is sized to need.
+    @asynccontextmanager
+    async def counter(self):
+        """Ollama's renderer reproduced and the tag's own tokenizer, without a model load
+        (``ollama_native.prompts``)."""
+        if self.tag is None or self.format is None:
+            raise ValueError(
+                "Ollama renders an imported GGUF with a Go template, which is not reproduced"
+            )
+        if self.format.runner == "llama-server":
+            binary = self.options.ollama.count_binary
+            if binary is None:
+                raise ValueError("counting a GGUF tag's prompts needs --ollama-count-binary")
+            log = self.store.path / "logs" / f"{self.target.id}-count.log"
+            async with magnitude_count(binary, "text", self.tag.weights(), log) as encode:
+                yield self.counts(PromptCounter(self.format, encode, self.options.ollama.answer_prefill))
+            return
+        tokens = tokenizer_json_count(self.tag.layer(name="tokenizer.json"))
 
-        Ollama counts a prompt by evaluating it, so the launch must hold the prompt, and a
-        prompt that turns out larger is still counted (from the runner's rejection or Ollama's
-        truncation warning). The tokenisation allowance other engines launch with can be the
-        model's whole context limit, which a large model does not fit on the GPU.
-        """
-        needed = max(r.checkpoint + r.output_limit for r in plan.prepared_requests)
-        return min(self.provisional_capacity(plan), needed)
+        async def encode(text):
+            return tokens(text)
+
+        yield self.counts(PromptCounter(self.format, encode, self.options.ollama.answer_prefill))
+
+    def counts(self, prompts: PromptCounter):
+        async def count(requests):
+            return {r.id: await prompts.count(r.body(self.served_model())) for r in requests}
+
+        return count
 
     async def prompt_counts(self, plan):
-        async with self.launch(
-            self.counting_capacity(plan), plan.parallel_sequences, "prepare"
-        ) as engine:
-            counts = await self.render_counts(plan, engine)
-        # Measured launches refuse a response whose evaluated prompt differs from these.
+        counts = await super().prompt_counts(plan)
         expected = {
             prompt_identity(request.body(self.served_model())): counts[request.id]
             for request in plan.prepared_requests
         }
         self.expected_path().write_text(json.dumps(expected, indent=2, sort_keys=True) + "\n")
-        return counts
-
-    @asynccontextmanager
-    async def context_counter(self):
-        capacity = min(self.options.ollama.sizing_context, self.artifact.context_limit)
-        async with self.launch(capacity, 1, "fixture-prepare") as engine:
-
-            async def count(context):
-                return (await self.render_counts(self.context_plan(context), engine))[
-                    "fixture-sizing"
-                ]
-
-            yield count
-
-    async def render_counts(self, plan, engine):
-        counts = {}
-        async with httpx.AsyncClient(timeout=1800, trust_env=False) as client:
-            for request in plan.prepared_requests:
-                response = await client.post(
-                    engine.endpoint + "/session-bench/count", json=request.body(engine.model)
-                )
-                response.raise_for_status()
-                counts[request.id] = response.json()["prompt_tokens"]
         return counts

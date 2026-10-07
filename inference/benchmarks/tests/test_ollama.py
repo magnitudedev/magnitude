@@ -1,9 +1,10 @@
 import json
+from argparse import Namespace
 
 import pytest
 
 from magnitude_benchmarks.adapters import ADAPTERS
-from magnitude_benchmarks.adapters.ollama_native import translate
+from magnitude_benchmarks.adapters.ollama_native import server, translate
 from magnitude_benchmarks.session_bench import validation
 from magnitude_benchmarks.session_bench.models import Artifact, ArtifactFile, Target, prepare
 from magnitude_benchmarks.session_bench.options import EngineOptions, OllamaOptions, Schedule
@@ -22,11 +23,29 @@ COLD = {
     "eval_duration": 612988000,
 }
 CACHED = {**COLD, "prompt_eval_cached_count": 7997, "prompt_eval_duration": 53837000}
-OVERFLOW = (
-    '{"error":"{\\"error\\":{\\"code\\":400,\\"message\\":\\"request (8001 tokens) exceeds the '
-    'available context size (4096 tokens), try increasing it\\",\\"type\\":'
-    '\\"exceed_context_size_error\\",\\"n_prompt_tokens\\":8001,\\"n_ctx\\":4096}}"}'
-)
+
+
+@pytest.mark.parametrize("configured_cache", [False, True])
+def test_server_home_isolation_preserves_device_code_cache(tmp_path, monkeypatch, configured_cache):
+    original_home = tmp_path / "user"
+    monkeypatch.setenv("HOME", str(original_home))
+    cache = tmp_path / "configured-cache" if configured_cache else original_home / ".nv" / "ComputeCache"
+    if configured_cache:
+        monkeypatch.setenv("CUDA_CACHE_PATH", str(cache))
+    else:
+        monkeypatch.delenv("CUDA_CACHE_PATH", raising=False)
+    args = Namespace(
+        base_path=tmp_path / "server",
+        store=tmp_path / "models",
+        max_concurrent_requests=1,
+        kv_cache_type=None,
+        flash_attention="auto",
+    )
+    env = server.server_environment(args, 1234)
+    assert env["HOME"] == str(args.base_path / "home")
+    assert env["CUDA_CACHE_PATH"] == str(cache)
+    assert env["CUDA_CACHE_PATH"] != str(args.base_path / "home" / ".nv" / "ComputeCache")
+
 
 
 def adapter(engine, kind, tmp_path, options=None):
@@ -96,12 +115,6 @@ def test_ollama_request_fixes_context_and_disables_thinking():
     assert "tools" not in request
 
 
-def test_ollama_overflow_rejection_states_the_prompt_size():
-    assert translate.overflow_prompt_tokens(400, OVERFLOW) == 8001
-    assert translate.overflow_prompt_tokens(500, OVERFLOW) is None
-    assert translate.overflow_prompt_tokens(400, '{"error":"model not found"}') is None
-
-
 def test_ollama_stream_chunks_become_deltas():
     assert translate.delta({"message": {"content": "Call"}}, 0) == {"content": "Call"}
     assert translate.delta({"message": {"thinking": "hm"}}, 0) == {"reasoning_content": "hm"}
@@ -145,8 +158,6 @@ def test_answer_prefill_sends_ollamas_glimmer_prompt_through_the_raw_route(tmp_p
     assert raw["options"] == chat["options"] and raw["keep_alive"] == chat["keep_alive"]
     assert translate.delta({"response": "Call"}, 0) == {"content": "Call"}
     for messages in (
-        body["messages"][1:],
-        [{"role": "system", "content": "Reasoning strength: high."}, body["messages"][1]],
         [*body["messages"], {"role": "tool", "content": "x"}],
     ):
         with pytest.raises(ValueError):
@@ -295,15 +306,6 @@ def test_registry_artifact_is_pinned_by_its_manifest(tmp_path, monkeypatch):
         prepare(Target(engine="ollama", reference="ollama:qwen3.5:4b-mlx"))
 
 
-def test_a_prompt_ollama_truncates_is_counted_from_its_warning():
-    line = (
-        b'time=2026-10-06T07:42:32.879Z level=WARN source=llama_server.go:320 msg="truncating '
-        b'input prompt" limit=2058 prompt=5406 keep=4 new=2058'
-    )
-    assert translate.truncated_prompt_tokens(line) == 5406
-    assert translate.truncated_prompt_tokens(b"slot print_timing: id  0 | task 26 |") is None
-
-
 def test_llama_runner_speculation_is_read_from_its_launch_line_and_slot_timings():
     launch = (
         b'time=2026-10-06T06:06:06.403Z level=INFO source=llama_server.go:436 msg="starting '
@@ -379,3 +381,28 @@ def test_gpu_placement_is_read_from_the_runners_load_lines():
     line = b'level=INFO msg="MLX engine initialized" "MLX version"=0.32.3-0-g64ea011 device=gpu'
     assert translate.mlx_device(line) == "gpu"
     assert translate.mlx_device(b'msg="mlx runner is ready" port=57428') is None
+
+
+def test_glimmer_default_system_matches_ollama_host_date(monkeypatch):
+    from datetime import date
+    from magnitude_benchmarks.adapters.ollama_native import render
+
+    class FixedDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 10, 7)
+
+    monkeypatch.setattr(render, "date", FixedDate)
+    messages = [{"role": "user", "content": "Hello"}]
+    expected = (
+        "<|start|>system<|message|>You are a helpful AI assistant."
+        "\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-07."
+        "\n\nReasoning strength: none."
+        '\n\n# Valid recipients: "self", "user".<|eot|>'
+        "<|start|>user<|message|>Hello<|eot|><|start|>assistant"
+    )
+    assert render.glimmer(messages) == render.GLIMMER_BOS + expected
+    assert translate.glimmer_prompt(messages) == expected
+    assert "Current date:" not in render.glimmer([
+        {"role": "system", "content": "Custom"}, *messages
+    ])

@@ -112,9 +112,17 @@ class ProseHistory:
         available = len(self.ends) - 1 - self.cursor - reserve
         if available < (1 if self.source.repeating else PASSAGE_WORDS):
             raise ValueError("Moby Dick has no remaining passage and canonical continuation")
+        def copy_context(suffix: str) -> Context:
+            # Counting APIs may require a user turn even for an assistant suffix.
+            # The identical prelude is subtracted with the prefix-only framing.
+            return Context(messages=[
+                {"role": "user", "content": "Continue the supplied text."},
+                {"role": "assistant", "content": COUNT_PREFIX + suffix},
+            ])
+
         framing = 0
         if self.source.repeating:
-            framing = await counter(Context(messages=[{"role": "assistant", "content": COUNT_PREFIX}]))
+            framing = await counter(copy_context(""))
 
         async def evaluate(words: int) -> tuple[Context, int, int, int, bool]:
             end = self.cursor + words
@@ -123,7 +131,7 @@ class ProseHistory:
                 starts = [self.cursor, *(p for p in self.source.paragraph_starts if self.cursor < p < end)]
                 for copy_start in reversed(starts):
                     suffix = self.passage(copy_start, end)
-                    copy_tokens = await counter(Context(messages=[{"role": "assistant", "content": COUNT_PREFIX + suffix}])) - framing
+                    copy_tokens = await counter(copy_context(suffix)) - framing
                     if copy_tokens >= self.output_tokens:
                         break
                 opening = " ".join(self.passage(copy_start, end).split()[:6])

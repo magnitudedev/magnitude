@@ -2259,6 +2259,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "magnitude-artifacts",
+ "magnitude-chat",
  "magnitude-engine",
  "magnitude-executor",
  "magnitude-serving",

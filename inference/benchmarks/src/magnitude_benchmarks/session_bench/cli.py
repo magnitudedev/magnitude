@@ -156,10 +156,9 @@ def parser() -> argparse.ArgumentParser:
         "a drafting request early in a context that fits prompt and output exactly)",
     )
     ollama.add_argument(
-        "--ollama-sizing-context",
-        type=int,
-        default=4096,
-        help="context of the Ollama launch that sizes the fixture when Ollama is the first target",
+        "--ollama-count-binary",
+        type=Path,
+        help="metadata-only magnitude-count tokenizer for GGUF registry tags",
     )
     ollama.add_argument(
         "--ollama-answer-prefill",
@@ -357,7 +356,8 @@ def main(argv=None) -> int:
                     flash_attention=args.ollama_flash_attention,
                     speculation=args.ollama_speculation,
                     context_headroom=args.ollama_context_headroom,
-                    sizing_context=args.ollama_sizing_context,
+                    count_binary=(args.ollama_count_binary.expanduser().absolute()
+                                  if args.ollama_count_binary else None),
                     answer_prefill=args.ollama_answer_prefill,
                 ),
                 watchdog=Watchdog(

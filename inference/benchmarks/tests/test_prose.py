@@ -310,3 +310,15 @@ async def test_repeat_warmup_includes_its_own_supplied_passage(book):
     assert warmup.fixture_provenance["copy_available_tokens"] >= warmup.output_limit
     assert warmup.messages[0] != plan.requests[0].messages[0]
     assert warmup.fixture_provenance["actual_context_tokens"] < 4096
+
+
+async def test_repeat_copy_sizing_accepts_counter_requiring_user_turn(book):
+    async def requires_user(context):
+        assert any(message["role"] == "user" for message in context.messages)
+        return await word_count(context)
+
+    source = Prose(book, {"sha256": "pinned"}, "prose-repeat")
+    compatible = await ProseHistory(source, "count-user").prepare(4096, requires_user, "test")
+    reference = await ProseHistory(source, "count-user").prepare(4096, word_count, "test")
+    assert compatible == reference
+    assert [m["role"] for m in compatible.content.messages] == ["system", "assistant", "user"]

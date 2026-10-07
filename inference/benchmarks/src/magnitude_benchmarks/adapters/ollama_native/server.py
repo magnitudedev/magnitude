@@ -85,6 +85,10 @@ def imported_name(path: Path) -> str:
 
 def server_environment(args: argparse.Namespace, port: int) -> dict[str, str]:
     env = os.environ.copy()
+    # The disposable server home isolates Ollama state, not device code. CUDA's
+    # default JIT cache follows HOME; preserve it so cached kernel compilation
+    # does not become timed inference merely because the server home changed.
+    env.setdefault("CUDA_CACHE_PATH", str(Path.home() / ".nv" / "ComputeCache"))
     home = args.base_path / "home"
     home.mkdir(parents=True, exist_ok=True)
     env.update(
@@ -129,8 +133,6 @@ class Ollama:
         self.runner_command: str | None = None
         # Speculation statistics the runner logged, newest last.
         self.drafted: list[tuple[int, int]] = []
-        # Full size of the last prompt Ollama truncated to fit the context.
-        self.truncated: int | None = None
         # What the runner logged while loading: layers on the GPU per model, or the MLX device.
         self.gpu_layers: list[tuple[int, int]] = []
         self.mlx_device: str | None = None
@@ -186,9 +188,6 @@ class Ollama:
                     self.runner = runner
             if b'msg="Loaded draft model"' in line:
                 self.draft_loaded = True
-            truncated = translate.truncated_prompt_tokens(line)
-            if truncated is not None:
-                self.truncated = truncated
             layers = translate.offloaded_layers(line)
             if layers is not None:
                 self.gpu_layers.append(layers)
@@ -222,19 +221,13 @@ class Ollama:
             self.model = self.args.registry_model
         self.show = self.call("/api/show", {"model": self.model})
         family = (self.show.get("details") or {}).get("family")
-        if self.args.answer_prefill and family != translate.GLIMMER_FAMILY:
-            raise RuntimeError(f"answer prefill is for {translate.GLIMMER_FAMILY}, not {family}")
+        if self.args.answer_prefill and family not in translate.GLIMMER_FAMILIES:
+            raise RuntimeError(f"answer prefill is for Muse Glimmer, not {family}")
         self.load()
         # The runner's load lines arrive through the log relay, shortly after the load returns.
         deadline = time.monotonic() + 5
         while not (self.gpu_layers or self.mlx_device) and time.monotonic() < deadline:
             time.sleep(0.05)
-        if self.args.answer_prefill:
-            self.verify_rendering()
-            # Its reloads cleared the load lines; wait for the last reload's.
-            deadline = time.monotonic() + 5
-            while not (self.gpu_layers or self.mlx_device) and time.monotonic() < deadline:
-                time.sleep(0.05)
         entry = self.loaded()
         self.evidence = {
             "ready": True,
@@ -244,6 +237,7 @@ class Ollama:
             "runner": self.runner,
             "draft_model_loaded": self.draft_loaded,
             "runner_command": self.runner_command,
+            "cuda_cache_path": self.env["CUDA_CACHE_PATH"],
             "speculation": self.args.speculation,
             "model_format": (self.show.get("details") or {}).get("format"),
             "quantization": (self.show.get("details") or {}).get("quantization_level"),
@@ -260,45 +254,6 @@ class Ollama:
             "size_vram_bytes": entry.get("size_vram"),
             "running": entry,
         }
-
-    def verify_rendering(self) -> None:
-        """Refuse to run unless the reproduced prompt is the one Ollama renders itself.
-
-        A fixed conversation is evaluated once through ``/api/chat`` with ``think`` false and
-        once through the raw route without the answer header; both must evaluate the same
-        number of prompt tokens, and the header must add exactly its own tokens.
-        """
-        messages = [
-            {"role": "system", "content": "Rendering check."},
-            {"role": "user", "content": "Reply with the word ready."},
-        ]
-        options = {"num_ctx": self.allocation, "num_predict": 1, "temperature": 0}
-        chat = {
-            "model": self.model,
-            "messages": messages,
-            "stream": False,
-            "think": False,
-            "keep_alive": -1,
-            "options": options,
-        }
-        raw = translate.prefilled_request(chat, self.runner) | {"stream": False}
-        bare = raw | {"prompt": raw["prompt"].removesuffix(translate.GLIMMER_ANSWER_HEADER)}
-        counts = []
-        for path, body in (("/api/chat", chat), ("/api/generate", bare), ("/api/generate", raw)):
-            counts.append(self.call(path, body, timeout=LOAD_SECONDS)["prompt_eval_count"])
-            self.reload()
-        rendered, reproduced, prefilled = counts
-        if rendered != reproduced or prefilled <= reproduced:
-            raise RuntimeError(
-                "answer prefill does not reproduce Ollama's prompt: chat evaluated "
-                f"{rendered} tokens, raw {reproduced}, raw with the answer header {prefilled}"
-            )
-        self.rendering = {
-            "chat_prompt_tokens": rendered,
-            "raw_prompt_tokens": reproduced,
-            "answer_header_tokens": prefilled - reproduced,
-        }
-        print(f"adapter: answer prefill rendering verified: {self.rendering}", flush=True)
 
     def loaded(self) -> dict[str, Any]:
         models = self.call("/api/ps")["models"]
@@ -372,8 +327,6 @@ def handler(ollama: Ollama) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             if ollama.evidence is None:
                 return self.reply(503, {"error": "model load is incomplete"})
-            if self.path == "/session-bench/count":
-                return self.count()
             if self.path == "/v1/chat/completions":
                 return self.chat()
             self.reply(404, {"error": "not found"})
@@ -391,35 +344,6 @@ def handler(ollama: Ollama) -> type[BaseHTTPRequestHandler]:
                     headers={"Content-Type": "application/json"},
                 ),
                 timeout=REQUEST_SECONDS,
-            )
-
-        def count(self) -> None:
-            """Prompt tokens as Ollama's runner renders and counts them.
-
-            Ollama has no tokenise route. The prompt is evaluated for one output token and its
-            reported prompt count is returned (the count includes tokens reused from the prompt
-            cache, so counting launches keep the cache). A prompt the llama.cpp runner rejects
-            as larger than the context is counted from that rejection, which states its size;
-            one Ollama truncates itself is counted from its truncation warning.
-            """
-            request = translate.chat_request(self.body(), ollama.model, ollama.allocation)
-            request["options"]["num_predict"] = 1
-            with ollama.turn:
-                ollama.truncated = None
-                try:
-                    with self.native(request) as response:
-                        final = [json.loads(line) for line in response if line.strip()][-1]
-                except urllib.error.HTTPError as error:
-                    text = error.read().decode(errors="replace")
-                    tokens = translate.overflow_prompt_tokens(error.code, text)
-                    if tokens is None:
-                        return self.reply(error.code, {"error": text})
-                    return self.reply(200, {"prompt_tokens": tokens, "basis": "overflow-error"})
-                truncated = ollama.truncated
-            if truncated is not None:
-                return self.reply(200, {"prompt_tokens": truncated, "basis": "truncation-warning"})
-            self.reply(
-                200, {"prompt_tokens": final["prompt_eval_count"], "basis": "prompt-evaluation"}
             )
 
         def chat(self) -> None:

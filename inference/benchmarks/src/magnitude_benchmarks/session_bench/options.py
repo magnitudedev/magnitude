@@ -110,9 +110,8 @@ class OllamaOptions(Record):
     #: Tokens allocated beyond the benchmark context. Ollama's llama.cpp runner ends a drafting
     #: request before a context that fits the prompt and output exactly is full.
     context_headroom: int = Field(default=0, ge=0)
-    #: Context of the launch that sizes the fixture. A prompt larger than it is counted without
-    #: being evaluated; a larger value costs evaluations but avoids small-context launches.
-    sizing_context: int = Field(default=4096, gt=0)
+    #: Metadata-only GGUF tokenizer executable; never the serving engine.
+    count_binary: Path | None = None
     #: Open the reply with the model's answer header. Only for a family whose format has no
     #: switch for thinking (Muse Glimmer): with ``think`` false the model still reasons first
     #: and Ollama discards that text. The prompt Ollama renders is sent through its raw
@@ -131,8 +130,8 @@ class OllamaOptions(Record):
         args += ["--ollama-speculation", self.speculation]
         if self.context_headroom:
             args += ["--ollama-context-headroom", str(self.context_headroom)]
-        if self.sizing_context != 4096:
-            args += ["--ollama-sizing-context", str(self.sizing_context)]
+        if self.count_binary is not None:
+            args += ["--ollama-count-binary", str(self.count_binary)]
         if self.answer_prefill:
             args += ["--ollama-answer-prefill"]
         return args

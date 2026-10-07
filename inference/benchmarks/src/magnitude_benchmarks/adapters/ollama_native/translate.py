@@ -49,7 +49,8 @@ def chat_request(body: dict[str, Any], model: str, context: int) -> dict[str, An
 
 
 # Muse Glimmer's format, as Ollama's ``glimmer`` renderer writes it (model/renderers/glimmer.go).
-GLIMMER_FAMILY = "muse-glimmer"
+# Ollama reports the GGUF architecture with a hyphen and the MLX model type with an underscore.
+GLIMMER_FAMILIES = {"muse-glimmer", "muse_glimmer"}
 GLIMMER_ANSWER_HEADER = " to=user<|message|>"
 GLIMMER_BOS = "<|begin_of_text|>"
 # On the raw completion route Ollama's llama.cpp runner adds the leading token itself; its MLX
@@ -62,31 +63,13 @@ def glimmer_prompt(messages: list[dict[str, Any]]) -> str:
     """The prompt Ollama's ``glimmer`` renderer produces for these messages with ``think`` false.
 
     Without the leading ``<|begin_of_text|>``, which depends on the runner
-    (``GLIMMER_RAW_LEADING``). Only what the benchmark sends is reproduced (a system message, then text turns);
+    (``GLIMMER_RAW_LEADING``). Only benchmark text turns are reproduced, including Ollama's default system message;
     anything the renderer would treat differently is refused rather than approximated.
     """
-    if not messages or messages[0]["role"] != "system":
-        raise ValueError("answer prefill needs a leading system message")
-    parts = []
-    for index, message in enumerate(messages):
-        role, content = message["role"], message["content"]
-        if not isinstance(content, str) or message.get("tool_calls") or message.get("thinking"):
-            raise ValueError("answer prefill supports text messages only")
-        if role == "system":
-            # The renderer rewrites or keeps a strength the system message states itself.
-            lowered = content.lower()
-            stated = "reasoning strength" in lowered or "reasoning effort" in lowered
-            if index or stated:
-                raise ValueError("answer prefill supports one plain leading system message")
-            parts.append(
-                "<|start|>system<|message|>" + content + "\n\nReasoning strength: none."
-                '\n\n# Valid recipients: "self", "user".<|eot|>'
-            )
-        elif role in GLIMMER_ROLES:
-            parts.append(f"<|start|>{GLIMMER_ROLES[role]}<|message|>{content}<|eot|>")
-        else:
-            raise ValueError(f"answer prefill does not support the {role} role")
-    return "".join(parts) + "<|start|>assistant"
+    from .render import GLIMMER_BOS, glimmer
+
+    return glimmer(messages).removeprefix(GLIMMER_BOS)
+
 
 
 def prefilled_request(chat: dict[str, Any], runner: str) -> dict[str, Any]:
@@ -148,19 +131,6 @@ def mlx_device(line: bytes) -> str | None:
     """The device the MLX runner reports when it starts."""
     match = MLX_DEVICE.search(line)
     return match.group(1).decode() if match else None
-
-
-TRUNCATION = re.compile(rb'msg="truncating input prompt" limit=\d+ prompt=(\d+)')
-
-
-def truncated_prompt_tokens(line: bytes) -> int | None:
-    """Full size of a prompt Ollama cut to fit the context, from the warning it logs.
-
-    Ollama renders and tokenises a registry model's prompt itself and truncates one that does
-    not fit before its runner sees it, so the runner never rejects it as too large.
-    """
-    match = TRUNCATION.search(line)
-    return int(match.group(1)) if match else None
 
 
 def llama_launch(line: bytes) -> str | None:
@@ -260,15 +230,3 @@ def delta(chunk: dict[str, Any], tool_index: int) -> dict[str, Any]:
     if calls:
         value["tool_calls"] = calls
     return value
-
-
-def overflow_prompt_tokens(status: int, text: str) -> int | None:
-    """Prompt size from the llama.cpp runner's context-overflow rejection, if this is one.
-
-    Ollama relays the runner's error as a JSON string inside its own error object, so the
-    field may arrive with escaped quotes.
-    """
-    if status != 400 or "exceed_context_size_error" not in text:
-        return None
-    match = re.search(r'n_prompt_tokens\\?":\s*(\d+)', text)
-    return int(match.group(1)) if match else None
