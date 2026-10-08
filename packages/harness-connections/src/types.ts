@@ -65,5 +65,5 @@ export interface HarnessConnection {
   readonly installSkill: (harness: HarnessId) => Effect.Effect<void, HarnessConnectionError>
   readonly installStartup: Effect.Effect<void, HarnessConnectionError>
   /** The setup a person applies by hand on a computer that will run the harness against this Magnitude. */
-  readonly describe: (target: Omit<HarnessSetupTarget, "model" | "models"> & { readonly model: ProviderModelId }) => Effect.Effect<HarnessSetup, HarnessConnectionError>
+  readonly describe: (target: Omit<HarnessSetupTarget, "model" | "models" | "updatedAt"> & { readonly model: ProviderModelId }) => Effect.Effect<HarnessSetup, HarnessConnectionError>
 }

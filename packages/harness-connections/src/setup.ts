@@ -15,17 +15,19 @@ import { CHAT_COMPLETIONS_API, LOCAL_TOKEN, anthropicLocalModelId, codexLocalMod
 
 export type SetupPlatform = "darwin" | "linux" | "win32"
 
-/** Where Magnitude is, as the machine that will run the harness reaches it. */
+/**
+ * What a setup prompt is rendered for. `origin` is Magnitude as the harness's machine reaches it,
+ * `key` is absent when that machine is the one running Magnitude, and `updatedAt` stamps settings a
+ * harness only keeps when they carry a write time.
+ */
 export interface HarnessSetupTarget {
   readonly harness: HarnessId
-  /** Every model to offer; the harness's default is `model`. */
   readonly models: ReadonlyArray<HarnessModel>
   readonly model: HarnessModel
   readonly platform: SetupPlatform
-  /** The origin this machine uses to reach Magnitude, such as `http://192.168.1.20:10100`. */
   readonly origin: string
-  /** The key other devices send; absent when the harness runs on the machine running Magnitude. */
   readonly key: Option.Option<string>
+  readonly updatedAt: string
 }
 
 export interface HarnessSetup {
@@ -169,7 +171,8 @@ const plan = (target: HarnessSetupTarget): SetupPlan => {
         { path: at(".cline/data/settings/providers.json"), format: "json", purpose: "the Magnitude provider",
           content: {
             version: 1,
-            providers: { "openai-compatible": { settings: { ...clineProviderSettings(Option.some(model.id), endpoints.openai), apiKey }, tokenSource: "manual" } },
+            modes: {},
+            providers: { "openai-compatible": { settings: { ...clineProviderSettings(Option.some(model.id), endpoints.openai), apiKey }, updatedAt: target.updatedAt, tokenSource: "manual" } },
             lastUsedProvider: "openai-compatible",
           } },
         { path: at(".cline/data/settings/models.json"), format: "json", purpose: "the model's capabilities",

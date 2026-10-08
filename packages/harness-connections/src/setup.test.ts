@@ -21,6 +21,7 @@ const model = Schema.decodeUnknownSync(HarnessModelSchema)({
 })
 const key = "mag-test-network-key"
 const origin = "http://192.168.1.20:10100"
+const updatedAt = "2026-10-08T20:00:00.000Z"
 
 /** Every fenced block in a prompt, with the language the prompt labels it with. */
 const blocks = (prompt: string) => [...prompt.matchAll(/```(\w+)\n([\s\S]*?)\n```/g)].map(([, format, body]) => ({ format: format!, body: body! }))
@@ -30,7 +31,7 @@ const parsed = ({ format, body }: { format: string; body: string }): unknown =>
 describe("browser harness setup", () => {
   for (const harness of HARNESS_PRIORITY) for (const platform of ["darwin", "linux", "win32"] as const satisfies readonly SetupPlatform[]) for (const remote of [true, false]) {
     it(`${harness} on ${platform}${remote ? " from another device" : " on the server"}`, () => {
-      const setup = describeHarnessSetup({ harness, models: [model], model, platform, origin, key: remote ? Option.some(key) : Option.none() })
+      const setup = describeHarnessSetup({ harness, models: [model], model, platform, origin, key: remote ? Option.some(key) : Option.none(), updatedAt })
       expect(setup.runCommand).toBe(harnessCommand(harness, model.id, platform))
       expect(setup.prompt).toContain(setup.runCommand)
       expect(setup.prompt).toContain(model.id)
@@ -51,7 +52,7 @@ describe("browser harness setup", () => {
   }
 
   it("carries the model's own limits rather than placeholder values", () => {
-    const setup = describeHarnessSetup({ harness: "opencode" as never, models: [model], model, platform: "darwin", origin, key: Option.none() })
+    const setup = describeHarnessSetup({ harness: "opencode" as never, models: [model], model, platform: "darwin", origin, key: Option.none(), updatedAt })
     expect(setup.prompt).toContain("65536")
     expect(setup.prompt).toContain("16384")
     expect(setup.prompt).not.toContain("32768")
@@ -59,19 +60,21 @@ describe("browser harness setup", () => {
 
   it("renders the same provider the one-click connectors write", () => {
     const endpoints = harnessEndpoints(origin)
-    const pi = parsed(blocks(describeHarnessSetup({ harness: "pi" as never, models: [model], model, platform: "darwin", origin, key: Option.none() }).prompt)[0]!)
+    const pi = parsed(blocks(describeHarnessSetup({ harness: "pi" as never, models: [model], model, platform: "darwin", origin, key: Option.none(), updatedAt }).prompt)[0]!)
     expect(pi).toEqual({ providers: { magnitude: piProviderConfig([model], endpoints.openai) } })
-    const opencode = parsed(blocks(describeHarnessSetup({ harness: "opencode" as never, models: [model], model, platform: "darwin", origin, key: Option.none() }).prompt)[0]!)
+    const opencode = parsed(blocks(describeHarnessSetup({ harness: "opencode" as never, models: [model], model, platform: "darwin", origin, key: Option.none(), updatedAt }).prompt)[0]!)
     expect(opencode).toEqual({ provider: { magnitude: openCodeProviderConfig([model], endpoints.openai) }, model: `magnitude/${model.id}` })
+    const cline = parsed(blocks(describeHarnessSetup({ harness: "cline" as never, models: [model], model, platform: "linux", origin, key: Option.some(key), updatedAt }).prompt)[0]!)
+    expect(cline).toMatchObject({ modes: {}, providers: { "openai-compatible": { updatedAt, tokenSource: "manual", settings: { baseUrl: endpoints.openai, apiKey: key } } } })
   })
 
   it("asks Codex for the key through its environment and Claude Code through its token only from another device", () => {
-    const codex = describeHarnessSetup({ harness: "codex" as never, models: [model], model, platform: "linux", origin, key: Option.some(key) })
+    const codex = describeHarnessSetup({ harness: "codex" as never, models: [model], model, platform: "linux", origin, key: Option.some(key), updatedAt })
     expect(parsed(blocks(codex.prompt)[0]!)).toMatchObject({ model_provider: "magnitude", model_providers: { magnitude: { env_key: "MAGNITUDE_API_KEY", base_url: `${origin}/inference/v1/proxies/codex` } } })
     expect(codex.prompt).toContain(`MAGNITUDE_API_KEY=${key}`)
-    const remoteClaude = parsed(blocks(describeHarnessSetup({ harness: "claude-code" as never, models: [model], model, platform: "darwin", origin, key: Option.some(key) }).prompt)[0]!)
+    const remoteClaude = parsed(blocks(describeHarnessSetup({ harness: "claude-code" as never, models: [model], model, platform: "darwin", origin, key: Option.some(key), updatedAt }).prompt)[0]!)
     expect(remoteClaude).toMatchObject({ env: { ANTHROPIC_AUTH_TOKEN: key, ANTHROPIC_BASE_URL: `${origin}/inference/anthropic/proxies/claude-code` } })
-    const localClaude = parsed(blocks(describeHarnessSetup({ harness: "claude-code" as never, models: [model], model, platform: "darwin", origin, key: Option.none() }).prompt)[0]!)
+    const localClaude = parsed(blocks(describeHarnessSetup({ harness: "claude-code" as never, models: [model], model, platform: "darwin", origin, key: Option.none(), updatedAt }).prompt)[0]!)
     expect(localClaude).not.toHaveProperty("env.ANTHROPIC_AUTH_TOKEN")
   })
 })

@@ -22,7 +22,7 @@ import {
   type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { makeStateDocument } from "@magnitudedev/storage"
-import { Cause, Effect, Option, Schema } from "effect"
+import { Cause, DateTime, Effect, Option, Schema } from "effect"
 import { ConnectionTransaction, connectionTransaction } from "./transaction"
 import { withConnectionLock } from "./lock"
 import { delimiter } from "node:path"
@@ -448,7 +448,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
       const models = uniqueModels(yield* resolveModels)
       const model = models.find(candidate => candidate.id === target.model)
       if (model === undefined) return yield* failure("describe", `Magnitude model is not installed: ${target.model}`, target.harness)
-      return describeHarnessSetup({ ...target, models, model })
+      return describeHarnessSetup({ ...target, models, model, updatedAt: DateTime.formatIso(yield* DateTime.now) })
     })).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError ? error : failure("describe", String(error), target.harness))),
   } satisfies HarnessConnection
   return { ...service, inspect: mutationLock.withPermits(1)(inspectConnections) }
