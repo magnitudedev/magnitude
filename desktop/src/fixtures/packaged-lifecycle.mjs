@@ -4,8 +4,8 @@ import { mkdtemp, rm, readFile, writeFile, chmod, mkdir } from 'node:fs/promises
 import { createServer } from 'node:http';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { spawn, execFileSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 
 // Playwright's Electron driver runs under Node; the owning Vitest suite runs under Bun.
@@ -191,10 +191,10 @@ try {
   await eventually(visibility, [{ visible: true, minimized: false }]);
   const window = await app.firstWindow();
   window.setDefaultTimeout(10000);
-  const rejectedConnection = await window.evaluate(async () => {
-    try { await window.__magnitudeDesktop.connect({ harness: 'codex' }); return null; }
-    catch (error) { return error.message; }
-  });
+  // Connections go through the service, so the packaged CLI reaches the same failure the app shows.
+  const rejectedCommand = spawnSync(join(dirname(dirname(executablePath)), 'Resources', 'magnitude'), ['connections', 'add', 'codex'], { env, encoding: 'utf8' });
+  assert.notEqual(rejectedCommand.status, 0);
+  const rejectedConnection = `${rejectedCommand.stdout}${rejectedCommand.stderr}`;
   assert.match(rejectedConnection, /No installed Magnitude models are available|Codex is not installed/);
   assert.doesNotMatch(rejectedConnection, /UnknownException|FiberFailure|Effect\.tryPromise|\n\s+at /);
   console.log('Rejected connection preserves actionable host failure and does not create a managed connection');
