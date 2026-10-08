@@ -223,7 +223,7 @@ export const describeHarnessSetup = (target: HarnessSetupTarget): HarnessSetup =
     `Default model: ${target.model.id} — ${target.model.name}; ${capabilities(target.model)}`,
     "",
     `Merge the settings below into ${setup.name}'s configuration files. Keep every existing provider, model, and setting that isn't shown here; replace only the Magnitude entries and the default-model keys shown. Create a file or its folders only if they don't exist yet. Use the same file format and keep comments. If ${setup.overrides.join(" or ")} is set, use the location it points to instead of the default path.`,
-    `${target.platform === "win32" ? "%USERPROFILE%" : "~"} is the current user's home folder (check \`${target.platform === "win32" ? "echo $env:USERPROFILE" : "echo $HOME"}\`). Each block shows its file from the top level down, so every key goes at the same nesting as shown. After editing, check that each file still parses as ${setup.files.map(file => file.format.toUpperCase()).filter((format, index, all) => all.indexOf(format) === index).join(" or ")}.`,
+    `After editing, check that each file still parses as ${setup.files.map(file => file.format.toUpperCase()).filter((format, index, all) => all.indexOf(format) === index).join(" or ")}.`,
     "",
     ...files.flatMap(file => [file, ""]),
     ...setup.environment.map(({ name, value }) => `${environmentStep(target.platform, name, value)}\n`),
