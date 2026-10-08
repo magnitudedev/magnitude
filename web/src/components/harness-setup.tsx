@@ -1,10 +1,11 @@
-import { useState } from "react"
+import { useId, useState, type ReactNode } from "react"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { Brand, Effect } from "effect"
-import { CheckIcon, CopyIcon } from "@phosphor-icons/react"
+import { CaretDownIcon, CheckIcon, CopyIcon } from "@phosphor-icons/react"
 import { HARNESS_PRIORITY, type HarnessId, type HarnessSetupPlatform, type ProviderModelId } from "@magnitudedev/sdk"
 import { useAgentClient } from "@magnitudedev/client-common"
 import { writeClipboardText } from "../lib/clipboard"
+import { CopyCommand } from "./copy-command"
 import { ErrorNotice } from "./error-notice"
 import { HarnessLogo } from "./harness-logo"
 import { pageLayout } from "./page-layout"
@@ -37,25 +38,27 @@ export function HarnessSetupList({ defaultModel, origin, remote, platform }: {
     <div className={pageLayout.harnessGrid}>
       {HARNESS_PRIORITY.map(harness => {
         const name = harnessNames[Brand.unbranded(harness)]
-        return <article key={harness} aria-label={name} className={pageLayout.harnessCard}>
-          <div className="flex flex-wrap items-center justify-between gap-4 md:flex-nowrap">
-            <div className="flex min-w-0 items-center gap-3">
-              <HarnessLogo id={harness} name={name} />
-              <h3 className="text-lg font-semibold">{name}</h3>
-            </div>
-            <div className="ml-auto shrink-0">
-              {defaultModel === undefined
-                ? <Button disabled>Copy setup prompt</Button>
-                : <CopySetupPrompt harness={harness} name={name} model={defaultModel} origin={origin} remote={remote} platform={platform} />}
-            </div>
-          </div>
-        </article>
+        return defaultModel === undefined
+          ? <article key={harness} aria-label={name} className={pageLayout.harnessCard}>
+            <SetupHeader harness={harness} name={name}><Button disabled>Copy setup prompt</Button></SetupHeader>
+          </article>
+          : <SetupCard key={harness} harness={harness} name={name} model={defaultModel} origin={origin} remote={remote} platform={platform} />
       })}
     </div>
   </section>
 }
 
-function CopySetupPrompt({ harness, name, model, origin, remote, platform }: {
+function SetupHeader({ harness, name, children }: { harness: HarnessId; name: string; children: ReactNode }) {
+  return <div className="flex flex-wrap items-center justify-between gap-4 md:flex-nowrap">
+    <div className="flex min-w-0 items-center gap-3">
+      <HarnessLogo id={harness} name={name} />
+      <h3 className="text-lg font-semibold">{name}</h3>
+    </div>
+    <div className="ml-auto flex shrink-0 items-center gap-2">{children}</div>
+  </div>
+}
+
+function SetupCard({ harness, name, model, origin, remote, platform }: {
   harness: HarnessId
   name: string
   model: ProviderModelId
@@ -65,20 +68,29 @@ function CopySetupPrompt({ harness, name, model, origin, remote, platform }: {
 }) {
   const client = useAgentClient()
   const setup = useAtomValue(client.Connections.DescribeHarnessSetup({ harness, model, platform, origin, remote })).result
+  const [open, setOpen] = useState(false)
   const [copied, setCopied] = useState(false)
   const [failed, setFailed] = useState(false)
+  const promptId = useId()
   const copy = (prompt: string) => Effect.runFork(writeClipboardText(prompt).pipe(
     Effect.tap(() => Effect.sync(() => { setCopied(true); setFailed(false) })),
     Effect.zipRight(Effect.sleep("3 seconds")),
     Effect.tap(() => Effect.sync(() => setCopied(false))),
     Effect.catchAll(() => Effect.sync(() => { setCopied(false); setFailed(true) })),
   ))
-  if (Result.isFailure(setup)) return <ErrorNotice title="Couldn’t prepare the setup prompt" description="Check that a model is still downloaded, then try again." />
-  return <>
-    <Button aria-label={`Copy ${name} setup prompt`} disabled={!Result.isSuccess(setup)} onClick={() => Result.isSuccess(setup) && copy(setup.value.prompt)}>
-      {copied ? <CheckIcon aria-hidden="true" /> : <CopyIcon aria-hidden="true" />}{copied ? "Copied" : "Copy setup prompt"}
-    </Button>
+  const ready = Result.isSuccess(setup)
+  return <article aria-label={name} className={pageLayout.harnessCard}>
+    <SetupHeader harness={harness} name={name}>
+      {!Result.isFailure(setup) && <>
+        <Button variant="ghost" aria-expanded={open} aria-controls={promptId} disabled={!ready} onClick={() => setOpen(value => !value)}>Show prompt<CaretDownIcon aria-hidden="true" className={`size-4 transition-transform ${open ? "rotate-180" : ""}`} /></Button>
+        <Button aria-label={`Copy ${name} setup prompt`} disabled={!ready} onClick={() => ready && copy(setup.value.prompt)}>
+          {copied ? <CheckIcon aria-hidden="true" /> : <CopyIcon aria-hidden="true" />}{copied ? "Copied" : "Copy setup prompt"}
+        </Button>
+      </>}
+    </SetupHeader>
+    {Result.isFailure(setup) && <ErrorNotice title="Couldn’t prepare the setup prompt" description="Check that a model is still downloaded, then try again." className="mt-3" />}
     {copied && <span role="status" className="sr-only">{name} setup prompt copied</span>}
-    {failed && <ErrorNotice title="Couldn’t copy to the clipboard" className="mt-2" />}
-  </>
+    {failed && <ErrorNotice title="Couldn’t copy to the clipboard" className="mt-3" />}
+    {open && ready && <div id={promptId} className="mt-4"><CopyCommand multiline command={setup.value.prompt} label={`Copy the ${name} prompt shown`} /></div>}
+  </article>
 }

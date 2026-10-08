@@ -22,7 +22,7 @@ export function CopyCommand({ command, label, multiline = false }: { command: st
   }
   return <div className="min-w-0 flex-1">
     <button type="button" aria-label={label} title={command} onClick={copy} className={`flex w-full min-w-0 cursor-pointer gap-2 rounded-md ${multiline ? "items-start py-2" : "h-9 items-center"} border border-slate-200 bg-slate-50 px-3 text-left transition-colors hover:border-blue-400 hover:bg-blue-50 focus-visible:outline-2 focus-visible:outline-blue-500 dark:border-slate-700 dark:bg-slate-900 dark:hover:border-blue-500 dark:hover:bg-slate-800`}>
-      <code className={`min-w-0 flex-1 text-xs text-slate-800 dark:text-slate-200 ${multiline ? "whitespace-pre-wrap break-all leading-5" : "truncate"}`}>{command}</code>
+      <code className={`min-w-0 flex-1 text-xs text-slate-800 dark:text-slate-200 ${multiline ? "whitespace-pre-wrap leading-5 [overflow-wrap:anywhere]" : "truncate"}`}>{command}</code>
       {copied ? <CheckIcon aria-hidden="true" className="size-4 shrink-0 text-green-500" /> : <CopyIcon aria-hidden="true" className="size-4 shrink-0" />}
     </button>
     {copied && <span role="status" className="sr-only">Command copied</span>}
