@@ -6,13 +6,15 @@
 //! position-keyed selection. A chained pass embeds the previous pass's
 //! selection (`sample_rows` result rows are `draft_rows` token rows) and
 //! conditions on its output feature, so no proposal returns to the host
-//! before the chain ends.
+//! before the chain ends. A causal-only transaction (priming, catch-up)
+//! drafts nothing: its entry pass ends once the attention has appended the
+//! rows' K/V history, the only thing a later draft reads of them.
 
 use super::{DeviceSubmission, HeadProgram};
 use crate::operators::{self, paired_block, Mixer};
 use crate::{
     completion::CompletionWaiter,
-    native::{draft_vocabulary, AttestedFeedForward, AttestedHead, AttestedHeadBlock, HeadLogitsKernels},
+    native::{AttestedFeedForward, AttestedHead, AttestedHeadBlock, HeadLogitsKernels},
     operators::attention::graph::{
         self as attention_graph, attention_weights, AttentionBlock, AttentionGraphEntries,
         CheckedAttentionEntries,
@@ -42,6 +44,7 @@ use magnitude_family_contracts::{
     WeightScope,
 };
 use magnitude_kernels::{
+    attention_project,
     dense_expand, dense_output, draft_rows, head_logits_rows, readout_features_rows, sample_rows,
     shape_rows,
 };
@@ -88,11 +91,16 @@ pub(crate) struct HeadGraphClass {
     pub segments: u64,
     pub steps: u64,
     pub shaped: bool,
+    /// Whether a causal-only entry of one slot reads its conditioning from a
+    /// target feature output on the device (a prompt chunk's entry run
+    /// behind the chunk) rather than host-written rows.
+    pub device: bool,
 }
 
 /// The admitted head classes used by both prepared formation and metadata
-/// assessment. A causal head has one pass; a drafting head chains up to the
-/// method's proposal bound.
+/// assessment. A causal head has one pass, conditioned by host rows or, for
+/// one slot, by the target's features on the device; a drafting head chains
+/// up to the method's proposal bound.
 pub(crate) fn head_graph_classes(
     limits: ResourceLimits,
     history_rows: u64,
@@ -132,8 +140,19 @@ pub(crate) fn head_graph_classes(
                 segments,
                 steps: 0,
                 shaped: false,
+                device: false,
             });
         }
+        classes.push(HeadGraphClass {
+            entry_rows,
+            slots: 1,
+            history_rows,
+            slab_rows,
+            segments,
+            steps: 0,
+            shaped: false,
+            device: true,
+        });
     }
     // Drafting passes project the draft vocabulary per slot: their slots are
     // bounded by the selection bound, not the launch's request slots.
@@ -161,6 +180,7 @@ pub(crate) fn head_graph_classes(
                         segments,
                         steps,
                         shaped,
+                        device: false,
                     });
                 }
             }
@@ -172,8 +192,8 @@ pub(crate) fn head_graph_classes(
 /// The per-run inputs of one pass.
 struct PassPorts {
     coordinates: NativePort,
-    visible: NativePort,
-    fresh: NativePort,
+    visible: Option<NativePort>,
+    fresh: Option<NativePort>,
     destinations: NativePort,
     /// The head's history planes, in plane-descriptor order.
     planes: Vec<NativePort>,
@@ -183,6 +203,7 @@ struct PassPorts {
 struct HeadGraphEntries<'a, G: GraphDraft + 'a> {
     input: G::Binding<'a, draft_rows::Entry>,
     attention: AttentionGraphEntries<'a, G>,
+    priming_project: G::Binding<'a, attention_project::Entry>,
     feed_forward: HeadFeedForwardEntries<'a, G>,
     features: G::Binding<'a, readout_features_rows::Entry>,
     logits: HeadLogitsEntries<'a, G>,
@@ -206,6 +227,7 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
         Ok(Self {
             input: &block.input,
             attention: (&block.attention).into(),
+            priming_project: &block.priming_project,
             feed_forward: match &block.feed_forward {
                 AttestedFeedForward::Dense(handles) => {
                     HeadFeedForwardEntries::Dense(handles.into())
@@ -301,6 +323,7 @@ impl CheckedHeadEntries {
         Ok(HeadGraphEntries {
             input: &self.input,
             attention: self.attention.entries()?,
+            priming_project: self.attention.entries()?.project,
             feed_forward: match &self.feed_forward {
                 CheckedHeadFeedForwardEntries::Dense(entries) => {
                     HeadFeedForwardEntries::Dense(entries.entries())
@@ -331,14 +354,16 @@ struct HeadGraphParts<P> {
     plan: P,
     tokens: NativePort,
     conditioning: NativePort,
-    out_rows: NativePort,
+    /// Each slot's last entry row, read by the entry pass's features; absent
+    /// from a causal-only graph, which reads no features.
+    out_rows: Option<NativePort>,
     passes: Vec<PassPorts>,
     constants: Vec<GraphConstant>,
     weights: Vec<(WeightPort, NativePort)>,
-    /// The output head's leading `draft_vocabulary` rows, when drafting.
+    /// The complete output head, when drafting.
     projection: Option<HeadProjectionPorts>,
     /// Selections `[steps * slots, 2]` when drafting; otherwise the entry
-    /// pass's features, exported so the graph has a result.
+    /// rows' block input, exported so the graph has a result.
     output: WorkflowTensor,
 }
 
@@ -398,9 +423,9 @@ fn planned_weight<G: GraphDraft>(
 
 /// The ports of the head's projection onto the draft vocabulary.
 enum HeadProjectionPorts {
-    /// The output projection's leading rows.
+    /// The complete output projection.
     Packed(NativePort),
-    /// The planes' leading rows (the radii only when certified).
+    /// The complete planes (the radii only when certified).
     Progressive(Vec<(ProgressivePlane, NativePort)>),
 }
 
@@ -439,6 +464,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         || class.slots > class.entry_rows
         || class.history_rows == 0
         || (class.steps == 0 && class.shaped)
+        || (class.device && (class.steps != 0 || class.slots != 1))
     {
         return Err(format!("head graph class {class:?} is inconsistent").into());
     }
@@ -476,8 +502,12 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         operators::attention::shape(hidden, attention).map_err(|error| error.to_string())?;
     let head_epsilon = operators::attention::head_norm_epsilon(attention, paired.epsilon())
         .map_err(|error| error.to_string())? as f32;
+    // A causal-only transaction only publishes its entry rows' K/V history:
+    // nothing reads their attention output, so its pass ends at the append
+    // and binds none of the weights after it.
+    let inject_only = class.steps == 0;
     // Draft head sublayers add their outputs to the residual (admission).
-    let attention_weights = attention_weights(&attention_shape, attention, true, false, |kind| {
+    let attention_weights = attention_weights(&attention_shape, attention, !inject_only, false, |kind| {
         planned_weight(
             &mut graph,
             load,
@@ -488,14 +518,17 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             &mut weights,
         )
     })?;
-    let output_norm = weight!(head, WeightKind::OutputNorm);
-    let draft_vocabulary = draft_vocabulary(vocabulary);
+    let output_norm = if inject_only {
+        None
+    } else {
+        Some(weight!(head, WeightKind::OutputNorm))
+    };
     let certified = class.slots <= readout::certified_rows(backend);
     let projection = (class.steps > 0)
         .then(|| -> Result<_, GraphError> {
             Ok(match readout::HeadPlans::of(load)? {
                 readout::HeadPlans::Packed(plan) => {
-                    HeadProjectionPorts::Packed(graph.port(plan.resident, &[draft_vocabulary, hidden])?)
+                    HeadProjectionPorts::Packed(graph.port(plan.resident, &[vocabulary, hidden])?)
                 }
                 readout::HeadPlans::Progressive(_) => HeadProjectionPorts::Progressive(
                     ProgressivePlane::ALL
@@ -506,7 +539,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                                 plane,
                                 graph.port(
                                     crate::progressive::element(plane),
-                                    &plane.shape(draft_vocabulary, hidden),
+                                    &plane.shape(vocabulary, hidden),
                                 )?,
                             ))
                         })
@@ -519,24 +552,39 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     let entry_dims = [("M", class.entry_rows), ("V", vocabulary), ("D", hidden)];
     graph.set_class_scope(Some("head-entry"));
     let tokens = graph.input_for(entries.input, "tokens", &entry_dims)?;
-    let conditioning = graph.input_for(entries.input, "conditioning", &entry_dims)?;
-    let out_rows = graph.input_for(
-        entries.features,
-        "out_rows",
-        &[("M", class.entry_rows), ("O", class.slots), ("D", hidden)],
-    )?;
+    // The host writes the entry rows' conditioning, or a device-conditioned
+    // class binds the leading rows of its chunk's target features.
+    let conditioning = if class.device {
+        graph.port_with_class_extent(
+            activation(geometry.activation_dtype),
+            &[class.entry_rows, hidden],
+            0,
+            "head_entry_rows",
+        )?
+    } else {
+        graph.input_for(entries.input, "conditioning", &entry_dims)?
+    };
+    let out_rows = if inject_only {
+        None
+    } else {
+        Some(graph.input_for(
+            entries.features,
+            "out_rows",
+            &[("M", class.entry_rows), ("O", class.slots), ("D", hidden)],
+        )?)
+    };
     graph.set_class_scope(None);
     let mut selections = (class.steps > 0)
         .then(|| {
             graph.local_for(
                 entries.sample,
                 "result",
-                &[("M", class.steps * class.slots), ("V", draft_vocabulary)],
+                &[("M", class.steps * class.slots), ("V", vocabulary)],
             )
         })
         .transpose()?;
     let mut constants = Vec::new();
-    let absent_scale = matches!(feed_forward, FeedForwardProgramSlot::Dense(_))
+    let absent_scale = (!inject_only && matches!(feed_forward, FeedForwardProgramSlot::Dense(_)))
         .then(|| GraphConstant::absent_scale(&mut graph, &mut constants))
         .transpose()?;
     let mut passes = Vec::new();
@@ -592,7 +640,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         };
         let (attended, state, controls) = attention_graph::attention(
             &mut graph,
-            entries.attention,
+            AttentionGraphEntries {
+                project: if inject_only { entries.priming_project } else { entries.attention.project },
+                ..entries.attention
+            },
             &attention_weights,
             &mut constants,
             &input,
@@ -610,9 +661,31 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 post_norm_epsilon: 0.0,
                 post_norm_scale: 1.0,
                 activation: activation(geometry.activation_dtype),
-                inject_only: false,
+                inject_only,
             },
         )?;
+        let (Some(output_norm), Some(out_rows)) = (&output_norm, &out_rows) else {
+            graph.set_class_scope(None);
+            graph.export(&attended)?;
+            return Ok(HeadGraphParts {
+                plan: graph,
+                tokens,
+                conditioning,
+                out_rows: None,
+                passes: vec![PassPorts {
+                    coordinates: controls.coordinates,
+                    visible: controls.visible,
+                    fresh: controls.fresh,
+                    destinations: controls.destinations,
+                    planes: state.planes,
+                    selection: None,
+                }],
+                constants,
+                weights,
+                projection: None,
+                output: attended,
+            });
+        };
         let advanced = match (&entries.feed_forward, feed_forward) {
             (HeadFeedForwardEntries::Dense(entries), FeedForwardProgramSlot::Dense(_)) => {
                 graph.set_class_scope((pass == 0).then_some("head-entry-dense"));
@@ -711,7 +784,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 &[("M", rows), ("O", class.slots), ("D", hidden)],
                 readout_features_rows::WorkflowArgs {
                     hidden: (&advanced).into(),
-                    norm: (&output_norm).into(),
+                    norm: output_norm.into(),
                     out_rows: chained_rows
                         .as_ref()
                         .map_or(out_rows.tensor(), |rows| rows.port().tensor())
@@ -733,7 +806,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         let logits = graph
                             .enqueue(
                                 *entry,
-                                &[("O", class.slots), ("V", draft_vocabulary), ("D", hidden)],
+                                &[("O", class.slots), ("V", vocabulary), ("D", hidden)],
                                 head_logits_rows::WorkflowArgs {
                                     features: (&features).into(),
                                     weight: weight.tensor().into(),
@@ -771,13 +844,13 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                             },
                             readout::ProgressiveRows {
                                 hidden: &advanced,
-                                norm: &output_norm,
+                                norm: output_norm,
                                 out_rows: &pass_rows,
                                 rows,
                                 projected: class.slots,
                                 selected: class.slots,
                             },
-                            (draft_vocabulary, hidden),
+                            (vocabulary, hidden),
                             epsilon,
                         )?
                     }
@@ -792,14 +865,14 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         &mut graph,
                         entries.sample,
                         class.slots,
-                        draft_vocabulary,
+                        vocabulary,
                     )?,
                 };
                 Some(readout::sample(
                     &mut graph,
                     entries.shape,
                     entries.sample,
-                    draft_vocabulary,
+                    vocabulary,
                     &mut logits,
                     class.slots,
                     class.shaped,
@@ -831,7 +904,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         plan: graph,
         tokens,
         conditioning,
-        out_rows,
+        out_rows: Some(out_rows.ok_or_else(|| "head graph has no entry pass".to_owned())?),
         passes,
         constants,
         weights,
@@ -872,8 +945,10 @@ fn certify_head_family(
     let mut layouts = BTreeMap::new();
     // Every field but the entry row count fixes the graph's structure; the
     // entry pass branches only through the row form of its row count.
-    let mut groups: BTreeMap<(u64, u64, bool, u64, u32, u64, RowForm), Vec<HeadGraphClass>> =
-        BTreeMap::new();
+    let mut groups: BTreeMap<
+        (u64, u64, bool, bool, u64, u32, u64, RowForm),
+        Vec<HeadGraphClass>,
+    > = BTreeMap::new();
     for &class in classes {
         if groups.values().any(|group| group.contains(&class)) {
             return Err("head graph class is duplicated".into());
@@ -883,6 +958,7 @@ fn certify_head_family(
                 class.slots,
                 class.steps,
                 class.shaped,
+                class.device,
                 class.history_rows,
                 class.slab_rows,
                 class.segments,
@@ -919,6 +995,9 @@ fn certify_head_family(
                 let slice = NativeGraphClassSlice::new()
                     .dimension("head_entry_rows", rows)
                     .scoped("head-entry", "M", rows);
+                if class.steps == 0 {
+                    return Ok::<_, String>(slice);
+                }
                 Ok::<_, String>(match binding.feed_forward {
                     FeedForwardProgramSlot::Dense(_) => slice
                         .scoped("head-entry-dense", "M", rows)
@@ -943,7 +1022,7 @@ fn certify_head_family(
         let layout = template.certify(&slices)?;
         family.include(layout.storage_bytes(), []);
         for &class in &group {
-            if matches!(binding.feed_forward, FeedForwardProgramSlot::Dense(_)) {
+            if class.steps > 0 && matches!(binding.feed_forward, FeedForwardProgramSlot::Dense(_)) {
                 family.include(
                     NativeGraphStorageBytes {
                         workspace: 0,
@@ -1101,30 +1180,18 @@ impl PreparedHeadGraphs {
         resident: &ResidentHead,
     ) -> Result<BoundHeadGraphs, SubmitError> {
         let mut uploaded = ConstantTensors::new(resident.embedding.tensor().device());
-        // The output head's leading draft-vocabulary rows: the packed
-        // projection's, or each plane's.
-        let leading = |tensor: &Tensor| -> Result<Tensor, SubmitError> {
-            let vocabulary = tensor
-                .extents()
-                .first()
-                .copied()
-                .ok_or_else(|| invalid("resident output head has no rows"))?;
-            tensor
-                .slice_leading(0, draft_vocabulary(vocabulary))
-                .map_err(device)
-        };
         let projection = match &resident.output {
-            ResidentOutput::Packed(weight) => vec![(None, leading(weight.tensor())?)],
+            ResidentOutput::Packed(weight) => vec![(None, weight.tensor())],
             ResidentOutput::Progressive(planes) => ProgressivePlane::ALL
                 .into_iter()
-                .map(|plane| Ok((Some(plane), leading(planes.plane(plane).tensor())?)))
-                .collect::<Result<Vec<_>, SubmitError>>()?,
+                .map(|plane| (Some(plane), planes.plane(plane).tensor()))
+                .collect(),
         };
         let projected = |plane: Option<ProgressivePlane>| -> Result<&Tensor, SubmitError> {
             projection
                 .iter()
                 .find(|(placed, _)| *placed == plane)
-                .map(|(_, tensor)| tensor)
+                .map(|(_, tensor)| *tensor)
                 .ok_or_else(|| invalid("the head projection and the resident output head disagree"))
         };
         let mut bound = BTreeMap::new();
@@ -1346,6 +1413,7 @@ impl NativeHeadProgram {
             segments: self.graphs.segments()?,
             steps: steps as u64,
             shaped,
+            device: matches!(core.conditioning(), crate::HeadConditioning::Features(_)),
         };
         let (graph, bound) = self.graphs.class(class)?;
         if graph.passes.len() != chain.len() + 1 {
@@ -1362,40 +1430,53 @@ impl NativeHeadProgram {
                 bindings.set(port, plane).map_err(device)?;
             }
         }
-        // Conditioning rows in entry-row order (the launch checked each
-        // slot's rows against the activation width), padded with zeros.
-        let row_bytes = self.geometry.hidden as usize * self.geometry.activation_dtype.bytes();
-        let crate::HeadConditioning::Rows(rows) = core.conditioning() else {
-            return Err(invalid(
-                "an embedded head enters host conditioning rows",
-            ));
-        };
-        let mut conditioning = Vec::with_capacity(entry_rows * row_bytes);
-        for rows in rows {
-            conditioning.extend_from_slice(rows.bytes());
-        }
-        if conditioning.len() != entry.actual_rows * row_bytes {
-            return Err(invalid(
-                "head conditioning bytes differ from the entry rows",
-            ));
-        }
-        conditioning.resize(entry_rows * row_bytes, 0);
         let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
-        active
-            .write_input(&graph.conditioning, &conditioning)
-            .map_err(device)?;
+        match core.conditioning() {
+            // Host rows in entry-row order (the launch checked each slot's
+            // rows against the activation width), padded with zeros.
+            crate::HeadConditioning::Rows(rows) => {
+                let row_bytes =
+                    self.geometry.hidden as usize * self.geometry.activation_dtype.bytes();
+                let mut conditioning = Vec::with_capacity(entry_rows * row_bytes);
+                for rows in rows {
+                    conditioning.extend_from_slice(rows.bytes());
+                }
+                if conditioning.len() != entry.actual_rows * row_bytes {
+                    return Err(invalid(
+                        "head conditioning bytes differ from the entry rows",
+                    ));
+                }
+                conditioning.resize(entry_rows * row_bytes, 0);
+                active
+                    .write_input(&graph.conditioning, &conditioning)
+                    .map_err(device)?;
+            }
+            // The target features' leading class rows; rows past the entry
+            // rows condition padding rows, which append nowhere.
+            crate::HeadConditioning::Features(features) => {
+                let features = features
+                    .tensor()
+                    .slice_leading(0, entry_rows as u64)
+                    .map_err(|error| invalid(format!("head conditioning features: {error}")))?;
+                bindings.set(&graph.conditioning, &features).map_err(device)?;
+            }
+        }
         active
             .write_input(
                 &graph.tokens,
                 &i32_bytes(entry.tokens.iter().flat_map(|token| [*token, 0])),
             )
             .map_err(device)?;
-        active
-            .write_input(
-                &graph.out_rows,
-                &i32_bytes((0..slots).map(|slot| entry.out_rows.get(slot).copied().unwrap_or(0))),
-            )
-            .map_err(device)?;
+        if let Some(out_rows) = &graph.out_rows {
+            active
+                .write_input(
+                    out_rows,
+                    &i32_bytes(
+                        (0..slots).map(|slot| entry.out_rows.get(slot).copied().unwrap_or(0)),
+                    ),
+                )
+                .map_err(device)?;
+        }
         for (index, (ports, pass)) in graph
             .passes
             .iter()
@@ -1410,17 +1491,17 @@ impl NativeHeadProgram {
             active
                 .write_input(&ports.coordinates, &controls.coordinates)
                 .map_err(device)?;
-            active
-                .write_input(&ports.visible, &controls.visible)
-                .map_err(device)?;
-            active
-                .write_input(&ports.fresh, &controls.fresh)
-                .map_err(device)?;
+            if let Some(visible) = &ports.visible {
+                active.write_input(visible, &controls.visible).map_err(device)?;
+            }
+            if let Some(fresh) = &ports.fresh {
+                active.write_input(fresh, &controls.fresh).map_err(device)?;
+            }
             active
                 .write_input(&ports.destinations, &controls.destinations)
                 .map_err(device)?;
             if let Some(selection) = &ports.selection {
-                let words = draft_vocabulary(self.geometry.vocabulary).div_ceil(32) as usize;
+                let words = self.geometry.vocabulary.div_ceil(32) as usize;
                 readout::write_selection(pass, &mut active, selection, slots, words)?;
             }
         }

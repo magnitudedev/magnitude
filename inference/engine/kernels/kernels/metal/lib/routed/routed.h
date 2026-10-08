@@ -18,7 +18,7 @@ inline ulong expert_row(ulong expert, ulong rows) { return expert * rows; }
 // Rows of weight tensor `base` starting at row `first`.
 template <typename W>
 inline projection::Weights<W> weights(device const uchar *base, packets::Rows16 layout, ulong first, uint k) {
-    return projection::Weights<W>{base + first * layout.stride, layout, k, nullptr};
+    return projection::Weights<W>{base, layout, k, nullptr, first};
 }
 
 // A plain activation prologue over rows of a [rows, columns] A tensor.

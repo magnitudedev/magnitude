@@ -139,9 +139,9 @@ pub trait MethodState {
     /// Clone request-local method state for a fallible transition.
     fn fork_transition(&self) -> Box<dyn MethodState>;
     /// The drafter position a prompt chunk's entry takes when the drafter
-    /// enters prompt chunks on the device, behind the chunk (a separate
-    /// drafter with no rows pending); `None` when chunks are entered by
-    /// method work after they commit.
+    /// enters prompt chunks on the device, behind the chunk (a
+    /// target-conditioned drafter with no rows pending); `None` when chunks
+    /// are entered by method work after they commit.
     fn priming_position(&self) -> Option<usize>;
     /// Enter a committed target chunk. `next` is the token the chunk's last
     /// row selected, when it selected one; `draft_from` is the position the

@@ -436,7 +436,6 @@ pub(crate) struct Allocation {
     // Dropping unpublished growth restores the old physical prefix and charge.
     predecessor: Option<Weak<Allocation>>,
     rollback_growth: Option<Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>>,
-    on_release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
     storage: Box<dyn Storage>,
     access: Arc<AccessGroup>,
     shared_access: OnceLock<Arc<AccessGroup>>,
@@ -515,7 +514,6 @@ impl Allocation {
             charge: Mutex::new(Some(charge)),
             predecessor: None,
             rollback_growth: None,
-            on_release: Mutex::new(None),
             storage,
             access: Arc::new(AccessGroup::default()),
             shared_access: OnceLock::new(),
@@ -536,7 +534,6 @@ impl Allocation {
             charge: Mutex::new(Some(charge)),
             predecessor: Some(Arc::downgrade(predecessor)),
             rollback_growth,
-            on_release: Mutex::new(None),
             storage,
             access: Arc::new(AccessGroup::default()),
             shared_access: OnceLock::new(),
@@ -560,15 +557,6 @@ impl Allocation {
     }
     pub(crate) fn storage(&self) -> &dyn Storage {
         &*self.storage
-    }
-
-    pub(crate) fn on_release(&self, release: impl FnOnce() + Send + Sync + 'static) {
-        let mut slot = self
-            .on_release
-            .lock()
-            .expect("allocation release lock poisoned");
-        assert!(slot.is_none(), "allocation already has a release hook");
-        *slot = Some(Box::new(release));
     }
     fn access_group(&self) -> &AccessGroup {
         self.shared_access
@@ -723,14 +711,6 @@ impl Drop for Allocation {
         drop(state);
         if let Some(fence) = fence {
             fence.wait_complete();
-        }
-        if let Some(release) = self
-            .on_release
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            release();
         }
         // The caller publishes by dropping the predecessor after all planes
         // are ready. If it is still live, this replacement was abandoned.

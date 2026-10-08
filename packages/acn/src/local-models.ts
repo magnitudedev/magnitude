@@ -110,8 +110,6 @@ const projectAssessment = (environmentId: string, assessment: ModelAssessment): 
       profile: assessment.profile,
       memory: {
         domains: assessment.memory, totalRequiredBytes, requiredSystemMemoryBytes,
-        systemUseState: { _tag: "NotObserved" },
-        currentHeadroomState: { _tag: "NotObserved" },
       },
       performance: assessment.performance,
     })

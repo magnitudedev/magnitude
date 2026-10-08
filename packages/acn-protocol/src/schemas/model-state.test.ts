@@ -211,7 +211,6 @@ describe("LocalModelSchema invariants", () => {
         profile: { contextLength: 4096 },
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
-          systemUseState: { _tag: "NotObserved" }, currentHeadroomState: { _tag: "NotObserved" },
         },
         performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
       },
@@ -241,7 +240,6 @@ describe("LocalModelSchema invariants", () => {
         profile: { contextLength: 4096 },
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
-          systemUseState: { _tag: "NotObserved" }, currentHeadroomState: { _tag: "NotObserved" },
         },
         performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
       },
@@ -270,8 +268,6 @@ describe("LocalModelSchema invariants", () => {
       }],
       totalRequiredBytes: 5,
       requiredSystemMemoryBytes: 4,
-      systemUseState: { _tag: "NotObserved" },
-      currentHeadroomState: { _tag: "NotObserved" },
     })).toThrow()
   })
 })

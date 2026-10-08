@@ -146,7 +146,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/linux-build-tools
         with:
-          packages: build-essential fakeroot rpm libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6
+          packages: build-essential fakeroot rpm libarchive-tools libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6
       - name: Install Windows native build components
         if: runner.os == 'Windows'
         shell: pwsh
@@ -239,7 +239,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
-      - run: sudo apt-get update && sudo apt-get install -y rpm xvfb dbus-x11 xfwm4 x11-utils xauth desktop-file-utils libglib2.0-bin
+      - run: sudo apt-get update && sudo apt-get install -y rpm libarchive-tools xvfb dbus-x11 xfwm4 x11-utils xauth desktop-file-utils libglib2.0-bin
       - run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:
@@ -291,6 +291,14 @@ jobs:
                 MAGNITUDE_TEST_CLI_EXECUTABLE=/accepted/bin/magnitude-cli \
                 xvfb-run -a dbus-run-session -- node /workspace/desktop/src/fixtures/linux-installed-lifecycle.mjs
             '
+
+      - name: Install the accepted pacman package in Arch Linux and exercise desktop ownership
+        if: matrix.id == 'linux-x64-gnu'
+        timeout-minutes: 15
+        run: |
+          set -- ./release/${{ matrix.id }}/*.pkg.tar.zst
+          test "$#" -eq 1
+          bash packages/release/scripts/acceptance/test-linux-pacman.sh "$1" "$RUNNER_TEMP/magnitude-release-cli" "$RUNNER_TEMP/chromium-seccomp.json"
 
   apple-consumer:
     needs: [matrix, host]
@@ -367,7 +375,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: npm install --global "npm@${NPM_VERSION}"
-      - run: sudo apt-get update && sudo apt-get install -y binutils rpm xvfb dbus-x11 xfwm4 x11-utils xauth desktop-file-utils libglib2.0-bin
+      - run: sudo apt-get update && sudo apt-get install -y binutils rpm libarchive-tools xvfb dbus-x11 xfwm4 x11-utils xauth desktop-file-utils libglib2.0-bin
       - run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:

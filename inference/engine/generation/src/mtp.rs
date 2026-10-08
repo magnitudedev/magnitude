@@ -9,6 +9,13 @@
 //! ending with the anchor (the last accepted token); the executor drafts the
 //! proposals on the device, in the drafter's form (MTP chains head rows, a
 //! DFlash draft reads one block).
+//!
+//! Prompt history needs no drafter transaction: the prompt knows the token
+//! after every chunk row, so a drafter with no rows pending has each prompt
+//! chunk's pairs entered on the device behind the chunk
+//! (`MethodState::priming_position`). Replayed and resumed history, whose
+//! state holds an open feature or pending pairs, is entered by drafter
+//! transactions after each chunk.
 
 use crate::{
     DraftCheckpoint, Method, MethodCheckpoint, MethodCheckpointError, MethodEffects,
@@ -250,8 +257,7 @@ impl MethodState for DrafterState {
     }
 
     fn priming_position(&self) -> Option<usize> {
-        (self.drafter == Drafter::DFlash
-            && self.pending.is_none()
+        (self.pending.is_none()
             && self.open.is_none()
             && self.head.is_none()
             && self.proposal.is_none())

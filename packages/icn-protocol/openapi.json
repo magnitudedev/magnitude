@@ -4802,6 +4802,53 @@
         "type": "string",
         "description": "Stable identity of one physical memory pool."
       },
+      "MemoryShortage": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Memory that cannot be moved is in the way of the load's claim in its limiting memory\ndomain. `available_bytes` is what a load may claim there: the reserve is already taken out.",
+            "required": [
+              "requiredBytes",
+              "availableBytes",
+              "_tag"
+            ],
+            "properties": {
+              "requiredBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "availableBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Blocked"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A memory domain the load uses was under pressure: at its reserve, or with other programs'\nmemory being displaced faster than the system absorbs. No byte count describes it.",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "UnderPressure"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Why a model that fits the machine could not be given its memory."
+      },
       "Message": {
         "type": "object",
         "required": [
@@ -5461,15 +5508,12 @@
           },
           {
             "type": "object",
+            "description": "The model fits this machine but could not be given its memory now.",
             "required": [
               "code",
               "message",
               "retryable",
-              "requiredMemoryBytes",
-              "allocationHeadroomBytes",
-              "systemReserveBytes",
-              "loadBoundaryBytes",
-              "minimumAdditionalAvailableBytes",
+              "shortage",
               "_tag"
             ],
             "properties": {
@@ -5482,38 +5526,13 @@
               "retryable": {
                 "type": "boolean"
               },
-              "requiredMemoryBytes": {
-                "type": "integer",
-                "format": "int64",
-                "description": "The load's startup peak claim in the limiting memory domain.",
-                "minimum": 0
-              },
-              "allocationHeadroomBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "systemReserveBytes": {
-                "type": "integer",
-                "format": "int64",
-                "description": "The limiting domain's planning reserve.",
-                "minimum": 0
-              },
-              "loadBoundaryBytes": {
-                "type": "integer",
-                "format": "int64",
-                "description": "The required memory plus the planning reserve.",
-                "minimum": 0
-              },
-              "minimumAdditionalAvailableBytes": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
+              "shortage": {
+                "$ref": "#/components/schemas/MemoryShortage"
               },
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "LowMemory"
+                  "MemoryShortage"
                 ]
               }
             }

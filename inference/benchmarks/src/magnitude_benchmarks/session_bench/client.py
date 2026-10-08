@@ -149,16 +149,14 @@ async def measure(
                     if not isinstance(delta, dict):
                         raise ValueError("missing delta")
                     content = delta.get("content") or ""
-                    # A template that always opens a reasoning block (LFM2.5
-                    # 2.6B) streams its first output as reasoning text, which
-                    # both engines separate; for prose it is generated text
-                    # all the same.
+                    # Every request disables thinking. Reasoning text is
+                    # collected only to refuse the response that carries it.
                     reasoning = delta.get("reasoning_content") or ""
                     if not isinstance(content, str) or not isinstance(reasoning, str):
                         raise ValueError("content delta is not text")
                     output += content
                     reasoned += reasoning
-                    semantic = bool(content) or (request.workload == "prose" and bool(reasoning))
+                    semantic = bool(content)
                     for call in delta.get("tool_calls") or []:
                         index = call.get("index")
                         if type(index) is not int or index < 0:
@@ -183,12 +181,25 @@ async def measure(
                     raise ValueError("stream ended without finish, consistent usage and [DONE]")
                 if evidence["usage"]["completion_tokens"] > request.output_limit:
                     raise ValueError("engine exceeded the shared output allowance")
-                if request.workload == "prose":
-                    text = output.strip() or reasoned.strip()
-                    if calls or not text or evidence["usage"]["completion_tokens"] < 1:
-                        raise ValueError("prose response must contain text and no tool calls")
-                    if finish == "length":
-                        if evidence["usage"]["completion_tokens"] != request.output_limit:
+                generated = evidence["usage"]["completion_tokens"]
+                if reasoned:
+                    outcome, error = (
+                        "invalid",
+                        f"response carries {len(reasoned)} characters of reasoning text "
+                        "although the request disables thinking",
+                    )
+                elif request.workload == "prose":
+                    if calls or generated < 1:
+                        raise ValueError(
+                            "prose response must report generated tokens and no tool calls"
+                        )
+                    if not output.strip():
+                        outcome, error = (
+                            "invalid",
+                            f"engine generated {generated} tokens and returned no answer text",
+                        )
+                    elif finish == "length":
+                        if generated != request.output_limit:
                             outcome, error = (
                                 "truncated",
                                 "context ended before the prose output budget",

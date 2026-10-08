@@ -3,7 +3,7 @@ use crate::{
     ReadoutBinding, RecurrentBinding, RoutedBinding, ShortConvBinding, StateSpaceBinding,
 };
 use magnitude_kernels::{
-    attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
+    attention_append_dense, attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project, dense_expand, dense_output, embedding_rows,
     gated_delta_chunk, gated_delta_project, gated_delta_project_convolved, gated_delta_step,
     gated_delta_step_convolved, post_norm_residual, project_rows, readout_exact_rows,
@@ -191,6 +191,7 @@ impl<E: seismic::Entry> SublayerOutput<NativeKernel<E>> {
 #[derive(Clone, Debug)]
 pub enum AttentionHistoryKernels {
     Dense {
+        append: NativeKernel<attention_append_dense::Entry>,
         decode: NativeKernel<attention_decode::Entry>,
         /// The multi-row decode (draft blocks, verification), tuned on its
         /// own row classes so it can read each history tile once for all
@@ -199,6 +200,7 @@ pub enum AttentionHistoryKernels {
         prefill: NativeKernel<attention_prefill::Entry>,
     },
     AffineK8V4 {
+        append: NativeKernel<attention_append_k8v4::Entry>,
         decode: NativeKernel<attention_decode_k8v4::Entry>,
         verify: Option<NativeKernel<attention_decode_k8v4::Entry>>,
         verify_four: Option<NativeKernel<attention_decode_k8v4::Entry>>,
@@ -217,16 +219,18 @@ impl AttentionHistoryKernels {
     pub fn invocation_workspace_bytes(&self) -> u64 {
         match self {
             Self::Dense {
+                append,
                 decode,
                 verify,
                 prefill,
             } => {
-                decode
+                append.invocation_workspace_bytes() + decode
                     .invocation_workspace_bytes()
                     .max(verify.as_ref().map_or(0, |kernel| kernel.invocation_workspace_bytes()))
                     + prefill.invocation_workspace_bytes()
             }
             Self::AffineK8V4 {
+                append,
                 decode,
                 verify,
                 verify_four,
@@ -234,7 +238,7 @@ impl AttentionHistoryKernels {
                 prefill,
                 prefill_listed,
             } => {
-                decode
+                append.invocation_workspace_bytes() + decode
                     .invocation_workspace_bytes()
                     .max(
                         verify

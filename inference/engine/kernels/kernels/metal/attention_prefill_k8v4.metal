@@ -1,3 +1,4 @@
+#define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 #define ATTENTION_I SEISMIC_DIM_I
 #define ATTENTION_U SEISMIC_DIM_U
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
@@ -5,6 +6,7 @@
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
 #define PREFILL_HEADS_PER_GROUP SEISMIC_TUNE_HEADS
 #define PREFILL_DIRECT SEISMIC_TUNE_DIRECT
+#define PREFILL_COISSUE SEISMIC_TUNE_COISSUE
 #include "lib/attention/attention.h"
 
 // The launches over affine K8/V4 history (bodies in lib/attention/attention.h):
@@ -16,7 +18,11 @@
 // `partials` the key partitions leave (attention::history_window), the
 // attend launch reads its tiles from there (attention::decoded_history), and
 // when the call takes several rounds the `fold` launch folds each round's
-// split records into the state the window keeps.
+// split records into the state the window keeps. Under COISSUE on simdgroup
+// matrices the attend launch pairs its simdgroups, one forming Q K^T on the
+// matrix pipe and one P V as scalar F16 products (attention::prefill_coissue),
+// over the same decoded history; a 512-column head takes a pair per
+// 256-column window.
 
 #if SEISMIC_TUNE_DIRECT
 // The window of a call that lists `listed` tiles, placed by the terms of

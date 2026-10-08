@@ -1,3 +1,4 @@
+#define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 // attention_prefill_k8v4: streaming attention for prefill rows over affine
 // K8/V4 history. The body (three launches) is `lib/attention/prefill.glsl`: the
 // prepare launch appends encoded rows and every history K/V tile decodes

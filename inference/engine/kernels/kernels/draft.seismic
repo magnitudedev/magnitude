@@ -33,16 +33,26 @@ fn draft_rows[M, V, D](tokens: &tensor[M, 2] i32, table: &tensor[V, D] EW,
     linear(joined, combine, result)
     return result
 
-# One threadgroup per (32 outputs, row). The threadgroup forms the row's
+# Metal decode uses one threadgroup per (32 outputs, row). Prefill joins
+# each row once, then shares combine weights across 64 rows through GEMM.
+# The decode threadgroup forms the row's
 # joined [2D] input in A in threadgroup memory (embedding rows and the combine
 # weight decoded through the `rows16` packet library), then each simdgroup
 # reduces four combine rows over it. (CUDA holds the joined row in F32 and
 # decodes mma16 lane chunks, hence its larger shared memory.)
 native draft_rows for metal from "metal/draft_rows.metal":
-    launch draft_rows:
+    scratch joined bytes (M * D * 2 * 2 * min(M / 17, 1))
+    launch draft_rows when M <= 16:
         threadgroups (ceil_div(D, 32), M, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (4 * D + 64)
+    launch draft_rows_join when M > 16:
+        threadgroups (1, M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (4 * D + 64)
+    launch draft_rows_gemm when M > 16:
+        threadgroups (ceil_div(D, 64), ceil_div(M, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
 
 # Packed tables and combine weights decode whole 64-column k-blocks (every
 # k-quant row is a multiple of 256 columns); the joined row is F32 in shared

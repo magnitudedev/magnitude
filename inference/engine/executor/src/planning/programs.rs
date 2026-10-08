@@ -680,6 +680,7 @@ fn draft_program_plan(
         blocks.push(DraftBlockBinding {
             attention,
             injection: AttentionBinding {
+                key_value_only: true,
                 norm: fusion_norm,
                 ..attention
             },

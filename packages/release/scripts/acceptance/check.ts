@@ -21,7 +21,7 @@ const run = Effect.gen(function* () {
     }
   }
   const metadata = yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: "0.0.14", os, os_version: release(), arch: process.arch,
-    package: os === "darwin" ? "mac-zip" : os === "windows" ? "windows-exe" : (yield* fs.exists("/usr/bin/dpkg")) ? "deb" : "rpm",
+    package: os === "darwin" ? "mac-zip" : os === "windows" ? "windows-exe" : (yield* fs.exists("/usr/bin/dpkg")) ? "deb" : (yield* fs.exists("/usr/bin/pacman")) ? "pacman" : "rpm",
     ...(os === "linux" ? { distro: distro.ID, distro_version: distro.VERSION_ID } : {}),
   })
   const identity = yield* Effect.try({ try: () => generateKeyPairSync("ed25519"), catch: () => new AcceptanceCheckFailed() })

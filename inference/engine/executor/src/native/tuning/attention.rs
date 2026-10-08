@@ -16,16 +16,17 @@
 
 use super::cases::projection_shape;
 use super::{
-    row_points, served_row_points, with_contexts, CaseState, EntryTuning, ModelInputs, PointShape,
-    TuningInputs,
-    TuningLimits,
+    longest_history, row_points, served_row_points, with_contexts, CaseState, EntryTuning,
+    ModelInputs, PointShape, TuningInputs, TuningLimits,
 };
 use crate::operators;
 use crate::operators::attention::graph::{
     affine_coefficients, rotary_amplitudes, rotary_components, rotary_frequencies, DECODE_ROWS,
 };
 use crate::{AttentionBinding, AttentionShape};
-use magnitude_family_contracts::{Attention, Operator, WeightKind, WeightScope};
+use magnitude_family_contracts::{
+    Attention, HistoryDomain, KeyValue, Operator, WeightKind, WeightScope,
+};
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project,
@@ -34,9 +35,10 @@ use seismic::{Device, Element, Tensor};
 use std::ops::Range;
 
 /// Start the Vulkan key-parallel form and Metal's grouped-query matrix
-/// forms at a bounded encoded-history slice. A start changes only the form's
-/// first measurement; every admissible configuration remains searchable and
-/// is judged on the case's served points.
+/// forms at a bounded encoded-history slice of the longest history the
+/// case's layers keep (a window layer never holds the whole context). A start
+/// changes only the form's first measurement; every admissible configuration
+/// remains searchable and is judged on the case's served points.
 fn decode_starts(
     mix: &AttentionMix,
     device: &Device,
@@ -47,16 +49,10 @@ fn decode_starts(
     let Some(defaults) = implementation.default_specialization(statics).ok() else {
         return Vec::new();
     };
-    let Some(admissible) = implementation.admissible(statics).ok() else {
-        return Vec::new();
-    };
     let default_parts = defaults.param("PARTS").unwrap_or(1);
+    let history = longest_history(limits, mix.window);
     // K8/V4 codes and the scale/zero pairs use 7W/4 bytes per KV head row.
-    let bytes_per_head = limits
-        .context_tokens
-        .saturating_mul(mix.shape.width)
-        .saturating_mul(7)
-        / 4;
+    let bytes_per_head = history.saturating_mul(mix.shape.width).saturating_mul(7) / 4;
     // Wide heads run the keywise walk in one subgroup. Across multiple
     // verification rows, extra partitions multiply its merge and dispatch
     // work; start at the default partition count and let the search compare
@@ -70,12 +66,11 @@ fn decode_starts(
     };
     match device.backend() {
         seismic::BackendName::Vulkan if desired_parts > default_parts || wide_verification => {
-            admissible
-                .into_iter()
-                .filter(|choice| {
-                    choice.param("MATRIX") == Some(0) && choice.param("KEYWISE") == Some(1)
-                })
-                .min_by_key(|choice| {
+            nearest(
+                implementation,
+                statics,
+                |choice| choice.param("MATRIX") == Some(0) && choice.param("KEYWISE") == Some(1),
+                |choice| {
                     let parts = choice.param("PARTS").unwrap_or(1);
                     let distance = defaults
                         .params()
@@ -88,10 +83,8 @@ fn decode_starts(
                         parts < desired_parts,
                         distance,
                     )
-                })
-                .map(|choice| choice.params().clone())
-                .into_iter()
-                .collect()
+                },
+            )
         }
         seismic::BackendName::Metal
             if mix.shape.width <= 256
@@ -99,10 +92,11 @@ fn decode_starts(
                     && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2))
                     || mix.shape.group == 8) =>
         {
-            admissible
-                .into_iter()
-                .filter(|choice| choice.param("MATRIX") == Some(1))
-                .min_by_key(|choice| {
+            nearest(
+                implementation,
+                statics,
+                |choice| choice.param("MATRIX") == Some(1),
+                |choice| {
                     let parts = choice.param("PARTS").unwrap_or(1);
                     // The long-context G8/W256 multirow form reuses one decoded
                     // K/V tile across four verification rows. Seed it at the
@@ -111,10 +105,9 @@ fn decode_starts(
                     let wide_group = mix.shape.group == 8;
                     let packed_g8 = wide_group
                         && mix.shape.width == 256
-                        && limits.context_tokens >= 16_384
+                        && history >= 16_384
                         && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2);
-                    let history_parts = limits
-                        .context_tokens
+                    let history_parts = history
                         .min(65_536)
                         .saturating_mul(mix.shape.width)
                         .saturating_mul(7)
@@ -141,17 +134,41 @@ fn decode_starts(
                         choice.param("SIMDS").unwrap_or(4).abs_diff(simds),
                         choice.param("SPAN").unwrap_or(128).abs_diff(span),
                     )
-                })
-                .map(|choice| choice.params().clone())
-                .into_iter()
-                .collect()
+                },
+            )
         }
         _ => Vec::new(),
     }
 }
 
+/// The parameter values of the admissible configuration `accepts` takes
+/// whose `key` is least, the first of equals in declaration order: found by
+/// walking the domain, never holding it.
+fn nearest<K: Ord>(
+    implementation: &seismic::NativeImplementation,
+    statics: &seismic::NativeSpecialization,
+    accepts: impl Fn(&seismic::NativeSpecialization) -> bool,
+    key: impl Fn(&seismic::NativeSpecialization) -> K,
+) -> Vec<seismic::ParameterValues> {
+    let mut best: Option<(K, seismic::ParameterValues)> = None;
+    let walked = implementation.walk_admissible(statics, |choice| {
+        if accepts(choice) {
+            let key = key(choice);
+            if best.as_ref().is_none_or(|(least, _)| key < *least) {
+                best = Some((key, choice.params().clone()));
+            }
+        }
+        true
+    });
+    match walked {
+        Ok(()) => best.map(|(_, values)| values).into_iter().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// `attention_project`: RMS prologue, one segmented query | gate | key |
 /// value projection.
+#[derive(Clone)]
 pub(crate) struct AttentionProjectTuning {
     pub binding: AttentionBinding,
     pub scopes: Vec<WeightScope>,
@@ -220,7 +237,9 @@ impl EntryTuning for AttentionProjectTuning {
         if projection_shape(inputs, &self.scopes, query)? != (shape.query_rows(), shape.hidden) {
             return Err("the query projection disagrees with the binding".into());
         }
-        let [_, statics @ ..] = shape.project_dimensions(0);
+        let [_, statics @ ..] = if self.binding.key_value_only {
+            shape.key_value_dimensions(0)
+        } else { shape.project_dimensions(0) };
         Ok(statics.to_vec())
     }
 
@@ -249,7 +268,12 @@ impl EntryTuning for AttentionProjectTuning {
                     }
                 };
                 Ok(AttentionProjectCase {
-                    gate: segment(shape.gate_rows(), WeightKind::AttentionGate)?,
+                    gate: {
+                        let gate = segment(shape.gate_rows(), WeightKind::AttentionGate)?;
+                        if self.binding.key_value_only {
+                            gate.slice_leading(0, 0).map_err(|error| error.to_string())?
+                        } else { gate }
+                    },
                     key: segment(shape.key_rows(), WeightKind::Key)?,
                     value: segment(shape.value_rows(), WeightKind::Value)?,
                     hidden: inputs.activation(
@@ -258,7 +282,9 @@ impl EntryTuning for AttentionProjectTuning {
                         index as u64 + 1,
                     )?,
                     input_norm: inputs.weight(scope, WeightKind::InputNorm)?,
-                    query,
+                    query: if self.binding.key_value_only {
+                        query.slice_leading(0, 0).map_err(|error| error.to_string())?
+                    } else { query },
                     epsilon: self.epsilon,
                 })
             })
@@ -282,6 +308,7 @@ impl EntryTuning for AttentionProjectTuning {
 }
 
 /// `attention_output`: output projection plus residual.
+#[derive(Clone)]
 pub(crate) struct AttentionOutputTuning {
     pub output: Element,
     pub activation: Element,
@@ -367,7 +394,7 @@ impl EntryTuning for AttentionOutputTuning {
         }
     }
 
-    generated_entry!(attention_output, this => this.elements());
+    generated_entry!(attention_output, this => this.elements(), rounded to this.activation);
 }
 
 /// What every fused attention entry tunes over.
@@ -384,18 +411,63 @@ pub(crate) struct AttentionMix {
     /// tiles its rows see (the entry's `L`, static where the forms differ by
     /// it: the two then have different admissible forms and tune apart).
     pub listed: bool,
+    /// The most history rows the layers the case binds keep
+    /// ([`history_window`]): its points see no longer history.
+    pub window: Option<u64>,
+}
+
+/// The most history rows the layers `scopes` name keep: the largest window
+/// among them, none when any keeps the whole context. A Shared layer reads
+/// its source's history and keeps what the source does.
+pub(crate) fn history_window(
+    inputs: &ModelInputs<'_>,
+    scopes: &[WeightScope],
+) -> Result<Option<u64>, String> {
+    let mut windows = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let domain = match &operator(inputs, &[*scope])?.key_value {
+            KeyValue::Owned { domain, .. } => *domain,
+            KeyValue::Shared { source } => {
+                let owner = match scope {
+                    WeightScope::TargetSublayer(_) => WeightScope::TargetSublayer(*source),
+                    WeightScope::HeadSublayer(_) => WeightScope::HeadSublayer(*source),
+                    WeightScope::DraftSublayer(_) => WeightScope::DraftSublayer(*source),
+                    other => return Err(format!("{other:?} names no sublayer")),
+                };
+                match &operator(inputs, &[owner])?.key_value {
+                    KeyValue::Owned { domain, .. } => *domain,
+                    KeyValue::Shared { .. } => {
+                        return Err(format!("{owner:?} owns no history for {scope:?} to read"))
+                    }
+                }
+            }
+        };
+        match domain {
+            HistoryDomain::Window { tokens } => windows.push(tokens),
+            HistoryDomain::Token | HistoryDomain::Block { .. } => return Ok(None),
+        }
+    }
+    windows
+        .into_iter()
+        .max()
+        .map(Some)
+        .ok_or_else(|| "a tuning case needs at least one layer".to_owned())
 }
 
 /// `attention_decode`, for row classes up to [`DECODE_ROWS`].
+#[derive(Clone)]
 pub(crate) struct AttentionDecodeTuning(pub AttentionMix);
 
 /// `attention_prefill`, for row classes beyond [`DECODE_ROWS`].
+#[derive(Clone)]
 pub(crate) struct AttentionPrefillTuning(pub AttentionMix);
 
 /// `attention_decode_k8v4`, for row classes up to [`DECODE_ROWS`].
+#[derive(Clone)]
 pub(crate) struct AttentionDecodeK8V4Tuning(pub AttentionMix);
 
 /// `attention_prefill_k8v4`, for row classes beyond [`DECODE_ROWS`].
+#[derive(Clone)]
 pub(crate) struct AttentionPrefillK8V4Tuning(pub AttentionMix);
 
 /// One argument set of a fused entry: the inputs every codec shares, and the
@@ -761,7 +833,8 @@ macro_rules! mix_entry {
             fn served(&self, limits: TuningLimits) -> Vec<PointShape> {
                 with_contexts(
                     limits,
-                    served_row_points(limits.max_rows, |rows| {
+                    self.0.window,
+                    served_row_points(limits, |rows| {
                         ($serves)(rows)
                             && self
                                 .0
@@ -921,6 +994,7 @@ mod tests {
             scopes: Vec::new(),
             epsilon: 1.0e-5,
             decode_rows: Some(1..2),
+            window: None,
         };
         let single = AttentionDecodeK8V4Tuning(mix);
         let limits = TuningLimits {

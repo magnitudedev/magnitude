@@ -1,3 +1,7 @@
+#include "lib/attention/inputs.cuh"
+#define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
+#define ATTENTION_INTERLEAVED SEISMIC_DIM_I
+#define ATTENTION_SEPARATE SEISMIC_DIM_U
 // attention_prefill (M >= 16): flash attention on tensor cores over dense
 // history (bodies in lib/attention/prefill.cuh).
 

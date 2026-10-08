@@ -67,7 +67,9 @@ case "$(uname -s)" in
     for tool in python3 openssl curl; do command -v "$tool" >/dev/null 2>&1 || fail "Install $tool before running this installer."; done
     if command -v apt-get >/dev/null 2>&1; then package=deb
     elif command -v dnf >/dev/null 2>&1; then package=rpm
-    else fail 'This Linux distribution requires apt or dnf.'; fi
+    elif command -v pacman >/dev/null 2>&1; then package=pacman
+    else fail 'This Linux distribution requires apt, dnf or pacman.'; fi
+    [ "$package" != pacman ] || [ "$arch" = x64 ] || fail 'Arch Linux packages are available for x86-64 only.'
     download "$origin/install/$channel/linux-$arch-$package.json" "$scratch/offer.json" 16384
     python3 - "$scratch" "$arch" "$package" "$channel" "$publisher_key" <<'PY'
 import base64, json, pathlib, re, subprocess, sys, urllib.parse
@@ -116,7 +118,8 @@ PY
     [ "$actual_digest" = "$(cat "$scratch/digest")" ] || fail 'The application checksum does not match.'
     if [ "$(id -u)" -eq 0 ]; then privilege=''; else privilege=sudo; fi
     if [ "$package" = deb ]; then $privilege apt-get install -y "$scratch/magnitude.deb"
-    else $privilege dnf install -y "$scratch/magnitude.rpm"; fi
+    elif [ "$package" = rpm ]; then $privilege dnf install -y "$scratch/magnitude.rpm"
+    else $privilege pacman -U --noconfirm "$scratch/magnitude.pacman"; fi
     printf '%s\n' 'Magnitude was installed. Run magnitude serve to start the server.'
     ;;
   *) fail 'This operating system is not supported.' ;;

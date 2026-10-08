@@ -75,6 +75,7 @@ impl RecurrentShape {
 }
 
 /// `gated_delta_project`: RMS prologue, segmented qkv | z | alpha | beta.
+#[derive(Clone)]
 pub(crate) struct RecurrentProjectTuning {
     pub norm: Element,
     pub qkv: Element,
@@ -182,6 +183,7 @@ impl EntryTuning for RecurrentProjectTuning {
 
 /// The recurrent output projection: `attention_output` over the gated rows
 /// [M, NV, W] the state entries publish, plus the residual.
+#[derive(Clone)]
 pub(crate) struct RecurrentOutputTuning {
     pub output: Element,
     pub activation: Element,
@@ -265,12 +267,13 @@ impl EntryTuning for RecurrentOutputTuning {
         }
     }
 
-    generated_entry!(attention_output, this => this.elements());
+    generated_entry!(attention_output, this => this.elements(), rounded to this.activation);
 }
 
 /// What both state entries tune over: the gated delta advance of one
 /// request's rows from the bank it reads to the bank it publishes, and the
 /// gating of its outputs.
+#[derive(Clone)]
 pub(crate) struct RecurrentState {
     pub recurrent_norm: Element,
     pub activation: Element,
@@ -280,9 +283,11 @@ pub(crate) struct RecurrentState {
 
 /// `gated_delta_step`, for row classes below [`CHUNKED_ROWS`]. Its
 /// parameters are mappings: every configuration is bit-exact.
+#[derive(Clone)]
 pub(crate) struct RecurrentStepTuning(pub RecurrentState);
 
 /// `gated_delta_chunk`, for row classes of [`CHUNKED_ROWS`] and more.
+#[derive(Clone)]
 pub(crate) struct RecurrentChunkTuning(pub RecurrentState);
 
 /// One request slot's tables for a case of `rows` rows: it reads bank 1 with
@@ -478,7 +483,7 @@ macro_rules! state_entry {
             }
 
             fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-                served_row_points(limits.max_rows, $serves)
+                served_row_points(limits, $serves)
             }
 
             fn rotation(
@@ -535,6 +540,7 @@ state_entry!(RecurrentChunkTuning, gated_delta_chunk, |rows| rows
 /// `gated_delta_project_convolved`, the convolved step form's projection,
 /// for row classes below [`CHUNKED_ROWS`]: `gated_delta_project`'s
 /// parameters, and the windows its launch publishes.
+#[derive(Clone)]
 pub(crate) struct RecurrentProjectConvolvedTuning(pub RecurrentProjectTuning);
 
 pub(crate) struct RecurrentProjectConvolvedCase {
@@ -564,7 +570,7 @@ impl EntryTuning for RecurrentProjectConvolvedTuning {
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        served_row_points(limits.max_rows, |rows| rows < CHUNKED_ROWS)
+        served_row_points(limits, |rows| rows < CHUNKED_ROWS)
     }
 
     fn rotation(
@@ -621,12 +627,13 @@ impl EntryTuning for RecurrentProjectConvolvedTuning {
         AW: this.0.alpha,
         BW: this.0.beta,
         A: this.0.activation,
-    });
+    }, rounded to this.0.activation);
 }
 
 /// `gated_delta_step_convolved`, the convolved step form's state advance,
 /// for row classes below [`CHUNKED_ROWS`]. Its parameters are mappings:
 /// every configuration is bit-exact.
+#[derive(Clone)]
 pub(crate) struct RecurrentStepConvolvedTuning(pub RecurrentState);
 
 pub(crate) struct RecurrentStepConvolvedCase {
@@ -666,7 +673,7 @@ impl EntryTuning for RecurrentStepConvolvedTuning {
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        served_row_points(limits.max_rows, |rows| rows < CHUNKED_ROWS)
+        served_row_points(limits, |rows| rows < CHUNKED_ROWS)
     }
 
     fn rotation(

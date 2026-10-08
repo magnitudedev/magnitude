@@ -1,13 +1,41 @@
 import type {
   LocalInferenceHardware,
+  MemoryShortage,
   ModelInstanceAllocation,
+  ModelInstanceFailure,
   ModelLoadDevice,
   ModelLoadPlan,
   ModelLoadStage,
   ModelOptimizationProgress,
+  ModelResidency,
 } from "@magnitudedev/sdk"
 import { Option } from "effect"
 import { formatMemorySize } from "./format-bytes"
+
+export const MEMORY_SHORTAGE_TITLE = "Not enough memory right now"
+
+/** What a memory shortage means for the user and what they can do about it. */
+export const describeMemoryShortage = (shortage: MemoryShortage): string => {
+  switch (shortage._tag) {
+    case "Blocked":
+      return `This model needs ${formatMemorySize(shortage.requiredBytes, { rounding: "up" })} and ${formatMemorySize(shortage.availableBytes)} is available. Quit apps you aren’t using, or choose a smaller model.`
+    case "UnderPressure":
+      return "Loading stopped because your computer ran low on memory. Quit apps you aren’t using, or choose a smaller model."
+  }
+}
+
+/** A load failure in the user's terms: a shortage is described, anything else is the service's message. */
+export const describeModelLoadFailure = (failure: ModelInstanceFailure): string =>
+  "_tag" in failure
+    ? `${MEMORY_SHORTAGE_TITLE}. ${describeMemoryShortage(failure.shortage)}`
+    : failure.message
+
+/** Whether the model was loaded and the machine running low on memory stopped it. */
+export const modelStoppedForMemory = (residency: ModelResidency): boolean =>
+  residency._tag === "Stopped" && residency.reason === "memory_pressure"
+
+export const MODEL_STOPPED_FOR_MEMORY_MESSAGE =
+  "Stopped because your computer ran low on memory"
 
 /** One word for a load stage, where space is short (the tray, the CLI). */
 export const formatModelLoadStage = (stage: ModelLoadStage): string => {

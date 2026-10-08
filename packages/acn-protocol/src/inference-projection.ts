@@ -57,20 +57,11 @@ export const projectInferenceResidency = (
         ? { _tag: "Resident", allocation: projectInferenceAllocation(instance.lifecycle.allocation.allocation) }
         : { _tag: "Planned", allocation: Option.map(instance.lifecycle.allocation.allocation, projectInferenceLoadPlan) },
     }
-    case "Stopped": return instance.lifecycle.reason === "memory_pressure"
-      ? {
-          _tag: "Failed",
-          failure: {
-            code: "low_memory",
-            message: "The model stopped because available memory became too low",
-            retryable: true,
-          },
-        }
-      : { _tag: "Unloaded" }
+    case "Stopped": return { _tag: "Stopped", reason: instance.lifecycle.reason }
     case "Failed": return {
       _tag: "Failed",
-      failure: instance.lifecycle.failure._tag === "LowMemory"
-        ? { ...instance.lifecycle.failure, code: "low_memory" }
+      failure: instance.lifecycle.failure._tag === "MemoryShortage"
+        ? { ...instance.lifecycle.failure, code: "memory_shortage" }
         : {
             code: instance.lifecycle.failure.code,
             message: instance.lifecycle.failure.message,

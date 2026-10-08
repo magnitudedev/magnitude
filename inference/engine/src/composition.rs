@@ -69,7 +69,10 @@ impl EngineConfiguration {
             })
         })?;
         let invalid = |reason: String| ResolveError::InvalidConfiguration { reason };
-        let model = self.model.resolve(definition).map_err(invalid)?;
+        let model = self
+            .model
+            .resolve_admitted(definition, host.draft_unavailable())
+            .map_err(invalid)?;
         let manifest = ExecutionManifest::new(
             host.package().manifest(),
             definition.clone(),

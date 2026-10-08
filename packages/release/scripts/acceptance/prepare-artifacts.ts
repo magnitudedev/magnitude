@@ -22,10 +22,10 @@ const run = Effect.gen(function* () {
     const host = artifact.host.value
     if (host.startsWith("darwin-") ? !/\.(dmg|zip)$/.test(artifact.filename)
       : host === "windows-x64-msvc" ? !artifact.filename.endsWith(".exe")
-      : !host.startsWith("linux-") || !/\.(deb|rpm)$/.test(artifact.filename)) return yield* new AcceptancePreparationFailed()
+      : !host.startsWith("linux-") || !/\.(deb|rpm|pkg\.tar\.zst)$/.test(artifact.filename)) return yield* new AcceptancePreparationFailed()
     const target = host.startsWith("darwin-") ? { os: "darwin", arch: host.endsWith("arm64") ? "arm64" : "x64", package: artifact.filename.endsWith(".dmg") ? "dmg" : "mac-zip" }
       : host === "windows-x64-msvc" ? { os: "windows", arch: "x64", package: "windows-exe" }
-      : { os: "linux", arch: host.includes("arm64") ? "arm64" : "x64", package: artifact.filename.endsWith(".deb") ? "deb" : "rpm" }
+      : { os: "linux", arch: host.includes("arm64") ? "arm64" : "x64", package: artifact.filename.endsWith(".deb") ? "deb" : artifact.filename.endsWith(".rpm") ? "rpm" : "pacman" }
     const manifest = yield* Schema.decodeUnknown(UpdateManifest)({ protocol: 1, version, commit, tag: `desktop-update-acceptance/${commit}/${version}`,
       artifact: { id: artifact.id, target, filename: artifact.filename, bytes: artifact.bytes, sha256: artifact.sha256 },
     })

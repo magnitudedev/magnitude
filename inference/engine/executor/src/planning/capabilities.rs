@@ -34,6 +34,15 @@ impl PlannedMethod {
         }
     }
 
+    /// How the method's drafter drafts; `None` for plain generation.
+    pub fn draft_form(self) -> Option<crate::DraftForm> {
+        match self {
+            Self::Plain => None,
+            Self::Mtp { .. } => Some(crate::DraftForm::Chained),
+            Self::DFlash { .. } => Some(crate::DraftForm::Block),
+        }
+    }
+
     /// Whether the method drafts with the definition's drafter.
     pub fn drafts(self) -> bool {
         !matches!(self, Self::Plain)

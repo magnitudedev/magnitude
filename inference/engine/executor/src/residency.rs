@@ -4,6 +4,7 @@
 //! their logical descriptor, imports them through the once-prepared execution
 //! path, and owns the sole cache of resulting device tensors.
 
+use crate::domain::ClaimRefusal;
 use crate::programs::native_import::NativeImportProgram;
 use crate::programs::ProgramSubmission;
 use crate::resources::ImportWindow;
@@ -40,6 +41,8 @@ pub enum WeightImportError {
     Submit(SubmitError),
     Completion(crate::DeviceError),
     Invariant(InvariantError),
+    /// The import's observer refused to let it continue.
+    Refused(ClaimRefusal),
 }
 
 impl fmt::Display for WeightImportError {
@@ -53,6 +56,7 @@ impl fmt::Display for WeightImportError {
             Self::Submit(error) => error.fmt(formatter),
             Self::Completion(error) => error.fmt(formatter),
             Self::Invariant(error) => error.fmt(formatter),
+            Self::Refused(refusal) => write!(formatter, "weight import halted: {refusal}"),
         }
     }
 }
@@ -66,6 +70,7 @@ impl std::error::Error for WeightImportError {
             Self::Submit(error) => Some(error),
             Self::Completion(error) => Some(error),
             Self::Invariant(error) => Some(error),
+            Self::Refused(refusal) => Some(refusal),
             Self::Invalid(_) | Self::Device(_) => None,
         }
     }
@@ -287,8 +292,9 @@ pub struct MappedImportReport {
     pub publishing: Duration,
 }
 
-/// Observes a component import in resident bytes: completed, then total.
-pub type ImportObserver = Box<dyn Fn(u64, u64)>;
+/// Observes a component import in resident bytes: completed, then total. A
+/// refusal halts the import before its next weight.
+pub type ImportObserver = Box<dyn FnMut(u64, u64) -> Result<(), ClaimRefusal>>;
 
 /// The resident bytes of the component import in progress and where they are
 /// reported.
@@ -337,17 +343,21 @@ impl ResidencyStore {
     }
 
     /// Cache a completed import, counting it toward the import in progress.
-    fn publish(&mut self, key: ResidencyKey, weight: ResidentWeight) {
+    /// The weight is resident either way; a refusal stops the import after it.
+    fn publish(&mut self, key: ResidencyKey, weight: ResidentWeight) -> Result<(), WeightImportError> {
+        let storage_bytes = weight.storage_bytes();
+        self.resident.insert(key, weight);
         if let Some(progress) = &mut self.import_progress {
             // Planned and allocated storage agree; the bound keeps a
             // disagreement from reporting past completion.
             progress.completed = progress
                 .completed
-                .saturating_add(weight.storage_bytes())
+                .saturating_add(storage_bytes)
                 .min(progress.total);
-            (progress.observer)(progress.completed, progress.total);
+            (progress.observer)(progress.completed, progress.total)
+                .map_err(WeightImportError::Refused)?;
         }
-        self.resident.insert(key, weight);
+        Ok(())
     }
 
     pub fn device(&self) -> &Device {
@@ -445,7 +455,7 @@ impl ResidencyStore {
             tensor,
             scale: None,
         };
-        self.publish(key, weight.clone());
+        self.publish(key, weight.clone())?;
         Ok(weight)
     }
 
@@ -498,7 +508,7 @@ impl ResidencyStore {
             tensor: destination.into_tensor(),
             scale,
         };
-        self.publish(key, weight.clone());
+        self.publish(key, weight.clone())?;
         Ok(weight)
     }
 
@@ -837,7 +847,7 @@ impl ResidencyStore {
                             tensor: destination.into_tensor(),
                             scale,
                         },
-                    );
+                    )?;
                 }
                 report.publishing += publishing.elapsed();
             }
@@ -853,7 +863,7 @@ impl ResidencyStore {
         &mut self,
         definition: &magnitude_family_contracts::ModelDefinition,
         package: &magnitude_artifacts::Package,
-        observer: ImportObserver,
+        mut observer: ImportObserver,
     ) -> Result<crate::ResidentTarget, crate::ResidencyError> {
         crate::resident_weights::validate_definition_package(definition, package)?;
         let weights = self.execution.load().target().to_vec();
@@ -864,7 +874,7 @@ impl ResidencyStore {
             .map(WeightPlan::storage_bytes)
             .sum::<Result<u64, String>>()
             .map_err(crate::ResidencyError::Invalid)?;
-        observer(0, total);
+        observer(0, total).map_err(WeightImportError::Refused)?;
         self.import_progress = Some(ImportProgress {
             completed: 0,
             total,
@@ -878,12 +888,13 @@ impl ResidencyStore {
             )
             .map_err(crate::ResidencyError::from)
             .and_then(|()| crate::resident_weights::import_target(definition, package, self));
-        let progress = self
+        let mut progress = self
             .import_progress
             .take()
             .expect("the target import owns its progress");
         if target.is_ok() && progress.completed < progress.total {
-            (progress.observer)(progress.total, progress.total);
+            (progress.observer)(progress.total, progress.total)
+                .map_err(WeightImportError::Refused)?;
         }
         target
     }

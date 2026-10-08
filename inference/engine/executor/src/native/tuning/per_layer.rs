@@ -10,6 +10,7 @@ use magnitude_kernels::per_layer_gate;
 use seismic::{Element, Tensor};
 
 /// `per_layer_gate` of the per-layer sublayers of one binding.
+#[derive(Clone)]
 pub(crate) struct PerLayerGateTuning {
     pub binding: PerLayerBinding,
     /// Every layer prepared with this specialization.

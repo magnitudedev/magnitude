@@ -8,6 +8,7 @@ import { isValidVersion } from "../../src/client-update/release-channels"
 import { buildDesktopApplication } from "../build/desktop"
 import { buildDesktopDmg } from "../apple/desktop"
 import { buildLinuxDesktopInstaller } from "../build/desktop-linux"
+import { linuxPackageFormats } from "../../src/linux-package"
 import { buildWindowsDesktopInstaller } from "../build/desktop-windows"
 import { ACN_EXECUTABLE_NAME } from "../../src/executables"
 import { ReleaseArtifactSchema } from "../../src/contracts"
@@ -87,7 +88,7 @@ const run = Effect.gen(function* () {
       const artifact = { ...installer.artifact, bytes: Number((yield* fs.stat(installer.output)).size), sha256: yield* sha256File(installer.output) }
       yield* fs.writeFileString(join(output, "artifacts", `${artifact.id}.artifact.json`), yield* Schema.encode(Schema.parseJson(ReleaseArtifactSchema))(artifact))
     } else {
-      for (const format of ["deb", "rpm"] as const) yield* buildLinuxDesktopInstaller({ app, version, revision: release.revision, arch: target.arch, format, output: join(output, "artifacts") })
+      for (const format of linuxPackageFormats(target.arch)) yield* buildLinuxDesktopInstaller({ app, version, revision: release.revision, arch: target.arch, format, output: join(output, "artifacts") })
     }
   }), original => fs.writeFileString(packagePath, original).pipe(Effect.orDie))
 })

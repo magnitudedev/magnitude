@@ -19,6 +19,9 @@ pub enum AllocationFailure {
     Unrepresentable,
     /// The host allocator refused.
     OutOfMemory,
+    /// The kernel refused to wire the allocation's pages.
+    #[cfg(target_os = "macos")]
+    WireRefused,
 }
 
 impl std::fmt::Display for AllocationFailure {
@@ -28,8 +31,29 @@ impl std::fmt::Display for AllocationFailure {
                 f.write_str("CPU allocation size is not representable on the host")
             }
             Self::OutOfMemory => f.write_str("CPU allocation failed"),
+            #[cfg(target_os = "macos")]
+            Self::WireRefused => f.write_str("CPU allocation could not be wired"),
         }
     }
+}
+
+/// On macOS every host buffer is wired, so the kernel never compresses or
+/// swaps the engine's holdings. Wiring is per page: a wired buffer owns
+/// whole pages, which no other allocation shares.
+#[cfg(target_os = "macos")]
+fn physical_layout(size: usize, align: usize) -> Result<Layout, AllocationFailure> {
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .map_err(|_| AllocationFailure::Unrepresentable)?;
+    let size = size
+        .max(1)
+        .checked_next_multiple_of(page)
+        .ok_or(AllocationFailure::Unrepresentable)?;
+    Layout::from_size_align(size, align.max(page)).map_err(|_| AllocationFailure::Unrepresentable)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn physical_layout(size: usize, align: usize) -> Result<Layout, AllocationFailure> {
+    Layout::from_size_align(size.max(1), align).map_err(|_| AllocationFailure::Unrepresentable)
 }
 
 struct Allocation {
@@ -49,7 +73,12 @@ unsafe impl Sync for Allocation {}
 impl Drop for Allocation {
     fn drop(&mut self) {
         // `pointer` came from `alloc_zeroed(self.physical_layout)` in
-        // `Buffer::new`; physical storage is always non-zero-sized.
+        // `Buffer::new`; physical storage is always non-zero-sized. The
+        // allocator may reuse these pages, so they are unwired first.
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::munlock(self.pointer.as_ptr().cast(), self.physical_layout.size());
+        }
         unsafe { dealloc(self.pointer.as_ptr(), self.physical_layout) };
     }
 }
@@ -68,10 +97,14 @@ impl Buffer {
         // A zero logical allocation still needs a live, aligned address for
         // typed native views. Keep that physical minimum private: the runtime
         // and transfer bounds continue to observe `logical_bytes`.
-        let physical_layout = Layout::from_size_align(size.max(1), align)
-            .map_err(|_| AllocationFailure::Unrepresentable)?;
+        let physical_layout = physical_layout(size, align)?;
         let raw = unsafe { alloc_zeroed(physical_layout) };
         let pointer = NonNull::new(raw).ok_or(AllocationFailure::OutOfMemory)?;
+        #[cfg(target_os = "macos")]
+        if unsafe { libc::mlock(raw.cast(), physical_layout.size()) } != 0 {
+            unsafe { dealloc(raw, physical_layout) };
+            return Err(AllocationFailure::WireRefused);
+        }
         Ok(Self {
             inner: Arc::new(Allocation {
                 pointer,
@@ -147,6 +180,20 @@ mod tests {
         let pointer = buffer.data_pointer() as usize;
         assert_ne!(pointer, 0);
         assert_eq!(pointer % 64, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_wired_buffer_owns_whole_pages() {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let buffer = Buffer::new(page as u64 + 1, 64).expect("wired buffer");
+        assert_eq!(buffer.len(), page as u64 + 1);
+        assert_eq!(buffer.data_pointer() as usize % page, 0);
+        assert_eq!(buffer.inner.physical_layout.size(), 2 * page);
+        // The second page is the buffer's own: it reads as allocated zeros.
+        let mut tail = [1];
+        buffer.read(page as u64, &mut tail);
+        assert_eq!(tail, [0]);
     }
 
     #[test]

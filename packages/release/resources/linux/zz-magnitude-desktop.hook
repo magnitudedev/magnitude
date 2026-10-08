@@ -1,0 +1,14 @@
+# Pacman ignores package scriptlet failures, so the quit-before-changing check is a transaction hook.
+# The zz- prefix orders it after other packages' pre-transaction hooks, so no later hook can abort
+# a transaction this hook has already marked as installing.
+[Trigger]
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = magnitude-desktop
+
+[Action]
+Description = Checking that Magnitude is not running...
+When = PreTransaction
+Exec = /usr/share/libalpm/scripts/magnitude-desktop-installation-begin
+AbortOnFail

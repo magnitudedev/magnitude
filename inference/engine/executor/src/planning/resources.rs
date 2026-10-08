@@ -148,6 +148,17 @@ pub struct StartupSlots {
     pub state: GraphSlots,
 }
 
+/// Whether a device of `backend` has a form of the affine K8/V4 prefill
+/// entry that reads history decoded for the call, for heads of `head_width`
+/// columns: on Metal the direct form on tensor operations (any head) and
+/// the co-issue form on simdgroup matrices (128-, 256- and 512-column heads,
+/// a 512-column head as two 256-column windows).
+/// Such forms take the history row tiles their launch's rows see; every
+/// other form reads the history in place.
+pub fn reads_decoded_history(backend: BackendName, tensor_operations: bool, head_width: u64) -> bool {
+    backend == BackendName::Metal && (tensor_operations || matches!(head_width, 128 | 256 | 512))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceCapacity {
     /// Stable capacity of the selected device's physical allocation domain.
@@ -775,15 +786,14 @@ impl StateResourcePlan {
         self.capacity_bytes.tensor_operations == TensorOperations::Formed
     }
 
-    /// Whether prefill attention graphs over this plan's history come in a
-    /// class that lists the history row tiles its launch's rows see, beside
-    /// the class that lists none: where the affine prefill entry has forms
-    /// that decode the listed tiles for the call, which only tensor
-    /// operations make faster than reading the history in place. A listing
-    /// class holds one request's history decoded, so a device without those
-    /// forms has none.
-    pub fn lists_history_tiles(&self) -> bool {
-        self.tensor_operations() && self.codec == KvCodec::AffineK8V4
+    /// Whether prefill attention graphs of `head_width`-column heads over
+    /// this plan's history come in classes that list the history row tiles
+    /// their launch's rows see, beside the class that lists none: where the
+    /// planned device has a form of the affine prefill entry that reads
+    /// history decoded for the call ([`reads_decoded_history`]).
+    pub fn lists_history_tiles(&self, backend: BackendName, head_width: u64) -> bool {
+        self.codec == KvCodec::AffineK8V4
+            && reads_decoded_history(backend, self.tensor_operations(), head_width)
     }
 
     pub fn capacity(&self) -> StateCapacityPlan {

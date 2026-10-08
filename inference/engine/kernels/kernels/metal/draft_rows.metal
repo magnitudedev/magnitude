@@ -1,8 +1,7 @@
-// draft_rows: the draft head's input row. One threadgroup per (32
-// outputs, row): it decodes the successor token's embedding row and reads the
-// conditioning row, RMS-normalizes both into the joined [2D] input (rounded
-// to A, in threadgroup memory), then each simdgroup reduces four combine rows
-// over the joined input. Weights use the `rows16` packet library.
+// draft_rows: normalize the successor embedding and conditioning in A, then
+// project their joined [2D] row. Decode fuses these into one threadgroup per
+// (32 outputs, row). Prefill joins each row once to scratch, then projects
+// through the shared matrix library so a weight tile serves many rows.
 #define KERNEL_W0 SEISMIC_TABLE
 #define KERNEL_W1 SEISMIC_COMBINE
 #include "lib/projection/projection.h"
@@ -18,27 +17,27 @@ constant constexpr uint draft_simdgroups = draft_threads / 32;
 constant constexpr uint draft_rows_per_simdgroup = 4;
 constant constexpr uint draft_outputs = draft_simdgroups * draft_rows_per_simdgroup;
 
-kernel void draft_rows(
-    device const int *tokens [[buffer(SEISMIC_BUFFER_TOKENS)]],
-    device const uchar *table [[buffer(SEISMIC_BUFFER_TABLE)]],
-    device const uchar *conditioning [[buffer(SEISMIC_BUFFER_CONDITIONING)]],
-    device const uchar *embedding_norm [[buffer(SEISMIC_BUFFER_EMBEDDING_NORM)]],
-    device const uchar *hidden_norm [[buffer(SEISMIC_BUFFER_HIDDEN_NORM)]],
-    device const uchar *combine [[buffer(SEISMIC_BUFFER_COMBINE)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
-    threadgroup uchar *shared [[threadgroup(0)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
+#define DRAFT_ROWS_ARGUMENTS \
+    device const int *tokens [[buffer(SEISMIC_BUFFER_TOKENS)]], \
+    device const uchar *table [[buffer(SEISMIC_BUFFER_TABLE)]], \
+    device const uchar *conditioning [[buffer(SEISMIC_BUFFER_CONDITIONING)]], \
+    device const uchar *embedding_norm [[buffer(SEISMIC_BUFFER_EMBEDDING_NORM)]], \
+    device const uchar *hidden_norm [[buffer(SEISMIC_BUFFER_HIDDEN_NORM)]], \
+    device const uchar *combine [[buffer(SEISMIC_BUFFER_COMBINE)]], \
+    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]], \
+    device uchar *joined_rows [[buffer(SEISMIC_BUFFER_SCRATCH_JOINED)]], \
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
+
+inline void draft_join(
+    device const int *tokens, device const uchar *table, device const uchar *conditioning,
+    device const uchar *embedding_norm, device const uchar *hidden_norm,
+    constant ulong *seismic_words, threadgroup uchar *shared, ulong row,
+    uint thread_index, uint sg, uint lane) {
     typedef typename activation::storage storage;
     const uint width = uint(SEISMIC_DIM_D);
-    const ulong row = ulong(group.y);
     threadgroup storage *joined = reinterpret_cast<threadgroup storage *>(shared);
     threadgroup float *partials = reinterpret_cast<threadgroup float *>(shared + 4ul * width);
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
-
     // The embedding row in A, packet by packet, and its sum of squares.
     projection::Weights<packets::W0> rows{table, KERNEL_W0_LAYOUT(width), width, nullptr};
     // Column 0 of a (token, status) selection row; a failed selection is -1.
@@ -88,6 +87,20 @@ kernel void draft_rows(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+}
+
+kernel void draft_rows(DRAFT_ROWS_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    typedef typename activation::storage storage;
+    const uint width = uint(SEISMIC_DIM_D);
+    const ulong row = ulong(group.y);
+    draft_join(tokens, table, conditioning, embedding_norm, hidden_norm, seismic_words,
+        shared, row, thread_index, sg, lane);
+    threadgroup storage *joined = reinterpret_cast<threadgroup storage *>(shared);
     // Four combine rows per simdgroup; lanes own packets of the 2D inputs.
     const uint inputs = 2u * width;
     projection::Weights<packets::W1> weights{combine, KERNEL_W1_LAYOUT(inputs), inputs, nullptr};
@@ -115,4 +128,36 @@ kernel void draft_rows(
         if (lane == 0)
             result[row * SEISMIC_RESULT_0_STRIDE_0 + ulong(output) * SEISMIC_RESULT_0_STRIDE_1] = sum;
     }
+}
+
+kernel void draft_rows_join(DRAFT_ROWS_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    typedef typename activation::storage storage;
+    const uint width = uint(SEISMIC_DIM_D);
+    const ulong row = ulong(group.y);
+    draft_join(tokens, table, conditioning, embedding_norm, hidden_norm, seismic_words,
+        shared, row, thread_index, sg, lane);
+    threadgroup storage *joined = reinterpret_cast<threadgroup storage *>(shared);
+    device storage *out = reinterpret_cast<device storage *>(joined_rows);
+    for (uint column = thread_index; column < 2u * width; column += draft_threads)
+        out[row * 2ul * width + column] = joined[column];
+}
+
+kernel void draft_rows_gemm(DRAFT_ROWS_ARGUMENTS,
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    PROJECTION_GEMM_SHARED(shared, 64, 64);
+    const uint width = uint(SEISMIC_DIM_D);
+    const uint inputs = 2u * width;
+    projection::Plain<activation, projection::AllRows> in{joined_rows, inputs, 1, inputs, {}};
+    projection::Store<element::F32> out{reinterpret_cast<device uchar *>(result),
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0};
+    projection::Weights<packets::W1> weights{combine, KERNEL_W1_LAYOUT(inputs), inputs, nullptr};
+    projection::gemm<packets::W1, 64, 64>(in, out, weights, uint(SEISMIC_DIM_M),
+        width, inputs, tile.y, tile.x, shared, sg, lane);
 }

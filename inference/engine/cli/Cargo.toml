@@ -10,7 +10,14 @@ license.workspace = true
 name = "magnitude-engine"
 path = "src/main.rs"
 
+# Host-only tokenizer and chat-template metadata; never opens an execution device.
+[[bin]]
+name = "magnitude-count"
+path = "src/count.rs"
+
 [dependencies]
+magnitude-artifacts = { path = "../artifacts" }
+magnitude-chat = { path = "../chat" }
 axum = "0.8.9"
 futures-util.workspace = true
 magnitude-engine = { path = ".." }

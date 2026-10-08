@@ -12,7 +12,13 @@ from pydantic import Field
 from .policy import ENGINES
 from .sessions import Record, digest
 
-GGUF_ENGINES = ("magnitude", "llama.cpp")
+GGUF_ENGINES = ("magnitude", "llama.cpp", "ollama")
+# Engines that serve a model from Ollama's own registry store rather than a local artifact.
+REGISTRY_ENGINES = ("ollama-mlx", "ollama-registry")
+# The stored format each registry engine serves; Ollama picks its runner from it.
+REGISTRY_FORMATS = {"ollama-mlx": "safetensors", "ollama-registry": "gguf"}
+GGUF_MODEL_LAYER = "application/vnd.ollama.image.model"
+OLLAMA_REGISTRY = "registry.ollama.ai"
 
 
 class Alias(Record):
@@ -21,12 +27,17 @@ class Alias(Record):
 
 
 class Target(Record):
-    engine: Literal["magnitude", "mlx-vlm", "omlx", "llama.cpp"]
+    engine: Literal[
+        "magnitude", "mlx-vlm", "omlx", "llama.cpp", "ollama", "ollama-mlx", "ollama-registry"
+    ]
     reference: str
 
     @property
-    def kind(self) -> Literal["mlx", "gguf"]:
-        """The container this engine accepts: the native engine and llama.cpp read GGUF."""
+    def kind(self) -> Literal["mlx", "gguf", "registry"]:
+        """The container this engine accepts: the native engine, llama.cpp and Ollama's
+        import read GGUF; the registry engines serve a model pulled into Ollama's store."""
+        if self.engine in REGISTRY_ENGINES:
+            return "registry"
         return "gguf" if self.engine in GGUF_ENGINES else "mlx"
 
     @property
@@ -44,7 +55,7 @@ class ArtifactFile(Record):
 class Artifact(Record):
     reference: str
     path: Path
-    kind: Literal["mlx", "gguf"]
+    kind: Literal["mlx", "gguf", "registry"]
     context_limit: int = Field(gt=0)
     metadata: dict
     files: tuple[ArtifactFile, ...]
@@ -75,6 +86,9 @@ def normalize_reference(reference: str, root: Path) -> str:
     if reference.startswith("hf:"):
         parse_hub(reference)
         return reference
+    if reference.startswith("ollama:"):
+        parse_registry(reference)
+        return reference
     # Normalize without following symlinks: a Hub snapshot's GGUF name links to an
     # extensionless content-addressed blob, and the engine opens the named file.
     return os.path.abspath(root / Path(reference).expanduser())
@@ -90,6 +104,99 @@ def parse_hub(reference: str) -> tuple[str, str, str | None]:
     if filename and (Path(filename).is_absolute() or ".." in Path(filename).parts):
         raise ValueError("unsafe Hub filename")
     return repository, revision, filename
+
+
+def parse_registry(reference: str) -> tuple[str, str, str]:
+    """Namespace, name and tag of an ``ollama:[namespace/]name:tag`` reference."""
+    match = re.fullmatch(
+        r"ollama:(?:([A-Za-z0-9][\w.-]*)/)?([A-Za-z0-9][\w.-]*):([\w.-]+)", reference
+    )
+    if match is None:
+        raise ValueError("Ollama references must be ollama:[namespace/]name:tag")
+    namespace, name, tag = match.groups()
+    return namespace or "library", name, tag
+
+
+def registry_manifest(reference: str) -> Path:
+    if "OLLAMA_MODELS" not in os.environ:
+        raise ValueError("Ollama registry targets require --ollama-models or OLLAMA_MODELS")
+    namespace, name, tag = parse_registry(reference)
+    store = Path(os.environ["OLLAMA_MODELS"]).expanduser()
+    return store / "manifests" / OLLAMA_REGISTRY / namespace / name / tag
+
+
+def gguf_description(path: Path) -> tuple[int, dict]:
+    """Declared context limit and identifying metadata of a GGUF file."""
+    from gguf import GGUFReader
+
+    reader = GGUFReader(str(path), "r")
+
+    def value(name):
+        field = reader.get_field(name)
+        return field.contents() if field else None
+
+    architecture = value("general.architecture")
+    context = value(f"{architecture}.context_length")
+    if not isinstance(context, int) or context <= 0:
+        raise ValueError("GGUF has no declared context limit")
+    return context, {"architecture": architecture, "file_type": value("general.file_type")}
+
+
+def prepare_registry(target: Target) -> "Artifact":
+    """Evidence for a pulled Ollama model: its manifest pins every layer by digest."""
+    reference = target.reference
+    path = registry_manifest(reference)
+    if not path.is_file():
+        raise ValueError(f"Ollama model is not in the store (pull it first): {path}")
+    manifest = json.loads(path.read_text())
+    blobs = path.parents[4] / "blobs"
+
+    def blob(digest: str) -> Path:
+        return blobs / digest.replace(":", "-")
+
+    configuration = json.loads(blob(manifest["config"]["digest"]).read_text())
+    layers = manifest["layers"]
+    stored = configuration.get("model_format")
+    if stored != REGISTRY_FORMATS[target.engine]:
+        raise ValueError(f"{target.engine} cannot serve an Ollama model stored as {stored}")
+    if stored == "gguf":
+        weights = [item for item in layers if item.get("mediaType") == GGUF_MODEL_LAYER]
+        if len(weights) != 1:
+            raise ValueError("Ollama GGUF model must have exactly one model layer")
+        context, description = gguf_description(blob(weights[0]["digest"]))
+        description["model_sha256"] = weights[0]["digest"].removeprefix("sha256:")
+        description["model_bytes"] = weights[0]["size"]
+    else:
+        model = next((item for item in layers if item.get("name") == "config.json"), None)
+        if model is None:
+            raise ValueError("Ollama model has no config.json layer declaring a context limit")
+        config = json.loads(blob(model["digest"]).read_text())
+        text = config.get("text_config", config)
+        context = text.get("max_position_embeddings") or text.get("max_sequence_length")
+        if not isinstance(context, int) or context <= 0:
+            raise ValueError("model configuration does not declare a context limit")
+        description = {"model_type": text.get("model_type", config.get("model_type"))}
+    stat = path.stat()
+    return Artifact(
+        reference=reference,
+        path=path,
+        kind="registry",
+        context_limit=context,
+        metadata={
+            **description,
+            "model_format": stored,
+            "quantization": configuration.get("file_type"),
+            "renderer": configuration.get("renderer"),
+            "parser": configuration.get("parser"),
+            "layers": len(layers),
+            "bytes": sum(item["size"] for item in layers),
+        },
+        files=(
+            ArtifactFile(
+                path=path.name, size=stat.st_size, sha256=file_hash(path), mtime_ns=stat.st_mtime_ns
+            ),
+        ),
+    )
 
 
 def select(root: Path, models: list[str], engines: list[str], targets: list[str]) -> list[Target]:
@@ -152,6 +259,12 @@ def artifact_files(path: Path) -> list[Path]:
 
 def prepare(target: Target) -> Artifact:
     reference = target.reference
+    if target.kind == "registry":
+        if not reference.startswith("ollama:"):
+            raise ValueError(f"{target.engine} requires an ollama:[namespace/]name:tag reference")
+        return prepare_registry(target)
+    if reference.startswith("ollama:"):
+        raise ValueError(f"{target.engine} cannot serve an Ollama registry model")
     if reference.startswith("hf:"):
         from huggingface_hub import hf_hub_download, snapshot_download
 
@@ -185,21 +298,8 @@ def prepare(target: Target) -> Artifact:
     else:
         if not path.is_file():
             raise ValueError(f"{target.engine} requires a GGUF file: {path}")
-        from gguf import GGUFReader
-
-        reader = GGUFReader(str(path), "r")
-
-        def value(name):
-            field = reader.get_field(name)
-            return field.contents() if field else None
-
-        architecture = value("general.architecture")
-        context = value(f"{architecture}.context_length")
-        if not isinstance(context, int) or context <= 0:
-            raise ValueError("GGUF has no declared context limit")
-        metadata = {"architecture": architecture, "file_type": value("general.file_type")}
+        context, metadata = gguf_description(path)
         files = [path]
-        del reader
     evidence = tuple(
         ArtifactFile(
             path=str(p.relative_to(path)) if path.is_dir() else path.name,

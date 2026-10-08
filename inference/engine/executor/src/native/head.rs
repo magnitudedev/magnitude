@@ -1,26 +1,10 @@
 use super::{AttentionKernels, DenseKernels, ProgressiveReadoutKernels, RoutedKernels};
 use crate::HeadBinding;
 use magnitude_kernels::{
-    draft_rows, head_logits_rows, readout_features_rows, sample_rows, shape_rows,
+    attention_project, draft_rows, head_logits_rows, readout_features_rows, sample_rows, shape_rows,
 };
 use seismic::NativeKernel;
 use std::collections::HashMap;
-
-/// Proposals are drawn from the leading token ids only: byte-pair
-/// vocabularies number their pieces in merge order, so the leading ids are
-/// the frequent ones, and the draft's vocabulary projection (the largest
-/// part of a draft step) streams a fraction of the output weight. Keeping
-/// ids equal to indices keeps the draft's position-keyed selection coupled
-/// to the target's. Verification selects over the whole vocabulary, so this
-/// bounds only which tokens can be proposed, never which are emitted.
-/// Qwen3.5 English prose: 84% of emitted tokens lie below 32768, 96% below
-/// 65536, 99% below 131072.
-const DRAFT_VOCABULARY: u64 = 65_536;
-
-/// The vocabulary the head's projection projects onto.
-pub(crate) fn draft_vocabulary(vocabulary: u64) -> u64 {
-    vocabulary.min(DRAFT_VOCABULARY)
-}
 
 /// Immutable draft-head specializations. A single semantic head key owns all
 /// native entries needed by that head block.
@@ -28,6 +12,7 @@ pub(crate) fn draft_vocabulary(vocabulary: u64) -> u64 {
 pub struct HeadKernels {
     pub(super) input: HashMap<HeadBinding, NativeKernel<draft_rows::Entry>>,
     pub(super) attention: HashMap<HeadBinding, AttentionKernels>,
+    pub(super) priming_project: HashMap<HeadBinding, NativeKernel<attention_project::Entry>>,
     pub(super) dense: HashMap<HeadBinding, DenseKernels>,
     pub(super) routed: HashMap<HeadBinding, RoutedKernels>,
     pub(super) features: HashMap<HeadBinding, NativeKernel<readout_features_rows::Entry>>,
@@ -42,7 +27,7 @@ pub struct HeadKernels {
 pub enum HeadLogitsKernels {
     /// `head_logits_rows` over the packed output projection.
     Packed(NativeKernel<head_logits_rows::Entry>),
-    /// The progressive planes' leading draft-vocabulary rows: a certified
+    /// Every vocabulary row of the progressive planes: a certified
     /// selection's levels for drafting slots up to the backend's certified
     /// bound, the full exact pass beyond.
     Progressive(ProgressiveReadoutKernels),

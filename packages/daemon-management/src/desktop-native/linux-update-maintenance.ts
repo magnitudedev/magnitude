@@ -3,6 +3,7 @@ import { Effect, Option, Schema, Stream } from "effect"
 import { basename, dirname, join, parse } from "node:path"
 import { createRequire } from "node:module"
 import { decodePublisherPublicKey, updateInstallerFilename } from "@magnitudedev/release/hosted-update"
+import { LinuxPackageFormat } from "@magnitudedev/release/linux-package"
 import { LinuxPackageUpdateFailed, makeLinuxPackageInstaller } from "./linux-update-package"
 
 import { PreparedUpdate } from "./prepared-update"
@@ -56,7 +57,7 @@ export const installLinuxApplicationUpdate = (requestPath: string, currentVersio
   }
   const trust = yield* fs.readFileString(trustPath).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Trust))))
   const key = yield* decodePublisherPublicKey(trust.publicKey)
-  const format = yield* fs.readFileString(formatPath).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ format: Schema.Literal("deb", "rpm") })))))
+  const format = yield* fs.readFileString(formatPath).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ format: LinuxPackageFormat })))))
   const request = yield* fs.stream(requestPath, { bytesToRead: 4097 }).pipe(Stream.runFold(Buffer.alloc(0), (all, bytes) => Buffer.concat([all, bytes])),
     Effect.flatMap(bytes => Effect.gen(function* () {
       if (bytes.length > 4096) return yield* new LinuxPackageUpdateFailed({ message: "The update request exceeded its size limit." })

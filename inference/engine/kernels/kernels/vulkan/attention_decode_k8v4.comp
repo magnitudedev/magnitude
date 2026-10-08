@@ -1,3 +1,4 @@
+#define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 // attention_decode_k8v4: split-KV decode attention over affine K8/V4 history.
 // The Vulkan form of `metal/attention_decode_k8v4.metal`: the partitioning,
 // subgroup walk and merge of `attention_decode`.

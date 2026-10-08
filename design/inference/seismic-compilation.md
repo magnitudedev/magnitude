@@ -48,15 +48,23 @@ preparation. Entry-wide declarations use a time-bounded local search of the auth
 weighted device-measured cost (`Σ weight × median`) over the points it times. The consumer
 describes its points in ascending estimated cost and supplies their inputs through a source that
 the tuner asks for a point's inputs only when it needs the point, with the time building them may
-take; the source refuses a point whose building is predicted not to fit. One tuning call spends
-the consumer's whole allowance: it builds the points in order, running each point's reference and
-validating and measuring the defaults there, admitting a point while that work stays within the
+take; the source refuses a point whose building is predicted not to fit. A unit's search is
+advanced in steps, so that a consumer tuning several units decides which the next time goes to.
+A census admits only the required points (the cheapest point when none is) and returns the
+defaults' measurements, from which the consumer divides its time among units. Starting the
+search reuses those measurements and admits further points in order, running each point's
+reference and validating and measuring the defaults there, while that work stays within the
 plan's admission time, each point predicted from the previous one: its building and validation as
-measured, its invocations at the defaults' measured device time scaled by their cost ratio. A
-census (`Strategy::Census`) admits only the required points (the cheapest point when none is)
-and returns the defaults' measurements, from which the consumer divides its time among units; a
-later search of the unit given that census (`Strategy::Censused`) reuses those measurements and
-admits further points within its admission. A point
+measured, its invocations at the defaults' measured device time scaled by their cost ratio; it
+then measures the defaults and every form's start whatever the time, so every form has a
+measurement before any is searched further. Refining continues the search until an instant the
+consumer names, any number of times: what the search measured is kept, each step continues the
+same procedure over it, and the steps together measure what one uninterrupted search measures,
+in the same order. Concluding confirms the finalists found so far and validates the choice, so a
+search concluded after any step yields the best configuration confirmed by the same rules; the
+search reports what concluding will take, and a step ends when the time before the consumer's
+limit only covers it. One tuning call is a start, a refinement to the end of its allowance and a
+conclusion. A point
 the consumer marks required may take the plan's required time instead; when the required points
 cannot fit, the tuner keeps the defaults without searching (`Unaffordable`). A point not admitted
 is not timed and folds its weight into the largest admitted point of its class (or the largest
@@ -68,7 +76,7 @@ themselves the reference (a native-default reference, against which they pass by
 Every chosen configuration passes at every point. A parameter read only by launches inactive at every timed point keeps its
 default: nothing measures it, and no validation runs its code.
 Each parameter's values are ordered numerically; neighbours differ by one step in one parameter. The search
-evaluates the defaults, then, as its time allows, one start per other value of each `form` parameter and any
+evaluates the defaults, one start per other value of each `form` parameter and any
 additional start configurations the consumer names. Each form start is the admissible configuration with that value nearest
 the defaults, unless the consumer supplies an admissible start for that form value; the hint then uses that form's first
 measurement slot. From the cheapest start of each form, cheapest form first, it repeatedly forms every
@@ -138,15 +146,26 @@ The distinct public handle makes direct-only use structural.
 Launch-scoped declarations use a factored search. The checked declaration gives each parameter
 its launch ownership, including explicit entry-parameter reads by kernels that are absent from
 launch geometry and activity conditions. Active launches, shared parameters and joint `where` restrictions
-determine the groups that must be measured together. The tuner measures every candidate in each
+determine the groups that must be measured together. The declared domain is never enumerated to
+find them: its size is the product of its parameters' value counts, and every form or launch
+parameter a declaration gains multiplies it. The partition needs distinct admissible assignments
+of a few parameters at a time (those the launch conditions read, each group's, each launch's code
+and group size), and takes each from a walk in which every parameter not coupled to them through
+`where` is held at its default, so its time and memory follow the sizes of the groups and not
+their product. The tuner measures every candidate in each
 group at the points where that group contributes work, evaluates boundary parameters that move
 points between launches, then confirms each group's shortlisted candidates against its defaults
 before assembling one choice per group. An independent launch group outside the consumer's
-served points keeps its declared default. Each launch is formed up front as one program holding
-all its code variants and held for the whole run, so a candidate forms nothing and supplies its
-runtime geometry. The search runs within the consumer's allowance, less what confirming the
+served points keeps its declared default. Only what is about to be measured is formed: a
+launch's code variants share one source, so the variants a chunk of candidates runs that no
+held program has are formed in one compile per launch and held, and the candidates assembled
+from them form nothing and supply their runtime geometry. The first boundary's form starts of
+every group are measured whatever the time. A group's other candidates are formed and measured
+a chunk at a time, so a step of the search can end between chunks; a later step sweeps the
+groups in the same order, takes what earlier steps measured and measures only what is missing.
+The search runs within the consumer's limit, less what confirming the
 assembled choice and validating it at untimed points will cost; when that time ends, unmeasured
-groups keep their defaults, an interrupted group's already formed candidates are measured and
+groups keep their defaults, an interrupted group's measured candidates are
 ranked, and the tuner skips further group confirmation. The assembled choice is
 remeasured and validated as a complete invocation against the selected reference before selection. If the default fails, a passing seed must first be found; unmeasured group defaults cannot themselves authorize a result. The assembled
 candidate and the passing seed are measured in shared sample rounds, so clock drift
@@ -179,7 +198,8 @@ own records of tuning results, Seismic exposes a device tuning identity that inc
 build, the CUDA driver and NVRTC release, or the CPU's detected instruction-set tier and CPU library
 version, and an implementation digest over an entry's declaration and the source rendered for it (on
 CPU, the compiled implementation's digest of its asset, its source root's CPU library files and the
-CPU library version).
+CPU library version). The digest names no location: the same sources built in another directory keep
+their stored results.
 A CPU device executes on one worker pool per process: one participant per physical performance core,
 the submitting thread among them, shared by every CPU device the process opens. A native submission
 is one pool job whatever its launch count: the participants of each launch claim its work items in

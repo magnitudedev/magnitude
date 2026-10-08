@@ -802,29 +802,15 @@ mod tests {
                         (state >> 24) as u8
                     })
                     .collect::<Vec<_>>();
-                if conversion.source == "gguf_iq4_xs" {
-                    // Finite f16 bases (exponent below 16): the scales are
-                    // formed products, and NaN payloads are not part of the
-                    // conversion contract.
-                    for packet in source.chunks_exact_mut(conversion.packet_bytes) {
-                        packet[1] &= 0xbf;
-                    }
-                }
-                if conversion.source == "gguf_iq4_nl" {
-                    // Finite f16 block scales: NaN payloads are not part of
-                    // the conversion contract.
-                    for packet in source.chunks_exact_mut(conversion.packet_bytes) {
-                        for block in packet.chunks_exact_mut(18) {
-                            block[1] &= 0xbf;
-                        }
-                    }
-                }
-                let id = seismic_lang::registry::representation_conversion(
+                let registered = seismic_lang::registry::representation_conversion(
                     representation(conversion.source).unwrap(),
                     representation(conversion.target).unwrap(),
                 )
-                .expect("registered conversion")
-                .id;
+                .expect("registered conversion");
+                // The scales a conversion converts as numbers are finite: NaN
+                // payloads are not part of the conversion contract.
+                registered.admit_source(&mut source);
+                let id = registered.id;
                 let expected =
                     seismic_lang::interp::repack(id, &[rows, k], &source).expect("registry repack");
                 let stride = (conversion.geometry)(k, 0).stride;

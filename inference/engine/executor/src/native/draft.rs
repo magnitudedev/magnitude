@@ -9,23 +9,8 @@ use magnitude_kernels::{
 use seismic::{Element, NativeKernel};
 use std::collections::HashMap;
 
-/// The vocabulary a separate draft's readout projects onto and selects over.
-/// Like the MTP head (`draft_vocabulary`), it scores the frequency-ordered
-/// leading rows: verification still selects over the whole vocabulary, so
-/// this bounds which tokens can be proposed, never which are emitted.
-/// DSpark's Markov bias is prepared over the whole vocabulary, so a draft
-/// with a Markov chain reads it all.
-pub(crate) fn draft_readout_vocabulary(markov: bool, vocabulary: u64) -> u64 {
-    if markov {
-        vocabulary
-    } else {
-        super::draft_vocabulary(vocabulary)
-    }
-}
-
 /// Immutable specializations of a separate draft (DFlash, DSpark, DFlash2), one per
-/// distinct binding. Token selection runs over the draft's readout
-/// vocabulary (`draft_readout_vocabulary`).
+/// distinct binding. Token selection runs over the full target vocabulary.
 #[derive(Debug, Default)]
 pub struct DraftKernels {
     /// The layers' block attention and their context injection (the same

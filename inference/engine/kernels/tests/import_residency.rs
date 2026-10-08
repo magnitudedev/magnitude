@@ -370,7 +370,7 @@ fn cuda_dense_import_matches_host_for_all_nine_pairs() {
 fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() {
     repack_matches_the_registered_conversion(
         &device(seismic::BackendName::Metal).unwrap(),
-        &[seismic::Layout::Rows16, seismic::Layout::Mma16],
+        &[seismic::Layout::Rows16, seismic::Layout::Mma16, seismic::Layout::Rows32],
     );
 }
 

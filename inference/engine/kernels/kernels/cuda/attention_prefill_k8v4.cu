@@ -1,3 +1,7 @@
+#include "lib/attention/inputs.cuh"
+#define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
+#define ATTENTION_INTERLEAVED SEISMIC_DIM_I
+#define ATTENTION_SEPARATE SEISMIC_DIM_U
 // attention_prefill_k8v4 (M >= 16): `attention_prefill` over affine K8/V4
 // history (bodies in lib/attention/prefill.cuh): the prepare launch appends
 // encoded rows; the attend launch's producer warps decode code tiles into F16

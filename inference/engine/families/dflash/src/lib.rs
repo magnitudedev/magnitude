@@ -16,7 +16,7 @@
 //! when the header declares it); the q/k norms apply per head.
 
 use magnitude_artifacts::{
-    gguf::{Directory, Value},
+    gguf::{Directory, Scalar, Value},
     TokenId,
 };
 use magnitude_family_common::{
@@ -123,6 +123,8 @@ const BLOCK_PARAMETERS: [&str; 2] = ["attn_conv_base", "ffn_conv_base"];
 pub enum Error {
     /// `general.architecture` is missing or not `dflash`.
     Architecture(Option<String>),
+    /// No explicit checkpoint attention semantics were published.
+    MissingCausality,
     /// A metadata key outside the admitted feature set.
     UnknownMetadata(String),
     /// A required key is missing or not of its admitted type.
@@ -153,6 +155,9 @@ impl fmt::Display for Error {
                 "GGUF architecture {architecture:?} is not \"{ARCHITECTURE}\""
             ),
             Self::Architecture(None) => formatter.write_str("missing GGUF architecture"),
+            Self::MissingCausality => formatter.write_str(
+                "missing dflash.attention.causal; drafting requires explicit attention semantics",
+            ),
             Self::UnknownMetadata(key) => write!(
                 formatter,
                 "draft metadata {key:?} names a feature outside the admitted set"
@@ -243,7 +248,10 @@ pub fn recognize(directory: &Directory) -> Result<(), Error> {
             Some(key) if !ADMITTED_KEYS.contains(&key) => {
                 return Err(Error::UnknownMetadata(metadata.name.clone()));
             }
-            Some(key) if matches!(metadata.value, Value::Array(_)) != ARRAY_KEYS.contains(&key) => {
+            Some(key)
+                if key != "attention.causal"
+                    && matches!(metadata.value, Value::Array(_)) != ARRAY_KEYS.contains(&key) =>
+            {
                 return Err(Error::Metadata {
                     key: metadata.name.clone(),
                     expected: "of its admitted arity",
@@ -612,24 +620,31 @@ fn dflash2_method(
     })
 }
 
-/// Each draft layer's history and block attention. A sliding layer (the
-/// pattern's, or every layer when a window has no pattern) keeps the
-/// `attention.sliding_window` positions with `q − k < W`, its own included,
-/// and reads its block causally; a full layer keeps the whole context and
-/// reads the whole block. `attention.causal`, when present, sets every
-/// layer's block attention instead (the reference `is_causal` override).
+/// History windows and block causality are independent checkpoint properties.
+/// Causality must be explicit: one BOOL broadcasts, ARRAY<BOOL> names each layer.
 fn layer_attention(
     m: &Metadata<'_>,
     block_count: u64,
 ) -> Result<Vec<(HistoryDomain, BlockAttention)>, Error> {
     let window = m.optional_integer("attention.sliding_window")?;
-    let causal = m.optional_flag("attention.causal")?;
+    let causal = match m.value("attention.causal") {
+        None => return Err(Error::MissingCausality),
+        Some(Value::Scalar(Scalar::Bool(causal))) => vec![*causal; block_count as usize],
+        Some(Value::Array(_)) => m.flags("attention.causal", block_count)?,
+        Some(_) => {
+            return Err(Error::Metadata {
+                key: m.key("attention.causal"),
+                expected: "a BOOL or ARRAY<BOOL> with one entry per layer",
+            })
+        }
+    };
     let sliding = m
         .optional_flags("attention.sliding_window_pattern", block_count)?
         .unwrap_or_else(|| vec![window.is_some(); block_count as usize]);
     sliding
         .into_iter()
-        .map(|sliding| {
+        .zip(causal)
+        .map(|(sliding, causal)| {
             let domain = match (sliding, window) {
                 (true, Some(tokens)) => HistoryDomain::Window { tokens },
                 (true, None) => {
@@ -640,7 +655,7 @@ fn layer_attention(
                 }
                 (false, _) => HistoryDomain::Token,
             };
-            let attention = match causal.unwrap_or(sliding) {
+            let attention = match causal {
                 true => BlockAttention::Causal,
                 false => BlockAttention::Bidirectional,
             };

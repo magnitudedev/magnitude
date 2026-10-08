@@ -33,7 +33,7 @@ constant constexpr uint TILE_N = 64;
 // Rows of dense weight `base` ([N, K] row-major, `stride` elements per row).
 template <typename W>
 inline projection::Weights<W> weight(device const uchar *base, ulong stride, uint bytes, uint k) {
-    return projection::Weights<W>{base, packets::Rows16{stride * bytes, 0, 0, 0, 0}, k, nullptr};
+    return projection::Weights<W>{base, packets::Rows16{stride * bytes, 0, 0, 0, 0, 1, 0}, k, nullptr};
 }
 
 // ---------------------------------------------------------------------------

@@ -212,8 +212,31 @@ const SEPARATE_DRAFTS: [(&str, &str, &dyn ModelFamily); 6] = [
     ),
 ];
 
+/// Synthetic graph-planning fixtures retain captured tensor geometry and supply
+/// explicit attention semantics for each named draft. These do not establish
+/// admission of the captured artifacts; binary-header admission is qualified
+/// separately by the DFlash family's publication test.
+fn synthetic_separate_draft_directory(file: &str) -> magnitude_artifacts::gguf::Directory {
+    use magnitude_artifacts::gguf::{Metadata, Scalar, Value};
+    let causal: &[bool] = match file {
+        "qwen3.6-35b-a3b__draft.json" => &[true, true, true, true, true, false],
+        "lfm2.5-2.6b__draft.json" => &[false; 5],
+        "qwen3.8-27b__draft-dspark.json" => &[false; 5],
+        "qwen3.8-27b__draft-dflash2.json" => &[false; 5],
+        "nemotron-3.5-lightning-30b-a3b__draft.json" => &[false; 6],
+        _ => panic!("no synthetic attention semantics for {file}"),
+    };
+    let mut directory = headers::directory(file);
+    directory.metadata.retain(|entry| entry.name != "dflash.attention.causal");
+    directory.metadata.push(Metadata {
+        name: "dflash.attention.causal".into(),
+        value: Value::Array(causal.iter().copied().map(Scalar::Bool).collect()),
+    });
+    directory
+}
+
 #[test]
-fn separate_drafts_plan_and_charge_every_graph_class_from_headers() {
+fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
     let identity = PackageIdentity {
         target: ArtifactIdentity([7; 32]),
         projector: None,
@@ -230,7 +253,7 @@ fn separate_drafts_plan_and_charge_every_graph_class_from_headers() {
     };
     for (target_file, draft_file, family) in SEPARATE_DRAFTS {
         let target = headers::directory(target_file);
-        let draft = headers::directory(draft_file);
+        let draft = synthetic_separate_draft_directory(draft_file);
         let declared = family.inspect(&target, None, identity).unwrap();
         let bound = magnitude_family_dflash::inspect(&draft, &declared, &|layer| {
             family.layer_entry(&declared, layer)

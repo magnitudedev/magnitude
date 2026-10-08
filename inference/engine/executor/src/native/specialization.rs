@@ -42,7 +42,7 @@ pub(super) enum Tuning<'a> {
 }
 
 impl<'a> Tuning<'a> {
-    fn model(&self) -> ModelInputs<'a> {
+    pub fn model(&self) -> ModelInputs<'a> {
         match self {
             Self::Tuner(tuner) => tuner.model(),
             Self::Listing(model) => *model,

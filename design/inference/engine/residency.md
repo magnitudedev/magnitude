@@ -17,9 +17,17 @@ device weights. Its key contains artifact identity, tensor name, and resident re
 its layout, so tied weights share physical storage while distinct components, representations, and
 layouts remain separate. The layout is the one fastest for the opened backend's kernels and may
 differ by backend: one map picks the representation from the source format and the layout from
-the execution path and backend (native Metal and Vulkan `rows16`, native CUDA `mma16`, native CPU and planned
-`packet`). Import converts through the weight's `[B, N, K]` view, which keeps every layout's row
-geometry; it never flattens a weight.
+the execution path and backend (native Metal `rows32`, native Vulkan `rows16`, native CUDA `mma16`,
+native CPU `rows8`, planned `packet`). Import converts through the weight's `[B, N, K]` view, which
+keeps every layout's row geometry; it never flattens a weight.
+A backend's layout is derived from its cooperative multiply (`inference/docs/kernels/lane-order.md`).
+Metal's `rows32` groups a matrix's rows in tiles of 32 and pads the row axis to a whole tile. Inside
+a tile each code plane holds, per 32 columns, the tile's rows' codes one row after another, so one
+aligned load is one row's codes of one packet and a tile's loads are contiguous; coefficient planes
+hold the tile's rows one after another, each row's bytes contiguous. A layout changes only where
+codes and coefficients sit: values, the model file and the resident bytes of whole tiles are those
+of `rows16`. The plan charges the padded tiles, and import writes them, as it does every layout's
+padding.
 Every import is exact: each resident value equals the source format's reference dequantization
 bit for bit. A source format without a representation of its own imports, through a registered
 Seismic conversion, into an existing representation that holds every value it encodes: Q3_K and
@@ -56,7 +64,8 @@ component weights are visited in source-file order. Consecutive whole tensors wh
 range fits the largest source tensor share one page-rounded read-only mapped window and one
 ordered native submission. Their resident destinations are allocated without a host zero-fill;
 the attested import entries write every physical byte, including representation padding.
-The mapped window stays owned through completion. Other backends use a one-shot staged source
+The mapped window stays owned through completion. Resident weights on macOS are wired like every
+engine holding ([engine memory](memory.md)); the mapped window is file-backed and is not. Other backends use a one-shot staged source
 upload, also without a prefill. The source file streams into that upload in bounded chunks, without
 a second whole-tensor host copy. Residency publishes each weight
 only after its submission completes; failed imports leave no cache entry.

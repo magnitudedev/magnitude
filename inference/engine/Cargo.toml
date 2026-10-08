@@ -32,6 +32,9 @@ opentelemetry = "0.33.0"
 opentelemetry_sdk = "0.33.0"
 opentelemetry-otlp = { version = "0.33.0", features = ["http-json", "reqwest"] }
 
+[dev-dependencies]
+magnitude-family-common = { path = "families/common", features = ["catalog-headers"] }
+
 [build-dependencies]
 sha2 = "=0.11.0"
 

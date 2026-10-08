@@ -9,7 +9,6 @@ from test_runner import FixtureAdapter
 
 from magnitude_benchmarks.fixtures.prose_history import (
     CONTINUATION_WORDS,
-    REPEAT_INSTRUCTION,
     Prose,
     ProseHistory,
 )
@@ -79,34 +78,110 @@ async def test_prose_continuation_uses_next_book_words_and_exhaustion_fails(sour
 
 @pytest.fixture
 def book():
-    front = "".join(f"front{i} " for i in range(300))
-    body = "".join(f"“word{i}’s” " for i in range(15000))
-    return f"{front}CHAPTER 1. Loomings.\n\nCall me Ishmael. {body}"
+    front = " ".join(f"front{i}" for i in range(300))
+    paragraphs = [
+        " ".join(f"“paragraph{paragraph}word{word}’s”" for word in range(80))
+        for paragraph in range(200)
+    ]
+    return f"{front}CHAPTER 1. Loomings.\n\nCall me Ishmael. " + "\n\n".join(paragraphs)
 
 
-async def test_prose_repeat_supplies_the_same_opening_at_every_checkpoint(book):
+async def word_count(context):
+    # A renderer with explicit framing overhead, shared by complete-context and
+    # marginal copy sizing; paragraph selection cannot count framing as source.
+    assert all(message["content"] for message in context.messages)
+    return 7 + sum(5 + len(message["content"].split()) for message in context.messages)
+
+
+async def test_prose_repeat_places_passage_before_final_copy_instruction(book):
     source = Prose(book, {"sha256": "pinned-test-source"}, "prose-repeat")
     assert source.identity != Prose(book, {"sha256": "pinned-test-source"}).identity
-    openings = set()
-    for checkpoint in (0, 4096, 16384):
-        prepared = await ProseHistory(source, "one").prepare(checkpoint, count, "test")
-        content = prepared.content.messages[-1]["content"]
-        assert content.startswith(REPEAT_INSTRUCTION + 'Call me Ishmael. "word0\'s" ')
-        assert not any(quote in content for quote in "‘’“”")
-        assert prepared.provenance["fixture"] == "prose.moby-dick.repeat"
-        assert prepared.tokens >= checkpoint
-        openings.add(content[: len(REPEAT_INSTRUCTION) + 1024])
-    assert len(openings) == 1
+    prepared = await ProseHistory(source, "one").prepare(4096, count, "test")
+    messages = prepared.content.messages
+    assert [message["role"] for message in messages] == ["system", "assistant", "user"]
+    passage, instruction = messages[-2]["content"], messages[-1]["content"]
+    assert passage.startswith('Call me Ishmael. "paragraph0word0\'s" ')
+    assert "\n\n" in passage
+    assert not any(quote in passage for quote in "‘’“”")
+    assert "repeat the supplied passage verbatim to the end." in instruction
+    assert instruction.endswith("Output only the passage text.")
+    assert len(instruction) < len(passage)
+    assert prepared.provenance["fixture"] == "prose.moby-dick.repeat"
+    assert prepared.provenance["recipe"] == "prose-repeat-history-v2"
+    assert prepared.tokens >= 4096
 
 
-async def test_prose_repeat_session_repeats_then_moves_to_new_text(book):
+@pytest.mark.parametrize("output_tokens", [64, 256, 512])
+async def test_prose_repeat_selects_latest_sufficient_paragraph_deterministically(book, output_tokens):
+    source = Prose(book, {"sha256": "pinned"}, "prose-repeat")
+    starts = []
+    for checkpoint in (1024, 2048, 4096):
+        history = ProseHistory(source, "one", output_tokens=output_tokens)
+        prepared = await history.prepare(checkpoint, word_count, "words")
+        again = await ProseHistory(source, "one", output_tokens=output_tokens).prepare(
+            checkpoint, word_count, "words"
+        )
+        assert prepared == again
+        provenance = prepared.provenance
+        start, end = provenance["copy_start_word"], provenance["passage_end_word"]
+        selected = history.passage(start, end)
+        supplied = prepared.content.messages[-2]["content"]
+        paragraphs = supplied.split("\n\n")
+        suffixes = ["\n\n".join(paragraphs[index:]) for index in range(len(paragraphs))]
+        qualifying = [suffix for suffix in suffixes if len(suffix.split()) >= output_tokens]
+        assert selected == qualifying[-1]
+        assert provenance["copy_available_tokens"] == len(selected.split())
+        assert provenance["copy_available_tokens"] >= output_tokens
+        assert provenance["copy_output_tokens"] == output_tokens
+        assert " ".join(selected.split()[:6]) in prepared.content.messages[-1]["content"]
+        assert start >= provenance["passage_start_word"]
+        starts.append(start)
+    assert starts == sorted(starts)
+    assert len(set(starts)) == len(starts)
+
+
+async def test_prose_repeat_session_copies_selected_suffix_then_moves_to_new_text(book):
     history = ProseHistory(Prose(book, {"sha256": "pinned"}, "prose-repeat"), "one")
     first = await history.prepare(4096, count, "test")
-    start, end = first.provenance["passage_start_word"], first.provenance["passage_end_word"]
+    start, end = first.provenance["copy_start_word"], first.provenance["passage_end_word"]
     history.complete()
-    assert history.messages[-1]["content"] == history.passage(start, start + CONTINUATION_WORDS)
-    second = await history.prepare(4096, count, "test")
+    assert history.messages[:-1] == first.content.messages
+    assert history.messages[-1] == {"role": "assistant", "content": history.passage(start, end)}
+    second = await history.prepare(8192, count, "test")
     assert second.provenance["passage_start_word"] == end
+    assert second.content.messages[: len(history.messages)] == history.messages
+    assert [message["role"] for message in second.content.messages[-2:]] == ["assistant", "user"]
+
+
+async def test_prose_repeat_schedules_preserve_shared_history_and_output_budget(book):
+    source = Prose(book, {"sha256": "pinned"}, "prose-repeat")
+    plan = await compile_plan(
+        source, source.identity, tuple(SECTIONS), (4096,), counter=count, sizing_identity="test"
+    )
+    seen = {}
+    for request in plan.requests:
+        assert request.fixture_provenance["copy_output_tokens"] == request.output_limit == 256
+        assert request.fixture_provenance["copy_available_tokens"] >= request.output_limit
+        assert [message["role"] for message in request.messages[-2:]] == ["assistant", "user"]
+        for dependency in request.depends_on:
+            previous = seen[dependency]
+            if previous.session == request.session:
+                assert request.messages[: len(previous.messages)] == previous.messages
+                assert request.messages[len(previous.messages)]["role"] == "assistant"
+        seen[request.id] = request
+
+
+async def test_prose_repeat_single_paragraph_uses_start_without_fallback():
+    source = Prose("Call me Ishmael. " + " ".join(f"word{i}" for i in range(4000)), {}, "prose-repeat")
+    prepared = await ProseHistory(source, "one").prepare(2048, word_count, "words")
+    assert prepared.provenance["copy_start_word"] == prepared.provenance["passage_start_word"]
+    assert prepared.provenance["copy_available_tokens"] >= 256
+
+
+async def test_prose_repeat_exhaustion_fails_clearly():
+    source = Prose("Call me Ishmael. " + " ".join(f"word{i}" for i in range(300)), {}, "prose-repeat")
+    with pytest.raises(ValueError, match="(?i)(remaining|enough|short|exceed|budget)"):
+        await ProseHistory(source, "one", output_tokens=1024).prepare(0, word_count, "words")
 
 
 @pytest.mark.parametrize(
@@ -143,6 +218,36 @@ async def test_prose_completion_budget_is_not_tool_truncation(source, finish, to
     async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
         result = await measure(client, "http://test", "model", plan.requests[0], lambda _: None)
     assert result.outcome == outcome
+
+
+@pytest.mark.parametrize(
+    "deltas,reason",
+    [
+        ([{"reasoning_content": "Copy it."}, {"content": "Continuation."}], "reasoning text"),
+        ([{"reasoning_content": "Copy it."}], "reasoning text"),
+        ([{}], "no answer text"),
+    ],
+)
+async def test_prose_refuses_reasoning_and_missing_answers(source, deltas, reason):
+    plan = await compile_plan(
+        source, source.identity, ("single",), (4096,), counter=count, sizing_identity="test"
+    )
+    events = [
+        *({"id": "response-1", "choices": [{"index": 0, "delta": delta}]} for delta in deltas),
+        {"id": "response-1", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        terminal_event(),
+        "[DONE]",
+    ]
+
+    def response(request):
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=Fragments(events)
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+        result = await measure(client, "http://test", "model", plan.requests[0], lambda _: None)
+    assert result.outcome == "invalid" and reason in result.error
+    assert result.ttft_ms is None or deltas[-1].get("content")
 
 
 @pytest.mark.parametrize("workload", ["prose-continue", "prose-repeat"])
@@ -191,3 +296,29 @@ async def test_prose_real_process_run_records_mode_and_no_bfcl(
     assert "no answer-quality scoring" in report
     assert "BFCL" not in report
     assert all(row["actual_completion_tokens"] == [4] for row in result["rows"])
+
+
+async def test_repeat_warmup_includes_its_own_supplied_passage(book):
+    source = Prose(book, {"sha256": "pinned"}, "prose-repeat")
+    plan = await compile_plan(
+        source, source.identity, ("context",), (4096,),
+        counter=word_count, sizing_identity="words",
+    )
+    warmup = plan.warmup
+    assert warmup.id == "warmup"
+    assert [m["role"] for m in warmup.messages] == ["system", "assistant", "user"]
+    assert warmup.fixture_provenance["copy_available_tokens"] >= warmup.output_limit
+    assert warmup.messages[0] != plan.requests[0].messages[0]
+    assert warmup.fixture_provenance["actual_context_tokens"] < 4096
+
+
+async def test_repeat_copy_sizing_accepts_counter_requiring_user_turn(book):
+    async def requires_user(context):
+        assert any(message["role"] == "user" for message in context.messages)
+        return await word_count(context)
+
+    source = Prose(book, {"sha256": "pinned"}, "prose-repeat")
+    compatible = await ProseHistory(source, "count-user").prepare(4096, requires_user, "test")
+    reference = await ProseHistory(source, "count-user").prepare(4096, word_count, "test")
+    assert compatible == reference
+    assert [m["role"] for m in compatible.content.messages] == ["system", "assistant", "user"]

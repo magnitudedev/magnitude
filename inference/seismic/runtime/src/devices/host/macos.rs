@@ -1,11 +1,12 @@
-//! macOS 13+: `sysctl hw.memsize` and Mach `HOST_VM_INFO64`.
+//! macOS 15+: `sysctl hw.memsize`, Mach `HOST_VM_INFO64` and the kernel's
+//! memory pressure level.
 //!
 //! macOS does not enforce `RLIMIT_AS`/`RLIMIT_DATA` against allocations, so
 //! no process memory limit applies.
 
 use super::{
-    HeadroomBasis, HeadroomEstimate, HostCapacity, HostMeasurements, HostMemoryStatus,
-    LimitVisibility,
+    DisplacementCounters, HeadroomBasis, HeadroomEstimate, HostCapacity, HostMeasurements,
+    HostSample, KernelPressure, LimitVisibility,
 };
 use crate::devices::{CapacityBasis, ObservationError};
 use std::time::SystemTime;
@@ -33,8 +34,36 @@ pub(super) fn capacity() -> Result<HostCapacity, String> {
     })
 }
 
+/// `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
+fn kernel_pressure() -> Result<KernelPressure, ObservationError> {
+    let mut level = 0_i32;
+    let mut length = std::mem::size_of::<i32>();
+    let status = unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_vm_pressure_level".as_ptr(),
+            (&mut level as *mut i32).cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 || length != std::mem::size_of::<i32>() {
+        return Err(ObservationError::Failed(format!(
+            "sysctl kern.memorystatus_vm_pressure_level returned status {status} with {length} bytes"
+        )));
+    }
+    match level {
+        1 => Ok(KernelPressure::Normal),
+        2 => Ok(KernelPressure::Warning),
+        4 => Ok(KernelPressure::Critical),
+        other => Err(ObservationError::Failed(format!(
+            "kern.memorystatus_vm_pressure_level reported unknown level {other}"
+        ))),
+    }
+}
+
 #[allow(deprecated)] // libc's Mach bindings are stable ABI; mach2 is not a dependency.
-pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
+pub(super) fn sample() -> Result<HostSample, ObservationError> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page_size_bytes = u64::try_from(page_size)
         .ok()
@@ -60,18 +89,23 @@ pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
     // reports that count; every field read below is in the macOS 13 prefix.
     let statistics = unsafe { statistics.assume_init() };
     let free_pages = u64::from(statistics.free_count);
+    let active_pages = u64::from(statistics.active_count);
     let inactive_pages = u64::from(statistics.inactive_count);
+    // Neither list says whether its pages are needed: a program's fresh data
+    // sits on the inactive list and idle file cache on the active one. Their
+    // sum with free pages is everything that is not wired or compressed.
     let headroom = free_pages
-        .checked_add(inactive_pages)
+        .checked_add(active_pages)
+        .and_then(|pages| pages.checked_add(inactive_pages))
         .and_then(|pages| pages.checked_mul(page_size_bytes))
         .ok_or_else(|| ObservationError::Failed("Mach headroom overflow".into()))?;
-    Ok(HostMemoryStatus {
+    Ok(HostSample {
         sampled_at,
         measurements: HostMeasurements::MacOs {
             page_size_bytes,
             free_pages,
             speculative_pages: u64::from(statistics.speculative_count),
-            active_pages: u64::from(statistics.active_count),
+            active_pages,
             inactive_pages,
             wired_pages: u64::from(statistics.wire_count),
             purgeable_pages: u64::from(statistics.purgeable_count),
@@ -81,9 +115,16 @@ pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
         },
         headroom: HeadroomEstimate {
             bytes: headroom,
-            basis: HeadroomBasis::MachFreeAndInactivePages,
+            basis: HeadroomBasis::MachMovablePages,
         },
         limits: Vec::new(),
         limit_visibility: LimitVisibility::Complete,
+        displacement: Some(DisplacementCounters {
+            compressed_pages: statistics.compressions,
+            decompressed_pages: statistics.decompressions,
+            swapped_out_pages: statistics.swapouts,
+            swapped_in_pages: statistics.swapins,
+        }),
+        kernel_pressure: Some(kernel_pressure()?),
     })
 }

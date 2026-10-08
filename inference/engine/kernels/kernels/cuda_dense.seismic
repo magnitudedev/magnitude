@@ -124,8 +124,9 @@ native short_conv_project for cuda from "cuda/short_conv_project.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (2 * (128 * 144 + 2 * 10240) + 2 * 2048)
 
-# A stage launch rounds the hidden rows to A (and the INT8 candidate's q8_1
-# rows), then `project_rows`' bands over them.
+# A stage launch rounds the hidden rows to A (`stage_s8` also forms the INT8
+# candidate's q8_1 rows, for the rows whose GEMM reads them), then
+# `project_rows`' bands over them.
 native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
     static (D, L, P, GS)
     params (code arithmetic INT8 in [0, 1])
@@ -133,8 +134,10 @@ native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
     scratch rounded bytes (M * D * 2)
     scratch staged bytes (M * D) when INT8 == 1 and M > 16 and M <= 64
     scratch groups bytes (M * D / 4) when INT8 == 1 and M > 16 and M <= 64
-    launch per_layer_gate_stage:
-        reads (INT8)
+    launch per_layer_gate_stage when M <= 16 or M > 64 or INT8 == 0:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch per_layer_gate_stage_s8 when INT8 == 1 and M > 16 and M <= 64:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch per_layer_gate_gemv when M <= 8:

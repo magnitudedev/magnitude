@@ -12,7 +12,6 @@ use super::{
     row_points, served_row_points, CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs,
     TuningLimits,
 };
-use crate::native::draft_vocabulary;
 use magnitude_batching::{HISTORY_WIDTH, SHAPING_WIDTH};
 use magnitude_family_contracts::{ProgressivePlane, WeightKind, WeightScope};
 use magnitude_kernels::{
@@ -25,6 +24,7 @@ use seismic::{Element, Tensor};
 const SELECTED_TOKENS: u64 = 256;
 
 /// The MTP input's fused embedding, two RMS norms and combine projection.
+#[derive(Clone)]
 pub(crate) struct DraftRowsTuning {
     pub embedding: Element,
     pub embedding_norm: Element,
@@ -142,7 +142,13 @@ impl EntryTuning for DraftRowsTuning {
 
 /// The projected-row points of the readout.
 fn projected_points(limits: TuningLimits) -> Vec<PointShape> {
-    served_row_points(limits.max_projected_rows, |_| true)
+    served_row_points(
+        TuningLimits {
+            max_rows: limits.max_projected_rows,
+            ..limits
+        },
+        |_| true,
+    )
 }
 
 /// `[V, D]` of the output projection.
@@ -152,13 +158,13 @@ fn vocabulary_shape(inputs: &ModelInputs<'_>) -> Result<(u64, u64), String> {
 
 /// `readout_head_rows`: final RMS norm and vocabulary projection of the rows
 /// `out_rows` selects.
+#[derive(Clone)]
 pub(crate) struct HeadRowsTuning {
     pub norm: Element,
     pub weight: Element,
     pub activation: Element,
     pub epsilon: f32,
-    /// The output weight's leading rows it projects onto (a draft readout's
-    /// `draft_vocabulary`); `None` projects onto every row.
+    /// Optional declared output rows; `None` projects onto every row.
     pub rows: Option<u64>,
 }
 
@@ -258,7 +264,13 @@ impl EntryTuning for HeadRowsTuning {
 /// The certified levels serve selection rows up to the backend's certified
 /// row bound.
 fn certified_points(limits: TuningLimits, rows: u64) -> Vec<PointShape> {
-    served_row_points(limits.max_projected_rows.min(rows), |_| true)
+    served_row_points(
+        TuningLimits {
+            max_rows: limits.max_projected_rows.min(rows),
+            ..limits
+        },
+        |_| true,
+    )
 }
 
 /// The bindings every progressive head entry shares.
@@ -270,8 +282,7 @@ pub(crate) struct ProgressiveTuning {
     /// The most selected rows the certified levels serve
     /// (`readout::certified_rows`).
     pub certified_rows: u64,
-    /// The planes' leading rows it projects onto (a draft head's
-    /// `draft_vocabulary`); `None` projects onto every row.
+    /// Optional declared plane rows; `None` projects onto every row.
     pub rows: Option<u64>,
 }
 
@@ -354,6 +365,7 @@ impl Selecting {
 
 /// `readout_top_rows`: the final norm and the 4-bit view of every
 /// vocabulary row, with each row's threshold.
+#[derive(Clone)]
 pub(crate) struct TopRowsTuning(pub ProgressiveTuning);
 
 pub(crate) struct TopRowsCase {
@@ -483,6 +495,7 @@ impl LevelCase {
 }
 
 /// `readout_refine_rows`: the 5-bit view of the rows level one keeps.
+#[derive(Clone)]
 pub(crate) struct RefineRowsTuning(pub ProgressiveTuning);
 
 impl EntryTuning for RefineRowsTuning {
@@ -545,6 +558,7 @@ impl EntryTuning for RefineRowsTuning {
 
 /// `readout_exact_rows`: the exact logits of the rows level two keeps (a few
 /// hundred of a large vocabulary).
+#[derive(Clone)]
 pub(crate) struct ExactRowsTuning(pub ProgressiveTuning);
 
 impl EntryTuning for ExactRowsTuning {
@@ -607,6 +621,7 @@ impl EntryTuning for ExactRowsTuning {
 
 /// `readout_planes_rows`: the final norm and the exact logits of every
 /// vocabulary row from the planes.
+#[derive(Clone)]
 pub(crate) struct PlanesRowsTuning(pub ProgressiveTuning);
 
 pub(crate) struct PlanesRowsCase {
@@ -675,6 +690,7 @@ impl EntryTuning for PlanesRowsTuning {
 
 /// `readout_selected_rows`: final RMS norm and the logits of a candidate token
 /// set.
+#[derive(Clone)]
 pub(crate) struct SelectedRowsTuning {
     pub norm: Element,
     pub weight: Element,
@@ -770,6 +786,7 @@ impl EntryTuning for SelectedRowsTuning {
 
 /// `head_logits_rows`: the MTP head's vocabulary projection of its normed
 /// feature rows.
+#[derive(Clone)]
 pub(crate) struct HeadLogitsTuning {
     pub weight: Element,
     pub activation: Element,
@@ -803,7 +820,7 @@ impl EntryTuning for HeadLogitsTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = vocabulary_shape(inputs)?;
-        Ok(vec![("V", draft_vocabulary(vocabulary)), ("D", hidden)])
+        Ok(vec![("V", vocabulary), ("D", hidden)])
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -816,12 +833,10 @@ impl EntryTuning for HeadLogitsTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, String> {
         let output = inputs.weight(WeightScope::Target, WeightKind::Output)?;
-        let [vocabulary, hidden] = output.extents()[..] else {
+        let [_, hidden] = output.extents()[..] else {
             return Err("the output weight is not a matrix".into());
         };
-        let weight = output
-            .slice_leading(0, draft_vocabulary(vocabulary))
-            .map_err(|error| error.to_string())?;
+        let weight = output;
         Ok(vec![HeadLogitsCase {
             features: inputs.activation(self.activation, &[point.rows, hidden], 1)?,
             weight,
@@ -852,6 +867,7 @@ fn logits(
 /// selected row over `vocabulary` tokens (the target's, or the draft
 /// head's). Its parameters partition the vocabulary without changing any
 /// result.
+#[derive(Clone)]
 pub(crate) struct ShapeRowsTuning {
     pub vocabulary: u64,
 }
@@ -936,6 +952,7 @@ impl EntryTuning for ShapeRowsTuning {
 /// `sample_rows`: one draw per selected row over its shaped logits of
 /// `vocabulary` tokens. Its parameters partition the vocabulary without
 /// changing any draw.
+#[derive(Clone)]
 pub(crate) struct SampleRowsTuning {
     pub vocabulary: u64,
 }

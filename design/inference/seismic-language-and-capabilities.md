@@ -106,7 +106,11 @@ external source the entry only converts, and the packed result of a `repack` int
 parameter, are raw row views; the registered conversion between their representations is resolved
 when the kernel runs, and moves codes and coefficients bit for bit. The CPU `Rows8` resident layout
 pads each matrix's row axis to eight and interleaves corresponding code and coefficient storage
-groups across each eight-row tile; conversion owns complete tiles, including zero padding. Because a CPU form is compiled
+groups across each eight-row tile; conversion owns complete tiles, including zero padding. The Metal
+`Rows32` resident layout pads the row axis to 32 and interleaves only the code planes, per 32 columns,
+across each 32-row tile; its coefficient planes hold the tile's rows one after another. Metal's
+packet library addresses a row of either row layout by its tile's base and its index in the tile
+(`packets::Rows16`), so a kernel that reads packets through the library runs on both. Because a CPU form is compiled
 with the program, its element coverage is declared; other backends compile each binding at
 preparation, and `elements` is rejected on them. Declared tuning parameters are runtime values.
 CPU weight projections may declare activation INT8 as an arithmetic parameter. Their exact path is
@@ -390,9 +394,12 @@ Metal compilation or execution errors are reported directly.
   backend's pinned toolchain, as preparation forms it, under configurations (element bindings,
   specializations, device facts) that together compile every preprocessor group of its authored
   sources; a group no admitted configuration reaches is rejected with `#error` or removed. Every
-  kernel request of every supported catalog model on every GPU backend its assessment accepts is
-  admissible, implemented and forms at its default specialization. For a backend whose toolchain
-  the operating system supplies, this holds for the verifying host's toolchain.
+  value of every `form` tuning parameter also forms, under each device configuration the host's
+  toolchain forms, at statics searched for it where only some admit it (a form may be a template a
+  constant selects, with no group of its own); a form value no configuration forms fails the check.
+  Every kernel request of every supported catalog model on every GPU backend its assessment
+  accepts is admissible, implemented and forms at its default specialization. For a backend whose
+  toolchain the operating system supplies, this holds for the verifying host's toolchain.
 - Ownership and bounded iteration determine legal reads, writes, moves, and parallel effects.
 - Every accepted write to storage shared across parallel participants carries
   an exclusive or atomic capability for those participants. Iteration-local

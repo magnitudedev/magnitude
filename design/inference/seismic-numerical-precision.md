@@ -54,9 +54,14 @@ classes it admits, each with an envelope. A configuration in a class that is not
 outside the search domain: it is never formed, timed or chosen. A configuration in admitted
 classes is compared with the same reference under the widest of its classes' envelopes instead of
 the element tolerances: per floating subject, the error's root mean square relative to the
-reference's, and the largest element error in units of the reference's root mean square. The
-first bound admits the class's expected error; the second rejects an error concentrated in a few
-elements, which is what a defective kernel produces. Non-finite values must agree bit for bit and
+reference's, and the largest distance between the published values' rounding cells in units of
+the reference's root mean square. The first bound uses raw published errors. For the peak guard,
+the cell distance subtracts each endpoint's half-spacing toward the other endpoint, clamped at
+zero; this accounts for final storage quantization, including asymmetric spacing at exponent
+boundaries. This gap is the minimum error compatible with the two rounding cells, not an upper
+bound on actual pre-rounding error. It is an empirical concentration guard, not an equivalence
+proof; raw RMS and whole-model qualification remain required. These comparison semantics are
+versioned in admitted-class evidence. Non-finite values must agree bit for bit and
 discrete subjects stay exact. A configuration in no class is held to the policy as before, and the
 declaration default, which is the reference, must be in none. Admitted classes and their
 envelopes are part of the evidence identity.

@@ -2,6 +2,7 @@
 // residual rows they were gathered from (`out_rows`).
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
 #include "lib/projection/projection.h"
+#include "lib/projection/packing.h"
 
 typedef element::Act activation;
 
@@ -15,10 +16,15 @@ typedef element::Act activation;
     device float *small_partials [[buffer(SEISMIC_BUFFER_SCRATCH_SMALL_PARTIALS)]],     \
     device uchar *fragments [[buffer(SEISMIC_BUFFER_SCRATCH_FRAGMENTS)]],               \
     device uchar *quantized [[buffer(SEISMIC_BUFFER_SCRATCH_QUANTIZED)]],               \
-    device float *row_scales [[buffer(SEISMIC_BUFFER_SCRATCH_ROW_SCALES)]],             \
+    device half *row_scales [[buffer(SEISMIC_BUFFER_SCRATCH_ROW_SCALES)]],              \
     device half *block_sums [[buffer(SEISMIC_BUFFER_SCRATCH_BLOCK_SUMS)]],              \
     device float *coefficients [[buffer(SEISMIC_BUFFER_SCRATCH_COEFFICIENTS)]],         \
     device half *biases [[buffer(SEISMIC_BUFFER_SCRATCH_BIASES)]],                      \
+    device float *packed [[buffer(SEISMIC_BUFFER_SCRATCH_PACKED)]],                     \
+    device half *token_factors [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_FACTORS)]],        \
+    device half *weight_factors [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_FACTORS)]],      \
+    device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
+    device float *weight_scales [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_SCALES)]],       \
     device const float *down_scale [[buffer(SEISMIC_BUFFER_DOWN_SCALE)]],               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
@@ -32,24 +38,61 @@ typedef element::Act activation;
         projection::scale_factor(down_scale, SEISMIC_DIM_DS, 0, 0), 1.0f);              \
     projection::Weights<packets::W0> w{down_weight, KERNEL_W0_LAYOUT(SEISMIC_DIM_F), uint(SEISMIC_DIM_F)}
 
+// The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows.
+#define DENSE_OUTPUT_GEMV(ROWS, LANES, TILED, COUNT)                                    \
+    DENSE_OUTPUT_OPERANDS;                                                              \
+    uint rows = uint(SEISMIC_DIM_O);                                                    \
+    if (TILED == 1 && projection::gemv_tile_row_serves(w, rows)) {                      \
+        PROJECTION_FOR_##COUNT##_TILE_ROWS(rows,                                        \
+            projection::gemv_tile_row<packets::W0, packets::W0, false, ROWS, MAXM, LANES>( \
+                in, out, w, w, rows, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane)); \
+        return;                                                                         \
+    }                                                                                   \
+    PROJECTION_FOR_##COUNT##_ROWS(rows,                                                 \
+        projection::gemv_form<packets::W0, packets::W0, false, ROWS, MAXM, LANES, (TILED == 2)>( \
+            in, out, w, w, rows, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane))
+
+// One row.
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV
-template <uint ROWS, uint LANES>
+template <uint ROWS, uint LANES, uint TILED>
 kernel void dense_output_gemv(DENSE_OUTPUT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
     uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    DENSE_OUTPUT_OPERANDS;
-    uint rows = uint(SEISMIC_DIM_O);
-    PROJECTION_FOR_ROWS(rows,
-        projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
-            in, out, w, rows, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane));
+    DENSE_OUTPUT_GEMV(ROWS, LANES, TILED, ONE);
+}
+#endif
+
+// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV_ROWS
+template <uint ROWS, uint LANES, uint TILED>
+kernel void dense_output_gemv_rows(DENSE_OUTPUT_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    DENSE_OUTPUT_GEMV(ROWS, LANES, TILED, SEVERAL);
+}
+#endif
+
+// Two rows: the same GEMV under this launch's mapping.
+#ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV_PAIR
+template <uint ROWS, uint LANES, uint TILED>
+kernel void dense_output_gemv_pair(DENSE_OUTPUT_ARGUMENTS,
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint simdgroups [[simdgroups_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    DENSE_OUTPUT_GEMV(ROWS, LANES, TILED, PAIR);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_BATCH
-template <uint BATCH_ROWS>
+template <uint BATCH_ROWS, uint BATCH_PARTS>
 kernel void dense_output_batch(DENSE_OUTPUT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -57,6 +100,15 @@ kernel void dense_output_batch(DENSE_OUTPUT_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     DENSE_OUTPUT_OPERANDS;
+    // Weights with a matrix GEMV take it; the others the batched rows, in
+    // the first threadgroups of the launch.
+    if constexpr (projection::matrix_codes<packets::W0>::available) {
+        projection::gemv_matrix<packets::W0, BATCH_PARTS>(in, out, w, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H),
+            uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane);
+        return;
+    }
+    if (tile * simdgroups * BATCH_ROWS * 8u >= uint(SEISMIC_DIM_H))
+        return;
     projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(in, out, w,
         uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane);
 }
@@ -147,7 +199,8 @@ kernel void dense_output_quantize(DENSE_OUTPUT_ARGUMENTS,
         return;
     DENSE_OUTPUT_OPERANDS;
     DENSE_OUTPUT_INT8_SCRATCH;
-    projection::int8_quantize(in, scratch, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), row, thread_index, lane, 1.0f);
+    projection::int8_quantize<projection::int8_codes<packets::W0>::interleaved>(in, scratch, uint(SEISMIC_DIM_O),
+        uint(SEISMIC_DIM_F), row, thread_index, lane, 1.0f);
 }
 #endif
 
@@ -163,14 +216,87 @@ kernel void dense_output_coefficients(DENSE_OUTPUT_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_INT8
+template <uint INT8_TILE>
 kernel void dense_output_int8(DENSE_OUTPUT_ARGUMENTS,
     uint3 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    PROJECTION_GEMM_SHARED(shared, 64, 64);
+    // The default form's tile only where the launch takes that form:
+    // threadgroup memory a kernel does not use still slows its products.
+    threadgroup float4 shared_words[projection::int8_codes<packets::W0>::available
+        ? 1 : projection::gemm_tile<64, 64>::bytes / 16];
+    threadgroup uchar *shared = reinterpret_cast<threadgroup uchar *>(shared_words);
     DENSE_OUTPUT_OPERANDS;
     DENSE_OUTPUT_INT8_SCRATCH;
-    projection::gemm_int8<packets::W0>(in, out, w, scratch, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H),
-        uint(SEISMIC_DIM_F), tile.y, tile.x, shared, sg, lane);
+    projection::gemm_int8<packets::W0, INT8_TILE>(in, out, w, scratch, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H),
+        uint(SEISMIC_DIM_F), tile.x, tile.y, shared, sg, lane);
+}
+#endif
+
+// The PACK form past 64 rows: the product rows as integer codes, two tokens
+// packed per operand element, the weights' block scales and biases, then the
+// packed tiles.
+#define DENSE_OUTPUT_PACKING_SCRATCH \
+    const projection::packing_scratch scratch{packed, token_factors, token_scales, weight_factors, weight_scales}
+
+#ifdef SEISMIC_FORMING_DENSE_OUTPUT_PACK
+kernel void dense_output_pack(DENSE_OUTPUT_ARGUMENTS,
+    uint pairs [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if constexpr (!projection::packing_codes<packets::W0>::available)
+        return;
+    threadgroup float4 peaks[8];
+    DENSE_OUTPUT_OPERANDS;
+    DENSE_OUTPUT_PACKING_SCRATCH;
+    projection::packing_operand<projection::packing_codes<packets::W0>::centre,
+        projection::packing_codes<packets::W0>::folds>(in, scratch, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), pairs,
+        peaks, thread_index, sg, lane);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_DENSE_OUTPUT_PACK_COEFFICIENTS
+kernel void dense_output_pack_coefficients(DENSE_OUTPUT_ARGUMENTS,
+    uint tile [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if constexpr (!projection::packing_codes<packets::W0>::available)
+        return;
+    threadgroup float peaks[8];
+    DENSE_OUTPUT_OPERANDS;
+    DENSE_OUTPUT_PACKING_SCRATCH;
+    projection::packing_tile_coefficients(w, scratch, uint(SEISMIC_DIM_F), tile, peaks, thread_index, sg, lane);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_DENSE_OUTPUT_PACKED
+template <uint PACK_TOKENS, uint WEIGHTS_AHEAD>
+kernel void dense_output_packed(DENSE_OUTPUT_ARGUMENTS,
+    uint tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if constexpr (!projection::packing_codes<packets::W0>::available)
+        return;
+    DENSE_OUTPUT_OPERANDS;
+    DENSE_OUTPUT_PACKING_SCRATCH;
+    const uint m = uint(SEISMIC_DIM_O);
+    projection::gemm_packed<packets::W0, PACK_TOKENS, WEIGHTS_AHEAD>(out, w, scratch, m,
+        (m + 127u) / 128u * 128u, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F),
+        tile * projection::packing_simdgroups + sg, lane);
+}
+#endif
+
+// PACK with weights that have no packed path: the staged tiles of the
+// default form, with its results.
+#ifdef SEISMIC_FORMING_DENSE_OUTPUT_UNPACKED
+kernel void dense_output_unpacked(DENSE_OUTPUT_ARGUMENTS,
+    uint3 tile [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if constexpr (projection::packing_codes<packets::W0>::available)
+        return;
+    DENSE_OUTPUT_GEMM(64, 64, 1, partials);
 }
 #endif

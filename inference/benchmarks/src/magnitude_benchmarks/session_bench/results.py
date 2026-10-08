@@ -51,7 +51,10 @@ def public_command(
         args += options.native.arguments()
     if any(target.engine == "llama.cpp" for target in targets):
         args += options.llama.arguments()
+    if any(target.engine in ("ollama", "ollama-mlx", "ollama-registry") for target in targets):
+        args += options.ollama.arguments()
     args += options.watchdog.arguments()
+    args += options.schedule.arguments()
     args += [
         "--suite",
         ",".join(sections),

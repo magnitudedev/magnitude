@@ -90,6 +90,53 @@ class LlamaOptions(Record):
         return args
 
 
+class OllamaOptions(Record):
+    """Ollama selection recorded with each benchmark run.
+
+    Unset values leave Ollama's own defaults in force: the product is measured as shipped
+    except for the context, which the workload fixes.
+    """
+
+    binary: Path | None = None
+    #: Ollama's model store (``OLLAMA_MODELS``): imports are written here, pulls are read here.
+    models: Path | None = None
+    #: ``OLLAMA_KV_CACHE_TYPE``; Ollama's default is f16.
+    kv_cache_type: Literal["f16", "q8_0", "q4_0"] | None = None
+    #: ``OLLAMA_FLASH_ATTENTION``; auto leaves the choice to Ollama.
+    flash_attention: Literal["auto", "on", "off"] = "auto"
+    #: Ollama's MLX runner drafts whenever a model ships a draft head. ``off`` parks it by
+    #: requesting logprobs, the only switch Ollama exposes; ``default`` leaves it on.
+    speculation: Literal["off", "default"] = "off"
+    #: Tokens allocated beyond the benchmark context. Ollama's llama.cpp runner ends a drafting
+    #: request before a context that fits the prompt and output exactly is full.
+    context_headroom: int = Field(default=0, ge=0)
+    #: Metadata-only GGUF tokenizer executable; never the serving engine.
+    count_binary: Path | None = None
+    #: Open the reply with the model's answer header. Only for a family whose format has no
+    #: switch for thinking (Muse Glimmer): with ``think`` false the model still reasons first
+    #: and Ollama discards that text. The prompt Ollama renders is sent through its raw
+    #: completion route with the header appended; the adapter refuses any other family.
+    answer_prefill: bool = False
+
+    def arguments(self) -> list[str]:
+        args = []
+        if self.binary is not None:
+            args += ["--ollama-binary", str(self.binary)]
+        if self.models is not None:
+            args += ["--ollama-models", str(self.models)]
+        if self.kv_cache_type is not None:
+            args += ["--ollama-kv-cache-type", self.kv_cache_type]
+        args += ["--ollama-flash-attention", self.flash_attention]
+        args += ["--ollama-speculation", self.speculation]
+        if self.context_headroom:
+            args += ["--ollama-context-headroom", str(self.context_headroom)]
+        if self.count_binary is not None:
+            args += ["--ollama-count-binary", str(self.count_binary)]
+        if self.answer_prefill:
+            args += ["--ollama-answer-prefill"]
+        return args
+
+
 class Watchdog(Record):
     """Bounds on a measured pass. Exceeding either retires the engine and fails the run.
 
@@ -114,10 +161,29 @@ class Watchdog(Record):
         return args
 
 
+class Schedule(Record):
+    """How many measured passes each target gets.
+
+    Unset, the schedule is balanced: every target is measured once per rotation of the target
+    order, at least twice. ``passes`` fixes the number of passes instead; with one pass each
+    target is measured once, in the order given, with no rotation.
+    """
+
+    passes: int | None = Field(default=None, gt=0)
+
+    def blocks(self, targets: int, repeat: int) -> int:
+        return self.passes if self.passes is not None else max(2, targets) * repeat
+
+    def arguments(self) -> list[str]:
+        return [] if self.passes is None else ["--passes", str(self.passes)]
+
+
 class EngineOptions(Record):
     native: NativeOptions = Field(default_factory=NativeOptions)
     llama: LlamaOptions = Field(default_factory=LlamaOptions)
+    ollama: OllamaOptions = Field(default_factory=OllamaOptions)
     watchdog: Watchdog = Field(default_factory=Watchdog)
+    schedule: Schedule = Field(default_factory=Schedule)
 
 
 DEFAULT_ENGINE_OPTIONS = EngineOptions()

@@ -110,9 +110,6 @@ pub struct TuningPartition {
     pub boundary: Vec<ParameterAddress>,
     pub points: Vec<PlannedPoint>,
     pub sources: Vec<LaunchSource>,
-    /// Distinct candidate/point/active-set timings, including points with no
-    /// active tuned launch.
-    pub measurements: usize,
 }
 
 impl TuningPartition {
@@ -205,18 +202,116 @@ fn constraint_parts(condition: &NativeCondition, parts: &mut Vec<Vec<String>>) {
     }
 }
 
+/// Visits admissible configurations that between them take every distinct
+/// admissible assignment of the addresses given.
+type Projection<'v> = dyn Fn(
+        &[ParameterAddress],
+        &mut dyn FnMut(&NativeSpecialization) -> Result<(), PlanError>,
+    ) -> Result<(), PlanError>
+    + 'v;
+
+/// `implementation` with every parameter that `selected` neither names nor
+/// is coupled to held at its value in `default`, an admissible
+/// configuration. `parts` are the independent restrictions of `where`:
+/// parameters one of them reads are coupled, transitively. The admissible
+/// configurations of the result take exactly the admissible assignments of
+/// `selected`: a restriction reads either only free parameters, and holds
+/// as it does in the whole domain, or only held ones, and holds as it does
+/// in `default`.
+fn restricted(
+    implementation: &NativeImplementation,
+    default: &NativeSpecialization,
+    parts: &[Vec<String>],
+    selected: &[ParameterAddress],
+) -> NativeImplementation {
+    let name = |address: &ParameterAddress| match address {
+        ParameterAddress::Entry(name) | ParameterAddress::Launch { name, .. } => name.clone(),
+    };
+    let named = selected.iter().map(name).collect::<BTreeSet<_>>();
+    // The names restrictions couple to the selected parameters. A name may
+    // be several launches' parameters: a restriction couples them all.
+    let mut reached = BTreeSet::<String>::new();
+    loop {
+        let before = reached.len();
+        for part in parts {
+            if part
+                .iter()
+                .any(|name| named.contains(name) || reached.contains(name))
+            {
+                reached.extend(part.iter().cloned());
+            }
+        }
+        if reached.len() == before {
+            break;
+        }
+    }
+    let free = |address: &ParameterAddress| {
+        selected.contains(address) || reached.contains(&name(address))
+    };
+    let mut restricted = implementation.clone();
+    for parameter in &mut restricted.params {
+        let address = entry_address(parameter);
+        if !free(&address) {
+            parameter.values = vec![address.value(default)];
+        }
+    }
+    for (ordinal, launch) in restricted.launches.iter_mut().enumerate() {
+        for parameter in &mut launch.params {
+            let address = local_address(ordinal, parameter);
+            if !free(&address) {
+                parameter.values = vec![address.value(default)];
+            }
+        }
+    }
+    restricted
+}
+
 /// Partition the declared domain. The checked declaration gives launch-local
 /// ownership; an entry parameter belongs to every launch whose geometry or
 /// condition reads it. An otherwise unowned entry parameter conservatively
 /// couples all launches unless it is a condition-only boundary parameter.
+///
+/// The domain is never enumerated: its size is the product of its
+/// parameters' value counts, and every form or launch parameter a
+/// declaration gains multiplies it. What the partition needs of it are
+/// distinct assignments of a few parameters at a time (those the launch
+/// conditions read, each group's, each launch's code), and each is walked
+/// with every parameter it is not coupled to held at its default
+/// ([`restricted`]): time and memory follow the sizes of the groups, not
+/// their product.
 pub fn partition(
     implementation: &NativeImplementation,
     statics: &NativeSpecialization,
     points: &[PointShape],
 ) -> Result<TuningPartition, PlanError> {
-    let admissible = implementation
-        .admissible(statics)
+    let default = implementation
+        .default_specialization(statics)
         .map_err(PlanError::Declaration)?;
+    let mut parts = Vec::new();
+    if let Some(constraint) = &implementation.constraint {
+        constraint_parts(constraint, &mut parts);
+    }
+    partition_over(implementation, points, &|selected, visit| {
+        let mut failure = None;
+        restricted(implementation, &default, &parts, selected)
+            .walk_admissible(statics, |configuration| match visit(configuration) {
+                Ok(()) => true,
+                Err(error) => {
+                    failure = Some(error);
+                    false
+                }
+            })
+            .map_err(PlanError::Declaration)?;
+        failure.map_or(Ok(()), Err)
+    })
+}
+
+/// [`partition`] over the admissible configurations `visit` supplies.
+fn partition_over(
+    implementation: &NativeImplementation,
+    points: &[PointShape],
+    visit: &Projection<'_>,
+) -> Result<TuningPartition, PlanError> {
     let mut geometry_reads = Vec::with_capacity(implementation.launches.len());
     let mut condition_reads = Vec::with_capacity(implementation.launches.len());
     for launch in &implementation.launches {
@@ -313,8 +408,6 @@ pub fn partition(
             }
         }
     }
-    // Every parameter's value in each admissible configuration, resolved
-    // once: the projections below index it rather than look values up.
     let addresses = implementation
         .params
         .iter()
@@ -332,61 +425,39 @@ pub fn partition(
                 }),
         )
         .collect::<Vec<_>>();
-    let column = addresses
-        .iter()
-        .enumerate()
-        .map(|(column, address)| (address.clone(), column))
-        .collect::<BTreeMap<_, _>>();
-    let values = admissible
-        .iter()
-        .map(|specialization| {
-            addresses
-                .iter()
-                .map(|address| address.value(specialization))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let columns = |selected: &[ParameterAddress]| {
-        selected.iter().map(|address| column[address]).collect::<Vec<_>>()
+    // A name a launch reads resolves as its evaluation does: the launch's
+    // own parameter first, then the entry's.
+    let resolve = |ordinal: usize, name: &str| {
+        [
+            ParameterAddress::Launch {
+                ordinal,
+                name: name.to_owned(),
+            },
+            ParameterAddress::Entry(name.to_owned()),
+        ]
+        .into_iter()
+        .find(|address| addresses.contains(address))
     };
-    let project = |configuration: usize, selected: &[usize]| {
-        selected
-            .iter()
-            .map(|&column| values[configuration][column])
-            .collect::<Vec<_>>()
-    };
-    // A condition's name resolves as its evaluation does: a launch's own
-    // parameter first, then the entry's.
-    let lookup = &column;
-    let condition_columns = condition_reads
-        .iter()
-        .enumerate()
-        .flat_map(|(ordinal, names)| {
-            names.iter().map(move |name| {
-                lookup
-                    .get(&ParameterAddress::Launch {
-                        ordinal,
-                        name: name.clone(),
-                    })
-                    .or_else(|| lookup.get(&ParameterAddress::Entry(name.clone())))
-                    .copied()
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut condition_addresses = Vec::new();
+    for (ordinal, names) in condition_reads.iter().enumerate() {
+        for address in names.iter().filter_map(|name| resolve(ordinal, name)) {
+            if !condition_addresses.contains(&address) {
+                condition_addresses.push(address);
+            }
+        }
+    }
     let mut measured = BTreeSet::new();
-    let mut activity = vec![Vec::<Vec<usize>>::with_capacity(points.len()); admissible.len()];
     let mut point_sets = vec![BTreeSet::<Vec<usize>>::new(); points.len()];
     // A point's active launches depend only on the values the launch
-    // conditions read, which few configurations of a domain distinguish.
-    let mut decided = vec![BTreeMap::<Vec<Option<u64>>, Vec<usize>>::new(); points.len()];
-    for (configuration, specialization) in admissible.iter().enumerate() {
-        let read = condition_columns
+    // conditions read: each distinct assignment of those is decided once.
+    let mut decided = vec![BTreeSet::<Vec<u64>>::new(); points.len()];
+    visit(&condition_addresses, &mut |specialization| {
+        let read = condition_addresses
             .iter()
-            .map(|column| column.map(|column| values[configuration][column]))
+            .map(|address| address.value(specialization))
             .collect::<Vec<_>>();
         for (index, point) in points.iter().enumerate() {
-            if let Some(active) = decided[index].get(&read) {
-                activity[configuration].push(active.clone());
+            if !decided[index].insert(read.clone()) {
                 continue;
             }
             let dimension = |name: &str| {
@@ -426,11 +497,10 @@ pub fn partition(
             for pair in tuned_active.windows(2) {
                 union(&mut parents, pair[0], pair[1]);
             }
-            point_sets[index].insert(active.clone());
-            decided[index].insert(read.clone(), active.clone());
-            activity[configuration].push(active);
+            point_sets[index].insert(active);
         }
-    }
+        Ok(())
+    })?;
     let mut components = BTreeMap::<usize, Vec<usize>>::new();
     for launch in tuned {
         components
@@ -451,19 +521,23 @@ pub fn partition(
                 .filter(|(_, owned)| owned.iter().any(|launch| launches.contains(launch)))
                 .map(|(address, _)| address.clone())
                 .collect::<Vec<_>>();
-            let selected = columns(&parameters);
-            let candidates = (0..admissible.len())
-                .map(|configuration| project(configuration, &selected))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            Group {
+            let mut candidates = BTreeSet::new();
+            visit(&parameters, &mut |specialization| {
+                candidates.insert(
+                    parameters
+                        .iter()
+                        .map(|address| address.value(specialization))
+                        .collect::<Vec<_>>(),
+                );
+                Ok(())
+            })?;
+            Ok(Group {
                 launches,
                 parameters,
-                candidates,
-            }
+                candidates: candidates.into_iter().collect(),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, PlanError>>()?;
     groups.sort_by_key(|group| group.launches[0]);
     let sources = implementation
         .launches
@@ -488,54 +562,35 @@ pub fn partition(
                         .map(|parameter| local_address(ordinal, parameter)),
                 )
                 .collect::<Vec<_>>();
-            let selected = columns(&code);
-            let variants = (0..admissible.len())
-                .map(|configuration| LaunchVariant {
-                    code: project(configuration, &selected),
-                    group_size: implementation.static_group_size(&admissible[configuration], ordinal),
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            LaunchSource { ordinal, variants }
-        })
-        .collect();
-    let mut measurements = 0usize;
-    for group in &groups {
-        let selected = columns(&group.parameters);
-        let mut configurations = BTreeMap::<Vec<u64>, Vec<usize>>::new();
-        for configuration in 0..admissible.len() {
-            configurations
-                .entry(project(configuration, &selected))
-                .or_default()
-                .push(configuration);
-        }
-        for candidate in &group.candidates {
-            for point in 0..points.len() {
-                let sets = configurations[candidate]
-                    .iter()
-                    .filter_map(|&configuration| {
-                        let active = &activity[configuration][point];
-                        active
-                            .iter()
-                            .any(|launch| group.launches.contains(launch))
-                            .then(|| active.clone())
-                    })
-                    .collect::<BTreeSet<_>>();
-                measurements += sets.len();
+            // A variant is its code values and its group size, which reads
+            // the parameters the launch's group extents name.
+            let mut read = code.clone();
+            let mut extent = Vec::new();
+            for expression in &launch.group_extent {
+                expression.parameters(&mut extent);
             }
-        }
-    }
-    for active_sets in &point_sets {
-        measurements += active_sets
-            .iter()
-            .filter(|active| {
-                !active
-                    .iter()
-                    .any(|launch| groups.iter().any(|group| group.launches.contains(launch)))
+            for address in extent.iter().filter_map(|name| resolve(ordinal, name)) {
+                if !read.contains(&address) {
+                    read.push(address);
+                }
+            }
+            let mut variants = BTreeSet::new();
+            visit(&read, &mut |specialization| {
+                variants.insert(LaunchVariant {
+                    code: code
+                        .iter()
+                        .map(|address| address.value(specialization))
+                        .collect(),
+                    group_size: implementation.static_group_size(specialization, ordinal),
+                });
+                Ok(())
+            })?;
+            Ok(LaunchSource {
+                ordinal,
+                variants: variants.into_iter().collect(),
             })
-            .count();
-    }
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
     let points = points
         .iter()
         .zip(point_sets)
@@ -549,7 +604,6 @@ pub fn partition(
         boundary,
         points,
         sources,
-        measurements,
     })
 }
 
@@ -619,7 +673,6 @@ mod tests {
             // read a launch parameter, so each instance has two sizes.
             [4, 4, 2]
         );
-        assert_eq!(plan.measurements, 22);
         assert_eq!(plan.points[1].active_sets, [vec![0], vec![1]]);
         let implementation = implementation("N > 16");
         let defaults = implementation
@@ -639,6 +692,108 @@ mod tests {
         assert_eq!(assembled.param("BATCH_FROM"), Some(3));
         assert_eq!(assembled.launch_param(0, "SIMDGROUPS"), Some(8));
         assert_eq!(assembled.launch_param(1, "SIMDGROUPS"), Some(4));
+    }
+
+    fn checked(text: String) -> NativeImplementation {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "scale.seismic".into(),
+            text,
+        }]))
+        .unwrap();
+        module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap()
+            .clone()
+    }
+
+    /// The partition taken from every admissible configuration: what
+    /// [`partition`] must equal without enumerating them.
+    fn enumerated(implementation: &NativeImplementation, points: &[PointShape]) -> TuningPartition {
+        let admissible = implementation
+            .admissible(&NativeSpecialization::new())
+            .unwrap();
+        partition_over(implementation, points, &|_, visit| {
+            admissible.iter().try_for_each(|configuration| visit(configuration))
+        })
+        .unwrap()
+    }
+
+    /// Structural forms whose launch parameters `where` holds at their
+    /// defaults outside the form, as the projection entries declare them.
+    fn forms() -> NativeImplementation {
+        checked(
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3], form TALL in [1, 0], form PACK in [0, 1])\n    where (PACK == 0 or TALL == 1) and (TALL == 1 or TILE == 64) and (PACK == 1 or (TOKENS == 4 and AHEAD == 0))\n    launch gemv when N < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8, 4], code ROWS in [1, 2, 4])\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when N >= BATCH_FROM and N <= 16:\n        params (SIMDGROUPS in [8, 4], code ROWS in [2, 1])\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch gemm when N > 16 and PACK == 0:\n        params (code TILE in [64, 128, 32])\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n    launch packed when N > 16 and PACK == 1 and TALL == 1:\n        params (code TOKENS in [4, 2], AHEAD in [0, 1])\n        threadgroups (ceil_div(N, TOKENS), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n"
+                .into(),
+        )
+    }
+
+    #[test]
+    fn the_partition_equals_the_one_taken_from_every_admissible_configuration() {
+        let constrained = checked("fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3])\n    where BATCH_FROM >= 3\n    launch gemv when N < BATCH_FROM:\n        params (code ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        params (code ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n".into());
+        for implementation in [
+            implementation("N > 16"),
+            implementation("N > 64"),
+            constrained,
+            forms(),
+        ] {
+            // Every served range, and ranges that leave launches unserved.
+            for served in [&points()[..], &points()[..2], &points()[3..]] {
+                let plan =
+                    partition(&implementation, &NativeSpecialization::new(), served).unwrap();
+                assert_eq!(plan, enumerated(&implementation, served));
+            }
+        }
+        // The forms couple their launches through `where`: one group holds
+        // the tall launches, with the candidates of each form and not their
+        // product.
+        let plan = partition(&forms(), &NativeSpecialization::new(), &points()).unwrap();
+        let tall = plan
+            .groups
+            .iter()
+            .find(|group| group.launches.contains(&2))
+            .unwrap();
+        assert_eq!(tall.launches, [2, 3]);
+        // TALL 0 with the default tile; TALL 1 unpacked with three tiles;
+        // packed with three tiles and four token and lookahead choices.
+        assert_eq!(tall.candidates.len(), 1 + 3 + 12);
+        assert_eq!(plan.groups.len(), 3);
+    }
+
+    #[test]
+    fn independent_launches_are_partitioned_without_walking_their_product() {
+        // Twelve launches, each serving one row count, sixteen candidates
+        // each: 16^12 admissible configurations.
+        let launches = (0..12)
+            .map(|launch| {
+                format!(
+                    "    launch band{launch} when N == {}:\n        params (WIDTH in [1, 2, 4, 8], code ROWS in [1, 2, 4, 8])\n        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH * 32, 1, 1)\n",
+                    launch + 1
+                )
+            })
+            .collect::<String>();
+        let implementation = checked(format!(
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n{launches}"
+        ));
+        let points = (1..=12)
+            .map(|rows| PointShape {
+                label: format!("m{rows}"),
+                dimensions: BTreeMap::from([("N".into(), rows)]),
+            })
+            .collect::<Vec<_>>();
+        let began = std::time::Instant::now();
+        let plan = partition(&implementation, &NativeSpecialization::new(), &points).unwrap();
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(plan.groups.len(), 12);
+        assert!(plan.groups.iter().all(|group| group.candidates.len() == 16));
+        assert!(plan
+            .sources
+            .iter()
+            .all(|source| source.variants.len() == 16));
+        assert!(plan
+            .points
+            .iter()
+            .enumerate()
+            .all(|(point, planned)| planned.active_sets == [vec![point]]));
     }
 
     #[test]

@@ -11,7 +11,7 @@ describe("modelCommandFailure", () => {
       headers: {},
       body: {
         error: {
-          code: "low_memory",
+          code: "memory_shortage",
           message: "Not enough memory to load the selected model",
           type: "model_error",
           param: Option.none(),
@@ -21,7 +21,7 @@ describe("modelCommandFailure", () => {
 
     expect(failure).toMatchObject({
       _tag: "LocalModelMutationFailed",
-      code: "low_memory",
+      code: "memory_shortage",
       message: "Not enough memory to load the selected model",
       retryable: true,
     })

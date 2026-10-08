@@ -427,7 +427,7 @@ describe("ICN local provider", () => {
   it("does not fabricate retry hints absent from the OpenAI error contract", async () => {
     const modelId = ProviderModelIdSchema.make("mdl_test")
     const http = HttpClient.make((request) => Effect.succeed(sseErrorResponse(request, {
-      code: "low_memory",
+      code: "memory_shortage",
       message: "Not enough memory to load model",
       type: "model_error",
     })))
@@ -446,7 +446,7 @@ describe("ICN local provider", () => {
         cause: {
           _tag: "StreamProviderError",
           providerError: {
-            code: "low_memory",
+            code: "memory_shortage",
             retryable: null,
             type: "model_error",
           },

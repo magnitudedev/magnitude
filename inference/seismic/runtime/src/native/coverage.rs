@@ -18,6 +18,15 @@
 //! reported: it is dead code, or reachable only through more than one change
 //! from every kept configuration.
 //!
+//! A `form` tuning parameter selects a structurally different algorithm,
+//! which a kernel may take without a preprocessor group (a template chosen
+//! by a constant, say) and which its declaration may admit only at some
+//! statics (a head width). Every value of every form parameter is therefore
+//! formed as well, once under each device configuration: by a kept
+//! configuration that holds it, or else by the first configuration the
+//! declaration admits with it, at statics searched for it. A form value no
+//! configuration forms is reported like an unreached group.
+//!
 //! Vulkan skeletons are preprocessed by glslang, the toolchain itself; CUDA
 //! and Metal skeletons by `clang -E`. Their conditions may read no
 //! toolchain-predefined macro except `__CUDA_ARCH__`, which the CUDA skeleton
@@ -97,6 +106,13 @@ pub struct Coverage {
     /// Groups reached, of all authored non-rejecting groups.
     pub reached: usize,
     pub groups: usize,
+    /// Values of `form` tuning parameters formed, of all the implemented
+    /// entries declare.
+    pub forms_formed: usize,
+    pub forms: usize,
+    /// Form values no configuration forms: none is admissible over the
+    /// searched statics, or the kernel rejects each one.
+    pub unformed: Vec<String>,
     /// Entries with no implemented configuration at all.
     pub unimplemented: Vec<String>,
     /// Configurations this host's toolchain cannot form (Metal tensor
@@ -106,9 +122,13 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// Whether every implementation formed and every group was reached.
+    /// Whether every implementation formed, every group was reached and
+    /// every form was formed.
     pub fn complete(&self) -> bool {
-        self.failures.is_empty() && self.unreached.is_empty() && self.unimplemented.is_empty()
+        self.failures.is_empty()
+            && self.unreached.is_empty()
+            && self.unformed.is_empty()
+            && self.unimplemented.is_empty()
     }
 }
 
@@ -116,8 +136,8 @@ impl fmt::Display for Coverage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "formed {} programs; reached {} of {} groups",
-            self.formed, self.reached, self.groups
+            "formed {} programs; reached {} of {} groups; formed {} of {} forms",
+            self.formed, self.reached, self.groups, self.forms_formed, self.forms
         )?;
         for failure in &self.failures {
             writeln!(f, "formation failure: {failure}")?;
@@ -127,6 +147,9 @@ impl fmt::Display for Coverage {
         }
         for site in &self.unreached {
             writeln!(f, "unreached group: {site}")?;
+        }
+        for form in &self.unformed {
+            writeln!(f, "unformed form: {form}")?;
         }
         for (configuration, entry) in &self.unformable {
             writeln!(f, "unformable on this host: `{entry}` {configuration:?}")?;
@@ -1020,6 +1043,12 @@ fn asserted(error: &NativeCompilationError) -> bool {
 #[derive(Default)]
 struct Search {
     formed: usize,
+    /// The rows the toolchain formed.
+    kept: Vec<Row>,
+    /// Form values formed, of the entry's, and the ones that were not.
+    forms_formed: usize,
+    forms: usize,
+    unformed: Vec<String>,
     failures: Vec<FormationFailure>,
     unformable: Vec<Configuration>,
     reached: BTreeSet<GroupSite>,
@@ -1031,7 +1060,10 @@ impl Search {
     /// Record a kept row's formation; `false` when the kernel rejects it.
     fn record(&mut self, subject: &Subject<'_>, row: &Row, formation: Formation) -> bool {
         match formation {
-            Formation::Formed(programs) => self.formed += programs,
+            Formation::Formed(programs) => {
+                self.formed += programs;
+                self.kept.push(row.clone());
+            }
             Formation::Rejected => return false,
             Formation::Failed(error) => self.failures.push(subject.describe(row, error)),
             Formation::Unformable => self.unformable.push(row.configuration),
@@ -1134,9 +1166,122 @@ fn search(subject: &Subject<'_>, former: &Former) -> Result<Option<Search>, Cove
         let candidates = binding_pairs(subject, &base, &mut seen);
         frontier = keep(subject, former, candidates, &mut search)?;
     }
+    form_values(subject, former, &base, &mut search)?;
     let rejecting = std::mem::take(&mut search.rejecting);
     search.universe.retain(|site| !rejecting.contains(site));
     Ok(Some(search))
+}
+
+/// One value of a `form` tuning parameter: the launch that declares it (none
+/// for the entry's own), its name and the value.
+type Form<'a> = (Option<usize>, &'a str, u64);
+
+fn holds(specialization: &NativeSpecialization, (launch, name, value): Form<'_>) -> bool {
+    match launch {
+        None => specialization.param(name) == Some(value),
+        Some(launch) => specialization.launch_param(launch, name) == Some(value),
+    }
+}
+
+/// Form every value of the entry's `form` parameters under each device
+/// configuration, at `base`'s bindings: nothing more where a kept row holds
+/// the value under that configuration; otherwise a row of a formed
+/// specialization that holds it, or of the first one the declaration admits
+/// with it ([`NativeImplementation::search_form`]). One row per value and
+/// device configuration, never the product with the other parameters.
+fn form_values(
+    subject: &Subject<'_>,
+    former: &Former,
+    base: &Row,
+    search: &mut Search,
+) -> Result<(), CoverageError> {
+    let implementation = subject.implementation;
+    let forms: Vec<Form<'_>> = implementation
+        .params
+        .iter()
+        .map(|parameter| (None, parameter))
+        .chain(implementation.launches.iter().enumerate().flat_map(
+            |(launch, declaration)| {
+                declaration.params.iter().map(move |parameter| (Some(launch), parameter))
+            },
+        ))
+        .filter(|(_, parameter)| parameter.form)
+        .flat_map(|(launch, parameter)| {
+            parameter.values.iter().map(move |value| (launch, parameter.name.as_str(), *value))
+        })
+        .collect();
+    let mut configurations = vec![base.configuration];
+    configurations.extend(former.variations(base.configuration));
+    // Whether each form is settled (formed, or beyond this host's toolchain)
+    // and whether a row of it failed, which is reported as that failure.
+    let mut settled = vec![false; forms.len()];
+    let mut failed = vec![false; forms.len()];
+    let mut rows: Vec<(usize, Row)> = Vec::new();
+    for (index, form) in forms.iter().enumerate() {
+        let specialization = search
+            .kept
+            .iter()
+            .chain(rows.iter().map(|(_, row)| row))
+            .map(|row| &row.specialization)
+            .find(|specialization| holds(specialization, *form))
+            .cloned()
+            .or_else(|| implementation.search_form(form.0, form.1, form.2));
+        let Some(specialization) = specialization else {
+            continue;
+        };
+        for configuration in &configurations {
+            let formed = search.kept.iter().any(|row| {
+                row.configuration == *configuration && holds(&row.specialization, *form)
+            });
+            if formed {
+                settled[index] = true;
+            } else {
+                rows.push((
+                    index,
+                    Row {
+                        bindings: base.bindings.clone(),
+                        specialization: specialization.clone(),
+                        configuration: *configuration,
+                    },
+                ));
+            }
+        }
+    }
+    let candidates = rows.iter().map(|(_, row)| row.clone()).collect::<Vec<_>>();
+    let mut implemented = Vec::new();
+    for ((index, row), evaluated) in rows.into_iter().zip(evaluate(subject, &candidates)?) {
+        search.universe.extend(evaluated.universe);
+        search.rejecting.extend(evaluated.rejecting);
+        if let Some(reached) = evaluated.reached {
+            implemented.push((index, row, reached));
+        }
+    }
+    let formations = in_parallel(&implemented, |(_, row, _)| form_row(subject, former, row));
+    for ((index, row, reached), formation) in implemented.into_iter().zip(formations) {
+        match formation {
+            Formation::Failed(_) => failed[index] = true,
+            Formation::Formed(_) | Formation::Unformable => settled[index] = true,
+            Formation::Rejected => {}
+        }
+        if search.record(subject, &row, formation) {
+            search.reached.extend(reached);
+        }
+    }
+    search.forms = forms.len();
+    search.forms_formed = settled.iter().filter(|settled| **settled).count();
+    search.unformed = forms
+        .iter()
+        .zip(settled.iter().zip(&failed))
+        .filter(|(_, (settled, failed))| !**settled && !**failed)
+        .map(|((launch, name, value), _)| match launch {
+            None => format!("`{}` {name} = {value}", subject.info.name),
+            Some(launch) => format!(
+                "`{}` launch `{}` {name} = {value}",
+                subject.info.name, implementation.launches[*launch].kernel
+            ),
+        })
+        .collect();
+    Ok(())
 }
 
 /// Evaluate `candidates` and keep each that reaches a group no kept row
@@ -1252,6 +1397,9 @@ pub fn cover(module: &CheckedModule, backend: BackendName) -> Result<Coverage, C
             continue;
         };
         coverage.formed += searched.formed;
+        coverage.forms_formed += searched.forms_formed;
+        coverage.forms += searched.forms;
+        coverage.unformed.extend(searched.unformed);
         coverage.failures.extend(searched.failures);
         coverage.unformable.extend(
             searched

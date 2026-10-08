@@ -62,6 +62,16 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
 /// stale.
 const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     (
+        "lib/attention/inputs",
+        &[BackendName::Cuda],
+        "query and visibility ABI macros are separate from CUDA shared attention helpers so cache-publication entries bind only K/V state inputs",
+    ),
+    (
+        "lib/attention/decode_merge",
+        &[BackendName::Cuda],
+        "decode output helpers are separate from CUDA's shared attention header so append-only entries do not require output bindings",
+    ),
+    (
         "lib/attention/prefill",
         &[BackendName::Cuda, BackendName::Vulkan],
         "prefill attention body (CUDA tensor-core flash, Vulkan tiled); Metal keeps its prefill in `attention.h`",
@@ -90,6 +100,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "lib/core/precise",
         &[BackendName::Vulkan],
         "bounded-error `exp`: Vulkan permits 3 + 2|x| ulp where Metal and CUDA do not",
+    ),
+    (
+        "lib/projection/packing",
+        &[BackendName::Metal],
+        "the token-packing GEMM of the projection entries' PACK form, on simdgroup matrices",
     ),
     (
         "lib/core/rotary",

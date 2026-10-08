@@ -4,8 +4,8 @@
 //! figures are process-scoped ("the maximum this process can commit").
 
 use super::{
-    HeadroomBasis, HeadroomEstimate, HostCapacity, HostMeasurements, HostMemoryStatus,
-    LimitVisibility, ProcessLimitKind, ProcessMemoryLimit,
+    HeadroomBasis, HeadroomEstimate, HostCapacity, HostMeasurements, HostSample, LimitVisibility,
+    ProcessLimitKind, ProcessMemoryLimit,
 };
 use crate::devices::{CapacityBasis, ObservationError};
 use std::time::SystemTime;
@@ -40,10 +40,10 @@ pub(super) fn capacity() -> Result<HostCapacity, String> {
     })
 }
 
-pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
+pub(super) fn sample() -> Result<HostSample, ObservationError> {
     let status = memory_status().map_err(ObservationError::Failed)?;
     let sampled_at = SystemTime::now();
-    Ok(HostMemoryStatus {
+    Ok(HostSample {
         sampled_at,
         measurements: HostMeasurements::Windows {
             available_physical_bytes: status.ullAvailPhys,
@@ -56,6 +56,8 @@ pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
         },
         limits: job_limits()?,
         limit_visibility: LimitVisibility::Complete,
+        displacement: None,
+        kernel_pressure: None,
     })
 }
 

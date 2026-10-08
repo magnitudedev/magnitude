@@ -423,6 +423,7 @@ impl Validator {
         // Admitted error classes join the identity only when there are any,
         // so a case without them keeps its identity.
         if !admitted.is_empty() {
+            identity.update(ErrorEnvelope::COMPARISON_VERSION);
             identity.update(format!("{admitted:?}"));
         }
         Ok(Self {
@@ -605,11 +606,28 @@ fn element(
     }
     Ok(())
 }
+/// Half the spacing to the adjacent published value toward another finite
+/// value. Direction matters at exponent boundaries; neither endpoint can
+/// step out to infinity because the other endpoint is finite.
+fn rounding_radius_toward(dtype: DType, bits: u32, toward: f64) -> f64 {
+    let value = seismic_lang::reference_math::conversion::exact_f64(dtype, bits);
+    let sign = 1u32 << (dtype.bytes() * 8 - 1);
+    let adjacent = if value == 0. {
+        1 | if toward < 0. { sign } else { 0 }
+    } else if (value > 0.) == (toward > value) {
+        bits + 1
+    } else {
+        bits - 1
+    };
+    (seismic_lang::reference_math::conversion::exact_f64(dtype, adjacent) - value).abs() * 0.5
+}
+
 /// One floating subject of an error-class configuration against its
 /// reference, as (reference bits, actual bits) per element: the error's root
-/// mean square within `relative_rms` of the reference's, and every element
-/// within `peak` reference root mean squares. Non-finite values must agree
-/// bit for bit.
+/// mean square within `relative_rms` of the reference's. The peak guard
+/// measures the gap between the two published values' rounding cells, so
+/// final storage rounding does not masquerade as concentrated kernel error.
+/// Non-finite values must agree bit for bit.
 fn within_envelope(
     subject: &str,
     dtype: DType,
@@ -619,7 +637,8 @@ fn within_envelope(
 ) -> Result<(), String> {
     let value = |bits| seismic_lang::reference_math::conversion::exact_f64(dtype, bits);
     let (mut count, mut squared_error, mut squared_reference) = (0usize, 0f64, 0f64);
-    let (mut peak, mut peak_index) = (0f64, 0usize);
+    let (mut peak, mut peak_index, mut largest_absolute) = (0f64, 0usize, 0f64);
+    let (mut peak_reference, mut peak_actual) = (0f64, 0f64);
     for (index, (reference, actual)) in elements.into_iter().enumerate() {
         let (r, a) = (value(reference), value(actual));
         if !r.is_finite() || !a.is_finite() {
@@ -633,8 +652,18 @@ fn within_envelope(
         let error = (a - r).abs();
         squared_error += error * error;
         squared_reference += r * r;
-        if error > peak {
-            (peak, peak_index) = (error, index);
+        largest_absolute = largest_absolute.max(error);
+        let gap = if error == 0. {
+            0.
+        } else {
+            (error
+                - rounding_radius_toward(dtype, reference, a)
+                - rounding_radius_toward(dtype, actual, r))
+            .max(0.)
+        };
+        if gap > peak {
+            (peak, peak_index) = (gap, index);
+            (peak_reference, peak_actual) = (r, a);
         }
         count += 1;
     }
@@ -646,12 +675,12 @@ fn within_envelope(
     let peak_limit = envelope.peak.get() * reference_rms;
     if !(relative_rms <= envelope.relative_rms.get()) || !(peak <= peak_limit) {
         return Err(format!(
-            "subject {subject}: relative RMS error {relative_rms:.3e} (limit {:.3e}), largest error {peak:.3e} at element {peak_index} (limit {peak_limit:.3e}, {} reference RMS)",
+            "subject {subject}: relative RMS error {relative_rms:.3e} (limit {:.3e}), largest rounding-cell gap {peak:.3e} at element {peak_index} (reference {peak_reference:.9e}, actual {peak_actual:.9e}; limit {peak_limit:.3e}, {} reference RMS)",
             envelope.relative_rms.get(),
             envelope.peak.get()
         ));
     }
-    metrics.maximum_absolute_error = metrics.maximum_absolute_error.max(peak);
+    metrics.maximum_absolute_error = metrics.maximum_absolute_error.max(largest_absolute);
     let usage = (relative_rms / envelope.relative_rms.get()).max(peak / peak_limit);
     if usage > metrics.maximum_envelope_usage {
         metrics.maximum_envelope_usage = usage;
@@ -876,15 +905,78 @@ mod tests {
         }
     }
     #[test]
+    fn packed_peak_accounts_for_published_rounding_without_relaxing_rms() {
+        let envelope = ErrorEnvelope {
+            relative_rms: Limit::new(0.02).unwrap(),
+            peak: Limit::new(0.5).unwrap(),
+        };
+        let bits = |v: f32| v.to_bits() >> 16;
+        let check = |reference: f32, actual: f32, background: f32| {
+            within_envelope(
+                "value",
+                DType::BF16,
+                (0..32768).map(|i| {
+                    if i == 0 {
+                        (bits(reference), bits(actual))
+                    } else {
+                        (bits(0.21875), bits(background))
+                    }
+                }),
+                envelope,
+                &mut NumericalMetrics::default(),
+            )
+        };
+        // Actual Qwen9 witnesses: four BF16 steps have a gap of only
+        // three steps between their final rounding cells.
+        assert!(check(7.125, 7.0, 0.21875).is_ok());
+        assert!(check(-5.09375, -5.21875, 0.21875).is_ok());
+        assert!(check(7.125, 6.875, 0.21875)
+            .unwrap_err()
+            .contains("element 0"));
+        // Aggregate error still uses the published values without a discount.
+        assert!(check(7.125, 7.0, 0.2265625)
+            .unwrap_err()
+            .contains("relative RMS"));
+        assert!(within_envelope(
+            "value",
+            DType::BF16,
+            [(bits(0.), bits(f32::from_bits(0x00010000)))],
+            envelope,
+            &mut NumericalMetrics::default()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rounding_cells_use_the_spacing_toward_the_other_value() {
+        let bits = |v: f32| v.to_bits() >> 16;
+        assert_eq!(rounding_radius_toward(DType::BF16, bits(1.), 0.), 1. / 512.);
+        assert_eq!(rounding_radius_toward(DType::BF16, bits(1.), 2.), 1. / 256.);
+        assert_eq!(
+            rounding_radius_toward(DType::BF16, bits(-1.), 0.),
+            1. / 512.
+        );
+        assert_eq!(
+            rounding_radius_toward(DType::BF16, bits(-1.), -2.),
+            1. / 256.
+        );
+        assert_eq!(rounding_radius_toward(DType::F16, 0x3c00, 0.), 1. / 4096.);
+        assert_eq!(
+            rounding_radius_toward(DType::F32, 1f32.to_bits(), 2.),
+            2f64.powi(-24)
+        );
+        assert!(rounding_radius_toward(DType::F32, f32::MAX.to_bits(), 0.).is_finite());
+    }
+
+    #[test]
     fn an_error_class_envelope_bounds_the_whole_subject_and_its_worst_element() {
         let envelope = ErrorEnvelope {
             relative_rms: Limit::new(2e-2).unwrap(),
             peak: Limit::new(0.25).unwrap(),
         };
         let subjects = vec!["value".into()];
-        let values = |f: &dyn Fn(usize) -> f32| -> Vec<u32> {
-            (0..1000).map(|i| f(i).to_bits()).collect()
-        };
+        let values =
+            |f: &dyn Fn(usize) -> f32| -> Vec<u32> { (0..1000).map(|i| f(i).to_bits()).collect() };
         let reference = vec![tensor(
             DType::F32,
             &values(&|i| if i % 2 == 0 { 1. } else { -1. }),

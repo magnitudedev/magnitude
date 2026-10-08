@@ -3,6 +3,7 @@ import { Context, Effect, Option, Schema, Stream } from "effect"
 import { createHash, type KeyObject } from "node:crypto"
 import { join } from "node:path"
 import { LINUX_DESKTOP_PACKAGE_NAME } from "@magnitudedev/release/executables"
+import { linuxPackageArchitecture, linuxPackageVersion, pacmanPackageIdentity, type LinuxPackageFormat } from "@magnitudedev/release/linux-package"
 import { acceptsUpdateRelease, UpdateRelease, verifyUpdateRelease } from "@magnitudedev/release/hosted-update"
 import { GuardedCommand } from "@magnitudedev/utils/guarded-command"
 
@@ -22,7 +23,7 @@ export const LinuxPackageInstaller = Context.GenericTag<LinuxPackageInstaller>("
 export const makeLinuxPackageInstaller = (options: {
   readonly trustedPublishers: ReadonlyMap<string, KeyObject>
   readonly currentVersion: string
-  readonly package: "deb" | "rpm"
+  readonly package: LinuxPackageFormat
   readonly callerUid: number
 }) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
@@ -64,10 +65,12 @@ export const makeLinuxPackageInstaller = (options: {
     }
     const query = target.package === "deb"
       ? Command.make("/usr/bin/dpkg-deb", "--show", "--showformat=${Package}\t${Version}\t${Architecture}", archive)
-      : Command.make("/usr/bin/rpm", "-qp", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}", archive)
-    const identity = (yield* executor.string(query)).trim().split("\t")
-    const arch = target.package === "deb" ? target.arch === "arm64" ? "arm64" : "amd64" : target.arch === "arm64" ? "aarch64" : "x86_64"
-    const versionPrefix = `${release.version.replace("-", "~")}-`
+      : target.package === "rpm" ? Command.make("/usr/bin/rpm", "-qp", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}", archive)
+      : Command.make("/usr/bin/bsdtar", "-xOf", archive, ".PKGINFO")
+    const output = yield* executor.string(query)
+    const identity = (target.package === "pacman" ? pacmanPackageIdentity(output) : output).trim().split("\t")
+    const arch = linuxPackageArchitecture(target.package, target.arch)
+    const versionPrefix = `${linuxPackageVersion(target.package, release.version)}-`
     if (identity.length !== 3 || identity[0] !== LINUX_DESKTOP_PACKAGE_NAME || identity[2] !== arch
       || !identity[1]!.startsWith(versionPrefix) || !/^[1-9][0-9]*$/.test(identity[1]!.slice(versionPrefix.length))) {
       return yield* new LinuxPackageUpdateFailed({ message: "The package identity does not match the signed Magnitude release." })
@@ -75,7 +78,8 @@ export const makeLinuxPackageInstaller = (options: {
     const environment = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
     const result = yield* (target.package === "deb"
       ? guarded.run("/usr/bin/apt-get", ["install", "--yes", "--no-remove", "--", archive], { ...environment, DEBIAN_FRONTEND: "noninteractive", NEEDRESTART_MODE: "l" })
-      : guarded.run("/usr/bin/dnf", ["--assumeyes", "install", archive], environment))
+      : target.package === "rpm" ? guarded.run("/usr/bin/dnf", ["--assumeyes", "install", archive], environment)
+      : guarded.run("/usr/bin/pacman", ["--upgrade", "--noconfirm", "--", archive], environment))
     yield* Effect.sync(() => { process.stdout.write(result.stdout); process.stderr.write(result.stderr) })
     if (result.code !== 0) return yield* new LinuxPackageUpdateFailed({ message: "The system package manager could not install Magnitude. Check its installation details before retrying." })
   })).pipe(Effect.mapError(error => error instanceof LinuxPackageUpdateFailed ? error

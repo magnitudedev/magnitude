@@ -16,7 +16,7 @@ export { ApplicationPage, HostAction, HostNotice, QuitFailureDecision, ModelTray
 export const activeLocalModel = (models: LocalModelsState) => {
   for (const model of models.models) {
     const residency = model._tag === "Catalog" ? ("residencyState" in model.acquisitionState ? model.acquisitionState.residencyState : undefined) : model.state._tag === "Ready" ? model.state.residencyState : undefined
-    if (residency && residency._tag !== "Unloaded" && residency._tag !== "Failed") {
+    if (residency && residency._tag !== "Unloaded" && residency._tag !== "Stopped" && residency._tag !== "Failed") {
       return Option.some({ model, residency })
     }
   }
@@ -30,7 +30,7 @@ export const MODEL_TRAY_PHASES: ReadonlyArray<string> = [
 ]
 const modelTrayStatus = (
   model: string,
-  residency: Exclude<ModelResidency, { readonly _tag: "Unloaded" | "Failed" }>,
+  residency: Exclude<ModelResidency, { readonly _tag: "Unloaded" | "Stopped" | "Failed" }>,
 ): typeof ModelTrayStatus.Type => {
   switch (residency._tag) {
     case "Requested": return { model, phase: formatModelLoadStage("preparing"), detail: { _tag: "Working" } }

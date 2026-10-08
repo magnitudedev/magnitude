@@ -158,3 +158,58 @@ def test_omlx_native_enrichment_keeps_evidence_and_checks_phase_boundary():
             instrumentation._terminal_payload({"usage": usage}, key)
     finally:
         instrumentation._metrics.pop(key)
+
+
+async def test_ollama_fixture_count_uses_tokenizer_without_process_or_engine(
+    artifact_path, tmp_path, monkeypatch
+):
+    import asyncio
+    from types import SimpleNamespace
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from magnitude_benchmarks.adapters.ollama import Ollama
+    from magnitude_benchmarks.adapters.ollama_native.prompts import PromptFormat
+    from magnitude_benchmarks.fixtures.contexts import Context
+
+    tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    path = tmp_path / "tokenizer.json"
+    tokenizer.save(str(path))
+    adapter = Ollama(
+        project_root(), Target(engine="ollama-mlx", reference="ollama:test"),
+        prepare(Target(engine="mlx-vlm", reference=str(artifact_path))),
+        RunStore(tmp_path, "count-only", {}), EngineOptions(),
+    )
+    adapter.tag = SimpleNamespace(layer=lambda **_: path)
+    adapter.format = PromptFormat("qwen3.8", "mlx", False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("counting must not start any engine or subprocess")
+
+    monkeypatch.setattr(adapter, "launch", forbidden)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
+    context = Context(messages=[{"role": "user", "content": "hello"}])
+    async with adapter.context_counter() as count:
+        measured = await count(context)
+        assert measured == await count(context)
+    text = adapter.format.chat_text({"messages": context.messages, "think": False})
+    assert measured == len(tokenizer.encode(text, add_special_tokens=False).ids)
+
+
+async def test_ollama_missing_host_renderer_never_falls_back_to_inference(
+    artifact_path, tmp_path, monkeypatch
+):
+    from magnitude_benchmarks.adapters.ollama import Ollama
+    from magnitude_benchmarks.fixtures.contexts import Context
+
+    adapter = Ollama(
+        project_root(), Target(engine="ollama", reference=str(artifact_path)),
+        prepare(Target(engine="mlx-vlm", reference=str(artifact_path))),
+        RunStore(tmp_path, "unsupported-count", {}), EngineOptions(),
+    )
+    adapter.tag = adapter.format = None
+    def forbidden(*args, **kwargs):
+        raise AssertionError("counting must not start an engine")
+    monkeypatch.setattr(adapter, "launch", forbidden)
+    with pytest.raises(ValueError, match="not reproduced"):
+        async with adapter.context_counter() as count:
+            await count(Context(messages=[{"role": "user", "content": "hello"}]))

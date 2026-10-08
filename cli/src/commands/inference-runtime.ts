@@ -13,6 +13,9 @@ import {
   formatSpeculativeMethod,
   formatStorageSize,
   isMeasuredModelLoadStage,
+  MODEL_STOPPED_FOR_MEMORY_MESSAGE,
+  describeModelLoadFailure,
+  modelStoppedForMemory,
   LOCAL_MODEL_RANKING_SCALE_LABELS,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
   localModelIsInstalled,
@@ -433,15 +436,19 @@ export const removeModel = (modelInput: string) => modelMutation(
   (modelId) => `Removed ${modelId} from this computer.\nThe model remains available in the catalog.\n`,
 )
 
+const UNLOADED = "Unloaded"
+
 const residencyLabel = (model: CatalogLocalModel): string => {
   const residency = residencyState(model)
-  if (residency === undefined) return "Unloaded"
+  if (residency === undefined) return UNLOADED
   switch (residency._tag) {
+    case "Unloaded": return UNLOADED
+    case "Stopped": return modelStoppedForMemory(residency) ? MODEL_STOPPED_FOR_MEMORY_MESSAGE : UNLOADED
     case "Requested": return "Loading"
     case "Loading": return isMeasuredModelLoadStage(residency.stage)
       ? `${formatModelLoadStage(residency.stage)} ${formatModelLoadPercentage(residency.fraction)}`
       : formatModelLoadStage(residency.stage)
-    case "Failed": return `Failed - ${residency.failure.message}`
+    case "Failed": return `Failed - ${describeModelLoadFailure(residency.failure)}`
     default: return residency._tag
   }
 }
@@ -466,7 +473,7 @@ const modelStatus = (model: CatalogLocalModel): string => {
     case "NotInstalled": return "Not installed"
     case "UpdateAvailable": {
       const residency = residencyLabel(model)
-      return residency === "Unloaded" ? "Update available" : `${residency} - Update available`
+      return residency === UNLOADED ? "Update available" : `${residency} - Update available`
     }
     case "Installed": return residencyLabel(model)
   }

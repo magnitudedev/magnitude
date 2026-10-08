@@ -12,8 +12,11 @@
 //!   planning reserve: the claimable ceiling is `headroom − planning`. Bytes
 //!   Seismic already charged are absent from observed headroom and are never
 //!   subtracted again.
-//! - Headroom at or below the planning reserve is the Reclaim band. Only
-//!   other programs can cause it, since no engine claim crosses the line.
+//! - Headroom at or below the planning reserve is the Reclaim band. No
+//!   engine claim crosses that line.
+//! - A host that reports displacement is also in Reclaim while it is in
+//!   distress ([`HostDistress`]): programs' memory is being swapped out or
+//!   thrashed through the compressor, whoever caused it.
 //!
 //! Process limits are the visible ones. A container's own cgroup limit is
 //! visible; limits of cgroups above it may be hidden, and are then bounded
@@ -21,9 +24,70 @@
 
 use seismic::{
     DeviceCatalog, DeviceInfo, DeviceMeasurements, DeviceMemory, DeviceMemoryInfo, DeviceSelector,
-    DeviceTopology, HostMemoryStatus, MemoryPoolId, MemoryPoolKind, ObservationError,
+    DeviceTopology, DisplacementWindow, HostMemoryStatus, KernelPressure, MemoryPoolId,
+    MemoryPoolKind, ObservationError,
 };
 use std::fmt;
+
+/// Harm to other programs that host headroom does not show: their memory is
+/// leaving RAM faster than the system can absorb. A host in distress is in
+/// the Reclaim band whatever its headroom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostDistress {
+    /// Pages were written to swap in each of the two most recent
+    /// displacement windows.
+    Swapping,
+    /// Each of the two most recent displacement windows compressed and
+    /// decompressed pages at the rates the kernel itself treats as thrashing.
+    Thrashing,
+    /// The kernel classifies system memory pressure as critical.
+    KernelCritical,
+}
+
+impl fmt::Display for HostDistress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Swapping => "the system is swapping",
+            Self::Thrashing => "the system is thrashing compressed memory",
+            Self::KernelCritical => "the kernel reports critical memory pressure",
+        })
+    }
+}
+
+/// XNU's compressor thrashing rule (`compute_swapout_target_age`): at least
+/// 20 compressions and 20 decompressions per 10 ms, and more than 50
+/// decompressions per 10 ms.
+const THRASHING_COMPRESSIONS_PER_SECOND: u64 = 2_000;
+const THRASHING_DECOMPRESSIONS_PER_SECOND: u64 = 5_000;
+
+fn rate_reaches(pages: u64, window: &DisplacementWindow, per_second: u64) -> bool {
+    u128::from(pages) * 1_000 >= u128::from(per_second) * window.duration.as_millis()
+}
+
+fn thrashed(window: &DisplacementWindow) -> bool {
+    rate_reaches(window.compressed_pages, window, THRASHING_COMPRESSIONS_PER_SECOND)
+        && rate_reaches(window.decompressed_pages, window, THRASHING_DECOMPRESSIONS_PER_SECOND)
+}
+
+/// The distress `host` reports, most severe first. A host that reports no
+/// displacement and no kernel pressure is never in distress. Displacement
+/// is distress only when two consecutive windows show it: one window of a
+/// load's own first compressions, or one burst of another program's swap,
+/// is the system absorbing demand.
+pub fn host_distress(host: &HostMemoryStatus) -> Option<HostDistress> {
+    if host.kernel_pressure == Some(KernelPressure::Critical) {
+        return Some(HostDistress::KernelCritical);
+    }
+    let displacement = host.displacement?;
+    let (latest, previous) = (displacement.latest?, displacement.previous?);
+    if thrashed(&latest) && thrashed(&previous) {
+        Some(HostDistress::Thrashing)
+    } else if latest.swapped_out_pages > 0 && previous.swapped_out_pages > 0 {
+        Some(HostDistress::Swapping)
+    } else {
+        None
+    }
+}
 
 /// The constraint that bounds a domain's claimable ceiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,14 +285,15 @@ pub fn fit_capacities(
     ])
 }
 
-/// The band of one observed domain. Only other processes can move a domain
-/// into `Reclaim`, since every engine claim keeps headroom above the
-/// planning reserve.
+/// The band of one observed domain. No engine claim takes headroom to the
+/// planning reserve; other programs can, and on a host that reports
+/// displacement the engine's own load can put the host in distress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryBand {
-    /// Headroom above the planning reserve.
+    /// Headroom above the planning reserve and no host distress.
     Normal,
-    /// Headroom at or below the planning reserve: pause growth and release.
+    /// Headroom at or below the planning reserve, or a host in distress:
+    /// pause growth and release.
     Reclaim,
 }
 
@@ -246,6 +311,9 @@ pub struct DomainReading {
     /// Additional bytes the engine may still claim: headroom above the
     /// planning reserve and, on Metal, the room left in the working set.
     pub ceiling_bytes: u64,
+    /// The host's distress, for a host RAM domain; a dedicated device's own
+    /// memory has none.
+    pub distress: Option<HostDistress>,
     pub band: MemoryBand,
 }
 
@@ -256,6 +324,7 @@ impl DomainReading {
         headroom_bytes: u64,
         constraint: MemoryConstraint,
         thresholds: DomainThresholds,
+        distress: Option<HostDistress>,
     ) -> Self {
         Self {
             role,
@@ -264,7 +333,8 @@ impl DomainReading {
             constraint,
             thresholds,
             ceiling_bytes: headroom_bytes.saturating_sub(thresholds.planning_bytes),
-            band: if headroom_bytes > thresholds.planning_bytes {
+            distress,
+            band: if headroom_bytes > thresholds.planning_bytes && distress.is_none() {
                 MemoryBand::Normal
             } else {
                 MemoryBand::Reclaim
@@ -321,6 +391,7 @@ fn domain_readings(
         .map(|limit| limit.remaining_bytes())
         .fold(host.headroom.bytes, u64::min);
     let host_thresholds = reserves.for_domain(host_capacity_bytes);
+    let host_distress = host_distress(host);
     let mismatched = || MemoryPolicyError::MismatchedObservation {
         device: selector.to_string(),
     };
@@ -331,6 +402,7 @@ fn domain_readings(
             host_headroom,
             MemoryConstraint::HostRam,
             host_thresholds,
+            host_distress,
         );
         return Ok(vec![match *measurements {
             // Metal's working set bounds claims on the same host domain
@@ -367,6 +439,7 @@ fn domain_readings(
             headroom,
             MemoryConstraint::DeviceLocal,
             reserves.for_domain(dedicated.capacity_bytes),
+            None,
         ),
         DomainReading::new(
             DomainRole::Staging,
@@ -374,6 +447,7 @@ fn domain_readings(
             host_headroom,
             MemoryConstraint::HostRam,
             host_thresholds,
+            host_distress,
         ),
     ])
 }
@@ -446,8 +520,8 @@ pub fn refresh_device_ceiling(
 mod tests {
     use super::*;
     use seismic::{
-        HeadroomBasis, HeadroomEstimate, HostMeasurements, LimitVisibility, ProcessLimitKind,
-        ProcessMemoryLimit,
+        HeadroomBasis, HeadroomEstimate, HostDisplacement, HostMeasurements, LimitVisibility,
+        ProcessLimitKind, ProcessMemoryLimit,
     };
     use std::time::SystemTime;
 
@@ -470,7 +544,118 @@ mod tests {
             },
             limits,
             limit_visibility: LimitVisibility::Complete,
+            displacement: None,
+            kernel_pressure: None,
         }
+    }
+
+    fn window(millis: u64, compressed: u64, decompressed: u64, swapped_out: u64) -> DisplacementWindow {
+        DisplacementWindow {
+            duration: std::time::Duration::from_millis(millis),
+            compressed_pages: compressed,
+            decompressed_pages: decompressed,
+            swapped_out_pages: swapped_out,
+            swapped_in_pages: 0,
+        }
+    }
+
+    fn displaced(
+        latest: Option<DisplacementWindow>,
+        previous: Option<DisplacementWindow>,
+    ) -> HostMemoryStatus {
+        HostMemoryStatus {
+            displacement: Some(HostDisplacement { latest, previous }),
+            kernel_pressure: Some(KernelPressure::Normal),
+            ..host(32 * GIB, Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_host_without_displacement_counters_is_never_in_distress() {
+        assert_eq!(host_distress(&host(0, Vec::new())), None);
+    }
+
+    #[test]
+    fn compression_alone_is_not_distress() {
+        // Other programs' idle data being compressed is the allowed cost of a load.
+        let compressing = displaced(Some(window(500, 1_000_000, 0, 0)), Some(window(500, 1_000_000, 0, 0)));
+        assert_eq!(host_distress(&compressing), None);
+        // Programs faulting compressed pages back without new compression is recovery.
+        let recovering = displaced(Some(window(500, 0, 1_000_000, 0)), None);
+        assert_eq!(host_distress(&recovering), None);
+    }
+
+    #[test]
+    fn thrashing_needs_both_rates_in_two_consecutive_windows() {
+        // 2,000 compressions/s and 5,000 decompressions/s over 500 ms.
+        let at_rate = window(500, 1_000, 2_500, 0);
+        let thrashing = displaced(Some(at_rate), Some(at_rate));
+        assert_eq!(host_distress(&thrashing), Some(HostDistress::Thrashing));
+        // A load's first compressions beside a burst of faults is one window.
+        assert_eq!(host_distress(&displaced(Some(at_rate), None)), None);
+        let quiet = window(500, 0, 2_500, 0);
+        assert_eq!(host_distress(&displaced(Some(at_rate), Some(quiet))), None);
+        assert_eq!(host_distress(&displaced(Some(quiet), Some(at_rate))), None);
+
+        let below_decompression = displaced(Some(window(500, 1_000, 2_499, 0)), Some(at_rate));
+        assert_eq!(host_distress(&below_decompression), None);
+        let below_compression = displaced(Some(window(500, 999, 2_500, 0)), Some(at_rate));
+        assert_eq!(host_distress(&below_compression), None);
+        // The same page counts over a longer window are a lower rate.
+        let slower = displaced(Some(window(1_000, 1_000, 2_500, 0)), Some(at_rate));
+        assert_eq!(host_distress(&slower), None);
+    }
+
+    #[test]
+    fn swapping_needs_swap_outs_in_two_consecutive_windows() {
+        let one_burst = displaced(Some(window(500, 0, 0, 40)), Some(window(500, 0, 0, 0)));
+        assert_eq!(host_distress(&one_burst), None);
+        let first_window = displaced(Some(window(500, 0, 0, 40)), None);
+        assert_eq!(host_distress(&first_window), None);
+        let ended = displaced(Some(window(500, 0, 0, 0)), Some(window(500, 0, 0, 40)));
+        assert_eq!(host_distress(&ended), None);
+        let sustained = displaced(Some(window(500, 0, 0, 1)), Some(window(500, 0, 0, 1)));
+        assert_eq!(host_distress(&sustained), Some(HostDistress::Swapping));
+    }
+
+    #[test]
+    fn critical_kernel_pressure_is_distress_without_any_window() {
+        let critical = HostMemoryStatus {
+            kernel_pressure: Some(KernelPressure::Critical),
+            ..displaced(None, None)
+        };
+        assert_eq!(host_distress(&critical), Some(HostDistress::KernelCritical));
+        let warning = HostMemoryStatus {
+            kernel_pressure: Some(KernelPressure::Warning),
+            ..displaced(None, None)
+        };
+        assert_eq!(host_distress(&warning), None);
+    }
+
+    #[test]
+    fn host_distress_puts_host_domains_in_reclaim_whatever_their_headroom() {
+        let swapping = displaced(Some(window(500, 0, 0, 1)), Some(window(500, 0, 0, 1)));
+        let host_backed = readings(&swapping, 32 * GIB, None, DeviceMeasurements::Host).unwrap();
+        assert_eq!(host_backed[0].band, MemoryBand::Reclaim);
+        assert_eq!(host_backed[0].distress, Some(HostDistress::Swapping));
+        // Headroom and ceiling are still reported as observed.
+        assert_eq!(host_backed[0].headroom_bytes, 32 * GIB);
+
+        // A dedicated device's own memory has no distress; its staging domain does.
+        let dedicated = readings(
+            &swapping,
+            32 * GIB,
+            Some(24 * GIB),
+            DeviceMeasurements::Cuda {
+                free_bytes: 20 * GIB,
+                total_bytes: 24 * GIB,
+            },
+        )
+        .unwrap();
+        assert_eq!(dedicated[0].band, MemoryBand::Normal);
+        assert_eq!(dedicated[0].distress, None);
+        assert_eq!(dedicated[1].band, MemoryBand::Reclaim);
+        assert_eq!(band_of(&dedicated), MemoryBand::Reclaim);
     }
 
     fn readings(

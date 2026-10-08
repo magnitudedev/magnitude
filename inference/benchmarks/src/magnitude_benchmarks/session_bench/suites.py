@@ -9,6 +9,7 @@ from ..fixtures.interactions import Interaction
 from ..fixtures.prose_history import Prose, ProseHistory
 from ..fixtures.records import digest
 from ..fixtures.ruler import RulerFixture
+from .policy import PROSE_OUTPUT_TOKENS
 from .sessions import Plan, Request, Section
 
 SECTIONS = {
@@ -93,7 +94,7 @@ async def compile_plan(
 
     def history_for(identity: str, index: int = 0) -> SessionInput:
         if isinstance(fixtures, Prose):
-            content = ProseHistory(fixtures, identity)
+            content = ProseHistory(fixtures, identity, output_tokens=PROSE_OUTPUT_TOKENS)
         elif isinstance(fixtures, RulerFixture):
             # Lane selection is independent of section, checkpoint and sizing search.
             content = fixtures.model_copy(update={"seed": fixtures.seed + index})
@@ -203,6 +204,10 @@ async def compile_plan(
                     current_group.append(identity)
                 previous_group = current_group
     qualification = None
+    if isinstance(fixtures, Prose) and fixtures.repeating:
+        qualification = await history_request(
+            history_for("qualification"), "warmup", "single", 0, counter, sizing_identity
+        )
     if isinstance(fixtures, RulerFixture):
         qualification = await history_request(
             history_for("qualification", 1_000_000),

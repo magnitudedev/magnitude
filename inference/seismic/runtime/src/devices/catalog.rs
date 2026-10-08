@@ -36,6 +36,8 @@ pub struct Catalog {
 struct CatalogState {
     topology: Arc<DeviceTopology>,
     opened: HashMap<DeviceId, Weak<DeviceInner>>,
+    /// Displacement windows of the host samples taken through this catalog.
+    displacement: host::DisplacementHistory,
 }
 
 impl Catalog {
@@ -44,6 +46,7 @@ impl Catalog {
             state: Mutex::new(CatalogState {
                 topology: Arc::new(inventory(0)?),
                 opened: HashMap::new(),
+                displacement: host::DisplacementHistory::default(),
             }),
         })
     }
@@ -169,8 +172,11 @@ impl Catalog {
         self.open(device.id)
     }
 
+    /// One host memory sample. Its displacement windows span the samples
+    /// taken through this catalog, so a process observes displacement only
+    /// while it keeps sampling.
     pub fn host_memory_status(&self) -> Result<HostMemoryStatus, ObservationError> {
-        host::status()
+        host::status(&mut self.state().displacement)
     }
 }
 

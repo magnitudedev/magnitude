@@ -3,7 +3,7 @@
 // model of that body (Qwen3.5-4B geometry, long contexts), on the local GPU
 // (Metal, or Vulkan elsewhere) and the CPU.
 
-use magnitude_kernels::{attention_decode, attention_prefill};
+use magnitude_kernels::{attention_append_dense, attention_decode, attention_prefill};
 use seismic::{
     BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor,
     Tensor,
@@ -368,6 +368,23 @@ fn prefill_kernel(
 
 /// The family entries' arguments of a bound case.
 macro_rules! args {
+    (attention_append_dense, $bound:expr, $case:expr) => {
+        attention_append_dense::Args {
+            key: &$bound.key,
+            value: &$bound.value,
+            key_norm: &$bound.key_norm,
+            value_norm: &$bound.value_norm,
+            rotary_components: &$bound.components,
+            rotary_frequencies: &$bound.frequencies,
+            rotary_amplitudes: &$bound.amplitudes,
+            coordinates: &$bound.coordinates,
+            destinations: &$bound.destinations,
+            history_key: &mut $bound.history_key,
+            history_value: &mut $bound.history_value,
+            epsilon: $case.epsilon,
+            slab_rows: $bound.slab_rows,
+        }
+    };
     ($module:ident, $bound:expr, $case:expr) => {
         $module::Args {
             query: &$bound.query,
@@ -1022,4 +1039,45 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
             );
         }
     }
+}
+
+
+/// State-only priming must publish the same K/V as ordinary attention,
+/// including slab boundaries and ignored destinations, without an output.
+#[test]
+fn dense_append_publishes_only_the_same_history_as_prefill() {
+    let rows = [
+        Row { spans: vec![(0, 16)], fresh: (0, 1), destination: 31, position: 16 },
+        Row { spans: vec![(0, 16)], fresh: (1, 2), destination: 32, position: 17 },
+        Row { spans: vec![(0, 16)], fresh: (2, 3), destination: -1, position: 18 },
+    ];
+    let case = Case::new(SMALL, 64, 1, &rows, 97);
+    let expected = case.expected();
+    let catalog = DeviceCatalog::discover().unwrap();
+    for backend in [BackendName::Cpu, BackendName::Metal] {
+        let Ok(device) = catalog.open_backend(backend) else { continue; };
+        let specialization = if is_cpu(&device) { cpu_statics(SMALL) }
+            else { qwen_form(statics(SMALL), SMALL) };
+        let append = attention_append_dense::native_for_device_with(
+            &device, attention_append_dense::Elements { A: Element::bf16() }, &append_specialization(&specialization),
+        ).unwrap();
+        let mut appended = Bound::new_with_slab_rows(&device, &case, 32);
+        append.call(args!(attention_append_dense, appended, case)).unwrap();
+        let mut full = Bound::new_with_slab_rows(&device, &case, 32);
+        let prefill = prefill_specializations_on(&device, SMALL, &[(16, 1)]).remove(0).1;
+        let _ = run_prefill(&prefill_kernel(&device, &prefill), &mut full, &case);
+        let actual_key = bf16_values(&appended.history_key);
+        assert_eq!(actual_key, bf16_values(&full.history_key), "{backend:?}: keys");
+        assert_eq!(bf16_values(&appended.history_value), bf16_values(&full.history_value), "{backend:?}: values");
+        for (a, e) in actual_key.iter().zip(&expected.1) {
+            assert!((a - e).abs() <= 8.0e-3 * e.abs().max(1.0), "{backend:?}: host key {a} != {e}");
+        }
+        assert_eq!(bf16_values(&appended.history_value), expected.2, "{backend:?}: host values");
+        eprintln!("{backend:?}: dense append exact prefill state; host reference agrees");
+    }
+}
+
+fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecialization {
+    specialization.statics().iter().filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U"))
+        .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(name, *value))
 }

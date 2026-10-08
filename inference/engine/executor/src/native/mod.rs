@@ -18,11 +18,10 @@ pub(crate) use attestation::{
 };
 use draft::DraftKernels;
 pub(crate) use draft::{
-    draft_readout_vocabulary, AttestedDflash2, Dflash2Kernels, Dflash2Projections,
+    AttestedDflash2, Dflash2Kernels, Dflash2Projections,
     DraftBlockKernels, MarkovKernels,
 };
 use glue::GlueKernels;
-pub(crate) use head::draft_vocabulary;
 use head::HeadKernels;
 pub use head::HeadLogitsKernels;
 pub(crate) use import::ImportKernels;
@@ -42,7 +41,8 @@ pub use tuning::pinned as pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use tuning::survey as tuning_survey;
 pub use tuning::{
-    attention_points, row_points, AdmittedErrorClasses, PointShape, TunedEntry, TuningContext,
+    attention_points, row_points, AdmittedErrorClasses, PointShape, SearchProgress, TunedEntry,
+    TuningContext,
     TuningEvent, TuningLimits, NO_ERROR_CLASSES,
     TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ZeroTuningWeights,
     ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
@@ -54,7 +54,7 @@ use crate::{
     ProgramPlan, RecurrentBinding, RoutedBinding, SublayerTail, VisionEntry,
 };
 use magnitude_kernels::{
-    attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
+    attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows, dense_expand,
     dense_output, dense_up, draft_rows, embedding_rows, gated_delta_chunk, gated_delta_project,
     gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, head_logits_rows,

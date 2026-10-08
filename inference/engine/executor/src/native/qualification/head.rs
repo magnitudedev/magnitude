@@ -10,7 +10,7 @@ impl<'a> QualificationView<'a> {
         };
         let (hidden, vocabulary) = (
             self.geometry.hidden,
-            crate::native::draft_vocabulary(self.geometry.vocabulary),
+            self.geometry.vocabulary,
         );
         for (index, (&binding, block)) in head_plan.blocks().iter().zip(&head.blocks).enumerate() {
             let label = format!("{binding:?}");

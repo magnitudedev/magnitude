@@ -650,14 +650,15 @@ fn attention_golden() {
                     // Metal's prefill also splits a kv head's query heads
                     // into groups and has the direct form, and the affine
                     // entry takes a call that lists its history row tiles
-                    // or not; the goldens are one group's staged walk of a
-                    // listing call.
+                    // or not and has the COISSUE form; the goldens are one
+                    // group's staged walk of a listing call.
                     if device.backend() == BackendName::Metal && !kind.decode() {
                         specialization = specialization
                             .with_param("HEADS", (geometry.g.next_power_of_two() as u64).min(16))
                             .with_param("DIRECT", 0);
                         if kind == Kind::PrefillK8V4 {
-                            specialization = specialization.with_static("L", 1);
+                            specialization =
+                                specialization.with_static("L", 1).with_param("COISSUE", 0);
                         }
                     }
                     // CUDA's prefill also splits key tiles; the goldens are

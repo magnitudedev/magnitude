@@ -416,7 +416,7 @@ fn json_constrained_generation_starts_with_and_without_forced_runs() {
         };
         let plan = prepared.input().constraint.as_ref().unwrap();
         let constraint = vocabulary.bind(&plan.grammar, &plan.prefix).unwrap();
-        let generation = GenerationSeed::new(
+        let mut generation = GenerationSeed::new(
             tokens.clone(),
             layout.clone(),
             options,
@@ -425,6 +425,8 @@ fn json_constrained_generation_starts_with_and_without_forced_runs() {
         .unwrap()
         .into_generation(Arc::new(Plain))
         .unwrap();
+        // The executor installs fresh numerical state before the first round.
+        generation.resume_at(None).unwrap();
         let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 64) else {
             panic!("a fresh plain generation starts a target round");
         };
@@ -493,6 +495,40 @@ fn last_message_boundary_follows_the_token_that_opens_it() {
             prepared[0].0.input().tokens[..boundary]
         );
     }
+}
+
+/// A template that renders an assistant turn in history unlike its
+/// generation prompt (here an empty reasoning block the history omits):
+/// the next turn shares the prompt through the token opening the assistant
+/// turn, short of the prompt's end, whatever the reply and next message are.
+#[test]
+fn next_turn_boundary_follows_the_last_token_the_next_turn_shares() {
+    let tokenizer = tokenizer();
+    let bundle = tagged(
+        "{% for m in messages %}<bos>{{ m.role }}: {{ m.content }}<eos>{% endfor %}<bos>assistant: <eos>think<eos>",
+    );
+    let selection = TemplateSelection::default();
+    let request = conversation("be terse", "Hello there");
+    let chat = PreparedChat::prepare(&bundle, &tokenizer, &request, &selection).unwrap();
+    let boundary = tokenizer
+        .encode("<bos>system: be terse<eos><bos>user: Hello there<eos><bos>", SpecialTokens::Recognize)
+        .unwrap()
+        .len();
+    assert!(boundary < chat.input().tokens.len());
+    assert_eq!(chat.next_turn_boundary(&bundle, &request, &selection), Some(boundary));
+    for (reply, question) in [("Hi", "And now?"), ("\u{E000}", "x")] {
+        let mut next = request.clone();
+        next.messages.push(serde_json::json!({"role": "assistant", "content": reply}));
+        next.messages.push(serde_json::json!({"role": "user", "content": question}));
+        let next = PreparedChat::prepare(&bundle, &tokenizer, &next, &selection).unwrap();
+        assert_eq!(next.input().tokens[..boundary], chat.input().tokens[..boundary]);
+        assert_ne!(next.input().tokens[boundary + 11], chat.input().tokens[boundary + 11]);
+    }
+    // A template whose history continues its generation prompt shares it
+    // whole: the boundary follows the prompt's last added token.
+    let plain = tagged(TURNS);
+    let chat = PreparedChat::prepare(&plain, &tokenizer, &request, &selection).unwrap();
+    assert_eq!(chat.next_turn_boundary(&plain, &request, &selection), Some(boundary));
 }
 
 /// An inserted sequence-start token shifts the boundary by one position.

@@ -50,6 +50,12 @@ input against its model definition before admitting it. A worker process opens e
 the host admitted (same component files and sizes and tensor directories) and carries the host's package
 identity, so both sides name one package. Live device resources remain worker-confined.
 
+A separate block drafter declares block causality independently of history
+windows. Its GGUF `dflash.attention.causal` is either BOOL (broadcast to all draft
+layers) or ARRAY<BOOL> with exactly one element per layer. No sliding-window or
+model-name heuristic supplies omitted semantics. Interpretation normalizes this
+once to per-layer block attention; execution consumes only that normalized model.
+
 ## Acceptance criteria
 
 - Artifact output contains no model-family numerical controls.

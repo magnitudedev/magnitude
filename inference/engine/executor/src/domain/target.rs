@@ -97,8 +97,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Draft `prime` behind `work` (whose lone slot is its prompt chunk),
-    /// conditioned by the step's feature output on the device. `work` is on
-    /// the device, so every error is fatal.
+    /// conditioned by the step's feature output on the device, in the
+    /// drafter's form: a block drafter's rows inject, a chained head's rows
+    /// run its entry pass over the head history. `work` is on the device, so
+    /// every error is fatal.
     pub(super) fn launch_priming(
         &mut self,
         mut work: TargetWork<F>,
@@ -119,15 +121,32 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .head_store
             .clone()
             .ok_or_else(|| DomainError::invariant("a drafter entry without a drafter store"))?;
-        let slot = self
-            .block_slot(&prime.tokens, prime.position, &[], &advance, 0)
-            .map_err(DomainError::invariant)?;
-        let batch = crate::batching::ValidatedHeadBatch::from_block_slots(
-            &[slot],
-            self.definition.decoder.vocabulary as usize,
-            self.head_class_limits()?,
-        )
-        .map_err(|error| DomainError::invariant(error.to_string()))?;
+        let vocabulary = self.definition.decoder.vocabulary as usize;
+        let class_limits = self.head_class_limits()?;
+        let batch = match self.execution.policy().method().draft_form() {
+            Some(crate::DraftForm::Block) => self
+                .block_slot(&prime.tokens, prime.position, &[], &advance, 0)
+                .and_then(|slot| {
+                    crate::batching::ValidatedHeadBatch::from_block_slots(
+                        &[slot],
+                        vocabulary,
+                        class_limits,
+                    )
+                    .map_err(|error| error.to_string())
+                }),
+            Some(crate::DraftForm::Chained) => self
+                .head_slot(request, &prime.tokens, prime.position, &[], &advance, 0)
+                .and_then(|slot| {
+                    crate::batching::ValidatedHeadBatch::from_slots(
+                        &[slot],
+                        vocabulary,
+                        class_limits,
+                    )
+                    .map_err(|error| error.to_string())
+                }),
+            None => Err("a drafter entry without a drafting method".into()),
+        }
+        .map_err(DomainError::invariant)?;
         // Entry rows every window drops before the first draft skip the
         // windowed layers (see `submit_head`).
         let windowed = super::head::skippable_window(&store).is_none_or(|window| {

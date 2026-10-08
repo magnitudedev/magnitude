@@ -14,17 +14,22 @@ use magnitude_batching::Demand;
 use magnitude_executor::{
     memory::{ClaimId, HoldingClass},
     platform::{self, DomainRole, OpenedPlatform, PlatformConfig, PlatformError},
+    require_normal,
     AttestedPrograms, ExecutionPlanDraft, ClaimRefusal, ComponentLoader, DeviceHeap, ExecutorDomain, KernelCache,
-    Operation, RequestId, ReservedResources, ResidencyStore, ResourceAllocator, ResourceCapacity,
-    ResourceDomainId, ResourcePlan, ResourcePlanner, StateBindings, TokenId, TuningContext,
-    TuningEvent,
-    TuningObserver, TuningOrigin, WorkKind, DEFAULT_KERNEL_CACHE_BYTES,
+    Operation, RequestId, ReservedResources, ResidencyError, ResidencyStore, ResourceAllocator,
+    ResourceCapacity, ResourceDomainId, ResourcePlan, ResourcePlanner, StateBindings, TokenId,
+    TuningContext, TuningEvent,
+    TuningObserver, TuningOrigin, WeightImportError, WorkKind, DEFAULT_KERNEL_CACHE_BYTES,
 };
 use magnitude_family_contracts::{InputLayout, PreparedModelInput, TokenPlan};
 use seismic::{BackendName, DeviceCatalog, DeviceMemory, DeviceSelector, MemoryPoolKind};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How often a weight import observes its memory domains' band. The import
+/// runs under one claim for as long as the weights take to become resident.
+const IMPORT_OBSERVATION_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A constructed executor domain with the facts readiness reports.
 pub(crate) struct NativeDomain {
@@ -300,8 +305,9 @@ pub(crate) fn build(
     let state_graphs = programs
         .state_graphs()
         .ok_or_else(|| internal("qualified program set has no state graphs"))?;
+    let catalog = Rc::new(catalog);
     let mut startup = StartupClaims {
-        heap: DeviceHeap::open(catalog, reserves, device.clone())
+        heap: DeviceHeap::open(catalog.clone(), reserves, device.clone())
             .map_err(|error| platform_error(PlatformError::Memory(error)))?,
         allocation_domain: MemoryDomain::of(device_selector, pool),
         held: None,
@@ -343,6 +349,8 @@ pub(crate) fn build(
     )?;
     startup.claim("target import", target_peak, target_upload)?;
     let import_progress = progress.clone();
+    let import_device = device.clone();
+    let mut band_observed = Instant::now();
     let target = residency
         .load_target(
             &manifest.definition,
@@ -351,10 +359,20 @@ pub(crate) fn build(
                 import_progress(LoadProgress::ImportingWeights {
                     completed_bytes,
                     total_bytes,
-                })
+                });
+                if band_observed.elapsed() >= IMPORT_OBSERVATION_INTERVAL {
+                    band_observed = Instant::now();
+                    require_normal(&catalog, &import_device, &reserves)?;
+                }
+                Ok(())
             }),
         )
-        .map_err(|error| internal(error.to_string()))?;
+        .map_err(|error| match error {
+            ResidencyError::Import(WeightImportError::Refused(refusal)) => {
+                startup.refusal("target import", refusal)
+            }
+            error => internal(error.to_string()),
+        })?;
     eprintln!(
         "magnitude-engine: resident target imported in {:.2} s ({} distinct weights)",
         phase_started.elapsed().as_secs_f64(),
@@ -475,12 +493,7 @@ impl StartupClaims {
         let claim = self
             .heap
             .claim(allocation, staged, HoldingClass::Model)
-            .map_err(|refusal| {
-                self.refusal(purpose, refusal, |role| match role {
-                    DomainRole::Allocation => allocation,
-                    DomainRole::Staging => staged,
-                })
-            })?;
+            .map_err(|refusal| self.refusal(purpose, refusal))?;
         self.held = Some(claim);
         Ok(())
     }
@@ -493,28 +506,22 @@ impl StartupClaims {
         }
         self.heap
             .hold_host_table(bytes)
-            .map_err(|refusal| self.refusal("host tables", refusal, |_| bytes))
+            .map_err(|refusal| self.refusal("host tables", refusal))
     }
 
-    fn refusal(
-        &self,
-        purpose: &str,
-        refusal: ClaimRefusal,
-        required: impl Fn(DomainRole) -> u64,
-    ) -> LoadError {
+    fn refusal(&self, purpose: &str, refusal: ClaimRefusal) -> LoadError {
         let domain = |role: DomainRole| match role {
             DomainRole::Allocation => self.allocation_domain,
             DomainRole::Staging => MemoryDomain::HostRam,
         };
         match refusal {
             ClaimRefusal::Blind(error) => platform_error(PlatformError::Memory(error)),
-            ClaimRefusal::Reclaim { role } => LoadError::InsufficientMemory {
-                purpose: format!("{purpose} (memory at or below the planning reserve)"),
-                domain: domain(role),
-                memory: InsufficientMemory {
-                    required: required(role),
-                    available: 0,
+            ClaimRefusal::Reclaim { role, distress } => LoadError::MemoryPressure {
+                purpose: match distress {
+                    Some(distress) => format!("{purpose} ({distress})"),
+                    None => format!("{purpose} (memory at or below the planning reserve)"),
                 },
+                domain: domain(role),
             },
             ClaimRefusal::Deficit {
                 role,
@@ -628,19 +635,82 @@ impl TuningObserver for TuningReport {
             TuningEvent::Started {
                 entry,
                 bindings,
-                configurations,
                 points,
-            } => eprintln!(
-                "magnitude-engine: tuning {entry} [{bindings}]: {configurations} configurations at {points} points"
-            ),
+            } => eprintln!("magnitude-engine: tuning {entry} [{bindings}] at {points} points"),
+            TuningEvent::Planned(plan) => {
+                for start in &plan.starts {
+                    let given = match start.forms {
+                        Some(true) => "defaults and form starts".to_owned(),
+                        Some(false) => format!(
+                            "defaults only (with form starts {:.2} s did not fit)",
+                            start.with_forms_seconds
+                        ),
+                        None => "not started (its defaults did not fit)".to_owned(),
+                    };
+                    eprintln!(
+                        "magnitude-engine: tuning plan: start {} [{}], share {:.1}%: {given}; estimated {:.2} s of {:.2} s available, took {:.2} s{}",
+                        start.entry,
+                        start.bindings,
+                        start.share * 100.0,
+                        start.estimated_seconds,
+                        start.available_seconds,
+                        start.actual_seconds,
+                        if start.cut { "; CUT at its limit" } else { "" }
+                    );
+                }
+                eprintln!(
+                    "magnitude-engine: tuning plan: starts ended at {:.2} s, refinement ({} slices) at {:.2} s with {:.2} s reserved for conclusions, conclusions at {:.2} s",
+                    plan.started_seconds,
+                    plan.slices,
+                    plan.refined_seconds,
+                    plan.reserved_seconds,
+                    plan.concluded_seconds
+                );
+                for (unit, step, seconds) in &plan.overruns {
+                    eprintln!(
+                        "magnitude-engine: tuning plan: the {step} of {unit} ended {seconds:.2} s after its limit"
+                    );
+                }
+            }
             TuningEvent::Finished(tuned) => {
                 let origin = match (tuned.origin, tuned.search) {
                     (TuningOrigin::Stored, _) => "stored".to_owned(),
                     (TuningOrigin::Searched, Some((allowance, stop))) => {
                         format!("budget {:.2} s, stop {stop:?}", allowance.as_secs_f64())
                     }
+                    (TuningOrigin::Searched, None) if tuned.progress.is_some() => {
+                        "not searched".to_owned()
+                    }
                     (TuningOrigin::Searched, None) => "surveyed".to_owned(),
                 };
+                // How far the unit's search got: reported here, not stored.
+                if let Some(progress) = &tuned.progress {
+                    let start = progress.start.map_or("not started".to_owned(), |(seconds, programs)| {
+                        format!("started in {seconds:.2} s with {programs} programs formed")
+                    });
+                    let search = progress.standing.map_or(String::new(), |standing| {
+                        format!(
+                            "; search {}: {} of {} configurations, {} of {} programs formed, best {:.3} of the defaults",
+                            if standing.finished { "complete" } else { "partial" },
+                            standing.measured,
+                            standing.admissible,
+                            standing.programs,
+                            standing.declared_programs,
+                            standing.cost
+                        )
+                    });
+                    eprintln!(
+                        "magnitude-engine: searched {} [{}]: share {:.1}% of step time; {start}{search}; building {:.2} s, references {:.2} s, forming {:.2} s, measuring {:.2} s, validating {:.2} s",
+                        tuned.entry,
+                        tuned.bindings,
+                        progress.share * 100.0,
+                        tuned.time.building_seconds,
+                        tuned.time.reference_seconds,
+                        tuned.time.forming_seconds,
+                        tuned.time.measuring_seconds,
+                        tuned.time.validating_seconds
+                    );
+                }
                 eprintln!(
                     "magnitude-engine: tuned {} [{}] in {:.2} s ({origin}): {:?} ({} measured, {} excluded, {} qualification rejections)",
                     tuned.entry,

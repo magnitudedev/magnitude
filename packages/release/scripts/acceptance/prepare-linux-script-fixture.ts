@@ -4,6 +4,7 @@ import { Effect, Schema } from "effect"
 import { generateKeyPairSync } from "node:crypto"
 import { join, resolve } from "node:path"
 import { sha256File } from "../../src/macos-app"
+import { LinuxPackageFormat, linuxPackageExtension } from "../../src/linux-package"
 import { UpdateManifest, signUpdateManifest } from "../../src/hosted-update/manifest"
 import { writeInstallationDistribution } from "../build/installation-distribution"
 
@@ -13,8 +14,8 @@ const run = Effect.gen(function* () {
   if (!artifactInput || !outputInput || !version || process.platform !== "linux") return yield* new AcceptanceFixtureFailed({ message: "Usage: prepare-linux-script-fixture.ts PACKAGE OUTPUT VERSION (on Linux)" })
   const artifact = resolve(artifactInput), output = resolve(outputInput)
   const fs = yield* FileSystem.FileSystem
-  const packageType = artifact.endsWith(".deb") ? "deb" : artifact.endsWith(".rpm") ? "rpm" : undefined
-  if (!packageType) return yield* new AcceptanceFixtureFailed({ message: "Expected a DEB or RPM package" })
+  const packageType = LinuxPackageFormat.literals.find(format => artifact.endsWith(linuxPackageExtension(format)))
+  if (!packageType) return yield* new AcceptanceFixtureFailed({ message: "Expected a DEB, RPM or pacman package" })
   const arch = yield* Schema.decodeUnknown(Schema.Literal("arm64", "x64"))(process.arch)
   const filename = `magnitude.${packageType}`
   const manifest = yield* Schema.decodeUnknown(UpdateManifest)({ protocol: 1, version, tag: `@magnitudedev/cli@${version}`, commit: "a".repeat(40),

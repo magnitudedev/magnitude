@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::{FutureExt as _, StreamExt as _};
-use magnitude_engine::census::MemoryDomain;
 use magnitude_engine::composition::{ReadinessMismatch, ReadyEngine};
 use magnitude_engine::error::{LoadError, PreviewError};
 use magnitude_engine::host::HostArtifacts;
@@ -23,7 +22,7 @@ use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation};
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
-    InstalledModelPackages as _, ModelId, ModelInstance, ModelInstanceId,
+    InstalledModelPackages as _, MemoryShortage, ModelId, ModelInstance, ModelInstanceId,
     ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan,
     ModelLoadStage, ModelPackageId, ModelServingConfiguration,
 };
@@ -32,13 +31,13 @@ use magnitude_service_models::{
     ManagedModelStore, ModelDomainResolver, serving_configuration_fingerprint,
     servable_model_bundle_key_for_bundle,
 };
-use seismic::{DeviceCatalog, DeviceMemory};
+use seismic::DeviceCatalog;
 
 use super::optimization::{self, PreparationJobs};
 use super::supervisor::{HostMemoryObserver, MemorySupervisor};
 use super::worker::EngineWorker;
 use super::{
-    LoadingObserver, LowMemory, ModelOperationFailure, ModelResidency, ModelResidencyDriver,
+    LoadingObserver, ModelOperationFailure, ModelResidency, ModelResidencyDriver,
     PreparedResidency, ReleaseControl, ResidencyAcquisition, ResidencyClient, ResidencyGrant,
     ResidencyLease, ResidencyNotification, ResidencyWorker, ResolvedResidencyTarget,
 };
@@ -369,23 +368,19 @@ fn preview_failure(error: PreviewError) -> ModelOperationFailure {
     ModelOperationFailure::new(code, error.to_string(), retryable)
 }
 
-/// A worker's load failure. Insufficient memory names the planning reserve of the domain whose
-/// claim failed, the line every engine claim keeps above.
-fn load_failure(
-    error: LoadError,
-    catalog: &DeviceCatalog,
-    reserves: &MemoryReserves,
-    worker: &EngineWorker,
-) -> ModelOperationFailure {
+/// A worker's load failure. A memory refusal is a shortage: blocked by the bytes the engine's
+/// claim found available above the domain's reserve, or under pressure with no byte count.
+fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailure {
     let retryable = error.retryable();
     let code = match &error {
-        LoadError::InsufficientMemory { domain, memory, .. } => {
-            let planning_reserve_bytes = planning_reserve(catalog, domain, reserves);
-            return ModelOperationFailure::LowMemory(LowMemory {
-                required_memory_bytes: memory.required,
-                allocation_headroom_bytes: memory.available.saturating_add(planning_reserve_bytes),
-                system_reserve_bytes: planning_reserve_bytes,
+        LoadError::InsufficientMemory { memory, .. } => {
+            return ModelOperationFailure::MemoryShortage(MemoryShortage::Blocked {
+                required_bytes: memory.required,
+                available_bytes: memory.available,
             });
+        }
+        LoadError::MemoryPressure { .. } => {
+            return ModelOperationFailure::MemoryShortage(MemoryShortage::UnderPressure {});
         }
         LoadError::Artifact(_) => "invalid_model_package",
         LoadError::Unsupported(_) => "unsupported_model",
@@ -403,34 +398,6 @@ fn load_failure(
         _ => error.to_string(),
     };
     ModelOperationFailure::new(code, message, retryable)
-}
-
-/// The planning reserve of a memory domain the worker claimed from.
-fn planning_reserve(catalog: &DeviceCatalog, domain: &MemoryDomain, reserves: &MemoryReserves) -> u64 {
-    let topology = catalog.topology();
-    let device = match domain {
-        MemoryDomain::HostRam => {
-            return reserves.for_domain(topology.host_pool().capacity_bytes).planning_bytes;
-        }
-        MemoryDomain::DeviceLocal { device } => *device,
-    };
-    let info = topology
-        .devices()
-        .iter()
-        .find(|info| info.selector == device)
-        .expect("a previewed device is in the catalog it was previewed on");
-    let capacity = match &info.memory {
-        DeviceMemory::Established(memory) => {
-            topology
-                .pool(memory.allocation_pool)
-                .expect("a device's pools belong to its topology")
-                .capacity_bytes
-        }
-        DeviceMemory::Unsupported { .. } => {
-            unreachable!("a previewed device has established memory")
-        }
-    };
-    reserves.for_domain(capacity).planning_bytes
 }
 
 /// The share of a tuning load's fraction that tuning fills; weight import fills the rest, or all
@@ -564,7 +531,7 @@ impl EngineResidency {
             )
         })?;
         let (worker, connection) = connected.map_err(|(worker, error)| {
-            load_failure(error, &environment.catalog, &environment.reserves, &worker)
+            load_failure(error, &worker)
         })?;
 
         // The worker read its own package: it must agree with the host's resolution on the

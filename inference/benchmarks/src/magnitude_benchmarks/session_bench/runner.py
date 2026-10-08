@@ -326,7 +326,7 @@ async def run(
                 )
             for request in plan.prepared_requests:
                 store.append("requests.jsonl", request.model_dump(mode="json"))
-            blocks = max(2, len(targets)) * repeat
+            blocks = options.schedule.blocks(len(targets), repeat)
             order = [
                 targets[i % len(targets) :] + targets[: i % len(targets)] for i in range(blocks)
             ]

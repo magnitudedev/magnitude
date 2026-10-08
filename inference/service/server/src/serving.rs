@@ -136,12 +136,12 @@ mod tests {
         );
         assert_eq!(
             unavailable(InventoryError::ModelOperation {
-                code: "low_memory".to_owned(),
+                code: "memory_shortage".to_owned(),
                 message: "short".to_owned(),
                 retryable: true,
             }),
             ServingError::Model(ModelUnavailable::Operation {
-                code: "low_memory".to_owned(),
+                code: "memory_shortage".to_owned(),
                 message: "short".to_owned(),
                 retryable: true,
             })

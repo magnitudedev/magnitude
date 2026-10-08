@@ -1,30 +1,32 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
-import { LowMemoryModelInstanceFailureSchema, LocalModelMutationFailed } from "@magnitudedev/sdk"
+import { MemoryShortageModelInstanceFailureSchema, LocalModelMutationFailed } from "@magnitudedev/sdk"
 import { Option, Schema } from "effect"
 import { ModelLoadFailureIndicator, ModelLoadNotice, downloadNotice, modelCommandNotice, modelRemovalNotice } from "./model-error"
 import { ErrorNotice, NoticeAction } from "./error-notice"
 
-const memory = Schema.decodeUnknownSync(LowMemoryModelInstanceFailureSchema)({
-  _tag: "LowMemory", code: "low_memory", message: "PRIVATE worker diagnostics 32358673408 bytes", retryable: true,
-  requiredMemoryBytes: 32358673408, systemReserveBytes: 6871947673,
-  allocationHeadroomBytes: 33741848576, loadBoundaryBytes: 26869900903,
-  minimumAdditionalAvailableBytes: 5488772506,
+const shortage = (value: unknown) => Schema.decodeUnknownSync(MemoryShortageModelInstanceFailureSchema)({
+  _tag: "MemoryShortage", code: "memory_shortage", message: "PRIVATE worker diagnostics 32358673408 bytes", retryable: true,
+  shortage: value,
 })
+const memory = shortage({ _tag: "Blocked", requiredBytes: 32358673408, availableBytes: 26869900903 })
 describe("desktop failure presentation", () => {
-  it("uses authoritative memory quantities and rounds required memory upward", () => {
+  it("states a blocked load in one sentence with the required memory rounded upward", () => {
     const html = renderToStaticMarkup(<ModelLoadNotice failure={memory} />)
-    expect(html).toContain("Free up 5.2 GB")
-    expect(html).toContain("30.2 GB")
-    expect(html).toContain("6.4 GB")
-    expect(html).toContain("31.4 GB")
-    expect(html).toContain("Memory breakdown")
-    expect(html).not.toMatch(/PRIVATE|bytes|32358673408|title=/)
+    expect(html).toContain("Not enough memory right now")
+    expect(html).toContain("This model needs 30.2 GB and 25 GB is available.")
+    expect(html).not.toMatch(/PRIVATE|bytes|32358673408|title=|<details/)
     expect(html.match(/role="alert"/g)).toHaveLength(1)
+  })
+  it("states a load stopped under pressure without any byte figure", () => {
+    const html = renderToStaticMarkup(<ModelLoadNotice failure={shortage({ _tag: "UnderPressure" })} />)
+    expect(html).toContain("Not enough memory right now")
+    expect(html).toContain("Loading stopped because your computer ran low on memory.")
+    expect(html).not.toMatch(/PRIVATE|bytes|\d GB/)
   })
   it("marks a failed row with a labelled amber indicator instead of an alert", () => {
     const html = renderToStaticMarkup(<ModelLoadFailureIndicator failure={memory} />)
-    expect(html).toContain('aria-label="Not enough memory to load this model"')
+    expect(html).toContain('aria-label="Not enough memory right now"')
     expect(html).toContain("text-amber-500")
     expect(html).not.toMatch(/role="alert"|PRIVATE|bytes|32358673408/)
   })

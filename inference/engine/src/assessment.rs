@@ -9,22 +9,24 @@
 //! template and reasoning inspection over header metadata. No device is
 //! opened, no weight payload is read and nothing is decoded.
 
-use crate::error::{classify_catalog, classify_graph, classify_plan, PlanOutcome, UnsupportedModel};
+use crate::error::{
+    classify_catalog, classify_graph, classify_plan, PlanOutcome, UnsupportedModel,
+};
 use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy};
-use crate::planning::{ExecutionPlanningError, plan_backend, plan_execution};
+use crate::planning::{plan_backend, plan_execution, ExecutionPlanningError};
 use magnitude_artifacts::PackageHeaders;
 use magnitude_chat::{
-    TemplateInspection,
     artifacts::{gguf_templates, gguf_tokenizer_vocabulary},
+    TemplateInspection,
 };
 use magnitude_executor::{
-    ExecutionPath, ExecutionPlanDraft,
     assessment::{
+        finish_execution_assessment, prepare_execution_assessment, resolve_bandwidth,
         AssessmentError, AssessmentRequest, DeviceBandwidth, ExecutionAssessment,
-        PreparedExecutionAssessment, finish_execution_assessment, prepare_execution_assessment,
-        resolve_bandwidth,
+        PreparedExecutionAssessment,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
+    ExecutionPath, ExecutionPlanDraft,
 };
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_scheduler::ServiceLimits;
@@ -125,6 +127,8 @@ pub struct ModelCapabilities {
 /// Host-side model facts established from headers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelFacts {
+    /// Why an optional separate drafter was disabled; target admission still succeeded.
+    pub draft_unavailable: Option<String>,
     pub capabilities: ModelCapabilities,
     /// [`magnitude_chat::TemplateInspection::fingerprint`] of the package's
     /// chat templates and reasoning profile.
@@ -363,10 +367,10 @@ fn resolve_package(
         Ok(family) => family,
         Err(unsupported) => return Ok(ResolvedPackage::Unsupported(unsupported)),
     };
-    let definition = match family
+    let admitted = match family
         .inspect(headers.target(), headers.projector(), headers.identity())
         .map_err(|error| error.0)
-        .and_then(|declared| crate::host::bind_draft(family, declared, headers.draft()))
+        .map(|declared| crate::host::bind_draft(family, declared, headers.draft()))
     {
         Ok(definition) => definition,
         Err(reason) => {
@@ -375,12 +379,14 @@ fn resolve_package(
             ));
         }
     };
+    let definition = admitted.definition;
     let context_limit = u32::try_from(definition.decoder.context_limit)
         .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
-    let facts = match model_facts(&headers, package, &definition, context_limit) {
+    let mut facts = match model_facts(&headers, package, &definition, context_limit) {
         Ok(facts) => facts,
         Err(unsupported) => return Ok(ResolvedPackage::Unsupported(unsupported)),
     };
+    facts.draft_unavailable = admitted.draft_unavailable.as_ref().map(ToString::to_string);
     let policy = ModelPolicy {
         method: package.method,
         ..policy.clone()
@@ -388,7 +394,7 @@ fn resolve_package(
     // A method the package cannot run (a declared draft of another variant)
     // is an invalid configuration of the bundle, as it is for a load.
     let model = policy
-        .resolve(&definition)
+        .resolve_admitted(&definition, admitted.draft_unavailable.as_ref())
         .map_err(ModelAssessmentError::Configuration)?;
     let manifest = ExecutionManifest::new(
         headers.manifest(),
@@ -414,6 +420,7 @@ fn model_facts(
 ) -> Result<ModelFacts, UnsupportedModel> {
     let chat = inspect_chat(headers, package, definition)?;
     Ok(ModelFacts {
+        draft_unavailable: None,
         capabilities: ModelCapabilities {
             vision: definition.vision.is_some(),
             tools: chat.tools,

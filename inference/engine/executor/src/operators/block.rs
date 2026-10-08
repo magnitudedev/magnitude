@@ -317,8 +317,8 @@ impl BlockSublayers<'_> {
                     BlockStatePorts::Attention(ports.planes),
                     BlockControlPorts::Attention {
                         coordinates: controls.coordinates,
-                        visible: controls.visible,
-                        fresh: controls.fresh,
+                        visible: controls.visible.ok_or("attention visibility is absent")?,
+                        fresh: controls.fresh.ok_or("attention fresh rows are absent")?,
                         destinations: controls.destinations,
                         history_tiles: controls.history_tiles,
                     },

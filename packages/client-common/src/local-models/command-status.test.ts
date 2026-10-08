@@ -5,12 +5,12 @@ import { localModelCommandStatus, localModelCommandFailure, type LocalModelComma
 import { makeSetupModel } from "../application/fixtures/model"
 const first = CatalogFormModelIdSchema.make("first:gguf:q4")
 const second = CatalogFormModelIdSchema.make("second:gguf:q4")
-const failure = (operation: LocalModelCommand, code = "low_memory") => localModelCommandFailure(operation, Cause.fail(new LocalModelMutationFailed({ code, message: "private diagnostics", retryable: true })))
+const failure = (operation: LocalModelCommand, code = "memory_shortage") => localModelCommandFailure(operation, Cause.fail(new LocalModelMutationFailed({ code, message: "private diagnostics", retryable: true })))
 const observation = (operation: LocalModelCommand, pending = false, modelId = first) => ({ modelId, operation, pending, failure: pending ? Option.none() : Option.some(failure(operation)) })
 const empty = { pending: false, pendingOperations: [], failures: [] }
 describe("model-specific command feedback", () => {
   it("preserves structured rejection facts and does not treat unknown errors as classified failures", () => {
-    expect(Option.getOrThrow(failure("load").rejection).code).toBe("low_memory")
+    expect(Option.getOrThrow(failure("load").rejection).code).toBe("memory_shortage")
     for (const cause of [Cause.die("private diagnostics"), Cause.interrupt(FiberId.none), Cause.fail(new Error("private diagnostics"))]) {
       expect(localModelCommandFailure("load", cause)).toEqual({ operation: "load", rejection: Option.none() })
     }
@@ -40,7 +40,7 @@ describe("model-specific command feedback", () => {
   })
   it("prefers an authoritative load failure only for the matching rejection category", () => {
     const base = makeSetupModel(true)
-    const model = { ...base, modelId: first, acquisitionState: { ...base.acquisitionState, residencyState: { _tag: "Failed" as const, failure: { code: "low_memory", message: "native message", retryable: true } } } }
+    const model = { ...base, modelId: first, acquisitionState: { ...base.acquisitionState, residencyState: { _tag: "Failed" as const, failure: { code: "memory_shortage", message: "native message", retryable: true } } } }
     expect(localModelCommandStatus(first, [[observation("load")]], Option.some(model))).toEqual(empty)
     const transport = { ...observation("load"), failure: Option.some(failure("load", "model_load_transport_failed")) }
     expect(localModelCommandStatus(first, [[transport]], Option.some(model)).failures).toEqual([failure("load", "model_load_transport_failed")])

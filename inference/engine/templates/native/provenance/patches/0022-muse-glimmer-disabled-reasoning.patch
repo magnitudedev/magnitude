@@ -1,0 +1,50 @@
+--- a/common/parsers/muse-glimmer.cpp
++++ b/common/parsers/muse-glimmer.cpp
+@@ -11,7 +11,27 @@ common_chat_params common_chat_params_init_muse_glimme
+                                                                const autoparser::generation_params & inputs) {
+     common_chat_params data;
+ 
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
++    auto has_tools = inputs.tools.is_array() && !inputs.tools.empty();
++    // Constrained grammar whenever tools are offered.
++    auto include_grammar = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
++
++    // The template has no reasoning switch. Its two controls are the reasoning
++    // strength written into the system message and the recipient the model
++    // itself chooses after "<|start|>assistant" (to=self reasons, to=user
++    // answers). Disabled reasoning sets the strength to none unless the request
++    // names one, and opens the answer to the user. With callable tools the
++    // recipient stays the model's choice, because a tool call is addressed the
++    // same way.
++    auto reasoning_disabled = inputs.enable_thinking.has_value() && !*inputs.enable_thinking;
++    auto names_strength     = inputs.extra_context.is_object() &&
++                              (inputs.extra_context.contains("reasoning_effort") ||
++                               inputs.extra_context.contains("reasoning_strength"));
++    std::optional<json> additional_context;
++    if (reasoning_disabled && !names_strength) {
++        additional_context = json{ { "reasoning_strength", "none" } };
++    }
++
++    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, additional_context);
+     data.generation_prompt = "<|start|>assistant";
+     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+     data.supports_thinking = true;
+@@ -39,14 +59,14 @@ common_chat_params common_chat_params_init_muse_glimme
+         }
+ 
+         data.prompt += data.generation_prompt;
++    } else if (reasoning_disabled && !include_grammar) {
++        const std::string recipient = " to=user<|message|>";
++        data.generation_prompt += recipient;
++        data.prompt            += recipient;
+     }
+ 
+     auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+ 
+-    auto has_tools = inputs.tools.is_array() && !inputs.tools.empty();
+-    // Constrained grammar whenever tools are offered.
+-    auto include_grammar = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+-
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+         auto start = p.rule("start", p.literal("<|start|>assistant"));
+ 

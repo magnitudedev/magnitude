@@ -5,11 +5,13 @@
 //! system-RAM headroom through Seismic in the service process, every 100 ms while a worker is
 //! resident and every second otherwise:
 //!
-//! - the first sample at or below the emergency reserve `E` kills the resident worker;
+//! - the first sample at or below the emergency reserve `E`, or at critical kernel memory
+//!   pressure, kills the resident worker;
 //! - one continuous second of failed observation while resident fails the worker;
 //! - an engine unload for memory pressure and a kill both release the instance as
-//!   `memory_pressure` and close load admission until headroom has stayed above the planning
-//!   reserve `P` for five seconds (any failed sample restarts that wait). Nothing reloads.
+//!   `memory_pressure` and close load admission until the host has stayed out of distress with
+//!   headroom above the planning reserve `P` for five seconds (any failed sample restarts that
+//!   wait). Nothing reloads.
 //!
 //! It also watches the resident worker for exit and unload and publishes its census.
 
@@ -20,7 +22,7 @@ use futures_util::future::BoxFuture;
 use magnitude_engine::error::{RequestError, UnloadCause};
 use magnitude_engine::worker::EngineClient;
 use magnitude_engine::worker::protocol::MemoryObservation;
-use magnitude_executor::platform::DomainThresholds;
+use magnitude_executor::platform::{DomainThresholds, HostDistress, host_distress};
 use magnitude_service_contracts::models::{ModelInstanceId, ModelReleaseReason};
 use seismic::{DeviceCatalog, DeviceTopology};
 use tokio::time::Instant;
@@ -38,13 +40,20 @@ const CENSUS_INTERVAL: Duration = Duration::from_secs(1);
 /// The failure code of a load refused while memory has not recovered.
 pub const MEMORY_PRESSURE_FAILURE_CODE: &str = "memory_pressure";
 
-/// System-RAM headroom: Seismic's platform estimate bounded by the room left under every
-/// process limit.
-pub trait HostMemoryObserver: Send + Sync + 'static {
-    fn headroom_bytes(&self) -> Result<u64, String>;
+/// One sample of system RAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostMemorySample {
+    /// Seismic's platform estimate bounded by the room left under every process limit.
+    pub headroom_bytes: u64,
+    /// The host's distress, on a platform that reports displacement.
+    pub distress: Option<HostDistress>,
 }
 
-/// Host headroom observed through the service's own device catalog.
+pub trait HostMemoryObserver: Send + Sync + 'static {
+    fn sample(&self) -> Result<HostMemorySample, String>;
+}
+
+/// System RAM observed through the service's own device catalog.
 pub struct SeismicHostMemory {
     catalog: Arc<DeviceCatalog>,
 }
@@ -56,16 +65,19 @@ impl SeismicHostMemory {
 }
 
 impl HostMemoryObserver for SeismicHostMemory {
-    fn headroom_bytes(&self) -> Result<u64, String> {
+    fn sample(&self) -> Result<HostMemorySample, String> {
         let status = self
             .catalog
             .host_memory_status()
             .map_err(|error| error.to_string())?;
-        Ok(status
-            .limits
-            .iter()
-            .map(|limit| limit.remaining_bytes())
-            .fold(status.headroom.bytes, u64::min))
+        Ok(HostMemorySample {
+            headroom_bytes: status
+                .limits
+                .iter()
+                .map(|limit| limit.remaining_bytes())
+                .fold(status.headroom.bytes, u64::min),
+            distress: host_distress(&status),
+        })
     }
 }
 
@@ -96,7 +108,8 @@ struct Supervised {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Admission {
     Open,
-    /// Closed by memory pressure; open again once headroom has stayed above `P` since `since`.
+    /// Closed by memory pressure; open again once the host has stayed out of distress with
+    /// headroom above `P` since `since`.
     Recovering { above_planning_since: Option<Instant> },
 }
 
@@ -214,24 +227,33 @@ impl Inner {
     /// One supervision step at `now`: worker outcome first, then one host sample.
     fn tick(&self, now: Instant) {
         self.check_worker();
-        let sample = self.observer.headroom_bytes();
+        let sample = self.observer.sample();
         let mut state = self.lock();
         match sample {
-            Ok(headroom) => {
+            Ok(HostMemorySample {
+                headroom_bytes: headroom,
+                distress,
+            }) => {
                 state.observation_failed_since = None;
-                if headroom <= self.thresholds.emergency_bytes
+                let emergency = if headroom <= self.thresholds.emergency_bytes {
+                    Some("system memory headroom reached the emergency reserve")
+                } else if distress == Some(HostDistress::KernelCritical) {
+                    Some("the kernel reports critical memory pressure")
+                } else {
+                    None
+                };
+                if let Some(reason) = emergency
                     && let Some(supervised) = state.supervised.take()
                 {
                     tracing::warn!(
                         memory.headroom_bytes = headroom,
                         memory.emergency_bytes = self.thresholds.emergency_bytes,
                         worker.pid = supervised.worker.pid(),
-                        "killing the inference worker: system memory headroom reached the emergency reserve"
+                        "killing the inference worker: {reason}"
                     );
-                    supervised.worker.terminate(
-                        MEMORY_PRESSURE_FAILURE_CODE,
-                        "system memory headroom reached the emergency reserve",
-                    );
+                    supervised
+                        .worker
+                        .terminate(MEMORY_PRESSURE_FAILURE_CODE, reason);
                     self.notifier.send(ResidencyNotification::ReleaseRequested {
                         instance_id: supervised.instance_id,
                         reason: ModelReleaseReason::MemoryPressure,
@@ -244,7 +266,7 @@ impl Inner {
                     above_planning_since,
                 } = &mut state.admission
                 {
-                    if headroom > self.thresholds.planning_bytes {
+                    if headroom > self.thresholds.planning_bytes && distress.is_none() {
                         let since = *above_planning_since.get_or_insert(now);
                         if now.duration_since(since) >= RECOVERY_STABLE_TIME {
                             state.admission = Admission::Open;
@@ -413,13 +435,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    struct ScriptedMemory(AtomicU64);
+    /// Scripted headroom (`u64::MAX` fails the observation) and distress.
+    struct ScriptedMemory(AtomicU64, Mutex<Option<HostDistress>>);
 
     impl HostMemoryObserver for ScriptedMemory {
-        fn headroom_bytes(&self) -> Result<u64, String> {
+        fn sample(&self) -> Result<HostMemorySample, String> {
             match self.0.load(Ordering::Acquire) {
                 u64::MAX => Err("observation failed".to_owned()),
-                bytes => Ok(bytes),
+                headroom_bytes => Ok(HostMemorySample {
+                    headroom_bytes,
+                    distress: *self.1.lock().unwrap(),
+                }),
             }
         }
     }
@@ -476,7 +502,7 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let memory = Arc::new(ScriptedMemory(AtomicU64::new(10 * GIB)));
+        let memory = Arc::new(ScriptedMemory(AtomicU64::new(10 * GIB), Mutex::new(None)));
         let (sender, notifications) = tokio::sync::mpsc::unbounded_channel();
         let notifier = ResidencyNotifier {
             send: Arc::new(move |notification| {
@@ -557,6 +583,39 @@ mod tests {
         fixture.inner.tick(start + Duration::from_secs(21));
         assert!(*fixture.inner.admission.borrow());
         assert!(fixture.notifications.try_recv().is_err(), "nothing reloads");
+    }
+
+    #[test]
+    fn critical_kernel_pressure_kills_and_only_a_host_out_of_distress_recovers() {
+        let mut fixture = fixture();
+        let worker = supervise(&fixture, Arc::default());
+        let start = Instant::now();
+
+        // Swapping and thrashing are the engine's to answer; the guard waits.
+        *fixture.memory.1.lock().unwrap() = Some(HostDistress::Swapping);
+        fixture.inner.tick(start);
+        *fixture.memory.1.lock().unwrap() = Some(HostDistress::Thrashing);
+        fixture.inner.tick(start);
+        assert!(!worker.terminated.load(Ordering::Acquire));
+        assert!(*fixture.inner.admission.borrow());
+
+        // Headroom is far above the emergency reserve throughout.
+        *fixture.memory.1.lock().unwrap() = Some(HostDistress::KernelCritical);
+        fixture.inner.tick(start);
+        assert!(worker.terminated.load(Ordering::Acquire));
+        assert!(released_for_memory_pressure(fixture.notifications.try_recv().unwrap()));
+        assert!(!*fixture.inner.admission.borrow());
+
+        // Distress of any kind holds admission closed however long it lasts.
+        *fixture.memory.1.lock().unwrap() = Some(HostDistress::Swapping);
+        fixture.inner.tick(start + Duration::from_secs(10));
+        fixture.inner.tick(start + Duration::from_secs(20));
+        assert!(!*fixture.inner.admission.borrow());
+        *fixture.memory.1.lock().unwrap() = None;
+        fixture.inner.tick(start + Duration::from_secs(21));
+        assert!(!*fixture.inner.admission.borrow());
+        fixture.inner.tick(start + Duration::from_secs(26));
+        assert!(*fixture.inner.admission.borrow());
     }
 
     #[test]

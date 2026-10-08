@@ -128,7 +128,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             DraftForm::Chained => operations
                 .iter()
                 .zip(&advances)
-                .map(|(operation, advance)| self.head_slot(operation, advance, steps))
+                .map(|(operation, advance)| match operation {
+                    Operation::Head {
+                        request,
+                        tokens,
+                        position,
+                        proposals,
+                        ..
+                    } => self.head_slot(*request, tokens, *position, proposals, advance, steps),
+                    _ => unreachable!("validated head group"),
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|slots| {
                     crate::batching::ValidatedHeadBatch::from_slots(
@@ -271,22 +280,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// step. Chained rows past the request's own proposals append nowhere and
     /// select at the request's last proposal position; their selections are
     /// discarded.
-    fn head_slot(
+    pub(super) fn head_slot(
         &self,
-        operation: &Operation,
+        request: RequestId,
+        tokens: &[TokenId],
+        position: usize,
+        proposals: &[SelectSpec],
         advance: &TentativeAdvance,
         steps: usize,
     ) -> Result<HeadSlot, String> {
-        let Operation::Head {
-            request,
-            tokens,
-            position,
-            proposals,
-            ..
-        } = operation
-        else {
-            return Err("non-head operation".into());
-        };
         let binding = advance.bindings();
         let i32_of = |value: usize, what: &str| {
             i32::try_from(value).map_err(|_| format!("head {what} exceeds i32"))
@@ -321,7 +323,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // A head row at head position p pairs the token after target row p
         // with that row's feature, so it takes target row p's coordinates.
         let chained = steps.saturating_sub(1);
-        let coordinates = self.input_coordinates(*request, *position, tokens.len() + chained)?;
+        let coordinates = self.input_coordinates(request, position, tokens.len() + chained)?;
         let row = |index: usize, token: i32, visible: Vec<[i32; 2]>| -> Result<Row, String> {
             Ok(Row {
                 token,

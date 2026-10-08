@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import os
 import signal
 import sys
 from pathlib import Path
@@ -19,6 +20,8 @@ from .options import (
     KvCacheType,
     LlamaOptions,
     NativeOptions,
+    OllamaOptions,
+    Schedule,
     Watchdog,
     default_native_binary,
 )
@@ -124,6 +127,46 @@ def parser() -> argparse.ArgumentParser:
     llama.add_argument("--llama-gpu-layers", type=int, default=99)
     llama.add_argument("--llama-cache-type-k", choices=get_args(KvCacheType), default="f16")
     llama.add_argument("--llama-cache-type-v", choices=get_args(KvCacheType), default="f16")
+    ollama = execute.add_argument_group("Ollama (--engine ollama, ollama-mlx, ollama-registry)")
+    ollama.add_argument("--ollama-binary", type=Path, help="ollama executable (default: PATH)")
+    ollama.add_argument(
+        "--ollama-models", type=Path, help="Ollama model store (default: OLLAMA_MODELS)"
+    )
+    ollama.add_argument(
+        "--ollama-kv-cache-type",
+        choices=("f16", "q8_0", "q4_0"),
+        help="OLLAMA_KV_CACHE_TYPE (default: Ollama's own, f16)",
+    )
+    ollama.add_argument(
+        "--ollama-flash-attention", choices=("auto", "on", "off"), default="auto"
+    )
+    ollama.add_argument(
+        "--ollama-speculation",
+        choices=("off", "default"),
+        default="off",
+        help="off: plain decoding (on Ollama's MLX runner by requesting logprobs, which parks "
+        "its drafting; a request that still drafts fails); default: Ollama drafts when the "
+        "model ships a draft head or its parameters enable one",
+    )
+    ollama.add_argument(
+        "--ollama-context-headroom",
+        type=int,
+        default=0,
+        help="tokens Ollama allocates beyond the benchmark context (its llama.cpp runner ends "
+        "a drafting request early in a context that fits prompt and output exactly)",
+    )
+    ollama.add_argument(
+        "--ollama-count-binary",
+        type=Path,
+        help="metadata-only magnitude-count tokenizer for GGUF registry tags",
+    )
+    ollama.add_argument(
+        "--ollama-answer-prefill",
+        action="store_true",
+        help="Muse Glimmer only (its format has no thinking-off switch): send the prompt Ollama "
+        "renders through its raw completion route with the answer header appended, so the "
+        "reply starts as the answer; refused for every other family",
+    )
     watchdog = execute.add_argument_group("watchdog")
     watchdog.add_argument(
         "--stall-seconds",
@@ -134,6 +177,12 @@ def parser() -> argparse.ArgumentParser:
         "--request-seconds", type=float, help="fail the run when one request runs this long"
     )
     execute.add_argument("--repeat", type=int, default=1, help="repeat the whole balanced schedule")
+    execute.add_argument(
+        "--passes",
+        type=int,
+        help="measured passes per target, replacing the balanced schedule (one pass per "
+        "rotation of the target order, at least two); 1 measures each target once",
+    )
     execute.add_argument(
         "--dry-run",
         action="store_true",
@@ -222,6 +271,9 @@ def main(argv=None) -> int:
     root = project_root()
     try:
         if args.command == "run":
+            if args.ollama_models is not None:
+                # Artifact preparation and the adapter read the same store.
+                os.environ["OLLAMA_MODELS"] = str(args.ollama_models.expanduser().absolute())
             selected = models.select(root, args.model, args.engine, args.target)
             sections = choices(args.suite, tuple(SECTIONS))
             checkpoints = contexts(args.context, preserve_order=args.workload == "retrieval")
@@ -293,9 +345,25 @@ def main(argv=None) -> int:
                     cache_type_k=args.llama_cache_type_k,
                     cache_type_v=args.llama_cache_type_v,
                 ),
+                ollama=OllamaOptions(
+                    binary=(
+                        args.ollama_binary.expanduser().absolute() if args.ollama_binary else None
+                    ),
+                    models=(
+                        args.ollama_models.expanduser().absolute() if args.ollama_models else None
+                    ),
+                    kv_cache_type=args.ollama_kv_cache_type,
+                    flash_attention=args.ollama_flash_attention,
+                    speculation=args.ollama_speculation,
+                    context_headroom=args.ollama_context_headroom,
+                    count_binary=(args.ollama_count_binary.expanduser().absolute()
+                                  if args.ollama_count_binary else None),
+                    answer_prefill=args.ollama_answer_prefill,
+                ),
                 watchdog=Watchdog(
                     stall_seconds=args.stall_seconds, request_seconds=args.request_seconds
                 ),
+                schedule=Schedule(passes=args.passes),
             )
             if args.dry_run:
                 value = asyncio.run(
@@ -354,6 +422,9 @@ def main(argv=None) -> int:
                 "mlx-vlm": "Stock MLX-VLM serving",
                 "omlx": "Pinned oMLX with native timing instrumentation",
                 "llama.cpp": "Upstream llama-server on PATH (GGUF)",
+                "ollama": "Ollama serving an imported GGUF (its llama.cpp runner)",
+                "ollama-mlx": "Ollama serving a pulled registry model (its MLX runner)",
+                "ollama-registry": "Ollama serving a pulled registry GGUF (its llama.cpp runner)",
             }
         elif args.command == "suites":
             value = {

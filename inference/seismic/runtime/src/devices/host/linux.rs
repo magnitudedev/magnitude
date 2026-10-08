@@ -8,8 +8,8 @@
 //! mount are reported as such, never presumed unlimited.
 
 use super::{
-    HeadroomBasis, HeadroomEstimate, HostCapacity, HostMeasurements, HostMemoryStatus,
-    LimitVisibility, ProcessLimitKind, ProcessMemoryLimit,
+    HeadroomBasis, HeadroomEstimate, HostCapacity, HostMeasurements, HostSample, LimitVisibility,
+    ProcessLimitKind, ProcessMemoryLimit,
 };
 use crate::devices::{CapacityBasis, ObservationError};
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ pub(super) fn capacity() -> Result<HostCapacity, String> {
     })
 }
 
-pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
+pub(super) fn sample() -> Result<HostSample, ObservationError> {
     let meminfo = read("/proc/meminfo")?;
     let sampled_at = SystemTime::now();
     let mem_free_bytes = kib_field(&meminfo, "MemFree:")
@@ -37,7 +37,7 @@ pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
     })?;
     let mut limits = resource_limits()?;
     let limit_visibility = cgroup_limits(Path::new("/"), &mut limits)?;
-    Ok(HostMemoryStatus {
+    Ok(HostSample {
         sampled_at,
         measurements: HostMeasurements::Linux {
             mem_free_bytes,
@@ -49,6 +49,10 @@ pub(super) fn status() -> Result<HostMemoryStatus, ObservationError> {
         },
         limits,
         limit_visibility,
+        // `MemAvailable` is the kernel's estimate of what is usable without
+        // swapping, so no displacement is read beside it.
+        displacement: None,
+        kernel_pressure: None,
     })
 }
 

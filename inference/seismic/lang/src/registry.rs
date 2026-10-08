@@ -271,16 +271,31 @@ pub enum IntrinsicNumerics {
 /// - `Mma16`: `Rows16` whose code-plane bytes are permuted, per 16-row tile,
 ///   into `mma.sync.m16n8k16` A-fragment order (`PackedRowLayout::code_bit`).
 ///   The CUDA resident layout.
+/// - `Rows32`: 32-row tiles (one row per lane of a 32-lane cooperative
+///   multiply). Each code plane is interleaved across the tile per 32 columns,
+///   so one aligned load is one row's codes of one packet and a tile's loads
+///   are contiguous. Only code planes are interleaved, because the multiply
+///   reads them a tile at a time; every other plane holds the tile's rows
+///   one after another, each row's bytes contiguous as in `Rows16`, because
+///   every consumer reads coefficients a row at a time.
+///   The Metal resident layout (`inference/docs/kernels/lane-order.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Layout {
     Packet,
     Rows16,
     Rows8,
     Mma16,
+    Rows32,
 }
 
 impl Layout {
-    pub const ALL: [Layout; 4] = [Layout::Packet, Layout::Rows16, Layout::Rows8, Layout::Mma16];
+    pub const ALL: [Layout; 5] = [
+        Layout::Packet,
+        Layout::Rows16,
+        Layout::Rows8,
+        Layout::Mma16,
+        Layout::Rows32,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -288,6 +303,7 @@ impl Layout {
             Layout::Rows16 => "rows16",
             Layout::Rows8 => "rows8",
             Layout::Mma16 => "mma16",
+            Layout::Rows32 => "rows32",
         }
     }
 
@@ -356,6 +372,28 @@ pub struct RepresentationConversion {
     pub kind: ConversionKind,
 }
 
+impl RepresentationConversion {
+    /// Brings `packets`, whole source packets of arbitrary bytes, into the
+    /// conversion's domain, changing as few bits as that takes. The domain
+    /// is the source packets whose binary16 fields the recipe converts as
+    /// numbers ([`PacketRepackRecipe::converted_f16_fields`]) are finite: a
+    /// NaN's payload is not part of the contract, since a device's
+    /// conversion quiets a signaling NaN where the host reference widens its
+    /// bits. Each such field has the high bit of its exponent cleared.
+    pub fn admit_source(&self, packets: &mut [u8]) {
+        let RepresentationKind::External(source) = &representation_info(self.source).kind else {
+            unreachable!("a registered conversion's source is external storage")
+        };
+        let fields = self.recipe.converted_f16_fields();
+        for packet in packets.chunks_exact_mut(source.packet_size as usize) {
+            for field in &fields {
+                let bit = (field + 14) as usize;
+                packet[bit / 8] &= !(1 << (bit % 8));
+            }
+        }
+    }
+}
+
 /// The placement of a conversion's packets in its destination layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConversionKind {
@@ -375,6 +413,45 @@ pub enum ConversionKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PacketRepackRecipe {
     pub planes: Vec<PlaneRepackRecipe>,
+}
+
+impl PacketRepackRecipe {
+    /// The first bit of every binary16 field of the source packet the recipe
+    /// converts as a number (the operand of an `F16ToF32`), ascending.
+    pub fn converted_f16_fields(&self) -> Vec<u32> {
+        fn collect(expression: &RepackExpr, fields: &mut Vec<u32>) {
+            match expression {
+                RepackExpr::SourceBits { .. } => {}
+                RepackExpr::F16ToF32(value) => match &**value {
+                    RepackExpr::SourceBits { bit, .. } => fields.push(*bit),
+                    _ => unreachable!("a validated recipe widens a source field"),
+                },
+                RepackExpr::ShiftLeft { value, .. }
+                | RepackExpr::OffsetI32 { value, .. }
+                | RepackExpr::I32ToF32(value) => collect(value, fields),
+                RepackExpr::Lookup { index, .. } => collect(index, fields),
+                RepackExpr::BitOr(left, right) | RepackExpr::MultiplyF32(left, right) => {
+                    collect(left, fields);
+                    collect(right, fields);
+                }
+            }
+        }
+        let mut fields = Vec::new();
+        for plane in &self.planes {
+            match plane {
+                PlaneRepackRecipe::BitRoutes(_) => {}
+                PlaneRepackRecipe::DenseValues(values)
+                | PlaneRepackRecipe::PackedEntries(values) => {
+                    for value in values {
+                        collect(value, &mut fields);
+                    }
+                }
+            }
+        }
+        fields.sort_unstable();
+        fields.dedup();
+        fields
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -588,6 +665,10 @@ pub const ROW_ALIGNMENT: u64 = 16;
 pub const MMA_TILE_ROWS: u64 = 16;
 /// Columns per `mma16` k-block: four `k16` fragment steps.
 pub const MMA_KBLOCK: u64 = 64;
+/// Rows per `rows32` tile: the lanes of a 32-lane cooperative multiply.
+pub const ROWS32_TILE_ROWS: u64 = 32;
+/// Columns per `rows32` code chunk: one packet of 32 codes of one row.
+pub const ROWS32_CHUNK: u64 = 32;
 /// Lanes of the warp that owns one `mma16` tile.
 pub const MMA_LANES: u64 = 32;
 
@@ -660,6 +741,7 @@ impl PackedRowLayout {
     pub fn tile_rows(&self) -> u64 {
         match self.layout {
             Layout::Mma16 => MMA_TILE_ROWS,
+            Layout::Rows32 => ROWS32_TILE_ROWS,
             Layout::Rows8 => 8,
             Layout::Rows16 => 1,
             Layout::Packet => unreachable!("a row layout is never `packet`"),
@@ -742,7 +824,7 @@ impl PackedRowLayout {
     /// extents). The caller established `extents` has a canonical byte count.
     pub fn stored_row(&self, extents: &[u64], row: u64) -> u64 {
         match self.layout {
-            Layout::Mma16 | Layout::Rows8 => {
+            Layout::Mma16 | Layout::Rows8 | Layout::Rows32 => {
                 let rows = extents[extents.len() - 2];
                 let tile = self.tile_rows();
                 row / rows * rows.div_ceil(tile) * tile + row % rows
@@ -789,6 +871,16 @@ impl PackedRowLayout {
                     + column / group * group_bytes * 8
                     + row % 8 * group_bytes;
                 byte * 8 + local * bits
+            }
+            // A tile's plane is `[chunk][row][chunk bytes]`: the codes of
+            // 32 columns of the tile's 32 rows are adjacent, row by row.
+            Layout::Rows32 => {
+                let chunk_bytes = ROWS32_CHUNK * bits / 8;
+                let byte = row / ROWS32_TILE_ROWS * stride * ROWS32_TILE_ROWS
+                    + offset * ROWS32_TILE_ROWS
+                    + column / ROWS32_CHUNK * chunk_bytes * ROWS32_TILE_ROWS
+                    + row % ROWS32_TILE_ROWS * chunk_bytes;
+                byte * 8 + column % ROWS32_CHUNK * bits
             }
             Layout::Mma16 => {
                 let row_bytes = geometry.bytes_per_row[plane];
@@ -856,10 +948,22 @@ impl PackedRowLayout {
         let group_bytes = u64::from(self.planes[index].bytes_per_group);
         let byte = match self.layout {
             Layout::Rows8 => {
-                row / 8 * geometry.stride * 8
-                    + geometry.offsets[index] * 8
-                    + packet * group_bytes * 8
-                    + row % 8 * group_bytes
+                let tile = self.tile_rows();
+                row / tile * geometry.stride * tile
+                    + geometry.offsets[index] * tile
+                    + packet * group_bytes * tile
+                    + row % tile * group_bytes
+                    + prefix
+            }
+            // A tile's group plane is `[row][plane bytes of a row]`: every
+            // row's groups are contiguous, and the tile's rows follow one
+            // another.
+            Layout::Rows32 => {
+                let tile = self.tile_rows();
+                row / tile * geometry.stride * tile
+                    + geometry.offsets[index] * tile
+                    + row % tile * geometry.bytes_per_row[index]
+                    + packet * group_bytes
                     + prefix
             }
             Layout::Rows16 | Layout::Mma16 => {
@@ -1327,7 +1431,7 @@ pub(crate) mod internals {
                 .iter()
                 .find(|repr| repr.name == resident)
                 .expect("external conversion names a registered packed representation");
-            for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16] {
+            for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16, Layout::Rows32] {
                 let name: &'static str =
                     Box::leak(format!("{resident}@{}", layout.as_str()).into_boxed_str());
                 representations.push(RepresentationInfo {
@@ -1359,6 +1463,9 @@ pub(crate) mod internals {
                         match rows.layout {
                             Layout::Rows16 => ConversionKind::Row,
                             Layout::Rows8 => ConversionKind::RowTile { rows: 8 },
+                            Layout::Rows32 => ConversionKind::RowTile {
+                                rows: ROWS32_TILE_ROWS as u32,
+                            },
                             Layout::Mma16 => ConversionKind::RowTile {
                                 rows: MMA_TILE_ROWS as u32,
                             },
@@ -1674,6 +1781,14 @@ pub(crate) mod internals {
         );
         let group_multiple = match layout {
             Layout::Rows16 | Layout::Rows8 => 1,
+            Layout::Rows32 => {
+                assert!(
+                    group.is_multiple_of(ROWS32_CHUNK as u32),
+                    "`{}` groups do not hold whole 32-column code chunks",
+                    repr.name
+                );
+                1
+            }
             Layout::Mma16 => {
                 let block = MMA_KBLOCK as u32;
                 assert!(
@@ -2207,9 +2322,15 @@ pub(crate) mod internals {
                         "representation conversion reads beyond its source packet"
                     );
                 }
+                RepackExpr::F16ToF32(value) => {
+                    assert!(
+                        matches!(**value, RepackExpr::SourceBits { width: 16, .. }),
+                        "representation conversion widens something other than a binary16 source field"
+                    );
+                    validate_expr(value, source_bits);
+                }
                 RepackExpr::ShiftLeft { value, .. }
                 | RepackExpr::OffsetI32 { value, .. }
-                | RepackExpr::F16ToF32(value)
                 | RepackExpr::I32ToF32(value) => validate_expr(value, source_bits),
                 RepackExpr::Lookup { index, table } => {
                     validate_expr(index, source_bits);
@@ -2610,6 +2731,46 @@ mod tests {
         layout
     }
 
+    /// A conversion's domain makes the scales it converts as numbers finite
+    /// and keeps every other source bit: IQ4_NL's eight block scales and
+    /// IQ4_XS's base, and nothing of Q4_0, whose scale moves bit for bit.
+    #[test]
+    fn a_conversion_admits_sources_with_finite_converted_scales() {
+        for (source, destination, fields) in [
+            (
+                "gguf_iq4_nl",
+                "iq4g32@rows16",
+                (0..8).map(|block| block * 144).collect::<Vec<u32>>(),
+            ),
+            ("gguf_iq4_xs", "iq4g32@rows16", vec![0]),
+            ("gguf_q4_0", "q4g32s@rows16", vec![]),
+        ] {
+            let conversion = representation_conversion(
+                representation(source).unwrap(),
+                representation(destination).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(conversion.recipe.converted_f16_fields(), fields, "{source}");
+            let RepresentationKind::External(layout) =
+                &representation_info(conversion.source).kind
+            else {
+                panic!("{source} is external storage")
+            };
+            let mut packets = vec![0xffu8; 2 * layout.packet_size as usize];
+            conversion.admit_source(&mut packets);
+            for (packet, bytes) in packets.chunks_exact(layout.packet_size as usize).enumerate() {
+                for (index, byte) in bytes.iter().enumerate() {
+                    let scale_high = fields.iter().any(|field| index as u32 == field / 8 + 1);
+                    assert_eq!(
+                        *byte,
+                        if scale_high { 0xbf } else { 0xff },
+                        "{source} packet {packet} byte {index}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn resident_conversions_are_keyed_by_source_representation_and_layout() {
         let q4_k = representation("gguf_q4_k").unwrap();
@@ -2826,7 +2987,7 @@ mod tests {
                 };
                 let packet = resident_conversion(source_info.id, Layout::Packet).unwrap();
                 let (packet_bytes, expected) = decode(packet);
-                for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16] {
+                for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16, Layout::Rows32] {
                     let conversion = resident_conversion(source_info.id, layout).unwrap();
                     let (converted, actual) = decode(conversion);
                     let RepresentationKind::PackedRows(rows) =

@@ -14,7 +14,7 @@ describe('agent model start failures', () => {
       providerError: {
         message: 'Not enough memory to load model',
         type: 'model_error',
-        code: 'low_memory',
+        code: 'memory_shortage',
         param: null,
         retryable: true,
       },
@@ -26,7 +26,7 @@ describe('agent model start failures', () => {
 
     expect(decision.outcome).toEqual({
       _tag: 'ModelNotReady',
-      failure: { code: 'low_memory', message: 'Not enough memory to load model', retryable: true },
+      failure: { code: 'memory_shortage', message: 'Not enough memory to load model', retryable: true },
       requestId: null,
     })
     expect(decision.retry).toEqual({ _tag: 'none' })

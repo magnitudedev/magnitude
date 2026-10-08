@@ -11,6 +11,7 @@ use magnitude_kernels::{attention_output, short_conv_project};
 use seismic::{Element, Tensor};
 
 /// `short_conv_project`: the input RMS and the `B`, `C`, `X` projections.
+#[derive(Clone)]
 pub(crate) struct ShortConvProjectTuning {
     pub binding: ShortConvBinding,
     pub scopes: Vec<WeightScope>,
@@ -129,6 +130,7 @@ impl EntryTuning for ShortConvProjectTuning {
 
 /// `attention_output` as the short-convolution output projection plus
 /// residual.
+#[derive(Clone)]
 pub(crate) struct ShortConvOutputTuning {
     pub binding: ShortConvBinding,
     pub scopes: Vec<WeightScope>,
@@ -212,5 +214,5 @@ impl EntryTuning for ShortConvOutputTuning {
     generated_entry!(attention_output, this => attention_output::Elements {
         OW: this.binding.output,
         A: this.binding.activation,
-    });
+    }, rounded to this.binding.activation);
 }

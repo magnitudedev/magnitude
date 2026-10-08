@@ -49,8 +49,6 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
         domains: [],
         totalRequiredBytes: 0,
         requiredSystemMemoryBytes: 0,
-        systemUseState: { _tag: "NotObserved" },
-        currentHeadroomState: { _tag: "NotObserved" },
       },
       performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 25 }],
     },

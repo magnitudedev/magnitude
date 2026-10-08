@@ -24,7 +24,7 @@ use crate::{
 use crate::{AttentionBinding, AttentionShape, SublayerTail};
 use magnitude_family_contracts::{Attention, Rotary, WeightKind};
 use magnitude_kernels::{
-    attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
+    attention_append_dense, attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project,
 };
 use magnitude_state::KvCodec;
@@ -49,11 +49,13 @@ impl<'a, G: GraphDraft + 'a> Clone for AttentionGraphEntries<'a, G> {
 
 pub(crate) enum AttentionHistoryEntries<'a, G: GraphDraft + 'a> {
     Dense {
+        append: G::Binding<'a, attention_append_dense::Entry>,
         decode: G::Binding<'a, attention_decode::Entry>,
         verify: Option<G::Binding<'a, attention_decode::Entry>>,
         prefill: G::Binding<'a, attention_prefill::Entry>,
     },
     AffineK8V4 {
+        append: G::Binding<'a, attention_append_k8v4::Entry>,
         decode: G::Binding<'a, attention_decode_k8v4::Entry>,
         verify: Option<G::Binding<'a, attention_decode_k8v4::Entry>>,
         verify_four: Option<G::Binding<'a, attention_decode_k8v4::Entry>>,
@@ -76,15 +78,18 @@ impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
     fn from(kernels: &'a AttentionKernels) -> Self {
         let history = match &kernels.history {
             AttentionHistoryKernels::Dense {
+                append,
                 decode,
                 verify,
                 prefill,
             } => AttentionHistoryEntries::Dense {
+                append,
                 decode,
                 verify: verify.as_ref(),
                 prefill,
             },
             AttentionHistoryKernels::AffineK8V4 {
+                append,
                 decode,
                 verify,
                 verify_four,
@@ -92,6 +97,7 @@ impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
                 prefill,
                 prefill_listed,
             } => AttentionHistoryEntries::AffineK8V4 {
+                append,
                 decode,
                 verify: verify.as_ref(),
                 verify_four: verify_four.as_ref(),
@@ -151,11 +157,13 @@ impl CheckedAttentionEntries {
     pub(crate) fn entries(&self) -> Result<AttentionGraphEntries<'_, NativeGraphMetadata>, String> {
         let history = match self.history {
             KvCodec::Dense => AttentionHistoryEntries::Dense {
+                append: &self.mix[..],
                 decode: &self.mix[..],
                 verify: None,
                 prefill: &self.mix[..],
             },
             KvCodec::AffineK8V4 => AttentionHistoryEntries::AffineK8V4 {
+                append: &self.mix[..],
                 decode: &self.mix[..],
                 verify: None,
                 verify_four: None,
@@ -247,8 +255,8 @@ pub(crate) struct AttentionStatePorts {
 #[derive(Clone)]
 pub(crate) struct AttentionControlPorts {
     pub coordinates: NativePort,
-    pub visible: NativePort,
-    pub fresh: NativePort,
+    pub visible: Option<NativePort>,
+    pub fresh: Option<NativePort>,
     pub destinations: NativePort,
     /// The history row tiles the launch's rows see, for an entry that takes
     /// them (the affine prefill).
@@ -296,7 +304,7 @@ pub(crate) fn attention_weights(
         gate: present(shape.gate_rows() > 0, WeightKind::AttentionGate)?,
         key: present(shape.key_rows() > 0, WeightKind::Key)?,
         value: present(shape.value_rows() > 0, WeightKind::Value)?,
-        query_norm: present(shape.head_norm > 0, WeightKind::QueryNorm)?,
+        query_norm: present(needs_output && shape.head_norm > 0, WeightKind::QueryNorm)?,
         // A Shared layer projects no keys, so it has no key norm.
         key_norm: present(shape.head_norm > 0 && shape.fresh > 0, WeightKind::KeyNorm)?,
         output: present(needs_output, WeightKind::AttentionOutput)?,
@@ -316,26 +324,28 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     let (rows, width, heads) = (block.rows, shape.width, shape.heads());
     // An absent projection segment reads zero rows of the query weight.
     let empty_weight = weights.query.slice_leading(0, 0);
+    let empty_gate_weight = weights.gate.as_ref().map(|gate| gate.slice_leading(0, 0))
+        .unwrap_or_else(|| empty_weight.clone());
     let projected = graph.enqueue(
         kernels.project,
-        &shape.project_dimensions(rows),
+        &if block.inject_only { shape.key_value_dimensions(rows) } else { shape.project_dimensions(rows) },
         attention_project::WorkflowArgs {
             hidden: hidden.into(),
             input_norm: (&weights.input_norm).into(),
-            query_weight: (&weights.query).into(),
-            gate_weight: segment(&weights.gate, &empty_weight),
+            query_weight: if block.inject_only { (&empty_weight).into() } else { (&weights.query).into() },
+            gate_weight: if block.inject_only { (&empty_gate_weight).into() } else { segment(&weights.gate, &empty_weight) },
             key_weight: segment(&weights.key, &empty_weight),
             value_weight: segment(&weights.value, &empty_weight),
             epsilon: block.epsilon,
-            project_mode: if block.inject_only { 1 } else { 0 },
+            project_mode: 0,
         },
     )?;
     // The mix entries read the projection per head.
     let projected = ProjectedRows {
         query: projected
             .r0
-            .reshape(&[rows, heads, width + shape.interleaved_gate]),
-        gate: projected.r1.reshape(&[rows, heads, shape.separate_gate]),
+            .reshape(&[rows, if block.inject_only { 0 } else { heads }, width + shape.interleaved_gate]),
+        gate: projected.r1.reshape(&[rows, if block.inject_only { 0 } else { heads }, shape.separate_gate]),
         key: projected
             .r2
             .reshape(&[shape.fresh, rows, shape.kv_heads * width]),
@@ -360,6 +370,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     if block.inject_only {
         return Ok((hidden.clone(), state, controls));
     }
+    let attended = attended.ok_or("attention result is absent")?;
     let output_weight = weights
         .output
         .as_ref()
@@ -431,7 +442,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     constants: &mut Vec<GraphConstant>,
     projected: &ProjectedRows,
     block: &AttentionBlock<'_>,
-) -> Result<(WorkflowTensor, AttentionStatePorts, AttentionControlPorts), GraphError> {
+) -> Result<(Option<WorkflowTensor>, AttentionStatePorts, AttentionControlPorts), GraphError> {
     let shape = block.shape;
     let (rows, width) = (block.rows, shape.width);
     let dimensions = shape.mix_dimensions(rows, block.history_rows, block.segments);
@@ -474,8 +485,8 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         .transpose()?;
     let controls = AttentionControlPorts {
         coordinates: input(graph, "coordinates")?,
-        visible: input(graph, "visible")?,
-        fresh: input(graph, "fresh")?,
+        visible: if block.inject_only { None } else { Some(input(graph, "visible")?) },
+        fresh: if block.inject_only { None } else { Some(input(graph, "fresh")?) },
         destinations: input(graph, "destinations")?,
         history_tiles,
     };
@@ -522,19 +533,18 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         ],
     };
     let scale = block.operator.scale as f32;
-    // -1 marks the injection-only route. Metal still runs the prepare/append
-    // launch, while its attention and merge launches have no work to do.
-    let gate_function = if block.inject_only {
-        -1
-    } else {
-        operators::attention::gate_function(block.operator)
-    };
+    let gate_function = operators::attention::gate_function(block.operator);
+    let destinations = controls.destinations.tensor().clone();
     // Every entry takes the same arguments but its history planes.
     macro_rules! mix {
         ($kernel:expr, $module:ident, $($plane:ident),*) => {
             mix!(@enqueue $kernel, $module, &dimensions, {}, $($plane),*)
         };
         (@enqueue $kernel:expr, $module:ident, $dimensions:expr, {$($extra:ident: $value:expr),*},
+            $($plane:ident),*) => {
+            mix!(@phase $kernel, $module, $dimensions, {$($extra: $value),*}, $($plane),*).value
+        };
+        (@phase $kernel:expr, $module:ident, $dimensions:expr, {$($extra:ident: $value:expr),*},
             $($plane:ident),*) => {{
             let [$($plane),*] = planes.as_mut_slice() else {
                 return Err("attention history planes disagree with the entry".into());
@@ -555,9 +565,9 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                         rotary_frequencies: frequencies.port().tensor().into(),
                         rotary_amplitudes: amplitudes.port().tensor().into(),
                         coordinates: controls.coordinates.tensor().into(),
-                        visible: controls.visible.tensor().into(),
-                        fresh: controls.fresh.tensor().into(),
-                        destinations: controls.destinations.tensor().into(),
+                        visible: controls.visible.as_ref().ok_or("attention visibility is absent")?.tensor().into(),
+                        fresh: controls.fresh.as_ref().ok_or("attention fresh rows are absent")?.tensor().into(),
+                        destinations: (&destinations).into(),
                         $($extra: $value,)*
                         $($plane: $plane.tensor_mut().into(),)*
                         epsilon: block.head_epsilon,
@@ -566,8 +576,46 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                         slab_rows: block.slab_rows,
                     },
                 )?
-                .value
+
         }};
+    }
+    // State-only entries bind no query, gate, visibility or selection values.
+    macro_rules! append {
+        ($kernel:expr, $module:ident, $($plane:ident),*) => {{
+            let [$($plane),*] = planes.as_mut_slice() else {
+                return Err("attention history planes disagree with the entry".into());
+            };
+            let append_dimensions = dimensions.iter().copied()
+                .filter(|(name, _)| !matches!(*name, "R" | "G" | "I" | "U")).collect::<Vec<_>>();
+            graph.enqueue(*$kernel, &append_dimensions, $module::WorkflowArgs {
+                key: (&key).into(), value: (&value).into(),
+                key_norm: (&key_norm).into(), value_norm: (&value_norm).into(),
+                rotary_components: components.port().tensor().into(),
+                rotary_frequencies: frequencies.port().tensor().into(),
+                rotary_amplitudes: amplitudes.port().tensor().into(),
+                coordinates: controls.coordinates.tensor().into(),
+                destinations: (&destinations).into(),
+                $($plane: $plane.tensor_mut().into(),)*
+                epsilon: block.head_epsilon, slab_rows: block.slab_rows,
+            })?;
+        }};
+    }
+    // Priming only publishes context K/V. Select the state-only entry at
+    // graph formation to omit attention/merge launches and their scratch
+    // buffers, even for a large prompt chunk.
+    if block.inject_only {
+        match &history {
+            AttentionHistoryEntries::Dense { append, .. } => {
+                append!(append, attention_append_dense, history_key, history_value);
+            }
+            AttentionHistoryEntries::AffineK8V4 { append, .. } => {
+                append!(append, attention_append_k8v4,
+                    history_key_codes, history_key_coefficients,
+                    history_value_codes, history_value_coefficients);
+            }
+        }
+        constants.extend([components, frequencies, amplitudes, unit]);
+        return Ok((None, AttentionStatePorts { planes }, controls));
     }
     let attended = match &history {
         AttentionHistoryEntries::Dense {
@@ -651,7 +699,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         }
     };
     constants.extend([components, frequencies, amplitudes, unit]);
-    Ok((attended, AttentionStatePorts { planes }, controls))
+    Ok((Some(attended), AttentionStatePorts { planes }, controls))
 }
 
 /// A projection segment's weight, or zero rows of the query weight when the

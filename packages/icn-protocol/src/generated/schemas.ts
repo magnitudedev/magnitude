@@ -1398,6 +1398,19 @@ export const MemoryDomainId = S.String
 export type MemoryDomainId = S.Schema.Type<typeof MemoryDomainId>
 export type MemoryDomainIdEncoded = S.Schema.Encoded<typeof MemoryDomainId>
 
+export const MemoryShortage = S.Union(
+  S.extend(
+    S.TaggedStruct("Blocked", {
+      availableBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      requiredBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("UnderPressure", {}), S.Record({ key: S.String, value: JsonValue })),
+)
+export type MemoryShortage = S.Schema.Type<typeof MemoryShortage>
+export type MemoryShortageEncoded = S.Schema.Encoded<typeof MemoryShortage>
+
 export const Message = S.Struct({
   content: S.suspend((): S.Schema<Content, ContentEncoded> => Content),
   role: S.suspend((): S.Schema<Role, RoleEncoded> => Role),
@@ -1668,15 +1681,11 @@ export const ModelInstanceFailure = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.TaggedStruct("LowMemory", {
-      allocationHeadroomBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    S.TaggedStruct("MemoryShortage", {
       code: S.String,
-      loadBoundaryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       message: S.String,
-      minimumAdditionalAvailableBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      requiredMemoryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       retryable: S.Boolean,
-      systemReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      shortage: S.suspend((): S.Schema<MemoryShortage, MemoryShortageEncoded> => MemoryShortage),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),

@@ -12,6 +12,9 @@ fi
 if command -v rpm >/dev/null && rpm -q magnitude-desktop >/dev/null 2>&1; then
   echo 'Remove the test installation before running this acceptance.' >&2; exit 1
 fi
+if command -v pacman >/dev/null && pacman -Q magnitude-desktop >/dev/null 2>&1; then
+  echo 'Remove the test installation before running this acceptance.' >&2; exit 1
+fi
 sudo -n true
 root=$(mktemp -d "${TMPDIR:-/tmp}/magnitude-script-acceptance.XXXXXXXX")
 echo "Acceptance output: $root"

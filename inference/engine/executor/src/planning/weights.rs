@@ -201,6 +201,14 @@ impl AttentionShape {
         ]
     }
 
+    /// Projection of history rows has no query or gate outputs.
+    pub fn key_value_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+        let mut dimensions = self.project_dimensions(rows);
+        dimensions[2].1 = 0;
+        dimensions[3].1 = 0;
+        dimensions
+    }
+
     /// The static axes of the fused attention entries.
     pub fn mix_statics(&self) -> [(&'static str, u64); 9] {
         [
@@ -214,6 +222,11 @@ impl AttentionShape {
             ("N", self.head_norm),
             ("NV", self.value_norm),
         ]
+    }
+
+    /// Cache publication has no query-head or gate geometry.
+    pub fn append_statics(&self) -> Vec<(&'static str, u64)> {
+        self.mix_statics().into_iter().filter(|(name, _)| !matches!(*name, "G" | "I" | "U")).collect()
     }
 
     /// The fused entries' dimensions for `rows` rows over `history_rows`
@@ -248,6 +261,8 @@ impl AttentionShape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionBinding {
     pub shape: AttentionShape,
+    /// State-only projection omits query and gate segments statically.
+    pub key_value_only: bool,
     pub norm: Element,
     pub query: Element,
     pub gate: Element,
@@ -695,7 +710,10 @@ impl ModelLoadPlan {
         if projector.is_some() != definition.vision.is_some() {
             return Err("projector component and vision definition disagree".into());
         }
-        if draft.is_some() != definition.draft.is_some() {
+        // An optional draft can remain in the opened package after semantic
+        // admission rejected it. Only an admitted definition requires its
+        // component; an unbound artifact contributes no weights to Plain.
+        if definition.draft.is_some() && draft.is_none() {
             return Err("draft component and draft definition disagree".into());
         }
         if selection.vision && definition.vision.is_none() {
@@ -1204,11 +1222,12 @@ struct ResidentForm {
 
 /// The layout resident packed weights use for an execution path on a device
 /// backend (spec S1/E7). Native kernels read the backend's execution layout:
-/// Metal and Vulkan `rows16`, CUDA `mma16`; native CPU kernels read `rows8`, while every planned
+/// Metal `rows32`, Vulkan `rows16`, CUDA `mma16`; native CPU kernels read `rows8`, while every planned
 /// (compiled) kernel reads the `packet` layout.
 pub fn resident_layout(path: ExecutionPath, backend: BackendName) -> Layout {
     match (path, backend) {
-        (ExecutionPath::Native, BackendName::Metal | BackendName::Vulkan) => Layout::Rows16,
+        (ExecutionPath::Native, BackendName::Metal) => Layout::Rows32,
+        (ExecutionPath::Native, BackendName::Vulkan) => Layout::Rows16,
         (ExecutionPath::Native, BackendName::Cuda) => Layout::Mma16,
         (ExecutionPath::Native, BackendName::Cpu) => Layout::Rows8,
         (ExecutionPath::Planned, _) => Layout::Packet,
@@ -1306,7 +1325,7 @@ mod representation_byte_tests {
     #[test]
     fn one_map_chooses_representation_from_format_and_layout_from_backend() {
         for (path, backend, layout) in [
-            (ExecutionPath::Native, BackendName::Metal, Layout::Rows16),
+            (ExecutionPath::Native, BackendName::Metal, Layout::Rows32),
             (ExecutionPath::Native, BackendName::Vulkan, Layout::Rows16),
             (ExecutionPath::Native, BackendName::Cuda, Layout::Mma16),
             (ExecutionPath::Native, BackendName::Cpu, Layout::Rows8),
