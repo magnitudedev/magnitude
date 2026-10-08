@@ -35,7 +35,7 @@ Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`
 
 **Connect** writes `~/.openclaw/openclaw.json`. Location overrides: `OPENCLAW_CONFIG_PATH` and `OPENCLAW_STATE_DIR`.
 
-Write the configuration yourself only when the agent runs where Connections cannot reach it, such as another device or WSL; see [Network access](/api/network-access) for `ADDRESS` and `API_KEY`.
+When the agent runs on another computer, open Magnitude in a browser on that computer, go to **Connections**, and choose **Copy setup prompt**. Paste it into the agent, or any coding agent, there: it applies the settings below with your address, key, and models filled in. The configuration below is the reference format; see [Network access](/api/network-access) for `ADDRESS` and `API_KEY`.
 
 `~/.openclaw/openclaw.json`:
 

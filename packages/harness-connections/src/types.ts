@@ -1,3 +1,4 @@
+import type { HarnessSetup, HarnessSetupTarget } from "./setup"
 import { Context, Data, Effect, Option, Schema } from "effect"
 import type { ProviderModelId } from "@magnitudedev/sdk"
 import { HarnessIdSchema, type HarnessId } from "@magnitudedev/sdk"
@@ -46,7 +47,7 @@ export interface HarnessConnectOptions {
 }
 
 export class HarnessConnectionError extends Data.TaggedError("HarnessConnectionError")<{
-  readonly operation: "list" | "connect" | "sync" | "disconnect" | "skill" | "startup"
+  readonly operation: "list" | "connect" | "sync" | "disconnect" | "skill" | "startup" | "describe"
   readonly harness?: HarnessId
   readonly message: string
 }> {}
@@ -63,4 +64,6 @@ export interface HarnessConnection {
   readonly disconnect: (harness: HarnessId) => Effect.Effect<void, HarnessConnectionError>
   readonly installSkill: (harness: HarnessId) => Effect.Effect<void, HarnessConnectionError>
   readonly installStartup: Effect.Effect<void, HarnessConnectionError>
+  /** The setup a person applies by hand on a computer that will run the harness against this Magnitude. */
+  readonly describe: (target: Omit<HarnessSetupTarget, "model" | "models"> & { readonly model: ProviderModelId }) => Effect.Effect<HarnessSetup, HarnessConnectionError>
 }

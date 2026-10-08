@@ -62,7 +62,29 @@ export const HarnessConnectOutcome = Schema.Struct({
 })
 export type HarnessConnectOutcome = typeof HarnessConnectOutcome.Type
 
-export const HarnessConnectionOperation = Schema.Literal("list", "connect", "sync", "disconnect", "skill", "startup")
+export const HarnessSetupPlatform = Schema.Literal("darwin", "linux", "win32")
+export type HarnessSetupPlatform = typeof HarnessSetupPlatform.Type
+
+/** Setup for a harness on the computer showing this page, which may not be the one running Magnitude. */
+export const HarnessSetupRequest = Schema.Struct({
+  harness: HarnessIdSchema,
+  model: ProviderModelIdSchema,
+  platform: HarnessSetupPlatform,
+  /** The origin that computer uses to reach Magnitude. */
+  origin: Schema.String,
+  /** Whether that computer is another device, which must send the Network access key. */
+  remote: Schema.Boolean,
+})
+export type HarnessSetupRequest = typeof HarnessSetupRequest.Type
+
+export const HarnessSetup = Schema.Struct({
+  prompt: Schema.String,
+  runCommand: Schema.String,
+  docsUrl: Schema.String,
+})
+export type HarnessSetup = typeof HarnessSetup.Type
+
+export const HarnessConnectionOperation = Schema.Literal("list", "connect", "sync", "disconnect", "skill", "startup", "describe")
 export class HarnessConnectionFailed extends Schema.TaggedError<HarnessConnectionFailed>()("HarnessConnectionFailed", {
   operation: HarnessConnectionOperation,
   harness: Schema.optionalWith(HarnessIdSchema, { as: "Option", exact: true }),

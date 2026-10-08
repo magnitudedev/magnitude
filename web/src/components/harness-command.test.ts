@@ -4,7 +4,7 @@ import { HarnessIdSchema } from "@magnitudedev/sdk"
 import { ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { Command } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"
-import { harnessCommand, shellArgument } from "./harness-command"
+import { harnessCommand, shellArgument } from "@magnitudedev/sdk"
 
 const model = Schema.decodeUnknownSync(ProviderModelIdSchema)("Qwen3.6-35B-A3B-Q4_K_M")
 it.each([

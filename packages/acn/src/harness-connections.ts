@@ -8,6 +8,8 @@ import {
   type HarnessConnectRequest,
   type HarnessConnectionsSnapshot,
   type HarnessId,
+  type HarnessSetup,
+  type HarnessSetupRequest,
 } from "@magnitudedev/acn-protocol"
 import {
   harnessCommandExecutor,
@@ -27,6 +29,8 @@ export interface AcnHarnessConnectionsApi {
   readonly connect: (request: HarnessConnectRequest) => Effect.Effect<HarnessConnectOutcome, HarnessConnectionFailed>
   readonly sync: (harness: Option.Option<HarnessId>) => Effect.Effect<void, HarnessConnectionFailed>
   readonly disconnect: (harness: HarnessId) => Effect.Effect<void, HarnessConnectionFailed>
+  /** Another device sends the key this service enforces; this computer needs none. */
+  readonly describe: (request: HarnessSetupRequest) => Effect.Effect<HarnessSetup, HarnessConnectionFailed>
 }
 export class AcnHarnessConnections extends Context.Tag("AcnHarnessConnections")<AcnHarnessConnections, AcnHarnessConnectionsApi>() {}
 
@@ -97,5 +101,12 @@ export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Eff
       Effect.mapError(failed),
       Effect.ensuring(changed),
     ),
+    describe: request => {
+      const key = request.remote ? host.activeNetwork.apiKey : Option.none<string>()
+      return service.pipe(
+        Effect.flatMap(connections => connections.describe({ harness: request.harness, model: request.model, platform: request.platform, origin: request.origin, key })),
+        Effect.mapError(failed),
+      )
+    },
   })
 }))

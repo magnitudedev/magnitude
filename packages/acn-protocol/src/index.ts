@@ -7,6 +7,7 @@ export * from "./acn-revision"
 export * from "./acn-instance"
 export * from "./service-start"
 export * from "./rpc-version"
+export { harnessCommand, harnessInstallationUrl, shellArgument } from "./harness-command"
 
 export * from "./service-endpoint"
 export { projectInferenceAllocation, projectInferenceLoadDevice, projectInferenceLoadPlan, projectInferenceResidency } from "./inference-projection"

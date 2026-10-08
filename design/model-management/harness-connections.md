@@ -16,10 +16,20 @@ applies_to:
 `HarnessConnection` configures an external agent harness to use Magnitude. `Connections` is the
 public CLI noun and the ACN RPC group; there is no separate connection-manager domain.
 
-ACN owns harness connections for the machine it runs on. Every client (the desktop app, a
-browser on another device, and the CLI) inspects, connects, synchronizes, and disconnects through
-the `Connections` RPCs, so configuration is always written where Magnitude and the harnesses run.
-No client runs its own copy of the connection service.
+ACN owns harness connections for the machine it runs on. The desktop app and the CLI inspect,
+connect, synchronize, and disconnect through the `Connections` RPCs, so configuration is written
+where Magnitude runs. No client runs its own copy of the connection service.
+
+A browser never connects harnesses in place, because it can't know which computer its viewer's
+harnesses run on. `DescribeHarnessSetup` renders, for a harness, the default model, the viewer's
+platform, and the origin the browser used, a prompt the viewer pastes into an agent on their own
+computer. The prompt carries the same provider configuration the connectors write (built by the
+same functions), with every installed model and its metadata, merge instructions that keep the
+viewer's other settings, the configuration-location overrides, any environment step, a reachability
+check, and the command to start the harness. From another device it carries the Network access key
+the service enforces, sent as the harness expects (Codex through `MAGNITUDE_API_KEY`, Claude Code
+through `ANTHROPIC_AUTH_TOKEN`); on the server's own computer it needs none. The skill is not part
+of it, since it describes the CLI on the computer running Magnitude.
 
 ## Pi extension distribution
 

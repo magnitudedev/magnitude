@@ -62,7 +62,8 @@ import { useNarrowViewport } from "./lib/viewport"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "./components/ui/alert-dialog"
 import { HardwareOverview, ModelRadar, SpeedInfo } from "./components/discovery-visuals"
 import { MemoryBreakdown } from "./components/memory-breakdown"
-import { HarnessConnections } from "./components/harness-connections"
+import { HarnessConnections, type CommandModel } from "./components/harness-connections"
+import { HarnessSetupList } from "./components/harness-setup"
 import { OtherApps } from "./components/other-apps"
 import { LabLogo, ModelLogo, modelLab, modelLabs, type ModelLab } from "./components/model-logo"
 
@@ -465,8 +466,11 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const navigate = useNavigate()
   const hardware = useLocalInferenceHardware()
   const state = useAtomValue(service.application)
+  // The desktop app, its service, and the agents always share one computer and user, so it
+  // configures agents in place. A browser can't know where its viewer's agents run.
+  const desktop = Option.isSome(service.clientWindow)
   // A desktop window serves its own loopback endpoint; a browser reaches the service at its own origin.
-  const apiOrigin = Option.isSome(service.clientWindow)
+  const apiOrigin = desktop
     ? (Result.isSuccess(state) ? Option.some(`http://127.0.0.1:${new URL(state.value.endpoint).port}`) : Option.none<string>())
     : Option.some(window.location.origin)
   const platform = useServerPlatform()
@@ -476,6 +480,17 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const ranked = Result.isSuccess(hardware) ? rankedLocalModelOptions(available.map(model => ({ id: model.modelId, kind: "stored" as const, model })), { fastToSmart: 0.5, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, available.length).map(option => option.model) : available
   const commandModels = ranked.map(model => ({ id: model.modelId, label: formatLocalModelDisplayName(model) }))
   const defaultModel = commandModels.find(model => model.id === active)?.id ?? commandModels[0]?.id
+  return <>
+    {!serviceReady && <p className="mt-5 text-sm text-slate-500">{desktop ? "Configuration checks are available. Start the service from Status before connecting a harness." : "Start the service from Status before setting up an agent."}</p>}
+    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service on Status." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("discover")}>Discover models</NoticeAction>} />}
+    {desktop
+      ? <DesktopHarnessConnections canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform} selectedModel={selectedModel} />
+      : Option.isSome(apiOrigin) && <HarnessSetupList defaultModel={defaultModel} origin={apiOrigin.value} remote={remote} platform={viewerPlatform()} />}
+    {Option.isSome(apiOrigin) && <OtherApps origin={apiOrigin.value} model={defaultModel} platform={remote ? viewerPlatform() : platform} remote={remote} onOpenSettings={() => navigate("settings")} />}
+  </>
+}
+/** One-click connections, for the desktop app only: it runs where the agents run. */
+function DesktopHarnessConnections({ canConnect, models, defaultModel, platform, selectedModel }: { canConnect: boolean; models: readonly CommandModel[]; defaultModel: ProviderModelId | undefined; platform: string; selectedModel: Option.Option<ProviderModelId> }) {
   const client = useAgentClient()
   const rows = useAtomValue(client.Connections.WatchHarnessConnections({})).result
   const connect = useAtomSet(client.Connections.ConnectHarness)
@@ -485,15 +500,12 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const busy = connecting.waiting || disconnecting.waiting
   const error = !busy && firstFailure([connecting, disconnecting])
   return <>
-    {!serviceReady && <p className="mt-5 text-sm text-slate-500">Configuration checks are available. Start the service from Status before connecting a harness.</p>}
-    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service on Status." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("discover")}>Discover models</NoticeAction>} />}
     {error && Result.isFailure(error) && <ErrorNotice title={Result.isFailure(disconnecting) ? "Couldn’t disconnect this agent" : "Couldn’t connect this agent"} description="Check the agent’s configuration before trying again. Some changes may not have completed." className="mt-5" />}
     {Result.isFailure(rows) ? <ErrorNotice title="Couldn’t check your connections" description="Connection status is unavailable. Magnitude will check again automatically." className="mt-5" />
       : !Result.isSuccess(rows) ? <ConnectionsSkeleton />
       : rows.value._tag === "Unavailable" ? <ErrorNotice title="Couldn’t check your connections" description="Magnitude can’t read the saved connection information. Check that its configuration is accessible." className="mt-5" />
-      : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform} remote={remote}
+      : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={models} defaultModel={defaultModel} platform={platform}
           onConnect={harness => connect({ harness, model: selectedModel, installSkill: true })} onDisconnect={harness => disconnect({ harness })} />}
-    {Option.isSome(apiOrigin) && <OtherApps origin={apiOrigin.value} model={defaultModel} platform={remote ? viewerPlatform() : platform} remote={remote} onOpenSettings={() => navigate("settings")} />}
   </>
 }
 /** The model row's status: the load stage in full while loading, the memory in use once loaded. */

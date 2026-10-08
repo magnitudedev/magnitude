@@ -271,8 +271,11 @@ user's shell. A divided footer links to Settings for network
 access. Network addresses and controls stay in Settings. Viewed from another device, the card
 describes the server's API at the address the browser used: the caption asks for the Network access
 key, the example request is in the viewer's shell and sends the key as a placeholder Bearer header,
-and the footer points to the key in Settings. Harness rows say they are installed on the computer
-running Magnitude, since connecting one changes that computer's configuration.
+and the footer points to the key in Settings. In a browser, local or remote, the harness rows have no
+status or grouping and no Connect, Repair, or Disconnect: each row's only action is **Copy setup
+prompt**, which copies the prompt from `DescribeHarnessSetup` for the default model, ending with the
+command to start the harness. The desktop app keeps one-click connections, since it, its service,
+and the harnesses share one computer and user.
 The initializer installs the canonical client-common palette variables; importing Tailwind alone
 does not initialize that palette. Native window appearance follows the same selected preference. macOS integrates native traffic
 lights beside the collapse toggle in the sidebar’s top row, with branding below and no separate title bar. The sidebar border and main content extend to the window’s top edge. Collapsing slides the sidebar fully away while retaining the native controls and a background-free expand toggle. Content keeps the same width in both states and is centered in the remaining area; closing the sidebar adds margins instead of reflowing content. Reduced-motion settings disable the transition, and hidden navigation is inert. The toggle is pinned to the sidebar’s right edge when expanded and uses the same sidebar icon in both states. Windows integrates native caption controls

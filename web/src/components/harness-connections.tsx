@@ -4,7 +4,7 @@ import type { HarnessConnectionStatus, HarnessId } from "@magnitudedev/sdk"
 import { Brand } from "effect"
 import { useMemo, useState } from "react"
 import type { ProviderModelId } from "@magnitudedev/sdk"
-import { harnessCommand } from "./harness-command"
+import { harnessCommand, harnessInstallationUrl } from "@magnitudedev/sdk"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select"
 import { ArrowClockwiseIcon, ArrowUpRightIcon } from "@phosphor-icons/react"
 import { CopyCommand } from "./copy-command"
@@ -12,16 +12,6 @@ import { Button } from "./ui/button"
 import { ActionTooltip, TooltipProvider } from "./ui/tooltip"
 import { HarnessLogo } from "./harness-logo"
 
-const installationDocs: Record<Brand.Brand.Unbranded<HarnessId>, string> = {
-  pi: "https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent#quick-start",
-  opencode: "https://opencode.ai/docs/#install",
-  hermes: "https://hermes-agent.nousresearch.com/docs/getting-started/installation/",
-  openclaw: "https://docs.openclaw.ai/install",
-  codex: "https://developers.openai.com/codex/cli",
-  "claude-code": "https://code.claude.com/docs/en/overview",
-  "oh-my-pi": "https://github.com/can1357/oh-my-pi#installation",
-  cline: "https://docs.cline.bot/getting-started/installing-cline",
-}
 
 type Props = {
   connections: readonly HarnessConnectionStatus[]
@@ -31,16 +21,15 @@ type Props = {
   models: readonly CommandModel[]
   defaultModel: ProviderModelId | undefined
   platform: string
-  remote?: boolean
   onDisconnect: (id: HarnessId) => void
 }
 
-export function HarnessConnections({ connections, busy, canConnect, onConnect, onDisconnect, models, defaultModel, platform, remote = false }: Props) {
+export function HarnessConnections({ connections, busy, canConnect, onConnect, onDisconnect, models, defaultModel, platform }: Props) {
   return <TooltipProvider><div className="mt-7 space-y-8">{[true, false].map(installed => {
     const rows = connections.filter(row => row.installed === installed)
       .sort((a, b) => Number(b.inspection._tag === "Connected") - Number(a.inspection._tag === "Connected"))
     if (rows.length === 0) return null
-    const title = installed ? remote ? "Installed on the computer running Magnitude" : "Installed on your machine" : "Not installed"
+    const title = installed ? "Installed on your machine" : "Not installed"
     return <section key={title} aria-label={title}>
       <h2 className="mb-4 text-sm font-medium text-slate-500">{title}</h2>
       <div className={pageLayout.harnessGrid}>{rows.map(row => {
@@ -61,7 +50,7 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
             {installed ? <>{row.inspection._tag === "Connected"
               ? <ActionTooltip label="Refresh connection" trigger={<Button variant="ghost" size="icon-sm" aria-label="Refresh connection" disabled={busy || !canConnect} onClick={() => onConnect(row.id)}><ArrowClockwiseIcon aria-hidden="true" className="size-4" /></Button>} />
               : <Button disabled={busy || !canConnect} onClick={() => onConnect(row.id)}>{needsAttention ? "Repair connection" : "Connect"}</Button>}{!needsAttention && (row.managed || row.inspection._tag === "Connected") && <Button variant="outline" disabled={busy} onClick={() => onDisconnect(row.id)}>Disconnect</Button>}</>
-              : <a href={installationDocs[Brand.unbranded(row.id)]} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm text-slate-500 hover:underline">Install {row.name}<ArrowUpRightIcon aria-hidden="true" className="size-4" /></a>}
+              : <a href={harnessInstallationUrl(row.id)} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm text-slate-500 hover:underline">Install {row.name}<ArrowUpRightIcon aria-hidden="true" className="size-4" /></a>}
           </div>
         </div>
               {installed && row.inspection._tag === "Unavailable" && <ErrorNotice title="Couldn’t verify this connection" description="The agent’s configuration could not be read or validated. Check it before reconnecting." className="mt-2" />}

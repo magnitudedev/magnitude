@@ -127,4 +127,4 @@ export function useDisconnectWarning(): { readonly warn: (warning: DisconnectWar
 }
 
 /** The viewer's operating system, for commands they run on this device rather than the server. */
-export const viewerPlatform = (): string => /Windows/i.test(navigator.userAgent) ? "win32" : /Mac/i.test(navigator.userAgent) ? "darwin" : "linux"
+export const viewerPlatform = (): "win32" | "darwin" | "linux" => /Windows/i.test(navigator.userAgent) ? "win32" : /Mac/i.test(navigator.userAgent) ? "darwin" : "linux"
