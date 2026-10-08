@@ -27,7 +27,15 @@ Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`
 
 **Connect** writes `~/.cline/data/settings/providers.json` and `~/.cline/data/settings/models.json`. Location overrides: `CLINE_DATA_DIR` and `CLINE_PROVIDER_SETTINGS_PATH`.
 
-When the agent runs on another computer, open Magnitude in a browser on that computer, go to **Connections**, and choose **Copy setup prompt**. Paste it into the agent, or any coding agent, there: it applies the settings below with your address, key, and models filled in. The configuration below is the reference format; see [Network access](/api/network-access) for `ADDRESS` and `API_KEY`.
+### On another computer
+
+1. In Magnitude, turn on **Settings → Network access**.
+2. On the other computer, open `http://ADDRESS:10100` in a browser, using the address from **Reachable at**, and sign in with the **API key**.
+3. In **Connections**, click **Copy setup prompt** on Cline and send it to your agent.
+
+### Edit the files yourself
+
+Use the address from **Reachable at** for `ADDRESS` and the **API key** for `API_KEY`.
 
 `~/.cline/data/settings/providers.json`:
 
@@ -42,9 +50,13 @@ When the agent runs on another computer, open Magnitude in a browser on that com
         "baseUrl": "http://ADDRESS:10100/inference/v1",
         "apiKey": "API_KEY",
         "model": "MODEL_ID"
-      }
+      },
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "tokenSource": "manual"
     }
   },
   "lastUsedProvider": "openai-compatible"
 }
 ```
+
+Set `updatedAt` to the current time. Cline replaces a provider entry that has no `updatedAt` with its own stored settings the next time it starts.

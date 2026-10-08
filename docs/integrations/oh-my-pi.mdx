@@ -27,7 +27,15 @@ Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`
 
 **Connect** writes `~/.omp/agent/models.yml` and `~/.omp/agent/config.yml`. Location overrides: `OMP_PROFILE`, `PI_PROFILE`, `PI_CONFIG_DIR`, and `PI_CODING_AGENT_DIR`.
 
-When the agent runs on another computer, open Magnitude in a browser on that computer, go to **Connections**, and choose **Copy setup prompt**. Paste it into the agent, or any coding agent, there: it applies the settings below with your address, key, and models filled in. The configuration below is the reference format; see [Network access](/api/network-access) for `ADDRESS` and `API_KEY`.
+### On another computer
+
+1. In Magnitude, turn on **Settings → Network access**.
+2. On the other computer, open `http://ADDRESS:10100` in a browser, using the address from **Reachable at**, and sign in with the **API key**.
+3. In **Connections**, click **Copy setup prompt** on Oh My Pi and send it to your agent.
+
+### Edit the files yourself
+
+Use the address from **Reachable at** for `ADDRESS` and the **API key** for `API_KEY`.
 
 `~/.omp/agent/models.yml`:
 
