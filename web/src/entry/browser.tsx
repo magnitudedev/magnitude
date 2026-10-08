@@ -17,4 +17,4 @@ const host: ApplicationHost = {
   shell: Option.none(),
 }
 
-renderApplication({ host, origin: Effect.succeed(window.location.origin), navigation: "location", canSignIn: true })
+renderApplication({ host, origin: Effect.succeed(window.location.origin), navigation: "location", canSignIn: true, reconnect: "OnConnect" })

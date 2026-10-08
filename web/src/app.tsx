@@ -55,9 +55,9 @@ import {
 } from "@magnitudedev/client-common"
 import { appearanceReadError } from "./appearance"
 import { useNavigate, useServerPlatform, useSession } from "./session"
-import { useServiceConnection, useServiceObservation, type ServiceObservation } from "./service-view"
+import { useReconnectAttempt, useServiceObservation, type ServiceObservation } from "./service-view"
 import { ConfirmDialog } from "./components/confirm-dialog"
-import { signOut, useCheckSignInOnMount, useDisconnectWarning, useRemoteAccess, useSignInRecheck, viewerPlatform } from "./remote-access"
+import { signOut, useDisconnectWarning, useRemoteAccess, viewerPlatform } from "./remote-access"
 import { useNarrowViewport } from "./lib/viewport"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "./components/ui/alert-dialog"
 import { HardwareOverview, ModelRadar, SpeedInfo } from "./components/discovery-visuals"
@@ -863,6 +863,7 @@ export function App() {
   const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
   return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><AppShell page={page} navigate={navigate} platform={platform}>
       {service?._tag === "Unreachable" ? <CannotReachMagnitude />
+      : service?._tag === "Reconnecting" ? <ReconnectingToMagnitude />
       : page === "status" ? Result.isFailure(observation.service) ? <ErrorNotice title="Couldn’t read service status" description="Magnitude can’t confirm the service’s current state." className="mt-7" /> : <Status observation={observation} />
       : page === "usage" ? <ServingUsage />
       : page === "settings" ? <SettingsPage />
@@ -872,12 +873,15 @@ export function App() {
       : null}
   </AppShell></>
 }
-/** A browser cannot restart the service; it can only try to reach it again. */
+/** Shown while a browser's own retries run after its connection drops, as it does when Magnitude restarts. */
+function ReconnectingToMagnitude() {
+  return <ErrorNotice className="mt-8" severity="info" title="Reconnecting to Magnitude…"
+    description="The connection to the Magnitude service was interrupted, as it is when Magnitude restarts." />
+}
+/** A browser cannot restart the service; after its own retries stop, Reconnect tries once more. */
 function CannotReachMagnitude() {
-  const connection = useServiceConnection()
-  const recheck = useSignInRecheck()
-  useCheckSignInOnMount()
-  const reconnectAction = useMemo(() => Atom.fn((_: void) => recheck.pipe(Effect.flatMap(required => required ? Effect.void : connection.connect))), [connection, recheck])
+  const attempt = useReconnectAttempt()
+  const reconnectAction = useMemo(() => Atom.fn((_: void) => attempt), [attempt])
   const reconnect = useAtomSet(reconnectAction)
   const reconnecting = useAtomValue(reconnectAction)
   return <ErrorNotice className="mt-8" title="Can’t reach Magnitude"

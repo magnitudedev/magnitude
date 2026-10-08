@@ -95,6 +95,12 @@ export const MagnitudeClient = Object.assign(
 export interface ClientOptions {
   readonly origin?: string;
   readonly connectTimeout?: Duration.DurationInput;
+  /**
+   * Who reconnects after a connection fails. "Automatic" (the default) lets any request or
+   * subscription reach the service again; "OnConnect" keeps a failed connection failed, without
+   * network traffic, until `connection.connect` is called, so the host decides when to retry.
+   */
+  readonly reconnect?: "Automatic" | "OnConnect";
 }
 export function clientLayer(
   options: ClientOptions & { readonly autoStart: false }
@@ -302,7 +308,8 @@ const makeClient = (
     );
 
     const select = (
-      failedId?: string
+      failedId?: string,
+      requested = false
     ): Effect.Effect<ServiceInfo, ConnectionError> =>
       Effect.flatten(
         admission
@@ -316,6 +323,8 @@ const makeClient = (
               )
                 return Effect.succeed(current.service);
               if (active !== undefined) return Deferred.await(active);
+              if (current._tag === "Failed" && !requested && options.reconnect === "OnConnect")
+                return Effect.fail(current.error);
               const pending = yield* Deferred.make<
                 ServiceInfo,
                 ConnectionError
@@ -423,7 +432,7 @@ const makeClient = (
         ...mapped.connection,
         state: SubscriptionRef.get(state),
         changes: state.changes,
-        connect: select().pipe(Effect.asVoid),
+        connect: select(undefined, true).pipe(Effect.asVoid),
       },
     });
   });

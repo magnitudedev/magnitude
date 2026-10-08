@@ -42,4 +42,4 @@ const firstSnapshot = observe(ApplicationSnapshot, bridge.observe).pipe(
   Effect.flatMap(Option.match({ onNone: () => Effect.fail(new ApplicationHostFailed({ message: "Magnitude's service state is unavailable." })), onSome: Effect.succeed })),
 )
 
-renderApplication({ host, origin: Effect.map(firstSnapshot, snapshot => snapshot.endpoint), navigation: "memory", canSignIn: false })
+renderApplication({ host, origin: Effect.map(firstSnapshot, snapshot => snapshot.endpoint), navigation: "memory", canSignIn: false, reconnect: "Automatic" })

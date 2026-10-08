@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react"
+import { createContext, useContext, useMemo, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Effect, Option } from "effect"
 import { FetchHttpClient, type HttpClient } from "@effect/platform"
@@ -84,11 +84,6 @@ export function useSignInRecheck(): Effect.Effect<boolean> {
   return useMemo(() => access.canSignIn
     ? signInRequired(access.origin).pipe(Effect.tap(required => required ? restartWindow : Effect.void))
     : Effect.succeed(false), [access])
-}
-
-export function useCheckSignInOnMount() {
-  const recheck = useSignInRecheck()
-  useEffect(() => { Effect.runFork(recheck) }, [recheck])
 }
 
 export type DisconnectWarning = "TurnOffNetworkAccess" | "RegenerateKey" | "ChangeAddress" | "Restart"

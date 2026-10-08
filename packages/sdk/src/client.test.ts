@@ -378,6 +378,32 @@ describe("MagnitudeClient", () => {
     );
   });
 
+  it("keeps a failed connection failed without traffic until connect when the host reconnects", async () => {
+    const f = fixture();
+    const live = MagnitudeClient.layer({ autoStart: false, reconnect: "OnConnect" }).pipe(
+      Layer.provide(Layer.succeed(HttpClient.HttpClient, f.http))
+    );
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* MagnitudeClient;
+        yield* client.models.stop({});
+        f.stop();
+        f.replace();
+        expect((yield* Effect.either(client.models.stop({})))._tag).toBe("Left");
+        yield* client.connection.changes.pipe(Stream.filter(state => state._tag === "Failed"), Stream.take(1), Stream.runDrain);
+        const before = f.requests.length;
+        expect((yield* Effect.either(client.models.stop({})))._tag).toBe("Left");
+        expect(f.requests.length).toBe(before);
+        f.resume();
+        expect((yield* Effect.either(client.models.stop({})))._tag).toBe("Left");
+        expect(f.requests.length).toBe(before);
+        yield* client.connection.connect;
+        expect((yield* client.connection.state)._tag).toBe("Ready");
+        yield* client.models.stop({});
+      }).pipe(Effect.provide(live))
+    );
+  });
+
   it("cancelling one waiter does not cancel the shared startup", async () => {
     const f = fixture();
     f.stop();

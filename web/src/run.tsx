@@ -25,6 +25,8 @@ export interface ApplicationEntry<E> {
   readonly navigation: "memory" | "location"
   /** Whether this window may be on another device and so may need to sign in; a browser may. */
   readonly canSignIn: boolean
+  /** A desktop window reconnects whenever its owner restarts the service; a browser retries on its own schedule. */
+  readonly reconnect: "Automatic" | "OnConnect"
 }
 
 function SessionGate() {
@@ -58,7 +60,7 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
     const scope = yield* Scope.make()
     const runtime = yield* Effect.runtime<never>()
     window.addEventListener("beforeunload", () => { Runtime.runFork(runtime)(Scope.close(scope, Exit.void)) }, { once: true })
-    const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
+    const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin, autoStart: false, reconnect: entry.reconnect }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
     const client = createAgentClient(connection.client, { host: entry.host, navigation: entry.navigation })
     const readError = Either.isLeft(appearance) ? "The saved appearance could not be read. Using System appearance." : null
     root.render(<RegistryProvider initialValues={[[appearanceReadError, readError]]}><AgentClientProvider tag={client}><ServiceConnectionProvider connection={connection.client.connection}><RemoteAccessProvider access={{ origin, canSignIn: entry.canSignIn, remote }}><SessionGate /></RemoteAccessProvider></ServiceConnectionProvider></AgentClientProvider></RegistryProvider>)
