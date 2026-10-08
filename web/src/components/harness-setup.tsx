@@ -54,7 +54,7 @@ function SetupHeader({ harness, name, children }: { harness: HarnessId; name: st
       <HarnessLogo id={harness} name={name} />
       <h3 className="text-lg font-semibold">{name}</h3>
     </div>
-    <div className="ml-auto flex shrink-0 items-center gap-2">{children}</div>
+    <div className="ml-auto flex shrink-0 items-center gap-4">{children}</div>
   </div>
 }
 
@@ -82,7 +82,7 @@ function SetupCard({ harness, name, model, origin, remote, platform }: {
   return <article aria-label={name} className={pageLayout.harnessCard}>
     <SetupHeader harness={harness} name={name}>
       {!Result.isFailure(setup) && <>
-        <Button variant="ghost" aria-expanded={open} aria-controls={promptId} disabled={!ready} onClick={() => setOpen(value => !value)}>Show prompt<CaretDownIcon aria-hidden="true" className={`size-4 transition-transform ${open ? "rotate-180" : ""}`} /></Button>
+        <button type="button" aria-expanded={open} aria-controls={promptId} disabled={!ready} onClick={() => setOpen(value => !value)} className="inline-flex cursor-pointer items-center gap-1 rounded text-sm font-medium text-slate-600 transition-colors hover:text-slate-900 focus-visible:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:cursor-default disabled:opacity-50 dark:text-slate-400 dark:hover:text-slate-100 dark:focus-visible:text-slate-100">Show prompt<CaretDownIcon aria-hidden="true" className={`size-3.5 transition-transform ${open ? "rotate-180" : ""}`} /></button>
         <Button aria-label={`Copy ${name} setup prompt`} disabled={!ready} onClick={() => ready && copy(setup.value.prompt)}>
           {copied ? <CheckIcon aria-hidden="true" /> : <CopyIcon aria-hidden="true" />}{copied ? "Copied" : "Copy setup prompt"}
         </Button>
