@@ -1,11 +1,12 @@
 import { sign, verify, type KeyObject } from "node:crypto"
 import { Effect, Schema } from "effect"
+import { LinuxPackageFormat } from "../linux-package"
 import { isNewerVersion, isValidVersion, admittedChannels, releaseChannelOf } from "../client-update/release-channels"
 
 export const ReleaseTarget = Schema.Union(
   Schema.Struct({ os: Schema.Literal("darwin"), arch: Schema.Literal("arm64", "x64"), package: Schema.Literal("mac-zip", "dmg") }),
   Schema.Struct({ os: Schema.Literal("windows"), arch: Schema.Literal("x64"), package: Schema.Literal("windows-exe") }),
-  Schema.Struct({ os: Schema.Literal("linux"), arch: Schema.Literal("arm64", "x64"), package: Schema.Literal("deb", "rpm") }),
+  Schema.Struct({ os: Schema.Literal("linux"), arch: Schema.Literal("arm64", "x64"), package: LinuxPackageFormat }),
 )
 export type ReleaseTarget = typeof ReleaseTarget.Type
 

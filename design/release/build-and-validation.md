@@ -73,13 +73,16 @@ not an assumption about filesystem API calls. Installed-consumer acceptance must
 launch without sandbox-disabling test flags, verify the canonical CLI/application-menu path and
 window class, and preserve the matched application/service bytes.
 RPM packaging disables build-root rewriting of the prebuilt payload, including stripping and debug
-section extraction. The desktop carries Magnitude's license alongside Electron's existing notices.
-Each DEB/RPM producer emits a schema-validated artifact record for the final copied package,
+section extraction. Pacman packages are assembled from the staged payload with bsdtar, following
+makepkg's archive layout, so the Ubuntu build host needs no Arch tooling; bsdtar records root
+ownership and the sandbox helper's setuid mode in both the archive and its file manifest. The desktop carries Magnitude's license alongside Electron's existing notices.
+Each DEB/RPM/pacman producer emits a schema-validated artifact record for the final copied package,
 including its format-specific identity, host, filename, byte size and SHA-256. That record is build
 metadata; it does not replace installed-consumer acceptance or authorize publication.
-Linux candidate assembly requires both formats for each selected Linux host. Native package tooling
-verifies the embedded package name, version, architecture and sandbox permissions against the
-release target; an installer extension or matching checksum alone is insufficient.
+Linux candidate assembly requires every format of each selected Linux host: DEB and RPM, plus
+pacman on x86-64. Native package tooling, or bsdtar reading `.PKGINFO` for pacman, verifies the
+embedded package name, version, architecture and sandbox permissions against the release target; an
+installer extension or matching checksum alone is insufficient.
 
 ## Windows build baseline
 
@@ -221,6 +224,10 @@ dependencies disabled, compare the installed service bytes and sandbox permissio
 the installed desktop lifecycle under an unprivileged user. Container init must reap detached
 children so process-exit checks retain their ordinary operating-system meaning. This gate does
 not replace native desktop-environment or real logout acceptance.
+The x86-64 consumer also installs the accepted pacman package in a fresh Arch Linux userspace,
+verifies its file manifest, service bytes and sandbox permissions, proves that pacman refuses to
+upgrade or remove the installation while the installation lock is held shared, and repeats the
+installed desktop lifecycle under an unprivileged user.
 The container syscall policy must permit Chromium to create its sandbox namespaces while retaining
 the default restrictions on other operations. Acceptance never disables Chromium's sandbox.
 

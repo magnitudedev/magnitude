@@ -2,6 +2,7 @@ import { acnExecutableRelativePath } from "../../src/macos-app"
 import { buildMacApp } from "../apple/build-app"
 import { buildDesktopApplication, DesktopBuildFailed } from "./desktop"
 import { buildLinuxDesktopInstaller } from "./desktop-linux"
+import { linuxPackageFormats } from "../../src/linux-package"
 import { buildWindowsDesktopInstaller } from "./desktop-windows"
 import { signWindowsCode } from "./windows-signing"
 import { BunContext } from "@effect/platform-bun"
@@ -252,7 +253,7 @@ export const buildHostArtifacts = async (
       })
       if (applications.length !== 1) return yield* new DesktopBuildFailed({ message: "Desktop packaging did not produce exactly one Linux application" })
       const artifacts: ReleaseArtifact[] = []
-      for (const format of ["deb", "rpm"] as const) {
+      for (const format of linuxPackageFormats(arch)) {
         const installer = yield* buildLinuxDesktopInstaller({
           app: applications[0]!, output, arch, format, version, revision: ACN_COORDINATION_REVISION,
         })

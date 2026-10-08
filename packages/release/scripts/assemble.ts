@@ -13,6 +13,7 @@ import { basename, resolve } from "node:path"
 import { Effect, Option, Schema } from "effect"
 import { BunContext } from "@effect/platform-bun"
 import { validateLinuxDesktopInstaller } from "./build/desktop-linux"
+import { linuxPackageFormats } from "../src/linux-package"
 import {
   releaseTag,
   ReleaseArtifactSchema,
@@ -92,7 +93,7 @@ const expectedArtifacts = new Map<string, string>([
     [`icn-base-${host.id}`, icnBaseArchive(host.id)] as const,
     ...(host.id === "darwin-arm64" || host.id === "darwin-x64" ? [[`desktop-${host.id}`, desktopInstaller(host.id)] as const, [`desktop-update-${host.id}`, desktopUpdateArchive(host.id)] as const] : []),
     ...(host.id === "linux-arm64-gnu" || host.id === "linux-x64-gnu"
-      ? (["deb", "rpm"] as const).map(format => [`desktop-${host.id}-${format}`, linuxDesktopInstaller(host.id as "linux-arm64-gnu" | "linux-x64-gnu", format, version, ACN_COORDINATION_REVISION)] as const)
+      ? linuxPackageFormats(host.id === "linux-arm64-gnu" ? "arm64" : "x64").map(format => [`desktop-${host.id}-${format}`, linuxDesktopInstaller(host.id as "linux-arm64-gnu" | "linux-x64-gnu", format, version, ACN_COORDINATION_REVISION)] as const)
       : []),
     ...(host.id === "windows-x64-msvc" ? [[`desktop-${host.id}`, windowsDesktopInstaller(version)] as const] : []),
   ]),
@@ -121,7 +122,7 @@ const validateLayout = async (
       return
     }
     if (host === "linux-arm64-gnu" || host === "linux-x64-gnu") {
-      const format = artifact.id === `desktop-${host}-deb` ? "deb" : artifact.id === `desktop-${host}-rpm` ? "rpm" : undefined
+      const format = linuxPackageFormats(host === "linux-arm64-gnu" ? "arm64" : "x64").find(format => artifact.id === `desktop-${host}-${format}`)
       if (format === undefined) throw new Error(`Unexpected Linux desktop artifact ${artifact.id}`)
       await Effect.runPromise(validateLinuxDesktopInstaller({
         file: archive, format, arch: host === "linux-arm64-gnu" ? "arm64" : "x64", version, revision: ACN_COORDINATION_REVISION,

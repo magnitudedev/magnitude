@@ -1,4 +1,5 @@
 import { Option } from "effect"
+import { linuxPackageArchitecture, linuxPackageVersion, type LinuxPackageFormat } from "./linux-package"
 
 export type HostId =
   | "darwin-arm64"
@@ -134,10 +135,13 @@ export const acnArchive = (host: HostId) => `magnitude-acn-${host}.tar.gz`
 export const desktopInstaller = (host: "darwin-arm64" | "darwin-x64") => `magnitude-desktop-${host}.dmg`
 export const desktopUpdateArchive = (host: "darwin-arm64" | "darwin-x64") => `magnitude-desktop-${host}.zip`
 export const windowsDesktopInstaller = (version: string) => `magnitude-desktop-windows-x64-${version}.exe`
-export const linuxDesktopInstaller = (host: "linux-arm64-gnu" | "linux-x64-gnu", format: "deb" | "rpm", version: string, revision: number) => {
-  return format === "deb"
-    ? `magnitude-desktop_${version}-${revision}_${host === "linux-arm64-gnu" ? "arm64" : "amd64"}.deb`
-    : `magnitude-desktop-${version}-${revision}.${host === "linux-arm64-gnu" ? "aarch64" : "x86_64"}.rpm`
+export const linuxDesktopInstaller = (host: "linux-arm64-gnu" | "linux-x64-gnu", format: LinuxPackageFormat, version: string, revision: number) => {
+  const arch = linuxPackageArchitecture(format, host === "linux-arm64-gnu" ? "arm64" : "x64")
+  switch (format) {
+    case "deb": return `magnitude-desktop_${version}-${revision}_${arch}.deb`
+    case "rpm": return `magnitude-desktop-${version}-${revision}.${arch}.rpm`
+    case "pacman": return `magnitude-desktop-${linuxPackageVersion(format, version)}-${revision}-${arch}.pkg.tar.zst`
+  }
 }
 export const icnBaseArchive = (host: HostId) => `magnitude-icn-base-${host}.tar.gz`
 

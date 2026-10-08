@@ -65,9 +65,13 @@ its DMG. The ZIP is a separate desktop artifact covered by the release manifest 
 receipts. It is not an inference/runtime acquisition archive. Producing it does not establish
 successful application replacement or relaunch; those remain updater acceptance requirements.
 
-Linux package metadata uses `~` for prerelease ordering. Published DEB/RPM filenames retain the
-SemVer `-` separator because GitHub rewrites `~` in asset names. Renaming the packaged file does
-not change its bytes, internal version, checksum, or installation behavior.
+Linux hosts publish DEB and RPM packages; the x86-64 host also publishes a pacman package for Arch
+Linux and its derivatives, which have no official ARM distribution. DEB/RPM metadata uses `~` for
+prerelease ordering, and their published filenames retain the SemVer `-` separator because GitHub
+rewrites `~` in asset names. Renaming the packaged file does not change its bytes, internal version,
+checksum, or installation behavior. Pacman's version comparison sorts `~` after the release it
+precedes, so pacman versions drop the prerelease separator instead (`1.2.0beta.1` sorts before
+`1.2.0`), and that version is also the pacman filename.
 
 Linux desktop packages use the name `magnitude-desktop` and place the matched application at
 `/usr/lib/magnitude-desktop/magnitude`. The application-menu launcher and headless CLI resolve
@@ -77,6 +81,12 @@ The package manager obtains exclusive admission before replacement/removal and r
 participating user app remains alive. A root-owned installation gate spans the separate maintainer
 script lifetimes; launches fail with repair guidance until configuration succeeds. Interrupted
 installation never becomes an independently running service. The lock inode survives reinstall.
+Pacman ignores package scriptlet failures, so the pacman package performs its exclusive admission in a
+PreTransaction hook with AbortOnFail, named to order after other packages' hooks, and completes it in
+its post-install, post-upgrade and post-remove scriptlets. Removal deletes the hook's own files before
+post-transaction hooks run, which is why completion is a scriptlet. A first installation has no hook
+on disk yet; its post-install scriptlet establishes the lock. A failed pacman transaction after
+admission leaves the repair gate in place until the package is reinstalled.
 Package abort hooks must preserve a healthy old installation after a rejected upgrade. Debian's
 `postinst abort-upgrade` and `abort-remove` release the gate after the package manager restores the
 old installation; a Debian refusal before gate acquisition does not acquire or clear another owner's gate.
@@ -86,8 +96,8 @@ package reinstallation to restore dependencies and clear the gate.
 `/usr/bin/magnitude-desktop` is the graphical launch entry; `/usr/bin/magnitude` resolves the
 bundled headless CLI. Login registration remains a user preference controlled
 by the running application. Package installation does not register an independent daemon or
-automatically open a window. Native DEB/RPM consumption and upgrade acceptance precede inclusion
-in the published artifact graph.
+automatically open a window. Native DEB/RPM/pacman consumption and upgrade acceptance precede
+inclusion in the published artifact graph.
 
 Windows installer candidates use the desktop's existing application lease and never start or adopt
 an independent service. The PowerShell bootstrap authenticates a publisher-signed standalone CLI

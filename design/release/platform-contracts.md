@@ -107,7 +107,8 @@ and ALSA libraries, plus util-linux for installation admission and Polkit/pkexec
 Wayland. They do not become requirements of the headless CLI or inference artifacts. FFmpeg,
 Electron, and the bundled rendering libraries are artifact-owned. Package metadata must resolve
 the graphical dependencies on each supported distribution without relying on optional recommends
-for directly linked libraries. Native consumer checks validate the final installed application's
+for directly linked libraries. Pacman packages list every directly linked library's Arch package,
+plus libarchive for the updater's package identity check. Native consumer checks validate the final installed application's
 loader closure and sandbox permissions; a build-host launch is insufficient.
 
 ## Windows contract

@@ -8,6 +8,7 @@
     "./targets": "./src/targets.ts",
     "./contracts": "./src/contracts.ts",
     "./executables": "./src/executables.ts",
+    "./linux-package": "./src/linux-package.ts",
     "./acquisition": "./src/acquisition.ts",
     "./trust": "./src/trust.ts",
     "./macos-app": "./src/macos-app.ts",

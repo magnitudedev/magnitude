@@ -11,8 +11,9 @@ Visit [Download Magnitude](https://magnitude.dev/download) and choose:
 | --- | --- |
 | Ubuntu / Debian | `.deb` |
 | Fedora / Red Hat | `.rpm` |
+| Arch Linux / Omarchy and other Arch-based distributions | `.pkg.tar.zst` |
 
-Choose **Intel / AMD (x64)** for an x86-64 processor or **ARM64** for an ARM64 processor. If you need to check, run `uname -m`: `x86_64` means x64; `aarch64` means ARM64.
+Choose **Intel / AMD (x64)** for an x86-64 processor or **ARM64** for an ARM64 processor. The Arch package is available for x64 only. If you need to check, run `uname -m`: `x86_64` means x64; `aarch64` means ARM64.
 
 ## Requirements
 
@@ -33,6 +34,11 @@ sudo apt install ./magnitude-desktop.deb
 <Tab title="Fedora">
 ```sh
 sudo dnf install ./magnitude-desktop.rpm
+```
+</Tab>
+<Tab title="Arch / Omarchy">
+```sh
+sudo pacman -U ./magnitude-desktop.pkg.tar.zst
 ```
 </Tab>
 </Tabs>
