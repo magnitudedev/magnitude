@@ -72,19 +72,32 @@ describe("install when idle", () => {
     expect(h.events).toEqual([])
     expect(Option.isNone(h.outcome())).toBe(true)
   })
-  it("defers while another Magnitude holds the installation lock, then installs at a later idle point", async () => {
+  it("defers without stopping while another Magnitude holds the installation lock, reports it, then installs at a later idle point", async () => {
     const h = harness({ lockFree: [false, true] })
+    const report = Effect.sync(() => { h.events.push("report") })
     await h.run(machine => Effect.gen(function* () {
-      yield* machine.install
-      expect(h.events).toEqual(["outcome deferred"])
-      const retry = yield* machine.installWhenIdle(release.version).pipe(Effect.fork)
+      const decision = yield* machine.installWhenIdle(release.version, report).pipe(Effect.fork)
       yield* TestClock.adjust(Duration.minutes(14))
-      expect(h.events).toEqual(["outcome deferred"])
+      // Still serving: no decision to stop, the deferral recorded and reported once.
+      expect(h.events).toEqual(["idle", "outcome deferred", "report"])
+      expect(h.notices).toEqual([`Magnitude ${release.version} is waiting for another Magnitude to quit; trying again later.`])
       yield* TestClock.adjust(Duration.minutes(1))
-      expect(yield* Fiber.join(retry)).toBe(true)
+      expect(yield* Fiber.join(decision)).toBe(true)
       yield* machine.install
     }))
-    expect(h.events).toEqual(["outcome deferred", "idle", "install", "outcome applied", "exec"])
+    expect(h.events).toEqual(["idle", "outcome deferred", "report", "idle", "install", "outcome applied", "exec"])
+  })
+  it("defers when the lock is taken between the idle decision and the installation", async () => {
+    const h = harness({ lockFree: [true, false, true] })
+    await h.run(machine => Effect.gen(function* () {
+      expect(yield* machine.installWhenIdle(release.version)).toBe(true)
+      yield* machine.install
+      expect(h.events).toEqual(["idle", "outcome deferred"])
+      const retry = yield* machine.installWhenIdle(release.version).pipe(Effect.fork)
+      yield* TestClock.adjust(Duration.minutes(15))
+      expect(yield* Fiber.join(retry)).toBe(true)
+    }))
+    expect(h.events).toEqual(["idle", "outcome deferred", "idle"])
   })
   it("returns to serving the current version when the package fails", async () => {
     const h = harness({ installer: "fails" })

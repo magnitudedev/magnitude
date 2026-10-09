@@ -42,8 +42,10 @@ first checks that it may install unattended (the Linux server's sudoers rule, or
 application folder); otherwise it keeps serving and prints one line naming `magnitude update
 install`, recording no outcome. To install it ends its owner scope, which releases its leases, runs
 the platform installer, and on success replaces its own process with the new version (same PID);
-on failure it serves the current version again. If another Magnitude holds the installation lock,
-it records `deferred` and tries again at a later idle point. Update checks start only once the
+on failure it serves the current version again. It checks the installation lock before stopping
+anything: if another Magnitude holds it, it keeps serving, records `deferred`, reports it with an
+immediate update check, and tries again at an idle point 15 minutes later. (A started service
+refuses to run while the lock is held, so stopping first would leave it down until the lock frees.) Update checks start only once the
 service is ready, so a new version reports `applied` only after it starts; one that fails before
 Ready reports `failed`/`startup` and exits non-zero for the service manager to retry. There is no
 rollback; withdrawing the release stops it being offered.

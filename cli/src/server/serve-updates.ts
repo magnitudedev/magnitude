@@ -78,17 +78,31 @@ export const makeIdleInstallation = Effect.gen(function* () {
   const retryAfter = yield* Ref.make(0)
   const noticed = yield* Ref.make(new Set<string>())
 
-  const installWhenIdle = (version: string) => Effect.gen(function* () {
-    const wait = (yield* Ref.get(retryAfter)) - (yield* Clock.currentTimeMillis)
-    if (wait > 0) yield* Effect.sleep(Duration.millis(wait))
+  const defer = (version: string) => Effect.gen(function* () {
+    yield* (yield* system.store).recordOutcome({ outcome: "deferred", version, reason: Option.none() })
+    yield* Ref.set(retryAfter, (yield* Clock.currentTimeMillis) + Duration.toMillis(deferredRetry))
+    yield* system.notify(`Magnitude ${version} is waiting for another Magnitude to quit; trying again later.`)
+  })
+
+  /**
+   * Resolves true at an idle point where the installation lock is free, so the caller may stop and
+   * install. The package refuses to upgrade while anyone else holds that lock, so a held lock defers
+   * without stopping: the deferral is reported through `report` and the current version keeps serving.
+   */
+  const installWhenIdle = (version: string, report: Effect.Effect<void> = Effect.void) => Effect.gen(function* () {
     if (!(yield* system.canInstallUnattended)) {
       const first = !(yield* Ref.get(noticed)).has(version)
       yield* Ref.update(noticed, seen => new Set([...seen, version]))
       if (first) yield* system.notify(`Magnitude ${version} is downloaded. Install it with \`magnitude update install\`.`)
       return false
     }
-    while (!(yield* system.isIdle)) yield* Effect.sleep(idlePoll)
-    return true
+    while (true) {
+      const wait = (yield* Ref.get(retryAfter)) - (yield* Clock.currentTimeMillis)
+      if (wait > 0) yield* Effect.sleep(Duration.millis(wait))
+      while (!(yield* system.isIdle)) yield* Effect.sleep(idlePoll)
+      if (yield* system.installationLockFree) return true
+      yield* defer(version).pipe(Effect.zipRight(report), Effect.catchAll(() => Effect.void))
+    }
   })
 
   const install = Effect.gen(function* () {
@@ -96,12 +110,8 @@ export const makeIdleInstallation = Effect.gen(function* () {
     const pending = yield* store.read
     if (Option.isNone(pending)) return
     const version = pending.value.release.version
-    // The package refuses to upgrade while anyone else holds the installation lock: defer instead.
-    if (!(yield* system.installationLockFree)) {
-      yield* store.recordOutcome({ outcome: "deferred", version, reason: Option.none() })
-      yield* Ref.set(retryAfter, (yield* Clock.currentTimeMillis) + Duration.toMillis(deferredRetry))
-      return yield* system.notify(`Magnitude ${version} is waiting for another Magnitude to quit; trying again later.`)
-    }
+    // The lock may have been taken since the idle decision.
+    if (!(yield* system.installationLockFree)) return yield* defer(version)
     yield* system.installPrepared
   }).pipe(Effect.catchAll(error => system.notify(`The update could not be installed: ${error.message} Serving the current version.`)))
 

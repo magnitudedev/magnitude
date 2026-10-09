@@ -43,7 +43,8 @@ export const runHeadlessApplication = (options: {
    * Called while serving with each downloaded update version. It waits for an idle point and answers
    * whether to stop the service and install it; interruption means the version changed or the owner stops.
    */
-  readonly installWhenIdle?: (version: string) => Effect.Effect<boolean>
+  /** Resolves true when the owner should stop to install; `report` sends a recorded outcome now. */
+  readonly installWhenIdle?: (version: string, report: Effect.Effect<void>) => Effect.Effect<boolean>
   /** Runs when the service fails before its first Ready, before the outcome is reported and the owner fails. */
   readonly startupFailed?: Effect.Effect<void>
 }) => Effect.scoped(Effect.gen(function* () {
@@ -113,7 +114,8 @@ export const runHeadlessApplication = (options: {
     // A newer download interrupts waiting for the previous one.
     yield* updates.changes.pipe(Stream.map(state => state.transfer), Stream.filter(transfer => transfer._tag === "Ready"),
       Stream.map(transfer => transfer.version), Stream.changes,
-      Stream.flatMap(version => Stream.fromEffect(Deferred.await(firstReady).pipe(Effect.zipRight(decide(version)))), { switch: true }),
+      Stream.flatMap(version => Stream.fromEffect(Deferred.await(firstReady).pipe(
+        Effect.zipRight(decide(version, updates.check("scheduled").pipe(Effect.timeout("15 seconds"), Effect.ignore))))), { switch: true }),
       Stream.filter(install => install), Stream.take(1),
       Stream.runForEach(() => Deferred.succeed(stop, "InstallUpdate")), Effect.forkScoped)
   }

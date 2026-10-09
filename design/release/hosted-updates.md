@@ -68,7 +68,8 @@ installer or package-manager failure, `authorization` when sudo or Polkit refuse
 the installed version does not reach Ready, and `incomplete` for an attempt with no recorded result.
 The privileged Linux helper reports its class through a distinct exit status, separate from the
 statuses sudo and pkexec use for authorization. `deferred` records an idle installation postponed
-because another Magnitude held the installation lock. The outcome is sent once with the next check.
+because another Magnitude held the installation lock; the service reports it with an immediate
+check. Other outcomes are sent once with the next check.
 
 Every request names its `owner`: `desktop`, `headless` (`serve` run by hand, or a finite CLI
 command), or `service` (the system service). Requests from older clients have no owner. The
