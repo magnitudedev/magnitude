@@ -5,7 +5,8 @@ const state = (transfer: ApplicationUpdateState["transfer"], check: ApplicationU
 describe("headless application update output", () => {
   it("gives owner-specific installation instructions without suggesting a live server restart", () => {
     const ready = state({ _tag: "Ready", version: "2.0.0" })
-    expect(renderApplicationUpdate(ready, "Headless")).toBe("Magnitude 2.0.0 is ready to install.\nStop the server, then run: magnitude serve\n")
+    expect(renderApplicationUpdate(ready, "Headless")).toBe("Magnitude 2.0.0 is ready to install.\nStop `magnitude serve`, then run: magnitude update install\n")
+    expect(renderApplicationUpdate(ready, "Headless", true)).toBe("Magnitude 2.0.0 is ready to install.\nThe server installs it on its own once it is idle.\n")
     expect(renderApplicationUpdate(ready, "None")).toBe("Magnitude 2.0.0 is ready to install.\nInstall: magnitude update install\n")
     expect(renderApplicationUpdate(ready, "Desktop")).toContain("Install and restart: magnitude update install")
   })

@@ -2,9 +2,11 @@ import { Effect, Schema } from "effect"
 import { ApplicationUpdateAction, type ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { updateApplication } from "../server/application"
+import { isServerSetUp } from "../server/serve-owner"
 import { runCommand } from "./output"
 
-export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "Desktop" | "Headless" | "None" = "Desktop"): string => {
+/** `server` is a Headless owner running as the system service, which installs on its own when idle. */
+export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "Desktop" | "Headless" | "None" = "Desktop", server = false): string => {
   if (state.check._tag === "Checking" && (state.transfer._tag === "Idle" || state.transfer._tag === "Failed")) {
     return "Checking for application updates.\n"
   }
@@ -14,7 +16,9 @@ export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "D
     case "Downloading": return `Downloading Magnitude ${state.transfer.version}: ${formatStorageSize(state.transfer.completed)} of ${formatStorageSize(state.transfer.total)}.\nCheck progress: magnitude update status\n`
     case "Staging": return `Preparing Magnitude ${state.transfer.version}.\nCheck progress: magnitude update status\n`
     case "InstallationFailed": return `${state.transfer.message}\nRetry installation: magnitude update install\nDiscard download: magnitude update discard\n`
-    case "Ready": return `Magnitude ${state.transfer.version} is ready to install.\n${owner === "Headless" ? "Stop the server, then run: magnitude serve" : owner === "None" ? "Install: magnitude update install" : "Install and restart: magnitude update install"}\n`
+    case "Ready": return `Magnitude ${state.transfer.version} is ready to install.\n${owner === "Headless"
+      ? server ? "The server installs it on its own once it is idle." : "Stop `magnitude serve`, then run: magnitude update install"
+      : owner === "None" ? "Install: magnitude update install" : "Install and restart: magnitude update install"}\n`
     case "Cancelling": return "Cancelling the automatic update download.\nCheck progress: magnitude update status\n"
     case "Closed": return "Magnitude is quitting.\n"
     case "Idle": return state.check._tag === "Succeeded" ? "Magnitude is up to date.\n"
@@ -24,6 +28,7 @@ export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "D
 }
 
 export const runUpdate = (input: string) => runCommand({
-  effect: Schema.decodeUnknown(ApplicationUpdateAction)(input).pipe(Effect.flatMap(action => updateApplication(action).pipe(Effect.map(result => ({ action, ...result }))))),
-  render: ({ action, state, owner }) => action === "install" ? owner === "None" ? "The Magnitude update was installed.\n" : "Magnitude is stopping its model and service to install the update and restart.\n" : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state, owner),
+  effect: Schema.decodeUnknown(ApplicationUpdateAction)(input).pipe(Effect.flatMap(action => updateApplication(action).pipe(
+    Effect.flatMap(result => (result.owner === "Headless" ? isServerSetUp : Effect.succeed(false)).pipe(Effect.map(server => ({ action, server, ...result }))))))),
+  render: ({ action, state, owner, server }) => action === "install" ? owner === "None" ? "The Magnitude update was installed.\n" : "Magnitude is stopping its model and service to install the update and restart.\n" : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state, owner, server),
 })
