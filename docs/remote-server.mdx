@@ -3,57 +3,86 @@ title: "Remote server"
 description: "Run models on a dedicated machine and use them from another computer."
 ---
 
-Use a machine such as a Mac Studio or DGX Spark for inference while your agent runs on your laptop. The server needs to be reachable from your laptop, through your local network or a private network such as Tailscale.
+Use a machine such as a Mac Studio, a DGX Spark or a Linux box with a GPU for inference while your agent runs on your laptop. The server needs to be reachable from your laptop, through your local network or a private network such as Tailscale.
+
+On Linux and macOS, Magnitude runs as a service: it starts at boot, keeps running after you log out, restarts if it crashes, and installs its own updates between requests. On Windows, run `magnitude serve` under a service wrapper; see [Windows](#windows).
 
 ## Install on the server
 
-Install Magnitude for [macOS](/installation/macos), [Linux](/installation/linux), or [Windows](/installation/windows). The package includes the `magnitude` CLI. Run the commands below on the server, using SSH if needed.
-
-On macOS, if the command is not registered in your shell, use `/Applications/Magnitude.app/Contents/Resources/magnitude` in place of `magnitude`.
-
-## Configure network access
-
-Edit `~/.magnitude/config.json`, or `%USERPROFILE%\.magnitude\config.json` on Windows. Create the directory and file if they do not exist. Add this `network` object, keeping any other settings:
-
-```json
-{
-  "network": {
-    "enabled": true,
-    "bind": "SERVER_IP",
-    "apiKey": "YOUR_SECRET_KEY",
-    "requireApiKey": true
-  }
-}
-```
-
-Replace `SERVER_IP` with the server's local-network or Tailscale IP address. Replace `YOUR_SECRET_KEY` with a long, randomly generated secret. Use the same key on your laptop. Settings apply when Magnitude starts.
-
-For Desktop Settings, other addresses, or an SSH tunnel that does not require Network access, see [Network access](/api/network-access).
-
-## Start Magnitude and download a model
-
-Fully quit Magnitude Desktop if it is running, then start the server:
+Run this on the server, over SSH if needed:
 
 ```sh
-magnitude serve
+curl -fsSL https://magnitude.dev/install.sh | sh
 ```
 
-Keep this terminal open. In another terminal on the server:
+On Linux, the installer first asks whether to run Magnitude as a server, then asks for your password once, and does the rest without further questions. Answer **y** to set the server up right away. If you answer no, or don't answer within a minute, set it up later with `magnitude server setup`.
+
+On macOS the installer installs the app without asking. Then run:
+
+```sh
+magnitude server setup
+```
+
+You can also install the package for [Linux](/installation/linux) or the app for [macOS](/installation/macos) yourself and run `magnitude server setup` afterwards. Run it as yourself, not with `sudo`: it asks for your password once, for the one step that needs it.
+
+## What setup does
+
+`magnitude server setup` registers Magnitude as a service, turns on [network access](/api/network-access), creates a network access key, and prints how to reach the server:
+
+```text
+Magnitude is running as a server on this machine.
+
+Open it in a browser on another computer:
+  http://192.168.1.20:10100
+
+Network access key: mag_…
+```
+
+The key is printed this once. Save it; afterwards it is in **Settings → Network access** in the browser app on this machine.
+
+<Tabs>
+<Tab title="Linux">
+Magnitude runs as the `magnitude.service` systemd unit under its own `magnitude` system account. Its models, settings and logs live in `/var/lib/magnitude`, and its configuration in `/var/lib/magnitude/config.json`. Setup adds you to the `magnitude` group; log out and back in before running `magnitude status` or `magnitude update`.
+
+Logs: `journalctl -u magnitude`
+</Tab>
+<Tab title="macOS">
+Magnitude runs as a LaunchDaemon, `dev.magnitude.server`, as you. It uses your own `~/.magnitude`, so the desktop app and the server share models and settings. It starts at boot before anyone logs in and keeps running after you log out.
+
+- macOS lists it in **System Settings → General → Login Items** as Magnitude. If you switch it off there, it no longer starts at boot.
+- With FileVault on, nothing starts until someone unlocks the disk after a restart.
+- As a background service it can't read privacy-protected folders such as Desktop and Documents without Full Disk Access. Serving models isn't affected.
+
+Logs: `~/.magnitude/logs/server.log`
+</Tab>
+</Tabs>
+
+Check on the server at any time with:
 
 ```sh
 magnitude status
-magnitude hardware
-magnitude catalog recommendations --preference balanced --limit 5
 ```
 
-If recommendations are not ready, run `magnitude catalog status` to check preparation, then request recommendations again. Copy a model ID from the output and download it:
+It shows each address other devices can use, without the key.
+
+## Download a model
+
+On the server:
 
 ```sh
+magnitude hardware
+magnitude catalog recommendations --preference balanced --limit 5
 magnitude catalog pull "MODEL_ID"
 magnitude models status "MODEL_ID"
 ```
 
-Check status until the download finishes. Magnitude loads the model on the first inference request. To load it ahead of time, run `magnitude models load "MODEL_ID"`.
+If recommendations are not ready, run `magnitude catalog status` to check preparation, then request recommendations again. Magnitude loads the model on the first inference request. To load it ahead of time, run `magnitude models load "MODEL_ID"`.
+
+Or do all of this from the browser app on your laptop.
+
+## Use the app from your laptop
+
+Open `http://SERVER_IP:10100` in a browser on your laptop and sign in with the network access key. From there you can browse recommendations, download and load models, watch usage, and change settings. See [Open the app from another device](/api/network-access#open-the-app-from-another-device).
 
 ## Connect from your laptop
 
@@ -62,59 +91,62 @@ Use these settings in your agent or app:
 | Setting | Value |
 | --- | --- |
 | OpenAI-compatible base URL | `http://SERVER_IP:10100/inference/v1` |
-| API key | The key you saved on the server |
+| API key | The network access key |
 | Model | The exact model ID you downloaded |
 
 Use your agent's [configuration instructions](/api/network-access#configure-the-app-or-agent), then [check the connection](/api/network-access#check-the-connection) from your laptop.
 
-## Use the app from your laptop
-
-Open `http://SERVER_IP:10100` in a browser on your laptop and sign in with the key you saved on the server. From there you can browse recommendations, download and load models, watch usage, and change settings, instead of running commands on the server. See [Open the app from another device](/api/network-access#open-the-app-from-another-device).
-
-## Keep the server running
-
-`magnitude serve` runs in the foreground. Ctrl+C stops it. An SSH terminal is not a persistent service; use a service manager to keep serving after disconnecting or restarting the machine.
-
-Opening Magnitude Desktop stops the foreground server and takes over serving.
-
-### Linux: systemd
-
-Create the user-service directory with `mkdir -p ~/.config/systemd/user`, then save this as `~/.config/systemd/user/magnitude-headless.service`:
-
-```ini
-[Unit]
-Description=Magnitude headless server
-
-[Service]
-ExecStart=/usr/bin/magnitude serve
-Restart=on-failure
-RestartSec=1
-KillMode=control-group
-TimeoutStopSec=30
-
-[Install]
-WantedBy=default.target
-```
-
-Stop any `magnitude serve` command you started manually, then enable the service:
+To use an agent on the server itself, connect it from your own terminal there:
 
 ```sh
-systemctl --user daemon-reload
-systemctl --user enable --now magnitude-headless.service
+magnitude connections connect pi
 ```
 
-For startup before login and operation after logout, enable lingering for your account with
-`loginctl enable-linger "$USER"`; your system may require administrator authorization.
-Use `journalctl --user -u magnitude-headless.service` for logs and
-`systemctl --user stop magnitude-headless.service` to stop it. `Restart=on-failure` recovers from
-a crash without restarting after a successful transfer to the desktop.
+This writes the agent's configuration into your home folder, pointing at the server on `localhost`.
 
-### macOS and Windows
+## Updates
 
-For operation while signed in, you can use Desktop with **Launch at login** enabled and close its window. Desktop's **Launch at login** does not start a headless server.
+The server checks for updates about once an hour, downloads them, and installs them when no request or agent turn is running. Clients reconnect after a short pause. If an update needs something only you can do, `magnitude status` and the logs say so. To install a downloaded update right away, stop the server and run `magnitude update install`.
 
-## Update the server
+## The desktop app on the same machine
 
-Magnitude can download updates while serving. It never stops a running headless server to install them. When an update is prepared, stop the server and start it again to apply the update before serving.
+The app and the server can't run at the same time. Opening the app while the server runs shows a screen that offers to keep the server, which opens it in your browser instead, or to stop it and use the app. Stopping asks for administrator authorization.
 
-For manual installation or a failed update, see [CLI reference](/reference#updates). For a systemd service, stop its unit before installation and start the unit afterward.
+## Stop and remove the server
+
+```sh
+magnitude server remove
+```
+
+It stops the service and removes it, and asks for your password once. Its data stays: in `/var/lib/magnitude` on Linux, or in `~/.magnitude` on macOS. Run `magnitude server setup` again to bring the server back with the same models.
+
+## Without the service
+
+To serve only until you stop it, for example to try things out:
+
+```sh
+magnitude serve
+```
+
+It runs in the foreground and Ctrl+C stops it. Opening the desktop app stops it and takes over serving. For network access without the service, see [Network access](/api/network-access).
+
+## Windows
+
+Magnitude has no server mode on Windows; `magnitude server setup` explains this and changes nothing. To run Magnitude as a service, wrap `magnitude serve` with [NSSM](https://nssm.cc), as you might for Ollama:
+
+1. Install Magnitude for [Windows](/installation/windows) as the account that will run the server, and download a model.
+2. Turn on network access: edit `%USERPROFILE%\.magnitude\config.json` and add the `network` object described in [Network access](/api/network-access), with a key.
+3. From an administrator PowerShell, register the service to run as that account:
+
+```powershell
+nssm install Magnitude "$env:LOCALAPPDATA\Programs\Magnitude CLI\magnitude.exe" serve
+nssm set Magnitude ObjectName "$env:USERDOMAIN\$env:USERNAME" "YOUR_PASSWORD"
+nssm set Magnitude AppStdout "$env:USERPROFILE\.magnitude\logs\server.log"
+nssm set Magnitude AppStderr "$env:USERPROFILE\.magnitude\logs\server.log"
+nssm set Magnitude AppExit Default Restart
+nssm start Magnitude
+```
+
+4. Allow inbound TCP port 10100 in Windows Defender Firewall if other computers need to reach it.
+
+The service keeps running when you or another user log off. Don't open the desktop app while it runs: the app takes over serving from it. To install an update, stop the service (`nssm stop Magnitude`), run `magnitude update install`, then start it again. To remove the service, run `nssm remove Magnitude confirm`.

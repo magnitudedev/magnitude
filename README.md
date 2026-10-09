@@ -32,7 +32,18 @@ https://github.com/user-attachments/assets/983328c8-93e8-4360-bfef-11e93ff76035
 2. Choose a recommended model in **Discover** and download it.
 3. Connect your agent in **Connections** and start using it.
 
+Or install from a terminal:
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh     # macOS and Linux
+irm https://magnitude.dev/install.ps1 | iex          # Windows PowerShell
+```
+
 The desktop app includes the `magnitude` CLI. No separate installation is needed.
+
+### Run it on a server
+
+On Linux and macOS, `magnitude server setup` runs Magnitude as a service that starts at boot, keeps running after logout, updates itself, and serves browsers and agents on other computers. On Linux, the install command offers to set this up for you. See [Remote server](https://docs.magnitude.dev/remote-server).
 
 ## Why Magnitude?
 

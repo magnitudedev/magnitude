@@ -10,8 +10,11 @@
 
 static volatile LONG stopping;
 static BOOL WINAPI console_control(DWORD event) {
+  /* Windows sends logoff only to services, for any user's logoff: a service keeps serving.
+     Handling it here also keeps the default handler from acting on it. */
+  if (event == CTRL_LOGOFF_EVENT) return TRUE;
   if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT && event != CTRL_CLOSE_EVENT &&
-      event != CTRL_LOGOFF_EVENT && event != CTRL_SHUTDOWN_EVENT) return FALSE;
+      event != CTRL_SHUTDOWN_EVENT) return FALSE;
   InterlockedExchange(&stopping, 1);
   return TRUE;
 }

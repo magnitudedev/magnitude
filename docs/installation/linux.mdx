@@ -23,7 +23,13 @@ Your package manager installs required desktop libraries. GPU inference also nee
 
 ## Install
 
-Open the downloaded package in your distribution's software installer, or use the terminal. Replace the filename below with the file you downloaded.
+The quickest way is the install command. It picks the right package, verifies it, and asks whether to run Magnitude as a [server](/remote-server):
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh
+```
+
+Or open the downloaded package in your distribution's software installer, or use the terminal. Replace the filename below with the file you downloaded.
 
 <Tabs>
 <Tab title="Ubuntu / Debian">
@@ -47,6 +53,6 @@ Open **Magnitude** from your applications menu and follow [Quick start](/get-sta
 
 ## Updates and removal
 
-App updates use your system package manager and may ask for authorization. Use **Settings → Application updates** for the available actions.
+App updates use your system package manager. Click **Restart** to install a downloaded update; at your desktop it installs without a password, while over SSH it asks for administrator authentication. Use **Settings → Application updates** for the available actions. A [server](/remote-server) installs its updates by itself.
 
 Remove Magnitude through your distribution's software manager. Downloaded models and settings live in `~/.magnitude` and are separate from the installed application package.
