@@ -1,8 +1,12 @@
 import { Clock, Duration, Effect, Queue, Random, Ref } from "effect"
 import type { UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 
-/** One application-owned timer. Resume only wakes it to re-evaluate the deadline. */
-export const makeUpdateSchedule = <E>(check: (reason: UpdateCheckReason) => Effect.Effect<void, E>) => Effect.gen(function* () {
+/**
+ * One application-owned timer. Resume only wakes it to re-evaluate the deadline. The first check
+ * runs 3 seconds after `start` completes, so an owner can wait until its service is ready before
+ * reporting the previous update's outcome.
+ */
+export const makeUpdateSchedule = <E>(check: (reason: UpdateCheckReason) => Effect.Effect<void, E>, start: Effect.Effect<void> = Effect.void) => Effect.gen(function* () {
   const wakeups = yield* Queue.sliding<void>(1)
   yield* Effect.addFinalizer(() => Queue.shutdown(wakeups))
   const deadline = yield* Ref.make((yield* Clock.currentTimeMillis) + 3_000)
@@ -30,6 +34,8 @@ export const makeUpdateSchedule = <E>(check: (reason: UpdateCheckReason) => Effe
       yield* runCheck(reason).pipe(Effect.catchAll(() => Effect.logDebug("Scheduled update check failed")))
     }))
   })
-  yield* tick.pipe(Effect.forever, Effect.forkScoped)
+  yield* start.pipe(
+    Effect.zipRight(Clock.currentTimeMillis.pipe(Effect.flatMap(now => Ref.update(deadline, current => Math.max(current, now + 3_000))))),
+    Effect.zipRight(tick.pipe(Effect.forever)), Effect.forkScoped)
   return { check: attempt, resume: Queue.offer(wakeups, undefined).pipe(Effect.asVoid) }
 })

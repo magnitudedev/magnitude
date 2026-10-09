@@ -16,6 +16,7 @@ import {
   Deferred,
   Duration,
   Effect,
+  Either,
   Exit,
   Fiber,
   Layer,
@@ -56,6 +57,7 @@ import { ProviderCredentialsLive } from "./provider-credentials"
 import { ModelSlotControllerLive } from "./model-slot-controller"
 import { MagnitudeCloudUsageLive } from "./magnitude-cloud-usage"
 import { ServingUsage, ServingUsageLive } from "./serving-usage"
+import { InferenceActivity, InferenceActivityLive, finishWithBody, type InferenceActivityApi } from "./inference-activity"
 import { makeUsageFetch, makeUsageWebSocket } from "./serving-usage-observer"
 import type { InferenceFetch } from "./inference-gateway"
 import {
@@ -324,7 +326,7 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     ProviderModelCatalogLive,
     withSharedClient
   )
-  const withUsage = Layer.provideMerge(ServingUsageLive, withCatalog)
+  const withUsage = Layer.provideMerge(Layer.merge(ServingUsageLive, InferenceActivityLive), withCatalog)
   const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withUsage)
   const withCredentials = Layer.provideMerge(
     ProviderCredentialsLive,
@@ -564,6 +566,7 @@ const makeInferenceProxy = (
   network: NetworkAccess,
   fetchTarget: InferenceFetch = fetch,
   usage?: ServingUsage,
+  activity?: InferenceActivityApi,
 ) => {
   const anthropicGateway = protocol === "claude-code"
     ? makeAnthropicGateway(icn, fetchTarget)
@@ -591,21 +594,26 @@ const makeInferenceProxy = (
       if (upgradeOrigin !== null && !isAllowedCorsOrigin(upgradeOrigin)) {
         return HttpServerResponse.empty({ status: 403 })
       }
-      return yield* makeCodexWebSocketProxy(request, source, icn, usage)
+      const proxy = makeCodexWebSocketProxy(request, source, icn, usage)
+      return yield* activity === undefined ? proxy : Effect.scoped(activity.hold.pipe(Effect.zipRight(proxy)))
     }
-    const response = anthropicGateway !== undefined
-      ? yield* anthropicGateway.route(source).pipe(Effect.either)
+    // A request counts as activity from here until its response body ends.
+    const finish = activity === undefined ? () => {} : yield* activity.begin
+    const route: Effect.Effect<Either.Either<Response, unknown>> = anthropicGateway !== undefined
+      ? anthropicGateway.route(source).pipe(Effect.either)
       : codexGateway !== undefined
-        ? yield* codexGateway.route(source).pipe(Effect.either)
-        : yield* Effect.tryPromise({
+        ? codexGateway.route(source).pipe(Effect.either)
+        : Effect.tryPromise({
           try: (signal) => protocol === "openai"
             ? proxyInferenceWebRequest(source, icn, fetchTarget, signal)
             : proxyLocalAnthropicInferenceRequest(source, icn, fetchTarget, signal),
           catch: (cause) => new InferenceProxyFailed({ cause }),
         }).pipe(Effect.either)
+    const response = yield* route.pipe(Effect.onInterrupt(() => Effect.sync(finish)))
     if (response._tag === "Right") {
-      return HttpServerResponse.fromWeb(response.right)
+      return HttpServerResponse.fromWeb(finishWithBody(response.right, finish))
     }
+    finish()
     yield* Effect.logError("Inference gateway failed", response.left)
     const requestId = `req_acn_gateway_${Date.now()}`
     const body = protocol === "anthropic" || protocol === "claude-code"
@@ -688,6 +696,7 @@ export const installAcnPublicRoutes = (
   remote: RemoteAccessApi,
   fetchTarget: InferenceFetch = fetch,
   usage?: ServingUsage,
+  activity?: InferenceActivityApi,
 ) => Effect.gen(function* () {
   const network = remote.network
   yield* router.add("POST", "/rpc", Effect.gen(function* () {
@@ -705,16 +714,16 @@ export const installAcnPublicRoutes = (
       : HttpServerResponse.empty({ status: 409 })
   }))
   yield* router.prefixed("/inference/v1/proxies/codex").add(
-    "*", "/*", makeInferenceProxy(icn, "codex", network, fetchTarget, usage),
+    "*", "/*", makeInferenceProxy(icn, "codex", network, fetchTarget, usage, activity),
   )
   yield* router.prefixed("/inference/v1").add(
-    "*", "/*", makeInferenceProxy(icn, "openai", network, fetchTarget),
+    "*", "/*", makeInferenceProxy(icn, "openai", network, fetchTarget, undefined, activity),
   )
   yield* router.prefixed("/inference/anthropic/proxies/claude-code").add(
-    "*", "/*", makeInferenceProxy(icn, "claude-code", network, fetchTarget),
+    "*", "/*", makeInferenceProxy(icn, "claude-code", network, fetchTarget, undefined, activity),
   )
   yield* router.prefixed("/inference/anthropic").add(
-    "*", "/*", makeInferenceProxy(icn, "anthropic", network, fetchTarget),
+    "*", "/*", makeInferenceProxy(icn, "anthropic", network, fetchTarget, undefined, activity),
   )
 })
 
@@ -814,7 +823,8 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       }
       const icn = Context.get(applicationContext, IcnProcess)
       const usage = Context.get(applicationContext, ServingUsage)
-      yield* installAcnPublicRoutes(router, lifecycle, icn, remote, makeUsageFetch(icn.origin, usage), usage)
+      yield* installAcnPublicRoutes(router, lifecycle, icn, remote, makeUsageFetch(icn.origin, usage), usage,
+        Context.get(applicationContext, InferenceActivity))
       yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
       return {
         subscriptions: Context.get(applicationContext, AcnSubscriptions),

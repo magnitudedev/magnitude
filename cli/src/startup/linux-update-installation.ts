@@ -1,5 +1,6 @@
 import { BunContext } from "@effect/platform-bun"
 import { acquireUpdateInstallationLease, completeLinuxUpdateHandoff, installLinuxApplicationUpdate, guardLinuxInstallerParent, LinuxUpdateHandoffRequest, linuxPackageUpdateExitCode,
+  parseLinuxUpdateInstallation,
   nativeHostLayer, relaunchLinuxAfterUpdate, unixPrivateFilePermissions } from "@magnitudedev/daemon-management/desktop-native"
 import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { Effect } from "effect"
@@ -7,8 +8,10 @@ import { CLI_VERSION } from "../version"
 import { writeSync } from "node:fs"
 import { readUpdateHandoff, UpdateHandoffChannelFailed } from "./update-handoff-channel"
 
-export const runLinuxUpdateInstallation = (request: string, parentStdin = false) => Effect.runPromise(
-  (parentStdin ? guardLinuxInstallerParent : Effect.void).pipe(Effect.zipRight(installLinuxApplicationUpdate(request, CLI_VERSION)),
+/** Entered as root through sudo or Polkit; the raw arguments must match the installer's exact grammar. */
+export const runLinuxUpdateInstallation = (argv: readonly string[]) => Effect.runPromise(
+  parseLinuxUpdateInstallation(argv).pipe(Effect.flatMap(({ request, parentStdin }) =>
+    (parentStdin ? guardLinuxInstallerParent : Effect.void).pipe(Effect.zipRight(installLinuxApplicationUpdate(request, CLI_VERSION))))).pipe(
     Effect.provide([BunContext.layer, guardedCommandLayer("/usr/lib/magnitude-desktop/resources/magnitude-command")]),
     Effect.catchAll(error => Effect.sync(() => {
       process.stderr.write(`${error.message}\n`)

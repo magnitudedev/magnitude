@@ -1,11 +1,12 @@
 import { Rpc } from "@effect/rpc"
 import { Schema } from "effect"
-import { atMostOnce } from "../transport/recovery"
+import { atMostOnce, replaySafe } from "../transport/recovery"
 import {
   ApplicationOwnerState,
   ApplicationOwnerUnavailable,
   OwnerRequestFailed,
   OwnerRequestUnsupported,
+  ServiceActivity,
 } from "../schemas/application-owner"
 
 const OwnerError = Schema.Union(ApplicationOwnerUnavailable, OwnerRequestUnsupported, OwnerRequestFailed)
@@ -19,8 +20,15 @@ const WatchApplicationOwner = Rpc.make("WatchApplicationOwner", {
   stream: true,
 })
 
+/** Whether the service is idle; the owner polls this before installing a downloaded update. */
+const GetServiceActivity = Rpc.make("GetServiceActivity", {
+  payload: Schema.Struct({}),
+  success: ServiceActivity,
+}).pipe(replaySafe)
+
 export const Application = {
   watchApplicationOwner: WatchApplicationOwner,
+  getServiceActivity: GetServiceActivity,
   checkApplicationUpdate: command("CheckApplicationUpdate", {}),
   downloadApplicationUpdate: command("DownloadApplicationUpdate", {}),
   discardApplicationUpdate: command("DiscardApplicationUpdate", {}),

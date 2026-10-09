@@ -28,9 +28,10 @@ program.command("_verify-windows-installation", { hidden: true }).argument("<off
     const { verifyInstallationDownload } = await import("./startup/verify-installation")
     await verifyInstallationDownload(offer, artifact, channel)
   })
-program.command("_install-application-update", { hidden: true }).argument("<request>").option("--parent-stdin").action(async (request, options) => {
+// Runs as root through sudo or Polkit. It validates the raw arguments itself instead of commander's parsing.
+program.command("_install-application-update", { hidden: true }).argument("[arguments...]").allowUnknownOption().helpOption(false).action(async () => {
   const { runLinuxUpdateInstallation } = await import("./startup/linux-update-installation")
-  await runLinuxUpdateInstallation(request, options.parentStdin === true)
+  await runLinuxUpdateInstallation(process.argv.slice(2))
 })
 program.command("_complete-application-update", { hidden: true }).action(async () => {
   const { runLinuxUpdateHandoff } = await import("./startup/linux-update-installation")

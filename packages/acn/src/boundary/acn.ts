@@ -14,6 +14,7 @@ import { ProviderModelCatalog } from "../provider-model-catalog";
 import { ModelSlotController } from "../model-slot-controller";
 import { MagnitudeCloudUsage } from "../magnitude-cloud-usage";
 import { ActiveSessionStatusesService } from "../active-session-statuses";
+import { InferenceActivity } from "../inference-activity";
 import { DisplayViewStreams, displayViewId } from "../display-view-streams";
 import { ACN_VERSION } from "../version";
 import { makeHealthResponse } from "../identity";
@@ -65,6 +66,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const cloudUsage = yield* MagnitudeCloudUsage;
     const servingUsage = yield* ServingUsage;
     const activeSessionStatuses = yield* ActiveSessionStatusesService;
+    const inferenceActivity = yield* InferenceActivity;
     const displayStreams = yield* DisplayViewStreams;
     const changes = yield* AcnChanges;
     const modelCatalog = yield* ModelCatalog;
@@ -335,6 +337,10 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       DisconnectHarness: ({ harness }) => observeRpcDefects("DisconnectHarness", harnessConnections.disconnect(harness).pipe(Effect.as({}))),
       DescribeHarnessSetup: request => observeRpcDefects("DescribeHarnessSetup", harnessConnections.describe(request)),
 
+      GetServiceActivity: () => observeRpcDefects("GetServiceActivity", Effect.all({
+        workingSessions: activeSessionStatuses.snapshot.pipe(Effect.map(snapshot => snapshot.sessions.filter(session => session.workStatus === "working").length)),
+        inferenceRequests: inferenceActivity.count,
+      })),
       WatchApplicationOwner: () => observeRpcStreamDefects("WatchApplicationOwner", watchApplicationOwner.pipe(Stream.provideService(AcnOwner, owner))),
       CheckApplicationUpdate: () => ownerRequest("CheckApplicationUpdate", { _tag: "CheckUpdate" }),
       DownloadApplicationUpdate: () => ownerRequest("DownloadApplicationUpdate", { _tag: "DownloadUpdate" }),

@@ -1,4 +1,4 @@
-import { Effect, Ref, TestClock, TestContext } from "effect"
+import { Deferred, Effect, Ref, TestClock, TestContext } from "effect"
 import { expect, it } from "vitest"
 import { makeUpdateSchedule } from "./update-schedule"
 
@@ -43,5 +43,20 @@ it("reports the first check as a launch, timer checks as scheduled, and explicit
     yield* TestClock.adjust("61 minutes")
     yield* TestClock.adjust("61 minutes")
     expect(yield* Ref.get(reasons)).toEqual(["launch", "manual", "scheduled", "scheduled"])
+  })).pipe(Effect.provide(TestContext.TestContext)))
+})
+
+it("does not check, or report an outcome, until the owner's service is ready", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const calls = yield* Ref.make(0)
+    const ready = yield* Deferred.make<void>()
+    yield* makeUpdateSchedule(() => Ref.update(calls, n => n + 1), Deferred.await(ready))
+    yield* TestClock.adjust("10 minutes")
+    expect(yield* Ref.get(calls)).toBe(0)
+    yield* Deferred.succeed(ready, undefined)
+    yield* TestClock.adjust("2 seconds")
+    expect(yield* Ref.get(calls)).toBe(0)
+    yield* TestClock.adjust("1 second")
+    expect(yield* Ref.get(calls)).toBe(1)
   })).pipe(Effect.provide(TestContext.TestContext)))
 })

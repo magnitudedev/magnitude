@@ -22,7 +22,7 @@ describe("running headless update control", () => {
       expect((yield* control("status")).state).toEqual(state)
       expect(calls).toEqual([])
       const failure = yield* control("install").pipe(Effect.flip)
-      expect(failure.message).toContain("Stop the server")
+      expect(failure.message).toContain("magnitude update install")
       expect(calls).toEqual([])
       for (const action of ["check", "download", "discard"] as const) {
         const reply = yield* control(action)

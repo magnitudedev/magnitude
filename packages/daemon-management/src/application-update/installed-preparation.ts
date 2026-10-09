@@ -1,5 +1,5 @@
 import { Effect, Option, Schema } from "effect"
-import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
+import { ReleaseTarget, UpdateClientMetadata, type UpdateOwner } from "@magnitudedev/release/hosted-update"
 import { makePreparedUpdateStore, PreparedUpdateStore } from "../desktop-native/prepared-update"
 import { makeUpdatePreferences } from "../desktop-native/update-preferences"
 import { nativeWindowsInstallerVerifier, WindowsInstallerVerifier } from "../desktop-native/windows-update-signature"
@@ -19,11 +19,13 @@ export const makeInstalledUpdatePreparation = (options: {
   readonly platform: "darwin" | "linux" | "win32"
   readonly architecture: "arm64" | "x64"
   readonly isolated: boolean
+  /** Who sends update requests: `serve` by hand or a finite CLI command (`headless`), or the service. */
+  readonly owner: UpdateOwner
 }) => Effect.gen(function* () {
   const configuration = yield* readInstalledUpdateConfiguration(options.resources)
   const metadata = options.platform === "linux"
-    ? yield* readLinuxUpdateMetadata(options.resources, options.version, options.osVersion)
-    : yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: options.version, os_version: options.osVersion,
+    ? yield* readLinuxUpdateMetadata(options.resources, options.version, options.osVersion, options.owner)
+    : yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: options.version, os_version: options.osVersion, owner: options.owner,
       os: options.platform === "win32" ? "windows" : "darwin", arch: options.architecture,
       package: options.platform === "win32" ? "windows-exe" : "mac-zip" })
   const target = yield* Schema.decodeUnknown(ReleaseTarget)({ os: metadata.os, arch: metadata.arch, package: metadata.package })

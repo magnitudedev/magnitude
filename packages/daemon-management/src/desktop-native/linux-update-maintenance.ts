@@ -1,6 +1,6 @@
 import { FileSystem } from "@effect/platform"
 import { Effect, Option, Schema, Stream } from "effect"
-import { basename, dirname, join, parse } from "node:path"
+import { basename, dirname, isAbsolute, join, normalize, parse } from "node:path"
 import { createRequire } from "node:module"
 import { decodePublisherPublicKey, updateInstallerFilename } from "@magnitudedev/release/hosted-update"
 import { LinuxPackageFormat } from "@magnitudedev/release/linux-package"
@@ -17,6 +17,20 @@ export const guardLinuxInstallerParent = Effect.try({
     native.guardInstallerParent(0)
   },
   catch: () => new LinuxPackageUpdateFailed({ reason: "install", message: "The installer could not retain the foreground command's lifetime." }),
+})
+
+/**
+ * The exact grammar of the privileged entry: `_install-application-update <request> [--parent-stdin]`.
+ * sudo and Polkit admit any arguments after the command name, so anything else is refused before work starts.
+ */
+export const parseLinuxUpdateInstallation = (argv: readonly string[]) => Effect.gen(function* () {
+  const [command, request, flag, ...rest] = argv
+  if (command !== "_install-application-update" || request === undefined || rest.length > 0
+    || (flag !== undefined && flag !== "--parent-stdin")
+    || !isAbsolute(request) || normalize(request) !== request || request.endsWith("/") || request.includes("\0") || request.length > 4096) {
+    return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "The application update request is invalid." })
+  }
+  return { request, parentStdin: flag === "--parent-stdin" }
 })
 
 export const linuxUpdateCallerUid = (environment: Readonly<Record<string, string | undefined>>) => Effect.gen(function* () {

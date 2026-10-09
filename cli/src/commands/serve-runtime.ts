@@ -8,7 +8,7 @@ import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { applicationNativeHostPath, applicationStateDirectory, nativeHostLayer, resolveApplicationProfile,
   resolveInstalledApplicationRuntime, runHeadlessApplication, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { isDevelopmentBuild } from "../runtime/environment"
-import { initializeServeUpdates, prepareServeStartup } from "../server/serve-updates"
+import { idleInstallationSystem, initializeServeUpdates, makeIdleInstallation, prepareServeStartup } from "../server/serve-updates"
 import { resolveServeOwner } from "../server/serve-owner"
 import { readServerReach, renderServeReady } from "../server/server-reach"
 
@@ -31,21 +31,34 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const stateDirectory = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: profile.dataDirectory, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR) })
   const addon = applicationNativeHostPath(runtime, process.platform, process.arch)
   const ready = yield* Ref.make(false)
+  // Unix servers install downloaded updates at idle points; Windows serve only prepares them.
+  const idle = runtime._tag === "Installed" && process.platform !== "win32"
+    ? Option.some(yield* makeIdleInstallation.pipe(Effect.provide(idleInstallationSystem({ runtime, profile, stateDirectory, addon, owner,
+      notify: line => Effect.sync(() => { process.stderr.write(`${line}\n`) }) }))))
+    : Option.none()
   // A restart request re-admits the owner in place, so settings read at service start take effect.
-  for (;;) if ((yield* runHeadlessApplication({ runtime, profile, stateDirectory, home: homedir(), environment: process.env,
+  for (;;) {
+    yield* Ref.set(ready, false)
+    const stop = yield* runHeadlessApplication({ runtime, profile, stateDirectory, home: homedir(), environment: process.env,
     prepareStartup: prepareServeStartup(runtime, profile, stateDirectory).pipe(
       Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon))),
-    initializeUpdates: initializeServeUpdates(runtime, profile, addon),
-    updateReady: version => Effect.sync(() => { process.stderr.write(`Magnitude ${version} is ready to install. Stop the server, then run: magnitude serve\n`) }),
+    initializeUpdates: initializeServeUpdates(runtime, profile, addon, owner),
+    ...(Option.isSome(idle) ? { installWhenIdle: idle.value.installWhenIdle, startupFailed: idle.value.startupFailed } : {}),
     stopping: reason => Effect.sync(() => { process.stderr.write(reason === "DesktopTakeover"
       ? "The desktop app was opened and is taking over. Stopping the headless server.\n"
-      : reason === "Restart" ? "Restarting the Magnitude server.\n" : "Stopping the Magnitude server.\n") }),
+      : reason === "Restart" ? "Restarting the Magnitude server.\n"
+      : reason === "InstallUpdate" ? "Stopping the service to install the downloaded update; clients reconnect when it is back.\n"
+      : "Stopping the Magnitude server.\n") }),
     stop: Deferred.await(stopped), observe: state => Ref.getAndSet(ready, state._tag === "Ready").pipe(Effect.flatMap(wasReady =>
       state._tag === "Ready" && !wasReady
         ? readServerReach({ endpoint: profile.endpoint, dataDirectory: profile.dataDirectory, service: owner === "service" }).pipe(
           Effect.flatMap(reach => Effect.sync(() => { process.stderr.write(renderServeReady(reach)) })))
         : Effect.void)),
-  }).pipe(Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon)))) !== "Restart") return
+  }).pipe(Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon)))
+    // Installation replaces this process on success; otherwise the current version serves again.
+    if (stop === "InstallUpdate" && Option.isSome(idle)) yield* idle.value.install
+    else if (stop !== "Restart") return
+  }
 })).pipe(Effect.provide([BunContext.layer, BunSqliteDriverLayer]), Effect.catchAll(error => Effect.sync(() => {
   process.stderr.write(`${error.message}\n`)
   process.exitCode = 1

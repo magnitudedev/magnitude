@@ -75,9 +75,9 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
 }) }))
 
 /** Finite mutations use the same kernel ownership, with no control listener, takeover or service. */
-export const acquireApplicationMaintenance = (directory: string) => Effect.gen(function* () {
+export const acquireApplicationMaintenance = (directory: string, groupAccess = false) => Effect.gen(function* () {
   const native = yield* NativeHost
-  yield* prepareOwnershipDirectory(directory)
+  yield* prepareOwnershipDirectory(directory, groupAccess)
   const lock = yield* native.acquireOwnership(join(directory, "application.lock"))
   if (Option.isNone(lock)) return yield* applicationAlreadyRunning(directory)
   if (yield* isUpdateInstallationActive(directory)) return yield* new ApplicationOwnershipFailed({

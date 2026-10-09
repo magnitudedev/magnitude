@@ -47,16 +47,16 @@ describe("root step admission", () => {
   const admit = (platform: string, real: string) => Effect.runPromise(Effect.either(requireInstalledRoot(platform, "/usr/bin/magnitude").pipe(
     Effect.provideService(FileSystem.FileSystem, fs(real)))))
   it("refuses an unprivileged caller", async () => {
-    vi.spyOn(process, "getuid").mockReturnValue(1000)
+    vi.spyOn(process as { getuid: () => number }, "getuid").mockReturnValue(1000)
     expect(Either.isLeft(await admit("linux", "/usr/lib/magnitude-desktop/resources/magnitude"))).toBe(true)
   })
   it("refuses a copy outside the installed path, and Windows", async () => {
-    vi.spyOn(process, "getuid").mockReturnValue(0)
+    vi.spyOn(process as { getuid: () => number }, "getuid").mockReturnValue(0)
     expect(Either.isLeft(await admit("linux", "/tmp/magnitude"))).toBe(true)
     expect(Either.isLeft(await admit("win32", "C:\\magnitude.exe"))).toBe(true)
   })
   it("admits root running the installed CLI", async () => {
-    vi.spyOn(process, "getuid").mockReturnValue(0)
+    vi.spyOn(process as { getuid: () => number }, "getuid").mockReturnValue(0)
     expect(await admit("linux", "/usr/lib/magnitude-desktop/resources/magnitude")).toEqual(Either.right("/usr/lib/magnitude-desktop/resources/magnitude"))
     expect(await admit("darwin", "/Applications/Magnitude.app/Contents/Resources/magnitude")).toEqual(Either.right("/Applications/Magnitude.app/Contents/Resources/magnitude"))
   })

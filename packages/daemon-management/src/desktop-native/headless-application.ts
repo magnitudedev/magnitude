@@ -20,8 +20,11 @@ import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/n
 
 export class HeadlessApplicationFailed extends Schema.TaggedError<HeadlessApplicationFailed>()("HeadlessApplicationFailed", { message: Schema.String }) {}
 
-/** Why a Headless owner ended. `Restart` asks the caller to admit a new owner with the same invocation. */
-export type HeadlessStop = "DesktopTakeover" | "Requested" | "Restart"
+/**
+ * Why a Headless owner ended. `Restart` asks the caller to admit a new owner with the same invocation;
+ * `InstallUpdate` asks it to install the downloaded update now that the service is idle and stopped.
+ */
+export type HeadlessStop = "DesktopTakeover" | "Requested" | "Restart" | "InstallUpdate"
 
 /**
  * Caller owns terminal/signal presentation; this scope owns admission, control and the exact service tree.
@@ -36,6 +39,13 @@ export const runHeadlessApplication = (options: {
   readonly initializeUpdates?: Effect.Effect<ApplicationUpdate, never, Scope.Scope>
   readonly prepareStartup?: Effect.Effect<void, { readonly message: string }, Scope.Scope>
   readonly updateReady?: (version: string) => Effect.Effect<void>
+  /**
+   * Called while serving with each downloaded update version. It waits for an idle point and answers
+   * whether to stop the service and install it; interruption means the version changed or the owner stops.
+   */
+  readonly installWhenIdle?: (version: string) => Effect.Effect<boolean>
+  /** Runs when the service fails before its first Ready, before the outcome is reported and the owner fails. */
+  readonly startupFailed?: Effect.Effect<void>
 }) => Effect.scoped(Effect.gen(function* () {
   const stop = yield* Deferred.make<HeadlessStop>()
   yield* options.stop.pipe(Effect.zipRight(Deferred.succeed(stop, "Requested")), Effect.forkScoped)
@@ -60,7 +70,9 @@ export const runHeadlessApplication = (options: {
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   const updates = yield* options.initializeUpdates ?? Effect.succeed(unavailableApplicationUpdate("Application updates require an installed Magnitude application."))
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
-  const update = yield* makeHeadlessUpdateControl(updates)
+  // Update checks start once the service is ready, so a new version reports `applied` only after it starts.
+  const firstReady = yield* Deferred.make<void>()
+  const update = yield* makeHeadlessUpdateControl(updates, Deferred.await(firstReady))
   if (options.updateReady) {
     const notify = options.updateReady
     yield* updates.changes.pipe(Stream.map(state => state.transfer), Stream.changesWith((a, b) =>
@@ -94,11 +106,26 @@ export const runHeadlessApplication = (options: {
     const name = yield* Schema.decodeUnknown(WindowsPipeName)(owner.socketPath)
     yield* serveWindowsApplicationControl(name, control).pipe(Effect.provide(nativeWindowsPrivatePipesLayer(addon)))
   } else yield* serveApplicationControl(owner.socketPath, control, options.profile.groupAccess)
-  yield* service.changes.pipe(Stream.runForEach(options.observe), Effect.forkScoped)
+  yield* service.changes.pipe(Stream.runForEach(state => (state._tag === "Ready" ? Deferred.succeed(firstReady, undefined) : Effect.void).pipe(
+    Effect.zipRight(options.observe(state)))), Effect.forkScoped)
+  if (options.installWhenIdle) {
+    const decide = options.installWhenIdle
+    // A newer download interrupts waiting for the previous one.
+    yield* updates.changes.pipe(Stream.map(state => state.transfer), Stream.filter(transfer => transfer._tag === "Ready"),
+      Stream.map(transfer => transfer.version), Stream.changes,
+      Stream.flatMap(version => Stream.fromEffect(Deferred.await(firstReady).pipe(Effect.zipRight(decide(version)))), { switch: true }),
+      Stream.filter(install => install), Stream.take(1),
+      Stream.runForEach(() => Deferred.succeed(stop, "InstallUpdate")), Effect.forkScoped)
+  }
   const failure = service.changes.pipe(Stream.filter(state => state._tag === "Failed" || state._tag === "CleanupFailed"), Stream.take(1), Stream.runHead,
     Effect.flatMap(state => Option.isSome(state) ? Effect.fail(new HeadlessApplicationFailed({ message: state.value.message })) : Effect.never))
   const result = yield* Effect.raceFirst(Deferred.await(stop), failure).pipe(Effect.exit)
   if (Exit.isSuccess(result) && options.stopping) yield* options.stopping(result.value)
+  if (Exit.isFailure(result) && !(yield* Deferred.isDone(firstReady)) && options.startupFailed) {
+    // An update that installed but never became ready is reported before the owner exits for a retry.
+    yield* options.startupFailed
+    yield* updates.check("launch").pipe(Effect.timeout("15 seconds"), Effect.ignore)
+  }
   yield* service.shutdown
   if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
   return result.value

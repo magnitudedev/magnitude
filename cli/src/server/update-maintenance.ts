@@ -34,7 +34,7 @@ export const runLocalUpdateMaintenance = (options: {
       if (platform === "win32") yield* recoverWindowsUpdateDirectory(addon, options.dataDirectory)
     }
     const preparation = yield* makeInstalledUpdatePreparation({ resources: runtime.resourcesDirectory, addonPath: addon,
-      dataDirectory: options.dataDirectory, version: CLI_VERSION, osVersion, platform, architecture, isolated: options.isolated })
+      dataDirectory: options.dataDirectory, version: CLI_VERSION, osVersion, platform, architecture, isolated: options.isolated, owner: "headless" })
     const execute = Effect.gen(function* () {
       if (options.action === "status") return yield* readPreparedUpdateState
       if (options.action === "install") {

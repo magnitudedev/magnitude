@@ -1,10 +1,10 @@
 import { FileSystem } from "@effect/platform"
-import { UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
+import { UpdateClientMetadata, type UpdateOwner } from "@magnitudedev/release/hosted-update"
 import { LinuxPackageFormat } from "@magnitudedev/release/linux-package"
 import { Effect, Schema } from "effect"
 import { join } from "node:path"
 
-export const readLinuxUpdateMetadata = (resources: string, version: string, osVersion: string) => Effect.gen(function* () {
+export const readLinuxUpdateMetadata = (resources: string, version: string, osVersion: string, owner: UpdateOwner) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const format = yield* fs.readFileString(join(resources, "update-package.json")).pipe(
     Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ format: LinuxPackageFormat })))),
@@ -14,6 +14,6 @@ export const readLinuxUpdateMetadata = (resources: string, version: string, osVe
     const field = /^(ID|VERSION_ID)=(?:"([^"\\]*)"|'([^'\\]*)'|([^\s'"\\]+))$/.exec(line)
     if (field) distro[field[1]!] = field[2] ?? field[3] ?? field[4]!
   }
-  return yield* Schema.decodeUnknown(UpdateClientMetadata)({ version, os: "linux", os_version: osVersion,
+  return yield* Schema.decodeUnknown(UpdateClientMetadata)({ version, os: "linux", os_version: osVersion, owner,
     arch: process.arch, package: format.format, ...(distro.ID ? { distro: distro.ID } : {}), ...(distro.VERSION_ID ? { distro_version: distro.VERSION_ID } : {}) })
 })

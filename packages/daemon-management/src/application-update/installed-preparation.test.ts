@@ -26,7 +26,7 @@ describe("installed update preparation", () => {
       const state = await Effect.runPromise(Effect.gen(function* () {
         const preparation = yield* makeInstalledUpdatePreparation({ resources: root, addonPath: "must-not-load.node",
           dataDirectory: join(root, "missing-profile"), version: "0.1.5", osVersion: "24.0.0", platform,
-          architecture: platform === "win32" ? "x64" : "arm64", isolated: true })
+          architecture: platform === "win32" ? "x64" : "arm64", isolated: true, owner: "headless" })
         const observed = yield* readPreparedUpdateState.pipe(Effect.provideService(PreparedUpdateStore, preparation.store),
           Effect.provideService(UpdatePreferences, preparation.preferences))
         // Refusal precedes identity acquisition and native verification.

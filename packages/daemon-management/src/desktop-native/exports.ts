@@ -21,7 +21,7 @@ export { LinuxTrayHost, linuxTrayHostLayer, type TrayHostState } from "./tray-ho
 
 export { makeWindowsOwnedChildSpawner } from "./windows-owned-child"
 export { requireServicePort } from "./service-port"
-export { installLinuxApplicationUpdate, guardLinuxInstallerParent } from "./linux-update-maintenance"
+export { installLinuxApplicationUpdate, guardLinuxInstallerParent, parseLinuxUpdateInstallation } from "./linux-update-maintenance"
 export { LinuxPackageUpdate, linuxPackageUpdateExitCode, linuxUpdateFailureReason } from "./linux-update-package"
 export { relaunchLinuxAfterUpdate, LinuxUpdateHandoffRequest, startLinuxUpdateHandoff, completeLinuxUpdateHandoff } from "./linux-update-handoff"
 export { relaunchWindowsAfterUpdate, WindowsUpdateHandoffRequest, startWindowsUpdateHandoff, completeWindowsUpdateHandoff } from "./windows-update-handoff"
