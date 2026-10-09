@@ -26,7 +26,7 @@ describe.skipIf(process.platform !== "darwin")("Installed macOS headless admissi
       const initialized = yield* Deferred.make<void>()
       const options = {
         runtime: { _tag: "Installed" as const, resourcesDirectory },
-        profile: { dataDirectory: join(root, "data"), isolated: true, port: 11101, endpoint: "http://127.0.0.1:11101" },
+        profile: { dataDirectory: join(root, "data"), isolated: true, port: 11101, endpoint: "http://127.0.0.1:11101", groupAccess: false },
         stateDirectory: join(root, "state"), home: root, environment: {}, stop: Effect.never,
         observe: () => Effect.void,
         initializeUpdates: Deferred.succeed(initialized, undefined).pipe(Effect.zipRight(Effect.never)),

@@ -26,20 +26,26 @@ export const ApplicationOwnerRequest = Schema.Union(
 )
 export type ApplicationOwnerRequest = typeof ApplicationOwnerRequest.Type
 
-const prepareOwnershipDirectory = (directory: string) => Effect.tryPromise({ try: async () => {
+/**
+ * Private profiles keep the ownership directory owner-only. The server profile lets the `magnitude`
+ * group traverse it to reach the control socket, without listing it or opening the lock.
+ */
+const ownershipDirectoryMode = (groupAccess: boolean) => groupAccess ? 0o710 : 0o700
+
+const prepareOwnershipDirectory = (directory: string, groupAccess = false) => Effect.tryPromise({ try: async () => {
     // Windows creates the final directory with its private ACL inside native acquisition.
-    await mkdir(process.platform === "win32" ? dirname(directory) : directory, { recursive: true, mode: 0o700 })
+    await mkdir(process.platform === "win32" ? dirname(directory) : directory, { recursive: true, mode: ownershipDirectoryMode(groupAccess) })
     if (process.platform !== "win32") {
       const info = await lstat(directory)
       if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid!()) throw new Error("Application directory must belong to the current user")
-      await chmod(directory, 0o700)
+      await chmod(directory, ownershipDirectoryMode(groupAccess))
     }
   }, catch: error => new ApplicationOwnershipFailed({ message: String(error) }) })
 
 /** A handoff requests cooperation; only acquisition of the retained kernel lock admits a new owner. */
-export const acquireApplicationOwner = (directory: string, request: ApplicationOwnerRequest) => Effect.gen(function* () {
+export const acquireApplicationOwner = (directory: string, request: ApplicationOwnerRequest, groupAccess = false) => Effect.gen(function* () {
   const native = yield* NativeHost
-  yield* prepareOwnershipDirectory(directory)
+  yield* prepareOwnershipDirectory(directory, groupAccess)
   for (;;) {
     const lock = yield* native.acquireOwnership(join(directory, "application.lock"))
     if (Option.isSome(lock)) return { _tag: "Owner" as const, socketPath: yield* native.ownedEndpoint(lock.value, directory), lock: lock.value }

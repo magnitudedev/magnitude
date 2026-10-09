@@ -9,6 +9,7 @@ import { makeOwnedService, type OwnerAgent } from "./owned-service"
 import { previousInstallationUpgrade } from "./previous-installation-live"
 import { checkServicePort, requireServicePort } from "./service-port"
 import type { ChildOutputMode } from "./child-output"
+import { SERVER_DATA_DIRECTORY } from "./server-profile"
 
 export const ApplicationRuntime = Schema.Union(
   Schema.TaggedStruct("Installed", { resourcesDirectory: Schema.String }),
@@ -37,6 +38,8 @@ export const resolveInstalledApplicationRuntime = (executable: string, platform:
 })
 export const ApplicationProfile = Schema.Struct({
   dataDirectory: Schema.String, isolated: Schema.Boolean, port: Schema.Number, endpoint: Schema.String,
+  /** The server profile shares its control endpoint with the `magnitude` group; data stays private. */
+  groupAccess: Schema.Boolean,
 })
 export type ApplicationProfile = typeof ApplicationProfile.Type
 
@@ -47,13 +50,18 @@ const paths = (platform: string) => platform === "win32" ? win32 : posix
 export const resolveApplicationProfile = (options: {
   readonly runtime: ApplicationRuntime; readonly home: string; readonly platform: string
   readonly acceptance: boolean; readonly environment: Environment
+  /** Whether the installed Linux server profile is active; see `isServerProfileActive`. */
+  readonly server: boolean
 }): ApplicationProfile => {
   const { runtime, environment, acceptance } = options
+  if (options.server && runtime._tag === "Installed" && !acceptance) {
+    return { dataDirectory: SERVER_DATA_DIRECTORY, isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100", groupAccess: true }
+  }
   const isolated = acceptance || runtime._tag === "Development" || environment.MAGNITUDE_DEV_DATA_DIR !== undefined
   const dataDirectory = environment.MAGNITUDE_DEV_DATA_DIR ?? paths(options.platform).join(options.home,
     acceptance ? ".magnitude-update-acceptance" : runtime._tag === "Installed" ? ".magnitude" : ".magnitude-desktop-dev")
   const port = isolated ? Number(environment.MAGNITUDE_DEV_PORT ?? (acceptance ? 11143 : 11101)) : 10100
-  return { dataDirectory, isolated, port, endpoint: `http://127.0.0.1:${port}` }
+  return { dataDirectory, isolated, port, endpoint: `http://127.0.0.1:${port}`, groupAccess: false }
 }
 
 export const applicationNativeHostPath = (runtime: ApplicationRuntime, platform: string, architecture: string) =>

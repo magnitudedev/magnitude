@@ -20,28 +20,34 @@ import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/n
 
 export class HeadlessApplicationFailed extends Schema.TaggedError<HeadlessApplicationFailed>()("HeadlessApplicationFailed", { message: Schema.String }) {}
 
-/** Caller owns terminal/signal presentation; this scope owns admission, control and the exact service tree. */
+/** Why a Headless owner ended. `Restart` asks the caller to admit a new owner with the same invocation. */
+export type HeadlessStop = "DesktopTakeover" | "Requested" | "Restart"
+
+/**
+ * Caller owns terminal/signal presentation; this scope owns admission, control and the exact service tree.
+ * It returns why it stopped once the service tree, control endpoint, leases and ownership are released.
+ */
 export const runHeadlessApplication = (options: {
   readonly runtime: ApplicationRuntime; readonly profile: ApplicationProfile
   readonly stateDirectory: string; readonly home: string; readonly environment: Readonly<Record<string, string | undefined>>
   readonly stop: Effect.Effect<void>
-  readonly stopping?: (reason: "DesktopTakeover" | "Requested") => Effect.Effect<void>
+  readonly stopping?: (reason: HeadlessStop) => Effect.Effect<void>
   readonly observe: (state: OwnedServiceState) => Effect.Effect<void>
   readonly initializeUpdates?: Effect.Effect<ApplicationUpdate, never, Scope.Scope>
   readonly prepareStartup?: Effect.Effect<void, { readonly message: string }, Scope.Scope>
   readonly updateReady?: (version: string) => Effect.Effect<void>
 }) => Effect.scoped(Effect.gen(function* () {
-  const stop = yield* Deferred.make<"DesktopTakeover" | "Requested">()
+  const stop = yield* Deferred.make<HeadlessStop>()
   yield* options.stop.pipe(Effect.zipRight(Deferred.succeed(stop, "Requested")), Effect.forkScoped)
   const native = yield* NativeHost
   const addon = applicationNativeHostPath(options.runtime, process.platform, process.arch)
   if (process.platform === "win32") yield* native.guardParent(0)
-  const owner = yield* acquireApplicationOwner(options.stateDirectory, { _tag: "Headless" })
+  const owner = yield* acquireApplicationOwner(options.stateDirectory, { _tag: "Headless" }, options.profile.groupAccess)
   if (owner._tag !== "Owner") return yield* new HeadlessApplicationFailed({ message: "Magnitude is already running." })
   if (yield* isUpdateInstallationActive(options.stateDirectory)) return yield* new HeadlessApplicationFailed({ message: "A Magnitude update is being installed. Run `magnitude serve` when it finishes." })
-  if (yield* Deferred.isDone(stop)) return
+  if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   if (options.prepareStartup) yield* Effect.raceFirst(options.prepareStartup, Deferred.await(stop))
-  if (yield* Deferred.isDone(stop)) return
+  if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   if (options.runtime._tag === "Installed") {
     if (process.platform === "linux") yield* acquireLinuxInstallationLease(addon)
     if (process.platform === "darwin") {
@@ -51,9 +57,9 @@ export const runHeadlessApplication = (options: {
       yield* acquireMacApplicationInstallationLease(bundle).pipe(Effect.provide(nativeMacUpdateAdmission(addon)))
     }
   }
-  if (yield* Deferred.isDone(stop)) return
+  if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   const updates = yield* options.initializeUpdates ?? Effect.succeed(unavailableApplicationUpdate("Application updates require an installed Magnitude application."))
-  if (yield* Deferred.isDone(stop)) return
+  if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   const update = yield* makeHeadlessUpdateControl(updates)
   if (options.updateReady) {
     const notify = options.updateReady
@@ -62,7 +68,7 @@ export const runHeadlessApplication = (options: {
       Stream.runForEach(state => state._tag === "Ready" ? notify(state.version) : Effect.void), Effect.forkScoped)
   }
   const ownerAgent: OwnerAgent = {
-    state: updates.changes.pipe(Stream.map(state => ({ owner: "Headless" as const, capabilities: ["Updates" as const, "Quit" as const], updates: Option.some(state), loginStartup: Option.none() }))),
+    state: updates.changes.pipe(Stream.map(state => ({ owner: "Headless" as const, capabilities: ["Updates" as const, "RestartService" as const, "Quit" as const], updates: Option.some(state), loginStartup: Option.none() }))),
     handle: request => {
       switch (request._tag) {
         case "CheckUpdate": return ownerResult(update("check"))
@@ -71,8 +77,9 @@ export const runHeadlessApplication = (options: {
         case "InstallUpdate": return ownerResult(update("install"))
         case "SetAutoDownload": return ownerResult(updates.setAutoDownload(request.enabled))
         case "Quit": return Effect.succeed(ownerDone(Deferred.succeed(stop, "Requested").pipe(Effect.asVoid)))
-        case "SetLoginStartup":
-        case "RestartService": return ownerUnsupported
+        // Restarting re-admits the owner, so settings that apply at service start take effect.
+        case "RestartService": return Effect.succeed(ownerDone(Deferred.succeed(stop, "Restart").pipe(Effect.asVoid)))
+        case "SetLoginStartup": return ownerUnsupported
       }
     },
   }
@@ -86,7 +93,7 @@ export const runHeadlessApplication = (options: {
   if (process.platform === "win32") {
     const name = yield* Schema.decodeUnknown(WindowsPipeName)(owner.socketPath)
     yield* serveWindowsApplicationControl(name, control).pipe(Effect.provide(nativeWindowsPrivatePipesLayer(addon)))
-  } else yield* serveApplicationControl(owner.socketPath, control)
+  } else yield* serveApplicationControl(owner.socketPath, control, options.profile.groupAccess)
   yield* service.changes.pipe(Stream.runForEach(options.observe), Effect.forkScoped)
   const failure = service.changes.pipe(Stream.filter(state => state._tag === "Failed" || state._tag === "CleanupFailed"), Stream.take(1), Stream.runHead,
     Effect.flatMap(state => Option.isSome(state) ? Effect.fail(new HeadlessApplicationFailed({ message: state.value.message })) : Effect.never))
@@ -94,4 +101,5 @@ export const runHeadlessApplication = (options: {
   if (Exit.isSuccess(result) && options.stopping) yield* options.stopping(result.value)
   yield* service.shutdown
   if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
+  return result.value
 })).pipe(Effect.provideService(ProcessGroupController, ProcessGroupControllerLive))

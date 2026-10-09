@@ -42,3 +42,5 @@ export { makeUnixProcessContinuation, ForegroundContinuationFailed } from "./uni
 export { acquireMacApplicationInstallationLease, nativeMacUpdateAdmission } from "./mac-update-lease"
 export type { OwnerAgent } from "./owned-service"
 export { ownerDone, ownerResult, ownerUnsupported } from "./owner-agent"
+export { SERVER_DATA_DIRECTORY, SERVER_USER, SERVER_MARKER_PATH, SERVER_MARKER_CONTENT, MAC_SERVER_LABEL, MAC_SERVER_PLIST, isServerProfileActive } from "./server-profile"
+export { ServerInstallationFailed, installedServerCli, parseServerInstallation, requireInstalledRoot, installLinuxServer, removeLinuxServer } from "./server-installation"

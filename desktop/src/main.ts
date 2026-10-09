@@ -57,8 +57,9 @@ const background = process.argv.includes("--background") || (process.platform ==
 const applicationRuntime: ApplicationRuntime = app.isPackaged
   ? { _tag: "Installed", resourcesDirectory: process.resourcesPath }
   : { _tag: "Development", repository: root }
+// The desktop app always uses the person's own profile, even where the server profile is set up.
 const profile = resolveApplicationProfile({ runtime: applicationRuntime, home: homedir(), platform: process.platform,
-  acceptance: isUpdateAcceptanceBuild, environment: process.env })
+  acceptance: isUpdateAcceptanceBuild, environment: process.env, server: false })
 const { isolated: isolatedProfile, dataDirectory: dataDir, port, endpoint } = profile
 const stateOverride = process.env.MAGNITUDE_DESKTOP_STATE_DIR
 // Chromium can create its profile before native ownership is acquired. Keep it outside the

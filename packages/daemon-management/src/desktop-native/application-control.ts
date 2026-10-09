@@ -31,7 +31,8 @@ export interface ApplicationControlOptions {
   readonly update: (action: ApplicationUpdateAction) => Effect.Effect<{ readonly state: ApplicationUpdateState; readonly afterReply: Effect.Effect<void> }, ApplicationUpdateControlFailed>
 }
 
-export const serveApplicationControl = (path: string, options: ApplicationControlOptions) => Effect.gen(function* () {
+/** The server profile admits the `magnitude` group, the service's primary group, to its control socket. */
+export const serveApplicationControl = (path: string, options: ApplicationControlOptions, groupAccess = false) => Effect.gen(function* () {
   if (process.platform === "win32") return yield* new ApplicationControlFailed({ message: "Windows application control requires the named-pipe ACL adapter" })
   yield* validateUnixControlPath(path)
   yield* Effect.tryPromise({ try: async () => {
@@ -63,7 +64,7 @@ export const serveApplicationControl = (path: string, options: ApplicationContro
       await new Promise<void>(resolve => server.close(() => resolve()))
       await unlink(path).catch(error => { if (error.code !== "ENOENT") throw error })
     }),
-  ).pipe(Effect.tap(() => Effect.tryPromise({ try: () => chmod(path, 0o600), catch: failure })), Effect.tap(() => Deferred.succeed(listening, undefined))))
+  ).pipe(Effect.tap(() => Effect.tryPromise({ try: () => chmod(path, groupAccess ? 0o660 : 0o600), catch: failure })), Effect.tap(() => Deferred.succeed(listening, undefined))))
   const worker = yield* serveApplicationRequests(connections.pipe(Stream.tapError(error => Deferred.fail(listening, error))), options)
   yield* Deferred.await(listening)
   return worker
@@ -97,7 +98,11 @@ const exchange = <Q, QI, A, AI>(path: string, requestSchema: Schema.Schema<Q, QI
     Effect.async<Socket, ApplicationControlFailed | ApplicationControlUnavailable>(resume => {
       const client = new Socket()
       client.on("error", error => resume(Effect.fail("code" in error && (error.code === "ENOENT" || error.code === "ECONNREFUSED")
-        ? new ApplicationControlUnavailable({ message: "Magnitude desktop is not running" }) : failure(error))))
+        ? new ApplicationControlUnavailable({ message: "Magnitude desktop is not running" })
+        // The server profile admits members of the magnitude group; membership applies to new logins.
+        : "code" in error && error.code === "EACCES" ? new ApplicationControlFailed({ message: "This account can't reach the Magnitude server yet. "
+          + "If `magnitude server setup` just added you to the magnitude group, log out and back in (or run `newgrp magnitude`)." })
+        : failure(error))))
       client.once("connect", () => resume(Effect.succeed(client)))
       client.connect(path)
       return Effect.sync(() => client.destroy())

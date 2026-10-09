@@ -6,6 +6,7 @@ import { registerStatusCommand } from "./commands/status"
 import { registerServeCommand } from "./commands/serve"
 import { registerInferenceCommands } from "./commands/inference"
 import { registerConnectionsCommand } from "./commands/connections"
+import { registerServerCommand } from "./commands/server"
 
 const program = new Command()
   .name("magnitude")
@@ -17,6 +18,7 @@ registerStatusCommand(program)
 program.command("native-runtime-check", { hidden: true })
   .action(() => import("./commands/native-runtime-check").then(({ runNativeRuntimeCheck }) => runNativeRuntimeCheck()))
 registerServeCommand(program)
+registerServerCommand(program)
 registerInferenceCommands(program)
 registerConnectionsCommand(program)
 registerUpdateCommand(program)

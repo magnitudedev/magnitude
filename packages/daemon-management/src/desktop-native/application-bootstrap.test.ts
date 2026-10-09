@@ -30,13 +30,21 @@ describe("application bootstrap selection", () => {
 
   it("preserves production, development and acceptance profile isolation", () => {
     const select = (runtime: ApplicationRuntime, acceptance = false, environment: Record<string, string> = {}) =>
-      resolveApplicationProfile({ runtime, acceptance, environment, home: "/home/user", platform: "linux" })
-    expect(select(installed)).toEqual({ dataDirectory: "/home/user/.magnitude", isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100" })
+      resolveApplicationProfile({ runtime, acceptance, environment, home: "/home/user", platform: "linux", server: false })
+    expect(select(installed)).toEqual({ dataDirectory: "/home/user/.magnitude", isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100", groupAccess: false })
     expect(select(development)).toMatchObject({ dataDirectory: "/home/user/.magnitude-desktop-dev", isolated: true, port: 11101 })
     expect(select(installed, true)).toMatchObject({ dataDirectory: "/home/user/.magnitude-update-acceptance", isolated: true, port: 11143 })
     expect(select(installed, false, { MAGNITUDE_DEV_DATA_DIR: "/isolated", MAGNITUDE_DEV_PORT: "12345" }))
-      .toEqual({ dataDirectory: "/isolated", isolated: true, port: 12345, endpoint: "http://127.0.0.1:12345" })
+      .toEqual({ dataDirectory: "/isolated", isolated: true, port: 12345, endpoint: "http://127.0.0.1:12345", groupAccess: false })
     expect(select(installed, false, { MAGNITUDE_DEV_PORT: "12345" }).port).toBe(10100)
+  })
+
+  it("selects the shared server profile only for an installed, non-acceptance runtime", () => {
+    const select = (runtime: ApplicationRuntime, acceptance = false) =>
+      resolveApplicationProfile({ runtime, acceptance, environment: {}, home: "/home/user", platform: "linux", server: true })
+    expect(select(installed)).toEqual({ dataDirectory: "/var/lib/magnitude", isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100", groupAccess: true })
+    expect(select(development).dataDirectory).toBe("/home/user/.magnitude-desktop-dev")
+    expect(select(installed, true).dataDirectory).toBe("/home/user/.magnitude-update-acceptance")
   })
 
   it.each([
@@ -46,7 +54,7 @@ describe("application bootstrap selection", () => {
   ])("uses matched installed resources on %s", (platform, resourcesDirectory, executable) => {
     const runtime: ApplicationRuntime = { _tag: "Installed", resourcesDirectory }
     const environment = Object.freeze({ KEEP: "unchanged", MAGNITUDE_ICN_PATH: "/explicit/engine" })
-    const profile = resolveApplicationProfile({ runtime, platform, home: platform === "win32" ? "C:\\Users\\Test User" : "/home/user", acceptance: false, environment })
+    const profile = resolveApplicationProfile({ runtime, platform, home: platform === "win32" ? "C:\\Users\\Test User" : "/home/user", acceptance: false, environment, server: false })
     const command = applicationServiceCommand({ output: "DiagnosticTail", runtime, profile, platform, architecture: "x64", environment })
     expect(command.executable).toBe(executable)
     expect(command.arguments).toEqual(["serve", "--data-dir", profile.dataDirectory, "--port", "10100"])
@@ -55,7 +63,7 @@ describe("application bootstrap selection", () => {
   })
 
   it("runs development source with the chosen runtime and preserves explicit engine selection", () => {
-    const profile = resolveApplicationProfile({ runtime: development, home: "/home/user", platform: "darwin", acceptance: false, environment: {} })
+    const profile = resolveApplicationProfile({ runtime: development, home: "/home/user", platform: "darwin", acceptance: false, environment: {}, server: false })
     const options = { output: "DiagnosticTail" as const, runtime: development, profile, platform: "darwin", architecture: "arm64" }
     const command = applicationServiceCommand({ ...options, environment: { MAGNITUDE_BUN_PATH: "/tools/bun" } })
     expect(command.executable).toBe("/tools/bun")

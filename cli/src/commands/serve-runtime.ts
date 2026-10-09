@@ -2,13 +2,16 @@ import { dirname, resolve } from "node:path"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
 import { BunContext } from "@effect/platform-bun"
-import { Deferred, Effect, Option, Runtime } from "effect"
+import { Deferred, Effect, Option, Runtime, Schema } from "effect"
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { applicationNativeHostPath, applicationStateDirectory, nativeHostLayer, resolveApplicationProfile,
   resolveInstalledApplicationRuntime, runHeadlessApplication, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { isDevelopmentBuild } from "../runtime/environment"
 import { initializeServeUpdates, prepareServeStartup } from "../server/serve-updates"
+import { resolveServeOwner } from "../server/serve-owner"
+
+class ServeRefused extends Schema.TaggedError<ServeRefused>()("ServeRefused", { message: Schema.String }) {}
 
 export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const stopped = yield* Deferred.make<void>()
@@ -20,20 +23,24 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const runtime: ApplicationRuntime = isDevelopmentBuild()
     ? { _tag: "Development", repository: resolve(dirname(fileURLToPath(import.meta.url)), "../../..") }
     : yield* resolveInstalledApplicationRuntime(process.execPath, process.platform)
-  const profile = resolveApplicationProfile({ runtime, home: homedir(), platform: process.platform, acceptance: false, environment: process.env })
+  const { server, owner } = yield* resolveServeOwner
+  if (server && owner !== "service") return yield* new ServeRefused({ message: "Magnitude runs as a server on this machine, so it is already serving. "
+    + "Run `magnitude status` to see how to reach it, or `magnitude server remove` to stop the server." })
+  const profile = resolveApplicationProfile({ runtime, home: homedir(), platform: process.platform, acceptance: false, environment: process.env, server })
   const stateDirectory = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: profile.dataDirectory, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR) })
   const addon = applicationNativeHostPath(runtime, process.platform, process.arch)
-  yield* runHeadlessApplication({ runtime, profile, stateDirectory, home: homedir(), environment: process.env,
+  // A restart request re-admits the owner in place, so settings read at service start take effect.
+  for (;;) if ((yield* runHeadlessApplication({ runtime, profile, stateDirectory, home: homedir(), environment: process.env,
     prepareStartup: prepareServeStartup(runtime, profile, stateDirectory).pipe(
       Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon))),
     initializeUpdates: initializeServeUpdates(runtime, profile, addon),
     updateReady: version => Effect.sync(() => { process.stderr.write(`Magnitude ${version} is ready to install. Stop the server, then run: magnitude serve\n`) }),
     stopping: reason => Effect.sync(() => { process.stderr.write(reason === "DesktopTakeover"
       ? "The desktop app was opened and is taking over. Stopping the headless server.\n"
-      : "Stopping the Magnitude server.\n") }),
+      : reason === "Restart" ? "Restarting the Magnitude server.\n" : "Stopping the Magnitude server.\n") }),
     stop: Deferred.await(stopped), observe: state => state._tag === "Ready"
       ? Effect.sync(() => { process.stderr.write(`Magnitude is serving at ${profile.endpoint}. Press Ctrl+C to stop.\n`) }) : Effect.void,
-  }).pipe(Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon)))
+  }).pipe(Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon)))) !== "Restart") return
 })).pipe(Effect.provide([BunContext.layer, BunSqliteDriverLayer]), Effect.catchAll(error => Effect.sync(() => {
   process.stderr.write(`${error.message}\n`)
   process.exitCode = 1
