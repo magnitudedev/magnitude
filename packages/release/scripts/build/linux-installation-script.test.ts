@@ -10,7 +10,8 @@ import { signUpdateRelease } from "../../src/hosted-update/release"
 import { renderUnixInstallationScript } from "./installation-scripts"
 
 // The script selects its package manager by availability, so each case sees only its own.
-const systemTools = ["cat", "cp", "cut", "id", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "tr", "uname", "wc"]
+const setsid = spawnSync("/bin/sh", ["-c", "command -v setsid"], { encoding: "utf8" }).stdout.trim()
+const systemTools = ["cat", "cp", "cut", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
 const managers = [
   { manager: "apt-get", package: "deb", receipt: /^install\n-y\n.*magnitude\.deb\n$/ },
   { manager: "pacman", package: "pacman", receipt: /^-U\n--noconfirm\n.*magnitude\.pacman\n$/ },
@@ -30,9 +31,11 @@ describe.skipIf(process.platform !== "linux").each(managers)("Linux installation
       }
       const executable = (name: string, contents: string) => writeFileSync(join(bin, name), contents, { mode: 0o700 })
       // Only network and privileged package mutation are replaced; parsing and OpenSSL run natively.
-      executable("curl", '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\n case "$1" in --output) output=$2; shift 2;; *) url=$1; shift;; esac\ndone\ncase "$url" in *.json) cp "$TEST_OFFER" "$output";; *) cp "$TEST_PACKAGE" "$output";; esac\n')
+      executable("curl", '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\n case "$1" in --output) output=$2; shift 2;; *) url=$1; shift;; esac\ndone\ncase "$url" in */api/installer?*"&offer=1") cp "$TEST_OFFER" "$output";; *) cp "$TEST_PACKAGE" "$output";; esac\n')
       executable(manager, '#!/bin/sh\nprintf "%s\\n" "$@" > "$TEST_APT_RECEIPT"\n')
-      executable("sudo", '#!/bin/sh\nexec "$@"\n')
+      // The installer runs apt-get through env to set a noninteractive frontend.
+      executable("env", '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do case "$1" in *=*) shift;; *) break;; esac; done\nexec "$@"\n')
+      executable("sudo", '#!/bin/sh\ncase "$1" in -v|-n) exit 0;; esac\nexec "$@"\n')
       const keys = generateKeyPairSync("ed25519")
       const bytes = Buffer.from("verified package fixture")
       const packagePath = join(root, "package.deb"), offerPath = join(root, "offer.json"), receipt = join(root, "receipt")
@@ -45,7 +48,8 @@ describe.skipIf(process.platform !== "linux").each(managers)("Linux installation
         download: `https://github.com/magnitudedev/magnitude/releases/download/test/magnitude.${format}` }))
       const script = await Effect.runPromise(renderUnixInstallationScript({ origin: "https://magnitude.dev", appleTeam: "ABCDEFGHIJ",
         publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }).pipe(Effect.provide(NodeContext.layer)))
-      const result = spawnSync("/bin/sh", ["-s"], { input: script, encoding: "utf8", timeout: 15000,
+      // setsid: no controlling terminal, as when an agent runs the installer.
+      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s"], { input: script, encoding: "utf8", timeout: 15000,
         env: { ...process.env, PATH: `${bin}:${tools}`, TEST_OFFER: offerPath, TEST_PACKAGE: packagePath, TEST_APT_RECEIPT: receipt } })
       if (scenario === "valid") {
         expect(result.status, result.stderr).toBe(0)
@@ -68,12 +72,13 @@ describe.skipIf(process.platform !== "linux")("Linux installation shell architec
       executable("uname", '#!/bin/sh\ncase "$1" in -m) echo aarch64;; *) echo Linux;; esac\n')
       executable("pacman", "#!/bin/sh\nexit 1\n")
       executable("curl", `#!/bin/sh\ntouch ${JSON.stringify(join(root, "downloaded"))}\nexit 1\n`)
-      for (const tool of ["python3", "openssl", "mktemp", "rm"]) {
+      for (const tool of ["python3", "openssl", "mktemp", "rm", "timeout"]) {
         const found = spawnSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim()
         if (found) symlinkSync(found, join(bin, tool))
       }
       const script = readFileSync(join(import.meta.dirname, "../../resources/install.sh"), "utf8").replace("@MAGNITUDE_INSTALL_ORIGIN@", "https://magnitude.dev")
-      const result = spawnSync("/bin/sh", ["-s"], { input: script, encoding: "utf8", timeout: 15000, env: { PATH: bin } })
+      // setsid: no controlling terminal, as when an agent runs the installer.
+      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s"], { input: script, encoding: "utf8", timeout: 15000, env: { PATH: bin } })
       expect(result.status).not.toBe(0)
       expect(result.stderr).toContain("x86-64 only")
       expect(existsSync(join(root, "downloaded"))).toBe(false)

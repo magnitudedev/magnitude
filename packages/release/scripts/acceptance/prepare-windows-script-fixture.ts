@@ -7,6 +7,7 @@ import { windowsDesktopInstaller, cliArchive } from "../../src/targets"
 import { sha256File } from "../../src/macos-app"
 import { UpdateManifest, signUpdateManifest } from "../../src/hosted-update/manifest"
 import { writeInstallationDistribution } from "../build/installation-distribution"
+import { writeInstallerOfferFixture } from "./installer-offer-fixture"
 
 class AcceptanceFailed extends Schema.TaggedError<AcceptanceFailed>()("AcceptanceFailed", { message: Schema.String }) {}
 const Configuration = Schema.Struct({ origin: Schema.String, keyId: Schema.String, publicKey: Schema.String, windowsPublisher: Schema.String })
@@ -34,7 +35,8 @@ const run = Effect.gen(function* () {
   const publication = yield* signUpdateManifest(manifest, keys.privateKey)
   const hosting = join(output, "hosting")
   yield* writeInstallationDistribution({ output: hosting, origin: "https://localhost:18443", appleTeam: "ABCDEFGHIJ",
-    windowsPublisher: "Magnitude Update Acceptance", publicKey, publications: [publication] })
+    windowsPublisher: "Magnitude Update Acceptance", publicKey })
+  yield* writeInstallerOfferFixture(hosting, publication, publicKey)
   const artifacts = join(hosting, "magnitudedev/magnitude/releases/download", manifest.tag)
   yield* fs.makeDirectory(artifacts, { recursive: true })
   yield* fs.copyFile(installer, join(artifacts, filename))

@@ -9,11 +9,10 @@ const parse = (argv: readonly string[], environment: Record<string, string | und
 
 describe("hidden root command grammar", () => {
   it("accepts exactly the user that ran sudo, or removal without arguments", async () => {
-    expect(await parse(["_server-install", "ada"])).toEqual(Either.right({ _tag: "Install", user: "ada", uid: 1000 }))
+    expect(await parse(["_server-install", "ada"])).toEqual(Either.right({ _tag: "Install", user: Option.some({ name: "ada", uid: 1000 }) }))
     expect(await parse(["_server-remove"])).toEqual(Either.right({ _tag: "Remove" }))
   })
   it.each([
-    ["no user", ["_server-install"]],
     ["an extra argument", ["_server-install", "ada", "extra"]],
     ["an option", ["_server-install", "--user", "ada"]],
     ["an option after the user", ["_server-install", "ada", "--force"]],
@@ -30,6 +29,10 @@ describe("hidden root command grammar", () => {
     ["another command", ["_install-application-update", "ada"]],
   ])("refuses %s", async (_, argv) => {
     expect(Either.isLeft(await parse(argv))).toBe(true)
+  })
+  it("accepts root's own setup only from a root login, not through sudo", async () => {
+    expect(await parse(["_server-install"], {})).toEqual(Either.right({ _tag: "Install", user: Option.none() }))
+    expect(Either.isLeft(await parse(["_server-install"]))).toBe(true)
   })
   it.each([
     ["without sudo", {}],
@@ -104,7 +107,7 @@ describe("Linux root step", () => {
 
   it("creates the account, data directory, group membership and marker, then enables the unit", async () => {
     const m = machine({ existing: false, dataUid: 0 })
-    await Effect.runPromise(m.provide(installLinuxServer("ada", 1000)))
+    await Effect.runPromise(m.provide(installLinuxServer(Option.some({ name: "ada", uid: 1000 }))))
     expect(m.commands).toEqual([
       "/usr/bin/id -u -- ada",
       "/usr/bin/getent group magnitude", "/usr/sbin/groupadd --system magnitude",
@@ -119,12 +122,18 @@ describe("Linux root step", () => {
   })
   it("reuses a kept data directory that already belongs to the service account", async () => {
     const m = machine({ existing: true, dataUid: 990 })
-    await Effect.runPromise(m.provide(installLinuxServer("ada", 1000)))
+    await Effect.runPromise(m.provide(installLinuxServer(Option.some({ name: "ada", uid: 1000 }))))
     expect(m.commands.some(line => line.includes("useradd") || line.includes("groupadd") || line.includes("chown"))).toBe(false)
+  })
+  it("adds no one to the group for a root login", async () => {
+    const m = machine({ existing: false, dataUid: 0 })
+    await Effect.runPromise(m.provide(installLinuxServer(Option.none())))
+    expect(m.commands.some(line => line.includes("usermod") || line.startsWith("/usr/bin/id -u -- ada"))).toBe(false)
+    expect(m.commands.at(-1)).toBe("/usr/bin/systemctl enable --now magnitude.service")
   })
   it("refuses when the sudo uid does not belong to the named user", async () => {
     const m = machine({ existing: false, dataUid: 0 })
-    expect(Either.isLeft(await Effect.runPromise(Effect.either(m.provide(installLinuxServer("ada", 1001)))))).toBe(true)
+    expect(Either.isLeft(await Effect.runPromise(Effect.either(m.provide(installLinuxServer(Option.some({ name: "ada", uid: 1001 }))))))).toBe(true)
     expect(m.commands).toEqual(["/usr/bin/id -u -- ada"])
   })
   it("removal stops the unit and removes the account and marker, keeping the data directory", async () => {

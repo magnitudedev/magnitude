@@ -19,18 +19,23 @@ export const installedServerCli = (platform: string) => Option.fromNullable(({
 const UserName = Schema.String.pipe(Schema.pattern(/^[a-z_][a-z0-9_.-]{0,31}$/), Schema.filter(name => name !== "root" && name !== SERVER_USER))
 
 /**
- * The hidden root commands accept exactly `_server-install <user>` or `_server-remove`. The user
- * must be the account that ran sudo, so the root step cannot be pointed at anyone else.
+ * The hidden root commands accept exactly `_server-install <user>`, `_server-install` or `_server-remove`.
+ * The user must be the account that ran sudo, so the root step cannot be pointed at anyone else. Without
+ * a user it is root's own setup, run directly from a root login rather than through sudo.
  */
 export const parseServerInstallation = (argv: readonly string[], environment: Readonly<Record<string, string | undefined>>) => Effect.gen(function* () {
   const [command, ...rest] = argv
   if (command === "_server-remove" && rest.length === 0) return { _tag: "Remove" as const }
+  if (command === "_server-install" && rest.length === 0) {
+    if (environment.SUDO_USER !== undefined || environment.SUDO_UID !== undefined) return yield* failed("Run `magnitude server setup` as yourself; it asks sudo for the root step.")
+    return { _tag: "Install" as const, user: Option.none<{ readonly name: string; readonly uid: number }>() }
+  }
   if (command !== "_server-install" || rest.length !== 1) return yield* failed("Usage: magnitude server setup")
   const user = yield* Schema.decodeUnknown(UserName)(rest[0]).pipe(Effect.mapError(() => failed("The server user name is invalid.")))
   if (environment.SUDO_USER !== user || !/^[1-9][0-9]*$/.test(environment.SUDO_UID ?? "")) {
     return yield* failed("Run `magnitude server setup` as yourself; it asks sudo for the root step.")
   }
-  return { _tag: "Install" as const, user, uid: Number(environment.SUDO_UID) }
+  return { _tag: "Install" as const, user: Option.some({ name: user, uid: Number(environment.SUDO_UID) }) }
 })
 
 /** Refuses unless the process is root and is the installed CLI, reached without symbolic links. */
@@ -79,11 +84,13 @@ const writeRootFile = (path: string, content: string) => Effect.gen(function* ()
 const systemctl = "/usr/bin/systemctl"
 
 /** Linux root step: the service account, its data directory, group membership, marker and unit. */
-export const installLinuxServer = (user: string, uid: number) => Effect.gen(function* () {
+export const installLinuxServer = (user: Option.Option<{ readonly name: string; readonly uid: number }>) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   if (!(yield* fs.exists("/run/systemd/system"))) return yield* failed("Server setup needs systemd. Run `magnitude serve` instead.")
-  const userUid = (yield* commandOutput("/usr/bin/id", "-u", "--", user).pipe(Effect.orElseSucceed(() => ""))).trim()
-  if (userUid !== String(uid)) return yield* failed("The account that ran sudo could not be identified.")
+  if (Option.isSome(user)) {
+    const userUid = (yield* commandOutput("/usr/bin/id", "-u", "--", user.value.name).pipe(Effect.orElseSucceed(() => ""))).trim()
+    if (userUid !== String(user.value.uid)) return yield* failed("The account that ran sudo could not be identified.")
+  }
   if (!(yield* succeeds("/usr/bin/getent", "group", SERVER_USER))) yield* run("create the magnitude group", "/usr/sbin/groupadd", "--system", SERVER_USER)
   if (!(yield* succeeds("/usr/bin/getent", "passwd", SERVER_USER))) {
     yield* run("create the magnitude user", "/usr/sbin/useradd", "--system", "--gid", SERVER_USER, "--home-dir", SERVER_DATA_DIRECTORY,
@@ -100,7 +107,7 @@ export const installLinuxServer = (user: string, uid: number) => Effect.gen(func
     yield* run(`give ${SERVER_DATA_DIRECTORY} to the magnitude user`, "/usr/bin/chown", "-R", "-h", "--", `${SERVER_USER}:${SERVER_USER}`, SERVER_DATA_DIRECTORY)
   }
   yield* fs.chmod(SERVER_DATA_DIRECTORY, 0o750)
-  yield* run(`add ${user} to the magnitude group`, "/usr/sbin/usermod", "-aG", SERVER_USER, "--", user)
+  if (Option.isSome(user)) yield* run(`add ${user.value.name} to the magnitude group`, "/usr/sbin/usermod", "-aG", SERVER_USER, "--", user.value.name)
   yield* rootDirectory(dirname(SERVER_MARKER_PATH), 0o755)
   yield* writeRootFile(SERVER_MARKER_PATH, SERVER_MARKER_CONTENT)
   yield* run("reload systemd", systemctl, "daemon-reload")

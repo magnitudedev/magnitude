@@ -11,6 +11,7 @@ import { sha256File } from "../../src/macos-app"
 import { signUpdateRelease, UpdateRelease } from "../../src/hosted-update/release"
 import { signUpdateManifest, UpdateManifest } from "../../src/hosted-update/manifest"
 import { writeInstallationDistribution } from "../build/installation-distribution"
+import { writeInstallerOfferFixture } from "./installer-offer-fixture"
 import { makePreparedUpdateStore } from "../../../daemon-management/src/desktop-native/prepared-update"
 import { unixPrivateFilePermissions } from "../../../daemon-management/src/desktop-native/private-files"
 
@@ -58,9 +59,10 @@ const run = Effect.gen(function* () {
     artifact: { id: "desktop-update-darwin-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, filename: archiveName,
       bytes: Number((yield* fs.stat(initialArchive)).size), sha256: yield* sha256File(initialArchive) } })
   const hosting = join(output, "script-hosting")
+  const publicKey = keys.publicKey.export({ type: "spki", format: "pem" }).toString()
   yield* writeInstallationDistribution({ output: hosting, origin: "https://localhost:18443", appleTeam: yield* Config.string("APPLE_TEAM_ID"),
-    windowsPublisher: "Magnitude Update Acceptance", publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString(),
-    publications: [yield* signUpdateManifest(manifest, keys.privateKey)] })
+    windowsPublisher: "Magnitude Update Acceptance", publicKey })
+  yield* writeInstallerOfferFixture(hosting, yield* signUpdateManifest(manifest, keys.privateKey), publicKey)
   const downloadDirectory = join(hosting, "magnitudedev/magnitude/releases/download", manifest.tag)
   yield* fs.makeDirectory(downloadDirectory, { recursive: true })
   yield* fs.copyFile(initialArchive, join(downloadDirectory, archiveName))

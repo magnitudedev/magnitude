@@ -7,22 +7,16 @@ apple_team='@MAGNITUDE_APPLE_TEAM@'
 publisher_key='@MAGNITUDE_PUBLISHER_KEY@'
 channel=stable
 destination=/Applications/Magnitude.app
-destination_set=false
+server_marker=/etc/magnitude/server
 fail() { printf '%s\n' "$*" >&2; exit 1; }
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --help|-h) printf '%s\n' 'Usage: install.sh [--channel stable|beta|alpha] [--destination /Applications/Magnitude.app]'; exit 0 ;;
-    --channel) [ "$#" -ge 2 ] || fail 'Missing channel'; channel=$2; shift 2 ;;
-    --destination) [ "$#" -ge 2 ] || fail 'Missing destination'; destination=$2; destination_set=true; shift 2 ;;
-    *) fail "Unknown installation option: $1" ;;
-  esac
-done
-case "$channel" in stable|beta|alpha) ;; *) fail 'Channel must be stable, beta, or alpha.' ;; esac
+[ "$#" -eq 0 ] || fail 'install.sh takes no options. Run: curl -fsSL https://magnitude.dev/install.sh | sh'
 case "$origin" in https://*) ;; *) fail 'The installation script has no release origin.' ;; esac
 case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64) arch=x64 ;; *) fail 'This architecture is not supported.' ;; esac
 umask 077
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/magnitude-install.XXXXXXXX")
-trap 'rm -rf "$scratch"' EXIT
+keepalive=''
+cleanup() { [ -z "$keepalive" ] || kill "$keepalive" 2>/dev/null || true; rm -rf "$scratch"; }
+trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 scratch=$(cd "$scratch" && pwd -P)
@@ -30,13 +24,16 @@ download() {
   curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
     --connect-timeout 15 --max-time 600 --max-filesize "$3" --output "$2" "$1"
 }
+# The landing server counts each request and answers with the publisher-signed offer for this target.
+offer() { download "$origin/api/installer?os=$1&arch=$arch&package=$2&offer=1" "$scratch/offer.json" 16384; }
+# Answers come from the terminal, never from the script's piped stdin.
+has_terminal() { (: </dev/tty) 2>/dev/null; }
 
 case "$(uname -s)" in
   Darwin)
     case "$apple_team" in *[!A-Z0-9]*|'') fail 'The installation script has no Apple publisher identity.' ;; esac
     [ "${#apple_team}" -eq 10 ] || fail 'Invalid Apple publisher identity.'
-    case "$destination" in /*.app) ;; *) fail 'The destination must be an absolute .app path.' ;; esac
-    download "$origin/install/$channel/darwin-$arch-mac-zip.json" "$scratch/offer.json" 16384
+    offer darwin mac-zip
     url=$(/usr/bin/plutil -extract download raw -o - "$scratch/offer.json")
     case "$url" in https://github.com/magnitudedev/magnitude/releases/download/*) ;; *) fail 'Unexpected application download location.' ;; esac
     bytes=$(/usr/bin/plutil -extract release.bytes raw -o - "$scratch/offer.json")
@@ -61,16 +58,48 @@ case "$(uname -s)" in
     /usr/bin/plutil -insert offer -json "$(cat "$scratch/offer.json")" "$scratch/request.plist"
     /usr/bin/plutil -convert json -o "$scratch/request.json" "$scratch/request.plist"
     "$app/Contents/Resources/magnitude" _install-mac-application "$(cat "$scratch/request.json")"
+    printf '%s\n' 'Magnitude was installed. Open it from Applications, or run `magnitude server setup` to run it as a server.'
     ;;
   Linux)
-    [ "$destination_set" = false ] || fail 'Linux installation paths are owned by the package manager.'
-    for tool in python3 openssl curl; do command -v "$tool" >/dev/null 2>&1 || fail "Install $tool before running this installer."; done
+    for tool in python3 openssl curl timeout; do command -v "$tool" >/dev/null 2>&1 || fail "Install $tool before running this installer."; done
     if command -v apt-get >/dev/null 2>&1; then package=deb
     elif command -v dnf >/dev/null 2>&1; then package=rpm
     elif command -v pacman >/dev/null 2>&1; then package=pacman
     else fail 'This Linux distribution requires apt, dnf or pacman.'; fi
     [ "$package" != pacman ] || [ "$arch" = x64 ] || fail 'Arch Linux packages are available for x86-64 only.'
-    download "$origin/install/$channel/linux-$arch-$package.json" "$scratch/offer.json" 16384
+
+    # 1. Ask first, so the person can walk away after answering and authorizing.
+    if [ -f "$server_marker" ]; then answer=configured
+    elif ! has_terminal; then answer=no
+    else
+      printf '%s\n%s ' 'Run Magnitude as a server? It starts on boot, runs without the desktop app,' \
+        'and you can use it from a browser on another computer. [y/N]' >/dev/tty
+      # --foreground keeps the reader in the terminal's process group, so it may read the terminal.
+      if line=$(timeout --foreground 60 sh -c 'IFS= read -r line </dev/tty && printf "%s" "$line"'); then
+        case "$line" in [Yy]|[Yy][Ee][Ss]) answer=yes ;; *) answer=no ;; esac
+      else
+        status=$?
+        [ "$status" -eq 124 ] || exit "$status"
+        printf '\n' >/dev/tty
+        answer=timeout
+      fi
+    fi
+
+    # 2. Get sudo up front and keep it fresh, instead of waiting at a password prompt later.
+    if [ "$(id -u)" -eq 0 ]; then privilege=''
+    else
+      command -v sudo >/dev/null 2>&1 || fail 'Installing Magnitude needs sudo. Install it, or run this installer as root.'
+      if has_terminal; then sudo -v </dev/tty || fail 'Installing Magnitude needs administrator access.'
+      else sudo -n -v 2>/dev/null || fail 'Installing Magnitude needs administrator access, and there is no terminal to ask for a password. Run it in a terminal, or allow passwordless sudo.'
+      fi
+      privilege=sudo
+      # Detached from the terminal so the installer's session ends when it does.
+      ( while sleep 50; do sudo -n -v 2>/dev/null || exit 0; done ) </dev/null >/dev/null 2>&1 &
+      keepalive=$!
+    fi
+
+    # 3. Download, verify and install the package.
+    offer linux "$package"
     python3 - "$scratch" "$arch" "$package" "$channel" "$publisher_key" <<'PY'
 import base64, json, pathlib, re, subprocess, sys, urllib.parse
 root, arch, package, channel, key = sys.argv[1:]
@@ -116,11 +145,25 @@ PY
     [ "$actual_bytes" = "$bytes" ] || fail 'The application download is incomplete.'
     actual_digest=$(sha256sum "$scratch/magnitude.$package" | cut -d ' ' -f 1)
     [ "$actual_digest" = "$(cat "$scratch/digest")" ] || fail 'The application checksum does not match.'
-    if [ "$(id -u)" -eq 0 ]; then privilege=''; else privilege=sudo; fi
-    if [ "$package" = deb ]; then $privilege apt-get install -y "$scratch/magnitude.deb"
+    # A running server holds the installation lock the package checks, so upgrade it stopped.
+    [ "$answer" != configured ] || $privilege systemctl stop magnitude.service
+    if [ "$package" = deb ]; then $privilege env DEBIAN_FRONTEND=noninteractive apt-get install -y "$scratch/magnitude.deb"
     elif [ "$package" = rpm ]; then $privilege dnf install -y "$scratch/magnitude.rpm"
     else $privilege pacman -U --noconfirm "$scratch/magnitude.pacman"; fi
-    printf '%s\n' 'Magnitude was installed. Run magnitude serve to start the server.'
+
+    # 4. Set up the server, reusing the sudo session from step 2, or say how to later.
+    case "$answer" in
+      configured)
+        $privilege systemctl start magnitude.service
+        printf '%s\n' 'Magnitude was upgraded and the server restarted. Run `magnitude status` to check on it.' ;;
+      yes)
+        if [ -z "$privilege" ] && [ -n "${SUDO_USER:-}" ]; then
+          printf '%s\n' "Magnitude was installed. To set up the server, run as $SUDO_USER: magnitude server setup"
+        else magnitude server setup </dev/null
+        fi ;;
+      timeout) printf '%s\n' 'Magnitude was installed.' 'No answer, skipping. To set it up later: magnitude server setup' ;;
+      *) printf '%s\n' 'Magnitude was installed.' 'Skipped. To set it up later: magnitude server setup' ;;
+    esac
     ;;
   *) fail 'This operating system is not supported.' ;;
 esac

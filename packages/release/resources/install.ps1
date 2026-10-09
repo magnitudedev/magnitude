@@ -1,5 +1,6 @@
-param([ValidateSet('stable', 'beta', 'alpha')][string]$Channel = 'stable')
+# irm https://magnitude.dev/install.ps1 | iex - installs the Magnitude desktop app for this user. It takes no options.
 $ErrorActionPreference = 'Stop'
+$Channel = 'stable'
 $origin = '@MAGNITUDE_INSTALL_ORIGIN@'
 $publisher = '@MAGNITUDE_WINDOWS_PUBLISHER@'
 if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem) { throw 'This installer requires 64-bit Windows.' }
@@ -41,7 +42,8 @@ function Assert-Publisher([string]$Path) {
 }
 try {
   $offerPath = Join-Path $scratch 'offer.json'
-  Get-InstallerFile "$origin/install/$Channel/windows-x64-windows-exe.json" $offerPath 16384
+  # The landing server counts each request and answers with the publisher-signed offer.
+  Get-InstallerFile "$origin/api/installer?os=windows&arch=x64&package=windows-exe&offer=1" $offerPath 16384
   $offer = Get-Content -LiteralPath $offerPath -Raw | ConvertFrom-Json
   $version = [string]$offer.release.version
   if ($version.Length -gt 96 -or $version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?$') { throw 'Invalid application version.' }
@@ -66,7 +68,7 @@ try {
   if (-not (($env:PATH -split ';') | Where-Object { $_.TrimEnd('\') -ieq $commandDirectory.TrimEnd('\') })) {
     $env:PATH = $commandDirectory + ';' + $env:PATH
   }
-  Write-Output 'Magnitude was installed. Run magnitude serve to start the server.'
+  Write-Output 'Magnitude was installed. Open it from the Start menu.'
 } finally {
   $client.Dispose()
   Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue

@@ -59,6 +59,7 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
     platform,
     user: userInfo().username,
     isRoot: process.getuid?.() === 0,
+    underSudo: process.env.SUDO_USER !== undefined,
     hasServiceManager: platform === "linux" ? fs.exists("/run/systemd/system").pipe(Effect.orElseSucceed(() => false)) : Effect.succeed(platform === "darwin"),
     personalOwner: applicationStateDirectory({ platform, dataDirectory: desktopDataDirectory, override: Option.none() }).pipe(
       Effect.flatMap(directory => requestApplication(join(directory, "application.sock"), "Observe")),
@@ -72,7 +73,8 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
       if (Option.isNone(cli) || !(yield* fs.exists(cli.value).pipe(Effect.orElseSucceed(() => false)))) {
         return yield* failed("Server mode needs the installed Magnitude app. Install it from https://magnitude.dev/download.")
       }
-      const code = yield* executor.exitCode(Command.make("/usr/bin/sudo", "--", cli.value, ...args).pipe(
+      const root = process.getuid?.() === 0
+      const code = yield* executor.exitCode(Command.make(root ? cli.value : "/usr/bin/sudo", ...(root ? args : ["--", cli.value, ...args])).pipe(
         Command.stdin("inherit"), Command.stdout("inherit"), Command.stderr("inherit"))).pipe(Effect.orElseSucceed(() => -1))
       if (code !== 0) return yield* failed("The root step did not finish; nothing else was changed.")
     }),

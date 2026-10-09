@@ -6,7 +6,7 @@ const harness = (overrides: Partial<ServerSetupHost> = {}) => {
   const events: string[] = []
   const output: string[] = []
   const host: ServerSetupHost = {
-    platform: "linux", user: "ada", isRoot: false,
+    platform: "linux", user: "ada", isRoot: false, underSudo: false,
     hasServiceManager: Effect.succeed(true),
     personalOwner: Effect.succeed(Option.none()),
     isSetUp: Effect.succeed(true),
@@ -55,8 +55,14 @@ describe("magnitude server setup", () => {
     expect(Either.isRight(await h.run(serverSetup))).toBe(true)
     expect(h.events).toEqual(["root _server-install ada", "network"])
   })
+  it("sets up a root login's service directly, with no group membership to add", async () => {
+    const h = harness({ isRoot: true, user: "root", hasTerminal: Effect.succeed(false) })
+    expect(Either.isRight(await h.run(serverSetup))).toBe(true)
+    expect(h.events).toEqual(["root _server-install", "network"])
+    expect(h.output()).toContain("sudo usermod -aG magnitude <account>")
+  })
   it("refuses to run under sudo", async () => {
-    const h = harness({ isRoot: true })
+    const h = harness({ isRoot: true, underSudo: true })
     const result = await h.run(serverSetup)
     expect(Either.isLeft(result) && result.left.message).toContain("without sudo")
     expect(h.events).toEqual([])

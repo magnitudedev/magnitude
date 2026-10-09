@@ -16,5 +16,5 @@ export const runServerRootStep = (argv: readonly string[]) => report(Effect.gen(
   yield* requireInstalledRoot(process.platform, process.execPath)
   if (process.platform !== "linux") return yield* Effect.dieMessage("Server root steps are only implemented for Linux.")
   if (request._tag === "Remove") return yield* removeLinuxServer
-  yield* installLinuxServer(request.user, request.uid)
+  yield* installLinuxServer(request.user)
 }).pipe(Effect.provide(BunContext.layer)))

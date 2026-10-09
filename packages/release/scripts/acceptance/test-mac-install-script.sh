@@ -31,7 +31,7 @@ CONFIG
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config "$root/tls.conf" \
   -keyout "$root/tls.key" -out "$root/tls.crt" > "$root/tls.log" 2>&1
 server_pid=''
-offer="$hosting/install/stable/darwin-arm64-mac-zip.json"
+offer="$hosting/api/installer"
 cp "$offer" "$root/offer-original.json"
 cleanup() {
   cp "$root/offer-original.json" "$offer"

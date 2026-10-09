@@ -18,6 +18,8 @@ export interface ServerSetupHost {
   readonly platform: NodeJS.Platform
   readonly user: string
   readonly isRoot: boolean
+  /** Running under sudo rather than from a root login. */
+  readonly underSudo: boolean
   /** systemd on Linux, launchd on macOS. */
   readonly hasServiceManager: Effect.Effect<boolean>
   /** The owner of the person's own profile, if the desktop app or `magnitude serve` is running. */
@@ -27,7 +29,7 @@ export interface ServerSetupHost {
   /** Whether sudo can run without asking: a cached password or a NOPASSWD rule. */
   readonly sudoWithoutPrompt: Effect.Effect<boolean>
   readonly confirm: (question: string) => Effect.Effect<boolean, ServerSetupFailed>
-  /** Runs the installed CLI's hidden root command through sudo, prompting at most once. */
+  /** Runs the installed CLI's hidden root command, through sudo unless this already is root, prompting at most once. */
   readonly runRootStep: (args: readonly string[]) => Effect.Effect<void, ServerSetupFailed>
   /** Waits for the service, turns network access on with a key, and restarts it if that is needed. */
   readonly enableNetworkAccess: Effect.Effect<ServerAccess, ServerSetupFailed>
@@ -37,7 +39,7 @@ export const ServerSetupHost = Context.GenericTag<ServerSetupHost>("@magnitudede
 
 const logsCommand = (platform: NodeJS.Platform) => platform === "darwin" ? "~/.magnitude/logs/service.log" : "journalctl -u magnitude"
 
-export const renderServerReady = (platform: NodeJS.Platform, access: ServerAccess) => [
+export const renderServerReady = (platform: NodeJS.Platform, access: ServerAccess, root = false) => [
   "Magnitude is running as a server on this machine.",
   "",
   "Open it in a browser on another computer:",
@@ -52,7 +54,9 @@ export const renderServerReady = (platform: NodeJS.Platform, access: ServerAcces
   `Status:  magnitude status`,
   `Logs:    ${logsCommand(platform)}`,
   `Stop:    magnitude server remove`,
-  ...(platform === "linux" ? ["", "You were added to the magnitude group. Log out and back in before running `magnitude status` or `magnitude update`."] : []),
+  ...(platform === "linux" ? ["", root
+    ? "To let another account use `magnitude status` and `magnitude update`, add it to the magnitude group: sudo usermod -aG magnitude <account>"
+    : "You were added to the magnitude group. Log out and back in before running `magnitude status` or `magnitude update`."] : []),
   "",
 ].join("\n")
 
@@ -61,23 +65,24 @@ export const serverSetup = Effect.gen(function* () {
   const host = yield* ServerSetupHost
   if (host.platform === "win32") return yield* host.write(`${WINDOWS_SERVER_MESSAGE}\n`)
   if (host.platform !== "linux" && host.platform !== "darwin") return yield* failed("Server mode is available on Linux and macOS.")
-  if (host.isRoot) return yield* failed("Run `magnitude server setup` as yourself, without sudo. It asks for your password when it needs it.")
+  if (host.isRoot && (host.underSudo || host.platform !== "linux")) return yield* failed("Run `magnitude server setup` as yourself, without sudo. It asks for your password when it needs it.")
   if (!(yield* host.hasServiceManager)) return yield* failed("Server setup needs systemd, which this machine doesn't run. Run `magnitude serve` instead to serve until you stop it.")
   const owner = yield* host.personalOwner
   if (Option.isSome(owner)) return yield* failed(owner.value === "Desktop"
     ? "Quit the Magnitude desktop app first. The app and the server can't run at the same time."
     : "Stop `magnitude serve` first. It and the server can't run at the same time.")
-  if (!(yield* host.sudoWithoutPrompt) && !(yield* host.hasTerminal)) return yield* failed("Server setup needs your password; run it in a terminal.")
-  yield* host.runRootStep(["_server-install", host.user])
+  if (!host.isRoot && !(yield* host.sudoWithoutPrompt) && !(yield* host.hasTerminal)) return yield* failed("Server setup needs your password; run it in a terminal.")
+  // A root login sets up the service itself; there is no person to add to the group.
+  yield* host.runRootStep(host.isRoot ? ["_server-install"] : ["_server-install", host.user])
   const access = yield* host.enableNetworkAccess
-  yield* host.write(renderServerReady(host.platform, access))
+  yield* host.write(renderServerReady(host.platform, access, host.isRoot))
 })
 
 export const serverRemove = Effect.gen(function* () {
   const host = yield* ServerSetupHost
   if (host.platform === "win32") return yield* host.write(`${WINDOWS_SERVER_MESSAGE}\n`)
   if (host.platform !== "linux" && host.platform !== "darwin") return yield* failed("Server mode is available on Linux and macOS.")
-  if (host.isRoot) return yield* failed("Run `magnitude server remove` as yourself, without sudo. It asks for your password when it needs it.")
+  if (host.isRoot && (host.underSudo || host.platform !== "linux")) return yield* failed("Run `magnitude server remove` as yourself, without sudo. It asks for your password when it needs it.")
   if (!(yield* host.isSetUp)) return yield* host.write("Magnitude isn't set up as a server on this machine.\n")
   if (!(yield* host.hasTerminal)) return yield* failed("Run `magnitude server remove` in a terminal to confirm it.")
   const kept = host.platform === "linux" ? SERVER_DATA_DIRECTORY : "~/.magnitude"
