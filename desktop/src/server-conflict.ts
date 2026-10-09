@@ -57,17 +57,17 @@ export const resolveServerConflict = (options: {
   const running = isServerRunning(options.personalStateDirectory)
   if (!(yield* running)) return "Proceed" as const
   const decision = yield* Deferred.make<ServerConflictDecision>()
+  const runtime = yield* Effect.runtime<never>()
   yield* Effect.acquireRelease(Effect.sync(() => {
     const dark = nativeTheme.shouldUseDarkColors
     const value = new BrowserWindow({ ...windowChrome(process.platform, dark), width: 720, height: 520, resizable: false, show: false,
       title: "Magnitude", icon: options.icon, backgroundColor: dark ? slate[925] : slate[50],
       webPreferences: { preload: options.preload, contextIsolation: true, nodeIntegration: false, sandbox: false } })
     value.once("ready-to-show", () => value.show())
-    value.on("closed", () => { Effect.runFork(Deferred.succeed(decision, "Quit")) })
+    value.on("closed", () => { Runtime.runFork(runtime)(Deferred.succeed(decision, "Quit")) })
     void value.loadURL(options.pageUrl)
     return value
   }), value => Effect.sync(() => { if (!value.isDestroyed()) value.destroy() }))
-  const runtime = yield* Effect.runtime<never>()
   yield* Effect.acquireRelease(Effect.sync(() => {
     ipcMain.handle("server-conflict:keep", () => Runtime.runPromise(runtime)(Effect.promise(() => shell.openExternal(SERVER_ADDRESS)).pipe(
       Effect.zipRight(Deferred.succeed(decision, "Quit")), Effect.as({ ok: true }))))
