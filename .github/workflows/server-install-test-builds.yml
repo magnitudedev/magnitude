@@ -25,6 +25,7 @@ jobs:
       linux: ${{ steps.plan.outputs.linux }}
       apple: ${{ steps.plan.outputs.apple }}
       windows: ${{ steps.plan.outputs.windows }}
+      variants: ${{ steps.plan.outputs.variants }}
     steps:
       - uses: actions/checkout@v4
       - id: plan
@@ -33,6 +34,7 @@ jobs:
           echo "linux=$(jq -c .linuxVersions "$plan")" >> "$GITHUB_OUTPUT"
           echo "apple=$(jq -c .appleVersions "$plan")" >> "$GITHUB_OUTPUT"
           echo "windows=$(jq -r .windowsVersions "$plan")" >> "$GITHUB_OUTPUT"
+          echo "variants=$(jq -c '.failingVariants // {}' "$plan")" >> "$GITHUB_OUTPUT"
 
   linux:
     needs: plan
@@ -67,9 +69,9 @@ jobs:
           echo "MAGNITUDE_ACCEPTANCE_OUTPUT=$RUNNER_TEMP/server-install-test" >> "$GITHUB_ENV"
       - run: bun packages/release/scripts/acceptance/build-desktop.ts
       - name: Make the failing test packages
-        if: matrix.version == '50.0.3' || matrix.version == '50.0.4'
+        if: fromJSON(needs.plan.outputs.variants)[matrix.version] != null
         shell: bash
-        run: bash packages/release/scripts/acceptance/server-install-variant.sh "$MAGNITUDE_ACCEPTANCE_OUTPUT/artifacts" "${{ matrix.version == '50.0.3' && 'preinstall' || 'startup' }}"
+        run: bash packages/release/scripts/acceptance/server-install-variant.sh "$MAGNITUDE_ACCEPTANCE_OUTPUT/artifacts" "${{ fromJSON(needs.plan.outputs.variants)[matrix.version] }}"
       - name: Publish acceptance-tagged assets and sign their manifests
         run: bun packages/release/scripts/acceptance/prepare-artifacts.ts
         env:
