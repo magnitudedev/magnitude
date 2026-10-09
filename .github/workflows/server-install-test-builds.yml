@@ -1,0 +1,190 @@
+name: Server install test builds
+
+# Builds the test releases for the server-install machine tests: the application pointed at a test
+# update server and trusting the acceptance publisher key. Assets go only to acceptance-tagged
+# prereleases (desktop-update-acceptance/<commit>/<version>); no channel or production metadata changes.
+on:
+  push:
+    branches: [server-install]
+    paths: ['.github/server-install-test-builds.json']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-install-test-builds
+  cancel-in-progress: false
+
+env:
+  BUN_VERSION: "1.4.2"
+
+jobs:
+  plan:
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    outputs:
+      linux: ${{ steps.plan.outputs.linux }}
+      apple: ${{ steps.plan.outputs.apple }}
+      windows: ${{ steps.plan.outputs.windows }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        run: |
+          plan=.github/server-install-test-builds.json
+          echo "linux=$(jq -c .linuxVersions "$plan")" >> "$GITHUB_OUTPUT"
+          echo "apple=$(jq -c .appleVersions "$plan")" >> "$GITHUB_OUTPUT"
+          echo "windows=$(jq -r .windowsVersions "$plan")" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: plan
+    permissions:
+      contents: write
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    container: ubuntu:22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.linux) }}
+    env:
+      MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
+    steps:
+      - name: Install packaging dependencies at the supported Linux baseline
+        run: apt-get update && apt-get install -y git gh jq ca-certificates curl unzip build-essential python3 fakeroot rpm libarchive-tools libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libxtst6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Point the build at the test update server
+        shell: bash
+        run: |
+          jq -n --arg origin "$(jq -r .origin .github/server-install-test-builds.json)" --rawfile key packages/release/resources/distribution/acceptance.pub.pem \
+            '{origin: $origin, keyId: "acceptance", publicKey: $key}' > "$RUNNER_TEMP/server-install-test-config.json"
+          echo "MAGNITUDE_ACCEPTANCE_CONFIG=$RUNNER_TEMP/server-install-test-config.json" >> "$GITHUB_ENV"
+          echo "MAGNITUDE_ACCEPTANCE_OUTPUT=$RUNNER_TEMP/server-install-test" >> "$GITHUB_ENV"
+      - run: bun packages/release/scripts/acceptance/build-desktop.ts
+      - name: Make the failing test packages
+        if: matrix.version == '50.0.3' || matrix.version == '50.0.4'
+        shell: bash
+        run: bash packages/release/scripts/acceptance/server-install-variant.sh "$MAGNITUDE_ACCEPTANCE_OUTPUT/artifacts" "${{ matrix.version == '50.0.3' && 'preinstall' || 'startup' }}"
+      - name: Publish acceptance-tagged assets and sign their manifests
+        run: bun packages/release/scripts/acceptance/prepare-artifacts.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_ARTIFACTS: ${{ env.MAGNITUDE_ACCEPTANCE_OUTPUT }}/artifacts
+          MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
+          DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+      - name: Attach the signed manifests for the test update server
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cp "$MAGNITUDE_ACCEPTANCE_OUTPUT/artifacts/prepared-manifests.json" "linux-x64-manifests.json"
+          gh release upload "desktop-update-acceptance/${{ github.sha }}/${{ matrix.version }}" linux-x64-manifests.json --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  apple:
+    needs: plan
+    permissions:
+      contents: write
+    environment: apple-release
+    runs-on: blacksmith-12vcpu-macos-15
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.apple) }}
+    env:
+      MAGNITUDE_APPLE_DISTRIBUTION: developer-id
+      MAGNITUDE_ACCEPTANCE_STANDARD_BUNDLE_ID: "true"
+      MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Import Apple signing credentials
+        run: bash packages/release/scripts/apple/credentials.sh
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_API_KEY_P8: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+      - name: Point the build at the test update server
+        shell: bash
+        run: |
+          jq -n --arg origin "$(jq -r .origin .github/server-install-test-builds.json)" --rawfile key packages/release/resources/distribution/acceptance.pub.pem \
+            '{origin: $origin, keyId: "acceptance", publicKey: $key}' > "$RUNNER_TEMP/server-install-test-config.json"
+          echo "MAGNITUDE_ACCEPTANCE_CONFIG=$RUNNER_TEMP/server-install-test-config.json" >> "$GITHUB_ENV"
+          echo "MAGNITUDE_ACCEPTANCE_OUTPUT=$RUNNER_TEMP/server-install-test" >> "$GITHUB_ENV"
+      - run: bun packages/release/scripts/acceptance/build-desktop.ts
+      - name: Publish acceptance-tagged assets and sign their manifests
+        run: bun packages/release/scripts/acceptance/prepare-artifacts.ts
+        env:
+          MAGNITUDE_ACCEPTANCE_ARTIFACTS: ${{ env.MAGNITUDE_ACCEPTANCE_OUTPUT }}/artifacts
+          MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
+          DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+      - name: Attach the signed manifests for the test update server
+        run: |
+          cp "$MAGNITUDE_ACCEPTANCE_OUTPUT/artifacts/prepared-manifests.json" "darwin-arm64-manifests.json"
+          gh release upload "desktop-update-acceptance/${{ github.sha }}/${{ matrix.version }}" darwin-arm64-manifests.json --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Remove signing credentials
+        if: always()
+        run: bash packages/release/scripts/apple/cleanup-credentials.sh
+
+  windows:
+    needs: plan
+    permissions:
+      contents: write
+    runs-on: blacksmith-8vcpu-windows-2025
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Point the build at the test update server
+        shell: pwsh
+        run: |
+          $plan = Get-Content .github/server-install-test-builds.json -Raw | ConvertFrom-Json
+          $config = @{ origin = $plan.origin; keyId = 'acceptance'; windowsPublisher = 'Magnitude Update Acceptance'
+            publicKey = (Get-Content packages/release/resources/distribution/acceptance.pub.pem -Raw) }
+          $path = Join-Path $env:RUNNER_TEMP 'server-install-test-config.json'
+          $config | ConvertTo-Json | Set-Content -LiteralPath $path -Encoding utf8NoBOM
+          "MAGNITUDE_ACCEPTANCE_CONFIG=$path" >> $env:GITHUB_ENV
+      - name: Build self-signed Windows applications and publish them under acceptance tags
+        shell: pwsh
+        run: ./packages/release/scripts/acceptance/build-windows-cohort.ps1
+        env:
+          MAGNITUDE_ACCEPTANCE_VERSIONS: ${{ needs.plan.outputs.windows }}
+          MAGNITUDE_ACCEPTANCE_COMMIT: ${{ github.sha }}
+          DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY: ${{ secrets.DISTRIBUTION_ACCEPTANCE_PUBLISHER_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+      - name: Attach the signed manifests and the acceptance publisher certificate
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'magnitude-windows-update-acceptance'
+          foreach ($version in '${{ needs.plan.outputs.windows }}'.Split(',')) {
+            Copy-Item (Join-Path $root "$version/artifacts/prepared-manifests.json") windows-x64-manifests.json -Force
+            gh release upload "desktop-update-acceptance/${{ github.sha }}/$version" windows-x64-manifests.json (Join-Path $root 'acceptance-publisher.cer') --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Upload failed for $version" }
+          }
+        env:
+          GH_TOKEN: ${{ github.token }}

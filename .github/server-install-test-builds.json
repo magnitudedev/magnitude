@@ -1,0 +1,6 @@
+{
+  "origin": "https://magnitude-updates-976f4c77.westus2.cloudapp.azure.com",
+  "linuxVersions": ["50.0.1", "50.0.2", "50.0.3", "50.0.4"],
+  "appleVersions": ["50.0.1", "50.0.2"],
+  "windowsVersions": "50.0.1,50.0.2"
+}
