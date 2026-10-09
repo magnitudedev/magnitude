@@ -37,7 +37,7 @@ export interface ServerSetupHost {
 }
 export const ServerSetupHost = Context.GenericTag<ServerSetupHost>("@magnitudedev/cli/ServerSetupHost")
 
-const logsCommand = (platform: NodeJS.Platform) => platform === "darwin" ? "~/.magnitude/logs/service.log" : "journalctl -u magnitude"
+const logsCommand = (platform: NodeJS.Platform) => platform === "darwin" ? "~/.magnitude/logs/server.log" : "journalctl -u magnitude"
 
 export const renderServerReady = (platform: NodeJS.Platform, access: ServerAccess, root = false) => [
   "Magnitude is running as a server on this machine.",

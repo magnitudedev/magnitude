@@ -1,8 +1,8 @@
 import { Command, CommandExecutor, FileSystem } from "@effect/platform"
-import { Effect, Option, Schema } from "effect"
+import { Effect, Option, Schedule, Schema } from "effect"
 import { randomUUID } from "node:crypto"
 import { dirname, join } from "node:path"
-import { SERVER_DATA_DIRECTORY, SERVER_MARKER_CONTENT, SERVER_MARKER_PATH, SERVER_USER } from "./server-profile"
+import { MAC_SERVER_LABEL, MAC_SERVER_PLIST, SERVER_DATA_DIRECTORY, SERVER_MARKER_CONTENT, SERVER_MARKER_PATH, SERVER_USER } from "./server-profile"
 
 export class ServerInstallationFailed extends Schema.TaggedError<ServerInstallationFailed>()("ServerInstallationFailed", {
   message: Schema.String,
@@ -126,4 +126,64 @@ export const removeLinuxServer = Effect.gen(function* () {
   if ((yield* fs.exists(markerDirectory)) && (yield* fs.readDirectory(markerDirectory)).length === 0) yield* fs.remove(markerDirectory)
   if (yield* succeeds("/usr/bin/getent", "passwd", SERVER_USER)) yield* run("remove the magnitude user", "/usr/sbin/userdel", SERVER_USER)
   if (yield* succeeds("/usr/bin/getent", "group", SERVER_USER)) yield* run("remove the magnitude group", "/usr/sbin/groupdel", SERVER_USER)
+}).pipe(Effect.mapError(error => error instanceof ServerInstallationFailed ? error : failed("Server removal could not finish.")))
+
+const launchctl = "/bin/launchctl"
+const xml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+
+/** The LaunchDaemon that serves as the person who set it up, at boot and after logout. */
+export const macServerPlist = (options: { readonly cli: string; readonly user: string; readonly home: string }) => `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${MAC_SERVER_LABEL}</string>
+  <key>AssociatedBundleIdentifiers</key><string>dev.magnitude.desktop</string>
+  <key>ProgramArguments</key>
+  <array><string>${xml(options.cli)}</string><string>serve</string></array>
+  <key>UserName</key><string>${xml(options.user)}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>${xml(options.home)}</string>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>WorkingDirectory</key><string>${xml(options.home)}</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>${xml(options.home)}/.magnitude/logs/server.log</string>
+  <key>StandardErrorPath</key><string>${xml(options.home)}/.magnitude/logs/server.log</string>
+</dict>
+</plist>
+`
+
+/** macOS root step: a root-owned LaunchDaemon that runs the app's CLI as the person, loaded into the system domain. */
+export const installMacServer = (user: { readonly name: string; readonly uid: number }, cli: string) => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const userUid = (yield* commandOutput("/usr/bin/id", "-u", "--", user.name).pipe(Effect.orElseSucceed(() => ""))).trim()
+  if (userUid !== String(user.uid)) return yield* failed("The account that ran sudo could not be identified.")
+  const record = yield* commandOutput("/usr/bin/dscl", ".", "-read", `/Users/${user.name}`, "NFSHomeDirectory")
+  const home = /^NFSHomeDirectory:\s*(\/\S.*)$/m.exec(record)?.[1]?.trim()
+  if (home === undefined || !home.startsWith("/") || home.includes("\n")) return yield* failed("Your home folder could not be found.")
+  // The log folder belongs to the person, so launchd never creates it as root.
+  const logs = join(home, ".magnitude", "logs")
+  yield* run("create the log folder", "/usr/bin/sudo", "-u", user.name, "--", "/bin/mkdir", "-p", "-m", "700", logs)
+  yield* run("create the server log", "/usr/bin/sudo", "-u", user.name, "--", "/usr/bin/touch", join(logs, "server.log"))
+  const temporary = join(dirname(MAC_SERVER_PLIST), `.${randomUUID()}.tmp`)
+  yield* fs.writeFileString(temporary, macServerPlist({ cli, user: user.name, home }), { flag: "wx", mode: 0o644 })
+  yield* run("protect the LaunchDaemon", "/usr/sbin/chown", "root:wheel", temporary)
+  yield* fs.chmod(temporary, 0o644)
+  yield* fs.rename(temporary, MAC_SERVER_PLIST)
+  // Replace a previous registration; a job switched off in Login Items is switched back on by setup.
+  yield* succeeds(launchctl, "bootout", `system/${MAC_SERVER_LABEL}`)
+  yield* succeeds(launchctl, "enable", `system/${MAC_SERVER_LABEL}`)
+  // A job that was just booted out can briefly refuse a new bootstrap while it finishes exiting.
+  yield* run("start the Magnitude server", launchctl, "bootstrap", "system", MAC_SERVER_PLIST).pipe(
+    Effect.retry(Schedule.spaced("1 second").pipe(Schedule.intersect(Schedule.recurs(5)))))
+}).pipe(Effect.mapError(error => error instanceof ServerInstallationFailed ? error : failed("Server setup could not finish.")))
+
+/** macOS root step: unloads and removes the LaunchDaemon; the person's data stays in ~/.magnitude. */
+export const removeMacServer = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  yield* succeeds(launchctl, "bootout", `system/${MAC_SERVER_LABEL}`)
+  yield* fs.remove(MAC_SERVER_PLIST, { force: true })
 }).pipe(Effect.mapError(error => error instanceof ServerInstallationFailed ? error : failed("Server removal could not finish.")))

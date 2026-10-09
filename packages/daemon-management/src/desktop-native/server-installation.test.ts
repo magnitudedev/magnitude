@@ -1,7 +1,7 @@
 import { CommandExecutor, FileSystem } from "@effect/platform"
 import { Effect, Either, Option } from "effect"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { installLinuxServer, parseServerInstallation, removeLinuxServer, requireInstalledRoot } from "./server-installation"
+import { installLinuxServer, macServerPlist, parseServerInstallation, removeLinuxServer, requireInstalledRoot } from "./server-installation"
 
 const sudo = { SUDO_USER: "ada", SUDO_UID: "1000" }
 const parse = (argv: readonly string[], environment: Record<string, string | undefined> = sudo) =>
@@ -146,5 +146,22 @@ describe("Linux root step", () => {
     ])
     expect(m.written).not.toContain("remove /var/lib/magnitude")
     expect(m.written).toContain("remove /etc/magnitude/server")
+  })
+})
+
+describe("macOS LaunchDaemon", () => {
+  const plist = macServerPlist({ cli: "/Applications/Magnitude.app/Contents/Resources/magnitude", user: "ada", home: "/Users/Ada & Co" })
+  it("runs the app's CLI serve as the person at load, kept alive, and named for the app", () => {
+    expect(plist).toContain("<key>Label</key><string>dev.magnitude.server</string>")
+    expect(plist).toContain("<array><string>/Applications/Magnitude.app/Contents/Resources/magnitude</string><string>serve</string></array>")
+    expect(plist).toContain("<key>UserName</key><string>ada</string>")
+    expect(plist).toContain("<key>RunAtLoad</key><true/>")
+    expect(plist).toContain("<key>KeepAlive</key><true/>")
+    expect(plist).toContain("<key>AssociatedBundleIdentifiers</key><string>dev.magnitude.desktop</string>")
+    expect(plist).not.toContain("dev.magnitude.acn")
+  })
+  it("logs to the person's ~/.magnitude/logs and escapes their home folder", () => {
+    expect(plist).toContain("<key>StandardOutPath</key><string>/Users/Ada &amp; Co/.magnitude/logs/server.log</string>")
+    expect(plist).not.toContain("Ada & Co")
   })
 })
