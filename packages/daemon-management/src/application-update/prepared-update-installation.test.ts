@@ -67,6 +67,16 @@ describe("prepared update installation", () => {
     expect(Option.isSome(await h.run(reconcilePreparedUpdate("1.0.0")))).toBe(true)
     expect(h.outcomes).toEqual([{ outcome: "failed", version: "2.0.0", reason: Option.some(reason) }])
   })
+  it.each([
+    [{ _tag: "Unattempted" }, []],
+    [{ _tag: "Attempted" }, [{ outcome: "failed", version: "2.0.0", reason: Option.some("incomplete") }]],
+    [{ _tag: "Failed", kind: "install", reason: "The package refused." }, [{ outcome: "failed", version: "2.0.0", reason: Option.some("install") }]],
+  ] as const)("drops a download superseded by a newer installed version without calling %o applied", async (installation, outcomes) => {
+    const h = harness(installation)
+    expect(Option.isNone(await h.run(reconcilePreparedUpdate("3.0.0")))).toBe(true)
+    expect(h.outcomes).toEqual(outcomes)
+    expect(h.events).toEqual(["cleanup", "discard"])
+  })
   it("records nothing for an unattempted pending update and survives an outcome write failure", async () => {
     const h = harness()
     expect(Option.isSome(await h.run(reconcilePreparedUpdate("1.0.0")))).toBe(true)

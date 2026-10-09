@@ -42,9 +42,13 @@ export const reconcilePreparedUpdate = (installedVersion: string) => Effect.gen(
   yield* store.removeAbandonedTransfers
   const pending = yield* store.read
   if (Option.isNone(pending)) return pending
-  const applied = !isNewerVersion(pending.value.release.version, installedVersion)
+  const prepared = pending.value.release.version
+  // Only the prepared version itself was applied. A newer installed version (installed some other
+  // way) supersedes the download: report its own attempt, if any, and drop it.
+  const applied = prepared === installedVersion
+  const superseded = isNewerVersion(installedVersion, prepared)
   yield* Option.match(outcomeOf(pending.value, applied), { onNone: () => Effect.void, onSome: store.recordOutcome }).pipe(Effect.ignore)
-  if (applied) {
+  if (applied || superseded) {
     yield* store.discard
     return Option.none<PreparedUpdate>()
   }

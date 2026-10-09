@@ -60,7 +60,7 @@ installed helper's exact update entry for active local sessions and requires adm
 for inactive and remote sessions. The action matches the helper's first argument, so it authorizes
 no other CLI entry. Restart remains the explicit installation step.
 
-Every installation path records its outcome with the prepared release. Success records `applied`
+Every installation path records its outcome with the prepared release; only that exact version running counts as applied, and a download superseded by a newer version installed another way is dropped with its own attempt's outcome, if any. Success records `applied`
 before retiring the preparation, so a terminal installation that executes the new version is still
 counted. A failure records its reason where it is classified, never by parsing its message:
 `verify` for signature, digest, version, architecture or package-identity refusal, `install` for an
