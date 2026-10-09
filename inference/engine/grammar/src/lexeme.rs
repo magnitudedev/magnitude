@@ -118,6 +118,7 @@ struct Builder<'n, 'b> {
     terms: &'b mut Terms,
     skeleton: Skeleton,
     shared: HashMap<(RuleId, u32), u32>,
+    limit: usize,
 }
 
 impl<'n> Builder<'n, '_> {
@@ -160,6 +161,9 @@ impl<'n> Builder<'n, '_> {
         }
     }
     fn build(&mut self, node: &'n Node, from: u32, to: u32) {
+        if self.skeleton.edges.len() > self.limit {
+            return;
+        }
         if is_regular(node, self.regular) {
             let term = self.terms.of_node(node, self.regular);
             self.skeleton.edges.push((from, to, Raw::Term(term)));
@@ -474,6 +478,50 @@ fn costliest(
         .map(|(rule, _)| *rule)
 }
 
+/// Edges and call sites of every Earley body's skeleton, built as assembly
+/// builds it, flattened rules shared where assembly shares them; `None` once
+/// either exceeds its limit, which bounds the work of measuring.
+fn measure<'n>(
+    network: &'n Network,
+    regular: &[Option<TermId>],
+    classes: &[Class],
+    flattened: &BTreeSet<RuleId>,
+    terms: &mut Terms,
+    limit: Size,
+) -> Option<Size> {
+    let peeled = BTreeSet::new();
+    let mut total = Size::default();
+    for body in earley_bodies(network, regular, classes, flattened) {
+        let mut repeats = BTreeMap::new();
+        let mut builder = Builder {
+            network,
+            regular,
+            classes,
+            flattened,
+            peeled: &peeled,
+            repeats: &mut repeats,
+            terms,
+            skeleton: Skeleton {
+                states: 2,
+                edges: Vec::new(),
+                heads: Vec::new(),
+            },
+            shared: HashMap::new(),
+            limit: limit.edges.saturating_sub(total.edges) as usize,
+        };
+        builder.build(body, 0, 1);
+        let edges = &builder.skeleton.edges;
+        total = total.plus(Size {
+            edges: edges.len() as u64,
+            calls: edges.iter().filter(|(_, _, raw)| matches!(raw, Raw::Call(..))).count() as u64,
+        });
+        if total.edges > limit.edges || total.calls > limit.calls {
+            return None;
+        }
+    }
+    Some(total)
+}
+
 /// Flatten every structural rule the allowance permits, except `kept`:
 /// while the skeletons would exceed it, keep as a call the rule whose
 /// copies cost the most.
@@ -482,26 +530,25 @@ fn choose_flattened(
     regular: &[Option<TermId>],
     classes: &[Class],
     kept: &BTreeSet<RuleId>,
+    terms: &mut Terms,
 ) -> BTreeSet<RuleId> {
-    let total = |flattened: &BTreeSet<RuleId>, memo: &mut HashMap<RuleId, Size>| {
-        earley_bodies(network, regular, classes, flattened)
-            .into_iter()
-            .fold(Size::default(), |total, body| {
-                total.plus(size(body, network, regular, classes, flattened, memo))
-            })
-    };
     // Without flattening, every reference is one call: the baseline.
-    let baseline = total(&BTreeSet::new(), &mut HashMap::new());
-    let edge_limit = Allowance::limit(network.symbols, FLATTEN_FACTOR) as u64;
-    let call_limit = CALL_FACTOR * baseline.calls.max(CALL_FLOOR);
+    let baseline = earley_bodies(network, regular, classes, &BTreeSet::new())
+        .into_iter()
+        .fold(Size::default(), |total, body| {
+            total.plus(size(body, network, regular, classes, &BTreeSet::new(), &mut HashMap::new()))
+        });
+    let limit = Size {
+        edges: Allowance::limit(network.symbols, FLATTEN_FACTOR) as u64,
+        calls: CALL_FACTOR * baseline.calls.max(CALL_FLOOR),
+    };
     let mut flattened: BTreeSet<RuleId> = (0..network.bodies.len())
         .filter(|&rule| {
             classes[rule] == Class::Structural && rule != network.root && !kept.contains(&rule)
         })
         .collect();
     loop {
-        let current = total(&flattened, &mut HashMap::new());
-        if current.edges <= edge_limit && current.calls <= call_limit {
+        if measure(network, regular, classes, &flattened, terms, limit).is_some() {
             return flattened;
         }
         match costliest(network, regular, classes, &flattened) {
@@ -537,7 +584,7 @@ impl Plan {
             .count();
         let mut kept = BTreeSet::new();
         loop {
-            let flattened = choose_flattened(network, &regular, classes, &kept);
+            let flattened = choose_flattened(network, &regular, classes, &kept, terms);
             let mut attempt = allowance.clone();
             let mut plan = Self::assemble(
                 network,
@@ -633,6 +680,7 @@ impl Plan {
                             heads: Vec::new(),
                         },
                         shared: HashMap::new(),
+                        limit: usize::MAX,
                     };
                     builder.build(body, 0, 1);
                     builder.skeleton
