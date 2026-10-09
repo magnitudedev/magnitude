@@ -1,18 +1,18 @@
 {
   "origin": "https://magnitude-updates-976f4c77.westus2.cloudapp.azure.com",
   "linuxVersions": [
-    "50.5.1",
-    "50.5.2",
-    "50.5.3",
-    "50.5.4"
+    "50.6.1",
+    "50.6.2",
+    "50.6.3",
+    "50.6.4"
   ],
   "appleVersions": [
-    "50.5.1",
-    "50.5.2"
+    "50.6.1",
+    "50.6.2"
   ],
   "windowsVersions": "",
   "failingVariants": {
-    "50.5.3": "preinstall",
-    "50.5.4": "startup"
+    "50.6.3": "preinstall",
+    "50.6.4": "startup"
   }
 }
