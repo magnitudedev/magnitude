@@ -26,6 +26,7 @@ const harness = (options: {
     recordOutcome: (value: UpdateOutcome) => Effect.sync(() => { outcome = Option.some(value); events.push(`outcome ${value.outcome}${Option.match(value.reason, { onNone: () => "", onSome: reason => `/${reason}` })}`) }),
     complete: () => Effect.sync(() => { outcome = Option.some({ outcome: "applied", version: release.version, reason: Option.none() }); pending = Option.none(); events.push("outcome applied") }),
     recordFailure: (_: unknown, kind: string) => Effect.sync(() => { events.push(`failed/${kind}`) }),
+    discard: Effect.sync(() => { pending = Option.none(); events.push("discard") }),
   } as unknown as PreparedUpdateStore
   const system = IdleInstallationSystem.of({
     canInstallUnattended: Effect.sync(() => options.authorized ?? true),
@@ -33,7 +34,10 @@ const harness = (options: {
     installationLockFree: Effect.sync(() => lockFree.length > 1 ? lockFree.shift()! : lockFree[0]!),
     store: Effect.succeed(store),
     installPrepared: options.installer === "fails"
-      ? Effect.sync(() => { events.push("install", "failed/install") }).pipe(Effect.zipRight(Effect.fail({ message: "The package manager could not install the update." })))
+      ? Effect.sync(() => {
+        events.push("install", "failed/install")
+        pending = Option.map(pending, value => ({ ...value, installation: { _tag: "Failed", kind: "install", reason: "Package refused" } }) as PreparedUpdate)
+      }).pipe(Effect.zipRight(Effect.fail({ message: "The package manager could not install the update." })))
       : Effect.gen(function* () { events.push("install"); yield* store.complete(release); events.push("exec") }),
     notify: line => Effect.sync(() => { notices.push(line) }),
   })
@@ -102,7 +106,8 @@ describe("install when idle", () => {
   it("returns to serving the current version when the package fails", async () => {
     const h = harness({ installer: "fails" })
     await h.run(machine => machine.install)
-    expect(h.events).toEqual(["install", "failed/install"])
+    // The failed download is dropped so a newer release can be fetched; its outcome stays to be reported.
+    expect(h.events).toEqual(["install", "failed/install", "outcome failed/install", "discard"])
     expect(h.notices.at(-1)).toContain("Serving the current version.")
   })
   it("turns an unreported applied outcome into failed/startup when the new version does not start", async () => {

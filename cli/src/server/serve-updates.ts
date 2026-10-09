@@ -113,7 +113,17 @@ export const makeIdleInstallation = Effect.gen(function* () {
     // The lock may have been taken since the idle decision.
     if (!(yield* system.installationLockFree)) return yield* defer(version)
     yield* system.installPrepared
-  }).pipe(Effect.catchAll(error => system.notify(`The update could not be installed: ${error.message} Serving the current version.`)))
+  }).pipe(Effect.catchAll(error => Effect.gen(function* () {
+    // Unattended, a failed download would hold back every later release: keep only its outcome, so
+    // the next check can fetch a newer version (or this one again, unless it was withdrawn).
+    const store = yield* system.store
+    const failed = yield* store.read
+    if (Option.isSome(failed) && failed.value.installation._tag === "Failed") {
+      yield* store.recordOutcome({ outcome: "failed", version: failed.value.release.version, reason: Option.some(failed.value.installation.kind) })
+      yield* store.discard
+    }
+    yield* system.notify(`The update could not be installed: ${error.message} Serving the current version.`)
+  }).pipe(Effect.catchAll(() => system.notify(`The update could not be installed: ${error.message} Serving the current version.`)))))
 
   const startupFailed = system.store.pipe(Effect.flatMap(store => Effect.gen(function* () {
     const outcome = yield* store.outcome
