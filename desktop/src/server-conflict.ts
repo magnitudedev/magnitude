@@ -38,7 +38,8 @@ const removeServer = Effect.gen(function* () {
   const executor = yield* CommandExecutor.CommandExecutor
   const command = process.platform === "darwin"
     ? Command.make("/usr/bin/osascript", "-e", `do shell script quoted form of "${cli.value}" & " _server-remove" with administrator privileges`)
-    : Command.make("/usr/bin/pkexec", cli.value, "_server-remove")
+    // Only the desktop's own authentication agent may ask; never a hidden terminal prompt.
+    : Command.make("/usr/bin/pkexec", "--disable-internal-agent", cli.value, "_server-remove")
   const code = yield* executor.exitCode(command).pipe(Effect.orElseSucceed(() => -1))
   if (code !== 0) return yield* new ServerRemovalFailed({ message: "The server was not stopped. Authorization is needed to stop it." })
 }).pipe(Effect.provide(NodeContext.layer))
