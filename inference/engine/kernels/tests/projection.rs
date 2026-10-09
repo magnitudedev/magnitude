@@ -1017,9 +1017,7 @@ fn attention_output_specialization_on(
     let specialization =
         with_gemv_rows(device, specialization, ATTENTION_OUTPUT_GEMV_ROWS_LAUNCH, mapping);
     if device.backend() == BackendName::Metal {
-        with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, PACK_DEFAULT)
-            .with_param("PACK", 0)
-            .with_launch_param(1, "BATCH_PARTS", mapping.batch_parts)
+        with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, PACK_DEFAULT).with_param("PACK", 0)
     } else {
         specialization
     }
@@ -1100,7 +1098,6 @@ fn dense_expand_specialization_on(
         with_pack(specialization, DENSE_EXPAND_PACKED_LAUNCH, PACK_DEFAULT)
             .with_param("PACK", 0)
             .with_param("INT8", 0)
-            .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
             .with_launch_param(1, "TILED", mapping.tiled)
             .with_launch_param(DENSE_EXPAND_GEMV_ROWS_LAUNCH, "TILED", mapping.tiled.min(1))
             .with_launch_param(DENSE_EXPAND_GEMV_ROWS_LAUNCH + 1, "TILED", mapping.tiled)
@@ -1179,17 +1176,12 @@ fn readout_head_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
-    let specialization = with_gemv_rows(
+    with_gemv_rows(
         device,
         readout_projection_specialization_on(device, statics, mapping),
         READOUT_HEAD_GEMV_ROWS_LAUNCH,
         mapping,
-    );
-    if device.backend() == BackendName::Metal {
-        specialization.with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
-    } else {
-        specialization
-    }
+    )
 }
 
 fn head_logits_specialization_on(
@@ -1645,58 +1637,6 @@ fn metal_dense_expand_scoped_launches_match_the_host() {
                 &expected,
                 &bound,
             );
-        }
-    }
-}
-
-/// The paired compressed-code matrix path keeps both projection sums in
-/// F32 until the original GLU epilogue. Cover its two activation fragments,
-/// split-K exchange, distinct gate/up formats, and generic batch fallback.
-#[test]
-fn metal_dense_expand_matrix_pair_matches_host() {
-    let Some(device) = devices()
-        .into_iter()
-        .find(|d| d.backend() == BackendName::Metal)
-    else {
-        return;
-    };
-    for act in [Act::Bf16, Act::F16] {
-        for (h, f) in [(256usize, 131usize), (2560, 67)] {
-            let norm = norm_values(h, 63);
-            for (gate_repr, up_repr) in [
-                (Repr::Q4k, Repr::Q4k),
-                (Repr::Q5k, Repr::Q4k),
-                (Repr::Q6k, Repr::Q5k),
-                (Repr::Q5k, Repr::Q6k),
-                (Repr::Q8, Repr::Q8),
-            ] {
-                let gate = weight(gate_repr, f, h, 61, 1.0);
-                let up = weight(up_repr, f, h, 62, 1.0);
-                for rows in [3usize, 5, 8, 13, 16] {
-                    let residual = uniform_values(rows * h, rows as u64, 1.0);
-                    let out_rows = (0..rows as i32).rev().collect::<Vec<_>>();
-                    let (expected, bound) = under(rows, || {
-                        dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6)
-                    });
-                    for parts in [1, 2, 4] {
-                        let mapping = Mapping {
-                            batch_from: 3,
-                            batch_parts: parts,
-                            ..gemm_mapping(64, 64, 1)
-                        };
-                        let actual = dense_expand_native(
-                            &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6,
-                            mapping,
-                        );
-                        assert_within(
-                            &format!("matrix pair {gate_repr:?}/{up_repr:?} M{rows} parts{parts}"),
-                            &actual,
-                            &expected,
-                            &bound,
-                        );
-                    }
-                }
-            }
         }
     }
 }
@@ -5514,282 +5454,6 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
         }
     }
 }
-
-/// Matrix column gathering preserves the rounded projection, convolution,
-/// and every window bank for partial fragments and taped, split slots.
-#[test]
-fn metal_convolved_matrix_columns_match_host() {
-    use magnitude_kernels::gated_delta_project_convolved;
-    use seismic::{SlabRegion, SlabTensor};
-    let Some(device) = devices()
-        .into_iter()
-        .find(|d| d.backend() == BackendName::Metal)
-    else {
-        return;
-    };
-    let act = Act::Bf16;
-    let (h, nk, nv, w, c, banks, tape) =
-        (512usize, 1usize, 2usize, 33usize, 4usize, 5usize, 3usize);
-    let channels = (2 * nk + nv) * w;
-    let segment_rows = [channels, nv * w, nv, nv];
-    let total: usize = segment_rows.iter().sum();
-    let norm = norm_values(h, 73);
-    let window_rows = c - 1 + tape;
-    let initial = uniform_values(banks * window_rows * channels, 74, 0.5)
-        .into_iter()
-        .map(|v| act.round(v))
-        .collect::<Vec<_>>();
-    let convolution = uniform_values(channels * c, 75, 0.25);
-    for (q, z) in [
-        (Repr::Q4k, Repr::Q6k),
-        (Repr::Q5k, Repr::Q4k),
-        (Repr::Q6k, Repr::Q5k),
-        (Repr::Q8, Repr::Bf16),
-    ] {
-        let reprs = [q, z, Repr::Q8, Repr::Q8];
-        let weights = (0..4)
-            .map(|i| weight(reprs[i], segment_rows[i], h, 76 + i as u64, 1.0))
-            .collect::<Vec<_>>();
-        let tensors = weights
-            .iter()
-            .map(|v| v.tensor(&device))
-            .collect::<Vec<_>>();
-        for rows in [8usize, 13] {
-            let hidden = uniform_values(rows * h, rows as u64, 1.0);
-            let (expected, bound) = under(rows, || {
-                let mut expected = Vec::new();
-                let mut bound = Vec::new();
-                for row in hidden.chunks_exact(h) {
-                    let (x, slack) = rms_row(act, row, &norm, 1e-6);
-                    for wt in &weights {
-                        for n in 0..wt.rows {
-                            let (acc, magnitude) = dot(&x, wt.row(n));
-                            expected.push(act.round(acc));
-                            bound.push(
-                                rounded_bound(act, acc, magnitude) + slack_dot(&slack, wt.row(n)),
-                            );
-                        }
-                    }
-                }
-                (expected, bound)
-            });
-            // (lo, count, stop, source bank, source tape, target bank).
-            // The final row is padding and must publish a zero convolution.
-            let slots = [
-                (0usize, 2usize, 1usize, 1usize, 2usize, 3usize),
-                (2, rows - 3, rows - 5, 2, 1, 4),
-            ];
-            let segments = i32_tensor(
-                &device,
-                &[3, 2],
-                &[0, 2, 2, (rows - 1) as i32, rows as i32, rows as i32],
-            );
-            let stop = i32_tensor(&device, &[2], &[1, (rows - 5) as i32]);
-            let previous = i32_tensor(&device, &[2], &[1, 2]);
-            let previous_tape = i32_tensor(&device, &[2], &[2, 1]);
-            let following = i32_tensor(&device, &[2], &[3, 4]);
-            for parts in [1u64, 2, 4] {
-                let mut slabs = SlabTensor::new(
-                    &device,
-                    2,
-                    banks as u64,
-                    vec![SlabRegion {
-                        element: act.element(),
-                        row_shape: vec![window_rows as u64, channels as u64],
-                    }],
-                )
-                .unwrap();
-                for slab in 0..banks.div_ceil(2) {
-                    slabs.add_slab().unwrap();
-                    let start = slab * 2;
-                    let count = 2.min(banks - start);
-                    slabs
-                        .region_rows(0, start as u64, count as u64)
-                        .unwrap()
-                        .write_from_host(&act.bytes(
-                            &initial[start * window_rows * channels
-                                ..(start + count) * window_rows * channels],
-                        ))
-                        .unwrap();
-                }
-                let mut window = slabs.logical_region(0).unwrap();
-                let mut spec = statics_on(
-                    &device,
-                    &[("H", h), ("NK", nk), ("NV", nv), ("W", w), ("C", c)],
-                )
-                .with_param("BATCH_FROM", 3)
-                .with_launch_param(2, "BATCH_SIMDGROUPS", 8)
-                .with_launch_param(2, "BATCH_ROWS", 2)
-                .with_launch_param(2, "BATCH_PARTS", parts);
-                for launch in [1, 3, 4] {
-                    spec = spec
-                        .with_launch_param(launch, "SIMDGROUPS", 8)
-                        .with_launch_param(launch, "ROWS", 2)
-                        .with_launch_param(launch, "LANES", 16);
-                }
-                let output = gated_delta_project_convolved::native_for_device_with(
-                    &device,
-                    gated_delta_project_convolved::Elements {
-                        NW: act.element(),
-                        QW: reprs[0].resident(&device),
-                        GW: reprs[1].resident(&device),
-                        AW: reprs[2].resident(&device),
-                        BW: reprs[3].resident(&device),
-                        A: act.element(),
-                    },
-                    &spec,
-                )
-                .unwrap()
-                .call(gated_delta_project_convolved::Args {
-                    hidden: &f32_tensor(&device, &[rows, h], &hidden),
-                    input_norm: &bf16_norm(&device, &norm),
-                    qkv_weight: &tensors[0],
-                    gate_weight: &tensors[1],
-                    alpha_weight: &tensors[2],
-                    beta_weight: &tensors[3],
-                    convolution: &f32_tensor(&device, &[channels, c], &convolution),
-                    segments: &segments,
-                    stop: &stop,
-                    previous_bank: &previous,
-                    previous_tape: &previous_tape,
-                    following_bank: &following,
-                    window: &mut window,
-                    epsilon: 1e-6,
-                    slab_banks: 2,
-                })
-                .unwrap();
-                let projection = read_act(act, &output.r0);
-                let label = format!("convolved {q:?}/{z:?} M{rows} parts{parts}");
-                assert_within(&label, &projection, &expected, &bound);
-                let mut expected_window = initial.clone();
-                let mut expected_convolved = vec![0.0f32; rows * channels];
-                for (lo, count, stop, source, taped, target) in slots {
-                    for local in 0..count {
-                        for n in 0..channels {
-                            let mut sum = 0.0f32;
-                            for tap in 0..c {
-                                let position = local as isize + tap as isize - (c - 1) as isize;
-                                let input = if position < 0 {
-                                    initial[(source * window_rows + (taped + c - 1)
-                                        - position.unsigned_abs())
-                                        * channels
-                                        + n]
-                                } else {
-                                    projection[(lo + position as usize) * total + n]
-                                };
-                                sum = convolution[n * c + tap].mul_add(input, sum);
-                            }
-                            expected_convolved[(lo + local) * channels + n] =
-                                sum / (1.0 + (-sum).exp());
-                        }
-                    }
-                    for kept in 0..c - 1 + count - stop {
-                        let position = stop as isize + kept as isize - (c - 1) as isize;
-                        for n in 0..channels {
-                            expected_window[(target * window_rows + kept) * channels + n] =
-                                if position < 0 {
-                                    initial[(source * window_rows + taped + c
-                                        - 1
-                                        - position.unsigned_abs())
-                                        * channels
-                                        + n]
-                                } else {
-                                    projection[(lo + position as usize) * total + n]
-                                };
-                        }
-                    }
-                }
-                assert_eq!(
-                    read_act(act, &window),
-                    expected_window,
-                    "{label}: all window banks"
-                );
-                // Same F32 tap chain; allow the host/Metal exponential's final rounding.
-                let convolution_bound = expected_convolved
-                    .iter()
-                    .map(|v| 2e-6 * v.abs() + 1e-7)
-                    .collect::<Vec<_>>();
-                assert_within(
-                    &format!("{label}: convolution"),
-                    &read_f32(&output.r1),
-                    &expected_convolved,
-                    &convolution_bound,
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn metal_attention_output_matrix_matches_host() {
-    let Some(device) = devices()
-        .into_iter()
-        .find(|d| d.backend() == BackendName::Metal)
-    else {
-        return;
-    };
-    let (d, q, w) = (131usize, 4usize, 128usize);
-    let k = q * w;
-    for act in [Act::Bf16, Act::F16] {
-        for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8] {
-            let weights = weight(repr, d, k, 714, 1.0);
-            for rows in [8usize, 13] {
-                let hidden = uniform_values(rows * d, 715, 1.0);
-                let gated = uniform_values(rows * k, 716, 1.0)
-                    .into_iter()
-                    .map(|v| act.round(v))
-                    .collect::<Vec<_>>();
-                let (expected, bound) = under(rows, || {
-                    let mut expected = Vec::new();
-                    let mut bound = Vec::new();
-                    for r in 0..rows {
-                        for n in 0..d {
-                            let (acc, magnitude) = dot(&gated[r * k..(r + 1) * k], weights.row(n));
-                            expected.push(hidden[r * d + n] + act.round(acc));
-                            bound.push(rounded_bound(act, acc, magnitude));
-                        }
-                    }
-                    (expected, bound)
-                });
-                for parts in [1, 2, 4] {
-                    let mapping = Mapping {
-                        batch_from: 3,
-                        batch_parts: parts,
-                        ..gemm_mapping(64, 64, 1)
-                    };
-                    let kernel = attention_output::native_for_device_with(
-                        &device,
-                        attention_output::Elements {
-                            A: act.element(),
-                            OW: repr.resident(&device),
-                        },
-                        &attention_output_specialization_on(
-                            &device,
-                            &[("D", d), ("Q", q), ("W", w)],
-                            mapping,
-                        ),
-                    )
-                    .unwrap();
-                    let output = kernel
-                        .call(attention_output::Args {
-                            hidden: &f32_tensor(&device, &[rows, d], &hidden),
-                            gated: &act_tensor(&device, act, &[rows, q, w], &gated),
-                            output_weight: &weights.tensor(&device),
-                        })
-                        .unwrap()
-                        .value;
-                    assert_within(
-                        &format!("attention output {act:?} {repr:?} M{rows} parts{parts}"),
-                        &read_f32(&output),
-                        &expected,
-                        &bound,
-                    );
-                }
-            }
-        }
-    }
-}
-
 
 #[test]
 fn metal_absent_query_projection_preserves_key_value() {

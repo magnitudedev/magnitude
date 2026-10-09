@@ -107,7 +107,7 @@ kernel void dense_expand_gemv_pair(DENSE_EXPAND_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_BATCH
-template <uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint BATCH_ROWS>
 kernel void dense_expand_batch(DENSE_EXPAND_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -115,17 +115,9 @@ kernel void dense_expand_batch(DENSE_EXPAND_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     DENSE_EXPAND_OPERANDS;
-    projection::Plain<activation, projection::AllRows> x{normalized,
-        SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    if constexpr (projection::matrix_codes<packets::W0>::available
-        && projection::matrix_codes<packets::W1>::available && SEISMIC_DIM_H % 256 == 0) {
-        projection::gemv_matrix_paired<packets::W0, packets::W1, BATCH_PARTS>(x, out,
-            gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H),
-            tile, shared, simdgroups, sg, lane);
-        return;
-    }
-    if (tile * simdgroups * BATCH_ROWS * 8u >= uint(SEISMIC_DIM_F))
-        return;
+    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
+    projection::threadgroup_squares_runtime(in, uint(SEISMIC_DIM_O), squares, simdgroups, sg, lane);
+    const auto x = projection::shared_norm(in, squares);
     projection::gemv_batch_paired_runtime<packets::W0, packets::W1, BATCH_ROWS>(x, out,
         gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared,
         simdgroups, sg, lane);
