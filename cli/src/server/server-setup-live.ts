@@ -1,14 +1,15 @@
-import { Command, CommandExecutor, FetchHttpClient, FileSystem } from "@effect/platform"
+import { Command, CommandExecutor, FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { Duration, Effect, Layer, Option, Schedule } from "effect"
 import { open } from "node:fs/promises"
 import { join } from "node:path"
 import { userInfo } from "node:os"
 import { MagnitudeClient } from "@magnitudedev/sdk"
-import { makeFirstPartyConnection } from "@magnitudedev/client-common"
-import { MAC_SERVER_PLIST, applicationStateDirectory, installedServerCli, isServerProfileActive, requestApplication } from "@magnitudedev/daemon-management/desktop-native"
+import { applicationStateDirectory, installedServerCli, requestApplication } from "@magnitudedev/daemon-management/desktop-native"
+import { isServerSetUp } from "./serve-owner"
 import { desktopDataDirectory, desktopServiceOrigin } from "./application"
 import { ServerSetupFailed, ServerSetupHost, type ServerAccess } from "./server-setup"
+import { withLocalService } from "./server-reach"
 
 const failed = (message: string) => new ServerSetupFailed({ message })
 
@@ -24,9 +25,7 @@ const askTerminal = (question: string) => Effect.acquireUseRelease(
   tty => Effect.promise(() => tty.close()),
 )
 
-const withService = <A, E>(use: (client: MagnitudeClient) => Effect.Effect<A, E>) => Effect.scoped(
-  makeFirstPartyConnection(MagnitudeClient.layer({ origin: desktopServiceOrigin, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(
-    Effect.flatMap(connection => use(connection.client)), Effect.timeout("5 seconds")))
+const withService = <A, E>(use: (client: MagnitudeClient) => Effect.Effect<A, E>) => withLocalService(desktopServiceOrigin, use)
 
 /** The service may still be starting, or restarting after a settings change. */
 const readNetworkAccess = (settled: boolean) => withService(client => client.configuration.getNetworkAccess({})).pipe(
@@ -64,8 +63,7 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
     personalOwner: applicationStateDirectory({ platform, dataDirectory: desktopDataDirectory, override: Option.none() }).pipe(
       Effect.flatMap(directory => requestApplication(join(directory, "application.sock"), "Observe")),
       Effect.map(snapshot => Option.some(snapshot.owner._tag)), Effect.orElseSucceed(() => Option.none())),
-    isSetUp: platform === "darwin" ? fs.exists(MAC_SERVER_PLIST).pipe(Effect.orElseSucceed(() => false))
-      : isServerProfileActive(platform).pipe(Effect.provideService(FileSystem.FileSystem, fs)),
+    isSetUp: isServerSetUp,
     hasTerminal: Effect.tryPromise(() => open("/dev/tty", "r+").then(tty => tty.close())).pipe(Effect.as(true), Effect.orElseSucceed(() => false)),
     sudoWithoutPrompt: executor.exitCode(Command.make("/usr/bin/sudo", "-n", "true")).pipe(Effect.map(code => code === 0), Effect.orElseSucceed(() => false)),
     confirm: question => askTerminal(question).pipe(Effect.map(answer => /^y(es)?$/i.test(answer))),

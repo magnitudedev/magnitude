@@ -17,7 +17,7 @@ describe("Magnitude service definitions", () => {
       version: Option.some("0.0.2"),
       startsAutomaticallyOnLogin: Option.some(true),
       activeModel: { _tag: "Observed", model: Option.none() },
-      owner: Option.some({ _tag: "Desktop", tray: { _tag: "Registered" } }),
+      owner: Option.some({ _tag: "Desktop", tray: { _tag: "Registered" } }), reach: Option.none(),
     })).toBe([
       "Magnitude service",
       "  Runtime         Ready",
@@ -34,7 +34,7 @@ describe("Magnitude service definitions", () => {
     const output = renderStatus({
       status: "Ready", address: "127.0.0.1:11101", version: Option.none(),
       startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" },
-      owner: Option.some({ _tag: "Desktop", tray: { _tag: "Unavailable", message: "Desktop panel is unavailable" } }),
+      owner: Option.some({ _tag: "Desktop", tray: { _tag: "Unavailable", message: "Desktop panel is unavailable" } }), reach: Option.none(),
     })
     expect(output).toContain("Active model    Unavailable")
     expect(output).not.toContain("Active model    None")
@@ -45,7 +45,7 @@ describe("Magnitude service definitions", () => {
     const output = renderStatus({
       status, address: "127.0.0.1:11101", version: Option.none(),
       startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" },
-      owner: Option.some({ _tag: "Headless" }),
+      owner: Option.some({ _tag: "Headless" }), reach: Option.none(),
     })
     expect(output).toContain(`Runtime         ${status}`)
     expect(output).toContain("Owner           Headless")
@@ -55,9 +55,21 @@ describe("Magnitude service definitions", () => {
 
   it("reports absence with actionable startup guidance and no desktop fields", () => {
     const output = renderStatus({ status: "Stopped", address: "127.0.0.1:10100", version: Option.none(),
-      startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" }, owner: Option.none() })
+      startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" }, owner: Option.none(), reach: Option.none() })
     expect(output).toContain("Not running\nOpen the Magnitude desktop app or run `magnitude serve`.\n")
     expect(output).not.toMatch(/Tray|Starts at login|Active model/)
   })
 
+  it("shows how to reach a ready server, without the key", () => {
+    const output = renderStatus({
+      status: "Ready", address: "127.0.0.1:10100", version: Option.some("1.0.0"),
+      startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Observed", model: Option.none() },
+      owner: Option.some({ _tag: "Headless" }),
+      reach: Option.some({ endpoint: "http://127.0.0.1:10100", configPath: "/var/lib/magnitude/config.json", service: true,
+        network: Option.some({ enabled: true, port: 10100, pending: false, interfaces: [{ name: "eth0", address: "10.0.0.4", kind: "lan" }] }) }),
+    })
+    expect(output).toContain("On this computer:   http://127.0.0.1:10100")
+    expect(output).toContain("http://10.0.0.4:10100")
+    expect(output).toContain("http://10.0.0.4:10100/inference/v1")
+  })
 })

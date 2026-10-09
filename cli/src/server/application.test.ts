@@ -1,7 +1,7 @@
 import { Effect } from "effect"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
-const calls = vi.hoisted(() => ({ observe: vi.fn(), update: vi.fn(), launch: vi.fn() }))
+const calls = vi.hoisted(() => ({ observe: vi.fn(), update: vi.fn(), launch: vi.fn(), server: { active: false } }))
 vi.mock("@magnitudedev/daemon-management/bun", () => ({ bundledWindowsNative: {} }))
 vi.mock("@magnitudedev/daemon-management/desktop-native", () => ({
   applicationStateDirectory: () => Effect.succeed("/test/state"),
@@ -9,11 +9,12 @@ vi.mock("@magnitudedev/daemon-management/desktop-native", () => ({
     desktopApplication: { observe: Effect.suspend(() => calls.observe()), ensure: Effect.suspend(() => calls.launch()) },
     updateDesktopApplication: (action: string) => calls.update(action),
     desktopDataDirectory: "/test/data", desktopIsolatedProfile: true,
+    serverProfile: Effect.sync(() => calls.server.active),
   }),
 }))
 import { updateApplication } from "./application"
 const state = { transfer: { _tag: "Idle" }, check: { _tag: "Idle" }, preference: { _tag: "Known", autoDownload: true } }
-beforeEach(() => { vi.clearAllMocks(); calls.update.mockReturnValue(Effect.succeed(state)) })
+beforeEach(() => { vi.clearAllMocks(); calls.server.active = false; calls.update.mockReturnValue(Effect.succeed(state)) })
 describe("application update routing", () => {
   it.each(["Desktop", "Headless"])("routes to the observed %s owner without launching or local mutation", async owner => {
     calls.observe.mockReturnValue(Effect.succeed({ owner: { _tag: owner } }))
@@ -27,6 +28,13 @@ describe("application update routing", () => {
     expect(error.message).toBe("Application updates require an installed Magnitude application.")
     expect(calls.update).not.toHaveBeenCalled()
     expect(calls.launch).not.toHaveBeenCalled()
+  })
+  it("never maintains the server profile from another account when the service is stopped", async () => {
+    calls.server.active = true
+    calls.observe.mockReturnValue(Effect.fail({ _tag: "ApplicationControlUnavailable", message: "Absent" }))
+    const error = await Effect.runPromise(updateApplication("download").pipe(Effect.flip))
+    expect(error.message).toContain("sudo systemctl start magnitude")
+    expect(calls.update).not.toHaveBeenCalled()
   })
   it("does not replay an owner mutation locally after a lost reply", async () => {
     calls.observe.mockReturnValue(Effect.succeed({ owner: { _tag: "Desktop" } }))

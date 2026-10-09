@@ -2,7 +2,7 @@ import { dirname, resolve } from "node:path"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
 import { BunContext } from "@effect/platform-bun"
-import { Deferred, Effect, Option, Runtime, Schema } from "effect"
+import { Deferred, Effect, Option, Ref, Runtime, Schema } from "effect"
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { applicationNativeHostPath, applicationStateDirectory, nativeHostLayer, resolveApplicationProfile,
@@ -10,6 +10,7 @@ import { applicationNativeHostPath, applicationStateDirectory, nativeHostLayer, 
 import { isDevelopmentBuild } from "../runtime/environment"
 import { initializeServeUpdates, prepareServeStartup } from "../server/serve-updates"
 import { resolveServeOwner } from "../server/serve-owner"
+import { readServerReach, renderServeReady } from "../server/server-reach"
 
 class ServeRefused extends Schema.TaggedError<ServeRefused>()("ServeRefused", { message: Schema.String }) {}
 
@@ -29,6 +30,7 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const profile = resolveApplicationProfile({ runtime, home: homedir(), platform: process.platform, acceptance: false, environment: process.env, server })
   const stateDirectory = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: profile.dataDirectory, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR) })
   const addon = applicationNativeHostPath(runtime, process.platform, process.arch)
+  const ready = yield* Ref.make(false)
   // A restart request re-admits the owner in place, so settings read at service start take effect.
   for (;;) if ((yield* runHeadlessApplication({ runtime, profile, stateDirectory, home: homedir(), environment: process.env,
     prepareStartup: prepareServeStartup(runtime, profile, stateDirectory).pipe(
@@ -38,8 +40,11 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
     stopping: reason => Effect.sync(() => { process.stderr.write(reason === "DesktopTakeover"
       ? "The desktop app was opened and is taking over. Stopping the headless server.\n"
       : reason === "Restart" ? "Restarting the Magnitude server.\n" : "Stopping the Magnitude server.\n") }),
-    stop: Deferred.await(stopped), observe: state => state._tag === "Ready"
-      ? Effect.sync(() => { process.stderr.write(`Magnitude is serving at ${profile.endpoint}. Press Ctrl+C to stop.\n`) }) : Effect.void,
+    stop: Deferred.await(stopped), observe: state => Ref.getAndSet(ready, state._tag === "Ready").pipe(Effect.flatMap(wasReady =>
+      state._tag === "Ready" && !wasReady
+        ? readServerReach({ endpoint: profile.endpoint, dataDirectory: profile.dataDirectory, service: owner === "service" }).pipe(
+          Effect.flatMap(reach => Effect.sync(() => { process.stderr.write(renderServeReady(reach)) })))
+        : Effect.void)),
   }).pipe(Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon)))) !== "Restart") return
 })).pipe(Effect.provide([BunContext.layer, BunSqliteDriverLayer]), Effect.catchAll(error => Effect.sync(() => {
   process.stderr.write(`${error.message}\n`)

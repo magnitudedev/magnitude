@@ -1,4 +1,6 @@
-import { desktopApplication, desktopServiceOrigin, readDesktopLoginStartup } from "../server/application"
+import { applicationDataDirectory, desktopApplication, desktopServiceOrigin, readDesktopLoginStartup } from "../server/application"
+import { isServerSetUp } from "../server/serve-owner"
+import { readServerReach, renderServerReach, type ServerReach } from "../server/server-reach"
 import { formatLocalModelDisplayName } from "@magnitudedev/client-common"
 import type { ApplicationOwner } from "@magnitudedev/sdk/desktop-host"
 import { Effect, Option } from "effect"
@@ -17,6 +19,7 @@ interface ServiceStatusPresentation {
   readonly startsAutomaticallyOnLogin: Option.Option<boolean>
   readonly activeModel: { readonly _tag: "Unavailable" } | { readonly _tag: "Observed"; readonly model: Option.Option<ActiveModel> }
   readonly owner: Option.Option<ApplicationOwner>
+  readonly reach: Option.Option<ServerReach>
 }
 
 const serviceAddress = new URL(desktopServiceOrigin).host
@@ -55,11 +58,14 @@ const publicServiceStatus = desktopApplication.observe.pipe(
       Effect.timeout("2 seconds"),
       Effect.orElseSucceed(() => ({ _tag: "Unavailable" } as const)),
     ) : Effect.succeed({ _tag: "Unavailable" } as const)
-    return Effect.all({ model: activeModel, login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login }): ServiceStatusPresentation => ({
+    const reach = state?._tag === "Ready" ? Effect.all([applicationDataDirectory, isServerSetUp]).pipe(
+      Effect.flatMap(([dataDirectory, service]) => readServerReach({ endpoint: desktopServiceOrigin, dataDirectory, service })), Effect.option)
+      : Effect.succeed(Option.none<ServerReach>())
+    return Effect.all({ model: activeModel, reach, login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach }): ServiceStatusPresentation => ({
       status: state?._tag ?? "Stopped", address: serviceAddress,
       version: state?._tag === "Ready" ? Option.some(String(state.health.version)) : Option.none(),
       startsAutomaticallyOnLogin: login, activeModel: model,
-      owner: Option.map(snapshot, value => value.owner),
+      owner: Option.map(snapshot, value => value.owner), reach,
     })))
   }),
 )
@@ -82,6 +88,7 @@ export const renderStatus = (status: ServiceStatusPresentation): string => [
       ? model.displayName
       : `${model.displayName} - ${model.status}`,
   })}`] : []),
+  ...Option.match(status.reach, { onNone: () => [], onSome: reach => ["", ...renderServerReach(reach).map(line => `  ${line}`)] }),
   ...(Option.isNone(status.owner) ? [
     "", "Not running", "Open the Magnitude desktop app or run `magnitude serve`.",
   ] : []),
