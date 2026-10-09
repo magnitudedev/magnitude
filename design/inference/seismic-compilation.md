@@ -152,8 +152,11 @@ parameter a declaration gains multiplies it. The partition needs distinct admiss
 of a few parameters at a time (those the launch conditions read, each group's, each launch's code
 and group size), and takes each from a walk in which every parameter not coupled to them through
 `where` is held at its default, so its time and memory follow the sizes of the groups and not
-their product. The tuner measures every candidate in each
-group at the points where that group contributes work, evaluates boundary parameters that move
+their product. Materializing a projected group or launch's code variants is bounded at 4,096
+distinct assignments. If a projection exceeds that bound, the walk retains its default assignment,
+stops, and marks tuning incomplete; this limits optimization exploration without narrowing
+invocation admission. The tuner measures every retained candidate in each group at the points where
+that group contributes work, evaluates boundary parameters that move
 points between launches, then confirms each group's shortlisted candidates against its defaults
 before assembling one choice per group. An independent launch group outside the consumer's
 served points keeps its declared default. Only what is about to be measured is formed: a
