@@ -117,6 +117,7 @@ struct Builder<'n, 'b> {
     repeats: &'b mut BTreeMap<RepeatId, &'n Node>,
     terms: &'b mut Terms,
     skeleton: Skeleton,
+    shared: HashMap<(RuleId, u32), u32>,
 }
 
 impl<'n> Builder<'n, '_> {
@@ -166,8 +167,20 @@ impl<'n> Builder<'n, '_> {
         }
         match node {
             Node::Rule(rule) => match self.classes[*rule] {
+                // A flattened rule built again toward the same continuation
+                // reuses that copy: every path through it ends where the
+                // first one does, so the language is unchanged.
                 Class::Structural if self.flattened.contains(rule) => {
-                    self.build(&self.network.bodies[*rule], from, to)
+                    let entry = match self.shared.get(&(*rule, to)) {
+                        Some(&entry) => entry,
+                        None => {
+                            let entry = self.state();
+                            self.shared.insert((*rule, to), entry);
+                            self.build(&self.network.bodies[*rule], entry, to);
+                            entry
+                        }
+                    };
+                    self.eps(from, entry);
                 }
                 Class::Structural | Class::Recursive => {
                     self.call(from, to, Key::Rule(*rule), 1, Some(1))
@@ -619,6 +632,7 @@ impl Plan {
                             edges: Vec::new(),
                             heads: Vec::new(),
                         },
+                        shared: HashMap::new(),
                     };
                     builder.build(body, 0, 1);
                     builder.skeleton
