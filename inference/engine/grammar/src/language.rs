@@ -5,8 +5,12 @@
 use crate::terminal::{has_byte, Bytes, Term, TermId, Terms};
 use llguidance::derivre::{raw::RelevanceCache, ExprRef, RegexAst, RegexBuilder};
 
-/// Derivative work allowed for one emptiness question.
-const FUEL: u64 = 200_000;
+/// Derivative work allowed for one emptiness question. A whole tool call's
+/// arguments can be one lexeme, and with parallel calls a question about it
+/// costs several hundred thousand units (733,147 for OpenClaw's 57 tools);
+/// one left unanswered peels or splits more of the plan, which asks more
+/// questions, so this budget must cover them.
+const FUEL: u64 = 2_000_000;
 /// Derivative work allowed per compilation. A question left unanswered
 /// counts as positive, which only makes the rendering finer.
 const TOTAL_FUEL: u64 = 20_000_000;
